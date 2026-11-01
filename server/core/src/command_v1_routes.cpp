@@ -3,6 +3,7 @@
 #include "authz_model.hpp"               // authz::to_string(Operation)
 #include "dispatch_denial_text.hpp"      // describe_dispatch_denial
 #include "dispatch_destructive_gate.hpp" // evaluate_destructive_targeting / confine_destructive_targets
+#include "dispatch_send_progress.hpp"    // SendProgress / SendProgressScope
 #include "http_route_sink.hpp"
 #include "mcp_input_bounds.hpp"     // kExecInstr* bounds + check_exec_instruction_shape
 #include "mcp_jsonrpc.hpp"          // mcp::json_exceeds_depth / kMcpMaxJsonDepth (#2437 depth guard)
@@ -353,9 +354,29 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
         }
     };
 
+    // Built BEFORE the dispatch (execution_mutation.cpp's `threw_detail` pattern): a second
+    // bad_alloc while building them after the throw must not escape without a `failure` row. The
+    // arm upgrades them when it learns a partial count, and keeps these if that cannot allocate.
+    // No retry hint in either: whether any agent received the command is unknown, and a blind
+    // retry could dispatch it twice.
+    std::string threw_detail = "reason=dispatch_exception " + what +
+                               " execution_id=" + audit_token(execution_id) +
+                               " correlation_id=" + cid;
+    std::string threw_remediation =
+        execution_id.empty()
+            ? "the dispatch failed part-way and some agents may already have received the "
+              "command; no execution record was created, so confirm on the devices before "
+              "sending it again"
+            : "the dispatch failed part-way and some agents may already have received the "
+              "command; the execution was left running, not cancelled, so results from any agent "
+              "that did receive it are still recorded against it: check its per-agent results "
+              "before sending it again";
+
     ConfinedDispatchOutcome outcome;
+    SendProgress progress; // sends confirmed before a throw (dispatch_send_progress.hpp)
     bool threw = false;
     try {
+        const SendProgressScope send_scope(progress);
         outcome = d.dispatch_fn(plugin, action, agent_ids, scope, params, execution_id, caller);
     } catch (const std::exception& e) {
         spdlog::error("POST /api/v1/commands: dispatch failed: {}", e.what());
@@ -367,29 +388,53 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
     if (threw) {
         // The execution row is deliberately NOT cancelled (up8-3 / sg-5): whether any agent
         // already received the command is unknown, and a `cancelled` row with agents_targeted 0
-        // would tell every reader that nothing was sent. Left `running`, a response from any agent
-        // that did receive it is still recorded, and the stuck-execution reaper closes the row
-        // only when no agent ever answered. The tracker has no `failed` execution status.
+        // would tell every reader nothing was sent. It stays `running` (the tracker has no
+        // `failed` status).
+        //
+        // When the sink confirmed sends before the throw, that count is stored as the row's
+        // `agents_targeted` (set_targeted also refreshes the counters), so those agents' results
+        // complete the row through the ordinary refresh_counts path; without it the row could
+        // never close (refresh_counts promotes only when agents_targeted > 0 and the
+        // stuck-execution reaper excludes any row an agent has answered). With NO confirmed send
+        // the row stays at 0 and the reaper cancels it if no agent ever answers. The count is a
+        // lower bound (see dispatch_send_progress.hpp).
+        bool recorded = false;
+        if (progress.sent > 0 && !execution_id.empty() && d.execution.set_targeted) {
+            try {
+                recorded = d.execution.set_targeted(execution_id, progress.sent);
+            } catch (...) {
+                recorded = false;
+            }
+            if (!recorded) {
+                spdlog::error("POST /api/v1/commands: set_agents_targeted failed for "
+                              "execution_id={} after a dispatch that threw",
+                              execution_id);
+                count_bookkeeping_failed(d.metrics, "set_agents_targeted");
+            }
+        }
+        if (recorded) {
+            try {
+                std::string detail_text = threw_detail + " agents_sent=" + std::to_string(progress.sent);
+                std::string remediation =
+                    "the dispatch failed part-way: at least " + std::to_string(progress.sent) +
+                    " agent(s) were sent the command before the failure, and others may also have "
+                    "received it; the execution was left running (not cancelled) with " +
+                    std::to_string(progress.sent) +
+                    " agent(s) targeted, so results from those agents are still recorded against "
+                    "it and will complete it: check its per-agent results before sending it "
+                    "again, and close it with cancel_execution (POST "
+                    "/api/v1/executions/{id}/cancel) if it should not wait";
+                threw_detail = std::move(detail_text);
+                threw_remediation = std::move(remediation);
+            } catch (...) { // NOLINT(bugprone-empty-catch): keep the pre-built generic strings
+            }
+        }
         (void)detail::emit_behavioral_audit(audit, req, res, "command.dispatch", "failure",
-                                            "command", "",
-                                            "reason=dispatch_exception " + what +
-                                                " execution_id=" + audit_token(execution_id) +
-                                                " correlation_id=" + cid);
-        // No retry hint: whether any agent received the command is unknown, and a blind retry
-        // could dispatch it twice.
+                                            "command", "", threw_detail);
         res.status = 500;
         res.set_content(
             error_body(res, 500, "dispatch failed", "dispatch_exception",
-                       {.remediation =
-                            execution_id.empty()
-                                ? "the dispatch failed part-way and some agents may already have "
-                                  "received the command; no execution record was created, so "
-                                  "confirm on the devices before sending it again"
-                                : "the dispatch failed part-way and some agents may already have "
-                                  "received the command; the execution was left running, not "
-                                  "cancelled, so results from any agent that did receive it are "
-                                  "still recorded against it: check its per-agent results before "
-                                  "sending it again"},
+                       {.remediation = std::move(threw_remediation)},
                        nlohmann::json{{"execution_id", execution_id}}),
             "application/json");
         return;

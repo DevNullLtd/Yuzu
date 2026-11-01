@@ -3,7 +3,8 @@
  * (POST /api/v1/instructions/{id}/execute) of the instruction-definition execute capability.
  * Ledger row post.api-instructions-param-execute (#2146).
  *
- * NO POSTGRES. InstructionStore, ApprovalManager and ExecutionTracker are all Postgres-backed,
+ * NO POSTGRES, except the one [pg] case that drives a throwing dispatch through the production
+ * make_ports binding over a REAL ExecutionTracker. InstructionStore, ApprovalManager and ExecutionTracker are all Postgres-backed,
  * so every one of them is a std::function SEAM on instruction_execute::Ports and is faked here.
  * What this file therefore does NOT prove (and the senior should know): the real store
  * round-trip (definition read, approval row, execution row, the ADR-1007 claim INSERT/UPDATE
@@ -22,12 +23,15 @@
 #include "dispatch_target_shape.hpp"
 #include "dispatch_zero_reach.hpp"
 #include "instruction_execute.hpp"
+#include "instruction_execute_ports.hpp"
 #include "instruction_execute_routes.hpp"
 #include "mcp_instruction_execute.hpp" // kSubmitterPendingCap alias
 #include "service_scope_policy.hpp"
 
 #include "../test_helpers.hpp"
+#include "test_execution_tracker_pg_helper.hpp"
 #include "test_instruction_execute_rig.hpp"
+#include "test_partial_send_dispatch.hpp"
 #include "test_route_sink.hpp"
 
 #include "agent.pb.h"
@@ -1270,6 +1274,264 @@ TEST_CASE("execute: a dispatch that throws with no execution tracker says no rec
     CHECK(ref->kind == RefusalKind::kDispatchFailed);
     CHECK(ref->remediation.find("no execution record was created") != std::string::npos);
     CHECK(ref->remediation.find("left running") == std::string::npos);
+}
+
+// The wedge this closes: a dispatch that throws mid fan-out used to leave agents_targeted at 0, and
+// refresh_counts only promotes a row to terminal when agents_targeted > 0 while the reaper skips
+// any row an agent has answered, so the row could never close. The sink's confirmed-send count is
+// now stored on the throw.
+TEST_CASE("execute: a dispatch that throws after confirmed sends records that count so the row "
+          "can complete",
+          "[instruction_execute][send_progress]") {
+    Rig r;
+    r.defs["d"] = make_def("d");
+    r.custom_dispatch = [](const std::vector<std::string>& ids) {
+        return yuzu::test::dispatch_throwing_on_nth_send(ids, /*throw_on_nth=*/2);
+    };
+    auto out = run(r.request("d", json{{"agent_ids", json::array({kA, kB, kC})}},
+                             make_caller("u", true)),
+                   r.ports(), r.audit());
+    const auto* ref = as_refusal(out);
+    REQUIRE(ref);
+    CHECK(ref->kind == RefusalKind::kDispatchFailed);
+    CHECK_FALSE(ref->retry_after_ms.has_value());
+    // The first send was confirmed before the second threw: ONE agent holds the command.
+    REQUIRE(r.targeted.size() == 1);
+    CHECK(r.targeted[0] == std::pair<std::string, int>{"exec-1", 1});
+    REQUIRE(r.refreshed.size() == 1); // responses that beat the count can now close the row
+    CHECK(r.refreshed[0] == "exec-1");
+    CHECK(r.cancelled.empty()); // still NOT cancelled: an agent holds the command
+    // The remediation is true: names the row, the count, that results still arrive, and the
+    // way to close it; and still advertises no retry.
+    CHECK(ref->remediation.find("exec-1") != std::string::npos);
+    CHECK(ref->remediation.find("at least 1 agent(s) were sent the command") != std::string::npos);
+    CHECK(ref->remediation.find("will complete it") != std::string::npos);
+    CHECK(ref->remediation.find("cancel_execution") != std::string::npos);
+    CHECK(ref->remediation.find("retry") == std::string::npos);
+    REQUIRE(r.audits.size() == 2);
+    CHECK(r.audits[1].result == "failure");
+    CHECK(r.audits[1].detail.find("reason=dispatch_exception") != std::string::npos);
+    CHECK(r.audits[1].detail.find("agents_sent=1") != std::string::npos);
+    CHECK(r.audits[1].detail.find("execution_id=exec-1") != std::string::npos);
+}
+
+TEST_CASE("execute: a dispatch that throws before any confirmed send records no count and leaves "
+          "the row running for the reaper",
+          "[instruction_execute][send_progress]") {
+    Rig r;
+    r.defs["d"] = make_def("d");
+    r.custom_dispatch = [](const std::vector<std::string>& ids) {
+        return yuzu::test::dispatch_throwing_on_nth_send(ids, /*throw_on_nth=*/1);
+    };
+    auto out = run(r.request("d", json{{"agent_ids", json::array({kA, kB, kC})}},
+                             make_caller("u", true)),
+                   r.ports(), r.audit());
+    const auto* ref = as_refusal(out);
+    REQUIRE(ref);
+    CHECK(ref->kind == RefusalKind::kDispatchFailed);
+    CHECK(r.targeted.empty());
+    CHECK(r.refreshed.empty());
+    CHECK(r.cancelled.empty()); // an in-flight first send is indeterminate: never cancel
+    CHECK(ref->remediation.find("some agents may already have received the command") !=
+          std::string::npos);
+    CHECK(ref->remediation.find("left running, not cancelled") != std::string::npos);
+    CHECK(r.audits[1].detail.find("agents_sent") == std::string::npos);
+}
+
+TEST_CASE("execute: a failed partial-count write is counted and keeps the generic remediation",
+          "[instruction_execute][send_progress]") {
+    Rig r;
+    r.set_targeted_ok = false;
+    r.defs["d"] = make_def("d");
+    r.custom_dispatch = [](const std::vector<std::string>& ids) {
+        return yuzu::test::dispatch_throwing_on_nth_send(ids, 3);
+    };
+    auto out = run(r.request("d", json{{"agent_ids", json::array({kA, kB, kC})}},
+                             make_caller("u", true)),
+                   r.ports(), r.audit());
+    const auto* ref = as_refusal(out);
+    REQUIRE(ref);
+    REQUIRE(r.targeted.size() == 1); // two sends were confirmed; the store refused the write
+    CHECK(r.targeted[0].second == 2);
+    CHECK(r.counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                    {{"op", "set_agents_targeted"}, {"surface", "rest"}}) == 1);
+    CHECK(ref->remediation.find("will complete it") == std::string::npos);
+    CHECK(ref->remediation.find("some agents may already have received the command") !=
+          std::string::npos);
+}
+
+TEST_CASE("execute: a throwing dispatch with no tracker wired records nothing",
+          "[instruction_execute][send_progress]") {
+    Rig r;
+    r.ledger_wired = false;
+    r.defs["d"] = make_def("d");
+    r.custom_dispatch = [](const std::vector<std::string>& ids) {
+        return yuzu::test::dispatch_throwing_on_nth_send(ids, 2);
+    };
+    auto out = run(r.request("d", json{{"agent_ids", json::array({kA, kB})}},
+                             make_caller("u", true)),
+                   r.ports(), r.audit());
+    REQUIRE(as_refusal(out));
+    CHECK(r.targeted.empty());
+    CHECK(as_refusal(out)->remediation.find("no execution record was created") !=
+          std::string::npos);
+}
+
+namespace {
+std::string execution_id_of(const std::string& audit_detail) {
+    const auto at = audit_detail.find("execution_id=");
+    REQUIRE(at != std::string::npos);
+    const auto from = at + std::string("execution_id=").size();
+    return audit_detail.substr(from, audit_detail.find(' ', from) - from);
+}
+} // namespace
+
+// The production binding over a REAL tracker: the wedge is a property of refresh_counts and the
+// reaper, so a fake tracker cannot show it closed.
+TEST_CASE("execute: [pg] a dispatch that throws on the 2nd of 3 sends leaves a row that the one "
+          "sent agent's answer completes",
+          "[pg][instruction_execute][send_progress]") {
+    yuzu::test::ExecutionTrackerPg tracker;
+    Rig r;
+    r.defs["d"] = make_def("d");
+    const Ports rig_ports = r.ports();
+
+    StoreBindings b;
+    b.execution_tracker = tracker.get();
+    b.capability_registry = &r.caps;
+    b.authorize = rig_ports.authorize;
+    b.validators = std::make_shared<instr::ParamValidatorCache>();
+    b.metrics = &r.metrics;
+    int throw_on = 2;
+    b.dispatch = [&throw_on](const std::string&, const std::string&,
+                             const std::vector<std::string>& ids,
+                             const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&, const DispatchCaller&, const std::string&,
+                             const std::string&) {
+        return yuzu::test::dispatch_throwing_on_nth_send(ids, throw_on);
+    };
+    Ports ports = make_ports(b);
+    ports.lookup_definition = rig_ports.lookup_definition; // InstructionStore is not under test
+
+    auto out = run(r.request("d", json{{"agent_ids", json::array({kA, kB, kC})}},
+                             make_caller("u", true)),
+                   ports, r.audit());
+    const auto* ref = as_refusal(out);
+    REQUIRE(ref);
+    CHECK(ref->kind == RefusalKind::kDispatchFailed);
+    REQUIRE(r.audits.size() == 2);
+    const std::string id = execution_id_of(r.audits[1].detail);
+
+    auto row = tracker->get_execution(id);
+    REQUIRE(row.has_value());
+    CHECK(row->agents_targeted == 1); // the one send confirmed before the throw
+    CHECK(row->status == "running");  // NOT cancelled: that agent holds the command
+    CHECK(ref->remediation.find(id) != std::string::npos);
+
+    // The sent agent answers: this is the result that could never close the row before.
+    yuzu::server::AgentExecStatus st;
+    st.agent_id = kA;
+    st.status = "success";
+    tracker->update_agent_status(id, st);
+    tracker->refresh_counts(id);
+    row = tracker->get_execution(id);
+    REQUIRE(row.has_value());
+    CHECK(row->agents_responded == 1);
+    CHECK(row->status == "succeeded");
+    CHECK(row->completed_at > 0);
+}
+
+TEST_CASE("execute: [pg] a dispatch that throws on the 1st send leaves the row running with no "
+          "target count, for the reaper",
+          "[pg][instruction_execute][send_progress]") {
+    yuzu::test::ExecutionTrackerPg tracker;
+    Rig r;
+    r.defs["d"] = make_def("d");
+    const Ports rig_ports = r.ports();
+    StoreBindings b;
+    b.execution_tracker = tracker.get();
+    b.capability_registry = &r.caps;
+    b.authorize = rig_ports.authorize;
+    b.validators = std::make_shared<instr::ParamValidatorCache>();
+    b.metrics = &r.metrics;
+    b.dispatch = [](const std::string&, const std::string&, const std::vector<std::string>& ids,
+                    const std::string&, const std::unordered_map<std::string, std::string>&,
+                    const std::string&, const DispatchCaller&, const std::string&,
+                    const std::string&) {
+        return yuzu::test::dispatch_throwing_on_nth_send(ids, 1);
+    };
+    Ports ports = make_ports(b);
+    ports.lookup_definition = rig_ports.lookup_definition;
+
+    auto out = run(r.request("d", json{{"agent_ids", json::array({kA, kB})}},
+                             make_caller("u", true)),
+                   ports, r.audit());
+    REQUIRE(as_refusal(out));
+    REQUIRE(r.audits.size() == 2);
+    const std::string id = execution_id_of(r.audits[1].detail);
+    const auto row = tracker->get_execution(id);
+    REQUIRE(row.has_value());
+    CHECK(row->agents_targeted == 0);
+    CHECK(row->status == "running"); // not cancelled: the first send is indeterminate
+    CHECK(r.audits[1].detail.find("agents_sent") == std::string::npos);
+}
+
+TEST_CASE("send progress: instrument_sink is the identity outside a scope, counts inside one, and "
+          "scopes nest",
+          "[instruction_execute][send_progress]") {
+    const auto make = [] {
+        ConfinedDispatchSink s;
+        s.send_to = [](const std::string& aid) { return aid != "down"; };
+        s.send_to_all_unfiltered = [] { return 3; };
+        return s;
+    };
+    {
+        const auto plain = instrument_sink(make());
+        CHECK(plain.send_to("a"));
+        CHECK(plain.send_to_all_unfiltered() == 3);
+        CHECK(SendProgressScope::current() == nullptr);
+    }
+    SendProgress outer;
+    {
+        const SendProgressScope outer_scope(outer);
+        CHECK(SendProgressScope::current() == &outer);
+        const auto counted = instrument_sink(make());
+        CHECK(counted.send_to("a"));
+        CHECK_FALSE(counted.send_to("down")); // an undelivered send is not counted
+        CHECK(counted.send_to_all_unfiltered() == 3);
+        CHECK(outer.sent == 4);
+        SendProgress inner;
+        {
+            const SendProgressScope inner_scope(inner);
+            CHECK(SendProgressScope::current() == &inner);
+            CHECK(instrument_sink(make()).send_to("b"));
+        }
+        CHECK(inner.sent == 1);
+        CHECK(SendProgressScope::current() == &outer); // restored
+        CHECK(outer.sent == 4);
+    }
+    CHECK(SendProgressScope::current() == nullptr);
+}
+
+TEST_CASE("send progress: wire_and_dispatch_confined counts the sends it actually makes",
+          "[instruction_execute][send_progress]") {
+    Rig r;
+    SendProgress progress;
+    {
+        const SendProgressScope scope(progress);
+        // The production wire function over a real AgentRegistry: three delivered sends.
+        auto out = r.real("testplug", "ping", {kA, kB, kC}, "", {}, "exec-x",
+                          make_caller("u", true), "d", "per-device");
+        CHECK(out.sent == 3);
+    }
+    CHECK(progress.sent == 3);
+    // Outside a scope the same call is uncounted and unchanged.
+    SendProgress untouched;
+    CHECK(r.real("testplug", "ping", {kA}, "", {}, "exec-y", make_caller("u", true), "d",
+                 "per-device")
+              .sent == 1);
+    CHECK(untouched.sent == 0);
 }
 
 TEST_CASE("execute: a create_execution that throws (std or non-std) writes a failure row, "

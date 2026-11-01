@@ -17,6 +17,7 @@
 #include "custom_properties_store.hpp"
 #include "dispatch_confined_arms.hpp"
 #include "dispatch_route_fallback.hpp"
+#include "dispatch_send_progress.hpp"
 #include "dispatch_target_shape.hpp"
 #include "execution_tracker.hpp"
 #include "gateway_route_store.hpp"
@@ -438,7 +439,7 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     // per-id consult) and `prepare_route_fallback` (the batched read).
     auto route_fallback =
         std::make_shared<yuzu::server::GatewayRouteFallback>(registry, gateway_route_store);
-    yuzu::server::ConfinedDispatchSink sink{
+    yuzu::server::ConfinedDispatchSink raw_sink{
         [&registry, &cmd, route_fallback](const std::string& aid) {
             // A local session ALWAYS wins (route_fallback->prepare() never
             // even looks up an id with one) — this fallback fires ONLY for a
@@ -465,6 +466,10 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         [&registry](const std::vector<std::string>& candidates) {
             return registry.has_remote_presence(candidates);
         }};
+    // Counts confirmed sends into the caller's SendProgressScope when one is open (the
+    // instruction-execute core and POST /api/v1/commands), so a throw mid fan-out still tells
+    // them how many agents hold the command. Identity otherwise.
+    const yuzu::server::ConfinedDispatchSink sink = yuzu::server::instrument_sink(std::move(raw_sink));
 
     // #3424/#3511: one registry read per dispatch, same lifecycle as `gate`
     // (built once by the caller before this function runs) -- never

@@ -2,6 +2,7 @@
 
 #include "dispatch_denial_text.hpp"
 #include "dispatch_destructive_gate.hpp"
+#include "dispatch_send_progress.hpp"
 #include "dispatch_target_shape.hpp"
 #include "rest_a4_envelope.hpp" // detail::make_correlation_id
 #include "sensitive_instruction_params.hpp"
@@ -500,6 +501,42 @@ void cancel_row(Ctx& c, const std::string& execution_id) {
     }
 }
 
+/// Records how many agents hold the command and re-evaluates the row's counters (responses that
+/// arrived BEFORE the count was set could not move it to terminal). Returns whether the count was
+/// stored; a failure is logged and counted, never thrown. Shared by the success path and the
+/// throwing-dispatch arm, which stores the confirmed partial count.
+bool record_targeted(Ctx& c, const std::string& execution_id, int agents) {
+    const Ports& p = c.ports;
+    if (!p.set_agents_targeted || execution_id.empty())
+        return false;
+    bool ok = false;
+    try {
+        ok = p.set_agents_targeted(execution_id, agents);
+    } catch (...) {
+        ok = false;
+    }
+    if (!ok) {
+        spdlog::error("instruction execute: set_agents_targeted failed for execution_id={}",
+                      execution_id);
+        bump(p, "yuzu_exec_tracker_bookkeeping_failed_total",
+             {{"op", "set_agents_targeted"},
+              {"surface", std::string(bookkeeping_label(c.rq.surface))}});
+    }
+    if (p.refresh_counts) {
+        try {
+            p.refresh_counts(execution_id);
+        } catch (const std::exception& e) {
+            spdlog::warn("instruction execute: refresh_counts threw for execution_id={}: {}",
+                         execution_id, e.what());
+        } catch (...) {
+            spdlog::warn("instruction execute: refresh_counts threw a non-standard exception "
+                         "for execution_id={}",
+                         execution_id);
+        }
+    }
+    return ok;
+}
+
 Outcome dispatch_stage(Ctx& c, Plan plan) {
     const Ports& p = c.ports;
     const Request& rq = c.rq;
@@ -574,9 +611,34 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
     const std::string dispatch_scope = (plan.agent_ids.empty() && plan.scope.empty())
                                            ? std::string(kBroadcastScope)
                                            : plan.scope;
+    // The throw arm's strings are built BEFORE the dispatch (execution_mutation.cpp's
+    // `threw_detail` pattern): a second bad_alloc while building them after the throw must not
+    // escape without a `failure` row. The arm may upgrade them once it knows the partial count,
+    // and falls back to these when that upgrade cannot allocate.
+    std::string threw_detail =
+        "reason=dispatch_exception definition=" + def_token + " execution_id=" + execution_id;
+    // NO retry hint, on the wire or in prose: whether any agent already received the command is
+    // unknown once the dispatch has thrown, so a blind retry could dispatch it twice.
+    // (command_v1_routes.cpp's dispatch_exception arm drops it for the same reason.)
+    std::string threw_remediation =
+        "the dispatch failed part-way and some agents may already have received the command; ";
+    if (execution_id.empty()) {
+        threw_remediation += "no execution record was created, so there are no per-agent results "
+                             "to check; confirm on the devices before running it again";
+    } else {
+        threw_remediation +=
+            "execution " + execution_id +
+            " was left running, not cancelled, so results from any agent that did receive the "
+            "command are still recorded against it; check that execution's per-agent results "
+            "before running the definition again (the server closes the record by itself if no "
+            "agent ever responds)";
+    }
+
     ConfinedDispatchOutcome o;
+    SendProgress progress; // sends confirmed before a throw (dispatch_send_progress.hpp)
     bool threw = false;
     try {
+        const SendProgressScope send_scope(progress);
         o = p.dispatch(def.plugin, def.action, plan.agent_ids, dispatch_scope, plan.params,
                        execution_id, rq.caller, def.id, def.concurrency_mode);
     } catch (const std::exception& e) {
@@ -588,33 +650,40 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
         threw = true;
     }
     if (threw) {
-        // up8-3 / sg-5: the execution row is deliberately NOT cancelled. Whether any agent
-        // already received the command is unknown once the dispatch has thrown, and a row marked
-        // `cancelled` (agents_targeted 0) would tell every reader that nothing was sent. Left at
-        // `running`, a response from any agent that did receive it is still recorded against the
-        // row (update_agent_status), and the stuck-execution reaper
-        // (ExecutionTracker::reap_stuck_running_executions: status 'running', agents_targeted 0,
-        // no agent response) closes it as cancelled only when no agent ever answered. The
-        // tracker has no `failed` execution status, so `running` is the honest "unknown" state.
-        c.audit("failure", "reason=dispatch_exception definition=" + def_token +
-                               " execution_id=" + execution_id);
-        // NO retry hint, on the wire or in prose: whether any agent already received the command
-        // is unknown once the dispatch has thrown, so a blind retry could dispatch it twice.
-        // (command_v1_routes.cpp's dispatch_exception arm drops it for the same reason.)
-        std::string remediation =
-            "the dispatch failed part-way and some agents may already have received the command; ";
-        if (execution_id.empty()) {
-            remediation += "no execution record was created, so there are no per-agent results "
-                           "to check; confirm on the devices before running it again";
-        } else {
-            remediation += "execution " + execution_id +
-                           " was left running, not cancelled, so results from any agent that did "
-                           "receive the command are still recorded against it; check that "
-                           "execution's per-agent results before running the definition again "
-                           "(the server closes the record by itself if no agent ever responds)";
+        // The execution row is deliberately NOT cancelled (up8-3 / sg-5): a row marked
+        // `cancelled` with agents_targeted 0 would tell every reader nothing was sent, and some
+        // agents may hold the command. It stays `running` (the tracker has no `failed` status).
+        //
+        // When the sink confirmed sends before the throw, that count is stored as the row's
+        // `agents_targeted` and the counters refreshed, so the results of those agents complete
+        // the row through the ordinary refresh_counts path. Without it the row could never close:
+        // refresh_counts promotes only when agents_targeted > 0, and the stuck-execution reaper
+        // excludes any row an agent has answered. With NO confirmed send the row stays at 0 and
+        // the reaper cancels it if no agent ever answers. The count is a lower bound (see
+        // dispatch_send_progress.hpp).
+        const bool recorded =
+            progress.sent > 0 && record_targeted(c, execution_id, progress.sent);
+        if (recorded) {
+            try {
+                std::string detail_text = threw_detail + " agents_sent=" + std::to_string(progress.sent);
+                std::string remediation =
+                    "the dispatch failed part-way: at least " + std::to_string(progress.sent) +
+                    " agent(s) were sent the command before the failure, and others may also have "
+                    "received it; execution " +
+                    execution_id + " was left running (not cancelled) with " +
+                    std::to_string(progress.sent) +
+                    " agent(s) targeted, so results from those agents are still recorded against "
+                    "it and will complete it; check that execution's per-agent results before "
+                    "running the definition again, and close it with cancel_execution "
+                    "(POST /api/v1/executions/{id}/cancel on REST) if it should not wait";
+                threw_detail = std::move(detail_text);
+                threw_remediation = std::move(remediation);
+            } catch (...) { // NOLINT(bugprone-empty-catch): keep the pre-built generic strings
+            }
         }
+        c.audit("failure", threw_detail);
         return Outcome{make_refusal(RefusalKind::kDispatchFailed, "dispatch_exception",
-                                    "dispatch failed", std::move(remediation)),
+                                    "dispatch failed", std::move(threw_remediation)),
                        c.audit_dropped};
     }
 
@@ -640,33 +709,7 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
 
     // 9. Success. Record the targeted count, then re-evaluate counters: responses that arrived
     //    BEFORE the count was set could not move the row to terminal.
-    if (p.set_agents_targeted && !execution_id.empty()) {
-        bool ok = false;
-        try {
-            ok = p.set_agents_targeted(execution_id, o.sent);
-        } catch (...) {
-            ok = false;
-        }
-        if (!ok) {
-            spdlog::error("instruction execute: set_agents_targeted failed for execution_id={}",
-                          execution_id);
-            bump(p, "yuzu_exec_tracker_bookkeeping_failed_total",
-                 {{"op", "set_agents_targeted"},
-                  {"surface", std::string(bookkeeping_label(rq.surface))}});
-        }
-        if (p.refresh_counts) {
-            try {
-                p.refresh_counts(execution_id);
-            } catch (const std::exception& e) {
-                spdlog::warn("instruction execute: refresh_counts threw for execution_id={}: {}",
-                             execution_id, e.what());
-            } catch (...) {
-                spdlog::warn("instruction execute: refresh_counts threw a non-standard exception "
-                             "for execution_id={}",
-                             execution_id);
-            }
-        }
-    }
+    (void)record_targeted(c, execution_id, o.sent);
     c.audit("success", "command_id=" + ::yuzu::log_token(o.command_id) +
                            " execution_id=" + execution_id + " agents=" + std::to_string(o.sent) +
                            " definition=" + def_token);

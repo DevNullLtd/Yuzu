@@ -34,6 +34,7 @@
 #include "dispatch_scope_ladder.hpp"
 #include "mcp_input_bounds.hpp"
 #include "service_scope_policy.hpp"
+#include "test_partial_send_dispatch.hpp"
 
 #include "../test_helpers.hpp"
 #include "test_route_sink.hpp"
@@ -107,6 +108,10 @@ struct Rig {
     std::optional<ConfinedDispatchOutcome> canned; // overrides the real seam for one outcome
     bool dispatch_throws = false;
     bool dispatch_throws_nonstd = false;
+    /// >0: the dispatch runs the REAL arms and the REAL instrumented sink, and send number N
+    /// throws (test_partial_send_dispatch.hpp).
+    int throw_on_nth_send = 0;
+    bool set_targeted_ok = true;
     bool create_throws = false;
     bool create_throws_nonstd = false;
     int dispatch_calls = 0;
@@ -238,7 +243,7 @@ struct Rig {
         };
         d.execution.set_targeted = [this](const std::string& id, int n) {
             targeted.emplace_back(id, n);
-            return true;
+            return set_targeted_ok;
         };
         d.metrics = &metrics;
         if (opts.emit)
@@ -266,6 +271,8 @@ struct Rig {
             throw std::runtime_error("boom");
         if (dispatch_throws_nonstd)
             throw 42; // NOLINT(hicpp-exception-baseclass): a non-std throw is the point
+        if (throw_on_nth_send > 0)
+            return yuzu::test::dispatch_throwing_on_nth_send(ids, throw_on_nth_send);
         const std::string command_id = plugin + "-cmd-" + std::to_string(dispatch_calls);
         if (canned) {
             auto out = *canned;
@@ -967,6 +974,63 @@ TEST_CASE("command_v1: a dispatch that throws (std or non-std) is a 500 with no 
         CHECK(rig.cancelled.empty());
         CHECK(rig.dispatch_calls == 1);
         CHECK(rig.has_audit("failure", "reason=dispatch_exception"));
+    }
+}
+
+TEST_CASE("command_v1: a dispatch that throws after confirmed sends records that count so the "
+          "row can complete, and the remediation says what is true",
+          "[server][command_v1][dispatch][send_progress]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    rig.throw_on_nth_send = 2;
+    const auto res = rig.post({{"plugin", "os_info"}, {"action", "os_version"},
+                               {"agent_ids", Ids{kA, kB, kC}}});
+    CHECK(res->status == 500);
+    CHECK(reason_of(res) == "dispatch_exception");
+    const auto err = body_of(res)["error"];
+    CHECK(err["retry_after_ms"].is_null());
+    CHECK(err["execution_id"] == "exec-1");
+    // One send was confirmed before the second threw: that is the row's target count.
+    REQUIRE(rig.targeted.size() == 1);
+    CHECK(rig.targeted[0] == std::pair<std::string, int>{"exec-1", 1});
+    CHECK(rig.cancelled.empty());
+    const auto rem = err["remediation"].get<std::string>();
+    CHECK(rem.find("at least 1 agent(s) were sent the command") != std::string::npos);
+    CHECK(rem.find("will complete it") != std::string::npos);
+    CHECK(rem.find("cancel_execution") != std::string::npos);
+    CHECK(rem.find("retry") == std::string::npos);
+    CHECK(rig.has_audit("failure", "reason=dispatch_exception"));
+    CHECK(rig.has_audit("failure", "agents_sent=1"));
+}
+
+TEST_CASE("command_v1: a dispatch that throws before any confirmed send records no count; a failed "
+          "count write keeps the generic remediation",
+          "[server][command_v1][dispatch][send_progress]") {
+    SECTION("first send throws") {
+        Rig rig;
+        rig.facts = {.legacy_open = true};
+        rig.throw_on_nth_send = 1;
+        const auto res = rig.post({{"plugin", "os_info"}, {"action", "os_version"},
+                                   {"agent_ids", Ids{kA, kB}}});
+        CHECK(res->status == 500);
+        CHECK(rig.targeted.empty());
+        CHECK(rig.cancelled.empty());
+        CHECK(body_of(res)["error"]["remediation"].get<std::string>().find("not cancelled") !=
+              std::string::npos);
+        CHECK_FALSE(rig.has_audit("failure", "agents_sent"));
+    }
+    SECTION("the count write fails") {
+        Rig rig;
+        rig.facts = {.legacy_open = true};
+        rig.throw_on_nth_send = 3;
+        rig.set_targeted_ok = false;
+        const auto res = rig.post({{"plugin", "os_info"}, {"action", "os_version"},
+                                   {"agent_ids", Ids{kA, kB, kC}}});
+        CHECK(res->status == 500);
+        REQUIRE(rig.targeted.size() == 1);
+        CHECK(rig.targeted[0].second == 2);
+        CHECK(body_of(res)["error"]["remediation"].get<std::string>().find("will complete it") ==
+              std::string::npos);
     }
 }
 

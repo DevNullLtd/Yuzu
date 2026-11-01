@@ -148,6 +148,9 @@ struct Rig {
     bool dispatch_throws_nonstd{false}; // throws an int, not a std::exception
     bool create_throws{false};          // create_execution throws a std::exception
     bool create_throws_nonstd{false};   // ... or an int
+    /// When set, replaces the stub/real dispatch (after the call is recorded): lets a test run a
+    /// dispatch that confirms some sends and then throws (test_partial_send_dispatch.hpp).
+    std::function<ConfinedDispatchOutcome(const std::vector<std::string>&)> custom_dispatch;
     ConfinedDispatchOutcome stub_outcome{.sent = 1, .command_id = "cmd-1"};
     std::int64_t seq{0};
 
@@ -319,6 +322,8 @@ struct Rig {
                 throw std::runtime_error("boom");
             if (dispatch_throws_nonstd)
                 throw 42; // NOLINT: a non-std throw is the point
+            if (custom_dispatch)
+                return custom_dispatch(ids);
             if (real_dispatch)
                 return real(pl, ac, ids, sc, pa, ex, caller, def_id, mode);
             return stub_outcome;
