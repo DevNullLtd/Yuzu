@@ -13960,11 +13960,18 @@ private:
                     "just dropped) — see the earlier boot-time error for why "
                     "(mutual-TLS credential construction likely failed)",
                     gw_pending.size());
-                metrics_
-                    .counter("yuzu_server_gateway_forward_total",
-                             {{"cluster_id", std::string(yuzu::server::kUnknownGatewayClusterLabel)},
-                              {"status", "unavailable"}})
-                    .increment(static_cast<double>(gw_pending.size()));
+                // Observability must not block the resolution below: the counter builds a label
+                // map under a lock and can throw (bad_alloc, system_error); an escape here would
+                // skip every drained command's terminal response.
+                try {
+                    metrics_
+                        .counter("yuzu_server_gateway_forward_total",
+                                 {{"cluster_id",
+                                   std::string(yuzu::server::kUnknownGatewayClusterLabel)},
+                                  {"status", "unavailable"}})
+                        .increment(static_cast<double>(gw_pending.size()));
+                } catch (...) { // NOLINT(bugprone-empty-catch): a lost increment only
+                }
                 // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22):
                 // the metric/log above previously left every drained command's
                 // command_id unresolved -- the exact "stuck forever" shape
