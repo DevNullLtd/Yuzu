@@ -311,6 +311,7 @@
 #include "agent_registry.hpp"
 #include "agent_service_impl.hpp"
 #include "cidr_match.hpp"
+#include "gateway_forward_guard.hpp"
 #include "gateway_mgmt_stub_pool.hpp"
 #include "gateway_route_store.hpp"
 #include "gateway_peer_audit.hpp"
@@ -13983,20 +13984,19 @@ private:
             }
             return;
         }
-        // The loop body is ONE try-statement (`for (...) try { ... } catch (...)`): everything
-        // from the first allocating statement (the resolution's label copy, the id copies, the
-        // closure captures) through the thread spawn can throw bad_alloc / system_error under
-        // exactly the resource pressure that makes a spawn fail, and an escape would unwind this
-        // loop and destroy every not-yet-forwarded drained command with no terminal response
-        // (dispatch already counted each as SENT). These three live OUTSIDE the try so the
-        // handler can name the command it is resolving.
-        std::string cmd_id;
-        std::string expected_agent_id;
-        bool resolve_attempted = false;
-        for (auto& gp : gw_pending) try {
-            cmd_id.clear();
-            expected_agent_id.clear();
-            resolve_attempted = false;
+        // The per-command body runs under `yuzu::server::guarded_forward`
+        // (gateway_forward_guard.hpp): everything from the first allocating statement (the
+        // resolution's label copy, the id copies, the closure captures) through the thread spawn
+        // can throw bad_alloc / system_error under exactly the resource pressure that makes a
+        // spawn fail, and an escape would unwind this loop and destroy every not-yet-forwarded
+        // drained command with no terminal response (dispatch already counted each as SENT).
+        // The guard's `ForwardAttempt` holds the three values that must OUTLIVE the body so its
+        // handler can name the command it is resolving; the body below reaches them through
+        // the `cmd_id` / `expected_agent_id` references and `attempt.resolve_attempted`.
+        yuzu::server::ForwardAttempt fwd_attempt;
+        const auto forward_one = [&](yuzu::server::ForwardAttempt& attempt, auto& gp) {
+            std::string& cmd_id = attempt.cmd_id;
+            std::string& expected_agent_id = attempt.agent_id;
             // HA WS-4 4.3: resolve per-command, against the eager pool built
             // at boot — see GatewayMgmtStubPool's file header for the
             // two-mode resolution rule (single-cluster mode ignores
@@ -14030,15 +14030,19 @@ private:
                 // a bad_alloc there leaves the flag false, so the handler below still resolves
                 // the command. The flag goes up immediately before the one non-idempotent step,
                 // process_gateway_response, whose partial failure is NOT retried by the handler.
-                const auto unknown_cluster_response =
-                    yuzu::server::build_gateway_forward_terminal_failure(
-                        cmd_id, "gateway_unknown_cluster",
-                        "No configured mgmt address for cluster '" +
-                            gp.cluster_id.value_or("<none>") + "' — command not delivered");
-                resolve_attempted = true;
-                apply_gateway_forward_terminal_response(&agent_service_, gp.agent_id,
-                                                        unknown_cluster_response);
-                continue;
+                yuzu::server::resolve_with_flag(
+                    attempt,
+                    [&] {
+                        return yuzu::server::build_gateway_forward_terminal_failure(
+                            cmd_id, "gateway_unknown_cluster",
+                            "No configured mgmt address for cluster '" +
+                                gp.cluster_id.value_or("<none>") + "' — command not delivered");
+                    },
+                    [&](const auto& unknown_cluster_response) {
+                        apply_gateway_forward_terminal_response(&agent_service_, gp.agent_id,
+                                                                unknown_cluster_response);
+                    });
+                return;
             }
             auto* stub = resolution.stub;
             auto* svc = &agent_service_;
@@ -14343,57 +14347,46 @@ private:
                 }
             };
             std::thread(std::move(forward_worker)).detach();
-        } catch (...) {
-            // Best effort, and honest about it. Dispatch has already counted this command as SENT
-            // (send_to returned true at the queue push), so an unresolved command_id here leaves
-            // its execution row `running` with a targeted count it can never complete (the
-            // reaper skips rows with agents_targeted > 0). Resolve it terminally now, exactly like
-            // every other no-delivery branch of this function, and keep going: every later drained
-            // command gets its own attempt. The resolver allocates too, so under the same pressure
-            // it can fail as well; that is logged at error level (with the ids) rather than
-            // swallowed, because a command left unresolved here is only closed by an operator
-            // cancel. A command whose unknown-cluster resolution already ran (`resolve_attempted`)
-            // is never resolved a second time: process_gateway_response is not idempotent.
-            // `cmd_id` / `expected_agent_id` are copies taken before the closure captured the
-            // moved-from `gp`; when the throw came before they were assigned, `gp` itself has not
-            // been moved yet and is the source.
-            if (!resolve_attempted) {
-                bool resolved = false;
-                try {
-                    const std::string& cid = cmd_id.empty() ? gp.cmd.command_id() : cmd_id;
-                    const std::string& aid = expected_agent_id.empty() ? gp.agent_id
-                                                                       : expected_agent_id;
-                    apply_gateway_forward_terminal_failure(
-                        &agent_service_, aid, cid, "gateway_forward_spawn_failed",
-                        "The server could not set up or start the thread that forwards this "
-                        "command to the gateway (resource exhaustion), command not "
-                        "delivered");
-                    resolved = true;
-                } catch (...) { // NOLINT(bugprone-empty-catch): reported just below
-                }
-                try {
+        };
+        for (auto& gp : gw_pending) {
+            yuzu::server::guarded_forward(
+                fwd_attempt,
+                [&](yuzu::server::ForwardAttempt& attempt) { forward_one(attempt, gp); },
+                [&]() -> const std::string& { return gp.cmd.command_id(); },
+                [&]() -> const std::string& { return gp.agent_id; },
+                // Best effort, and honest about it. Dispatch has already counted this command as
+                // SENT (send_to returned true at the queue push), so an unresolved command_id
+                // here leaves its execution row `running` with a targeted count it can never
+                // complete (the reaper skips rows with agents_targeted > 0). The guard resolves
+                // it terminally now, exactly like every other no-delivery branch of this
+                // function, and keeps going: every later drained command gets its own attempt.
+                // The resolver allocates too, so under the same pressure it can fail as well;
+                // that is logged at error level (with the ids) rather than swallowed, because a
+                // command left unresolved here is only closed by an operator cancel. A command
+                // whose unknown-cluster resolution already ran (`resolve_attempted`) is never
+                // resolved a second time: process_gateway_response is not idempotent.
+                [&](const std::string& aid, const std::string& cid, std::string_view reason,
+                    std::string_view detail) {
+                    apply_gateway_forward_terminal_failure(&agent_service_, aid, cid,
+                                                           std::string(reason),
+                                                           std::string(detail));
+                },
+                [&](const std::string& aid, const std::string& cid, bool resolved) {
                     spdlog::error("Gateway SendCommand for agent {} command {}: forwarding could "
                                   "not be set up (thread creation or allocation failed); {}",
-                                  ::yuzu::log_id_token(expected_agent_id.empty() ? gp.agent_id
-                                                                                 : expected_agent_id),
-                                  ::yuzu::log_id_token(cmd_id.empty() ? gp.cmd.command_id()
-                                                                      : cmd_id),
+                                  ::yuzu::log_id_token(aid), ::yuzu::log_id_token(cid),
                                   resolved ? "the command was resolved as failed"
                                            : "the terminal write ALSO failed, so the execution "
                                              "stays running until an operator cancels it");
-                } catch (...) { // NOLINT(bugprone-empty-catch): last resort; the loop continues
-                }
-            } else {
-                try {
+                },
+                [&](const std::string& cid) {
                     spdlog::error("Gateway SendCommand for command {}: the unknown-cluster "
                                   "terminal write threw part-way; not retried "
                                   "(process_gateway_response is not idempotent), so the command "
                                   "may be left unresolved and its execution can stay running "
                                   "until an operator cancels it",
-                                  ::yuzu::log_id_token(cmd_id));
-                } catch (...) { // NOLINT(bugprone-empty-catch): last resort; the loop continues
-                }
-            }
+                                  ::yuzu::log_id_token(cid));
+                });
         }
     }
 
