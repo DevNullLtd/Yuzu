@@ -10712,7 +10712,7 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         // fault and the staleness bound (concept words, so copy edits do not false-fail).
         const auto desc = t["description"].get<std::string>();
         for (const char* concept_word : {"policy", "profile", "fault", "staleness bound", "platform",
-                                         "crash_source_coverage", "retry_after_ms"})
+                                         "crash_source_coverage", "retry_after_ms", "get_dex_app", "-32602"})
             CHECK(desc.find(concept_word) != std::string::npos);
         const auto& platform_in = t["inputSchema"]["properties"]["platform"];
         CHECK(platform_in["enum"] == nlohmann::json::array({"all", "windows", "macos", "linux"}));

@@ -1820,7 +1820,7 @@ static const ToolDef kTools[] = {
      "per platform whether its crash sources are complete (windows) or partial (linux, macos), so "
      "a short list for linux or macos is not proof of a healthy fleet. An empty apps list means no "
      "crash or hang signal in the window on that scope, not a failure. "
-     "Pass platform=windows for the former Windows-only figures. No device floor is applied. "
+     "Pass platform=windows for the Windows scope only; get_dex_app is the per-application drill-down and counts every platform. An invalid platform or window is invalid params (-32602, terminal: do not retry it unchanged). No device floor is applied. "
      "The policy object names the score policy every figure was scored under (source default or custom, "
      "revision, fault - a reason string when a stored policy document was refused and the shipped "
      "defaults are in force, otherwise null - and the four tier edges and display names); each "

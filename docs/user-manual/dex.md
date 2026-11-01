@@ -457,7 +457,7 @@ does (agentic-first parity):
   and hang summary, faulting modules, exceptions, affected devices). Audited
   fail-closed (`dex.app.view`) and denied to a service-scoped API token, because it
   names devices fleet-wide.
-- **`GET /api/v1/dex/apps?window=`**, the application stability list (a distinct
+- **`GET /api/v1/dex/apps?window=&platform=`**, the application stability list (a distinct
   device count per application, no `agent_id`; not audited).
 - **`GET /api/v1/dex/catalogue?os=&window=`**, the Catalogue family cards, fleet
   coverage and the uncatalogued list, and **`GET /api/v1/dex/catalogue/group?name=&os=&window=`**,

@@ -10,3 +10,13 @@ Every owning boundary and every borrow the diff adds or changes in C++ (server/c
 | R4 | spdlog default-logger capture in the invalid_scope warn test (`yuzu::test::LogCapture`) | RAII test helper (`tests/unit/test_log_capture.hpp`), local to the test | constructor swaps in a capture logger over a local `std::ostringstream` | `cap.stop()` before reading the text, else the destructor at scope exit; both restore the previous default logger and level and drop the capture logger from the registry | none (non-copyable, non-movable); the previous logger is held by `shared_ptr` | RAII: a failed `CHECK` or exception unwinds through the destructor, which restores the logger |
 
 No new fd, HANDLE, SOCKET, `FILE*`, sqlite3 object, OpenSSL or BCrypt object, thread, subprocess, callback context, mapped library or temp path. No manual cleanup in new C++.
+
+## Addendum: MCP leg (5b10913d9, 5049e0988, and the fix round that follows them)
+
+Adds `server/core/src/mcp_server.cpp` (the `list_dex_apps` handler) and `tests/unit/server/test_mcp_server.cpp` to the files above. Supplements R1; nothing above is changed.
+
+| ID | Resource / construct | Owner type | Acquired | Released | Transfer | Failure cleanup |
+|---|---|---|---|---|---|---|
+| R5 | The MCP handler's `platform` (`std::optional<std::string>`, from `param_string_strict`) and `scope` (normalised copy) | `std::optional<std::string>` and `std::string` values, locals of the `list_dex_apps` branch | argument parse | end of the branch | `scope` is passed by const reference to `DexApi::apps`; no view outlives the call | none (value types; every early return answers and returns) |
+
+No new fd, HANDLE, SOCKET, `FILE*`, sqlite3 object, OpenSSL or BCrypt object, thread, subprocess, callback context, mapped library or temp path. No manual cleanup in new C++.
