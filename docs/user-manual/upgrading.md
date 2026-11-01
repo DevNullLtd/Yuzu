@@ -4,6 +4,14 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 > **Fresh deployment only.** 0.15.0 supports initial deployment into a freshly provisioned database; it provides no upgrade path from an earlier build's database or backups and no return to an earlier build. The server does not enforce this: migrations do not refuse a database written by another build, and an importer that runs at any boot where the database holds no import record for the file still reads leftover `enrollment-tokens.cfg` and `pending-agents.cfg` files without checking where they came from. Procedures below that describe upgrading, rolling back or restoring an earlier build's data are historical and not supported for 0.15.0 (see "Deployment contract (hard cutover)" in the Forensics section of this page).
 
+## ⚠️ Breaking: a user-store outage on Settings user create / role change and on SCIM `active:false` is now a retryable 503 with its own audit reason (#4068)
+
+**What changed.** When the user store cannot answer, `POST /api/settings/users/{username}/role` used to answer `404` and record `user.role_change` / `denied` / `user_not_found`. It now answers `503` (`Retry-After: 2`) and records `user.role_change` / `failure` / `store_unavailable`. `POST /api/settings/users` no longer proceeds on an unanswered duplicate-name check: it answers `503` and records `user.create` / `failure` / `store_unavailable`. A SCIM `PUT`/`PATCH` with `active:false` on a resource whose mirror already reads inactive used to answer `200` (reporting the deprovision complete) when the user store could not confirm the account state; it now answers `503` with `Retry-After: 2` and records `scim.user.deactivated` / `failure` / `store_unavailable: verifying account state`. A genuinely missing user is still `404` / `user_not_found`.
+
+**Who is affected.** SIEM rules that match `user.role_change` with result `denied` or detail `user_not_found` and were (unknowingly) counting outages; scripts that treat a `404` from the role route as permanent; IdP connectors that treated the old `200` as success.
+
+**What to do.** Retry on `503`. Add `store_unavailable` to any `failure` rule on these actions. See the SCIM guide, "When the user store cannot answer a deactivation", for what the SCIM change does not cover.
+
 ## ⚠️ Breaking: the scoped-permission audit row changes shape and separates a store outage from a missing grant (#3739)
 
 **What changed.** When the ordinary RBAC check behind a per-agent permission gate (the Tag, device-page, agent-properties and other `require_scoped_permission` routes) refuses a request, the `auth.scoped_permission_required` audit row is now written with the fields in their proper place, and its `detail` says whether a failed read stood behind the refusal. Nothing about the request or response changes: the answer is the same fail-closed `403`, with the same body.
