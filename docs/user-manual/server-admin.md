@@ -1068,7 +1068,7 @@ that holds it).
   through a transaction-mode pooler or to a standby, and make sure the database
   role can run `pg_current_wal_lsn()` and `pg_walfile_name()`; this affects a
   single-replica server too; `cause="epoch_record"` rising means the sequence cap was reached
-  (`ALTER SEQUENCE leader_elector.leader_epoch_seq RESTART` is safe) or the
+  (`ALTER SEQUENCE leader_elector.leader_epoch_seq RESTART` is safe for ordering, but the next election pins the timeline one above the real one and the server logs a warning) or the
   `leader_state` row was corrupted to exactly 9223372036854775807 (the log line
   `failed to record epoch ... (server said: ...)` names which): see
   [Upgrading](upgrading.md#behaviour-change-the-leader-epoch-now-carries-the-postgres-timeline-ha-6535)); then, in

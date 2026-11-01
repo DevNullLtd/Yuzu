@@ -220,7 +220,7 @@ carries the one coordinate every promotion advances regardless of what WAL was l
   `docs/user-manual/upgrading.md`. The floor assumes the lock holder is the only writer
   of the row: a manual `UPDATE` racing a mint can still be overwritten, as before #6535.
 * Refusals enforced rather than assumed: the sequence is capped at `MAXVALUE 4294967295` (migration v2; at
-  the cap `nextval` raises, and `ALTER SEQUENCE ... RESTART` is a safe remedy because of the floor), and a
+  the cap `nextval` raises, and `ALTER SEQUENCE ... RESTART` is a safe remedy because of the floor: the first mint after it is monotonic but lands one timeline above the real one with a count of 0, so it pins the timeline as in item 3 until the real timeline catches up; the elector warns, and reaching the cap takes 2^32 elections), and a
   timeline outside `1..2^31-1` is refused before `nextval`; both land in the existing `epoch_record` acquire
   failure, fail closed. At boot (and on every reconnect) the elector probes the timeline and **refuses to
   open** if it cannot read it (a DSN that resolves to a standby already fails earlier, in the migration

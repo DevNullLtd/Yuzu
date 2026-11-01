@@ -502,14 +502,62 @@ TEST_CASE("LeaderElector repairs a sequence that is BEHIND the stored row so the
     CHECK(scalar(admin.get(), "SELECT last_value FROM leader_elector.leader_epoch_seq") == "502");
     b.resign();
 
-    // The promoted standby lacks B's mint: the row is A's, and the REPAIRED sequence (502, with its
-    // pre-logged horizon) survived. The new leader's epoch must differ from B's: it would equal it
-    // (row+1 = +502) if the sequence had never been repaired.
+    // The promoted standby lacks B's mint, so the row is A's. What the SEQUENCE holds there depends on
+    // how much WAL it replayed, and only two states are reachable (the in-memory 502 exists only on
+    // the old primary). setval() resets Postgres' sequence pre-logging, so B's nextval is WAL-logged
+    // 32 values ahead of 501, to a horizon of 534.
+    //
+    // (a) Replay stopped after the repair's setval record: the sequence is at 501, the election after
+    //     the lost one REPEATS B's epoch. This is the documented residual (ADR-2002 section 3 item 3:
+    //     "the election after it remains exposed"), pinned here so it cannot be mistaken for covered.
     seed_leader_row(admin.get(), lock_name, "(5::bigint << 32) + 501");
-    LeaderElector c(cfg_tl(db.dsn(), "after-promotion", 1));
-    REQUIRE(c.try_acquire());
-    CHECK(*c.epoch() == (std::int64_t{5} << 32) + 503);
-    CHECK(*c.epoch() != e_b);
+    exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 501, true)");
+    {
+        LeaderElector c(cfg_tl(db.dsn(), "after-promotion-setval-only", 1));
+        REQUIRE(c.try_acquire());
+        CHECK(*c.epoch() == e_b); // the exposure the repair does NOT close
+        c.resign();
+    }
+    // (b) Replay included B's nextval record: the sequence resumes at the pre-logged horizon, so the
+    //     next election is separated from B's. It would equal B's (row+1) without the repair.
+    seed_leader_row(admin.get(), lock_name, "(5::bigint << 32) + 501");
+    exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 534, true)");
+    LeaderElector d(cfg_tl(db.dsn(), "after-promotion-horizon", 1));
+    REQUIRE(d.try_acquire());
+    CHECK(*d.epoch() == (std::int64_t{5} << 32) + 535);
+    CHECK(*d.epoch() != e_b);
+}
+
+TEST_CASE("LeaderElector: a lossy promotion where the OLDER row survives stays above the ex-leader's epoch (#6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    const std::string lock_name = kServerBackgroundLeaderLock;
+    auto admin = connect(db.dsn());
+    // Unlike simulate_lost_mint (which deletes the row), here the promoted standby still has the
+    // PREVIOUS election's row: the row floor must stay inert and the timeline alone must lift the
+    // new epoch above the ex-leader's even though the sequence repeats.
+    LeaderElector first(cfg_tl(db.dsn(), "first", 1));
+    REQUIRE(first.try_acquire());
+    const std::int64_t e0 = *first.epoch(); // timeline 1, count 1
+    first.resign();
+    exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 1, true)"); // next mint is WAL-logged
+    LeaderElector ex(cfg_tl(db.dsn(), "ex-leader", 1));
+    REQUIRE(ex.try_acquire());
+    const std::int64_t e_old = *ex.epoch(); // timeline 1, count 2: the mint the standby loses
+    ex.resign();
+
+    // Promotion: the standby holds E0's row and the sequence as of the setval record.
+    seed_leader_row(admin.get(), lock_name, std::to_string(e0));
+    exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 1, true)");
+    LeaderElector nl(cfg_tl(db.dsn(), "new-leader", 2));
+    REQUIRE(nl.try_acquire());
+    const std::int64_t e_new = *nl.epoch();
+    REQUIRE((e_old & kSeqMask) == (e_new & kSeqMask)); // the sequence repeated: only the timeline differs
+    CHECK(e_new > e_old);
+    CHECK((e_new >> 32) == 2); // the packed term won; the row floor did not
+    auto claim = connect(db.dsn());
+    CHECK_FALSE(eval_bool(claim.get(), LeaderElector::epoch_fence_sql(lock_name, e_old)));
+    CHECK(eval_bool(claim.get(), LeaderElector::epoch_fence_sql(lock_name, e_new)));
 }
 
 TEST_CASE("LeaderElector's sequence repair never parks the sequence at its cap (#6535)",
