@@ -129,6 +129,8 @@ struct Rig {
         json attrs, payload;
     };
     std::vector<Emitted> emitted;
+    /// Audit rows and emitted events in the order they happened (one vector, so order is real).
+    std::vector<std::string> trace;
     bool emit_throws = false;
 
     yuzu::server::test::TestRouteSink sink;
@@ -179,6 +181,7 @@ struct Rig {
         d.audit_fn = [this](const httplib::Request&, const std::string& action,
                             const std::string& result, const std::string&, const std::string& tid,
                             const std::string& detail) {
+            trace.push_back("audit:" + result);
             audits.push_back({"<re-resolving>", "", action, result, tid, detail});
             return true;
         };
@@ -187,6 +190,7 @@ struct Rig {
                                         const std::string& role, const std::string& action,
                                         const std::string& result, const std::string&,
                                         const std::string& tid, const std::string& detail) {
+                trace.push_back("audit:" + result);
                 audits.push_back({s.username, role, action, result, tid, detail});
                 return result == "requested" ? requested_row_persists : outcome_row_persists;
             };
@@ -240,6 +244,7 @@ struct Rig {
         if (opts.emit)
             d.emit_event_fn = [this](const std::string& type, const httplib::Request&,
                                      const json& attrs, const json& payload) {
+                trace.push_back("emit:" + type);
                 emitted.push_back({type, attrs, payload});
                 if (emit_throws)
                     throw std::runtime_error("analytics sink blew up");
@@ -1005,6 +1010,12 @@ TEST_CASE("command_v1: a dispatch publishes the legacy command.dispatched event 
     CHECK(ev.payload["scope"] == "");
     CHECK(ev.payload.size() == 4);
     CHECK(rig.audits.back().result == "success");
+    // The ordering the title claims, on one trace: the event is published AFTER the outcome row
+    // (and the requested row before the effect), never before it.
+    REQUIRE(rig.trace.size() == 3);
+    CHECK(rig.trace[0] == "audit:requested");
+    CHECK(rig.trace[1] == "audit:success");
+    CHECK(rig.trace[2] == "emit:command.dispatched");
 }
 
 TEST_CASE("command_v1: a scoped dispatch carries the caller's scope in the event payload",

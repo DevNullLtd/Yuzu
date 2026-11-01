@@ -44828,6 +44828,27 @@ TEST_CASE("MCP execute_instruction_definition: operator tier dispatches an auto 
     CHECK(idef_audited(ts, "success"));
 }
 
+TEST_CASE("MCP execute_instruction_definition: an unwired classifier is -32603 "
+          "classifier_unavailable with retry_after_ms null, and nothing is dispatched",
+          "[mcp][integration][execute][idef][retryhint]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.classify_unwired = true;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["reason"] == "classifier_unavailable");
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    CHECK(body["error"]["data"]["remediation"].get<std::string>().find("retrying will not help") !=
+          std::string::npos);
+    CHECK(rig.calls.empty());
+}
+
 TEST_CASE("MCP execute_instruction_definition: an operator-tier auto-approval can NOT skip a "
           "non-auto definition (the binding rule)",
           "[mcp][integration][execute][idef][approval][security]") {
@@ -45413,6 +45434,11 @@ TEST_CASE("MCP execute_instruction_definition: an approved tier ticket for a ben
     CHECK(sb["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
     CHECK(sb["error"]["data"]["reason"] == "approval_required");
     CHECK(rig.calls.empty()); // NOTHING reached the dispatch port: the exact send set is empty
+    // The probe refused BEFORE the ticket was consumed: it is still spendable. Without this a
+    // revert that consumes first and refuses after would stay green on the assertions above.
+    auto row = appr.get(ticket);
+    REQUIRE(row);
+    CHECK(row->consumed_at == 0);
 }
 
 TEST_CASE("MCP execute_instruction_definition: an administrator on the supervised tier still runs a "

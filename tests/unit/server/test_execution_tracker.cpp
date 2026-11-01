@@ -4362,6 +4362,58 @@ TEST_CASE("make_tracker_mutation_ports: a rerun whose read DEGRADES is unavailab
     CHECK(rerun.has_value());
 }
 
+TEST_CASE("make_tracker_mutation_ports: a failed_only rerun whose SECOND read (the per-device "
+          "statuses) fails after the original read succeeded is unavailable and creates no record",
+          "[pg][execution_tracker][mutation][2146]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    const auto ports = make_tracker_mutation_ports(&tracker);
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    AgentExecStatus failed;
+    failed.agent_id = "a1";
+    failed.status = "failure";
+    tracker.update_agent_status(*id, failed);
+    const auto count_rows = [&] { return tracker.query_executions(ExecutionQuery{}).size(); };
+    const auto before = count_rows();
+    REQUIRE(before == 1);
+
+    // Break ONLY what the per-device status read selects. The original-row read (get_execution_
+    // checked) subselects `error_detail` from the same table and does not touch this column, so it
+    // still succeeds and the failure lands on the second read in create_rerun_checked.
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto drop = pg::exec_params(
+            lease.get(),
+            "ALTER TABLE execution_tracker.agent_exec_status DROP COLUMN plugin_result_status",
+            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    // Control: the original reads, and a full (not failed_only) rerun does not need the status
+    // table, so this proves the first read is healthy. It is the one record created below.
+    auto full = ports.create_rerun(*id, "operator", false);
+    CHECK(full.has_value());
+    CHECK(count_rows() == before + 1);
+
+    // The failed_only rerun cannot size its record: unavailable, never "0 failed devices", and
+    // no record is created (an unchecked second read would create an empty one and succeed).
+    auto rerun = ports.create_rerun(*id, "operator", true);
+    REQUIRE_FALSE(rerun.has_value());
+    CHECK(rerun.error() == ExecutionTracker::RerunError::kStoreDegraded);
+    CHECK(count_rows() == before + 1);
+
+    // Through the shared sequence: a 503-class outcome, not a success and not a not-found.
+    MutationAudit audit;
+    auto out = apply_execution_mutation(
+        ports, mutation_req(ExecutionMutation::kRerun, *id, /*failed_only=*/true), audit.fn());
+    CHECK(out.status != ExecutionMutationStatus::kDone);
+    CHECK(out.status != ExecutionMutationStatus::kNotFound);
+    CHECK(count_rows() == before + 1);
+}
+
 TEST_CASE("make_tracker_mutation_ports: a CLOSED tracker degrades every port",
           "[execution_tracker][mutation][2146]") {
     pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",

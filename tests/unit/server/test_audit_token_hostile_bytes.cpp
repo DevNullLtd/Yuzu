@@ -225,6 +225,11 @@ TEST_CASE("CH-12: hostile bytes through the real AuditStore insert never lose th
     auto rows = store.query();
     REQUIRE(rows.has_value());
     CHECK(rows->size() == expected_rows);
+    // The valid_utf8(stored) checks below are guaranteed by AuditStore's own column scrubbing
+    // (invalid UTF-8 and NUL become U+FFFD before the insert), so they hold for the RAW cases too
+    // and say nothing about the token fix. What they pin is "no hostile byte loses or corrupts a
+    // row". The token fix itself (valid, folded output, whole-character clip) is pinned by the
+    // non-PG helper-level cases above.
     for (const auto& r : *rows) {
         fact("stored detail_hex=" + hex(r.detail) + " valid_utf8=" + std::to_string(valid_utf8(r.detail)) +
              " c1_or_separator=" + std::to_string(has_c1_or_separator(r.detail)));
