@@ -19,7 +19,7 @@
 ///     uses the session the caller already resolved and never resolves a second one. It does
 ///     not read, set or consume any step-up state.
 ///   - The audit actor is stamped from that held session, including the principal class
-///     (`session.principal_kind`), not re-derived from the request's credential-presentation
+///     (`session.is_engine()`), not re-derived from the request's credential-presentation
 ///     headers. A request that carries a cookie plus an Authorization header can therefore be
 ///     stamped with a different class here than a request-time row built by
 ///     `make_audit_event` (which stamps the class from the request's headers); this row names
@@ -77,7 +77,7 @@ namespace yuzu::server::detail {
 struct SameSiteAuditPrincipal {
     std::string id;   ///< session.username, the stable authorization principal
     std::string role; ///< role_to_string(effective_role(session)), as request-time rows stamp
-    std::string cls;  ///< session.principal_kind
+    std::string cls;  ///< "engine" when session.is_engine(), else "human"
 };
 
 using SameSitePrincipalAuditFn = std::function<bool(
@@ -231,7 +231,7 @@ apply_same_site_write_gate(const httplib::Request& req, httplib::Response& res,
             audit, req, "csrf.denied", "denied",
             SameSiteAuditPrincipal{session.username,
                                    auth::role_to_string(auth::effective_role(session)),
-                                   session.principal_kind},
+                                   session.is_engine() ? "engine" : "human"},
             "Endpoint", onbehalf::sanitize_for_log(req.method, 16) + " " +
                             onbehalf::sanitize_for_log(req.path),
             std::string("cross-site or header-less browser write refused; reason=") +

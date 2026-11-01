@@ -45,7 +45,34 @@ COOKIE_JAR=$(mktemp /tmp/yuzu-e2e-cookies.XXXXXX)
 RESP_BODY=$(mktemp /tmp/yuzu-e2e-body.XXXXXX)
 RESP_HEADERS=$(mktemp /tmp/yuzu-e2e-headers.XXXXXX)
 
+# Name of the section-34 MCP control token ("" until it is minted). The exit trap
+# revokes any live token carrying this name, so the control token is revoked even
+# when its id was never captured (the create reply has no token_id) or the run
+# aborts before the in-line revoke.
+MCP_CTL_LABEL=""
+
 cleanup() {
+    if [[ -n "$MCP_CTL_LABEL" ]]; then
+        local listed tid code
+        listed=$(curl -s -m 10 -b "$COOKIE_JAR" "${SERVER_URL}/api/v1/tokens" 2>/dev/null \
+            | python3 -c '
+import json, sys
+try:
+    for t in json.load(sys.stdin).get("data", []):
+        if t.get("name") == sys.argv[1] and not t.get("revoked"):
+            print(t["token_id"])
+except Exception:
+    pass
+' "$MCP_CTL_LABEL" 2>/dev/null) || listed=""
+        for tid in $listed; do
+            code=$(curl -s -m 10 -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+                -H "Origin: ${SITE_ORIGIN:-$SERVER_URL}" \
+                -X DELETE "${SERVER_URL}/api/v1/tokens/${tid}" 2>/dev/null) || code="000"
+            if [[ "$code" != "200" ]]; then
+                echo "WARNING: could not revoke e2e MCP control token id=${tid} (HTTP ${code}); revoke it by hand" >&2
+            fi
+        done
+    fi
     rm -f "$COOKIE_JAR" "$RESP_BODY" "$RESP_HEADERS"
 }
 trap cleanup EXIT
@@ -1387,10 +1414,62 @@ log "═════════════════════════
 http_post_noauth "$SERVER_URL/mcp/v1/" '{"jsonrpc":"2.0","method":"ping","id":1}'
 assert_eq "POST /mcp/v1/ without auth returns 401" "401" "$HTTP_STATUS"
 
-# MCP with auth → 200
+# MCP with a session cookie → 403 / -32003. /mcp/v1/ refuses every credential
+# without an MCP tier, and a cookie session has none. http_post sends the cookie
+# jar plus a same-site Referer, so the same-site gate admits the request and the
+# refusal below is the MCP tier check.
 http_post "$SERVER_URL/mcp/v1/" '{"jsonrpc":"2.0","method":"ping","id":1}'
-assert_eq "POST /mcp/v1/ with auth returns 200" "200" "$HTTP_STATUS"
-assert_contains "MCP ping returns jsonrpc response" "jsonrpc" "$HTTP_BODY"
+assert_eq "POST /mcp/v1/ with a cookie session returns 403" "403" "$HTTP_STATUS"
+MCP_REFUSAL_CODE=$(echo "$HTTP_BODY" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin)['error']['code'])
+except Exception:
+    print('')
+" 2>/dev/null)
+assert_eq "MCP cookie-session refusal carries JSON-RPC code -32003" "-32003" "$MCP_REFUSAL_CODE"
+
+# Control: a readonly MCP-tier token, sent as Authorization: Bearer with NO
+# cookie, reaches the endpoint. The mint and revoke are cookie-session writes and
+# keep the cookie jar and same-site header that http_post/http_delete send; the
+# MCP call must not (a live cookie wins session resolution over a bearer token).
+MCP_CTL_LABEL="e2e-api-mcp-readonly-$(date +%s)"
+http_post "$SERVER_URL/api/v1/tokens" \
+    "{\"name\":\"$MCP_CTL_LABEL\",\"mcp_tier\":\"readonly\",\"expires_at\":$(( $(date +%s) + 86400 ))}"
+assert_eq "POST /api/v1/tokens (mcp_tier readonly) returns 201" "201" "$HTTP_STATUS"
+MCP_CTL_TOKEN=$(extract_json_field "token" "$HTTP_BODY")
+if [[ -n "$MCP_CTL_TOKEN" ]]; then
+    MCP_CTL_STATUS=$(curl -s -m 10 -o "$RESP_BODY" -w "%{http_code}" \
+        -H "Authorization: Bearer $MCP_CTL_TOKEN" \
+        -X POST -H "Content-Type: application/json" \
+        -d '{"jsonrpc":"2.0","method":"ping","id":1}' \
+        "$SERVER_URL/mcp/v1/" 2>/dev/null) || MCP_CTL_STATUS="000"
+    assert_eq "POST /mcp/v1/ with a readonly bearer token returns 200" "200" "$MCP_CTL_STATUS"
+    assert_contains "MCP ping returns jsonrpc response" "jsonrpc" "$(cat "$RESP_BODY")"
+else
+    TESTS=$((TESTS + 1))
+    fail "MCP readonly control token was not returned; bearer ping not exercised"
+fi
+
+# Revoke the control token (the create reply has no token_id: find it by name).
+http_get "$SERVER_URL/api/v1/tokens"
+MCP_CTL_ID=$(echo "$HTTP_BODY" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    for t in d.get('data', []):
+        if t.get('name') == '$MCP_CTL_LABEL':
+            print(t['token_id']); break
+except Exception:
+    pass
+" 2>/dev/null)
+if [[ -n "$MCP_CTL_ID" ]]; then
+    http_delete "$SERVER_URL/api/v1/tokens/$MCP_CTL_ID"
+    assert_status_ok "DELETE /api/v1/tokens/{token_id} (MCP control token)" "$HTTP_STATUS"
+else
+    TESTS=$((TESTS + 1))
+    fail "could not find the MCP control token to revoke"
+fi
 
 log ""
 

@@ -1,1 +1,0 @@
-- **macOS CI installs Erlang/OTP and rebar3 from hash-pinned downloads.** The macOS job no longer uses `erlef/setup-beam`, whose tool cache the two BigMags runner agents shared and raced on (intermittent `EEXIST`/`ENOENT` failures at the install step); it downloads pinned OTP 28.5.0.7 and rebar3 3.24.0 into a per-job directory and checks their SHA-256s (#4841).

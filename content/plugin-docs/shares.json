@@ -438,8 +438,6 @@
       "server/core/src/capability_decls/plugin_action_catalogue_shares.hpp"
     ],
     "changelog": [
-      "changelog.d/2026-10-12-shares.added.md",
-      "changelog.d/2026-10-27-shares-windows-leg.added.md",
       "changelog.d/2026-10-29-shares-macos-leg.added.md"
     ],
     "definitions": [

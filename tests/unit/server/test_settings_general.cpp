@@ -15,6 +15,7 @@
 
 #include "settings_general_routes.hpp"
 
+#include "app_shell.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -432,6 +433,19 @@ TEST_CASE("general page: six colour schemes as radios; whitelisted on read and w
     CHECK_THAT(html, ContainsSubstring("id=\"theme-blocked\" role=\"status\" hidden"));
     CHECK(count_of(html, "localStorage.setItem(THEME_KEY, v)") == 1);
     CHECK(count_of(html, "localStorage.getItem(THEME_KEY)") == 1);
+}
+
+TEST_CASE("general page: every picker radio and the THEMES regex come from kThemeWhitelistRe",
+          "[general][settings][page][theme]") {
+    const std::string html = kSettingsGeneralHtml;
+    const std::regex whitelist{std::string(yuzu::server::shell::kThemeWhitelistRe)};
+    const std::regex radio{"name=\"theme\" value=\"([^\"]*)\""};
+    int n = 0;
+    for (std::sregex_iterator it(html.begin(), html.end(), radio), end; it != end; ++it, ++n)
+        CHECK(std::regex_match((*it)[1].str(), whitelist));
+    CHECK(n == 6);
+    CHECK_THAT(html, ContainsSubstring("THEMES = /" +
+                                       std::string(yuzu::server::shell::kThemeWhitelistRe) + "/;"));
 }
 
 TEST_CASE("general page: density is whitelisted on read, guarded, and admin-page only",

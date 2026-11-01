@@ -80,17 +80,24 @@ function showError(rootEl, msg) {
 const MONO_FONT = getComputedStyle(document.documentElement)
   .getPropertyValue('--mds-font-family-mono').trim() || 'monospace';
 
+// Read a CSS custom property off <html> (the active colour scheme), falling
+// back when the token is unset. The theme boot script runs before this module.
+function cssToken(name, fallback) {
+  return (getComputedStyle(document.documentElement).getPropertyValue(name) || '').trim() || fallback;
+}
+
 // PR 6: per-OS cube colour palette. Keys match the lowercase substring we
 // expect in `MachineNode.os` from fleet_topology.v1; default covers
-// agents whose os field is empty or unknown. Slate data colours from
-// yuzu.css (--c2, --c3, --c1, --mut); opacity is set on the material,
-// not the colour, so colour stays vivid through transparency.
+// agents whose os field is empty or unknown. Data colours read from the
+// yuzu.css tokens (--c2, --c3, --c1, --mut) so every scheme applies; opacity
+// is set on the material, not the colour, so colour stays vivid through
+// transparency.
 const OS_PALETTE = {
-  linux:   '#2dd4bf',  // --c2
-  darwin:  '#f5c542',  // --c3
-  macos:   '#f5c542',
-  windows: '#4c9aff',  // --c1
-  default: '#9aa2ae'   // --mut
+  linux:   cssToken('--c2', '#2dd4bf'),
+  darwin:  cssToken('--c3', '#f5c542'),
+  macos:   cssToken('--c3', '#f5c542'),
+  windows: cssToken('--c1', '#4c9aff'),
+  default: cssToken('--mut', '#9aa2ae')
 };
 function pickOsColor(osName) {
   if (!osName) return OS_PALETTE.default;
@@ -103,18 +110,18 @@ function pickOsColor(osName) {
 
 // PR 7: per-category process-node palette. Keys exactly match the lowercase
 // strings emitted by category_to_string() in process_category.hpp; any
-// string not in the table falls through to `other`. Slate data colours
-// from yuzu.css (--mut, --c1, --c3, --c2, --c5, --faint) for contrast
-// against the cube's translucent shell on the dark canvas. Pinned
+// string not in the table falls through to `other`. Data colours read from
+// yuzu.css (--mut, --c1, --c3, --c2, --c5, --faint) so each scheme keeps its
+// contrast against the cube's translucent shell. Pinned
 // in test_static_js_bundle.cpp — the palette is a UX contract; changing
 // a colour is deliberate, not incidental.
 const CATEGORY_PALETTE = {
-  system:   '#9aa2ae',
-  browser:  '#4c9aff',
-  database: '#f5c542',
-  web:      '#2dd4bf',
-  runtime:  '#a78bfa',
-  other:    '#9199a6'
+  system:   cssToken('--mut', '#9aa2ae'),
+  browser:  cssToken('--c1', '#4c9aff'),
+  database: cssToken('--c3', '#f5c542'),
+  web:      cssToken('--c2', '#2dd4bf'),
+  runtime:  cssToken('--c5', '#a78bfa'),
+  other:    cssToken('--faint', '#9199a6')
 };
 function pickCategoryColor(category) {
   if (!category) return CATEGORY_PALETTE.other;
@@ -448,10 +455,12 @@ function buildHostnameLabel(hostname) {
   canvas.width = 256;
   canvas.height = 64;
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = 'rgba(20,23,28,0.6)';  // --bg
+  ctx.fillStyle = cssToken('--bg', '#14171c');
+  ctx.globalAlpha = 0.6;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.globalAlpha = 1;
   ctx.font = '500 24px ' + MONO_FONT;
-  ctx.fillStyle = '#c4cad3';  // --ink2
+  ctx.fillStyle = cssToken('--ink2', '#c4cad3');
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   let label = String(hostname || '(unknown)');
@@ -612,10 +621,12 @@ function buildPortLabel(port) {
   canvas.width = 96;
   canvas.height = 40;
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = 'rgba(20,23,28,0.7)';  // --bg
+  ctx.fillStyle = cssToken('--bg', '#14171c');
+  ctx.globalAlpha = 0.7;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.globalAlpha = 1;
   ctx.font = '500 22px ' + MONO_FONT;
-  ctx.fillStyle = '#ff6b7a';  // --c4, matches the listener sphere
+  ctx.fillStyle = cssToken('--c4', '#ff6b7a');  // the sphere itself stays 0xff6b7a on every scheme
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(':' + port, canvas.width / 2, canvas.height / 2);

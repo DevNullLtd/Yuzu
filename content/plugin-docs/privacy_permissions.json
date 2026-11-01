@@ -355,11 +355,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
     ],
-    "changelog": [
-      "changelog.d/2026-09-29-privacy_permissions-macos-leg.added.md",
-      "changelog.d/2026-09-30-privacy_permissions-windows-leg.added.md",
-      "changelog.d/5293-privacy_permissions-windows-hardenings.changed.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/privacy_permissions.yaml"
     ],

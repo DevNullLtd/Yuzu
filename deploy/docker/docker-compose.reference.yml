@@ -15,7 +15,7 @@
 ##      startup and surfaced at /health.
 ##   2. The certs live in the `certs` named volume below so the CA + leaves
 ##      (and therefore the trust your agents have) SURVIVE container
-##      replacement / upgrades. Do not delete that volume.
+##      replacement. Do not delete that volume.
 ##
 ## Bring-your-own-cert (optional): to use your own PKI instead of the built-in
 ## CA, mount your material into /etc/yuzu/certs and add
@@ -35,7 +35,7 @@
 ## with a reverse proxy, and review docs/user-manual/ before exposing it.
 ##
 ## Usage:
-##   export YUZU_VERSION=0.12.0
+##   export YUZU_VERSION=0.15.0
 ##   # Two DISTINCT credentials — store both in your secrets manager. The
 ##   # superuser password stays inside the postgres service; the app role
 ##   # password is what the server's DSN carries. They must differ (the
@@ -46,13 +46,15 @@
 ##   docker compose -f docker-compose.reference.yml logs -f server
 ##   # trust the CA, then browse https://localhost:8443/
 ##
-## Upgrade (data + CA preserving):
-##   export YUZU_VERSION=0.14.1     # pick the new release tag
-##   docker compose -f docker-compose.reference.yml pull
-##   docker compose -f docker-compose.reference.yml up -d
-##
-## The `server-data` and `certs` volumes survive container replacement; the
-## server runs schema migrations automatically at startup. See
+## Upgrading from an earlier build: not supported by 0.15.0. This release is a
+## HARD CUTOVER: it supports initial deployment into a FRESH database only.
+## Do not point it at a `postgres-data`, `server-data` or `certs` volume written
+## by an earlier build, and do not run an earlier image against this stack's
+## database; the server does not detect either. Recreating the containers of
+## THIS deployment is fine (the volumes survive container replacement). Restore
+## only a backup taken from THIS deployment on 0.15.0 or later: a dump or a
+## keys/data archive from an earlier build is the same unsupported act, and the
+## server will not detect it. See "Deployment contract (hard cutover)" in
 ## docs/user-manual/upgrading.md.
 ##
 ## CAUTION: `docker compose down -v` deletes the `server-data`, `certs`, AND
@@ -111,7 +113,7 @@
 services:
   # ── Yuzu Server ──────────────────────────────────────────────────────
   server:
-    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.14.1}
+    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.15.0}
     container_name: yuzu-server
     restart: unless-stopped
     # MCP streamed POST ships ON by default (docs/user-manual/server-admin.md
@@ -153,7 +155,7 @@ services:
     volumes:
       # All server state (SQLite DBs, yuzu-server.cfg, enrollment tokens, OTA
       # binaries). The default CMD points --config + --data-dir here, so it is
-      # preserved across upgrades.
+      # preserved when the container is recreated.
       - server-data:/var/lib/yuzu
       # The auto-generated CA + leaf certs. MUST persist so the CA (and the
       # trust your agents have in it) survives container replacement.
@@ -176,7 +178,7 @@ services:
   # instead is first-class — point YUZU_POSTGRES_DSN at it and remove this
   # service.
   postgres:
-    image: ghcr.io/devnullltd/yuzu-postgres:${YUZU_VERSION:-0.14.1}
+    image: ghcr.io/devnullltd/yuzu-postgres:${YUZU_VERSION:-0.15.0}
     container_name: yuzu-postgres
     restart: unless-stopped
     environment:
