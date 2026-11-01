@@ -805,7 +805,8 @@ public:
     /// Consume a single recovery code for login or step-up. Returns true
     /// if the code matched an unconsumed row (and that row is now
     /// consumed). False on no-match (also false if the user has no
-    /// recovery codes / is not enrolled). Recovery codes are PBKDF2-hashed,
+    /// recovery codes / is not enrolled, or the account is inactive or
+    /// removed — #4058). Recovery codes are PBKDF2-hashed,
     /// not envelope-encrypted (verify-only, ADR-0010 — no SecretCodec
     /// involvement, no SecretUnavailable outcome here).
     std::expected<bool, AuthDBError> mfa_consume_recovery_code(const std::string& username,
