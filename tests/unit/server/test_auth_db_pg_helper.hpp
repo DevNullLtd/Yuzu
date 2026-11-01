@@ -50,6 +50,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <exception>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -420,8 +422,8 @@ inline bool wait_for_pg_lock_waiter(const std::string& dsn, const std::string& l
     return false;
 }
 
-/// #3808: drive the REAL "concurrent MFA disable lands inside an enroll-verify's
-/// load -> guarded-UPDATE window" race, deterministically and without a test hook.
+/// #3808: drive the REAL "provisional secret changes inside an enroll-verify's load ->
+/// guarded-UPDATE window" race, deterministically and without a test hook.
 ///
 ///   1. A dedicated session opens a txn and takes `SELECT ... FOR UPDATE` on the
 ///      user's row. Plain reads are not blocked by it, so the victim still loads
@@ -430,22 +432,38 @@ inline bool wait_for_pg_lock_waiter(const std::string& dsn, const std::string& l
 ///      (`UPDATE auth.users SET mfa_enrolled_at = now() ...`) queues on that lock.
 ///   3. Once `wait_for_pg_lock_waiter` confirms the UPDATE really is queued, the
 ///      holder runs `interfering_sql` (each statement bound to `username` as $1) in
-///      the SAME txn and COMMITs — what a committed `mfa_disable` (or a disable +
-///      re-init) does to the row.
+///      the SAME txn and COMMITs - what a committed `mfa_disable`, re-init, sweep or
+///      rewrap does to the row.
 ///   4. Under READ COMMITTED the released UPDATE re-evaluates its WHERE against the
 ///      committed row, matches 0 rows and enters the classifier under test.
 ///
-/// Returns true iff the victim's UPDATE was observed queued. On false the victim is
-/// still released (nothing hangs) but its result is not the race under test, so the
-/// caller must REQUIRE the return value before asserting on it. If the holder
-/// session cannot be opened the victim is NOT run and false is returned.
-/// `victim` must capture its own result by reference; `interfering_sql` are
-/// test-authored literals, never input.
+/// The interference is STAND-IN SQL, not the real operations: the classifier reads
+/// only four facts (active, enrolled, password hash, stored-secret-vs-loaded), and
+/// the real `mfa_disable` / `cleanup_provisional_mfa` / `rewrap_all` change none
+/// other than the secret. Hosting the real operations needs a queue-ahead thread (a
+/// real call opens its own lease and would queue BEHIND the victim); tracked as a
+/// follow-up, not built here.
+///
+/// Returns true iff the victim's UPDATE was observed queued AND the interference
+/// committed. On false the victim is still released (nothing hangs) but its result is
+/// not the race under test, so the caller must REQUIRE the return value before
+/// asserting on it. If the holder session cannot be opened the victim is NOT run and
+/// false is returned. `victim` must capture its own result by reference; an exception
+/// it throws is captured on its thread and RETHROWN here after the join (a throw out
+/// of a std::thread body would std::terminate the whole test binary). The
+/// `interfering_sql` literals are test-authored, never input. `std::initializer_list`
+/// (not a vector) so a braced list of two string literals cannot select
+/// `std::vector`'s iterator-pair constructor.
+///
+/// Why not `test_principal_lock_gate.hpp` (`Workers`/`HeldLocks`, the documented seam
+/// for parking a request on a real Postgres lock): that holds the RBAC rows through a
+/// `PgPool`; this needs a plain row lock on `auth.users` from a DSN, a rendezvous on
+/// one specific statement, and a mid-txn mutation before COMMIT.
 template <class Victim>
 [[nodiscard]] inline bool run_enroll_verify_race(const std::string& dsn,
                                                  const std::string& username,
-                                                 const std::vector<std::string>& interfering_sql,
-                                                 Victim&& victim) {
+                                                 std::initializer_list<const char*> interfering_sql,
+                                                 const Victim& victim) {
     using yuzu::server::pg::PgConn;
     using yuzu::server::pg::PgResult;
     PgConn holder{PQconnectdb(dsn.c_str())};
@@ -461,18 +479,43 @@ template <class Victim>
         if (b.status() != PGRES_COMMAND_OK)
             return false;
     }
-    if (!exec1("SELECT 1 FROM auth.users WHERE username = $1 FOR UPDATE")) {
-        PgResult rb{PQexec(holder.get(), "ROLLBACK")};
+    // From here the txn is open. Every exit before the explicit COMMIT below
+    // (including a throw) must release the row lock BEFORE the victim thread is joined,
+    // or the join waits on a victim that is itself blocked on the holder's lock until
+    // the pool's lock_timeout fires. `Scope` is that guarantee: a ROLLBACK (a no-op
+    // after the COMMIT) then the join, in that order, on every path. Closing the
+    // connection would roll the txn back too; the explicit ROLLBACK just makes the
+    // ordering deterministic.
+    struct Scope {
+        PgConn& conn;
+        std::thread thread;
+        ~Scope() {
+            PgResult rb{PQexec(conn.get(), "ROLLBACK")};
+            if (thread.joinable())
+                thread.join();
+        }
+    } scope{holder, {}};
+
+    if (!exec1("SELECT 1 FROM auth.users WHERE username = $1 FOR UPDATE"))
         return false;
-    }
-    std::thread t([&] { victim(); });
+    std::exception_ptr victim_error;
+    scope.thread = std::thread([&] {
+        try {
+            victim();
+        } catch (...) {
+            victim_error = std::current_exception();
+        }
+    });
     const bool queued = wait_for_pg_lock_waiter(dsn, "UPDATE auth.users SET mfa_enrolled_at%");
     bool interfered = true;
-    for (const auto& sql : interfering_sql)
-        interfered = exec1(sql.c_str()) && interfered;
+    for (const char* sql : interfering_sql)
+        interfered = exec1(sql) && interfered;
     PgResult c{PQexec(holder.get(), "COMMIT")};
-    t.join();
-    return queued && interfered && c.status() == PGRES_COMMAND_OK;
+    const bool committed = c.status() == PGRES_COMMAND_OK;
+    scope.thread.join(); // the victim has its result before the caller reads it
+    if (victim_error)
+        std::rethrow_exception(victim_error);
+    return queued && interfered && committed;
 }
 
 } // namespace yuzu::test

@@ -2054,10 +2054,12 @@ TEST_CASE("AuthDB MFA: enrollment guard claims only the row whose stored secret 
 //
 // When the guarded UPDATE above matches nothing, `mfa_verify_enrollment` runs ONE classify
 // SELECT and maps its four facts through the pure `detail::classify_enroll_verify_miss`.
-// The race itself (a disable landing between the secret load and the UPDATE) cannot be
-// interleaved deterministically, so this pins both halves separately: the precedence
-// ladder over every boolean combination, and the classify SELECT's facts against seeded rows
-// (mirroring the production statement -- a drift between the two is the thing to notice).
+// The REAL race is driven by the test further below. These two pin the halves separately:
+// the precedence ladder over every boolean combination, and the classify SELECT's facts
+// against seeded rows. NOTE the facts test runs a hand-copied MIRROR of the production
+// SELECT: it documents the SQL's semantics and CANNOT detect the production statement
+// drifting (mutating the production SQL leaves it green). The real-race test below is the
+// guard for that; do not cite this one as closure evidence.
 // The point of the whole ladder: a benign concurrent cancel must NOT land on WriteFailed,
 // which `is_store_unavailable()` routes to a false 503 + degrade metric.
 TEST_CASE("AuthDB MFA: classify_enroll_verify_miss precedence covers every combination (#3808)",
@@ -2178,7 +2180,7 @@ TEST_CASE("AuthDB MFA: a disable that lands inside enroll-verify is MfaEnrollmen
     };
     // Enrol `user` up to (but not through) the verify, race `interfering_sql` into the window,
     // and report what the verify returned plus whether the row ended up enrolled.
-    auto race = [&](const std::string& user, const std::vector<std::string>& interfering_sql) {
+    auto race = [&](const std::string& user, std::initializer_list<const char*> interfering_sql) {
         REQUIRE(h.db.upsert_user(user, "pwhash", "s", yuzu::server::auth::Role::user).has_value());
         auto init = h.db.mfa_init_enrollment(user, "Yuzu", std::nullopt);
         REQUIRE(init.has_value());
@@ -2211,7 +2213,7 @@ TEST_CASE("AuthDB MFA: a disable that lands inside enroll-verify is MfaEnrollmen
     };
 
     // What mfa_disable does to the row: secret and enrolled_at both NULL.
-    const std::string kDisable =
+    const char* const kDisable =
         "UPDATE auth.users SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL WHERE username = $1";
 
     SECTION("plain disable -> cancelled, nothing enrolled, not a store outage") {

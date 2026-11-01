@@ -1138,8 +1138,7 @@ TEST_CASE("POST /login/mfa/enroll answers 409 and audits mfa.enroll.cancelled wh
     const std::string code = h.totp_at(secret, 0);
     const auto enroll_body = form({{"mfa_pending_token", pending}, {"code", code}});
 
-    decltype(h.sink.Post("/login/mfa/enroll", enroll_body, "application/x-www-form-urlencoded"))
-        step2;
+    std::unique_ptr<httplib::Response> step2;
     REQUIRE(yuzu::test::run_enroll_verify_race(
         h.auth_db.dsn(), "alice",
         {"UPDATE auth.users SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL WHERE "
@@ -1158,6 +1157,19 @@ TEST_CASE("POST /login/mfa/enroll answers 409 and audits mfa.enroll.cancelled wh
     CHECK(h.count_audits("mfa.enroll.cancelled", "alice") >= 1);
     CHECK(h.count_audits("mfa.enroll.failed", "alice") == 0);
     CHECK(h.count_audits("mfa.enroll.race", "alice") == 0);
+    // The detail states only the observed fact and NEVER a cause (the stale-provisional sweep,
+    // `--mfa-reset` and a KEK rewrap reach this path with no disable); a named "disable" sends
+    // an auditor looking for an mfa.disabled row that may not exist.
+    {
+        AuditQuery q;
+        q.action = "mfa.enroll.cancelled";
+        q.principal = "alice";
+        auto rows = h.audit_store->query(q);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK((*rows)[0].detail == "reason=provisional_secret_changed; nothing enrolled");
+        CHECK((*rows)[0].detail.find("disable") == std::string::npos);
+    }
     // Nothing was enrolled (the account really is un-enrolled after the disable).
     auto status = h.auth_db->mfa_status("alice");
     REQUIRE(status.has_value());

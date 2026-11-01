@@ -1775,6 +1775,9 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
     // #5342 Gate 8 (F4): the credential anchor, always bound in the guarded
     // UPDATE below — the caller's proven hash, else the hash read above.
     const std::string anchor = expected_password_hash_hex.value_or(row->password_hash_hex);
+    // The ENCRYPTED envelope blob (never the plaintext secret), hex-encoded once: the guarded UPDATE
+    // and, on a 0-row miss, the classify SELECT both bind it.
+    const std::string secret_hex = auth::AuthManager::bytes_to_hex(row->secret_blob);
 
     auto secret_view = std::string_view(reinterpret_cast<const char*>(dec->data()), dec->size());
     auto current = mfa::current_counter(std::chrono::system_clock::now());
@@ -1839,13 +1842,15 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
             "AND mfa_totp_secret = decode($3, 'hex') "
             "AND password_hash = $4 RETURNING id",
             std::vector<std::string>{std::to_string(*matched), username,
-                                     auth::AuthManager::bytes_to_hex(row->secret_blob), anchor});
+                                     secret_hex, anchor});
         if (r.status() != PGRES_TUPLES_OK)
             return false; // write outage → fail closed (WriteFailed → 503)
         if (PQntuples(r.get()) == 0) {
             // 0 rows = the user was deactivated/deleted mid-request, OR a concurrent
-            // verify already enrolled them, OR a concurrent disable / disable+re-init
-            // replaced the provisional secret this verify loaded (#3808). Classify so
+            // verify already enrolled them, OR the provisional secret this verify
+            // loaded is no longer the stored one (#3808: a disable, a re-init, the
+            // stale-provisional sweep, `--mfa-reset` or a KEK rewrap — not
+            // distinguishable here, so no caller may name a cause). Classify so
             // each benign race is graded by its own business outcome — NOT WriteFailed,
             // which `is_store_unavailable()` routes to a false 503 + a
             // secret-unavailable degrade metric + a kCritical "store unavailable" audit.
@@ -1864,7 +1869,7 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
                 "(mfa_totp_secret IS DISTINCT FROM decode($3, 'hex')) "
                 "FROM auth.users WHERE username = $1",
                 std::vector<std::string>{username, anchor,
-                                         auth::AuthManager::bytes_to_hex(row->secret_blob)});
+                                         secret_hex});
             if (cls.status() == PGRES_TUPLES_OK && PQntuples(cls.get()) == 1) {
                 txn_error = detail::classify_enroll_verify_miss(
                     to_bool(col(cls.get(), 0, 0)), to_bool(col(cls.get(), 0, 1)),

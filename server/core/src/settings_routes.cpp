@@ -6852,6 +6852,26 @@ void SettingsRoutes::register_routes(
                                       "text/html; charset=utf-8");
                       return;
                   }
+                  if (!codes_res && codes_res.error() == AuthDBError::MfaEnrollmentCancelled) {
+                      // #3808: the provisional secret this code was verified against is
+                      // no longer the stored one — cleared or replaced by a disable, a
+                      // re-init, the stale-provisional sweep, `--mfa-reset` or a KEK
+                      // rewrap; the database cannot tell which, so nothing here names a
+                      // cause. Nothing was enrolled. Audited as its own benign outcome
+                      // (not mfa.enroll.failed; not a store outage — the value is outside
+                      // is_store_unavailable(), so no degrade counter).
+                      // Render the NOT-ENROLLED state (empty fifth argument): a non-empty
+                      // `enrollment_pending_for_verify` would force the provisional code
+                      // form, whose secret is gone — the operator would be told to start
+                      // again but offered only a confirm box that can never succeed.
+                      audit_fn_(req, "mfa.enroll.cancelled", "ok", "User", session->username,
+                                "reason=provisional_secret_changed; nothing enrolled");
+                      res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
+                                                          "Enrollment was cancelled or replaced. "
+                                                          "Start enrollment again."),
+                                      "text/html; charset=utf-8");
+                      return;
+                  }
                   if (!codes_res) {
                       // Re-render the verify form (no QR re-reveal — the
                       // provisional row survives so the operator's
@@ -6874,23 +6894,6 @@ void SettingsRoutes::register_routes(
                       // and tell the operator the true state rather than "code
                       // rejected". `MfaAlreadyEnrolled` is not in
                       // is_store_unavailable(), so no false 503/degrade path.
-                      if (codes_res.error() == AuthDBError::MfaEnrollmentCancelled) {
-                          // A concurrent disable (or disable+re-init) replaced the
-                          // provisional secret this code was verified against (#3808).
-                          // Benign and nothing was enrolled: audit it as its own
-                          // outcome (not mfa.enroll.failed, not a store outage —
-                          // MfaEnrollmentCancelled is outside is_store_unavailable(),
-                          // so no degrade counter) and tell the operator to restart.
-                          audit_fn_(req, "mfa.enroll.cancelled", "ok", "User", session->username,
-                                    "provisional enrollment cancelled or replaced by a "
-                                    "concurrent disable; nothing enrolled");
-                          res.set_content(
-                              render_mfa_fragment(*session, {}, {}, {}, session->username,
-                                                  "Enrollment was cancelled or replaced. Start "
-                                                  "enrollment again."),
-                              "text/html; charset=utf-8");
-                          return;
-                      }
                       if (codes_res.error() == AuthDBError::MfaAlreadyEnrolled) {
                           audit_fn_(req, "mfa.enroll.race", "ok", "User", session->username,
                                     "already enrolled by a concurrent verify; no duplicate "

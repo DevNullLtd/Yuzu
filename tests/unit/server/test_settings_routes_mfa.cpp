@@ -446,6 +446,19 @@ TEST_CASE("POST /api/settings/mfa/verify tells the operator to start again and a
     // Honest about what happened: not the store-outage wording, not "code rejected".
     CHECK(res->body.find("temporarily unavailable") == std::string::npos);
     CHECK(res->body.find("Code rejected") == std::string::npos);
+    // RECOVERABLE: the operator is told to start again, so the page must OFFER that. A
+    // non-empty `enrollment_pending_for_verify` forced the provisional confirm form instead
+    // (a code box whose secret is gone, a "wait for the next code" hint, no Set-up button;
+    // under enforcement not even Cancel). The not-enrolled state has the Set-up button.
+    CHECK(res->body.find("Set up two-factor") != std::string::npos);
+    CHECK(res->body.find("wait for the next code") == std::string::npos);
+    CHECK(res->body.find("Confirm code") == std::string::npos);
+    // The audit detail states only the observed fact and NEVER a cause: a named "disable"
+    // sends an auditor looking for an mfa.disabled row that may not exist (the stale-
+    // provisional sweep, `--mfa-reset` and a KEK rewrap reach this path with no disable).
+    CHECK(h.audit_detail("mfa.enroll.cancelled") ==
+          "reason=provisional_secret_changed; nothing enrolled");
+    CHECK(h.audit_detail("mfa.enroll.cancelled").find("disable") == std::string::npos);
     CHECK_FALSE(has_step_up_proof(h, token)); // nothing enrolled, so no proof is earned
     CHECK(h.has_audit("mfa.enroll.cancelled", "ok", "admin"));
     CHECK_FALSE(h.has_audit("mfa.enroll.failed"));

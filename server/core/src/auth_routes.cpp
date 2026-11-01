@@ -3184,12 +3184,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // store-unavailable signal (#3777, CC7.2).
                 already_enrolled = true;
             } else if (r.error() == AuthDBError::MfaEnrollmentCancelled) {
-                // A concurrent disable (or disable+re-init) replaced the provisional
-                // secret this code was verified against (#3808). Benign: nothing was
-                // enrolled. NOT a store outage — MfaEnrollmentCancelled is outside
-                // is_store_unavailable(), so no 503 / degrade counter — and NOT a
-                // wrong code. Handled distinctly below. Must stay ahead of the
-                // is_store_unavailable arm.
+                // The provisional secret this code was verified against is no longer
+                // the stored one (#3808): cleared or replaced by a disable, a
+                // re-init, the stale-provisional sweep, `--mfa-reset` or a KEK
+                // rewrap. The database cannot tell those apart, so nothing below
+                // may name a cause. Benign: nothing was enrolled. NOT a store
+                // outage — MfaEnrollmentCancelled is outside is_store_unavailable(),
+                // so no 503 / degrade counter — and NOT a wrong code. Handled
+                // distinctly below.
                 enrollment_cancelled = true;
             } else if (is_store_unavailable(r.error())) {
                 // ★ SECURITY (architect BLOCK): a decrypt/store failure must
@@ -3233,16 +3235,18 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
 
         if (enrollment_cancelled) {
-            // The provisional enrollment was cancelled or replaced mid-verify. The
-            // pending token was move-erased on take-ownership above and is NOT
-            // re-inserted: its provisional secret is gone, so it is spent and the
-            // operator must sign in again to start over. No session is minted.
-            // Audited as its own benign outcome — never mfa.enroll.failed (a bad
-            // code) nor the kCritical store-unavailable event.
+            // The provisional enrollment changed under this verify. The pending
+            // token was move-erased on take-ownership above and is NOT
+            // re-inserted: its provisional secret is gone or replaced, so it is
+            // spent and the operator must sign in again to start over. No session
+            // is minted. Audited as its own benign outcome — never mfa.enroll.failed
+            // (a bad code) nor the kCritical store-unavailable event. The detail
+            // states only the observed fact, in the key=value style of
+            // `step_up_proof=...`: a SIEM or auditor reading a named cause would
+            // look for a matching mfa.disabled row that may never have existed.
             audit_log_for_principal(req, "mfa.enroll.cancelled", "ok", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
-                                    "provisional enrollment cancelled or replaced by a "
-                                    "concurrent disable; nothing enrolled");
+                                    "reason=provisional_secret_changed; nothing enrolled");
             res.status = 409;
             res.set_content(detail::a4_error(res, "MFA enrollment was cancelled or replaced; "
                                                   "sign in again to start over"),

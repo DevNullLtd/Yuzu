@@ -124,14 +124,20 @@ enum class AuthDBError : std::uint8_t {
     CredentialChanged,
     /// #3808: `mfa_verify_enrollment` verified a code against the provisional
     /// secret it loaded, but by the time its guarded UPDATE ran that secret was
-    /// no longer the stored one — a concurrent `mfa_disable` NULLed it, or a
-    /// disable + `mfa_init_enrollment` replaced it with a different one. The
-    /// provisional enrollment was cancelled or superseded; nothing was enrolled.
-    /// A benign business outcome, NOT a store fault (`is_store_unavailable` is
-    /// false): the caller reports "start enrollment again", never a 503 or a
-    /// secret-unavailable degrade signal. Ranked BELOW `MfaAlreadyEnrolled` and
-    /// `CredentialChanged` — a password reset also wipes the provisional secret,
-    /// and that refusal must win.
+    /// no longer the stored one. Several things do that and the classifier CANNOT
+    /// tell them apart (it reads only "stored blob differs from the loaded blob"):
+    /// `mfa_disable`, a disable + `mfa_init_enrollment` re-init, the stale-
+    /// provisional sweep (`cleanup_provisional_mfa`, no actor, every replica),
+    /// the `--mfa-reset` boot CLI, and an online KEK rewrap (`rewrap_all`, which
+    /// rewrites the envelope blob in place with the plaintext UNCHANGED). Nothing
+    /// was enrolled. A benign business outcome, NOT a store fault
+    /// (`is_store_unavailable` is false): the caller reports "start enrollment
+    /// again", never a 503 or a secret-unavailable degrade signal.
+    /// CALLERS MUST NOT NAME A CAUSE in an audit row, message or doc: an auditor
+    /// reading "disable" goes looking for an `mfa.disabled` row that may never
+    /// have existed. Ranked BELOW `MfaAlreadyEnrolled` and `CredentialChanged` —
+    /// a password reset also wipes the provisional secret, and that refusal must
+    /// win.
     MfaEnrollmentCancelled,
 };
 
@@ -156,6 +162,8 @@ namespace detail {
 /// #3808: the ONE precedence ladder for `mfa_verify_enrollment`'s guarded-UPDATE
 /// 0-row branch, over the four facts the classify SELECT reads in a single
 /// statement. Pure so every combination is unit-testable without a database.
+/// A TEST SEAM, exposed here only so the unit test can call it: not for callers
+/// outside `auth_db.cpp` (the only production caller) and its tests.
 ///   1. inactive/deleted row            -> WriteFailed (fail-closed 503, unchanged)
 ///   2. already enrolled                -> MfaAlreadyEnrolled (a concurrent verify won)
 ///   3. password hash moved             -> CredentialChanged (MUST outrank 4: a
