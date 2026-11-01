@@ -20,3 +20,14 @@ Adds `server/core/src/mcp_server.cpp` (the `list_dex_apps` handler) and `tests/u
 | R5 | The MCP handler's `platform` (`std::optional<std::string>`, from `param_string_strict`) and `scope` (normalised copy) | `std::optional<std::string>` and `std::string` values, locals of the `list_dex_apps` branch | argument parse | end of the branch | `scope` is passed by const reference to `DexApi::apps`; no view outlives the call | none (value types; every early return answers and returns) |
 
 No new fd, HANDLE, SOCKET, `FILE*`, sqlite3 object, OpenSSL or BCrypt object, thread, subprocess, callback context, mapped library or temp path. No manual cleanup in new C++.
+
+## Addendum: files the header list omits
+
+Also in the range: `server/core/src/dex_perf_rules.hpp` and `tests/unit/server/test_openapi_spec_completeness.cpp`. Supplements the header list; nothing above is changed.
+
+| ID | Resource / construct | Owner type | Acquired | Released | Transfer | Failure cleanup |
+|---|---|---|---|---|---|---|
+| R6 | `dex_fleet_os_label(std::string_view raw)` in `dex_perf_rules.hpp` | the parameter is a non-owning view; the return is an owned `std::string` | per call (the one caller is the fleet lambda in `server.cpp`, covered by R3) | the return value's scope in the caller | returned by value; no view is stored | none (value type) |
+| R7 | The new cases in `test_openapi_spec_completeness.cpp` | locals of the `TEST_CASE` (`nlohmann::json`, `std::string`) | in the case | end of the case | none | none (value types) |
+
+No new fd, HANDLE, SOCKET, `FILE*`, sqlite3 object, OpenSSL or BCrypt object, thread, subprocess, callback context, mapped library or temp path. No manual cleanup in new C++.
