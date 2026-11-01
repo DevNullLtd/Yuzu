@@ -479,6 +479,11 @@ template <class Victim>
         if (b.status() != PGRES_COMMAND_OK)
             return false;
     }
+    // Declared BEFORE `scope` on purpose: locals are destroyed in reverse order, and `Scope`'s
+    // destructor joins the victim thread, which writes this slot if the victim throws. Declared
+    // after `scope` it would be destroyed first and an early exit would join a thread still
+    // writing a dead object.
+    std::exception_ptr victim_error;
     // From here the txn is open. Every exit before the explicit COMMIT below
     // (including a throw) must release the row lock BEFORE the victim thread is joined,
     // or the join waits on a victim that is itself blocked on the holder's lock until
@@ -498,7 +503,6 @@ template <class Victim>
 
     if (!exec1("SELECT 1 FROM auth.users WHERE username = $1 FOR UPDATE"))
         return false;
-    std::exception_ptr victim_error;
     scope.thread = std::thread([&] {
         try {
             victim();
