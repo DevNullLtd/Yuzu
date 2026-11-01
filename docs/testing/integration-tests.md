@@ -249,13 +249,18 @@ It is the wrapper Meson's gateway `test()` targets call, and CI runs it that way
 The MCP server is tested at the unit level via `tests/unit/server/test_mcp_server.cpp` (JSON-RPC parsing, tier policy, token integration, tool dispatch). For manual integration testing:
 
 ```bash
-# Create an MCP token
+# Create an MCP token (a cookie-session REST write, so it needs the same-site Origin).
+# A tiered token must carry expires_at: unix epoch seconds, in the future, at most 90 days out.
+# macOS: EXPIRES_AT=$(date -v+7d +%s)
+EXPIRES_AT=$(date -d '+7 days' +%s)
 curl -X POST http://localhost:8080/api/v1/tokens \
   -H "Origin: http://localhost:8080" \
   -H "Cookie: $COOKIE" \
-  -d '{"name":"mcp-test","mcp_tier":"readonly","expires_in_days":7}'
+  -d "{\"name\":\"mcp-test\",\"mcp_tier\":\"readonly\",\"expires_at\":$EXPIRES_AT}"
 
-# Call MCP endpoint
+# Call MCP endpoint: send ONLY the Authorization header, never the session cookie.
+# /mcp/v1/ refuses a credential with no MCP tier (403, -32003), and a live cookie is
+# resolved before the Bearer token, so a request carrying both is refused too.
 curl -X POST http://localhost:8080/mcp/v1/ \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"list_agents","arguments":{}},"id":1}'

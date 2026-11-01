@@ -5358,7 +5358,7 @@ The v1 twin of `PUT /api/config/:key`; the path parameter (`{param}` in the rout
 - **Errors:** every refusal is an A4 error envelope: `400` for a missing or invalid `value` (a JSON `null`, array or object is refused: send a string or a number or boolean), an unknown key, or a key with its own route (`dex_score_policy`); `401` when a fresh MFA proof is needed (the step-up envelope below); `403` for a refused caller (with `remediation`, no `permission` field), a cross-site cookie write, or a SAML session or engine principal (step-up); `503` when the store is unavailable or the `attempted` row cannot be stored (with `retry_after_ms`).
 - **Step-up:** one of the [step-up routes](#step-up-envelope-on-high-risk-endpoints): an MFA-enrolled local or OIDC cookie session needs a fresh proof per `--mfa-enforcement`; un-enrolled accounts and API-token and MCP-token callers pass. It is checked by the central step-up check before the route runs, ahead of the permission and caller-rule checks, so an enrolled cookie session without a fresh proof gets the step-up `401` even if it also lacks `Infrastructure:Write`. The legacy `PUT /api/config/:key` is unchanged and is not step-up gated.
 
-MCP: `set_runtime_config`, with the arguments `{"key": "...", "value": "..."}` (strings; `key` 1 to 64 characters from `a-z` and `_`, `value` at most 256 bytes). The readonly and operator tiers cannot call it. A supervised-tier token reaches only the five keys that are not administrator-only (`heartbeat_timeout`, `response_retention_days`, `guardian_event_retention_days`, `auto_approve_enabled`, `log_level`); the rest answer a permission error and the `config.update / denied` audit row, and `dex_score_policy` answers invalid params. An untiered administrator API token is admitted for every key, as on REST. It is not approval-gated at the supervised tier: the write is audit-first, and an MCP-tier token cannot reach the administrator-only keys, including every sign-in setting. The retention values are stored but not enforced, even after a restart (see [When a change takes effect](#when-a-change-takes-effect)).
+MCP: `set_runtime_config`, with the arguments `{"key": "...", "value": "..."}` (strings; `key` 1 to 64 characters from `a-z` and `_`, `value` at most 256 bytes). The readonly and operator tiers cannot call it. A supervised-tier token reaches only the five keys that are not administrator-only (`heartbeat_timeout`, `response_retention_days`, `guardian_event_retention_days`, `auto_approve_enabled`, `log_level`); the rest answer a permission error and the `config.update / denied` audit row, and `dex_score_policy` answers invalid params. A token must carry an MCP tier to reach `/mcp/v1/` at all (an untiered credential is refused, #4309), and an administrator token with a tier still cannot reach the administrator-only keys, including every sign-in setting; change those over REST or the Settings pages. It is not approval-gated at the supervised tier: the write is audit-first. The retention values are stored but not enforced, even after a restart (see [When a change takes effect](#when-a-change-takes-effect)).
 
 ### Settings
 
@@ -13109,7 +13109,8 @@ principal only, and the per-tick session check compares the class captured at at
 | `404` | Session unknown, expired, another principal's, another credential class's, **or** the `Last-Event-ID` cursor is outside the replay window (`-32007`) — re-initialize with the credential you will use |
 | `403` | `Origin` not in `--mcp-allowed-origin` (`-32008`) |
 | `403` | Service-scoped API token (`-32003`; no `permission` field, because no permission grant would admit the caller; use a token without `scope_service`). Checked after the kill switches, `Origin`, protocol version and authentication, and before the session header, `Accept` and the stream lease, so it answers even when `Mcp-Session-Id` is absent. Audited `mcp.session.reject` `reason=service_scoped` |
-| `405` | Streaming disabled (`--mcp-no-streaming`) |
+| `403` | Credential with no MCP tier, such as a session cookie or an API token minted without `mcp_tier` (`-32003`, message `/mcp/v1/ requires an MCP-tier bearer token`, `null` id, no `permission` field; mint a tiered token and send it as `Authorization: Bearer` without a cookie). Checked after the kill switches, `Origin`, protocol version and authentication, and before the service-scope deny, the session header and `Accept`, so it answers even when `Mcp-Session-Id` is absent and takes precedence over the `404` session paths; an unauthenticated request stays `401`. Audited `mcp.session.reject` `reason=tier_required` (audit row rate-limited; counter complete), counted on `yuzu_mcp_admission_refused_total` |
+| `405` | Streaming disabled (`--mcp-no-streaming`); answered before authentication, so it precedes every `403` above |
 | `406` | `Accept` did not include `text/event-stream` (`-32011`) |
 | `429` | Concurrent-stream cap, or a superseded stream on this session is still closing (`-32012`; honour `retry_after_ms`) |
 
@@ -13129,13 +13130,13 @@ name the reason in that same A4 shape.
 
 Ends the session named by `Mcp-Session-Id` (and closes its stream). `200` on success;
 `404` if the session is unknown, expired, already ended, or belongs to another principal or another credential class (call `initialize` to start a new session; the original session is not terminated by a class mismatch); `400` if the header is
-absent.
+absent. A credential with no MCP tier (a session cookie, or an API token minted without `mcp_tier`) is refused `403` (`-32003`, `reason=tier_required`; audit row rate-limited, counter complete) after authentication and before the session header is read, so it takes precedence over the `400` and `404` above; an unauthenticated request stays `401`, and `405` (streaming disabled) is answered first.
 
 #### `POST /mcp/v1/`
 
 JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 
-**Permission:** Bearer token with `mcp_tier` set (readonly, operator, or supervised). The tier determines which tools are accessible, enforced before RBAC.
+**Permission:** Bearer token with `mcp_tier` set (readonly, operator, or supervised). The tier determines which tools are accessible, enforced before RBAC. A credential with no MCP tier (a session cookie, or an API token minted without `mcp_tier`) is refused `403` (`-32003`, `null` id, message `/mcp/v1/ requires an MCP-tier bearer token`, audited `reason=tier_required`; audit row rate-limited, counter complete) after authentication and before the JSON-RPC body or the `Mcp-Session-Id` header is read, so it takes precedence over a parse error and over the `404` session paths; an unauthenticated request stays `401`. Do not send a session cookie with the token: a live cookie is resolved first and the request is refused.
 
 **Request body (tool call):**
 

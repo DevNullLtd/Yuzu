@@ -12,12 +12,55 @@
 # Quick rebuild (code-only):
 #   docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
 #
-# Pre-bake the deps image:
+# Pre-bake the deps image (linux/amd64 only, see "Supported platforms" below):
 #   docker build --target deps -t yuzu-gateway-deps -f deploy/docker/Dockerfile.gateway .
 #   docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
 
+# ── Supported platforms (#6711) ───────────────────────────────────────────
+#
+# linux/amd64 ONLY. The pinned erlang:28-alpine index below is mixed: its amd64
+# entry is on Alpine 3.23 (musl 1.2.5) while every other entry, arm64 included,
+# is on Alpine 3.24 (musl 1.2.6). The runtime stage is alpine:3.23, so an arm64
+# build trips the #2150 abi-guard only after the whole rebar3 build. Moving
+# arm64 to 3.24 is not an option either: the abi-guard below bans musl >= 1.2.6
+# with OTP < 29.1 on every architecture, because that pairing aborts beam.smp at
+# boot on AMX CPUs (#1743). AMX is x86-only, so for arm64 this is the
+# builder/runtime lockstep policy, not a measured arm64 fault. The first RUN
+# below therefore refuses any other architecture up front, with the reason.
+#
+# This is a scoping choice, not a ceiling: older erlang:28-alpine indexes exist
+# whose amd64 AND arm64 entries are both on Alpine 3.23 (registry-checked
+# 2026-10-29 for 28.5.0.0, 28.5.0.1 and 28.4.x; evidence in #6740), so re-pinning
+# to one would make arm64 buildable at the cost of an older OTP patch than the
+# 28.5.0.2 used here. That trade is tracked separately; published gateway images
+# are amd64-only either way.
+#
+# Lift this with that re-pin (#6740) or with the move to OTP 29.1 or newer. The
+# marker line is read by scripts/ci/check-gateway-base-index.py, which fails when the
+# listed platforms are not all annotated, in the pinned index, as built on the
+# runtime stage's Alpine release; add a platform to the marker and to the guard
+# below together. The guard treats an unset TARGETARCH (a builder that does not
+# set it) as amd64; the abi-guard below still stops such an arm64 build.
+# yuzu:gateway-platforms linux/amd64
+
 # ── Stage 1: deps — fetch and compile Erlang dependencies (cached) ────────
 FROM erlang:28-alpine@sha256:e1db7a6948008f2f97b63bd139add18e9304980bdc90da6ddab91d89f0a665da AS deps
+
+# BuildKit sets TARGETARCH from --platform (and from the host when it is not
+# given). Keep the allowed set in step with the marker line above.
+ARG TARGETARCH
+RUN case "${TARGETARCH:-amd64}" in amd64) ;; *) \
+      echo "FATAL: Dockerfile.gateway supports linux/amd64 only (TARGETARCH=${TARGETARCH})." \
+           "Upstream builds this architecture of the pinned erlang:28-alpine on a newer Alpine than the" \
+           "runtime stage; the abi-guard (#2150) requires the same Alpine release in both, and the runtime" \
+           "cannot move to the newer one before OTP 29.1 (#1743), unless the builder is re-pinned (#6740)." \
+           "Build with --platform linux/amd64 (on an arm64 host that is emulation, which has crashed in" \
+           "the Erlang deps stage under OrbStack; prefer an amd64 host or CI)." \
+           "See #6711 and docs/operations/troubleshooting.md." \
+           "A single-node demo can use deploy/docker/Dockerfile.gateway.chisel (demo variant: no" \
+           "gateway-entrypoint.sh, so it cannot resolve its own cluster advertise address; do not use" \
+           "it for a scaled or clustered gateway)."; \
+      exit 1;; esac
 
 RUN apk add --no-cache git
 
