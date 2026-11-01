@@ -136,6 +136,52 @@ def parse_ecosystem_table(text):
     return set(entries)
 
 
+def parse_vocab_table(text, name):
+    """The (value, title, tooltip) rows of `std::array<VocabEntry, N> k<name>{{...}};` in `text`,
+    in order. Comment-stripped like parse_ecosystem_table; anti-vacuous: parsed rows must equal the
+    declared size. The stripper is not string-aware, so a tooltip must not contain `//` or `/*`:
+    it would eat the closing quote and fail loud on the size check."""
+    m = re.search(rf"std::array<VocabEntry, (\d+)> k{name}\{{\{{(.*?)\}}\}};", text, re.S)
+    if not m:
+        raise AssertionError(f"k{name} not found in {CATALOG_RULES}")
+    body = re.sub(r"/\*.*?\*/|//[^\n]*", "", m.group(2), flags=re.S)
+    # Adjacent string literals concatenate in C++; join them before matching the three fields.
+    body = re.sub(r'"\s+"', "", body)
+    rows = re.findall(r'\{"([a-z_.]+)",\s*"([^"]+)",\s*"([^"]+)"\}', body)
+    if not rows or len(rows) != int(m.group(1)):
+        raise AssertionError(f"parsed {len(rows)} k{name} rows, declared {m.group(1)}")
+    return rows
+
+
+def collector_sources(text):
+    """`plugin.action` for every row of the collector's kInventoryActions, in order. A `.plugin`
+    is a string literal; a `.action` is a literal or a `kAction*` string_view constant, resolved
+    from its declaration. Comment-stripped like the table parsers: a commented-out action is not a
+    collected source. Anti-vacuous: every `{.plugin =` row opener must parse into a pair, so a row
+    spelled any other way (a named-constant plugin, a runtime action) fails loud instead of
+    vanishing from the expected chip list."""
+    text = re.sub(r"/\*.*?\*/|//[^\n]*", "", text, flags=re.S)
+    consts = dict(re.findall(r'constexpr std::string_view (kAction\w+) = "([a-z0-9_]+)";', text))
+    m = re.search(r"kInventoryActions\[\] = \{(.*?)\n\};", text, re.S)
+    if not m:
+        raise AssertionError("kInventoryActions not found")
+    pairs = re.findall(r'\.plugin = "([a-z0-9_]+)",\s*\.action = ("[a-z0-9_]+"|kAction\w+)', m.group(1))
+    openers = len(re.findall(r"\{\s*\.plugin\s*=", m.group(1)))
+    if openers != len(pairs):
+        raise AssertionError(f"parsed {len(pairs)} kInventoryActions rows, found {openers} rows: "
+                             f"each needs a string-literal .plugin and a literal or kAction* .action")
+    out = []
+    for plugin, action in pairs:
+        if action.startswith('"'):
+            action = action.strip('"')
+        elif action in consts:
+            action = consts[action]
+        else:
+            raise AssertionError(f"unresolved action constant {action}")
+        out.append(f"{plugin}.{action}")
+    return out
+
+
 def table_ecosystems():
     return parse_ecosystem_table(read(CATALOG_RULES))
 
@@ -270,6 +316,19 @@ class VocabularyConsistency(unittest.TestCase):
         self.assertEqual(self.emitted_kinds, EXPECTED_KINDS)
         self.assertEqual(self.emitted_ecos, EXPECTED_ECOSYSTEMS)
 
+    def test_kind_table_equals_vocabulary(self):
+        rows = parse_vocab_table(read(CATALOG_RULES), "SoftwareKinds")
+        self.assertEqual({r[0] for r in rows}, EXPECTED_KINDS)
+        self.assertEqual(len(rows), len(EXPECTED_KINDS))
+
+    def test_source_table_equals_collector_sources(self):
+        want = collector_sources(read("agents/core/src/sync_source_installed_software.cpp"))
+        self.assertGreaterEqual(len(want), 6)
+        self.assertTrue(all("." in w and not w.endswith(".") for w in want), want)
+        got = [r[0] for r in parse_vocab_table(read(CATALOG_RULES), "SoftwareSources")]
+        # Ordered: the chips follow the collector's table order.
+        self.assertEqual(got, want)
+
     def test_lane3_predicate_covers_vocabulary(self):
         hdr = read(CPE_HDR)
         for eco in EXPECTED_ECOSYSTEMS - LANE1:
@@ -296,6 +355,21 @@ class GateParsers(unittest.TestCase):
 
     def enums(self, spec, field="ecosystem"):
         return [e for _, e in openapi_field_enums(spec, field)]
+
+    @staticmethod
+    def _actions(*rows):
+        return "kInventoryActions[] = {\n" + "\n".join(rows) + "\n};"
+
+    def test_collector_sources_reads_digit_names_and_comments(self):
+        src = self._actions('    {.plugin = "q2", .action = "list_v2", .adapt = a},',
+                            '    // {.plugin = "gone", .action = "x", .adapt = a},')
+        self.assertEqual(collector_sources(src), ["q2.list_v2"])
+
+    def test_collector_sources_fails_loud_on_an_unparseable_row(self):
+        for row in ('{.plugin = kPlugin, .action = "list", .adapt = a},',
+                    '{.plugin = "p", .action = std::string_view{}, .adapt = a},'):
+            with self.assertRaises(AssertionError):
+                collector_sources(self._actions('{.plugin = "p", .action = "ok", .adapt = a},', row))
 
     def test_token_parameter_is_a_token(self):
         (enum,) = self.enums(_doc([self.TOKEN_PARAM]))
@@ -380,6 +454,30 @@ class GateParsers(unittest.TestCase):
     def test_block_opener_inside_a_line_comment_opens_nothing(self):
         rows = ('{"a", "linux"}, // note /*', '{"b", "linux"},')
         self.assertEqual(parse_ecosystem_table(_table(2, *rows)), {"a", "b"})
+
+    def test_commented_vocab_row_is_not_a_row_and_size_mismatch_raises(self):
+        t = lambda n, *r: "std::array<VocabEntry, %d> kX{{\n%s\n}};" % (n, "\n".join(r))
+        live = '{"a", "A", "tip"},'
+        self.assertEqual(parse_vocab_table(t(1, live, '// {"b", "B", "tip"},'), "X"),
+                         [("a", "A", "tip")])
+        with self.assertRaisesRegex(AssertionError, "parsed 1 kX rows, declared 2"):
+            parse_vocab_table(t(2, live, '/* {"b", "B", "tip"}, */'), "X")
+
+    def test_collector_sources_resolves_constants_in_order(self):
+        src = ('constexpr std::string_view kActionM = "managers";\n'
+               'const InventoryAction kInventoryActions[] = {\n'
+               '    {.plugin = "p", .action = "list"},\n'
+               '    {.plugin = "q",\n     .action = kActionM,\n     .adapt = f},\n'
+               '};\n')
+        self.assertEqual(collector_sources(src), ["p.list", "q.managers"])
+
+    def test_collector_sources_ignores_commented_out_rows(self):
+        src = ('const InventoryAction kInventoryActions[] = {\n'
+               '    {.plugin = "p", .action = "list"},\n'
+               '    /* {.plugin = "b", .action = "blocked"}, */\n'
+               '    // {.plugin = "l", .action = "lined"},\n'
+               '};\n')
+        self.assertEqual(collector_sources(src), ["p.list"])
 
 
 if __name__ == "__main__":
