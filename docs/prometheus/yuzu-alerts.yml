@@ -3679,10 +3679,13 @@ groups:
   #    not proof. Correctness for a leader-driven claim is the epoch fence in
   #    its WRITE (leader_elector.hpp), never this gauge. The fence is PER
   #    DATABASE (see YuzuLeaderSplitBrain) and assumes no committed transaction
-  #    is lost on a promotion (synchronous replication, the shipped quorum
-  #    default): under asynchronous replication, or a degraded non-strict quorum,
-  #    a lagging promotion could re-mint an epoch, and "fenced claims remain
-  #    safe" below is NOT claimed for that case.
+  #    is lost on a promotion to a DIFFERENT, still-live primary. Since #6535 the
+  #    epoch carries the Postgres timeline, so a lossy promotion of a streaming
+  #    standby no longer lets a paused ex-leader's epoch equal the new leader's.
+  #    That is not claimed for: two primaries accepting writes at once, a physical
+  #    snapshot restored without archive recovery, a logical restore, promotion
+  #    tooling that skips the previous timeline's history, or a rolling upgrade
+  #    while a pre-#6535 binary can lead (docs/user-manual/ha-postgres.md).
   #  - Single replica (the supported default): SplitBrain cannot fire (one
   #    series), NoLeader fires only if the elector never leads (loops paused),
   #    Flapping usually does NOT see a single replica's restart loop (see that
@@ -3749,7 +3752,7 @@ groups:
             replicas share one database is the stale one the replica whose
             yuzu_server_leader_epoch differs from
             leader_elector.leader_state.current_leader_epoch; restart it. Within
-            one database (with synchronous replication) fenced claims remain
+            one database fenced claims remain
             safe and the unfenced background passes may be running twice.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#leader-election-metrics-and-alerts-ha-ws-11"
 

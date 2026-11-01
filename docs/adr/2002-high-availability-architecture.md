@@ -190,6 +190,32 @@ side-effecting claim (§6) checks `claim.epoch == current_leader_epoch` **in the
 the claim**, independent of whether the actor still *believes* it holds the lock. A stale ex-leader
 therefore cannot commit a claim even in the window before it notices its lock dropped.
 
+**Update (2026-11-01, #6535) — the epoch is timeline-packed.** A sequence alone is not monotonic across a
+*lossy* promotion: under asynchronous replication, or a degraded non-strict quorum, the promoted standby can
+lack the latest mint (both the sequence advance and the `leader_state` row), so a new leader can re-mint the
+sequence value a paused ex-leader still holds, and the equality fence admits both. (Postgres WAL-logs a
+sequence 32 values ahead, so a promoted standby normally resumes past a lost value and does not repeat it; the
+repeat needs the lost mint to be one that crossed a 32-value boundary, so the exposure was narrow, not absent.
+`scripts/ha/ha-leader-epoch-lossy-promotion.sh` forces that case.) Reading the surviving row
+cannot repair that (`GREATEST(seq, current_leader_epoch) + 1` recomputes the same value), so the epoch now
+carries the one coordinate every promotion advances regardless of what WAL was lost:
+`epoch = (timeline << 32) + nextval(leader_epoch_seq)`. The timeline is the Postgres WAL-insertion timeline
+of the primary the elector is connected to, read inside the mint statement from
+`pg_walfile_name(pg_current_wal_lsn())` (not `pg_control_checkpoint()`, which lags a fast promotion). A
+promotion moves it from T to T+1, so the new leader's epoch is strictly greater than anything the old
+timeline issued. The epoch stays a single `bigint`, so `epoch_fence_sql()` and every fenced claim site are
+unchanged. Two refusals are enforced rather than assumed: the sequence is capped at `MAXVALUE 4294967295`
+(migration v2), and a timeline outside `1..2^31-1` is refused before `nextval`; either lands in the existing
+`epoch_record` acquire failure, fail closed. **What this does not cover** (stated so it is not read as "the
+epoch is monotonic across any promotion"): two live primaries (the fence is per database, §3 above is
+unchanged on that); a physical-snapshot restore started without archive recovery, which keeps its timeline
+while the sequence rolls back, and a logical restore into a fresh cluster, which resets both; consecutive
+lossy promotions under orchestration that lets a node promote without having seen the previous promotion's
+timeline history (Patroni's candidate check is believed to refuse this; verify before relying on it); a
+platform whose WAL functions differ, where the mint fails loudly instead; and a rolling upgrade while a
+pre-#6535 binary can still lead. Epochs are now `>= 2^32`, and a downgrade to a pre-#6535 binary re-mints
+small epochs; see `docs/user-manual/upgrading.md`.
+
 ### 4. Operator sessions — durable in Postgres, absolute wall-clock (Q4)
 Sessions move from the in-memory map (`AuthManager::sessions_`, `steady_clock`) to durable Postgres
 rows **core validates**, executing the ADR-0031 direction. Presentation terminates the request and

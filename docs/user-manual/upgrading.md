@@ -120,6 +120,16 @@ Minting is a cookie-session write: it needs a same-site `Origin` or `Referer` (s
 
 **Rollback.** Rolling an agent back to an earlier build restores the silent wipe: a directory it cannot list reads as empty again and the next sync replaces the host's stored entitlement rows with nothing.
 
+## Behaviour change: the leader epoch now carries the Postgres timeline (HA, #6535)
+
+**What changed.** The fenced leader election mints its epoch as `(timeline << 32) + counter`, where the timeline is the Postgres WAL timeline of the primary the server is connected to. Every promotion starts a new timeline, so a new leader's epoch is always higher than a paused former leader's, even when the promotion lost the previous election (asynchronous replication, or a degraded non-strict quorum). The cases this still does not cover are listed in `docs/user-manual/ha-postgres.md` and ADR-2002 section 3. The safe-to-scale gate is not lifted by this change; running a second replica is still unsupported.
+
+**What you will see.** `yuzu_server_leader_epoch` and `leader_elector.leader_state.current_leader_epoch` jump from small numbers to values of at least 4294967297 on the first election after the upgrade, and move by a multiple of 4294967296 after a promotion. That is expected. Read the value as `value >> 32` (timeline) and `value & 4294967295` (election count). One schema step runs automatically: the `leader_epoch_seq` sequence is capped at 4294967295 (about four billion elections).
+
+**Rolling upgrade.** Upgrade every replica before relying on the new guarantee. While a pre-#6535 binary can still win the election, it mints small epochs again: fencing within one timeline still works, but the lossy-promotion protection does not.
+
+**Rollback.** Rolling back to a build without this change is safe for leadership: the next election mints a new epoch that supersedes the stored one. It is NOT safe for the plugin enablement store: `plugin_config_store.enablement_meta.issuer_epoch` keeps the packed value and the older build then rejects every enablement batch as fenced. After the last new-build server has stopped, reset it with `UPDATE plugin_config_store.enablement_meta SET issuer_epoch = 0 WHERE id = 1;`.
+
 ## New: leader-election metrics and alerts (HA WS-11, #4014)
 
 Additive; no behaviour change and no action is needed to keep a deployment working. Every server with a

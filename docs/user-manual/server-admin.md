@@ -1039,10 +1039,10 @@ that holds it).
   whichever primary the DSN resolves to. Only when every replica
   shares **one** database is the stale replica the one whose
   `yuzu_server_leader_epoch` differs from `leader_state.current_leader_epoch`;
-  restart it. Within one database fenced claims stay safe (assuming no committed
-  transaction was lost on a promotion, that is, synchronous replication, the
-  shipped quorum default; the fence is not claimed safe across a lossy
-  asynchronous promotion) and what runs twice is the unfenced background passes. **What it does not catch:** a *paused*
+  restart it. Within one database fenced claims stay safe, including across a
+  lossy promotion of a streaming standby (the epoch carries the Postgres timeline, so
+  a promotion always yields a higher epoch; the cases that does not cover are listed
+  in `docs/user-manual/ha-postgres.md`) and what runs twice is the unfenced background passes. **What it does not catch:** a *paused*
   ex-leader (the case the epoch fence exists for) — its process is frozen, so its
   series goes stale, not `1`, and a frozen process serves no `/metrics`, so no
   alert on its own series can evaluate. That case is covered by the fence itself
