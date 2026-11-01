@@ -17,8 +17,11 @@ Files:
 | `gateway/apps/yuzu_gw/test/yuzu_gw_scale_probe.erl` | The sampler that runs inside the gateway node |
 | `gateway/apps/yuzu_gw/test/yuzu_gw_scale_peer.erl` | Starts, kills and stops the nodes |
 | `gateway/apps/yuzu_gw/test/ct/yuzu_gw_scale_SUITE_data/register_plugins.eterm` | The 69 plugins each agent registers with |
-| `scripts/test/gen-gateway-scale-register-fixture.py` | Regenerates that file from `agents/plugins/*/src` |
-| `scripts/test/gateway-scale-report.py` | Prints a summary of a run's JSON file |
+| `gateway/apps/yuzu_gw/test/ct/yuzu_gw_scale_SUITE_data/heartbeat_tags.eterm` | The status tags of the `idle_memory` case's heartbeats |
+| `gateway/apps/yuzu_gw/test/ct/yuzu_gw_scale_SUITE_data/idle_mem_ceiling.eterm` | The `idle_memory` ceilings (bytes per connection) |
+| `scripts/test/gen-gateway-scale-register-fixture.py` | Regenerates `register_plugins.eterm` from `agents/plugins/*/src` |
+| `scripts/test/gateway-scale-report.py` | Prints a summary of a run's JSON file (scenarios or `idle_memory`) |
+| `scripts/test/gateway-idle-mem.sh` | Runs the `idle_memory` case and prints its summary |
 
 ## How it is built
 
@@ -28,9 +31,11 @@ measures:
 
 - **gateway**: the `yuzu_gw` application with the listener settings of
   `config/sys.config.prod` (acceptors, HTTP/2 limits, connection limits), the
-  production VM flags of `config/vm.args.src`, and the production circuit
+  production VM flags (read from `config/vm.args.src` at each start, less the
+  node name and cookie; see "Idle memory per connection"), and the production circuit
   breaker settings. Two things differ from production: the listeners and the
-  upstream hop are plaintext (TLS cost is not measured), and every port is
+  upstream hop are plaintext (TLS cost is not measured; the `idle_memory` case
+  is the exception, see "Idle memory per connection"), and every port is
   chosen by the operating system.
 - **upstream**: the fake server. It answers `ProxyRegister` after a configurable
   delay (20 to 50 ms by default in the measured phases), records every call, and
@@ -245,6 +250,285 @@ Other settings, all optional:
   work can show in the gateway's numbers at large sizes; the published practice
   (Tsung, amoc) is to run the generators on separate hosts. Treat the 25,000
   size as a check that the gateway survives, not as a performance figure.
+
+## Idle memory per connection
+
+The `idle_memory` case measures what one idle agent connection costs the
+gateway in memory: the instrument for the per-connection memory budget (the
+goal is 8 KiB, judged on Linux, on BEAM memory plus the gateway process's
+anonymous memory). It is not in `all/0`: neither the default run nor the Meson
+`gateway ct` test runs it. Run it with the script, from the repo root:
+
+```bash
+scripts/test/gateway-idle-mem.sh [results-dir]      # default ~/yuzu-idle-mem; about 45 min
+# or directly, from gateway/
+rebar3 ct --dir apps/yuzu_gw/test/ct --suite yuzu_gw_scale_SUITE --case idle_memory
+```
+
+For each transport, in order, it starts a fresh gateway, fake server and load
+generator (the nodes above), then for each N of the sweep, ascending, grows the
+fleet to N agents (ramped), waits until all N are live at the load generator
+and registered at the gateway (a point where they are not fails the case: the
+harness is broken, the number would mean nothing), waits the minimum settle
+period, then samples every 5 s until the memory is steady: until the mean of
+the last window (four heartbeat intervals) is within 2% of the mean of the
+window before it, for both BEAM total and OS anonymous memory. M(N) is the mean
+of that last window (trimmed: the lowest and highest tenth of its samples
+dropped, so a one-sample dip of the anonymous memory does not move it). A
+point still moving at the cap (twenty heartbeat
+intervals) is reported as not steady, and fails the case under
+`YUZU_GW_SCALE_GATE=1`.
+
+Why a mean over a long window. Every heartbeat leaves its snapshot's dead
+copies (refc binaries) in the Cowboy connection process and, on TLS, the ssl
+receiver, until those processes collect, which with a 150 KB snapshot is about
+every second heartbeat. Because the harness's agents all register within
+seconds, their collections are in phase, so the gateway's BEAM memory swings
+with a period of about two heartbeats (measured on macOS, 2,000 TLS agents:
+between about 550 and 920 KiB per connection, a 60 s period) while the OS
+anonymous memory stays at its high-water mark. A real fleet's phases are
+spread, so the expected memory is the time average over whole cycles; the
+window's lowest and highest samples are reported as the envelope
+(`per_conn_envelope`). The first measurements, taken 60 to 85 s after the
+fleet was complete, were still climbing.
+
+Each simulated agent:
+
+- connects over the transport: `tls` is the agent listener's shipped options
+  (`config/sys.config.prod`: TLS 1.2 with the ECDHE-ECDSA suites, one-way,
+  `verify_none`, `fail_if_no_peer_cert false`) with a run-local P-384 root and
+  P-256 gateway leaf (the shapes the server's first-boot PKI issues), the agent
+  verifying the gateway and sending SNI; `mtls` is the documented move to
+  mutual TLS (`verify_peer`, `fail_if_no_peer_cert false`) with a client
+  certificate; `ktls` is `tls` with `ktls => true` (the kernel-TLS agent
+  listener of branch `perf/gateway-idle-mem-ktls`; the case fails unless the
+  listener really runs `yuzu_gw_ktls_transport`); `plain` is plaintext, for
+  comparison. The management listener and the upstream hop stay plaintext;
+- registers with the 69-plugin `RegisterRequest` (about 9 KB encoded, as for
+  every case);
+- holds `Subscribe` open;
+- sends `Heartbeat` every 30 s (`YUZU_GW_SCALE_HB_MS`) with `sent_at`, the 97
+  `yuzu.*` status tags of `heartbeat_tags.eterm` (every tag key the agent core
+  names, with healthy-agent values; the upper end of the core set) and a
+  `fleet_snapshot_json` on every heartbeat.
+
+The fleet snapshot. `agents/core/src/agent.cpp` runs `tar.fleet_snapshot` every
+30 s on a pump thread and attaches the newest snapshot to the next heartbeat
+whenever the pump has produced a new one; the pump advances on every successful
+run, whether or not anything changed, and the heartbeat is also every 30 s, so
+an agent with the TAR plugin sends a snapshot on about every heartbeat. A
+snapshot is the host's whole process table (pid, ppid, name, command line,
+user) and connection table, up to 4096 rows each
+(`agents/plugins/tar/src/tar_fleet_snapshot.hpp`): its size follows the host,
+not a constant. The header documents 50 to 500 KB for realistic hosts and about
+1.3 MB at the cap; 200 to 800 KB was observed on a busy rig host
+(`docs/user-manual/gateway.md`); this schema over a developer macOS host's
+tables on 2026-10-26 (836 processes, 43 sockets) gives 150,178 bytes, which is
+the default size. The proto comment's "5 to 20 KB" is not what the agent sends.
+The case builds a schema-shaped document of the chosen size.
+
+Each sample, taken inside the gateway node (`yuzu_gw_scale_probe:idle_sample/1`):
+
+- `erlang:memory()` by category (`beam_total`, `beam_processes`,
+  `beam_binary`, `beam_ets`, `beam_system`, `beam_code`, ...), the process and
+  port counts;
+- the gateway OS process's memory: on Linux `/proc/self/status`
+  (`os_anon` = `os_rss_anon` = `RssAnon`, `os_vm_hwm`, ...) and
+  `/proc/self/smaps_rollup` (`os_rss`, `os_pss`, `os_smaps_anon` = its
+  `Anonymous`, ...); on macOS `ps` RSS (`os_rss`) and the
+  physical footprint from `footprint` (`os_anon`, the nearest macOS has to
+  anonymous RSS; best effort);
+- the kernel's memory for the gateway's connections, outside the process. On
+  Linux:
+  - socket buffers: `ss -tmn` per agent-listener socket (`socket_allocated`,
+    the sum of the `skmem` allocations; `socket_queued`; `socket_limits`, the
+    autotuned buffer sizes) and the host-wide TCP memory of
+    `/proc/net/sockstat` (`socket_host_tcp_mem`, every socket on the host);
+  - slab, from `/proc/slabinfo` (read directly, or with `sudo -n cat`; with
+    neither, `socket_slab_source` is `none` and only the buffers are
+    counted), as objects in use (`active_objs * objsize`) in four groups:
+    `socket_slab_pair` (TCP, TCPv6, sock_inode_cache, filp, dentry,
+    eventpoll_epi, eventpoll_pwq, lsm_inode_cache, lsm_file_cache: one object
+    per socket at each end of a connection), `socket_slab_kmalloc`
+    (`kmalloc-*`: kTLS's context, AEAD transforms and receive parser, about
+    4 KB a connection, and small blobs of both ends), `socket_slab_conntrack`
+    (`nf_conntrack*`) and `socket_slab_net` (`skbuff_*`, `tcp_bind_bucket`,
+    `request_sock_TCP*`, `tw_sock_TCP*`, `inet_peer_cache`).
+    `socket_slab_total` is every cache's pages, for reference. Objects, not
+    pages: a cache with free space in its slabs takes new objects without new
+    pages, so pages follow the host's history at small N;
+  - `socket_kernel` = `slab_pair / 2 + slab_kmalloc + slab_conntrack +
+    slab_net + socket_allocated`: the gateway's share. The load generator runs
+    on the same host and holds the other end of every connection, so the pair
+    caches are halved; the other groups are counted whole, which overstates
+    by the client's small kmalloc share. `socket_kernel_host` counts every
+    group whole plus `socket_host_tcp_mem`: both ends, an upper bound. Both
+    are host-wide reads: anything else allocating in these caches between
+    `M(0)` and `M(N)` shows up, so run on a host otherwise idle;
+  - `all_in` = `os_anon + socket_kernel`, the figure the per-agent budget
+    check judges (ADR-0074 D14: 64 KiB per idle agent, all-in). At the
+    largest N of each transport the summary prints `budget ... PASS/FAIL`
+    against `YUZU_GW_IDLEMEM_BUDGET_KIB`, and the JSON holds it as `budget`.
+    It is reported, never failed.
+
+  On macOS the queued bytes only;
+- the heartbeat buffer's size (`hb_buffer_bytes`) and drop counters. The
+  buffer is bounded (64 MiB by default) and flushes at most about 24 MiB a
+  second, so with large snapshots at 10,000 agents it fills and evicts
+  snapshots: that is a fixed, not a per-connection, cost, visible in the slope.
+
+Per point it reports the last window's samples, their mean, whether and when
+the point was steady (`steady`, `settled_ms`), the trace of every sample
+(`trace`: ms since sampling began, BEAM total, OS anon), the marginal cost per
+connection `per_conn = (M(N) - M(0)) / N` for every number, its envelope, and
+`slope`, the
+cost of the agents added at that step, `(M(N) - M(Nprev)) / (N - Nprev)`. At
+the largest N it also reports, averaged over 20 agents, every long-lived
+process one agent costs, by role (`agent`, the `yuzu_gw_agent` owner; `stream`,
+the `Subscribe` handler; `conn`, the Cowboy connection; and on TLS `ssl_sup`,
+`ssl_receiver`, `ssl_sender`), each with its `memory` and the refc binary bytes
+it references (off-heap, so not in `memory`, shared out by reference count),
+before and after a garbage collection of it; the 15 largest ETS tables; and,
+as a diagnostic, one more sample after a garbage collection of every process
+(what the steady state holds that a collection would free; the judged figure
+is the natural one).
+
+Output: `yuzu_gw_idle_mem-<run>.json` (everything) and `.txt` (the summary,
+also printed) in `YUZU_GW_SCALE_RESULTS_DIR` or the CT log directory, plus
+`SCALE_METRIC scale_idle_memory_<transport>_<metric>_n<N>` lines.
+`python3 scripts/test/gateway-scale-report.py <file.json>` prints the per-point
+table.
+
+Settings (all optional):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `YUZU_GW_IDLEMEM_TRANSPORTS` | `tls,plain` | transports, in order: `tls`, `mtls`, `ktls`, `plain` |
+| `YUZU_GW_IDLEMEM_BUDGET_KIB` | 64 | the all-in per-agent budget the summary checks (reported only) |
+| `YUZU_GW_IDLEMEM_SWEEP` | `0,1000,5000,10000` | the N points (0 is always added) |
+| `YUZU_GW_IDLEMEM_RATE` | 500 | agents per second while the fleet grows |
+| `YUZU_GW_SCALE_HB_MS` | 30000 | heartbeat interval (the agent's) |
+| `YUZU_GW_IDLEMEM_SETTLE_MS` | twice the heartbeat interval | minimum wait after every agent is live, before sampling |
+| `YUZU_GW_IDLEMEM_WINDOW_MS` | four heartbeat intervals | the averaging window; steady = two consecutive windows agree |
+| `YUZU_GW_IDLEMEM_STEADY_TOL_PCT` | 2 | how closely they must agree, in percent |
+| `YUZU_GW_IDLEMEM_SETTLE_MAX_MS` | twenty heartbeat intervals | the cap; a point still moving then is reported not steady |
+| `YUZU_GW_IDLEMEM_SAMPLE_MS` | 5000 | between samples |
+| `YUZU_GW_IDLEMEM_SNAPSHOT_BYTES` | 150000 | fleet snapshot size; 0 = no snapshot |
+| `YUZU_GW_IDLEMEM_SNAPSHOT_EVERY` | 1 | attach the snapshot to every Nth heartbeat |
+| `YUZU_GW_IDLEMEM_TAGS` | 1 | 0 = heartbeats without status tags |
+| `YUZU_GW_IDLEMEM_ROLES_K` | 20 | agents averaged for the per-role footprint |
+
+Limits:
+
+- All the nodes share one host; the load generator's TLS and heartbeat work
+  competes with the gateway for CPU (not for memory, which is per node).
+- The `N = 0` baseline includes the shipped `+P 4M +Q 2M` tables and the code
+  of a loaded gateway, so `M(N) / N` is NOT the per-connection figure; the
+  marginal is.
+- The fixed-size parts (the heartbeat buffer, allocator carriers kept after a
+  peak) are spread over N in `per_conn`; compare `slope` between points to see
+  what is linear.
+- macOS's `os_anon` is the physical footprint, not Linux's `Anonymous`, and
+  its socket figure is queued bytes only. Judge on Linux.
+- The allocator flags decide most of `os_anon`. Until 2026-10-27 the gateway
+  node ran with a copied list of VM flags that lacked the allocator flags
+  `vm.args.src` gained in the Phase 1b change (`+MHas ageffcbf +MHsbct 8
+  +MBsbct 16 +Muacful de +Mumadtn true`); it now reads `vm.args.src` itself. On
+  Rocky Linux 9 at 3,000 TLS agents with empty snapshots, the copied list gave
+  about 218 KiB of `os_anon` per connection and the release's flags about
+  89 KiB, with BEAM memory unchanged (about 43 KiB), so `os_anon` figures taken
+  with the harness before that date overstate the release's.
+- Until 2026-10-27 Linux `os_anon` was `smaps_rollup`'s `Anonymous`. With the
+  release's allocator flags, which map and unmap carriers every heartbeat, a
+  rollup read can miss mappings: on Rocky Linux 9 (kernel 5.14) at 3,000
+  agents single reads fell as far as 63% below `RssAnon` in the same sample,
+  so the window mean ran low and three identical runs spread over up to
+  20 KiB per connection (`RssAnon`: up to 11 KiB). `os_anon` is now
+  `RssAnon`; the rollup figure stays in the samples as `os_smaps_anon`.
+
+### The ceiling (ratchet)
+
+`yuzu_gw_scale_SUITE_data/idle_mem_ceiling.eterm` holds, per
+`{OsFamily, Transport}`, ceilings in bytes per connection for some of the
+`per_conn` numbers at the largest N of a sweep, applied only when that N is
+at least the entry's `min_n`. A ceiling may only go down: lower it in the
+change that makes the gateway cheaper, never raise it to make a run pass. A
+run over a ceiling is recorded in the JSON and the summary, and fails the case
+when `YUZU_GW_SCALE_GATE=1` (the case is never run by CI; see the results
+below for why).
+
+The checked-in ceilings are the Linux results below plus 15% headroom. The
+headroom is a guess: run-to-run variance has not been measured yet.
+
+### Idle memory results (2026-10-26)
+
+Default settings: 150000 B snapshot on every 30 s heartbeat, 97 status tags, a
+9035 B RegisterRequest naming 69 plugins. Every point reached a steady state.
+KiB per connection, `(M(N) - M(0)) / N`.
+
+Linux (the judged platform): a Rocky Linux 9 VM, EL9 kernel 5.14, x86_64, 16
+schedulers, OTP 28.4.2. Run `20261026T172533-6I6BU`.
+
+| Transport | N | BEAM | of which processes / binary / ETS | OS anon | processes per agent |
+|---|---|---|---|---|---|
+| TLS | 1000 | 809.8 | | 1382.9 | 6 |
+| TLS | 5000 | 825.8 | | 1145.2 | 6 |
+| TLS | 10000 | 825.7 | 288.5 / 474.9 / 59.2 | 902.2 | 6 |
+| plain | 1000 | 416.3 | | 771.1 | 3 |
+| plain | 5000 | 440.3 | | 599.2 | 3 |
+| plain | 10000 | 430.8 | 168.1 / 203.9 / 56.7 | 562.7 | 3 |
+
+The baseline `M(0)` was about 151 MiB of BEAM memory and 154 MiB of
+anonymous memory for each transport. Kernel socket memory for idle
+connections is close to zero: `ss` reported about 5 B per socket allocated at
+10000, and the receive and send queues were empty.
+
+macOS (development only): Apple arm64, OTP 28.4, run
+`20261026T170933-1LE44`. TLS at 10000 measured 720.4 KiB BEAM and 923.4 KiB
+physical footprint. Plaintext measured 365.8 KiB and 484.5 KiB.
+
+What the numbers mean:
+
+- Most of the cost is the fleet snapshot. Off-heap binaries are referenced by
+  the Cowboy connection process and, on TLS, by the ssl receiver: about 475
+  KiB per connection on TLS and about 200 KiB on plaintext. These are
+  garbage, released only when the process next collects. A forced GC of
+  every process at 10000 dropped TLS BEAM to 193.6 KiB per connection, and
+  plaintext to 158.5 KiB.
+- Agents that register within seconds of each other heartbeat in phase. Their
+  garbage forms a saw-tooth with a period of about 60 s, so a single sample
+  can be off by around 40%. The harness therefore reports a trimmed mean over
+  4 heartbeat intervals.
+- ETS costs about 59 KiB per agent: `yuzu_gw_agents` (29 KiB) and
+  `yuzu_gw_owner_sessions` (two rows, 27 KiB) hold the registration data.
+- TLS adds three processes per agent: the ssl receiver, the ssl sender and
+  the ssl connection supervisor.
+- The heartbeat buffer is a fixed cost of up to 64 MiB, spread over N.
+
+Why CI does not run it: a default run takes about 45 minutes and needs about
+20000 file descriptors. The CI hosts are shared by four runner agents, and
+variance has not yet been measured there, so a gate would be a flake source.
+The intended gate is a weekly Linux job running `YUZU_GW_IDLEMEM_SWEEP=0,10000`
+with `YUZU_GW_SCALE_GATE=1`. It waits until the coefficient of variation over
+five runs on the CI host is known, and the headroom is then set from it. A
+lint against `origin/dev` would refuse any change that raises a ceiling.
+
+### The CI check's heartbeat shape and threshold
+
+The CI check (owner decision, 2026-10-29) measures the ADR-0073 heartbeat:
+liveness only, no fleet snapshot, i.e. `YUZU_GW_IDLEMEM_SNAPSHOT_BYTES=0`. It
+judges `all_in` (OS anonymous memory plus the gateway's kernel share, see
+"What it reports") against 64 KiB per agent (`YUZU_GW_IDLEMEM_BUDGET_KIB`,
+ADR-0074 D14). For now it is reported only: the `budget ... PASS/FAIL` line
+never fails a run.
+
+Consequence: until ADR-0073's heartbeat ships, the check does not measure the
+heartbeat a shipped agent sends. Today's agent with the TAR plugin attaches a
+fleet snapshot to about every heartbeat (the harness default of 150000 B), and
+that costs more per agent: on one Linux host, 2026-10-29, the kTLS branch
+measured 60.4 KiB all-in at 5,000 agents with the 150000 B snapshot against
+38.4 KiB without it. Run the default (snapshot) setting as well when the
+shipped heartbeat's cost is the question.
 
 ## Results on 29a8e655b (before the fixes)
 
