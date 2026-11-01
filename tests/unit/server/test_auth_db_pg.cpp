@@ -349,11 +349,13 @@ TEST_CASE("AuthDB::recheck_role_locked hands the current password_hash to the ca
     REQUIRE(h.db.upsert_user("rr", "h0", "s0", yuzu::server::auth::Role::admin).has_value());
     std::string seen_hash;
     yuzu::server::auth::Role seen_role = yuzu::server::auth::Role::user;
-    REQUIRE(h.db.recheck_role_locked("rr", [&](yuzu::server::auth::Role r, const std::string& hh,
-                                               std::int64_t) {
-                    seen_role = r;
-                    seen_hash = hh;
-                }).has_value());
+    REQUIRE(h.db.recheck_role_locked(
+                    "rr",
+                    [&](yuzu::server::auth::Role r, const std::string& hh, std::int64_t) {
+                        seen_role = r;
+                        seen_hash = hh;
+                    })
+                .has_value());
     CHECK(seen_role == yuzu::server::auth::Role::admin);
     CHECK(seen_hash == "h0");
     // A committed credential change (a plain UPDATE stands in for the owner's).
@@ -2935,9 +2937,10 @@ void remove_commit_failer(PGconn* c, const std::string& table) {
 
 } // namespace
 
-TEST_CASE("AuthDB migrates v2 -> v3: existing rows start at generation 0 (hard cutover, no seed) and "
-          "the trigger is ENABLE ALWAYS",
-          "[pg][auth_db][migration][mfa_binding]") {
+TEST_CASE(
+    "AuthDB migrates v2 -> v3: existing rows start at generation 0 (hard cutover, no seed) and "
+    "the trigger is ENABLE ALWAYS",
+    "[pg][auth_db][migration][mfa_binding]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     REQUIRE(pool.valid());
@@ -3082,10 +3085,10 @@ TEST_CASE("AuthDB verifiers return the generation and an instant captured BEFORE
         CHECK(e->factor_gen == 1);
         CHECK(e->verified_ms >= lo);
         CHECK(e->verified_ms <= hook_now);
-        const std::int64_t enrolled_ms = std::stoll(scalar(
-            h.conn.get(),
-            "SELECT (extract(epoch from mfa_enrolled_at)*1000)::bigint FROM auth.users "
-            "WHERE username = 'v1'"));
+        const std::int64_t enrolled_ms = std::stoll(
+            scalar(h.conn.get(),
+                   "SELECT (extract(epoch from mfa_enrolled_at)*1000)::bigint FROM auth.users "
+                   "WHERE username = 'v1'"));
         CHECK(e->verified_ms < enrolled_ms); // captured before the pause, so before the UPDATE
         CHECK(e->recovery_codes.size() == 10);
     }
@@ -3563,14 +3566,15 @@ TEST_CASE("AuthDB recovery bypass opens past a tampered trigger and never report
                         "mfa_enrolled_at = now() WHERE username = 't1'");
     // (The seeded secret is not a valid envelope, so the status of the still-enrolled row is not
     // read: only the clear is under test.)
-    open_with(yuzu::server::MfaBindingCheck::kBypassForRecovery, opened, flag, status,
-              [&](AuthDB& store) {
-                  REQUIRE(store.mfa_disable("t1").has_value());
-                  const auto after_clear = store.mfa_status("t1");
-                  REQUIRE(after_clear.has_value());
-                  CHECK_FALSE(after_clear->enrolled);
-              },
-              /*read_status=*/false);
+    open_with(
+        yuzu::server::MfaBindingCheck::kBypassForRecovery, opened, flag, status,
+        [&](AuthDB& store) {
+            REQUIRE(store.mfa_disable("t1").has_value());
+            const auto after_clear = store.mfa_status("t1");
+            REQUIRE(after_clear.has_value());
+            CHECK_FALSE(after_clear->enrolled);
+        },
+        /*read_status=*/false);
     CHECK(opened);
 
     // Intact: the bypass still reports the binding as not enforced (a bypassed instance never
@@ -3729,10 +3733,9 @@ TEST_CASE("AuthDB trigger validation latches (Invalid, sticky) on an AFTER or st
     CHECK_FALSE(h.db.mfa_binding_enforced());
     // Restoring the canonical trigger does not re-admit: sticky until restart.
     run_sql(h.conn.get(), "DROP TRIGGER users_mfa_factor_gen ON auth.users");
-    run_sql(h.conn.get(),
-            "CREATE TRIGGER users_mfa_factor_gen BEFORE UPDATE OF mfa_enrolled_at, "
-            "mfa_factor_gen ON auth.users FOR EACH ROW EXECUTE FUNCTION "
-            "auth.users_mfa_factor_gen()");
+    run_sql(h.conn.get(), "CREATE TRIGGER users_mfa_factor_gen BEFORE UPDATE OF mfa_enrolled_at, "
+                          "mfa_factor_gen ON auth.users FOR EACH ROW EXECUTE FUNCTION "
+                          "auth.users_mfa_factor_gen()");
     run_sql(h.conn.get(), kRestoreTriggerSql);
     CHECK_FALSE(h.db.mfa_status("sh")->binding_enforced);
 }
@@ -3752,7 +3755,8 @@ TEST_CASE("AuthDB trigger validation under 8 concurrent readers latches when the
     PgPool wide{{.conninfo = db.dsn(), .size = kThreads + 1}};
     AuthDB reader{wide, codec2, /*cleanup_interval_secs=*/0};
     REQUIRE(reader.is_open());
-    reader.set_binding_validation_memo_for_test(std::chrono::milliseconds(0)); // validate every read
+    reader.set_binding_validation_memo_for_test(
+        std::chrono::milliseconds(0)); // validate every read
 
     // Three phases separated by barriers, so what each reader must see is deterministic: (1) the
     // trigger is intact, every read is enforced; (2) thread 0 disabled it before the barrier

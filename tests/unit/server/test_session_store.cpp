@@ -514,7 +514,8 @@ TEST_CASE("SessionStore: touch_activity is monotonic — a now() stamp never reg
 // migration (the #2343 tests below reset schema_meta to 1 and construct a store again) applies
 // v2 and then v3 over a clean table instead of failing on columns that already exist.
 static bool undo_binding_migration(PgPool& pool) {
-    return exec_ok(pool, "DROP TRIGGER IF EXISTS sessions_mfa_rebind_guard ON session_store.sessions") &&
+    return exec_ok(pool,
+                   "DROP TRIGGER IF EXISTS sessions_mfa_rebind_guard ON session_store.sessions") &&
            exec_ok(pool, "DROP FUNCTION IF EXISTS session_store.sessions_mfa_rebind_guard()") &&
            exec_ok(pool, "ALTER TABLE session_store.sessions DROP COLUMN IF EXISTS mfa_factor_gen, "
                          "DROP COLUMN IF EXISTS mfa_bind_seq");
@@ -1150,7 +1151,8 @@ TEST_CASE("SessionStore v3: concurrent validation latches when the trigger is di
     PgPool pool{{.conninfo = db.dsn(), .size = kThreads + 2}};
     SessionStore store{pool};
     REQUIRE(store.is_open());
-    store.set_binding_validation_memo_for_test(std::chrono::milliseconds{0}); // every find validates
+    store.set_binding_validation_memo_for_test(
+        std::chrono::milliseconds{0}); // every find validates
 
     // Three phases separated by barriers, so what each reader must see is deterministic: (1) the
     // trigger is intact, the guard reads in force; (2) thread 0 disabled it before the barrier

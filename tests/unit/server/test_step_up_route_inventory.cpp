@@ -693,8 +693,9 @@ TEST_CASE("step-up route inventory (lexical): only the two kFactorCredential han
                  pos = text.find(name, pos + 1)) {
                 if (!is_member_call(text, pos, name))
                     continue;
-                const std::string where = file + ":" + std::to_string(text_scan::line_of(text, pos)) +
-                                          " " + std::string(name);
+                const std::string where = file + ":" +
+                                          std::to_string(text_scan::line_of(text, pos)) + " " +
+                                          std::string(name);
                 callers.push_back(where);
                 // The route this call sits in: the nearest registration before it.
                 std::string pattern;

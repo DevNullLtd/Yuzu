@@ -185,8 +185,7 @@ void refuse_factor_credential_gate_unwired(const httplib::Request& req, httplib:
 // and answer the gate's own 403, mutating nothing.
 void refuse_factor_credential_not_local(const httplib::Request& req, httplib::Response& res,
                                         const auth::Session& session, std::string_view label) {
-    spdlog::error("settings: factor-credential admission is not local; failing closed ({})",
-                  label);
+    spdlog::error("settings: factor-credential admission is not local; failing closed ({})", label);
     StepUpVerdict v;
     v.decision = StepUpDecision::kFactorCredentialNonLocal;
     v.reason = "factor_credential_requires_local_session";
@@ -7010,9 +7009,9 @@ void SettingsRoutes::register_routes(
                   // again to earn a proof. Never reached on a failed or rejected verification (all
                   // return above).
                   // The audit row below says only `not_stamped`; this line says why. Sampled (1 in
-                  // kStampThrewLogEvery, the first always) so a failing auth store cannot become a log storm.
-                  // `what()` is text an exception chose, so it is sanitised. Guarded: a formatter
-                  // or logger throw must not escape the catch and drop the codes reveal.
+                  // kStampThrewLogEvery, the first always) so a failing auth store cannot become a
+                  // log storm. `what()` is text an exception chose, so it is sanitised. Guarded: a
+                  // formatter or logger throw must not escape the catch and drop the codes reveal.
                   const auto note_stamp_threw = [](const char* what) noexcept {
                       try {
                           static std::atomic<uint64_t> stamp_threw_hits{0};

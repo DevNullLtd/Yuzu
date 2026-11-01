@@ -3694,9 +3694,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // is spent), but the stamp could not be confirmed: the store write failed, or the
                 // factor recheck could not read the generation and the proof was cleared (a
                 // failed clear in that double fault leaves a genuine proof for the current
-                // generation). An outage, not a bad credential, yet a retry with the SAME code is a 401 replay:
-                // so no retry_after_ms (an immediate retry cannot succeed) and a message that
-                // tells the operator to wait for the next code.
+                // generation). An outage, not a bad credential, yet a retry with the SAME code is a
+                // 401 replay: so no retry_after_ms (an immediate retry cannot succeed) and a
+                // message that tells the operator to wait for the next code.
                 res.status = 503;
                 res.set_content(
                     detail::a4_denial(res, 503,

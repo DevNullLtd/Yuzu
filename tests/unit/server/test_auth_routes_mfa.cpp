@@ -2229,8 +2229,9 @@ TEST_CASE("a session-store error while recording a valid step-up is a 503 with n
     // to wait for the next code and carries NO retry hint (a null retry_after_ms).
     const auto body = nlohmann::json::parse(res->body, nullptr, false);
     REQUIRE_FALSE(body.is_discarded());
-    CHECK(body["error"]["message"].get<std::string>() ==
-          "Your code was accepted but could not be recorded. Wait for the next code and try again.");
+    CHECK(
+        body["error"]["message"].get<std::string>() ==
+        "Your code was accepted but could not be recorded. Wait for the next code and try again.");
     CHECK(body["error"]["retry_after_ms"].is_null());
     CHECK(res->body.find("MFA step-up failed") == std::string::npos);
     CHECK(res->body.find("Invalid verification code") == std::string::npos);

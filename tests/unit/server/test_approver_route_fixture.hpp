@@ -54,7 +54,9 @@ struct ApproverRouteFixture {
         approval::Deps deps;
         deps.approval_manager = mgr.get();
         deps.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) { return true; };
+                          const std::string&) {
+            return true;
+        };
         deps.resolve_session_fn =
             [&auth_mgr](const httplib::Request& req) -> std::optional<auth::Session> {
             return auth_mgr.validate_session(AuthRoutes::extract_session_cookie(req));
@@ -65,10 +67,13 @@ struct ApproverRouteFixture {
             audits.push_back({a, r, d});
             return true;
         };
-        deps.emit_event_fn = [](const std::string&, const httplib::Request&,
-                                const nlohmann::json&, const nlohmann::json&) {};
+        deps.emit_event_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
+                                const nlohmann::json&) {
+        };
         deps.step_up_fn = [](const httplib::Request&, httplib::Response&, const auth::Session&,
-                             const std::string&) { return true; };
+                             const std::string&) {
+            return true;
+        };
         deps.approver_mfa_fn = [this, &db, durable = std::move(durable_fn)](
                                    const httplib::Request& req, httplib::Response& res,
                                    const auth::Session& session,

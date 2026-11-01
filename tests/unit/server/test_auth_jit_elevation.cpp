@@ -431,9 +431,9 @@ struct JitHarness {
         REQUIRE(r.status() == PGRES_COMMAND_OK);
     }
     /// Move `token`'s elevation window `elapsed_ms` into the past so it has lapsed. With a durable
-    /// store the window is authored (and reaped) from the stored row, so the row is moved as well as
-    /// the cache deadline: `lapse_elevation_for_test` alone is cache-only and a store-backed reap
-    /// would still see a live window.
+    /// store the window is authored (and reaped) from the stored row, so the row is moved as well
+    /// as the cache deadline: `lapse_elevation_for_test` alone is cache-only and a store-backed
+    /// reap would still see a live window.
     void lapse_elevation(const std::string& token, long long elapsed_ms) {
         auto lease = auth_db.pool().acquire();
         REQUIRE(lease);

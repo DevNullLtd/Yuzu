@@ -1770,9 +1770,8 @@ TEST_CASE("approval integration: a durable proof past 300 s on the database cloc
           "[server][routes][approval_routes][pg][approver_mfa]") {
     RealGate g;
     g.h.session = g.session("alice", "local", auth::Role::admin, milliseconds(10'000));
-    const auto now_ms = std::chrono::duration_cast<milliseconds>(
-                            system_clock::now().time_since_epoch())
-                            .count();
+    const auto now_ms =
+        std::chrono::duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
     g.durable = {auth::DurableMfaProof::Source::kRow, now_ms - 450'000, now_ms, g.gen_of("alice")};
     auto res = g.decide("approve", g.id);
     REQUIRE(res);
@@ -2072,12 +2071,11 @@ TEST_CASE("approval integration: enrol then approve at once passes for a bound s
         if (bound) {
             // Verified 2 s BEFORE the enrolment instant, bound to the generation it produced.
             REQUIRE(mgr.mark_session_mfa_verified(
-                token,
-                yuzu::server::LocalMfaProof{st->factor_gen, g.enrolled_ms(user) - 2'000}));
+                token, yuzu::server::LocalMfaProof{st->factor_gen, g.enrolled_ms(user) - 2'000}));
         } else {
             // A proof with no generation: what a legacy row or a rebind-guard unbind holds.
-            REQUIRE(mgr.mark_session_mfa_verified(
-                token, yuzu::server::LocalMfaProof{0, st->db_now_ms}));
+            REQUIRE(mgr.mark_session_mfa_verified(token,
+                                                  yuzu::server::LocalMfaProof{0, st->db_now_ms}));
         }
         auto live = mgr.validate_session(token);
         REQUIRE(live.has_value());
@@ -2194,7 +2192,8 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf
     CHECK(read < closure.find("auth_routes_->durable_mfa_proof_for("));
     CHECK(closure.find("AuthRoutes::extract_session_cookie(req)", read) != std::string::npos);
     CHECK(closure.find("session.username", read) != std::string::npos);
-    CHECK(closure.find("auth_routes_->durable_mfa_proof_for(") < closure.find("require_enrolled_fresh_mfa("));
+    CHECK(closure.find("auth_routes_->durable_mfa_proof_for(") <
+          closure.find("require_enrolled_fresh_mfa("));
     CHECK(closure.find("action_label, durable,") != std::string::npos);
     // The route="approval" 503 counter depends on the registry being handed to the gate: a
     // nullptr here compiles and silently loses the series.

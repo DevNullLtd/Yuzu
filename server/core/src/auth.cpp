@@ -855,57 +855,56 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
     // #5274: set inside the row lock when the stored hash is no longer the one
     // the caller verified the supplied password against.
     bool credential_changed = false;
-    auto outcome = auth_db_->recheck_role_locked(username, [&](Role db_role,
-                                                               const std::string& db_hash,
-                                                               std::int64_t /*factor_gen*/) {
-        // Invoked while AuthDB holds this row's lock - see the header doc.
-        // Lock ORDERING invariant (cpp-expert Gate 8 catch): this is the
-        // first place in this file mu_ is acquired from INSIDE an open
-        // AuthDB transaction. Safe only because every DB write this file
-        // makes (update_role_checked/reactivate_user/remove_user_checked, the first and
-        // last through the #4966 owner's guarded transactions) completes its own
-        // DB call BEFORE ever touching mu_ (the file-wide "never hold mu_
-        // across a DB call" discipline, stated where each of those calls
-        // takes mu_) - so no code path can be holding mu_ while ALSO
-        // attempting to open a transaction that needs this same row lock,
-        // which would deadlock against this one. A future change that holds
-        // mu_ and then calls an AuthDB write method would break this.
-        //
-        // TEST-ONLY seam (see set_role_recheck_inside_lock_hook_for_test's
-        // doc): a no-op (nullptr) in production.
-        if (role_recheck_inside_lock_hook_for_test_)
-            role_recheck_inside_lock_hook_for_test_();
-        // #5274: a password change committed between the caller's DB-first
-        // read (find_user_or_hydrate) and this row lock means the password was
-        // verified against a credential that no longer exists. Deny - no
-        // re-verify against the new hash; the user retries. Checked BEFORE the
-        // cache write so a denied check leaves the cache untouched. The compare
-        // is of two server-held hashes (no secret-dependent timing to protect),
-        // but constant_time_compare costs nothing and keeps the idiom uniform.
-        if (!constant_time_compare(db_hash, verified_hash_hex)) {
-            credential_changed = true;
-            return;
-        }
-        std::unique_lock lock(mu_);
-        auto it = users_.find(username);
-        if (it != users_.end()) {
-            it->second.role = db_role;
-            it->second.role_version = next_role_version_();
-        }
-        // else: the entry vanished from the cache mid-recheck. Provably
-        // unreachable today (cpp-expert Gate 8 verified this by tracing):
-        // the only eraser of a specific username is remove_user_checked(),
-        // whose DB write (the owner's `deactivate_account`, the guarded soft
-        // delete, #4966) takes this SAME row lock, so its cache-erase (which
-        // runs strictly after that commit) cannot land before a callback
-        // that already observed the row as active. Not a silent bypass if
-        // this invariant is ever broken by a future change - `result` still
-        // gets set to the DB-confirmed role either way, which is the
-        // conservative choice (the row lock already proved the account is
-        // active; a merely-absent cache entry is this process's own
-        // bookkeeping lagging, not a signal to deny).
-        result = db_role;
-    });
+    auto outcome = auth_db_->recheck_role_locked(
+        username, [&](Role db_role, const std::string& db_hash, std::int64_t /*factor_gen*/) {
+            // Invoked while AuthDB holds this row's lock - see the header doc.
+            // Lock ORDERING invariant (cpp-expert Gate 8 catch): this is the
+            // first place in this file mu_ is acquired from INSIDE an open
+            // AuthDB transaction. Safe only because every DB write this file
+            // makes (update_role_checked/reactivate_user/remove_user_checked, the first and
+            // last through the #4966 owner's guarded transactions) completes its own
+            // DB call BEFORE ever touching mu_ (the file-wide "never hold mu_
+            // across a DB call" discipline, stated where each of those calls
+            // takes mu_) - so no code path can be holding mu_ while ALSO
+            // attempting to open a transaction that needs this same row lock,
+            // which would deadlock against this one. A future change that holds
+            // mu_ and then calls an AuthDB write method would break this.
+            //
+            // TEST-ONLY seam (see set_role_recheck_inside_lock_hook_for_test's
+            // doc): a no-op (nullptr) in production.
+            if (role_recheck_inside_lock_hook_for_test_)
+                role_recheck_inside_lock_hook_for_test_();
+            // #5274: a password change committed between the caller's DB-first
+            // read (find_user_or_hydrate) and this row lock means the password was
+            // verified against a credential that no longer exists. Deny - no
+            // re-verify against the new hash; the user retries. Checked BEFORE the
+            // cache write so a denied check leaves the cache untouched. The compare
+            // is of two server-held hashes (no secret-dependent timing to protect),
+            // but constant_time_compare costs nothing and keeps the idiom uniform.
+            if (!constant_time_compare(db_hash, verified_hash_hex)) {
+                credential_changed = true;
+                return;
+            }
+            std::unique_lock lock(mu_);
+            auto it = users_.find(username);
+            if (it != users_.end()) {
+                it->second.role = db_role;
+                it->second.role_version = next_role_version_();
+            }
+            // else: the entry vanished from the cache mid-recheck. Provably
+            // unreachable today (cpp-expert Gate 8 verified this by tracing):
+            // the only eraser of a specific username is remove_user_checked(),
+            // whose DB write (the owner's `deactivate_account`, the guarded soft
+            // delete, #4966) takes this SAME row lock, so its cache-erase (which
+            // runs strictly after that commit) cannot land before a callback
+            // that already observed the row as active. Not a silent bypass if
+            // this invariant is ever broken by a future change - `result` still
+            // gets set to the DB-confirmed role either way, which is the
+            // conservative choice (the row lock already proved the account is
+            // active; a merely-absent cache entry is this process's own
+            // bookkeeping lagging, not a signal to deny).
+            result = db_role;
+        });
     if (!outcome) {
         // #4020 Gate 3 quality-engineer follow-up: only a genuine UserNotFound
         // (soft-deleted/removed) means the cache is actually stale - evicting on

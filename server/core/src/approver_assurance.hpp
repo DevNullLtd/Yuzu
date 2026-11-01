@@ -58,9 +58,9 @@ enum class ApproverRefusal {
     kMfaNotEnrolled,        ///< local account with no enrolled MFA factor (#6079)
     kMfaProofMissing,       ///< SSO login whose IdP asserted no MFA method (#6079)
     kSamlMfaUnsupported,    ///< SAML sessions carry no MFA attestation (#4935, #6079)
-    kMfaProofStale,         ///< step-up challenge: proof older than the window, unbound, or bound to
-                            ///< another factor generation (#6079)
-    kAccountUnavailable     ///< account deactivated or no longer exists (#6079)
+    kMfaProofStale,     ///< step-up challenge: proof older than the window, unbound, or bound to
+                        ///< another factor generation (#6079)
+    kAccountUnavailable ///< account deactivated or no longer exists (#6079)
 };
 
 /// Stable, machine-readable prefix of the A4 `message` on every refusal. Pinned

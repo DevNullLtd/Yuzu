@@ -36,8 +36,8 @@
 /// TWIN: `rest_method`/`rest_pattern` name the REST route the tool mirrors, byte-for-byte as
 /// registered, so the self-check can prove the twin exists in `kStepUpPolicy` and that the
 /// tool is never classified weaker than its twin: a tool whose twin is kRequired,
-/// kFactorCredential or kPendingRuling is itself kRequired or kPendingRuling, never kExempt. Both are empty for a
-/// tool with no single REST route.
+/// kFactorCredential or kPendingRuling is itself kRequired or kPendingRuling, never kExempt. Both
+/// are empty for a tool with no single REST route.
 ///
 /// Self-checks (`consteval`, so a bad edit is a BUILD FAILURE): no duplicate tool name, every
 /// kExempt reason from the named list, the pending literal on every kPendingRuling row, every

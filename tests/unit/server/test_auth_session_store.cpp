@@ -803,7 +803,6 @@ TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the
     }
 }
 
-
 // ── #6079: carried, factor-bound MFA proofs through AuthManager ────────────────────────────────
 //
 // AuthManager hands the store the verifier's {factor generation, DB instant} unchanged, refuses an

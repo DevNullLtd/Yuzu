@@ -350,7 +350,8 @@ const std::vector<pg::PgMigration>& migrations() {
          "  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
          "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
          "  last_login_at TIMESTAMPTZ,"
-         "  is_active BOOLEAN NOT NULL DEFAULT TRUE," // see RbacStore::unassign_role back-reference above
+         "  is_active BOOLEAN NOT NULL DEFAULT TRUE," // see RbacStore::unassign_role back-reference
+                                                      // above
          "  mfa_totp_secret BYTEA,"
          "  mfa_enrolled_at TIMESTAMPTZ,"
          "  mfa_disabled_at TIMESTAMPTZ,"
@@ -754,9 +755,10 @@ AuthDB::AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec, int cleanup_inte
         // fails closed; the one-shots make none.
         spdlog::warn("AuthDB: recovery bypass of the MFA factor-generation trigger check "
                      "(trigger state: {}); this one-shot process does not enforce factor binding",
-                     boot_check == BindingCheck::Valid     ? "in force"
-                     : boot_check == BindingCheck::Invalid ? "missing, not ENABLE ALWAYS, or altered"
-                                                           : "unreadable");
+                     boot_check == BindingCheck::Valid ? "in force"
+                     : boot_check == BindingCheck::Invalid
+                         ? "missing, not ENABLE ALWAYS, or altered"
+                         : "unreadable");
         impl_->binding_ok.store(false);
     } else if (boot_check != BindingCheck::Valid) {
         spdlog::error("AuthDB: the MFA factor-generation trigger (auth.users_mfa_factor_gen) is "
@@ -2095,12 +2097,12 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
         //       waited lands as CredentialChanged, never as an enrolment.
         pg::PgResult r = pg::exec_params(
             conn,
-            "UPDATE auth.users SET mfa_enrolled_at = now(), mfa_last_counter = $1, updated_at = now() "
+            "UPDATE auth.users SET mfa_enrolled_at = now(), mfa_last_counter = $1, updated_at = "
+            "now() "
             "WHERE username = $2 AND is_active = TRUE AND mfa_enrolled_at IS NULL "
             "AND mfa_totp_secret = decode($3, 'hex') "
             "AND password_hash = $4 RETURNING id, mfa_factor_gen",
-            std::vector<std::string>{std::to_string(*matched), username,
-                                     secret_hex, anchor});
+            std::vector<std::string>{std::to_string(*matched), username, secret_hex, anchor});
         if (r.status() != PGRES_TUPLES_OK)
             return false; // write outage → fail closed (WriteFailed → 503)
         if (PQntuples(r.get()) == 0) {

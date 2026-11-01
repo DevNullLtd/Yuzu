@@ -30,15 +30,15 @@ namespace yuzu::server {
 /// The second factor a session stands on, as seen by the approver gate. The
 /// zero value is the refusing one: a value-initialised state never admits.
 enum class MfaFactorState : std::uint8_t {
-    kNotEnrolled = 0,   ///< local account with no enrolled factor
-    kEnrolledLocal,     ///< local account with an enrolled TOTP factor
-    kIdpAttested,       ///< OIDC session carrying an IdP `amr`-seeded proof
-    kNoIdpProof,        ///< OIDC session with no usable `amr`-seeded proof
-    kSamlUnsupported,   ///< SAML carries no MFA attestation in this release (#4935)
-    kNotInteractive,    ///< any other auth_source (bearer, engine, unknown)
-    kStoreUnavailable,  ///< the enrolment read failed (outage, undecryptable secret, or an
-                        ///< enrolled row with no usable factor generation), or the durable
-                        ///< proof read failed
+    kNotEnrolled = 0,    ///< local account with no enrolled factor
+    kEnrolledLocal,      ///< local account with an enrolled TOTP factor
+    kIdpAttested,        ///< OIDC session carrying an IdP `amr`-seeded proof
+    kNoIdpProof,         ///< OIDC session with no usable `amr`-seeded proof
+    kSamlUnsupported,    ///< SAML carries no MFA attestation in this release (#4935)
+    kNotInteractive,     ///< any other auth_source (bearer, engine, unknown)
+    kStoreUnavailable,   ///< the enrolment read failed (outage, undecryptable secret, or an
+                         ///< enrolled row with no usable factor generation), or the durable
+                         ///< proof read failed
     kAccountUnavailable, ///< local session whose account is deactivated, deleted or malformed
 };
 

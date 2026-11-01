@@ -247,26 +247,25 @@ std::int64_t steady_now_ms() {
 
 const std::vector<pg::PgMigration>& migrations() {
     static const std::vector<pg::PgMigration> kMigrations = {
-        {1,
-         "CREATE TABLE sessions ("
-         "  token_hash          TEXT PRIMARY KEY,"
-         "  username            TEXT NOT NULL,"
-         "  display_name        TEXT NOT NULL DEFAULT '',"
-         "  role                TEXT NOT NULL,"
-         "  auth_source         TEXT NOT NULL DEFAULT 'local',"
-         "  oidc_sub            TEXT NOT NULL DEFAULT '',"
-         "  token_scope_service TEXT NOT NULL DEFAULT '',"
-         "  mcp_tier            TEXT NOT NULL DEFAULT '',"
-         "  principal_kind      TEXT NOT NULL DEFAULT 'human',"
-         "  created_at_ms       BIGINT NOT NULL,"
-         "  expires_at_ms       BIGINT NOT NULL,"
-         "  last_activity_ms    BIGINT NOT NULL,"
-         "  mfa_verified_ms     BIGINT NOT NULL DEFAULT 0,"
-         "  elevated_until_ms   BIGINT NOT NULL DEFAULT 0,"
-         "  elevation_issued_ms BIGINT NOT NULL DEFAULT 0);"
-         "CREATE INDEX sessions_username_idx ON sessions (username);"
-         "CREATE INDEX sessions_expires_idx ON sessions (expires_at_ms);"
-         "CREATE TABLE session_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"},
+        {1, "CREATE TABLE sessions ("
+            "  token_hash          TEXT PRIMARY KEY,"
+            "  username            TEXT NOT NULL,"
+            "  display_name        TEXT NOT NULL DEFAULT '',"
+            "  role                TEXT NOT NULL,"
+            "  auth_source         TEXT NOT NULL DEFAULT 'local',"
+            "  oidc_sub            TEXT NOT NULL DEFAULT '',"
+            "  token_scope_service TEXT NOT NULL DEFAULT '',"
+            "  mcp_tier            TEXT NOT NULL DEFAULT '',"
+            "  principal_kind      TEXT NOT NULL DEFAULT 'human',"
+            "  created_at_ms       BIGINT NOT NULL,"
+            "  expires_at_ms       BIGINT NOT NULL,"
+            "  last_activity_ms    BIGINT NOT NULL,"
+            "  mfa_verified_ms     BIGINT NOT NULL DEFAULT 0,"
+            "  elevated_until_ms   BIGINT NOT NULL DEFAULT 0,"
+            "  elevation_issued_ms BIGINT NOT NULL DEFAULT 0);"
+            "CREATE INDEX sessions_username_idx ON sessions (username);"
+            "CREATE INDEX sessions_expires_idx ON sessions (expires_at_ms);"
+            "CREATE TABLE session_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"},
         // v2 (#2343): the stored principal class is exactly one of two pairings: a human
         // session (any source but engine_token) or an engine session (engine_token). Token
         // sessions (api/mcp/engine tokens) are never persisted, and every persist_new_session
@@ -400,35 +399,36 @@ SessionStore::create(const SessionWriteParams& params) {
         PgResult r = exec_params(
             c,
             ("INSERT INTO session_store.sessions ("
-            "token_hash, username, display_name, role, auth_source, oidc_sub, token_scope_service, "
-            "mcp_tier, principal_kind, created_at_ms, expires_at_ms, last_activity_ms, "
-            "mfa_verified_ms, elevated_until_ms, elevation_issued_ms, mfa_factor_gen, mfa_bind_seq) "
-            "SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9, n.ms, n.ms + $10::bigint, n.ms, "
-            "CASE WHEN $12::bigint > 0 THEN (CASE WHEN $12::bigint <= n.ms THEN $12::bigint "
-            "ELSE 0 END) ELSE $11::bigint END, 0, 0, "
-            "CASE WHEN $12::bigint > 0 AND $12::bigint <= n.ms THEN $13::bigint ELSE 0 END, 1 "
-            "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
-            "ON CONFLICT (token_hash) DO UPDATE SET "
-            "username=EXCLUDED.username, display_name=EXCLUDED.display_name, role=EXCLUDED.role, "
-            "auth_source=EXCLUDED.auth_source, oidc_sub=EXCLUDED.oidc_sub, "
-            "token_scope_service=EXCLUDED.token_scope_service, mcp_tier=EXCLUDED.mcp_tier, "
-            "principal_kind=EXCLUDED.principal_kind, created_at_ms=EXCLUDED.created_at_ms, "
-            "expires_at_ms=EXCLUDED.expires_at_ms, last_activity_ms=EXCLUDED.last_activity_ms, "
-            "mfa_verified_ms=EXCLUDED.mfa_verified_ms, elevated_until_ms=EXCLUDED.elevated_until_ms, "
-            "elevation_issued_ms=EXCLUDED.elevation_issued_ms, "
-            "mfa_factor_gen=EXCLUDED.mfa_factor_gen, "
-            "mfa_bind_seq=session_store.sessions.mfa_bind_seq + 1 "
-            "RETURNING " +
-                std::string(kAuthoredReturning))
+             "token_hash, username, display_name, role, auth_source, oidc_sub, "
+             "token_scope_service, "
+             "mcp_tier, principal_kind, created_at_ms, expires_at_ms, last_activity_ms, "
+             "mfa_verified_ms, elevated_until_ms, elevation_issued_ms, mfa_factor_gen, "
+             "mfa_bind_seq) "
+             "SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9, n.ms, n.ms + $10::bigint, n.ms, "
+             "CASE WHEN $12::bigint > 0 THEN (CASE WHEN $12::bigint <= n.ms THEN $12::bigint "
+             "ELSE 0 END) ELSE $11::bigint END, 0, 0, "
+             "CASE WHEN $12::bigint > 0 AND $12::bigint <= n.ms THEN $13::bigint ELSE 0 END, 1 "
+             "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
+             "ON CONFLICT (token_hash) DO UPDATE SET "
+             "username=EXCLUDED.username, display_name=EXCLUDED.display_name, role=EXCLUDED.role, "
+             "auth_source=EXCLUDED.auth_source, oidc_sub=EXCLUDED.oidc_sub, "
+             "token_scope_service=EXCLUDED.token_scope_service, mcp_tier=EXCLUDED.mcp_tier, "
+             "principal_kind=EXCLUDED.principal_kind, created_at_ms=EXCLUDED.created_at_ms, "
+             "expires_at_ms=EXCLUDED.expires_at_ms, last_activity_ms=EXCLUDED.last_activity_ms, "
+             "mfa_verified_ms=EXCLUDED.mfa_verified_ms, "
+             "elevated_until_ms=EXCLUDED.elevated_until_ms, "
+             "elevation_issued_ms=EXCLUDED.elevation_issued_ms, "
+             "mfa_factor_gen=EXCLUDED.mfa_factor_gen, "
+             "mfa_bind_seq=session_store.sessions.mfa_bind_seq + 1 "
+             "RETURNING " +
+             std::string(kAuthoredReturning))
                 .c_str(),
-            std::vector<std::string>{params.token_hash, params.username, params.display_name,
-                                     params.role, params.auth_source, params.oidc_sub,
-                                     params.token_scope_service, params.mcp_tier,
-                                     params.principal_kind,
-                                     std::to_string(params.session_lifetime_ms),
-                                     std::to_string(params.mfa_verified_ms_abs),
-                                     std::to_string(lp.verified_ms),
-                                     std::to_string(lp.factor_gen)});
+            std::vector<std::string>{
+                params.token_hash, params.username, params.display_name, params.role,
+                params.auth_source, params.oidc_sub, params.token_scope_service, params.mcp_tier,
+                params.principal_kind, std::to_string(params.session_lifetime_ms),
+                std::to_string(params.mfa_verified_ms_abs), std::to_string(lp.verified_ms),
+                std::to_string(lp.factor_gen)});
         if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) == 0) {
             err = std::string("session insert failed: ") + PQerrorMessage(c);
             return false;
@@ -590,12 +590,13 @@ SessionStore::mark_mfa(const std::string& token_hash, const LocalMfaProof& proof
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         PgResult r = exec_params(
             c,
-            (std::string("UPDATE session_store.sessions s SET "
-                         "mfa_verified_ms = CASE WHEN $2::bigint <= n.ms THEN $2::bigint ELSE 0 END, "
-                         "mfa_factor_gen = CASE WHEN $2::bigint <= n.ms THEN $3::bigint ELSE 0 END, "
-                         "mfa_bind_seq = s.mfa_bind_seq + 1 "
-                         "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
-                         "WHERE s.token_hash = $1 RETURNING ") +
+            (std::string(
+                 "UPDATE session_store.sessions s SET "
+                 "mfa_verified_ms = CASE WHEN $2::bigint <= n.ms THEN $2::bigint ELSE 0 END, "
+                 "mfa_factor_gen = CASE WHEN $2::bigint <= n.ms THEN $3::bigint ELSE 0 END, "
+                 "mfa_bind_seq = s.mfa_bind_seq + 1 "
+                 "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
+                 "WHERE s.token_hash = $1 RETURNING ") +
              kAuthoredReturningUpd)
                 .c_str(),
             std::vector<std::string>{token_hash, std::to_string(proof.verified_ms),

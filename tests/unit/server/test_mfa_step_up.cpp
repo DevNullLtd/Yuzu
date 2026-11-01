@@ -816,8 +816,9 @@ TEST_CASE_METHOD(ApproverFixture,
           MfaFactorState::kAccountUnavailable);
 }
 
-TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an SSO or bearer session never borrows a "
-                                  "local namesake's factor",
+TEST_CASE_METHOD(ApproverFixture,
+                 "probe_mfa_factor: an SSO or bearer session never borrows a "
+                 "local namesake's factor",
                  "[pg][mfa][stepup][approver][probe]") {
     // Both an SSO-shaped name and an ENROLLED local namesake (alice) must give the same answer.
     for (const char* user : {"oidc:x#y", "alice"}) {
@@ -839,8 +840,9 @@ TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an SSO or bearer session ne
           MfaFactorState::kIdpAttested);
 }
 
-TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an enrolled row with a non-positive "
-                                  "generation is kStoreUnavailable (#6079)",
+TEST_CASE_METHOD(ApproverFixture,
+                 "probe_mfa_factor: an enrolled row with a non-positive "
+                 "generation is kStoreUnavailable (#6079)",
                  "[pg][mfa][stepup][approver][probe]") {
     // `enrolled` implies a trigger-owned generation >= 1. A row that says otherwise would make
     // the binding comparison vacuous, so the probe refuses it. The row can only be built by
@@ -866,8 +868,9 @@ TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an enrolled row with a non-
     CHECK(frank.factor_gen == 0);
 }
 
-TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an unreadable secret is kStoreUnavailable, "
-                                  "never kNotEnrolled",
+TEST_CASE_METHOD(ApproverFixture,
+                 "probe_mfa_factor: an unreadable secret is kStoreUnavailable, "
+                 "never kNotEnrolled",
                  "[pg][mfa][stepup][approver][probe]") {
     null_secret_keep_enrolled("alice"); // P10
     CHECK(probe_mfa_factor(make_session("alice", "local"), *db).state ==
@@ -1137,8 +1140,9 @@ TEST_CASE_METHOD(ApproverFixture,
     }
 }
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a future-dated proof, or one past "
-                                  "the durable ceiling, is not fresh",
+TEST_CASE_METHOD(ApproverFixture,
+                 "require_enrolled_fresh_mfa: a future-dated proof, or one past "
+                 "the durable ceiling, is not fresh",
                  "[pg][mfa][stepup][approver]") {
     // R18: a proof stamped in the future derives to "no proof".
     {

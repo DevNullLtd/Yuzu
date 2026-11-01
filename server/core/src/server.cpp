@@ -16003,34 +16003,31 @@ private:
         // answers. The session resolver and audit callable are built once and captured by value;
         // per request only a small struct of pointers is made.
         web_server_->set_pre_request_handler(
-            [this,
-             step_up_resolve = StepUpSessionFn([this](const httplib::Request& r) {
-                 return auth_routes_->resolve_session(r);
-             }),
-             step_up_audit = StepUpAuditFn([this](const httplib::Request& r, const std::string& a,
-                                                  const std::string& rs, const std::string& tt,
-                                                  const std::string& ti, const std::string& d) {
-                 return audit_log(r, a, rs, tt, ti, d);
-             }),
-             step_up_durable = DurableProofFn([this](const httplib::Request& r,
-                                                     const auth::Session& s) {
-                 return auth_routes_->durable_mfa_proof_for(r, s);
-             })](const httplib::Request& req, httplib::Response& res)
-                -> httplib::Server::HandlerResponse {
-            // The body cap and the chokepoint live in `detail::run_pre_request_stage`
-            // (step_up_wiring.hpp), which contains every throw. Building the deps does not
-            // allocate or throw; the auth store pointer is re-read per request.
-            const StepUpChokepointDeps step_up_deps{
-                .resolve_session = &step_up_resolve,
-                .auth_db = auth_mgr_.auth_db_ptr(),
-                .mfa_status = nullptr,
-                .durable_proof = &step_up_durable,
-                .audit_fn = &step_up_audit,
-                .metrics = &metrics_,
-                .window_secs = cfg_.mfa_step_up_window_secs,
-                .mfa_enforcement = cfg_.mfa_enforcement};
-            return detail::run_pre_request_stage(req, res, step_up_deps);
-        });
+            [this, step_up_resolve = StepUpSessionFn([this](const httplib::Request& r) {
+                       return auth_routes_->resolve_session(r);
+                   }),
+             step_up_audit = StepUpAuditFn(
+                 [this](const httplib::Request& r, const std::string& a, const std::string& rs,
+                        const std::string& tt, const std::string& ti,
+                        const std::string& d) { return audit_log(r, a, rs, tt, ti, d); }),
+             step_up_durable =
+                 DurableProofFn([this](const httplib::Request& r, const auth::Session& s) {
+                     return auth_routes_->durable_mfa_proof_for(r, s);
+                 })](const httplib::Request& req,
+                     httplib::Response& res) -> httplib::Server::HandlerResponse {
+                // The body cap and the chokepoint live in `detail::run_pre_request_stage`
+                // (step_up_wiring.hpp), which contains every throw. Building the deps does not
+                // allocate or throw; the auth store pointer is re-read per request.
+                const StepUpChokepointDeps step_up_deps{.resolve_session = &step_up_resolve,
+                                                        .auth_db = auth_mgr_.auth_db_ptr(),
+                                                        .mfa_status = nullptr,
+                                                        .durable_proof = &step_up_durable,
+                                                        .audit_fn = &step_up_audit,
+                                                        .metrics = &metrics_,
+                                                        .window_secs = cfg_.mfa_step_up_window_secs,
+                                                        .mfa_enforcement = cfg_.mfa_enforcement};
+                return detail::run_pre_request_stage(req, res, step_up_deps);
+            });
 
         // -- Auth routes (login, logout, OIDC) — delegated to AuthRoutes --------
         auth_routes_->register_routes(*web_server_);
