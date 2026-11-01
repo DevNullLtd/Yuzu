@@ -2091,7 +2091,8 @@ TEST_CASE("REST execute: a denied gate runs nothing", "[instruction_execute][res
 TEST_CASE("REST execute: a definition id with a control byte is a 400 invalid_definition_id with ONE "
           "denied row and no store read; a normal id still runs",
           "[instruction_execute][rest][security]") {
-    for (const std::string id : {std::string("d\0xyz", 5), std::string("d\x7f"), std::string("d\x1f")}) {
+    for (const auto& id :
+         {std::string("d\0xyz", 5), std::string("d\x7f"), std::string("d\x1f")}) {
         INFO(id.size());
         RouteRig r;
         r.core.defs["d"] = make_def("d");

@@ -23,7 +23,7 @@ struct NotAStdException {};
 
 // Pins "deliberately NOT noexcept": a noexcept wrapper would std::terminate on any throw its
 // catch-all did not absorb, and an accidental `noexcept` is invisible to a runtime test.
-auto throwing_fn = []() -> std::expected<int, StoreReadError> {
+[[maybe_unused]] auto throwing_fn = []() -> std::expected<int, StoreReadError> {
     throw std::runtime_error("x");
 };
 static_assert(!noexcept(checked_pending_count(throwing_fn)),

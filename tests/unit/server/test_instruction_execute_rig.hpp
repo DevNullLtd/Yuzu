@@ -356,7 +356,7 @@ struct Rig {
     }
 
     std::uint64_t counter(const std::string& name, const yuzu::Labels& l) {
-        return metrics.counter(name, l).value();
+        return static_cast<std::uint64_t>(metrics.counter(name, l).value());
     }
 };
 
