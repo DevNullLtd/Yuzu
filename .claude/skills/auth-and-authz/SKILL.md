@@ -376,7 +376,14 @@ duplicate `10`; the one live cross-reference to the old numbering
    now accepts a complete SAML SP config **with HTTPS enabled** as an SSO path,
    so a SAML-only Linux/macOS deployment can disable local-password login; the
    `--no-https` case is refused fail-closed (the SAML provider is disabled over
-   plain HTTP, so booting would lock everyone out), and a SAML session still
+   plain HTTP, so booting would lock everyone out). #4160 adds a second,
+   runtime-wiring check in `ServerImpl` (`sso_only_runtime_providers_ok`): sso-only
+   also refuses to start when no provider was left usable after wiring (chiefly an
+   unreadable or unloadable SAML IdP cert, judged by `SamlProvider`'s own
+   `load_idp_key` probe, never a second parser), local-only and with no IdP network
+   probe so break-glass stays the outage recovery. Four provider gauges
+   (`yuzu_auth_oidc_provider_configured`, `..._oidc_provider_enabled`,
+   `..._saml_provider_configured`, `..._saml_provider_enabled`) report the state. A SAML session still
    cannot use JIT elevation (no local TOTP / no OIDC `amr`). The rest are UX/polish: SP metadata endpoint
    (`GET /saml/metadata`), IdP-metadata auto-fetch, and the Settings-UI
    reconfigure. **Windows

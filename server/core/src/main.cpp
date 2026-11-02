@@ -2316,7 +2316,9 @@ int main(int argc, char* argv[]) {
         }
         // Name the active SSO path(s) so this CC6.3 evidence line is accurate
         // under an OIDC-only, SAML-only, or dual deployment (the boot guard above
-        // has already proven at least one is present).
+        // has already proven at least one is CONFIGURED; whether wiring then left
+        // it usable is re-checked in ServerImpl (#4160), which refuses to start
+        // if none is).
         std::string sso_providers;
         if (yuzu::server::oidc_config_complete(cfg))
             sso_providers = "OIDC";
@@ -2325,7 +2327,7 @@ int main(int argc, char* argv[]) {
             sso_providers += sso_providers.empty() ? "SAML" : " + SAML";
 #endif
         spdlog::warn("Hardened auth mode ACTIVE (--auth-mode=sso-only): local-password login is "
-                     "DISABLED fleet-wide; only SSO ({}) can mint a session.{}",
+                     "DISABLED fleet-wide; only SSO (configured: {}) can mint a session.{}",
                      sso_providers,
                      cfg.break_glass_user.empty()
                          ? std::string(" No break-glass account is configured.")

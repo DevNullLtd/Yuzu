@@ -38,7 +38,7 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [REST API Reference](rest-api.md) | Complete REST API v1 endpoint reference with request/response examples |
 | [Gateway](gateway.md) | Erlang/OTP gateway node for multi-site deployments and scale-out |
 | [Echo](echo.md) | Continuous system state change tracking -- processes, network, services, users |
-| [Upgrading](upgrading.md) | Version upgrades, rollback, and migration |
+| [Upgrading](upgrading.md) | Version notes and the 0.15.0 fresh-deployment contract (no upgrade path from earlier builds) |
 | [Release Verification](release-verification.md) | SHA256SUMS, cosign signatures, SLSA provenance, and CycloneDX / SPDX SBOMs |
 | [MCP (AI Integration)](mcp.md) | Model Context Protocol server -- AI-driven fleet querying, tools, tokens, and approval workflows |
 | [Security Hardening](security-hardening.md) | mTLS setup, firewall rules, secret management, quarantine, IOC checking, certificate inventory, and production hardening |
@@ -108,7 +108,7 @@ The container images (`yuzu-server`, `yuzu-gateway`, `yuzu-agent` and their chis
 carry their own runtime libraries and are not affected; use them for the server and gateway
 on any other distribution. The exception is `yuzu-agent-bundle-chisel`, which delivers
 agent files: the Linux agent extracted from it has the tarball's requirements. Building the
-native packages to an older baseline is targeted for 0.15.0 (#5143).
+native packages to an older baseline is not part of 0.15.0; it is planned under ADR-2003 (#5143).
 
 ## Quick Start
 

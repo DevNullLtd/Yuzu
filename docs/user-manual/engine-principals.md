@@ -500,13 +500,18 @@ fix — an earlier revision of this doc, and of the primitive itself, treated
 streaming as rate-capped-only and concurrency-exempt, which left an engine
 principal able to open an unbounded number of concurrent streams).
 
-**Forward guard (track 2f).** When MCP Streamable-HTTP `GET`/`POST` gains a
-live SSE stream (today `GET /mcp/v1/` is a `405` placeholder — see
-[MCP — Streamable HTTP sessions](mcp.md#streamable-http-sessions)), that
-handler MUST adopt the pending concurrency slot into the stream exactly like
-the three routes already covered by this cap, or it silently reintroduces
-the UP-1 gap for MCP engine principals specifically — the surface this cap
-exists to protect.
+**Streaming guard (track 2f).** The MCP Streamable-HTTP `GET /mcp/v1/` stream
+(see [MCP — Streamable HTTP sessions](mcp.md#streamable-http-sessions); it
+answers `405` only when the server runs with `--mcp-no-streaming`) adopts the
+pending concurrency slot into the stream, exactly like the three routes already
+covered by this cap. Any further MCP streaming surface MUST do the same, or it
+silently reintroduces the UP-1 gap for MCP engine principals specifically — the
+surface this cap exists to protect.
+
+**MCP tier.** An engine principal's API token is always minted with
+`mcp_tier` `readonly`, and `/mcp/v1/` refuses any credential with no MCP tier
+for every principal, engines included, so an engine credential is always
+admitted by that check (a tier-less engine row would be refused, not exempted).
 
 **Tuning guidance:** the defaults (16 concurrent, 20/s) are conservative
 starting points for a single autonomous module; raise

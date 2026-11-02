@@ -32,7 +32,7 @@
 ## configuration needed for the cluster to form.
 services:
   gateway:
-    image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.14.1}
+    image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.15.0}
     # Planned stop: the gateway ends its agent sessions and sends their
     # DISCONNECTED notices to the server before it exits, within
     # shutdown_flush_budget_ms (default 20 s), then stops its processes. The

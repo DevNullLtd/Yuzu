@@ -1,1 +1,0 @@
-- **Echo process-tree custom window refuses a date that does not exist.** A From or To such as `2026-02-31T00:00` was read as 3 March and the tree was reconstructed for the wrong window; it is now refused with the existing "not a valid time" note and nothing is dispatched to the device (#5715).

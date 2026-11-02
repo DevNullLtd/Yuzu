@@ -41,6 +41,7 @@
 #include "content_etag.hpp"
 #include "crypto_library_model.hpp"
 #include "device_token_store.hpp"
+#include "dex_read_model.hpp" // the scope tokens and the basis/coverage the builder can emit
 #include "license_store.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
@@ -58,9 +59,10 @@
 #include <atomic>
 #include <cctype>
 #include <cstddef>
+#include <functional>
 #include <iterator>
-#include <optional>
 #include <map>
+#include <optional>
 #include <regex>
 #include <set>
 #include <string>
@@ -624,6 +626,91 @@ TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query
     }
 }
 
+TEST_CASE("openapi_spec_json(): /dex/apps documents the platform scope parameter and coverage",
+          "[openapi][dex]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/dex/apps"));
+    const auto& op = spec["paths"]["/dex/apps"]["get"];
+
+    REQUIRE(op.contains("parameters")); // const operator[] on a missing key asserts
+    const json* platform = nullptr;
+    for (const auto& p : op["parameters"])
+        if (p.value("name", "") == "platform")
+            platform = &p;
+    REQUIRE(platform != nullptr);
+    CHECK((*platform)["in"] == "query");
+    CHECK((*platform)["required"] == false);
+    CHECK((*platform)["schema"]["enum"] == json::array({"all", "windows", "macos", "linux"}));
+    CHECK((*platform)["schema"]["default"] == "all");
+
+    CHECK(op["responses"]["200"].value("description", "").find("crash_source_coverage") !=
+          std::string::npos);
+    CHECK(op["responses"]["400"].value("description", "").find("invalid platform") !=
+          std::string::npos);
+}
+
+TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and the coverage the "
+          "/dex/apps builder can emit",
+          "[openapi][dex]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["components"]["schemas"].contains("DexAppsList"));
+    const auto& list = spec["components"]["schemas"]["DexAppsList"];
+    // A lookup by JSON pointer that yields null for a missing node: a regression that deletes part
+    // of the schema fails an assertion here instead of aborting the whole test binary.
+    const auto at = [&list](const std::string& ptr) {
+        return list.value(json::json_pointer(ptr), json());
+    };
+    const auto contains = [](const json& array, const json& v) {
+        return std::find(array.begin(), array.end(), v) != array.end();
+    };
+
+    // The published population vocabulary is exactly the four values, and every `<scope>_online`
+    // the builder can publish is inside it.
+    const json basis_enum = at("/properties/population_basis/enum");
+    CHECK(basis_enum ==
+          json::array({"all_online", "windows_online", "macos_online", "linux_online"}));
+    for (const char* scope : {yuzu::server::kDexAppsScopeAll, yuzu::server::kDexAppsScopeWindows,
+                              yuzu::server::kDexAppsScopeMacos, yuzu::server::kDexAppsScopeLinux})
+        CHECK(contains(basis_enum, json(yuzu::server::dex_apps_population_basis(scope))));
+
+    // crash_source_coverage is always emitted, so it is a declared and required property, and its
+    // schema is a closed object: the three platform keys, each exactly complete|partial.
+    CHECK(contains(at("/required"), json("crash_source_coverage")));
+    const std::string cov = "/properties/crash_source_coverage";
+    const json coverage = at(cov);
+    REQUIRE(coverage.is_object());
+    CHECK(coverage.value("type", "") == "object");
+    CHECK(coverage.value("additionalProperties", true) == false); // absent must fail, not assert
+    CHECK(at(cov + "/properties").size() == 3);
+    for (const char* os : {"windows", "macos", "linux"})
+        CHECK(at(cov + "/properties/" + os + "/enum") == json::array({"complete", "partial"}));
+    // ... and it covers what the builder can publish under `all`.
+    for (const auto& [os, value] :
+         yuzu::server::dex_apps_crash_source_coverage(yuzu::server::kDexAppsScopeAll))
+        CHECK(contains(at(cov + "/properties/" + os + "/enum"), json(value)));
+
+    // The figures are no longer called Windows-only: each description the scope changed names the
+    // platform scope and none says Windows (the default scope is every platform).
+    const auto scoped = [&at](const std::string& node) {
+        const json d = at(node + "/description");
+        if (!d.is_string())
+            return false;
+        const auto text = d.get<std::string>();
+        return text.find("scope") != std::string::npos && text.find("Windows") == std::string::npos;
+    };
+    CHECK(scoped(""));
+    CHECK(scoped("/properties/population"));
+    CHECK(scoped("/properties/apps_total"));
+    CHECK(scoped("/properties/population_basis"));
+    const std::string app = "/properties/apps/items/properties/";
+    for (const char* key : {"crashes", "hangs", "distinct_devices"}) {
+        CHECK(scoped(app + key));
+        CHECK(scoped(app + "versions/items/properties/" + key));
+    }
+}
+
 TEST_CASE("openapi_spec_json(): the execution-statistics reads document their degraded-read 503 "
           "(A4 envelope, retry_after_ms 2000)",
           "[openapi][execution_statistics]") {
@@ -958,6 +1045,83 @@ TEST_CASE("openapi_spec_json(): x-yuzu-unavailable marks exactly the operations 
     }
 }
 
+TEST_CASE("openapi_spec_json(): the operations that override the top-level security are exactly "
+          "the ones that do not take an operator token (#6508)",
+          "[openapi][structure][security]") {
+    const json spec = json::parse(yuzu::server::openapi_spec_json());
+
+    // The default: any one of the three operator credentials.
+    REQUIRE(spec.contains("security"));
+    CHECK(spec["security"] ==
+          json::parse(R"([{"bearerAuth":[]},{"apiKeyHeader":[]},{"cookieAuth":[]}])"));
+
+    // Every scheme a requirement names is defined, and each scheme has the transport the handler
+    // reads: the upload credentials are headers, the session is a cookie.
+    const auto& schemes = spec.at("components").at("securitySchemes");
+    CHECK(schemes.size() == 5);
+    CHECK(schemes.at("bearerAuth").at("type") == "http");
+    CHECK(schemes.at("bearerAuth").at("scheme") == "bearer");
+    CHECK(schemes.at("apiKeyHeader").at("type") == "apiKey");
+    CHECK(schemes.at("apiKeyHeader").at("in") == "header");
+    CHECK(schemes.at("apiKeyHeader").at("name") == "X-Yuzu-Token");
+    CHECK(schemes.at("cookieAuth").at("type") == "apiKey");
+    CHECK(schemes.at("cookieAuth").at("in") == "cookie");
+    CHECK(schemes.at("cookieAuth").at("name") == "yuzu_session");
+    CHECK(schemes.at("uploadGrantAuth").at("type") == "apiKey");
+    CHECK(schemes.at("uploadGrantAuth").at("in") == "header");
+    CHECK(schemes.at("uploadGrantAuth").at("name") == "X-Yuzu-Upload-Grant");
+    CHECK(schemes.at("uploadSessionAuth").at("type") == "apiKey");
+    CHECK(schemes.at("uploadSessionAuth").at("in") == "header");
+    CHECK(schemes.at("uploadSessionAuth").at("name") == "X-Yuzu-Upload-Session");
+
+    // The override set. An operation joining or leaving it is a decision to make here, on purpose:
+    // each of these refuses or ignores the credential the default tells a client to send.
+    //  - the CA root and CRL are public;
+    //  - the elevation and password routes act on the caller's own browser session, so a token is
+    //    refused (auth_routes.cpp elevate and revoke read the cookie directly);
+    //  - the five upload routes authenticate by a grant or session credential in a header and never
+    //    consult an operator credential (file_retrieval_routes.cpp).
+    const std::map<std::string, json> kOverrides = {
+        {"get /ca/root", json::array()},
+        {"get /ca/crl", json::array()},
+        {"post /elevate", json::parse(R"([{"cookieAuth":[]}])")},
+        {"post /elevate/revoke", json::parse(R"([{"cookieAuth":[]}])")},
+        {"post /users/me/password", json::parse(R"([{"cookieAuth":[]}])")},
+        {"post /users/{username}/password", json::parse(R"([{"cookieAuth":[]}])")},
+        {"post /uploads", json::parse(R"([{"uploadGrantAuth":[]}])")},
+        {"put /uploads/{upload_id}/chunk", json::parse(R"([{"uploadSessionAuth":[]}])")},
+        {"get /uploads/{upload_id}", json::parse(R"([{"uploadSessionAuth":[]}])")},
+        {"delete /uploads/{upload_id}", json::parse(R"([{"uploadSessionAuth":[]}])")},
+        {"post /uploads/{upload_id}/commit", json::parse(R"([{"uploadSessionAuth":[]}])")},
+    };
+
+    std::map<std::string, json> found;
+    for (const auto& o : all_operations(spec)) {
+        if (!o.op.contains("security"))
+            continue;
+        found[o.where()] = o.op["security"];
+        // A requirement may name only a defined scheme.
+        for (const auto& alt : o.op["security"]) {
+            for (const auto& [name, scopes] : alt.items()) {
+                INFO(o.where() << " names " << name);
+                CHECK(schemes.contains(name));
+            }
+        }
+    }
+    CHECK(found == kOverrides);
+
+    // The info text names every exemption, so a reader of it is not told to send a token to a route
+    // that refuses one.
+    const std::string info = spec.at("info").at("description").get<std::string>();
+    for (const char* needle :
+         {"GET /ca/root", "GET /ca/crl", "POST /elevate,", "POST /elevate/revoke",
+          "POST /users/me/password", "POST /users/{username}/password", "X-Yuzu-Upload-Grant",
+          "X-Yuzu-Upload-Session", "with three exceptions"}) {
+        INFO(needle);
+        CHECK(info.find(needle) != std::string::npos);
+    }
+}
+
 TEST_CASE("GET /api/v1/openapi.json: gated on Infrastructure:Read for every form of the document",
           "[openapi][security]") {
     RestApiV1 api;
@@ -1002,6 +1166,58 @@ TEST_CASE("GET /api/v1/openapi.json: gated on Infrastructure:Read for every form
         CHECK(allowed->status == 200);
         CHECK_FALSE(allowed->body.empty());
     }
+}
+
+TEST_CASE("if_none_match_matches: RFC 9110 lists and weak comparison and * alone and any malformed "
+          "header matches nothing",
+          "[openapi][etag]") {
+    // Called directly so whitespace at the ends of the value, which the route test cannot send
+    // (httplib drops a field value that starts or ends with a space), is covered.
+    using yuzu::server::if_none_match_matches;
+    const std::string e = "\"abc\"";
+    struct Case {
+        const char* header;
+        bool matches;
+    };
+    const Case cases[] = {
+        {"\"abc\"", true},          {"W/\"abc\"", true},        {"\"x\", \"abc\"", true},
+        {"\"abc\" ,\t\"x\"", true}, {"\"a,b\", \"abc\"", true}, {",,\"abc\",,", true},
+        {"\"abc\" ,", true},        {" \"abc\" ", true},        {"*", true},
+        {" * ", true},              {"\t*\t", true},            {"", false},
+        {" ", false},               {",", false},               {"\"abd\"", false},
+        {"W/", false},              {"W/\"", false},             {"\"abc", false},
+        {"abc\"", false},            {"garbage", false},         {"*x", false},
+        {"* ,\"x\"", false},         {"\"x\", *", false},        {"*, \"abc\"", false},
+        {"\"x\" \"abc\"", false},   {"\"abc\"x", false},        {"\"abc\"\"x\"", false},
+        {"w/\"abc\"", false},       {"W/ \"abc\"", false},      {"W/W/\"abc\"", false},
+        {"\"x\"W/\"abc\"", false},  {"\"x\" , ", false},
+        {"\"a,\"abc\"", false},      {"x\"abc\"", false},        {"*,", false},
+        {"*,\"abc\"", false},
+        // Inside a tag only etagc bytes are legal (RFC 9110 section 8.8.3): no space, control byte
+        // or DEL, so one such tag makes the whole header invalid even beside the right tag. Bytes
+        // from 0x80 up (obs-text) and punctuation are fine.
+        {"\"bad space\", \"abc\"", false},  {"\"abc\", \"bad space\"", false},
+        {"\"a\tb\", \"abc\"", false},      {"\"a\x7f\", \"abc\"", false},
+        {"\"a\x01\", \"abc\"", false},     {"\"\xc3\xa9\", \"abc\"", true},
+        {"\"a!#~\", \"abc\"", true},        {"\"\"", false},
+    };
+    for (const auto& c : cases) {
+        INFO("If-None-Match: [" << c.header << "]");
+        CHECK(if_none_match_matches(c.header, e) == c.matches);
+    }
+    // A NUL byte inside a tag is not an etagc byte: it neither truncates the tag nor matches, and
+    // a tag holding one makes the whole header invalid, beside the right tag or not.
+    CHECK_FALSE(if_none_match_matches(std::string("\"a\0bc\"", 6), e));
+    CHECK_FALSE(if_none_match_matches(std::string("\"a\0bc\", \"abc\"", 13), e));
+    const std::string nul_tag("\"a\0bc\"", 6);
+    CHECK_FALSE(if_none_match_matches(nul_tag, nul_tag));
+    CHECK_FALSE(if_none_match_matches("W/" + nul_tag, nul_tag));
+    // A very long list is linear work and answers correctly at both ends.
+    std::string big;
+    for (int i = 0; i < 4000; ++i)
+        big += "\"x\",";
+    CHECK_FALSE(if_none_match_matches(big, e));
+    CHECK(if_none_match_matches(big + e, e));
 }
 
 TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matching If-None-Match",
@@ -1065,6 +1281,70 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
         CHECK(full_hit->body.empty());
     }
 
+    SECTION("a weak validator, a list and * revalidate too (RFC 9110 weak comparison)") {
+        const std::string stale = "\"0000000000000000\"";
+        for (const std::string& header :
+             {"W/" + lean_etag, stale + ", " + lean_etag, lean_etag + " ,\t" + stale,
+              std::string("\"a,b\", ") + lean_etag, "," + lean_etag + ",", std::string("*")}) {
+            INFO(header);
+            auto hit = sink.Get(lean_path, {{"If-None-Match", header}});
+            REQUIRE(hit);
+            CHECK(hit->status == 304);
+            CHECK(hit->body.empty());
+            CHECK(hit->get_header_value("ETag") == lean_etag);
+            CHECK(hit->get_header_value("Cache-Control") == "no-cache, private");
+        }
+    }
+
+    SECTION("a header that is not a valid If-None-Match is a full 200, never a wrong 304") {
+        // Each case holds a complete copy of the right tag, or a `*`, so a substring search or a
+        // lenient parser would answer 304. A valid header is `*` alone or a comma-separated list
+        // of quoted tags; anything else matches nothing.
+        const std::string stale = "\"0000000000000000\"";
+        for (const std::string& header :
+             {std::string("garbage"), lean_etag.substr(0, lean_etag.size() - 1),
+              std::string("W/"), std::string("\"unterminated"), full_etag + "x",
+              "\"x" + lean_etag, lean_etag + "x", lean_etag + lean_etag, stale + " " + lean_etag,
+              "w/" + lean_etag, "W/ " + lean_etag, std::string("*x"), std::string("* ,") + stale,
+              stale + ", *", "*, " + lean_etag, std::string(), "\"bad space\", " + lean_etag,
+              lean_etag + ", \"bad space\""}) {
+            INFO(header);
+            auto miss = sink.Get(lean_path, {{"If-None-Match", header}});
+            REQUIRE(miss);
+            CHECK(miss->status == 200);
+            CHECK(miss->body == lean->body);
+            CHECK(miss->get_header_value("ETag") == lean_etag);
+        }
+    }
+
+    SECTION("a field sent on several lines is read as one comma-joined list (RFC 9110 5.3)") {
+        // The occurrences are added in whatever order the underlying unordered multimap keeps,
+        // so each case gives the same answer whichever line is read first.
+        const std::string stale = "\"0000000000000000\"";
+        struct Case {
+            std::string first;
+            std::string second;
+            int status;
+        };
+        const Case cases[] = {
+            {stale, lean_etag, 304},
+            {"W/" + lean_etag, stale, 304},
+            {stale, full_etag, 200},
+            {lean_etag, "garbage", 200},
+            {lean_etag, "\"bad space\"", 200},
+            {"*", stale, 200},
+        };
+        for (const auto& c : cases) {
+            INFO(c.first << " | " << c.second);
+            sink.repeated_headers = {{"If-None-Match", c.first}, {"If-None-Match", c.second}};
+            auto r = sink.Get(lean_path);
+            sink.repeated_headers.clear();
+            REQUIRE(r);
+            CHECK(r->status == c.status);
+            CHECK(r->body.empty() == (c.status == 304));
+        }
+    }
+
     SECTION("another form's validator, or a stale one, is a full 200") {
         auto crossed = sink.Get(lean_path, {{"If-None-Match", full_etag}});
         REQUIRE(crossed);
@@ -1079,27 +1359,14 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
 
     SECTION("the permission gate runs before the validator is looked at") {
         admit = false;
-        auto denied = sink.Get(lean_path, {{"If-None-Match", lean_etag}});
-        REQUIRE(denied);
-        CHECK(denied->status == 403);
-        CHECK(denied->get_header_value("ETag").empty());
-        CHECK(denied->body.find("\"openapi\"") == std::string::npos);
-    }
-
-    SECTION("the comparison is exact: a weak validator, a list or * is a full 200") {
-        // The server compares the header to its one ETag as a string. It does not parse the
-        // If-None-Match grammar, so each of these revalidates by refetching. That is documented
-        // (rest-api.md, the spec text); a proxy that weakens or merges validators costs the
-        // 304 saving, never correctness.
-        for (const std::string& inm :
-             {"W/" + lean_etag, lean_etag + ", \"0000000000000000\"",
-              "\"0000000000000000\", " + lean_etag, std::string("*")}) {
-            INFO("If-None-Match: " << inm);
-            auto r = sink.Get(lean_path, {{"If-None-Match", inm}});
-            REQUIRE(r);
-            CHECK(r->status == 200);
-            CHECK(r->body == lean->body);
-            CHECK(r->get_header_value("ETag") == lean_etag);
+        for (const std::string& header : {lean_etag, "W/" + lean_etag, "\"x\", " + lean_etag,
+                                          std::string("*")}) {
+            INFO(header);
+            auto denied = sink.Get(lean_path, {{"If-None-Match", header}});
+            REQUIRE(denied);
+            CHECK(denied->status == 403);
+            CHECK(denied->get_header_value("ETag").empty());
+            CHECK(denied->body.find("\"openapi\"") == std::string::npos);
         }
     }
 
@@ -1316,14 +1583,15 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
           "[openapi][structure]") {
     // The operationId is the method name an OpenAPI client generator derives (upgrading.md says
     // so), so renaming one is a breaking change for every generated client. The checksum below
-    // fails on ANY change to the set of ids: a rename, an addition or a removal.
+    // fails on ANY change to the id-to-operation pairs: a rename, an addition, a removal, or
+    // two operations exchanging their ids (which a hash of the ids alone cannot see).
     //
     // To update it after an intended change: run this test, copy the checksum the failure
     // prints into kOperationIdChecksum, and state the rename in the operationId note of
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"b0aa91e2814e4349\"";
+    static const std::string kOperationIdChecksum = "\"22536dd3060e5782\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
@@ -1343,15 +1611,74 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
                 FAIL_CHECK("operationId " << id << " is also used by " << it->second);
         }
         CHECK(seen.size() == ops.size());
-        // std::map iterates in key order, so the joined text is the sorted list of ids.
+        // std::map iterates in key order, so the joined text is the sorted "id method path" lines.
         std::string joined;
         for (const auto& [id, where] : seen) {
             joined += id;
+            joined += ' ';
+            joined += where;
             joined += '\n';
         }
-        INFO("sorted operationIds hash to " << yuzu::server::content_etag(joined)
+        INFO("sorted operationId pairs hash to " << yuzu::server::content_etag(joined)
              << " (update kOperationIdChecksum, and see the comment above it)");
         CHECK(yuzu::server::content_etag(joined) == kOperationIdChecksum);
+    }
+}
+
+TEST_CASE("openapi documents: no text cites an issue, an ADR, a build wave or the review process",
+          "[openapi][structure]") {
+    // The document is read by operators and by agentic workers integrating with the API, on
+    // /swagger and in generated clients. It states behaviour; it does not cite the issue, ADR
+    // decision, design section, build wave, SOC 2 control, review gate or C++ symbol that shaped
+    // it. Every string value in the document is checked, in both forms (keys are not text).
+    static const std::regex kInternal(
+        R"((^|[^A-Za-z0-9])#[0-9]+\b|\bADR-?[0-9]{4}|\bSOC ?2\b|\b[Ii]ssues? [0-9]|\b[Pp]ull request [0-9]|github\.com|\bmanifest_by_name\b|\bCC-?[0-9]|\bPhase [0-9]|\bWave [0-9]|)"
+        R"(\bPRs? ?[0-9]|\bWS-[A-Z][0-9]|\bA2-R[0-9]|\bINV-[0-9]|\bUP-[0-9]+|\bCDX-|[Gg]overnance|)"
+        R"(\bGate [0-9]|fix round|re-review|[Aa]pi-parity|API-parity|\bBatch [A-Z]\b|\bsprint\b|§|)"
+        R"(decision log|docs/adr/|\badr/[0-9]{4}|[A-Za-z_]+::[A-Za-z_]|\.(hpp|cpp)\b|\b[a-z]+_fn\b|)"
+        R"(\bk[A-Z][a-z]+[A-Z]\w*|\(new\)|\([A-B][0-9]\)|\bA4 (error )?envelope|\bB[12]\b|)"
+        R"(\b[a-z][a-z_]+\(\)|routed-concerns|parity ledger|\bHermes\b|\bAstra\b|\b(SOLE|sole) (gate|authorization)|)"
+        R"([a-z0-9]_fn\b|_(row|detail)_json\b|\bagent_ids_json\b|\bspec_json\b|)"
+        R"(\brequire_(fleet_read|scoped_permission)\b|\bis_rbac_administrator\b|\bdispatch_confined|)"
+        R"((^|[^/A-Za-z0-9])A[1-5]([^A-Za-z0-9]|$)|A4Error|)"
+        R"(\b(ExecutionTracker|WorkflowEngine|SessionStore|TagStore|AuthFn|ExecutionEventBus|MachineNode|ClientValidation)\b|)"
+        R"(\(M[0-9]\b|capability [0-9]+\.[0-9]|UAT non-functional|tracked open|\b(shared|same|one|row)( [A-Za-z_]+)? builder\b|)"
+        R"(authorization-topology floor|\b(ledger|ladder)\b|docs/[a-z-]*(ladder|invariants)\.md|)"
+        R"(\bBRD\b|\bF[0-9]+[a-z]\b|\bSprint\b|\bADR [0-9]|\bGH-[0-9]|\b[Tt]icket [0-9]|\bJira\b|\bEpic [0-9]|\bslice [0-9])");
+    // The line an operator reads first is held to more: no control number, gate word or label.
+    static const std::regex kSummary(R"(SOC ?2|\bCC-?[0-9]|\bGate\b|\bADR\b|\([A-B][0-9]\)|(^|[^A-Za-z0-9])#[0-9]|\bA[1-5]\b|capability [0-9])");
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        std::size_t strings = 0;
+        const std::function<void(const json&, const std::string&)> walk =
+            [&](const json& node, const std::string& where) {
+                if (node.is_string()) {
+                    ++strings;
+                    INFO(where);
+                    const std::string text = node.get<std::string>();
+                    // The one retained schema reference names A4ErrorEnvelope (renaming it would
+                    // change generated clients); no prose may.
+                    if (text != "#/components/schemas/A4ErrorEnvelope") {
+                        std::smatch hit;
+                        const bool internal = std::regex_search(text, hit, kInternal);
+                        INFO("matched: " << hit.str());
+                        CHECK_FALSE(internal);
+                    }
+                } else if (node.is_array()) {
+                    for (std::size_t i = 0; i < node.size(); ++i)
+                        walk(node[i], where + "/" + std::to_string(i));
+                } else if (node.is_object()) {
+                    for (const auto& [key, value] : node.items())
+                        walk(value, where + "/" + key);
+                }
+            };
+        walk(spec, "");
+        CHECK(strings > 1000); // the walk really reached the text
+        for (const auto& o : all_operations(spec)) {
+            INFO(o.where());
+            CHECK_FALSE(std::regex_search(o.op.value("summary", std::string()), kSummary));
+        }
     }
 }
 

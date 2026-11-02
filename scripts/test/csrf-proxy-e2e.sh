@@ -208,6 +208,27 @@ else:
 PY
 }
 
+# The endpoint's own tier refusal: a JSON-RPC 2.0 error whose error.code is -32003.
+# Prints -32003 on an exact match, else WHY (so the `check` failure line is legible).
+mcp_refusal_code() { # $1 = body file
+    python3 -I - "$1" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "rb") as f:
+        doc = json.loads(f.read().decode("utf-8"))
+except Exception as exc:
+    print("not-json:%s" % type(exc).__name__)
+    sys.exit(0)
+err = doc.get("error") if isinstance(doc, dict) else None
+if not isinstance(err, dict):
+    print("no-error-object")
+elif doc.get("jsonrpc") != "2.0":
+    print("jsonrpc=%r" % (doc.get("jsonrpc"),))
+else:
+    print(err.get("code"))
+PY
+}
+
 # Trap 1: explicit Cookie header, NOT -b/--cookie. Trap 4: Host is always the
 # rewritten backend Host. "-" means "send no such header".
 # Sets R_RC (curl exit), R_STATUS, R_KIND, R_WHY and leaves the body in $RIG/body.
@@ -302,7 +323,12 @@ common_cases() {
     probe POST "$MCP_PATH" - - "$MCP_BODY"
     expect "JSON-RPC POST, no headers" CENTRAL-REFUSED "the JSON-RPC endpoint is gated too"
     probe POST "$MCP_PATH" - "http://${PROXIED}/" "$MCP_BODY"
-    expect "control: JSON-RPC POST, same-site Referer" HANDLER-200 "gate admits, endpoint answers"
+    # The gate admits the request, then the endpoint refuses the cookie session (a
+    # cookie has no MCP tier): HTTP 403 with JSON-RPC code -32003. The gate's own
+    # refusal carries code 403, so central_shape reports `code=-32003` for this
+    # body and it cannot be mistaken for CENTRAL-REFUSED.
+    expect "control: JSON-RPC POST, same-site Referer" HANDLER-403 "gate admits, endpoint refuses a cookie"
+    check "endpoint refusal is JSON-RPC -32003" "$(mcp_refusal_code "$RIG/body")" "-32003" "tier check, not the gate"
     probe GET "$READ_PATH" - -
     if [[ "$R_KIND" == CENTRAL-REFUSED || "$R_KIND" == TRANSPORT-ERROR ]]; then
         check "GET, no headers" "$R_KIND" "not CENTRAL-REFUSED" "safe methods are never gated"

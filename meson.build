@@ -6,7 +6,7 @@ project(
   # once generated `int kVersionPatch = 1-dev;` and red-lined the whole C++
   # matrix (fca69e34). The suffix-tolerant split below (search
   # PROJECT_VERSION_PATCH) stays as defense-in-depth, not as licence.
-  version: '0.14.1',
+  version: '0.15.0',
   license: 'AGPL-3.0-or-later',
   meson_version: '>=1.3.0',
   default_options: [
@@ -567,7 +567,7 @@ if build_agent
   subdir('agents/plugins/browser_policy')  # Wave 10 PR10.2-b
   subdir('agents/plugins/update_source_trust')  # Wave 10 PR10.1-d
   subdir('agents/plugins/mgmt_posture')  # management-plane posture (Linux + macOS legs; Windows planned)
-  subdir('agents/plugins/shares')  # configured SMB/NFS shares (Linux leg; macOS and Windows planned)
+  subdir('agents/plugins/shares')  # configured SMB/NFS shares (Linux, macOS and Windows legs)
   subdir('agents/plugins/remote_access_audit')  # SSH inbound-access audit (Linux + macOS legs; Windows planned)
   subdir('agents/plugins/runtimes')  # Wave 10 PR10.1-b
   subdir('agents/plugins/browser_inventory')  # Wave 10 P2a
