@@ -433,7 +433,8 @@ private:
                                const std::string& template_id = {},
                                const std::vector<std::string>& visible_columns = {},
                                const authz::VisibleSet& scope = std::nullopt,
-                               ForensicsServed* served = nullptr);
+                               ForensicsServed* served = nullptr,
+                               bool rows_omitted = false);
 
     /// Render filter controls for a plugin schema. Every control carries
     /// @ref kResultsSyncScope; the form itself is `hx-sync="this:drop"` so the SSE-driven summary

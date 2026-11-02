@@ -1372,8 +1372,10 @@ constexpr char kDashJs7[] = R"HTM(    /* ── Global Keyboard Shortcuts ──
        captured: the retry reads the pager stamp and the live filter bar when it fires, so a
        dispatch in between turns it into a no-op. */
     var rrTimer = null, rrBusy = 0, rrDirty = false, rrArmedUntil = 0;
-    /* 300 s: the deadline the gateway forward gives a dispatched command (SendCommand). Frames
-       after it get one trailing refresh (below), then the tab stops reading. */
+    /* 300 s: the gateway forward's default per-command timeout (SendCommand). Direct dispatch has
+       no bound, so a command that outlives this stops refreshing on its own (the next sort, page
+       or filter renders the summary). Frames after the window get one trailing refresh, then the
+       tab stops reading. */
     var RR_WINDOW_MS = 300000;
     function scheduleResultsRefresh() {
       if (rrTimer || !rrArmedUntil) return;

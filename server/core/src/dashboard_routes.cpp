@@ -494,14 +494,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 }
                 const ResponseTierFilter& tier = *tier_resolved;
                 ForensicsServed served;
-                // The background refresh only reads for its counts: its rows are discarded
-                // client-side (swap none), so it leaves no response.forensics.read row -- a null
-                // `served` keeps the audit to rows an operator was actually shown.
+                // The background refresh reads for its counts and renders the summary, pager and
+                // header only: it carries NO stored rows (rows_omitted), so it has none to audit and
+                // leaves no response.forensics.read row. `refresh=1` is a plain query parameter any
+                // caller can send, which is why the rows are omitted server-side rather than just
+                // discarded by the page (swap none): nothing is read out unaudited.
                 auto html = render_results(command_id, tier, plugin, sort_col, sort_dir,
                                            page, per_page, filters, text_query,
                                            definition_id, template_id,
                                            visible_columns, gate.scope,
-                                           background_refresh ? nullptr : &served);
+                                           background_refresh ? nullptr : &served,
+                                           background_refresh);
                 // #5669: every operator-driven results response empties the Create Group slot --
                 // the form it holds was built for the previous filters. The background refresh
                 // carries the same live filters the table shows, so it leaves the form alone.
@@ -2679,7 +2682,8 @@ std::string DashboardRoutes::render_results(
     const std::string& template_id,
     const std::vector<std::string>& visible_columns,
     const authz::VisibleSet& scope,
-    ForensicsServed* served) {
+    ForensicsServed* served,
+    bool rows_omitted) {
 
     if (!response_store_) {
         return "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\">"
@@ -2878,7 +2882,7 @@ std::string DashboardRoutes::render_results(
     } else if (all_lines.empty()) {
         html += "<tr><td colspan=\"" + std::to_string(visible_col_count) +
                 "\" class=\"empty-state\">No results match your filters.</td></tr>";
-    } else {
+    } else if (!rows_omitted) {
         for (int64_t i = start; i < end; ++i) {
             const auto& rl = all_lines[i];
             // Data row

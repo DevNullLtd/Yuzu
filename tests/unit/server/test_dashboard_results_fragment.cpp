@@ -1226,6 +1226,11 @@ TEST_CASE("/fragments/results: response.forensics.read is written only when the 
         REQUIRE(refresh);
         CHECK(refresh->status == 200);
         CHECK(contains(refresh->body, "id=\"result-summary\"")); // still renders what it is for
+        // `refresh=1` is a query parameter any caller can send: it must carry no stored rows, or
+        // skipping the audit row would let Forensics-tier output be read unaudited.
+        CHECK_FALSE(contains(refresh->body, "TOKEN-FORENSICS-A"));
+        CHECK_FALSE(contains(refresh->body, "TOKEN-ORDINARY-02"));
+        CHECK_FALSE(contains(refresh->body, "class=\"result-row\""));
         CHECK(verb_rows().empty());
         // Even a persist failure has nothing to report: no row was attempted.
         h.persist_fail_action = "response.forensics.read";
