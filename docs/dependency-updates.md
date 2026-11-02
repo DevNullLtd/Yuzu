@@ -236,8 +236,9 @@ AGPL-3.0-or-later. The `yuzu_drogon_canary` executable is not installed
 `*.dll` from `vcpkg_installed/x64-windows/bin` into the Windows archive, so the drogon and
 trantor libraries may be staged there. BSD-3-Clause requires its notice in binary
 redistribution, so `NOTICE` now lists drogon and trantor with their copyright holders (taken
-from the vcpkg port's `copyright` files). `release.yml` does not itself copy `NOTICE` or the vcpkg
-`copyright` files; how the archive carries them was not checked here.
+from the vcpkg port's `copyright` files). No release path ships `NOTICE` or the vcpkg `copyright` files (checked: `release.yml`, the Inno
+Setup files, and the rpm and debian packaging); staging them in the release archives is a
+follow-up tracked in the PR body. Drogon's other bundled libraries were not checked.
 
 A future cpp-httplib bump should follow the BUMP CHECKLIST comment in
 `server/core/src/body_cap_httplib.hpp`.
@@ -249,8 +250,9 @@ already carries the same fix. No CVE id is cited: none appears in the vcpkg
 tree. The Windows `GetAddrInfoEx` and macOS `CFHost` resolver paths are unchanged by this bump.
 
 **New behaviour.** On glibc builds a lookup against an unresponsive resolver now waits for the
-resolver itself (cpp-httplib estimates about 30 seconds in total with default resolver
-settings) before the request fails; see `docs/user-manual/upgrading.md`.
+resolver itself (about 30 seconds with default resolver settings; cpp-httplib's header says the
+system resolver timeout, about 30 s by default, past the caller's timeout, which we read as
+about 30 s from the start of the lookup, unmeasured) before the request fails; see `docs/user-manual/upgrading.md`.
 
 **SBOMs.** Unchanged mechanism: `.github/workflows/release.yml` generates them
 with Syft (`anchore/sbom-action`), scanning the build workspace and the pushed

@@ -4873,7 +4873,7 @@ Held-open SSE streams also lease this pool: each re-validates its credential eve
 
 ### Provisioning a native (non-container) install
 
-Docker Compose deployments get PostgreSQL automatically — every tracked compose bundles a `postgres` service (the `ghcr.io/devnullltd/yuzu-postgres` image: PostgreSQL 18 + pgvector + first-boot role/database init). The server's PostgreSQL client library is libpq 18.4; it was measured against a PostgreSQL 16 server with scram and md5 roles (14 of 14 tests each), while PostgreSQL 17 servers and servers older than 16 are not measured. Native installs use the provisioning helper instead:
+Docker Compose deployments get PostgreSQL automatically — every tracked compose bundles a `postgres` service (the `ghcr.io/devnullltd/yuzu-postgres` image: PostgreSQL 18 + pgvector + first-boot role/database init). The server's PostgreSQL client library is libpq 18.4; it was measured against a PostgreSQL 16 server with scram and md5 roles (14 of 14 tests each), while PostgreSQL 17 servers are not measured and servers below the documented 16+ floor are not supported. Native installs use the provisioning helper instead:
 
 | Install method | Helper location | Invocation |
 |---|---|---|
