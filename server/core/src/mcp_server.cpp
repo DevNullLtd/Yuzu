@@ -7630,6 +7630,14 @@ McpServer::HandlerFn McpServer::build_handler(
             // by the BurnGuard below (NOT by mcp_audit — see its comment for why
             // hooking mcp_audit directly under-counts).
             bool approval_ticket_just_consumed = false;
+            // L1 (#2146, ADR-0033 section 10): the effect a supervised-tier C8 ticket was
+            // bound to, for the three tools whose (plugin, action) is read from a STORED
+            // definition at dispatch time (execute_instruction_definition and the two
+            // definition-resolved result-set producers). Set by the C8 block below on the
+            // call that mints or recalls a ticket; read by those handlers, which hand it to
+            // the dispatch stage so the definition that RUNS is the one the human approved.
+            // Unset on the operator tier (no ticket, nothing to hold the lookup to).
+            std::optional<std::string> ticket_bound_effect;
 
             // Audit helper. Returns true when the audit row persisted, false when it was
             // dropped, so SOC 2 read/write surfaces can
@@ -8318,7 +8326,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
 
                     const std::string definition_id = std::string(kMcpDefinitionPrefix) + tool_name;
-                    const std::string canon = canonical_args(args);
+                    // The ticket's bound subject. For every tool but the three L1 tools below it
+                    // is exactly the canonical arguments (byte-identical to before); for those
+                    // three an `effect_binding()` line is PREPENDED once the effect is resolved.
+                    const std::string args_canon = canonical_args(args);
+                    std::string canon = args_canon;
                     const std::string supplied_id = param_str(args, "approval_id");
                     // M2 (PR #1796): device-targeted tools prefix the pending
                     // audit detail with the endpoint so SIEM can filter
@@ -8432,8 +8444,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     // tool never stamps Ticket provenance (sec-F1, #2146), so a pair gated by
                     // the ExecuteGate (AdminOrApproval/AlwaysApproval) is refused here for a
                     // non-admin caller BEFORE a ticket is minted, rather than being lifted by a
-                    // ticket whose canon binds the arguments and not the definition's pair.
-                    // A Plan falls through to mint/recall.
+                    // ticket. A Plan falls through to mint/recall, with its resolved pair folded
+                    // into the ticket's subject (L1, below) so a later repoint is refused too.
                     if (tool_name == "execute_instruction_definition") {
                         namespace idef = yuzu::server::mcp::instruction_definition;
                         // RBAC BEFORE the probe (Gate 8 pass 2, sg-b1). The probe reads the
@@ -8489,6 +8501,97 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                             return;
                         }
+                        // L1: the probe's Plan names the pair this call WOULD dispatch. Bind it
+                        // into the ticket's subject so the approver sees the resolved
+                        // plugin.action and a repoint between approval and recall fails the
+                        // ordinary match below (no consume, nothing dispatched). The mint and
+                        // the recall both reach this line, so both compute the same string.
+                        const auto& bound_plan =
+                            std::get<yuzu::server::instruction_execute::Plan>(prepared.result);
+                        ticket_bound_effect = yuzu::server::instruction_execute::effect_binding(
+                            bound_plan.def.plugin, bound_plan.def.action,
+                            bound_plan.def.approval_mode, bound_plan.def.concurrency_mode);
+                        canon = *ticket_bound_effect + args_canon;
+                    }
+                    if (tool_name == "create_result_set_from_instruction_result" ||
+                        tool_name == "reevaluate_result_set") {
+                        // L1 (the definition-resolved result-set producers; the same window as
+                        // execute_instruction_definition). Their (plugin, action) is read from a
+                        // STORED definition when the handler runs: create_* from the named
+                        // instruction, reevaluate_* from the instruction the stored set was
+                        // minted from (an echo-query set is the fixed echo.sql). Resolve it here,
+                        // on the mint AND the recall, with the same read the handler makes, and
+                        // bind it exactly as above. RBAC FIRST (the sg-b1 order): this reads
+                        // stored rows, so a token without Execution:Execute learns nothing.
+                        // Read-only and side-effect free: no audit of its own, no heal. Anything
+                        // the handler will itself refuse (empty or oversize id, absent or
+                        // not-owned set, unsupported source_kind, missing instruction) binds
+                        // `unresolved`, which can never equal a real pair, so a state that later
+                        // becomes resolvable is refused rather than run. A store FAULT is not an
+                        // absence: it refuses here, retryable, with no ticket minted or spent.
+                        if (!perm_fn(req, res, "Execution", "Execute"))
+                            return;
+                        std::optional<std::pair<std::string, std::string>> rs_pair;
+                        bool rs_store_fault = false;
+                        const auto rs_lookup_pair = [&](const std::string& instruction_id) {
+                            if (instruction_id.empty() || instruction_id.size() > kInstructionIdMaxLen)
+                                return;
+                            if (!instruction_store || !instruction_store->is_open()) {
+                                rs_store_fault = true;
+                                return;
+                            }
+                            auto def_read = instruction_store->get_definition(instruction_id);
+                            if (!def_read) {
+                                rs_store_fault = true;
+                                return;
+                            }
+                            if (*def_read)
+                                rs_pair.emplace((*def_read)->plugin, (*def_read)->action);
+                        };
+                        if (tool_name == "create_result_set_from_instruction_result") {
+                            rs_lookup_pair(param_str(args, "instruction_id"));
+                        } else {
+                            const auto rs_id = param_str(args, "id");
+                            if (!rs_id.empty() && rs_id.size() <= kResultSetIdMaxLen) {
+                                if (!result_set_store_) {
+                                    rs_store_fault = true;
+                                } else if (auto row_read = result_set_store_->get(rs_id); !row_read) {
+                                    rs_store_fault = true;
+                                } else if (const auto& row = *row_read;
+                                           row && row->owner_principal == session->username &&
+                                           !json_exceeds_depth(row->source_payload,
+                                                               kMcpMaxJsonDepth)) {
+                                    if (row->source_kind == source_kind::kEchoQuery) {
+                                        rs_pair.emplace("echo", "sql");
+                                    } else if (row->source_kind == source_kind::kInstructionResult) {
+                                        const auto sp = nlohmann::json::parse(row->source_payload,
+                                                                              nullptr, false);
+                                        if (sp.is_object() && sp.contains("instruction_id") &&
+                                            sp["instruction_id"].is_string())
+                                            rs_lookup_pair(sp["instruction_id"].get<std::string>());
+                                    }
+                                }
+                            }
+                        }
+                        if (rs_store_fault) {
+                            const bool audit_ok =
+                                mcp_audit("failure", "reason=effect_unresolvable_store_fault");
+                            res.set_content(
+                                a4_error(kInternalError,
+                                         "the definition this call would run could not be read; "
+                                         "the store is unavailable",
+                                         "retry once the server reports ready; no approval ticket "
+                                         "was created or consumed",
+                                         mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                                "application/json");
+                            return;
+                        }
+                        ticket_bound_effect =
+                            rs_pair ? yuzu::server::instruction_execute::effect_binding(
+                                          rs_pair->first, rs_pair->second, "", "")
+                                    : std::string(yuzu::server::instruction_execute::
+                                                      kUnresolvedEffect);
+                        canon = *ticket_bound_effect + args_canon;
                     }
                     if (tool_name == "execute_instruction") {
                         if (auto bv = check_exec_instruction_shape(args)) {
@@ -9025,6 +9128,34 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     auto appr = std::move(*appr_read);
+                    // L1: the same tool and arguments, bound to a DIFFERENT effect (the stored
+                    // definition was repointed since the approval was requested). The ticket
+                    // text is `<effect line>` + the canonical arguments, and a canonical-JSON
+                    // dump never contains a raw newline, so the arguments are recognised as
+                    // the text after the first newline. Told apart from an ordinary mismatch
+                    // ONLY for the principal who requested the ticket (they already hold the
+                    // arguments and the id, and the answer is about their own request).
+                    const auto effect_moved_from = [&](const std::string& stored) {
+                        return ticket_bound_effect.has_value() && stored != canon &&
+                               stored.starts_with("effect=") &&
+                               stored.size() > args_canon.size() &&
+                               stored.ends_with("\n" + args_canon);
+                    };
+                    if (appr && appr->definition_id == definition_id &&
+                        appr->submitted_by == session->username &&
+                        effect_moved_from(appr->scope_expression)) {
+                        mcp_audit("denied", "approval_id=" + supplied_id +
+                                                " refused: the definition changed since the "
+                                                "approval was requested (ticket not consumed)");
+                        res.set_content(
+                            a4_error(kPermissionDenied,
+                                     "the definition changed since this approval was requested",
+                                     "the approval ticket was not consumed but no longer matches; "
+                                     "call again without approval_id to request approval for "
+                                     "the definition as it is now"),
+                            "application/json");
+                        return;
+                    }
                     if (!appr || appr->definition_id != definition_id ||
                         appr->scope_expression != canon) {
                         // Absent, or for a different tool / different arguments.
@@ -13644,14 +13775,36 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // L1: the pair this call is about to dispatch must be the pair the consumed
+                // ticket was bound to (the C8 block resolved it with the same reads). Checked
+                // before the authorizer, any execution row or any send: the ticket is already
+                // spent, so a change since the recall's check runs nothing.
+                if (ticket_bound_effect &&
+                    *ticket_bound_effect !=
+                        yuzu::server::instruction_execute::effect_binding(plugin, action, "", "")) {
+                    const bool audit_ok = audit_fn(
+                        req, "result_set.create", "denied", "ResultSet", "",
+                        "reason=definition_changed source_kind=" + audit_token(std::string(src_kind)));
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "RESULT_SET_DEFINITION_CHANGED: the definition changed after "
+                                 "this call's approval ticket was checked; nothing was dispatched",
+                                 "the approval ticket is spent; call again without approval_id to "
+                                 "request approval for the definition as it is now",
+                                 -1, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
                 auto caller = caller_fn(*session);
                 // sg-1 (#2146), the sec-F1 class: the (plugin, action) pair of a
                 // kInstructionResult producer (create_result_set_from_instruction_result and
                 // reevaluate_result_set) comes from a STORED definition that an editor can
-                // repoint between ticket approval and recall, while the C8 ticket canon binds
-                // only the call's arguments (dispatch_pairs_for returns {} for these tools).
-                // A Ticket stamp would lift the ExecuteGate of a pair nobody approved, so a
-                // definition-resolved producer NEVER carries Ticket: the pair's own gate decides.
+                // repoint between ticket approval and recall. Since L1 the C8 ticket binds that
+                // resolved pair (`ticket_bound_effect`, checked just above), so a repoint
+                // between approval and recall is refused; the Ticket stamp is STILL withheld,
+                // because a ticket approves the pair at the moment of approval and the pair's own
+                // ExecuteGate must still decide for a caller who is not an administrator.
+                // A definition-resolved producer therefore NEVER carries Ticket.
                 // Only the echo-query source keeps the stamp: its pair is the fixed
                 // echo.sql, not read from anything an editor can change.
                 const bool definition_resolved = src_kind != source_kind::kEchoQuery;
@@ -19319,15 +19472,21 @@ McpServer::HandlerFn McpServer::build_handler(
                                       : DispatchCaller{.exec_visible =
                                                            yuzu::server::authz::deny_all()};
                 // sec-F1 (#2146): this tool is NOT an approval_provenance stamping site
-                // (dispatch_caller.hpp). The C8 tier ticket binds the call's ARGUMENTS only,
-                // while the (plugin, action) pair comes from the stored definition, which an
-                // editor can repoint between approval and recall; stamping Ticket here would let
-                // an approval granted for a benign pair lift the ExecuteGate of a gated one. The
-                // value is forced to None (not left to caller_fn) so no upstream stamp survives,
-                // and the pair's own gate decides: a non-admin caller on a gated pair is refused.
+                // (dispatch_caller.hpp). Since L1 the C8 tier ticket binds the resolved
+                // (plugin, action) as well as the call's arguments, so a repoint between
+                // approval and recall is refused (see `ticket_bound_effect` and
+                // `Request::expected_effect`). It is still not a stamping site: the ticket
+                // approves the pair as it stood at approval time, and a pair gated by the
+                // ExecuteGate must stay decided by the pair's own gate (an approval of one
+                // definition state must never lift AdminOrApproval/AlwaysApproval). The value is
+                // forced to None (not left to caller_fn) so no upstream stamp survives, and the
+                // pair's own gate decides: a non-admin caller on a gated pair is refused.
                 rq.caller.approval_provenance = yuzu::server::ApprovalProvenance::None;
                 rq.submitter_pending_cap = idef::kSubmitterPendingCap;
                 rq.correlation_id = call_cid;
+                // L1: on the supervised tier, the effect the consumed ticket was bound to. The
+                // core re-reads the definition, and holds that read to it (definition_changed).
+                rq.expected_effect = ticket_bound_effect;
                 const auto out = yuzu::server::instruction_execute::run(
                     rq, instr_exec_ports_,
                     [&](std::string_view result_status, const std::string& detail_text) {

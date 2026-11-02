@@ -16,6 +16,8 @@
  * confinement cases assert the EXACT recipients rather than that a VisibleSet was handed over.
  */
 
+#include <algorithm>
+
 #include "agent_registry.hpp"
 #include "command_outbox_store.hpp" // the reaper reads the outbox schema
 #include "command_capability.hpp"
@@ -251,6 +253,80 @@ TEST_CASE("execute: a definition id that is not valid UTF-8 is refused at step 0
         CHECK(r.audits[0].detail.find(std::string(kAuditDefinitionIdMax, 'a') + "...") !=
               std::string::npos);
     }
+}
+
+// L1 (#2146): `Request::expected_effect` is the MCP supervised tier's hold on the dispatch stage's
+// own fresh lookup. A definition that no longer resolves to the bound effect is refused BEFORE the
+// authorizer, any audit row of the `requested` family, any execution row or any send.
+TEST_CASE("execute: an expected_effect that no longer matches the looked-up definition is refused "
+          "before the authorizer, any row or any send; a matching one runs",
+          "[instruction_execute][security][l1]") {
+    const auto bound = effect_binding("testplug", "ping", "auto", "per-device");
+    CHECK(bound == "effect=[\"testplug\",\"ping\",\"auto\",\"per-device\"]\n");
+    {
+        Rig r;
+        r.defs["d"] = make_def("d", "scrub"); // repointed since the effect was bound
+        auto rq = r.request("d", json::object(), make_caller("u", true));
+        rq.expected_effect = bound;
+        auto out = run(rq, r.ports(), r.audit());
+        const auto* ref = as_refusal(out);
+        REQUIRE(ref);
+        CHECK(ref->kind == RefusalKind::kBadRequest);
+        CHECK(ref->reason == "definition_changed");
+        CHECK_FALSE(ref->retry_after_ms.has_value());
+        CHECK(r.calls.empty());
+        CHECK(r.rows.empty());
+        REQUIRE(r.audits.size() == 1);
+        CHECK(r.audits[0].result == "denied");
+        CHECK(r.audits[0].detail.find("reason=definition_changed") != std::string::npos);
+    }
+    for (const char* tweak : {"mode", "concurrency"}) {
+        INFO(tweak);
+        Rig r;
+        r.defs["d"] = make_def("d", "ping");
+        if (std::string(tweak) == "mode")
+            r.defs["d"].approval_mode = "role-gated";
+        else
+            r.defs["d"].concurrency_mode = "per-definition";
+        auto rq = r.request("d", json::object(), make_caller("u", true));
+        rq.expected_effect = bound;
+        const auto out = run(rq, r.ports(), r.audit());
+        const auto* ref = as_refusal(out);
+        REQUIRE(ref);
+        CHECK(ref->reason == "definition_changed");
+        CHECK(r.calls.empty());
+    }
+    {
+        Rig r;
+        r.defs["d"] = make_def("d", "ping");
+        auto rq = r.request("d", json::object(), make_caller("u", true));
+        rq.expected_effect = bound;
+        auto out = run(rq, r.ports(), r.audit());
+        CHECK(as_refusal(out) == nullptr);
+        CHECK(r.calls.size() == 1);
+    }
+    {
+        // Unset (REST, the operator tier, the probe itself): no hold, behaviour unchanged.
+        Rig r;
+        r.defs["d"] = make_def("d", "scrub");
+        auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
+        CHECK(as_refusal(out) == nullptr);
+        CHECK(r.calls.size() == 1);
+    }
+}
+
+TEST_CASE("effect_binding: JSON-encoded so a hostile stored value cannot forge a field or a line, "
+          "and invalid UTF-8 does not throw",
+          "[instruction_execute][security][l1]") {
+    const auto hostile = effect_binding("p\n\"x", "a,b\"]", "m\r", std::string("c\xFF", 2));
+    // Exactly one raw newline: the terminator. Every control byte in a value is escaped.
+    CHECK(std::count(hostile.begin(), hostile.end(), '\n') == 1);
+    CHECK(hostile.back() == '\n');
+    CHECK(hostile.find('\r') == std::string::npos);
+    CHECK(hostile.starts_with("effect=["));
+    // Two different effects never bind identically (field boundaries are unforgeable).
+    CHECK(effect_binding("a", "b,c", "", "") != effect_binding("a,b", "c", "", ""));
+    CHECK(effect_binding("a", "b", "", "") != std::string(kUnresolvedEffect));
 }
 
 TEST_CASE("execute: the chokepoint dry run refuses BEFORE any body work or ticket",

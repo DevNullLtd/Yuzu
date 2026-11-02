@@ -56,13 +56,17 @@ inline constexpr CommandCapability row(std::string_view plugin, std::string_view
 }
 
 // Test catalogue. "testplug" is NOT a production plugin; every row exists for one rule below.
-inline constexpr std::array<CommandCapability, 5> kFixture{{
+inline constexpr std::array<CommandCapability, 6> kFixture{{
     row("testplug", "ping", DispatchClass::ReadOnly, Mutability::None, "Infrastructure",
         authz::Operation::Read, ExecuteGate::None),
     row("testplug", "wipe", DispatchClass::Destructive, Mutability::Irreversible, "Infrastructure",
         authz::Operation::Delete, ExecuteGate::None),
     row("testplug", "gated", DispatchClass::Mutating, Mutability::Reversible, "Infrastructure",
         authz::Operation::Write, ExecuteGate::AdminOrApproval),
+    // A second UNGATED pair that DOES something (the attack needs both pairs permitted to the
+    // caller: ping -> scrub is the tags.get -> tags.delete shape of the L1 finding).
+    row("testplug", "scrub", DispatchClass::Mutating, Mutability::Reversible, "Infrastructure",
+        authz::Operation::Write, ExecuteGate::None),
     row("testplug", "forensic", DispatchClass::ReadOnly, Mutability::None, "Forensics",
         authz::Operation::Read, ExecuteGate::None),
     // The quarantine control plugin is protective: never os_gate_unreadable / plugin_not_found.
@@ -116,6 +120,10 @@ struct Rig {
     std::map<std::string, InstructionDefinition> defs;
     bool store_error{false};
     int lookups{0}; ///< definition-store reads the pipeline made (a pre-RBAC probe must make none)
+    /// Runs inside the lookup port, after `lookups` is incremented and before the read: lets a
+    /// test repoint a definition BETWEEN two reads of one call (the recall's probe and the
+    /// dispatch stage's own fresh lookup).
+    std::function<void(int nth_lookup)> on_lookup;
     bool store_unwired{false};
 
     bool approvals_wired{true};
@@ -227,6 +235,8 @@ struct Rig {
         if (!store_unwired) {
             p.lookup_definition = [this](const std::string& id) -> DefinitionLookup {
                 ++lookups;
+                if (on_lookup)
+                    on_lookup(lookups);
                 if (store_error)
                     return std::unexpected(std::string("db down"));
                 if (auto it = defs.find(id); it != defs.end())

@@ -45909,6 +45909,161 @@ TEST_CASE("MCP execute_instruction_definition: an approved tier ticket cannot la
     CHECK(row->consumed_at == 0);
 }
 
+// L1 (#2146, ADR-0033 section 10), the HIGH finding of the external review: a supervised-tier
+// ticket for execute_instruction_definition bound only the tool name and the arguments, so a
+// definition repointed from one caller-permitted ungated pair to another (the tags.get ->
+// tags.delete shape: ping -> scrub here) dispatched under an approval granted for the first. The
+// ticket's subject now leads with the resolved effect; the probe on the recall recomputes it
+// before the ticket is consumed, and the dispatch stage holds its own fresh lookup to it.
+TEST_CASE("MCP execute_instruction_definition: an approved tier ticket cannot run a DIFFERENT ungated "
+          "pair the definition was repointed at; the ticket is unspent and repointing back restores it",
+          "[pg][mcp][integration][execute][idef][approval][security][l1]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "auto"); // benign, ungated
+    idef_start(ts, rig, "supervised", /*admin=*/false);
+    auto first = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(first);
+    const auto fb = nlohmann::json::parse(first->body);
+    REQUIRE(fb.contains("error"));
+    CHECK(fb["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    const std::string ticket = fb["error"]["data"]["approval_id"];
+
+    // What the approver sees: the resolved plugin.action LEADS the ticket subject, ahead of the
+    // arguments (the approvals table clips the scope cell to 120 bytes).
+    auto minted = appr.get(ticket);
+    REQUIRE(minted);
+    CHECK(minted->scope_expression.starts_with(
+        "effect=[\"testplug\",\"ping\",\"auto\",\"per-device\"]\n"));
+    REQUIRE(appr.approve(ticket, "admin", "ok").has_value());
+
+    // An editor repoints the definition at a DIFFERENT pair that is also ungated and also
+    // permitted to the caller (both pass the authorizer, the gate and the definition's mode).
+    rig.defs["d"].action = "scrub";
+    auto second = ts.call(idef_call({{"definition_id", "d"}, {"approval_id", ticket}}, 2));
+    REQUIRE(second);
+    const auto sb = nlohmann::json::parse(second->body);
+    REQUIRE(sb.contains("error")); // a refusal, not a success
+    CHECK(sb["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(sb["error"]["message"].get<std::string>().find("definition changed") != std::string::npos);
+    CHECK(rig.calls.empty()); // NOTHING reached the dispatch port: the exact send set is empty
+    CHECK(rig.rows.empty());  // and no execution row exists
+    auto row = appr.get(ticket);
+    REQUIRE(row);
+    CHECK(row->consumed_at == 0); // refused BEFORE the ticket was spent
+    CHECK(idef_audited(ts, "denied"));
+
+    // Repoint BACK: the same ticket is still redeemable, and runs the pair that was approved.
+    rig.defs["d"].action = "ping";
+    auto third = ts.call(idef_call({{"definition_id", "d"}, {"approval_id", ticket}}, 3));
+    REQUIRE(third);
+    CHECK(idef_payload(*third)["agents_reached"] == 1);
+    REQUIRE(rig.calls.size() == 1);
+    CHECK(rig.calls[0].plugin == "testplug");
+    CHECK(rig.calls[0].action == "ping");
+    CHECK(rig.calls[0].provenance == yuzu::server::ApprovalProvenance::None);
+    row = appr.get(ticket);
+    REQUIRE(row);
+    CHECK(row->consumed_at != 0);
+}
+
+TEST_CASE("MCP execute_instruction_definition: a ticket whose arguments match but whose stored "
+          "definition was repointed gets a different ticket (the dedup key carries the effect)",
+          "[pg][mcp][integration][execute][idef][approval][security][l1]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "auto");
+    idef_start(ts, rig, "supervised", /*admin=*/false);
+    auto a = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(a);
+    const std::string t1 = nlohmann::json::parse(a->body)["error"]["data"]["approval_id"];
+    // The same call again, same definition state: the pending ticket is handed back (idempotent).
+    auto again = ts.call(idef_call({{"definition_id", "d"}}, 2));
+    REQUIRE(again);
+    CHECK(nlohmann::json::parse(again->body)["error"]["data"]["approval_id"] == t1);
+    // After a repoint the same call asks for a NEW approval: the old pending ticket is for a
+    // different effect and must not be handed to a reviewer as if it covered this one.
+    rig.defs["d"].action = "scrub";
+    auto b = ts.call(idef_call({{"definition_id", "d"}}, 3));
+    REQUIRE(b);
+    const std::string t2 = nlohmann::json::parse(b->body)["error"]["data"]["approval_id"];
+    CHECK(t2 != t1);
+    auto minted = appr.get(t2);
+    REQUIRE(minted);
+    CHECK(minted->scope_expression.starts_with(
+        "effect=[\"testplug\",\"scrub\",\"auto\",\"per-device\"]\n"));
+}
+
+TEST_CASE("MCP execute_instruction_definition: a definition repointed AFTER the recall's probe but "
+          "before the dispatch stage's own lookup runs nothing",
+          "[pg][mcp][integration][execute][idef][approval][security][l1]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "auto");
+    idef_start(ts, rig, "supervised", /*admin=*/false);
+    auto first = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(first);
+    const std::string ticket = nlohmann::json::parse(first->body)["error"]["data"]["approval_id"];
+    REQUIRE(appr.approve(ticket, "admin", "ok").has_value());
+    // Lookups so far: 1 (the mint's probe). The recall reads twice: the pre-consume probe (#2),
+    // which sees `ping` and matches, then the dispatch stage's own fresh read (#3). Repoint
+    // exactly between them.
+    rig.on_lookup = [&rig](int nth) {
+        if (nth == 3)
+            rig.defs["d"].action = "scrub";
+    };
+    auto second = ts.call(idef_call({{"definition_id", "d"}, {"approval_id", ticket}}, 2));
+    REQUIRE(second);
+    const auto sb = nlohmann::json::parse(second->body);
+    REQUIRE(sb.contains("error"));
+    CHECK(sb["error"]["data"]["reason"] == "definition_changed");
+    CHECK(rig.lookups == 3);  // the repoint really was injected between the two reads
+    CHECK(rig.calls.empty()); // nothing dispatched
+    CHECK(rig.rows.empty());  // and no execution row
+    // The ticket WAS spent by then (the probe matched): that is the documented, narrow cost.
+    auto row = appr.get(ticket);
+    REQUIRE(row);
+    CHECK(row->consumed_at != 0);
+}
+
+TEST_CASE("MCP execute_instruction_definition: a ticket minted without the effect binding is refused "
+          "as an ordinary mismatch and stays unspent",
+          "[pg][mcp][integration][execute][idef][approval][security][l1]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "auto");
+    idef_start(ts, rig, "supervised", /*admin=*/false);
+    // A ticket in the former shape: the canonical arguments alone (what a build without the
+    // binding minted). Tickets pending at an upgrade are not honoured and must be re-requested.
+    auto legacy = appr.submit_typed("mcp:execute_instruction_definition", "test-user",
+                                    nlohmann::json{{"definition_id", "d"}}.dump(), "",
+                                    yuzu::server::ApprovalOrigin::kMcp);
+    REQUIRE(legacy);
+    REQUIRE(appr.approve(*legacy, "admin", "ok").has_value());
+    auto res = ts.call(idef_call({{"definition_id", "d"}, {"approval_id", *legacy}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"].get<std::string>().find("does not match") != std::string::npos);
+    CHECK(rig.calls.empty());
+    auto row = appr.get(*legacy);
+    REQUIRE(row);
+    CHECK(row->consumed_at == 0);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 namespace {
 /// "No execution row exists", proven by a CHECKED read: the unchecked query_executions() turns a
@@ -45923,8 +46078,9 @@ inline void check_no_execution_rows(const yuzu::server::ExecutionTracker& tracke
 // sg-1 (#2146), the sec-F1 class: the definition-resolved result-set producers
 // (create_result_set_from_instruction_result, reevaluate_result_set) never carry Ticket
 // approval provenance. Their (plugin, action) comes from a STORED definition an editor can
-// repoint between ticket approval and recall; the C8 ticket canon binds only the call's
-// arguments. The authorizer and the dispatch port below both run the REAL chokepoint
+// repoint between ticket approval and recall. Since L1 the C8 ticket binds that resolved pair
+// as well as the call's arguments (a repoint is refused at the match, ticket unspent), and the
+// Ticket stamp is STILL withheld so a gated pair stays decided by its own gate. The authorizer and the dispatch port below both run the REAL chokepoint
 // (classify_and_authorize_dispatch) over a two-row fixture, so the exact send set is observable.
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -46028,15 +46184,30 @@ std::string rs_mint_and_approve(McpTestServer& ts, yuzu::server::ApprovalManager
     return ticket;
 }
 
-void rs_repoint_to_gated(yuzu::server::InstructionStore& instr, const std::string& id) {
+void rs_repoint(yuzu::server::InstructionStore& instr, const std::string& id,
+                const std::string& plugin, const std::string& action) {
     auto got = instr.get_definition(id);
     REQUIRE(got.has_value());
     REQUIRE(got->has_value());
     auto def = **got;
-    def.plugin = "registry";
-    def.action = "set_value";
+    def.plugin = plugin;
+    def.action = action;
     def.parameter_schema.clear(); // update_definition: empty KEEPS the stored schema
     REQUIRE(instr.update_definition(def).has_value());
+}
+
+void rs_repoint_to_gated(yuzu::server::InstructionStore& instr, const std::string& id) {
+    rs_repoint(instr, id, "registry", "set_value");
+}
+
+/// L1: a recall refused because the stored definition changed since the approval was requested.
+/// It is a refusal at the C8 match, so the ticket is NOT consumed and nothing was dispatched.
+void check_definition_changed_refusal(const httplib::Response& res) {
+    const auto body = nlohmann::json::parse(res.body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"].get<std::string>().find("definition changed") !=
+          std::string::npos);
 }
 
 std::string rs_make_definition(yuzu::server::InstructionStore& instr) {
@@ -46090,27 +46261,58 @@ TEST_CASE("MCP create_result_set_from_instruction_result: an approved tier ticke
     ts.result_set_store_for_test = rs_bundle.get();
     ts.instruction_store_for_test = &instr;
 
-    SECTION("non-admin: repointed after approval is refused and nothing is sent") {
+    SECTION("non-admin: repointed after approval is refused at the match, ticket unspent, "
+            "nothing is sent; repointing back restores the ticket") {
         rs_gate_wire(ts, log, /*admin=*/false);
         const nlohmann::json args = {{"instruction_id", iid}};
         const auto ticket = rs_mint_and_approve(ts, *appr_bundle.get(),
                                                 "create_result_set_from_instruction_result", args);
+        // The approver sees what will run: the resolved pair leads the ticket's subject.
+        auto row = appr_bundle.get()->get(ticket);
+        REQUIRE(row);
+        CHECK(row->scope_expression.starts_with(
+            "effect=[\"os_info\",\"version\",\"\",\"\"]\n"));
         rs_repoint_to_gated(instr, iid);
         auto args2 = args;
         args2["approval_id"] = ticket;
         auto res = ts.call(rs_tool_call("create_result_set_from_instruction_result", args2, 2));
         REQUIRE(res);
-        check_gated_refusal(*res);
+        check_definition_changed_refusal(*res);
         CHECK(log.dispatch_calls == 0); // the exact send set is empty
         CHECK(log.sent.empty());
-        // NOT asserted: the ticket's consumed_at. Unlike execute_instruction_definition, whose C8
-        // probe refuses before the ticket is spent, these producers refuse inside the handler,
-        // after C8 consumed the ticket (measured: consumed_at != 0). Not a regression of sg-1,
-        // which only guarantees the repointed pair is never sent.
+        // L1: the repoint is caught at the C8 match, BEFORE the ticket is spent.
+        row = appr_bundle.get()->get(ticket);
+        REQUIRE(row);
+        CHECK(row->consumed_at == 0);
         // The refusal precedes every side effect: no execution row to cancel, no result-set row.
         check_no_execution_rows(*tracker_bundle.get());
         std::string next;
         CHECK(rs_bundle.get()->list_by_owner("test-user", "", 100, next).empty());
+        // Repoint BACK: the same ticket is still redeemable and runs the approved pair.
+        rs_repoint(instr, iid, "os_info", "version");
+        auto again = ts.call(rs_tool_call("create_result_set_from_instruction_result", args2, 3));
+        REQUIRE(again);
+        REQUIRE(nlohmann::json::parse(again->body).contains("result"));
+        REQUIRE(log.sent.size() == 1);
+        CHECK(log.sent[0] == "os_info.version");
+    }
+
+    SECTION("non-admin: a pair that was ALREADY gated at approval time is still refused by the "
+            "pair's own gate, never lifted by the ticket") {
+        rs_gate_wire(ts, log, /*admin=*/false);
+        rs_repoint_to_gated(instr, iid);
+        const nlohmann::json args = {{"instruction_id", iid}};
+        const auto ticket = rs_mint_and_approve(ts, *appr_bundle.get(),
+                                                "create_result_set_from_instruction_result", args);
+        auto args2 = args;
+        args2["approval_id"] = ticket;
+        auto res = ts.call(rs_tool_call("create_result_set_from_instruction_result", args2, 2));
+        REQUIRE(res);
+        check_gated_refusal(*res);
+        CHECK(log.dispatch_calls == 0);
+        CHECK(log.sent.empty());
+        // This refusal is inside the handler, after C8 consumed the ticket (the binding matched).
+        check_no_execution_rows(*tracker_bundle.get());
     }
 
     SECTION("non-admin: a non-repointed benign definition still runs, with NO Ticket provenance") {
@@ -46175,11 +46377,44 @@ TEST_CASE("MCP reevaluate_result_set: an approved tier ticket for a benign pair 
     ts.instruction_store_for_test = &instr;
     const nlohmann::json args = {{"id", seeded->id}};
 
-    SECTION("non-admin: repointed after approval is refused and nothing is sent") {
+    SECTION("non-admin: repointed after approval is refused at the match, ticket unspent, "
+            "nothing is sent; repointing back restores the ticket") {
         rs_gate_wire(ts, log, /*admin=*/false);
         const auto ticket =
             rs_mint_and_approve(ts, *appr_bundle.get(), "reevaluate_result_set", args);
+        auto row = appr_bundle.get()->get(ticket);
+        REQUIRE(row);
+        CHECK(row->scope_expression.starts_with(
+            "effect=[\"os_info\",\"version\",\"\",\"\"]\n"));
         rs_repoint_to_gated(instr, iid);
+        auto args2 = args;
+        args2["approval_id"] = ticket;
+        auto res = ts.call(rs_tool_call("reevaluate_result_set", args2, 2));
+        REQUIRE(res);
+        check_definition_changed_refusal(*res);
+        CHECK(log.dispatch_calls == 0);
+        CHECK(log.sent.empty());
+        row = appr_bundle.get()->get(ticket);
+        REQUIRE(row);
+        CHECK(row->consumed_at == 0);
+        // No execution row, and the owner's result sets are exactly the seeded one.
+        check_no_execution_rows(*tracker_bundle.get());
+        std::string next;
+        CHECK(rs_bundle.get()->list_by_owner("test-user", "", 100, next).size() == 1);
+        rs_repoint(instr, iid, "os_info", "version");
+        auto again = ts.call(rs_tool_call("reevaluate_result_set", args2, 3));
+        REQUIRE(again);
+        REQUIRE(nlohmann::json::parse(again->body).contains("result"));
+        REQUIRE(log.sent.size() == 1);
+        CHECK(log.sent[0] == "os_info.version");
+    }
+
+    SECTION("non-admin: a pair that was ALREADY gated at approval time is still refused by the "
+            "pair's own gate, never lifted by the ticket") {
+        rs_gate_wire(ts, log, /*admin=*/false);
+        rs_repoint_to_gated(instr, iid);
+        const auto ticket =
+            rs_mint_and_approve(ts, *appr_bundle.get(), "reevaluate_result_set", args);
         auto args2 = args;
         args2["approval_id"] = ticket;
         auto res = ts.call(rs_tool_call("reevaluate_result_set", args2, 2));
@@ -46187,10 +46422,7 @@ TEST_CASE("MCP reevaluate_result_set: an approved tier ticket for a benign pair 
         check_gated_refusal(*res);
         CHECK(log.dispatch_calls == 0);
         CHECK(log.sent.empty());
-        // No execution row, and the owner's result sets are exactly the seeded one.
         check_no_execution_rows(*tracker_bundle.get());
-        std::string next;
-        CHECK(rs_bundle.get()->list_by_owner("test-user", "", 100, next).size() == 1);
     }
 
     SECTION("non-admin: a non-repointed benign definition still re-runs, with NO Ticket provenance") {

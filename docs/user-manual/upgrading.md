@@ -159,6 +159,10 @@ place.
 
 **Rollback.** Rolling back restores the old behaviour: a ticket again lifts the gate of a stored definition's action, including one repointed after the ticket was approved. No data changes in either direction.
 
+## Behaviour change: supervised-tier approval tickets bind the resolved definition effect (#2146)
+
+The ticket for `execute_instruction_definition`, `create_result_set_from_instruction_result` and `reevaluate_result_set` now binds the `plugin.action` the stored definition resolves to, not only the call's arguments, so a definition repointed between approval and re-call is refused (`-32003` "the definition changed since this approval was requested", ticket unspent) instead of running the new action under the old approval. Approval tickets pending for these three tools when you upgrade must be re-requested. An unreadable definition store while a ticket is requested for the two result-set tools is now a retryable `-32603` instead of a ticket, and a supervised token without `Execution:Execute` is refused before the ticket for them rather than after it is approved.
+
 ## ⚠️ Breaking: /mcp/v1/ refuses callers whose credential carries no MCP tier (#4309)
 
 **What changed.** `GET`, `POST` and `DELETE` on `/mcp/v1/` now refuse every authenticated credential whose MCP tier is empty, for every principal, with HTTP `403` and JSON-RPC `-32003`. The message is `/mcp/v1/ requires an MCP-tier bearer token`; the body has a `null` id, a `correlation_id`, `retry_after_ms: null` and a `remediation`, and no `permission` field. Two credential kinds carry no tier: a browser session cookie (local, OIDC or SAML sign-in) and an API token minted without `mcp_tier` (this includes a service-scoped token, one minted with `scope_service`, that has no tier). There is no engine special case: an engine token is always minted with tier `readonly`, so it is admitted, and a tierless engine row would be refused. There is no flag and no kill switch for this check, by design: a default-open flag would keep the gap open, and the remedy is one REST call.

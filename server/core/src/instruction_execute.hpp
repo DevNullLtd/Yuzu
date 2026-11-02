@@ -36,7 +36,8 @@
 /// own `approval_mode` is evaluated FIRST and INDEPENDENTLY of any MCP tier mechanism. An
 /// operator-tier token's auto-approval and a supervised-tier ticket that C8 consumed are TIER
 /// facts about the caller; neither is an input to this module, and `Request` deliberately has no
-/// field through which one could arrive. `auto` dispatches; `always` and any unknown value
+/// field through which one could arrive (`Request::expected_effect` is not one: it carries the
+/// effect a ticket was bound to, never an approval). `auto` dispatches; `always` and any unknown value
 /// (fail closed) need approval; `role-gated` needs approval unless the caller is an effective
 /// administrator (`DispatchCaller::principal_is_admin`, JIT-elevation aware). A call that needs
 /// approval is answered `PendingApproval` and dispatches NOTHING. There is no redemption path
@@ -153,9 +154,39 @@ struct Request {
     /// handler, so one call is one id). Empty -> the core mints one; either way the id used comes
     /// back in `Outcome::correlation_id` / `PrepareOutcome::correlation_id`.
     std::string correlation_id;
+    /// MCP supervised tier only (#2146, L1). The `effect_binding()` text the C8 approval ticket
+    /// was minted over; engaged only on the call that is about to spend that ticket. The core
+    /// recomputes the binding from the definition it looks up (step 1) and, if it differs,
+    /// refuses with `definition_changed` BEFORE the authorizer, any row or any dispatch. This
+    /// closes the window between the recall's pre-consume probe and this call's own fresh
+    /// lookup: the definition dispatched is the definition the human approved, or nothing runs.
+    /// Unset (REST, operator tier, the probe itself) = no binding to hold the lookup to.
+    std::optional<std::string> expected_effect;
 };
 
 using DefinitionLookup = std::expected<std::optional<InstructionDefinition>, std::string>;
+
+/// What the result-set producers bind when the stored definition cannot be resolved at all
+/// (empty or oversize id, absent or not-owned set, unsupported source kind, missing definition).
+/// It can never equal an `effect_binding()` result, so state that later becomes resolvable is
+/// refused rather than run; the producer's own handler refuses the unresolvable cases itself.
+inline constexpr std::string_view kUnresolvedEffect = "effect=unresolved\n";
+
+/// The effect-bearing part of a resolved definition, as the text a supervised-tier approval
+/// ticket binds in front of the call's canonical arguments (#2146, ADR-0033 section 10: an
+/// approval binds to the effect, not to a name that can be repointed). `effect=` + a compact
+/// JSON array of (plugin, action, approval_mode, concurrency_mode) + one `\n`. JSON, so a
+/// hostile or odd stored value cannot forge a field boundary or inject a control byte; the
+/// array is FIRST in the ticket text because the approvals table clips the scope cell to 120
+/// bytes and the reviewer must see what will run. Deliberately NOT a content hash and NOT
+/// `version`/`updated_at`: a comment or schema edit that leaves the effect alone must not
+/// invalidate an approval, and repointing the definition BACK restores it. Parameter values are
+/// not part of it: `Plan::params` is the supplied params verbatim (no defaults are applied), and
+/// they are already in the ticket's canonical arguments. A caller with no concurrency mode (the
+/// result-set producers dispatch by pair only) passes empty strings for the last two.
+[[nodiscard]] std::string effect_binding(std::string_view plugin, std::string_view action,
+                                         std::string_view approval_mode,
+                                         std::string_view concurrency_mode);
 
 /// What gets persisted as the execution row; the production binding fills an `Execution`.
 struct ExecutionRow {

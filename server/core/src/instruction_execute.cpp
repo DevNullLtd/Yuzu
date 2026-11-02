@@ -132,6 +132,18 @@ std::string resolve_cid(const Request& rq) {
 
 } // namespace
 
+std::string effect_binding(std::string_view plugin, std::string_view action,
+                           std::string_view approval_mode, std::string_view concurrency_mode) {
+    // `replace`, not the strict default: a stored value that is not valid UTF-8 must not throw
+    // out of the MCP handler. Two values differing only in invalid bytes bind identically, which
+    // is irrelevant here (the authorizer rejects an unknown pair either way).
+    const nlohmann::json effect = nlohmann::json::array(
+        {std::string(plugin), std::string(action), std::string(approval_mode),
+         std::string(concurrency_mode)});
+    return "effect=" +
+           effect.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";
+}
+
 std::string bounded_definition_id(std::string_view id) {
     if (id.size() <= kAuditDefinitionIdMax)
         return std::string(id);
@@ -218,6 +230,21 @@ PrepareOutcome prepare_impl(Ctx& c) {
     }
     InstructionDefinition def = std::move(**looked_up);
     const std::string def_token = ::yuzu::log_token(bounded_definition_id(rq.definition_id));
+
+    // 1b. The effect a supervised-tier ticket was minted over (L1). Held BEFORE the authorizer,
+    //     any row or any dispatch: this lookup is a second, fresh read of a definition an editor
+    //     may have repointed since the recall's pre-consume probe saw it, and the ticket has
+    //     already been spent by now, so the only safe answer to a change is to run nothing.
+    if (rq.expected_effect &&
+        *rq.expected_effect !=
+            effect_binding(def.plugin, def.action, def.approval_mode, def.concurrency_mode)) {
+        c.audit("denied", "reason=definition_changed definition=" + def_token);
+        return refuse(c, make_refusal(RefusalKind::kBadRequest, "definition_changed",
+                                      "the definition changed after this call's approval ticket "
+                                      "was checked; nothing was dispatched",
+                                      "the approval ticket is spent; re-request approval for the "
+                                      "definition as it is now and re-call"));
+    }
 
     // 2. The shared chokepoint's dry run for the definition's own (plugin, action), BEFORE any
     //    body work: a caller who may not run this pair learns nothing about its parameters, and
