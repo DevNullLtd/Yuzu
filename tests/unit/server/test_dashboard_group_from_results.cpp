@@ -1061,8 +1061,14 @@ TEST_CASE("group-from-results: a Search over a read cut by the byte cap is refus
 
     auto res = h.post(q_form_body("cut-by-bytes", "&q=alp"));
     CHECK(res->status == 422);
-    CHECK(contains(res->get_header_value("HX-Trigger"), "showToast"));
-    CHECK(contains(res->get_header_value("HX-Trigger"), "partial"));
+    // The toast and the body say the same sentence, byte for byte (the 422 body is never swapped,
+    // so the toast is the operator's only signal).
+    CHECK(res->get_header_value("HX-Trigger") ==
+          R"({"showToast":{"message":"The result set was cut by the read cap, so the agent list is )"
+          R"(partial. Nothing was created. Narrow the filters and try again.","level":"error"}})");
+    CHECK(res->body == "<span class=\"feedback-error\">The result set was cut by the read cap, so "
+                       "the agent list is partial. Nothing was created. Narrow the filters and try "
+                       "again.</span>");
     CHECK_FALSE(h.mg.find_group_by_name("cut-by-bytes").has_value());
 }
 
@@ -1085,6 +1091,7 @@ TEST_CASE("group-from-results: a Search plus a column filter over a read cut by 
     auto res = h.post(q_form_body("cut-by-rows", "&f_category=cat-a&q=alp"));
     CHECK(res->status == 422);
     CHECK(contains(res->get_header_value("HX-Trigger"), "showToast"));
+    CHECK(contains(res->get_header_value("HX-Trigger"), "Narrow the filters and try again."));
     CHECK_FALSE(h.mg.find_group_by_name("cut-by-rows").has_value());
 
     // Control: a cap that holds every match lets the same request through.
