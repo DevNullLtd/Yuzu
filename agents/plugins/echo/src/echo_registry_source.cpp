@@ -187,18 +187,31 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
             OfflineDiscovery d = reader_.offline_profiles(sids);
             offline = reconcile_offline(cur.offline, prev_hku, sids, d);
             // The ProfileList walk is index-driven: a profile deleted or renamed (X -> X.bak) while
-            // it runs can be skipped though it is healthy. A removal therefore needs two agreeing
-            // walks: when a complete walk would drop a profile with a known path, walk once more
-            // and believe that answer (an incomplete second walk keeps the known list).
-            const auto dropped = [&](const OfflineProfile& k) {
-                return !k.path.empty() &&
-                       std::find(sids.begin(), sids.end(), k.sid) == sids.end() &&
+            // it runs can be skipped though it is healthy. A profile is therefore removed only
+            // when two complete walks of this tick both omit it, a user who has just logged off
+            // (no path yet) included. When a complete walk would drop a known profile, or one that
+            // was loaded last tick, walk ONCE more and keep every profile either walk listed or
+            // named in `partial` (an incomplete second walk removes nothing).
+            const auto would_drop = [&](const std::string& sid) {
+                return std::find(sids.begin(), sids.end(), sid) == sids.end() &&
                        std::none_of(offline.begin(), offline.end(),
-                                    [&](const OfflineProfile& o) { return o.sid == k.sid; });
+                                    [&](const OfflineProfile& o) { return o.sid == sid; });
             };
-            if (d.complete && std::any_of(cur.offline.begin(), cur.offline.end(), dropped)) {
+            if (d.complete &&
+                (std::any_of(cur.offline.begin(), cur.offline.end(),
+                             [&](const OfflineProfile& k) { return would_drop(k.sid); }) ||
+                 std::any_of(prev_hku.begin(), prev_hku.end(), [&](const std::string& sid) {
+                     return is_user_hive_name(sid) && would_drop(sid);
+                 }))) {
                 d = reader_.offline_profiles(sids);
-                offline = reconcile_offline(cur.offline, prev_hku, sids, d);
+                for (const auto& p : reconcile_offline(cur.offline, prev_hku, sids, d)) {
+                    const auto it = std::find_if(offline.begin(), offline.end(),
+                                                 [&](const OfflineProfile& o) { return o.sid == p.sid; });
+                    if (it == offline.end())
+                        offline.push_back(p);
+                    else if (it->path.empty())
+                        it->path = p.path; // prefer the entry that has a path
+                }
             }
             discovery_incomplete = !d.complete;
         } else {
@@ -214,7 +227,7 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
         for (const auto& o : offline)
             offline_sids.insert(o.sid);
 
-        // Roots that left scope -- a profile a COMPLETE walk shows gone from the profile list, or
+        // Roots that left scope -- a profile two COMPLETE walks show gone from the profile list, or
         // a name that is no longer a profile hive (a logged-off user stays in scope as an offline
         // root, and a logon diffs against its baseline): drop their state and shrink the baseline
         // row, so a profile that reappears re-baselines from scratch, never as a mass removal of
@@ -373,6 +386,8 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
 
             st.read_start = read_start;
             st.read_end = read_end;
+            if (!offline_root)
+                st.deferred = false; // an owed offline read is moot once the hive is read as a loaded root
             st.status = std::string(to_string(rd.status));
             if (rd.status != RegistryReadStatus::Unreadable)
                 st.baselined = true; // a Capped first read is a partial baseline, by design

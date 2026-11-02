@@ -486,7 +486,8 @@ cursor.** What it adds to the pattern:
     budget cut off keeps its status, is marked `deferred` (counted by
     `registry_offline_roots_deferred`) and goes first next tick. At about one
     mount per budget second the tail of a long list is read over the following
-    ticks. A stop (`stop()` sets `stopping_`) mid-pass leaves the remaining due
+    ticks; nothing guarantees an hourly read for every hive, since the tail waits for
+    whatever the live roots leave. A stop (`stop()` sets `stopping_`) mid-pass leaves the remaining due
     hives `deferred` with no row.
   - *Transitions* are explicit in `collect()`: a root that was loaded and is
     offline now has its `window_base` reset and its stale notify consumed
@@ -498,10 +499,13 @@ cursor.** What it adds to the pattern:
     notify-sourced row with a window starting at the notify). An offline root never
     advances `window_base`, takes no part in the retention floor, and is excluded
     from `pending_first`.
-  - *Scope.* It is removed only by a COMPLETE profile walk, and a removal of a
-    profile with a known path needs a second complete walk in the same tick to
-    agree (the enumeration is index-driven, so a concurrent delete or rename can
-    skip a healthy profile). An incomplete walk (the list unopenable, cut short, or
+  - *Scope.* A profile is dropped only when two complete walks in the same tick
+    both omit it, a user who has just logged off (no path yet) included: when a
+    complete walk would drop a known profile or one that was loaded last tick,
+    `collect()` walks once more (never a second HKU enumeration) and keeps every
+    profile either walk listed or named in `partial`, because the enumeration is
+    index-driven and a concurrent delete or rename can skip a healthy profile, a
+    different one on each walk. A second walk that is incomplete removes nothing. An incomplete walk (the list unopenable, cut short, or
     stopped at the 512-entry cap) keeps the known list (`registry_offline_discovery_incomplete`)
     and ADDS the profiles it did list, so a host over the cap still gets the
     profiles the walk reaches. A record whose path was unreadable keeps its cursor
@@ -511,7 +515,7 @@ cursor.** What it adds to the pattern:
     previous tick and gone now (a logoff) is a known profile whose path is not yet
     known (`{sid, ""}`, the `prev_loaded` argument), so a user who logs off during an
     incomplete or partial walk keeps the baseline too: a complete walk that lists it
-    supplies the path, and one that names it nowhere drops it. A root whose path is
+    supplies the path, and it is dropped only when two complete walks name it nowhere. A root whose path is
     empty is never mounted: it is marked `deferred` each tick (baseline and status
     untouched, no row) and read the first tick a walk supplies the path; a profile
     whose own record stays unreadable on complete walks stays unpathed, is walked
@@ -530,8 +534,9 @@ cursor.** What it adds to the pattern:
     tick; a timeout is an attempt (`offline:timeout`, one gap row) and halts the rest
     of the tick. The tokens a row can carry are listed in the user manual
     (*Offline read outcomes*).
-  - *Discovery* (a ProfileList registry walk, never a mount) runs hourly, on an HKU
-    name-watch mark, and on every tick while no logged-off profile is known, while
+  - *Discovery* (a ProfileList registry walk, never a mount) runs hourly, on a
+    restart's first tick (`force_all_`), on a re-baseline (a re-enable or a lost cursor),
+    on an HKU name-watch mark, and on every tick while no logged-off profile is known, while
     the last walk was incomplete or while a known profile has no path yet, which is
     also how a cursor from a build without offline hives picks them up. It is
     classified against the loaded list collect() took for that tick (the

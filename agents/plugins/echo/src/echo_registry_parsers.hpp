@@ -69,7 +69,7 @@
 // again its first loaded read happens at once and diffs against the offline baseline. A failed
 // mount is an Unreadable read with a named reason (one gap row per transition); an INCOMPLETE
 // profile discovery keeps the known offline list (reconcile_offline): scope is removed only
-// when a complete walk says the profile is gone.
+// when two complete walks of one tick both omit the profile (collect() confirms a removal).
 
 #include "echo_db.hpp" // RegistryEvent
 
@@ -299,7 +299,8 @@ RegistryScope::roots_for(const std::vector<std::string>& hku_subkeys,
 /// joins `known` as `{sid, ""}` before the rules above run. A real `known` entry wins (first
 /// seen); an incomplete walk carries it; a complete walk carries it only when it names the sid
 /// in `partial` or lists it in `profiles` (which supplies the path). A complete walk that names
-/// it nowhere still drops it: that walk is authoritative. Only SID-named hives count
+/// it nowhere still drops it from THIS list; collect() confirms such a removal with a second
+/// complete walk and keeps what either walk listed. Only SID-named hives count
 /// (`.DEFAULT` and `<sid>_Classes` leave HKU too, and are not profiles).
 [[nodiscard]] inline std::vector<OfflineProfile>
 reconcile_offline(const std::vector<OfflineProfile>& known_in,
@@ -345,7 +346,8 @@ reconcile_offline(const std::vector<OfflineProfile>& known_in,
 /// One ProfileList walk, classified: the pure half of the Windows shell's discovery (which only
 /// gathers the three walk facts, the merged profile list and the sids whose record failed to
 /// read). A loaded profile is not offline. A profile whose path could not be read or is empty
-/// is `partial` (its previous cursor entry stands), as is a sid whose record failed outright.
+/// is `partial` (its previous cursor entry stands), as is a sid whose record failed outright (a
+/// failed `<sid>.bak` record by its base sid, as a listed one is).
 /// A failed ProfileList open walked nothing: incomplete, with no profiles. A walk cut short or
 /// stopped at the profile cap is incomplete too, but the profiles it did list are returned.
 /// A `<sid>.bak` record (the leftover of a temporary-profile event) proves its base sid exists
@@ -366,13 +368,17 @@ classify_offline_discovery(bool walk_complete, bool root_failed, bool truncated,
         if (std::find(d.partial.begin(), d.partial.end(), sid) == d.partial.end())
             d.partial.push_back(sid);
     };
+    // A `<sid>.bak` record, listed or failed, names its BASE sid, never the `.bak` text.
+    const auto add_backup_base = [&](const std::string& record) {
+        const std::string base = record.substr(0, record.size() - 4);
+        if (is_user_hive_name(base) && !is_virtual_service_sid(base))
+            add_partial(base);
+    };
     for (const auto& p : profiles) {
         if (p.state == yuzu::profiles::HiveState::loaded)
             continue;
         if (yuzu::profiles::is_profile_backup_entry(p.sid)) {
-            const std::string base = p.sid.substr(0, p.sid.size() - 4);
-            if (is_user_hive_name(base) && !is_virtual_service_sid(base))
-                add_partial(base);
+            add_backup_base(p.sid);
             continue;
         }
         if (is_virtual_service_sid(p.sid))
@@ -382,9 +388,12 @@ classify_offline_discovery(bool walk_complete, bool root_failed, bool truncated,
         else
             d.profiles.push_back({p.sid, p.profile_path});
     }
-    for (const auto& sid : failed_sids)
-        if (!is_virtual_service_sid(sid))
-            add_partial(sid); // a record that failed to read is not "gone"
+    for (const auto& sid : failed_sids) { // a record that failed to read is not "gone"
+        if (yuzu::profiles::is_profile_backup_entry(sid))
+            add_backup_base(sid);
+        else if (!is_virtual_service_sid(sid))
+            add_partial(sid);
+    }
     return d;
 }
 
