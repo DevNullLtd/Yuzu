@@ -495,8 +495,8 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # (GET/PUT /api/v1/config and the MCP tools get_runtime_config / set_runtime_config).
 # 213 -> 212 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me flipped from planned to twinned
 # (GET /api/v1/me + the get_me MCP tool).
-# 212 -> 210 (#4041): MCP list_agents is now confined through require_fleet_read, so get.api-agents and
-# get.fragments-devices-list left their dated exception and are twinned to it.
+# 212 -> 210 (#4041, ADR-1005 2026-11-02 entry): MCP list_agents moved onto require_fleet_read, so
+# get.api-agents and get.fragments-devices-list left their dated exception and are twinned to it.
 BASELINE_UNTWINNED = 210
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only

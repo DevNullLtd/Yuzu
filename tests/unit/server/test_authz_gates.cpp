@@ -11,11 +11,11 @@
 
 #include "audit_store.hpp"
 #include "auth_routes.hpp"
-#include "mcp_policy.hpp"
 #include "authz_gates.hpp"
 #include "service_scope_policy.hpp"
 
 #include "management_group_store.hpp"
+#include "mcp_policy.hpp"
 #include "oidc_provider.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -455,16 +455,17 @@ TEST_CASE("require_fleet_read: mcp_tier='readonly' token, Read op ⇒ tier "
     CHECK(result->unfiltered());
 }
 
-// #4041: list_agents drops its own tier_allows and relies on this gate for the MCP tier
-// axis. No real tier denies Infrastructure:Read (every tier allows Read there), so the
-// tier branch is exercised on a securable whose Read every tier refuses (TlsConfig,
-// mcp_policy.hpp's always-denied set) with a real, mintable readonly token. The tier
-// branch precedes the RBAC axis, so a global grant must not rescue the call.
+// #4041: list_agents dropped its own tier_allows. The C8 gate checks the tool's pair first;
+// this branch is the backstop behind it. No real tier denies Infrastructure:Read (every
+// tier allows Read there), so the branch is exercised on a securable whose Read every tier
+// refuses (TlsConfig, mcp_policy.hpp's always-denied set) with a real, mintable readonly
+// token. The tier branch precedes the RBAC axis, so a global grant does not rescue the call.
 TEST_CASE("require_fleet_read: an MCP tier that does not allow the pair is denied 403 by the "
           "tier branch, ahead of RBAC",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.set_permission({"RespReader", "TlsConfig", "Read", "allow"}).has_value());
     REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value()); // GLOBAL allow
     auto raw = r.api_tokens->create_token("gates-test-tier-deny", "minter", now_epoch() + 3600,
                                           /*scope_service=*/"", /*mcp_tier=*/"readonly");

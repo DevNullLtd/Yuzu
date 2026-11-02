@@ -331,7 +331,8 @@ struct RoutesHarness {
     std::optional<yuzu::server::auth::Session> resolved;
     int resolver_calls{0};
     /// perm_fn / fleet_read_fn invocations: a tool handler reaches them (list_agents asks
-    /// Infrastructure:Read through fleet_read_fn since #4041) only after admission, so 0 here proves no tool ran for a refused caller.
+    /// Infrastructure:Read through fleet_read_fn since #4041) only after admission, so 0 here
+    /// proves no tool ran for a refused caller.
     int tool_gate_calls{0};
     /// The factory's audit-budget clock (ms), injected so a test moves the window by hand.
     std::int64_t now_ms{1'000};

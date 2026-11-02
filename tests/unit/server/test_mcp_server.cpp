@@ -1319,6 +1319,8 @@ struct McpTestServer {
     /// get_agent_details triggered ZERO backing read (mirrors the REST twin's
     /// FakeDeviceApi.lookup_calls). Populated in start(); null before then.
     std::shared_ptr<yuzu::server::test::JsonDeviceApi> device_api_for_test_;
+    /// Leaves build_handler's DeviceApi null, for the tools' wiring-fault branch.
+    bool device_api_unwired_for_test{false};
 
     /// ADR-0024 (SLE discovery): optionally wire a typed SoftwareLicensingStore so
     /// query_software_licenses (the MCP twin of the GET /sle/agents/{id} drill) is
@@ -1594,7 +1596,9 @@ private:
         // agents, byte-identical to the pre-rewire behaviour.
         device_api_for_test_ =
             std::make_shared<yuzu::server::test::JsonDeviceApi>(agents_fn);
-        auto device_api_for_test = device_api_for_test_;
+        std::shared_ptr<yuzu::server::test::JsonDeviceApi> device_api_for_test;
+        if (!device_api_unwired_for_test)
+            device_api_for_test = device_api_for_test_;
 
         // #2384: the engine-credential store rides a setter, not a
         // build_handler param — wire before the handlers are built.
@@ -5798,6 +5802,15 @@ TEST_CASE("MCP list_agents (#4041): a confined caller sees only in-scope agents,
     CHECK(res->body.find("db-01") == std::string::npos);
     REQUIRE(asked.size() == 1);
     CHECK(asked[0] == std::make_pair(std::string{"Infrastructure"}, std::string{"Read"}));
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["result"].contains("structuredContent"));
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["agents"] ==
+          nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>()));
+    // Confinement is reported as a status, never as a count of hidden devices.
+    CHECK(sc.value("scope_basis", "") == "authority_scoped");
+    CHECK_FALSE(sc.contains("devices_omitted"));
 }
 
 TEST_CASE("MCP list_agents (#4041): an unconfined caller (nullopt scope) still sees every agent",
@@ -5815,7 +5828,9 @@ TEST_CASE("MCP list_agents (#4041): an unconfined caller (nullopt scope) still s
     auto res = ts.call(kListAgentsCall);
     REQUIRE(res);
     CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001", "agent-002"});
-    CHECK(calls == 1); // the gate, not a bare perm_fn, decided
+    CHECK(calls == 1);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body["result"]["structuredContent"].contains("scope_basis"));
 }
 
 TEST_CASE("MCP list_agents (#4041): a deny-all scope (present, empty) lists no agents",
@@ -5833,6 +5848,10 @@ TEST_CASE("MCP list_agents (#4041): a deny-all scope (present, empty) lists no a
     CHECK(res->status == 200);
     CHECK(list_agents_ids(res).empty());
     CHECK(res->body.find("agent-001") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result")); // an empty list, not a JSON-RPC error
+    CHECK(body["result"]["structuredContent"]["agents"].empty());
+    CHECK(body["result"]["structuredContent"].value("scope_basis", "") == "authority_scoped");
 }
 
 TEST_CASE("MCP list_agents (#4041): a gate that denies writes its own response and no agent "
@@ -5853,6 +5872,10 @@ TEST_CASE("MCP list_agents (#4041): a gate that denies writes its own response a
     CHECK(res->status == 403);
     CHECK(res->body.find("agent-001") == std::string::npos);
     CHECK(res->body.find("agent-002") == std::string::npos);
+    // The handler stops at the gate: its own response stands and no success row is written.
+    CHECK(res->body.find("permission denied") != std::string::npos);
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.list_agents|success") ==
+          ts.audit_log.end());
 }
 
 TEST_CASE("MCP list_agents (#4041): fails closed when fleet_read_fn_ is genuinely unwired",
@@ -5863,9 +5886,61 @@ TEST_CASE("MCP list_agents (#4041): fails closed when fleet_read_fn_ is genuinel
 
     auto res = ts.call(kListAgentsCall);
     REQUIRE(res);
+    CHECK(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("service unavailable") !=
+          std::string::npos);
     CHECK(res->body.find("agent-001") == std::string::npos);
+}
+
+TEST_CASE("MCP list_agents (#4041): an unwired DeviceApi is an error, never an empty list",
+          "[mcp][integration][security][confinement]") {
+    McpTestServer ts;
+    ts.device_api_unwired_for_test = true;
+    ts.start();
+
+    auto res = ts.call(kListAgentsCall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("device registry unavailable") !=
+          std::string::npos);
+    CHECK(ts.audit_log.back() == "mcp.list_agents|failure");
+}
+
+TEST_CASE("MCP list_agents (#4041): tools/list states the scope contract",
+          "[mcp][integration][a5]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":4042})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "list_agents")
+            tool = &t;
+    REQUIRE(tool != nullptr);
+    const auto description = (*tool)["description"].get<std::string>();
+    CHECK(description.find("List all") == std::string::npos);
+    CHECK(description.find("scope_basis") != std::string::npos);
+    CHECK(description.find("never disclosed") != std::string::npos);
+    CHECK((*tool)["outputSchema"]["properties"].contains("scope_basis"));
+}
+
+TEST_CASE("MCP fleet_overview (#4041): the prompt does not read a confined list as the fleet",
+          "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"prompts/get","id":4043,)"
+        R"("params":{"name":"fleet_overview"}})");
+    REQUIRE(res);
+    CHECK(res->body.find("scope_basis") != std::string::npos);
 }
 
 // ── #4027: Echo read-twin round-trip — proves registration (kTools/
@@ -14275,6 +14350,132 @@ void exec_tracker_ddl(const std::string& dsn, const std::string& sql) {
     REQUIRE(r.ok());
 }
 } // namespace
+
+// #4041: the real require_fleet_read and real stores. The stubbed list_agents tests above
+// cannot see the behaviour this issue changed: a caller whose only Infrastructure:Read comes
+// from a management group was 403 at the bare perm_fn and now gets its own devices.
+// perm_override_for_test denies every perm_fn call, so a perm_fn stacked in front of the gate
+// fails these cases (the #3216 defect).
+namespace {
+struct ListAgentsRealGate {
+    yuzu::test::ResponseExecutionAuthzPgRig authz;
+    McpTestServer ts;
+
+    explicit ListAgentsRealGate(const std::string& dsn) : authz{dsn} {
+        REQUIRE(authz.rbac.create_role({"InfraReader4041", "", false, 0}).has_value());
+        REQUIRE(authz.rbac.set_permission({"InfraReader4041", "Infrastructure", "Read", "allow"})
+                    .has_value());
+        REQUIRE(authz.mgmt.add_member(authz.bob_group, "agent-001").has_value());
+        REQUIRE(authz.mgmt.add_member(authz.alice_group, "agent-002").has_value());
+        ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+        ts.perm_override_for_test = [](const std::string&, const std::string&) { return false; };
+        ts.mock_username = "bob";
+    }
+
+    void grant_through_group() {
+        REQUIRE(authz.mgmt.assign_role({authz.bob_group, "user", "bob", "InfraReader4041"})
+                    .has_value());
+    }
+
+    std::unique_ptr<httplib::Response> call() {
+        ts.start("operator");
+        return ts.call_raw("POST", kListAgentsCall,
+                           {{"Authorization", "Bearer " + authz.mint_bob()}});
+    }
+};
+} // namespace
+
+TEST_CASE("MCP list_agents (#4041): a group-only caller gets its own devices through the real "
+          "gate",
+          "[pg][mcp][integration][security][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    ListAgentsRealGate rig{authz_db.dsn()};
+    rig.grant_through_group();
+
+    auto res = rig.call();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001"});
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["result"]["structuredContent"]["agents"].size() == 1);
+    CHECK(body["result"]["structuredContent"].value("scope_basis", "") == "authority_scoped");
+    CHECK(rig.ts.audit_log.back() == "mcp.list_agents|success");
+}
+
+TEST_CASE("MCP list_agents (#4041): a global grant sees every device, unscoped",
+          "[pg][mcp][integration][security][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    ListAgentsRealGate rig{authz_db.dsn()};
+    REQUIRE(rig.authz.rbac.assign_role({"user", "bob", "InfraReader4041"}).has_value());
+
+    auto res = rig.call();
+    REQUIRE(res);
+    CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001", "agent-002"});
+    auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body["result"]["structuredContent"].contains("scope_basis"));
+}
+
+TEST_CASE("MCP list_agents (#4041): RBAC off leaves every device visible, unscoped",
+          "[pg][mcp][integration][security][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    ListAgentsRealGate rig{authz_db.dsn()};
+    rig.authz.rbac.set_rbac_enabled(false);
+
+    auto res = rig.call();
+    REQUIRE(res);
+    CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001", "agent-002"});
+    auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body["result"]["structuredContent"].contains("scope_basis"));
+}
+
+TEST_CASE("MCP list_agents (#4041): no grant of any kind is refused with no rows",
+          "[pg][mcp][integration][security][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    ListAgentsRealGate rig{authz_db.dsn()};
+
+    auto res = rig.call();
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("agent-001") == std::string::npos);
+    CHECK(res->body.find("agent-002") == std::string::npos);
+}
+
+// ADR-0017's 2026-07-24 Update (a): the group read is additive to a global deny.
+TEST_CASE("MCP list_agents (#4041): a global deny plus a group allow gets the group's devices",
+          "[pg][mcp][integration][security][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    ListAgentsRealGate rig{authz_db.dsn()};
+    REQUIRE(rig.authz.rbac.create_role({"InfraDeny4041", "", false, 0}).has_value());
+    REQUIRE(rig.authz.rbac.set_permission({"InfraDeny4041", "Infrastructure", "Read", "deny"})
+                .has_value());
+    REQUIRE(rig.authz.rbac.assign_role({"user", "bob", "InfraDeny4041"}).has_value());
+    rig.grant_through_group();
+
+    auto res = rig.call();
+    REQUIRE(res);
+    CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001"});
+}
+
+TEST_CASE("MCP list_agents (#4041): a service-scoped token stops at C8, before the gate",
+          "[mcp][integration][security][service_scope]") {
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    int gate_calls = 0;
+    ts.fleet_read_fn_for_test = [&gate_calls](const httplib::Request&, httplib::Response&,
+                                              const std::string&, const std::string&)
+        -> yuzu::server::authz::FleetReadGate {
+        ++gate_calls;
+        return {true, std::nullopt};
+    };
+    ts.start();
+
+    auto res = ts.call(kListAgentsCall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kPermissionDenied);
+    CHECK(gate_calls == 0);
+}
 
 TEST_CASE("MCP summarize_working_set execution: confined caller sees the exact projected counts (#3526)",
           "[pg][mcp][integration][agentic-demo][scope][4753]") {

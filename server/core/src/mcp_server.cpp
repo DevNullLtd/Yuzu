@@ -635,9 +635,20 @@ std::string lower_copy(std::string v) {
 static_assert(kMaxFacetValueBytes == 2048,
               "update the preview tool text, the OpenAPI text and the docs");
 static const ToolDef kTools[] = {
-    {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
+    {"list_agents",
+     "List the connected agents the caller may read, with hostname, OS, architecture, and "
+     "version. Read-only. Requires Infrastructure:Read. A live snapshot of the agents connected "
+     "to this server: an enrolled device that is offline is not listed. Use get_agent_details "
+     "for one device's tags and detail; each row's agent_id feeds the per-agent tools. Confined: "
+     "results are narrowed to the devices the caller may read, and when that is narrower than "
+     "the fleet structuredContent carries scope_basis authority_scoped (a status; the number of "
+     "hidden devices is never disclosed). Every row and count then describes only the devices "
+     "you may read and is never a statement about the fleet: an empty list means no connected "
+     "agent you may read, not that none exists. Without that field the list is every agent "
+     "connected to this server. A permission denial is terminal; an authorization-store failure "
+     "is a retryable 503 with retry_after_ms, never an empty list.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
+     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}},"scope_basis":{"type":"string","enum":["authority_scoped"]}},"required":["agents"]})j"},
 
     // ── #4027 API-parity read twins: Echo process-tree / capture-sources device
     // pickers + retention-paused source list. Requires Infrastructure:Read,
@@ -6932,7 +6943,9 @@ McpServer::HandlerFn McpServer::build_handler(
             if (prompt_name == "fleet_overview") {
                 prompt_text = "Give me a summary of the fleet: how many agents are connected, "
                               "OS breakdown (Windows/Linux/macOS), and overall compliance status. "
-                              "Use the list_agents and get_fleet_compliance tools.";
+                              "Use the list_agents and get_fleet_compliance tools. If "
+                              "list_agents returns scope_basis, report its counts as the agents "
+                              "in your scope, not as the fleet.";
             } else if (prompt_name == "investigate_agent") {
                 auto agent_id = param_str(params, "agent_id", "UNKNOWN");
                 prompt_text =
@@ -9100,10 +9113,10 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "list_agents") {
                 // #4041: a fan-out read of per-agent data — fleet_read_fn_
                 // (require_fleet_read, the ADR-0017 admit-then-filter chokepoint)
-                // is the SOLE gate, no separate tier_allows/perm_fn call: it
-                // applies the MCP tier itself (authz_gates.cpp, ahead of RBAC) and
-                // the C8 gate above has already checked this tool's pair. Mirrors
-                // the Echo device pickers below. Unwired fails closed.
+                // is the SOLE gate in this handler, no separate tier_allows/perm_fn
+                // call: the C8 gate above has already tier-checked this tool's pair,
+                // for every principal class. Mirrors the Echo device pickers below.
+                // Unwired fails closed.
                 if (!fleet_read_fn_) {
                     spdlog::error("list_agents: fleet_read_fn_ unwired — misconfigured "
                                   "call site; failing closed");
@@ -9114,10 +9127,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the A4 error body + status
-                std::vector<DeviceListRow> devices =
-                    device_api ? device_api->list_devices() : std::vector<DeviceListRow>{};
+                if (!device_api) {
+                    // Wiring fault: never an empty list, which reads as an empty fleet
+                    // (mirrors get_agent_details and REST's 503).
+                    mcp_audit("failure");
+                    res.set_content(
+                        error_response(id, kInternalError, "device registry unavailable"),
+                        "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& d : devices) {
+                for (const auto& d : device_api->list_devices()) {
                     if (!authz::in_scope(gate.scope, d.agent_id))
                         continue;
                     arr.add(JObj()
@@ -9127,12 +9147,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("arch", d.arch)
                                 .add("agent_version", d.agent_version));
                 }
+                // Confinement is reported as a STATUS, never a count of hidden devices
+                // (mcp_tools_hardware.cpp, ADR-0017 INV-3). content[0].text stays the
+                // bare array; gate.scope == nullopt is global read, nothing was dropped.
+                JObj structured;
+                structured.raw("agents", arr.str());
+                if (gate.scope)
+                    structured.add("scope_basis", "authority_scoped");
                 mcp_audit("success");
                 res.set_content(
-                    success_response(id,
-                                      tool_result_split(arr.str(),
-                                                         JObj().raw("agents", arr.str()).str(),
-                                                         kObjectOutputSchema)),
+                    success_response(
+                        id, tool_result_split(arr.str(), structured.str(), kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -9164,7 +9189,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // both confirmed by direct source inspection): the two device pickers
             // now read the SAME shared builder their REST twin calls
             // (api-twin-recipe.md Rule 1) from an UNFILTERED registry snapshot
-            // (all_devices_fn_ — same source list_agents' agents_fn and
+            // (all_devices_fn_ — same registry source list_agents and
             // GET /api/v1/devices (#4033) use), with gate.scope as the SOLE
             // filter — not an intersection with echo_devices_fn_'s direct-
             // membership-only pre-filter (see set_all_devices_fn's doc comment

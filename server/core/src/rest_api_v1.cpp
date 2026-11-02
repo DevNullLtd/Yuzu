@@ -11227,10 +11227,7 @@ void RestApiV1::register_routes(
     // filtered/paginated device-list REST surface is a tracked follow-up,
     // out of this issue's scope.
     //
-    // list_agents (MCP) itself is NOT migrated onto require_fleet_read by
-    // this PR — its unconfined-fan-out gap (Evidence item 1's correction) is
-    // filed separately as #4041 (P1, same-priority follow-up per the
-    // acceptance criteria's "or file an explicit...follow-up" clause).
+    // list_agents (MCP) was migrated onto require_fleet_read under #4041.
     //
     // NOT audited on a successful read: device identity/OS/arch/version is
     // machine metadata, not behavioural PII — matches the fragment's OWN
