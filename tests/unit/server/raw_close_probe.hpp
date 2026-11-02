@@ -6,11 +6,11 @@
 ///
 /// WHY a raw socket and not `httplib::Client`: the Client sends `Connection: close` itself by
 /// default (keep-alive is off) and the server echoes it, so a header check through the Client
-/// passes even when the server never adds the header, and for a declared body of 1 MiB or more it
-/// stops to wait for an early response and never sends the body. This probe sends exactly the
-/// bytes it is given, with no `Connection` header, reads the response head, then waits up to 2 s
-/// for EOF: EOF means the server closed the connection, a timeout means it is still holding it
-/// (reading the declared body, or keep-alive).
+/// passes even when the server never adds the header, and for a declared body of 1024 bytes or
+/// more it sends `Expect: 100-continue` and stops to wait for an early response before it sends
+/// the body. This probe sends exactly the bytes it is given, with no `Connection` header, reads
+/// the response head, then waits (5 s by default) for EOF: EOF means the server closed the
+/// connection, a timeout means it is still holding it (reading the declared body, or keep-alive).
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -51,7 +51,8 @@ inline constexpr const char* kEmptyThenChunkedPostRequest =
     "POST /anything HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding:\r\n"
     "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
 
-inline CloseProbeResult probe_for_close(int port, const std::string& request) {
+inline CloseProbeResult probe_for_close(int port, const std::string& request,
+                                        std::chrono::seconds wait = std::chrono::seconds(5)) {
     struct Fd {
         int v;
         explicit Fd(int f) : v(f) {}
@@ -69,7 +70,7 @@ inline CloseProbeResult probe_for_close(int port, const std::string& request) {
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     REQUIRE(::connect(sock.v, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
     timeval tv{};
-    tv.tv_sec = 2;
+    tv.tv_sec = static_cast<time_t>(wait.count());
     REQUIRE(::setsockopt(sock.v, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0);
     REQUIRE(::send(sock.v, request.data(), request.size(), 0) ==
             static_cast<ssize_t>(request.size()));
@@ -77,8 +78,8 @@ inline CloseProbeResult probe_for_close(int port, const std::string& request) {
     CloseProbeResult out;
     char buf[1024];
     // SO_RCVTIMEO bounds each recv; this deadline bounds the EINTR retries (a retried recv starts
-    // a fresh SO_RCVTIMEO window). Same 2 s as the socket timeout.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    // a fresh SO_RCVTIMEO window) and the data path below. Same as the socket timeout.
+    const auto deadline = std::chrono::steady_clock::now() + wait;
     while (out.head.find("\r\n\r\n") == std::string::npos) {
         const ssize_t n = ::recv(sock.v, buf, sizeof(buf), 0);
         if (n < 0 && errno == EINTR && std::chrono::steady_clock::now() < deadline)
@@ -91,6 +92,13 @@ inline CloseProbeResult probe_for_close(int port, const std::string& request) {
         if (n == 0) {
             out.closed = true; // FIN
             break;
+        }
+        if (n > 0) {
+            // Data after the head (a body the server is still writing): keep reading, but not
+            // past the deadline, so a server that never stops sending cannot hold the probe.
+            if (std::chrono::steady_clock::now() >= deadline)
+                break;
+            continue;
         }
         if (n < 0) {
             const int err = errno;

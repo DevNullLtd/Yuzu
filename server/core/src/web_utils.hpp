@@ -766,7 +766,8 @@ has_non_identity_content_encoding(std::string_view content_encoding) noexcept {
 /// Content-Length reading, so a call site that is touched later need not be re-checked
 /// by hand. A genuinely malformed
 /// (non-numeric or negative) `Content-Length` still
-/// reads as 0 here (httplib trims surrounding whitespace, so `Content-Length:  5` reads as 5) — that is fine, NOT a re-opened gap: httplib's OWN
+/// reads as 0 here (httplib trims surrounding whitespace, so `Content-Length:  5` reads as 5).
+/// That is fine, NOT a re-opened gap: httplib's OWN
 /// reader answers 400 and refuses to read the body at all for that case,
 /// so no handler is ever reached regardless of what this gate alone
 /// decides. (httplib 0.59.0 also answers 400 to an all-digit value above

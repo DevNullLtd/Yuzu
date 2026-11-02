@@ -25,6 +25,8 @@
 #include "test_loopback_http.hpp"
 #include "web_utils.hpp"
 
+#include "../test_helpers.hpp"
+
 #include <httplib.h>
 
 #include <catch2/catch_test_macros.hpp>
@@ -42,6 +44,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -454,9 +457,12 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_sess
 // ── 8. On-the-wire coverage for the D1-D4 hardening of the pre-routing
 //       chokepoint (server.cpp `set_pre_routing_handler`) ───────────────────
 //
-// SKIPPED UNDER ThreadSanitizer (#438), same reasoning as
-// test_mcp_body_cap.cpp: this deliberately exercises httplib::Server's
-// middleware wiring, which crashes the TSan build.
+// Compiled out under ThreadSanitizer (#438, the guard below), as in
+// test_mcp_body_cap.cpp. The original reason was a crash of the TSan build in
+// httplib's asynchronous name lookup; CI's TSan jobs now preload a synchronous
+// getaddrinfo shim (scripts/ci/build-gai-sync-shim.sh, used by nightly.yml and
+// sanitizer-tests.yml) that covers loopback servers, so the guard is a leftover
+// until this section is re-enabled and run under TSan.
 //
 // This fixture drives the SAME UNIFIED pre-routing DECISION server.cpp's
 // `enforce_pre_auth_body_cap` lambda makes (D1: one branch for every path,
@@ -1269,42 +1275,28 @@ TEST_CASE("Post-read body cap: a MEASURABLE over-cap body is still caught by the
     CHECK(ts.post_read_rejections.load() == 0);
 }
 
-TEST_CASE("Pre-routing body cap: a pre-routing refusal closes the connection without draining "
-          "the declared body",
+TEST_CASE("Pre-routing body cap: a pre-routing refusal closes the connection while the declared "
+          "body is still unsent",
           "[body_cap][pre_routing][bounds][integration]") {
-    // Pins the property server.cpp's CONNECTION-REUSE CONSTRAINT paragraph depends on. A real
-    // client declares a 64 MiB body on a route whose cap is 4 MiB and the pre-routing handler
-    // refuses with 413 before reading it. What is pinned: the refusal ends with the server
-    // closing the socket, and the number of bytes the client got in before the close is bounded
-    // by the socket buffers, not by the declared size.
+    // The real gate (`evaluate_body_cap`, through the fixture) refuses a declared 64 MiB body on
+    // a route whose cap is 4 MiB. The probe sends the head and five body bytes and no more, with
+    // no `Expect` header (an `httplib::Client` would send `Expect: 100-continue` for a body this
+    // size and so never send it). A response head can therefore only arrive if the answer comes
+    // before the body is read; the 413 must carry `Connection: close` and the socket must reach
+    // EOF.
     UnifiedBodyCapTestServer ts;
     ts.start();
 
-    constexpr std::size_t kDeclared = 64u * 1024 * 1024;
-    constexpr std::size_t kChunk = 64u * 1024;
-    std::size_t provided = 0;
-    httplib::Client cli("127.0.0.1", ts.port);
-    cli.set_connection_timeout(5, 0);
-    cli.set_write_timeout(5, 0);
-    cli.set_read_timeout(5, 0);
-    const std::string chunk(kChunk, 'A');
-    auto res = cli.Post(
-        "/api/v1/devices", kDeclared,
-        [&](std::size_t offset, std::size_t length, httplib::DataSink& sink) {
-            const auto n = std::min<std::size_t>(length, kChunk);
-            if (!sink.write(chunk.data(), n))
-                return false; // the server closed the connection
-            provided = offset + n;
-            return true;
-        },
-        "application/octet-stream");
-
-    INFO("bytes the client got into the socket before the close: " << provided);
-    // Half the declared body is far above any socket-buffer total and far below the declared body.
-    CHECK(provided < kDeclared / 2);
-    if (res)
-        CHECK(res->status == 413);
-    CHECK(ts.pre_routing_rejections.load() >= 1);
+    const std::string req = "POST /api/v1/devices HTTP/1.1\r\n"
+                            "Host: 127.0.0.1\r\n"
+                            "Content-Type: application/octet-stream\r\n"
+                            "Content-Length: 67108864\r\n\r\nhello";
+    const auto r = yuzu::test::probe_for_close(ts.port, req);
+    INFO(r.head);
+    CHECK(r.head.starts_with("HTTP/1.1 413"));
+    CHECK(r.head.find("Connection: close") != std::string::npos);
+    CHECK(r.closed);
+    CHECK(ts.pre_routing_rejections.load() == 1);
     CHECK(ts.handler_calls.load() == 0);
 }
 
@@ -1351,16 +1343,16 @@ struct PreRoutingAnswerServer {
 
 } // namespace
 
-TEST_CASE("Pre-routing answer: a response below 400 to a request with an unread framed body "
-          "closes the connection",
+TEST_CASE("Pre-routing answer: a response to a request with an unread framed body closes the "
+          "connection",
           "[body_cap][pre_routing][bounds][integration]") {
     // From httplib 0.59 a response below 400 that leaves a declared request body unread must carry
     // `Connection: close`. The probe waits for EOF rather than reading the header alone: the header
-    // is what we set, EOF is what the SERVER did with it. The 413 control is not evidence for the
-    // rule (httplib stamps close itself for a status >= 400); the 302 and 200 rows are. The third
-    // framing is an empty Transfer-Encoding line followed by `chunked`: `get_header_value` sees no
-    // Transfer-Encoding, httplib reads the body as chunked.
-    for (const int status : {302, 200}) {
+    // is what we set, EOF is what the SERVER did with it. The 302 and 200 rows pin the close rule;
+    // the 413 and 400 rows pin that a refusal is answered and closed too (httplib stamps close
+    // itself for a status >= 400). The third framing is an empty Transfer-Encoding line followed by
+    // `chunked`: `get_header_value` sees no Transfer-Encoding, httplib reads the body as chunked.
+    for (const int status : {302, 200, 413, 400}) {
         for (const auto& [name, request] :
              {std::pair<const char*, std::string>{"chunked", yuzu::test::kChunkedPostRequest},
               std::pair<const char*, std::string>{"content-length 64 MiB declared",
@@ -1384,7 +1376,7 @@ TEST_CASE("Pre-routing answer: a bodyless request keeps its keep-alive connectio
     // pre-routing handler (the sign-in redirect of a bookmarked page) must not lose keep-alive.
     PreRoutingAnswerServer ts(302);
     const auto r = yuzu::test::probe_for_close(
-        ts.port, "GET /home HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        ts.port, "GET /home HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", std::chrono::seconds(2));
     INFO(r.head);
     CHECK(r.head.find("Connection: close") == std::string::npos);
     CHECK_FALSE(r.closed);
@@ -1478,29 +1470,147 @@ TEST_CASE("transfer_encoding_for_body_cap: an empty first line still reads as pr
 
 // ── httplib's pre-request handler runs before the body is read (cpp-httplib >= 0.47) ─────────────
 //
-// The post-read body cap and the step-up stage measure `req.body`, so they must run AFTER httplib
+// The post-read body cap and the step-up check measure `req.body`, so they must run AFTER httplib
 // has read it: they are installed through `PostReadStageRegistry` and the route sink, never as
 // `set_pre_request_handler`. These two cases keep that true when the baseline moves or when the
-// route-sink wrapper change is reverted on its own.
+// route-sink wrapper change is reverted on its own. The scan LOGIC below shares nothing with the
+// wrapper change's own wiring tests, but this file as a whole needs that change
+// (`post_read_stage_test_support.hpp`, `PostReadStageRegistry`), so it is the source scan that
+// carries the pin, not the file's independence.
 
 namespace {
 
 /// `{major, minor}` of the httplib this build links, from `CPPHTTPLIB_VERSION` ("0.59.0").
+/// A malformed string fails the test loudly instead of reading as an old version.
 std::pair<int, int> httplib_major_minor() {
     const std::string_view v = CPPHTTPLIB_VERSION;
-    int major = 0;
-    int minor = 0;
-    const auto dot = v.find('.');
-    REQUIRE(dot != std::string_view::npos);
-    std::from_chars(v.data(), v.data() + dot, major);
-    const auto rest = v.substr(dot + 1);
-    std::from_chars(rest.data(), rest.data() + rest.find('.'), minor);
+    const auto dot1 = v.find('.');
+    REQUIRE(dot1 != std::string_view::npos);
+    const auto dot2 = v.find('.', dot1 + 1);
+    REQUIRE(dot2 != std::string_view::npos);
+    int major = -1;
+    int minor = -1;
+    const auto r1 = std::from_chars(v.data(), v.data() + dot1, major);
+    const auto r2 = std::from_chars(v.data() + dot1 + 1, v.data() + dot2, minor);
+    INFO("CPPHTTPLIB_VERSION = " << v);
+    REQUIRE(r1.ec == std::errc{});
+    REQUIRE(r1.ptr == v.data() + dot1);
+    REQUIRE(r2.ec == std::errc{});
+    REQUIRE(r2.ptr == v.data() + dot2);
+    REQUIRE(major >= 0);
+    REQUIRE(minor >= 0);
     return {major, minor};
 }
 
 bool httplib_reads_body_after_pre_request_handler() {
     const auto [major, minor] = httplib_major_minor();
     return major > 0 || minor >= 47;
+}
+
+/// `in` with comments and string, raw-string and character literals blanked, so a mention in a
+/// comment or a string cannot count as code. False in `clean` when a comment or literal is left
+/// open. Minimal on purpose: it is enough for the identifier scan below.
+struct CodeOnly {
+    std::string text;
+    bool clean = true;
+};
+
+CodeOnly code_only(const std::string& in) {
+    CodeOnly r;
+    const auto n = in.size();
+    const auto is_ident = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+               c == '_';
+    };
+    for (std::size_t i = 0; i < n;) {
+        const char c = in[i];
+        if (c == '/' && i + 1 < n && in[i + 1] == '/') {
+            while (i < n && in[i] != '\n')
+                ++i;
+        } else if (c == '/' && i + 1 < n && in[i + 1] == '*') {
+            const auto end = in.find("*/", i + 2);
+            if (end == std::string::npos) {
+                r.clean = false;
+                break;
+            }
+            r.text += ' ';
+            i = end + 2;
+        } else if (c == '"' || c == '\'') {
+            // A quote right after an identifier character that is not an encoding prefix is a
+            // digit separator (120'000), not a literal.
+            auto b = i;
+            while (b > 0 && is_ident(in[b - 1]))
+                --b;
+            const auto id = in.substr(b, i - b);
+            if (c == '\'' && !id.empty() && id != "L" && id != "u" && id != "U" && id != "u8") {
+                r.text += c;
+                ++i;
+            } else if (c == '"' &&
+                       (id == "R" || id == "u8R" || id == "uR" || id == "UR" || id == "LR")) {
+                const auto open = in.find('(', i + 1);
+                if (open == std::string::npos || open - (i + 1) > 16) {
+                    r.clean = false;
+                    break;
+                }
+                const std::string close = ")" + in.substr(i + 1, open - (i + 1)) + "\"";
+                const auto end = in.find(close, open + 1);
+                if (end == std::string::npos) {
+                    r.clean = false;
+                    break;
+                }
+                r.text += "\"\"";
+                i = end + close.size();
+            } else {
+                ++i;
+                while (i < n && in[i] != c) {
+                    if (in[i] == '\\')
+                        ++i;
+                    ++i;
+                }
+                if (i >= n) {
+                    r.clean = false;
+                    break;
+                }
+                r.text += c;
+                r.text += c;
+                ++i;
+            }
+        } else {
+            r.text += c;
+            ++i;
+        }
+    }
+    return r;
+}
+
+/// Occurrences of `name` as a whole identifier in the code-only text.
+std::size_t count_identifier(const std::string& text, std::string_view name) {
+    const auto is_ident = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+               c == '_';
+    };
+    std::size_t n = 0;
+    for (auto at = text.find(name); at != std::string::npos; at = text.find(name, at + 1)) {
+        const bool left = at == 0 || !is_ident(text[at - 1]);
+        const auto end = at + name.size();
+        const bool right = end >= text.size() || !is_ident(text[end]);
+        if (left && right)
+            ++n;
+    }
+    return n;
+}
+
+/// How many times the bare token `set_pre_request_handler` appears as code in `text`: any use
+/// (`->`, `.`, `::`, a member pointer, a call through an alias) counts, not only a call.
+std::size_t pre_request_handler_uses(const std::string& text) {
+    return count_identifier(text, "set_pre_request_handler");
+}
+
+std::string read_server_src_file(const char* name) {
+    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/" + name, std::ios::binary);
+    INFO("reading " << name);
+    REQUIRE(in.good());
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
 } // namespace
@@ -1526,15 +1636,22 @@ TEST_CASE("httplib pre-request handler: it runs before the request body is read 
     const int port = svr.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
     std::thread server_thread([&]() { svr.listen_after_bind(); });
+    // Stops and joins on every exit, including a failed REQUIRE below: a joinable std::thread
+    // destroyed during unwinding would terminate the whole test binary. The wait sits inside the
+    // joinable() test because stop() is a no-op until the accept loop is running.
+    yuzu::test::ScopeExit joiner{[&] {
+        if (server_thread.joinable()) {
+            svr.wait_until_ready();
+            svr.stop();
+            server_thread.join();
+        }
+    }};
     svr.wait_until_ready();
 
     const std::string body(2048, 'x');
     httplib::Client cli("127.0.0.1", port);
     cli.set_read_timeout(10, 0);
     const auto r = cli.Post("/probe", body, "application/octet-stream");
-
-    svr.stop();
-    server_thread.join();
 
     REQUIRE(r);
     CHECK(r->status == 200);
@@ -1546,39 +1663,48 @@ TEST_CASE("httplib pre-request handler: it runs before the request body is read 
         CHECK(pre_request_body_size.load() == body.size());
 }
 
-TEST_CASE("server.cpp never installs httplib's pre-request handler on a baseline that reads the "
-          "body after it",
+TEST_CASE("server.cpp and the route sink never use httplib's pre-request handler on a baseline "
+          "that reads the body after it",
           "[body_cap][httplib_version][lexical]") {
-    // A source-text pin owned by the baseline change, not by the route-sink wrapper change: if
-    // the wrapper change is reverted alone on this baseline, server.cpp would again install the
-    // stage with `set_pre_request_handler`, which runs before the body is read, so the post-read
-    // body cap and the step-up check would silently see an empty body. Self-contained on purpose:
-    // it shares no helper with the wrapper change's own wiring tests.
+    // A source-text pin, over comment- and literal-stripped text, that does not depend on the
+    // route-sink wrapper change's own tests: the bare token `set_pre_request_handler` must not
+    // appear as code in server.cpp or in the three files that implement the stage, in any form.
+    // If that wrapper change were reverted on its own on this baseline, server.cpp would again
+    // install the stage that way, which runs before the body is read, and the post-read body cap
+    // and the step-up check would see an empty body.
     if (!httplib_reads_body_after_pre_request_handler()) {
         SUCCEED("this httplib reads the body before its pre-request handler");
         return;
     }
-    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/server.cpp", std::ios::binary);
-    REQUIRE(in.good());
-    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    // A call is a member access followed by the name and a parenthesis; prose that mentions the
-    // name does not match.
-    const auto skip_space_back = [&](std::size_t at) {
-        while (at > 0 && (src[at - 1] == ' ' || src[at - 1] == '\t' || src[at - 1] == '\n' ||
-                          src[at - 1] == '\r'))
-            --at;
-        return at;
-    };
-    constexpr std::string_view kName = "set_pre_request_handler";
-    std::size_t calls = 0;
-    for (auto at = src.find(kName); at != std::string::npos; at = src.find(kName, at + 1)) {
-        const auto before = skip_space_back(at);
-        const bool member = before > 0 && (src[before - 1] == '.' || src[before - 1] == '>');
-        const auto after = src.find_first_not_of(" \t\r\n", at + kName.size());
-        if (member && after != std::string::npos && src[after] == '(')
-            ++calls;
+    for (const char* name :
+         {"server.cpp", "http_route_sink.hpp", "post_read_stage.hpp", "post_read_stage.cpp"}) {
+        INFO(name);
+        const auto stripped = code_only(read_server_src_file(name));
+        REQUIRE(stripped.clean);
+        CHECK(pre_request_handler_uses(stripped.text) == 0);
     }
-    CHECK(calls == 0);
-    // ... and the stage still goes in through the registry.
-    CHECK(src.find("PostReadStageRegistry::instance().install(") != std::string::npos);
+    // The stage still goes in through the registry.
+    const auto server = code_only(read_server_src_file("server.cpp"));
+    REQUIRE(server.clean);
+    CHECK(server.text.find("PostReadStageRegistry::instance().install(") != std::string::npos);
+}
+
+TEST_CASE("pre-request handler scan: negative controls", "[body_cap][httplib_version][lexical]") {
+    // The scan above must see every form of use, and must not see a mention.
+    const auto uses = [](const std::string& src) {
+        const auto s = code_only(src);
+        REQUIRE(s.clean);
+        return pre_request_handler_uses(s.text);
+    };
+    CHECK(uses("svr->set_pre_request_handler(f);") == 1);
+    CHECK(uses("svr.set_pre_request_handler(f);") == 1);
+    CHECK(uses("httplib::Server::set_pre_request_handler;") == 1);
+    CHECK(uses("auto p = &httplib::Server::set_pre_request_handler;") == 1);
+    CHECK(uses("x\n  ->\n  set_pre_request_handler\n  (f);") == 1);
+    CHECK(uses("// svr->set_pre_request_handler(f);\n") == 0);
+    CHECK(uses("/* set_pre_request_handler */ int a;") == 0);
+    CHECK(uses("const char* s = \"set_pre_request_handler\";") == 0);
+    CHECK(uses("auto s = R\"x(set_pre_request_handler)x\";") == 0);
+    CHECK(uses("my_set_pre_request_handler(f); set_pre_request_handler_2(f);") == 0);
+    CHECK_FALSE(code_only("int a; /* open").clean);
 }

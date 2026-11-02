@@ -765,7 +765,7 @@ struct BodyCapDecision {
 /// `const httplib::Request&` here would tempt a future caller to re-derive
 /// `is_chunked` (or `content_length`, or `has_content_length`) INSIDE this
 /// function from the request instead of from the caller's own
-/// `content_length_for_body_cap`/`is_chunked_for_body_cap` calls — at
+/// `content_length_for_body_cap`/`is_chunked_for_body_cap` calls, at
 /// which point the production call site and the test fixture below are back
 /// to two independent implementations of the same httplib quirk, which is
 /// precisely the class of defect #2407 R2 was. Taking the already-extracted

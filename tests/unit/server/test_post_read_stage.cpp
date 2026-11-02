@@ -16,6 +16,7 @@
 #include "../../../server/core/src/http_route_sink.hpp"
 #include "../../../server/core/src/post_read_stage.hpp"
 #include "../../../server/core/src/route_inventory.hpp"
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -353,13 +354,16 @@ TEST_CASE("post-read stage: an exempt server with no stage installed serves its 
 
 TEST_CASE("post-read stage: a regex route does not match a path longer than httplib's regex "
           "route path limit, so neither the stage nor the handler runs for it",
-          "[postread][wiring][regex_cap]") {
+          "[postread][wiring][regex_cap][body_cap][bounds][integration]") {
     // From cpp-httplib 0.59.0 a regex route (any pattern with a capture group, `(.+)` included)
     // is skipped for a path longer than CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH (256 bytes by
     // default), where 0.37.1 had no such limit. An unmatched path never reaches a handler, so the
     // effect on the routes that carry an id in the path (`/api/v1/tokens/(.+)` and the like) is a
-    // refusal (httplib's own 404), never an ungated pass. Pinned here so a httplib that changes
-    // the limit, or a build that sets CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH, is noticed.
+    // refusal (httplib's own 404), never an ungated pass. The upgrade guide and the changelog
+    // state the number, so a httplib that changes the limit, or a build that sets the macro, must
+    // fail here before that text goes stale.
+    CHECK(CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH == 256);
+
     httplib::Server svr;
     Clean clean(&svr);
     std::atomic<int> stage_calls{0};
@@ -377,21 +381,39 @@ TEST_CASE("post-read stage: a regex route does not match a path longer than http
     const int port = svr.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
     std::thread th([&] { svr.listen_after_bind(); });
+    // Stops and joins on every exit, including a failed REQUIRE below: a joinable std::thread
+    // destroyed during unwinding would terminate the whole test binary. The wait sits inside the
+    // joinable() test because stop() is a no-op until the accept loop is running.
+    yuzu::test::ScopeExit joiner{[&] {
+        if (th.joinable()) {
+            svr.wait_until_ready();
+            svr.stop();
+            th.join();
+        }
+    }};
     svr.wait_until_ready();
 
-    httplib::Client cli("127.0.0.1", port);
-    auto shortp = cli.Get("/yuzu_test_re/" + std::string(40, 'a'));
-    auto longp = cli.Get("/yuzu_test_re/" + std::string(300, 'a'));
+    const std::string prefix = "/yuzu_test_re/";
+    const auto at_limit =
+        prefix + std::string(CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH - prefix.size(), 'a');
+    const auto over_limit = at_limit + "a";
+    REQUIRE(at_limit.size() == CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH);
 
-    svr.stop();
-    th.join();
+    httplib::Client cli("127.0.0.1", port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    const auto shortp = cli.Get(prefix + std::string(40, 'a'));
+    const auto atp = cli.Get(at_limit);
+    const auto overp = cli.Get(over_limit);
 
     REQUIRE(shortp);
     CHECK(shortp->status == 200);
-    REQUIRE(longp);
-    CHECK(longp->status == 404);
-    CHECK(handler_calls.load() == 1);
-    CHECK(stage_calls.load() == 1);
+    REQUIRE(atp);
+    CHECK(atp->status == 200);
+    REQUIRE(overp);
+    CHECK(overp->status == 404);
+    CHECK(handler_calls.load() == 2);
+    CHECK(stage_calls.load() == 2);
 }
 
 TEST_CASE("post-read stage: a sink on a server with no stage installed refuses every verb and "
