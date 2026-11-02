@@ -68,10 +68,8 @@
 // notify is consumed, so nothing from its loaded life pins the ETW buffer. When it is loaded
 // again its first loaded read happens at once and diffs against the offline baseline. A failed
 // mount is an Unreadable read with a named reason (one gap row per transition); an INCOMPLETE
-// profile discovery keeps the known offline list (reconcile_offline): scope is removed only
-// when two complete walks of one tick both omit the profile, and a path first learned or changed
-// for a known profile is taken only when both walks list the same one (collect() confirms both
-// with a second walk).
+// profile discovery keeps the known offline list (reconcile_offline); removing a known profile
+// or taking a new path for it needs two agreeing walks in one tick (collect() confirms).
 
 #include "echo_db.hpp" // RegistryEvent
 
