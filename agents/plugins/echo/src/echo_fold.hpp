@@ -435,6 +435,9 @@ struct KeyedContribution {
 /// First 8 bytes of SHA-256 over the length-prefixed field list, as a signed 64-bit
 /// value. Length prefixes (not a separator) so no field value can forge a boundary.
 /// 64 bits distinguish payloads; this is a replay check, not an adversarial boundary.
+/// The digest is PERSISTED in echo_fold_seen: changing the field set a delta feeds
+/// in, or this encoding, makes every stored digest a false collision, so such a change
+/// must clear the ring (DELETE FROM echo_fold_seen) in the same schema step.
 [[nodiscard]] inline int64_t identity_digest(const std::vector<std::string>& fields) {
     std::string buf;
     for (const auto& f : fields) {

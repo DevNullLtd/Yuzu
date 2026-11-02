@@ -385,6 +385,11 @@ EchoFold::fold_cursor_rows(EchoDatabase& db, std::string_view source,
             if (rc == SQLITE_ROW) { // inserted: a first sighting, fold it
                 sqlite3_reset(ins.get()); // the insert is done; drop the pending RETURNING row
                 ++seq;
+                // add()'s bool is deliberately ignored: `kept` holds only representable
+                // stamps, so it cannot refuse here; a misnamed key or measure makes
+                // resolve() throw, which unwinds the lambda and rolls back as Transient.
+                // The Interner (and its staged ids) lives OUTSIDE the lambda because
+                // checked_transaction runs it exactly once, never retrying.
                 acc.add(c->ts, c->keys, c->measures);
                 ++res.folded;
                 continue;

@@ -146,7 +146,9 @@ int echo_query_authorizer(void* /*ctx*/, int action, const char* arg1, const cha
             // `SELECT COUNT(*) FROM <view>` is reported as a column-less read of the table
             // behind the view with no view context. Allow that for the row tables only: it
             // exposes a row count the view already exposes, never a column. The dictionary
-            // and the replay ring stay denied outright.
+            // and the replay ring stay denied outright. Sound only while every roll-up view
+            // is a WHERE-less single-table projection (generate_fold_ddl, pinned by test);
+            // a filter or JOIN in a view turns this count into an oracle.
             if (is_fold_row_table(arg1) && (!arg2 || *arg2 == '\0'))
                 return SQLITE_OK;
             return SQLITE_DENY;

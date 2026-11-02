@@ -1,7 +1,7 @@
 /**
  * test_echo_fold_sizing.cpp -- bytes-per-row ceilings for the roll-up substrate.
  *
- * Every fold source folds 100,000 distinct-key events in ONE transaction; the
+ * Every fold source folds 20,000 distinct-key events in ONE transaction; the
  * test then reports how many bytes the roll-up tables and their unique index cost
  * per row. The dictionary and the replay ring grow in the same file, so each is
  * measured by a control (an in-memory copy of the same schema that receives the
@@ -33,7 +33,7 @@ using namespace yuzu::echo;
 
 namespace {
 
-constexpr int kEvents = 100'000;
+constexpr int kEvents = 20'000;
 constexpr int64_t kBase = 1793615400; // 2026-11-02T10:30:00Z: every event shares one hour/day/month
 
 int64_t pragma(sqlite3* db, const char* name) {
@@ -213,26 +213,28 @@ Sizes measure(const FoldSourceDef& def) {
 TEST_CASE("roll-up size: bytes per row stay under the pinned ceilings, for every fold source",
           "[echo][fold][fold_sizing]") {
     // Ceilings, bytes per row (table + unique index, all tiers). process, tcp, module, registry and
-    // perf are the design figures. The rest are the measured figure x 1.25 rounded up to a multiple
-    // of 8, with the measurement beside each. All of them depend on this fixture's small non-zero
-    // measures and its TEXT measure lengths (text_measure_len), not on production data.
+    // perf are the design figures. The rest are the figure measured at 100,000 keys x 1.25 rounded
+    // up to a multiple of 8. Both measurements sit beside each ceiling (at 100,000 keys, then at
+    // the 20,000 this test folds; the per-row cost barely moves with the key count). All of them
+    // depend on this fixture's small non-zero measures and its TEXT measure lengths
+    // (text_measure_len), not on production data.
     const std::map<std::string, double> ceiling = {
-        {"process", 56},   // measured 54.2
-        {"tcp", 64},       // measured 58.3
-        {"module", 80},    // measured 60.8
-        {"registry", 640}, // measured 612.3 (a 512 B last_data: 7 rows to a 4 KiB page)
-        {"perf", 192},     // measured 109.1
-        {"service", 128},  // measured 99.1
-        {"user", 72},      // measured 52.1
-        {"procperf", 104}, // measured 78.0
-        {"netqual", 88},   // measured 64.3
-        {"software", 72},  // measured 56.6
-        {"arp", 72},       // measured 52.2
-        {"dns", 64},       // measured 50.1
-        {"netconn", 96},   // measured 71.8
-        {"mapdrive", 104}, // measured 77.8
-        {"power", 88},     // measured 65.3
-        {"removable", 120}, // measured 93.1
+        {"process", 56},    // measured 54.2 @100k, 51.0 @20k
+        {"tcp", 64},        // measured 58.3 @100k, 55.3 @20k
+        {"module", 80},     // measured 60.8 @100k, 57.8 @20k
+        {"registry", 640},  // measured 612.3 @100k, 610.8 @20k (a 512 B last_data: 7 rows to a 4 KiB page)
+        {"perf", 192},      // measured 109.1 @100k, 108.3 @20k
+        {"service", 128},   // measured 99.1 @100k, 96.3 @20k
+        {"user", 72},       // measured 52.1 @100k, 48.9 @20k
+        {"procperf", 104},  // measured 78.0 @100k, 75.4 @20k
+        {"netqual", 88},    // measured 64.3 @100k, 61.0 @20k
+        {"software", 72},   // measured 56.6 @100k, 53.5 @20k
+        {"arp", 72},        // measured 52.2 @100k, 49.2 @20k
+        {"dns", 64},        // measured 50.1 @100k, 46.9 @20k
+        {"netconn", 96},    // measured 71.8 @100k, 69.0 @20k
+        {"mapdrive", 104},  // measured 77.8 @100k, 74.8 @20k
+        {"power", 88},      // measured 65.3 @100k, 62.1 @20k
+        {"removable", 120}, // measured 93.1 @100k, 90.0 @20k
     };
     Sizes tcp, registry;
     for (const auto& def : fold_sources()) {

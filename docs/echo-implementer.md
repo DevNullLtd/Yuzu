@@ -186,11 +186,16 @@ returned as an error, never as an empty success.
 **`echo.sql` and the authorizer.** The views read the dictionary and the `_r` tables, so
 `echo_query_authorizer` lets those tables be read ONLY when SQLite reports the access under a
 roll-up view (plus a column-less `COUNT(*)`-style read of a `_r` table, which exposes only a row
-count the view already shows). That rule is sound only because `validate_and_translate_sql`
-refuses `WITH`: SQLite reports a CTE's reads under the CTE's name, so a CTE named after a view
-would otherwise reach the dictionary. The authorizer rule is defence in depth behind that
-refusal, not the closure. Direct reads of `echo_dict`, `echo_fold_seen` and any `_r` table, and
-the `usage_*` tables, stay denied.
+count the view already shows, and only while every view is a WHERE-less single-table projection,
+which the DDL test pins). That rule is sound only because `validate_and_translate_sql` refuses
+`WITH`: SQLite reports a CTE's reads under the CTE's name, so a CTE named after a view would
+otherwise reach the dictionary. The same validator refuses `NATURAL` and `USING` joins: SQLite
+resolves their shared columns before name resolution, so those reads never reach the authorizer
+at all (`echo_dict a NATURAL JOIN echo_dict b` counts the dictionary; a view joined `USING` to a
+usage table is a per-user presence oracle); both are observed by test on the shipped SQLite, and
+`ON` joins carry every read through the authorizer. The authorizer rule is defence in depth
+behind those refusals, not the closure. Direct reads of `echo_dict`, `echo_fold_seen` and any
+`_r` table, and the `usage_*` tables, stay denied.
 
 **`install_fold_schema` is destructive.** A view cannot take the name of an existing table, so it
 drops a legacy tier table first. It exists as the migration precursor and has no production caller

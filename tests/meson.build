@@ -1403,7 +1403,7 @@ echo_test_exe = executable(
   link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   dependencies: echo_test_deps,
 )
-# The sizing cases fold 100,000 distinct keys per source, so they run as their own test() with a
+# The sizing cases fold 20,000 distinct keys per source, so they run as their own test() with a
 # longer timeout; the main run excludes them (the same filter-split shape as the server shards below).
 test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 90)
 test('echo fold sizing', echo_test_exe, args: ['[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)

@@ -327,6 +327,7 @@ TEST_CASE("fold_sources: 1:1 with the registry, internally consistent", "[echo][
                 REQUIRE(g != d.columns.end());
                 CHECK(g->sql_type == "INTEGER");
                 CHECK(g->role == ColumnRole::kMeasure);
+                CHECK(g->merge == MergeOp::kMax); // the guard itself only ever moves forward
             }
             if (c.role == ColumnRole::kGenerated) {
                 const std::string expr{c.generated_expr};
@@ -450,6 +451,31 @@ TEST_CASE("generate_fold_ddl: tables, indexes and views are exactly what the dec
     const auto digest = rows(m.db, "SELECT \"notnull\" FROM pragma_table_info('echo_fold_seen') WHERE name='digest'");
     REQUIRE(digest.size() == 1);
     CHECK(digest[0][0] == "1");
+
+    // Every view is a WHERE-less single-table projection: no JOIN, no row filter, and
+    // the only WHERE is the one inside each correlated dictionary lookup. The authorizer
+    // lets a column-less read of a `_r` table through because its row count is exactly
+    // the view's; a filter or a JOIN in a view would turn that count into an oracle.
+    for (const auto& d : fold_sources()) {
+        if (d.own_tables)
+            continue;
+        std::size_t interned = 0;
+        for (const auto& c : d.columns)
+            interned += c.interned ? 1 : 0;
+        for (auto tier : d.tiers) {
+            const auto view = fold_view_name(d.name, tier);
+            INFO("view " << view);
+            const auto sql = rows(m.db, "SELECT sql FROM sqlite_master WHERE type='view' AND name='" + view + "'");
+            REQUIRE(sql.size() == 1);
+            const std::string& v = sql[0][0];
+            CHECK(v.find(" JOIN ") == std::string::npos);
+            CHECK(v.ends_with(" FROM " + physical_table_name(d.name, tier) + " r"));
+            std::size_t wheres = 0;
+            for (auto pos = v.find(" WHERE "); pos != std::string::npos; pos = v.find(" WHERE ", pos + 1))
+                ++wheres;
+            CHECK(wheres == interned);
+        }
+    }
 }
 
 TEST_CASE("generate_fold_ddl: every view keeps today's columns first, in order, with the same types",
@@ -1431,6 +1457,12 @@ TEST_CASE("fold and GC serialise: no dangling dictionary id after concurrent use
     REQUIRE(f->db.execute_sql("INSERT INTO process_hourly_r(hour_ts, name_id, user_id, parent_name_id) "
                               "VALUES (1, 999999, 999999, 999999)"));
     CHECK(integrity_violations(*f) > 0);
+
+    // Equivalence pin: the view never hides a row. A dangling id reads as a NULL text key,
+    // and the view's row count stays the row table's: that is what makes the authorizer's
+    // column-less read of a `_r` table expose nothing the view does not.
+    CHECK(f->n("SELECT COUNT(*) FROM process_hourly") == f->n("SELECT COUNT(*) FROM process_hourly_r"));
+    CHECK(f->n("SELECT COUNT(*) FROM process_hourly WHERE name IS NULL AND user IS NULL") == 1);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1465,8 +1497,18 @@ TEST_CASE("operator SQL reads the roll-up views, never the tables behind them", 
     const auto cnt = plugin_sql(f->db, "SELECT COUNT(*) FROM process_hourly");
     REQUIRE(cnt.has_value());
     CHECK(cnt->rows[0][0] == "1");
-    // A column-less read of a row table exposes only a count the view already exposes.
-    CHECK(plugin_sql(f->db, "SELECT COUNT(*) FROM process_hourly_r").has_value());
+    // A column-less read of a row table exposes only a count the view already exposes:
+    // bare COUNT(*), SELECT 1 and EXISTS are the allowed shapes, pinned here. Every
+    // column, id, rowid and oid read of a `_r` table stays denied, as does a count that
+    // a column narrows (WHERE, ORDER BY, GROUP BY): those read the column.
+    for (const char* sql : {
+             "SELECT COUNT(*) FROM process_hourly_r",
+             "SELECT 1 FROM process_hourly_r",
+             "SELECT EXISTS(SELECT 1 FROM process_hourly_r)",
+         }) {
+        INFO(sql);
+        CHECK(plugin_sql(f->db, sql).has_value());
+    }
 
     for (const char* sql : {
              "SELECT * FROM echo_dict",
@@ -1480,13 +1522,86 @@ TEST_CASE("operator SQL reads the roll-up views, never the tables behind them", 
              "SELECT COUNT(*) FROM echo_dict",
              "SELECT 1 FROM echo_dict",
              "SELECT COUNT(*) FROM echo_fold_seen",
+             "SELECT 1 FROM echo_fold_seen",
              "SELECT hour_ts FROM process_hourly_r",
+             "SELECT id FROM process_hourly_r",
+             "SELECT oid FROM process_hourly_r",
+             "SELECT _rowid_ FROM process_hourly_r",
              "SELECT rowid FROM process_hourly_r",
              "SELECT name_id FROM process_hourly_r",
+             "SELECT 1 FROM process_hourly_r WHERE rowid = 1",
+             "SELECT 1 FROM process_hourly_r ORDER BY name_id",
+             "SELECT COUNT(*) FROM process_hourly_r GROUP BY user_id",
+             "SELECT COUNT(*) FROM perf_hourly_r WHERE cpu_avg > 0",
          }) {
         INFO(sql);
         CHECK_FALSE(plugin_sql(f->db, sql).has_value());
     }
+}
+
+TEST_CASE("operator SQL: NATURAL and USING joins never reach the dictionary or the usage tables",
+          "[echo][fold][authorizer]") {
+    // SQLite resolves a NATURAL / USING join's shared columns before name resolution, so
+    // those column reads never reach the authorizer, and a table whose only reads are
+    // USING terms is never reported column-less either. The probes below drive the
+    // read-only connection DIRECTLY (validator bypassed) and pin what the authorizer alone
+    // does; the plugin path (validator first) must refuse every one of them.
+    auto f = make_fold_db();
+    fold_names(*f, {"a.exe"});
+    {
+        UserEvent li;
+        li.ts = kT0;
+        li.action = "login";
+        li.user = "u";
+        li.domain = "d";
+        li.logon_type = "2";
+        auto acc = make_acc("user");
+        user_delta({li}, acc);
+        REQUIRE(f->fold.fold_rows(f->db, "user", acc).has_value());
+    }
+    // A usage row for the same user on the same day: the presence oracle's target (#4260).
+    REQUIRE(f->db.execute_sql("INSERT INTO usage_daily_user(day_ts, exe_key, user) VALUES (" +
+                              std::to_string(kDay0) + ", 'x.exe', 'u')"));
+
+    struct Probe {
+        const char* sql;
+        bool authorizer_admits; // observed on the shipped SQLite, pinned
+    };
+    // Observed: the authorizer alone ADMITS a NATURAL join and a USING join over real
+    // columns (the dictionary's size; the user's presence in the usage table), because
+    // those column reads never reach it. USING over the rowid alias `id` is the one
+    // shape it still catches: a rowid-alias read leaves the table column-less, which is
+    // reported, and the dictionary is denied column-less. That is why the validator, not
+    // the authorizer, is the closure for NATURAL / USING; these pins say so.
+    const Probe probes[] = {
+        {"SELECT COUNT(*) FROM echo_dict a NATURAL JOIN echo_dict b", true},
+        {"SELECT COUNT(*) FROM echo_dict a JOIN echo_dict b USING (text)", true},
+        {"SELECT COUNT(*) FROM echo_dict a JOIN echo_dict b USING (id)", false},
+        {"SELECT COUNT(*) FROM user_daily NATURAL JOIN usage_daily_user WHERE user_daily.user = 'u'", true},
+        {"SELECT COUNT(*) FROM user_daily JOIN usage_daily_user USING (day_ts, user) "
+         "WHERE user_daily.user = 'u'",
+         true},
+    };
+    for (const auto& p : probes) {
+        INFO(p.sql);
+        const auto direct = f->db.execute_user_query(p.sql);
+        CHECK(direct.has_value() == p.authorizer_admits);
+        if (direct.has_value()) {
+            REQUIRE(direct->rows.size() == 1);
+            CHECK(direct->rows[0][0] != "0"); // it really reached the data
+        }
+    }
+    for (const auto& p : probes) {
+        INFO(p.sql);
+        const auto v = validate_and_translate_sql(p.sql);
+        REQUIRE_FALSE(v.has_value());
+        CHECK(v.error().find("forbidden keyword") != std::string::npos);
+    }
+    // ON joins keep working, and identifiers or literals that merely contain the words
+    // are not the keywords.
+    CHECK(plugin_sql(f->db, "SELECT COUNT(*) FROM process_hourly p JOIN process_daily d ON d.name = p.name")
+              .has_value());
+    CHECK(plugin_sql(f->db, "SELECT name AS using_it, 'natural' AS n FROM process_hourly").has_value());
 }
 
 TEST_CASE("operator SQL: a CTE can never shadow a roll-up view name", "[echo][fold][authorizer]") {

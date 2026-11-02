@@ -175,6 +175,11 @@ bool contains_dangerous_keyword(const std::string& stripped_sql) {
         // echo_query_authorizer lets the dictionary and `_r` tables be read by a
         // roll-up view, and SQLite reports a CTE's inner reads under the CTE's name.
         "WITH",
+        // NATURAL and USING joins are refused: SQLite resolves their shared columns
+        // before name resolution, so those reads never reach the authorizer (a
+        // dictionary self-join counts the dictionary; a view joined to a usage table
+        // is a per-user presence oracle). ON joins carry every read through it.
+        "NATURAL", "USING",
     };
 
     for (auto kw : dangerous) {
