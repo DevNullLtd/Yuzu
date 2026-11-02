@@ -423,8 +423,11 @@ from those two settings, not an observed figure. Plan for these requirements:
   The first retry is 1 to 3 s, so about a third of a failed node's agents land in each of
   three one-second steps; later retries spread wider, so the agents of a failed node return
   in flatter bursts rather than all at once. In a long outage an agent retries about twice
-  as often as it did with the old fixed 2, 4, 8 ... 256 s waits (a mean wait of about 135 s
-  once settled, against 256 s), which is simulated, not measured on a fleet. The 300 s is
+  as often as it did with the old fixed 2, 4, 8 ... 256 s waits (about 28 attempts in 30
+  minutes against 13, and a mean wait of about 135 s once settled, against 256 s); these
+  figures come from a simulation, not a fleet measurement. The average return after an
+  outage is usually sooner, but the slowest 1% of agents can wait longer than before
+  (simulated: about 285 s against 250 s). The 300 s is
   the wait only; one attempt can then take up to 30 s (the Register deadline). A restarted
   agent connects at once with no wait, and the heartbeat-driven re-registration cooldown is
   unchanged and not randomised. Survivors absorb the returning share at the registration
@@ -1338,7 +1341,7 @@ listen socket, so a new connection to the agent port is **refused** at once
 accepted are reset. Every connection already established is untouched and keeps
 working. This is deliberate, rather than leaving new connections waiting in the kernel's
 listen backlog: a refused agent goes straight into its reconnect backoff (a random wait
-from a window around 2, 4, 8 ... seconds, at most 300 s) and a load balancer retries a refused connect on another node,
+between 1 s and three times its previous wait, at most 300 s) and a load balancer retries a refused connect on another node,
 while a connection parked in the backlog completes the TCP handshake, makes the agent
 wait for a TLS handshake nobody answers until gRPC gives up (about 18 s, measured
 against a server that accepts TCP and never answers), is not

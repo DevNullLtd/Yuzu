@@ -30,8 +30,11 @@
  *     single agent's delay grows much more slowly, so in a long outage an agent retries
  *     about twice as often as the old ladder did. Simulated, 30 minutes down: a mean of
  *     about 28 attempts against 13 for the old ladder, and a steady-state mean delay of
- *     about 135 s against 256 s. That is the cost of the faster recovery and the
- *     better spread; it is the owner's choice on #5990.
+ *     about 135 s against 256 s. That is the cost of the shorter average wait and the
+ *     better spread; it is the owner's choice on #5990. The average return after an
+ *     outage is usually sooner, but the slowest 1% of agents can wait longer than under
+ *     the old ladder (simulated p99 about 285 s against 250 s), because a wait that
+ *     started just before the server returned can be up to 300 s.
  *   - When previous_delay * 3 exceeds the cap, a draw above the cap becomes the cap
  *     itself, so the cap carries extra probability mass (this is the formula as decided).
  *
@@ -55,6 +58,12 @@ inline constexpr int kMaxReconnectDelaySecs = 300;
 /// A delay is drawn from [base, previous_delay * this].
 inline constexpr int kReconnectGrowthFactor = 3;
 
+/// Smallest wait between the retries of an enrolled-but-no-certificate Register. The server
+/// issues one certificate per agent per 30 s (server.cpp, kCsrIssueMinInterval), so four waits
+/// of at least this many seconds put the last bounded retry (kMaxCsrAttempts = 5) outside
+/// that window, as the old fixed 2+4+8+16 s ladder did. Plain reconnects use the base.
+inline constexpr int kReconnectCsrRetryFloorSecs = 8;
+
 /// Decorrelated-jitter reconnect delay. Owns the one piece of state the scheme needs: the
 /// previous delay. Single-threaded by design (the agent's reconnect loop is on one thread).
 class ReconnectBackoff {
@@ -70,12 +79,17 @@ public:
     /// `uniform_in(lo, hi)` must return an integer in [lo, hi] (inclusive). Whatever it
     /// returns is clamped back into that window, so a faulty source can neither spin the
     /// loop (below base) nor exceed three times the previous delay.
+    ///
+    /// `floor_secs` raises a too-short draw to at least that many seconds (never above the
+    /// cap); the floored value becomes the new `previous_delay`. It exists for the one retry
+    /// loop that must not outrun a server-side throttle (kReconnectCsrRetryFloorSecs); every
+    /// other caller leaves it at the base, which changes nothing.
     template <class UniformIn>
-    int next(UniformIn&& uniform_in) {
+    int next(UniformIn&& uniform_in, int floor_secs = kReconnectBaseSecs) {
         const int hi = previous_ * kReconnectGrowthFactor;
         const int pick = std::clamp(static_cast<int>(uniform_in(kReconnectBaseSecs, hi)),
                                     kReconnectBaseSecs, hi);
-        previous_ = std::min(pick, kMaxReconnectDelaySecs);
+        previous_ = std::min(std::max(pick, floor_secs), kMaxReconnectDelaySecs);
         return previous_;
     }
 

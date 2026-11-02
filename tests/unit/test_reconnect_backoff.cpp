@@ -17,7 +17,6 @@
 #include <random>
 #include <set>
 #include <stdexcept>
-#include <utility>
 #include <vector>
 
 using namespace yuzu::agent;
@@ -167,15 +166,15 @@ TEST_CASE("the delay actually spreads: a deterministic ladder would fail this",
     CHECK(first == std::set<int>{1, 2, 3});
 
     // From a previous delay of 27 the window is 1..81: the draws cover most of it.
-    std::set<int> from_ten;
+    std::set<int> from_27;
     for (int i = 0; i < 4000; ++i) {
         ReconnectBackoff b;
         (void)b.next(FixedSource{3});  // previous = 3
         (void)b.next(FixedSource{9});  // previous = 9
         (void)b.next(FixedSource{27}); // previous = 27
-        from_ten.insert(b.next(src));  // window 1..81
+        from_27.insert(b.next(src));   // window 1..81
     }
-    CHECK(from_ten.size() >= 70);
+    CHECK(from_27.size() >= 70);
 }
 
 TEST_CASE("simulated fleet: no one-second bucket holds more than a bounded share of retries",
@@ -189,9 +188,11 @@ TEST_CASE("simulated fleet: no one-second bucket holds more than a bounded share
     // the first wave, only breaks it into three and widens the spread every round.
     constexpr int kAgents = 10'000;
     constexpr int kRounds = 8;
-    // Observed with this engine and seed (see the commit message); the bounds leave headroom
-    // for sampling noise only.
-    constexpr int kBound[kRounds] = {3500, 2300, 1300, 700, 480, 340, 260, 200};
+    // Peaks observed with this engine and seed are 3351 2046 1130 555 357 273 192 130. Over 3000
+    // other seeds the worst were 3516 2158 1186 621 424 304 221 170, so the bounds leave
+    // headroom for sampling noise only. The seed is fixed, so the test is deterministic; the
+    // round-1 bound is the tight one and would need to move if the seed or the draw order did.
+    constexpr int kBound[kRounds] = {3600, 2300, 1300, 700, 480, 340, 260, 200};
 
     std::mt19937 engine{20261102u};
     EngineSource src{engine};
@@ -216,8 +217,8 @@ TEST_CASE("simulated fleet: no one-second bucket holds more than a bounded share
         CAPTURE(round, peak);
         CHECK(peak <= kBound[round - 1]);
     }
-    // By the last round the fleet is spread over hundreds of distinct seconds (751 or more
-    // in every seed tried).
+    // By the last round the fleet is spread over hundreds of distinct seconds (742 or more
+    // over 3000 seeds).
     CHECK(last_round_buckets.size() >= 600);
 }
 
@@ -257,6 +258,81 @@ TEST_CASE("a long outage costs about twice the retries of the old ladder (the do
     CHECK(old_attempts == 13);
     CHECK(mean > 24.0);
     CHECK(mean < 33.0);
+
+    // The settled mean delay quoted next to it (about 135 s against the old 256 s): one long
+    // run after a warm-up, so the average is of the stationary distribution.
+    ReconnectBackoff settled;
+    for (int i = 0; i < 200; ++i)
+        (void)settled.next(src);
+    constexpr int kDraws = 200'000;
+    double delay_sum = 0;
+    for (int i = 0; i < kDraws; ++i)
+        delay_sum += settled.next(src);
+    const double settled_mean = delay_sum / kDraws;
+    CAPTURE(settled_mean);
+    CHECK(settled_mean > 125.0);
+    CHECK(settled_mean < 150.0);
+}
+
+TEST_CASE("a floor raises a too-short wait, never past the cap, and becomes the previous delay",
+          "[agent][reconnect_backoff]") {
+    // The enrolled-but-no-certificate retries use kReconnectCsrRetryFloorSecs so that four waits
+    // outlast the server's 30 s one-certificate-per-agent window (the old fixed ladder summed
+    // to exactly 30 s). The floor changes nothing for a draw already above it.
+    static_assert(4 * kReconnectCsrRetryFloorSecs > 30);
+
+    ReconnectBackoff b;
+    FixedSource low{0}; // the source asks for the minimum every time
+    int total = 0;
+    for (int i = 0; i < 4; ++i)
+        total += b.next(low, kReconnectCsrRetryFloorSecs);
+    CHECK(total >= 4 * kReconnectCsrRetryFloorSecs);
+    CHECK(total > 30);
+
+    // A draw above the floor is kept; a floor above the cap is the cap.
+    ReconnectBackoff c;
+    CHECK(c.next(FixedSource{3}, 2) == 3);
+    ReconnectBackoff d;
+    CHECK(d.next(FixedSource{1}, 5000) == kMaxReconnectDelaySecs);
+
+    // The floored value is the previous delay, so the window still grows from it.
+    ReconnectBackoff e;
+    FixedSource src{0};
+    CHECK(e.next(src, 8) == 8);
+    CHECK(e.previous() == 8);
+    (void)e.next(src, 1);
+    CHECK(src.last_hi == 24); // 3 x 8
+
+    // The default floor is the base: existing behaviour is unchanged.
+    ReconnectBackoff f;
+    CHECK(f.next(FixedSource{0}) == kReconnectBaseSecs);
+
+    // Every sequence of the four no-certificate waits, as the agent runs them (reset at the
+    // first retry, then floored), clears the server's 30 s window: asserted over 100,000 seeded
+    // sequences and the two extreme sources, not as a percentile. The count of waits is
+    // kMaxCsrAttempts (5) - 1 in agent.cpp; a change to it means re-deriving this.
+    std::mt19937 engine{4242u};
+    EngineSource rnd{engine};
+    bool every_sequence_ok = true;
+    for (int run = 0; run < 100'000; ++run) {
+        ReconnectBackoff g;
+        g.reset();
+        int sum = 0;
+        for (int i = 0; i < 4; ++i) {
+            const int w = g.next(rnd, kReconnectCsrRetryFloorSecs);
+            every_sequence_ok = every_sequence_ok && w >= kReconnectCsrRetryFloorSecs &&
+                                w <= kMaxReconnectDelaySecs;
+            sum += w;
+        }
+        every_sequence_ok = every_sequence_ok && sum >= 32;
+    }
+    CHECK(every_sequence_ok);
+    ReconnectBackoff top;
+    TopSource ts;
+    int top_sum = 0;
+    for (int i = 0; i < 4; ++i)
+        top_sum += top.next(ts, kReconnectCsrRetryFloorSecs);
+    CHECK(top_sum >= 32);
 }
 
 TEST_CASE("reconnect_seed: a working entropy source supplies the words and is not degraded",

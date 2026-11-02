@@ -9,7 +9,7 @@ disagrees with ADR-2002, the ADR wins.
 
 **Verified 2026-11-02 (WS-13 row and the WS-13 clause of the gate only, against `origin/dev` at `5662c5f07`, with `gh`):** the WS-13 plan was
 written and reviewed (Fable: endorse with amendments) and the project lead decided its six open questions (Decided below, in the WS-13 row and
-the gate text). Slice 13.1 (jittered reconnect) is in the change that made this edit. WS-13 is NOT done, and the gate is NOT lifted. Every other row
+the gate text). Slice 13.1 (decorrelated-jitter reconnect, #5990) is in the change that made this edit. WS-13 is NOT done, and the gate is NOT lifted. Every other row
 is as stamped below.
 
 **Verified 2026-11-01 (status re-stamp against the merge-base with `origin/dev`, `2dcc2fcee`, with `gh`):** ONLY the WS-3 and

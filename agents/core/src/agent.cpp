@@ -1727,11 +1727,16 @@ public:
         // a node loss drops a whole share of the fleet at one instant, and a fixed ladder
         // would bring them all back in lock step. `reconnect_count` still decides WHETHER to
         // wait; `reconnect_backoff` decides HOW LONG, from its own previous delay. It is reset
-        // only once registration has fully succeeded (below), so the enrolled-but-no-cert
-        // retry keeps growing its delay across its Register calls. Main-thread only, so no
-        // lock; the engine is seeded from several OS words so two agents started from one
-        // cloned image do not share a sequence.
+        // when registration has fully succeeded (below), when a provisioned certificate is
+        // about to be used for the mTLS re-Register, and on the first enrolled-but-no-cert
+        // retry (so that retry grows from the base, not from an approval wait's long delay);
+        // later no-cert retries keep growing across their Register calls. Main-thread only,
+        // so no lock; the engine is seeded from several OS words so two agents started from
+        // one cloned image do not share a sequence.
         yuzu::agent::ReconnectBackoff reconnect_backoff;
+        // Minimum for the NEXT wait only: raised for the no-cert retries (server CSR throttle),
+        // consumed at the loop top.
+        int reconnect_floor_secs = yuzu::agent::kReconnectBaseSecs;
         std::mt19937 reconnect_rng{[] {
             // std::random_device THROWS when no entropy source can be opened, and run() has no
             // handler on this path (main.cpp calls it bare), so a throw here would be a
@@ -1801,9 +1806,12 @@ public:
         while (!stop_requested_.load(std::memory_order_acquire)) {
             if (reconnect_count > 0) {
                 // Decorrelated jitter: random in [1 s, 3 x the previous delay], at most 5 min.
-                const int delay = reconnect_backoff.next([&reconnect_rng](int lo, int hi) {
-                    return std::uniform_int_distribution<int>{lo, hi}(reconnect_rng);
-                });
+                const int delay = reconnect_backoff.next(
+                    [&reconnect_rng](int lo, int hi) {
+                        return std::uniform_int_distribution<int>{lo, hi}(reconnect_rng);
+                    },
+                    reconnect_floor_secs);
+                reconnect_floor_secs = yuzu::agent::kReconnectBaseSecs;
                 spdlog::info("Reconnecting in {}s (attempt #{})", delay, reconnect_count);
                 plugin_ctx_.config["agent.reconnect_count"] = std::to_string(reconnect_count);
                 for (int i = 0; i < delay && !stop_requested_.load(std::memory_order_acquire); ++i)
@@ -2008,7 +2016,8 @@ public:
                     continue; // Retry until approved
                 }
 
-                reconnect_count = 0; // Registration succeeded — reset backoff
+                reconnect_count = 0; // Registration succeeded: reset the retry count (the delay
+                                     // state, reconnect_backoff, is reset below)
 
                 // Remove the token file now that it has done its one job. A failed
                 // remove keeps the path set so the next accepted Register retries.
@@ -2102,14 +2111,17 @@ public:
                                      csr_attempts, kMaxCsrAttempts);
                         if (csr_attempts == 1)
                             reconnect_backoff.reset(); // grow from the base, not from an approval wait
+                        // The server issues one cert per agent per 30 s: keep these waits
+                        // long enough that the last bounded retry falls outside that window.
+                        reconnect_floor_secs = yuzu::agent::kReconnectCsrRetryFloorSecs;
                         reconnect_count = csr_attempts; // gate the wait; the delay grows from here
                         continue;                       // retry Register with the same CSR
                     }
                 }
 
                 session_id_ = resp.session_id();
-                // Registration has fully succeeded (the enrolled-but-no-cert retry above
-                // `continue`s before here, so its delays keep growing): the next failure
+                // Registration has fully succeeded (the later no-cert retries above
+                // `continue` before here, so their delays keep growing): the next failure
                 // starts again from the base delay.
                 reconnect_backoff.reset();
                 auto connected_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -3211,7 +3223,7 @@ public:
                                 if (hb_code == grpc::StatusCode::NOT_FOUND ||
                                     hb_code == grpc::StatusCode::UNAUTHENTICATED) {
                                     // A successful Register resets reconnect_count
-                                    // (the normal backoff), so without a damper here
+                                    // and the backoff delay (the normal backoff), so without a damper here
                                     // a server that reaps every fresh session would
                                     // drive a fleet-wide register→beat→reject→
                                     // register storm (governance UP-1). Apply an
