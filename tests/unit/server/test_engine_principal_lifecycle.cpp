@@ -1463,6 +1463,88 @@ TEST_CASE("Engine-principal REST: DELETE carries a retry hint where nothing has 
 // No-admin auditor query (§4.2).
 // ═══════════════════════════════════════════════════════════════════════════
 
+namespace {
+/// Makes the identity revoke fail ("raise") or report that it changed nothing ("skip") by putting a
+/// trigger on the real `engine_principals` table of the shared throwaway database. The credential
+/// revoke runs first on a different table, so it still succeeds. Dropped on scope exit, because the
+/// database is shared with the other cases in this file.
+class IdentityRevokeFault {
+  public:
+    enum class Mode { Raise, Skip };
+
+    explicit IdentityRevokeFault(Mode mode) {
+        const char* body = mode == Mode::Raise
+                               ? "RAISE EXCEPTION 'yuzu_test identity revoke fault';"
+                               : "RETURN NULL;";
+        run(std::string("CREATE FUNCTION engine_principal_store.yuzu_test_revoke_fault() RETURNS "
+                        "trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.lifecycle_state = 'revoked' "
+                        "THEN ") +
+            body + " END IF; RETURN NEW; END $$");
+        run("CREATE TRIGGER yuzu_test_revoke_fault BEFORE UPDATE ON "
+            "engine_principal_store.engine_principals FOR EACH ROW EXECUTE FUNCTION "
+            "engine_principal_store.yuzu_test_revoke_fault()");
+    }
+    ~IdentityRevokeFault() { remove(); }
+    IdentityRevokeFault(const IdentityRevokeFault&) = delete;
+    IdentityRevokeFault& operator=(const IdentityRevokeFault&) = delete;
+
+    void remove() {
+        if (removed_)
+            return;
+        removed_ = true;
+        run("DROP TRIGGER IF EXISTS yuzu_test_revoke_fault ON "
+            "engine_principal_store.engine_principals");
+        run("DROP FUNCTION IF EXISTS engine_principal_store.yuzu_test_revoke_fault()");
+    }
+
+  private:
+    static void run(const std::string& sql) {
+        auto lease = ep_lc_shared().pool->acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+        REQUIRE(r.ok());
+    }
+    bool removed_{false};
+};
+} // namespace
+
+TEST_CASE("Engine-principal REST: DELETE retries after the credentials are revoked but the "
+          "identity revoke fails or changes nothing",
+          "[pg][rest][engine_principal][revoke][retry_hint]") {
+    RestEngineHarness h;
+
+    {
+        // (d) the identity revoke errors after the credentials were revoked: 503 with a hint,
+        // and repeating the call finishes the revoke.
+        auto [pid, raw] = h.create_and_mint("revoke-fault-raise");
+        (void)raw;
+        IdentityRevokeFault fault{IdentityRevokeFault::Mode::Raise};
+        auto res = h.revoke(pid);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_retry_hint(*res));
+        fault.remove();
+        auto again = h.revoke(pid);
+        REQUIRE(again);
+        CHECK(again->status == 200);
+    }
+    {
+        // (e) the identity revoke reports it changed nothing on an active principal: 503 with no
+        // hint, and repeating the call after the cause is gone completes the revoke.
+        auto [pid, raw] = h.create_and_mint("revoke-fault-skip");
+        (void)raw;
+        IdentityRevokeFault fault{IdentityRevokeFault::Mode::Skip};
+        auto res = h.revoke(pid);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_no_retry_hint(*res));
+        fault.remove();
+        auto again = h.revoke(pid);
+        REQUIRE(again);
+        CHECK(again->status == 200);
+    }
+}
+
 TEST_CASE("Engine-principal REST: no-admin auditor query returns clean for a "
           "normally-permissioned engine principal",
           "[pg][rest][engine_principal][no_admin]") {

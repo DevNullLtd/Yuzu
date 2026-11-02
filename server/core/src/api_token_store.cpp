@@ -1757,8 +1757,8 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
         // are checking the same shape (#2443 added that helper for the same
         // linkage question, unlocked). pair_matches_pin collapses "not
         // linked" and "linked but wrong pin" into one bool; here those are
-        // two DIFFERENT client-visible error classes (this block: retryable
-        // "no in-flight rotation to confirm"; the pin check below: terminal
+        // two DIFFERENT client-visible error classes (this block: terminal
+        // "rotation pair is malformed"; the pin check below: terminal
         // "token_id does not match" - see engine_store_error_class.hpp).
         // Swapping in the bool would silently merge them. A shared helper
         // needs a reason enum, not a bool - tracked as #2953, not done here
@@ -1775,7 +1775,14 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
         if (predecessor == nullptr || successor == nullptr || successor->rotation_group.empty() ||
             successor->rotation_group != predecessor->rotation_group ||
             successor->supersedes_token_id != predecessor->token_id) {
-            error_msg = "no in-flight rotation to confirm";
+            // A POSITIVE read of exactly two active rows whose linkage is
+            // broken: terminal, not the ambiguous empty read. Its own string
+            // (keyed Conflict), because "no in-flight rotation to confirm" is
+            // keyed Transient and would hand an agentic client a retry hint
+            // for a state no retry can repair. Same reasoning and wording as
+            // the human token-keyed `confirm_token_rotation`.
+            error_msg = "rotation pair is malformed - confirm cannot proceed; "
+                        "revoke one side explicitly";
             return false;
         }
 

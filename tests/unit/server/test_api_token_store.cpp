@@ -1845,6 +1845,39 @@ TEST_CASE("ApiTokenStore: confirm_rotation sole-credential states are terminal, 
     CHECK(classify_engine_store_error(none.error()) == E::Transient);
 }
 
+TEST_CASE("ApiTokenStore: confirm_rotation on two active credentials with broken linkage is a "
+          "terminal conflict, never the retryable empty-read error (#6716)",
+          "[pg][token][rotation][confirm]") {
+    using yuzu::server::detail::classify_engine_store_error;
+    using E = yuzu::server::detail::EngineStoreErrorClass;
+
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    // Two active credentials that no rotation linked together: a positive read
+    // of a malformed pair, not an empty one. Retrying cannot repair it, so it
+    // must not classify as the Transient (retryable, hinted) empty-read error.
+    const std::string principal = "engine:rotation-confirm-malformed";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc-a", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.create_token("svc-b", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 2);
+
+    auto malformed =
+        store.confirm_rotation(principal, active.at(0).token_id, "irrelevant-secret", "admin");
+    REQUIRE_FALSE(malformed.has_value());
+    CHECK(malformed.error().find("rotation pair is malformed") != std::string::npos);
+    CHECK(malformed.error().find("no in-flight rotation to confirm") == std::string::npos);
+    CHECK(classify_engine_store_error(malformed.error()) == E::Conflict);
+}
+
 TEST_CASE("ApiTokenStore: confirm_rotation replay after success is a terminal already-confirmed "
           "conflict, not a retryable 503 (#2404)",
           "[pg][token][rotation][confirm]") {
