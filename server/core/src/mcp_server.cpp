@@ -9202,8 +9202,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         appr->submitted_by == session->username && appr->consumed_at == 0 &&
                         (appr->status == "pending" || appr->status == "approved") &&
                         effect_moved_from(appr->scope_expression)) {
+                        // The call-wide id (idempotent): header, body and audit row agree.
                         const std::string moved_cid =
-                            yuzu::server::detail::make_correlation_id();
+                            yuzu::server::detail::ensure_correlation_id(res);
                         const bool audit_ok = mcp_audit(
                             "denied", "reason=definition_changed approval_id=" + supplied_id +
                                           " refused: the definition changed since the approval "
@@ -9221,13 +9222,29 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     if (!appr || appr->definition_id != definition_id ||
                         appr->scope_expression != canon) {
-                        // Absent, or for a different tool / different arguments.
-                        mcp_audit("denied", "approval_id does not match this request");
+                        // Absent, or for a different tool / different arguments, or a
+                        // consumed / rejected / expired ticket whose effect has moved.
+                        // The row names the ticket ONLY when the store returned one (the id
+                        // is then the store's server-minted value, never raw caller bytes;
+                        // an unknown id is deliberately not echoed) and carries the call's
+                        // correlation id, so the refusal is traceable to its approval row.
+                        // No refused counter moves here, as for every other mismatch: that
+                        // family counts consume-rung refusals and its anti-oracle contract
+                        // (no reason label) is not widened by this change.
+                        const std::string mismatch_cid =
+                            yuzu::server::detail::ensure_correlation_id(res);
+                        mcp_audit("denied",
+                                  (appr ? "approval_id=" + appr->id + " status=" + appr->status +
+                                              " refused: "
+                                        : std::string()) +
+                                      "approval_id does not match this request correlation_id=" +
+                                      mismatch_cid);
                         res.set_content(
                             a4_error(kPermissionDenied,
                                      "approval_id does not match this tool and arguments",
                                      "submit this exact call without approval_id to obtain a "
-                                     "matching approval ticket"),
+                                     "matching approval ticket",
+                                     -1, mismatch_cid),
                             "application/json");
                         return;
                     }

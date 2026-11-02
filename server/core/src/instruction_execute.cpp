@@ -203,10 +203,13 @@ PrepareOutcome prepare_impl(Ctx& c) {
 
     // 1. Definition lookup. A store fault is not "no such definition".
     if (!ports.lookup_definition) {
+        // NEVER wired: a server defect that does not clear by itself, so no retry hint and a
+        // defect remediation (the same class as the kMisconfigured arms). The kind stays
+        // kStoreUnavailable (a 503-class answer). A wired port that FAILS, below, is a fault a
+        // retry can clear and keeps its hint.
         return refuse(c, make_refusal(RefusalKind::kStoreUnavailable, "store_unavailable",
                                       "instruction store not available",
-                                      "retry shortly; the definition store is unavailable",
-                                      kRetryAfterMs));
+                                      std::string(kMisconfiguredRemediation)));
     }
     auto looked_up = ports.lookup_definition(rq.definition_id);
     if (!looked_up) {
