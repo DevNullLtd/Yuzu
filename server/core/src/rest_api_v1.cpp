@@ -487,6 +487,18 @@ static int engine_store_error_status(const std::string& err) {
     return 503; // unreachable — all enum cases return above
 }
 
+// #6716: retry hint for a retryable (503) engine-store failure. Sets the
+// Retry-After header and returns the A4 `retry_after_ms` for the body, same
+// 2 s / 2000 ms floor as the mint pre-check and the rotate read-back arm. A
+// terminal status (400/403/409) gets neither, so a client that honours the hint
+// never retries a call that cannot succeed.
+static std::optional<std::int64_t> engine_store_retry_hint(httplib::Response& res, int status) {
+    if (status != 503)
+        return std::nullopt;
+    res.set_header("Retry-After", "2");
+    return 2000;
+}
+
 // #2961 round-2 finding (item 4): the store's own error string for the
 // resolve_rotation_initiator failure — "rotation confirmation unavailable —
 // fall back to revoke" — is the ONLY guidance a machine client (agentic
@@ -6274,7 +6286,10 @@ void RestApiV1::register_routes(
             // guard (Hermes LOW / UP-10).
             if (!eps || !eps->is_open() || !token_store || !token_store->is_open()) {
                 res.status = 503;
-                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                res.set_header("Retry-After", "2");
+                res.set_content(detail::a4_error(res, "service unavailable",
+                                                 detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                                "application/json");
                 return;
             }
             auto session = auth_fn(req, res);
@@ -6291,7 +6306,10 @@ void RestApiV1::register_routes(
             auto existing_res = eps->get(principal_id);
             if (!existing_res) {
                 res.status = 503;
-                res.set_content(detail::a4_error(res, existing_res.error()), "application/json");
+                res.set_header("Retry-After", "2");
+                res.set_content(detail::a4_error(res, existing_res.error(),
+                                                 detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                                "application/json");
                 return;
             }
             if (!*existing_res) {
@@ -6315,7 +6333,10 @@ void RestApiV1::register_routes(
                     // revoke that did not persist must abort before we ever touch
                     // the identity, never proceed on an assumed-zero count.
                     res.status = 503;
-                    res.set_content(detail::a4_error(res, creds_res.error()), "application/json");
+                    res.set_header("Retry-After", "2");
+                    res.set_content(detail::a4_error(res, creds_res.error(),
+                                                     detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                                    "application/json");
                     (void)detail::emit_behavioral_audit(
                         audit_fn, req, res, "engine_principal.revoke", "failure", "EnginePrincipal",
                         principal_id, creds_res.error());
@@ -6326,7 +6347,10 @@ void RestApiV1::register_routes(
             auto revoke_res = eps->revoke(principal_id, superseded_by);
             if (!revoke_res) {
                 res.status = 503;
-                res.set_content(detail::a4_error(res, revoke_res.error()), "application/json");
+                res.set_header("Retry-After", "2");
+                res.set_content(detail::a4_error(res, revoke_res.error(),
+                                                 detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                                "application/json");
                 (void)detail::emit_behavioral_audit(audit_fn, req, res, "engine_principal.revoke",
                                                     "failure", "EnginePrincipal", principal_id,
                                                     revoke_res.error());
@@ -6604,7 +6628,10 @@ void RestApiV1::register_routes(
             if (!eps || !eps->is_open() || !token_store ||
                 !token_store->is_open()) {
                 res.status = 503;
-                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                res.set_header("Retry-After", "2");
+                res.set_content(detail::a4_error(res, "service unavailable",
+                                                 detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                                "application/json");
                 return;
             }
             auto session = auth_fn(req, res);
@@ -6635,7 +6662,10 @@ void RestApiV1::register_routes(
                                                                  session->username);
             if (!result) {
                 res.status = engine_store_error_status(result.error());
-                res.set_content(detail::a4_error(res, result.error()), "application/json");
+                res.set_content(
+                    detail::a4_error(res, result.error(),
+                                     {.retry_after_ms = engine_store_retry_hint(res, res.status)}),
+                    "application/json");
                 (void)detail::emit_behavioral_audit(
                     audit_fn, req, res, "engine_principal.credential.rotate", "failure",
                     "EnginePrincipal", principal_id, result.error());
@@ -6784,7 +6814,10 @@ void RestApiV1::register_routes(
                 !token_store->is_open()) {
                 confirm_metric("transient"); // store unavailable at the open guard
                 res.status = 503;
-                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                res.set_header("Retry-After", "2");
+                res.set_content(detail::a4_error(res, "service unavailable",
+                                                 detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                                "application/json");
                 return;
             }
             auto session = auth_fn(req, res);
@@ -6848,11 +6881,12 @@ void RestApiV1::register_routes(
                 confirm_metric(yuzu::server::detail::confirm_result_label(
                     yuzu::server::detail::classify_engine_store_error(confirmed.error())));
                 res.status = engine_store_error_status(confirmed.error());
-                res.set_content(detail::a4_error(
-                                    res, confirmed.error(),
-                                    {.remediation =
-                                         confirm_rotation_error_remediation(confirmed.error())}),
-                                "application/json");
+                res.set_content(
+                    detail::a4_error(
+                        res, confirmed.error(),
+                        {.retry_after_ms = engine_store_retry_hint(res, res.status),
+                         .remediation = confirm_rotation_error_remediation(confirmed.error())}),
+                    "application/json");
                 (void)detail::emit_behavioral_audit(
                     audit_fn, req, res, "engine_principal.credential.confirm", "failure",
                     "EnginePrincipal", principal_id, confirmed.error());

@@ -1251,6 +1251,215 @@ TEST_CASE("Engine-principal REST: a partial rotate whose audit write also drops 
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Retry hints on the engine credential rotate / confirm and principal revoke
+// routes (#6716). A retryable 503 carries Retry-After and the A4 retry_after_ms;
+// a terminal state, or a 503 where state already changed, carries neither.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+/// True when the response carries no retry hint at all: no Retry-After header and a null
+/// `retry_after_ms` in the A4 body.
+bool has_no_retry_hint(const httplib::Response& res) {
+    const auto body = nlohmann::json::parse(res.body, nullptr, false);
+    return !res.has_header("Retry-After") && body.is_object() && body.contains("error") &&
+           body["error"].contains("retry_after_ms") && body["error"]["retry_after_ms"].is_null();
+}
+
+bool has_retry_hint(const httplib::Response& res) {
+    const auto body = nlohmann::json::parse(res.body, nullptr, false);
+    return res.get_header_value("Retry-After") == "2" && body.is_object() &&
+           body.contains("error") && body["error"].contains("retry_after_ms") &&
+           body["error"]["retry_after_ms"].is_number_integer() &&
+           body["error"]["retry_after_ms"].get<int>() == 2000;
+}
+} // namespace
+
+TEST_CASE("Engine-principal REST: rotate, confirm and DELETE answer 503 with a retry hint when "
+          "the stores are not open (no Postgres needed)",
+          "[rest][engine_principal][retry_hint][degraded]") {
+    // An engine store that never opened plus an unwired token store: every one of the three
+    // routes stops at its store-open guard. Needs no live database.
+    yuzu::server::pg::PgPool broken_pool{
+        {.conninfo = "host=127.0.0.1 port=1 connect_timeout=1", .size = 1}};
+    EnginePrincipalStore broken_store{broken_pool};
+    REQUIRE_FALSE(broken_store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    RestApiV1 api;
+    yuzu::server::test::TestRouteSink sink; // after `api`: its handlers capture the owner
+    auth::Session session;
+    session.username = "alice";
+    session.role = auth::Role::admin;
+    auto auth_fn = [&session](const httplib::Request&,
+                              httplib::Response&) -> std::optional<auth::Session> {
+        return session;
+    };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) -> bool { return true; };
+    auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) -> bool {
+        return true;
+    };
+    api.set_engine_principal_store(&broken_store);
+    api.register_routes(sink, auth_fn, perm_fn, audit_fn, /*rbac_store=*/nullptr,
+                        /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
+                        /*quarantine_store=*/nullptr,
+                        /*response_store=*/nullptr,
+                        /*instruction_store=*/nullptr,
+                        /*execution_tracker=*/nullptr,
+                        /*schedule_engine=*/nullptr,
+                        /*approval_manager=*/nullptr,
+                        /*tag_store=*/nullptr,
+                        /*audit_store=*/nullptr,
+                        /*service_group_fn=*/{},
+                        /*tag_push_fn=*/{},
+                        /*inventory_store=*/nullptr,
+                        /*product_pack_store=*/nullptr,
+                        /*sw_deploy_store=*/nullptr,
+                        /*device_token_store=*/nullptr,
+                        /*license_store=*/nullptr,
+                        /*guaranteed_state_store=*/nullptr,
+                        /*metrics_registry=*/&metrics,
+                        /*session_revoke_fn=*/{},
+                        /*execution_event_bus=*/nullptr,
+                        /*result_set_store=*/nullptr,
+                        /*command_dispatch_fn=*/{});
+
+    const std::string pid = "engine:retry-hint";
+    auto rotate = sink.Post("/api/v1/engine-principals/" + pid + "/credentials/rotate", "{}");
+    REQUIRE(rotate);
+    CHECK(rotate->status == 503);
+    CHECK(has_retry_hint(*rotate));
+
+    auto confirm = sink.Post("/api/v1/engine-principals/" + pid + "/credentials/confirm", "{}");
+    REQUIRE(confirm);
+    CHECK(confirm->status == 503);
+    CHECK(has_retry_hint(*confirm));
+
+    auto del = sink.dispatch("DELETE", "/api/v1/engine-principals/" + pid, "{}");
+    REQUIRE(del);
+    CHECK(del->status == 503);
+    CHECK(has_retry_hint(*del));
+}
+
+TEST_CASE("Engine-principal REST: rotate carries a retry hint on a transient store fault and none "
+          "on a terminal conflict",
+          "[pg][rest][engine_principal][rotation][retry_hint][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw1] = h.create_and_mint("rotate-retry-hint");
+    (void)raw1;
+
+    {
+        auto held = hold_all_token_pool_leases();
+        auto res = h.rotate(pid);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_retry_hint(*res));
+    }
+
+    // Terminal: a second operator re-serving the first operator's rotation is a 409.
+    h.session_user = "alice";
+    auto r1 = h.rotate(pid);
+    REQUIRE(r1);
+    REQUIRE(r1->status == 200);
+    h.session_user = "bob";
+    auto r2 = h.rotate(pid);
+    REQUIRE(r2);
+    CHECK(r2->status == 409);
+    CHECK(has_no_retry_hint(*r2));
+}
+
+TEST_CASE("Engine-principal REST: confirm carries a retry hint on a transient store fault and none "
+          "on a terminal state or a post-commit audit failure",
+          "[pg][rest][engine_principal][confirm][retry_hint][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw1] = h.create_and_mint("confirm-retry-hint");
+    (void)raw1;
+    h.session_user = "alice";
+    auto rot = h.rotate(pid);
+    REQUIRE(rot);
+    REQUIRE(rot->status == 200);
+    const auto data = nlohmann::json::parse(rot->body)["data"];
+    const auto token_id = data["token_id"].get<std::string>();
+    const auto secret = data["token"].get<std::string>();
+
+    {
+        auto held = hold_all_token_pool_leases();
+        auto res = h.confirm(pid, token_id, secret);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_retry_hint(*res));
+    }
+
+    // The confirm commits but its audit row drops: 503, state changed, so no hint (the
+    // client must reconcile, not repeat the confirm).
+    h.audit_allow = false;
+    auto audit_dropped = h.confirm(pid, token_id, secret);
+    REQUIRE(audit_dropped);
+    CHECK(audit_dropped->status == 503);
+    CHECK(has_no_retry_hint(*audit_dropped));
+    h.audit_allow = true;
+
+    // Terminal: the replay of a resolved rotation is a 409.
+    auto replay = h.confirm(pid, token_id, secret);
+    REQUIRE(replay);
+    CHECK(replay->status == 409);
+    CHECK(has_no_retry_hint(*replay));
+}
+
+TEST_CASE("Engine-principal REST: DELETE carries a retry hint where nothing has changed yet and "
+          "none once the revoke committed",
+          "[pg][rest][engine_principal][revoke][retry_hint][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw1] = h.create_and_mint("revoke-retry-hint");
+    (void)raw1;
+
+    {
+        // (b) the identity read cannot answer.
+        auto held = hold_all_engine_pool_leases();
+        auto res = h.revoke(pid);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_retry_hint(*res));
+    }
+    {
+        // (c) the credential revoke cannot persist; the identity is untouched.
+        auto held = hold_all_token_pool_leases();
+        auto res = h.revoke(pid);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_retry_hint(*res));
+    }
+    // The identity was never touched (credentials are revoked first).
+    {
+        auto got = h.get(pid);
+        REQUIRE(got);
+        REQUIRE(got->status == 200);
+        CHECK(nlohmann::json::parse(got->body)["data"]["lifecycle_state"].get<std::string>() !=
+              "revoked");
+    }
+
+    // 404 is terminal.
+    auto missing = h.revoke("engine:retry-hint-missing");
+    REQUIRE(missing);
+    CHECK(missing->status == 404);
+    CHECK(has_no_retry_hint(*missing));
+
+    // (f) the revoke commits, then its audit row drops: 503, state changed, no hint.
+    h.audit_allow = false;
+    auto audit_dropped = h.revoke(pid);
+    REQUIRE(audit_dropped);
+    CHECK(audit_dropped->status == 503);
+    CHECK(has_no_retry_hint(*audit_dropped));
+    h.audit_allow = true;
+    auto got = h.get(pid);
+    REQUIRE(got);
+    REQUIRE(got->status == 200);
+    CHECK(nlohmann::json::parse(got->body)["data"]["lifecycle_state"].get<std::string>() ==
+          "revoked");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // No-admin auditor query (§4.2).
 // ═══════════════════════════════════════════════════════════════════════════
 
