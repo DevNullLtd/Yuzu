@@ -1778,7 +1778,7 @@ TEST_CASE("AuthDB MFA: recovery code is not consumable on an inactive account (#
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("deadrec", "h", "s", yuzu::server::auth::Role::user).has_value());
-    auto codes = h.db.mfa_regenerate_recovery_codes("deadrec");
+    auto codes = h.db.mfa_regenerate_recovery_codes("deadrec", std::nullopt);
     REQUIRE(codes.has_value());
     REQUIRE(codes->size() == 10);
 
@@ -1788,12 +1788,16 @@ TEST_CASE("AuthDB MFA: recovery code is not consumable on an inactive account (#
         REQUIRE(r.ok());
         return r;
     };
+    // #6079: consuming a code needs an enrolled factor (the consuming statement reads the factor
+    // generation under the row lock), so enrol by raw UPDATE; otherwise the later acceptance
+    // would fail for the wrong reason and the case would no longer isolate the `is_active` guard.
+    exec("UPDATE auth.users SET mfa_enrolled_at = now() WHERE username = $1");
     exec("UPDATE auth.users SET is_active = FALSE WHERE username = $1");
 
     // Inactive: a valid, unconsumed code is refused as "no match" (not an error).
     auto refused = h.db.mfa_consume_recovery_code("deadrec", codes->front());
     REQUIRE(refused.has_value());
-    CHECK_FALSE(*refused);
+    CHECK_FALSE(refused->ok);
 
     // ...and the row was not burned.
     auto unconsumed = exec("SELECT COUNT(*) FROM auth.mfa_recovery_codes "
@@ -1804,7 +1808,7 @@ TEST_CASE("AuthDB MFA: recovery code is not consumable on an inactive account (#
     exec("UPDATE auth.users SET is_active = TRUE WHERE username = $1");
     auto accepted = h.db.mfa_consume_recovery_code("deadrec", codes->front());
     REQUIRE(accepted.has_value());
-    CHECK(*accepted);
+    CHECK(accepted->ok);
 }
 
 // ── MFA enroll -> verify round trip THROUGH SecretCodec ──────────────────
