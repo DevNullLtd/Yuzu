@@ -5258,13 +5258,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         // The eligible row's `identity_source` must equal the session's own
         // `auth_source` — a DIRECT mapping (`local`↔`local`, `oidc`↔`oidc`,
-        // `saml`↔`saml`), NOT "oidc-or-else-local". A SAML session therefore
-        // expects `identity_source=="saml"`, which no row carries today (SAML
-        // is not provisioned — #1852 fast-follow), so SAML is fail-closed at
-        // this gate; and a SAML NameID crafted to collide with a `local` (or
-        // `oidc`) row can no longer satisfy it. This keeps the guard correct
-        // when SAML provisioning + SAML-MFA land, without a rework (Hermes
-        // cyber-review finding, #1852 hardening).
+        // `saml`↔`saml`), NOT "oidc-or-else-local". A SAML session expects
+        // `identity_source=="saml"`, which no row carries today (SAML is not
+        // provisioned; #1852 fast-follow). Today a SAML session never gets
+        // this far: it has no `auth.users` row, so `is_elevation_eligible`
+        // above answers "not eligible" and it is refused there. This gate is
+        // what stays correct when SAML provisioning + SAML-MFA land: a SAML
+        // NameID crafted to collide with a `local` (or `oidc`) row cannot
+        // satisfy it (Hermes cyber-review finding, #1852 hardening).
         //
         // An `engine_token` session (design doc §6/§9) never reaches this
         // comparison at all: `POST /api/v1/elevate` is COOKIE-session only
