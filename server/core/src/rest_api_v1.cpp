@@ -467,8 +467,10 @@ static DexScorePolicyWriteRequest score_policy_write_request(DexScorePolicyWrite
 // confirm that reads a NON-empty active set (one credential, or >2, or a
 // two-credential pair) is a positive read — see rotation_confirm_state.hpp —
 // so those states now carry terminal conflict/client strings (409/400), and
-// only the genuinely-empty-or-unrecognized-pair case keeps the retryable "no
-// in-flight rotation to confirm".
+// only the genuinely-EMPTY read keeps the retryable "no in-flight rotation to
+// confirm". #6716: a two-credential pair that is NOT linked (malformed) is a
+// positive read too, so it is the terminal "rotation pair is malformed"
+// conflict (409, no retry hint), never the retryable empty-read string.
 static int engine_store_error_status(const std::string& err) {
     // Thin dispatch over the shared classifier (engine_store_error_class.hpp)
     // so REST and the MCP twin (mcp_error_for_store_msg) never diverge.
@@ -488,10 +490,12 @@ static int engine_store_error_status(const std::string& err) {
 }
 
 // #6716: retry hint for a retryable (503) engine-store failure. Sets the
-// Retry-After header and returns the A4 `retry_after_ms` for the body, same
-// 2 s / 2000 ms floor as the mint pre-check and the rotate read-back arm. A
-// terminal status (400/403/409) gets neither, so a client that honours the hint
-// never retries a call that cannot succeed.
+// Retry-After header and returns the A4 `retry_after_ms` for the body. The
+// 2 s / 2000 ms value is the one the rotate read-back arm and the mint
+// pre-check (store-open guard) already use; it is NOT the mint CSPRNG-failure
+// arm, which keeps its own `Retry-After: 5`. A terminal status (400/403/409)
+// gets neither, so a client that honours the hint never retries a call that
+// cannot succeed.
 static std::optional<std::int64_t> engine_store_retry_hint(httplib::Response& res, int status) {
     if (status != 503)
         return std::nullopt;
@@ -6348,6 +6352,12 @@ void RestApiV1::register_routes(
                 }
                 creds_revoked = *creds_res;
             }
+            // #6716 (UP-3): from here on the credentials ARE revoked. A failure
+            // row below must carry that count, because the repeat call (which the
+            // hint invites) revokes 0 and records `credentials_revoked=0`, so the
+            // count would otherwise appear in no audit row at all.
+            const std::string revoked_count_detail =
+                "credentials_revoked=" + std::to_string(creds_revoked);
             auto revoke_res = eps->revoke(principal_id, superseded_by);
             if (!revoke_res) {
                 res.status = 503;
@@ -6355,30 +6365,57 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, revoke_res.error(),
                                                  detail::A4ErrorOpts{.retry_after_ms = 2000}),
                                 "application/json");
-                (void)detail::emit_behavioral_audit(audit_fn, req, res, "engine_principal.revoke",
-                                                    "failure", "EnginePrincipal", principal_id,
-                                                    revoke_res.error());
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.revoke", "failure", "EnginePrincipal",
+                    principal_id, revoke_res.error() + "; " + revoked_count_detail);
                 return;
             }
             bool revoked = *revoke_res;
+            bool revoked_by_concurrent_request = false;
             if (!revoked && !already_revoked) {
-                // Authoritative posture (EnginePrincipalStore doc comment): a
-                // lease/query failure returns false, never a silent success —
-                // this is a real store failure, not idempotent no-op.
-                res.status = 503;
-                res.set_content(detail::a4_error(res, "failed to revoke engine principal — try again"),
-                                "application/json");
-                (void)detail::emit_behavioral_audit(audit_fn, req, res, "engine_principal.revoke",
-                                                    "failure", "EnginePrincipal", principal_id,
-                                                    "store_unavailable");
-                return;
+                // EnginePrincipalStore::revoke returns false ONLY when its UPDATE
+                // matched no active row (a lease or query failure is the error
+                // arm above). With `already_revoked` false at the read above, the
+                // reachable cause is a concurrent DELETE that revoked the identity
+                // between that read and this write. Re-read to tell that apart
+                // from an identity that is still active (#6716 UP-4).
+                auto reread = eps->get(principal_id);
+                if (reread && *reread && (*reread)->lifecycle_state != "active") {
+                    // The winner did the work and this call killed the
+                    // credentials: idempotent success, not a failure.
+                    revoked_by_concurrent_request = true;
+                } else {
+                    // Still active (or gone, or unreadable): the identity is not
+                    // confirmed revoked and its credentials are already dead, the
+                    // same state as the revoke-error arm above, so the same hint.
+                    std::string why;
+                    if (!reread)
+                        why = "revoke matched no active row and the re-read failed: " +
+                              reread.error();
+                    else if (!*reread)
+                        why = "revoke matched no active row and the principal is no longer "
+                              "found";
+                    else
+                        why = "revoke matched no active row but the principal is still active";
+                    res.status = 503;
+                    res.set_header("Retry-After", "2");
+                    res.set_content(
+                        detail::a4_error(res, "failed to revoke engine principal — try again",
+                                         detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                        "application/json");
+                    (void)detail::emit_behavioral_audit(
+                        audit_fn, req, res, "engine_principal.revoke", "failure", "EnginePrincipal",
+                        principal_id, why + "; " + revoked_count_detail);
+                    return;
+                }
             }
             // #2466/#2406: fail closed — the revoke committed (credentials already
             // killed above), but an unrecorded revoke must not read as success.
             if (!detail::emit_behavioral_audit(
                     audit_fn, req, res, "engine_principal.revoke", "success", "EnginePrincipal",
                     principal_id,
-                    "credentials_revoked=" + std::to_string(creds_revoked) +
+                    revoked_count_detail +
+                        (revoked_by_concurrent_request ? "; revoked_by_concurrent_request" : "") +
                         (superseded_by.empty() ? "" : "; superseded_by=" + superseded_by))) {
                 res.status = 503;
                 res.set_content(
@@ -6885,6 +6922,15 @@ void RestApiV1::register_routes(
                 confirm_metric(yuzu::server::detail::confirm_result_label(
                     yuzu::server::detail::classify_engine_store_error(confirmed.error())));
                 res.status = engine_store_error_status(confirmed.error());
+                // #6716: a malformed two-credential pair is a corruption signal that
+                // the `conflict` series of the confirm metric (which docs call an
+                // expected agent-retry shape) would otherwise hide, so make a
+                // persistent one observable in the log as well.
+                if (confirmed.error().find("rotation pair is malformed") != std::string::npos)
+                    spdlog::warn("engine credential confirm refused: rotation pair for principal "
+                                 "'{}' is malformed (two active credentials with no rotation "
+                                 "linkage); revoke one side explicitly",
+                                 log_token(principal_id));
                 res.set_content(
                     detail::a4_error(
                         res, confirmed.error(),
