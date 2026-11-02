@@ -482,9 +482,7 @@ TEST_CASE("dashboard execute: a dispatch aborts an in-flight results request and
     CHECK(std::prev(trigger.end()).key() == "htmx:abort");
     CHECK(trigger.at("htmx:abort").at("target") == "#filter-bar");
 
-    // The stamp the page's swap guard compares a late /fragments/results response against.
-    CHECK(contains(res->body, "<nav id=\"result-pagination\" hx-swap-oob=\"true\" "
-                              "data-command-id=\"" + cmd + "\"></nav>"));
+    CHECK(contains(res->body, "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>"));
     // The initializer exists for every dispatch, with or without a definition.
     CHECK(contains(res->body, "<div id=\"chart-deck-host\" hx-swap-oob=\"true\" "
                               "hx-get=\"/fragments/results?command_id=" + cmd +
@@ -495,15 +493,21 @@ TEST_CASE("dashboard execute: a dispatch aborts an in-flight results request and
     CHECK_FALSE(contains(res->body, "hx-include=\"#filter-bar\""));
 }
 
-TEST_CASE("dashboard execute: help aborts an in-flight results request and clears the pager stamp",
+TEST_CASE("dashboard execute: help aborts an in-flight results request and replaces the "
+          "previous command's chrome",
           "[server][dashboard][execute][sync]") {
     Harness h(/*with_registry=*/true);
     auto res = h.post("instruction=help&scope=__all__");
     REQUIRE(res->status == 200);
     CHECK(res->get_header_value("HX-Trigger") == R"({"htmx:abort":{"target":"#filter-bar"}})");
-    // outerHTML (not innerHTML): replacing the element also drops data-command-id.
+    // outerHTML (not innerHTML): replacing the element drops the previous command's pending
+    // hx-get / hx-trigger load (filter bar, chart-deck host) and clears the pager's view stamp.
     CHECK(contains(res->body, "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>"));
+    CHECK(contains(res->body, "<div id=\"chart-deck-host\" hx-swap-oob=\"true\"></div>"));
+    CHECK(contains(res->body, "<div id=\"filter-bar\" hx-swap-oob=\"true\"></div>"));
     CHECK_FALSE(contains(res->body, "<nav id=\"result-pagination\" hx-swap-oob=\"innerHTML\""));
+    CHECK_FALSE(contains(res->body, "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\""));
+    CHECK_FALSE(contains(res->body, "<div id=\"filter-bar\" hx-swap-oob=\"innerHTML\""));
     CHECK(h.calls.empty());
 }
 

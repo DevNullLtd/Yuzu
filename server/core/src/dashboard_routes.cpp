@@ -1087,11 +1087,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                              + html_escape(context) + "</span>";
                      html += "<strong id=\"row-count\" hx-swap-oob=\"true\">"
                              + std::to_string(row_count) + "</strong>";
-                     // Clear filter bar and pagination for help display
-                     html += "<div id=\"filter-bar\" hx-swap-oob=\"innerHTML\"></div>";
-                     // outerHTML (not innerHTML): replacing the element also clears the
-                     // data-command-id stamp, so the swap guard never compares a late response
-                     // against the previous command's id.
+                     // Clear filter bar and pagination for help display. outerHTML ("true"), not
+                     // innerHTML, for the filter bar, the pager and the chart-deck host below:
+                     // replacing the element removes the previous command's hx-get / hx-trigger
+                     // (its pending 2 s load would otherwise land that command's chrome over the
+                     // help table) and, for the pager, clears the view stamp the SSE summary
+                     // refresh reads (an innerHTML clear would leave the old data-page on it).
+                     html += "<div id=\"filter-bar\" hx-swap-oob=\"true\"></div>";
                      html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>";
                      html += "<div id=\"result-summary\" hx-swap-oob=\"innerHTML\"></div>";
                      html += "<div id=\"group-form-slot\" hx-swap-oob=\"innerHTML\"></div>";
@@ -1102,7 +1104,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // this OOB swap is defence-in-depth so a future
                      // refactor of that listener can't silently leave
                      // stale charts on the page.
-                     html += "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>";
+                     html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\"></div>";
                      // The help table replaces the results: abort a results request still in
                      // flight for the previous command (see kResultsAbortTrigger).
                      res.set_header("HX-Trigger",
@@ -1587,11 +1589,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  html += "\" hx-trigger=\"load delay:2s\" hx-swap=\"none\"></div>";
 
                  // OOB: clear pagination and summary
-                 // The empty pager is stamped with the new command id: the page's swap guard
-                 // rejects a /fragments/results response for any other command, so a late
-                 // answer for the previous command cannot touch this command's chrome.
-                 html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\" data-command-id=\"" +
-                         html_escape(command_id) + "\"></nav>";
+                 html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>";
                  html += "<div id=\"result-summary\" hx-swap-oob=\"true\"></div>";
                  html += "<div id=\"group-form-slot\" hx-swap-oob=\"true\"></div>";
 
@@ -2923,12 +2921,11 @@ std::string DashboardRoutes::render_results(
 
     // OOB: pagination
     // The data-* stamp is read by the page JS: the SSE-driven summary refresh rebuilds this view's
-    // query from it, and data-command-id lets the swap guard drop a late response for another
-    // command. Always emitted, also for an empty result.
-    html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\" data-command-id=\"" +
-            html_escape(command_id) + "\" data-sort=\"" + html_escape(sort_col) +
-            "\" data-dir=\"" + html_escape(sort_dir) + "\" data-page=\"" +
-            std::to_string(page) + "\" data-per-page=\"" + std::to_string(per_page) + "\">";
+    // query from it. Always emitted, also for an empty result.
+    html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\" data-sort=\"" +
+            html_escape(sort_col) + "\" data-dir=\"" + html_escape(sort_dir) +
+            "\" data-page=\"" + std::to_string(page) + "\" data-per-page=\"" +
+            std::to_string(per_page) + "\">";
     if (total_lines > 0) {
         html += "<span>Showing " + std::to_string(start + 1) + "-" +
                 std::to_string(end) + " of " + std::to_string(total_lines) + "</span>";

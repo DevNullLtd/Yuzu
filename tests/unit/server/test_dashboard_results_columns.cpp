@@ -1271,8 +1271,8 @@ TEST_CASE("render_results: the agent count is distinct agents, not stored rows",
     CHECK(contains(searched, "2 results across 1 agent"));
 }
 
-// #6075 / the client refresh and stale-command guard read these stamps.
-TEST_CASE("render_results: #result-pagination carries the view and the command id, also when empty",
+// #6075 / the client summary refresh reads these stamps.
+TEST_CASE("render_results: #result-pagination carries the view, also when empty",
           "[pg][server][dashboard][render_results][sync]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1283,7 +1283,7 @@ TEST_CASE("render_results: #result-pagination carries the view and the command i
     const auto html =
         acc.render_view("cmd-stamp-1", "registry", "output", "desc", 1, 25, {}, "");
     CHECK(contains(html, "<nav id=\"result-pagination\" hx-swap-oob=\"true\" "
-                         "data-command-id=\"cmd-stamp-1\" data-sort=\"output\" data-dir=\"desc\" "
+                         "data-sort=\"output\" data-dir=\"desc\" "
                          "data-page=\"1\" data-per-page=\"25\">"));
 }
 

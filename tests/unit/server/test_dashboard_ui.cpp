@@ -221,11 +221,10 @@ TEST_CASE("dashboard rows: every row, including the three-equal one, stacks unde
     CHECK(rule.find("grid-template-columns: minmax(0, 1fr)") != std::string::npos);
 }
 
-// #6075 / #5677: the summary and pager follow responses as they arrive, and a late response for a
-// previous command is dropped. The behaviour is proven in a real browser; these pins keep the
-// wiring from being deleted or moved somewhere the page no longer loads.
-TEST_CASE("dashboard page: SSE output and status drive a throttled summary refresh, and a "
-          "command-generation guard drops a stale command's swap",
+// #6075: the summary and pager follow responses as they arrive. The behaviour is proven in a real
+// browser; these pins keep the wiring from being deleted or moved somewhere the page no longer
+// loads.
+TEST_CASE("dashboard page: SSE output and status drive a throttled summary refresh",
           "[dashboard][ui]") {
     const std::string html = page();
 
@@ -245,11 +244,6 @@ TEST_CASE("dashboard page: SSE output and status drive a throttled summary refre
     // still refreshes once per window. No clearTimeout on the results timer.
     CHECK(html.find("if (rrTimer) return;") != std::string::npos);
     CHECK(html.find("clearTimeout(rrTimer)") == std::string::npos);
-
-    // The guard: a body listener reads the pager's stamp and cancels a mismatched swap.
-    CHECK(count_of(html, "document.body.addEventListener('htmx:beforeSwap'") == 1);
-    CHECK(html.find("nav.dataset.commandId") != std::string::npos);
-    CHECK(html.find("evt.detail.shouldSwap = false") != std::string::npos);
 
     // CSP: the dashboard forbids eval, and htmx compiles hx-on:* with new Function().
     CHECK(html.find("hx-on") == std::string::npos);

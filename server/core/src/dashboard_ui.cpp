@@ -1346,7 +1346,7 @@ constexpr char kDashJs7[] = R"HTM(    /* ── Global Keyboard Shortcuts ──
     }
 
     /* Results summary/pager follow responses as they arrive. The server stamps #result-pagination
-       with the view (data-sort/dir/page/per-page) and the command id; a refresh re-reads
+       with the view (data-sort/dir/page/per-page); a refresh re-reads
        /fragments/results with the LIVE filter bar and swap:none, so only the OOB summary, pager
        and header land (rows are untouched). The filter bar is hx-sync="this:drop": a refresh
        issued while any results request is in flight is discarded, never queued, and that
@@ -1368,25 +1368,6 @@ constexpr char kDashJs7[] = R"HTM(    /* ── Global Keyboard Shortcuts ──
     ['[sse-swap="output"]', '[sse-swap="command-status"]'].forEach(function(sel) {
       var el = document.querySelector(sel);
       if (el) el.addEventListener('htmx:sseMessage', scheduleResultsRefresh);
-    });
-
-    /* Command-generation guard. htmx applies hx-swap-oob fragments inside the swap path only, so
-       dropping the swap here also drops a stale command's summary/pager/button: a late
-       /fragments/results (or Create Group form) response whose command_id differs from the one
-       #result-pagination is stamped with is ignored. */
-    document.body.addEventListener('htmx:beforeSwap', function(evt) {
-      var xhr = evt.detail.xhr;
-      var cfg = evt.detail.requestConfig;
-      if (!xhr || !cfg) return;
-      var path = String(cfg.path || '');
-      if (path.indexOf('/fragments/results') !== 0 &&
-          path.indexOf('/fragments/create-group-form') !== 0) return;
-      var cid;
-      try { cid = new URL(xhr.responseURL, location.href).searchParams.get('command_id'); }
-      catch (_) { return; }
-      var nav = document.getElementById('result-pagination');
-      var cur = nav && nav.dataset.commandId;
-      if (cid && cur && cid !== cur) evt.detail.shouldSwap = false;
     });
 
     /* Agent online/offline → trigger agentChanged on body */

@@ -384,8 +384,8 @@ private:
     /// summary. Every sort/pager link carries only the identity of the view (command, plugin,
     /// sort, dir, page, per_page, definition) and re-reads the LIVE filter bar through
     /// `hx-include="#filter-bar"`, so a changed filter is never reverted by a stale baked URL.
-    /// `#result-pagination` carries `data-command-id` / `data-sort` / `data-dir` / `data-page` /
-    /// `data-per-page` for the client-side refresh and stale-command guard. The "N agents" count
+    /// `#result-pagination` carries `data-sort` / `data-dir` / `data-page` / `data-per-page` for
+    /// the client-side summary refresh. The "N agents" count
     /// is DISTINCT agents (a stored row is one frame, so one agent can own several), and when
     /// @p text_query is set it counts only agents with a matching line; the Create Group button is
     /// offered for a text query alone. When @p definition_id is non-empty AND the definition has a
