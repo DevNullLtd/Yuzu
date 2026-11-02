@@ -261,14 +261,11 @@ struct RegistryReader {
     /// One bounded read of `root`. Must not throw. `deadline` is an absolute now_ts() value.
     std::function<SubtreeRead(const std::string& root, std::int64_t deadline)> read_subtree;
     std::function<std::vector<std::string>()> loaded_sids; // subkey names under HKEY_USERS
-    /// The profiles whose hive is NOT loaded, from the profile list. Asked on the ticks that
-    /// re-enumerate loaded hives (an HKU name change, a reconcile tick, a re-baseline), on every
-    /// tick while the known offline list is empty, and on every tick while the last walk was
-    /// incomplete or a known profile has no path yet -- so an ordinary tick with a settled list
-    /// does not walk. `complete == false` means "keep what you knew": it is never read as
-    /// "nothing exists" (see reconcile_offline). Classified against collect's own HKU snapshot
-    /// for this tick (`loaded_sids`, as it will use it), never a second enumeration: a profile
-    /// is offline exactly when its sid is not in that list. Must not throw.
+    /// The profiles whose hive is NOT loaded, from the profile list, classified against collect's
+    /// own `loaded_sids` for this tick (never a second HKU enumeration). Asked when loaded hives
+    /// are re-enumerated, while the known list is empty, and while the last walk was incomplete
+    /// or a known profile has no path yet (see collect()). `complete == false` means "keep what
+    /// you knew", never "nothing exists" (see reconcile_offline). Must not throw.
     std::function<OfflineDiscovery(const std::vector<std::string>& loaded_sids)> offline_profiles;
     /// Mounts one offline hive through the shared guarded ladder and reads every root in
     /// `roots` (this hive's logical `HKU\<sid>\...` roots) from that one mount. Called

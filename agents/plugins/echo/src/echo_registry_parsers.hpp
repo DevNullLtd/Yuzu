@@ -69,9 +69,7 @@
 // again its first loaded read happens at once and diffs against the offline baseline. A failed
 // mount is an Unreadable read with a named reason (one gap row per transition); an INCOMPLETE
 // profile discovery keeps the known offline list (reconcile_offline): scope is removed only
-// when a complete walk says the profile is gone. That holds for a user who logs off on the very
-// tick the walk is incomplete: the profile stays in scope with no path yet, is not read, and is
-// read once a later complete walk supplies the path.
+// when a complete walk says the profile is gone.
 
 #include "echo_db.hpp" // RegistryEvent
 
