@@ -22,6 +22,15 @@
 ///   - `category` is one of `kCategories` (empty = other).
 ///   - `cpe_product` is OUR OWN column (never read from the CPE resolver).
 ///   - No quoting: a field may not contain a comma or a double quote.
+///   - Rows that share a canonical product (same vendor, product and edition) must
+///     agree on `category` and `cpe_product`; a conflict is rejected, never resolved
+///     by row order. `cpe_product` may not be `-` or `.`.
+///   - Bounded input: the parser is the trust boundary for every pack body. A pack over
+///     `kMaxPackBytes`, over `kMaxPackRows` rows, with a field over `kMaxFieldBytes`
+///     or with a NUL byte anywhere is rejected. `pack_version` carries a month 01-12.
+///     The normalisers' output (`normalize_title`, `normalize_vendor`, `alias_key`)
+///     is baked into every stored key, so a change to any of them requires a new
+///     `pack_version` (see product_registry_store.hpp).
 
 #include "product_normalize.hpp"
 
@@ -38,6 +47,12 @@ namespace yuzu::server {
 inline constexpr std::array<std::string_view, 5> kCategories{
     "web_server", "database", "message_broker", "runtime", "other",
 };
+
+/// Upper bounds on one pack body (the seed is a few KB; these leave room for growth while
+/// keeping a pack a bounded, in-memory parse and a bounded boot-time load).
+inline constexpr std::size_t kMaxPackBytes = 1U << 20; ///< 1 MiB of CSV text
+inline constexpr std::size_t kMaxPackRows = 5000;
+inline constexpr std::size_t kMaxFieldBytes = 256; ///< per field, so a key stays far below the btree row limit
 
 /// Lower bound on rows in a pack. A pack thinner than this resolves almost
 /// nothing; the parser rejects it rather than ship a hollow seed.
@@ -76,7 +91,7 @@ struct ParsedPack {
 [[nodiscard]] std::expected<ParsedPack, std::string> parse_normalization_pack(std::string_view csv);
 
 /// Package-URL type for an ecosystem; empty when no purl type exists
-/// (windows/msi/macos/pkgutil/snap/flatpak/optional_feature).
+/// (windows/msi/macos/macos_pkgutil/snap/flatpak/optional_feature).
 [[nodiscard]] constexpr std::string_view purl_type_for(std::string_view ecosystem) noexcept {
     if (ecosystem == "rpm")
         return "rpm";

@@ -1,11 +1,10 @@
-# Software title alias pack (SAM.4) - PROVISIONAL SEED.
+# Software title alias pack - the seed shipped with the server.
 #
-# Maps raw installed-software titles onto canonical products for the server-side
-# title normalisation job. Embedded in the server binary (server/core/meson.build
-# -> kSoftwareNormalizationSeed) and loaded into Postgres at first boot ONLY when no
-# pack has been loaded yet; a later pack replaces it through the upload route, never
-# through a newer binary. The sizing measurement that would tune this seed (S-2) has
-# not been run: treat the coverage as provisional.
+# Maps raw installed-software titles onto canonical products for the server's title
+# normalisation job. Embedded in the server binary and loaded into Postgres at first
+# boot ONLY when no pack has been loaded yet; a newer binary never replaces a stored
+# pack. The rows below are a starting set rather than a measured one: a title they do
+# not resolve is labelled unnormalized and queued for curation, never guessed.
 #
 # Columns:
 #   ecosystem,raw_name,raw_publisher,vendor,product,edition,category,cpe_product
@@ -28,6 +27,9 @@
 #
 # Precedence when several rows could match a title: curated before pack, then
 # (ecosystem, publisher) > (ecosystem, any) > (any, publisher) > (any, any).
+# Rows for the same product (same vendor, product and edition) must agree on category
+# and cpe_product, and every spelling of a product uses the SAME vendor value: the
+# vendor is part of the product's identity, so two vendor spellings are two products.
 # No quoting: a field may not contain a comma or a double quote.
 #
 #pack_version: 2026.11.1
@@ -53,7 +55,7 @@
 ,postgresql,,postgresql,postgresql,,database,postgresql
 ,postgresql-server,,postgresql,postgresql,,database,postgresql
 ,mariadb-server,,mariadb,mariadb,,database,mariadb
-,mysql-server,,mysql,mysql,,database,mysql
+,mysql-server,,oracle,mysql,,database,mysql
 ,redis-server,,redis,redis,,database,redis
 ,rabbitmq-server,,rabbitmq,rabbitmq,,message_broker,rabbitmq
 ,mosquitto,,eclipse,mosquitto,,message_broker,mosquitto
@@ -76,7 +78,7 @@ windows,Java 8 Update 361 (64-bit),,Oracle,JRE,,runtime,jre
 windows,Microsoft .NET Runtime - 8.0.1 (x64),,Microsoft,.NET Runtime,,runtime,.net
 windows,Microsoft .NET SDK 8.0.100 (x64),,Microsoft,.NET SDK,,runtime,.net
 windows,Node.js,,OpenJS Foundation,node.js,,runtime,node.js
-windows,PostgreSQL 16,,PostgreSQL Global Development Group,postgresql,,database,postgresql
+windows,PostgreSQL 16,,postgresql,postgresql,,database,postgresql
 windows,MySQL Server 8.0,,Oracle,mysql,,database,mysql
 windows,MariaDB 10.11 (x64),,MariaDB,mariadb,,database,mariadb
 windows,MongoDB,,MongoDB,mongodb,,database,mongodb
@@ -95,7 +97,7 @@ windows,FileZilla Client 3.66.1,,Tim Kosse,FileZilla,,other,filezilla
 windows,Docker Desktop,,Docker,Docker Desktop,,other,desktop
 windows,Oracle VM VirtualBox 7.0.12,,Oracle,VirtualBox,,other,vm_virtualbox
 windows,VMware Workstation,,VMware,Workstation,,other,workstation
-windows,LibreOffice 7.6.4.1,,The Document Foundation,LibreOffice,,other,libreoffice
+windows,LibreOffice 7.6.4.1,,libreoffice,LibreOffice,,other,libreoffice
 # -- macOS applications and Homebrew formulae ---------------------------------------
 macos,Firefox,,Mozilla,Firefox,,other,firefox
 macos,Google Chrome,,Google,Chrome,,other,chrome

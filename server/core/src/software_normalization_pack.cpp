@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <set>
 #include <tuple>
+#include <unordered_map>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -25,14 +27,17 @@ std::string_view trim(std::string_view s) {
     return s;
 }
 
-/// `YYYY.MM.N`: 4 digits, '.', 2 digits, '.', 1+ digits.
+/// `YYYY.MM.N`: 4 digits, '.', a month 01-12, '.', 1+ digits.
 bool valid_pack_version(std::string_view v) {
     const auto digits = [](std::string_view s) {
         return !s.empty() && std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; });
     };
     if (v.size() < 9 || v[4] != '.' || v[7] != '.')
         return false;
-    return digits(v.substr(0, 4)) && digits(v.substr(5, 2)) && digits(v.substr(8));
+    if (!digits(v.substr(0, 4)) || !digits(v.substr(5, 2)) || !digits(v.substr(8)))
+        return false;
+    const int month = (v[5] - '0') * 10 + (v[6] - '0');
+    return month >= 1 && month <= 12;
 }
 
 bool valid_cpe_product(std::string_view s) {
@@ -40,6 +45,11 @@ bool valid_cpe_product(std::string_view s) {
         return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' ||
                c == '-' || c == '+';
     });
+}
+
+/// "-" and "." are CPE logical values (not applicable / any), never a product token.
+bool reserved_cpe_product(std::string_view s) {
+    return s == "-" || s == ".";
 }
 
 bool known_ecosystem(std::string_view e) {
@@ -55,8 +65,17 @@ std::string line_error(std::size_t line, std::string_view what) {
 } // namespace
 
 std::expected<ParsedPack, std::string> parse_normalization_pack(std::string_view csv) {
+    // Caps first: this parser is the trust boundary for every pack body, so nothing below
+    // runs over an unbounded or binary input.
+    if (csv.size() > kMaxPackBytes)
+        return std::unexpected("pack exceeds kMaxPackBytes (" + std::to_string(kMaxPackBytes) + ")");
+    if (csv.find('\0') != std::string_view::npos)
+        return std::unexpected("pack contains a NUL byte");
+
     ParsedPack out;
     std::set<std::tuple<std::string, std::string, std::string>> seen;
+    // norm_key -> (category, cpe_product): rows sharing a product must agree on its attributes.
+    std::unordered_map<std::string, std::pair<std::string, std::string>> product_attrs;
     bool have_version = false;
     std::size_t line_no = 0;
     std::size_t pos = 0;
@@ -94,6 +113,11 @@ std::expected<ParsedPack, std::string> parse_normalization_pack(std::string_view
         }
         if (f.size() != kFieldCount)
             return std::unexpected(line_error(line_no, "expected exactly 8 fields"));
+        if (std::any_of(f.begin(), f.end(),
+                        [](std::string_view v) { return v.size() > kMaxFieldBytes; }))
+            return std::unexpected(line_error(line_no, "field exceeds kMaxFieldBytes"));
+        if (out.rows.size() >= kMaxPackRows)
+            return std::unexpected(line_error(line_no, "pack exceeds kMaxPackRows"));
 
         PackRow row;
         row.ecosystem = std::string{f[0]};
@@ -130,6 +154,8 @@ std::expected<ParsedPack, std::string> parse_normalization_pack(std::string_view
             return std::unexpected(line_error(line_no, "unknown category"));
         if (!valid_cpe_product(f[7]))
             return std::unexpected(line_error(line_no, "cpe_product has an invalid character"));
+        if (reserved_cpe_product(f[7]))
+            return std::unexpected(line_error(line_no, "cpe_product is a reserved placeholder"));
         row.cpe_product = std::string{f[7]};
         // The shape `norm_key()` produces from a raw title, so a pack product is found by
         // the dimension's exact-key read and by the SLE matcher's exact tier alike.
@@ -137,6 +163,13 @@ std::expected<ParsedPack, std::string> parse_normalization_pack(std::string_view
 
         if (!seen.emplace(row.ecosystem, row.raw_name, row.raw_publisher).second)
             return std::unexpected(line_error(line_no, "duplicate (ecosystem, raw_name, raw_publisher)"));
+        // One product, one set of attributes: the load upserts by norm_key, so a second row
+        // with another category or cpe_product would silently win or lose by row order.
+        const auto [attrs, fresh] =
+            product_attrs.try_emplace(row.norm_key, std::pair{row.category, row.cpe_product});
+        if (!fresh && attrs->second != std::pair{row.category, row.cpe_product})
+            return std::unexpected(
+                line_error(line_no, "norm_key shared with a different category or cpe_product"));
         out.rows.push_back(std::move(row));
     }
     if (!have_version)

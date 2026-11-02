@@ -5551,9 +5551,10 @@ groups:
             catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuSoftwareNormalizationStale
-        # The SAM.4 title normalisation job (SoftwareNormalizationJob) ticks hourly (after a
-        # full capped tick it ticks again in 60 s until the backlog is drained; a failed tick
-        # always waits the hour) and stamps yuzu_software_normalization_last_success_timestamp
+        # The title normalisation job (SoftwareNormalizationJob) ticks hourly (after a full
+        # capped tick, or one that found the catalogue rollup's title_triples not yet filled,
+        # it ticks again in 60 s; a failed tick always waits the hour) and stamps
+        # yuzu_software_normalization_last_success_timestamp
         # on a tick with no failed pass. If ticks stop succeeding, the title dimension and
         # curation queue stop following the fleet. `> 0` GUARD IS LOAD-BEARING: the gauge is
         # seeded to 0 when the job is constructed, so a naive `now - ts` fires on every cold
@@ -5573,37 +5574,50 @@ groups:
             The software title normalisation job has not completed a clean tick in over 2h
             (cadence is 1h). The title dimension and curation queue are frozen at their last
             good state. Check yuzu_software_normalization_pass_total{outcome="error"} and the
-            SoftwareNormalizationJob log (Postgres availability, the 60 s per-pass budget, the
-            catalogue rollup that feeds title_triples).
+            server log lines prefixed "Software normalisation:" and "SoftwareTitleDimension:"
+            (Postgres availability, the 60 s per-pass budget). Its candidate source is the
+            catalogue rollup's title_triples table, which this alert cannot watch: if
+            YuzuInventoryCatalogRollupStale or YuzuInventoryCatalogRollupFailing is also
+            firing, fix the rollup first, because a clean tick over a stalled rollup does
+            not alert here.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuSoftwareNormalizationFailing
-        # Sized to the HOURLY cadence. The job adds at most ONE error increment per hour (a
-        # failed tick is never re-armed early), so a rate()/15m window with a 15m hold (the
-        # sibling YuzuInventoryCatalogRollupFailing shape) can never observe it: the single
-        # increment ages out of a 15m window long before `for` elapses. increase()[2h] >= 2
-        # fires on the second failed hourly tick and stays firing for the hour both
-        # increments remain in the window; one isolated failure followed by a success stays
-        # quiet. The threshold is >= 2, not > 1: increase() extrapolates to the window edges
-        # (factor >= 1, never below), so a SINGLE increment on a non-zero baseline (an earlier
-        # failure that has aged out of the window) reads a little above 1 (~1.01 on a 1m
-        # scrape) for the whole hour it stays in the window, while two increments read >= 2.
-        # That holds while the scrape interval is far below 2h. A job that never succeeded
+        # Sized to the HOURLY cadence. The job adds at most ONE error increment per tick (a
+        # failed tick is never re-armed early), and the wait is measured from the END of a
+        # tick, so a sustained outage's period is 3600 s PLUS the tick's own duration, always
+        # a little over an hour. A rate()/15m window with a 15m hold (the sibling
+        # YuzuInventoryCatalogRollupFailing shape) can never observe that: the single
+        # increment ages out of a 15m window long before `for` elapses. A 2h window is too
+        # tight as well: with a period over 60 min it holds only ONE increment for a couple
+        # of minutes of every period, the expression drops below 2 and `for` resets, so the
+        # alert would go quiet once an hour in a sustained outage. increase()[3h] >= 2 always
+        # holds at least two increments while the period is under 90 min, fires on the second
+        # failed tick and stays firing through the outage; one isolated failure followed by a
+        # success stays quiet. The threshold is >= 2, not > 1: increase() extrapolates to the
+        # window edges (factor >= 1, never below), so a SINGLE increment on a non-zero
+        # baseline (an earlier failure that has aged out of the window) reads a little above 1
+        # (~1.01 on a 1m scrape) for the whole time it stays in the window, while two
+        # increments read >= 2. That holds while the scrape interval is far below 3h. A job
+        # that never succeeded
         # (the case the Stale rule's `> 0` guard skips) fires at its second failed tick: both
         # outcome series are seeded at 0 when the job is constructed, so the first failure is
         # already an increase.
         expr: |
-          sum by (instance) (increase(yuzu_software_normalization_pass_total{outcome="error"}[2h])) >= 2
+          sum by (instance) (increase(yuzu_software_normalization_pass_total{outcome="error"}[3h])) >= 2
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Software title normalisation ticks are failing"
           description: >-
-            Two or more hourly software title normalisation ticks failed within 2h. If
+            Two or more hourly software title normalisation ticks failed within 3h. If
             yuzu_software_normalization_last_success_timestamp is still 0 the job has never
             completed a tick; otherwise the dimension is frozen at its last good state.
-            Investigate Postgres availability and the SoftwareNormalizationJob log (a pass
-            over its 60 s budget, a missing alias pack, a failed queue reconcile).
+            Investigate Postgres availability and the server log lines prefixed
+            "Software normalisation:" and "SoftwareTitleDimension:" (a pass over its 60 s
+            budget, a missing alias pack, a failed queue reconcile). The catalogue rollup that
+            fills title_triples has its own alerts (YuzuInventoryCatalogRollupStale and
+            YuzuInventoryCatalogRollupFailing); check them as the upstream cause.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       # YuzuInventoryStaleAgents — SHIPPED DISABLED. The freshness gauge
       # (yuzu_inventory_stale_agents{source}) is exported and graphable, but there

@@ -30,6 +30,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -2116,6 +2117,38 @@ TEST_CASE("refresh_catalog_rollup rebuilds title_triples with exact distinct tri
     // A second refresh replaces the table rather than appending.
     REQUIRE(store.refresh_catalog_rollup());
     CHECK(count_rows(pool, "title_triples") == 3);
+}
+
+TEST_CASE("refresh_catalog_rollup leaves an over-wide triple out of title_triples and still succeeds",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    // Ingest clamps each field to 1024 bytes but not their sum. Three incompressible 1024-byte
+    // fields exceed the btree entry limit (~2704 bytes) of title_triples' primary key: without
+    // the size cap in the rollup INSERT the whole refresh would fail ("index row size ...
+    // exceeds btree version 4 maximum") and freeze the catalogue. Deterministic noise, because a
+    // repeated character would compress below the limit and not reproduce the failure.
+    const auto noise = [](std::uint32_t seed) {
+        std::mt19937 gen{seed};
+        std::string out;
+        for (int i = 0; i < 1024; ++i)
+            out += static_cast<char>(33 + gen() % 94);
+        return out;
+    };
+    put(store, "d1",
+        Rows{ent(noise(1), "1.0", noise(2), "package", noise(3), kSrcPkg),
+             ent("small-title", "1.0", "Pub", "package", "rpm", kSrcPkg)});
+    REQUIRE(store.refresh_catalog_rollup());
+
+    // Control: the wide row was ingested, so only the cap kept it out of title_triples.
+    CHECK(count_rows(pool, "installed_software") == 2);
+    CHECK(count_rows(pool, "title_triples") == 1);
+    auto r = run_sql(pool, "SELECT name FROM software_inventory_store.title_triples");
+    REQUIRE(PQntuples(r.get()) == 1);
+    CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "small-title");
+    // The catalogue itself refreshed (it does not depend on the cap).
+    auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->refreshed_at > 0);
 }
 
 TEST_CASE("catalogue Installs are exact distinct devices under every filter grain",

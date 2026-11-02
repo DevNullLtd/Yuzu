@@ -11,15 +11,17 @@
 #include <spdlog/spdlog.h>
 
 #include <exception>
+#include <utility>
 
 namespace yuzu::server {
 
 SoftwareNormalizationJob::SoftwareNormalizationJob(SoftwareTitleDimension& dimension,
                                                    std::chrono::seconds interval,
-                                                   yuzu::MetricsRegistry* metrics)
+                                                   yuzu::MetricsRegistry* metrics,
+                                                   TickObserver on_tick)
     : dimension_(dimension),
       interval_(interval <= std::chrono::seconds{0} ? std::chrono::seconds{3600} : interval),
-      metrics_(metrics) {
+      metrics_(metrics), on_tick_(std::move(on_tick)) {
     // Seeded BEFORE the first tick: a lazily created error counter would first appear at 1,
     // an increase the Failing rule cannot see, and the Stale rule needs the timestamp series
     // to exist (it guards `> 0`; a never-successful job is the Failing rule's case).
@@ -77,6 +79,14 @@ TickResult SoftwareNormalizationJob::tick_once() {
         spdlog::warn("Software normalisation: tick had a failed pass or reconcile "
                      "({} passes, {} titles)",
                      r.passes, r.processed);
+    else
+        spdlog::info("Software normalisation: tick complete ({} passes, {} titles, {}, next in {} s)",
+                     r.passes, r.processed,
+                     r.capped ? "backlog remains" : r.source_pending ? "waiting for the catalogue rollup"
+                                                                     : "caught up",
+                     rearm_interval(r, interval_).count());
+    if (on_tick_)
+        on_tick_(r);
     return r;
 }
 

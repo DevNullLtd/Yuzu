@@ -37,7 +37,7 @@
 /// cross-store query owner, which reads `software_inventory_store.title_triples`);
 /// this class owns the schema, the pack load and the alias reads.
 ///
-/// Alias-key contract (D2): a pack/curated alias is keyed on
+/// Alias-key contract: a pack/curated alias is keyed on
 /// `software_normalization_pack.hpp::alias_key()` - the normalised title with the
 /// extracted edition re-appended - stored in `product_aliases.raw_name`, plus the
 /// normalised vendor in `raw_publisher`. There is NO edition wildcard. The tier
@@ -50,9 +50,21 @@
 /// edit) MUST set `title_dimension.pack_version = ''` (the stale sentinel) for the
 /// affected rows - by alias key, or by `product_id` - in the SAME transaction. The
 /// normalisation job re-selects any row whose `pack_version` differs from the
-/// current pack, so no new column or generation counter is needed. This
-/// store's own mutations (the seed load, which stamps the pack version, and the
-/// `ON DELETE SET NULL` foreign key) need no sentinel write.
+/// current pack, so no new column or generation counter is needed. That write MUST
+/// first take the blocking `pg_advisory_xact_lock(hashtextextended(
+/// 'software_normalization', 0))` that every normalisation pass tries: a pass that
+/// selected a row before the mutation commits would otherwise upsert it afterwards,
+/// stamping the current `pack_version` over the sentinel and losing the invalidation.
+/// This store's own mutations (the seed load, which stamps the pack version, and the
+/// `ON DELETE SET NULL` foreign key) need no sentinel write. A writer of
+/// `products.category` must use a value from `kCategories`: the dimension's `category`
+/// column is constrained to that set and a pass writing another value would fail.
+///
+/// Normaliser contract: every stored key (`product_aliases.raw_name`, `products.norm_key`,
+/// `title_dimension` resolutions) is derived with `normalize_title`, `normalize_vendor` and
+/// `alias_key`. There is no normaliser-version column; a change to the output of any of
+/// them REQUIRES a new `pack_version` (the job's `<>` arm then re-normalises every row)
+/// and a re-keyed pack.
 
 #include <libpq-fe.h> // PGconn: the static reads below take a caller-pinned connection (see
                       // pg_migration_runner.hpp - include libpq, never re-declare pg_conn)
@@ -220,11 +232,14 @@ public:
 
     /// The alias read on a CALLER-PINNED connection, for the title dimension owner's
     /// single transaction (a nested lease would need a second pool connection): active
-    /// pack/curated aliases whose `raw_name` (alias key) is in `alias_keys`, joined to
-    /// their products. `std::nullopt` on a SQL failure (no degrade accounting: the
-    /// caller's pass fails and is retried).
+    /// aliases whose `raw_name` (alias key) is in `alias_keys` and whose `source` is
+    /// EXACTLY one of `sources` (`pack:<ecosystem>` / `curated:<ecosystem>` - the caller
+    /// knows the candidates' ecosystems, so the read is an equality probe on the primary
+    /// key's leading column, not a prefix scan), joined to their products. `std::nullopt`
+    /// on a SQL failure (no degrade accounting: the caller's pass fails and is retried).
     [[nodiscard]] static std::optional<std::vector<NormalizationAliasRow>>
-    read_normalization_aliases(PGconn* conn, const std::vector<std::string_view>& alias_keys);
+    read_normalization_aliases(PGconn* conn, const std::vector<std::string_view>& alias_keys,
+                               const std::vector<std::string_view>& sources);
 
     /// The products whose `norm_key` is in `norm_keys` (UNIQUE, so at most one row per
     /// key), on a caller-pinned connection - the dimension's exact-key read. Same

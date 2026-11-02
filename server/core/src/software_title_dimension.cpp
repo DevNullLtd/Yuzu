@@ -32,6 +32,9 @@ namespace {
 
 constexpr std::chrono::milliseconds kAcquireTimeout{3000};
 constexpr std::size_t kCancelCheckEvery = 256;
+/// An open queue row whose device count has not changed is re-stamped (`last_seen_at`) at
+/// most this often, so the hourly reconcile writes only the rows that moved.
+constexpr std::int64_t kQueueRestampSecs = 86400;
 
 std::int64_t now_secs() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -82,15 +85,27 @@ bool set_statement_timeout(PGconn* c) {
     return exec_logged(c, "statement_timeout", sql.c_str(), {}).status() == PGRES_COMMAND_OK;
 }
 
-/// The cluster-wide single-writer lock, taken as the first statement of a pass and of the
-/// queue reconcile. `nullopt` = the statement failed; `false` = a peer holds it (skip).
+/// The cluster-wide single-writer lock, taken (after the transaction's `SET LOCAL
+/// statement_timeout`) at the start of a pass and of the queue reconcile. `true` = this transaction now holds it; `false` = a peer holds it (skip);
+/// `nullopt` = the statement failed OR answered with any shape other than one row of exactly
+/// "t" or "f" (fail closed: an unexpected answer never reads as "we hold the lock").
 std::optional<bool> try_norm_lock(PGconn* c) {
     pg::PgResult lk = exec_logged(
         c, "advisory lock",
         "SELECT pg_try_advisory_xact_lock(hashtextextended('software_normalization', 0))", {});
     if (lk.status() != PGRES_TUPLES_OK)
         return std::nullopt;
-    return !(PQntuples(lk.get()) == 1 && std::string_view(PQgetvalue(lk.get(), 0, 0)) == "f");
+    if (PQntuples(lk.get()) == 1) {
+        const std::string_view v = PQgetvalue(lk.get(), 0, 0);
+        if (v == "t")
+            return true;
+        if (v == "f")
+            return false;
+    }
+    spdlog::warn("SoftwareTitleDimension: advisory lock answered with an unexpected shape "
+                 "({} rows) - treated as failed",
+                 PQntuples(lk.get()));
+    return std::nullopt;
 }
 
 /// Distinct values as views (the keyed reads take a de-duplicated array).
@@ -127,6 +142,11 @@ TitleResolution resolve_title(const TitleKey& key,
     out.edition = nt.edition;
     out.title_version = nt.version;
     out.purl_type = std::string{purl_type_for(key.ecosystem)};
+
+    // A name with no title token ("2019", "(x64)", "Pro") identifies nothing; it never reaches
+    // an alias or a product, whatever the key it would form.
+    if (nt.title.empty())
+        return out;
 
     const auto adopt = [&](const ProductRow& p, std::string method) {
         out.norm_status = "normalized";
@@ -232,7 +252,7 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
             }
             const std::string pack_version = PQgetvalue(pk.get(), 0, 0);
 
-            // The `<>` arm also catches the '' stale sentinel (D14); the third arm is a
+            // The `<>` arm also catches the '' stale sentinel (see product_registry_store.hpp); the third arm is a
             // product deleted under a normalized row (ON DELETE SET NULL).
             pg::PgResult cand = exec_logged(
                 c, "candidates",
@@ -254,7 +274,21 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
                                   cell_i64(cand, i, 3)});
             processed = static_cast<int>(titles.size());
             if (titles.empty()) {
-                inner = PassOutcome::ok;
+                // Nothing to normalise. If title_triples is itself empty while installed
+                // software exists, the rollup that fills it has not completed yet (a fresh
+                // boot or the table's own migration): say so, so the job looks again in a
+                // minute rather than after a full interval. Self-bounding - once the rollup
+                // has run, title_triples is empty only when there is no inventory.
+                pg::PgResult src = exec_logged(
+                    c, "source pending",
+                    "SELECT (NOT EXISTS (SELECT 1 FROM software_inventory_store.title_triples)) "
+                    "   AND EXISTS (SELECT 1 FROM software_inventory_store.installed_software)",
+                    {});
+                if (src.status() != PGRES_TUPLES_OK || PQntuples(src.get()) != 1)
+                    return false;
+                inner = std::string_view(PQgetvalue(src.get(), 0, 0)) == "t"
+                            ? PassOutcome::source_pending
+                            : PassOutcome::ok;
                 return true;
             }
 
@@ -266,12 +300,19 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
             std::vector<std::string> product_keys;
             alias_keys.reserve(titles.size());
             product_keys.reserve(titles.size());
+            std::set<std::string> ecosystems{""}; // the wildcard ecosystem always applies
             for (const auto& t : titles) {
                 alias_keys.push_back(alias_key(normalize_title(t.key.raw_name)));
                 product_keys.push_back(norm_key(t.key.raw_name, t.key.raw_publisher));
+                ecosystems.insert(t.key.ecosystem);
             }
-            auto aliases =
-                ProductRegistryStore::read_normalization_aliases(c, distinct_views(alias_keys));
+            // The exact `source` values resolve_title can match: tier x (ecosystem | wildcard).
+            std::vector<std::string> sources;
+            for (const char* tier : {"pack:", "curated:"})
+                for (const auto& eco : ecosystems)
+                    sources.push_back(tier + eco);
+            auto aliases = ProductRegistryStore::read_normalization_aliases(
+                c, distinct_views(alias_keys), distinct_views(sources));
             if (!aliases)
                 return false;
             std::unordered_map<std::string, std::vector<NormalizationAliasRow>> aliases_by_key;
@@ -381,9 +422,11 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
             if (!dn.empty()) {
                 if (abort_requested())
                     return false;
+                // Only an OPEN row leaves the queue when its title resolves: 'rejected' is a
+                // curator decision that outlives both the title's absence and its resolution.
                 if (exec_logged(c, "queue delete",
                         "DELETE FROM product_registry_store.curation_queue "
-                        "WHERE (raw_name, raw_publisher, ecosystem) IN "
+                        "WHERE status = 'open' AND (raw_name, raw_publisher, ecosystem) IN "
                         "  (SELECT a, b, c FROM unnest($1::text[], $2::text[], $3::text[]) "
                         "     AS t(a, b, c))",
                         {text_array(dn), text_array(dp), text_array(de)})
@@ -435,17 +478,22 @@ bool SoftwareTitleDimension::reconcile_queue(const std::function<bool()>& cancel
                 return true; // a peer is normalising; it reconciles
             if (cancelled && cancelled())
                 return false;
-            // ponytail: one set-based UPDATE over the whole queue; partition it if the
-            // queue ever exceeds ~10^5 rows.
+            // ponytail: one set-based UPDATE inside the 60 s statement_timeout, touching only
+            // rows whose count moved (or that are a day stale), so the hourly tuple churn is the
+            // changed set and not the whole queue. If the open queue ever approaches what one
+            // statement can update inside that budget, partition the UPDATE by key range.
             const std::string now = std::to_string(now_secs());
-            if (exec_logged(c, "queue refresh",
-                            "UPDATE product_registry_store.curation_queue q "
-                            "SET device_count = t.device_count, last_seen_at = $1::bigint "
-                            "FROM software_inventory_store.title_triples t "
-                            "WHERE q.raw_name = t.name AND q.raw_publisher = t.publisher "
-                            "  AND q.ecosystem = t.ecosystem",
-                            {now})
-                    .status() != PGRES_COMMAND_OK)
+            static const std::string kQueueRefreshSql =
+                "UPDATE product_registry_store.curation_queue q "
+                "SET device_count = t.device_count, last_seen_at = $1::bigint "
+                "FROM software_inventory_store.title_triples t "
+                "WHERE q.raw_name = t.name AND q.raw_publisher = t.publisher "
+                "  AND q.ecosystem = t.ecosystem "
+                "  AND (q.device_count IS DISTINCT FROM t.device_count "
+                "       OR q.last_seen_at < $1::bigint - " +
+                std::to_string(kQueueRestampSecs) + ")";
+            if (exec_logged(c, "queue refresh", kQueueRefreshSql.c_str(), {now}).status() !=
+                PGRES_COMMAND_OK)
                 return false;
             if (cancelled && cancelled())
                 return false;
@@ -505,7 +553,12 @@ void SoftwareTitleDimension::refresh_gauges() {
                 return log_failed("isolation", iso);
             pg::PgResult g = pg::exec_params(
                 c,
-                "SELECT COALESCE(d.norm_status, 'pending'), count(*), "
+                // A title with no dimension row, or whose 'normalized' row lost its product
+                // (ON DELETE SET NULL, awaiting re-selection), is pending - never normalized.
+                "SELECT CASE WHEN d.norm_status = 'normalized' AND d.product_id IS NOT NULL "
+                "            THEN 'normalized' "
+                "            WHEN d.norm_status = 'unnormalized' THEN 'unnormalized' "
+                "            ELSE 'pending' END, count(*), "
                 "       COALESCE(sum(t.device_count), 0) "
                 "FROM software_inventory_store.title_triples t "
                 "LEFT JOIN product_registry_store.title_dimension d "
@@ -553,11 +606,13 @@ void SoftwareTitleDimension::refresh_gauges() {
     for (std::size_t i = 0; i < kStatus.size(); ++i)
         metrics_->gauge("yuzu_software_titles", {{"norm_status", kStatus[i]}})
             .set(static_cast<double>(titles[i]));
+    // No title_triples rows (rollup not run yet, or no inventory) is NOT "fully normalised":
+    // the ratio is left unset (absent before the first non-empty read, last value after)
+    // rather than reported as a perfect 0. The catalogue-rollup alerts watch the feed itself.
     const std::int64_t total_devices = devices[0] + devices[1] + devices[2];
-    metrics_->gauge("yuzu_software_unnormalized_ratio")
-        .set(total_devices == 0 ? 0.0
-                                : static_cast<double>(devices[1] + devices[2]) /
-                                      static_cast<double>(total_devices));
+    if (total_devices > 0)
+        metrics_->gauge("yuzu_software_unnormalized_ratio")
+            .set(static_cast<double>(devices[1] + devices[2]) / static_cast<double>(total_devices));
     metrics_->gauge("yuzu_software_normalization_curation_queue_size")
         .set(static_cast<double>(queue_open));
     if (!last_pack_version_label_.empty() && last_pack_version_label_ != pack_version)
@@ -591,6 +646,10 @@ TickResult SoftwareTitleDimension::run_tick(const std::function<bool()>& cancell
             tick.errored = true;
             break;
         }
+        if (r.outcome == PassOutcome::source_pending) {
+            tick.source_pending = true;
+            break;
+        }
         if (r.outcome == PassOutcome::skipped_peer || r.processed < kPassLimit)
             break; // a peer is normalising, or a short page: nothing left to do
         if (pass + 1 == max_passes)
@@ -603,6 +662,7 @@ TickResult SoftwareTitleDimension::run_tick(const std::function<bool()>& cancell
     if (stop())
         tick.cancelled = !tick.errored;
     tick.capped = tick.capped && !tick.errored && !tick.cancelled;
+    tick.source_pending = tick.source_pending && !tick.errored && !tick.cancelled;
     // A shutdown cancel skips the gauges: they keep their last values (the same posture as a
     // degraded read) and the stop path avoids a lease plus the title_triples join.
     if (!tick.cancelled)

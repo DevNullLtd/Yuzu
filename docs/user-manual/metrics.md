@@ -297,19 +297,19 @@ The same counter, its other sources and the per-degrade log sampling are describ
 
 ## Software title normalisation metrics
 
-The hourly software title normalisation job (see [Inventory](inventory.md)) exports seven families. Every label set is closed and bounded; none carries a title or an agent id. A degraded read of the gauge inputs leaves the previous values in place rather than writing zeros.
+The hourly software title normalisation job (see [Inventory](inventory.md)) exports seven families. No label carries a title or an agent id, and every label set is bounded except `pack_version`, which holds one series per alias pack version the process has seen (a handful over a server's life). A degraded read of the gauge inputs leaves the previous values in place rather than writing zeros.
 
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_software_normalization_pass_total{outcome}` | counter | Normalisation ticks by `outcome` (`success` or `error`). A tick is `error` when a pass failed, timed out or found no pack, or the curation-queue reconcile failed; a tick cancelled by shutdown is neither. Both series are present at 0 from start-up, so a first failure is already an increase. |
 | `yuzu_software_normalization_duration_seconds` | gauge | Wall-clock seconds of the last tick. |
 | `yuzu_software_normalization_last_success_timestamp` | gauge | Epoch seconds of the last clean tick; 0 until the first success. |
-| `yuzu_software_titles{norm_status}` | gauge | Distinct installed-software titles by `norm_status`: `normalized`, `unnormalized`, or `pending` (present in the inventory with no dimension row yet). |
-| `yuzu_software_unnormalized_ratio` | gauge | Device-weighted fraction of titles that are `unnormalized` or `pending`; 0 when there is no inventory. |
+| `yuzu_software_titles{norm_status}` | gauge | Distinct installed-software titles by `norm_status`: `normalized`, `unnormalized`, or `pending` (present in the inventory with no dimension row yet, or `normalized` with its product since deleted, until the next pass re-resolves it). |
+| `yuzu_software_unnormalized_ratio` | gauge | Install-weighted fraction of titles that are `unnormalized` or `pending`. Not exported until the title list has had a first non-empty read, and it keeps its last value if the list later becomes empty: an empty or never-built list is not reported as a perfect 0. |
 | `yuzu_software_normalization_curation_queue_size` | gauge | Titles in the curation queue with status `open`. |
 | `yuzu_software_normalization_pack_info{pack_version}` | gauge | 1 on the loaded alias pack's version label; the previous label is set to 0 when the pack changes. |
 
-Two alerts read them: `YuzuSoftwareNormalizationStale` (last success older than 7200 s, warning) and `YuzuSoftwareNormalizationFailing` (`increase(yuzu_software_normalization_pass_total{outcome="error"}[2h]) >= 2` for 10 minutes, warning: two hourly ticks failed within two hours). A job that has never succeeded is the Failing rule's case, not the Stale rule's.
+Two alerts read them: `YuzuSoftwareNormalizationStale` (last success older than 7200 s, warning) and `YuzuSoftwareNormalizationFailing` (`increase(yuzu_software_normalization_pass_total{outcome="error"}[3h]) >= 2` for 10 minutes, warning: two hourly ticks failed within three hours). A job that has never succeeded is the Failing rule's case, not the Stale rule's. Neither watches the job's input list: if the catalogue rollup that rebuilds it stops completing, the gauges freeze while ticks keep succeeding, and `YuzuInventoryCatalogRollupStale` or `YuzuInventoryCatalogRollupFailing` is the signal.
 
 ## Executions event-outbox metrics (HA WS-2a)
 

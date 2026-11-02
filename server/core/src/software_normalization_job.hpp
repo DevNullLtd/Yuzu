@@ -10,10 +10,13 @@
 /// (server.cpp `stop()`), and `request_stop()` is called when the server starts draining.
 ///
 /// Two cadences (`rearm_interval`): QUIET - the configured interval (hourly) - and
-/// BACKLOG - `kBacklogRearm` (60 s) while the last tick hit its pass cap on a full page
-/// (up to 200,000 titles per tick), so a pack bump or a first boot drains in minutes, not
-/// 200,000 titles per hour. A failed, timed-out or cancelled tick KEEPS the quiet interval:
-/// retrying at once would re-select the same batch and repeat the failure.
+/// SHORT - `kBacklogRearm` (60 s) after a tick that either hit its pass cap on a full page
+/// (up to 200,000 titles per tick) or found the candidate source (`title_triples`) still
+/// empty while installed software exists (the catalogue rollup has not completed yet). A
+/// backlog therefore moves at up to 200,000 titles per minute-spaced tick rather than per
+/// hour, and a fresh boot picks up its first titles as soon as the rollup has run (the
+/// rollup's own duration still applies). A failed, timed-out or cancelled tick KEEPS the
+/// quiet interval: retrying at once would re-select the same batch and repeat the failure.
 ///
 /// Metrics: `yuzu_software_normalization_pass_total{outcome=success|error}` (a
 /// cancelled tick is neither) and `..._last_success_timestamp` are seeded at construction
@@ -25,6 +28,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <thread>
 
 namespace yuzu {
@@ -33,22 +37,28 @@ class MetricsRegistry;
 
 namespace yuzu::server {
 
-/// Re-arm delay while a backlog remains (the last tick ended on a full page at its cap).
+/// Re-arm delay while work is known to be waiting: the last tick ended on a full page at
+/// its cap, or the candidate source had not been filled yet.
 inline constexpr std::chrono::seconds kBacklogRearm{60};
 
-/// The wait before the next tick: the short backlog floor only for a capped tick (never
-/// longer than the configured interval), otherwise `interval`.
+/// The wait before the next tick: the short floor only for a capped or source-pending tick
+/// (never longer than the configured interval), otherwise `interval`.
 [[nodiscard]] constexpr std::chrono::seconds rearm_interval(const TickResult& r,
                                                             std::chrono::seconds interval) noexcept {
-    return r.capped ? std::min(kBacklogRearm, interval) : interval;
+    return (r.capped || r.source_pending) ? std::min(kBacklogRearm, interval) : interval;
 }
 
 class SoftwareNormalizationJob {
 public:
+    /// Called after every tick (including a cancelled one), on the thread that ran it, once
+    /// its metrics are written. A seam for tests to wait on a completed tick without polling;
+    /// production passes none. A throw is caught by the run loop like any tick exception.
+    using TickObserver = std::function<void(const TickResult&)>;
+
     /// `dimension` is borrowed (must outlive this). `interval` is the
     /// completion-to-start spacing; non-positive falls back to one hour.
     SoftwareNormalizationJob(SoftwareTitleDimension& dimension, std::chrono::seconds interval,
-                             yuzu::MetricsRegistry* metrics = nullptr);
+                             yuzu::MetricsRegistry* metrics = nullptr, TickObserver on_tick = {});
     ~SoftwareNormalizationJob();
 
     SoftwareNormalizationJob(const SoftwareNormalizationJob&) = delete;
@@ -63,7 +73,8 @@ public:
     void request_stop() noexcept;
 
     /// One tick plus its metrics, synchronously: the thread's body, public so a test can
-    /// observe the metric mapping without a thread. Never throws past `run_tick`'s guarantee.
+    /// observe the metric mapping without a thread. Throws only if `run_tick` or the metrics
+    /// registry does; `run()` catches that.
     [[nodiscard]] TickResult tick_once();
 
 private:
@@ -72,6 +83,7 @@ private:
     SoftwareTitleDimension& dimension_;
     std::chrono::seconds interval_;
     yuzu::MetricsRegistry* metrics_;
+    TickObserver on_tick_;
     std::atomic<bool> stop_{false};
     std::thread thread_;
 };

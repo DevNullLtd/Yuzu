@@ -64,6 +64,17 @@ constexpr int kFleetQueryRowCap = 100000;
 // the small precomputed tables, no bound.
 constexpr const char* kRollupStatementTimeout = "60s";
 
+/// Largest combined byte length of a (name, publisher, ecosystem) triple admitted to
+/// `title_triples`, whose PRIMARY KEY is a btree over those three TEXT columns. Postgres
+/// refuses an index entry larger than about 2704 bytes on an 8 kB page (a third of the page
+/// less its headers; "index row size ... exceeds btree version 4 maximum", SQLSTATE 54000),
+/// and that failure would roll back this whole refresh and freeze the catalogue. Ingest
+/// clamps each field to 1024 bytes but not their sum, and 3 x 1024 incompressible bytes
+/// reproduce the failure. 2704 less the index tuple header (8), three 4-byte varlena headers
+/// (12) and alignment leaves about 2680; 2400 keeps a comfortable margin. A longer triple is
+/// left out of title_triples (and so out of title normalisation), never the refresh.
+constexpr int kTitleTripleMaxBytes = 2400;
+
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
     // migration transaction, so these tables land in `software_inventory_store`.
@@ -1831,7 +1842,8 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
         if (!cmd("INSERT INTO software_inventory_store.title_triples (name, publisher, "
                  "ecosystem, device_count) SELECT name, publisher, ecosystem, "
                  "count(DISTINCT agent_id) FROM software_inventory_store.installed_software "
-                 "GROUP BY name, publisher, ecosystem"))
+                 "WHERE octet_length(name) + octet_length(publisher) + octet_length(ecosystem) <= " +
+                 std::to_string(kTitleTripleMaxBytes) + " GROUP BY name, publisher, ecosystem"))
             return false;
 
         // Fleet-newest version of EVERY title, bounded memory: stream version_rollup in

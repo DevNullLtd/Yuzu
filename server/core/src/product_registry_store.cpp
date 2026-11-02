@@ -105,19 +105,21 @@ const std::vector<pg::PgMigration>& migrations() {
          // (raw_name, raw_publisher, ecosystem) triple. product_id is nullable
          // with ON DELETE SET NULL (curating a product away must not leave a
          // dangling identity); a 'normalized' row with a NULL product is re-queued.
-         // pack_version = '' is the stale sentinel (see the header, D14).
+         // pack_version = '' is the stale sentinel (see the header).
          "CREATE TABLE title_dimension ("
          "  raw_name       TEXT NOT NULL,"
          "  raw_publisher  TEXT NOT NULL,"
          "  ecosystem      TEXT NOT NULL,"
-         "  norm_status    TEXT NOT NULL,"
-         "  method         TEXT NOT NULL DEFAULT '',"
+         "  norm_status    TEXT NOT NULL CHECK (norm_status IN ('normalized', 'unnormalized')),"
+         "  method         TEXT NOT NULL DEFAULT '' "
+         "                 CHECK (method IN ('', 'curated', 'pack', 'exact_norm', 'birth')),"
          "  product_id     BIGINT REFERENCES products (product_id) ON DELETE SET NULL,"
          "  vendor         TEXT NOT NULL DEFAULT '',"
          "  product        TEXT NOT NULL DEFAULT '',"
          "  edition        TEXT NOT NULL DEFAULT '',"
          "  title_version  TEXT NOT NULL DEFAULT '',"
-         "  category       TEXT NOT NULL DEFAULT 'other',"
+         "  category       TEXT NOT NULL DEFAULT 'other' CHECK (category IN "
+         "                 ('web_server', 'database', 'message_broker', 'runtime', 'other')),"
          "  purl_type      TEXT NOT NULL DEFAULT '',"
          "  cpe_product    TEXT NOT NULL DEFAULT '',"
          "  pack_version   TEXT NOT NULL,"
@@ -233,6 +235,40 @@ ProductRegistryStore::ProductRegistryStore(pg::PgPool& pool) : pool_(pool) {
         spdlog::error("ProductRegistryStore: schema migration failed — product registry "
                       "persistence disabled");
         return;
+    }
+
+    // Post-migration projection check (postgres-store-playbook "Runner guards"): run() skips
+    // any migration at or below the stored high-water mark, so a schema_meta stamped by a
+    // different binary can leave a v2 column missing while run() still reports success. One
+    // LIMIT 0 SELECT per table over every column the runtime uses touches no rows and fails
+    // the store closed here, not as `undefined column` on the first pass or pack load.
+    struct Projection {
+        const char* table;
+        const char* columns;
+    };
+    static constexpr Projection kProjections[] = {
+        {"products", kProductCols},
+        {"product_aliases", "source, raw_name, raw_publisher, product_id, method, confidence, "
+                            "first_matched_at, last_seen_at, status, pack_version"},
+        {"normalization_pack", "id, pack_version, sha256, body, loaded_by, loaded_at"},
+        {"title_dimension", "raw_name, raw_publisher, ecosystem, norm_status, method, product_id, "
+                            "vendor, product, edition, title_version, category, purl_type, "
+                            "cpe_product, pack_version, first_seen_at, updated_at"},
+        {"curation_queue", "raw_name, raw_publisher, ecosystem, device_count, status, "
+                           "first_queued_at, last_seen_at"},
+    };
+    for (const auto& p : kProjections) {
+        const std::string sql = std::string("SELECT ") + p.columns +
+                                " FROM product_registry_store." + p.table + " LIMIT 0";
+        pg::PgResult probe = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+        if (probe.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ProductRegistryStore: post-migration schema projection check failed on "
+                          "{} - an expected column is missing (hypothesis: a skipped or partial "
+                          "migration; could also be a dropped connection or other transient "
+                          "failure) - product registry persistence disabled: {}",
+                          p.table, PQresultErrorMessage(probe.get()));
+            return;
+        }
     }
     open_ = true;
 }
@@ -630,9 +666,10 @@ ProductRegistryStore::load_pack_if_empty(const ParsedPack& pack, std::string_vie
 
 std::optional<std::vector<NormalizationAliasRow>>
 ProductRegistryStore::read_normalization_aliases(PGconn* conn,
-                                                 const std::vector<std::string_view>& alias_keys) {
+                                                 const std::vector<std::string_view>& alias_keys,
+                                                 const std::vector<std::string_view>& sources) {
     std::vector<NormalizationAliasRow> out;
-    if (alias_keys.empty())
+    if (alias_keys.empty() || sources.empty())
         return out;
     pg::PgResult res = pg::exec_params(
         conn,
@@ -641,9 +678,9 @@ ProductRegistryStore::read_normalization_aliases(PGconn* conn,
         "  p.updated_at, p.purl_type, p.cpe_product, p.origin, p.category "
         "FROM product_registry_store.product_aliases a "
         "JOIN product_registry_store.products p ON p.product_id = a.product_id "
-        "WHERE a.status = 'active' AND a.raw_name = ANY($1::text[]) "
-        "  AND (a.source LIKE 'pack:%' OR a.source LIKE 'curated:%')",
-        std::vector<std::string>{pg::to_text_array(alias_keys)});
+        "WHERE a.status = 'active' AND a.source = ANY($2::text[]) "
+        "  AND a.raw_name = ANY($1::text[])",
+        std::vector<std::string>{pg::to_text_array(alias_keys), pg::to_text_array(sources)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("ProductRegistryStore: alias read failed: {}", PQerrorMessage(conn));
         return std::nullopt;

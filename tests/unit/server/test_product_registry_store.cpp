@@ -18,10 +18,12 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <chrono>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using yuzu::server::ProductRegistryStore;
@@ -403,7 +405,7 @@ TEST_CASE("load_pack_if_empty loads the pack products and aliases once and repor
 }
 
 TEST_CASE("read_normalization_aliases returns pack and curated rows for the requested alias keys "
-          "only",
+          "and exact sources only",
           "[pg][product_registry][normalization]") {
     PROD_SHARED(store, pool);
     REQUIRE(store.load_pack_if_empty(seed_pack(), "seed").has_value());
@@ -416,7 +418,9 @@ TEST_CASE("read_normalization_aliases returns pack and curated rows for the requ
     auto lease = pool.try_acquire_for(std::chrono::seconds{5});
     REQUIRE(lease);
     const std::vector<std::string_view> keys{"7-zip", "no such key"};
-    auto rows = ProductRegistryStore::read_normalization_aliases(lease.get(), keys);
+    const std::vector<std::string_view> sources{"pack:windows", "curated:windows", "pack:",
+                                                "curated:"};
+    auto rows = ProductRegistryStore::read_normalization_aliases(lease.get(), keys, sources);
     REQUIRE(rows.has_value());
     bool pack_row = false, curated_row = false;
     for (const auto& r : *rows) {
@@ -432,7 +436,21 @@ TEST_CASE("read_normalization_aliases returns pack and curated rows for the requ
     CHECK(pack_row);
     CHECK(curated_row);
     CHECK(rows->size() == 2);
-    auto none = ProductRegistryStore::read_normalization_aliases(lease.get(), {});
+    // The source filter is an EXACT match: another ecosystem's source, or the empty list, reads
+    // nothing, and a single source reads only that tier.
+    auto other_eco = ProductRegistryStore::read_normalization_aliases(
+        lease.get(), keys, std::vector<std::string_view>{"pack:macos", "curated:macos"});
+    REQUIRE(other_eco.has_value());
+    CHECK(other_eco->empty());
+    auto only_pack = ProductRegistryStore::read_normalization_aliases(
+        lease.get(), keys, std::vector<std::string_view>{"pack:windows"});
+    REQUIRE(only_pack.has_value());
+    REQUIRE(only_pack->size() == 1);
+    CHECK((*only_pack)[0].source == "pack:windows");
+    auto no_sources = ProductRegistryStore::read_normalization_aliases(lease.get(), keys, {});
+    REQUIRE(no_sources.has_value());
+    CHECK(no_sources->empty());
+    auto none = ProductRegistryStore::read_normalization_aliases(lease.get(), {}, sources);
     REQUIRE(none.has_value());
     CHECK(none->empty());
 }
@@ -454,4 +472,142 @@ TEST_CASE("read_products_by_norm_key returns exactly the products with the reque
     auto none = ProductRegistryStore::read_products_by_norm_key(lease.get(), {});
     REQUIRE(none.has_value());
     CHECK(none->empty());
+}
+
+TEST_CASE("the v2 migration upgrades populated v1 rows with the matcher defaults and leaves them "
+          "out of the normalisation read",
+          "[pg][product_registry][normalization]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    {
+        ProductRegistryStore fresh{pool};
+        REQUIRE(fresh.is_open());
+    }
+    const auto exec = [&](const char* stmt) {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(lease.get(), stmt, std::vector<std::string>{});
+        CAPTURE(stmt);
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    };
+    // Stage the v1 shape by hand (drop everything v2 added), populate it the way v1 writers did,
+    // then rewind schema_meta so the next construction runs the v2 step over live rows.
+    exec("DROP TABLE product_registry_store.title_dimension");
+    exec("DROP TABLE product_registry_store.curation_queue");
+    exec("DROP TABLE product_registry_store.normalization_pack");
+    exec("ALTER TABLE product_registry_store.products DROP COLUMN purl_type, DROP COLUMN "
+         "cpe_product, DROP COLUMN origin, DROP COLUMN category");
+    exec("ALTER TABLE product_registry_store.product_aliases DROP COLUMN status, DROP COLUMN "
+         "pack_version");
+    exec("INSERT INTO product_registry_store.products (norm_key, vendor, title, edition, platform, "
+         "created_at, updated_at) VALUES ('acme:widget', 'acme', 'widget', '', '', 11, 12)");
+    exec("INSERT INTO product_registry_store.product_aliases (source, raw_name, raw_publisher, "
+         "product_id, method, confidence, first_matched_at, last_seen_at) "
+         "SELECT 'installed_software', 'widget', 'acme', product_id, 'exact_norm', 1.0, 11, 12 "
+         "FROM product_registry_store.products WHERE norm_key = 'acme:widget'");
+    exec("UPDATE public.schema_meta SET version = 1 WHERE store = 'product_registry_store'");
+
+    ProductRegistryStore store{pool};
+    REQUIRE(store.is_open());
+    auto row = store.get_product("acme:widget");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->origin == "matcher");
+    CHECK((*row)->category == "other");
+    CHECK((*row)->purl_type.empty());
+    CHECK((*row)->cpe_product.empty());
+    CHECK((*row)->created_at == 11); // the v1 values survive untouched
+    auto aliases = store.list_aliases((*row)->product_id);
+    REQUIRE(aliases.has_value());
+    REQUIRE(aliases->size() == 1);
+    CHECK((*aliases)[0].status == "active");
+    CHECK((*aliases)[0].pack_version.empty());
+
+    // A matcher link is never a normalisation alias, whatever sources are asked for.
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    auto read = ProductRegistryStore::read_normalization_aliases(
+        lease.get(), std::vector<std::string_view>{"widget"},
+        std::vector<std::string_view>{"pack:", "curated:", "installed_software"});
+    REQUIRE(read.has_value());
+    CHECK(read->size() == 1); // the matcher link is returned only because its source was NAMED ...
+    auto real = ProductRegistryStore::read_normalization_aliases(
+        lease.get(), std::vector<std::string_view>{"widget"},
+        std::vector<std::string_view>{"pack:", "curated:", "pack:windows", "curated:windows"});
+    REQUIRE(real.has_value());
+    CHECK(real->empty()); // ... and the sources the title dimension asks for never name it
+}
+
+TEST_CASE("ProductRegistryStore reports !is_open when a v2 column is missing although schema_meta "
+          "is current",
+          "[pg][product_registry][normalization]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    {
+        ProductRegistryStore intact{pool};
+        REQUIRE(intact.is_open()); // control: the guard must not refuse a healthy schema
+    }
+    std::vector<std::pair<std::string, std::string>> columns; // (table, column)
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema = 'product_registry_store' ORDER BY table_name, ordinal_position",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        for (int i = 0; i < PQntuples(r.get()); ++i)
+            columns.emplace_back(PQgetvalue(r.get(), i, 0), PQgetvalue(r.get(), i, 1));
+    }
+    for (const char* table : {"products", "product_aliases", "normalization_pack",
+                              "title_dimension", "curation_queue"}) {
+        CAPTURE(table);
+        REQUIRE(std::any_of(columns.begin(), columns.end(),
+                            [&](const auto& c) { return c.first == table; }));
+    }
+    const auto alter = [&](const std::string& stmt) {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(lease.get(), stmt.c_str(), std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    };
+    for (const auto& [table, column] : columns) {
+        CAPTURE(table, column);
+        const std::string prefix =
+            "ALTER TABLE product_registry_store.\"" + table + "\" RENAME COLUMN \"";
+        alter(prefix + column + "\" TO \"" + column + "_gone\"");
+        {
+            ProductRegistryStore broken{pool};
+            CHECK_FALSE(broken.is_open());
+        }
+        alter(prefix + column + "_gone\" TO \"" + column + "\"");
+        {
+            ProductRegistryStore restored{pool};
+            CHECK(restored.is_open());
+        }
+    }
+}
+
+TEST_CASE("title_dimension refuses an unknown norm_status or method or category",
+          "[pg][product_registry][normalization]") {
+    PROD_SHARED(store, pool);
+    const auto insert = [&](const char* status, const char* method, const char* category) {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "INSERT INTO product_registry_store.title_dimension (raw_name, raw_publisher, ecosystem, "
+            "norm_status, method, category, pack_version, first_seen_at, updated_at) "
+            "VALUES (gen_random_uuid()::text, '', '', $1, $2, $3, '2026.11.1', 1, 1)",
+            std::vector<std::string>{status, method, category});
+        return r.status() == PGRES_COMMAND_OK;
+    };
+    CHECK(insert("normalized", "pack", "database"));
+    CHECK(insert("unnormalized", "", "other"));
+    CHECK_FALSE(insert("maybe", "", "other"));
+    CHECK_FALSE(insert("normalized", "guess", "other"));
+    CHECK_FALSE(insert("normalized", "pack", "gadget"));
 }

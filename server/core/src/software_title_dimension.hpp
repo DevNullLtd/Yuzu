@@ -23,16 +23,19 @@
 ///     `software_inventory_store.title_triples` and writes
 ///     `product_registry_store.title_dimension` / `curation_queue` on ONE lease per
 ///     pass; neither store grows a cross-schema method. Every pass is one bounded
-///     transaction opening with `pg_try_advisory_xact_lock` (a peer replica holding
-///     it = skip, success). Changes-only comes from the candidate query: a settled
-///     title (current `pack_version`, resolved or queued) is never selected again, so
-///     a replay writes nothing.
+///     transaction that sets its `statement_timeout` and then takes
+///     `pg_try_advisory_xact_lock` (a peer replica holding it = skip, success).
+///     Changes-only comes from the candidate query: a settled title (current
+///     `pack_version`, resolved or queued) is never selected again, so a replay writes
+///     nothing. A settled title is therefore NOT re-resolved when the registry or the
+///     fleet changes underneath it: only a new pack version, a deleted product or the
+///     stale sentinel below re-selects it.
 ///
-/// Alias precedence (D2): tier (curated > pack) first, then specificity
+/// Alias precedence: tier (curated > pack) first, then specificity
 /// (eco,pub) > (eco,'') > ('',pub) > ('',''). There is NO edition wildcard: a
 /// title whose normalised edition is E matches only an alias key carrying E.
 ///
-/// Dimension invalidation (D14): a row is re-normalised when its `pack_version`
+/// Dimension invalidation: a row is re-normalised when its `pack_version`
 /// differs from the current pack, when its product was deleted, or when its
 /// `pack_version` is '' (the stale sentinel a future curation write sets - see
 /// product_registry_store.hpp).
@@ -61,11 +64,10 @@ namespace yuzu::server {
 
 class SoftwareInventoryStore;
 
-/// Auto-birth (minting a product for an unmatched title) is OFF: the S-2
-/// measurement that sizes it has not run (the row's own `< 60 % -> drop` rule
-/// applied as the safe default). Flipping this needs a product-minting path in the
-/// owner (a `static_assert` in the .cpp stops a silent flip); the schema already
-/// carries `origin = 'birth'`, so no migration is needed.
+/// Auto-birth (minting a product for an unmatched title) is OFF: the measurement
+/// that would size it has not been made, so the safe default applies. Flipping this
+/// needs a product-minting path in the owner (a `static_assert` in the .cpp stops a
+/// silent flip); the schema already carries `origin = 'birth'`, so no migration is needed.
 inline constexpr bool kAutoBirthEnabled = false;
 inline constexpr std::size_t kAutoBirthMinTokens = 2;
 
@@ -105,7 +107,10 @@ struct TitleResolution {
                                             const std::vector<NormalizationAliasRow>& aliases_for_key,
                                             const ProductRow* exact_product, bool auto_birth);
 
-enum class PassOutcome { ok, skipped_peer, no_pack, failed, cancelled, timed_out };
+/// `source_pending`: no candidate was selected, `title_triples` is empty and
+/// `installed_software` is not - the rollup that fills the candidate source has not
+/// completed yet. A clean outcome, distinct from `ok` only so the job can look again soon.
+enum class PassOutcome { ok, skipped_peer, no_pack, failed, cancelled, timed_out, source_pending };
 
 struct PassResult {
     PassOutcome outcome{PassOutcome::failed};
@@ -117,6 +122,11 @@ struct PassResult {
 struct TickResult {
     bool errored{false};   ///< a pass failed/timed out/had no pack, or the reconcile failed
     bool cancelled{false}; ///< stopped by the cancel predicate (neither success nor error)
+    /// The candidate source (`title_triples`) is still empty although installed software
+    /// exists: the catalogue rollup has not completed since boot or since the table was
+    /// created. A clean tick; the job re-arms early so the first titles are not an hour late.
+    /// False on any error or cancel, like `capped`.
+    bool source_pending{false};
     /// The tick ran its pass cap and the last pass was a full page: a backlog remains.
     /// False on any error, cancel or peer skip (an immediate retry would re-select the same
     /// batch and repeat the failure), so the job re-arms early ONLY on a healthy backlog.
@@ -139,14 +149,16 @@ public:
     /// ONE bounded pass in its own transaction. `cancelled` and the wall `budget`
     /// (production: `kPassBudget`; a parameter so a test can trip it) are polled every
     /// 256 titles and before each write; a trip rolls the pass back (`cancelled` /
-    /// `timed_out`). Never throws.
+    /// `timed_out`). Does not throw: the body is wrapped in a catch-all that reports `failed`.
+    /// `cancelled` must not throw.
     [[nodiscard]] PassResult run_pass(const std::function<bool()>& cancelled = {},
                                       std::chrono::seconds budget = kPassBudget);
 
     /// One tick: passes until a short page / failure / cap / cancel, then the queue
     /// reconcile, then (unless cancelled) the gauges. `max_passes` is the pass cap
     /// (production: `kMaxPassesPerTick`; a parameter so a test can reach the cap with
-    /// a small fixture). Never throws.
+    /// a small fixture). Does not throw, because `run_pass`, `reconcile_queue` and
+    /// `refresh_gauges` each catch internally; the `cancelled` predicate must not throw.
     [[nodiscard]] TickResult run_tick(const std::function<bool()>& cancelled = {},
                                       int max_passes = kMaxPassesPerTick);
 
@@ -154,7 +166,10 @@ public:
     /// re-queue a present current-pack `unnormalized` title whose open row was pruned
     /// while it was away, and drop `open` rows whose title vanished (rejected rows
     /// persist, and are never reopened). One transaction under the same try-lock; true
-    /// on success or peer skip.
+    /// on success or peer skip. Only rows whose count moved (or that are a day stale) are
+    /// written. There is deliberately no would-wipe guard: an empty `title_triples` empties
+    /// the open queue, and only each row's `first_queued_at` is lost (the queue is
+    /// regenerated from `title_dimension` as titles return).
     [[nodiscard]] bool reconcile_queue(const std::function<bool()>& cancelled = {});
 
     /// Recompute the exposed gauges. A degraded read leaves the previous values

@@ -2454,7 +2454,8 @@ public:
                           "gauge");
         metrics_.describe("yuzu_software_normalization_pass_total",
                           "Software-title normalisation ticks by outcome (success/error); hourly, "
-                          "or every 60 s while a backlog remains. A cancelled tick (shutdown) is "
+                          "or every 60 s while a backlog remains or the catalogue rollup has not "
+                          "yet filled the candidate source. A cancelled tick (shutdown) is "
                           "neither. Keep-last-good on error.",
                           "counter");
         metrics_.describe("yuzu_software_normalization_duration_seconds",
@@ -2469,8 +2470,11 @@ public:
                           "(normalized/unnormalized/pending)",
                           "gauge");
         metrics_.describe("yuzu_software_unnormalized_ratio",
-                          "Fraction of installed-software devices-by-title whose title is not yet "
-                          "normalized (unnormalized or pending), device-weighted, 0 when empty",
+                          "Fraction of installed-software installs (device-title pairs) whose "
+                          "title is not yet normalized (unnormalized or pending). Not exported "
+                          "until the first non-empty read of the title source; unchanged while "
+                          "that source is empty (a stalled catalogue rollup is not a perfect "
+                          "ratio)",
                           "gauge");
         metrics_.describe("yuzu_software_normalization_curation_queue_size",
                           "Open titles in the software normalisation curation queue",
@@ -8075,20 +8079,21 @@ public:
                 startup_failed_ = true;
             } else {
                 product_registry_store_->set_metrics(&metrics_);
-                // SAM.4 software-title normalisation. The seed is build-embedded, deterministic
-                // content, so a parse or load failure is a defective build, not an operator
-                // condition: fail closed (same posture as the CPE resolver). Loaded only when
-                // the PG row is absent (D8); a later binary's newer seed is logged, not applied.
+                // Software-title normalisation. The seed is build-embedded, deterministic
+                // content, so a parse failure is a defective build; a load failure is that or
+                // a database fault (including a transient one): either way fail closed, the
+                // same posture as the CPE resolver. Loaded only when the PG row is absent; a
+                // later binary's newer seed is logged, not applied.
                 if (software_inventory_store_ && software_inventory_store_->is_open()) {
                     auto seed = parse_normalization_pack(kSoftwareNormalizationSeed);
                     if (!seed) {
-                        spdlog::error("[SAM.4] Refusing to start: embedded software normalisation "
+                        spdlog::error("[PG] Refusing to start: embedded software normalisation "
                                       "seed is invalid: {}",
                                       seed.error());
                         startup_failed_ = true;
                     } else if (auto loaded = product_registry_store_->load_pack_if_empty(*seed, "seed");
                                !loaded) {
-                        spdlog::error("[SAM.4] Refusing to start: software normalisation pack load "
+                        spdlog::error("[PG] Refusing to start: software normalisation pack load "
                                       "failed: {}",
                                       loaded.error());
                         startup_failed_ = true;
