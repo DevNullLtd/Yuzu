@@ -202,6 +202,50 @@ workflow or Dockerfile), **add it to the `files` array in
 `docs/reviews/` evidence. The post-sed verifier checks listed files, while the
 toolchain-contract inventory test finds an unlisted active reference.
 
+### Baseline bump 2026.10.16
+
+`builtin-baseline` moved from `4b77da7fed37817f124936239197833469f1b9a8` to
+`9eec002df1cd109f8f104cd966a763daf9751489` (committed 2026-10-17 UTC, tagged
+`2026.10.16` upstream). Versions and licenses are read from
+`ports/<port>/vcpkg.json` at each commit; `pv` is `port-version`.
+
+| Direct dependency | Old | New | `license` field |
+|---|---|---|---|
+| grpc | 1.76.0 pv1 | 1.81.1 | no change (Apache-2.0) |
+| protobuf | 6.33.4 pv1 | 6.33.4 pv2 | no change (BSD-3-Clause) |
+| abseil | 20260107.1 | 20260107.1 pv3 | no change (Apache-2.0) |
+| spdlog | 1.17.0 | 1.17.0 pv1 | no change (MIT) |
+| cli11 | 2.6.2 | 2.7.2 | no change (BSD-3-Clause) |
+| cpp-httplib | 0.37.1 | 0.59.0 | no change (MIT) |
+| sqlite3 | 3.52.0 | 3.53.4 pv2 | no change (blessing) |
+| libpq | 16.9 pv3 | 18.4 pv1 | no change (PostgreSQL) |
+| openssl | 3.6.1 pv2 | 3.6.5 pv2 | no change (Apache-2.0) |
+| catch2 | 3.13.0 pv1 | 3.16.0 | no change (BSL-1.0) |
+| libxml2 | 2.15.2 | 2.15.4 | no change (MIT) |
+| xmlsec | 1.3.9 pv1 | 1.3.12 pv1 | no change (X11 AND MPL-1.1) |
+| zlib | 1.3.1 | 1.3.2 pv2 | no change (Zlib) |
+| drogon | 1.9.12 | 1.9.13 pv2 | **changed**: `MIT` to `MIT AND BSD-3-Clause` |
+
+`nlohmann-json` (3.12.0 pv2) is unchanged. The license comparison covered the
+direct dependencies in `vcpkg.json` only; transitive dependencies were not
+checked.
+
+**Resolver use-after-free, closed on glibc only.** The cpp-httplib 0.59.0
+header carries the fix for upstream issue 2431 (a use-after-free around
+`getaddrinfo_a` cancellation), in its glibc branch only; the 0.43.2 header
+already carries the same fix. No CVE id is cited: none appears in the vcpkg
+tree. The Windows `GetAddrInfoEx` cancel path and the macOS `CFHost` path are
+not fixed by it. The Windows hazard has no tracking issue yet (it is planned
+with the outbound DNS work) and must stay open until fixed.
+
+**New behaviour.** On glibc builds a timed-out outbound name lookup now waits for the
+resolver itself (cpp-httplib estimates about 30 seconds with default resolver
+settings) before the request fails; see `docs/user-manual/upgrading.md`.
+
+**SBOMs.** Unchanged mechanism: `.github/workflows/release.yml` generates them
+with Syft (`anchore/sbom-action`), scanning the build workspace and the pushed
+release images by digest.
+
 ## Rebar3 deps review checklist
 
 `rebar3` has no dependabot ecosystem. `rebar3 update` only refreshes the

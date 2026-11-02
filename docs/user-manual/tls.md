@@ -34,6 +34,67 @@ credentials still negotiate whatever gRPC's library default offers
 (AEAD-only suites, TLS 1.2 floor) — the agent side is not yet pinned; tracked
 under [#4722](https://github.com/Tr3kkR/Yuzu/issues/4722).
 
+**Windows outbound HTTPS trust store.** On Windows, a cpp-httplib HTTPS client
+that keeps default trust verifies the server certificate chain through the
+Windows certificate store (Schannel) alone. In cpp-httplib 0.59 Schannel asks
+Windows to build a chain to a trusted root and requires the `serverAuth`
+usage along that chain; the OpenSSL chain verdict is no longer consulted, and
+a certificate that cannot be read in DER form is refused. cpp-httplib 0.37.1
+requested no usage and required both OpenSSL and Schannel to accept the chain.
+A client keeps default trust unless it sets its own CA file, directory, PEM or
+store, turns system-CA trust off, disables Windows verification, or installs a
+server certificate verifier.
+
+The clients this covers are the agent plugins `http_client` and `content_dist`
+and, on a Windows server, the OIDC discovery and JWKS fetches (when TLS
+verification is not skipped), webhook delivery, analytics sinks, offload
+targets and the NVD client. Not covered: on Windows the OIDC token exchange
+and directory sync use WinHTTP, which this change does not touch, and the
+healthcheck probe loads its own trust anchor.
+
+What changes for operators:
+
+- **New acceptance.** A chain that Windows accepts is now accepted even where
+  OpenSSL would have refused it, because OpenSSL's second opinion is gone.
+  Chain construction also changed: 0.59.0 gives Windows the certificates the
+  server presented, where 0.37.1 offered only the leaf, so a server that sends
+  its own intermediate, with no issuer URL and none in the machine's
+  Intermediate CA store, can be newly accepted.
+- **New refusal.** A root that Windows trusts only for purposes other than
+  `serverAuth` is now refused.
+- Whether a chain is refused depends on what Windows can build a chain to, not
+  only on what is installed: cpp-httplib notes that Windows may fetch missing
+  roots and intermediates on demand. A root deployed to the Windows
+  certificate store, for example by group policy (including a corporate or
+  TLS-inspection root), is a root Windows can build to.
+- Manage that trust in the Windows certificate store (`certlm.msc`) or through
+  group policy. A root installed only in one user's certificate store is not
+  necessarily trusted by a service running under a different account, so
+  install it in the machine store.
+- Revocation checking is unchanged from 0.37.1: an end-certificate check. An
+  unreachable revocation source may also cause a refusal (not verified on
+  Windows).
+- `content_dist` artifacts are still hash-verified.
+
+How to spot a refusal: the `http_client` plugin reports `connection failed` from
+its `get` and `head` actions and `download failed: HTTP connection error` from
+its `download` action, and `content_dist` reports `download failed: HTTP
+connection error` for a download and `failed to open upload session (HTTP 0)`
+for an upload (which retries with backoff before it reports), each for any request
+that returned no response and with no certificate detail. The server's OIDC discovery and JWKS fetches log the
+HTTP client's error text. Before upgrading, run `certutil -verify -urlfetch
+<certificate file>` on the Windows host that runs the server or agent, against
+the certificate chain as the target presents it (a lone leaf file can look worse
+than the real handshake, because the new code gives Windows the certificates the
+server sent); `openssl s_client -connect <host>:<port> -servername <host> -showcerts` prints the chain a
+target sends. That check is not confirmed to test the `serverAuth` usage, so a
+clean result does not rule out the new refusal. Judge trust against the
+machine certificate store (confirm the chain's root is under Local Computer in
+`certlm.msc`); a service account's own user store is normally empty (not
+verified by Yuzu). `content_dist` uploads go to the agent's configured server web
+URL, so a Windows agent whose server certificate comes from an internal CA
+depends on the machine store for them as well.
+
 ## Why a process environment variable
 
 gRPC's C++ credentials API (`grpc::SslServerCredentialsOptions`,
