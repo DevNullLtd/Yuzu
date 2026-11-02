@@ -1286,17 +1286,20 @@ them (mode `identity`: without a resolvable server identity; mode
   `reference-gateway-sys.config` is ahead of the pinned release image until
   the next release ships.
 
-BYO-cert installs: point `mgmt_peer_pins` at your server certificate — which
-**must carry the `serverAuth` EKU** — or paste its SPKI SHA-256; pin-list
-edits take effect on gateway restart. A pin is not the only way to admit the
+BYO-cert installs: set `{mgmt_peer_auth_mode, pin}` (the shape copied from
+`sys.config.prod` is now `identity` with no pin, and a certificate that carries
+no identity is refused under it as `no_uri_san`) and point `mgmt_peer_pins` at
+your server certificate — which **must carry the `serverAuth` EKU** — or paste
+its SPKI SHA-256; pin-list edits take effect on gateway restart. A pin is not the only way to admit the
 server any more (#6016): with the built-in certificates the gateway can instead
 admit it by the identity URI SAN `yuzu://<install>/server` that the install CA
 puts on the server's certificate (`mgmt_peer_auth_mode` `identity_or_pin` or
 `identity`), which needs no gateway change when the server's key is renewed
 when no pin is configured (a pin kept in `identity` mode must follow the
-renewal). It is an opt-in: the shipped reference configs and an unset mode are
-`pin`, and the identity trusts the issuing CA's issuance policy, so it must not
-be enabled behind a CA that lets a requester choose a URI SAN. Rolling the
+renewal). From release N+1 the shipped reference configs set
+`identity` with no pin; an unset mode is still `pin`, so a config of your own
+changes nothing until you set the key (the boot logs a WARN that it was defaulted). The identity trusts the issuing CA's issuance
+policy, so it must not be used behind a CA that lets a requester choose a URI SAN. Rolling the
 gateway back to a binary from before #6016 ignores these settings: the
 deny-list is no longer honoured, and a configuration with no pins (dropped
 for `identity`, or `identity_or_pin` running on the identity alone) refuses to
@@ -1306,7 +1309,8 @@ first (see the "Rolling back" paragraph of that section). The rollback is a
 gateway restart, so do it only if the node's agents can take the disconnect,
 because agents without the #5183 fix stay wedged after it.
 Bring-your-own certificates, `--no-default-certs` and a server given its own `--cert`/`--key`
-carry no identity and stay on pins. See
+carry no identity: set `{mgmt_peer_auth_mode, pin}` and keep their pin, or every command
+is refused `no_uri_san`. See
 [Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity)
 and `docs/adr/2004-gateway-mgmt-server-identity.md`. `{allow_insecure_mgmt, true}` is a
 lab-rig acknowledgement only; never set it where `:50063` is reachable from

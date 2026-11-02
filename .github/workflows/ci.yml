@@ -1627,7 +1627,7 @@ jobs:
       #
       # The OTHER hop, server -> gateway management listener (the privileged command plane, #5175), is
       # covered too, in the production posture: strict mutual TLS, auth_fun
-      # yuzu_gw_authz:check_mgmt_peer/1 and mgmt_peer_pins = the server's default leaf, the server
+      # yuzu_gw_authz:check_mgmt_peer/1 and the server admitted by its identity (mgmt_peer_auth_mode identity, no pin), the server
       # pointed at it with --gateway-command-addr. The script dispatches commands to the real agent
       # through the server's REST API (one round trip, then a 300-command burst over the server's one
       # management connection, each required to return the agent's SUCCESS), and
