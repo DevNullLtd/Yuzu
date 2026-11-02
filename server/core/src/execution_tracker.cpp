@@ -40,6 +40,41 @@ constexpr const char* kStoreName = "execution_tracker";
 constexpr std::chrono::milliseconds kReadTimeout{1500};
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
 
+// Read-degrade observability (#3834, #1675 convention; mirrors InstructionStore's
+// note_read_degrade). One bounded-label counter for the five degrade-distinguishable
+// `_checked` readers, so an operator watching dashboards (not tailing logs) sees the store
+// degrade. Both label sets are CLOSED, and a label value is spelled in exactly ONE place: the
+// two arrays below. The named constants the emit sites use are INDEXED OUT of those arrays and
+// are never spelled a second time, so a value that is emitted but absent from the startup
+// pre-seed (seed_read_degrade_metrics reads the same arrays) cannot occur WHILE every emit site
+// uses them. note_read_degrade itself accepts any string, so that is a convention held by review
+// and the tests, not by the type system. A new `_checked` reader, or a new degrade cause, adds an
+// element to the array first and then names it - never pass a free-form string. The
+// index-to-name pairing is pinned by the tests (a swapped index would put a reader's degrade on
+// another reader's series).
+constexpr const char* kReadDegradeMetric = "yuzu_server_execution_tracker_read_degrade_total";
+
+constexpr std::array kReadDegradeMethods{ // CTAD: the compiler counts, so no trailing null slot
+    "query_executions", "get_execution", "get_agent_statuses", "get_agent_statuses_for_executions",
+    "get_children"};
+constexpr const char* kMethodQueryExecutions = kReadDegradeMethods[0];
+constexpr const char* kMethodGetExecution = kReadDegradeMethods[1];
+constexpr const char* kMethodGetAgentStatuses = kReadDegradeMethods[2];
+constexpr const char* kMethodGetAgentStatusesForExecutions = kReadDegradeMethods[3];
+constexpr const char* kMethodGetChildren = kReadDegradeMethods[4];
+
+constexpr std::array kReadDegradeReasons{"store_not_open", "pool_acquire_timeout",
+                                         "query_error"};
+constexpr const char* kReasonStoreNotOpen = kReadDegradeReasons[0];
+constexpr const char* kReasonPoolTimeout = kReadDegradeReasons[1];
+constexpr const char* kReasonQueryError = kReadDegradeReasons[2];
+
+// Null-safe: a harness that never calls set_metrics() simply emits nothing.
+void note_read_degrade(yuzu::MetricsRegistry* metrics, const char* method, const char* reason) {
+    if (metrics)
+        metrics->counter(kReadDegradeMetric, {{"method", method}, {"reason", reason}}).increment();
+}
+
 // get_children_checked()'s row cap (#2146 A2-R1 governance re-review,
 // blocking): the query had no LIMIT at all before this fix. No
 // creation-side ceiling exists on how many children an execution can
@@ -798,6 +833,26 @@ void append_execution_scope_clause(std::string& sql, std::vector<std::string>& b
 }
 } // namespace
 
+void ExecutionTracker::seed_read_degrade_metrics(yuzu::MetricsRegistry& metrics) {
+    // HELP text is 7-bit ASCII (scripts/ci/check-metrics-help-ascii.sh).
+    metrics.describe(
+        kReadDegradeMetric,
+        "ExecutionTracker reads (the five _checked readers) that returned a degraded answer "
+        "instead of data, by method (query_executions|get_execution|get_agent_statuses|"
+        "get_agent_statuses_for_executions|get_children) and reason: store_not_open (the "
+        "tracker never opened; a running server refuses to boot in that state, so this stays 0), "
+        "pool_acquire_timeout (no connection lease was obtained: pool saturated, database "
+        "unreachable or in connect backoff, or shutdown), query_error (a lease was held and "
+        "the statement failed or timed out). The unchecked wrappers that delegate to a _checked "
+        "reader are counted too (not get_execution), and so are the server's own periodic "
+        "reads, so a non-zero value does not by itself mean users are affected. A read that "
+        "found nothing is not a degrade. Diagnostic only.",
+        "counter");
+    for (const auto* method : kReadDegradeMethods)
+        for (const auto* reason : kReadDegradeReasons)
+            metrics.counter(kReadDegradeMetric, {{"method", method}, {"reason", reason}});
+}
+
 std::vector<Execution> ExecutionTracker::query_executions(const ExecutionQuery& q) const {
     return query_executions_checked(q, std::nullopt).value_or(std::vector<Execution>{});
 }
@@ -807,11 +862,13 @@ ExecutionTracker::query_executions_checked(const ExecutionQuery& q,
                                            const ExecutionScope& scope) const {
     if (!open_) {
         spdlog::warn("ExecutionTracker::query_executions_checked degraded: tracker not open");
+        note_read_degrade(metrics_, kMethodQueryExecutions, kReasonStoreNotOpen);
         return std::nullopt;
     }
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         spdlog::warn("ExecutionTracker::query_executions_checked degraded: pool exhausted");
+        note_read_degrade(metrics_, kMethodQueryExecutions, kReasonPoolTimeout);
         return std::nullopt;
     }
 
@@ -851,6 +908,7 @@ ExecutionTracker::query_executions_checked(const ExecutionQuery& q,
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("ExecutionTracker::query_executions_checked degraded: query failed");
+        note_read_degrade(metrics_, kMethodQueryExecutions, kReasonQueryError);
         return std::nullopt;
     }
 
@@ -901,11 +959,13 @@ std::expected<std::optional<Execution>, std::string>
 ExecutionTracker::get_execution_checked(const std::string& id) const {
     if (!open_) {
         spdlog::warn("ExecutionTracker::get_execution_checked degraded: tracker not open");
+        note_read_degrade(metrics_, kMethodGetExecution, kReasonStoreNotOpen);
         return std::unexpected("execution tracker not open");
     }
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         spdlog::warn("ExecutionTracker::get_execution_checked degraded: pool exhausted");
+        note_read_degrade(metrics_, kMethodGetExecution, kReasonPoolTimeout);
         return std::unexpected("execution tracker temporarily unavailable (pool exhausted)");
     }
     // Deliberately NOT delegating to exec_by_id_at above: that helper
@@ -919,6 +979,7 @@ ExecutionTracker::get_execution_checked(const std::string& id) const {
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{id});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("ExecutionTracker::get_execution_checked degraded: query failed");
+        note_read_degrade(metrics_, kMethodGetExecution, kReasonQueryError);
         return std::unexpected("execution query failed");
     }
     if (PQntuples(res.get()) == 0)
@@ -955,6 +1016,7 @@ ExecutionTracker::get_agent_statuses_checked(
     const std::optional<std::vector<std::string>>& visible_agents) const {
     if (!open_) {
         spdlog::warn("ExecutionTracker::get_agent_statuses_checked degraded: tracker not open");
+        note_read_degrade(metrics_, kMethodGetAgentStatuses, kReasonStoreNotOpen);
         return std::nullopt;
     }
     // Build the SQL and the (possibly O(visible set)) array parameter BEFORE taking the
@@ -974,11 +1036,13 @@ ExecutionTracker::get_agent_statuses_checked(
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         spdlog::warn("ExecutionTracker::get_agent_statuses_checked degraded: pool exhausted");
+        note_read_degrade(metrics_, kMethodGetAgentStatuses, kReasonPoolTimeout);
         return std::nullopt;
     }
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("ExecutionTracker::get_agent_statuses_checked degraded: query failed");
+        note_read_degrade(metrics_, kMethodGetAgentStatuses, kReasonQueryError);
         return std::nullopt;
     }
 
@@ -1031,6 +1095,7 @@ ExecutionTracker::get_agent_statuses_for_executions_checked(
     if (!open_) {
         spdlog::warn(
             "ExecutionTracker::get_agent_statuses_for_executions_checked degraded: tracker not open");
+        note_read_degrade(metrics_, kMethodGetAgentStatusesForExecutions, kReasonStoreNotOpen);
         return std::nullopt;
     }
     // SQL + array parameters are built BEFORE the pool lease (no O(set) work under a lease).
@@ -1052,12 +1117,14 @@ ExecutionTracker::get_agent_statuses_for_executions_checked(
     if (!lease) {
         spdlog::warn(
             "ExecutionTracker::get_agent_statuses_for_executions_checked degraded: pool exhausted");
+        note_read_degrade(metrics_, kMethodGetAgentStatusesForExecutions, kReasonPoolTimeout);
         return std::nullopt;
     }
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn(
             "ExecutionTracker::get_agent_statuses_for_executions_checked degraded: query failed");
+        note_read_degrade(metrics_, kMethodGetAgentStatusesForExecutions, kReasonQueryError);
         return std::nullopt;
     }
 
@@ -1098,6 +1165,7 @@ ExecutionTracker::get_children_checked(const std::string& parent_id,
                                        const ExecutionScope& scope) const {
     if (!open_) {
         spdlog::warn("ExecutionTracker::get_children_checked degraded: tracker not open");
+        note_read_degrade(metrics_, kMethodGetChildren, kReasonStoreNotOpen);
         return std::nullopt;
     }
 
@@ -1128,7 +1196,19 @@ ExecutionTracker::get_children_checked(const std::string& parent_id,
     // nothing to scope it to. Mirrors software_licensing_store.cpp's
     // count_stale_agents / app_perf_rollup.cpp's roll_day idiom.
     std::optional<ExecutionChildrenResult> out;
-    const bool committed = pool_.with_txn_for(kReadTimeout, [&](PGconn* c) -> bool {
+    // #3834: acquire the lease first (bounded, ADR-0012 s2a) and hand it to with_txn_on, instead
+    // of with_txn_for, so a pool-acquire timeout can be told apart from a failed statement for
+    // the read-degrade counter. with_txn_for is exactly try_acquire_for + with_txn_on, so the
+    // acquire budget and transaction shape are unchanged. with_txn_on's three rules
+    // (pg_pool.hpp): bounded acquire (above), NOTHING between the acquire and the call, and the
+    // lease is never reused after it is passed.
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::warn("ExecutionTracker::get_children_checked degraded: pool exhausted");
+        note_read_degrade(metrics_, kMethodGetChildren, kReasonPoolTimeout);
+        return std::nullopt;
+    }
+    const bool committed = pool_.with_txn_on(std::move(lease), [&](PGconn* c) -> bool {
         pg::PgResult t = pg::exec_params(
             c, (std::string("SET LOCAL statement_timeout = '") + kChildrenStatementTimeout + "'")
                   .c_str(),
@@ -1152,8 +1232,9 @@ ExecutionTracker::get_children_checked(const std::string& parent_id,
         return true;
     });
     if (!committed) {
-        spdlog::warn("ExecutionTracker::get_children_checked degraded: acquire/statement-timeout/"
+        spdlog::warn("ExecutionTracker::get_children_checked degraded: statement-timeout/"
                      "query failure");
+        note_read_degrade(metrics_, kMethodGetChildren, kReasonQueryError);
         return std::nullopt;
     }
     return out;

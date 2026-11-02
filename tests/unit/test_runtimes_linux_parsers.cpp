@@ -45,6 +45,7 @@
 #include "runtimes_linux_parsers.hpp"
 #include "runtimes_parsers.hpp"
 
+#include "runtimes_fixture_tree.hpp" // manifest decoder + materializer (shared with the python tests)
 #include "test_helpers.hpp" // yuzu::test::TempDir
 
 #include <cstddef>
@@ -74,84 +75,9 @@
 namespace rt = yuzu::runtimes;
 namespace lnx = yuzu::runtimes::lnx;
 namespace fs = std::filesystem;
+using namespace runtimes_fixture;
 
 namespace {
-
-// -- manifest line decoder (pure; portable) ----------------------------------------
-
-enum class ManifestKind { text, symlink, directory };
-
-struct ManifestEntry {
-    std::string rel;
-    ManifestKind kind = ManifestKind::text;
-    std::string payload; // decoded text | link target | (unused)
-};
-
-enum class LineOutcome { skipped, entry, malformed };
-
-struct ParsedLine {
-    LineOutcome outcome = LineOutcome::skipped;
-    ManifestEntry entry;
-    std::string error;
-};
-
-/// Decodes the escapes of a `T:` payload (\n, \t, \\). nullopt on a dangling
-/// backslash or an unknown escape.
-std::optional<std::string> unescape_text(std::string_view s) {
-    std::string out;
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        if (s[i] != '\\') {
-            out += s[i];
-            continue;
-        }
-        if (++i >= s.size()) return std::nullopt;
-        switch (s[i]) {
-        case 'n':  out += '\n'; break;
-        case 't':  out += '\t'; break;
-        case '\\': out += '\\'; break;
-        default:   return std::nullopt;
-        }
-    }
-    return out;
-}
-
-ParsedLine parse_manifest_line(std::string line) {
-    ParsedLine r;
-    if (!line.empty() && line.back() == '\r') line.pop_back(); // CRLF checkout tolerance
-    if (line.empty() || line.front() == '#') return r;
-    const auto bad = [&r](std::string msg) {
-        r.outcome = LineOutcome::malformed;
-        r.error = std::move(msg);
-        return r;
-    };
-    const auto tab = line.find('\t');
-    if (tab == std::string::npos || tab == 0) return bad("no tab separator: " + line);
-    r.entry.rel = line.substr(0, tab);
-    if (r.entry.rel.front() == '/' || r.entry.rel.find("..") != std::string::npos)
-        return bad("path must be relative and inside the tree: " + r.entry.rel);
-    const std::string payload = line.substr(tab + 1);
-    if (payload.size() < 2 || payload[1] != ':') return bad("payload lacks a kind prefix: " + line);
-    const std::string body = payload.substr(2);
-    switch (payload[0]) {
-    case 'T': {
-        auto t = unescape_text(body);
-        if (!t) return bad("bad escape in T: payload: " + line);
-        r.entry.kind = ManifestKind::text;
-        r.entry.payload = std::move(*t);
-        break;
-    }
-    case 'L':
-        r.entry.kind = ManifestKind::symlink;
-        r.entry.payload = body;
-        break;
-    case 'D': r.entry.kind = ManifestKind::directory; break;
-    default: return bad("unknown payload kind: " + line);
-    }
-    if (r.entry.kind == ManifestKind::symlink && r.entry.payload.empty())
-        return bad("empty L: payload: " + line);
-    r.outcome = LineOutcome::entry;
-    return r;
-}
 
 bool token_matches_leg_grammar(std::string_view t) {
     // ^linux:[a-z0-9_]+(:[a-z0-9_]+)*$
@@ -347,54 +273,10 @@ TEST_CASE("runtimes linux: a path touches a network mount when on, under or cont
 
 namespace {
 
-/// Materializes tree.manifest under `root`. Returns false with `error` set on any
-/// failure so the caller can REQUIRE with a useful message.
+/// Materializes a manifest from the fixture directory (default tree.manifest) under `root`.
 bool materialize_manifest(const fs::path& root, std::string& error,
                           const char* manifest_name = "tree.manifest") {
-    const auto manifest_file = fixture_dir() / manifest_name;
-    std::ifstream in(manifest_file, std::ios::binary);
-    if (!in) {
-        error = "could not open " + manifest_file.string();
-        return false;
-    }
-    std::string line;
-    while (std::getline(in, line)) {
-        const auto p = parse_manifest_line(line);
-        if (p.outcome == LineOutcome::skipped) continue;
-        if (p.outcome == LineOutcome::malformed) {
-            error = p.error;
-            return false;
-        }
-        const fs::path target = root / p.entry.rel;
-        std::error_code ec;
-        fs::create_directories(p.entry.kind == ManifestKind::directory ? target
-                                                                        : target.parent_path(),
-                               ec);
-        if (ec) {
-            error = "create_directories failed for " + target.string() + ": " + ec.message();
-            return false;
-        }
-        switch (p.entry.kind) {
-        case ManifestKind::directory: break;
-        case ManifestKind::symlink:
-            fs::create_symlink(p.entry.payload, target, ec);
-            if (ec) {
-                error = "create_symlink failed for " + target.string() + ": " + ec.message();
-                return false;
-            }
-            break;
-        case ManifestKind::text: {
-            std::ofstream out(target, std::ios::binary);
-            if (!out) {
-                error = "could not create " + target.string();
-                return false;
-            }
-            out << p.entry.payload;
-            break;
-        }
-        }
-    }
-    return true;
+    return materialize_manifest_file(root, error, fixture_dir() / manifest_name);
 }
 
 void write_text(const fs::path& p, const std::string& text) {
@@ -1457,6 +1339,171 @@ TEST_CASE("runtimes linux: an action with no walk arm is a visible failure, neve
     Acc acc;
     CHECK(lnx::action_rows_at(static_cast<rt::Action>(99), "/nonexistent", acc).empty());
     CHECK(acc.reason() == "internal_error");
+}
+
+// == python ===================================================================================
+
+namespace {
+const char* kDebianPythonRow = "python|unmodelled|3.11|/usr/bin/python3.11|-";
+}
+
+TEST_CASE("runtimes linux: python_rows_at reads python3.<minor> regular files from the captured tree "
+          "(REAL CAPTURE structure)",
+          "[runtimes][linux][walk][python]") {
+    // debian:bookworm + python3-minimal: python3.11 regular, python3 -> python3.11 symlink,
+    // pdb3.11 / py3versions symlinks, /usr/local/bin present and empty. Only the regular file is a
+    // row; the version is major.minor from the NAME (the patch level is not available).
+    // MUTATION: matching symlinks too adds `python3` (no minor) or duplicates; dropping the regular
+    // filter lets the pdb3.11 / py3versions links through the name test only by accident.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_py_"};
+    std::string err;
+    REQUIRE(materialize_manifest(dir.path, err));
+    Acc acc;
+    const auto rows = lnx::python_rows_at(dir.path, acc);
+    CHECK_FALSE(acc.any_failure());
+    CHECK(rows == std::vector<std::string>{kDebianPythonRow});
+}
+
+TEST_CASE("runtimes linux: python_rows_at lists both roots, exact names only, root order (SYNTHETIC)",
+          "[runtimes][linux][walk][python]") {
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_py_syn_"};
+    for (const char* f : {"usr/bin/python3.12", "usr/bin/python3.9", "usr/bin/python3.12-config",
+                          "usr/bin/python3.12m", "usr/bin/python2.7", "usr/bin/python312",
+                          "usr/bin/python3", "usr/local/bin/python3.13"})
+        write_text(dir.path / f, "");
+    make_dir(dir.path / "usr/bin/python3.8"); // a directory is not an interpreter
+    std::error_code ec;
+    fs::create_symlink("python3.12", dir.path / "usr/bin/python3.10", ec); // a distro alias: skipped
+    REQUIRE_FALSE(ec);
+    Acc acc;
+    CHECK(lnx::python_rows_at(dir.path, acc) ==
+          std::vector<std::string>{"python|unmodelled|3.12|/usr/bin/python3.12|-",
+                                   "python|unmodelled|3.9|/usr/bin/python3.9|-",
+                                   "python|unmodelled|3.13|/usr/local/bin/python3.13|-"});
+    CHECK_FALSE(acc.any_failure());
+}
+
+TEST_CASE("runtimes linux: python roots: absent is supported, a foreign symlink is refused, an in-set "
+          "alias is silent (SYNTHETIC)",
+          "[runtimes][linux][walk][python]") {
+    SECTION("neither root exists") {
+        yuzu::test::TempDir dir{"yuzu_test_runtimes_py_absent_"};
+        Acc acc;
+        CHECK(lnx::python_rows_at(dir.path, acc).empty());
+        CHECK_FALSE(acc.any_failure());
+    }
+    SECTION("/usr/local points outside the candidate set: refused, and the target is never listed") {
+        yuzu::test::TempDir dir{"yuzu_test_runtimes_py_foreign_"};
+        write_text(dir.path / "usr/bin/python3.11", "");
+        write_text(dir.path / "usr/nfs/local/bin/python3.99", ""); // canary
+        std::error_code ec;
+        fs::create_symlink("../nfs/local", dir.path / "usr/local", ec);
+        REQUIRE_FALSE(ec);
+        Acc acc;
+        const auto rows = lnx::python_rows_at(dir.path, acc);
+        CHECK(rows == std::vector<std::string>{kDebianPythonRow});
+        CHECK(acc.reason() == std::string{lnx::kTokSymlinkRefused});
+    }
+    SECTION("/usr/local/bin names the other candidate: a covered alias, listed once via usr/bin") {
+        yuzu::test::TempDir dir{"yuzu_test_runtimes_py_alias_"};
+        write_text(dir.path / "usr/bin/python3.11", "");
+        make_dir(dir.path / "usr/local");
+        std::error_code ec;
+        fs::create_symlink("../bin", dir.path / "usr/local/bin", ec);
+        REQUIRE_FALSE(ec);
+        Acc acc;
+        CHECK(lnx::python_rows_at(dir.path, acc) == std::vector<std::string>{kDebianPythonRow});
+        CHECK_FALSE(acc.any_failure());
+    }
+}
+
+TEST_CASE("runtimes linux: python walk honours the network-mount guard, the dir-entry cap and the "
+          "shared row budget (SYNTHETIC)",
+          "[runtimes][linux][walk][python][cap]") {
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_py_caps_"};
+    for (const char* f : {"usr/bin/python3.10", "usr/bin/python3.11", "usr/bin/python3.12",
+                          "usr/local/bin/python3.13"})
+        write_text(dir.path / f, "");
+    SECTION("a network-mounted /usr/bin is skipped and /usr/local/bin is still read") {
+        lnx::WalkConfig cfg;
+        cfg.network_mounts = {"/usr/bin"};
+        Acc acc;
+        CHECK(lnx::python_rows_at(dir.path, acc, cfg) ==
+              std::vector<std::string>{"python|unmodelled|3.13|/usr/local/bin/python3.13|-"});
+        CHECK(acc.reason() == std::string{lnx::kTokNetworkFsSkipped});
+    }
+    SECTION("the per-directory cap bounds the listing and reports row_cap") {
+        Acc acc;
+        // The cap is per directory: two of /usr/bin's three entries are read, /usr/local/bin's one
+        // still is. MUTATION: ignoring the cap lists all four.
+        const auto rows = lnx::python_rows_at(dir.path, acc, dir_cap(2));
+        CHECK(rows.size() == 3);
+        CHECK(acc.reason() == std::string{lnx::kTokRowCap});
+    }
+    SECTION("the row budget is one budget across both roots") {
+        lnx::WalkLimits l;
+        l.rows = 3;
+        Acc acc;
+        CHECK(lnx::python_rows_at(dir.path, acc, limits_cfg(l)).size() == 3);
+        CHECK(acc.reason() == std::string{lnx::kTokRowCap});
+    }
+}
+
+TEST_CASE("runtimes linux: run_linux_at(python) emits the status row first and OK/FULL through a real "
+          "CommandContext",
+          "[runtimes][linux][walk][wire][python]") {
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_py_leg_"};
+    std::string err;
+    REQUIRE(materialize_manifest(dir.path, err));
+    const auto run = run_leg(rt::Action::python, dir.path);
+    CHECK(run.rc == 0);
+    CHECK(run.rows == std::vector<std::string>{"status|python|supported|-", kDebianPythonRow});
+    CHECK(run.status == YUZU_RESULT_STATUS_OK);
+    CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(run.provenance.empty());
+}
+
+TEST_CASE("runtimes linux: /usr/local -> ../var/usrlocal (rpm-ostree) is a covered alias through the "
+          "leg, not a constraint (SYNTHETIC)",
+          "[runtimes][linux][walk][python][wire]") {
+    // Fedora CoreOS/Silverblue/RHCOS/RHEL Edge link /usr/local to ../var/usrlocal. MUTATION: dropping
+    // var/usrlocal/bin from kPythonRoots reports symlink_refused (status constrained) on EVERY python
+    // dispatch of such a host, and the python3.13 installed there is lost.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_py_ostree_"};
+    write_text(dir.path / "usr/bin/python3.11", "");
+    std::error_code ec;
+    fs::create_symlink("../var/usrlocal", dir.path / "usr/local", ec);
+    REQUIRE_FALSE(ec);
+    SECTION("nothing installed under /var/usrlocal: silent, supported, only the distro interpreter") {
+        const auto run = run_leg(rt::Action::python, dir.path);
+        CHECK(run.rc == 0);
+        CHECK(run.rows == std::vector<std::string>{"status|python|supported|-", kDebianPythonRow});
+        CHECK(run.status == YUZU_RESULT_STATUS_OK);
+        CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    }
+    SECTION("a python3.13 under var/usrlocal/bin is found once, through its own candidate") {
+        write_text(dir.path / "var/usrlocal/bin/python3.13", "");
+        const auto run = run_leg(rt::Action::python, dir.path);
+        CHECK(run.rc == 0);
+        CHECK(run.rows == std::vector<std::string>{"status|python|supported|-", kDebianPythonRow,
+                                                   "python|unmodelled|3.13|/var/usrlocal/bin/python3.13|-"});
+        CHECK(run.status == YUZU_RESULT_STATUS_OK);
+        CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+        CHECK(run.provenance.empty());
+    }
+}
+
+TEST_CASE("runtimes linux: a refused python root is a recorded failure through the dispatch (SYNTHETIC)",
+          "[runtimes][linux][walk][python]") {
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_py_refused_"};
+    make_dir(dir.path / "usr");
+    make_dir(dir.path / "srv");
+    std::error_code ec;
+    fs::create_symlink("../srv", dir.path / "usr/bin", ec);
+    REQUIRE_FALSE(ec);
+    Acc acc;
+    CHECK(lnx::action_rows_at(rt::Action::python, dir.path, acc).empty());
+    CHECK(acc.reason() == std::string{lnx::kTokSymlinkRefused});
 }
 
 #endif // !defined(_WIN32)

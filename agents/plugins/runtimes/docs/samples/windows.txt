@@ -1,0 +1,14 @@
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-28 · interactive user (elevated) · leg-hash 10a510136fd8
+== action=dotnet
+status|dotnet|unsupported|windows:planned
+[result_status] UNAVAILABLE / PARTIAL / windows:planned
+
+== action=jvm
+status|jvm|unsupported|windows:planned
+[result_status] UNAVAILABLE / PARTIAL / windows:planned
+
+== action=python
+status|python|supported|-
+python|cpython|3.14.6|C:/Python314/|PythonCore
+[result_status] OK / FULL / 
+

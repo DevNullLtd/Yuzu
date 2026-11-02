@@ -326,6 +326,60 @@ No dedicated alert rule ships for either family in this change — same posture 
 routing directory reap counter below, which also has none; revisit once real fleet data exists
 to size a threshold.
 
+## Execution-tracker read-degrade metric (#3834)
+
+Until now a degraded read of the execution tracker (the store behind execution history, the
+executions drawer and result polls) was visible only as a server log line. This counter makes it
+visible on a dashboard.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_execution_tracker_read_degrade_total{method,reason}` | counter | An execution-tracker read returned a degraded answer instead of data. `method` ∈ `query_executions`\|`get_execution`\|`get_agent_statuses`\|`get_agent_statuses_for_executions`\|`get_children` names the reader (it is not an HTTP method). `reason` ∈ `store_not_open`\|`pool_acquire_timeout`\|`query_error` says where the read failed, not why (see below). Pre-seeded to 0 for all 15 combinations. **Diagnostic only — not an availability or user-impact measure:** it also counts the server's own periodic reads (about 4 per minute per replica of `method="query_executions"` with no users at all, more while `/health`, `/api/health`, the health summary or the dashboard health fragment is polled by an authenticated caller), so any database trouble makes it non-zero within one 15 s tick plus the read wait. |
+
+**How to read it:**
+
+- A counted degrade is answered `503` (or a retryable error) by the REST, MCP and dashboard
+  execution routes. Some server-internal readers fail open instead: the command-queue-depth gauge
+  reads 0, the health summary shows 0 in flight, and the shutdown drain can see 0 running and end
+  early. Those were already true; the counter makes them visible.
+- `reason="pool_acquire_timeout"` means no database connection was obtained. That is pool
+  saturation **or** a database that is unreachable or in connect backoff (or shutdown), so it is
+  not by itself a reason to raise `--postgres-pool-size`. Check `yuzu_server_pg_reachable` first:
+  when it is 0 the database is unreachable or refusing connections (a database whose
+  connection slots are used up, for example by other clients on a Postgres without the reserved slots
+  the shipped images set, refuses the probe's reconnect too: see "Sizing `max_connections`" in
+  [server-admin.md](server-admin.md)), not a pool that is too small. Treat it as saturation only
+  when `yuzu_pg_pool_in_use` is at the pool size. `yuzu_pg_acquire_wait_seconds` records only
+  successful checkouts, so it stays flat when the pool is completely exhausted. Before raising
+  the pool, look for long or blocked statements holding the connections (`pg_stat_activity`): then
+  the pool is the symptom, and more connections only add load to a struggling database.
+- `reason="query_error"` means a connection was obtained and the statement failed or timed out
+  (a slow or locked table, a stale connection after a restart or failover, a schema mismatch).
+- `reason="store_not_open"` stays 0 on a running server, which refuses to start without the
+  tracker; it exists so the three reasons match the other stores' read-degrade counters.
+- The reasons can change during one incident (a failover typically shows `query_error` first and
+  `pool_acquire_timeout` after), so read them together.
+- Counters are per replica. One connection pool serves every store, so a tracker
+  `pool_acquire_timeout` can be the symptom of another store holding connections.
+- **No alert rule ships for this counter** (tracked in #6883). A per-reason alert would flap during a failover, and
+  the rate includes the server's own polling. If you alert on it, alert on the sum across reasons
+  with a sustained `for:` of several minutes (the server's own polling makes it non-zero on any
+  single blip), alongside `yuzu_server_pg_reachable`.
+
+**Useful PromQL queries:**
+
+```promql
+# Tracker reads degrading, by reader and reason (includes the server's own polling).
+sum by (method, reason) (increase(yuzu_server_execution_tracker_read_degrade_total[5m])) > 0
+
+# No label filter separates user impact from the server's own polling (query_executions is
+# also the executions-list reader behind the REST, MCP and dashboard pages): read this next to
+# yuzu_server_pg_reachable, not instead of it.
+
+# Fleet-wide vs one replica.
+sum by (instance, reason) (increase(yuzu_server_execution_tracker_read_degrade_total[5m]))
+```
+
 ## Command outbox delivery metrics (HA WS-3 3.3)
 
 Scheduled instruction fires enqueue a durable `pending` occurrence to

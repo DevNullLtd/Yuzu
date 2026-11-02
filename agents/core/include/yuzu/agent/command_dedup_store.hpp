@@ -91,6 +91,11 @@ enum class DedupState {
 };
 
 /// Outcome of claim().
+///
+/// Adding an enumerator here REQUIRES revisiting decide_after_claim()
+/// (agents/core/src/command_dedup_decision.hpp, #3668): a status that switch does not
+/// handle fails SAFE to "answer RUNNING, run nothing", so the new case would silently
+/// stop executing commands. -Wswitch flags the switch, but the build is werror=false.
 enum class ClaimStatus {
     Claimed,   ///< first sighting; caller owns the in-flight record and must resolve it
     Duplicate, ///< already known; see `state` (+ `response` when Terminal)
