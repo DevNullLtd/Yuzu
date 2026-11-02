@@ -79,8 +79,8 @@ regressible — nothing fails loudly when one is broken.
      corrupt file that cannot be moved aside fails the open instead and takes the normal degraded path
      (`yuzu_agent_dedup_open_failed_total`, `yuzu.dedup_degraded=1`). So does a fresh store that cannot be
      created after a successful quarantine: the history is then lost AND the agent is degraded, the error names
-     the quarantined file, and `yuzu_agent_dedup_quarantined_total` is NOT incremented (that branch is
-     untested; see `docs/test-coverage.md`).
+     the quarantined file, and `yuzu_agent_dedup_quarantined_total` is NOT incremented (the store side of that branch is
+     tested; the agent.cpp counter non-increment is not; see `docs/test-coverage.md`).
    - **The fleet signal does not survive a restart.** The heartbeat tag is a per-process counter, so one agent
      restart returns it to 0 while up to 3 quarantined files remain on the endpoint. A durable marker (derived
      from the `.corrupt-*` files, or a row in the fresh store) is a candidate follow-up that has not been filed.

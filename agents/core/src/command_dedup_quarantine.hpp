@@ -107,8 +107,8 @@ inline std::optional<std::pair<long long, long long>> parse_quarantine_name(std:
 /// process A just created, leaving A on an orphaned inode.
 ///
 /// `epoch_seconds` is clamped to >= 0: a clock before 1970 would otherwise write `.corrupt--5`,
-/// which parse_quarantine_name rejects, so the file could never be pruned. The moved file keeps its
-/// existing mode/ACL (0600 on POSIX after a normal open).
+/// which parse_quarantine_name rejects, so the file could never be pruned. The moved file and its carried
+/// sidecars are then set owner-only, best effort (0600 on POSIX; a read-only-attribute toggle on Windows).
 inline std::optional<std::filesystem::path> quarantine_corrupt_db(const std::filesystem::path& path,
                                                                  std::int64_t epoch_seconds) {
     const std::int64_t epoch = epoch_seconds < 0 ? 0 : epoch_seconds;
