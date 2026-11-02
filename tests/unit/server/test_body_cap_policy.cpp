@@ -1476,8 +1476,8 @@ TEST_CASE("transfer_encoding_for_body_cap: an empty first line still reads as pr
 // The post-read body cap and the step-up check measure `req.body`, so they must run AFTER httplib
 // has read it: they are installed through `PostReadStageRegistry` and the route sink, never as
 // `set_pre_request_handler`. The cases in this section keep that true when the baseline moves or
-// when the route-sink wrapper change is reverted on its own. The scan LOGIC below shares nothing with the
-// wrapper change's own wiring tests, but this file as a whole needs that change
+// when the route-sink wrapper change is reverted on its own. The scan LOGIC below shares nothing
+// with the wrapper change's own wiring tests, but this file as a whole needs that change
 // (`post_read_stage_test_support.hpp`, `PostReadStageRegistry`), so it is the source scan that
 // carries the pin, not the file's independence.
 
@@ -1741,12 +1741,13 @@ TEST_CASE("no server source file uses httplib's pre-request handler on a baselin
           "the body after it",
           "[body_cap][httplib_version][lexical]") {
     // A source-text pin, over comment- and literal-stripped text of EVERY file under the server
-    // source and public header directories, that does not depend on the route-sink wrapper change's own tests: the
-    // bare token `set_pre_request_handler` must not appear as code anywhere, in any form. If that
-    // wrapper change were reverted on its own on this baseline, server.cpp would again install
-    // the stage that way, which runs before the body is read, and the post-read body cap and the
-    // step-up check would see an empty body. (There is no allowlist: the one deliberate use of
-    // the handler in this repository is in a test, outside the scanned directories.)
+    // source and public header directories, that does not depend on the route-sink wrapper
+    // change's own tests: the bare token `set_pre_request_handler` must not appear as code
+    // anywhere, in any form. If that wrapper change were reverted on its own on this baseline,
+    // server.cpp would again install the stage that way, which runs before the body is read,
+    // and the post-read body cap and the step-up check would see an empty body. (There is no
+    // allowlist: the one deliberate use of the handler in this repository is in a test, outside
+    // the scanned directories.)
     if (!httplib_reads_body_after_pre_request_handler()) {
         SUCCEED("this httplib reads the body before its pre-request handler");
         return;
@@ -1769,9 +1770,10 @@ TEST_CASE("no server source file uses httplib's pre-request handler on a baselin
 
 TEST_CASE("the body-cap decision and the close rule have exactly one production caller each",
           "[body_cap][lexical]") {
-    // Over the whole server source and public header directories: a second `evaluate_body_cap(` call site (one that
-    // could read the headers raw) or a second `close_if_unread_framed_body(` call site would be a
-    // second copy of a rule that has one home. The defining headers are excluded by name.
+    // Over the whole server source and public header directories: a second `evaluate_body_cap(`
+    // call site (one that could read the headers raw) or a second `close_if_unread_framed_body(`
+    // call site would be a second copy of a rule that has one home. The defining headers are
+    // excluded by name.
     std::string eval_sites;
     std::string close_sites;
     std::size_t eval_calls = 0;
