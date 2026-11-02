@@ -1,0 +1,1 @@
+- **Agent command-dedup claim decision is now a tested pure function.** The replay / answer-RUNNING / proceed choice and the `__guard__`-only claim bypass in the agent's command loop moved out of `agent.cpp` into `command_dedup_decision.hpp` with unit tests for every branch. No behaviour change (#3668).

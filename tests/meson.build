@@ -283,6 +283,7 @@ agent_test_exe = executable(
     'unit/test_kv_store.cpp',
     'unit/test_fake_journal_store.cpp', # IJournalStore test double contract (#4153)
     'unit/test_command_dedup_store.cpp',
+    'unit/test_command_dedup_decision.cpp', # decide_after_claim/should_claim pure core (#3668)
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
     'unit/test_guardian_engine_legacy_sink.cpp', # #4783 commit 1: [!mayfail] red evidence only
