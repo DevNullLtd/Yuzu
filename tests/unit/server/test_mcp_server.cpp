@@ -45305,7 +45305,8 @@ TEST_CASE("MCP execute_instruction_definition: an unknown definition is -32602 a
 TEST_CASE("MCP execute_instruction_definition: a definition_id with a control byte is -32602 "
           "invalid_definition_id before any store read; a normal id still dispatches",
           "[mcp][integration][execute][idef][security]") {
-    for (const std::string id : {std::string("d\0xyz", 5), std::string("d\x7f"), std::string("d\x1f")}) {
+    for (const auto& id :
+         {std::string("d\0xyz", 5), std::string("d\x7f"), std::string("d\x1f")}) {
         INFO(id.size());
         McpTestServer ts;
         Rig rig;
@@ -45804,8 +45805,8 @@ TEST_CASE("MCP execute_instruction_definition: supervised non-admin on a gated p
 TEST_CASE("MCP execute_instruction_definition: supervised tier refuses a hostile definition_id "
           "at the pre-mint probe: no ticket is minted and nothing is read or dispatched",
           "[pg][mcp][integration][execute][idef][approval][security]") {
-    for (const std::string id : {std::string("d\0xyz", 5), std::string("d\x7f"), std::string("d\x1f"),
-                                 std::string("d\r\nforged")}) {
+    for (const auto& id : {std::string("d\0xyz", 5), std::string("d\x7f"), std::string("d\x1f"),
+                           std::string("d\r\nforged")}) {
         INFO(id.size());
         yuzu::test::ApprovalManagerPg appr_bundle;
         yuzu::server::ApprovalManager& appr = *appr_bundle;
