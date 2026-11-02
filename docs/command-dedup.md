@@ -34,6 +34,13 @@ regressible — nothing fails loudly when one is broken.
 7. **Store open/write failure is a DELIBERATE fail-OPEN** (run undeduplicated) that **MUST stay
    observable** (`yuzu.dedup_degraded` heartbeat plus local counters), never silent.
 
+Invariants 3 and 4, the claim-error leg of 7 (`count_claim_error`), and the `owns_claim` result that
+gates 1's queue-full release are decided by the pure, proto-free `agents/core/src/command_dedup_decision.hpp`
+(`should_claim`, `decide_after_claim`), unit-tested in `tests/unit/test_command_dedup_decision.cpp`.
+`agent.cpp`'s claim block acts on its answer, and `tests/test_agent_command_dedup_wiring_lexical.py`
+pins that it still calls both functions and acts on every field. A change to which commands are
+claimed, or to replay / RUNNING / proceed, belongs in the header, not inline.
+
 ## Two further contracts
 
 - `record_terminal` is **FIRST-WRITE-WINS** (in-flight → terminal only).

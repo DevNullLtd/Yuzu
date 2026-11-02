@@ -1334,6 +1334,10 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
         }
         const std::string child_path =
            full + "\\" + yuzu::win::from_wide(sub.data(), static_cast<int>(slen));
+        // Not configuration (see registry_path_excluded): never opened, so its constant writes
+        // cannot disturb the read of the rest of the root.
+        if (registry_path_excluded(child_path))
+            continue;
         yuzu::win::RegKey child;
         // OPEN_LINK: a child that is a symbolic-link key is read as the link (its own
         // SymbolicLinkValue), never followed into whatever it points at.
@@ -1369,8 +1373,16 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
     // can no longer be queried was deleted mid-walk, which is the same answer. Control flow
     // reaches here only when neither `capped` nor `unreadable` is set.
     KeyInfo after;
-    if (query_key(key, after) != ERROR_SUCCESS || !(after == before))
+    if (query_key(key, after) != ERROR_SUCCESS || !(after == before)) {
         ctx.capped = true;
+        return;
+    }
+    // The key's write time, published only now that the two queries agree: a row takes it as
+    // its time. A key written during the walk, or one the walk left early (capped, unreadable),
+    // gets no stamp, and its candidates fall back to the end of the read.
+    ctx.out->written[full] = static_cast<std::int64_t>(
+        (static_cast<std::uint64_t>(before.written.dwHighDateTime) << 32) |
+        before.written.dwLowDateTime);
 }
 
 // Reads the subtree under an already-open `key`, labelling its key paths from `label` (never from
@@ -1382,6 +1394,7 @@ SubtreeRead read_root_at(HKEY key, const std::string& label, std::int64_t deadli
         read_key(ctx, key, label, 0);
         if (ctx.unreadable) {
             out.keys.clear();
+            out.written.clear();
             out.skipped.clear();
             out.status = RegistryReadStatus::Unreadable;
         } else {
@@ -1389,6 +1402,7 @@ SubtreeRead read_root_at(HKEY key, const std::string& label, std::int64_t deadli
         }
     } catch (...) {
         out.keys.clear();
+        out.written.clear();
         out.skipped.clear();
         out.status = RegistryReadStatus::Unreadable;
     }

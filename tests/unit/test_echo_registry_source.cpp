@@ -246,7 +246,7 @@ TEST_CASE("baseline_entry_from_bytes hashes every byte read (R8)", "[echo][regis
     CHECK(ea.h != eb.h);
     CHECK(ea.s == eb.s);
     CHECK(ea == baseline_entry_from_bytes(P::kRegBinary, a.size(), a, false)); // identical bytes
-    CHECK(ea.d.size() <= kBaselineRenderCap);
+    CHECK(ea.d.empty()); // the old value is not kept in the baseline: it is never stored in a row
     const auto big = baseline_entry_from_bytes(P::kRegBinary, 9'000'000, a, true);
     CHECK(big.dt); // hash covers a prefix only
     CHECK(big.s == 9'000'000);
@@ -301,13 +301,15 @@ TEST_CASE("diff_registry_snapshot: added/changed/removed values and the four rea
         const auto& changed = by.at("changed:A:ImagePath");
         CHECK(changed.data == "c:\\a2.exe");
         CHECK(changed.has_prev);
-        CHECK(changed.prev_data == "c:\\a.exe");
+        CHECK(changed.prev_size == utf16("c:\\a.exe").size());
+        CHECK(changed.prev_data.empty()); // the old value is no longer rendered into the baseline
         CHECK(changed.root == root);
         CHECK(changed.window_lo == 10);
         CHECK(changed.window_hi == 20);
         CHECK(by.at("added:A:Start").data == "2");
         CHECK_FALSE(by.at("added:A:Start").has_prev);
-        CHECK(by.at("removed:B:ImagePath").prev_data == "c:\\b.exe");
+        CHECK(by.at("removed:B:ImagePath").has_prev);
+        CHECK(by.at("removed:B:ImagePath").prev_data.empty());
         CHECK(d.changed);
     }
 
@@ -387,7 +389,9 @@ TEST_CASE("diff_registry_snapshot: added/changed/removed values and the four rea
         const auto d = diff_registry_snapshot(first.baseline, read3, root, "notify", win, 20);
         for (const auto& c : d.candidates)
             if (c.value == "Blob") {
+                CHECK(kRegistryDataCap == 512);
                 CHECK(c.data.size() <= kRegistryDataCap);
+                CHECK_FALSE(c.data.empty());
                 CHECK(c.data_truncated);
                 CHECK(c.size == 10'000);
             }
@@ -1573,7 +1577,8 @@ TEST_CASE("registry source: baseline tick writes baselines and no rows; a change
     const auto third = tick(t.db, *src);
     CHECK(third.events_emitted == 1);
     const auto rows = q(t.db, "SELECT action, hive, key_path, value_name, data, prev_data, "
-                              "actor_pid, actor_image, detail, observed_at, source FROM registry_live");
+                              "actor_pid, actor_image, detail, observed_at, source, "
+                              "prev_data_truncated, prev_data_size, ts FROM registry_live");
     REQUIRE(rows.rows.size() == 1);
     const auto& r = rows.rows[0];
     CHECK(r[0] == "changed");
@@ -1581,7 +1586,9 @@ TEST_CASE("registry source: baseline tick writes baselines and no rows; a change
     CHECK(r[2] == "SOFTWARE\\yuzu_test_r\\Svc");
     CHECK(r[3] == "Start");
     CHECK(r[4] == "2");
-    CHECK(r[5] == "1");
+    CHECK(r[5].empty());  // the old value is not stored ...
+    CHECK(r[11] == "1");  // ... and the row says there was one (prev_data_truncated)
+    CHECK(r[12] != "0");  // with its size
     CHECK(r[6] == "0");  // no writer named ...
     CHECK(r[7].empty()); // ... no image ...
     CHECK(r[8] == "attr:none"); // ... and the row says why
@@ -1589,6 +1596,8 @@ TEST_CASE("registry source: baseline tick writes baselines and no rows; a change
     CHECK(r[9] != std::to_string(filetime_to_unix_ms(T0 + 98 * SEC)));  // not the notify time
     CHECK(r[9] != std::to_string(filetime_to_unix_ms(T0 + 300 * SEC))); // nor the finalising tick
     CHECK(r[10] == "notify");
+    // The reader reported no key write time here, so the row's time is the end of the read.
+    CHECK(r[13] == std::to_string(filetime_to_unix_ms(read_end) / 1000));
     CHECK(read_cursor(t.db).held.empty());
 
     f.clock = T0 + 400 * SEC;
@@ -2733,6 +2742,204 @@ TEST_CASE("registry source: a logged-off user's roots leave scope without a remo
     CHECK(read_cursor(t.db).roots.empty());
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Storage budget: row volume (512 B data, no old value, no bam subtree, key write time)
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("registry_path_excluded: the bam State subtree only, on a separator boundary",
+          "[echo][registry][pure]") {
+    const std::string bam = "HKLM\\SYSTEM\\CurrentControlSet\\Services\\bam\\State";
+    CHECK(registry_path_excluded(bam));
+    CHECK(registry_path_excluded(bam + "\\UserSettings"));
+    CHECK(registry_path_excluded(bam + "\\UserSettings\\S-1-5-21-1"));
+    CHECK(registry_path_excluded("hklm\\system\\currentcontrolset\\services\\BAM\\state")); // ASCII case folded
+    CHECK(registry_path_excluded("HKLM\\SYSTEM\\CurrentControlSet\\Services\\bam\\STATE\\x"));
+    CHECK_FALSE(registry_path_excluded(bam + "X"));              // not on a boundary
+    CHECK_FALSE(registry_path_excluded(bam + "X\\UserSettings"));
+    CHECK_FALSE(registry_path_excluded("HKLM\\SYSTEM\\CurrentControlSet\\Services\\bam")); // the parent
+    CHECK_FALSE(registry_path_excluded("HKLM\\SYSTEM\\CurrentControlSet\\Services\\bam\\Other"));
+    CHECK_FALSE(registry_path_excluded("HKLM\\SYSTEM\\CurrentControlSet\\Services\\bamX\\State"));
+    CHECK_FALSE(registry_path_excluded("HKLM\\SYSTEM\\CurrentControlSet\\Services\\Dhcp"));
+    CHECK_FALSE(registry_path_excluded(""));
+    CHECK_FALSE(registry_path_excluded("HKU\\S-1-5-21-1\\Software\\Run"));
+}
+
+TEST_CASE("diff_registry_snapshot ignores the bam State subtree in both directions",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const std::string root = "HKLM\\SYSTEM\\CurrentControlSet\\Services";
+    const std::string bam_state = root + "\\bam\\State";
+    const RegistryWindow win{10, 20};
+
+    // A read that visits bam\State yields no candidate for it and keeps it out of the baseline.
+    auto read = complete({{root + "\\Dhcp", {{"Start", vread(P::kRegDword, dword(2))}}},
+                          {bam_state, {{"Version", vread(P::kRegDword, dword(1))}}},
+                          {bam_state + "\\UserSettings", {{"x", vread(P::kRegDword, dword(1))}}}});
+    const auto first = diff_registry_snapshot({}, read, root, "notify", win, 20);
+    REQUIRE(first.candidates.size() == 1);
+    CHECK(first.candidates[0].key == root + "\\Dhcp");
+    CHECK(first.baseline.keys.size() == 1);
+    CHECK_FALSE(first.baseline.keys.contains(bam_state));
+
+    // A baseline written by an earlier build still holds the subtree: the next read drops it
+    // without a removed row, and reports the baseline as changed so it is rewritten once.
+    RegistryBaseline legacy = first.baseline;
+    legacy.keys[bam_state]["Version"] = baseline_entry_from_bytes(P::kRegDword, 4, dword(1), false);
+    legacy.keys[bam_state + "\\UserSettings"]["x"] = baseline_entry_from_bytes(P::kRegDword, 4, dword(1), false);
+    auto read2 = complete({{root + "\\Dhcp", {{"Start", vread(P::kRegDword, dword(2))}}}});
+    const auto second = diff_registry_snapshot(legacy, read2, root, "reconcile", win, 30);
+    CHECK(second.candidates.empty());
+    CHECK(second.changed);
+    CHECK_FALSE(second.baseline.keys.contains(bam_state));
+    CHECK_FALSE(second.baseline.keys.contains(bam_state + "\\UserSettings"));
+
+    // The same holds for a partial read, which starts from a copy of the baseline.
+    SubtreeRead capped = read2;
+    capped.status = RegistryReadStatus::Capped;
+    const auto third = diff_registry_snapshot(legacy, capped, root, "reconcile", win, 40);
+    CHECK(third.candidates.empty());
+    CHECK_FALSE(third.baseline.keys.contains(bam_state));
+
+    // The key IN the read with a changed value yields no row either.
+    auto read3 = complete({{root + "\\Dhcp", {{"Start", vread(P::kRegDword, dword(2))}}},
+                           {bam_state, {{"Version", vread(P::kRegDword, dword(9))}}}});
+    const auto fourth = diff_registry_snapshot(second.baseline, read3, root, "notify", win, 50);
+    CHECK(fourth.candidates.empty());
+}
+
+TEST_CASE("registry rows: the old value is not stored, only its type and size", "[echo][registry][pure]") {
+    auto c = cand("changed", "Start", 4, 4, 10, 20);
+    c.has_prev = true;
+    c.prev_type = 4;
+    c.prev_size = 4;
+    c.prev_data = "legacy text from an old baseline";
+    const auto row = registry_row_from_candidate(c, 0, "", "attr:none", 1);
+    CHECK(row.prev_data.empty());
+    CHECK(row.prev_data_size == 4);
+    CHECK(row.prev_data_truncated == 1); // "there was a value; it is not stored"
+    CHECK_FALSE(row.prev_data_type.empty());
+    CHECK(row.data == "x"); // the NEW value is unchanged
+
+    c.prev_size = 0; // an empty old value: nothing was left out
+    CHECK(registry_row_from_candidate(c, 0, "", "attr:none", 1).prev_data_truncated == 0);
+    c.has_prev = false;
+    CHECK(registry_row_from_candidate(c, 0, "", "attr:none", 1).prev_data_size == 0);
+}
+
+TEST_CASE("registry rows: the time is the key's LastWriteTime, clamped to the read",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const std::string root = "HKLM\\SOFTWARE\\r";
+    const std::int64_t read_end = T0 + 100 * SEC;
+    const std::int64_t wrote = T0 + 40 * SEC;
+    const RegistryWindow win{T0, read_end};
+    SubtreeRead base_read = complete({{root + "\\A", {{"v", vread(P::kRegDword, dword(1))}}}});
+    const auto base = diff_registry_snapshot({}, base_read, root, "reconcile", win, read_end, true);
+
+    const auto one_change = [&](std::int64_t key_written) {
+        SubtreeRead r = complete({{root + "\\A", {{"v", vread(P::kRegDword, dword(2))}}}});
+        r.written[root + "\\A"] = key_written;
+        const auto d = diff_registry_snapshot(base.baseline, r, root, "notify", win, read_end);
+        REQUIRE(d.candidates.size() == 1);
+        return d.candidates[0];
+    };
+
+    SECTION("a plausible write time becomes the row time; the record key stays on the read") {
+        const auto c = one_change(wrote);
+        CHECK(c.key_written == wrote);
+        const auto row = registry_row_from_candidate(c, 0, "", "attr:none", 1);
+        CHECK(row.ts == filetime_to_unix_ms(wrote) / 1000);
+        CHECK(row.observed_at == filetime_to_unix_ms(read_end)); // unchanged: the read
+        CHECK(row.record_key == registry_row_from_candidate(one_change(0), 0, "", "attr:none", 1).record_key);
+    }
+    SECTION("a write time after the read is clamped to the read end") {
+        const auto row = registry_row_from_candidate(one_change(read_end + 5 * SEC), 0, "", "attr:none", 1);
+        CHECK(row.ts == filetime_to_unix_ms(read_end) / 1000);
+    }
+    SECTION("an unknown (0) write time falls back to the read end") {
+        const auto row = registry_row_from_candidate(one_change(0), 0, "", "attr:none", 1);
+        CHECK(row.ts == filetime_to_unix_ms(read_end) / 1000);
+    }
+    SECTION("a Capped read that visited a key but published no stamp for it uses the read end") {
+        // The reader stamps a key only after its final validation; a walk that ended early or
+        // saw the key written leaves `written` without the key, and the row must not be timed
+        // from any earlier query.
+        SubtreeRead part = complete({{root + "\\A", {{"v", vread(P::kRegDword, dword(2))}}}});
+        part.status = RegistryReadStatus::Capped;
+        REQUIRE_FALSE(part.written.contains(root + "\\A"));
+        const auto d = diff_registry_snapshot(base.baseline, part, root, "notify", win, read_end);
+        REQUIRE(d.candidates.size() == 1);
+        CHECK(d.candidates[0].key_written == 0);
+        const auto row = registry_row_from_candidate(d.candidates[0], 0, "", "attr:none", 1);
+        CHECK(row.ts == filetime_to_unix_ms(read_end) / 1000);
+    }
+    SECTION("a key_removed row has no write time and uses the read end") {
+        SubtreeRead gone;
+        gone.status = RegistryReadStatus::Absent;
+        gone.written[root + "\\A"] = wrote; // even a stale stamp must not be used for a vanished key
+        const auto d = diff_registry_snapshot(base.baseline, gone, root, "reconcile", win, read_end);
+        bool saw_key_removed = false;
+        for (const auto& c : d.candidates) {
+            const auto row = registry_row_from_candidate(c, 0, "", "attr:none", 1);
+            CHECK(row.ts == filetime_to_unix_ms(read_end) / 1000);
+            saw_key_removed = saw_key_removed || c.action == "key_removed";
+        }
+        CHECK(saw_key_removed);
+    }
+}
+
+TEST_CASE("registry cursor: the key write time round-trips and a legacy candidate decodes to 0",
+          "[echo][registry][pure]") {
+    RegistryCursor cur;
+    cur.present = true;
+    cur.tick = 1;
+    cur.hku = {};
+    auto held = cand("changed", "Start", 4, 4, 10, 20);
+    held.key_written = T0 + 7 * SEC;
+    cur.held = {held};
+    const auto json = encode_registry_cursor(cur);
+    auto back = decode_registry_cursor(json);
+    REQUIRE_FALSE(back.malformed);
+    REQUIRE(back.held.size() == 1);
+    CHECK(back.held[0].key_written == T0 + 7 * SEC);
+
+    // A cursor written before the field existed: the candidate carries no "kw".
+    auto legacy = nlohmann::json::parse(json);
+    for (auto& h : legacy["held"])
+        h.erase("kw");
+    const auto old = decode_registry_cursor(legacy.dump());
+    REQUIRE_FALSE(old.malformed);
+    REQUIRE(old.held.size() == 1);
+    CHECK(old.held[0].key_written == 0);
+    CHECK(old.held[0].observed_at == held.observed_at);
+}
+
+TEST_CASE("registry baseline: the old value is not rendered, and the field is still written",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const auto e = baseline_entry_from_bytes(P::kRegSz, 18, utf16("c:\\a.exe"), false);
+    CHECK(e.d.empty());
+    CHECK_FALSE(e.h.empty()); // the change-detection hash is unaffected
+    RegistryBaseline b;
+    b.keys["K"]["v"] = e;
+    const auto json = nlohmann::json::parse(encode_registry_baseline(b));
+    CHECK(json.at("keys").at("K").at("v").at("d") == ""); // kept for a rolled-back build
+    // A baseline from an earlier build, with text in "d", still decodes.
+    auto legacy = json;
+    legacy["keys"]["K"]["v"]["d"] = "c:\\a.exe";
+    const auto back = decode_registry_baseline(legacy.dump());
+    CHECK_FALSE(back.malformed);
+    CHECK(back.baseline.keys.at("K").at("v").d == "c:\\a.exe");
+    // The next diff sees identical bytes as unchanged (the hash decides), and reports the
+    // baseline changed once because its "d" now differs, with no row.
+    SubtreeRead r = complete({{"K", {{"v", vread(P::kRegSz, utf16("c:\\a.exe"))}}}});
+    const auto d = diff_registry_snapshot(back.baseline, r, "K", "reconcile", RegistryWindow{1, 2}, 2);
+    CHECK(d.candidates.empty());
+    CHECK(d.changed);
+    CHECK(d.baseline.keys.at("K").at("v").d.empty());
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Offline (unloaded) hives over an injected reader
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2742,6 +2949,18 @@ namespace {
 SubtreeRead uread(const std::string& root, std::uint32_t v) {
     return complete({{root, {{"v", vread(4, dword(v))}}}});
 }
+
+// uread with the key's LastWriteTime (FILETIME) the offline reader saw: the same `written` map the
+// live reader fills, so an offline row takes the same key-write-time as its `ts`.
+SubtreeRead uread_written(const std::string& root, std::uint32_t v, std::int64_t key_written) {
+    auto r = uread(root, v);
+    r.written[root] = key_written;
+    return r;
+}
+
+// What a changed row holds for a DWORD that was 1 before: the old value's type, size and "there
+// was a value" flag, and NO text (type '/' size '/' prev_data_truncated '/' prev_data).
+const std::string kOldDwordNotStored = "REG_DWORD/4/1/";
 
 OfflineHiveRead hive_read(std::map<std::string, SubtreeRead> roots) {
     OfflineHiveRead h;
@@ -2826,7 +3045,7 @@ TEST_CASE("registry offline: first sight baselines silently; one mount per hive 
     CHECK(r.next().events_emitted == 1);
     CHECK(r.f.offline_profile_calls == 2);
     CHECK(r.f.offline_calls.size() == 2);
-    const auto rows = q(r.t.db, "SELECT action, hive, key_path, data, prev_data, actor_pid, "
+    const auto rows = q(r.t.db, "SELECT action, hive, key_path, data, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, actor_pid, "
                                 "detail, source, record_key FROM registry_live");
     REQUIRE(rows.rows.size() == 1);
     const auto& row = rows.rows[0];
@@ -2834,7 +3053,7 @@ TEST_CASE("registry offline: first sight baselines silently; one mount per hive 
     CHECK(row[1] == "HKU");
     CHECK(row[2] == kSidA + "\\" + kSuffix); // the logical name, never a salted mount name
     CHECK(row[3] == "2");
-    CHECK(row[4] == "1");
+    CHECK(row[4] == kOldDwordNotStored); // old value: type, size, "there was one", no text
     CHECK(row[5] == "0");
     CHECK(row[6] == "attr:offline");
     CHECK(row[7] == "offline");
@@ -3127,10 +3346,10 @@ TEST_CASE("registry offline: logoff keeps scope, resets the retention term and c
     r.tick_to(12);
     r.next();
     REQUIRE(r.f.offline_calls.size() == 1);
-    const auto rows = q(r.t.db, "SELECT prev_data, data, detail FROM registry_live "
+    const auto rows = q(r.t.db, "SELECT prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live "
                                 "WHERE action = 'changed'");
     REQUIRE(rows.rows.size() == 1);
-    CHECK(rows.rows[0][0] == "1");
+    CHECK(rows.rows[0][0] == kOldDwordNotStored);
     CHECK(rows.rows[0][1] == "2");
     CHECK(rows.rows[0][2] == "attr:offline");
 }
@@ -3191,6 +3410,44 @@ TEST_CASE("registry offline: an offline read never advances window_base and leav
     CHECK(r.src->buffer_for_test().size() == 1); // the old event was released, the new one kept
 }
 
+TEST_CASE("registry offline: a row takes the key's write time as its ts, as a loaded hive's does",
+          "[echo][registry][lifecycle]") {
+    const auto run = [](std::optional<std::int64_t> key_written_at) {
+        OfflineRig r;
+        const auto root = uroot(kSidA);
+        r.f.offline_discovery.profiles = {prof(kSidA)};
+        r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+        r.next();
+        r.tick_to(12);
+        // the value changed while the user was logged off; the hive is read at the hourly tick
+        const auto written = key_written_at ? *key_written_at : 0;
+        r.f.offline_reads[kSidA] =
+            hive_read({{root, written ? uread_written(root, 2, written) : uread(root, 2)}});
+        REQUIRE(r.next().events_emitted == 1);
+        const auto rows = q(r.t.db, "SELECT action, data, ts, observed_at, "
+                                    "prev_data_type || '/' || prev_data_size || '/' || prev_data FROM registry_live");
+        REQUIRE(rows.rows.size() == 1);
+        return rows.rows[0];
+    };
+
+    SECTION("a plausible key time is the row's ts; observed_at stays the read") {
+        const std::int64_t wrote = T0 + 3 * SEC;
+        const auto row = run(wrote);
+        CHECK(row[0] == "changed");
+        CHECK(row[1] == "2"); // the changed value is still detected: its new data ...
+        CHECK(row[4] == "REG_DWORD/4/"); // ... and the old value's type and size, not its text
+        CHECK(std::stoll(row[2]) == filetime_to_unix_ms(wrote) / 1000);
+        CHECK(std::stoll(row[3]) / 1000 > std::stoll(row[2])); // the read is later than the write
+    }
+    SECTION("no key time, or one after the read, falls back to the read") {
+        for (const auto& row : {run(std::nullopt), run(T0 + 100000 * SEC)}) {
+            CHECK(row[0] == "changed");
+            CHECK(row[1] == "2");
+            CHECK(std::stoll(row[2]) == std::stoll(row[3]) / 1000);
+        }
+    }
+}
+
 TEST_CASE("registry offline: an incomplete profile walk keeps the known scope and is flagged; a complete one clears the flag",
           "[echo][registry][lifecycle]") {
     OfflineRig r;
@@ -3211,9 +3468,9 @@ TEST_CASE("registry offline: an incomplete profile walk keeps the known scope an
     CHECK(read_cursor(r.t.db).roots.contains(root));
     CHECK(nonempty_baseline(r.state(root))); // the baseline was not erased
     CHECK(r.state(root) != baseline);       // the known path was still read: the change is not lost
-    const auto rows = q(r.t.db, "SELECT prev_data, data, detail FROM registry_live");
+    const auto rows = q(r.t.db, "SELECT prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
     REQUIRE(rows.rows.size() == 1);
-    CHECK(rows.rows[0][0] == "1");
+    CHECK(rows.rows[0][0] == kOldDwordNotStored);
     CHECK(rows.rows[0][1] == "2");
     CHECK(rows.rows[0][2] == "attr:offline");
 
@@ -3269,10 +3526,10 @@ TEST_CASE("registry offline: a user who logs off on a tick whose walk is incompl
         CHECK(r.f.offline_profile_calls == walks + 2);
         REQUIRE(r.f.offline_calls.size() == 1);
         CHECK(r.f.offline_calls[0].path == prof(kSidA).path);
-        const auto rows = q(r.t.db, "SELECT action, prev_data, data, detail FROM registry_live");
+        const auto rows = q(r.t.db, "SELECT action, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
         REQUIRE(rows.rows.size() == 1);
         CHECK(rows.rows[0][0] == "changed");
-        CHECK(rows.rows[0][1] == "1");
+        CHECK(rows.rows[0][1] == kOldDwordNotStored);
         CHECK(rows.rows[0][2] == "2");
         CHECK(rows.rows[0][3] == "attr:offline");
         cur = read_cursor(r.t.db);
@@ -3904,10 +4161,10 @@ TEST_CASE("registry offline: a user who has just logged off is protected by the 
         r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
         r.tick_to(12);
         r.next();
-        const auto rows = q(r.t.db, "SELECT action, prev_data, data, detail FROM registry_live");
+        const auto rows = q(r.t.db, "SELECT action, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
         REQUIRE(rows.rows.size() == 1);
         CHECK(rows.rows[0][0] == "changed");
-        CHECK(rows.rows[0][1] == "1");
+        CHECK(rows.rows[0][1] == kOldDwordNotStored);
         CHECK(rows.rows[0][2] == "2");
         CHECK(rows.rows[0][3] == "attr:offline");
     }
@@ -3976,10 +4233,10 @@ TEST_CASE("registry offline: a pathless profile carried from an EARLIER tick is 
         CHECK_FALSE(resolved.roots.at(root).deferred);
         REQUIRE(r.f.offline_calls.size() == mounts + 1);
         CHECK(r.f.offline_calls.back().path == prof(kSidA).path);
-        const auto rows = q(r.t.db, "SELECT action, prev_data, data, detail FROM registry_live");
+        const auto rows = q(r.t.db, "SELECT action, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
         REQUIRE(rows.rows.size() == 1);
         CHECK(rows.rows[0][0] == "changed");
-        CHECK(rows.rows[0][1] == "1");
+        CHECK(rows.rows[0][1] == kOldDwordNotStored);
         CHECK(rows.rows[0][2] == "2");
         CHECK(rows.rows[0][3] == "attr:offline");
     }
@@ -4648,20 +4905,36 @@ TEST_CASE("registry live: set, change and delete through a pre-opened handle are
     DWORD one = 1, two = 2;
     run.transition([&] { RegSetValueExW(key.h, L"LiveVal", 0, REG_DWORD, reinterpret_cast<BYTE*>(&one), 4); },
                    mine("LiveVal", RegistryEtwOp::Set));
-    run.transition([&] { RegSetValueExW(key.h, L"LiveVal", 0, REG_DWORD, reinterpret_cast<BYTE*>(&two), 4); },
-                   mine("LiveVal", RegistryEtwOp::Set));
+    // The key's own LastWriteTime right after the second write: the row's time must be this, not
+    // the moment the reader happened to look. (No other writer touches this salted key.)
+    std::int64_t changed_written_unix = 0;
+    run.transition(
+        [&] {
+            RegSetValueExW(key.h, L"LiveVal", 0, REG_DWORD, reinterpret_cast<BYTE*>(&two), 4);
+            FILETIME ft{};
+            if (RegQueryInfoKeyW(key.h, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                 nullptr, nullptr, nullptr, nullptr, &ft) == ERROR_SUCCESS) {
+                const auto ft100ns = (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) |
+                                     ft.dwLowDateTime;
+                changed_written_unix =
+                    static_cast<std::int64_t>((ft100ns - 116444736000000000ULL) / 10000000ULL);
+            }
+        },
+        mine("LiveVal", RegistryEtwOp::Set));
     run.transition([&] { RegDeleteValueW(key.h, L"LiveVal"); }, mine("LiveVal", RegistryEtwOp::DeleteValue));
 
-    const auto rows = q(run.t.db, "SELECT action, data, prev_data, actor_pid, actor_image, detail, source "
+    const auto rows = q(run.t.db, "SELECT action, data, prev_data, actor_pid, actor_image, detail, source, ts "
                                   "FROM registry_live WHERE value_name = 'LiveVal' ORDER BY id");
     REQUIRE(rows.rows.size() == 3);
     CHECK(rows.rows[0][0] == "added");
     CHECK(rows.rows[0][1] == "1");
     CHECK(rows.rows[1][0] == "changed");
     CHECK(rows.rows[1][1] == "2");
-    CHECK(rows.rows[1][2] == "1"); // prev
+    CHECK(rows.rows[1][2].empty()); // prev_data is not stored
+    REQUIRE(changed_written_unix > 0);
+    CHECK(std::stoll(rows.rows[1][7]) == changed_written_unix); // row time = the key's LastWriteTime
     CHECK(rows.rows[2][0] == "removed");
-    CHECK(rows.rows[2][2] == "2");
+    CHECK(rows.rows[2][2].empty());
     const auto me = std::to_string(::GetCurrentProcessId());
     for (const auto& r : rows.rows) {
         CHECK(r[3] == me); // this process wrote it
