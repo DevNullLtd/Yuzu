@@ -13207,7 +13207,7 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 
 | Tool | Description |
 |---|---|
-| `list_agents` | List connected agents with status |
+| `list_agents` | List the connected agents the caller may read |
 | `get_agent_details` | Detailed info for a specific agent |
 | `query_audit_log` | Search audit events with filters |
 | `list_definitions` | List instruction definitions |

@@ -638,15 +638,17 @@ static const ToolDef kTools[] = {
     {"list_agents",
      "List the connected agents the caller may read, with hostname, OS, architecture, and "
      "version. Read-only. Requires Infrastructure:Read. A live snapshot of the agents connected "
-     "to this server: an enrolled device that is offline is not listed. Use get_agent_details "
-     "for one device's tags and detail; each row's agent_id feeds the per-agent tools. Confined: "
-     "results are narrowed to the devices the caller may read, and when that is narrower than "
-     "the fleet structuredContent carries scope_basis authority_scoped (a status; the number of "
-     "hidden devices is never disclosed). Every row and count then describes only the devices "
-     "you may read and is never a statement about the fleet: an empty list means no connected "
-     "agent you may read, not that none exists. Without that field the list is every agent "
-     "connected to this server. A permission denial is terminal; an authorization-store failure "
-     "is a retryable 503 with retry_after_ms, never an empty list.",
+     "to this server: an enrolled device that is offline is not listed, so use list_hardware_ci "
+     "for enrolled devices. Use get_agent_details for one device's tags and detail; each row's "
+     "agent_id feeds the per-agent tools. Confined: when the read is scoped to the devices the "
+     "caller may read, the result carries scope_basis authority_scoped, and the text content is "
+     "the object {agents, scope_basis} instead of the bare array of an unscoped read. It is a "
+     "status, set whether or not anything was hidden; the number of hidden devices is never "
+     "disclosed. Every row and count then describes only the devices you may read and is never "
+     "a statement about the fleet: an empty list means no connected agent you may read, not "
+     "that none exists. Without that field the list is every agent connected to this server. A "
+     "permission denial is terminal; an authorization-store failure is a retryable 503 with "
+     "retry_after_ms, never an empty list; an unwired server is a non-retryable internal error.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}},"scope_basis":{"type":"string","enum":["authority_scoped"]}},"required":["agents"]})j"},
 
@@ -660,7 +662,7 @@ static const ToolDef kTools[] = {
     // all three now read from an UNFILTERED source (all_devices_fn_ /
     // DashboardRoutes::gather_echo_retention_paused with
     // extra_scope_is_authoritative=true) exactly like list_agents' own
-    // agents_fn, with fleet_read_fn_'s gate.scope as the SOLE filter — no
+    // DeviceApi read, with fleet_read_fn_'s gate.scope as the SOLE filter — no
     // longer intersected with a separate per-operator-scoped provider. See
     // set_all_devices_fn's doc comment (mcp_server.hpp) for the full
     // rationale.
@@ -9148,16 +9150,19 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("agent_version", d.agent_version));
                 }
                 // Confinement is reported as a STATUS, never a count of hidden devices
-                // (mcp_tools_hardware.cpp, ADR-0017 INV-3). content[0].text stays the
-                // bare array; gate.scope == nullopt is global read, nothing was dropped.
+                // (mcp_tools_hardware.cpp), in both channels so a client reading only
+                // the text sees it. A scoped caller was refused before #4041, so no
+                // text consumer changes shape; gate.scope == nullopt keeps the bare
+                // array of a global read, where nothing was dropped.
                 JObj structured;
                 structured.raw("agents", arr.str());
                 if (gate.scope)
                     structured.add("scope_basis", "authority_scoped");
+                const std::string body = structured.str();
                 mcp_audit("success");
                 res.set_content(
-                    success_response(
-                        id, tool_result_split(arr.str(), structured.str(), kObjectOutputSchema)),
+                    success_response(id, tool_result_split(gate.scope ? body : arr.str(), body,
+                                                           kObjectOutputSchema)),
                     "application/json");
                 return;
             }

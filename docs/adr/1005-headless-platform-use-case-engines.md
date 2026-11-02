@@ -1096,21 +1096,25 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      before the exception), both with `list_agents` as the MCP twin. The two
      `(4041, "2027-01-31")` pins leave `STRICT_EXCEPTION_PINS` and
      `BASELINE_UNTWINNED` falls from 212 to 210. The 2026-10-23 entry is left as
-     written; this entry supersedes its `list_agents` paragraph.
+     written; this entry supersedes its second part.
 
      What changed for a caller, because the gap was over-denial and not a leak
      (ADR-0017): no caller that was already admitted loses a row. A global allow, an
-     engine grant and RBAC off (the default) still read every connected agent,
-     unfiltered; this entry does not confine them. The change is an
+     engine grant and, for non-engine callers, RBAC off (the default) still read
+     every connected agent, unfiltered; this entry does not confine them. The change is an
      admission widening: with RBAC on, a caller whose `Infrastructure:Read` comes
      only through a management group, including one that also holds a global deny
      (the additive rule of ADR-0017's 2026-07-24 Update), was refused 403 and now
      gets that group's devices. An authorization-store failure moves from 403 to a
      retryable 503, and a denial now audits as `auth.fleet_read_required` rather
-     than `auth.permission_required`. A narrowed result carries `scope_basis:
-     "authority_scoped"`, a status as on `list_hardware_ci`; `devices_omitted` is
-     not copied from REST, because a count of hidden devices is an existence oracle
-     (ADR-0017 INV-3).
+     than `auth.permission_required`. A scoped read carries `scope_basis:
+     "authority_scoped"` in both channels, a status as on `list_hardware_ci`, so
+     `content[0].text` is `{agents, scope_basis}` for such a caller and stays the
+     bare array for everyone else; every caller that gets the object was refused
+     before, so no existing text consumer changes shape. `devices_omitted` is not
+     copied from REST, because a count of hidden devices is an existence oracle
+     (ADR-0032 Decision 11, ADR-0033 section 10, ADR-0017 INV-3); REST still serves
+     it, which #6257 tracks.
 
      `twinned` holds for every caller but one, the `get.api-me` shape (the
      2026-10-24 entry above): a service-scoped token is refused at C8 on MCP, where

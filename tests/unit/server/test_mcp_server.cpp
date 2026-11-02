@@ -5771,11 +5771,15 @@ std::vector<std::string> list_agents_ids(const std::unique_ptr<httplib::Response
     auto body = nlohmann::json::parse(res->body);
     if (!body.contains("result"))
         return ids;
-    auto agents = nlohmann::json::parse(
-        body["result"]["content"][0]["text"].get<std::string>());
-    for (const auto& a : agents)
+    auto text = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    for (const auto& a : text.is_object() ? text["agents"] : text)
         ids.push_back(a["agent_id"].get<std::string>());
     return ids;
+}
+// content[0].text as JSON: the bare array when unconfined, {agents, scope_basis} when scoped.
+nlohmann::json list_agents_text(const std::unique_ptr<httplib::Response>& res) {
+    auto body = nlohmann::json::parse(res->body);
+    return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
 }
 constexpr const char* kListAgentsCall =
     R"({"jsonrpc":"2.0","method":"tools/call","id":4041,"params":{"name":"list_agents"}})";
@@ -5806,8 +5810,8 @@ TEST_CASE("MCP list_agents (#4041): a confined caller sees only in-scope agents,
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body["result"].contains("structuredContent"));
     const auto& sc = body["result"]["structuredContent"];
-    CHECK(sc["agents"] ==
-          nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>()));
+    // Both channels carry the marker, so a client reading only the text sees it too.
+    CHECK(list_agents_text(res) == sc);
     // Confinement is reported as a status, never as a count of hidden devices.
     CHECK(sc.value("scope_basis", "") == "authority_scoped");
     CHECK_FALSE(sc.contains("devices_omitted"));
@@ -5831,6 +5835,7 @@ TEST_CASE("MCP list_agents (#4041): an unconfined caller (nullopt scope) still s
     CHECK(calls == 1);
     auto body = nlohmann::json::parse(res->body);
     CHECK_FALSE(body["result"]["structuredContent"].contains("scope_basis"));
+    CHECK(list_agents_text(res).is_array()); // unconfined clients keep the bare array
 }
 
 TEST_CASE("MCP list_agents (#4041): a deny-all scope (present, empty) lists no agents",
@@ -5850,8 +5855,10 @@ TEST_CASE("MCP list_agents (#4041): a deny-all scope (present, empty) lists no a
     CHECK(res->body.find("agent-001") == std::string::npos);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("result")); // an empty list, not a JSON-RPC error
+    REQUIRE(body["result"]["structuredContent"]["agents"].is_array());
     CHECK(body["result"]["structuredContent"]["agents"].empty());
     CHECK(body["result"]["structuredContent"].value("scope_basis", "") == "authority_scoped");
+    CHECK(list_agents_text(res).value("scope_basis", "") == "authority_scoped");
 }
 
 TEST_CASE("MCP list_agents (#4041): a gate that denies writes its own response and no agent "
@@ -14399,6 +14406,7 @@ TEST_CASE("MCP list_agents (#4041): a group-only caller gets its own devices thr
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["result"]["structuredContent"]["agents"].size() == 1);
     CHECK(body["result"]["structuredContent"].value("scope_basis", "") == "authority_scoped");
+    CHECK(list_agents_text(res).value("scope_basis", "") == "authority_scoped");
     CHECK(rig.ts.audit_log.back() == "mcp.list_agents|success");
 }
 
@@ -14453,7 +14461,9 @@ TEST_CASE("MCP list_agents (#4041): a global deny plus a group allow gets the gr
 
     auto res = rig.call();
     REQUIRE(res);
+    CHECK(res->status == 200);
     CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001"});
+    CHECK(list_agents_text(res).value("scope_basis", "") == "authority_scoped");
 }
 
 TEST_CASE("MCP list_agents (#4041): a service-scoped token stops at C8, before the gate",
