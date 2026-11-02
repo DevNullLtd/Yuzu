@@ -117,6 +117,18 @@ resolve_test_() ->
                               undefined, "yuzu://X/server", [],
                               [Mgmt("/no/such/ca.pem")], []))
       end},
+     {"a pin setting that is not a list is a boot defect in every mode, not a runtime refusal",
+      fun() ->
+          [?assertMatch({error, [{bad_mgmt_peer_pins, _}]},
+                        yuzu_gw_mgmt_identity:resolve(Mode, undefined, [], [], Bad))
+           || Mode <- [undefined, pin, identity_or_pin, identity],
+              Bad <- [{cert_file, "x"}, undefined, [a | b]]],
+          %% the shipped shape and an empty list stay fine
+          ?assertMatch({ok, #{mode := identity}},
+                       yuzu_gw_mgmt_identity:resolve(identity, undefined, [], [], [])),
+          ?assertMatch({ok, #{mode := pin}},
+                       yuzu_gw_mgmt_identity:resolve(pin, undefined, [], [], Pins))
+      end},
      {"an improper deny list is a defect, not a crash",
       fun() ->
           ?assertMatch({error, [{bad_mgmt_peer_denied, _}]},
@@ -425,6 +437,40 @@ cases(Certs) ->
       fun() ->
           ?assertEqual({true, ?SERVER_ID},
                        Check(id_srv, [], (Id(identity))#{denied := [1, 2, 3]}))
+      end},
+     {"E2E: an UNSET mode is the pin mode: a peer that carries the (public) identity on a non-pinned key is refused",
+      fun() ->
+          Mgmt = #{name => mgmt, service_protos => [management_pb],
+                   services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},
+                   listen => #{port => 50063, ip => {0, 0, 0, 0}},
+                   tls => #{certfile => "gw.pem", keyfile => "gw.key",
+                            cacertfile => maps:get(ca, Certs)},
+                   auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1},
+          Saved = [{K, application:get_env(yuzu_gw, K)}
+                   || K <- [grpc_listeners, mgmt_peer_pins, mgmt_peer_auth_mode,
+                            mgmt_peer_identity, mgmt_peer_denied]],
+          try
+              [application:unset_env(yuzu_gw, K)
+               || K <- [mgmt_peer_auth_mode, mgmt_peer_identity, mgmt_peer_denied]],
+              application:set_env(yuzu_gw, grpc_listeners, [Mgmt]),
+              Pin = [{cert_file, maps:get(id_srv_pem, Certs)}],
+              application:set_env(yuzu_gw, mgmt_peer_pins, Pin),
+              ok = yuzu_gw_mgmt_pins:refresh(Pin),
+              ok = yuzu_gw_app:check_mgmt_auth_config(),
+              %% the derived identity must NOT become a second way in for a
+              %% configuration that only ever listed pins (it is a hash of the public
+              %% CA certificate, so under a CA that lets a requester pick a URI SAN
+              %% anyone could present it)
+              ?assertMatch(#{mode := pin}, yuzu_gw_mgmt_identity:current()),
+              ?assertEqual({true, ?SERVER_ID}, yuzu_gw_authz:check_mgmt_peer(der(Certs, id_srv))),
+              ?assertEqual(false, yuzu_gw_authz:check_mgmt_peer(der(Certs, id_rot)))
+          after
+              [case V of
+                   {ok, X} -> application:set_env(yuzu_gw, K, X);
+                   undefined -> application:unset_env(yuzu_gw, K)
+               end || {K, V} <- Saved],
+              ok = yuzu_gw_mgmt_identity:reset()
+          end
       end},
      {"the entry point reads the published mode, identity and deny-list",
       fun() ->

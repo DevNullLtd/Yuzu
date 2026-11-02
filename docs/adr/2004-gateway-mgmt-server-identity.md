@@ -62,19 +62,44 @@ the traffic, so a dead fallback does not go unseen until the day it is needed.
 
 | Mode | Admits | Selected when |
 |---|---|---|
-| `pin` | an SPKI pin (`mgmt_peer_pins`), as before #6016 | the key is unset (always), or set to `pin` |
-| `identity_or_pin` | the identity **or** a pin | only when an operator sets it |
-| `identity` | the identity, **and** any pin that is configured | only when an operator sets it |
+| `pin` | an SPKI pin (`mgmt_peer_pins`), as before #6016 | the key is unset (always), or set to `pin`: required for certificates that carry no identity |
+| `identity_or_pin` | the identity **or** a pin | only when an operator sets it (the explicit transition mode) |
+| `identity` | the identity, **and** any pin that is configured | only when an operator sets it (release N+1: both shipped configs do) |
 
-An unset `mgmt_peer_auth_mode` is **always** `pin`. The identity is an explicit opt-in and is never
-implied by a missing key, so a configuration with no pins and no mode still refuses to boot on an
-exposed listener (`no_mgmt_peer_pins`), exactly as before #6016. An installation that does nothing
-keeps its pin behaviour across the upgrade, and the shipped reference configs
-(`gateway/config/sys.config.prod`, `deploy/docker/reference-gateway-sys.config`) ship
-`{mgmt_peer_auth_mode, pin}` explicitly. If `mgmt_peer_identity` is set while the mode is `pin`, the
-identity is ignored and the boot logs a warning saying so. Bring-your-own certificates,
-`--no-default-certs` and a server given its own `--cert`/`--key` never carry
-the identity and stay in `pin`.
+**Release N and release N+1.** An unset `mgmt_peer_auth_mode` is **always** `pin`, in release N and
+in release N+1. The identity is never implied by a missing key, so an installation whose own
+`sys.config` does not set the key keeps its pin behaviour across the upgrade, and a configuration
+with no pins and no mode still refuses to boot on an exposed listener (`no_mgmt_peer_pins`),
+exactly as before #6016. The boot logs a WARN that the mode was defaulted to `pin`. What release
+N+1 changes is the shipped reference configs:
+
+- the reference configs (`gateway/config/sys.config.prod`,
+  `deploy/docker/reference-gateway-sys.config`) set `{mgmt_peer_auth_mode, identity}` and list **no
+  pin**, so a server key renewal needs no gateway action. A pin there would also have to match and
+  would re-create the renewal window;
+- `pin` stays, as the explicit mode that bring-your-own certificates, `--no-default-certs` and a
+  server given its own `--cert`/`--key` must set. Removing it was rejected: those installs cannot
+  carry the URI and would have no way to admit the server. An own-certificate install that takes
+  or copies the new shipped config without setting `pin` is refused `no_uri_san` (counter
+  `yuzu_gw_mgmt_auth_rejected_total{reason="no_uri_san"}`, alert `YuzuGatewayMgmtAuthRejected`, and the critical
+  `YuzuGatewayMgmtIdentityOutage` once the gateway has admitted nothing for five minutes);
+- if `mgmt_peer_identity` is set while the mode is `pin`, the identity is ignored and the boot logs
+  a warning saying so;
+- the bundle guard is unchanged (an explicit identity over a `cacertfile` that is not demonstrably
+  one certificate needs mode `identity` with a pin).
+
+**Decision and the alternatives.** Chosen: an unset mode stays `pin`, and the shipped configs carry
+the identity. Rejected: an unset mode that is `identity`. It refuses every command of a pin-only
+install whose server certificate has no identity (an outage cohort at the gateway upgrade), makes a
+pin-only install with a CA bundle on the management listener refuse to boot, and contradicts release
+N's published promise that an unset value is always `pin`, so nothing changes until the operator
+sets it. Also rejected: an unset mode that is `identity_or_pin` when pins are listed, so that a
+pin-only installation keeps working untouched. It widens trust without the operator asking: the
+identity is derived from the public CA certificate, so under a bring-your-own or corporate CA that
+lets a requester choose a URI SAN, any certificate that CA issues carrying that identity would be
+admitted by a key the operator never set (a security review verified this by running an attacker
+certificate that carried the public identity). A later release may make the identity the default
+for an unset key, once the unset-mode WARN has shipped and operators have had time to set the key.
 
 ### 3. The identity is resolved once, at boot
 
@@ -135,9 +160,14 @@ automatically is the CRL-fed follow-up below.
   identity alone) makes the old binary refuse to boot (`no_mgmt_peer_pins`) and takes the command plane down. The rollback is
   itself a gateway restart. Restore the pins first (`docs/user-manual/gateway.md`, "Authorizing
   the server by its identity", "Rolling back").
-- **Release N+1.** Pins become an optional extra constraint only; `pin_mismatch` rotation alerting is
-  retired for identity-mode installations. Gated on every server replica having run a release that
-  mints the identity (a replica on an older binary keeps a URI-less certificate until it restarts).
+- **Release N+1 (this amendment).** The shipped reference configs set the identity (see section 2):
+  they ship `identity` with no pin, an unset mode stays `pin`, and `pin` is the
+  explicit mode for certificates that carry no identity. `pin_mismatch` rotation alerting is not
+  deleted: `pin` and `identity_or_pin` remain supported, and an installation on `identity` with no
+  pin produces no `pin_mismatch`, so `YuzuGatewayMgmtPinMismatch` stays quiet there by construction.
+  Gated on every server replica having run a release that mints the identity (a replica on an older
+  binary keeps a URI-less certificate until it restarts): a gateway on `identity` in front of one
+  refuses every command.
 - **Follow-up (same issue).** CRL-fed automatic withdrawal: the gateway reads the CA's CRL,
   verifies it against the CA, and refuses `revocation_stale` / `revocation_unknown` rather than
   admitting on a missing list.
@@ -173,7 +203,7 @@ not (a hardware-backed `KeyProvider`) loses that separation on this hop in `iden
 only the server holds it. For the Yuzu install CA that is enforced in code (`sign_agent_csr` never
 emits it). A corporate CA used as the management listener's `cacertfile` may let a requester pick a
 URI SAN with serverAuth, and a `cacertfile` bundle holds several CAs, any of which could mint it.
-Neither case is detectable from the gateway, so the identity is opt-in, a bundle needs `identity`
+Neither case is detectable from the gateway, so a bundle needs `identity`
 mode with a pin (`identity_over_ca_bundle`), and a single-certificate corporate CA whose issuance
 policy is not known to refuse the URI stays in `pin`.
 
@@ -204,12 +234,26 @@ removed for `identity` mode, refuses to boot. Restore the pins before rolling ba
 configured name is harmless to an older binary holds for the server certificate (`docs/pki-architecture.md`),
 not for the gateway.
 
-**Risk acceptance.** Two consequences above are accepted risks: a CA-key-only holder can command the
-fleet in the identity modes, and automatic withdrawal is lost until the CRL-fed follow-up lands. The
+**Merge and release gate.** Two conditions, binding on the pull request that makes the shipped
+reference configs `identity`:
+
+1. it must not merge until a release that MINTS the identity (the server half, #6072) has shipped;
+2. it must not merge until one release has passed since the gateway check (#6131, itself waiting on
+   #5695).
+
+Separately, an operator action rather than a condition on the pull request: operators upgrade every
+server replica first, before any gateway takes the new config.
+
+**Risk acceptance.** Three consequences are accepted risks: (1) a CA-key-only holder can command the
+fleet under the shipped configs (a pin needed the server's private key); (2) withdrawal is a serial
+in `mgmt_peer_denied` plus a gateway restart, with no CRL path until the follow-up, and revoking the
+certificate in the CA inventory alone does nothing; (3) an own-certificate install that takes the
+new shipped config loses its command plane (`no_uri_san`) until it sets `pin`. The
 author does not approve their own risk acceptance. The acceptance is recorded by the approving
 reviewer on the pull request, with a review-by date set there. To make it durable in git, the
 approving commit flips this ADR's status to `accepted` or appends a `governance.d` row naming the
-approver, the date and the review-by date; this ADR carries neither a name nor a date for it.
+approver, the date and the review-by date; this ADR carries neither a name nor a date for it. The
+status stays `proposed` until then.
 
 **Review record.** The governance run for this change is the committed ledger
 `governance.d/6016-gateway-mgmt-identity.*.jsonl` (the random suffix is generated at commit time).
