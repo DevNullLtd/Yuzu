@@ -41,7 +41,10 @@
 /// administrator (`DispatchCaller::principal_is_admin`, JIT-elevation aware). A call that needs
 /// approval is answered `PendingApproval` and dispatches NOTHING. There is no redemption path
 /// for such a ticket: it is minted with `ApprovalOrigin::kInstruction`, which the MCP recall
-/// refuses (`origin_redeemable_as`), and no interactive redemption exists. An administrator
+/// refuses (`origin_redeemable_as`), and no interactive redemption exists. Such a ticket records
+/// the definition and the scope expression ONLY: it does NOT approve explicit `agent_ids` or `params`
+/// (they are not stored with it), so any future redemption must bind them (a bound request,
+/// `ApprovalManager::submit_bound`) before it ships. An administrator
 /// still reaches `role-gated` definitions because the token or session carries the creator's
 /// role: that is a ROLE fact, not a tier fact.
 ///
