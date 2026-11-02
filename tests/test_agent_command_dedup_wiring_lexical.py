@@ -36,7 +36,13 @@ wrapping, re-indentation and comment text mentioning a token cannot satisfy or b
 Patterns anchor on distinctive tokens, never line numbers.
 
 Lexical only: it cannot see a relocation that keeps the tokens but changes control flow
-(review-enforced). The self-test applies in-memory mutations to agent.cpp and requires
+(review-enforced). Accepted blind spots, all of the same class: code disabled by `#if 0` or wrapped
+in `/* */` (block comments are deliberately not stripped), a deleted `stream_write_mu_` lock (a
+convention shared with other sites, not one of this gate's invariants), and a `//` inside a string
+literal on the same line as pinned code (normalise() strips from the `//`, so the rest of that line
+is not scanned; no such line exists in the claim region today). A `/* */` comment or a string
+literal that contains the text `claimed_here = ` makes the assignment count go red: a loud false-red,
+not a false-green. The self-test applies in-memory mutations to agent.cpp and requires
 problems() to be non-empty on each; a mutation whose pattern no longer matches agent.cpp fails
 loudly (stale pattern) rather than passing vacuously.
 
@@ -54,7 +60,7 @@ AGENT_CPP = ROOT / "agents" / "core" / "src" / "agent.cpp"
 TAG = "test_agent_command_dedup_wiring_lexical"
 HINT = (
     " (this gate pins the #3668 wiring; if agent.cpp was legitimately restructured or renamed,"
-    " update the patterns AND the MUTATIONS regexes in tests/test_agent_command_dedup_wiring_lexical.py)"
+    " update the patterns AND the MUTATIONS / FN_MUTATIONS patterns in tests/test_agent_command_dedup_wiring_lexical.py)"
 )
 
 
@@ -203,9 +209,8 @@ MUTATIONS = [
      "empty command_id"),
 ]
 
-# Mutations that need more than one substitution. Each is (name, fn(raw) -> mutated, expected substring
-# of the FIRST problem). Added after the quality-engineer's Gate 8 mutation run found these shapes
-# slipped past the regex-only table above.
+# Mutations that need more than one substitution, which the single-regex table above cannot express.
+# Each is (name, fn(raw) -> mutated, expected substring of the FIRST problem).
 def _only_replay_branch_continues(raw):
     out = re.sub(r"(stream->Write\(dup_resp, grpc::WriteOptions\(\)\);)\s*continue;", r"\g<1>", raw)
     return re.sub(r'(terminal outcome",\s*cmd\.command_id\(\)\);)(\s*\} else \{)', r"\g<1> continue;\g<2>", out)
