@@ -1348,10 +1348,10 @@ constexpr char kDashJs7[] = R"HTM(    /* ── Global Keyboard Shortcuts ──
     /* Results summary/pager follow responses as they arrive. The server stamps #result-pagination
        with the view (data-sort/dir/page/per-page); a refresh re-reads
        /fragments/results with the LIVE filter bar and swap:none, so only the OOB summary, pager
-       and header land (rows are untouched). The filter bar is hx-sync="this:drop": a refresh
-       issued while any results request is in flight is discarded, never queued, and that
-       request's own response renders the summary. Throttled (not debounced) to one call per
-       second: a trailing-only debounce never fires under continuous output. */
+       and header land (rows are untouched). The filter bar is hx-sync="this:drop": htmx discards
+       a refresh issued while a request is in flight and never queues it, so the page defers it
+       itself (below). Throttled (not debounced) to one call per second: a trailing-only debounce
+       never fires under continuous output. */
     function refreshResultsSummary() {
       var f = document.getElementById('filter-bar');
       var nav = document.getElementById('result-pagination');
@@ -1360,11 +1360,30 @@ constexpr char kDashJs7[] = R"HTM(    /* ── Global Keyboard Shortcuts ──
                                    page: nav.dataset.page, per_page: nav.dataset.perPage});
       htmx.ajax('GET', '/fragments/results?' + p, {source: f, swap: 'none'});
     }
-    var rrTimer = null;
+    /* The drop has no retry, so the page tracks the scope itself: a request that parks on the
+       filter bar (a results fragment or the Create Group form GET, a refresh included) counts as
+       busy from htmx:beforeRequest to htmx:afterRequest, which an abort fires too. A refresh that
+       falls due while one is in flight is marked dirty and re-armed once the scope is idle, so the
+       last event is never left unrendered. The re-arm is a timer, not a call: htmx frees the sync
+       slot only after afterRequest returns. Nothing is captured: the retry reads the pager stamp and
+       the live filter bar when it fires, so a dispatch in between turns it into a no-op. */
+    var rrTimer = null, rrBusy = 0, rrDirty = false;
     function scheduleResultsRefresh() {
       if (rrTimer) return;
-      rrTimer = setTimeout(function() { rrTimer = null; refreshResultsSummary(); }, 1000);
+      rrTimer = setTimeout(function() {
+        rrTimer = null;
+        if (rrBusy > 0) { rrDirty = true; return; }
+        refreshResultsSummary();
+      }, 1000);
     }
+    function trackResultsScope(evt, delta) {
+      var cfg = evt.detail && evt.detail.requestConfig;
+      if (!cfg || !/^\/fragments\/(results|create-group-form)\b/.test(cfg.path || '')) return;
+      rrBusy = Math.max(0, rrBusy + delta);
+      if (rrBusy === 0 && rrDirty) { rrDirty = false; scheduleResultsRefresh(); }
+    }
+    document.body.addEventListener('htmx:beforeRequest', function(e) { trackResultsScope(e, 1); });
+    document.body.addEventListener('htmx:afterRequest', function(e) { trackResultsScope(e, -1); });
     ['[sse-swap="output"]', '[sse-swap="command-status"]'].forEach(function(sel) {
       var el = document.querySelector(sel);
       if (el) el.addEventListener('htmx:sseMessage', scheduleResultsRefresh);

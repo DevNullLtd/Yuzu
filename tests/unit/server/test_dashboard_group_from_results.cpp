@@ -145,13 +145,14 @@ void seed_matching_responses(ResponseStore& rs, std::initializer_list<std::strin
 }
 
 /// One frame for `agent` with an explicit category and title (the Search term matches the title).
+/// @p plugin is the plugin the row is stored under (the Forensics tier keys on it).
 void seed_titled_response(ResponseStore& rs, const std::string& agent, const std::string& category,
-                          const std::string& title) {
+                          const std::string& title, const char* plugin = kPlugin) {
     StoredResponse r;
     r.instruction_id = kCommandId;
     r.agent_id = agent;
     r.status = 1;
-    r.plugin = kPlugin;
+    r.plugin = plugin;
     r.output = "high|" + category + "|" + title + "|detail\n";
     rs.store(r);
 }
@@ -1040,6 +1041,108 @@ TEST_CASE("group-from-results: a Search term matching only an agent's registry d
     auto group = h.mg.find_group_by_name("q-by-host");
     REQUIRE(group.has_value());
     CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-D"});
+}
+
+// #4990: the Forensics tier narrows a Search set exactly as it narrows a column-filter set. Every
+// tier case above posts without `q` (the facet branch), so the tier inside agents_matching_text is
+// pinned only here. agent-A and agent-B hold Forensics rows, agent-C and agent-D ordinary ones;
+// agent-D does not match the term, agent-B is outside the category the column filter picks.
+TEST_CASE("create-group-form: a Search preview counts only the rows the caller's Forensics tier "
+          "may read",
+          "[pg][server][dashboard][group_from_results][search][forensics]") {
+    GroupFromResultsHarness h;
+    const char* const forensics = yuzu::server::test::kForensicsPlugin;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha", forensics);
+    seed_titled_response(h.rs(), "agent-B", "cat-b", "alpha2", forensics);
+    seed_titled_response(h.rs(), "agent-C", "cat-a", "alpha3", yuzu::server::test::kOrdinaryPlugin);
+    seed_titled_response(h.rs(), "agent-D", "cat-a", "beta", yuzu::server::test::kOrdinaryPlugin);
+    const std::string base = std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                             "&plugin=" + kPlugin;
+
+    SECTION("without Forensics:Read, q alone previews exactly the ordinary match") {
+        h.forensics.viewer();
+        auto res = h.sink.Get(base + "&q=alp");
+        REQUIRE(res != nullptr);
+        CHECK(contains(res->body, "1 agent will be added"));
+        CHECK_FALSE(contains(res->body, "3 agents will be added"));
+    }
+    SECTION("without Forensics:Read, q plus a column filter previews exactly the ordinary match") {
+        h.forensics.viewer();
+        auto res = h.sink.Get(base + "&f_category=cat-a&q=alp");
+        REQUIRE(res != nullptr);
+        CHECK(contains(res->body, "1 agent will be added"));
+        CHECK_FALSE(contains(res->body, "2 agents will be added"));
+    }
+    SECTION("a global Forensics:Read previews every match") {
+        h.forensics.admin();
+        auto alone = h.sink.Get(base + "&q=alp");
+        REQUIRE(alone != nullptr);
+        CHECK(contains(alone->body, "3 agents will be added"));
+        auto both = h.sink.Get(base + "&f_category=cat-a&q=alp");
+        REQUIRE(both != nullptr);
+        CHECK(contains(both->body, "2 agents will be added"));
+    }
+    SECTION("an Unknown decision shows no count, never a number from a partial row set") {
+        h.forensics.unknown();
+        auto res = h.sink.Get(base + "&q=alp");
+        REQUIRE(res != nullptr);
+        CHECK(contains(res->body, "agent count unavailable"));
+        CHECK_FALSE(contains(res->body, "will be added"));
+    }
+}
+
+TEST_CASE("group-from-results: a Search set is narrowed by the caller's Forensics tier, and an "
+          "Unknown decision creates nothing",
+          "[pg][server][dashboard][group_from_results][search][forensics]") {
+    GroupFromResultsHarness h;
+    const char* const forensics = yuzu::server::test::kForensicsPlugin;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha", forensics);
+    seed_titled_response(h.rs(), "agent-B", "cat-b", "alpha2", forensics);
+    seed_titled_response(h.rs(), "agent-C", "cat-a", "alpha3", yuzu::server::test::kOrdinaryPlugin);
+    seed_titled_response(h.rs(), "agent-D", "cat-a", "beta", yuzu::server::test::kOrdinaryPlugin);
+
+    SECTION("without Forensics:Read, q alone materialises exactly the ordinary match") {
+        h.forensics.viewer();
+        auto res = h.post(q_form_body("tier-q-viewer", "&q=alp"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("tier-q-viewer");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-C"});
+    }
+    SECTION("without Forensics:Read, q plus a column filter materialises exactly the ordinary "
+            "match") {
+        h.forensics.viewer();
+        auto res = h.post(q_form_body("tier-qf-viewer", "&f_category=cat-a&q=alp"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("tier-qf-viewer");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-C"});
+    }
+    SECTION("a global Forensics:Read materialises every match") {
+        h.forensics.admin();
+        auto alone = h.post(q_form_body("tier-q-admin", "&q=alp"));
+        CHECK(alone->status == 200);
+        auto g1 = h.mg.find_group_by_name("tier-q-admin");
+        REQUIRE(g1.has_value());
+        CHECK(member_ids_of(h.mg, g1->id) ==
+              std::set<std::string>{"agent-A", "agent-B", "agent-C"});
+
+        auto both = h.post(q_form_body("tier-qf-admin", "&f_category=cat-a&q=alp"));
+        CHECK(both->status == 200);
+        auto g2 = h.mg.find_group_by_name("tier-qf-admin");
+        REQUIRE(g2.has_value());
+        CHECK(member_ids_of(h.mg, g2->id) == std::set<std::string>{"agent-A", "agent-C"});
+    }
+    SECTION("an Unknown decision answers the notice and creates no group") {
+        h.forensics.unknown();
+        auto res = h.post(q_form_body("tier-q-unknown", "&q=alp"));
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "could not be completed"));
+        CHECK(contains(res->body, "Nothing was created"));
+        CHECK(contains(res->get_header_value("HX-Trigger"), "showToast"));
+        CHECK(res->get_header_value("HX-Retarget").empty());
+        CHECK_FALSE(h.mg.find_group_by_name("tier-q-unknown").has_value());
+    }
 }
 
 // A set cut by a read cap is partial; a group is never materialised from it.

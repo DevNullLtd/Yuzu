@@ -468,7 +468,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
                 if (!tier_resolved) {
                     // Unknown: a visible notice, never the empty or "no results" state (#4990).
-                    res.set_content(render_forensics_unknown_results(), "text/html; charset=utf-8");
+                    // An operator-driven refusal also closes the Create Group form (#5669): it
+                    // was built for filters this refusal has just replaced.
+                    auto refusal = render_forensics_unknown_results();
+                    if (!background_refresh)
+                        refusal += "<div id=\"group-form-slot\" hx-swap-oob=\"true\"></div>";
+                    res.set_content(refusal, "text/html; charset=utf-8");
                     return;
                 }
                 const ResponseTierFilter& tier = *tier_resolved;
