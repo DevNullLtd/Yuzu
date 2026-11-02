@@ -24,8 +24,8 @@
 /// cumulative value that resets to 0 on an agent restart, so an unlabelled fleet SUM of them
 /// has no churn-robust `increase()` alert (docs/observability-conventions.md). Counting the
 /// agents whose value is non-zero sidesteps that: a restart that zeroes one agent's counter
-/// removes it from the count once its next heartbeat arrives, and the question an operator actually has -
-/// "how many endpoints are affected?" - is the thing published. Same shape as
+/// removes it from the count once its next heartbeat arrives, and the question an operator
+/// actually has ("how many endpoints are affected?") is the thing published. Same shape as
 /// `yuzu_fleet_ota_signature_refusing_agents`. Consequence, stated in every HELP string below:
 /// a counter-derived gauge means "since that agent's last restart", NOT "currently". Only the
 /// degraded flag is a live 0/1 reading, which is why it is the only one with an alert.
@@ -141,8 +141,10 @@ static_assert(kDedupPresenceIndex < kNDedupAgentCountMetrics,
 /// Capacity signal: the agent's cached row count (in-flight + terminal) in its dedup store.
 /// Rolled up as the fleet MAX (a sum of row counts is meaningless; the question is "how close
 /// is the fullest store to its bound"), hence the `_max` suffix. ABSENT, not 0, when no agent
-/// reported a valid value. Compare against kMaxDedupRows (20000, agents/core command_dedup_store.hpp
-/// - not restated as a constant here, same no-upward-edge rule) plus one prune interval (512).
+/// reported a valid value. Compare against kMaxDedupRows (20000, in agents/core
+/// command_dedup_store.hpp; not restated as a constant here, same no-upward-edge rule, and
+/// pinned to the HELP text by tests/test_dedup_fleet_tags_lexical.py) plus one prune interval
+/// (512).
 inline constexpr const char* kDedupRowsTag = "yuzu.dedup_rows";
 inline constexpr const char* kDedupRowsMaxGauge = "yuzu_fleet_dedup_rows_max";
 inline constexpr const char* kDedupRowsMaxHelp =

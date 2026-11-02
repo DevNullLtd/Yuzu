@@ -411,8 +411,9 @@ TEST_CASE("CommandDedupStore: cached_row_count survives a move of the store",
 namespace {
 // Joins the thread on EVERY exit path, including the exception a failed REQUIRE throws: a
 // std::thread destroyed while joinable calls std::terminate, which would abort the whole test
-// binary and hide every other result. (std::jthread would do this, but libc++ 15-17, i.e. Apple
-// Clang 15, does not ship it by default.)
+// binary and hide every other result. (std::jthread would do this, but it is not available in
+// every supported libc++, e.g. Apple Clang 15's; the rest of the codebase gates it behind
+// __cpp_lib_jthread.)
 struct StopAndJoin {
     std::atomic<bool>& stop;
     std::thread& thread;
@@ -459,7 +460,9 @@ TEST_CASE("CommandDedupStore: cached_row_count is safe to read while claims and 
 
     // Do not start writing until the reader has observed a value, so `reads > 0` below cannot
     // fail on a loaded runner that has not yet scheduled the reader. The count is known (0) after
-    // construction, so this cannot spin forever.
+    // construction; the REQUIRE makes a regression that leaves it unknown fail here instead of
+    // spinning until the test runner's timeout.
+    REQUIRE(t.store.cached_row_count().has_value());
     while (reads.load(std::memory_order_relaxed) == 0)
         std::this_thread::yield();
 

@@ -6757,7 +6757,8 @@ tests:
   #
   # The expression exists because of cases F, G and H below: on the bare gauge each one resets the
   # 15 m `for:` clock and a persistently degraded agent never alerts. Cases I and J pin the
-  # window's width: 11 consecutive degraded minutes must NOT fire and 12 must. Mutation-checked
+  # window's width: a degradation spanning 10 minutes (11 samples at a 1m scrape) must NOT fire and
+  # one spanning 11 minutes (12 samples) must. Mutation-checked
   # (each case run alone against each mutant): removing the window, or shrinking it to 1m or 2m,
   # reddens F and G; a bare gauge without `sum by (job)` additionally reddens H; a wider or
   # narrower window than 5m reddens I or J; `>= 0` reddens C, C-1, D and E; `== 1` reddens B and
@@ -6947,12 +6948,13 @@ tests:
           - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
             value: 1
 
-  # CASE I -- the measured lower bound of the firing window. The 5m window lags the END of the
-  # condition, so a degradation of 11 consecutive minutes (samples at 1m) is NOT enough to fire
-  # and a fixed agent is not paged for it. RED if the window is widened (the same condition then
-  # fires). Measured with promtool at this evaluation interval: 11 samples never fire.
+  # CASE I -- the measured lower bound of the firing window. The 5m window carries the condition
+  # 5 minutes past the LAST degraded sample, so a degradation SPANNING 10 minutes (11 samples at a
+  # 1m scrape, first to last) is NOT enough to fire: a fixed agent is not paged for it. RED if the
+  # window is widened (the same condition then fires). Measured with promtool: 11 samples never
+  # fire.
   - interval: 1m
-    name: dedup store degraded - 11 minutes of degradation does not fire
+    name: dedup store degraded - a 10 minute span of degradation does not fire
     input_series:
       - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
         values: "1x10 0x50"
@@ -6964,11 +6966,12 @@ tests:
         eval_time: 16m
         exp_samples: []
 
-  # CASE J -- 12 consecutive degraded minutes DO fire, at exactly the 15 minute mark, and the
-  # alert is already gone a minute later (it can fire for an agent that was fixed at minute 12).
-  # RED if the window is narrowed (the same condition then never fires).
+  # CASE J -- a degradation SPANNING 11 minutes (12 samples at a 1m scrape) DOES fire, at exactly
+  # the 15 minute mark, and the alert is already gone a minute later (it can fire for an agent
+  # that was fixed at minute 11). RED if the window is narrowed (the same condition then never
+  # fires).
   - interval: 1m
-    name: dedup store degraded - 12 minutes of degradation fires at the 15 minute mark
+    name: dedup store degraded - an 11 minute span of degradation fires at the 15 minute mark
     input_series:
       - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
         values: "1x11 0x49"
