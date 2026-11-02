@@ -3073,10 +3073,11 @@ TEST_CASE("AuthDB factor generation is a fresh positive token on every change of
     issue(gen_of(h.conn.get(), "g1"));
 }
 
-// The trigger function is pinned to `search_path = pg_catalog`, so a caller whose search_path
-// lists a writable schema before pg_catalog cannot substitute `gen_random_uuid` and force a known
-// generation. Without the pin the shadow's constant UUID yields generation 1 (the constant's
-// 15 hex digits are all zero, plus one), which is what the assertions below would then see.
+// The trigger function is pinned to `search_path = pg_catalog, pg_temp`, so a caller whose
+// search_path lists a writable schema before pg_catalog cannot substitute `gen_random_uuid` and
+// force a known generation. Without the pin the shadow's constant UUID yields generation 1 (the
+// constant's 15 hex digits are all zero, plus one), which is what the assertions below would then
+// see.
 TEST_CASE("AuthDB factor generation ignores a gen_random_uuid shadowed on the caller's search_path",
           "[pg][auth_db][mfa_binding]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
@@ -3089,13 +3090,58 @@ TEST_CASE("AuthDB factor generation ignores a gen_random_uuid shadowed on the ca
                               constant_uuid + "'::uuid $$");
     run_sql(h.conn.get(), "SET search_path = yuzu_test_shadow, pg_catalog");
     // The shadow is live in the calling session (the test would otherwise prove nothing).
-    CHECK(scalar(h.conn.get(), "SELECT gen_random_uuid()::text") == constant_uuid);
+    REQUIRE(scalar(h.conn.get(), "SELECT gen_random_uuid()::text") == constant_uuid);
     run_sql(h.conn.get(), "UPDATE auth.users SET mfa_enrolled_at = now() WHERE username = 'sh'");
     run_sql(h.conn.get(), "RESET search_path");
     const std::int64_t gen = gen_of(h.conn.get(), "sh");
     CHECK(gen > 0);
     CHECK(gen != 1); // the value the shadow's constant would have produced
     run_sql(h.conn.get(), "DROP SCHEMA yuzu_test_shadow CASCADE");
+}
+
+// pg_temp is searched FIRST for relations and types even when a pinned search_path omits it, so a
+// role with UPDATE on auth.users and the default TEMP privilege could make a temporary composite
+// type named `text` plus implicit casts through it and force generation 1. The function's path
+// lists pg_temp last, which is what keeps `text` and `uuid` resolving in pg_catalog. Runs in a
+// FRESH session (plpgsql caches plans per session) as a non-superuser role.
+TEST_CASE("AuthDB factor generation ignores a type shadowed in the caller's temporary schema",
+          "[pg][auth_db][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("pt", "h", "s", yuzu::server::auth::Role::user).has_value());
+    // Roles are cluster-wide: salt the name with the per-test database name, and drop it on exit.
+    const std::string dbname = PQdb(h.conn.get());
+    const std::string role = dbname + "_r";
+    struct RoleGuard {
+        PGconn* c;
+        std::string role;
+        ~RoleGuard() {
+            PgResult owned{PQexec(c, ("DROP OWNED BY \"" + role + "\"").c_str())};
+            PgResult dropped{PQexec(c, ("DROP ROLE IF EXISTS \"" + role + "\"").c_str())};
+        }
+    } guard{h.conn.get(), role};
+    run_sql(h.conn.get(), "CREATE ROLE \"" + role + "\" NOSUPERUSER");
+    run_sql(h.conn.get(), "GRANT USAGE ON SCHEMA auth TO \"" + role + "\"");
+    run_sql(h.conn.get(), "GRANT SELECT, UPDATE ON auth.users TO \"" + role + "\"");
+    run_sql(h.conn.get(), "GRANT TEMP ON DATABASE \"" + dbname + "\" TO \"" + role + "\"");
+
+    PgConn session = connect(db.dsn()); // fresh session: no cached plan of the trigger function
+    run_sql(session.get(), "SET ROLE \"" + role + "\"");
+    run_sql(session.get(), "CREATE TYPE pg_temp.text AS (a int)");
+    run_sql(session.get(), "CREATE FUNCTION pg_temp.mk(uuid) RETURNS pg_temp.text LANGUAGE sql "
+                           "AS 'SELECT ROW(1)::pg_temp.text'");
+    run_sql(session.get(), "CREATE FUNCTION pg_temp.back(pg_temp.text) RETURNS pg_catalog.text "
+                           "LANGUAGE sql AS 'SELECT ''x000000000000000''::pg_catalog.text'");
+    run_sql(session.get(), "CREATE CAST (uuid AS pg_temp.text) WITH FUNCTION pg_temp.mk(uuid) "
+                           "AS IMPLICIT");
+    run_sql(session.get(), "CREATE CAST (pg_temp.text AS pg_catalog.text) WITH FUNCTION "
+                           "pg_temp.back(pg_temp.text) AS IMPLICIT");
+    run_sql(session.get(), "UPDATE auth.users SET mfa_enrolled_at = now() WHERE username = 'pt'");
+    run_sql(session.get(), "RESET ROLE");
+    const std::int64_t gen = gen_of(h.conn.get(), "pt");
+    CHECK(gen > 0);
+    CHECK(gen != 1); // the value the temporary-schema shadow would have forced
+    CHECK(gen != 2);
 }
 
 // The restore case the random token exists for. An auth-only database restore (from a backup taken
@@ -3560,7 +3606,7 @@ TEST_CASE("AuthDB refuses to open when the generation trigger is not in force",
         std::string apply;
         std::string restore;
     };
-    // The shipped definition: same body AND the same `SET search_path = pg_catalog`, so each row
+    // The shipped definition: same body AND the same `SET search_path = pg_catalog, pg_temp`, so each row
     // below that replaces the function isolates ONE pin of the boot check. `fn_with` builds the
     // CREATE OR REPLACE with a chosen SET clause (empty: none, which resets proconfig).
     const auto fn_with = [](const std::string& set_clause) {
@@ -3568,7 +3614,7 @@ TEST_CASE("AuthDB refuses to open when the generation trigger is not in force",
                            "trigger LANGUAGE plpgsql ") +
                set_clause + " AS $$" + kBindingFnBody + "$$";
     };
-    const std::string recreate_fn = fn_with("SET search_path = pg_catalog");
+    const std::string recreate_fn = fn_with("SET search_path = pg_catalog, pg_temp");
     const std::string recreate_trigger =
         "CREATE TRIGGER users_mfa_factor_gen BEFORE UPDATE OF mfa_enrolled_at, mfa_factor_gen ON "
         "auth.users FOR EACH ROW EXECUTE FUNCTION auth.users_mfa_factor_gen()";
@@ -3583,11 +3629,15 @@ TEST_CASE("AuthDB refuses to open when the generation trigger is not in force",
          "ALTER TABLE auth.users ENABLE TRIGGER users_mfa_factor_gen", kRestoreTriggerSql},
         {"function body replaced",
          "CREATE OR REPLACE FUNCTION auth.users_mfa_factor_gen() RETURNS trigger LANGUAGE plpgsql "
-         "SET search_path = pg_catalog AS $$ BEGIN RETURN NEW; END $$",
+         "SET search_path = pg_catalog, pg_temp AS $$ BEGIN RETURN NEW; END $$",
          recreate_fn},
         {"function recreated without the search_path pin (proconfig reset to NULL)", fn_with(""),
          recreate_fn},
         {"function pinned to a different search_path", fn_with("SET search_path = public"),
+         recreate_fn},
+        // The regression pin for the temporary-schema finding: a path that omits pg_temp still
+        // searches it first for type names, so this must be refused, not accepted as pg_catalog.
+        {"function pinned to pg_catalog only (no pg_temp)", fn_with("SET search_path = pg_catalog"),
          recreate_fn},
         {"WHEN clause narrows the firing",
          "DROP TRIGGER users_mfa_factor_gen ON auth.users; CREATE TRIGGER users_mfa_factor_gen "
@@ -3623,7 +3673,7 @@ TEST_CASE("AuthDB refuses to open when the generation trigger is not in force",
              kRestoreTriggerSql},
         {"re-pointed at a byte-identical function under a different name",
          "CREATE FUNCTION auth.users_mfa_factor_gen_shadow() RETURNS trigger LANGUAGE plpgsql "
-         "SET search_path = pg_catalog AS $$" +
+         "SET search_path = pg_catalog, pg_temp AS $$" +
              std::string(kBindingFnBody) +
              "$$; DROP TRIGGER users_mfa_factor_gen ON auth.users; CREATE TRIGGER "
              "users_mfa_factor_gen BEFORE UPDATE OF mfa_enrolled_at, mfa_factor_gen ON auth.users "
@@ -3633,7 +3683,7 @@ TEST_CASE("AuthDB refuses to open when the generation trigger is not in force",
              kRestoreTriggerSql + "; DROP FUNCTION auth.users_mfa_factor_gen_shadow()"},
         {"re-pointed at a byte-identical function of the same name in another schema",
          "CREATE SCHEMA yuzu_test_shadow; CREATE FUNCTION yuzu_test_shadow.users_mfa_factor_gen() "
-         "RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$" +
+         "RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$" +
              std::string(kBindingFnBody) +
              "$$; DROP TRIGGER users_mfa_factor_gen ON auth.users; CREATE TRIGGER "
              "users_mfa_factor_gen BEFORE UPDATE OF mfa_enrolled_at, mfa_factor_gen ON auth.users "

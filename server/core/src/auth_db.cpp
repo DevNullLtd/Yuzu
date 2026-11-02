@@ -260,12 +260,16 @@ constexpr std::chrono::milliseconds kAcquireRetryTimeout{150};
 // stored proof carries, and that stale proof would match again; a random value is not reproduced
 // by replaying enrolments on the restored row. The distinctness guard keeps two changes of one
 // row in one transaction different even in the one-in-2^60 case of a repeated draw.
-// The function is created with `SET search_path = pg_catalog`, so the names it calls
+// The function is created with `SET search_path = pg_catalog, pg_temp`, so the names it calls
 // (`gen_random_uuid`, `replace`, `substr`) and the operators it uses resolve in pg_catalog and
 // never in a schema the calling session lists first: without the pin, a session whose search_path
-// names a writable schema before pg_catalog could shadow them and force a known generation. The
-// boot check requires the pin (`pg_proc.proconfig`), so a `CREATE OR REPLACE FUNCTION` that omits
-// the SET clause (which resets `proconfig`) is reported as tampering.
+// names a writable schema before pg_catalog could shadow them and force a known generation.
+// pg_temp is listed LAST on purpose: a path that omits it still searches the session's temporary
+// schema FIRST for relations and types, so a role with TEMP privilege could create a temporary
+// type named `text` (the body's `::text`) plus implicit casts through it and force a known
+// generation; listed explicitly, pg_temp is searched after pg_catalog and can no longer win.
+// The boot check requires the pin (`pg_proc.proconfig`), so a `CREATE OR REPLACE FUNCTION` that
+// omits the SET clause (which resets `proconfig`) is reported as tampering.
 // FROZEN: shipped in migration v3 and pinned byte-for-byte by the boot check, together with the
 // SET clause; changing either needs a NEW migration (CREATE OR REPLACE) and an accepted (old,new)
 // pair in the check, or every migrated replica refuses to boot.
@@ -294,7 +298,7 @@ std::string migration_v3_sql() {
     sql += "SET LOCAL lock_timeout = '3s'; ";
     sql += "ALTER TABLE users ADD COLUMN mfa_factor_gen BIGINT NOT NULL DEFAULT 0; ";
     sql += "CREATE FUNCTION users_mfa_factor_gen() RETURNS trigger LANGUAGE plpgsql "
-           "SET search_path = pg_catalog AS $$";
+           "SET search_path = pg_catalog, pg_temp AS $$";
     sql += kUsersMfaFactorGenBody;
     sql += "$$; ";
     sql += "CREATE TRIGGER users_mfa_factor_gen BEFORE UPDATE OF mfa_enrolled_at, mfa_factor_gen "
@@ -643,9 +647,11 @@ decrypt_mfa_secret(pg::SecretCodec& codec, const LoadedMfaRow& row) {
 // contains both columns (a superset passes: the `@>` test; it still fires on every change to
 // either), with the INSERT/DELETE/TRUNCATE bits clear and no WHEN clause, and call the plpgsql
 // function of that name, in the table's schema, whose body is byte-identical to the pinned
-// constant and whose `proconfig` is exactly `{search_path=pg_catalog}`: the pin keeps the
-// function's name resolution and operators independent of the caller's search_path, and a NULL
-// `proconfig` (what `CREATE OR REPLACE FUNCTION` without the SET clause leaves) reads as Invalid.
+// constant and whose `proconfig` is exactly `{"search_path=pg_catalog, pg_temp"}` (one element;
+// pg_temp last so the session's temporary schema cannot shadow a type name first): the pin keeps
+// the function's name resolution and operators independent of the caller's search_path, and a
+// NULL `proconfig` (what `CREATE OR REPLACE FUNCTION` without the SET clause leaves) reads as
+// Invalid.
 // `tgtype` bits (pg_trigger.h): ROW 1, BEFORE 2,
 // INSERT 4, DELETE 8, UPDATE 16, TRUNCATE 32, INSTEAD 64.
 enum class BindingCheck : std::uint8_t {
@@ -667,7 +673,7 @@ enum class BindingCheck : std::uint8_t {
         "AND p.pronamespace = (SELECT relnamespace FROM pg_class WHERE oid = t.tgrelid) "
         "AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql') "
         "AND p.prosrc = $1::text "
-        "AND COALESCE(p.proconfig = ARRAY['search_path=pg_catalog']::text[], false) "
+        "AND COALESCE(p.proconfig = ARRAY['search_path=pg_catalog, pg_temp']::text[], false) "
         "FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid "
         "WHERE t.tgrelid = 'auth.users'::regclass AND t.tgname = 'users_mfa_factor_gen' "
         "AND NOT t.tgisinternal",
