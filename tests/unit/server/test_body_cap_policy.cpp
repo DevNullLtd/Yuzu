@@ -18,8 +18,10 @@
  * exists to catch.
  */
 
+#include "body_cap_httplib.hpp"
 #include "body_cap_policy.hpp"
 #include "post_read_stage_test_support.hpp"
+#include "raw_close_probe.hpp"
 #include "test_loopback_http.hpp"
 #include "web_utils.hpp"
 
@@ -59,11 +61,13 @@
 using yuzu::server::BodyCapDecision;
 using yuzu::server::BodyCapMatch;
 using yuzu::server::body_cap_prefix_matches;
+using yuzu::server::content_encoding_for_body_cap;
 using yuzu::server::content_length_for_body_cap;
 using yuzu::server::evaluate_body_cap;
 using yuzu::server::kBodyCapAnyMethod;
 using yuzu::server::kBodyCapTable;
 using yuzu::server::resolve_body_cap;
+using yuzu::server::transfer_encoding_for_body_cap;
 
 namespace {
 
@@ -557,6 +561,10 @@ struct UnifiedBodyCapTestServer {
         sink.Get("/health", ok_handler);
         sink.Post("/health", ok_handler);
         sink.Post("/mcp/v1/", ok_handler);
+        // Bodyless DELETE (MCP session teardown): a method other than POST/PUT/PATCH, so an
+        // absent Content-Length is not itself "unmeasurable", which isolates the
+        // Transfer-Encoding argument in the empty-first-line wire test below.
+        sink.Delete("/mcp/v1/", ok_handler);
         // A small-cap (256 KiB), requires_measurable=false class — used by
         // the post-read-stage tests below so a genuine chunked over-cap body
         // stays cheap to send in a test.
@@ -577,8 +585,13 @@ struct UnifiedBodyCapTestServer {
             // so a mutation to production's combination (an inverted
             // condition, a swapped 411/413, a dropped branch) had nothing
             // here that could see it. Routing through the one shared
-            // function makes that divergence structurally impossible instead
-            // of something to keep re-verifying by hand. `is_chunked` still
+            // function shares the COMBINATION of predicates, so it need not be
+            // re-verified by hand. The Content-Length, Transfer-Encoding and
+            // Content-Encoding ARGUMENTS come from the same accessors
+            // server.cpp uses (`content_length_for_body_cap`,
+            // `transfer_encoding_for_body_cap`); a raw first-line
+            // `get_header_value("Transfer-Encoding")` would miss an empty first
+            // line followed by `chunked`. `is_chunked` still
             // MUST come from httplib's own `is_chunked_transfer_encoding`
             // (unchanged from before this extraction — a prior version of
             // this fixture called `req.get_header_value_u64` directly for
@@ -591,8 +604,8 @@ struct UnifiedBodyCapTestServer {
             // decision-combination gap this same defect class lives in).
             const auto decision = evaluate_body_cap(
                 req.method, req.path, req.has_header("Content-Length"),
-                content_length_for_body_cap(req), req.get_header_value("Transfer-Encoding"),
-                req.get_header_value("Content-Encoding"),
+                content_length_for_body_cap(req), transfer_encoding_for_body_cap(req),
+                content_encoding_for_body_cap(req),
                 httplib::detail::is_chunked_transfer_encoding(req.headers));
             if (decision.refuse) {
                 res.status = decision.status;
@@ -799,7 +812,29 @@ TEST_CASE("Pre-routing body cap: a non-chunked Transfer-Encoding does NOT suppre
                                 te + "\r\n\r\n";
         const auto resp = raw_request_status_line(ts.port, req);
         INFO("Transfer-Encoding: " << te);
-        CHECK(resp.starts_with("HTTP/1.1 413"));
+        // httplib >= 0.43 rejects Content-Length > 0 together with ANY Transfer-Encoding with a 400
+        // (RFC 9112 6.3) BEFORE the pre-routing gate runs, so the gate's own 413 is only reachable on
+        // older httplib. Either way the request must be refused and the handler must never run; the
+        // gate's authoritative-length logic is pinned directly by the pure tests above.
+        CHECK((resp.starts_with("HTTP/1.1 413") || resp.starts_with("HTTP/1.1 400")));
+    }
+    CHECK(ts.handler_calls.load() == 0);
+
+    // Content-Length: 0 with a non-chunked Transfer-Encoding: httplib 0.43 let it through to the gate
+    // (the 400 applied to a non-zero length); httplib 0.59.0 answers 400 to ANY Transfer-Encoding
+    // whose final coding is not chunked, whatever the Content-Length. Both are safe. The property
+    // pinned here is that there is nothing to cap, so it is never answered 413, and that the
+    // handler never runs for a request httplib considers mis-framed (asserted below for the 400).
+    for (const auto* te : {"identity", "x"}) {
+        const std::string req0 = std::string("POST /api/v1/ca/import-chain HTTP/1.1\r\n"
+                                             "Host: 127.0.0.1\r\n"
+                                             "Content-Length: 0\r\n"
+                                             "Transfer-Encoding: ") +
+                                 te + "\r\n\r\n";
+        const auto resp0 = raw_request_status_line(ts.port, req0);
+        INFO("Content-Length: 0 + Transfer-Encoding: " << te << " -> " << resp0);
+        CHECK_FALSE(resp0.starts_with("HTTP/1.1 413"));
+        CHECK(resp0.starts_with("HTTP/1.1 400"));
     }
     CHECK(ts.handler_calls.load() == 0);
 
@@ -849,21 +884,16 @@ TEST_CASE("Pre-routing body cap: a non-identity Content-Encoding is refused rega
 
     // A request with NO Content-Encoding header (ordinary traffic) is still
     // admitted (sanity: the check is encoding-VALUE aware, not "any
-    // Content-Encoding header present"). Deliberately NOT tested by sending
-    // an EXPLICIT `Content-Encoding: identity` end-to-end here: doing so
-    // during development surfaced a SEPARATE, PRE-EXISTING httplib quirk,
-    // unrelated to this change — `detail::create_decompressor` (httplib.h:
-    // 6717) recognises only gzip/deflate/br/zstd and returns null for
-    // anything else INCLUDING the literal string "identity", so httplib's
-    // own content-reader 415s an explicit `identity` value for any ordinary
-    // route's body read (`prepare_content_receiver`, httplib.h:6980-6986) —
-    // completely independent of `has_non_identity_content_encoding`, which
-    // correctly does NOT refuse it at THIS (pre-routing) chokepoint. That
-    // downstream quirk is out of scope for #2407 and worth its own follow-up
-    // (an explicit `identity` is a materially different declaration from
-    // omitting the header, and RFC 7231 §3.1.2.1 lists it as valid), but
-    // asserting past it here would make this test depend on unrelated
-    // httplib internals rather than on the D4 decision under test.
+    // Content-Encoding header present"). An EXPLICIT `Content-Encoding: identity`
+    // is asserted end-to-end in its own case further down, because the docs
+    // promise it is admitted. Background: through 0.37.1 `detail::create_decompressor`
+    // recognised only gzip/deflate/br/zstd and returned null for anything else
+    // INCLUDING the literal string "identity", so httplib's own content-reader
+    // 415'd an explicit `identity` value for any ordinary route's body read. From
+    // 0.59.0 `prepare_content_receiver` leaves an unrecognised coding, "identity"
+    // included, alone and passes the payload through (httplib.h v0.59.0:8489-8500).
+    // `has_non_identity_content_encoding` never refused it at THIS (pre-routing)
+    // chokepoint.
     auto r3 = cli.Post("/api/v1/devices", "small body", "application/json");
     REQUIRE(r3);
     CHECK(r3->status == 200);
@@ -909,6 +939,73 @@ TEST_CASE("Pre-routing body cap: /mcp/ still behaves as before through the unifi
     }
     CHECK(ts.handler_calls.load() == 0);
 }
+
+TEST_CASE("Pre-routing body cap: an empty first Transfer-Encoding line followed by chunked is "
+          "refused 411 on a requires_measurable class",
+          "[body_cap][mcp][bounds][integration]") {
+    // `get_header_value("Transfer-Encoding")` reads the empty FIRST line, which reads as "no
+    // Transfer-Encoding", while httplib reads the last line (chunked). DELETE is used because it
+    // is a method (not POST/PUT/PATCH) whose absent Content-Length is not itself
+    // unmeasurable, so the 411 can only come from the Transfer-Encoding argument
+    // (`transfer_encoding_for_body_cap`) reaching `evaluate_body_cap`. The body is complete so a fixture that wrongly admits the request
+    // answers promptly instead of waiting on the chunk reader.
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    const std::string req = "DELETE /mcp/v1/ HTTP/1.1\r\n"
+                            "Host: 127.0.0.1\r\n"
+                            "Transfer-Encoding:\r\n"
+                            "Transfer-Encoding: chunked\r\n\r\n"
+                            "0\r\n\r\n";
+    const auto resp = raw_request_status_line(ts.port, req);
+    CHECK(resp.starts_with("HTTP/1.1 411"));
+    CHECK(ts.handler_calls.load() == 0);
+}
+
+TEST_CASE("Pre-routing body cap: an empty first Content-Encoding line followed by an encoding is "
+          "refused 415",
+          "[body_cap][bounds][integration]") {
+    // `get_header_value("Content-Encoding")` reads the empty FIRST line, which reads as "no
+    // encoding", while httplib's body reader decodes against the combined value (`br`). The
+    // gate must refuse on the value httplib acts on (`content_encoding_for_body_cap`), so a body
+    // httplib would decode never reaches the reader or a handler.
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    const std::string body = "garbage";
+    const std::string req = "POST /api/v1/devices HTTP/1.1\r\n"
+                            "Host: 127.0.0.1\r\n"
+                            "Content-Encoding:\r\n"
+                            "Content-Encoding: br\r\n"
+                            "Content-Length: " +
+                            std::to_string(body.size()) + "\r\n\r\n" + body;
+    const auto resp = raw_request_status_line(ts.port, req);
+    CHECK(resp.starts_with("HTTP/1.1 415"));
+    // The gate answered (httplib without a brotli build would answer 415 itself).
+    CHECK(ts.pre_routing_rejections.load() == 1);
+    CHECK(ts.handler_calls.load() == 0);
+}
+
+TEST_CASE("Pre-routing body cap: an explicit Content-Encoding: identity is admitted",
+          "[body_cap][bounds][integration]") {
+    // The docs promise an explicit `identity` reaches the handler. It does so only while both
+    // the gate (an exact, case-insensitive `identity`) and httplib's reader (an unrecognised
+    // coding is passed through) agree, so a bump or a gate change that breaks either side fails
+    // here instead of silently changing what clients may send.
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    const std::string body = "small body";
+    const std::string req = "POST /api/v1/devices HTTP/1.1\r\n"
+                            "Host: 127.0.0.1\r\n"
+                            "Content-Encoding: identity\r\n"
+                            "Content-Length: " +
+                            std::to_string(body.size()) + "\r\n\r\n" + body;
+    const auto resp = raw_request_status_line(ts.port, req);
+    CHECK(resp.starts_with("HTTP/1.1 200"));
+    CHECK(ts.pre_routing_rejections.load() == 0);
+    CHECK(ts.handler_calls.load() == 1);
+}
 #endif // !_WIN32
 
 TEST_CASE("Pre-routing body cap: /mcp/ still behaves as before through the unified path "
@@ -934,9 +1031,9 @@ TEST_CASE("Pre-routing body cap: an all-digit Content-Length above 2^64-1 is ref
     // The defect this pins: `std::from_chars` reports
     // `result_out_of_range` for these two values and the pre-#2407-R1 code
     // folded that to `content_length = 0` ("no header present, don't
-    // cap") — while httplib's own `is_numeric()` + `strtoull()` parser
-    // (httplib.h:2769-2789) accepts the same all-digit string and returns
-    // `SIZE_MAX`, which is what it ALSO uses to decide what it buffers.
+    // cap") — while httplib's own accessor returned `SIZE_MAX` for it (0.37.1:
+    // `is_numeric()` + `strtoull()`), which is what it ALSO used to decide what it buffers. 0.59.0
+    // flags the value invalid and answers 400 (`get_header_value_u64`, httplib.h v0.59.0:3480-3506).
     // `content_length_for_body_cap` (web_utils.hpp) now delegates to that
     // same accessor, so both values must resolve to "oversize" (413), on
     // the plain catch-all class, not just /mcp/.
@@ -952,7 +1049,10 @@ TEST_CASE("Pre-routing body cap: an all-digit Content-Length above 2^64-1 is ref
                                 overflow_value + "\r\n\r\n";
         INFO("Content-Length: " << overflow_value);
         const auto resp = raw_request_status_line(ts.port, req);
-        CHECK(resp.starts_with("HTTP/1.1 413"));
+        // httplib 0.59.0 treats an out-of-range Content-Length as invalid and answers 400 while
+        // parsing the request head, before the pre-routing gate runs; older httplib saturates to
+        // SIZE_MAX and the gate answers 413. Either refuses it before any body is read.
+        CHECK((resp.starts_with("HTTP/1.1 413") || resp.starts_with("HTTP/1.1 400")));
     }
     CHECK(ts.handler_calls.load() == 0);
 }
@@ -961,14 +1061,14 @@ TEST_CASE("Pre-routing body cap: a malformed (non-numeric) Content-Length is nev
           "silently admitted — refused end-to-end even where this gate alone reads it "
           "as absent (#2407 R2)",
           "[body_cap][bounds][integration]") {
-    // `is_numeric()` (httplib.h:2769-2773) requires EVERY character to be
+    // `is_numeric()` (httplib.h v0.59.0:3476-3478) requires EVERY character to be
     // an ASCII digit, so each of these fails it and
     // `content_length_for_body_cap` reads them as 0 — matching httplib's
     // OWN accessor exactly (that is the point of #2407 R1/R2: one shared
     // function, not two that might disagree). A 0 reading is NOT oversize,
     // so THIS gate alone lets the request past as Unhandled. That is fine,
     // not a re-opened gap: httplib's own body reader
-    // (`detail::read_content`, httplib.h:7057-7063) independently rejects
+    // (`detail::read_content`, httplib.h v0.59.0:8574-8579) independently rejects
     // the SAME malformed header with its own `is_invalid_value` check and
     // answers 400 before any route handler runs — this test asserts THAT
     // end-to-end outcome, proving the request is refused somewhere in the
@@ -1001,23 +1101,18 @@ TEST_CASE("Pre-routing body cap: a malformed (non-numeric) Content-Length is nev
 TEST_CASE("Pre-routing body cap: duplicate Content-Length headers cannot desync the "
           "gate's decision from httplib's own body read (#2407 R2)",
           "[body_cap][bounds][integration]") {
-    // httplib's `Headers` is `std::unordered_multimap<..., case_ignore::hash,
-    // case_ignore::equal_to>` (httplib.h:778-780) — an UNORDERED container,
-    // not the ordered `std::multimap` an RFC 7230 "first occurrence" framing
-    // might suggest. WHICH of two duplicate `Content-Length` values
-    // `get_header_value_u64("Content-Length", 0, /*id=*/0)` resolves to is
-    // therefore UNSPECIFIED by the C++ standard (hash-bucket insertion
-    // order, not header-line order). Measured empirically against this
-    // vcpkg baseline while writing this test (a standalone reproduction
-    // against a real httplib::Server): `id=0` resolved to the LAST header
-    // LINE sent, not the first — the opposite of what an ordered container,
-    // or an RFC-literal reading, would give. This test deliberately does
-    // NOT assert on that specific measurement, because it is an
-    // IMPLEMENTATION detail that could shift with a future vcpkg bump, not
-    // a contract. What it asserts instead is the SAFETY property that holds
-    // regardless of which duplicate value httplib's bucket order happens to
-    // prefer: `content_length_for_body_cap` (this gate) and httplib's own
-    // body reader (httplib.h:7057-7061) call the IDENTICAL accessor with
+    // Through 0.37.1 httplib's `Headers` was `std::unordered_multimap<...,
+    // case_ignore::hash, case_ignore::equal_to>`, an UNORDERED container, so
+    // WHICH of two duplicate `Content-Length` values
+    // `get_header_value_u64("Content-Length", 0, /*id=*/0)` resolved to was
+    // UNSPECIFIED by the C++ standard (measured then: the LAST header line
+    // sent). From 0.59.0 `Headers` is an insertion-ordered multimap
+    // (httplib.h v0.59.0:1084-1101, 1360-1362), so `id=0` is the FIRST line
+    // sent. This test deliberately does NOT assert on which one wins, because
+    // that is an implementation detail that could shift with a future vcpkg
+    // bump, not a contract. What it asserts instead is the SAFETY property that
+    // holds regardless of which duplicate value httplib prefers: `content_length_for_body_cap` (this gate) and httplib's own
+    // body reader (httplib.h v0.59.0:8574-8576) call the IDENTICAL accessor with
     // the IDENTICAL id against the SAME already-parsed `Headers` object,
     // for the SAME single request — so whichever value "wins" is the SAME
     // value at BOTH call sites, deterministically, every time. There is no
@@ -1045,11 +1140,40 @@ TEST_CASE("Pre-routing body cap: duplicate Content-Length headers cannot desync 
     // of these) would mean the gate and the real reader disagreed about
     // which duplicate to trust — the split-brain this test exists to rule
     // out.
-    const bool refused = resp.starts_with("HTTP/1.1 413");
+    // httplib >= 0.43 (RFC 9110 8.6) rejects DIFFERING duplicate Content-Length values with a 400
+    // before the gate runs; older httplib resolves one of them and reaches the gate. Both are safe:
+    // the property is that nothing is buffered past the cap and the handler never sees a body the
+    // gate did not vet.
+    const bool refused = resp.starts_with("HTTP/1.1 413") || resp.starts_with("HTTP/1.1 400");
     const bool admitted = resp.starts_with("HTTP/1.1 200");
     INFO("response: " << resp);
     CHECK((refused || admitted));
     CHECK(ts.handler_calls.load() == (admitted ? 1 : 0));
+
+    // IDENTICAL duplicates are not rejected by httplib, so they still reach the gate and keep
+    // exercising the original same-accessor property: the oversize value must be refused by the
+    // gate (413), the small one admitted. The oversize value is deliberately a parseable u64:
+    // httplib 0.59.0 answers 400 to an out-of-range one before the gate (pinned by the test above).
+    {
+        const std::string big = "POST /api/v1/devices HTTP/1.1\r\n"
+                                "Host: 127.0.0.1\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Content-Length: 99999999999\r\n"
+                                "Content-Length: 99999999999\r\n\r\n";
+        const auto rbig = raw_request_status_line(ts.port, big);
+        INFO("identical oversize duplicates -> " << rbig);
+        CHECK(rbig.starts_with("HTTP/1.1 413"));
+    }
+    {
+        const std::string ok = "POST /api/v1/devices HTTP/1.1\r\n"
+                               "Host: 127.0.0.1\r\n"
+                               "Content-Type: application/json\r\n"
+                               "Content-Length: 2\r\n"
+                               "Content-Length: 2\r\n\r\nok";
+        const auto rok = raw_request_status_line(ts.port, ok);
+        INFO("identical small duplicates -> " << rok);
+        CHECK(rok.starts_with("HTTP/1.1 200"));
+    }
 }
 #endif // !_WIN32
 
@@ -1062,7 +1186,7 @@ TEST_CASE("Pre-routing body cap: duplicate Content-Length headers cannot desync 
 // (`resolve_body_cap` etc.), never httplib's actual middleware wiring for
 // this stage, so a test written only against a fixture like that could not
 // have told a real server.cpp defect from a fixture defect. These cases
-// exercise the real stage wiring (registry plus route-sink wrapper) end-to-end —
+// exercise the real httplib `pre_request_handler_` call site end-to-end —
 // same reasoning as section 8 above for the pre-routing stage.
 #ifndef _WIN32
 TEST_CASE("Post-read body cap: a genuine chunked body over a class's cap is rejected "
@@ -1141,6 +1265,210 @@ TEST_CASE("Post-read body cap: a MEASURABLE over-cap body is still caught by the
     CHECK(ts.post_read_calls.load() == 0);
     CHECK(ts.post_read_rejections.load() == 0);
 }
+
+TEST_CASE("Pre-routing body cap: a pre-routing refusal closes the connection without draining "
+          "the declared body",
+          "[body_cap][pre_routing][bounds][integration]") {
+    // Pins the property server.cpp's CONNECTION-REUSE CONSTRAINT paragraph depends on. A real
+    // client declares a 64 MiB body on a route whose cap is 4 MiB and the pre-routing handler
+    // refuses with 413 before reading it. What is pinned: the refusal ends with the server
+    // closing the socket, and the number of bytes the client got in before the close is bounded
+    // by the socket buffers, not by the declared size.
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    constexpr std::size_t kDeclared = 64u * 1024 * 1024;
+    constexpr std::size_t kChunk = 64u * 1024;
+    std::size_t provided = 0;
+    httplib::Client cli("127.0.0.1", ts.port);
+    cli.set_connection_timeout(5, 0);
+    cli.set_write_timeout(5, 0);
+    cli.set_read_timeout(5, 0);
+    const std::string chunk(kChunk, 'A');
+    auto res = cli.Post(
+        "/api/v1/devices", kDeclared,
+        [&](std::size_t offset, std::size_t length, httplib::DataSink& sink) {
+            const auto n = std::min<std::size_t>(length, kChunk);
+            if (!sink.write(chunk.data(), n))
+                return false; // the server closed the connection
+            provided = offset + n;
+            return true;
+        },
+        "application/octet-stream");
+
+    INFO("bytes the client got into the socket before the close: " << provided);
+    // Half the declared body is far above any socket-buffer total and far below the declared body.
+    CHECK(provided < kDeclared / 2);
+    if (res)
+        CHECK(res->status == 413);
+    CHECK(ts.pre_routing_rejections.load() >= 1);
+    CHECK(ts.handler_calls.load() == 0);
+}
+
+namespace {
+
+/// A server whose ONLY handler is a pre-routing one answering a fixed status, with the SAME
+/// `close_if_unread_framed_body` helper server.cpp's post-routing handler calls on every response
+/// (the wiring is pinned lexically in test_step_up_wiring.cpp; this fixture reproduces no rule of
+/// its own).
+struct PreRoutingAnswerServer {
+    explicit PreRoutingAnswerServer(int status) {
+        // 30 s read timeout, as production: a body that is still being read is then unambiguous
+        // against the probe's 2 s wait.
+        svr.set_read_timeout(30, 0);
+        svr.set_pre_routing_handler(
+            [status](const httplib::Request&, httplib::Response& res)
+                -> httplib::Server::HandlerResponse {
+                res.status = status;
+                res.set_content("x", "text/plain");
+                if (status >= 300 && status < 400)
+                    res.set_header("Location", "/home");
+                return httplib::Server::HandlerResponse::Handled;
+            });
+        svr.set_post_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+            yuzu::server::close_if_unread_framed_body(req, res);
+        });
+        port = svr.bind_to_any_port("127.0.0.1");
+        REQUIRE(port > 0);
+        th = std::thread([this] { svr.listen_after_bind(); });
+        svr.wait_until_ready();
+    }
+    ~PreRoutingAnswerServer() {
+        svr.stop();
+        if (th.joinable())
+            th.join();
+    }
+    PreRoutingAnswerServer(const PreRoutingAnswerServer&) = delete;
+    PreRoutingAnswerServer& operator=(const PreRoutingAnswerServer&) = delete;
+
+    httplib::Server svr;
+    int port = 0;
+    std::thread th;
+};
+
+} // namespace
+
+TEST_CASE("Pre-routing answer: a response below 400 to a request with an unread framed body "
+          "closes the connection",
+          "[body_cap][pre_routing][bounds][integration]") {
+    // From httplib 0.59 a response below 400 that leaves a declared request body unread must carry
+    // `Connection: close`. The probe waits for EOF rather than reading the header alone: the header
+    // is what we set, EOF is what the SERVER did with it. The 413 control is not evidence for the
+    // rule (httplib stamps close itself for a status >= 400); the 302 and 200 rows are. The third
+    // framing is an empty Transfer-Encoding line followed by `chunked`: `get_header_value` sees no
+    // Transfer-Encoding, httplib reads the body as chunked.
+    for (const int status : {302, 200}) {
+        for (const auto& [name, request] :
+             {std::pair<const char*, std::string>{"chunked", yuzu::test::kChunkedPostRequest},
+              std::pair<const char*, std::string>{"content-length 64 MiB declared",
+                                                  yuzu::test::kLengthPostRequest},
+              std::pair<const char*, std::string>{"empty then chunked Transfer-Encoding lines",
+                                                  yuzu::test::kEmptyThenChunkedPostRequest}}) {
+            DYNAMIC_SECTION("status " << status << ", " << name) {
+                PreRoutingAnswerServer ts(status);
+                const auto r = yuzu::test::probe_for_close(ts.port, request);
+                INFO(r.head);
+                CHECK(r.head.find("Connection: close") != std::string::npos);
+                CHECK(r.closed);
+            }
+        }
+    }
+}
+
+TEST_CASE("Pre-routing answer: a bodyless request keeps its keep-alive connection",
+          "[body_cap][pre_routing][integration]") {
+    // The close rule is for a declared, unread body only: an ordinary GET answered from the
+    // pre-routing handler (the sign-in redirect of a bookmarked page) must not lose keep-alive.
+    PreRoutingAnswerServer ts(302);
+    const auto r = yuzu::test::probe_for_close(
+        ts.port, "GET /home HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    INFO(r.head);
+    CHECK(r.head.find("Connection: close") == std::string::npos);
+    CHECK_FALSE(r.closed);
+}
+
 #endif // !_WIN32
 
 #endif // !YUZU_TSAN_BUILD
+
+TEST_CASE("close_if_unread_framed_body: decides on status and declared framing",
+          "[body_cap][pre_routing]") {
+    // Pure logic: no sockets, so it runs on every platform and under TSan.
+    httplib::Request chunked;
+    chunked.headers.emplace("Transfer-Encoding", "chunked");
+    httplib::Request sized;
+    sized.headers.emplace("Content-Length", "10");
+    httplib::Request zero;
+    zero.headers.emplace("Content-Length", "0");
+    httplib::Request bare;
+    httplib::Request overflow;
+    overflow.headers.emplace("Content-Length", "99999999999999999999999");
+    // First line empty, last line chunked: get_header_value reads the empty first line.
+    httplib::Request empty_then_chunked;
+    empty_then_chunked.headers.emplace("Transfer-Encoding", "");
+    empty_then_chunked.headers.emplace("Transfer-Encoding", "chunked");
+
+    const auto closes = [](const httplib::Request& req, int status) {
+        httplib::Response res;
+        res.status = status;
+        yuzu::server::close_if_unread_framed_body(req, res);
+        return res.get_header_value("Connection") == "close";
+    };
+    CHECK(closes(chunked, 302));
+    CHECK(closes(sized, 200));
+    CHECK(closes(overflow, 302)); // out-of-range reads as SIZE_MAX, which is a declared body
+    CHECK(closes(empty_then_chunked, 302));
+    CHECK_FALSE(closes(zero, 302));
+    CHECK_FALSE(closes(bare, 302));
+    // 400 and above: httplib closes itself, the helper adds nothing.
+    CHECK_FALSE(closes(chunked, 413));
+    CHECK_FALSE(closes(sized, 400));
+    // A body a handler already read leaves nothing to drain: keep-alive is untouched.
+    httplib::Request consumed = sized;
+    consumed.body_consumed_ = true;
+    CHECK_FALSE(closes(consumed, 200));
+}
+
+TEST_CASE("content_encoding_for_body_cap: reads the combined value httplib decodes against",
+          "[body_cap]") {
+    httplib::Request none;
+    httplib::Request plain;
+    plain.headers.emplace("Content-Encoding", "br");
+    httplib::Request empty_then_br;
+    empty_then_br.headers.emplace("Content-Encoding", "");
+    empty_then_br.headers.emplace("Content-Encoding", "br");
+    httplib::Request identity_then_br;
+    identity_then_br.headers.emplace("Content-Encoding", "identity");
+    identity_then_br.headers.emplace("Content-Encoding", "br");
+    httplib::Request empty_only;
+    empty_only.headers.emplace("Content-Encoding", "");
+    CHECK(content_encoding_for_body_cap(none).empty());
+    CHECK(content_encoding_for_body_cap(empty_only).empty());
+    CHECK(content_encoding_for_body_cap(plain) == "br");
+    // The raw first-line read this accessor replaces sees nothing here.
+    CHECK(empty_then_br.get_header_value("Content-Encoding").empty());
+    CHECK(content_encoding_for_body_cap(empty_then_br) == "br");
+    CHECK(yuzu::server::has_non_identity_content_encoding(
+        content_encoding_for_body_cap(empty_then_br)));
+    // A list that is not exactly one coding is refused by the gate (httplib does not decode it).
+    CHECK(content_encoding_for_body_cap(identity_then_br) == "identity, br");
+    CHECK(yuzu::server::has_non_identity_content_encoding(
+        content_encoding_for_body_cap(identity_then_br)));
+}
+
+TEST_CASE("transfer_encoding_for_body_cap: an empty first line still reads as present",
+          "[body_cap]") {
+    httplib::Request none;
+    httplib::Request plain;
+    plain.headers.emplace("Transfer-Encoding", "chunked");
+    httplib::Request empty_then_chunked;
+    empty_then_chunked.headers.emplace("Transfer-Encoding", "");
+    empty_then_chunked.headers.emplace("Transfer-Encoding", "chunked");
+    CHECK(yuzu::server::transfer_encoding_for_body_cap(none).empty());
+    CHECK(yuzu::server::transfer_encoding_for_body_cap(plain) == "chunked");
+    // body_unmeasurable refuses any non-empty value, so the marker must not be empty.
+    CHECK_FALSE(yuzu::server::transfer_encoding_for_body_cap(empty_then_chunked).empty());
+    CHECK(yuzu::server::body_unmeasurable(
+        "POST", /*has_content_length=*/true,
+        yuzu::server::transfer_encoding_for_body_cap(empty_then_chunked)));
+}

@@ -351,6 +351,49 @@ TEST_CASE("post-read stage: an exempt server with no stage installed serves its 
     CHECK(PostReadStageRegistry::instance().stage_for(&s.svr) == nullptr);
 }
 
+TEST_CASE("post-read stage: a regex route does not match a path longer than httplib's regex "
+          "route path limit, so neither the stage nor the handler runs for it",
+          "[postread][wiring][regex_cap]") {
+    // From cpp-httplib 0.59.0 a regex route (any pattern with a capture group, `(.+)` included)
+    // is skipped for a path longer than CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH (256 bytes by
+    // default), where 0.37.1 had no such limit. An unmatched path never reaches a handler, so the
+    // effect on the routes that carry an id in the path (`/api/v1/tokens/(.+)` and the like) is a
+    // refusal (httplib's own 404), never an ungated pass. Pinned here so a httplib that changes
+    // the limit, or a build that sets CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH, is noticed.
+    httplib::Server svr;
+    Clean clean(&svr);
+    std::atomic<int> stage_calls{0};
+    std::atomic<int> handler_calls{0};
+    PostReadStageRegistry::instance().install(
+        &svr, [&](const httplib::Request&, httplib::Response&) {
+            stage_calls.fetch_add(1);
+            return Handled::Unhandled;
+        });
+    HttplibRouteSink sink(svr);
+    sink.Get(R"(/yuzu_test_re/(.+))", [&](const httplib::Request&, httplib::Response& res) {
+        handler_calls.fetch_add(1);
+        res.set_content("ok", "text/plain");
+    });
+    const int port = svr.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread th([&] { svr.listen_after_bind(); });
+    svr.wait_until_ready();
+
+    httplib::Client cli("127.0.0.1", port);
+    auto shortp = cli.Get("/yuzu_test_re/" + std::string(40, 'a'));
+    auto longp = cli.Get("/yuzu_test_re/" + std::string(300, 'a'));
+
+    svr.stop();
+    th.join();
+
+    REQUIRE(shortp);
+    CHECK(shortp->status == 200);
+    REQUIRE(longp);
+    CHECK(longp->status == 404);
+    CHECK(handler_calls.load() == 1);
+    CHECK(stage_calls.load() == 1);
+}
+
 TEST_CASE("post-read stage: a sink on a server with no stage installed refuses every verb and "
           "registers nothing (fail closed)",
           "[postread][wiring]") {

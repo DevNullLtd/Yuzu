@@ -53,7 +53,7 @@
 //     branch. That is exactly the false-green #1786 fixed; it is re-armable
 //     by omitting the argument.
 //
-// `httplib::detail::` is an INTERNAL httplib API (pinned to 0.37.x here:
+// `httplib::detail::` is an INTERNAL httplib API (compiled against 0.59.0 here:
 // `parse_query_text`, `extract_media_type`). That dependency predates this
 // file's current form and is deliberate — no public equivalent exists, and
 // the failure mode of an httplib bump is a loud compile error in a test-only

@@ -1,7 +1,7 @@
 #pragma once
 // Loopback httplib helpers for tests that prove a PRE-ROUTING rejection
 // (403/413/415 returned from a pre-routing handler before the request body
-// is read). Pinned httplib version: 0.37.1 (vcpkg.json).
+// is read). Written against httplib 0.37.1; the same mechanism holds on 0.59.0 (measured).
 //
 // MECHANISM (#2757): httplib's routing() invokes the pre-routing handler
 // before read_content runs, and write_response_core sets `Connection: close`

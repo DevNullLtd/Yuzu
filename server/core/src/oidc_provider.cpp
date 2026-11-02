@@ -1447,7 +1447,8 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     try {
         // Use heap-allocated client and explicit reset to work around httplib
         // 0.37.1 SSLClient destructor crash (invalid free in OpenSSL context
-        // cleanup after HTTPS connections).
+        // cleanup after HTTPS connections). 0.59.0 rewrote that destructor and this was not
+        // re-tested against it; the explicit reset is kept because it is harmless.
         // Egress policy: vet the target and pin the connect to a vetted address (the same
         // function the GETs use); nothing is sent to an address the policy refuses. A failed
         // CONNECT moves on to the next permitted address (no request was sent, so a retry is
@@ -2070,7 +2071,7 @@ bool endpoint_acceptable(const std::string& value, std::string_view scheme,
 // SHUT_RD, not SHUT_RDWR. Shutting the write side too killed a test process with SIGPIPE in 4 of
 // 4 runs of an HTTPS response that completes right at the deadline (default SIGPIPE disposition;
 // measured in Gate 5, not the handshake-drip case); with SHUT_RD there were none. Production is
-// protected anyway: httplib::Server's constructor ignores SIGPIPE process-wide (httplib.h:10405)
+// protected anyway: httplib::Server's constructor ignores SIGPIPE process-wide (httplib.h v0.59.0:12951-12958)
 // and nothing in server/core/src installs another disposition; the read side is simply the
 // smaller hammer. Tests that drive the watchdog set SIGPIPE to ignored themselves.
 //
@@ -2082,7 +2083,7 @@ bool endpoint_acceptable(const std::string& value, std::string_view scheme,
 // select(): shutdown() (SD_RECEIVE or SD_BOTH) on the duplicate or on the original does NOT wake
 // the waiter, but CancelIoEx() on the duplicate does (select() returned WSAEINTR at once; 6 of 6
 // runs), without touching the connection. That experiment is not the evidence for this class:
-// httplib 0.37.1 waits with WSAPoll on Windows (httplib.h poll_wrapper, behind select_impl and
+// httplib (0.37.1 and 0.59.0) waits with WSAPoll on Windows (httplib.h poll_wrapper, behind select_impl and
 // wait_until_socket_is_ready), not select(). The evidence that the cut ends a stalled handshake
 // through httplib's real wait is the end-to-end Windows drip test (test_oidc_provider.cpp).
 #ifndef _WIN32
@@ -2339,7 +2340,8 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify,
         const std::size_t attempts = std::max<std::size_t>(1, pins->size());
         for (std::size_t attempt = 0; attempt < attempts; ++attempt) {
             // Heap-allocated with an explicit reset: httplib 0.37.1's SSLClient destructor can
-            // crash after a failed connection to a non-routable host.
+            // crash after a failed connection to a non-routable host (0.59.0 rewrote that
+            // destructor; not re-tested against it, the reset is kept because it is harmless).
             auto client = std::make_unique<httplib::Client>(target->origin);
             // Fail closed if httplib would connect to a host other than the one just vetted.
             if (client->host() != target->host)

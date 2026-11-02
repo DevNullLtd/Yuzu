@@ -33,6 +33,18 @@ inline constexpr char kSep = '\x1f';
 
 using Params = std::multimap<std::string, std::string>;
 
+/// Copy of an HTTP layer's query-parameter container as a key-sorted `Params`. The pure parsers in
+/// this directory take a `std::multimap`, and `httplib::Params` stopped being one (cpp-httplib
+/// 0.59 made it an insertion-ordered multimap), so a route hands the parsers this copy: it is
+/// needed for TYPE compatibility, and it keeps iteration SORTED by key, which the output order of
+/// some callers depends on. Through 0.37.1 the source WAS a `std::multimap`, so the copy was
+/// value-identical there; on 0.59 it re-sorts by key and keeps equal keys in wire order. Convert at the route boundary rather than
+/// teach the pure parsers about httplib.
+template <class Src>
+[[nodiscard]] Params to_params(const Src& src) {
+    return Params(src.begin(), src.end());
+}
+
 /// True for text Postgres can bind: strict UTF-8 and no NUL. Anything else would surface as a
 /// store error (SQLSTATE 22021) and be reported as a retryable 503 instead of a caller 400.
 [[nodiscard]] inline bool valid_text(std::string_view v) {
