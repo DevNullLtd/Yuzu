@@ -47,6 +47,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "command_frames.hpp"   // make_output_frame / make_final_frame (CommandResponse.action)
 #include "ota_update_thread.hpp" // OTA update thread lifecycle (unit-tested, #2182)
 #include "shutdown_deadline_guard.hpp" // #2233 item 3: end-to-end stop() deadline
+#include "command_dedup_decision.hpp"            // dedup claim/replay decision core (pure, unit-tested)
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
 #include "sync_source_installed_software.hpp" // ADR-0016 source #1
@@ -195,6 +196,12 @@ static_assert(kShutdownDeadlineGrace == kBaselineShutdownGrace,
 constexpr std::string_view kSyncKvNamespace = "__sync__";
 static_assert(is_reserved_plugin_name(kSyncKvNamespace),
               "kSyncKvNamespace must be a reserved plugin name (plugin_loader.hpp)");
+
+// #3668. The command-dedup claim bypass (kDedupBypassPlugin, command_dedup_decision.hpp) names the
+// Guardian side channel, which is dispatched by its reserved name. Bind it to kReservedPluginNames
+// so the constant cannot drift from the loader's reserved list.
+static_assert(is_reserved_plugin_name(kDedupBypassPlugin),
+              "kDedupBypassPlugin must be a reserved plugin name (plugin_loader.hpp)");
 
 #if defined(_WIN32)
 constexpr const char* kAgentOs = "windows";
@@ -895,6 +902,15 @@ public:
                 command_dedup_ =
                     std::make_unique<CommandDedupStore>(std::move(*dedup_result));
                 spdlog::info("Command dedup store ready: {}", dedup_path.string());
+                // #3665: open() recovered from a corrupt file. Protection is back, but the
+                // history is gone — surface it (the store already logged the reason).
+                if (const auto& q = command_dedup_->quarantined_this_open()) {
+                    spdlog::warn("Command dedup history before this boot was lost (corrupt "
+                                 "store quarantined as {}) — a command redelivered after "
+                                 "its original execution may re-execute",
+                                 *q);
+                    metrics_.counter("yuzu_agent_dedup_quarantined_total").increment();
+                }
             } else {
                 spdlog::error("Failed to open command dedup store: {}",
                               dedup_result.error().message);
@@ -1694,22 +1710,35 @@ public:
                     sleep_for(kFirstDelay);
                     LocalDispatcher dispatcher;
                     while (!stop_requested_.load(std::memory_order_acquire)) {
-                        // #1001 / arch-S3 — local-dispatch concerns
-                        // (capture buffer, byte cap, truncation sentinel)
-                        // live in LocalDispatcher. The pump just decides
-                        // what to do with each cycle's result.
-                        auto result = dispatcher.run(echo_descriptor, "fleet_snapshot");
-                        if (result.truncated) {
-                            spdlog::warn("Snapshot pump: capture truncated at {}B; "
-                                         "dropping this cycle's snapshot",
-                                         result.captured.size());
-                        } else if (result.rc == 0 && !result.captured.empty()) {
-                            std::lock_guard lock(snapshot_mu_);
-                            latest_snapshot_ = std::move(result.captured);
-                            latest_snapshot_seq_.fetch_add(1, std::memory_order_acq_rel);
-                        } else if (result.rc != 0) {
-                            spdlog::warn("Snapshot pump: echo.fleet_snapshot rc={}, captured={}B",
-                                         result.rc, result.captured.size());
+                        // This runs on snapshot_pump_thread_ (joined at shutdown); an
+                        // exception escaping a std::thread body calls std::terminate, so a
+                        // cycle's failure (the Echo plugin's process enumeration reads /proc,
+                        // which can throw when a process exits mid-read) is caught here and
+                        // logged. A failed cycle costs one snapshot; the pump goes on.
+                        try {
+                            // #1001 / arch-S3 — local-dispatch concerns
+                            // (capture buffer, byte cap, truncation sentinel)
+                            // live in LocalDispatcher. The pump just decides
+                            // what to do with each cycle's result.
+                            auto result = dispatcher.run(echo_descriptor, "fleet_snapshot");
+                            if (result.truncated) {
+                                spdlog::warn("Snapshot pump: capture truncated at {}B; "
+                                             "dropping this cycle's snapshot",
+                                             result.captured.size());
+                            } else if (result.rc == 0 && !result.captured.empty()) {
+                                std::lock_guard lock(snapshot_mu_);
+                                latest_snapshot_ = std::move(result.captured);
+                                latest_snapshot_seq_.fetch_add(1, std::memory_order_acq_rel);
+                            } else if (result.rc != 0) {
+                                spdlog::warn(
+                                    "Snapshot pump: echo.fleet_snapshot rc={}, captured={}B",
+                                    result.rc, result.captured.size());
+                            }
+                        } catch (const std::exception& e) {
+                            spdlog::warn("Snapshot pump: cycle aborted by an exception: {}",
+                                         e.what());
+                        } catch (...) {
+                            spdlog::warn("Snapshot pump: cycle aborted by an unknown exception");
                         }
                         sleep_for(kInterval);
                     }
@@ -2638,6 +2667,12 @@ public:
                             // which is not separately detectable. "replays" counts
                             // served terminal replays.
                             tags["yuzu.dedup_degraded"] = command_dedup_ ? "0" : "1";
+                            // #3665: >0 when THIS process start recovered from a corrupt
+                            // command_dedup.db (history before the boot was lost). Without
+                            // this tag the recovery would be visible only in the endpoint's
+                            // own log, since the agent has no /metrics endpoint.
+                            tags["yuzu.dedup_quarantined"] = std::to_string(static_cast<int64_t>(
+                                metrics_.counter("yuzu_agent_dedup_quarantined_total").value()));
                             tags["yuzu.dedup_replays"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_dedup_replays_total").value()));
                             tags["yuzu.dedup_claim_errors"] = std::to_string(static_cast<int64_t>(
@@ -3359,42 +3394,51 @@ public:
                     // bypasses the claim: gating on the literal (not the whole
                     // reserved-name set) keeps durable idempotency the SAFE DEFAULT
                     // for any future reserved-name command — a future __update__ OTA
-                    // path is deduplicated unless it, too, opts out here.
+                    // path is deduplicated unless it, too, opts out in should_claim().
+                    // The decision itself (which commands are claimed; replay / RUNNING /
+                    // proceed after the claim) lives in command_dedup_decision.hpp — pure
+                    // and unit-tested (tests/unit/test_command_dedup_decision.cpp, #3668).
+                    // Everything with a side effect stays here.
                     if (cmd.command_id().empty()) {
                         spdlog::warn("Received command with empty command_id — replay "
                                      "protection cannot apply");
-                    } else if (command_dedup_ && cmd.plugin() != "__guard__") {
+                    } else if (should_claim(command_dedup_ != nullptr, cmd.command_id(),
+                                            cmd.plugin())) {
                         auto claim = command_dedup_->claim(cmd.command_id());
+                        // Parse the stored outcome only for a terminal duplicate; the
+                        // decision takes the bool so it stays proto-free.
+                        pb::CommandResponse stored;
+                        const bool stored_parses =
+                            claim.status == ClaimStatus::Duplicate &&
+                            claim.state == DedupState::Terminal &&
+                            stored.ParseFromString(claim.response);
+                        const auto decision =
+                            decide_after_claim(claim.status, claim.state, stored_parses);
                         // Own the in-flight record ONLY when WE claimed it — a
                         // fall-through on Error (fail-open) must NOT later release a
                         // row a concurrent first delivery owns.
-                        claimed_here = (claim.status == ClaimStatus::Claimed);
-                        if (claim.status == ClaimStatus::Error)
+                        claimed_here = decision.owns_claim;
+                        if (decision.count_claim_error)
                             metrics_.counter("yuzu_agent_dedup_claim_errors_total").increment();
-                        if (claim.status == ClaimStatus::Duplicate) {
+                        if (decision.action != DedupAction::Proceed) {
                             pb::CommandResponse dup_resp;
-                            bool replayed = false;
-                            if (claim.state == DedupState::Terminal) {
-                                pb::CommandResponse stored;
-                                if (stored.ParseFromString(claim.response)) {
-                                    dup_resp = std::move(stored);
-                                    auto now_ms =
-                                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                                            std::chrono::system_clock::now().time_since_epoch())
-                                            .count();
-                                    dup_resp.mutable_sent_at()->set_millis_epoch(now_ms);
-                                    replayed = true;
-                                    metrics_.counter("yuzu_agent_dedup_replays_total").increment();
-                                    spdlog::info("Replay of command {} — returning stored "
-                                                 "terminal outcome",
-                                                 cmd.command_id());
-                                } else {
+                            if (decision.action == DedupAction::ReplayStored) {
+                                dup_resp = std::move(stored);
+                                auto now_ms =
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count();
+                                dup_resp.mutable_sent_at()->set_millis_epoch(now_ms);
+                                metrics_.counter("yuzu_agent_dedup_replays_total").increment();
+                                spdlog::info("Replay of command {} — returning stored "
+                                             "terminal outcome",
+                                             cmd.command_id());
+                            } else {
+                                if (claim.status == ClaimStatus::Duplicate &&
+                                    claim.state == DedupState::Terminal)
                                     spdlog::error("Stored terminal outcome for {} failed to "
                                                   "parse — answering RUNNING",
                                                   cmd.command_id());
-                                }
-                            }
-                            if (!replayed) {
                                 dup_resp.set_command_id(cmd.command_id());
                                 dup_resp.set_status(pb::CommandResponse::RUNNING);
                                 // Plain progress text — NOT a parsed sentinel (no
@@ -3432,7 +3476,7 @@ public:
                     // load-time check in plugin_loader.cpp also rejects reserved
                     // names, but defence-in-depth keeps both halves explicit).
                     // See docs/yuzu-guardian-design-v1.1.md §7.2.
-                    if (cmd.plugin() == "__guard__") {
+                    if (cmd.plugin() == kDedupBypassPlugin) {
                         pb::CommandResponse resp;
                         resp.set_command_id(cmd.command_id());
                         auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
