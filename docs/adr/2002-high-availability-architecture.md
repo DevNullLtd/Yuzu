@@ -465,20 +465,16 @@ cluster unit; intra-zone scale is more nodes.
   addresses behind the name change a quarantined agent can reach no node and cannot be released remotely.
   The resolver does not parse a list or a scheme, so any list syntax must carry a test that the
   allow-list is not empty.
-- **Reconnect timing (13.1, done).** After a lost stream each retry waits a random whole number of seconds
-  in [ladder/2, 3*ladder/2] (`ladder` = 2^n, n capped at 8; first retry 1 to 3 s; 128 to 300 s from the eighth
-  retry; never below 1 s or above 300 s). The mean delay equals the old ladder up to the 128 s step only; at
-  the top step it is about 214 s against the old fixed 256 s, and the window is not symmetric. The first
-  retry lands in three one-second buckets, so the agents of a failed node return in flatter bursts, not
-  without bursts. A restarted agent has no wait, and the heartbeat-driven re-registration cooldown
-  (#1894) is unchanged. **Deviation from an owner decision, recorded here and not resolved:** #5990
-  (owner decision 2026-10-17) specifies decorrelated jitter, `min(cap, random_between(base, previous*3))`
-  with a reset after a successful Register, and a 10,000-agent simulation test. 13.1 is a stateless window
-  with no previous-delay state, so the "never more than 3x the previous delay" acceptance item and the
-  previous-delay state are not met by construction. The reset after a successful Register holds
-  (`reconnect_count` returns to 0), and the 10,000-agent simulation exists as the "simulated fleet" case in
-  `tests/unit/test_reconnect_backoff.cpp`. #5990 stays open until the project lead rules whether this
-  shape satisfies, amends or replaces it.
+- **Reconnect timing (13.1, done; implements #5990).** After a lost stream each retry waits a random whole number of
+  seconds in [1, 3 x the previous delay], at most 300 s (decorrelated jitter, owner decision 2026-10-17), and the previous
+  delay returns to 1 s after a successful Register. The first retry is 1 to 3 s, so the agents of a failed node return
+  in three one-second buckets at first, not without bursts, and spread wider with each retry (a 10,000-agent
+  simulation in `tests/unit/test_reconnect_backoff.cpp` bounds the share in any one second per round). **Cost, simulated
+  and pinned by a test:** in a sustained outage an agent retries about twice as often as the old fixed ladder did (about
+  28 attempts in 30 minutes against 13; a steady-state mean delay of about 135 s against 256 s), because a typical
+  agent's delay grows far more slowly than the mean does. The enrolled-but-no-certificate retry keeps growing its delay
+  across its Register calls. A restarted agent has no wait, and the heartbeat-driven re-registration cooldown (#1894) is
+  unchanged.
 - **Known gap, unconfirmed.** A gateway node that is up but has lost its server still acknowledges proxied
   heartbeats from node-local state (`yuzu_gw_agent_service:heartbeat/2`; an unknown session gets `NOT_FOUND`),
   and the agent re-registers only on `NOT_FOUND` or `UNAUTHENTICATED`, so the agent sees success, gets no

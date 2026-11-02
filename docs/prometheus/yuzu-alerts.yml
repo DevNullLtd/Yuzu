@@ -453,8 +453,9 @@ groups:
       # Threshold: increase() >= 10 over 10m, i.e. about ten increases. One
       # request that fails to encode, or one oversized daily-sync batch, counts
       # once and must not warn; a systematic encoder fault (every Register failing)
-      # reaches 10 on a gateway fronting about 4 or more agents (one agent
-      # retries about 3 times per 10m at its steady 128 to 300 s backoff). A small
+      # reaches 10 on a gateway fronting about 3 or more agents (one agent
+      # retries about 4 times per 10m at its steady backoff, a mean wait of about
+      # 135 s under the agent's decorrelated jitter). A small
       # gateway, or a low-rate RPC (inventory, notify_stream, guardian: the
       # series is per rpc_name, there is no sum), can fault without reaching it:
       # for those use the log line "Upstream RPC ... raised" and

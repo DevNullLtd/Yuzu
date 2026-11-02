@@ -1723,10 +1723,15 @@ public:
 
         // 3. Register with server — with reconnect loop
         int reconnect_count = 0;
-        // Reconnect delays are jittered (reconnect_backoff.hpp, HA WS-13): a node loss drops
-        // a whole share of the fleet at one instant, and a fixed ladder would bring them all
-        // back in lock step. Main-thread only, so no lock; seeded from several OS words so two
-        // agents started from one cloned image do not share a sequence.
+        // Reconnect delays use decorrelated jitter (reconnect_backoff.hpp, #5990, HA WS-13):
+        // a node loss drops a whole share of the fleet at one instant, and a fixed ladder
+        // would bring them all back in lock step. `reconnect_count` still decides WHETHER to
+        // wait; `reconnect_backoff` decides HOW LONG, from its own previous delay. It is reset
+        // only once registration has fully succeeded (below), so the enrolled-but-no-cert
+        // retry keeps growing its delay across its Register calls. Main-thread only, so no
+        // lock; the engine is seeded from several OS words so two agents started from one
+        // cloned image do not share a sequence.
+        yuzu::agent::ReconnectBackoff reconnect_backoff;
         std::mt19937 reconnect_rng{[] {
             // std::random_device THROWS when no entropy source can be opened, and run() has no
             // handler on this path (main.cpp calls it bare), so a throw here would be a
@@ -1795,11 +1800,10 @@ public:
 
         while (!stop_requested_.load(std::memory_order_acquire)) {
             if (reconnect_count > 0) {
-                // Exponential backoff, jittered: centred on 2^n seconds, never above 5 minutes.
-                const int delay = yuzu::agent::reconnect_delay_secs(
-                    reconnect_count, [&reconnect_rng](int lo, int hi) {
-                        return std::uniform_int_distribution<int>{lo, hi}(reconnect_rng);
-                    });
+                // Decorrelated jitter: random in [1 s, 3 x the previous delay], at most 5 min.
+                const int delay = reconnect_backoff.next([&reconnect_rng](int lo, int hi) {
+                    return std::uniform_int_distribution<int>{lo, hi}(reconnect_rng);
+                });
                 spdlog::info("Reconnecting in {}s (attempt #{})", delay, reconnect_count);
                 plugin_ctx_.config["agent.reconnect_count"] = std::to_string(reconnect_count);
                 for (int i = 0; i < delay && !stop_requested_.load(std::memory_order_acquire); ++i)
@@ -2099,6 +2103,10 @@ public:
                 }
 
                 session_id_ = resp.session_id();
+                // Registration has fully succeeded (the enrolled-but-no-cert retry above
+                // `continue`s before here, so its delays keep growing): the next failure
+                // starts again from the base delay.
+                reconnect_backoff.reset();
                 auto connected_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                               std::chrono::system_clock::now().time_since_epoch())
                                               .count();

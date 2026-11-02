@@ -418,11 +418,13 @@ from those two settings, not an observed figure. Plan for these requirements:
   subject alternative name. `--cert-san` adds names to the server's auto-generated default
   certificates only; certificates you supply yourself must carry the name already.
 - **Reconnect timing.** After a lost `Subscribe` stream each retry waits a random whole
-  number of seconds from a window around 2, 4, 8 ... seconds: the first retry 1 to 3 s, the
-  second 2 to 6 s, up to 64 to 192 s, then 128 to 300 s from the eighth retry on (never less
-  than 1 s, never more than 300 s). The first retry therefore lands in only three one-second
-  steps, about a third of a failed node's agents in each, and later retries spread wider, so
-  the agents of a failed node return in flatter bursts rather than all at once. The 300 s is
+  number of seconds between 1 s and three times the agent's previous wait, at most 300 s
+  (decorrelated jitter, #5990); the wait returns to the start after a successful `Register`.
+  The first retry is 1 to 3 s, so about a third of a failed node's agents land in each of
+  three one-second steps; later retries spread wider, so the agents of a failed node return
+  in flatter bursts rather than all at once. In a long outage an agent retries about twice
+  as often as it did with the old fixed 2, 4, 8 ... 256 s waits (a mean wait of about 135 s
+  once settled, against 256 s), which is simulated, not measured on a fleet. The 300 s is
   the wait only; one attempt can then take up to 30 s (the Register deadline). A restarted
   agent connects at once with no wait, and the heartbeat-driven re-registration cooldown is
   unchanged and not randomised. Survivors absorb the returning share at the registration

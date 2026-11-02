@@ -1,41 +1,43 @@
 #pragma once
 
 /**
- * reconnect_backoff.hpp -- the agent's reconnect delay, as a pure function.
+ * reconnect_backoff.hpp -- the agent's reconnect delay, as a pure function of its
+ * own previous delay.
  *
- * No I/O, no clock, no platform dependency. The random source is INJECTED, so
- * the schedule is unit-testable without waiting or seeding anything.
+ * No I/O, no clock, no platform dependency. The random source is INJECTED, so the
+ * schedule is unit-testable without waiting or seeding anything.
  *
- * Why this is jittered (HA WS-13, #291): when a gateway node dies, every agent it
- * held loses its Subscribe stream in the same instant. A deterministic 2, 4, 8 ...
- * ladder sends all of them back at exactly the same moments, so the surviving nodes
- * (and the server behind them) take the failed node's whole share (about 1/N of the
- * fleet) as synchronised waves. Spreading each delay over a window flattens the waves.
+ * Decorrelated jitter (owner decision on #5990, 2026-10-17; Marc Brooker, "Exponential
+ * Backoff And Jitter", AWS Architecture Blog, 2015):
  *
- * The window is centred on the old ladder value up to the 128 s step, so the MEAN delay
- * is unchanged there:
+ *     delay = min( cap , random_between( base , previous_delay * 3 ) )
  *
- *     ladder(n) = min(2^n, 256)               n = reconnect_count, capped at 8
- *     delay(n)  = uniform[ ladder/2 , ladder * 3/2 ], at least 1 s, at most 300 s
+ * with base 1 s, cap 300 s, and previous_delay set back to base after a successful
+ * Register. The first retry is therefore 1 to 3 s.
  *
- * That makes the first retry 1 to 3 s (was exactly 2 s), the second 2 to 6 s, and so
- * on. The delay is never below 1 s, so a misbehaving random source cannot make the
- * reconnect loop spin. At the top step (n >= 8) the 300 s ceiling truncates the window to
- * 128 to 300 s: its mean is 214 s where the old ladder held a fixed 256 s, so the
- * average is NOT unchanged there and the window is not symmetric.
+ * Why this exists (HA WS-13, #291, #5990): the delay used to be a fixed 2, 4, 8 ... 256 s
+ * ladder, so every agent that lost the same gateway node or server came back at the same
+ * instants, wave after wave. Each delay now depends on the agent's OWN previous delay
+ * and a random draw, not on the retry number, so agents that start together drift apart.
  *
- * Delays are whole seconds, so the first retry lands in three one-second buckets (about
- * a third of the agents that lost a stream together in each). Later retries spread wider.
- * Only a lost-stream retry is covered: a process restart starts again at count 0 with
- * no wait.
+ * Behaviour a reader should know:
+ *   - The FIRST retry is whole seconds in 1..3, so a cohort that lost a stream together
+ *     still lands in three one-second buckets (about a third each). The spread widens with
+ *     every retry; this scheme does not remove the first wave, it breaks it into three.
+ *   - The delay is never below base (1 s), so a misbehaving random source cannot make the
+ *     reconnect loop spin, and never above cap (300 s) nor three times the previous delay.
+ *   - The MEAN delay grows about 1.5x per retry (the old ladder doubled), but a typical
+ *     single agent's delay grows much more slowly, so in a long outage an agent retries
+ *     about twice as often as the old ladder did. Simulated, 30 minutes down: a mean of
+ *     about 28 attempts against 13 for the old ladder, and a steady-state mean delay of
+ *     about 135 s against 256 s. That is the cost of the faster recovery and the
+ *     better spread; it is the owner's choice on #5990.
+ *   - When previous_delay * 3 exceeds the cap, a draw above the cap becomes the cap
+ *     itself, so the cap carries extra probability mass (this is the formula as decided).
  *
- * Note for readers of the old code: its `kMaxReconnectDelaySecs = 300` never bound,
- * because `1 << 8` is 256 and the exponent was capped at 8. 300 s is now the real
- * upper bound of the jittered window.
- *
- * NOT covered here, deliberately: the heartbeat-driven forced re-registration
- * cooldown (`forced_rereg_streak_`, #1894). It is a separate damper keyed on
- * NOT_FOUND / UNAUTHENTICATED heartbeats and is unchanged.
+ * NOT covered here, deliberately: the heartbeat-driven forced re-registration cooldown
+ * (`forced_rereg_streak_`, #1894). It is a separate damper keyed on NOT_FOUND /
+ * UNAUTHENTICATED heartbeats and is unchanged.
  */
 
 #include <algorithm>
@@ -44,37 +46,42 @@
 
 namespace yuzu::agent {
 
+/// Smallest reconnect delay and the value `previous_delay` returns to after a success.
+inline constexpr int kReconnectBaseSecs = 1;
+
 /// Upper bound of a single reconnect delay, in seconds.
 inline constexpr int kMaxReconnectDelaySecs = 300;
 
-/// The exponent cap of the ladder (2^8 = 256 s).
-inline constexpr int kReconnectLadderMaxExponent = 8;
+/// A delay is drawn from [base, previous_delay * this].
+inline constexpr int kReconnectGrowthFactor = 3;
 
-/// The un-jittered ladder: 2^n seconds, n capped at kReconnectLadderMaxExponent.
-/// Returns 0 for `reconnect_count <= 0` (the first connection attempt does not wait).
-constexpr int reconnect_ladder_secs(int reconnect_count) noexcept {
-    if (reconnect_count <= 0)
-        return 0;
-    const int n = std::min(reconnect_count, kReconnectLadderMaxExponent);
-    return std::min(1 << n, kMaxReconnectDelaySecs);
-}
+/// Decorrelated-jitter reconnect delay. Owns the one piece of state the scheme needs: the
+/// previous delay. Single-threaded by design (the agent's reconnect loop is on one thread).
+class ReconnectBackoff {
+public:
+    /// The delay most recently returned by next(), or the base after reset().
+    constexpr int previous() const noexcept { return previous_; }
 
-/// The jittered delay to wait before reconnect attempt `reconnect_count`, in seconds.
-///
-/// `uniform_in(lo, hi)` must return an integer in [lo, hi] (inclusive). Whatever it
-/// returns is clamped back into the window, so a faulty source can neither stall the
-/// agent beyond the window nor spin the loop.
-///
-/// Returns 0 for `reconnect_count <= 0`.
-template <class UniformIn>
-int reconnect_delay_secs(int reconnect_count, UniformIn&& uniform_in) {
-    const int ladder = reconnect_ladder_secs(reconnect_count);
-    if (ladder == 0)
-        return 0;
-    const int lo = std::max(1, ladder / 2);
-    const int hi = std::min(ladder + ladder / 2, kMaxReconnectDelaySecs);
-    return std::clamp(static_cast<int>(uniform_in(lo, hi)), lo, hi);
-}
+    /// Registration succeeded: the next failure starts again from the base.
+    constexpr void reset() noexcept { previous_ = kReconnectBaseSecs; }
+
+    /// The delay to wait before the next attempt, in seconds, and the new `previous_delay`.
+    ///
+    /// `uniform_in(lo, hi)` must return an integer in [lo, hi] (inclusive). Whatever it
+    /// returns is clamped back into that window, so a faulty source can neither spin the
+    /// loop (below base) nor exceed three times the previous delay.
+    template <class UniformIn>
+    int next(UniformIn&& uniform_in) {
+        const int hi = previous_ * kReconnectGrowthFactor;
+        const int pick = std::clamp(static_cast<int>(uniform_in(kReconnectBaseSecs, hi)),
+                                    kReconnectBaseSecs, hi);
+        previous_ = std::min(pick, kMaxReconnectDelaySecs);
+        return previous_;
+    }
+
+private:
+    int previous_ = kReconnectBaseSecs;
+};
 
 /// Words that seed the agent's reconnect random engine, and whether they are the degraded
 /// kind.

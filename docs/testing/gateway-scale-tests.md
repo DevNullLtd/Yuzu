@@ -56,7 +56,7 @@ version, description and actions, about 9 KB encoded), then a `Subscribe`
 stream held open, and a `Heartbeat` every 30 s. It answers every command with
 `SUCCESS`. After a failed `Register`, a lost connection or an ended stream it
 waits 2, 4, 8 ... seconds (capped at 300 s, no jitter) before trying again. The real
-agent (`agents/core/src/agent.cpp`) now randomises each delay (HA WS-13, #291), so this
+agent (`agents/core/src/agent.cpp`) now uses decorrelated jitter (#5990, HA WS-13), so this
 simulator models a harsher, in-step fleet than production.
 
 The management client is shaped like the server's: one connection, one
