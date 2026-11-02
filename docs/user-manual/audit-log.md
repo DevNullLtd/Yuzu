@@ -684,8 +684,9 @@ by the `?campaign=<id>` link) and reading the current grants are deliberate requ
 refused caller writes the ordinary permission-denied row for each. A refused API or MCP token
 writes one on every fragment, and an engine-class session is refused on all three with an
 `access_review.*` row, `result=denied`, `detail=engine_session_denied`. Settings keeps an older
-Access Reviews panel; viewing it writes no `access_review.*` row, so use this page when the
-reading itself must be on the record.
+Access Reviews panel; a person's successful view of it writes no `access_review.*` row (a
+refused engine session does: `result=denied`, `detail=engine_session_denied`), so use this page
+when the reading itself must be on the record.
 
 Not available yet on this page: a campaign due date (campaigns have no due-date field) and a
 button that exports a campaign's decisions (the **Export decisions** button is disabled). A
