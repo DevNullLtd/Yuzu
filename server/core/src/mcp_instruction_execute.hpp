@@ -30,17 +30,19 @@
 /// action) pair is gated by the ExecuteGate and who is not an administrator is refused there
 /// (`approval_required`, permanent, no retry hint), before any tier ticket exists.
 ///
-/// NO TICKET PROVENANCE (sec-F1, architect ruling). The C8 tier ticket binds the call's
-/// ARGUMENTS (definition_id, params, targets). The (plugin, action) pair it would run comes from
-/// the STORED definition, which `update_definition` edits in place, so between approval and
-/// recall an editor can repoint the definition at a pair carrying `AdminOrApproval` /
-/// `AlwaysApproval`. Stamping `Ticket` would then lift that gate on an approval that was granted
-/// for a different action. This tool therefore never stamps it: the pair's own ExecuteGate
-/// decides, evaluated at the recall against the pair that will actually dispatch. Cost, accepted
-/// by the owner: a supervised token cannot use a ticket to run a definition whose pair is gated;
-/// it gets an `approval_required` refusal (permission denied, no retry hint), and only an
-/// administrator caller (a ROLE fact, `principal_is_admin`: the token carries its creator's
-/// role) still reaches a gated pair or a `role-gated` definition.
+/// NO TICKET PROVENANCE (sec-F1, architect ruling). The (plugin, action) pair this tool runs
+/// comes from the STORED definition, which `update_definition` edits in place. Since L1 the C8
+/// tier ticket binds that resolved effect (`effect_binding`) as well as the call's arguments
+/// (definition_id, params, targets), so a repoint after approval is refused at the ticket match
+/// and again in the core's own fresh lookup. The `Ticket` stamp is nonetheless withheld, as a
+/// POLICY line (dispatch_caller.hpp): the stamping tools take their pair from the call's own
+/// arguments or a fixed pair, whereas this tool resolves it from a store, and an approval of an
+/// indirectly resolved effect is not taken to lift the pair's own ExecuteGate. The pair's own
+/// ExecuteGate decides, evaluated at the recall against the pair that will actually dispatch.
+/// Cost, accepted by the owner: a supervised token cannot use a ticket to run a definition whose
+/// pair is gated; it gets an `approval_required` refusal (permission denied, no retry hint), and
+/// only an administrator caller (a ROLE fact, `principal_is_admin`: the token carries its
+/// creator's role) still reaches a gated pair or a `role-gated` definition.
 ///
 /// `pending_approval` is a SUCCESS result, not `-32006`: that code's contract is a ticket the
 /// caller may redeem by re-calling with `approval_id`, and this ticket is minted with
