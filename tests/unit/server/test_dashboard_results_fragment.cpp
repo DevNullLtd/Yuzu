@@ -1126,7 +1126,8 @@ TEST_CASE("/fragments/results: Forensics rows follow the caller's Forensics visi
         CHECK(contains(res->body, "TOKEN-FORENSICS-B"));
         CHECK(contains(res->body, "TOKEN-ORDINARY-A"));
         CHECK(contains(res->body, "TOKEN-ORDINARY-C"));
-        CHECK(contains(res->body, "4 agents"));
+        // Four rows, three distinct agents: the summary counts agents, not stored frames.
+        CHECK(contains(res->body, "3 agents"));
     }
     SECTION("a per-agent subset is unsupported and sees no Forensics row, named agent or not") {
         h.forensics.unsupported_subset({"agent-b"});
