@@ -45918,7 +45918,7 @@ TEST_CASE("MCP execute_instruction_definition: an approved tier ticket cannot la
 // before the ticket is consumed, and the dispatch stage holds its own fresh lookup to it.
 TEST_CASE("MCP execute_instruction_definition: an approved tier ticket cannot run a DIFFERENT ungated "
           "pair the definition was repointed at; the ticket is unspent and repointing back restores it",
-          "[pg][mcp][integration][execute][idef][approval][security][l1]") {
+          "[pg][mcp][integration][execute][idef][approval][security][c8_effect]") {
     yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
     McpTestServer ts;
@@ -45950,6 +45950,8 @@ TEST_CASE("MCP execute_instruction_definition: an approved tier ticket cannot ru
     REQUIRE(sb.contains("error")); // a refusal, not a success
     CHECK(sb["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
     CHECK(sb["error"]["message"].get<std::string>().find("definition changed") != std::string::npos);
+    CHECK(sb["error"]["data"]["reason"] == "definition_changed");
+    CHECK(sb["error"]["data"]["retry_after_ms"].is_null());
     CHECK(rig.calls.empty()); // NOTHING reached the dispatch port: the exact send set is empty
     CHECK(rig.rows.empty());  // and no execution row exists
     auto row = appr.get(ticket);
@@ -45973,7 +45975,7 @@ TEST_CASE("MCP execute_instruction_definition: an approved tier ticket cannot ru
 
 TEST_CASE("MCP execute_instruction_definition: a ticket whose arguments match but whose stored "
           "definition was repointed gets a different ticket (the dedup key carries the effect)",
-          "[pg][mcp][integration][execute][idef][approval][security][l1]") {
+          "[pg][mcp][integration][execute][idef][approval][security][c8_effect]") {
     yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
     McpTestServer ts;
@@ -46003,7 +46005,7 @@ TEST_CASE("MCP execute_instruction_definition: a ticket whose arguments match bu
 
 TEST_CASE("MCP execute_instruction_definition: a definition repointed AFTER the recall's probe but "
           "before the dispatch stage's own lookup runs nothing",
-          "[pg][mcp][integration][execute][idef][approval][security][l1]") {
+          "[pg][mcp][integration][execute][idef][approval][security][c8_effect]") {
     yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
     McpTestServer ts;
@@ -46036,9 +46038,180 @@ TEST_CASE("MCP execute_instruction_definition: a definition repointed AFTER the 
     CHECK(row->consumed_at != 0);
 }
 
+/// The detail text of every `denied` mcp.execute_instruction_definition row.
+static std::vector<std::string> idef_denied_details(const McpTestServer& ts) {
+    std::vector<std::string> out;
+    for (std::size_t i = 0; i < ts.audit_log.size() && i < ts.audit_details.size(); ++i)
+        if (ts.audit_log[i] == "mcp.execute_instruction_definition|denied")
+            out.push_back(ts.audit_details[i]);
+    return out;
+}
+
+// unhappy p9-1 / security p9-1: the distinct "definition changed ... (ticket not consumed)" answer
+// and its audit note are TRUE only for an UNSPENT ticket (pending, or approved with consumed_at
+// 0). A ticket already consumed, rejected or expired must NOT be described as "not consumed": it
+// falls through to the ordinary mismatch answer, whose audit row says so truthfully.
+TEST_CASE("MCP execute_instruction_definition: the definition-changed answer and its audit note "
+          "belong only to an UNSPENT ticket; a spent, rejected or expired one is a mismatch",
+          "[pg][mcp][integration][execute][idef][approval][security][c8_effect]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "auto");
+    idef_start(ts, rig, "supervised", /*admin=*/false);
+    auto first = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(first);
+    const std::string ticket = nlohmann::json::parse(first->body)["error"]["data"]["approval_id"];
+
+    const auto recall_moved = [&](int id) {
+        rig.defs["d"].action = "scrub"; // the editor repoints the stored definition
+        auto r = ts.call(idef_call({{"definition_id", "d"}, {"approval_id", ticket}}, id));
+        REQUIRE(r);
+        return nlohmann::json::parse(r->body);
+    };
+    const auto says_not_consumed = [&] {
+        for (const auto& d : idef_denied_details(ts))
+            if (d.find("not consumed") != std::string::npos)
+                return true;
+        return false;
+    };
+    const auto expect_ordinary_mismatch = [&](const nlohmann::json& b) {
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        const auto msg = b["error"]["message"].get<std::string>();
+        CHECK(msg.find("does not match") != std::string::npos);
+        CHECK(msg.find("definition changed") == std::string::npos);
+        CHECK_FALSE(says_not_consumed()); // the audit row must not claim an unspent ticket
+    };
+
+    SECTION("pending (not yet approved) with a moved effect: the distinct, truthful answer") {
+        const auto b = recall_moved(2);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["message"].get<std::string>().find("definition changed") !=
+              std::string::npos);
+        CHECK(b["error"]["data"]["reason"] == "definition_changed");
+        CHECK(b["error"]["data"]["retry_after_ms"].is_null());
+        // The audit row carries the machine token and the SAME correlation id as the body.
+        const auto details = idef_denied_details(ts);
+        REQUIRE(!details.empty());
+        const auto& d = details.back();
+        CHECK(d.find("reason=definition_changed") != std::string::npos);
+        CHECK(d.find("(ticket not consumed)") != std::string::npos);
+        CHECK(d.ends_with(" correlation_id=" +
+                          b["error"]["data"]["correlation_id"].get<std::string>()));
+        CHECK(appr.get(ticket)->consumed_at == 0);
+    }
+
+    SECTION("approved and unspent with a moved effect: still says so, and still unspent") {
+        REQUIRE(appr.approve(ticket, "admin", "ok").has_value());
+        const auto b = recall_moved(2);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["data"]["reason"] == "definition_changed");
+        CHECK(says_not_consumed());
+        CHECK(appr.get(ticket)->consumed_at == 0);
+        CHECK(rig.calls.empty());
+    }
+
+    SECTION("consumed (a replay) with a moved effect: ordinary mismatch, never 'not consumed'") {
+        REQUIRE(appr.approve(ticket, "admin", "ok").has_value());
+        auto ran = ts.call(idef_call({{"definition_id", "d"}, {"approval_id", ticket}}, 2));
+        REQUIRE(ran);
+        CHECK(idef_payload(*ran)["agents_reached"] == 1);
+        REQUIRE(appr.get(ticket)->consumed_at != 0);
+        const std::size_t sent_before = rig.calls.size();
+        expect_ordinary_mismatch(recall_moved(3));
+        CHECK(rig.calls.size() == sent_before); // the replay dispatched nothing
+    }
+
+    SECTION("rejected with a moved effect: ordinary mismatch, never 'not consumed'") {
+        REQUIRE(appr.reject(ticket, "admin", "no").has_value());
+        expect_ordinary_mismatch(recall_moved(2));
+        CHECK(rig.calls.empty());
+    }
+
+    SECTION("expired with a moved effect: ordinary mismatch, never 'not consumed'") {
+        REQUIRE(appr.approve(ticket, "admin", "ok").has_value());
+        {
+            auto lease = appr_bundle.pool().acquire();
+            REQUIRE(lease);
+            auto res = yuzu::server::pg::exec_params(
+                lease.get(),
+                "UPDATE approval_manager.approvals SET status = 'expired' WHERE id = $1",
+                std::vector<std::string>{ticket});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+        }
+        expect_ordinary_mismatch(recall_moved(2));
+        CHECK(rig.calls.empty());
+    }
+}
+
+// unhappy p9-4: the distinct answer is shown only to the principal who REQUESTED the ticket. A
+// ticket submitted by someone else whose subject differs only by effect gets the generic answer.
+TEST_CASE("MCP execute_instruction_definition: a moved-effect ticket from ANOTHER principal "
+          "gets the generic mismatch, not the distinct definition-changed answer",
+          "[pg][mcp][integration][execute][idef][approval][security][c8_effect]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "auto");
+    idef_start(ts, rig, "supervised", /*admin=*/false);
+    // A ticket for the same tool and arguments, bound to a different effect, requested by
+    // "other-user" (the session principal is "test-user").
+    const std::string subject = "effect=[\"testplug\",\"scrub\",\"auto\",\"per-device\"]\n" +
+                                nlohmann::json{{"definition_id", "d"}}.dump();
+    auto other = appr.submit_typed("mcp.execute_instruction_definition", "other-user", subject, "",
+                                   yuzu::server::ApprovalOrigin::kMcp);
+    REQUIRE(other);
+    REQUIRE(appr.approve(*other, "admin", "ok").has_value());
+    auto res = ts.call(idef_call({{"definition_id", "d"}, {"approval_id", *other}}));
+    REQUIRE(res);
+    const auto b = nlohmann::json::parse(res->body);
+    REQUIRE(b.contains("error"));
+    CHECK(b["error"]["message"].get<std::string>().find("does not match") != std::string::npos);
+    CHECK(b["error"]["message"].get<std::string>().find("definition changed") == std::string::npos);
+    CHECK_FALSE(b["error"]["data"].contains("reason")); // no oracle about another's ticket
+    CHECK(rig.calls.empty());
+    CHECK(appr.get(*other)->consumed_at == 0);
+}
+
+// unhappy/quality t5: the core's definition_changed refusal precedes the authorizer. A repoint
+// landing between the recall's probe and the dispatch stage's own lookup, onto a pair the caller
+// may NOT run, must still answer definition_changed (not the gate's approval_required).
+TEST_CASE("MCP execute_instruction_definition: a late repoint onto a GATED pair answers "
+          "definition_changed, not the pair gate's approval_required",
+          "[pg][mcp][integration][execute][idef][approval][security][c8_effect]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "auto");
+    idef_start(ts, rig, "supervised", /*admin=*/false);
+    auto first = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(first);
+    const std::string ticket = nlohmann::json::parse(first->body)["error"]["data"]["approval_id"];
+    REQUIRE(appr.approve(ticket, "admin", "ok").has_value());
+    rig.on_lookup = [&rig](int nth) {
+        if (nth == 3) // between the recall's probe (2) and the dispatch stage's own read (3)
+            rig.defs["d"].action = "gated";
+    };
+    auto second = ts.call(idef_call({{"definition_id", "d"}, {"approval_id", ticket}}, 2));
+    REQUIRE(second);
+    const auto sb = nlohmann::json::parse(second->body);
+    REQUIRE(sb.contains("error"));
+    CHECK(rig.lookups == 3); // the repoint really was injected before the dispatch stage's read
+    CHECK(sb["error"]["data"]["reason"] == "definition_changed");
+    CHECK(sb["error"]["data"]["reason"] != "approval_required");
+    CHECK(rig.calls.empty());
+}
+
 TEST_CASE("MCP execute_instruction_definition: a ticket minted without the effect binding is refused "
           "as an ordinary mismatch and stays unspent",
-          "[pg][mcp][integration][execute][idef][approval][security][l1]") {
+          "[pg][mcp][integration][execute][idef][approval][security][c8_effect]") {
     yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
     McpTestServer ts;
@@ -46048,7 +46221,7 @@ TEST_CASE("MCP execute_instruction_definition: a ticket minted without the effec
     idef_start(ts, rig, "supervised", /*admin=*/false);
     // A ticket in the former shape: the canonical arguments alone (what a build without the
     // binding minted). Tickets pending at an upgrade are not honoured and must be re-requested.
-    auto legacy = appr.submit_typed("mcp:execute_instruction_definition", "test-user",
+    auto legacy = appr.submit_typed("mcp.execute_instruction_definition", "test-user",
                                     nlohmann::json{{"definition_id", "d"}}.dump(), "",
                                     yuzu::server::ApprovalOrigin::kMcp);
     REQUIRE(legacy);
@@ -46209,6 +46382,8 @@ void check_definition_changed_refusal(const httplib::Response& res) {
     CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
     CHECK(body["error"]["message"].get<std::string>().find("definition changed") !=
           std::string::npos);
+    CHECK(body["error"]["data"]["reason"] == "definition_changed"); // machine-readable
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());       // permanent, not retryable
 }
 
 std::string rs_make_definition(yuzu::server::InstructionStore& instr) {
@@ -46584,4 +46759,314 @@ TEST_CASE("MCP execute_bundle: the recall of an approved ticket KEEPS Ticket pro
     REQUIRE(log.sent.size() == 1);
     CHECK(log.sent[0] == "os_info.uptime");
     CHECK(log.provenance[0] == yuzu::server::ApprovalProvenance::Ticket);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// L1 / C8 effect binding for the definition-resolved result-set producers (pass-9 tests).
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+/// Repoint a stored definition WITHOUT Catch2 assertions: it runs on the MCP server thread inside
+/// a permission hook, where an assertion macro is not safe. Returns whether the update landed.
+bool rs_repoint_unasserted(yuzu::server::InstructionStore& instr, const std::string& id,
+                           const std::string& plugin, const std::string& action) {
+    auto got = instr.get_definition(id);
+    if (!got || !got->has_value())
+        return false;
+    auto def = **got;
+    def.plugin = plugin;
+    def.action = action;
+    def.parameter_schema.clear(); // update_definition: empty KEEPS the stored schema
+    return instr.update_definition(def).has_value();
+}
+
+} // namespace
+
+// quality t1: the producer-side check in rs_run_async. The hook repoints the definition on the
+// handler's OWN Execution:Execute check, which runs after the recall's C8 resolution (so the C8
+// match passes and the ticket is consumed) and before the handler's definition read. The pair
+// gate alone would not catch this: the new pair is never reached, rs_run_async refuses first.
+TEST_CASE("MCP result-set producers: a repoint AFTER the recall's C8 check but before the "
+          "handler's own definition read runs nothing (DEFINITION_CHANGED, ticket spent)",
+          "[pg][mcp][integration][result-sets][approval][security][c8_effect]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+    const std::string iid = rs_make_definition(instr);
+
+    CreateRequest cr;
+    cr.owner_principal = "test-user";
+    cr.name = "seed";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = nlohmann::json{{"instruction_id", iid}}.dump();
+    auto seeded = rs_bundle.get()->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    RsGateLog log; // BEFORE ts: the dispatch lambda ts holds references it
+    McpTestServer ts;
+    ts.approval_manager_for_test = appr_bundle.get();
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    std::atomic<bool> armed{false};
+    std::atomic<int> exec_checks{0};
+    std::atomic<bool> repointed{false};
+    ts.perm_override_for_test = [&](const std::string& sec, const std::string& op) {
+        if (armed && sec == "Execution" && op == "Execute" && ++exec_checks == 2)
+            repointed = rs_repoint_unasserted(instr, iid, "os_info", "uptime");
+        return true;
+    };
+    rs_gate_wire(ts, log, /*admin=*/false);
+
+    const auto run = [&](const std::string& tool, const nlohmann::json& args) {
+        const auto ticket = rs_mint_and_approve(ts, *appr_bundle.get(), tool, args);
+        auto args2 = args;
+        args2["approval_id"] = ticket;
+        armed = true;
+        auto res = ts.call(rs_tool_call(tool, args2, 2));
+        armed = false;
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(exec_checks == 2);  // the hook fired exactly where intended
+        CHECK(repointed == true); // and the repoint landed
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_DEFINITION_CHANGED") !=
+              std::string::npos);
+        CHECK(body["error"]["data"]["reason"] == "definition_changed");
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(log.dispatch_calls == 0);
+        CHECK(log.sent.empty());
+        // The C8 match passed, so the ticket WAS spent: the documented narrow cost.
+        CHECK(appr_bundle.get()->get(ticket)->consumed_at != 0);
+        check_no_execution_rows(*tracker_bundle.get());
+        bool saw_row = false;
+        for (std::size_t i = 0; i < ts.audit_log.size() && i < ts.audit_details.size(); ++i)
+            if (ts.audit_log[i] == "result_set.create|denied" &&
+                ts.audit_details[i].find("reason=definition_changed") != std::string::npos &&
+                ts.audit_details[i].find(" correlation_id=") != std::string::npos)
+                saw_row = true;
+        CHECK(saw_row);
+        std::string next;
+        return rs_bundle.get()->list_by_owner("test-user", "", 100, next).size();
+    };
+
+    SECTION("create_result_set_from_instruction_result") {
+        CHECK(run("create_result_set_from_instruction_result", {{"instruction_id", iid}}) == 1);
+    }
+    SECTION("reevaluate_result_set") {
+        CHECK(run("reevaluate_result_set", {{"id", seeded->id}}) == 1);
+    }
+}
+
+// quality t2: the `unresolved` and echo bindings, and no cross-owner oracle.
+TEST_CASE("MCP result-set producers: ghost instruction binds effect=unresolved; an echo set binds "
+          "echo.sql and its recall runs; another owner's set binds exactly like a missing one",
+          "[pg][mcp][integration][result-sets][approval][security][c8_effect]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+
+    RsGateLog log;
+    McpTestServer ts;
+    ts.approval_manager_for_test = appr_bundle.get();
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    ts.caller_fn_for_test = [](const auth::Session& s) -> yuzu::server::DispatchCaller {
+        yuzu::server::DispatchCaller c;
+        c.principal = s.username;
+        c.principal_role = "operator";
+        c.exec_visible = yuzu::server::authz::VisibleSet{}; // unfiltered
+        return c;
+    };
+    ts.start_with_dispatch(
+        [&log](const std::string& plugin, const std::string& action,
+               const std::vector<std::string>&, const std::string&,
+               const std::unordered_map<std::string, std::string>&, const std::string&,
+               const yuzu::server::DispatchCaller& caller)
+            -> yuzu::server::ConfinedDispatchOutcome {
+            ++log.dispatch_calls;
+            log.sent.push_back(plugin + "." + action);
+            log.provenance.push_back(caller.approval_provenance);
+            return {.sent = 1, .command_id = "cmd-eff"};
+        },
+        "supervised");
+
+    const auto mint_subject = [&](const std::string& tool, const nlohmann::json& args) {
+        auto r = ts.call(rs_tool_call(tool, args, 1));
+        REQUIRE(r);
+        const auto b = nlohmann::json::parse(r->body);
+        REQUIRE(b.contains("error"));
+        REQUIRE(b["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+        const std::string id = b["error"]["data"]["approval_id"];
+        auto row = appr_bundle.get()->get(id);
+        REQUIRE(row);
+        return std::pair{id, row->scope_expression};
+    };
+
+    SECTION("a ghost instruction id binds effect=unresolved; the approved call is then refused by "
+            "the handler and the ticket is spent (the producers do not refuse pre-mint)") {
+        const auto [id, subject] = mint_subject("create_result_set_from_instruction_result",
+                                                {{"instruction_id", "ghost-instruction"}});
+        CHECK(subject.starts_with("effect=unresolved\n"));
+        REQUIRE(appr_bundle.get()->approve(id, "admin", "ok").has_value());
+        auto res = ts.call(rs_tool_call("create_result_set_from_instruction_result",
+                                        {{"instruction_id", "ghost-instruction"},
+                                         {"approval_id", id}},
+                                        2));
+        REQUIRE(res);
+        const auto b = nlohmann::json::parse(res->body);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["message"].get<std::string>().find("INSTRUCTION_NOT_FOUND") !=
+              std::string::npos);
+        CHECK(log.dispatch_calls == 0);
+    }
+
+    SECTION("an echo-sourced re-evaluation binds the fixed echo.sql and its approved recall runs") {
+        CreateRequest cr;
+        cr.owner_principal = "test-user";
+        cr.name = "echo-seed";
+        cr.source_kind = std::string(source_kind::kEchoQuery);
+        cr.source_payload = nlohmann::json{{"sql", "SELECT 1"}}.dump();
+        auto seeded = rs_bundle.get()->create_materialized(cr, {});
+        REQUIRE(seeded.has_value());
+        const auto [id, subject] = mint_subject("reevaluate_result_set", {{"id", seeded->id}});
+        CHECK(subject.starts_with("effect=[\"echo\",\"sql\",\"\",\"\"]\n"));
+        REQUIRE(appr_bundle.get()->approve(id, "admin", "ok").has_value());
+        auto res = ts.call(rs_tool_call("reevaluate_result_set",
+                                        {{"id", seeded->id}, {"approval_id", id}}, 2));
+        REQUIRE(res);
+        REQUIRE(nlohmann::json::parse(res->body).contains("result"));
+        REQUIRE(log.sent.size() == 1);
+        CHECK(log.sent[0] == "echo.sql");
+    }
+
+    SECTION("another owner's set binds exactly like a missing one: no cross-owner oracle") {
+        CreateRequest cr;
+        cr.owner_principal = "someone-else";
+        cr.name = "theirs";
+        cr.source_kind = std::string(source_kind::kInstructionResult);
+        cr.source_payload = nlohmann::json{{"instruction_id", rs_make_definition(instr)}}.dump();
+        auto theirs = rs_bundle.get()->create_materialized(cr, {});
+        REQUIRE(theirs.has_value());
+        const auto [id_theirs, subj_theirs] =
+            mint_subject("reevaluate_result_set", {{"id", theirs->id}});
+        const auto [id_missing, subj_missing] =
+            mint_subject("reevaluate_result_set", {{"id", "rs_does_not_exist"}});
+        CHECK(subj_theirs.starts_with("effect=unresolved\n"));
+        CHECK(subj_missing.starts_with("effect=unresolved\n"));
+        // Neither mint leaks the resolved pair of a set the caller does not own.
+        CHECK(subj_theirs.find("os_info") == std::string::npos);
+    }
+}
+
+// quality t3: the producers' pre-mint Execution:Execute check (the sg-b1 pattern) and the
+// store-fault refusals of the C8 resolution. Nothing is minted on any of them.
+TEST_CASE("MCP result-set producers: a supervised token without Execution:Execute is refused "
+          "before any resolution; an unwired or unreadable store refuses and mints nothing",
+          "[pg][mcp][integration][result-sets][approval][security][c8_effect]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle.get();
+    const nlohmann::json create_args = {{"instruction_id", "some-instruction"}};
+    const nlohmann::json reeval_args = {{"id", "rs_some_set"}};
+
+    const auto refusal = [](const httplib::Response& r) {
+        auto b = nlohmann::json::parse(r.body);
+        REQUIRE(b.contains("error"));
+        return b["error"];
+    };
+
+    SECTION("no Execution:Execute: 403, identical for any input, nothing minted") {
+        RsGateLog log;
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        ts.result_set_store_for_test = rs_bundle.get();
+        ts.perm_override_for_test = [](const std::string& sec, const std::string& op) {
+            return !(sec == "Execution" && op == "Execute");
+        };
+        rs_gate_wire(ts, log, /*admin=*/false);
+        for (const auto& [tool, args] :
+             {std::pair<std::string, nlohmann::json>{"create_result_set_from_instruction_result",
+                                                     create_args},
+              {"reevaluate_result_set", reeval_args}}) {
+            INFO(tool);
+            auto res = ts.call(rs_tool_call(tool, args, 1));
+            REQUIRE(res);
+            CHECK(res->status == 403);
+            CHECK(appr.pending_count() == 0);
+            CHECK(log.dispatch_calls == 0);
+        }
+    }
+
+    SECTION("create_*: an instruction store that was never wired is a permanent wiring defect") {
+        RsGateLog log;
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        ts.result_set_store_for_test = rs_bundle.get();
+        // instruction_store_for_test deliberately left unset
+        rs_gate_wire(ts, log, /*admin=*/false);
+        auto res = ts.call(
+            rs_tool_call("create_result_set_from_instruction_result", create_args, 1));
+        REQUIRE(res);
+        const auto e = refusal(*res);
+        CHECK(e["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(e["data"]["reason"] == "effect_unresolvable_store_unwired");
+        CHECK(e["data"]["retry_after_ms"].is_null()); // retrying cannot help
+        CHECK(appr.pending_count() == 0);
+    }
+
+    SECTION("reevaluate_*: a result-set store that was never wired is a permanent wiring defect") {
+        RsGateLog log;
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        // result_set_store_for_test deliberately left unset
+        rs_gate_wire(ts, log, /*admin=*/false);
+        auto res = ts.call(rs_tool_call("reevaluate_result_set", reeval_args, 1));
+        REQUIRE(res);
+        const auto e = refusal(*res);
+        CHECK(e["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(e["data"]["reason"] == "effect_unresolvable_store_unwired");
+        CHECK(e["data"]["retry_after_ms"].is_null());
+        CHECK(appr.pending_count() == 0);
+    }
+
+    SECTION("create_*: a wired instruction store that cannot answer is a retryable store fault") {
+        yuzu::server::pg::PgPool bad_pool{
+            {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1",
+             .size = 1}};
+        yuzu::server::InstructionStore broken{bad_pool};
+        REQUIRE_FALSE(broken.is_open());
+        RsGateLog log;
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        ts.result_set_store_for_test = rs_bundle.get();
+        ts.instruction_store_for_test = &broken; // non-null but unusable
+        rs_gate_wire(ts, log, /*admin=*/false);
+        auto res = ts.call(
+            rs_tool_call("create_result_set_from_instruction_result", create_args, 1));
+        REQUIRE(res);
+        const auto e = refusal(*res);
+        CHECK(e["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(e["data"]["reason"] == "effect_unresolvable_store_fault");
+        CHECK(e["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(appr.pending_count() == 0);
+        bool row_has_cid = false;
+        for (std::size_t i = 0; i < ts.audit_details.size(); ++i)
+            if (ts.audit_details[i].starts_with("reason=effect_unresolvable_store_fault") &&
+                ts.audit_details[i].ends_with(
+                    " correlation_id=" + e["data"]["correlation_id"].get<std::string>()))
+                row_has_cid = true;
+        CHECK(row_has_cid);
+    }
 }
