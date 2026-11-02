@@ -402,6 +402,36 @@ per RPC. An agent that re-registers on a new connection (for example after a fai
 to another node) mints a new session, which is compatible with this rule. Multi-node
 behaviour is not tested with a real agent (a two-node registry unit test exists).
 
+**Agent reconnect and failover.** The agent has one `--server` address and one channel,
+and re-registers on a new session after every lost `Subscribe` stream. When its gateway
+node dies it therefore reaches a surviving node only if that address leads to one: an L4
+virtual IP or balancer in front of the nodes, or a DNS name with one address per node. At
+the gRPC layer the second form was measured to move to the surviving address within about a
+second of the connected one dying, with two test servers behind one multi-address name and
+the agent's channel settings; it was not measured with a real agent, real TLS or a silent
+network partition (a dead peer that sends nothing is found by the 60 s keepalive ping plus
+its 20 s timeout, about 80 s). Plan for these requirements:
+
+- **Certificates.** The agent checks the gateway certificate against the name in `--server`
+  and has no override, so every node's certificate must carry that name or address as a
+  subject alternative name (`--cert-san`, see TLS).
+- **Reconnect timing.** Each retry waits a random time centred on 2, 4, 8 ... seconds (the
+  first retry 1 to 3 s, at most 300 s), so the agents of a failed node do not return in
+  waves.
+- **Quarantine.** A quarantined agent can reach only the server addresses it resolved at
+  startup (this is deliberate: a compromised host's DNS must not decide what survives
+  containment). Use addresses that stay the same (a virtual IP or fixed node addresses) for
+  gateway-fronted fleets; if the addresses behind the name change, a quarantined agent
+  cannot reach any node and cannot be released remotely.
+- **A node that is up but has lost its server.** Failover does not cover this case. From
+  the agent source, the agent only logs an `UNAVAILABLE` heartbeat answer (it re-registers
+  only on `NOT_FOUND` or `UNAUTHENTICATED`) and its keepalives to the gateway stay healthy,
+  so it would stay on that node while the server's 90 s route lease expires and the agent
+  stops being dispatchable. This has not been observed end to end; the HA WS-13 spike
+  measures it.
+- **Agents older than 0.15.0** may wedge in their reconnect path and need a restart (see
+  [Heartbeat admission](#heartbeat-admission)).
+
 *Observed in testing.* The first two results are from a real C++ agent against a
 plaintext gateway listener, two agents per run; the last two are 50 agents against a TLS
 agent listener (OKD 4.21 and HAProxy 3.2.25, details below):
@@ -1291,8 +1321,8 @@ listen socket, so a new connection to the agent port is **refused** at once
 (`ECONNREFUSED`); connections the kernel had queued but the gateway had not yet
 accepted are reset. Every connection already established is untouched and keeps
 working. This is deliberate, rather than leaving new connections waiting in the kernel's
-listen backlog: a refused agent goes straight into its reconnect backoff (2, 4, 8 ...
-seconds, at most 256 s) and a load balancer retries a refused connect on another node,
+listen backlog: a refused agent goes straight into its reconnect backoff (centred on 2, 4,
+8 ... seconds, each spread by up to half either way, at most 300 s) and a load balancer retries a refused connect on another node,
 while a connection parked in the backlog completes the TCP handshake, makes the agent
 wait for a TLS handshake nobody answers until gRPC gives up (about 18 s, measured
 against a server that accepts TCP and never answers), is not

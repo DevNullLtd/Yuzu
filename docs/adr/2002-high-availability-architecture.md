@@ -445,6 +445,40 @@ cluster unit; intra-zone scale is more nodes.
   cluster they connect through a **cluster-front (VIP / DNS-multi / node list)** and reconnect on node
   loss. Both gateway endpoints are addressable by **VIP or node list — support both**.
 
+**Update (2026-11-02, WS-13 / #291 — decided after a Fable plan review).**
+- **First design: a VIP or a multi-address DNS name, with no agent code.** The agent takes one
+  `--server` address and builds one channel (`agents/core/src/agent.cpp`, the single `CreateCustomChannel`
+  call), which keeps one gateway node per session. At the gRPC layer (1.76, the agent's channel settings,
+  two test servers behind one multi-address name) the default `pick_first` policy moved to the surviving
+  address within about a second of the connected one dying. This is **not yet measured** with a real agent,
+  real TLS or a silent partition (keepalive 60 s + 20 s), so it supports "support both" in design but is
+  not evidence for the gate. An agent-side endpoint list (a gRPC target built from `--server a:p,b:p` plus a
+  fixed TLS target name) is built only if a static node list without DNS becomes a required topology; a
+  server-advertised endpoint list is WS-15 scope.
+- **Requirements this puts on the topology.** Every node's certificate must carry the name or address the
+  agent dials (the agent has no target-name override). Gateway-fronted quarantine needs addresses that do
+  not change: the quarantine allow-list is resolved **once at startup, deliberately** (#3429), so after the
+  addresses behind the name change a quarantined agent can reach no node and cannot be released remotely.
+  The resolver does not parse a list or a scheme, so any list syntax must carry a test that the
+  allow-list is not empty.
+- **Reconnect timing (13.1, done).** Each retry waits a random time centred on 2^n seconds (first retry
+  1 to 3 s, at most 300 s), so the agents of a failed node do not return in waves. The mean schedule is
+  unchanged.
+- **Known gap, unconfirmed.** A gateway node that is up but has lost its server answers proxied heartbeats
+  `UNAVAILABLE`; the agent only logs that (it re-registers on `NOT_FOUND` or `UNAUTHENTICATED`), its
+  keepalives stay healthy, and the route lease (90 s) expires. The WS-13 spike measures it; if confirmed,
+  a WS-13 slice (the gateway ends agent streams after an outage longer than the lease) closes it.
+- **Rollout.** Moving a direct-connect fleet behind a gateway silently stops its agents updating
+  themselves while #5619 is open (the gateway implements neither `CheckForUpdate` nor `DownloadUpdate`),
+  so the rollout refuses unless the operator declares out-of-band package management. It also needs
+  agents of 0.15.0 or later (older agents wedge in their reconnect path, #2182), no quarantined devices,
+  and a statement of what changes (client-address attribution, mTLS at the edge).
+- **Gate wording.** The clause "for gateway-fronted fleets, WS-13 is done" became: WS-13's failover items for
+  a deployment with more than one gateway node, and its rollout item for any fleet that still connects
+  directly. Losing a server replica does not move agents (the gateway replays a `ProxyRegister` for every
+  agent it holds, see Context); agent failover answers losing a gateway node. The gateway's upstream
+  reaching every server replica is tracked under #5648. The gate is **not lifted**.
+
 **Status (WS-4): 4.1 done; 4.2a (writer-path hardening) done; 4.2b (Tasks A–D: store layer, per-site
 fail-closed posture + renew correlation, dispatch-wiring, `route_unreadable` consumer + alert rule) done;
 `#4324` per-home stream-generation fence done; 4.3a (intra-cluster routing) done; `#4555` (gateway
