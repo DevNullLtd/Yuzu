@@ -26,10 +26,12 @@
 #include "directory_sync.hpp"   // access-review read-model optional email enrichment
 #include "http_route_sink.hpp"
 #include "integrations_render.hpp" // MCP + Gateway panel markup and the MCP form parser
+#include <yuzu/log_token.hpp> // log_key_token: CWE-117 neutralisation (#4068 store-error lines)
 #include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
 #include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log (enrol-confirm stamp log)
 #include "oidc_writer_gate.hpp" // writer priority for the OIDC lock (#5692 UP-13)
+#include "sso_boot_guard.hpp" // oidc_config_complete + publish_oidc_provider_gauges (#4160)
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
@@ -195,8 +197,10 @@ void respond_last_administrator_refused(httplib::Response& res, yuzu::MetricsReg
 }
 
 // #4966: the retryable store-fault answer of the guarded DELETE: 503 with `Retry-After: 2` and a
-// matching `retry_after_ms`, like the token-revoke route's store-fault arm. The role writes use
-// `respond_committed_no_retry` instead (a store failure there may have committed).
+// matching `retry_after_ms`, like the token-revoke route's store-fault arm. #4068: also the answer
+// to a failed READ before any write (the create-user duplicate check and the role-change
+// current-role read), where nothing has changed. The role WRITES use `respond_committed_no_retry`
+// instead (a store failure there may have committed).
 void respond_lifecycle_store_unavailable(httplib::Response& res, std::string_view message) {
     res.status = 503;
     res.set_header("Retry-After", "2");
@@ -4161,6 +4165,12 @@ void SettingsRoutes::register_routes(
             cfg_->oidc_skip_tls_verify = skip_tls;
             retire_on_exit.unpublished = std::move(*oidc_provider_);
             *oidc_provider_ = std::move(new_provider);
+            // #4160: keep the provider gauges truthful across a runtime reconfigure
+            // (they are otherwise only written at boot). Same publisher as server.cpp.
+            if (metrics_registry_) {
+                publish_oidc_provider_gauges(*metrics_registry_, oidc_config_complete(*cfg_),
+                                             *oidc_provider_ && (*oidc_provider_)->is_enabled());
+            }
         }
         spdlog::info("OIDC provider reinitialized via Settings UI (issuer={})", issuer);
 
@@ -4387,7 +4397,21 @@ void SettingsRoutes::register_routes(
         }
 
         // #399: reject duplicate username on the create path.
-        if (auth_mgr_->get_user_role(username).has_value()) {
+        // #4068: a store ERROR is not "doesn't exist" - fail closed (503) instead of
+        // proceeding to create on the strength of an unanswered lookup.
+        const auto existing_role = auth_mgr_->get_user_role(username);
+        if (!existing_role &&
+            existing_role.error() == auth::AuthManager::GetUserRoleError::DbError) {
+            spdlog::error("POST /api/settings/users: AuthDB lookup for '{}' failed - refusing "
+                          "to create on an unanswered duplicate check",
+                          ::yuzu::log_key_token(username));
+            audit_fn_(req, "user.create", "failure", "User", username, "store_unavailable");
+            respond_lifecycle_store_unavailable(
+                res, "User store temporarily unavailable. No change was made; try again in a "
+                     "few seconds.");
+            return;
+        }
+        if (existing_role.has_value()) {
             spdlog::warn("POST /api/settings/users: username '{}' already exists — rejected",
                          username);
             audit_fn_(req, "user.create", "denied", "User", username, "duplicate_username");
@@ -4926,6 +4950,20 @@ void SettingsRoutes::register_routes(
 
         // Get current role for audit logging
         auto current_entry_opt = auth_mgr_->get_user_role(target_username);
+        if (!current_entry_opt &&
+            current_entry_opt.error() == auth::AuthManager::GetUserRoleError::DbError) {
+            // #4068: a store error is NOT "user not found" - say so in the audit row and
+            // answer a retryable 503 (nothing has been changed yet).
+            spdlog::error("POST /api/settings/users/{}/role: AuthDB lookup failed - refusing the "
+                          "role change on an unanswered read",
+                          ::yuzu::log_key_token(target_username));
+            audit_fn_(req, "user.role_change", "failure", "User", target_username,
+                      "store_unavailable");
+            respond_lifecycle_store_unavailable(
+                res, "User store temporarily unavailable. No change was made; try again in a "
+                     "few seconds.");
+            return;
+        }
         if (!current_entry_opt) {
             audit_fn_(req, "user.role_change", "denied", "User", target_username, "user_not_found");
             res.status = 404;

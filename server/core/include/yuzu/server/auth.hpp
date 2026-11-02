@@ -868,6 +868,12 @@ public:
     /// `server/core/src/**` references it. A no-op if `token` is not a live session.
     void lapse_elevation_for_test(const std::string& token, std::chrono::milliseconds elapsed);
 
+    /// TEST-ONLY: make the next session validate poll the durable
+    /// write-generation immediately, instead of waiting out the ~1 s poll
+    /// interval (#6079). Does not touch the cached generation or the stale-serve
+    /// anchor. Production code MUST NOT call this.
+    void expire_session_generation_poll_for_test();
+
     /// TEST-ONLY: installs a callback fired inside
     /// `recheck_role_after_credential_check`, BEFORE it starts its row-locked
     /// AuthDB re-check (`AuthDB::recheck_role_locked`). Originally fired
@@ -1143,9 +1149,16 @@ public:
     /// Returns false if user not found, refused, or failed.
     bool update_role(const std::string& username, Role new_role);
 
-    /// Look up a user's legacy role. Returns nullopt if user not found (or,
-    /// in AuthDB-backed mode, if the store could not answer - never falls
-    /// back to a cached value on a store error). AuthDB-authoritative on
+    /// Why `get_user_role()` has no role to return (#4068). `NotFound` is a
+    /// SUCCESSFUL negative answer (no such user, soft-deleted, or a rejected
+    /// username shape); `DbError` means the store could not answer, so the
+    /// caller does NOT know whether the user exists and must not treat it as
+    /// "absent" (a fail-open on any "absent => proceed/no-op" branch).
+    enum class GetUserRoleError { NotFound, DbError };
+
+    /// Look up a user's legacy role. The error channel distinguishes a genuine
+    /// miss (`NotFound`) from an AuthDB store error (`DbError`, which never
+    /// falls back to a cached value). AuthDB-authoritative on
     /// EVERY call when configured (no cache, no cache fallback) - see the
     /// .cpp definition's doc for why (Gate 3 governance BLOCKING finding,
     /// #4020: this is the call auth_routes.cpp's legacy API-token session
@@ -1153,7 +1166,8 @@ public:
     /// live stale-privilege gap after a demotion, independent of
     /// authenticate()/verify_password() entirely). Config-file mode (no
     /// AuthDB) remains cache-only, unchanged.
-    std::optional<Role> get_user_role(const std::string& username) const;
+    [[nodiscard]] std::expected<Role, GetUserRoleError>
+    get_user_role(const std::string& username) const;
 
     /// Check whether any users are configured.
     bool has_users() const;
@@ -1713,9 +1727,9 @@ private:
     /// would_strand | grant_read). No-op without a MetricsRegistry.
     void note_lifecycle_store_failure(const char* op) const;
 
-    /// Poll the durable write-generation on an interval; when it has advanced
-    /// (a create/invalidate/elevate/mfa mutation landed, possibly on another
-    /// replica), clear the process-local `sessions_` cache so the next lookup
+    /// Poll the durable write-generation on an interval; when it has changed
+    /// (advanced: a create/invalidate/elevate/mfa mutation landed, possibly on
+    /// another replica; or regressed after a restore or failover; #6079), clear the process-local `sessions_` cache so the next lookup
     /// re-reads authoritative state. Interval-gated + single-flight (mirrors
     /// RbacStore::maybe_refresh_generation); a refresh FAILURE keeps serving the
     /// existing cache (the absolute `expires_at` on every session is the
@@ -1723,7 +1737,7 @@ private:
     ///
     /// Coherence does NOT depend on anchoring a locally-committed write: a
     /// mutation bumps the durable generation, so within one refresh interval
-    /// this same poll observes the advance and clears the cache, re-reading
+    /// this same poll observes the change and clears the cache, re-reading
     /// authoritative state — write-through to the local cache only covers the
     /// sub-interval window until then.
     void maybe_refresh_session_generation() const;

@@ -45,7 +45,7 @@ guardian_agent_status_rollup(GuaranteedStateStore& store, const std::string& age
     GuardianAgentStatusRollup out;
     for (const auto& st : *statuses_result) {
         if (!rule_names.count(st.rule_id))
-            continue; // orphan census row for a since-deleted rule
+            continue; // rule deleted between the status read and the name read
         ++out.total_rules;
         if (st.state == "errored")
             ++out.errored_rules;
