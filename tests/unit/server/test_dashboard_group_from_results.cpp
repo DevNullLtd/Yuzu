@@ -1309,7 +1309,7 @@ namespace {
 // The constant toast a refused Search admission answers (JSON as refusal_toast_header builds it).
 const std::string kSearchRefusalToast =
     R"({"showToast":{"message":"The Search term could not be used: reading responses is not )"
-    R"(permitted or the permission check is unavailable. Nothing was created.","level":"error"}})";
+    R"(permitted or the permission check is unavailable.","level":"error"}})";
 } // namespace
 
 TEST_CASE("group-from-results: a Search term needs the results table's Response:Read admission, in "

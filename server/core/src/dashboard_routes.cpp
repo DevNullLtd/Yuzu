@@ -144,7 +144,7 @@ static constexpr const char* kGroupPartialRefusal =
 /// The toast for a Search term the caller may not use (Response:Read refused or unavailable).
 static constexpr const char* kSearchAdmissionRefusal =
     "The Search term could not be used: reading responses is not permitted or the permission "
-    "check is unavailable. Nothing was created.";
+    "check is unavailable.";
 
 /// Intersects @p ids with the caller's visible @p scope (nullopt = sees all); returns how many
 /// ids were dropped. The intersection the group POST and the preview's Search-term path share:
@@ -2822,18 +2822,21 @@ std::string DashboardRoutes::render_results(
     }
     bool ascending = (sort_dir == "asc");
 
-    std::sort(all_lines.begin(), all_lines.end(),
-              [sort_idx, ascending](const ResultLine& a, const ResultLine& b) {
-                  std::string va, vb;
-                  if (sort_idx < 0) {
-                      va = a.agent_name;
-                      vb = b.agent_name;
-                  } else {
-                      va = (sort_idx < static_cast<int>(a.fields.size())) ? a.fields[sort_idx] : "";
-                      vb = (sort_idx < static_cast<int>(b.fields.size())) ? b.fields[sort_idx] : "";
-                  }
-                  return ascending ? (va < vb) : (va > vb);
-              });
+    // The background refresh renders no rows (rows_omitted): its order never shows, so skip the sort.
+    if (!rows_omitted) {
+        std::sort(all_lines.begin(), all_lines.end(),
+                  [sort_idx, ascending](const ResultLine& a, const ResultLine& b) {
+                      std::string va, vb;
+                      if (sort_idx < 0) {
+                          va = a.agent_name;
+                          vb = b.agent_name;
+                      } else {
+                          va = (sort_idx < static_cast<int>(a.fields.size())) ? a.fields[sort_idx] : "";
+                          vb = (sort_idx < static_cast<int>(b.fields.size())) ? b.fields[sort_idx] : "";
+                      }
+                      return ascending ? (va < vb) : (va > vb);
+                  });
+    }
 
     // Phase 4: paginate
     int64_t total_lines = static_cast<int64_t>(all_lines.size());

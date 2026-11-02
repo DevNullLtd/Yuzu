@@ -126,8 +126,9 @@ Recommended order for a fresh install:
 > stored output content; filters alone need only `ManagementGroup:Write`.
 >
 > A degraded **management-group** store fails **closed** here too: an
-> empty visible set makes the two GETs return success-empty without the
-> query ever reaching the response store, and makes `group-from-results`
+> empty visible set makes the two GETs return success-empty (for a
+> filters-only request without the query reaching the response store; a Search
+> term is matched first and the result then scoped to empty), and makes `group-from-results`
 > report "no agents match." A degraded **RBAC** store behaves differently —
 > it never reaches this scoping at all, because each route's own flat
 > admission gate (below) denies with `403` first, the same as any other
