@@ -118,18 +118,9 @@ std::vector<UserSession> enumerate_users() {
         if (entry->ut_type != USER_PROCESS)
             continue;
 
-        UserSession us;
-        us.user = std::string(entry->ut_user);
-        us.session_id = std::string(entry->ut_line);
-
-        std::string host(entry->ut_host);
-        us.domain = host.empty() ? "local" : host;
-
-        // Determine logon type from tty name
-        std::string line_str(entry->ut_line);
-        us.logon_type = line_str.starts_with("pts/") ? "remote" : "interactive";
-
-        sessions.push_back(std::move(us));
+        // Bounded field reads and the remote-vs-interactive rule live in the shared conversion
+        // (echo_collectors.hpp), which the unit tests drive with hand-built records.
+        sessions.push_back(user_session_from_utmp(*entry));
     }
     endutent();
     return sessions;
@@ -148,18 +139,9 @@ std::vector<UserSession> enumerate_users() {
         if (entry->ut_type != USER_PROCESS)
             continue;
 
-        UserSession us;
-        us.user = std::string(entry->ut_user);
-        us.session_id = std::string(entry->ut_line);
-
-        std::string host(entry->ut_host);
-        us.domain = host.empty() ? "local" : host;
-
-        // Determine logon type from tty name
-        std::string line_str(entry->ut_line);
-        us.logon_type = line_str.starts_with("ttys") ? "remote" : "interactive";
-
-        sessions.push_back(std::move(us));
+        // Every Terminal.app tab is a ttysNNN, so the line name is no evidence of a remote
+        // session: the shared conversion classifies on ut_host (echo_collectors.hpp).
+        sessions.push_back(user_session_from_utmp(*entry));
     }
     endutxent();
     return sessions;

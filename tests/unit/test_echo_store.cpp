@@ -5,6 +5,7 @@
  * stats, config get/set, state get/set.
  */
 
+#include "echo_aggregator.hpp" // run_budget: the failed-measurement case
 #include "echo_db.hpp"
 #include "echo_netqual.hpp"
 #include "echo_netqual_boot.hpp"
@@ -334,7 +335,7 @@ TEST_CASE("EchoDatabase: try_get_state is tri-state", "[echo][store][registry]")
 TEST_CASE("EchoDatabase: purge_source(registry) erases the rows, the cursor (held values included) and every baseline",
           "[echo][store][purge][registry]") {
     auto t = make_test_db();
-    // The cursor row is a content store too: it holds the rendered old/new values of a change
+    // The cursor row is a content store too: it holds the rendered values of a change
     // whose writer is not settled yet. Purging the source must erase it with everything else.
     const std::string cursor_with_held =
        R"({"v":1,"tick":4,"held":[{"r":"HKLM\\A","k":"HKLM\\A\\K","v":"Secret","a":"changed",)"
@@ -3700,4 +3701,392 @@ TEST_CASE("adopt_legacy_echo_db: a rename that cannot complete fails closed and 
     REQUIRE_FALSE(opened.has_value());
     CHECK(opened.error().find("tar.db") != std::string::npos);
     CHECK_FALSE(fs::exists(echo_db));
+}
+
+// =============================================================================
+// Storage budget primitives (auto_vacuum, db_size_bytes, delete_counted, hygiene)
+// =============================================================================
+
+namespace {
+
+int64_t pragma_int(EchoDatabase& db, const std::string& pragma) {
+    auto q = db.execute_query("PRAGMA " + pragma, /*max_rows=*/1);
+    REQUIRE(q.has_value());
+    REQUIRE(q->rows.size() == 1);
+    return std::stoll(q->rows[0][0]);
+}
+
+void insert_tcp_rows(EchoDatabase& db, int n, int64_t ts0) {
+    std::vector<NetworkEvent> evs;
+    for (int i = 0; i < n; ++i) {
+        NetworkEvent ev;
+        ev.ts = ts0 + i;
+        ev.snapshot_id = 1;
+        ev.action = "connected";
+        ev.proto = "tcp";
+        ev.local_addr = "10.0.0.1";
+        ev.local_port = 1000 + i;
+        ev.remote_addr = "10.0.0." + std::to_string(i % 200);
+        ev.remote_port = 443;
+        ev.state = "ESTABLISHED";
+        ev.pid = 1;
+        ev.process_name = "curl";
+        evs.push_back(std::move(ev));
+    }
+    REQUIRE(db.insert_network_events(evs));
+}
+
+int64_t count_table_rows(EchoDatabase& db, const std::string& table) {
+    auto q = db.execute_query("SELECT COUNT(*) FROM " + table, 1);
+    REQUIRE(q.has_value());
+    return std::stoll(q->rows.at(0).at(0));
+}
+
+} // namespace
+
+TEST_CASE("EchoDatabase: a fresh echo.db is incremental auto_vacuum with a capped WAL",
+          "[echo][store][budget]") {
+    auto t = make_test_db();
+    CHECK(pragma_int(t.db, "auto_vacuum") == 2);
+    CHECK(t.db.storage_bytes().auto_vacuum == 2);
+    CHECK(pragma_int(t.db, "journal_size_limit") == 16777216);
+}
+
+TEST_CASE("EchoDatabase: db_size_bytes is used pages plus the WAL, not the file size",
+          "[echo][store][budget]") {
+    auto t = make_test_db();
+    insert_tcp_rows(t.db, 3000, 1000);
+    // A contiguous range empties whole pages (every-other-row deletes may free none), and the
+    // case is only meaningful with a non-empty freelist: used pages differ from the file then.
+    REQUIRE(t.db.execute_sql("DELETE FROM tcp_live WHERE id <= 2000"));
+
+    const int64_t page_count = pragma_int(t.db, "page_count");
+    const int64_t freelist = pragma_int(t.db, "freelist_count");
+    REQUIRE(freelist > 0);
+    const int64_t page_size = pragma_int(t.db, "page_size");
+    std::error_code ec;
+    const auto wal = fs::file_size(fs::path{t.path.string() + "-wal"}, ec);
+    const int64_t wal_bytes = ec ? 0 : static_cast<int64_t>(wal);
+
+    const auto sb = t.db.storage_bytes();
+    CHECK(sb.page_count == page_count);
+    CHECK(sb.freelist_count == freelist);
+    CHECK(sb.page_size == page_size);
+    CHECK(sb.wal_bytes == wal_bytes);
+    CHECK(t.db.stats().db_size_bytes == (page_count - freelist) * page_size + wal_bytes);
+    CHECK(sb.data_bytes() == (page_count - freelist) * page_size);
+    CHECK(sb.file_bytes() == page_count * page_size);
+}
+
+namespace {
+
+// Denies the pragma reads behind storage_bytes() while `deny` is set (an authorizer is how a
+// failing measurement is injected without a production hook).
+struct PragmaDenier {
+    bool deny{false};
+};
+
+int deny_pragma_reads(void* user, int action, const char* arg1, const char*, const char*,
+                      const char*) {
+    if (!static_cast<const PragmaDenier*>(user)->deny)
+        return SQLITE_OK;
+    if (action == SQLITE_PRAGMA)
+        return SQLITE_DENY;
+    if (action == SQLITE_READ && arg1 != nullptr && std::string_view{arg1}.starts_with("pragma_"))
+        return SQLITE_DENY;
+    return SQLITE_OK;
+}
+
+} // namespace
+
+TEST_CASE("EchoDatabase: a failed size measurement is reported as failed, never as an empty database",
+          "[echo][store][budget][chaos]") {
+    PragmaDenier denier; // outlives the database that holds a pointer to it
+    auto t = make_test_db();
+    insert_tcp_rows(t.db, 200, 1000);
+    REQUIRE(t.db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
+        sqlite3_set_authorizer(h.raw(), deny_pragma_reads, &denier);
+        return {};
+    }));
+
+    // Positive control: with the injector off the measurement is real.
+    const auto healthy = t.db.storage_bytes();
+    REQUIRE(healthy.ok);
+    CHECK(healthy.page_count > 0);
+    CHECK(healthy.page_size > 0);
+
+    denier.deny = true;
+    const auto failed = t.db.storage_bytes();
+    CHECK_FALSE(failed.ok);
+    CHECK(failed.data_bytes() == 0); // all zero: the reason callers must look at `ok`
+    // The eviction pass treats it as a failure, not as "within budget" (and so does not evict).
+    const auto res = yuzu::echo::run_budget(t.db, 1'700'000'000, /*target_bytes=*/0, [] { return true; });
+    CHECK(res.failed);
+    CHECK_FALSE(res.exhausted);
+    CHECK(res.evicted_raw == 0);
+    CHECK(res.evicted_hourly == 0);
+    denier.deny = false;
+    CHECK(t.db.storage_bytes().ok);
+    CHECK(count_table_rows(t.db, "tcp_live") == 200);
+
+    // A closed store is the same shape.
+    EchoDatabase moved = std::move(t.db);
+    CHECK_FALSE(t.db.storage_bytes().ok);
+    t.db = std::move(moved); // hand it back so the fixture's destructor sees a live handle
+}
+
+TEST_CASE("EchoDatabase: set_state with identical JSON is a no-op, a change rewrites",
+          "[echo][store][state][budget]") {
+    auto t = make_test_db();
+    const auto updated_at = [&] {
+        auto q = t.db.execute_query("SELECT updated_at FROM echo_state WHERE collector='process'", 1);
+        REQUIRE(q.has_value());
+        REQUIRE(q->rows.size() == 1);
+        return std::stoll(q->rows[0][0]);
+    };
+    REQUIRE(t.db.set_state("process", R"([{"pid":1}])"));
+    REQUIRE(t.db.execute_sql("UPDATE echo_state SET updated_at = 1 WHERE collector='process'"));
+
+    REQUIRE(t.db.set_state("process", R"([{"pid":1}])")); // identical: no page dirtied
+    CHECK(updated_at() == 1);
+    CHECK(t.db.get_state("process") == R"([{"pid":1}])");
+
+    REQUIRE(t.db.set_state("process", R"([{"pid":2}])")); // different: rewritten
+    CHECK(updated_at() > 1);
+    CHECK(t.db.get_state("process") == R"([{"pid":2}])");
+}
+
+TEST_CASE("EchoDatabase: a StateWrite inside insert_network_events skips an identical baseline",
+          "[echo][store][state][budget]") {
+    auto t = make_test_db();
+    const auto updated_at = [&] {
+        auto q = t.db.execute_query("SELECT updated_at FROM echo_state WHERE collector='network'", 1);
+        REQUIRE(q.has_value());
+        REQUIRE(q->rows.size() == 1);
+        return std::stoll(q->rows[0][0]);
+    };
+    NetworkEvent ev;
+    ev.ts = 5;
+    ev.snapshot_id = 1;
+    ev.action = "connected";
+    ev.proto = "tcp";
+    ev.local_port = 1;
+    ev.remote_port = 2;
+    REQUIRE(t.db.insert_network_events({ev}, StateWrite{"network", "[1]"}));
+    REQUIRE(t.db.execute_sql("UPDATE echo_state SET updated_at = 1 WHERE collector='network'"));
+
+    ev.local_port = 3;
+    REQUIRE(t.db.insert_network_events({ev}, StateWrite{"network", "[1]"}));
+    CHECK(updated_at() == 1); // the rows landed, the identical baseline did not rewrite
+    CHECK(count_table_rows(t.db, "tcp_live") == 2);
+    REQUIRE(t.db.insert_network_events({ev}, StateWrite{"network", "[2]"}));
+    CHECK(updated_at() > 1);
+}
+
+TEST_CASE("EchoDatabase: delete_counted counts RETURNING rows and bumps the counter atomically",
+          "[echo][store][budget]") {
+    auto t = make_test_db();
+    insert_tcp_rows(t.db, 10, 1000);
+    const std::string sql =
+        "DELETE FROM tcp_live WHERE id IN (SELECT id FROM tcp_live ORDER BY id LIMIT 4) RETURNING id";
+
+    auto first = t.db.delete_counted(sql, "budget_test_counter");
+    REQUIRE(first.has_value());
+    CHECK(*first == 4);
+    CHECK(count_table_rows(t.db, "tcp_live") == 6);
+    CHECK(t.db.get_config("budget_test_counter", "") == "4");
+
+    auto second = t.db.delete_counted(sql, "budget_test_counter");
+    REQUIRE(second.has_value());
+    CHECK(*second == 4);
+    CHECK(t.db.get_config("budget_test_counter", "") == "8"); // accumulates
+
+    auto none = t.db.delete_counted("DELETE FROM tcp_live WHERE id < 0 RETURNING id",
+                                    "budget_test_counter");
+    REQUIRE(none.has_value());
+    CHECK(*none == 0);
+    CHECK(t.db.get_config("budget_test_counter", "") == "8");
+}
+
+TEST_CASE("EchoDatabase: a failing delete_counted leaves the rows and the counter unchanged",
+          "[echo][store][budget]") {
+    auto t = make_test_db();
+    insert_tcp_rows(t.db, 10, 1000);
+    const std::string sql =
+        "DELETE FROM tcp_live WHERE id IN (SELECT id FROM tcp_live ORDER BY id LIMIT 4) RETURNING id";
+
+    SECTION("a statement that fails part-way") {
+        // A trigger aborts the whole statement on one of the rows.
+        REQUIRE(t.db.execute_sql(
+            "CREATE TRIGGER yuzu_test_block BEFORE DELETE ON tcp_live WHEN OLD.local_port = 1002 "
+            "BEGIN SELECT RAISE(ABORT, 'blocked'); END"));
+        auto r = t.db.delete_counted(sql, "budget_test_counter");
+        REQUIRE_FALSE(r.has_value());
+        CHECK_FALSE(r.error().empty());
+        CHECK(count_table_rows(t.db, "tcp_live") == 10);
+        CHECK(t.db.get_config("budget_test_counter", "absent") == "absent");
+    }
+    SECTION("the counter bump failing rolls the deletes back") {
+        REQUIRE(t.db.execute_sql(
+            "CREATE TRIGGER yuzu_test_block_cfg BEFORE INSERT ON echo_config "
+            "WHEN NEW.key = 'budget_test_counter' BEGIN SELECT RAISE(ABORT, 'blocked'); END"));
+        auto r = t.db.delete_counted(sql, "budget_test_counter");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(count_table_rows(t.db, "tcp_live") == 10); // the deletes did not survive the failed bump
+    }
+    SECTION("an unknown table") {
+        auto r = t.db.delete_counted("DELETE FROM no_such_table RETURNING id", "budget_test_counter");
+        REQUIRE_FALSE(r.has_value());
+    }
+    // The connection is not left inside a transaction by any failure.
+    CHECK(t.db.execute_sql("DROP TRIGGER IF EXISTS yuzu_test_block"));
+    insert_tcp_rows(t.db, 1, 5000);
+}
+
+TEST_CASE("EchoDatabase: rollback_open_transaction clears a transaction an unwind left open",
+          "[echo][store][budget]") {
+    auto t = make_test_db();
+    // Autocommit: a no-op, the database stays usable.
+    t.db.rollback_open_transaction();
+    insert_tcp_rows(t.db, 1, 1000);
+
+    // A raw BEGIN left open (what an exception between BEGIN and COMMIT does).
+    REQUIRE(t.db.execute_sql("BEGIN"));
+    NetworkEvent ev;
+    ev.ts = 2000;
+    ev.snapshot_id = 1;
+    ev.action = "connected";
+    ev.proto = "tcp";
+    CHECK_FALSE(t.db.insert_network_events({ev})); // cannot BEGIN inside the open transaction
+    t.db.rollback_open_transaction();
+    CHECK(t.db.insert_network_events({ev}));
+    CHECK(count_table_rows(t.db, "tcp_live") == 2);
+}
+
+TEST_CASE("EchoDatabase: set_config and set_state refuse to join a transaction left open",
+          "[echo][store][budget]") {
+    // The window between an unwind releasing mu_ and fail_internal's rollback: a standalone
+    // write that joined the abandoned transaction would report success and then be discarded.
+    auto t = make_test_db();
+    REQUIRE(t.db.set_config("yuzu_test_key", "before"));
+    REQUIRE(t.db.execute_sql("BEGIN"));
+    CHECK_FALSE(t.db.set_config("yuzu_test_key", "joined"));
+    CHECK_FALSE(t.db.set_state("yuzu_test_collector", "{\"joined\":1}"));
+    t.db.rollback_open_transaction();
+    CHECK(t.db.get_config("yuzu_test_key", "") == "before"); // nothing was written, nothing lost
+    CHECK(t.db.set_config("yuzu_test_key", "after"));
+    CHECK(t.db.set_state("yuzu_test_collector", "{\"after\":1}"));
+    CHECK(t.db.get_config("yuzu_test_key", "") == "after");
+    CHECK(t.db.get_state("yuzu_test_collector") == "{\"after\":1}");
+}
+
+TEST_CASE("EchoDatabase: an interrupted conversion VACUUM leaves the file intact and a retry works",
+          "[echo][store][budget][chaos]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_av_interrupt_"};
+    {
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(tmp.path.string().c_str(), &owner.db) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(owner.db,
+                             "PRAGMA auto_vacuum=0; CREATE TABLE yuzu_test_pad(x BLOB);"
+                             "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1500) "
+                             "INSERT INTO yuzu_test_pad SELECT zeroblob(4000) FROM n;"
+                             "DELETE FROM yuzu_test_pad WHERE rowid % 4 != 0;",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+
+    // A progress handler installed through the transaction handle's raw connection (it outlives
+    // the transaction). It counts every callback and, once armed, interrupts the statement that
+    // makes callback number `interrupt_after + 1`.
+    struct Interrupter {
+        bool armed{false};
+        int calls{0};
+        int interrupt_after{0};
+    } interrupter;
+    REQUIRE(db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
+        sqlite3_progress_handler(
+            h.raw(), 1,
+            [](void* p) -> int {
+                auto* i = static_cast<Interrupter*>(p);
+                ++i->calls;
+                return (i->armed && i->calls > i->interrupt_after) ? 1 : 0;
+            },
+            &interrupter);
+        return {};
+    }));
+
+    const auto before = db.storage_bytes();
+    REQUIRE(before.ok);
+    REQUIRE(before.auto_vacuum == 0);
+    REQUIRE(before.freelist_count > 0);
+
+    // vacuum_to_incremental() runs `PRAGMA auto_vacuum=INCREMENTAL` and then VACUUM. Measure how
+    // many callbacks the PRAGMA alone makes, so the interrupt lands inside the VACUUM and not in
+    // the PRAGMA that precedes it (an interrupted PRAGMA would prove nothing about the VACUUM).
+    interrupter.calls = 0;
+    REQUIRE(db.execute_sql("PRAGMA auto_vacuum=INCREMENTAL"));
+    const int pragma_calls = interrupter.calls;
+
+    interrupter.calls = 0;
+    interrupter.interrupt_after = pragma_calls;
+    interrupter.armed = true;
+    CHECK_FALSE(db.vacuum_to_incremental());
+    interrupter.armed = false;
+    CHECK(interrupter.calls > pragma_calls); // the injector fired inside the VACUUM
+
+    // Nothing half-converted: still the original file, still sound.
+    const auto after = db.storage_bytes();
+    CHECK(after.auto_vacuum == 0);
+    CHECK(after.page_count == before.page_count);
+    CHECK(after.freelist_count == before.freelist_count);
+    auto integrity = db.execute_query("PRAGMA integrity_check", 5);
+    REQUIRE(integrity.has_value());
+    REQUIRE(integrity->rows.size() == 1);
+    CHECK(integrity->rows[0][0] == "ok");
+    CHECK(db.get_config("retention_days", "") == "7");
+
+    // And the interruption is not sticky: the next attempt converts.
+    REQUIRE(db.vacuum_to_incremental());
+    CHECK(db.storage_bytes().auto_vacuum == 2);
+}
+
+TEST_CASE("EchoDatabase: a pre-auto_vacuum database converts with one VACUUM",
+          "[echo][store][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_av_"};
+    {
+        // A database as an older build left it: tables already exist, auto_vacuum none, and
+        // plenty of free pages (the schema the open creates would otherwise use up a small
+        // freelist).
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(tmp.path.string().c_str(), &owner.db) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(owner.db,
+                             "PRAGMA auto_vacuum=0; CREATE TABLE yuzu_test_pad(x BLOB);"
+                             "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1500) "
+                             "INSERT INTO yuzu_test_pad SELECT zeroblob(4000) FROM n;"
+                             "DELETE FROM yuzu_test_pad WHERE rowid % 4 != 0;",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    {
+        EchoDatabase db = std::move(*opened);
+        const auto before = db.storage_bytes();
+        CHECK(before.auto_vacuum == 0); // the open pragma cannot convert a populated file
+        CHECK(before.freelist_count > 0);
+
+        REQUIRE(db.vacuum_to_incremental());
+        const auto after = db.storage_bytes();
+        CHECK(after.auto_vacuum == 2);
+        CHECK(after.freelist_count == 0);
+        CHECK(after.page_count < before.page_count);
+        CHECK(db.get_config("retention_days", "") == "7"); // data survived the rebuild
+
+        // Hygiene calls on a healthy database.
+        db.incremental_vacuum(256);
+        CHECK(db.checkpoint(CheckpointMode::kPassive) != CheckpointResult::kError);
+        CHECK(db.checkpoint(CheckpointMode::kTruncate) == CheckpointResult::kOk);
+        CHECK(db.storage_bytes().wal_bytes == 0); // TRUNCATE reclaimed the WAL file
+    }
 }
