@@ -1202,25 +1202,27 @@ A server predating this metrics family, or a scrape config dropping the
 `yuzu_rotation_sweep_*` series, reads as a silently-healthy sweep — none of
 these are paired with their own "series is absent" companion alert today
 (unlike `YuzuAuditRetentionNotRunning`/`YuzuAuditRetentionMetricMissing`);
-that gap is tracked, not closed, by this round.
+that gap is tracked, not closed.
 
 ## Human API-token confirm metric (P2 #11)
 
 ```
-# HELP yuzu_api_token_confirm_total Human API-token rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient); store-reaching calls only, pre-store denials excluded - the human-owned twin of yuzu_engine_principal_confirm_total
+# HELP yuzu_api_token_confirm_total Human API-token rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient|secret_mismatch); store-reaching calls only, pre-store denials excluded - the human-owned twin of yuzu_engine_principal_confirm_total (secret_mismatch added #3015 proof-of-possession)
 # TYPE yuzu_api_token_confirm_total counter
 yuzu_api_token_confirm_total{surface="rest",result="success"} 0
 yuzu_api_token_confirm_total{surface="rest",result="conflict"} 0
 yuzu_api_token_confirm_total{surface="rest",result="client_error"} 0
 yuzu_api_token_confirm_total{surface="rest",result="transient"} 0
+yuzu_api_token_confirm_total{surface="rest",result="secret_mismatch"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="success"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="conflict"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="client_error"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="transient"} 0
+yuzu_api_token_confirm_total{surface="mcp",result="secret_mismatch"} 0
 ```
 
 The human-owned twin of [`yuzu_engine_principal_confirm_total`](#engine-credential-confirm-metric-2404)
-directly above — same closed `surface` x `result` cross-product (8 series),
+directly above — same closed `surface` x `result` cross-product (10 series),
 pre-seeded to `0` at startup for the same `absent()`-alert reason, and the
 same intended scope contract: counted only when a confirm reaches the
 credential store or trips the store-open guard (`result="transient"`),

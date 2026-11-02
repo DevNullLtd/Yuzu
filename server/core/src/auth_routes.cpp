@@ -5316,7 +5316,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // enforced structurally, plus the `!row` deny two branches up). Were
         // it ever to arrive here, `session->auth_source == "oidc"` is false
         // for "engine_token", so it takes the local-session `else` branch
-        // below (the local-session branch), which requires local TOTP enrollment the
+        // below, which requires local TOTP enrollment the
         // engine principal's non-existent `users` row can never satisfy —
         // denied either way.
         const bool oidc_amr_proof = session->auth_source == "oidc" &&
