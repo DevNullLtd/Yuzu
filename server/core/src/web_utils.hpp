@@ -858,8 +858,8 @@ template <typename Req>
 /// discarded a length httplib was about to act on. Verified on a raw socket
 /// against the real vendored httplib.
 ///
-/// `is_chunked` MUST come from httplib's own `is_chunked_transfer_encoding`,
-/// never from a local reading of the header. Third time this change was bitten
+/// `is_chunked` MUST come from httplib's own decision, through `is_chunked_for_body_cap`
+/// (body_cap_httplib.hpp), never from a local reading of the header. Third time this change was bitten
 /// by that same root cause — `Content-Encoding` and the `Content-Length`
 /// overflow parse were the first two — and all three were fixed the same way:
 /// ask httplib instead of re-deciding.

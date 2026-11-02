@@ -16,11 +16,11 @@
 /// the meaning stated at each helper, and that `prepare_content_receiver` still decodes against
 /// the combined `Content-Encoding` value.
 
-#include "web_utils.hpp"
-
 #include <string>
 
 #include <httplib.h>
+
+#include "web_utils.hpp"
 
 namespace yuzu::server {
 
@@ -33,6 +33,14 @@ namespace yuzu::server {
 /// re-check that `prepare_content_receiver` still decodes against this combined value.
 [[nodiscard]] inline std::string content_encoding_for_body_cap(const httplib::Request& req) {
     return httplib::detail::get_combined_header_value(req.headers, "Content-Encoding");
+}
+
+/// The `has_content_length` argument `evaluate_body_cap` is given: whether the request carries ANY
+/// `Content-Length` line, answered from the header map itself (the value comes from
+/// `content_length_for_body_cap`). The body is pinned lexically by test_body_cap_policy.cpp.
+[[nodiscard]] inline bool has_content_length_for_body_cap(const httplib::Request& req) {
+    const auto cl_range = req.headers.equal_range("Content-Length");
+    return cl_range.first != cl_range.second;
 }
 
 /// The `is_chunked` argument `evaluate_body_cap` is given: httplib's own decision about whether the

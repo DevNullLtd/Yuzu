@@ -925,10 +925,12 @@ constexpr const char* kEgressUnresolvedReason = "the host name did not resolve";
 
 // Decides where ONE fetch may connect, BEFORE any socket exists. A host that is an IP literal is
 // classified directly (no DNS). Any other host (a name, or a numeric spelling the OS resolver
-// might read differently, such as `127.1`) is resolved here, with httplib's own bounded resolver,
-// and EVERY returned address is classified by its bytes. Returns the numeric addresses the
-// connection may be PINNED to (the permitted ones, in resolver order, at most kMaxPinnedAddresses),
-// or an EMPTY list when the host is an IP literal that needs no pin. A refusal or a resolver
+// might read differently, such as `127.1`) is resolved here, with httplib's own resolver, and
+// EVERY returned address is classified by its bytes. On a glibc build that resolver is not held to
+// the caller's time bound: a lookup against an unresponsive resolver can take about 30 s. Returns
+// the numeric addresses the connection may be PINNED to (the permitted ones, in resolver order, at
+// most kMaxPinnedAddresses), or an EMPTY list when the host is an IP literal that needs no pin. A
+// refusal or a resolver
 // failure is a fixed reason (never the address, never resolver text). Pinning closes the window
 // between this check and the connect: httplib is told to connect to that numeric address and does
 // no second lookup, so a DNS answer that changes in between cannot redirect the request. The
@@ -954,8 +956,10 @@ struct ResolvedAddress {
     std::array<unsigned char, 16> bytes{};
 };
 
-// Resolves `host` (a name, not a literal) to its IPv4 and IPv6 addresses within about
-// `timeout_sec` seconds. False when the name did not resolve or the lookup timed out. Own
+// Resolves `host` (a name, not a literal) to its IPv4 and IPv6 addresses. The lookup is cancelled
+// after `timeout_sec` seconds, except on a glibc build where httplib then waits for the resolver
+// itself (about 30 s against an unresponsive one). False when the name did not resolve or the
+// lookup timed out. Own
 // function per platform because httplib's helper cannot be consumed generically: on Windows it
 // returns a GetAddrInfoExW result cast to `addrinfo`, whose layout differs after ai_addr (the
 // blob, blob length and provider fields precede ai_next) and which must be released with
@@ -2326,7 +2330,8 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify,
             return std::unexpected("request failed: no file descriptor available");
         // Egress policy: resolve and classify the target BEFORE any socket exists, then pin the
         // connect to a vetted address (see vet_egress_target). Name resolution is part of the
-        // total bound below.
+        // total bound below, except on a glibc build where it can run to about 30 s against an
+        // unresponsive resolver.
         const auto pins = vet_egress_target(target->host, allow_private_networks, target->cleartext,
                                             timeout_ms, nat64_prefixes);
         if (!pins)

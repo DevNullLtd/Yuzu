@@ -15259,8 +15259,9 @@ private:
                 try {
                     // TWO deliberately separate header lookups (#2407 R1 fix,
                     // hardened 2026-08-07 — do not "simplify" back to one).
-                    // Presence (`has_content_length`) is answered by this
-                    // iterator range. The VALUE comes from
+                    // Presence is answered by `has_content_length_for_body_cap`
+                    // (body_cap_httplib.hpp), the iterator range over the
+                    // header map. The VALUE comes from
                     // `content_length_for_body_cap` (web_utils.hpp) — see
                     // that function's doc comment for the CRITICAL bypass a
                     // hand-rolled `std::from_chars` parse caused here once
@@ -15271,9 +15272,6 @@ private:
                     // both this call site and the test fixtures' through the
                     // ONE shared function keeps the Content-Length value
                     // reading the same everywhere.
-                    const auto cl_range = req.headers.equal_range("Content-Length");
-                    const bool has_content_length = cl_range.first != cl_range.second;
-
                     // THE DECISION — the ONE callable both this production
                     // chokepoint and test_body_cap_policy.cpp's
                     // UnifiedBodyCapTestServer fixture invoke (#2898). See
@@ -15287,7 +15285,7 @@ private:
                     // ourselves instead of asking httplib — see
                     // `content_length_is_authoritative`'s doc comment).
                     const auto decision = yuzu::server::evaluate_body_cap(
-                        req.method, req.path, has_content_length,
+                        req.method, req.path, has_content_length_for_body_cap(req),
                         content_length_for_body_cap(req),
                         transfer_encoding_for_body_cap(req),
                         content_encoding_for_body_cap(req),
