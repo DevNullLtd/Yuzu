@@ -1392,7 +1392,7 @@ Terminal, irreversible revoke. Every active credential is revoked **first**, the
 }
 ```
 
-**Errors:** `404` — engine principal not found. `503` — a genuine store failure at any step of the sequence (the principal lookup, the credential-store revoke, or the identity revoke itself) — never an idempotent no-op; credentials are revoked strictly before the identity, so a `503` here never leaves the identity flipped to `revoked` while a credential is still live. A `503` because the stores are not open, the principal lookup failed, the credential revoke failed or the identity revoke failed carries `Retry-After: 2` and `retry_after_ms: 2000`; repeating the call is safe. The `503` for a revoke the store reported as not applied carries no hint. `503` + `Sec-Audit-Failed: true` — the revoke audit row could not persist (see *Audit-persist failure* above); the revoke may already have taken effect, so reconcile via `GET`. This `503` carries no retry hint.
+**Errors:** `404` — engine principal not found. `503` — a genuine store failure at any step of the sequence (the principal lookup, the credential-store revoke, or the identity revoke itself) — never an idempotent no-op; credentials are revoked strictly before the identity, so a `503` here never leaves the identity flipped to `revoked` while a credential is still live. `503` + `Sec-Audit-Failed: true` — the revoke audit row could not persist (see *Audit-persist failure* above); the revoke may already have taken effect, so reconcile via `GET`. The 503 has six causes: the stores are not open, the identity read failed, the credential revoke failed, the identity revoke returned an error (the credentials are already revoked), the identity revoke reported not done without an error, and the audit row could not be saved. The first four carry `Retry-After` and `retry_after_ms`; the last two do not. Repeating the call is safe.
 
 ---
 
@@ -2076,8 +2076,11 @@ Quarantine a device.
 > grant. That remediation does not help a group-only holder, a JIT-elevated administrator
 > with no grant of their own, or a transient RBAC read failure: for the last, check
 > `yuzu_server_rbac_read_degrade_total` before treating the refusal as permanent. The
-> `403` bodies never carry a `permission` field: holding that permission would not admit
-> the caller, so naming it would be a false remediation hint. A refused request writes no
+> `403` bodies above never carry a `permission` field: holding that permission would not admit
+> the caller, so naming it would be a false remediation hint. The per-device scoped gate runs
+> before this check and has its own `403` (the caller lacks `Security:Execute` on the target
+> device, or the RBAC read failed): that body does carry a `permission` field and the refusal
+> is audited as `auth.scoped_permission_required`, not `quarantine.enable`. A refused request writes no
 > quarantine record and no `attempt` audit row. It writes a `quarantine.enable` row with
 > `result=denied` and the reason in `detail`, and increments
 > `yuzu_server_dispatch_denied_total{reason}`. A session that expires between the first
@@ -10938,7 +10941,7 @@ These endpoints drive the **Plugin Code Signing** card, which appears on **Setti
 
 **v1 deprecated.** `GET /api/v1/agent/plugin-policy` predates #4028, is now DEPRECATED, and stays on its original flat-body shape (no `data` envelope, `require_admin` gate instead of `PluginSigning:Read`, no audit row, the old bespoke error shape) — see `server-admin.md`'s vNEXT note for the announced removal window. #4028 originally hardened this route's shape in place; #4144 corrected that into the v1/v2 split below, since an in-place envelope reshape is a breaking change per `docs/api-versioning-policy.md`.
 
-- **Permission:** `PluginSigning:Read` (Administrator-only via the `rbac_store.cpp` seed; floored in `authz_topology_floor.hpp` so an RBAC-off deployment stays admin-gated — the same practical posture the prior admin-only gate had for interactive sessions and non-MCP API tokens). **No MCP token, at any tier, can satisfy this permission** — `PluginSigning` is one of four server-administration securables `mcp_policy.hpp`'s `tier_allows()` denies outright, regardless of Read/Write, so an admin-owned MCP token that would otherwise fall through the legacy role check is stopped before it gets there. The bundle holds X.509 certificates only (no private keys), but the SHA-256 fingerprint and the trust-anchor identity are operationally sensitive — non-admin token holders are not authorized to see when the trust anchor rotates. Future automatic agent-side fetch will introduce a dedicated agent identity for this endpoint.
+- **Permission:** `PluginSigning:Read` (granted to Administrator by default via the `rbac_store.cpp` seed, so with RBAC enforced a custom role granted it is admitted; floored in `authz_topology_floor.hpp` so an RBAC-off deployment requires the admin role — the same practical posture the prior admin-only gate had for interactive sessions and non-MCP API tokens). **No MCP token, at any tier, can satisfy this permission** — `PluginSigning` is one of four server-administration securables `mcp_policy.hpp`'s `tier_allows()` denies outright, regardless of Read/Write, so an admin-owned MCP token that would otherwise fall through the legacy role check is stopped before it gets there. The bundle holds X.509 certificates only (no private keys), but the SHA-256 fingerprint and the trust-anchor identity are operationally sensitive — non-admin token holders are not authorized to see when the trust anchor rotates. Future automatic agent-side fetch will introduce a dedicated agent identity for this endpoint.
 - **Audit:** fail-closed. `settings.plugin_signing.read` is persisted before the response is built; if the audit subsystem is unavailable the route returns 503 rather than serve settings data without durable evidence.
 - **Stability:** pilot-stable. The field set is unlikely to shrink (forward-compatible additions only). `cert_count`/`sha256`/`subjects`/`trust_bundle_pem` are derived from a single filesystem read (#4144) — they cannot describe two different bundle versions on a concurrent-upload race, unlike v1.
 - **Response (200, bundle uploaded):**
