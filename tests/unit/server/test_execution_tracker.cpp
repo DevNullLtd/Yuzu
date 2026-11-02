@@ -3194,6 +3194,88 @@ TEST_CASE("ExecutionTracker: WS-2a refresh_counts terminal transition is atomic 
     CHECK(exec->status == "running");
 }
 
+TEST_CASE("ExecutionTracker: WS-2a refresh_counts partial-append rollback — progress "
+          "append succeeds, terminal append fails, the WHOLE txn rolls back (#3846)",
+          "[pg][execution_tracker][outbox]") {
+    // The sibling case above drops event_outbox, so the FIRST append (progress)
+    // fails and the second is never attempted. This pins the partial sequence:
+    // refresh_counts_once's `execution-progress` INSERT succeeds, then its
+    // `execution-completed` INSERT fails. The already-succeeded progress row, the
+    // aggregate recompute and the terminal status flip must all roll back together.
+    // Injected with a CHECK constraint that rejects only the terminal event type.
+    // This relies on refresh_counts_once appending execution-progress BEFORE
+    // execution-completed. If that order ever changes, the test degrades to the
+    // sibling's first-append case (still green, but no longer proves that an
+    // earlier successful append rolls back) — revisit it then.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution()); // status "running"
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.set_agents_targeted(*id, 1));
+
+    // In-memory bus attached AFTER create_execution/set_agents_targeted so only
+    // refresh_counts's own publishes are counted. The durable append does not
+    // need a bus; this pins that a ROLLED-BACK refresh publishes nothing live.
+    ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+
+    auto run_sql = [&](const char* sql) {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    };
+
+    {
+        // A responded agent row inserted directly, so refresh_counts sees
+        // all-responded WITHOUT update_agent_status (whose own append would fire).
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO execution_tracker.agent_exec_status "
+            "(execution_id, agent_id, status, dispatched_at, first_response_at, completed_at, "
+            " exit_code, error_detail, plugin_result_status) "
+            "VALUES ($1, 'agent-1', 'success', 0, 0, 0, 0, '', 0)",
+            std::vector<std::string>{*id});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    }
+
+    run_sql("ALTER TABLE execution_tracker.event_outbox "
+            "ADD CONSTRAINT yuzu_test_no_terminal_append "
+            "CHECK (event_type <> 'execution-completed')");
+
+    tracker.refresh_counts(*id); // progress append OK -> terminal append fails -> rollback
+
+    {
+        auto exec = tracker.get_execution(*id);
+        REQUIRE(exec.has_value());
+        CHECK(exec->status == "running");     // terminal transition rolled back
+        CHECK(exec->agents_responded == 0);   // aggregate recompute rolled back too
+    }
+    // The progress row that DID insert must not survive the failed second append.
+    CHECK(fetch_outbox(tracker_bundle.pool(), *id).empty());
+    CHECK(bus.snapshot(*id).empty()); // nothing published for the rolled-back txn
+
+    // Positive control: lift the injected failure. The rolled-back state is
+    // retryable (not wedged) and the same call now commits both events.
+    run_sql("ALTER TABLE execution_tracker.event_outbox "
+            "DROP CONSTRAINT yuzu_test_no_terminal_append");
+    tracker.refresh_counts(*id);
+
+    auto exec = tracker.get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "succeeded");
+    CHECK(exec->agents_responded == 1); // contrast with the rolled-back 0 above
+    auto rows = fetch_outbox(tracker_bundle.pool(), *id);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].event_type == "execution-progress");
+    CHECK(rows[1].event_type == "execution-completed");
+    CHECK(rows[1].is_terminal);
+    CHECK(bus.snapshot(*id).size() == 2); // both events published, once, after commit
+}
+
 // ── #4982 Part B: reap_stuck_running_executions ──────────────────────────────
 //
 // The candidate query is a cross-schema NOT EXISTS against

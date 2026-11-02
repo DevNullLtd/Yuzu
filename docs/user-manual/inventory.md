@@ -11,13 +11,14 @@ cadences.
 
 - **Machine-wide installed software** (blob contract v2): name, version,
   publisher, install date, plus the package-manager fields below. The daily
-  sync calls six inventory actions in-process and merges their rows:
+  sync calls seven inventory actions in-process and merges their rows:
   `installed_apps` `list_inventory` (Windows: `HKLM` + the agent service
   account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
   `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
   `store_packages` (Linux snaps and flatpaks), and
   `windows_optional_features` `list` and `msi_packages` `list_inventory`
-  (Windows machine-context MSI products). An action whose plugin is not loaded, or
+  (Windows machine-context MSI products), and `runtimes` `python` (installed
+  Python interpreters). An action whose plugin is not loaded, or
   that answers "unsupported on this OS", is skipped. A plugin that is not
   loaded is logged at warn (the rows its action produced are removed on the next
   report); without `installed_apps` the source stays idle and sends nothing,
@@ -29,10 +30,13 @@ cadences.
   skips that day's report and keeps the last good state — nothing is deleted. A
   `constrained` `managers` answer that still names at least one present manager
   is accepted: the constraint concerns manager facts the presence row never
-  carried. A skipped cycle is retried sooner on a phase-aligned backoff:
-  waits that double from 1 h after each consecutive skip (1 h, 2 h, 4 h, 8 h, …),
-  each retry capped so it never lands after the next daily slot — up to four
-  extra attempts — then one attempt per daily slot until a collection succeeds.
+  carried. A `constrained` `runtimes` `python` answer is the other exception: it
+  withholds only the Python rows and the cycle continues, so the stored Python rows
+  are removed until a later read succeeds (see Troubleshooting). A skipped cycle
+  is retried sooner on a phase-aligned backoff: waits that double from 1 h after
+  each consecutive skip (1 h, 2 h, 4 h, 8 h, …), each retry capped so it never
+  lands after the next daily slot — up to four extra attempts — then one attempt
+  per daily slot until a collection succeeds.
   While it is skipping, the agent publishes the heartbeat tags
   `yuzu.sync.installed_software.skip_streak` (consecutive skips since the last
   success, uncapped) and `yuzu.sync.installed_software.last_skip` (the reason
@@ -41,7 +45,8 @@ cadences.
   `source` names the
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `pkg_inventory.store_packages`,
-  `windows_optional_features.list`, `msi_packages.list_inventory`); `package_id`
+  `windows_optional_features.list`, `msi_packages.list_inventory`,
+  `runtimes.python`); `package_id`
   is empty for these producers except `msi_packages.list_inventory`, where it is
   the MSI product code. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
@@ -80,19 +85,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -149,6 +154,28 @@ cadences.
   and the machine-context guarantee. Install location and uninstall string are
   not collected (wire slots 13-14 stay reserved and empty, #5186). If the
   enumeration itself fails the cycle is skipped (see Troubleshooting).
+
+  **Python interpreters** are collected through `runtimes` `python` (all three OSes;
+  `source` `runtimes.python`) as one `app` row per interpreter, `name` `Python`,
+  `ecosystem` `python`, `version` the interpreter version; publisher and the other
+  package fields are empty. No process is started: each OS answers from install
+  metadata. Windows reads the PEP 514 `HKLM\SOFTWARE\Python\PythonCore` keys in both
+  registry views (python.org installs; per-user installs and other PEP 514
+  publishers are not listed) and reports the full `x.y.z`. macOS reads the
+  python.org framework under `/Library/Frameworks/Python.framework/Versions` and
+  reports the full `x.y.z` from each version's `Info.plist`. Linux lists
+  `python3.<minor>` files in `/usr/bin`, `/usr/local/bin` and `/var/usrlocal/bin` (the
+  last exists only on rpm-ostree hosts such as Fedora CoreOS and RHEL Edge, where
+  `/usr/local` links to `../var/usrlocal`) and reports **major.minor only** (for
+  example `3.11`): the patch level is not stored anywhere without running the
+  interpreter, so it is not guessed.
+  Homebrew, pyenv, conda, virtual environments and Xcode's Python are not walked. A
+  read that cannot be completed (an unreadable or network-mounted root, a cap, an
+  access-denied registry key) withholds only the `python` rows from that day's report
+  and every other source is still sent; the report replaces the device's stored
+  software rows, so the stored `python` rows are removed until a read succeeds again
+  (see Troubleshooting). A missing or unreadable version file never does this, the
+  row reports the version it could determine.
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,
@@ -826,6 +853,23 @@ read more than 20000 rows` (or a merged-entry or 3 MiB blob cap) is not an
 action failure: that host reports more software rows than one report can carry,
 so its report is skipped rather than sent truncated; review the host's
 inventory rather than removing a plugin.
+
+**A device's Python rows vanished, but the rest of its software is still reported; its
+log shows `sync: runtimes.python constrained (<tokens>) — rows withheld this cycle`.**
+The `runtimes` `python` read was constrained, so the agent withheld only the Python rows
+rather than send a partial list. The report replaces the device's stored software rows,
+so its stored `python` rows are removed until a read succeeds again; no other source is
+affected and the cycle is not skipped. The tokens name the cause:
+`linux:runtimes:network_fs_skipped` (`/usr/bin`, `/usr/local/bin`, `/var/usrlocal/bin` or
+a directory above one of them, such as `/usr/local`, is on a network mount, so it is
+never opened), `linux:runtimes:permission_denied`,
+`linux:runtimes:symlink_refused` (a symlink at a root that is not a same-action alias;
+the rpm-ostree `/usr/local -> ../var/usrlocal` link is covered and is not a cause),
+`linux:runtimes:mountinfo_unreadable` and `macos:runtimes:mountinfo_unreadable` (the
+mount table could not be read), `macos:runtimes:permission_denied`,
+`windows:runtimes:python_reg:access_denied` and any `<os>:runtimes:row_cap` or
+`windows:runtimes:python_reg:row_cap` (a walk cap was hit). Fix the named cause; the next
+daily sync restores the rows.
 
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`

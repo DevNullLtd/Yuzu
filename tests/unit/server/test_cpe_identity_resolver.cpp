@@ -88,9 +88,12 @@ TEST_CASE("os-native lanes are not-assessed with no identity work", "[cpe]") {
     SoftwareEntry flatpak_runtime = pkg("org.gnome.Platform", "", "flatpak", "", "pkg");
     // Machine-context MSI products: kind pkg, so only the ecosystem edit makes it os-native.
     SoftwareEntry msi = pkg("7-Zip 26.04 (x64 edition)", "26.04.00.0", "msi", "", "pkg");
+    // An installed Python interpreter (runtimes.python): the plugin emits kind `app`, which is
+    // os-native on its own, so kind `pkg` isolates the ecosystem edit.
+    SoftwareEntry python = pkg("Python", "3.13.1", "python", "", "pkg");
 
-    for (const SoftwareEntry* e :
-         {&win, &mac, &brew, &cask, &receipt, &feat, &feat_rpm, &snap, &flatpak_runtime, &msi}) {
+    for (const SoftwareEntry* e : {&win, &mac, &brew, &cask, &receipt, &feat, &feat_rpm, &snap,
+                                   &flatpak_runtime, &msi, &python}) {
         auto id = r.resolve(*e);
         REQUIRE(id.outcome == IdentityOutcome::NotAssessed);
         REQUIRE(id.not_assessed_reason == std::string(kReasonOsNative));

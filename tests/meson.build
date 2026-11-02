@@ -638,6 +638,8 @@ agent_test_exe = executable(
     'unit/test_runtimes_parsers.cpp',            # Wave 10 PR10.1-b: pure parsers over REAL CAPTURE fixtures, unguarded on every OS
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_runtimes_python_parsers.cpp',     # runtimes python: pure python layer + macOS framework walk over a materialized fixture tree (walk body POSIX-only)
+    'unit/test_runtimes_win_walk.cpp',           # runtimes python: PythonCore dual-view walk, FakeOps + salted scratch key (Windows-only; no-op TU elsewhere)
     'unit/test_pkg_inventory_parsers.cpp',          # Wave 10 PR10.1-c: pure row formatters/tokens + synthetic in-code macOS walk cases (no committed fixture)
     'unit/test_pkg_inventory_macos_parsers.cpp',    # Wave 10 PR10.1-c: injected-root Homebrew walk over a REAL CAPTURE Cellar tree
     'unit/test_pkg_inventory_linux_parsers.cpp',    # pkg_inventory Linux legs: injected-root Linux snap/flatpak/managers walk over a REAL CAPTURE tree manifest (body POSIX-only)

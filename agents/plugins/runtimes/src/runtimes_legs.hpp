@@ -6,8 +6,8 @@
  * entry-point declarations, and (c) the two result-emission helpers every
  * leg calls, so no leg picks a status/completeness pairing by hand.
  *
- * Shipped legs: Linux. macOS and Windows are PLANNED placeholders that emit
- * `status|<action>|unsupported|<macos|windows>:planned`.
+ * Shipped legs: Linux (dotnet, jvm, python); macOS and Windows ship `python` only -- their dotnet
+ * and jvm are PLANNED placeholders that emit `status|<action>|unsupported|<macos|windows>:planned`.
  */
 #pragma once
 
@@ -23,12 +23,13 @@
 namespace yuzu::runtimes {
 
 /// One value per `actions()` entry (runtimes_plugin.cpp).
-enum class Action { dotnet, jvm };
+enum class Action { dotnet, jvm, python };
 
 [[nodiscard]] constexpr std::string_view action_name(Action a) noexcept {
     switch (a) {
     case Action::dotnet: return "dotnet";
     case Action::jvm:    return "jvm";
+    case Action::python: return "python";
     }
     return "dotnet";
 }
@@ -38,6 +39,7 @@ enum class Action { dotnet, jvm };
 [[nodiscard]] constexpr std::optional<Action> parse_action(std::string_view s) noexcept {
     if (s == "dotnet") return Action::dotnet;
     if (s == "jvm") return Action::jvm;
+    if (s == "python") return Action::python;
     return std::nullopt;
 }
 
