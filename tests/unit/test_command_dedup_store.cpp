@@ -22,12 +22,15 @@
 
 #include <sqlite3.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -405,6 +408,53 @@ TEST_CASE("CommandDedupStore: cached_row_count survives a move of the store",
     CHECK_FALSE(t.store.cached_row_count().has_value());
 }
 
+TEST_CASE("CommandDedupStore: cached_row_count is safe to read while claims and prunes run",
+          "[command_dedup][row_count][concurrent]") {
+    // The heartbeat thread reads cached_row_count() lock-free while the reader thread claims and
+    // a worker thread records/prunes under mu_. This is the one cross-thread read the cache adds,
+    // so it is the case TSan (nightly) needs: a data race on cached_rows_ or db_ would be flagged
+    // here. Without TSan it still pins the bounds: never negative once known, never beyond the
+    // rows ever inserted, and exact against the table once the writer has stopped.
+    auto t = make_store();
+    t.store.set_max_dedup_rows_for_test(50);
+    constexpr int kCycles = 600; // > kPruneInterval (512), so at least one prune + recount runs
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> reads{0};
+    std::atomic<std::int64_t> lowest{INT64_MAX};
+    std::atomic<std::int64_t> highest{-1};
+    std::thread reader([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            if (const auto rows = t.store.cached_row_count()) {
+                reads.fetch_add(1, std::memory_order_relaxed);
+                std::int64_t cur = lowest.load(std::memory_order_relaxed);
+                while (*rows < cur && !lowest.compare_exchange_weak(cur, *rows)) {}
+                cur = highest.load(std::memory_order_relaxed);
+                while (*rows > cur && !highest.compare_exchange_weak(cur, *rows)) {}
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    for (int i = 0; i < kCycles; ++i) {
+        const auto id = "conc-" + std::to_string(i);
+        REQUIRE(t.store.claim(id).status == ClaimStatus::Claimed);
+        REQUIRE(t.store.record_terminal(id, "SUCCESS") == RecordOutcome::Recorded);
+    }
+    stop.store(true, std::memory_order_release);
+    reader.join();
+
+    CHECK(reads.load() > 0);
+    CHECK(lowest.load() >= 0); // a known count is never negative
+    CHECK(highest.load() <= kCycles); // never more rows than were ever inserted
+    const auto cached = t.store.cached_row_count();
+    const auto real = t.store.count();
+    REQUIRE(cached.has_value());
+    REQUIRE(real.has_value());
+    CHECK(*cached == *real); // no release() ran, so the cache is exact
+    CHECK(*cached < kCycles); // the prune evicted, and the recount saw it
+}
+
 // ── Corruption recovery (#3665) ──────────────────────────────────────────────
 
 // Quarantined siblings of `db` (`<name>.corrupt-*`, plus their -wal/-shm sidecars).
@@ -495,6 +545,29 @@ TEST_CASE("CommandDedupStore: a non-database file is quarantined and recreated",
     CHECK(quarantine_siblings(path).size() == 1);
     auto dup = reopened->claim("cmd-after-recovery");
     CHECK(dup.status == ClaimStatus::Duplicate);
+}
+
+TEST_CASE("CommandDedupStore: the fresh store after a quarantine reports a known zero row count",
+          "[command_dedup][lifecycle][corruption][row_count]") {
+    // #3665 recovery builds a NEW store through the same constructor that takes the initial
+    // count. The quarantined file's rows are gone, so the cache must read a KNOWN 0 (an unknown
+    // would look like an agent that does not report the tag), and must then track claims.
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    QuarantineCleanup qc{path};
+    write_bytes(path, "this is not a sqlite database");
+
+    auto result = CommandDedupStore::open(path);
+    REQUIRE(result.has_value());
+    REQUIRE(result->quarantined_this_open().has_value());
+    auto fresh = result->cached_row_count();
+    REQUIRE(fresh.has_value());
+    CHECK(*fresh == 0);
+
+    REQUIRE(result->claim("cmd-after-recovery").status == ClaimStatus::Claimed);
+    auto after = result->cached_row_count();
+    REQUIRE(after.has_value());
+    CHECK(*after == 1);
 }
 
 TEST_CASE("CommandDedupStore: a file whose schema page is garbage is quarantined",

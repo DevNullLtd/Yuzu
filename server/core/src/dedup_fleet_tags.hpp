@@ -14,9 +14,11 @@
 /// The keys are duplicated here rather than `#include`d from the agent ON PURPOSE - the same
 /// rationale as guardian_health_fleet_tags.hpp: server production code including an agent
 /// private header would add an upward server -> agent dependency edge the build graph does not
-/// have and must not gain. tests/unit/server/test_dedup_fleet_tags.cpp is the drift guard: it
-/// pins the keys against the agent source text, so a rename on either side without the other is
-/// a red test, not a silently-dead gauge.
+/// have and must not gain. Two tests bind the sides: tests/test_dedup_fleet_tags_lexical.py pins
+/// the keys against the agent source text (every `yuzu.dedup_*` tag agent.cpp emits has a row
+/// here or a reasoned exemption, and the reverse), so a rename on either side without the other
+/// is a red test, not a silently-dead gauge; and tests/unit/server/test_dedup_fleet_tags.cpp
+/// tests the parse and classification below directly.
 ///
 /// SHAPE: a COUNT OF AGENTS, not a sum of counters. Every counter tag is a per-process
 /// cumulative value that resets to 0 on an agent restart, so an unlabelled fleet SUM of them
@@ -27,6 +29,14 @@
 /// `yuzu_fleet_ota_signature_refusing_agents`. Consequence, stated in every HELP string below:
 /// a counter-derived gauge means "since that agent's last restart", NOT "currently". Only the
 /// degraded flag is a live 0/1 reading, which is why it is the only one with an alert.
+///
+/// POPULATION AND SCOPE: every gauge here is computed over the agents with a heartbeat in the
+/// last 90 s (the health store's staleness window; an offline agent, or one that heartbeats
+/// slower than 90 s, drops out), and `AgentHealthStore` is per core replica, so each replica
+/// exports only the agents attached to it (sum across replicas; a failover can briefly count an
+/// agent on two). `yuzu_fleet_agents_dedup_store_degraded` covers a store that failed to OPEN;
+/// a store that opened and later failed writes shows only on the latched `..._claim_erroring`,
+/// `..._record_erroring` and `..._release_erroring` counts, which have no alert.
 ///
 /// WHAT ABSENCE MEANS: the count gauges are server-owned counts over the reporting population
 /// and are published every sweep, 0 included, so a flat 0 is a measurement. Whether anyone is
@@ -80,11 +90,15 @@ inline constexpr std::size_t kDedupPresenceIndex = 0;
 /// HELP text is 7-bit ASCII (scripts/ci/check-metrics-help-ascii.sh).
 inline constexpr DedupAgentCountMetric kDedupAgentCountMetrics[] = {
     {"yuzu.dedup_degraded", DedupCountKind::kFlag, "yuzu_fleet_agents_dedup_store_degraded",
-     "Agents whose durable command-dedup store never opened (heartbeat tag "
+     "Agents whose durable command-dedup store could not be opened (heartbeat tag "
      "yuzu.dedup_degraded = 1). Such an agent still runs commands but WITHOUT replay "
      "protection: a redelivered command may execute twice (at-least-once, fail-open by design, "
-     "ADR-2002 WS-0). A live reading, recomputed every sweep: it clears when the agent restarts "
-     "with a working store. >0 sustained is the YuzuDedupStoreDegraded alert"},
+     "ADR-2002 WS-0). Covers a store that failed to OPEN only: a store that opened and later "
+     "failed writes shows on yuzu_fleet_agents_dedup_claim_erroring, which has no alert. A "
+     "live reading over agents with a heartbeat in the last 90 s, recomputed every sweep and "
+     "exported per core replica (sum across replicas): it clears about 45 s after a restarted "
+     "agent's next heartbeat, and an agent offline for more than 90 s leaves it without having "
+     "been fixed. >0 sustained is the YuzuDedupStoreDegraded sample alert"},
     {"yuzu.dedup_replays", DedupCountKind::kPositiveCounter, "yuzu_fleet_agents_dedup_replaying",
      "Agents that have served at least one durable terminal-outcome replay since their last "
      "restart (heartbeat tag yuzu.dedup_replays > 0). Informational: a replay is the dedup "
@@ -120,6 +134,8 @@ inline constexpr DedupAgentCountMetric kDedupAgentCountMetrics[] = {
 };
 
 inline constexpr std::size_t kNDedupAgentCountMetrics = std::size(kDedupAgentCountMetrics);
+static_assert(kDedupPresenceIndex < kNDedupAgentCountMetrics,
+              "the presence row must exist in the table");
 
 /// Capacity signal: the agent's cached row count (in-flight + terminal) in its dedup store.
 /// Rolled up as the fleet MAX (a sum of row counts is meaningless; the question is "how close
@@ -130,17 +146,24 @@ inline constexpr const char* kDedupRowsTag = "yuzu.dedup_rows";
 inline constexpr const char* kDedupRowsMaxGauge = "yuzu_fleet_dedup_rows_max";
 inline constexpr const char* kDedupRowsMaxHelp =
     "Largest durable command-dedup store, in rows (in-flight + terminal), reported by any agent "
-    "(heartbeat tag yuzu.dedup_rows, an approximate cached count). The store is a ring that "
-    "keeps the newest 20000 terminal rows, so a healthy value tops out near 20500; in-flight "
-    "rows from crashed commands are never evicted and are the only way it grows past that. "
-    "Absent when no agent reports it";
+    "(heartbeat tag yuzu.dedup_rows, an approximate cached count that can over-read after a "
+    "burst of released claims). The store is a ring that keeps the newest 20000 terminal rows, "
+    "so a healthy value tops out near 20500; in-flight rows from crashed commands are never "
+    "evicted and are one way it grows past that. It is a MAX of agent-reported values: one "
+    "agent's forged value below the plausibility ceiling owns it and it names no agent, so "
+    "treat it as a hint and investigate sustained values above about 25000. Absent when no "
+    "agent reports it";
 
 /// Meta-gauges, the coverage denominators that absence would otherwise hide.
 inline constexpr const char* kDedupReportingGauge = "yuzu_fleet_agents_dedup_reporting";
 inline constexpr const char* kDedupReportingHelp =
-    "Agents whose latest heartbeat carried a valid yuzu.dedup_degraded flag, i.e. the agents "
-    "the yuzu_fleet_agents_dedup_* counts are measuring. An agent that predates the tag is not "
-    "counted here, so a 0 in the dedup counts is only reassuring when this is non-zero";
+    "Agents with a heartbeat in the last 90 s whose latest heartbeat carried a valid "
+    "yuzu.dedup_degraded flag, i.e. the agents the yuzu_fleet_agents_dedup_* counts are "
+    "measuring. Exported per core replica (each replica counts only the agents attached to it; "
+    "sum across replicas). An agent that predates the tag, or whose flag was rejected, is not "
+    "counted here, so a 0 in the dedup counts is only reassuring when this is non-zero and "
+    "close to the number of agents you expect; the counts can exceed this when an agent's flag "
+    "was rejected but another of its dedup tags was valid";
 inline constexpr const char* kDedupTagRejectedGauge = "yuzu_fleet_agents_dedup_tag_rejected";
 inline constexpr const char* kDedupTagRejectedHelp =
     "Agents whose latest heartbeat carried at least one yuzu.dedup_* value the server "
@@ -149,7 +172,12 @@ inline constexpr const char* kDedupTagRejectedHelp =
     ">0 means an agent is sending malformed or forged dedup tags";
 
 /// Forged-value-safe parse of an agent-supplied dedup tag. Digits only, 1 to 10 characters,
-/// at most kMaxPlausibleDedupValue; "0" is valid. Anything else is nullopt (rejected).
+/// at most kMaxPlausibleDedupValue; "0" is valid. Anything else is nullopt (rejected). Leading
+/// zeros are ACCEPTED ("0000000001" is 1): the agent writes std::to_string and never emits
+/// them, the value is only compared and counted, never summed or used as a label, and rejecting
+/// them would only add a way for a benign formatting change to drop an agent from the counts.
+/// The 10-character cap is load-bearing: it is what keeps `v * 10 + digit` from wrapping an
+/// unsigned long long, so a 20-digit forgery can never read as a small number.
 /// No allocation, no exceptions: the value is attacker-controlled and read once per agent per
 /// sweep under the health-store lock.
 [[nodiscard]] inline std::optional<unsigned long long> parse_dedup_value(

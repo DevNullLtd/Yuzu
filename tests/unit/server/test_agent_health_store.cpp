@@ -2855,7 +2855,7 @@ std::string dedup_sweep(const std::vector<
 
 TEST_CASE("REAL AgentHealthStore: dedup_degraded is a live 0/1 flag; reporting and rejected "
           "are the denominators",
-          "[health_store][dedup][real]") {
+          "[health_store][dedup_fleet][real]") {
     const auto out = dedup_sweep({
         {"a", {{"yuzu.dedup_degraded", "1"}}},       // counted + reporting
         {"b", {{"yuzu.dedup_degraded", "0"}}},       // reporting, not counted
@@ -2870,7 +2870,7 @@ TEST_CASE("REAL AgentHealthStore: dedup_degraded is a live 0/1 flag; reporting a
 }
 
 TEST_CASE("REAL AgentHealthStore: every dedup count gauge is published at 0 on an empty fleet",
-          "[health_store][dedup][real]") {
+          "[health_store][dedup_fleet][real]") {
     // Server-owned counts over the reporting population: a flat 0 is a measurement, and
     // `reporting` = 0 is what says nobody is being measured. Only rows_max is absent.
     const auto out = dedup_sweep({});
@@ -2882,7 +2882,7 @@ TEST_CASE("REAL AgentHealthStore: every dedup count gauge is published at 0 on a
 }
 
 TEST_CASE("REAL AgentHealthStore: dedup counter gauges count agents with a value > 0",
-          "[health_store][dedup][real]") {
+          "[health_store][dedup_fleet][real]") {
     for (const auto& m : yuzu::server::detail::kDedupAgentCountMetrics) {
         if (m.kind != yuzu::server::detail::DedupCountKind::kPositiveCounter)
             continue;
@@ -2896,14 +2896,19 @@ TEST_CASE("REAL AgentHealthStore: dedup counter gauges count agents with a value
             {"f", {{m.tag, "garbage"}}},     // rejected
             {"g", {{m.tag, "1000000001"}}},  // above the plausibility ceiling: rejected, not clamped
             {"h", {{m.tag, "12345678901"}}}, // over 10 chars: rejected
+            {"i", {{m.tag, "18446744073709551617"}}}, // 2^64+1: wraps to 1 without the cap
         });
         CHECK(series_val(out, std::string(m.gauge) + " ") == 2.0);
-        CHECK(series_val(out, "yuzu_fleet_agents_dedup_tag_rejected ") == 4.0);
+        CHECK(series_val(out, "yuzu_fleet_agents_dedup_tag_rejected ") == 5.0);
+        // No cross-talk: every OTHER count gauge stays 0 when only this tag is set.
+        for (const auto& other : yuzu::server::detail::kDedupAgentCountMetrics)
+            if (std::string(other.gauge) != m.gauge)
+                CHECK(series_val(out, std::string(other.gauge) + " ") == 0.0);
     }
 }
 
 TEST_CASE("REAL AgentHealthStore: an agent restart (counter back to 0) leaves the count",
-          "[health_store][dedup][real]") {
+          "[health_store][dedup_fleet][real]") {
     // The reason this is an agent COUNT rather than a fleet sum: the counters are per-process,
     // so a restart that zeroes one must not look like a negative increment - it just stops
     // being counted.
@@ -2919,7 +2924,7 @@ TEST_CASE("REAL AgentHealthStore: an agent restart (counter back to 0) leaves th
 }
 
 TEST_CASE("REAL AgentHealthStore: dedup_rows_max is the fleet MAX and absent when unreported",
-          "[health_store][dedup][real]") {
+          "[health_store][dedup_fleet][real]") {
     const char* k = "yuzu.dedup_rows";
     {
         const auto out = dedup_sweep({
@@ -2948,7 +2953,7 @@ TEST_CASE("REAL AgentHealthStore: dedup_rows_max is the fleet MAX and absent whe
 }
 
 TEST_CASE("REAL AgentHealthStore: a stale dedup_rows_max series does not outlive its reporter",
-          "[health_store][dedup][real]") {
+          "[health_store][dedup_fleet][real]") {
     yuzu::server::detail::AgentHealthStore store;
     yuzu::MetricsRegistry metrics;
     beat_tags(store, "a", {{"yuzu.dedup_rows", "500"}});
@@ -2962,7 +2967,7 @@ TEST_CASE("REAL AgentHealthStore: a stale dedup_rows_max series does not outlive
 }
 
 TEST_CASE("REAL AgentHealthStore: one agent with several bad dedup tags is rejected once",
-          "[health_store][dedup][real]") {
+          "[health_store][dedup_fleet][real]") {
     const auto out = dedup_sweep({
         {"a",
          {{"yuzu.dedup_degraded", "7"},
@@ -2971,4 +2976,28 @@ TEST_CASE("REAL AgentHealthStore: one agent with several bad dedup tags is rejec
     });
     CHECK(series_val(out, "yuzu_fleet_agents_dedup_tag_rejected ") == 1.0);
     CHECK(series_val(out, "yuzu_fleet_agents_dedup_reporting ") == 0.0); // its flag was rejected
+}
+
+TEST_CASE("REAL AgentHealthStore: a valid degraded flag with a rejected rows tag counts once each",
+          "[health_store][dedup_fleet][real]") {
+    // reporting = 1 (the flag is valid), rejected = 1 (the rows tag is not), and an absent rows
+    // series (nothing valid to take a MAX of).
+    const auto out = dedup_sweep({
+        {"a", {{"yuzu.dedup_degraded", "0"}, {"yuzu.dedup_rows", "garbage"}}},
+    });
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_reporting ") == 1.0);
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_tag_rejected ") == 1.0);
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_dedup_rows_max"));
+}
+
+TEST_CASE("REAL AgentHealthStore: a counter can count an agent whose flag was rejected",
+          "[health_store][dedup_fleet][real]") {
+    // Documented in the reporting HELP: the counts are NOT bounded by `reporting`. An agent whose
+    // degraded flag is forged (2) is not reporting, but its valid claim_errors still counts.
+    const auto out = dedup_sweep({
+        {"a", {{"yuzu.dedup_degraded", "2"}, {"yuzu.dedup_claim_errors", "5"}}},
+    });
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_reporting ") == 0.0);
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_claim_erroring ") == 1.0);
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_tag_rejected ") == 1.0);
 }

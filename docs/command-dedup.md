@@ -34,8 +34,12 @@ regressible — nothing fails loudly when one is broken.
 7. **Store open/write failure is a DELIBERATE fail-OPEN** (run undeduplicated) that **MUST stay
    observable** (`yuzu.dedup_degraded` heartbeat plus local counters), never silent. The server
    turns those heartbeat tags into `yuzu_fleet_agents_dedup_*` gauges (`server/core/src/dedup_fleet_tags.hpp`)
-   and the `YuzuDedupStoreDegraded` alert (#3663); `tests/test_dedup_fleet_tags_lexical.py` fails if an
-   emitted `yuzu.dedup_*` tag has no server row, so a new tag cannot be a write nobody reads.
+   and a sample alert for the open-failure case, `YuzuDedupStoreDegraded` (#3663); its coverage limits (a store that
+   opened and later failed writes, agents offline or slow past 90 s, per-replica counts) are listed in
+   `docs/user-manual/security-hardening.md` "Fleet monitoring of the dedup store".
+   `tests/test_dedup_fleet_tags_lexical.py` fails if an emitted `yuzu.dedup_*` tag has no server row OR a named,
+   tracked exemption, so a new tag cannot quietly become a write nobody reads; the one current exemption is
+   `yuzu.dedup_quarantined` (#6933).
 
    **Corruption recovery (#3665).** A `command_dedup.db` that CANNOT BE OPENED because it is corrupt is
    quarantined and recreated, once, rather than leaving the agent degraded on every boot.
@@ -86,8 +90,10 @@ regressible — nothing fails loudly when one is broken.
      tested; the agent.cpp counter non-increment is not; see `docs/test-coverage.md`).
    - **The fleet signal does not survive a restart.** The heartbeat tag is a per-process counter, so one agent
      restart returns it to 0 while up to 3 quarantined files remain on the endpoint. A durable marker (derived
-     from the `.corrupt-*` files, or a row in the fresh store) is to be designed with the first server consumer of the
-     `yuzu.dedup_*` tags, tracked in #3663.
+     from the `.corrupt-*` files, or a row in the fresh store) is to be designed WITH its server consumer, tracked in
+     #6933. The first server consumer of the `yuzu.dedup_*` tags (#3663) deliberately does not read this tag: the
+     owner shipped it without the marker, so the enterprise-architect ruling on #6912 ("consumer and durable marker
+     ship together") is deferred, not satisfied, until #6933 lands.
    - The helper is a copy of echo's `quarantine_corrupt_db` (`echo_db.cpp`). Hoisting both into
      `agents/shared` is tracked in #6914. Echo does not yet have this code's
      no-overwrite claim or negative-epoch clamp.

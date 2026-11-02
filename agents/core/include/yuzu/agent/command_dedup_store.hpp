@@ -219,12 +219,15 @@ public:
      * `yuzu.dedup_rows`). Never takes mu_ and never queries SQLite, so the
      * heartbeat thread cannot contend with claim() on the latency-critical reader.
      *
-     * EXACT at open() and again after every prune (record_terminal() recounts
-     * under mu_ each kPruneInterval terminal records). Between those points it is
-     * only incremented on a new claim: a release() of an in-flight row does not
+     * EXACT at construction and again after every prune that reaches its recount
+     * (record_terminal() recounts under mu_ each kPruneInterval terminal records; a
+     * prune whose DELETE failed to PREPARE returns before it). Between those points
+     * it is only incremented on a new claim: a release() of an in-flight row does not
      * decrement it, so it can over-read by the number of releases since the last
-     * recount -- an over-read of a capacity gauge, never an under-read. nullopt
-     * when the initial count failed (unknown, NOT zero). Counts in-flight and
+     * recount -- an over-read of a capacity gauge, never an under-read. A recount that
+     * fails KEEPS the previous value, so nullopt means only that the count at
+     * construction failed (unknown, NOT zero) and stays so until a prune recount
+     * succeeds, which on a low-volume agent can be a long time. Counts in-flight and
      * terminal rows together, like count().
      */
     [[nodiscard]] std::optional<std::int64_t> cached_row_count() const noexcept;
@@ -260,8 +263,8 @@ private:
     /// Clock-free ring eviction over TERMINAL rows only. Caller holds mu_.
     void prune_locked() noexcept;
 
-    /// COUNT(*) into cached_rows_ (-1 on failure). Caller holds mu_ (or is the
-    /// sole owner, as in open()).
+    /// COUNT(*) into cached_rows_; on failure the previous value is kept. Caller holds mu_ (or is the
+    /// sole owner, as in the constructor).
     void refresh_row_count_locked() noexcept;
 
     /// Sentinel for "row count unknown" in cached_rows_.
