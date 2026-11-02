@@ -17,6 +17,7 @@
 #include "echo_registry_source.hpp"
 #include "echo_schema_registry.hpp"
 #include "test_helpers.hpp"
+#include "test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -990,6 +991,60 @@ TEST_CASE("reconcile_offline: a complete walk replaces, an incomplete one keeps,
     CHECK(reconcile_offline(known, {kSidA}, partial) == std::vector<OfflineProfile>{prof(kSidB)});
     complete.profiles = {prof(kSidA), prof(kSidB)};
     CHECK(reconcile_offline(known, {kSidA, kSidB}, complete).empty());
+}
+
+TEST_CASE("classify_offline_discovery: a loaded profile is skipped, an unreadable path is partial, a cut walk or a failed root is incomplete",
+          "[echo][registry][pure]") {
+    using yuzu::profiles::HiveState;
+    using yuzu::profiles::ProfileInfo;
+    const std::string sid_c = "S-1-5-21-3", sid_d = "S-1-5-21-4", sid_e = "S-1-5-21-5",
+                      sid_f = "S-1-5-21-6";
+    const auto info = [](const std::string& sid, HiveState st, std::string path, bool unreadable = false) {
+        return ProfileInfo{sid, "", std::move(path), st, unreadable};
+    };
+    const std::vector<ProfileInfo> profiles{
+       info(kSidA, HiveState::loaded, "C:\\Users\\a"),               // logged in: not offline
+       info(kSidB, HiveState::not_loaded, "C:\\Users\\b"),           // offline
+       info(sid_c, HiveState::loaded_classes_only, "C:\\Users\\c"),  // its NTUSER.DAT is not loaded
+       info(sid_d, HiveState::not_loaded, "C:\\Users\\d", true),     // path unreadable: partial
+       info(sid_e, HiveState::not_loaded, ""),                         // no path: partial
+    };
+    const std::vector<std::string> none;
+
+    // a complete walk: loaded skipped, a path-less profile partial (its cursor entry stands)
+    const auto d = classify_offline_discovery(true, false, false, profiles, none);
+    CHECK(d.complete);
+    CHECK(d.profiles == std::vector<OfflineProfile>{{kSidB, "C:\\Users\\b"}, {sid_c, "C:\\Users\\c"}});
+    CHECK(d.partial == std::vector<std::string>{sid_d, sid_e});
+    const std::vector<OfflineProfile> known{prof(sid_d), prof(sid_f)};
+    CHECK(reconcile_offline(known, {}, d) ==
+          std::vector<OfflineProfile>{{kSidB, "C:\\Users\\b"}, {sid_c, "C:\\Users\\c"}, prof(sid_d)});
+
+    // a record that failed to read is partial too, once (named by the walk and by the list)
+    const std::vector<std::string> failed{sid_d, sid_f};
+    CHECK(classify_offline_discovery(true, false, false, profiles, failed).partial ==
+          std::vector<std::string>{sid_d, sid_e, sid_f});
+
+    // a walk cut short, or stopped at the profile cap, is incomplete but still lists what it saw
+    for (const auto& [walk_complete, truncated] : {std::pair{false, false}, std::pair{true, true}}) {
+        INFO("walk_complete=" << walk_complete << " truncated=" << truncated);
+        const auto cut = classify_offline_discovery(walk_complete, false, truncated, profiles, none);
+        CHECK_FALSE(cut.complete);
+        CHECK(cut.profiles.size() == 2);
+        CHECK(cut.partial == std::vector<std::string>{sid_d, sid_e});
+    }
+
+    // ProfileList could not be opened: nothing was walked, so nothing is reported
+    const auto root = classify_offline_discovery(false, true, false, profiles, failed);
+    CHECK_FALSE(root.complete);
+    CHECK(root.profiles.empty());
+    CHECK(root.partial.empty());
+
+    // an empty, complete walk is a real answer: no logged-off profile exists
+    const auto empty = classify_offline_discovery(true, false, false, {}, none);
+    CHECK(empty.complete);
+    CHECK(empty.profiles.empty());
+    CHECK(empty.partial.empty());
 }
 
 TEST_CASE("cursor codec carries `offline` and `deferred`, both optional on decode",
@@ -2933,6 +2988,140 @@ TEST_CASE("registry offline: a record with an unreadable path keeps its entry; a
     CHECK(read_cursor(r.t.db).roots.empty());
     CHECK(read_cursor(r.t.db).offline.empty());
     CHECK(r.state(root) == kEmptyBaseline); // shrunk, not a removal storm
+    CHECK(count_rows(r.t.db) == 0);
+}
+
+TEST_CASE("registry offline: a hive refused on first sight is retried only at reconcile",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    const std::string why = "offline:file_refused:hive_path_unc";
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = refused_hive({root}, why);
+    r.next(); // first sight: refused, so never baselined
+    CHECK(r.f.offline_calls.size() == 1);
+    CHECK(r.gap_unreadable_rows() == 1);
+    CHECK(r.state(root).empty());
+    CHECK_FALSE(read_cursor(r.t.db).roots.at(root).baselined);
+
+    r.tick_to(11); // eleven ordinary ticks: a refusal costs one attempt an hour, not one a tick
+    CHECK(r.f.offline_calls.size() == 1);
+    CHECK(r.gap_unreadable_rows() == 1);
+    r.tick_to(12);
+    r.next(); // the reconcile retries once, still refused, no second row
+    CHECK(r.f.offline_calls.size() == 2);
+    CHECK(r.gap_unreadable_rows() == 1);
+
+    // once the guard lets it through, the next reconcile baselines it silently
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.tick_to(24);
+    CHECK(r.f.offline_calls.size() == 2);
+    r.next();
+    CHECK(r.f.offline_calls.size() == 3);
+    CHECK(read_cursor(r.t.db).roots.at(root).baselined);
+    CHECK(r.state(root) != kEmptyBaseline);
+    CHECK(count_rows(r.t.db) == 1); // only the first-sight gap row
+}
+
+TEST_CASE("registry offline: the incomplete-walk warning fires once per transition into incomplete",
+          "[echo][registry][lifecycle]") {
+    yuzu::test::LogCapture logs;
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+
+    // incomplete, incomplete, complete, incomplete: two transitions into incomplete. An HKU
+    // name-watch mark forces a walk on each tick.
+    for (const bool complete : {false, false, true, false}) {
+        r.f.offline_discovery.complete = complete;
+        r.f.dirty->mark_hku();
+        r.next();
+        CHECK(r.config("registry_offline_discovery_incomplete") == (complete ? "0" : "1"));
+    }
+    logs.stop();
+    const std::string text = logs.text();
+    const std::string needle = "profile list could not be read completely";
+    std::size_t warnings = 0;
+    for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1))
+        ++warnings;
+    CHECK(warnings == 2);
+    CHECK(r.f.offline_profile_calls == 5);          // the walk ran on every one of the five ticks
+    CHECK(count_rows(r.t.db) == 0);                 // a failed walk is a status key and a log line
+    CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)}); // scope kept
+}
+
+TEST_CASE("registry offline: the deferred retry marker survives a source restart",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next(); // baselined at first sight
+    r.tick_to(12);
+
+    // the reconcile's mount is not attempted (an earlier mount this tick timed out)
+    OfflineHiveRead skipped;
+    skipped.attempted = false;
+    skipped.reason = "offline:skipped_after_timeout";
+    r.f.offline_reads[kSidA] = skipped;
+    r.next();
+    REQUIRE(r.f.offline_calls.size() == 2);
+    const auto parked = read_cursor(r.t.db).roots.at(root);
+    REQUIRE(parked.baselined);
+    REQUIRE(parked.status == "complete");
+    REQUIRE(parked.deferred); // the only thing that makes the root due before the next hour
+
+    // A new source over the same database and reader. start() is not called: it would force a
+    // reconcile and read the hive whatever the flag says.
+    r.src = make_registry_cursor_source(RegistryScope{{}, {kSuffix}}, r.f.reader());
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+    r.next(); // not a reconcile tick: the persisted flag alone makes the hive due
+    CHECK(r.f.offline_calls.size() == 3);
+    const auto after = read_cursor(r.t.db).roots.at(root);
+    CHECK_FALSE(after.deferred);
+    CHECK(after.baselined);
+    CHECK(count_rows(r.t.db) == 1); // the change since the persisted baseline
+    CHECK(q(r.t.db, "SELECT detail FROM registry_live").rows.at(0).at(0) == "attr:offline");
+
+    r.next();
+    CHECK(r.f.offline_calls.size() == 3); // back to hourly
+}
+
+TEST_CASE("registry offline: a rollback to a build that ignores `offline` drops the roots without a removal storm, and the upgrade re-baselines them silently",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    REQUIRE(r.state(root) != kEmptyBaseline);
+    REQUIRE(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
+
+    // The older build never lists a logged-off profile: to it the walk is complete and empty,
+    // so the roots leave scope through the existing path. Its cursor has no `offline` field.
+    r.tick_to(12);
+    r.f.offline_discovery = OfflineDiscovery{};
+    r.next();
+    CHECK(read_cursor(r.t.db).roots.empty());
+    CHECK(read_cursor(r.t.db).offline.empty());
+    CHECK(r.state(root) == kEmptyBaseline); // shrunk, so a later logon cannot diff against it
+    CHECK(count_rows(r.t.db) == 0);
+    CHECK(q(r.t.db, "SELECT COUNT(*) FROM registry_live WHERE action = 'removed'").rows.at(0).at(0) == "0");
+    const auto cursor = r.t.db.get_cursor("registry");
+    REQUIRE(cursor.has_value());
+    REQUIRE(cursor->has_value());
+    CHECK_FALSE(nlohmann::json::parse(**cursor).contains("offline"));
+
+    // Upgrading again: the cursor holds no offline list, so the next ordinary tick walks, finds
+    // the profile and baselines it from scratch, silently.
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    const auto calls = r.f.offline_calls.size();
+    r.next();
+    CHECK(r.f.offline_calls.size() == calls + 1);
+    CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
+    CHECK(r.state(root) != kEmptyBaseline);
     CHECK(count_rows(r.t.db) == 0);
 }
 

@@ -87,6 +87,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -285,8 +286,9 @@ reconcile_offline(const std::vector<OfflineProfile>& known, const std::vector<st
         return std::find(loaded.begin(), loaded.end(), sid) != loaded.end();
     };
     const auto push = [&](const OfflineProfile& p) {
-        if (is_loaded(p.sid) ||
-            std::any_of(out.begin(), out.end(), [&](const OfflineProfile& o) { return o.sid == p.sid; }))
+        const bool seen = std::any_of(out.begin(), out.end(),
+                                      [&](const OfflineProfile& o) { return o.sid == p.sid; });
+        if (is_loaded(p.sid) || seen)
             return;
         out.push_back(p);
     };
@@ -301,6 +303,39 @@ reconcile_offline(const std::vector<OfflineProfile>& known, const std::vector<st
             push(k);
     }
     return out;
+}
+
+/// One ProfileList walk, classified: the pure half of the Windows shell's discovery (which only
+/// gathers the three walk facts, the merged profile list and the sids whose record failed to
+/// read). A loaded profile is not offline. A profile whose path could not be read or is empty
+/// is `partial` (its previous cursor entry stands), as is a sid whose record failed outright.
+/// A failed ProfileList open walked nothing: incomplete, with no profiles. A walk cut short or
+/// stopped at the profile cap is incomplete too, but the profiles it did list are returned.
+[[nodiscard]] inline OfflineDiscovery
+classify_offline_discovery(bool walk_complete, bool root_failed, bool truncated,
+                           std::span<const yuzu::profiles::ProfileInfo> profiles,
+                           std::span<const std::string> failed_sids) {
+    OfflineDiscovery d;
+    if (root_failed) {
+        d.complete = false;
+        return d;
+    }
+    d.complete = walk_complete && !truncated;
+    const auto add_partial = [&](const std::string& sid) {
+        if (std::find(d.partial.begin(), d.partial.end(), sid) == d.partial.end())
+            d.partial.push_back(sid);
+    };
+    for (const auto& p : profiles) {
+        if (p.state == yuzu::profiles::HiveState::loaded)
+            continue;
+        if (p.profile_path_unreadable || p.profile_path.empty())
+            add_partial(p.sid);
+        else
+            d.profiles.push_back({p.sid, p.profile_path});
+    }
+    for (const auto& sid : failed_sids)
+        add_partial(sid); // a record that failed to read is not "gone"
+    return d;
 }
 
 // ── Value rendering ─────────────────────────────────────────────────────────

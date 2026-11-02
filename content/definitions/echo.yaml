@@ -700,8 +700,8 @@ spec:
           is listed as unsupported and records nothing. A curated watch list (Run and RunOnce, Services,
           Image File Execution Options, AppInit_DLLs, Winlogon, LSA, Policies and
           Defender under HKLM, plus Run, RunOnce, Policies and Winlogon under every
-          loaded user hive) is watched for changes; each added, changed or removed
-          value is recorded with its old and new data.
+          user profile hive, loaded or unloaded) is watched for changes; each
+          added, changed or removed value is recorded with its old and new data.
           VALUES ARE STORED UNMASKED: any value under a watched key, changed or
           not, is readable through echo.sql - the per-key baseline in echo_state
           stores every current value (for example a Winlogon autologon
@@ -714,19 +714,25 @@ spec:
           name, type, size and time window: actor_pid and actor_image name the
           single process that made a matching write, which is a lead to verify
           against $Process_Live, not proof, and detail says attr:corr,
-          attr:ambiguous, attr:none, attr:degraded, attr:off or attr:lost-restart.
+          attr:ambiguous, attr:none, attr:degraded, attr:off, attr:lost-restart
+          or attr:offline.
           The ETW session needs an elevated agent; without one rows say attr:off
-          and the key watch alone runs. A change is read at the slow tick that
+          and the key watch alone runs. The roots of a logged-off user's unloaded
+          hive have no watch: they are read hourly through the guarded offline-hive
+          mount, and their rows say source=offline and attr:offline, never naming
+          a process. A change is read at the slow tick that
           sees it (every slow_interval, 300 s by default) and its row lands in
           that tick once its writer is settled, or in the next one when the
           write was within a few seconds of the tick or was found by the full
           re-read of every watched key (every 12 slow ticks, hourly at the
           default). A change whose marker cannot depend on a later event
-          (attr:off, attr:lost-restart) is written in the tick that sees it,
-          never held. A value written and reverted between two reads is not
+          (attr:off, attr:lost-restart, attr:offline) is written in the tick that
+          sees it, never held. A value written and reverted between two reads is not
           recorded. A key is baselined silently at its first read, so for a user
-          hive that loads at logon (or a user who logs off and back on) anything
-          written to its watched keys before that first read is not a row.
+          hive first seen at logon anything written to its watched keys before
+          that first read is not a row; a user's baseline carries across logoff
+          and logon, so a change made while they were logged off is reported by
+          the next read.
           Retention is a row count (500000 rows). Setting "false" pauses capture
           and a later "true" re-baselines every watched key (no row is invented
           for what changed while paused). Requires an agent newer than v0.14.1;

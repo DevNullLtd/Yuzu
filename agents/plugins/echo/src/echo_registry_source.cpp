@@ -181,7 +181,8 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
         }
         const std::vector<std::string> live_roots = scope_.roots_for(sids);
         const std::vector<std::string> roots = scope_.roots_for(sids, offline);
-        ensure_watch(live_roots); // offline roots are never armed: there is no watch on an unloaded hive
+        // Offline roots are never armed: there is no watch on an unloaded hive.
+        ensure_watch(live_roots);
 
         // Roots that left scope (a logged-off user): drop their state and shrink the
         // baseline row, so a logon later re-baselines from scratch, never as a mass
@@ -361,12 +362,14 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
 
             if (is_offline_root(root, offline)) {
                 // Nothing to arm on an unloaded hive: that is not a defect. An offline root is
-                // due on the hourly reconcile, a missing baseline, a re-baseline (status
-                // empty) or a retry (deferred) -- never on a notify, so a hive that stays
-                // refused costs one attempt an hour.
+                // due on the hourly reconcile, a never-attempted or re-baselined root (status
+                // empty / not baselined) or a retry (deferred) -- never on a notify. A hive
+                // refused on its first sight (unreadable, not baselined) has been attempted, so
+                // it waits for the hour too: a hive that stays refused costs one attempt an hour.
                 st.armed = true;
-                const bool offline_due = reconcile || !st.baselined || st.status.empty() ||
-                                         st.status == "due" || st.deferred;
+                const bool offline_due = reconcile || st.deferred || st.status.empty() ||
+                                         st.status == "due" ||
+                                         (!st.baselined && st.status != "unreadable");
                 if (!offline_due)
                     continue;
                 if (read_any && reader_.now_ts() >= deadline) {
@@ -406,7 +409,6 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
                         rd = std::move(it->second);
                     } else {
                         rd.status = RegistryReadStatus::Unreadable; // the mount answered nothing for it
-                        rd.reason = hv.reason;
                     }
                     if (rd.reason.empty() && rd.status == RegistryReadStatus::Unreadable)
                         rd.reason = hv.reason;
@@ -543,7 +545,8 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
         // Status keys (always written, skipped when unchanged).
         // watch_roots / unarmed describe the LIVE roots (an offline root has nothing to arm);
         // unreadable / capped stay aggregate over every root, so a capped offline read is visible.
-        std::size_t unarmed = 0, unreadable = 0, capped = 0, offline_roots = 0, offline_unreadable = 0;
+        std::size_t unarmed = 0, unreadable = 0, capped = 0;
+        std::size_t offline_roots = 0, offline_unreadable = 0;
         for (const auto& [name, st] : cur.roots) {
             const bool off = is_offline_root(name, offline);
             unarmed += (!off && !st.armed) ? 1 : 0;
@@ -1352,21 +1355,15 @@ std::vector<std::string> enumerate_hku() {
 
 // ── Offline (unloaded) per-user hives ───────────────────────────────────────
 
-// The profiles whose hive is not loaded, from one ProfileList walk. `complete` is mapdrive's
-// own rule (profile_list_complete, plus "not truncated"): a walk that was cut short, that hit
-// an unreadable ProfileList or that stopped at the profile cap proves nothing about what is
-// absent, so the core keeps the scope it knew. A record whose ProfileImagePath could not be
-// read is `partial`: its previous path entry stands even on a complete walk.
+// The profiles whose hive is not loaded, from one ProfileList walk. This shell only gathers
+// the facts (the walk's Win32 codes, the merged profile list, the sids whose record failed);
+// classify_offline_discovery (echo_registry_parsers.hpp, unit-tested on every OS) decides.
+// `complete` is mapdrive's own rule (profile_list_complete, plus "not truncated"): a walk that
+// was cut short, that hit an unreadable ProfileList or that stopped at the profile cap proves
+// nothing about what is absent, so the core keeps the scope it knew.
 OfflineDiscovery discover_offline_profiles() noexcept {
-    OfflineDiscovery d;
     try {
         const auto disc = yuzu::win::enumerate_profile_list();
-        d.complete = profile_list_complete(disc.root_rc, disc.last_rc, disc.probe_rc) &&
-                     !disc.truncated;
-        if (disc.root_rc != ERROR_SUCCESS) {
-            d.complete = false;
-            return d; // nothing was walked
-        }
         if (disc.truncated) {
             static std::atomic<bool> s_warned{false};
             if (!s_warned.exchange(true))
@@ -1376,25 +1373,15 @@ OfflineDiscovery discover_offline_profiles() noexcept {
         }
         const auto profiles =
            yuzu::profiles::build_profile_list(disc.records, yuzu::win::enumerate_hku_subkeys());
-        const auto add_partial = [&](const std::string& sid) {
-            if (std::find(d.partial.begin(), d.partial.end(), sid) == d.partial.end())
-                d.partial.push_back(sid);
-        };
-        for (const auto& p : profiles) {
-            if (p.state == yuzu::profiles::HiveState::loaded)
-                continue;
-            if (p.profile_path_unreadable || p.profile_path.empty()) {
-                add_partial(p.sid);
-                continue;
-            }
-            d.profiles.push_back({p.sid, p.profile_path});
-        }
+        std::vector<std::string> failed;
         for (const auto& f : disc.record_failures)
-            add_partial(f.sid); // a record that failed to read is not "gone"
+            failed.push_back(f.sid);
+        return classify_offline_discovery(
+           profile_list_complete(disc.root_rc, disc.last_rc, disc.probe_rc),
+           disc.root_rc != ERROR_SUCCESS, disc.truncated, profiles, failed);
     } catch (...) {
         return OfflineDiscovery{false, {}, {}};
     }
-    return d;
 }
 
 // One tick's mount bookkeeping: the first mount to time out (or be refused) stops every later
@@ -1472,8 +1459,9 @@ OfflineHiveRead read_offline_hive_bounded(const std::string& sid, const std::str
                   },
                   &report);
                if (status != yuzu::win::HiveAccessStatus::ok)
-                   r = unreadable_hive(roots, true,
-                                       "offline:" + yuzu::profiles::hive_access_token(status, report.refusal));
+                   r = unreadable_hive(
+                      roots, true,
+                      "offline:" + yuzu::profiles::hive_access_token(status, report.refusal));
            } catch (...) {
                r = unreadable_hive(roots, true, "offline:exception");
            }
@@ -1498,7 +1486,8 @@ OfflineHiveRead read_offline_hive_bounded(const std::string& sid, const std::str
               ? yuzu::echo::MountCallResult::timed_out
               : yuzu::echo::MountCallResult::rejected);
         tick.halted = decision.halt_walk;
-        tick.halted_token = decision.attempted ? "skipped_after_timeout" : "skipped_after_rejection";
+        tick.halted_token =
+           decision.attempted ? "skipped_after_timeout" : "skipped_after_rejection";
         spdlog::warn("Echo registry: offline hive mount for {} ({}); no further mounts this tick",
                      sid, decision.attempted ? "timeout" : "mount_rejected");
         return unreadable_hive(roots, decision.attempted,

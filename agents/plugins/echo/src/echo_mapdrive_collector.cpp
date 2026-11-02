@@ -28,7 +28,8 @@
 #include "bounded_wait.hpp" // yuzu::shared::bounded_call_ex — ../../shared include dir
 #include "echo_capture_status.hpp" // classify_subprocess_capture, IncompleteCaptureError, would_exceed_cap
 #include "echo_collectors.hpp"
-#include "echo_hive_mount_gate.hpp" // g_mount_workers_in_flight, MountWorkerGuard, kHiveMountBoundMs, pin_plugin_module
+// g_mount_workers_in_flight, MountWorkerGuard, kHiveMountBoundMs, pin_plugin_module
+#include "echo_hive_mount_gate.hpp"
 
 #include <yuzu/agent/subprocess_runner.hpp> // run_bounded_subprocess (rung 2 argv sites)
 

@@ -474,7 +474,17 @@ cursor.** What it adds to the pattern:
   list (`registry_offline_discovery_incomplete`), and a record whose path was
   unreadable keeps its cursor entry. A failed mount is an Unreadable read with a
   named reason (`offline:<token>`), one gap row per transition; the `deferred`
-  flag on the root's state, not its status, schedules the next-tick retry.
+  flag on the root's state, not its status, schedules the next-tick retry. A hive
+  refused at its first sight has been attempted, so it waits for the hour like any
+  other refusal; only a root never tried, or re-baselined, is due outside the
+  reconcile. A mount the shared worker ceiling refuses (`decide_mount_call`:
+  rejected means nothing ran) is not an attempt: `offline:mount_rejected`, later
+  hives that tick `offline:skipped_after_rejection`, no gap row, retried next tick;
+  a timeout is an attempt (`offline:timeout`, one gap row) and halts the rest of the
+  tick. Profile discovery runs hourly and on an HKU name-watch mark, and on every
+  tick while no logged-off profile is known (a ProfileList and HKU registry
+  enumeration, never a mount), which is also how a cursor from a build without
+  offline hives picks them up.
 - **Rows land in the tick that observes the change, or the next one, and the writer is
   correlated, not verified.** A candidate is held only while `now - window_hi <
   kEtwSettle100ns` (5 s), and a notify window closes 1 s after the last notify, so a

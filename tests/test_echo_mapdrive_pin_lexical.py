@@ -30,7 +30,9 @@ test_echo_mapdrive.cpp), so this pins the wiring lexically. Invariants:
      decide_walk_gate(pin_plugin_module(), ...) before its first bounded_call_ex, refuses without
      mounting when the gate is closed or an earlier mount this tick halted the rest, counts its
      worker in flight before with_user_hive, bounds the wait with kHiveMountBoundMs and halts the
-     tick on a timeout/rejection.
+     tick on a timeout/rejection, and opens each root with REG_OPTION_OPEN_LINK. Its profile
+     discovery (discover_offline_profiles) routes through the unit-tested pure
+     classify_offline_discovery.
 
 Robustness: `//` comments are stripped and whitespace is collapsed before matching, so a
 commented-out call cannot satisfy a check. Lexical only: it cannot see a relocation that keeps
@@ -128,8 +130,23 @@ def problems(collector_src, plugin_src, gate_src, registry_src):
             out.append("a timed-out or rejected offline mount no longer halts the tick")
         if "decide_mount_call(" not in offline:
             out.append("the offline reader no longer asks decide_mount_call")
+        # A root that is itself a symbolic-link key is read as the link, never followed: the
+        # same flags open_root passes on the live path (security-relevant, kept in step here).
+        if not re.search(r"RegOpenKeyExW\([^;]*?REG_OPTION_OPEN_LINK, KEY_READ \| KEY_WOW64_64KEY, "
+                         r"key\.put\(\)\)", offline):
+            out.append("the offline reader's root open no longer passes REG_OPTION_OPEN_LINK with "
+                       "KEY_READ | KEY_WOW64_64KEY")
     if not re.search(r"r\.read_offline_hive = .*?read_offline_hive_bounded\(", r):
         out.append("the Windows reader no longer wires read_offline_hive to read_offline_hive_bounded")
+    # The profile-list classification is unit-tested (classify_offline_discovery); the Windows
+    # shell must feed it, or an empty-but-complete discovery would leave every test green.
+    discovery = body_of(r, "OfflineDiscovery discover_offline_profiles() noexcept")
+    if discovery is None:
+        out.append("discover_offline_profiles() is missing")
+    elif "classify_offline_discovery(" not in discovery:
+        out.append("discover_offline_profiles() no longer classifies through classify_offline_discovery")
+    if not re.search(r"r\.offline_profiles = \[\] \{ return discover_offline_profiles\(\); \}", r):
+        out.append("the Windows reader no longer wires offline_profiles to discover_offline_profiles")
 
     walk = body_of(c, "void enum_registry_outbound_history(")
     if walk is None:
@@ -286,6 +303,25 @@ class EchoMapdrivePinLexical(unittest.TestCase):
             "registry hook no longer wired": dict(r=mutate(
                 r, "return read_offline_hive_bounded(sid, path, roots, deadline, *tick);",
                    "return OfflineHiveRead{};")),
+            "registry discovery stops classifying": dict(r=mutate(
+                r, "return classify_offline_discovery(", "return classify_offline(")),
+            "registry discovery hook no longer wired": dict(r=mutate(
+                r, "r.offline_profiles = [] { return discover_offline_profiles(); };",
+                   "r.offline_profiles = [] { return OfflineDiscovery{}; };")),
+            "registry closed gate answers attempted": dict(r=mutate(
+                r, "if (gate != yuzu::echo::WalkGate::open)\n        return unreadable_hive(roots, false,",
+                   "if (gate != yuzu::echo::WalkGate::open)\n        return unreadable_hive(roots, true,")),
+            "registry halted check inverted": dict(r=mutate(
+                r, "if (tick.halted)\n", "if (!tick.halted)\n")),
+            "registry reader stops asking decide_mount_call": dict(r=mutate(
+                r, "decide_mount_call(", "decide_mount(")),
+            "registry gate asked after the mount": dict(r=mutate(
+                r, "const auto gate = yuzu::echo::decide_walk_gate(",
+                   "(void)yuzu::shared::bounded_call_ex(kHiveMountBoundMs, [] { return 0; });\n"
+                   "    const auto gate = yuzu::echo::decide_walk_gate(")),
+            "registry root open drops the link flag": dict(r=mutate(
+                r, "REG_OPTION_OPEN_LINK, KEY_READ | KEY_WOW64_64KEY, key.put()",
+                   "0, KEY_READ | KEY_WOW64_64KEY, key.put()")),
         }
         for name, over in cases.items():
             with self.subTest(mutation=name):

@@ -320,7 +320,8 @@ private:
     bool was_disabled_{false};
 
     std::vector<std::string> armed_roots_;
-    bool offline_incomplete_{false}; // the last profile discovery was incomplete (warn once per transition)
+    // The last profile discovery was incomplete (warn once per transition).
+    bool offline_incomplete_{false};
 
     // Loss accounting; advanced only after a successful commit, so a failed commit
     // re-derives and re-reports the same loss on the next tick.
