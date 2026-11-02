@@ -21,6 +21,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/agent/reconnect_backoff.hpp>
 #include <yuzu/agent/server_address_resolver.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/agent/trigger_engine.hpp>
@@ -1722,7 +1723,15 @@ public:
 
         // 3. Register with server — with reconnect loop
         int reconnect_count = 0;
-        constexpr int kMaxReconnectDelaySecs = 300; // 5 minutes max backoff
+        // Reconnect delays are jittered (reconnect_backoff.hpp, HA WS-13): a node loss drops
+        // a whole share of the fleet at one instant, and a fixed ladder would bring them all
+        // back in lock step. Main-thread only, so no lock; seeded from several OS words so two
+        // agents started from one cloned image do not share a sequence.
+        std::mt19937 reconnect_rng{[] {
+            std::random_device rd;
+            std::seed_seq seed{rd(), rd(), rd(), rd()};
+            return std::mt19937{seed};
+        }()};
         /// Ceiling on a single Register attempt. Generous — a busy server plus TLS plus an
         /// approval check is not instant — but FINITE, which is the whole point: without it a
         /// server that completes TLS and then goes silent parks the main thread forever, and on
@@ -1755,8 +1764,11 @@ public:
 
         while (!stop_requested_.load(std::memory_order_acquire)) {
             if (reconnect_count > 0) {
-                // Exponential backoff: 2^n seconds, capped at 5 minutes
-                int delay = std::min(1 << std::min(reconnect_count, 8), kMaxReconnectDelaySecs);
+                // Exponential backoff, jittered: centred on 2^n seconds, never above 5 minutes.
+                const int delay = yuzu::agent::reconnect_delay_secs(
+                    reconnect_count, [&reconnect_rng](int lo, int hi) {
+                        return std::uniform_int_distribution<int>{lo, hi}(reconnect_rng);
+                    });
                 spdlog::info("Reconnecting in {}s (attempt #{})", delay, reconnect_count);
                 plugin_ctx_.config["agent.reconnect_count"] = std::to_string(reconnect_count);
                 for (int i = 0; i < delay && !stop_requested_.load(std::memory_order_acquire); ++i)
