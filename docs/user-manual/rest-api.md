@@ -4399,6 +4399,9 @@ Audited as `access_review.closed`.
 Every `access_review.*` verb above additionally records `result=denied`
 (`detail="engine_session_denied"`) when the caller's own session is
 engine-classed — see the "Engine-session denial" note above.
+The Settings Access reviews fragments (`GET /fragments/settings/access-reviews` and its
+`/campaign` view) write the same denied rows, under `access_review.list` and
+`access_review.get`, with an empty `target_id`.
 `access_review.campaign_opened` and `access_review.attested` also record
 `result=denied`, `detail=content_type_not_json` (empty `target_id`) when a
 request is refused with `415`.
