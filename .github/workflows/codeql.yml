@@ -22,8 +22,9 @@ name: "CodeQL"
 # job spanning Linux + Windows; a job-level `if` cannot reference the
 # `matrix` context, so a fail-closed per-leg gate would require splitting
 # the job — out of scope for the cutover. If Big Tam is offline at the
-# scheduled run, the Linux leg queues until its job timeout (same as the
-# pre-cutover Shulgi-offline behaviour); CodeQL is not a required check.
+# scheduled run, the Linux leg waits in the queue for a runner (the job's
+# timeout-minutes only counts from pickup; same as the pre-cutover
+# Shulgi-offline behaviour); CodeQL is not a required check.
 #
 # The two runs are separate matrix legs with `fail-fast: false`, so a
 # quirk on one platform doesn't kill the other. Each leg uploads SARIF
@@ -41,6 +42,10 @@ name: "CodeQL"
 #     + build_tests=true + languages c-cpp,actions, and the workflow
 #     matrixed across Linux + Windows runners to close the #ifdef _WIN32
 #     gap that a Linux-only analysis physically cannot reach.
+#   2026-10-21 → 2026-11-02: the dev→main promotion (C++ TUs 1157 → 1437)
+#     pushed both legs past the 90-min ceiling; scheduled runs were
+#     cancelled daily from 2026-10-22. Timeout raised to 180 — see the
+#     `analyze` job's timeout-minutes comment for the measurements.
 #
 # Coverage-knob setup (maximize findings on both platforms):
 #   - queries: +security-and-quality (superset of security-extended;
@@ -118,8 +123,9 @@ on:
   schedule:
     # Daily 04:00 UTC cron. Tightens C++ vuln detection from <=7 days to
     # <=24h (folds CodeQL into the Tier-3 nightly cadence; it is a long
-    # trace, NOT the PR fast-path — last green run 2026-10-21: Linux 50m,
-    # Windows 66m; see timeout-minutes below for why that no longer holds).
+    # trace, NOT the PR fast-path — last green run 2026-10-21: Linux ~52m,
+    # Windows ~72m wall-clock; see timeout-minutes below for why that no
+    # longer holds).
     # The 04:00 slot was chosen to be 2h ahead of nightly.yml's 06:00 cron,
     # but GitHub starts both late (observed: this 08:00-12:00 UTC, nightly
     # 11:00-13:00 UTC), so the two now overlap in practice and CodeQL's Linux
@@ -199,11 +205,17 @@ jobs:
     # measure how long that query actually needs on Linux; it is not a
     # derived bound. If Linux still cancels, the remedy is a per-query
     # evaluation timeout (not an analyze-action input; it would need
-    # CODEQL_ACTION_EXTRA_OPTIONS `database run-queries --timeout`,
-    # unverified) or a query-filters exclude in codeql-config.yml (drops a
-    # CWE-119 security query on both legs and requires updating
-    # scripts/ci/test_runner_health_check.py's pin of exactly two
+    # CODEQL_ACTION_EXTRA_OPTIONS `database run-queries --timeout`;
+    # that flag and its semantics are unverified, and a skipped query
+    # leaves the job green with a CWE-119 query never evaluated — a false
+    # green unless the skip is surfaced) or a query-filters exclude in
+    # codeql-config.yml (drops that query on both legs and requires
+    # updating scripts/ci/test_runner_health_check.py's pin of exactly two
     # excludes) — not another bump.
+    #
+    # Scheduled runs execute the DEFAULT-branch copy of this file, so this
+    # value takes effect only once it reaches main. Measure with a
+    # workflow_dispatch from main only (see the standing invariant above).
     timeout-minutes: 180
     strategy:
       # fail-fast: false so Linux completes its SARIF upload even if
