@@ -283,6 +283,7 @@ agent_test_exe = executable(
     'unit/test_kv_store.cpp',
     'unit/test_fake_journal_store.cpp', # IJournalStore test double contract (#4153)
     'unit/test_command_dedup_store.cpp',
+    'unit/test_command_dedup_decision.cpp', # decide_after_claim/should_claim pure core (#3668)
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
     'unit/test_guardian_engine_legacy_sink.cpp', # #4783 commit 1: [!mayfail] red evidence only
@@ -638,6 +639,8 @@ agent_test_exe = executable(
     'unit/test_runtimes_parsers.cpp',            # Wave 10 PR10.1-b: pure parsers over REAL CAPTURE fixtures, unguarded on every OS
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_runtimes_python_parsers.cpp',     # runtimes python: pure python layer + macOS framework walk over a materialized fixture tree (walk body POSIX-only)
+    'unit/test_runtimes_win_walk.cpp',           # runtimes python: PythonCore dual-view walk, FakeOps + salted scratch key (Windows-only; no-op TU elsewhere)
     'unit/test_pkg_inventory_parsers.cpp',          # Wave 10 PR10.1-c: pure row formatters/tokens + synthetic in-code macOS walk cases (no committed fixture)
     'unit/test_pkg_inventory_macos_parsers.cpp',    # Wave 10 PR10.1-c: injected-root Homebrew walk over a REAL CAPTURE Cellar tree
     'unit/test_pkg_inventory_linux_parsers.cpp',    # pkg_inventory Linux legs: injected-root Linux snap/flatpak/managers walk over a REAL CAPTURE tree manifest (body POSIX-only)
@@ -4017,6 +4020,17 @@ test('Echo mapdrive hive-mount pin wiring lexical gate (#5291)',
 test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   _python3_test,
   args: [files('test_agent_ota_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Command-dedup claim wiring (#3668): the claim decision is a pure function with its own unit
+# tests; this pins that agent.cpp's Subscribe loop still CALLS it and acts on every field of the
+# answer (no gRPC seam to test the loop, #1492). Carries its own in-memory mutation self-test.
+# No build required.
+test('agent command-dedup wiring lexical gate (#3668)',
+  _python3_test,
+  args: [files('test_agent_command_dedup_wiring_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )

@@ -177,6 +177,21 @@ code.
 
 ## Gates outside the tier ladder
 
+### Browser smoke (`/test` Phase 5, `tests/puppeteer/ui-smoke.mjs`)
+
+A local gate in `/test`, not a CI job. It drives a headless browser against the running
+dashboard: it crawls every route the shell nav links to (200, the `Content-Security-Policy`
+header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
+discovered routes against `EXPECTED`, a hand-copied list of the nav in `app_shell.cpp`, in both
+directions, checks that submit controls stay inside their form or dialog at two viewport sizes,
+and runs four scenarios (stubbed where they write: those requests are answered in the browser,
+so nothing reaches the server). The gate first runs
+`ui-smoke.mjs --selftest`, which checks against a local fixture (no stack) that each crawl and
+layout check fails when it should; a selftest failure fails the gate. A failure records FAIL (the
+older `Puppeteer` gate is warn-only); a missing `tests/puppeteer/node_modules/puppeteer`
+records SKIP with the `npm ci` hint. Shared mechanics are in `tests/puppeteer/lib/harness.mjs`;
+`tests/puppeteer/README.md` covers running it by hand.
+
 ### Release re-publish guard (`release-guard`, #5282)
 
 The first job in `release.yml`. It refuses any run whose ref is not a tag
@@ -855,12 +870,13 @@ the gateway source and rerunning the suite).
 
 The same run covers the **management hop**, server to gateway (`:50063`, the privileged command
 plane; the symptom of #5175 was every `SendCommand` reaching the server as `Socket closed`). The
-gateway's management listener runs in the production posture except for the mode: strict mutual TLS
+gateway's management listener runs in the production posture, in the shipped mode by default: strict mutual TLS
 (`verify_peer` + `fail_if_no_peer_cert`), `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1`, and
-`mgmt_peer_pins = [{cert_file, <server default-server.pem>}]` (the shipped form: the gateway pins that
-leaf's SPKI and requires `serverAuth`), plus `mgmt_peer_auth_mode = identity_or_pin`. The rig opts in to
-that mode (#6016); the shipped configs stay on `pin`, so the shipped `pin` configuration (resolved and judged by the real boot-guard functions) is covered by
-the eunit module `yuzu_gw_config_posture_tests`, not exercised on the real stack; the server is pointed at it with `--gateway-command-addr` and
+`mgmt_peer_auth_mode = identity` with no `mgmt_peer_pins` (the shipped form since release N+1, #6016: the
+gateway derives the identity from the single-certificate `default-ca.pem` and requires `serverAuth`);
+`YUZU_GW_MGMT_AUTH_MODE=identity_or_pin` is the one setting that differs from the shipped
+posture: it runs the transition mode, also pinning `<server default-server.pem>`. The shipped configurations (resolved and judged by the real boot-guard
+functions) are also covered by the eunit module `yuzu_gw_config_posture_tests`; the server is pointed at it with `--gateway-command-addr` and
 presents its own default leaf. Three layers check it. (1) The script dispatches `os_info.os_name` to
 the real agent through the server's REST API (admin login, `POST /api/command`, poll
 `/api/responses/{id}`): one round trip, then 300 commands, 16 at a time, whose streams all share the
