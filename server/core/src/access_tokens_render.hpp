@@ -87,7 +87,10 @@ struct PageFlags {
 /// A later failed or denied attempt writes the same action with a store error string as its
 /// detail; that text is never shown. "" = no committed revoke recorded. The success detail is
 /// `credentials_revoked=N[; superseded_by=ID]` from REST, or the operator's own typed reason
-/// from MCP; it is escaped like every other store string.
+/// from MCP. When a concurrent revoke won, both surfaces write
+/// `credentials_revoked=N; revoked_by_concurrent_request` plus an optional
+/// `; superseded_by_not_persisted` (and, MCP only, `; reason=<reason>`). The text is escaped
+/// like every other store string.
 [[nodiscard]] std::string committed_revoke_detail(const std::vector<AuditEvent>& newest_first);
 
 /// Newest-first window of `engine_principal.revoke` audit events read for one principal. The

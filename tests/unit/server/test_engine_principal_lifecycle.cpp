@@ -1478,6 +1478,16 @@ const AuditCall* last_audit_for(const std::vector<AuditCall>& log, const std::st
     return nullptr;
 }
 
+/// The `action` rows appended at or after index `from`: what ONE call wrote.
+std::vector<AuditCall> audit_rows_since(const std::vector<AuditCall>& log, std::size_t from,
+                                        const std::string& action) {
+    std::vector<AuditCall> rows;
+    for (std::size_t i = from; i < log.size(); ++i)
+        if (log[i].action == action)
+            rows.push_back(log[i]);
+    return rows;
+}
+
 std::size_t audit_count_for(const std::vector<AuditCall>& log, const std::string& action,
                             const std::string& result) {
     return static_cast<std::size_t>(
@@ -1504,10 +1514,16 @@ TEST_CASE("Engine-principal REST: DELETE retries after the credentials are revok
         auto [pid, raw] = h.create_and_mint("revoke-fault-raise");
         (void)raw;
         IdentityRevokeFault fault{*ep_lc_shared().pool, IdentityRevokeFault::Mode::Raise};
+        const std::size_t rows_before = h.audit_log.size();
         auto res = h.revoke(pid);
         REQUIRE(res);
         CHECK(res->status == 503);
         CHECK(has_retry_hint(*res));
+        // The faulted call wrote exactly one revoke row, and it is the failure row.
+        const auto faulted_rows =
+            audit_rows_since(h.audit_log, rows_before, "engine_principal.revoke");
+        REQUIRE(faulted_rows.size() == 1);
+        CHECK(faulted_rows.front().result == "failure");
         // Half done: the credential is gone, the identity is still active.
         const auto mid = identity_state(pid);
         CHECK(mid["lifecycle_state"].get<std::string>() == "active");
@@ -1536,10 +1552,16 @@ TEST_CASE("Engine-principal REST: DELETE retries after the credentials are revok
         auto [pid, raw] = h.create_and_mint("revoke-fault-skip");
         (void)raw;
         IdentityRevokeFault fault{*ep_lc_shared().pool, IdentityRevokeFault::Mode::Skip};
+        const std::size_t rows_before = h.audit_log.size();
         auto res = h.revoke(pid);
         REQUIRE(res);
         CHECK(res->status == 503);
         CHECK(has_retry_hint(*res));
+        // The faulted call wrote exactly one revoke row, and it is the failure row.
+        const auto faulted_rows =
+            audit_rows_since(h.audit_log, rows_before, "engine_principal.revoke");
+        REQUIRE(faulted_rows.size() == 1);
+        CHECK(faulted_rows.front().result == "failure");
         const auto mid = identity_state(pid);
         CHECK(mid["lifecycle_state"].get<std::string>() == "active");
         CHECK(mid["active_credentials"].empty());
@@ -1612,7 +1634,10 @@ TEST_CASE("Engine-principal REST: a credential minted between a faulted DELETE a
     auto minted = h.mint(pid);
     REQUIRE(minted);
     REQUIRE(minted->status == 201);
+    const auto minted_raw = nlohmann::json::parse(minted->body)["data"]["token"].get<std::string>();
     CHECK(h.token_store->list_active_for_principal(pid).size() == 1);
+    // The late credential really authenticates until the repeat runs.
+    CHECK(h.token_store->validate_token(minted_raw).has_value());
 
     fault.remove();
     auto repeat = h.revoke(pid);
@@ -1628,6 +1653,8 @@ TEST_CASE("Engine-principal REST: a credential minted between a faulted DELETE a
     CHECK(state["lifecycle_state"].get<std::string>() == "revoked");
     CHECK(state["active_credentials"].empty());
     CHECK(h.token_store->list_active_for_principal(pid).empty());
+    // The secret that was minted in between no longer authenticates.
+    CHECK_FALSE(h.token_store->validate_token(minted_raw).has_value());
 }
 
 TEST_CASE("Engine-principal REST: a confirm whose audit row drops is not hinted, the replay is a "

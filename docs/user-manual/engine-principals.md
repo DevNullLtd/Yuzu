@@ -162,7 +162,8 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
      caller's own tokens, and an engine credential is owned by the engine
      principal.)
   2. Revoke the successor with `DELETE /api/v1/tokens/{token_id}`. This is a
-     REST call only (the MCP tools have no per-credential revoke). It needs
+     REST call. (An MCP worker has `revoke_api_token`; see "Revoking one
+     credential over MCP" below.) The REST route needs
      `ApiToken:Delete`, a fresh MFA step-up, and an **effective administrator**,
      because only the token's owner or an administrator may revoke it and the
      owner here is the engine principal, not a person. Any other caller gets
@@ -311,11 +312,47 @@ Two other confirm answers are terminal, not retryable. Two active credentials
 that are not a linked rotation pair answer `409` (it used to be a retryable
 `503`): the stored rows are malformed, which no retry can repair, so `GET` the
 principal, inspect both credentials, and revoke the unwanted one with
-`DELETE /api/v1/tokens/{token_id}` (REST only; the MCP tools have no
-per-credential revoke). And a `rotate` that finds one active credential still
-carrying unresolved rotation metadata (for example after its predecessor was
-revoked out of band) answers `409` instead of minting; inspect that credential
-before doing anything, and never re-rotate it.
+`DELETE /api/v1/tokens/{token_id}` (or `revoke_api_token` over MCP, see
+below). The MCP `confirm_engine_rotation` answers this case as a terminal
+invalid-params error with no `retry_after_ms`, and the REST confirm also writes a
+warning log line naming it. And a `rotate` that finds one active credential
+still carrying unresolved rotation metadata (for example after its predecessor
+was revoked out of band) answers `409` instead of minting (over MCP,
+`rotate_engine_credential` answers invalid-params with no `retry_after_ms`);
+the message starts `one active credential with unresolved rotation metadata`.
+Before this refusal existed, such a rotate answered `200` with a new secret and
+left the malformed pair behind.
+
+**The way out of either `409`.**
+
+1. `GET /api/v1/engine-principals/{id}` and inspect `active_credentials`. In the
+   one-credential case, if a consumer is still using that credential it is the
+   good survivor: leave it alone.
+2. Only if the credential is confirmed stale (or, in the two-credential case,
+   once you know which one to drop), revoke it with
+   `DELETE /api/v1/tokens/{token_id}`. That route needs `ApiToken:Delete`, a
+   fresh MFA step-up and an **effective administrator**; any other caller gets
+   `404 token not found`. The reason is the one given under "If the secret is
+   lost" in section 3 above: the credential's owner is the engine principal, not
+   a person.
+3. If no credential remains afterwards, mint a fresh one with
+   `POST /api/v1/engine-principals/{id}/credentials`. Never use
+   `DELETE /api/v1/engine-principals/{id}` for this: it is terminal.
+
+A sole credential whose predecessor has simply expired can be refused by the
+one-credential `rotate` for a short time: the rotation sweep (it runs every
+60 seconds) clears the leftover rotation linkage on the next tick, after which
+`rotate` works again. The sweep only does this for a successor that has been
+presented at least once. A successor that was never used keeps its linkage, and
+`rotate` keeps refusing it, until it is used, revoked or expires.
+
+**Revoking one credential over MCP.** The tool `revoke_api_token` (token id from
+`GET /api/v1/engine-principals/{id}`) revokes a single credential. It needs the
+`ApiToken:Delete` permission, a supervised-tier MCP bearer token (approval-gated,
+like the other destructive tools), and a caller that is an effective
+administrator (an administrator, or a user with an active elevation); for any
+other caller an engine credential is reported as `token not found`. Use it the
+same way as the REST call above.
 
 **Cap your retries.** `rotate` and `confirm` answer a `503` with `Retry-After: 2`
 when they find no active credential or no in-flight rotation, because that empty
@@ -356,7 +393,7 @@ still-valid credential. Calling this again on an already-revoked principal is
 a no-op success, not an error.
 
 If a `503` interrupts the revoke after the credentials were revoked but before
-the identity was, the principal stays `active` with **zero credentials** until a
+the identity was, the principal may stay `active` with **zero credentials** until a
 repeat call completes. The repeat answers `200` with `credentials_revoked: 0`;
 the count from the interrupted call is only in that call's failure audit row
 (`credentials_revoked=<N>` in its detail). Every `503` from the revoke steps carries

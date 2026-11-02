@@ -4153,7 +4153,8 @@ TEST_CASE("MCP confirm_engine_rotation: retry_after_ms only on a transient store
 
     auto rot = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
-        R"("params":{"name":"rotate_engine_credential","arguments":{"principal_id":"engine:mcp-confirm-hint"}}})");
+        R"("params":{"name":"rotate_engine_credential",)"
+        R"("arguments":{"principal_id":"engine:mcp-confirm-hint"}}})");
     REQUIRE(rot->status == 200);
     const auto rot_payload = nlohmann::json::parse(
         nlohmann::json::parse(rot->body)["result"]["content"][0]["text"].get<std::string>());

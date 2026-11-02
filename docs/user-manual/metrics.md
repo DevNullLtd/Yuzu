@@ -1121,8 +1121,10 @@ failure, or the ambiguous empty read "no in-flight rotation to confirm"),
 `secret_mismatch` is a presented secret that does not verify (403), and
 `success` is a completed confirm. A malformed two-credential pair used to count
 as `transient`; it now counts as `conflict`, so a persistent malformed pair is
-visible only on the `conflict` series (and in a warning log line on the
-server), not on `transient`. Alert authors who watch this family for store
+visible on the `conflict` series, not on `transient`; the REST confirm route also
+writes a warning log line on the server, and on MCP the signals are the
+`conflict` series and the `engine_principal.credential.confirm` failure audit
+row. Alert authors who watch this family for store
 corruption should watch `conflict` as well.
 
 **Scope contract.** Counted only when a confirm reaches `ApiTokenStore::confirm_rotation`
