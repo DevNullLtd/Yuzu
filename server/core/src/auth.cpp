@@ -2339,7 +2339,8 @@ std::size_t AuthManager::report_stale_cfg_credentials() {
     return stale;
 }
 
-std::optional<Role> AuthManager::get_user_role(const std::string& username) const {
+std::expected<Role, AuthManager::GetUserRoleError>
+AuthManager::get_user_role(const std::string& username) const {
     // Gate 3 governance BLOCKING finding (cpp-safety), fix shape confirmed via
     // Sol/codex opine: this was a pure `users_` cache read with NO AuthDB
     // fallback at all - completely independent of authenticate()/
@@ -2391,8 +2392,10 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
         if (!db_user) {
             // Gate 3 re-review follow-up (cpp-expert + authdb, converged): log
             // a genuine store error distinctly from a plain not-found, so a PG
-            // outage that silently floors every legacy-token session to
-            // Role::user (auth_routes.cpp's `.value_or(Role::user)`) leaves an
+            // outage - which floors every legacy-token session to Role::user
+            // (auth_routes.cpp's `.value_or(Role::user)`) and, since #4068,
+            // makes the Settings create/role-change routes and SCIM
+            // active:false answer 503 - leaves an
             // operational trail instead of zero diagnostic signal - mirrors
             // find_user_or_hydrate's own UserNotFound-vs-DbError split in this
             // same file.
@@ -2405,29 +2408,27 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
             if (db_user.error() != yuzu::server::AuthDBError::UserNotFound &&
                 db_user.error() != yuzu::server::AuthDBError::InvalidUsername) {
                 spdlog::error("get_user_role: AuthDB lookup for '{}' failed (store error, not "
-                              "a genuine miss) - returning nullopt",
+                              "a genuine miss) - returning DbError",
                               ::yuzu::log_key_token(username));
                 // Gate 5 chaos-injector CH-3/UP-6 follow-up: a log line alone is
-                // invisible exactly while the store is already stressed (the
-                // scenario that matters). This is the ONLY caller-visible signal
-                // that auth_routes.cpp's `.value_or(Role::user)` is about to
-                // floor a legacy-token-authenticated request's role down - narrows
-                // the observability gap; the honest fix (this call returning
-                // std::expected so callers can distinguish "not found" from
-                // "store degraded" and respond accordingly, e.g. 503 instead of a
-                // silent floor) touches 6 call sites and is a follow-up, not this
-                // metric.
+                // invisible exactly while the store is already stressed. The
+                // counter stays (auth_routes.cpp's legacy-token synthesis still
+                // floors to Role::user on DbError and has no other signal);
+                // since #4068 the error channel ALSO lets every other caller
+                // respond to a store error explicitly instead of reading it as
+                // "not found".
                 if (metrics_)
                     metrics_->counter("yuzu_auth_get_user_role_store_error_total").increment();
+                return std::unexpected(GetUserRoleError::DbError);
             }
-            return std::nullopt;
+            return std::unexpected(GetUserRoleError::NotFound);
         }
         return db_user->role;
     }
     std::shared_lock lock(mu_);
     auto it = users_.find(username);
     if (it == users_.end())
-        return std::nullopt;
+        return std::unexpected(GetUserRoleError::NotFound);
     return it->second.role;
 }
 

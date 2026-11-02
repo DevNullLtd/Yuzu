@@ -3336,18 +3336,20 @@ public:
                           "between the verify read and the row-locked recheck",
                           "counter");
         metrics_.counter("yuzu_auth_credential_changed_during_verify_total");
-        // Gate 5 chaos-injector CH-3/UP-6 follow-up (#4020): the ONE
-        // caller-visible signal that get_user_role() is about to floor a
-        // legacy-API-token-authenticated request's role to Role::user
-        // (auth_routes.cpp's `.value_or(Role::user)`) on a genuine AuthDB
-        // store error - not a plain not-found. Single call site, single
-        // failure shape reaches it (AuthDBError::QueryFailed; UserNotFound/
-        // InvalidUsername are excluded before the increment), so no label
+        // Gate 5 chaos-injector CH-3/UP-6 follow-up (#4020): the caller-visible
+        // signal that get_user_role() hit a genuine AuthDB store error - not a
+        // plain not-found. Counts EVERY caller (#4068): the legacy-API-token
+        // session synthesis floors the request to Role::user, the Settings
+        // create-user / role-change routes and SCIM active:false answer 503,
+        // and the SCIM create-race re-read records it in its audit detail (the
+        // answer stays 500, #6837). Any AuthDBError other than UserNotFound /
+        // InvalidUsername reaches it (in practice QueryFailed), so no label
         // set - pre-seeded to 0 so an increase() alert is meaningful.
         metrics_.describe("yuzu_auth_get_user_role_store_error_total",
-                          "get_user_role() AuthDB lookups that failed on a genuine store error "
-                          "(not a plain not-found/invalid-username miss) - each one floors the "
-                          "caller's legacy-API-token-authenticated request to Role::user",
+                          "get_user_role() AuthDB lookups (any caller) that failed on a genuine "
+                          "store error (not a plain not-found/invalid-username miss); the "
+                          "legacy-API-token path floors that request to Role::user, the "
+                          "Settings and SCIM active:false callers refuse with 503",
                           "counter");
         metrics_.counter("yuzu_auth_get_user_role_store_error_total");
         // HA WS-1/1a: durable SessionStore degradation on the auth hot path

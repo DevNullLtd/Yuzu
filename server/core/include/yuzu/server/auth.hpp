@@ -1149,9 +1149,16 @@ public:
     /// Returns false if user not found, refused, or failed.
     bool update_role(const std::string& username, Role new_role);
 
-    /// Look up a user's legacy role. Returns nullopt if user not found (or,
-    /// in AuthDB-backed mode, if the store could not answer - never falls
-    /// back to a cached value on a store error). AuthDB-authoritative on
+    /// Why `get_user_role()` has no role to return (#4068). `NotFound` is a
+    /// SUCCESSFUL negative answer (no such user, soft-deleted, or a rejected
+    /// username shape); `DbError` means the store could not answer, so the
+    /// caller does NOT know whether the user exists and must not treat it as
+    /// "absent" (a fail-open on any "absent => proceed/no-op" branch).
+    enum class GetUserRoleError { NotFound, DbError };
+
+    /// Look up a user's legacy role. The error channel distinguishes a genuine
+    /// miss (`NotFound`) from an AuthDB store error (`DbError`, which never
+    /// falls back to a cached value). AuthDB-authoritative on
     /// EVERY call when configured (no cache, no cache fallback) - see the
     /// .cpp definition's doc for why (Gate 3 governance BLOCKING finding,
     /// #4020: this is the call auth_routes.cpp's legacy API-token session
@@ -1159,7 +1166,8 @@ public:
     /// live stale-privilege gap after a demotion, independent of
     /// authenticate()/verify_password() entirely). Config-file mode (no
     /// AuthDB) remains cache-only, unchanged.
-    std::optional<Role> get_user_role(const std::string& username) const;
+    [[nodiscard]] std::expected<Role, GetUserRoleError>
+    get_user_role(const std::string& username) const;
 
     /// Check whether any users are configured.
     bool has_users() const;
