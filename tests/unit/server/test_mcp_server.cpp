@@ -63,6 +63,7 @@
 #include "test_forensics_tier_fixture.hpp" // #4990: the Forensics tier fixture
 #include "test_route_sink.hpp"  // M.9 PR-2b: in-process sink for that REST half
 #include "test_principal_lock_gate.hpp" // SqlFault: a REAL table moved aside in the throwaway DB
+#include "test_identity_revoke_fault.hpp" // IdentityRevokeFault, shared with the REST twin test
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 #include "test_compliance_api_double.hpp" // ADR-0031 WS-A4: FnComplianceApi
@@ -4206,6 +4207,155 @@ TEST_CASE("MCP confirm_engine_rotation: retry_after_ms only on a transient store
     CHECK(bad_body["error"]["message"].get<std::string>().find("rotation pair is malformed") !=
           std::string::npos);
     CHECK(bad_body["error"]["data"]["retry_after_ms"].is_null());
+}
+
+// #6716: revoke_engine_principal is the MCP twin of DELETE /api/v1/engine-principals/{id}. The
+// credentials are revoked FIRST and the identity SECOND, so the identity revoke can fail after the
+// credentials are already dead. The REST cases are in test_engine_principal_lifecycle.cpp; both
+// drive the SAME IdentityRevokeFault trigger on the real engine_principals table.
+TEST_CASE("MCP revoke_engine_principal: a fault after the credential revoke is retryable, "
+          "records the revoked count, and the repeat finishes the revoke (#6716)",
+          "[mcp][pg][engine_principal][revoke][retry_hint]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    yuzu::server::EnginePrincipalStore eps{pool}; // the SAME pool, as server.cpp builds it
+    REQUIRE(eps.is_open());
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const auto make = [&](const std::string& id) {
+        REQUIRE(eps.create(id, "alice", "j", "internal", "alice", id).has_value());
+        REQUIRE(store.create_token("svc", id, now + 90 * 24 * 3600, "", "readonly", "engine")
+                    .has_value());
+    };
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.engine_principal_store_for_test = &eps;
+    ts.start();
+    const auto revoke_call = [&](const std::string& pid, const std::string& superseded_by = "") {
+        nlohmann::json args{{"principal_id", pid}};
+        if (!superseded_by.empty())
+            args["superseded_by"] = superseded_by;
+        return ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                      {"method", "tools/call"},
+                                      {"id", 5},
+                                      {"params", {{"name", "revoke_engine_principal"},
+                                                  {"arguments", args}}}}
+                           .dump());
+    };
+    // (result, detail) of every engine_principal.revoke row, oldest first.
+    const auto revoke_rows = [&] {
+        std::vector<std::pair<std::string, std::string>> rows;
+        REQUIRE(ts.audit_log.size() == ts.audit_details.size());
+        for (std::size_t i = 0; i < ts.audit_log.size(); ++i)
+            if (ts.audit_log[i].starts_with("engine_principal.revoke|"))
+                rows.emplace_back(ts.audit_log[i].substr(std::string("engine_principal.revoke|").size()),
+                                  ts.audit_details[i]);
+        return rows;
+    };
+    const auto payload_of = [](const std::unique_ptr<httplib::Response>& r) -> nlohmann::json {
+        const auto j = nlohmann::json::parse(r->body);
+        REQUIRE(j.contains("result"));
+        return nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+    };
+    const auto state_of = [&](const std::string& pid) {
+        auto got = eps.get(pid);
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        return (*got)->lifecycle_state;
+    };
+
+    SECTION("normal revoke is unchanged") {
+        make("engine:mcp-rv-normal");
+        auto r = revoke_call("engine:mcp-rv-normal");
+        REQUIRE(r);
+        const auto p = payload_of(r);
+        CHECK(p["revoked"].get<bool>() == true);
+        CHECK(p["credentials_revoked"].get<int>() == 1);
+        CHECK(state_of("engine:mcp-rv-normal") == "revoked");
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].first == "success");
+        CHECK(rows[0].second.find("revoked_by_concurrent_request") == std::string::npos);
+    }
+
+    SECTION("(d) the identity revoke errors: retry hint, failure row ends with the count") {
+        const std::string pid = "engine:mcp-rv-raise";
+        make(pid);
+        yuzu::server::test::IdentityRevokeFault fault{
+            pool, yuzu::server::test::IdentityRevokeFault::Mode::Raise};
+        auto r = revoke_call(pid);
+        REQUIRE(r);
+        const auto body = nlohmann::json::parse(r->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultRetryMs);
+        // Half done: the credential is gone, the identity is still active.
+        CHECK(state_of(pid) == "active");
+        CHECK(store.list_active_for_principal(pid).empty());
+        auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].first == "failure");
+        CHECK(rows[0].second.ends_with("; credentials_revoked=1"));
+        CHECK(rows[0].second.find("yuzu_test identity revoke fault") != std::string::npos);
+
+        fault.remove();
+        auto again = revoke_call(pid);
+        REQUIRE(again);
+        CHECK(payload_of(again)["credentials_revoked"].get<int>() == 0);
+        CHECK(state_of(pid) == "revoked");
+        rows = revoke_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].first == "success");
+    }
+
+    SECTION("(e) race: a concurrent revoke wins, so the call is an idempotent success") {
+        const std::string pid = "engine:mcp-rv-race";
+        make(pid);
+        yuzu::server::test::IdentityRevokeFault fault{
+            pool, yuzu::server::test::IdentityRevokeFault::Mode::Race};
+        auto r = revoke_call(pid, "engine:mcp-rv-successor");
+        REQUIRE(r);
+        const auto p = payload_of(r);
+        CHECK(p["revoked"].get<bool>() == true);
+        CHECK(p["credentials_revoked"].get<int>() == 1);
+        CHECK(state_of(pid) == "revoked");
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1); // a success row and no failure row for the same call
+        CHECK(rows[0].first == "success");
+        CHECK(rows[0].second ==
+              "credentials_revoked=1; revoked_by_concurrent_request; superseded_by_not_persisted");
+        // The row must not claim the caller's value was persisted.
+        CHECK(rows[0].second.find("superseded_by=") == std::string::npos);
+    }
+
+    SECTION("(e) the identity revoke changed nothing and is still active: retryable") {
+        const std::string pid = "engine:mcp-rv-skip";
+        make(pid);
+        yuzu::server::test::IdentityRevokeFault fault{
+            pool, yuzu::server::test::IdentityRevokeFault::Mode::Skip};
+        auto r = revoke_call(pid);
+        REQUIRE(r);
+        const auto body = nlohmann::json::parse(r->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultRetryMs);
+        CHECK(state_of(pid) == "active");
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].first == "failure");
+        CHECK(rows[0].second ==
+              "revoke matched no active row but the principal is still active; "
+              "credentials_revoked=1");
+
+        fault.remove();
+        auto again = revoke_call(pid);
+        REQUIRE(again);
+        CHECK(payload_of(again)["credentials_revoked"].get<int>() == 0);
+        CHECK(state_of(pid) == "revoked");
+    }
 }
 
 // ── Human API-token rotation (P2 #11, SOC 2 CC6.3) ──────────────────────────

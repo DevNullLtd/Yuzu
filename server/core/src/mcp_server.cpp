@@ -26472,42 +26472,76 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::size_t credentials_revoked = *credentials_revoked_res;
+                // #6716: from here on the credentials ARE revoked. A failure row below
+                // carries that count, because the repeat call (which the retry hint
+                // invites) revokes 0 and records no count, so it would otherwise
+                // appear in no audit row at all. Same detail as the REST route.
+                const std::string revoked_count_detail =
+                    "credentials_revoked=" + std::to_string(credentials_revoked);
+                const auto fail_after_credentials = [&](const std::string& why) {
+                    const std::string detail = why + "; " + revoked_count_detail;
+                    mcp_audit("failure", detail);
+                    (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
+                                   principal_id, detail);
+                };
                 auto revoked_res = engine_principal_store_->revoke(principal_id, superseded_by);
                 if (!revoked_res) {
-                    mcp_audit("failure", revoked_res.error());
-                    (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
-                                   principal_id, revoked_res.error());
+                    fail_after_credentials(revoked_res.error());
                     res.set_content(a4_error(kInternalError, revoked_res.error(),
                                              "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
                 const bool revoked = *revoked_res;
-                if (!revoked && already_revoked) {
-                    // Idempotent no-op: the principal was already terminal before
-                    // this call, so `revoke()` returning false here is expected,
-                    // not an error — proceed to the success response below (same
-                    // as the REST route falling through this case).
-                } else if (!revoked) {
-                    // Genuine store failure (authoritative posture, EnginePrincipalStore
-                    // doc comment): a lease/query failure returns false, never a
-                    // silent success. Distinct from "already revoked" above — this is
-                    // retryable/partial-revoke state, not a permanent client-input
-                    // error, so map it to a 503-class retryable error rather than
-                    // kInvalidParams (which would misleadingly read as "bad request,
-                    // don't retry").
-                    mcp_audit("failure", "engine principal store failed to revoke");
-                    (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
-                                   principal_id, "store_unavailable");
-                    res.set_content(a4_error(kInternalError,
-                                             "failed to revoke engine principal — try again",
-                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
+                bool revoked_by_concurrent_request = false;
+                if (!revoked && !already_revoked) {
+                    // EnginePrincipalStore::revoke returns false ONLY when its UPDATE
+                    // matched no active row (a lease or query failure is the error arm
+                    // above). With `already_revoked` false at the read above, the
+                    // reachable cause is a concurrent revoke that landed between that
+                    // read and this write. Re-read to tell that apart from an identity
+                    // that is still active (mirrors the REST DELETE route).
+                    auto reread = engine_principal_store_->get(principal_id);
+                    if (reread && *reread && (*reread)->lifecycle_state != "active") {
+                        // The winner did the work and this call killed the credentials:
+                        // idempotent success, not a failure.
+                        revoked_by_concurrent_request = true;
+                    } else {
+                        // Still active (or gone, or unreadable): the identity is not
+                        // confirmed revoked and its credentials are already dead, the
+                        // same state as the revoke-error arm above, so the same hint.
+                        std::string why;
+                        if (!reread)
+                            why = "revoke matched no active row and the re-read failed: " +
+                                  reread.error();
+                        else if (!*reread)
+                            why = "revoke matched no active row and the principal is no longer "
+                                  "found";
+                        else
+                            why = "revoke matched no active row but the principal is still "
+                                  "active";
+                        fail_after_credentials(why);
+                        res.set_content(a4_error(kInternalError,
+                                                 "failed to revoke engine principal — try again",
+                                                 "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                        return;
+                    }
                 }
+                // `!revoked && already_revoked` is the idempotent no-op: the principal
+                // was already terminal before this call, so `false` is expected, not an
+                // error. The REST route falls through it the same way.
+                // The race row carries the same detail the REST route writes. A
+                // caller-supplied superseded_by was NOT persisted (the winner's value
+                // stands), so the row does not claim it was.
+                const std::string success_detail =
+                    revoked_by_concurrent_request
+                        ? revoked_count_detail + "; revoked_by_concurrent_request" +
+                              (superseded_by.empty() ? "" : "; superseded_by_not_persisted")
+                        : reason;
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "engine_principal.revoke", "success", "EnginePrincipal",
-                    principal_id, reason);
+                    principal_id, success_detail);
                 if (!audit_ok) {
                     // #3937: fail closed (parity with REST #2466 + plugin-config MCP
                     // precedent). The principal + its credentials were revoked but the

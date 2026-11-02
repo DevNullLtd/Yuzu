@@ -6416,7 +6416,13 @@ void RestApiV1::register_routes(
                     principal_id,
                     revoked_count_detail +
                         (revoked_by_concurrent_request ? "; revoked_by_concurrent_request" : "") +
-                        (superseded_by.empty() ? "" : "; superseded_by=" + superseded_by))) {
+                        // The winner's write stands: a caller-supplied value was NOT persisted
+                        // by this call, so the row must not claim it was (#6716).
+                        (superseded_by.empty()
+                             ? ""
+                             : (revoked_by_concurrent_request
+                                    ? "; superseded_by_not_persisted"
+                                    : "; superseded_by=" + superseded_by)))) {
                 res.status = 503;
                 res.set_content(
                     detail::a4_error(res, "the engine principal was revoked but its audit record "
