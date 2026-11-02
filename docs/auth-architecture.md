@@ -998,6 +998,12 @@ gate applied.
   starts at `0` ("never assigned") and the trigger assigns a value from the next enrolment change, so an account that was already
   enrolled on a carried-over database reads generation `0`, is refused `503` (audit `reason=mfa_proof_unavailable`), and
   must have its factor cleared with `yuzu-server --mfa-reset <user>` (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in).
+- **Decisions are not re-checked under the row lock.** The approve and reject decision, the 35 ordinary
+  step-up routes and the JIT elevation routes compare the generation once, at the gate read; only the
+  factor-changing operations (Settings disable, recovery-code regeneration, the sign-in stamp) compare it
+  again under the `auth.users` row lock. A clear that commits between the gate read and the decision lets
+  that one decision stand: it linearises before the clear. Re-checking would nest locks across the approval
+  store and `AuthDB`, and the exposure is the same class as the accepted residuals of the hard-cutover entry.
 - **The session side is guarded too.** `session_store.sessions.mfa_factor_gen` and `mfa_bind_seq`
   (session_store migration v3) hold the bound proof. The trigger `sessions_mfa_rebind_guard`
   (`ENABLE ALWAYS`) sets `mfa_factor_gen` to `0` ("unbound") on any write of a proof or identity column
