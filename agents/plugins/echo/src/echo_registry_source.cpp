@@ -81,7 +81,6 @@ void RegistryCursorSource::start(EchoDatabase& db) {
     // A persisted cursor means a previous run: whatever was written while the agent
     // was down is found by the baseline diff, but the events that would name its
     // writer were never seen. An unreadable cursor is treated the same way.
-    stopping_.store(false, std::memory_order_release);
     const auto cursor = db.get_cursor("registry");
     if (!cursor || cursor->has_value()) {
         pending_gap_ = true;
@@ -97,7 +96,6 @@ void RegistryCursorSource::start(EchoDatabase& db) {
 }
 
 void RegistryCursorSource::stop() noexcept {
-    stopping_.store(true, std::memory_order_release); // first: a pass in flight mounts nothing more
     try {
         reader_.stop();
     } catch (...) {
@@ -192,17 +190,15 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
             // (no path yet) included. When a complete walk would drop a known profile, or one that
             // was loaded last tick, walk ONCE more and keep every profile either walk listed or
             // named in `partial` (an incomplete second walk removes nothing).
-            const auto would_drop = [&](const std::string& sid) {
-                return std::find(sids.begin(), sids.end(), sid) == sids.end() &&
-                       std::none_of(offline.begin(), offline.end(),
-                                    [&](const OfflineProfile& o) { return o.sid == sid; });
+            // `owed` is every profile a complete walk must still name (reconcile_offline's own
+            // `known`, so a virtual service or system SID that unloaded is not one of them).
+            const auto owed =
+               reconcile_offline(cur.offline, prev_hku, sids, OfflineDiscovery{false, {}, {}});
+            const auto would_drop = [&](const OfflineProfile& k) {
+                return std::none_of(offline.begin(), offline.end(),
+                                    [&](const OfflineProfile& o) { return o.sid == k.sid; });
             };
-            if (d.complete &&
-                (std::any_of(cur.offline.begin(), cur.offline.end(),
-                             [&](const OfflineProfile& k) { return would_drop(k.sid); }) ||
-                 std::any_of(prev_hku.begin(), prev_hku.end(), [&](const std::string& sid) {
-                     return is_user_hive_name(sid) && would_drop(sid);
-                 }))) {
+            if (d.complete && std::any_of(owed.begin(), owed.end(), would_drop)) {
                 d = reader_.offline_profiles(sids);
                 for (const auto& p : reconcile_offline(cur.offline, prev_hku, sids, d)) {
                     const auto it = std::find_if(offline.begin(), offline.end(),
@@ -498,10 +494,6 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
             });
             if (!offline_due)
                 continue;
-            if (stopping_.load(std::memory_order_acquire)) {
-                defer(); // a stop mid-pass: no further mount, and no row for the hive left unread
-                continue;
-            }
             if (read_any && reader_.now_ts() >= deadline) {
                 defer();
                 continue;
@@ -1390,12 +1382,33 @@ SubtreeRead read_root_at(HKEY key, const std::string& label, std::int64_t deadli
     return out;
 }
 
+// Is `sid`'s hive gone from HKEY_USERS? A loaded profile's hive is HKU\<sid>; once the user logs
+// off it is unloaded and the key no longer exists.
+bool hku_hive_unloaded(const std::string& sid) {
+    yuzu::win::RegKey key;
+    const LONG rc =
+       RegOpenKeyExW(HKEY_USERS, yuzu::win::to_wide(sid).c_str(), 0, KEY_READ, key.put());
+    return rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND;
+}
+
 SubtreeRead read_root(const std::string& root, std::int64_t deadline) noexcept {
     SubtreeRead out;
     try {
         yuzu::win::RegKey key;
         const LONG rc = open_root(root, KEY_READ, key);
         if (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND) {
+            // The root is not there -- or its whole hive is not: a user who logged off after
+            // collect() took its HKU snapshot (or before a missed name-watch mark refreshed it)
+            // answers the same way. Absent would be read as "every value was deleted" and blank
+            // the baseline; Unreadable keeps it, and the next HKU refresh moves the root offline,
+            // where it is diffed against that baseline. A key missing under a hive that is still
+            // loaded stays Absent.
+            const std::string sid = hku_sid_of(root);
+            if (!sid.empty() && hku_hive_unloaded(sid)) {
+                out.status = RegistryReadStatus::Unreadable;
+                out.reason = "hive_unloaded";
+                return out;
+            }
             out.status = RegistryReadStatus::Absent;
             return out;
         }
@@ -1477,7 +1490,8 @@ struct OfflineMountTick {
     std::int64_t deadline{0};
     bool halted{false};
     const char* halted_token{"skipped_after_timeout"};
-    bool gate_warned{false}; // the mount gate is closed and said so; cleared when it reopens
+    // The closed gate was warned of; the next mount attempt that finds it open clears this.
+    bool gate_warned{false};
 };
 
 // One warning per open -> closed transition of the shared mount gate (a failed module pin, or a
@@ -1536,8 +1550,10 @@ OfflineHiveRead read_offline_hive_bounded(const std::string& sid, const std::str
        kHiveMountBoundMs, [sid, path, roots, deadline]() -> OfflineHiveRead {
            const MountWorkerGuard in_flight; // counted until this closure really returns
            OfflineHiveRead r;
-           // Built before the try: the handler must not allocate (a bad_alloc there would leave
-           // the closure and the caller blocked for the whole bound), so it only moves this in.
+           // Built before the try so the handler allocates nothing (a bad_alloc there would
+           // leave the closure and the caller blocked for the whole bound); it only moves this in.
+           // Building it can itself throw, before any mount: the closure then unwinds, the guard
+           // above releases the count and the caller reports a timeout at the bound.
            OfflineHiveRead failed = unreadable_hive(roots, true, "offline:exception");
            yuzu::win::HiveAccessReport report;
            try {
@@ -1572,7 +1588,8 @@ OfflineHiveRead read_offline_hive_bounded(const std::string& sid, const std::str
            } catch (...) {
                r = std::move(failed);
            }
-           // A leaked mount is system-wide and keeps NTUSER.DAT locked until something releases it.
+           // The second statement outside the try. A leaked mount is system-wide and keeps
+           // NTUSER.DAT locked until something releases it.
            if (report.unload_failed) {
                // Every failure is recorded (which hive, which mount); the alert is raised once.
                spdlog::info("Echo registry: hive unload failed for {} (mount HKU\\{})", sid,

@@ -13,7 +13,6 @@
 #include "echo_registry_parsers.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -266,7 +265,8 @@ struct RegistryReader {
     /// own `loaded_sids` for this tick (never a second HKU enumeration). Asked on an HKU
     /// name-watch mark, on the full re-read and on a re-baseline, while the known list is empty,
     /// and while the last walk was incomplete or a known profile has no path yet (see collect());
-    /// asked a second time in one tick only to confirm the removal of a profile that had a path.
+    /// asked a second time in one tick only to confirm the removal of a known profile (one with
+    /// no path yet, or that was loaded last tick, included).
     /// `complete == false` means "keep what you knew" (and add what the walk did list), never
     /// "nothing exists" (see reconcile_offline). Must not throw.
     std::function<OfflineDiscovery(const std::vector<std::string>& loaded_sids)> offline_profiles;
@@ -326,9 +326,6 @@ private:
     std::vector<std::string> armed_roots_;
     // The last profile discovery was incomplete (warn once per transition).
     bool offline_incomplete_{false};
-    // Set by stop() from another thread while collect() may be mid-pass: no further hive is
-    // mounted, so a shutdown never runs into the agent's hard-exit with a mount live.
-    std::atomic<bool> stopping_{false};
 
     // Loss accounting; advanced only after a successful commit, so a failed commit
     // re-derives and re-reports the same loss on the next tick.

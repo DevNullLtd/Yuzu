@@ -59,7 +59,8 @@
 // OFFLINE HIVES. A profile whose hive is not loaded (a logged-off user) keeps its per-user
 // roots in scope under the SAME root names as when it is loaded (`HKU\<sid>\<suffix>`), so
 // one baseline carries across logoff and logon. Such a root has no key watch and no ETW
-// attribution: it is read hourly (the reconcile tick) by mounting the hive file through the
+// attribution: it is read on the HOURLY tick (not on a restart's full re-read), and at once when
+// it was never read, was Capped, or is owed a retry, by mounting the hive file through the
 // shared guarded ladder, once per hive, and its rows carry source=offline and
 // detail=attr:offline -- an unloaded hive is written by file-level tools or by another
 // process's mount, never by a registry call this session could attribute, so nothing is
@@ -301,14 +302,22 @@ RegistryScope::roots_for(const std::vector<std::string>& hku_subkeys,
 /// in `partial` or lists it in `profiles` (which supplies the path). A complete walk that names
 /// it nowhere still drops it from THIS list; collect() confirms such a removal with a second
 /// complete walk and keeps what either walk listed. Only SID-named hives count
-/// (`.DEFAULT` and `<sid>_Classes` leave HKU too, and are not profiles).
+/// (`.DEFAULT` and `<sid>_Classes` leave HKU too, and are not profiles), and a virtual service
+/// SID or a well-known system SID that unloads is not a logged-off user either: it is never
+/// carried, so it costs no confirming walk and leaves no entry behind.
+///
+/// A sid the walk flagged `partial` keeps its known path when it has one, even if the same walk
+/// also lists it: the pair `S` + `S.bak` is the temporary-profile signature, and a listed `S` then
+/// points at the TEMP folder, whose hive must never be diffed against the real baseline.
 [[nodiscard]] inline std::vector<OfflineProfile>
 reconcile_offline(const std::vector<OfflineProfile>& known_in,
                   const std::vector<std::string>& prev_loaded,
                   const std::vector<std::string>& loaded, const OfflineDiscovery& d) {
     std::vector<OfflineProfile> known = known_in;
     for (const auto& sid : prev_loaded)
-        if (is_user_hive_name(sid) && std::find(loaded.begin(), loaded.end(), sid) == loaded.end())
+        if (is_user_hive_name(sid) && !is_virtual_service_sid(sid) &&
+            !yuzu::profiles::is_system_sid(sid) &&
+            std::find(loaded.begin(), loaded.end(), sid) == loaded.end())
             known.push_back({sid, {}});
     std::vector<OfflineProfile> out;
     const auto is_loaded = [&](const std::string& sid) {
@@ -322,10 +331,16 @@ reconcile_offline(const std::vector<OfflineProfile>& known_in,
         out.push_back(p);
     };
     if (d.complete) {
+        const auto is_partial = [&](const std::string& sid) {
+            return std::find(d.partial.begin(), d.partial.end(), sid) != d.partial.end();
+        };
+        for (const auto& k : known) // a known real path outranks a listed one for a partial sid
+            if (!k.path.empty() && is_partial(k.sid))
+                push(k);
         for (const auto& p : d.profiles)
             push(p);
-        for (const auto& k : known)
-            if (std::find(d.partial.begin(), d.partial.end(), k.sid) != d.partial.end())
+        for (const auto& k : known) // a pathless one comes after, so a listed path can fill it
+            if (is_partial(k.sid))
                 push(k);
     } else {
         for (const auto& k : known) {
@@ -352,8 +367,10 @@ reconcile_offline(const std::vector<OfflineProfile>& known_in,
 /// stopped at the profile cap is incomplete too, but the profiles it did list are returned.
 /// A `<sid>.bak` record (the leftover of a temporary-profile event) proves its base sid exists
 /// and is mid-rename: the base sid is `partial` (its known entry stands) and the record is never
-/// a profile, so it is never mounted under the `.bak` name. A virtual service SID is skipped
-/// outright (is_virtual_service_sid).
+/// a profile, so it is never mounted under the `.bak` name. The base sid's OWN record is then not
+/// listed either: beside a `.bak` it names the temporary profile's folder, whose hive must never
+/// be mounted against the real baseline, so the pair stays `partial` and nothing is read until
+/// the `.bak` is gone. A virtual service SID is skipped outright (is_virtual_service_sid).
 [[nodiscard]] inline OfflineDiscovery
 classify_offline_discovery(bool walk_complete, bool root_failed, bool truncated,
                            std::span<const yuzu::profiles::ProfileInfo> profiles,
@@ -369,31 +386,37 @@ classify_offline_discovery(bool walk_complete, bool root_failed, bool truncated,
             d.partial.push_back(sid);
     };
     // A `<sid>.bak` record, listed or failed, names its BASE sid, never the `.bak` text.
+    std::set<std::string> has_backup; // base sids that have a `.bak` sibling in this walk
     const auto add_backup_base = [&](const std::string& record) {
         const std::string base = record.substr(0, record.size() - 4);
-        if (is_user_hive_name(base) && !is_virtual_service_sid(base))
+        if (is_user_hive_name(base) && !is_virtual_service_sid(base)) {
             add_partial(base);
-    };
-    for (const auto& p : profiles) {
-        if (p.state == yuzu::profiles::HiveState::loaded)
-            continue;
-        if (yuzu::profiles::is_profile_backup_entry(p.sid)) {
-            add_backup_base(p.sid);
-            continue;
+            has_backup.insert(base);
         }
+    };
+    for (const auto& p : profiles)
+        if (p.state != yuzu::profiles::HiveState::loaded &&
+            yuzu::profiles::is_profile_backup_entry(p.sid))
+            add_backup_base(p.sid);
+    for (const auto& sid : failed_sids)
+        if (yuzu::profiles::is_profile_backup_entry(sid))
+            add_backup_base(sid);
+    for (const auto& p : profiles) {
+        if (p.state == yuzu::profiles::HiveState::loaded ||
+            yuzu::profiles::is_profile_backup_entry(p.sid))
+            continue;
         if (is_virtual_service_sid(p.sid))
             continue;
+        if (has_backup.contains(p.sid))
+            continue; // beside its `.bak`: the temporary profile's record, partial only
         if (p.profile_path_unreadable || p.profile_path.empty())
             add_partial(p.sid);
         else
             d.profiles.push_back({p.sid, p.profile_path});
     }
-    for (const auto& sid : failed_sids) { // a record that failed to read is not "gone"
-        if (yuzu::profiles::is_profile_backup_entry(sid))
-            add_backup_base(sid);
-        else if (!is_virtual_service_sid(sid))
+    for (const auto& sid : failed_sids) // a record that failed to read is not "gone"
+        if (!yuzu::profiles::is_profile_backup_entry(sid) && !is_virtual_service_sid(sid))
             add_partial(sid);
-    }
     return d;
 }
 
@@ -570,8 +593,10 @@ struct SubtreeRead {
     RegistryReadStatus status{RegistryReadStatus::Unreadable};
     std::map<std::string, std::map<std::string, RegistryValueRead>> keys;
     std::vector<std::string> skipped;
-    /// Empty for a live read. An offline read that could not mount its hive carries the
-    /// named refusal (`offline:<token>`), which the gap row quotes.
+    /// Empty for an ordinary read. An Unreadable read can name its cause, which the gap row
+    /// quotes: an offline read that could not mount its hive carries the refusal
+    /// (`offline:<token>`), and a live read whose whole hive was unloaded under it carries
+    /// `hive_unloaded`.
     std::string reason;
 };
 

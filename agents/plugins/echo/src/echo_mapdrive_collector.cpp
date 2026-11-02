@@ -1123,8 +1123,9 @@ bool pin_plugin_module() noexcept {
                                reinterpret_cast<LPCWSTR>(&pin_plugin_module), &module))
             return true;
         spdlog::error("Echo hive mount: could not pin the plugin module (GetLastError {}); no "
-                      "hive is mounted (mapped-drive history or registry offline reads) until the "
-                      "agent restarts, because a detached mount thread must not outlive an unload",
+                      "hive is read (mapped-drive history for loaded and logged-off profiles, "
+                      "registry offline reads) until the agent restarts, because a detached mount "
+                      "thread must not outlive an unload",
                       GetLastError());
         return false;
     }();

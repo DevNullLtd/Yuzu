@@ -104,7 +104,7 @@ empty); `n/a` means the source does not apply to that OS. The table is read from
 | `mapdrive` | mapped network shares, both directions | live: outbound, history and inbound (inbound needs local admin) | constrained: outbound live only | constrained: mounts and fstab, inbound needs Samba |
 | `power` | sleep, wake, AC transitions (cursor) | constrained: power broadcast | live: `pmset -g log` replay | constrained: logind, needs the libsystemd build, AC read always |
 | `removable` | media attach and detach, exec from removable (cursor) | live: event-log channels | constrained: DiskArbitration | constrained: udev netlink |
-| `registry` | registry value and key changes (cursor) | live: `RegNotifyChangeKeyValue`; logged-off profiles on the full re-read (every 12 slow ticks, hourly at the default 300 s) via the guarded hive mount | n/a | n/a |
+| `registry` | registry value and key changes (cursor) | live: `RegNotifyChangeKeyValue`; logged-off profiles on the hourly tick (every 12 slow ticks, hourly at the default 300 s) via the guarded hive mount | n/a | n/a |
 | `usage` | per-executable runs, derived from `process` | live | constrained: inherits `process` | live |
 
 ### Source notes
@@ -126,7 +126,7 @@ empty); `n/a` means the source does not apply to that OS. The table is read from
   pinned in memory before the first mount; if the pin fails no hive is read, and while a stuck
   mount is still running later runs do not start new mounts. `purge_source mapdrive` also clears the
   pending-retry list so a retry cannot re-insert purged rows.
-- **`registry`.** Values are stored unmasked, and a loaded-hive row names a correlated writer where one is found (a lead, not proof). Logged-off users' hives are read on the full re-read (every 12 slow ticks: hourly at the default 300 s, between 6 minutes and 24 hours as `slow_interval` varies) through the guarded offline-hive mount: one mount per hive, loaded roots first and the hives in the budget that is left (the tail of a long list is read over the following ticks, visible as `registry_offline_roots_deferred`), rows `attr:offline` and never attributed, one `gap:unreadable` row per root (up to five per hive) for a refused or failed mount. Discovery walks the profile list with its 512-entry cap: beyond it the profiles the walk reaches are read and `registry_offline_discovery_incomplete` stays `1`. See Caveats.
+- **`registry`.** Values are stored unmasked, and a loaded-hive row names a correlated writer where one is found (a lead, not proof). The hives of logged-off users whose profile path the walk can resolve are read on the hourly tick (every 12 slow ticks: hourly at the default 300 s, between 6 minutes and 24 hours as `slow_interval` varies; a hive that is capped, deferred or owed a retry is mounted again on the next tick) through the guarded offline-hive mount: one mount per hive, loaded roots first and the hives in the budget that is left (the tail of a long list is read over the following ticks, visible as `registry_offline_roots_deferred`), rows `attr:offline` and never attributed, one `gap:unreadable` row per root (up to five per hive) for a refused or failed mount. Discovery walks the profile list with its 512-entry cap: beyond it the profiles the walk reaches are read and `registry_offline_discovery_incomplete` stays `1`. See Caveats.
 
 ### Diagrams
 
@@ -261,7 +261,7 @@ window of a disable is likewise reported only as a gap, never as its own events.
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | Agent service account (LocalSystem today, #1442; the `echo.*` row of `docs/agent-privilege-model.md` lists `SeBackupPrivilege` and `Performance Log Users` for the intended account; the only Echo code that enables `SeBackupPrivilege` and `SeRestorePrivilege` is the `mapdrive` history backfill (once, at init, plus its retries) and the `registry` source's offline reads (on every full re-read, hourly at the default 300 s, for each logged-off profile the profile-list walk can resolve a path for; it reads at most 512 entries), each only for the span of mounting a logged-out profile's offline `NTUSER.DAT`) | **None beyond the service account's own rights.** LocalSystem already satisfies the ETW session requirements; the `software` source needs no extra privilege beyond the account's existing registry-read access. The `netqual` source needs an elevated agent: a non-elevated agent records nothing and `status` reports `netqual_capture_method=none`. | 2026-09-07, bare-metal, captured as `SYSTEM` — broader privilege than the deployed service account; no OS-level read was reached in this capture (see Caveats) | Not observed in this capture. Not every Windows leg is plain `supported`: `process` falls back to a `CreateToolhelp32Snapshot` poll if the ETW session cannot start, and `netqual` and `power` are `constrained`. For the other Windows legs a refused read is expected to surface as an `error\|` line from the underlying Win32 call rather than a degrade (inferred from the code, not shown in the capture). |
+| Windows | Agent service account (LocalSystem today, #1442; the `echo.*` row of `docs/agent-privilege-model.md` lists `SeBackupPrivilege` and `Performance Log Users` for the intended account; the only Echo code that enables `SeBackupPrivilege` and `SeRestorePrivilege` is the `mapdrive` history backfill (once, at init, plus its retries) and the `registry` source's offline reads (on the hourly tick, every 12 slow ticks, at the default 300 s, and on every tick for a hive that is capped, deferred or owed a retry, for each logged-off profile the profile-list walk can resolve a path for; it reads at most 512 entries), each only for the span of mounting a logged-out profile's offline `NTUSER.DAT`) | **None beyond the service account's own rights.** LocalSystem already satisfies the ETW session requirements; the `software` source needs no extra privilege beyond the account's existing registry-read access. The `netqual` source needs an elevated agent: a non-elevated agent records nothing and `status` reports `netqual_capture_method=none`. | 2026-09-07, bare-metal, captured as `SYSTEM` — broader privilege than the deployed service account; no OS-level read was reached in this capture (see Caveats) | Not observed in this capture. Not every Windows leg is plain `supported`: `process` falls back to a `CreateToolhelp32Snapshot` poll if the ETW session cannot start, and `netqual` and `power` are `constrained`. For the other Windows legs a refused read is expected to surface as an `error\|` line from the underlying Win32 call rather than a degrade (inferred from the code, not shown in the capture). |
 | macOS | **root** (LaunchDaemon, no `UserName`; see the TL;DR and the `echo.*` row of `docs/agent-privilege-model.md`) | Endpoint Security process capture needs root **and** the `com.apple.developer.endpoint-security.client` entitlement; without both, `es_new_client`/`es_subscribe` fails and the process/tcp legs self-heal to the `KERN_PROC_ALL`/`proc_pidfdinfo` poll (`ProcEsCollector::start`). The `nstat` flow source (`tcp`, `netqual`) likewise needs root for system-wide visibility. | 2026-09-07, bare-metal, captured at **euid 501**, an ordinary user account; the root LaunchDaemon path was not exercised by this capture. | A missing entitlement/privilege never blocks the leg outright — it logs a warning and falls back to the poll (`ProcEsCollector::start`). |
 | Linux | Agent account (`yuzu-agent` on the packaged unit); not root. The `echo.*` row of `docs/agent-privilege-model.md` assumes `cap_dac_read_search` set on the binary by `scripts/install-agent-user.sh` | A file capability on the binary does not take effect under the packaged unit's `NoNewPrivileges=true`, so on the packaged unit the working route is `AmbientCapabilities=CAP_DAC_READ_SEARCH` in a drop-in (not measured for this plugin). Service enumeration (`systemctl`) runs as bounded argv under the agent account, not elevated. | 2026-09-06, container, captured at **euid 0 (root)** — broader than the deployed unprivileged account. | Not observed in this capture. |
 
@@ -816,17 +816,23 @@ three broken legs; it is one chokepoint. See Caveats item 1.
    A value written and reverted between two reads is not recorded, and a profile first seen (at
    its first logon, or as a logged-off profile first found after an upgrade) is baselined silently
    at its first read: the upgrade date is the start of offline coverage. A logged-off user's hive is
-   read on the full re-read (every 12 slow ticks, hourly at the default 300 s; 6 minutes to 24 hours
-   as `slow_interval` varies), unmasked, through the guarded offline-hive mount, for every profile
+   read on the hourly tick (every 12 slow ticks, hourly at the default 300 s; 6 minutes to 24 hours
+   as `slow_interval` varies), unmasked, through the guarded offline-hive mount, for each profile
    the profile-list walk can resolve a path for (the walk reads at most 512 entries; beyond that the
-   profiles it reaches are read and `registry_offline_discovery_incomplete` stays `1`). A change in
+   profiles it reaches are read and `registry_offline_discovery_incomplete` stays `1`, and a profile
+   deleted from such a host is never dropped). A profile first found with an absent or unreadable
+   `ProfileImagePath` is not read, and nothing reports it (no health key, row or log line) until a
+   later walk supplies the path; a virtual service or system account is never read; a profile listed
+   beside its `<sid>.bak` leftover (a temporary profile) is not mounted. A change in
    such a hive is recorded when it is next read, so it may predate the read or the logoff, and it is
    never attributed (`attr:offline`): a write the user made just before logging off, and Yuzu's own
    audited `registry.set_user_value`, look the same. A refused or failed mount keeps the baseline and
    writes one gap row per root (up to five per hive) naming the reason. The mount holds the profile's
-   `NTUSER.DAT` exclusively for its duration and enables the backup and restore privileges, which can
-   fail a logon that races it (the profile may load as a temporary one); a mount that cannot be
-   unloaded leaves the hive locked until it is released (`reg unload`).
+   `NTUSER.DAT` exclusively for its duration, expected to be short but not measured, and enables the
+   backup and restore privileges, which can fail a logon that races it (the profile may load as a
+   temporary one); a mount that cannot be unloaded leaves the hive locked until it is released
+   (`reg unload`). Mounts are not audited one by one: the latest read time and status per root are
+   in the `echo_cursor` row.
 
 ## Source and tests
 

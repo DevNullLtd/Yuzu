@@ -487,8 +487,11 @@ cursor.** What it adds to the pattern:
     `registry_offline_roots_deferred`) and goes first next tick. At about one
     mount per budget second the tail of a long list is read over the following
     ticks; nothing guarantees an hourly read for every hive, since the tail waits for
-    whatever the live roots leave. A stop (`stop()` sets `stopping_`) mid-pass leaves the remaining due
-    hives `deferred` with no row.
+    whatever the live roots leave. A pass is not interruptible: `shutdown()` takes `collect_mu_`
+    before it calls `stop()`, and `collect()` runs under the same lock, so a shutdown waits out
+    the pass, queued offline mounts included (each bounded at 30 s), and a mount can still be
+    live at the agent's hard-exit. Moving the offline mounts out from under `collect_mu_` is an
+    open follow-up.
   - *Transitions* are explicit in `collect()`: a root that was loaded and is
     offline now has its `window_base` reset and its stale notify consumed
     (restored on a failed commit like every take), so nothing from its loaded life
@@ -510,8 +513,13 @@ cursor.** What it adds to the pattern:
     and ADDS the profiles it did list, so a host over the cap still gets the
     profiles the walk reaches. A record whose path was unreadable keeps its cursor
     entry. A `<sid>.bak` record is proof that its base sid exists (it joins `partial`)
-    and is never mounted under the `.bak` name; virtual service SIDs
-    (`is_virtual_service_sid`) are never offline profiles. A sid loaded on the
+    and is never mounted under the `.bak` name, and neither is its base sid's own
+    record when both are listed (the pair is the temporary-profile signature: the base
+    record then names the TEMP folder, so the base sid stays `partial` and its known path
+    stands, `classify_offline_discovery` and `reconcile_offline`); virtual service SIDs
+    (`is_virtual_service_sid`) and the well-known system SIDs (`is_system_sid`) are never
+    offline profiles, and one whose hive unloads leaves scope silently (it was never a
+    logged-off user, so it costs no confirming walk and leaves no pathless entry). A sid loaded on the
     previous tick and gone now (a logoff) is a known profile whose path is not yet
     known (`{sid, ""}`, the `prev_loaded` argument), so a user who logs off during an
     incomplete or partial walk keeps the baseline too: a complete walk that lists it
@@ -519,8 +527,12 @@ cursor.** What it adds to the pattern:
     empty is never mounted: it is marked `deferred` each tick (baseline and status
     untouched, no row) and read the first tick a walk supplies the path; a profile
     whose own record stays unreadable on complete walks stays unpathed, is walked
-    again every tick, is never read and nothing but `registry_offline_roots_deferred`
-    says so.
+    again every tick, is never read and `registry_offline_roots_deferred` counts it.
+    That holds for an entry already in scope (a known profile, or one that has just
+    logged off); a profile FIRST found with an absent or unreadable path never enters
+    scope (`reconcile_offline` keeps a `partial` sid only if it is already known), so
+    it has no roots for any health key to count, `registry_offline_discovery_incomplete`
+    stays `0` on a complete walk, and nothing reports it until a walk supplies the path.
   - *Failures.* A failed mount is an Unreadable read with a named reason
     (`offline:<token>`) and one gap row per ROOT per transition (up to five per
     hive); the `deferred` flag on the root's state, not its status, schedules the
@@ -533,7 +545,11 @@ cursor.** What it adds to the pattern:
     hives that tick `offline:skipped_after_rejection`, no gap row, retried next
     tick; a timeout is an attempt (`offline:timeout`, one gap row) and halts the rest
     of the tick. The tokens a row can carry are listed in the user manual
-    (*Offline read outcomes*).
+    (*Offline read outcomes*). The live arm has one named reason of its own:
+    `read_root` answers `Unreadable` / `hive_unloaded` when an `HKU\<sid>` root is
+    not found AND `HKU\<sid>` itself is gone (a logoff after the tick took its
+    HKU snapshot), never `Absent`, which would diff the whole baseline as removed
+    and blank it; a key missing under a hive that is still loaded stays `Absent`.
   - *Discovery* (a ProfileList registry walk, never a mount) runs hourly, on a
     restart's first tick (`force_all_`), on a re-baseline (a re-enable or a lost cursor),
     on an HKU name-watch mark, and on every tick while no logged-off profile is known, while
