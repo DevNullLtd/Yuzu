@@ -854,7 +854,7 @@ the session store it uses to end the account's sessions the same way.
 
 - **An enrolled operator gets `503` where they used to be asked for a code.** On the step-up routes and JIT
   elevation, the dashboard shows a toast and a REST caller gets `503` with the message "this account's
-  second-factor state cannot be verified" (`mfa_step_up_required: false`, no `retry_after_ms`, and a remediation
+  second-factor state cannot be verified; if it persists, ask an administrator to follow the MFA binding enforcement runbook" (`mfa_step_up_required: false`, no `retry_after_ms`, and a remediation
   that names the MFA binding enforcement runbook); the `mfa.step_up.required` audit row carries
   `reason=mfa_proof_unavailable` and `yuzu_auth_secret_unavailable_total{route="mfa_binding"}` rises. Approve and
   reject answer that central message only while `--mfa-step-up-window-secs` is above 0; at 0 the approver rule
