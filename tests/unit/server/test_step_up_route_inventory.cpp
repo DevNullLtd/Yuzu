@@ -491,7 +491,7 @@ TEST_CASE("step-up route inventory: only the redirect listener's sink opts out o
 
     std::size_t exempt_total = 0;
     std::vector<std::string> exempt_in, direct;
-    bool exempt_builds_redirect_sink = false;
+    bool exempt_on_redirect_member = false;
     std::size_t files_checked = 0;
     const auto scan_corpus = [&](const auto& files) {
         for (const auto& [file, text] : files) {
@@ -502,13 +502,14 @@ TEST_CASE("step-up route inventory: only the redirect listener's sink opts out o
             if (const auto n = count_of(code, "StageRequirement::ExemptNoStage"); n > 0) {
                 exempt_total += n;
                 exempt_in.push_back(file);
-                // The statement that builds the redirect listener's sink: the exemption's own
-                // construction, read from the 200 characters of code just before it (the call
-                // wraps and is indented, so the member name sits well over 100 characters back).
-                const auto at = code.find("StageRequirement::ExemptNoStage");
-                exempt_builds_redirect_sink =
-                    code.substr(at > 200 ? at - 200 : 0, at > 200 ? 200 : at)
-                        .find("redirect_sink_") != std::string::npos;
+                // The exemption is constructed on the redirect server member: with whitespace
+                // erased, the receiver and the token are adjacent.
+                std::string flat = code;
+                std::erase_if(flat, [](char ch) {
+                    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+                });
+                exempt_on_redirect_member =
+                    count_of(flat, "*redirect_server_,StageRequirement::ExemptNoStage") == 1;
             }
             for (const char* recv : {"web_server_->", "redirect_server_->"})
                 for (const char* verb : {"Get(", "Post(", "Put(", "Delete(", "Patch(", "Options("})
@@ -522,9 +523,9 @@ TEST_CASE("step-up route inventory: only the redirect listener's sink opts out o
     INFO("ExemptNoStage appears in: " << join(exempt_in));
     CHECK(exempt_total == 1);
     REQUIRE(exempt_in.size() == 1);
-    // Exactly server.cpp (not `mcp_server.cpp`), and the sink it builds is the redirect listener's.
+    // Exactly server.cpp (not `mcp_server.cpp`), on the redirect server member.
     CHECK(exempt_in.front().substr(exempt_in.front().find_last_of("/\\") + 1) == "server.cpp");
-    CHECK(exempt_builds_redirect_sink);
+    CHECK(exempt_on_redirect_member);
     INFO("Direct verb calls on a server, bypassing the sink:\n" << join(direct));
     CHECK(direct.empty());
 }

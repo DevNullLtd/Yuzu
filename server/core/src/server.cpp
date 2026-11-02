@@ -8982,16 +8982,18 @@ public:
         auth_routes_->set_scim_store(cfg_.scim_enable ? scim_store_.get() : nullptr);
 
         // The route sink fails closed with `std::logic_error` on: (a) a registration on a server
-        // with no post-read stage installed, (b) `PostReadStageRegistry::install` misuse (a route
-        // is already recorded), (c) a registration after the route table is sealed that the
-        // step-up policy does not classify. Any other `std::logic_error` subtype is a refusal to
-        // start too and is logged with its text. Left to escape, these unwind run() into main's
-        // catch only after the gRPC listeners are bound, so agents and the gateway see
-        // accept-then-exit churn; route them through the same `startup_failed_` check as the other
-        // web-server boot failures. An unclassified route BEFORE the seal is not one of these
-        // triggers: the pre-seal sweep sets `startup_failed_` without throwing, and is not
-        // redundant with this catch. Exceptions that are not `std::logic_error` (bad_alloc,
-        // std::system_error from a thread constructor, filesystem_error) still unwind to main.
+        // with no post-read stage installed, (b) `PostReadStageRegistry::install` misuse (an empty
+        // stage, a second install, or a route already recorded), (c) a registration after the
+        // route table is sealed that the step-up policy does not classify (no current caller in
+        // start_web_server(): the seal runs after the last registration). Any other
+        // `std::logic_error` subtype is a refusal to start too and is logged with its text. Left
+        // to escape, these unwind run() into main's catch only after the gRPC listeners are
+        // bound, so agents and the gateway see accept-then-exit churn; route them through the same
+        // `startup_failed_` check as the other web-server boot failures. An unclassified route
+        // BEFORE the seal is not one of these triggers: the pre-seal sweep sets `startup_failed_`
+        // without throwing, and is not redundant with this catch. Exceptions that are not
+        // `std::logic_error` (bad_alloc, std::system_error from a thread constructor,
+        // filesystem_error) still unwind to main.
         try {
             start_web_server();
         } catch (const std::logic_error& e) {
@@ -9016,8 +9018,8 @@ public:
         if (startup_failed_) {
             spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
                          "(among others: SCIM boot failure, HTTPS cipher-pin failure, the MFA "
-                         "step-up route classification abort or a route-registration refusal; "
-                         "see the preceding critical log); "
+                         "step-up route classification abort, a route-registration refusal or "
+                         "another std::logic_error; see the preceding critical log); "
                          "stopping the already-started agent/management gRPC listeners.");
             stop();
             return;

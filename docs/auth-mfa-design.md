@@ -795,6 +795,8 @@ regress:
    not installed for the server (or installed after the first route, so that route is left
    unwrapped), a registration that bypasses the sink, or an `ExemptNoStage` beyond the plaintext
    redirect listener. The sink throws on a stageless server and `install` throws once a route
-   is recorded; a best-effort source scan pins the single production exemption (the redirect
-   listener's sink) and the absence of a literal direct verb call on the web server, and does
-   not see aliases, `ContentReader` overloads or custom-method routes.
+   is recorded; a best-effort source scan pins the single production exemption (constructed on
+   the redirect server member), the absence of a literal direct verb call on either server
+   member (`web_server_->`, `redirect_server_->`), and the absence of a literal-path mutating
+   registration on any receiver other than `sink`. It does not see an alias with a variable
+   path, a `ContentReader` overload or a custom-method route.

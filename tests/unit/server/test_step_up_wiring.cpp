@@ -1936,11 +1936,13 @@ TEST_CASE("wiring: server.cpp owns the post-read stage registration through a sc
 
 // A `std::logic_error` out of start_web_server() must become a startup failure, not an exception
 // unwinding out of run() after the gRPC listeners are bound. The triggers are (a) a sink
-// registration with no stage installed, (b) `PostReadStageRegistry::install` misuse (a route is
-// already recorded), (c) a registration after the route table is sealed, and (d) any incidental
-// `std::logic_error` subtype. An unclassified route BEFORE the seal is not a trigger: the pre-seal
-// sweep sets `startup_failed_` without throwing, and is not redundant with this catch. Exceptions
-// that are not logic errors (bad_alloc, std::system_error, filesystem_error) still unwind to main.
+// registration with no stage installed, (b) `PostReadStageRegistry::install` misuse (an empty
+// stage, a second install, or a route already recorded), (c) a registration after the route table
+// is sealed (no current caller in start_web_server(): the seal runs after the last registration),
+// and (d) any incidental `std::logic_error` subtype. An unclassified route BEFORE the seal is not
+// a trigger: the pre-seal sweep sets `startup_failed_` without throwing, and is not redundant with
+// this catch. Exceptions that are not logic errors (bad_alloc, std::system_error,
+// filesystem_error) still unwind to main.
 TEST_CASE("wiring: server.cpp turns a refused route registration into a startup failure",
           "[stepup][wiring][lexical]") {
     const auto stripped = strip_comments_and_literals(read_server_cpp());

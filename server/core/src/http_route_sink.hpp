@@ -10,7 +10,7 @@
 // segfault is in httplib's internal state machine, not a race TSan caught
 // (issue #438). Most loopback fixtures are therefore compiled out under
 // the Sanitizers (TSan) CI job; the socket cases in test_post_read_stage.cpp
-// are the exception and run there with the CI gai shim.
+// are among the few that run there with the CI gai shim.
 //
 // The fix is a thin polymorphic seam at the route-registration boundary:
 //   - Production code constructs HttplibRouteSink(svr) and passes a
