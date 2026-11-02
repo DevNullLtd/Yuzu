@@ -31,10 +31,12 @@ Three groundwork facts make this tractable rather than a rewrite:
 
 1. **The Erlang gateway already clusters** (OTP `pg` process groups, ETS registry) and already
    tolerates *server* failover — it re-proxies a `ProxyRegister` for the agents a restarted or
-   replaced server no longer knows, because the new server "may be a fresh instance with an empty registry"
-   (`yuzu_gw_upstream.erl`). Since #5695 that replay is evidence-driven (a targeted replay of the
-   ids a heartbeat verdict lists as unknown; a full replay only when at least half of a batch is unknown or
-   a CONNECTED notice was lost), not an unconditional replay of every held agent on reconnect. **But** per-agent *targeted* routing is today a **node-local ETS lookup**
+   replaced server no longer knows, because the new server may be a fresh instance with an empty registry.
+   Since #5695 that replay is evidence-driven (a targeted replay of the ids a heartbeat verdict lists as
+   unknown; a full replay on enough unknown ids, a truncated verdict or a lost CONNECTED notice, with a
+   cooldown; the exact triggers are in the header block of `yuzu_gw_upstream.erl`), not an unconditional
+   replay of every held agent on reconnect.
+   **But** per-agent *targeted* routing is today a **node-local ETS lookup**
    (`yuzu_gw_registry:lookup`, `yuzu_gw_registry.erl:90`) — `pg` is used only for broadcast groups —
    so distributed intra-cluster agent→node routing is **net-new work**, not a free property (see §7).
 2. **ADR-0031 (presentation/core/engine decomposition)** already commits the direction: sessions and
