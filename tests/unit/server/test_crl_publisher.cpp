@@ -480,6 +480,9 @@ TEST_CASE("CrlPublisher: publish() backdates thisUpdate by the clock-skew allowa
     // it used to. nextUpdate is what a gateway's staleness window is measured from.
     const auto validity_s = std::chrono::duration_cast<std::chrono::seconds>(kCrlValidity).count();
     CHECK(latest->next_update == fixed_epoch + validity_s);
+    // The literal, not the constant: a revert of kCrlValidity must fail here (the constants'
+    // own static_asserts sit just below, above the freshness test).
+    CHECK(latest->next_update == fixed_epoch + 48 * 3600);
     CHECK(latest->next_update - latest->this_update ==
           validity_s + static_cast<int64_t>(pki::kClockSkewBackdate.count()));
     // Independently of the fixed injected clock: this_update must not be in the future relative
@@ -488,6 +491,12 @@ TEST_CASE("CrlPublisher: publish() backdates thisUpdate by the clock-skew allowa
 }
 
 // ── Republish threshold against the 48 h validity (#6016 PR 4d) ──────────────
+
+// The cadence is a contract with external CRL consumers (docs/user-manual/upgrading.md, the
+// planned gateway CRL withdrawal), so pin it by literal: changing either value must touch this
+// test and its reviewer, not slip through a test that is written in terms of the constants.
+static_assert(kCrlValidity == std::chrono::hours{48});
+static_assert(kCrlRepublishThreshold == std::chrono::hours{24});
 
 TEST_CASE("CrlPublisher: the freshness pass republishes inside the last 24 h of a 48 h CRL and not "
          "before",
@@ -525,11 +534,19 @@ TEST_CASE("CrlPublisher: the freshness pass republishes inside the last 24 h of 
     auto epoch_to_tp = [](int64_t e) {
         return std::chrono::system_clock::time_point{std::chrono::seconds{e}};
     };
-    CHECK_FALSE(publisher_at(epoch_to_tp(latest->next_update - threshold_s - 60))
-                    .decide_freshness_tick()
-                    .act);
-    const auto due =
-        publisher_at(epoch_to_tp(latest->next_update - threshold_s + 60)).decide_freshness_tick();
+    CHECK(threshold_s == 24 * 3600);
+    auto decide_with = [&](int64_t secs_left) {
+        return publisher_at(epoch_to_tp(latest->next_update - secs_left)).decide_freshness_tick();
+    };
+    // Not due with a minute to spare, and not due with EXACTLY the threshold left: the check is a
+    // strict `<`. A degraded read would also report act=false, so assert that it did not happen.
+    for (const auto secs_left : {threshold_s + 60, threshold_s}) {
+        const auto d = decide_with(secs_left);
+        CHECK_FALSE(d.act);
+        CHECK_FALSE(d.check_degraded);
+    }
+    // One second inside the threshold is due, as a Freshness republish (not a self-heal).
+    const auto due = decide_with(threshold_s - 1);
     CHECK(due.act);
     CHECK(due.reason == CrlTrigger::Freshness);
 }
