@@ -24,7 +24,7 @@ TEST_CASE("decide_after_claim: first sighting proceeds and owns the claim",
     CHECK_FALSE(d.count_claim_error);
 }
 
-TEST_CASE("decide_after_claim: store error fails OPEN, owns nothing, and is counted",
+TEST_CASE("decide_after_claim: store error fails OPEN and owns nothing and is counted",
           "[command_dedup][decision]") {
     auto d = decide_after_claim(ClaimStatus::Error, DedupState::InFlight, false);
     CHECK(d.action == DedupAction::Proceed);
@@ -98,7 +98,7 @@ TEST_CASE("decide_after_claim: only Claimed ever owns the claim",
             }
 }
 
-TEST_CASE("decide_after_claim: an out-of-range status fails SAFE, never Proceed",
+TEST_CASE("decide_after_claim: an out-of-range status fails SAFE and never proceeds",
           "[command_dedup][decision]") {
     auto d = decide_after_claim(static_cast<ClaimStatus>(99), DedupState::InFlight, false);
     CHECK(d.action == DedupAction::AnswerRunning);
