@@ -182,13 +182,13 @@ authorization** (#1422, #6016): the listener's `auth_fun` (run by the gateway's 
 `serverAuth` EKU AND is admitted by `{yuzu_gw, mgmt_peer_auth_mode}`: its key matches
 `{yuzu_gw, mgmt_peer_pins}` (your server's cert), or it carries the server identity URI SAN
 `yuzu://<install>/server` that the install CA puts on the server's built-in certificate, or either,
-depending on the mode (unset means `pin`; the identity is an explicit opt-in, and the shipped reference configs set `pin`) — a CA-issued cert alone (any agent's leaf, the gateway's own
+depending on the mode (unset means `pin`, so an upgrade changes nothing; the identity is never implied by a missing key; the shipped reference configs set `identity` with no pin; bring-your-own certificates must set `pin`) — a CA-issued cert alone (any agent's leaf, the gateway's own
 leaf) is rejected with `UNAUTHENTICATED`. A pin needs the server's private key; the identity needs only a
 certificate the install CA signed with that URI, so a deployment that guards the CA key separately from
 the server key should stay in `pin` mode or use `identity` with a pin (which requires both). The identity also trusts the issuing CA's issuance policy: do not enable it where the listener's `cacertfile` is a corporate CA that lets a requester choose a URI SAN with serverAuth (stay in `pin`), and an identity over a `cacertfile` that is not demonstrably exactly one readable certificate (a bundle, or an empty, unreadable or half-written file) refuses to boot unless the mode is `identity` with a pin configured (`identity_over_ca_bundle`). A serial
 deny-list, `mgmt_peer_denied`, refuses a withdrawn certificate in every mode and is read at boot (a change
 takes effect at the next gateway restart, which disconnects the node's agents; a gateway rolled back to a
-pre-#6016 binary does not honour it). The gateway **refuses to boot** when a
+pre-#6016 binary does not honour it). Revoking the server certificate in the CA inventory does NOT remove its command-plane access (the gateway reads no CRL until the follow-up; under the old pin default, replacing the pinned file withdrew a key within a few seconds without a restart; now withdrawal is a serial in `mgmt_peer_denied` plus a gateway restart, which disconnects the node's agents, and agents without the #5183 fix stay wedged). The gateway **refuses to boot** when a
 network-reachable mgmt listener lacks this posture; never set
 `{allow_insecure_mgmt, true}` outside an isolated lab rig, and never publish
 `:50063` from a plaintext stack. See `docs/user-manual/gateway.md` "TLS posture"
