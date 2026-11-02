@@ -525,7 +525,7 @@ TEST_CASE("device_ci v2: an escaped pipe stays inside its field and shifts no co
         CHECK(parse_blob(a).scalar[23] == "CHS-A"); // the row that sorts first
     }
     SECTION("an escaped pipe inside a mount path stays in the mount column and is still redacted") {
-        in.volumes = cap("volume|A|/Users/al\\|ice/x|d1|apfs|1|-");
+        in.volumes = cap("volume|A|/Users/jsmith/a\\|b/x|d1|apfs|1|-");
         const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
         REQUIRE(p.rows.at("volume").size() == 1);
         CHECK(p.rows.at("volume")[0][1] == "[redacted]");
