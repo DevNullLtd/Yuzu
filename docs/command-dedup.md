@@ -34,6 +34,27 @@ regressible — nothing fails loudly when one is broken.
 7. **Store open/write failure is a DELIBERATE fail-OPEN** (run undeduplicated) that **MUST stay
    observable** (`yuzu.dedup_degraded` heartbeat plus local counters), never silent.
 
+   **Corruption recovery (#3665).** A corrupt `command_dedup.db` is quarantined and recreated, once,
+   rather than leaving the agent degraded on every boot. `CommandDedupStore::open` moves the file and its
+   `-wal`/`-shm`/`-journal` sidecars to `command_dedup.db.corrupt-<epoch>[-n]` (never overwriting an earlier
+   quarantine) and opens a fresh store. What counts as corruption is deliberately narrow: `SQLITE_CORRUPT` /
+   `SQLITE_NOTADB` from any open step, or a `PRAGMA quick_check` that reports damage. BUSY, IOERR, FULL,
+   CANTOPEN and PERM are NOT corruption and never quarantine (that would discard good history). Do not copy
+   echo's `integrity_ok`, which treats any prepare failure as corrupt.
+   Limits, all deliberate:
+   - **The history in the corrupt file is lost.** A command executed before the corruption and redelivered
+     after it can re-execute. That is no worse than staying degraded, which already permitted it.
+   - It is observable: an `error` log naming the reason and the quarantine path, a `warn` from the agent,
+     and `yuzu_agent_dedup_quarantined_total`. Recovery restores protection, so `yuzu.dedup_degraded` stays
+     `0`. A corrupt file that cannot be moved aside fails the open instead and takes the normal degraded path
+     (`yuzu_agent_dedup_open_failed_total`, `yuzu.dedup_degraded=1`).
+   - Corruption that appears AFTER a successful open still makes `claim()` return `Error` (degraded,
+     counted) until the next restart, when the open check catches it.
+   - Quarantine files are never pruned (each is small; the ring bounds the row count). A disk that corrupts
+     the file on every boot leaves one quarantine file per boot.
+   - The helper is a copy of echo's `quarantine_corrupt_db` (`echo_db.cpp`). Hoisting both into
+     `agents/shared` is a tracked follow-up.
+
 Invariants 3 and 4, the claim-error leg of 7 (`count_claim_error`), and the `owns_claim` result that
 gates 1's queue-full release are decided by the pure, proto-free `agents/core/src/command_dedup_decision.hpp`
 (`should_claim`, `decide_after_claim`), unit-tested in `tests/unit/test_command_dedup_decision.cpp`.

@@ -18,10 +18,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
+#include <vector>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -292,6 +295,53 @@ TEST_CASE("CommandDedupStore: release reports Released on a healthy store",
     CHECK(t.store.release("never-claimed") == ReleaseOutcome::Released);
 }
 
+
+// ── Corruption recovery (#3665) ──────────────────────────────────────────────
+
+// Quarantined siblings of `db` (`<name>.corrupt-*`, plus their -wal/-shm sidecars).
+static std::vector<fs::path> quarantine_siblings(const fs::path& db) {
+    std::vector<fs::path> out;
+    std::error_code ec;
+    const auto prefix = db.filename().string() + ".corrupt-";
+    if (!fs::exists(db.parent_path(), ec))
+        return out;
+    for (const auto& e : fs::directory_iterator(db.parent_path(), ec)) {
+        if (e.path().filename().string().starts_with(prefix))
+            out.push_back(e.path());
+    }
+    return out;
+}
+
+// Removes every `<db>.corrupt-*` file on scope exit (TempDbFile only knows the live files).
+struct QuarantineCleanup {
+    fs::path db;
+    ~QuarantineCleanup() {
+        for (const auto& p : quarantine_siblings(db)) {
+            std::error_code ec;
+            fs::remove(p, ec);
+        }
+    }
+};
+
+static void write_bytes(const fs::path& p, const std::string& bytes) {
+    std::error_code ec;
+    fs::create_directories(p.parent_path(), ec);
+    REQUIRE_FALSE(ec);
+    {
+        std::ofstream f(p, std::ios::binary);
+        REQUIRE(f.is_open());
+        f << bytes;
+        f.flush();
+        REQUIRE(f.good());
+    }
+    REQUIRE(fs::file_size(p) == bytes.size()); // the bytes reached the filesystem
+}
+
+static std::string read_bytes(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+}
+
 TEST_CASE("CommandDedupStore: open fails on an unusable path (a directory)",
           "[command_dedup][lifecycle]") {
     yuzu::test::TempDir dir{"yuzu_test_cmddedup_dir_"};
@@ -301,35 +351,184 @@ TEST_CASE("CommandDedupStore: open fails on an unusable path (a directory)",
     // The path is a directory, not a valid database file — open must fail.
     auto result = CommandDedupStore::open(dir.path);
     CHECK_FALSE(result.has_value());
+    // #3665: CANTOPEN is environmental, not corruption — it must NEVER quarantine (that would
+    // move a directory / discard good history). The path is left exactly as found.
+    CHECK(fs::is_directory(dir.path));
+    CHECK(quarantine_siblings(dir.path).empty());
 }
 
-TEST_CASE("CommandDedupStore: open fails on a non-database file",
-          "[command_dedup][lifecycle]") {
+TEST_CASE("CommandDedupStore: a non-database file is quarantined and recreated",
+          "[command_dedup][lifecycle][corruption]") {
     const auto path = fresh_db_path();
     yuzu::test::TempDbFile guard{path};
-    // fresh_db_path()'s parent dir may not exist yet if no earlier case in this
-    // binary has created it — an unchecked ofstream open into a missing parent
-    // fails SILENTLY (no exception, no bytes written), and open() below then
-    // creates that same parent itself and succeeds against a fresh empty DB
-    // (#3744: misdiagnosed as a Windows/Defender visibility race — it reproduces
-    // on any platform once the shared temp dir doesn't already exist).
-    std::error_code ec;
-    fs::create_directories(path.parent_path(), ec);
-    REQUIRE_FALSE(ec);
+    QuarantineCleanup qc{path};
+    const std::string garbage = "this is not a sqlite database";
+    write_bytes(path, garbage);
+
     {
-        std::ofstream f(path, std::ios::binary);
-        REQUIRE(f.is_open());
-        f << "this is not a sqlite database";
-        REQUIRE(f.good());
-        f.flush();
-        REQUIRE(f.good());
+        auto result = CommandDedupStore::open(path);
+        REQUIRE(result.has_value());
+        REQUIRE(result->quarantined_this_open().has_value());
+
+        const auto q = quarantine_siblings(path);
+        REQUIRE(q.size() == 1);
+        CHECK(q[0].filename().string() == *result->quarantined_this_open());
+        CHECK(read_bytes(q[0]) == garbage); // evidence preserved byte-for-byte
+
+        // The fresh store is fully functional.
+        CHECK(result->claim("cmd-after-recovery").status == ClaimStatus::Claimed);
     }
-    // f.good() alone doesn't prove the bytes reached disk: the actual flush/
-    // write happens in the destructor above, which can't propagate an I/O
-    // error — the explicit flush() + re-check makes the failure observable
-    // here instead of manifesting as a silent empty file for open() to accept.
-    REQUIRE(fs::file_size(path) > 0);
-    // journal_mode/synchronous read-back or the schema DDL rejects a garbage file.
+
+    // A later boot is a normal open: no second quarantine, and the claim persisted.
+    auto reopened = CommandDedupStore::open(path);
+    REQUIRE(reopened.has_value());
+    CHECK_FALSE(reopened->quarantined_this_open().has_value());
+    CHECK(quarantine_siblings(path).size() == 1);
+    auto dup = reopened->claim("cmd-after-recovery");
+    CHECK(dup.status == ClaimStatus::Duplicate);
+}
+
+TEST_CASE("CommandDedupStore: a damaged table page (opens cleanly) is quarantined by quick_check",
+          "[command_dedup][lifecycle][corruption]") {
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    QuarantineCleanup qc{path};
+    {
+        auto opened = CommandDedupStore::open(path);
+        REQUIRE(opened.has_value());
+        for (int i = 0; i < 50; ++i)
+            REQUIRE(opened->claim("cmd-" + std::to_string(i)).status == ClaimStatus::Claimed);
+    } // last connection closes -> WAL checkpointed into the main file
+
+    // Keep page 1 (the header + schema, so open_v2 / the schema step succeed) and trash the rest.
+    auto bytes = read_bytes(path);
+    REQUIRE(bytes.size() > 8192);
+    for (std::size_t i = 4096; i < bytes.size(); ++i)
+        bytes[i] = static_cast<char>(0xAB);
+    write_bytes(path, bytes);
+
     auto result = CommandDedupStore::open(path);
-    CHECK_FALSE(result.has_value());
+    REQUIRE(result.has_value());
+    CHECK(result->quarantined_this_open().has_value());
+    CHECK(quarantine_siblings(path).size() == 1);
+    // History in the damaged file is gone (documented); the store itself is healthy again.
+    CHECK(result->claim("cmd-0").status == ClaimStatus::Claimed);
+}
+
+TEST_CASE("CommandDedupStore: a stale -wal beside a corrupt file is never adopted by the fresh store",
+          "[command_dedup][lifecycle][corruption]") {
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    QuarantineCleanup qc{path};
+    const fs::path wal = path.string() + "-wal";
+    write_bytes(path, "garbage main file");
+    write_bytes(wal, "stale wal bytes");
+
+    {
+        auto result = CommandDedupStore::open(path);
+        REQUIRE(result.has_value());
+        REQUIRE(result->quarantined_this_open().has_value());
+
+        // SQLite may itself discard a garbage WAL when the failed attempt's connection closes, in
+        // which case there is nothing to move. Either way the stale bytes must not be live: a
+        // surviving `-wal` beside the fresh DB must not be the stale one, and if the quarantine
+        // kept a copy it must be intact.
+        if (fs::exists(wal))
+            CHECK(read_bytes(wal) != "stale wal bytes");
+        const fs::path qwal =
+            (path.parent_path() / *result->quarantined_this_open()).string() + "-wal";
+        if (fs::exists(qwal))
+            CHECK(read_bytes(qwal) == "stale wal bytes");
+
+        CHECK(result->claim("cmd-fresh").status == ClaimStatus::Claimed);
+    }
+
+    // The fresh store is self-consistent across a restart: no second quarantine, claim kept.
+    auto reopened = CommandDedupStore::open(path);
+    REQUIRE(reopened.has_value());
+    CHECK_FALSE(reopened->quarantined_this_open().has_value());
+    CHECK(reopened->claim("cmd-fresh").status == ClaimStatus::Duplicate);
+}
+
+TEST_CASE("CommandDedupStore: a second corruption never overwrites an earlier quarantine",
+          "[command_dedup][lifecycle][corruption]") {
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    QuarantineCleanup qc{path};
+
+    // Occupy every `.corrupt-<epoch>` name the open could pick (the clock is 1 s granular and
+    // can step backward), so the collision-safe `-<n>` suffix MUST be used.
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    std::vector<fs::path> blockers;
+    for (long long e = now - 2; e <= now + 5; ++e) {
+        fs::path b = path;
+        b += ".corrupt-" + std::to_string(e);
+        write_bytes(b, "earlier quarantine");
+        blockers.push_back(b);
+    }
+    write_bytes(path, "second corruption");
+
+    auto result = CommandDedupStore::open(path);
+    REQUIRE(result.has_value());
+    REQUIRE(result->quarantined_this_open().has_value());
+
+    for (const auto& b : blockers)
+        CHECK(read_bytes(b) == "earlier quarantine"); // untouched
+    const auto q = quarantine_siblings(path);
+    REQUIRE(q.size() == blockers.size() + 1);
+    CHECK(read_bytes(path.parent_path() / *result->quarantined_this_open()) == "second corruption");
+}
+
+#ifndef _WIN32
+TEST_CASE("CommandDedupStore: a corrupt file that cannot be moved aside fails open, untouched",
+          "[command_dedup][lifecycle][corruption]") {
+    if (::geteuid() == 0)
+        SKIP("root bypasses directory permissions; the unmovable case cannot be built");
+
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_ro_"};
+    std::error_code ec;
+    fs::create_directories(dir.path, ec);
+    REQUIRE_FALSE(ec);
+    const auto path = dir.path / "command_dedup.db";
+    write_bytes(path, "garbage main file");
+
+    // Read-only parent: the corrupt file opens read-write (its own mode) but cannot be renamed.
+    struct RestorePerms {
+        fs::path d;
+        ~RestorePerms() {
+            std::error_code e;
+            fs::permissions(d, fs::perms::owner_all, fs::perm_options::replace, e);
+        }
+    } restore{dir.path};
+    fs::permissions(dir.path, fs::perms::owner_read | fs::perms::owner_exec,
+                    fs::perm_options::replace, ec);
+    REQUIRE_FALSE(ec);
+
+    auto result = CommandDedupStore::open(path);
+    REQUIRE_FALSE(result.has_value()); // observable fail-open path, same as any open failure
+    // It must be the quarantine-failure branch, not an unrelated CANTOPEN that merely also fails.
+    CHECK(result.error().message.find("could not be quarantined") != std::string::npos);
+    CHECK(read_bytes(path) == "garbage main file"); // original untouched
+    CHECK(quarantine_siblings(path).empty());
+}
+#endif
+
+TEST_CASE("CommandDedupStore: a healthy open and reopen never quarantine",
+          "[command_dedup][lifecycle][corruption]") {
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    QuarantineCleanup qc{path};
+    {
+        auto opened = CommandDedupStore::open(path);
+        REQUIRE(opened.has_value());
+        CHECK_FALSE(opened->quarantined_this_open().has_value());
+        REQUIRE(opened->claim("cmd-keep").status == ClaimStatus::Claimed);
+    }
+    auto reopened = CommandDedupStore::open(path);
+    REQUIRE(reopened.has_value());
+    CHECK_FALSE(reopened->quarantined_this_open().has_value());
+    CHECK(reopened->claim("cmd-keep").status == ClaimStatus::Duplicate); // history kept
+    CHECK(quarantine_siblings(path).empty());
 }

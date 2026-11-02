@@ -1,0 +1,1 @@
+- A corrupt agent `command_dedup.db` is now moved aside to `command_dedup.db.corrupt-<timestamp>` and recreated on startup, instead of leaving the agent without durable command replay protection until the file was deleted by hand. The recovery is logged and counted in `yuzu_agent_dedup_quarantined_total`; the dedup history held in the corrupt file is lost (#3665).
