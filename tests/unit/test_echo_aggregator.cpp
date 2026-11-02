@@ -2927,6 +2927,71 @@ TEST_CASE("run_budget: the deadline is checked between batches", "[echo][aggrega
     CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == 5000 - 2 * kBudgetBatchRows);
 }
 
+TEST_CASE("budget_catch_up_after: only a deadline-limited pass over target arms, and it carries "
+          "the clock it was admitted with",
+          "[echo][aggregator][budget][chaos]") {
+    // The plugin cannot arm a catch-up deterministically through the C ABI (arming needs a real
+    // 2 s deadline hit and a free-function clock), so the decision is this pure function.
+    constexpr int64_t kTarget = 1000;
+    // A reading <= 0 is the legitimate dead-CMOS case: it must travel like any other, which is
+    // why `armed` is a separate field and not "admitted_now != 0".
+    for (const int64_t admitted : {int64_t{-5}, int64_t{0}, kBudgetNow, kEchoMaxPlausibleNow}) {
+        // bit 0 deadline_hit, bit 1 exhausted, bit 2 failed, bit 3 data above target.
+        // Exactly one row arms: deadline hit, not exhausted, not failed, over target.
+        for (int bits = 0; bits < 16; ++bits) {
+            INFO("admitted = " << admitted << ", bits = " << bits);
+            BudgetPassResult res;
+            res.deadline_hit = (bits & 1) != 0;
+            res.exhausted = (bits & 2) != 0;
+            res.failed = (bits & 4) != 0;
+            res.data_bytes_after = (bits & 8) != 0 ? kTarget + 1 : kTarget;
+            const auto next = budget_catch_up_after(res, kTarget, admitted);
+            if (bits == 0b1001) {
+                CHECK(next.armed);
+                CHECK(next.admitted_now == admitted); // the arming reading, unchanged
+            } else {
+                CHECK_FALSE(next.armed);
+                CHECK(next.admitted_now == 0);
+            }
+        }
+    }
+}
+
+TEST_CASE("run_budget: a catch-up slice keeps the arming clock, so a later forward step widens no floor",
+          "[echo][aggregator][budget][chaos]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_carry_"};
+    auto db = open_budget_db(tmp);
+    constexpr int64_t kStep = kEchoMinBigStepSec + 86400; // a forward step the guard would refuse
+    // 2,500 raw capture rows 25-58 h old (past the 24 h floor), two 23 h old (inside it), the
+    // rollup mark one hour behind the arming clock.
+    seed_tcp_live(db, 2500, kBudgetNow - 58 * 3600, kBudgetNow - 25 * 3600);
+    seed_tcp_live(db, 2, kBudgetNow - 23 * 3600, kBudgetNow - 23 * 3600);
+    set_mark(db, "tcp", kBudgetNow - 3600);
+
+    // The arming pass ran out of time with rows left, admitted at kBudgetNow.
+    int calls = 0;
+    const auto first = run_budget(db, kBudgetNow, 0, [&] { return ++calls <= 1; });
+    REQUIRE_FALSE(first.failed);
+    const auto latch = budget_catch_up_after(first, 0, kBudgetNow);
+    REQUIRE(latch.armed);
+    REQUIRE(latch.admitted_now == kBudgetNow);
+
+    // The wall clock then steps forward; the slice runs with the carried reading, not that one.
+    const int64_t fresh = kBudgetNow + kStep;
+    REQUIRE(latch.admitted_now != fresh);
+    const auto slice = run_budget(db, latch.admitted_now, 0, kAlwaysTime);
+    REQUIRE_FALSE(slice.failed);
+    CHECK(slice.exhausted); // everything past the arming clock's 24 h floor is gone ...
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == 2); // ... and the 23 h rows are kept
+    CHECK_FALSE(budget_catch_up_after(slice, 0, latch.admitted_now).armed); // the drain ended
+
+    // Positive control: the same rows go under the stepped clock, because its floor is the mark.
+    const auto stepped = run_budget(db, fresh, 0, kAlwaysTime);
+    REQUIRE_FALSE(stepped.failed);
+    CHECK(stepped.evicted_raw == 2);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == 0);
+}
+
 TEST_CASE("run_budget: a failing table is skipped and reported, the others still evict",
           "[echo][aggregator][budget]") {
     yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_fail_"};
@@ -3204,6 +3269,37 @@ TEST_CASE("vacuum_decision: a deferral marker ahead of the clock is stale, not r
     }
     CHECK(decide(kNow - 86399, kDisk) == VacuumAction::kSkip); // a genuinely recent marker holds
     CHECK(decide(kNow, kDisk) == VacuumAction::kSkip);         // recorded this very second
+}
+
+TEST_CASE("deferred_marker_reading: a failed-write copy outranks an older stored marker",
+          "[echo][aggregator][budget][chaos]") {
+    // After a failed marker write the persisted value can only be older than the in-memory
+    // attempt time. A stale positive stored marker must not hide it, or a database that cannot
+    // store the marker repeats a failed conversion every maintenance pass instead of daily.
+    constexpr int64_t kMiB = 1024 * 1024;
+    constexpr int64_t kT = 1'700'000'000;
+    const auto decide = [&](int64_t stored, int64_t copy, int64_t now) {
+        return vacuum_decision(0, 200 * kMiB, 234 * kMiB, 500 * kMiB, 1000 * kMiB, 400 * kMiB,
+                               deferred_marker_reading(stored, copy), now,
+                               /*eviction_exhausted=*/false);
+    };
+    // The attempt at kT failed to persist over an expired stored marker; the next pass is 900 s on.
+    CHECK(decide(kT - 86401, kT, kT + 900) == VacuumAction::kSkip);
+    // Controls: the expired stored marker alone re-admits; a stored marker of kT holds.
+    CHECK(decide(kT - 86401, 0, kT + 900) == VacuumAction::kRun);
+    CHECK(decide(kT, 0, kT + 900) == VacuumAction::kSkip);
+    // A stored marker AHEAD of the clock (a forward excursion) must not outrank a sane copy:
+    // max() would pick it, vacuum_decision would discard it as stale, and every pass would run.
+    CHECK(decide(kT + 365 * 86400, kT, kT + 900) == VacuumAction::kSkip);
+    CHECK(decide(kT + 365 * 86400, 0, kT + 900) == VacuumAction::kRun);
+    // The copy is held for a day, then the conversion is retried.
+    CHECK(decide(kT - 86401, kT, kT + 86400) == VacuumAction::kRun);
+    // The precedence itself.
+    CHECK(deferred_marker_reading(0, 0) == 0);
+    CHECK(deferred_marker_reading(5, 0) == 5);
+    CHECK(deferred_marker_reading(0, 7) == 7);
+    CHECK(deferred_marker_reading(5, 7) == 7);
+    CHECK(deferred_marker_reading(9, 7) == 7);
 }
 
 TEST_CASE("vacuum_decision: exhausted eviction above target no longer blocks the conversion",

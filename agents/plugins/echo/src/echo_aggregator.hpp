@@ -457,6 +457,31 @@ struct BudgetPassResult {
 [[nodiscard]] std::vector<std::string> budget_raw_eligible_sources();
 [[nodiscard]] std::vector<std::string> budget_hourly_eligible_sources();
 
+/// Whether the fast tick should run another eviction slice, and with which clock. A pass that
+/// ran out of time with rows left to evict arms a catch-up; every slice of that drain then runs
+/// with the reading the ARMING pass was admitted with (the retention clock guard had a verdict
+/// on it), never a fresh one: a slice has no guard contact of its own, so a clock that stepped
+/// forward since would widen every floor with nothing to refuse it. `admitted_now` is only
+/// meaningful when `armed` (and is 0 otherwise); it is a separate field, not a sentinel, because
+/// a reading <= 0 is the legitimate dead-CMOS case (see kEchoMaxPlausibleNow).
+struct BudgetCatchUp {
+    bool armed{false};
+    int64_t admitted_now{0};
+};
+
+/// The catch-up decision after a pass: armed only when the pass ended on its deadline with rows
+/// still eligible and data still over target. A failed pass is retried by the next maintenance
+/// pass, not hammered; an exhausted one has nothing left to take. A slice re-arms through this
+/// same function with the same `admitted_now`, so a drain never acquires a newer clock until a
+/// guarded maintenance pass admits one.
+[[nodiscard]] constexpr BudgetCatchUp budget_catch_up_after(const BudgetPassResult& res,
+                                                            int64_t target_bytes,
+                                                            int64_t admitted_now) noexcept {
+    if (res.deadline_hit && !res.exhausted && !res.failed && res.data_bytes_after > target_bytes)
+        return {true, admitted_now};
+    return {};
+}
+
 /// Bytes data + WAL sit above the budget; 0 within it. Depends only on the measured sizes,
 /// never on how the last eviction pass ended.
 [[nodiscard]] constexpr int64_t budget_over_bytes(int64_t data_bytes, int64_t wal_bytes,
@@ -479,6 +504,19 @@ enum class VacuumAction { kSkip, kRun, kDefer };
                                            int64_t file_bytes, int64_t free_disk_bytes,
                                            int64_t deferred_at, int64_t now,
                                            bool eviction_exhausted) noexcept;
+
+/// The conversion-deferral time to feed vacuum_decision. `failed_write_copy` is the in-memory
+/// attempt time kept ONLY while the most recent marker write failed (a later successful write
+/// clears it to 0), and the marker has a single writer, so when it is non-zero it is the newest
+/// attempt this process knows of and the persisted `stored` value can only be older: a stale
+/// positive `stored` must not hide it, or a database that cannot store the marker would repeat a
+/// failed conversion every pass instead of daily. Not max(): a persisted marker ahead of the
+/// clock (written during a forward excursion) would outrank a sane copy and then be discarded
+/// by vacuum_decision's future-marker rule, re-admitting every pass.
+[[nodiscard]] constexpr int64_t deferred_marker_reading(int64_t stored,
+                                                        int64_t failed_write_copy) noexcept {
+    return failed_write_copy > 0 ? failed_write_copy : stored;
+}
 
 /// Parse a `db_budget_bytes` value: decimal digits only, fits int64, >= kEchoDbBudgetBytesMin.
 [[nodiscard]] std::optional<int64_t> parse_budget_bytes(std::string_view text);

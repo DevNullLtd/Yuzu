@@ -1490,6 +1490,12 @@ private:
     // Set when a pass ran out of time with evictable rows left and data still over target:
     // each fast tick then runs one more bounded slice (do_collect_fast) until it clears.
     std::atomic<bool> budget_catch_up_{false};
+    // The clock reading the pass that armed the catch-up was admitted with (the retention clock
+    // guard had a verdict on it). Every slice of that drain runs with it, never a fresh reading:
+    // a slice has no guard contact of its own. A separate field, not a sentinel in one int64,
+    // because a reading <= 0 is the legitimate dead-CMOS case. Only meaningful while the flag is
+    // set; written and read under rollup_mu_ (the flag alone is also peeked lock-free).
+    std::atomic<std::int64_t> budget_catch_up_now_{0};
     // The conversion-VACUUM deferral time when the persisted marker could not be written: it
     // keeps the retry at most daily for this process. 0 = none. Written under rollup_mu_, read
     // lock-free by status.
@@ -4487,8 +4493,9 @@ private:
                 std::lock_guard guard_lock(retention_guard_.mu);
                 ++retention_guard_.budget_skips;
             }
-            // A catch-up slice armed by an earlier pass must not run on this clock either.
-            budget_catch_up_.store(false, std::memory_order_relaxed);
+            // A pending catch-up slice is cleared: the guard has just refused the clock, so the
+            // reading that slice was admitted with is no longer a basis to keep deleting on.
+            set_budget_catch_up({});
             spdlog::warn("ECHO: byte budget pass skipped: the retention clock guard refused this "
                          "pass's clock reading");
         } else {
@@ -4502,16 +4509,25 @@ private:
 
     // ── byte budget: eviction, VACUUM gate, file hygiene ─────────────────────
 
+    // Store both halves of the catch-up latch: the clock first, then the flag the reader checks.
+    // The caller holds rollup_mu_, which orders the pair for run_budget_catch_up.
+    void set_budget_catch_up(const yuzu::echo::BudgetCatchUp& c) {
+        budget_catch_up_now_.store(c.admitted_now, std::memory_order_relaxed);
+        budget_catch_up_.store(c.armed, std::memory_order_relaxed);
+    }
+
     // One bounded eviction pass plus the post-pass hygiene. Runs in the 15-minute maintenance
     // pass (`maintenance_pass`, which also gates the one-off conversion VACUUM) and as the
-    // catch-up slice of a fast tick. The caller holds rollup_mu_.
+    // catch-up slice of a fast tick. `now_ts` is the clock the retention guard admitted for a
+    // maintenance pass, and the ARMING pass's admitted reading for a catch-up slice (never a
+    // fresh one). The caller holds rollup_mu_.
     void enforce_budget(std::int64_t now_ts, bool maintenance_pass) {
         // Tri-state: an unreadable budget is NOT the default. Falling back to 250 MiB would
         // delete down to a smaller target than the operator configured.
         const auto configured = yuzu::echo::budget_from_config(
             db_->try_get_config(std::string{yuzu::echo::kDbBudgetKey}));
         if (!configured) {
-            budget_catch_up_.store(false, std::memory_order_relaxed);
+            set_budget_catch_up({});
             spdlog::warn("ECHO: db_budget_bytes could not be read; the byte budget pass was "
                          "skipped and is retried at the next pass");
             return;
@@ -4524,10 +4540,9 @@ private:
         const auto res = yuzu::echo::run_budget(*db_, now_ts, target, time_left);
 
         // Another slice on the next fast tick only when this one ran out of time with rows left
-        // to evict. A failed pass is retried by the next maintenance pass, not hammered.
-        budget_catch_up_.store(res.deadline_hit && !res.exhausted && !res.failed &&
-                                   res.data_bytes_after > target,
-                               std::memory_order_relaxed);
+        // to evict, carrying the clock reading this pass ran with (a slice re-arms with the same
+        // one). A failed pass is retried by the next maintenance pass, not hammered.
+        set_budget_catch_up(yuzu::echo::budget_catch_up_after(res, target, now_ts));
         const std::int64_t evicted = res.evicted_raw + res.evicted_hourly;
         if (evicted > 0) {
             spdlog::info("ECHO: byte budget evicted {} raw capture rows and {} hourly rows "
@@ -4571,16 +4586,18 @@ private:
         }
     }
 
-    // The conversion-deferral time: the persisted marker (0 when absent, unreadable or not a
-    // whole non-negative number), else the in-memory copy kept when the marker write failed.
-    // The one reader behind both the VACUUM decision and the status line.
+    // The conversion-deferral time: the in-memory copy kept while the last marker write failed,
+    // else the persisted marker (0 when absent, unreadable or not a whole non-negative number);
+    // precedence in yuzu::echo::deferred_marker_reading. The one reader behind both the VACUUM
+    // decision and the status line.
     std::int64_t deferred_marker() {
         const auto text = db_->get_config(std::string{yuzu::echo::kAutoVacuumDeferredKey}, "0");
         std::int64_t at = 0;
         const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), at);
         if (ec != std::errc{} || p != text.data() + text.size() || at < 0)
             at = 0;
-        return at > 0 ? at : vacuum_marker_fallback_.load(std::memory_order_relaxed);
+        return yuzu::echo::deferred_marker_reading(
+            at, vacuum_marker_fallback_.load(std::memory_order_relaxed));
     }
 
     // Persist the deferral time. A write that fails keeps an in-memory copy so a database that
@@ -4657,14 +4674,18 @@ private:
     // One more bounded eviction slice per fast tick while a pass has left the database over
     // target. try_lock only: it never waits on a maintenance pass, and a pass that is running
     // already does the same work. Called with collect_mu_ RELEASED, so rollup_mu_ is never
-    // taken inside it.
+    // taken inside it. The slice runs with the clock reading the arming pass was admitted with,
+    // not a fresh one: it has no retention-guard contact of its own, so a clock that stepped
+    // forward since would widen every floor unchecked. The next maintenance pass admits (or
+    // refuses, and clears the latch) a new reading.
     void run_budget_catch_up() {
         if (!budget_catch_up_.load(std::memory_order_relaxed))
             return;
         std::unique_lock lock(rollup_mu_, std::try_to_lock);
         if (!lock.owns_lock() || !budget_catch_up_.load(std::memory_order_relaxed))
             return;
-        enforce_budget(now_epoch_seconds(), /*maintenance_pass=*/false);
+        enforce_budget(budget_catch_up_now_.load(std::memory_order_relaxed),
+                       /*maintenance_pass=*/false);
     }
 
     // ── sql action (warehouse query engine) ──────────────────────────────────

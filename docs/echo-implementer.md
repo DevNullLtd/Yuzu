@@ -97,7 +97,9 @@ Flow:
    catch-up. A pass that ends on the deadline with rows left to evict arms a
    catch-up slice that `do_collect_fast` runs after its collect (outside
    `collect_mu_`, under `try_lock` on `rollup_mu_`, so it never waits on a
-   rollup). The conversion `VACUUM` writes its deferral marker before it runs
+   rollup). Every slice of that drain runs with the clock reading the arming
+   pass was admitted with, never a fresh one: a slice has no retention-guard
+   contact of its own. The conversion `VACUUM` writes its deferral marker before it runs
    and clears it on success, and `incremental_vacuum(256)` repeats while the
    pass's deadline allows (at least one step). The budget is hard for eligible
    data pages and soft for the WAL, and rows that are never evicted can hold
