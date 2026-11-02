@@ -10681,7 +10681,7 @@ curl -si -X PUT -H "Authorization: Bearer $TOKEN" -H 'If-Match: "2f9a498b26e9479
 
 The answer's `document` is version 2 with the full `model` block: `per_device_event_cap` 8 and the other three at their defaults (`regression_start_ratio` 1.0, `regression_full_ratio` 3.0, `interval_confidence` 0.95); `GET` returns the same. A `model` without `"version": 2` is a `400` with `unparseable at model: requires version 2`. A document that uses no model parameter is stored as version 1 again.
 
-To go back to the shipped defaults, `DELETE` with the current revision: `curl -si -X DELETE -H "Authorization: Bearer $TOKEN" -H 'If-Match: "2f9a498b26e94798"' "https://yuzu.example.com/api/v1/dex/score-policy"`.
+To go back to the shipped defaults, `DELETE` with the current revision: `curl -si -X DELETE -H "Authorization: Bearer $TOKEN" -H 'If-Match: "<revision>"' "https://yuzu.example.com/api/v1/dex/score-policy"`. Take `<revision>` from the preceding `PUT` response's `ETag` (or `data.revision`), or from a fresh `GET`; every write changes it, so the revision from an earlier step is refused with `409`.
 
 #### `GET /api/v1/dex/catalogue`
 
