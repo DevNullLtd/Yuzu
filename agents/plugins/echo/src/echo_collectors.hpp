@@ -19,6 +19,7 @@
  */
 
 #include "echo_db.hpp"
+#include "echo_hour_dedup.hpp" // HourlySeenSet (compute_network_events)
 #include "echo_mapdrive_backfill.hpp" // ProfileHiveOutcome (MapDriveHistory below)
 #include "echo_schema_registry.hpp" // OsSupportStatus (read_failure_token)
 #include "echo_netqual.hpp" // TcpQualitySample (returned by collect_tcp_quality)
@@ -30,11 +31,14 @@
 #endif
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <functional> // enumerate_services_impl's injectable-runner RunFn (non-Windows)
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::echo {
@@ -585,9 +589,64 @@ std::vector<ProcessEvent> compute_process_events(
     const std::vector<yuzu::agent::ProcessInfo>& current, int64_t timestamp, int64_t snapshot_id,
     const std::vector<std::string>& redaction_patterns = kDefaultRedactionPatterns);
 
+/// True for a TCP state in which the connection is already ending: TIME_WAIT, CLOSING,
+/// LAST_ACK, FIN_WAIT1/2, CLOSE_WAIT, CLOSED, plus the Linux spelling CLOSE and the Windows
+/// DELETE_TCB. UDP has an empty state, which is not closing.
+[[nodiscard]] inline bool tcp_state_is_closing(std::string_view state) noexcept {
+    return state == "TIME_WAIT" || state == "CLOSING" || state == "LAST_ACK" ||
+           state == "FIN_WAIT1" || state == "FIN_WAIT2" || state == "CLOSE_WAIT" ||
+           state == "CLOSED" || state == "CLOSE" || state == "DELETE_TCB";
+}
+
+/**
+ * Typed network diff, keyed on the 5-tuple (proto, local addr/port, remote addr/port).
+ *
+ *   - new key, not closing: `connected`.
+ *   - new key, already closing (a short-lived socket the poll only ever sees in TIME_WAIT):
+ *     one `connected` row, state as seen, per (process, remote address, remote port) per hour.
+ *     `closing_seen` is the hourly de-duplication set; repeats are dropped and never get a
+ *     `disconnected` row. The hourly connect count for these sockets is therefore distinct
+ *     remotes per process.
+ *   - tracked key moving to a closing state: one `disconnected` row with the new state.
+ *   - tracked closing key moving back to a non-closing state (4-tuple reuse): `connected`.
+ *   - key gone: `disconnected` only if it was last seen non-closing.
+ *
+ * `closing_seen` is mutated; pass a COPY and keep it only once the rows are committed, so a
+ * rolled-back tick re-derives the same rows.
+ */
 std::vector<NetworkEvent> compute_network_events(const std::vector<NetConnection>& previous,
                                                  const std::vector<NetConnection>& current,
-                                                 int64_t timestamp, int64_t snapshot_id);
+                                                 int64_t timestamp, int64_t snapshot_id,
+                                                 HourlySeenSet& closing_seen);
+
+/// Process name remembered for a pid, so sockets and module loads (which carry a pid but not
+/// always a name) can be labelled. `exited_at` is 0 while the process is believed running.
+struct PidName {
+    std::string name;
+    int64_t exited_at{0};
+};
+
+/// How long a name stays usable after its process exited (120 s; two fast ticks at the default
+/// interval): a socket or module load of a just-exited process still resolves, but a reused pid
+/// whose start event was missed does not inherit a stale name beyond this window.
+inline constexpr int64_t kPidNameGraceSec = 120;
+
+/// Fill an EMPTY process_name from the map. Ignores pid 0; uses an entry only while it is
+/// running or within kPidNameGraceSec of its exit at `ts`.
+void fill_process_names(std::vector<NetConnection>& conns,
+                        const std::unordered_map<uint32_t, PidName>& names, int64_t ts);
+
+/// One name from the same map and the same rules (module loads).
+[[nodiscard]] std::string pid_name_lookup(const std::unordered_map<uint32_t, PidName>& names,
+                                          uint32_t pid, int64_t ts);
+
+/// Poll-leg exit reconcile: every entry still believed running (`exited_at == 0`) whose pid is
+/// absent from `running` is stamped exited at `ts`, so the grace window applies on a platform
+/// with no process stream. `running` must be the UNFILTERED enumeration (a process dropped by a
+/// stabilization exclusion is still running). Entries already stamped, and pids present, are
+/// untouched. O(|running| + |names|), bounded by the caller's map cap.
+void note_pid_exits(std::unordered_map<uint32_t, PidName>& names,
+                    const std::vector<yuzu::agent::ProcessInfo>& running, int64_t ts);
 
 std::vector<ServiceEvent> compute_service_events(const std::vector<ServiceInfo>& previous,
                                                  const std::vector<ServiceInfo>& current,
@@ -596,6 +655,37 @@ std::vector<ServiceEvent> compute_service_events(const std::vector<ServiceInfo>&
 std::vector<UserEvent> compute_user_events(const std::vector<UserSession>& previous,
                                            const std::vector<UserSession>& current,
                                            int64_t timestamp, int64_t snapshot_id);
+
+/// Text of a fixed-width utmp field: up to the first NUL, or all `n` bytes when the field is
+/// full with no terminator (ut_user/ut_line/ut_host are not guaranteed NUL-terminated).
+[[nodiscard]] inline std::string utmp_text(const char* p, std::size_t n) {
+    if (!p)
+        return {};
+    const void* nul = std::memchr(p, '\0', n);
+    return std::string(p, nul ? static_cast<std::size_t>(static_cast<const char*>(nul) - p) : n);
+}
+
+/// Logon type of a utmp session from its ut_host: remote when a host is recorded and it is not
+/// an X display (":0", ":1.0"), else interactive. Linux and macOS share the rule; the tty
+/// name is not evidence (a local terminal emulator also gets a pty).
+[[nodiscard]] inline std::string logon_type_from_host(std::string_view host) {
+    return (!host.empty() && host.front() != ':') ? "remote" : "interactive";
+}
+
+/// The session a utmp (Linux) or utmpx (macOS) USER_PROCESS record describes. One template
+/// because both structs carry ut_user/ut_line/ut_host as fixed-width character arrays: they are
+/// read bounded, `domain` is the recorded host ("local" when there is none) and `logon_type`
+/// follows logon_type_from_host. The platform enumerators only walk the database and call this.
+template <class Entry>
+[[nodiscard]] UserSession user_session_from_utmp(const Entry& e) {
+    UserSession us;
+    us.user = utmp_text(e.ut_user, sizeof(e.ut_user));
+    us.session_id = utmp_text(e.ut_line, sizeof(e.ut_line));
+    const std::string host = utmp_text(e.ut_host, sizeof(e.ut_host));
+    us.domain = host.empty() ? "local" : host;
+    us.logon_type = logon_type_from_host(host);
+    return us;
+}
 
 /**
  * Compute software install/uninstall diff.
