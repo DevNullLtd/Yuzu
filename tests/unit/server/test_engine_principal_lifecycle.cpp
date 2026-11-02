@@ -3289,3 +3289,47 @@ TEST_CASE("ApiTokenStore::list_rotations_nearing_expiry_unused: flags an unused 
     auto nearing_after_use = tokens->list_rotations_nearing_expiry_unused(24 * 3600 + 10);
     CHECK(nearing_after_use.pairs.empty());
 }
+
+TEST_CASE("Engine-principal REST: rotate answers 409 with no secret and no retry hint when the "
+          "sole surviving credential still carries stale rotation linkage (#6716 UP-6)",
+          "[pg][rest][engine_principal][rotation][retry_hint]") {
+    RestEngineHarness h{/*dedicated_token_db=*/true};
+    auto [pid, raw1] = h.create_and_mint("rotate-stale-survivor");
+    (void)raw1;
+
+    auto r1 = h.rotate(pid);
+    REQUIRE(r1);
+    REQUIRE(r1->status == 200);
+    std::string predecessor_id, successor_id;
+    for (const auto& t : h.token_store->list_active_for_principal(pid)) {
+        if (t.supersedes_token_id.empty())
+            predecessor_id = t.token_id;
+        else
+            successor_id = t.token_id;
+    }
+    REQUIRE_FALSE(predecessor_id.empty());
+    REQUIRE_FALSE(successor_id.empty());
+
+    // Out-of-band revoke of the predecessor with the pair-resolve step skipped (direct SQL), so
+    // the survivor keeps its linkage: the durable state a failed best-effort resolve leaves.
+    {
+        pg::PgConn conn{PQconnectdb(h.token_dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r = pg::exec_params(
+            conn.get(), "UPDATE api_token_store.api_tokens SET revoked = TRUE WHERE token_id = $1",
+            std::vector<std::string>{predecessor_id});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    REQUIRE(h.token_store->list_active_for_principal(pid).size() == 1);
+
+    auto res = h.rotate(pid);
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(has_no_retry_hint(*res));
+    CHECK(res->body.find("unresolved rotation metadata") != std::string::npos);
+    CHECK(res->body.find("\"token\"") == std::string::npos); // no secret disclosed
+    // Nothing was minted: the survivor is still the only active credential.
+    auto active = h.token_store->list_active_for_principal(pid);
+    REQUIRE(active.size() == 1);
+    CHECK(active[0].token_id == successor_id);
+}

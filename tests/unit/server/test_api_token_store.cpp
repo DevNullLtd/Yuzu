@@ -6335,3 +6335,70 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: failed_pairs counts a COMMIT 
     REQUIRE(pred_after->has_value());
     CHECK_FALSE((*pred_after)->revoked);
 }
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential refuses a sole credential that still carries "
+          "stale rotation linkage and mints nothing (#6716 UP-6)",
+          "[pg][token][rotation][engine_principal]") {
+    using yuzu::server::detail::classify_engine_store_error;
+    using E = yuzu::server::detail::EngineStoreErrorClass;
+
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotate-stale-linkage";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+
+    // Negative control: a clean sole credential still rotates (201 path).
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+    std::string predecessor_id, successor_id;
+    for (const auto& t : store.list_active_for_principal(principal)) {
+        if (t.supersedes_token_id.empty())
+            predecessor_id = t.token_id;
+        else
+            successor_id = t.token_id;
+    }
+    REQUIRE_FALSE(predecessor_id.empty());
+    REQUIRE_FALSE(successor_id.empty());
+
+    // Manufacture the UP-6 state: the predecessor is revoked out of band and the
+    // best-effort pair-resolve never ran, so the surviving successor keeps its
+    // rotation_group and supersedes_token_id (same direct-SQL seam as the confirm
+    // test above).
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const std::string sql =
+            "UPDATE api_token_store.api_tokens SET revoked = TRUE WHERE token_id = '" +
+            predecessor_id + "';";
+        PgResult res{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(res.ok());
+    }
+    auto before = store.list_active_for_principal(principal);
+    REQUIRE(before.size() == 1);
+    CHECK(before[0].token_id == successor_id);
+    CHECK_FALSE(before[0].supersedes_token_id.empty());
+
+    auto refused = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("unresolved rotation metadata") != std::string::npos);
+    CHECK(refused.error().find("do not rotate") != std::string::npos);
+    CHECK(classify_engine_store_error(refused.error()) == E::Conflict);
+    // Same refusal as confirm gives for the same state: the two never disagree.
+    auto confirm = store.confirm_rotation(principal, successor_id, "irrelevant-secret", "admin");
+    REQUIRE_FALSE(confirm.has_value());
+    CHECK(confirm.error() == refused.error());
+
+    // Nothing was minted or changed: still exactly the one survivor, same linkage.
+    auto after = store.list_active_for_principal(principal);
+    REQUIRE(after.size() == 1);
+    CHECK(after[0].token_id == successor_id);
+    CHECK(after[0].supersedes_token_id == before[0].supersedes_token_id);
+    CHECK(after[0].rotation_group == before[0].rotation_group);
+}
