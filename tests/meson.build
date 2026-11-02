@@ -4021,6 +4021,17 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   timeout: 30,
 )
 
+# Command-dedup claim wiring (#3668): the claim decision is a pure function with its own unit
+# tests; this pins that agent.cpp's Subscribe loop still CALLS it and acts on every field of the
+# answer (no gRPC seam to test the loop, #1492). Carries its own in-memory mutation self-test.
+# No build required.
+test('agent command-dedup wiring lexical gate (#3668)',
+  _python3_test,
+  args: [files('test_agent_command_dedup_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # Echo rename upgrade window: static lexical gate pinning that agent.cpp still CALLS the tested
 # tar.db adoption helper and the KV re-key after KvStore::open( and before the first plugin
 # init (no Agent::run() seam exists to test that, #1492). Carries its own in-memory mutation

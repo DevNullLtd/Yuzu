@@ -5,10 +5,18 @@
 /// ADR-2002, issue #3668) — factored out of agent.cpp's Subscribe command-read
 /// loop per this repo's "pure core, thin shell" discipline (see
 /// sync_now_decision.hpp, docs/testing/unit-test-conventions.md). agent.cpp is not
-/// gRPC-test-harnessed, so before this extraction a wiring regression in the claim
-/// block (claiming `__guard__`, re-executing a duplicate, not downgrading an
-/// unparsable stored blob) was invisible to every test: CommandDedupStore's own
-/// tests cover the store, not the loop's use of it.
+/// gRPC-test-harnessed, so before this extraction nothing tested the claim block's
+/// decision at all: CommandDedupStore's own tests cover the store, not the loop's
+/// use of it.
+///
+/// Two layers pin it, and neither covers the other's half:
+///   - tests/unit/test_command_dedup_decision.cpp pins the DECISION (these
+///     functions), plus the compile-time checks at the bottom of this header.
+///   - tests/test_agent_command_dedup_wiring_lexical.py pins the SHELL's use of it
+///     (agent.cpp still calls both functions, acts on `owns_claim` and
+///     `count_claim_error`, and `continue`s after answering a duplicate). It is
+///     lexical, so a relocation that keeps the tokens but changes control flow is
+///     review-enforced.
 ///
 /// The claim itself (`CommandDedupStore::claim`) is a side effect, so the decision
 /// is split around it:
@@ -62,8 +70,14 @@ struct DedupDecision {
     bool count_claim_error{false};
 };
 
-/// The one reserved plugin name that bypasses the claim (invariant 3). A named
-/// constant so the tests and the shell cannot drift from each other.
+/// The one reserved plugin name that bypasses the claim (invariant 3).
+///
+/// COUPLED to agent.cpp's reserved-name dispatch: the claim is skipped for this name
+/// ONLY because that dispatch branch resolves the command itself (its own write +
+/// `continue`). If the claim bypass and that branch named different strings, a
+/// bypassed command would fall through to plugin dispatch, or a claimed one would be
+/// left unresolved (RUNNING-forever on every re-send). agent.cpp therefore compares
+/// against this constant at the dispatch site, and the wiring gate pins that.
 inline constexpr std::string_view kDedupBypassPlugin = "__guard__";
 
 /// Whether this command goes through CommandDedupStore::claim() at all.
@@ -102,5 +116,20 @@ inline constexpr std::string_view kDedupBypassPlugin = "__guard__";
     // never read as "go ahead and execute" with a claim we do not own.
     return {DedupAction::AnswerRunning, false, false};
 }
+
+// Compile-time self-checks: these invariants fail the BUILD on every compiler, not only
+// the unit-test run. Invariant 3 (literal-only bypass), 4 (no Duplicate proceeds) and
+// the fail-safe for a status this function does not know.
+static_assert(!should_claim(true, "c", "__guard__"));
+static_assert(should_claim(true, "c", "__sync__"));
+static_assert(should_claim(true, "c", "__update__"));
+static_assert(!should_claim(true, "", "echo"));
+static_assert(!should_claim(false, "c", "echo"));
+static_assert(decide_after_claim(ClaimStatus::Duplicate, DedupState::InFlight, true).action ==
+              DedupAction::AnswerRunning);
+static_assert(decide_after_claim(ClaimStatus::Duplicate, DedupState::Terminal, false).action ==
+              DedupAction::AnswerRunning);
+static_assert(decide_after_claim(static_cast<ClaimStatus>(99), DedupState::InFlight, false)
+                  .action == DedupAction::AnswerRunning);
 
 } // namespace yuzu::agent

@@ -1,9 +1,9 @@
 // Pure unit tests for command_dedup_decision.hpp — the claim/replay/RUNNING DECISION
 // core extracted from agent.cpp's Subscribe command-read loop (HA WS-0, issue #3668).
 //
-// agent.cpp is not gRPC-test-harnessed, so these tests are the only thing that fails if
-// the loop's use of CommandDedupStore regresses: claiming __guard__, re-executing a
-// duplicate, or not downgrading an unreplayable terminal to RUNNING. The store itself is
+// These pin the DECISION only. They cannot see whether agent.cpp still calls it: that is
+// pinned lexically by tests/test_agent_command_dedup_wiring_lexical.py (agent.cpp is not
+// gRPC-test-harnessed, so there is no behavioural seam for the shell). The store itself is
 // covered by test_command_dedup_store.cpp. No gRPC, no store, no protobuf.
 
 #include "command_dedup_decision.hpp"
@@ -53,7 +53,7 @@ TEST_CASE("decide_after_claim: in-flight duplicate answers RUNNING",
     }
 }
 
-TEST_CASE("decide_after_claim: terminal duplicate with an unparsable blob answers RUNNING, never re-runs",
+TEST_CASE("decide_after_claim: terminal duplicate with an unparsable blob answers RUNNING and never re-runs",
           "[command_dedup][decision]") {
     auto d = decide_after_claim(ClaimStatus::Duplicate, DedupState::Terminal, false);
     CHECK(d.action == DedupAction::AnswerRunning);
@@ -67,6 +67,24 @@ TEST_CASE("decide_after_claim: no Duplicate input ever proceeds (invariant 4)",
             auto d = decide_after_claim(ClaimStatus::Duplicate, state, parses);
             CHECK(d.action != DedupAction::Proceed);
             CHECK_FALSE(d.owns_claim);
+        }
+}
+
+TEST_CASE("decide_after_claim: Claimed and Error ignore the stored-outcome inputs",
+          "[command_dedup][decision]") {
+    // state / stored_blob_parses are meaningful only for Duplicate; a stale value there
+    // must never turn a fresh claim into a replay, or an Error into a non-proceed.
+    for (auto state : {DedupState::InFlight, DedupState::Terminal})
+        for (bool parses : {false, true}) {
+            auto claimed = decide_after_claim(ClaimStatus::Claimed, state, parses);
+            CHECK(claimed.action == DedupAction::Proceed);
+            CHECK(claimed.owns_claim);
+            CHECK_FALSE(claimed.count_claim_error);
+
+            auto error = decide_after_claim(ClaimStatus::Error, state, parses);
+            CHECK(error.action == DedupAction::Proceed);
+            CHECK_FALSE(error.owns_claim);
+            CHECK(error.count_claim_error);
         }
 }
 
@@ -96,6 +114,8 @@ TEST_CASE("should_claim: __guard__ is the ONLY reserved name that bypasses the c
     CHECK(should_claim(true, "cmd-1", "__update__"));
     CHECK(should_claim(true, "cmd-1", "__guard__x"));
     CHECK(should_claim(true, "cmd-1", "__guard_"));
+    // Exact literal only: a case variant is a different plugin name and is claimed.
+    CHECK(should_claim(true, "cmd-1", "__GUARD__"));
     CHECK(should_claim(true, "cmd-1", "echo"));
     CHECK(should_claim(true, "cmd-1", ""));
 }

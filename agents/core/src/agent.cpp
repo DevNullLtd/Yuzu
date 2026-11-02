@@ -3360,7 +3360,7 @@ public:
                     // bypasses the claim: gating on the literal (not the whole
                     // reserved-name set) keeps durable idempotency the SAFE DEFAULT
                     // for any future reserved-name command — a future __update__ OTA
-                    // path is deduplicated unless it, too, opts out here.
+                    // path is deduplicated unless it, too, opts out in should_claim().
                     // The decision itself (which commands are claimed; replay / RUNNING /
                     // proceed after the claim) lives in command_dedup_decision.hpp — pure
                     // and unit-tested (tests/unit/test_command_dedup_decision.cpp, #3668).
@@ -3441,7 +3441,7 @@ public:
                     // load-time check in plugin_loader.cpp also rejects reserved
                     // names, but defence-in-depth keeps both halves explicit).
                     // See docs/yuzu-guardian-design-v1.1.md §7.2.
-                    if (cmd.plugin() == "__guard__") {
+                    if (cmd.plugin() == kDedupBypassPlugin) {
                         pb::CommandResponse resp;
                         resp.set_command_id(cmd.command_id());
                         auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
