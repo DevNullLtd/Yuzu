@@ -67,7 +67,7 @@ inputs ever change (a new manifest, a new pinned commit, a key-format migration)
 ENTRIES BEHIND that fallback stop being reachable by a fresh primary key but stay immortal
 via the open prefix — the same quota-crowding failure mode as below, just gated on how
 often the key's inputs change rather than guaranteed on every run. The vcpkg example
-further down describes the pre-bump shape; the canary's restore-key was narrowed in the 2026.10.16 baseline bump (#3888).
+further down stays the recommended pattern; the CANARY's copy of the pattern was narrowed (ci.yml) in the 2026.10.16 baseline bump (#3888).
 
 It is a WRONG shape outright — correctness-safe or not — for a time-bucket key (see "For
 ccache" below), where the key's inputs change on every run by construction: a bare

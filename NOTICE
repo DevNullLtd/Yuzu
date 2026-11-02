@@ -50,6 +50,11 @@ section is maintained manually; see `vcpkg.json` and
   spdlog ................................ MIT
   nlohmann/json ......................... MIT
   CLI11 ................................. BSD-3-Clause
+  Drogon (build canary) ................. MIT AND BSD-3-Clause
+      Copyright (c) 2018-2023 An Tao (MIT); the Result, Row and Field classes derive from
+      libpqxx, Copyright (c) 2001-2017 Jeroen T. Vermeulen (BSD-3-Clause)
+  trantor (drogon dependency) ........... BSD-3-Clause
+      Copyright (c) 2016-2021 Tao An
   cpp-httplib ........................... MIT
   SQLite ................................ Public Domain
   libpq (PostgreSQL client library) ..... PostgreSQL License (BSD-style)

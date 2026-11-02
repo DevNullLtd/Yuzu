@@ -205,7 +205,7 @@ toolchain-contract inventory test finds an unlisted active reference.
 ### Baseline bump 2026.10.16
 
 `builtin-baseline` moved from `4b77da7fed37` to `9eec002df1cd` (short SHAs; the full
-values are in `vcpkg.json`; committed 2026-10-17 UTC, tagged
+new value is in `vcpkg.json`, the old one in git history; committed 2026-10-17 UTC, tagged
 `2026.10.16` upstream). Versions and licenses are read from
 `ports/<port>/vcpkg.json` at each commit; `pv` is `port-version`.
 
@@ -231,8 +231,16 @@ direct dependencies in `vcpkg.json` only; transitive dependencies were not
 checked.
 
 The drogon change is a permissive one (MIT to MIT AND BSD-3-Clause), compatible with
-AGPL-3.0-or-later. drogon is used only by the `yuzu_drogon_canary` build target
-(`server/core/meson.build`, `install: false`) and is not distributed.
+AGPL-3.0-or-later. The `yuzu_drogon_canary` executable is not installed
+(`server/core/meson.build`, `install: false`), but `.github/workflows/release.yml` copies every
+`*.dll` from `vcpkg_installed/x64-windows/bin` into the Windows archive, so the drogon and
+trantor libraries may be staged there. BSD-3-Clause requires its notice in binary
+redistribution, so `NOTICE` now lists drogon and trantor with their copyright holders (taken
+from the vcpkg port's `copyright` files). `release.yml` does not itself copy `NOTICE` or the vcpkg
+`copyright` files; how the archive carries them was not checked here.
+
+A future cpp-httplib bump should follow the BUMP CHECKLIST comment in
+`server/core/src/body_cap_httplib.hpp`.
 
 **Resolver use-after-free, closed on glibc only.** The cpp-httplib 0.59.0
 header carries the fix for upstream issue 2431 (a use-after-free around
@@ -240,8 +248,8 @@ header carries the fix for upstream issue 2431 (a use-after-free around
 already carries the same fix. No CVE id is cited: none appears in the vcpkg
 tree. The Windows `GetAddrInfoEx` and macOS `CFHost` resolver paths are unchanged by this bump.
 
-**New behaviour.** On glibc builds a timed-out outbound name lookup now waits for the
-resolver itself (cpp-httplib estimates about 30 seconds with default resolver
+**New behaviour.** On glibc builds a lookup against an unresponsive resolver now waits for the
+resolver itself (cpp-httplib estimates about 30 seconds in total with default resolver
 settings) before the request fails; see `docs/user-manual/upgrading.md`.
 
 **SBOMs.** Unchanged mechanism: `.github/workflows/release.yml` generates them
