@@ -42,7 +42,7 @@ name: "CodeQL"
 #     + build_tests=true + languages c-cpp,actions, and the workflow
 #     matrixed across Linux + Windows runners to close the #ifdef _WIN32
 #     gap that a Linux-only analysis physically cannot reach.
-#   2026-10-21 → 2026-11-02: the dev→main promotion (C++ TUs 1157 → 1437)
+#   2026-10-21 → 2026-11-02: the dev→main promotion (first-party .cpp/.cc files 1157 → 1437)
 #     pushed both legs past the 90-min ceiling; scheduled runs were
 #     cancelled daily from 2026-10-22. Timeout raised to 180 — see the
 #     `analyze` job's timeout-minutes comment for the measurements.
@@ -122,12 +122,12 @@ on:
     branches: [dev, main]
   schedule:
     # Daily 04:00 UTC cron. Tightens C++ vuln detection from <=7 days to
-    # <=24h WHEN scheduled runs complete (2026-10-22 → 2026-11-02 they did
-    # not; nothing alerts on a stale scan — #6880; incident: #6873). Folds CodeQL into
-    # the Tier-3 nightly cadence; it is a long
+    # <=24h WHEN scheduled runs complete. From 2026-10-22 to 2026-11-02
+    # they did not (incident: #6873), and nothing alerts on a stale scan
+    # (#6880). Folds CodeQL into the Tier-3 nightly cadence; it is a long
     # trace, NOT the PR fast-path — last green run 2026-10-21: Linux ~52m,
     # Windows ~72m wall-clock; see timeout-minutes below for why that no
-    # longer holds).
+    # longer holds.
     # The 04:00 slot was chosen to be 2h ahead of nightly.yml's 06:00 cron,
     # but GitHub starts both late (observed: this 08:00-12:00 UTC, nightly
     # 11:00-13:00 UTC), so the two now overlap in practice and CodeQL's Linux
@@ -224,7 +224,8 @@ jobs:
     # workflow_dispatch from main only (see the standing invariant above);
     # the concurrency group means a main dispatch cancels an in-flight
     # scheduled run, and vice versa. Revisit if any green leg exceeds ~135m
-    # or Linux is still cancelled at 180 on two consecutive runs.
+    # (75% of the ceiling) or Linux is still cancelled at 180 on two
+    # consecutive runs.
     timeout-minutes: 180
     strategy:
       # fail-fast: false so Linux completes its SARIF upload even if
