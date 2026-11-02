@@ -73,6 +73,15 @@ pg::PgResult exec_logged(PGconn* c, const char* label, const char* sql,
     return r;
 }
 
+/// `SET LOCAL statement_timeout` from `kPassBudget` (the pass budget IS the statement
+/// timeout - one number). Deliberately the constant, never `run_pass`'s `budget` argument:
+/// a test passes 0 s and `statement_timeout = 0` DISABLES the timeout in Postgres.
+bool set_statement_timeout(PGconn* c) {
+    static const std::string sql =
+        "SET LOCAL statement_timeout = '" + std::to_string(kPassBudget.count()) + "s'";
+    return exec_logged(c, "statement_timeout", sql.c_str(), {}).status() == PGRES_COMMAND_OK;
+}
+
 /// The cluster-wide single-writer lock, taken as the first statement of a pass and of the
 /// queue reconcile. `nullopt` = the statement failed; `false` = a peer holds it (skip).
 std::optional<bool> try_norm_lock(PGconn* c) {
@@ -198,8 +207,7 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
     bool ok = false;
     try {
         ok = pool_.with_txn_for(kAcquireTimeout, [&](PGconn* c) -> bool {
-            if (exec_logged(c, "statement_timeout", "SET LOCAL statement_timeout = '60s'", {})
-                    .status() != PGRES_COMMAND_OK)
+            if (!set_statement_timeout(c))
                 return false;
 
             // Cluster-wide single writer: a peer holding the lock is already normalising.
@@ -418,8 +426,7 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
 bool SoftwareTitleDimension::reconcile_queue(const std::function<bool()>& cancelled) {
     try {
         return pool_.with_txn_for(kAcquireTimeout, [&](PGconn* c) -> bool {
-            if (exec_logged(c, "statement_timeout", "SET LOCAL statement_timeout = '60s'", {})
-                    .status() != PGRES_COMMAND_OK)
+            if (!set_statement_timeout(c))
                 return false;
             const auto locked = try_norm_lock(c);
             if (!locked)
@@ -430,13 +437,38 @@ bool SoftwareTitleDimension::reconcile_queue(const std::function<bool()>& cancel
                 return false;
             // ponytail: one set-based UPDATE over the whole queue; partition it if the
             // queue ever exceeds ~10^5 rows.
+            const std::string now = std::to_string(now_secs());
             if (exec_logged(c, "queue refresh",
                             "UPDATE product_registry_store.curation_queue q "
                             "SET device_count = t.device_count, last_seen_at = $1::bigint "
                             "FROM software_inventory_store.title_triples t "
                             "WHERE q.raw_name = t.name AND q.raw_publisher = t.publisher "
                             "  AND q.ecosystem = t.ecosystem",
-                            {std::to_string(now_secs())})
+                            {now})
+                    .status() != PGRES_COMMAND_OK)
+                return false;
+            if (cancelled && cancelled())
+                return false;
+            // Re-queue: a title that was pruned while absent and has returned. Its dimension
+            // row is permanent and current-pack 'unnormalized', so no pass candidate selects it
+            // again; this is the only path that restores its open row. A stale-pack row is left
+            // to the pass (it re-resolves and queues or deletes itself). DO NOTHING keeps a
+            // 'rejected' row rejected and an existing open row as the UPDATE above left it.
+            if (exec_logged(c, "queue requeue",
+                            "INSERT INTO product_registry_store.curation_queue "
+                            "(raw_name, raw_publisher, ecosystem, device_count, status, "
+                            " first_queued_at, last_seen_at) "
+                            "SELECT t.name, t.publisher, t.ecosystem, t.device_count, 'open', "
+                            "       $1::bigint, $1::bigint "
+                            "FROM software_inventory_store.title_triples t "
+                            "JOIN product_registry_store.title_dimension d "
+                            "  ON (d.raw_name, d.raw_publisher, d.ecosystem) = "
+                            "     (t.name, t.publisher, t.ecosystem) "
+                            "WHERE d.norm_status = 'unnormalized' "
+                            "  AND d.pack_version = (SELECT pack_version FROM "
+                            "       product_registry_store.normalization_pack WHERE id = 1) "
+                            "ON CONFLICT (raw_name, raw_publisher, ecosystem) DO NOTHING",
+                            {now})
                     .status() != PGRES_COMMAND_OK)
                 return false;
             if (cancelled && cancelled())
@@ -501,11 +533,21 @@ void SoftwareTitleDimension::refresh_gauges() {
             pack_version = PQgetvalue(q.get(), 0, 1);
             return true;
         });
+    } catch (const std::exception& ex) {
+        spdlog::warn("SoftwareTitleDimension: gauge refresh threw ({}) - previous values kept",
+                     ex.what());
+        return;
     } catch (...) {
-        ok = false;
+        spdlog::warn("SoftwareTitleDimension: gauge refresh threw an unknown exception - "
+                     "previous values kept");
+        return;
     }
-    if (!ok)
+    if (!ok) {
+        // A failed statement already logged itself; an unavailable lease did not.
+        spdlog::warn("SoftwareTitleDimension: gauge refresh failed (lease or statement, see any "
+                     "preceding line) - previous values kept");
         return; // keep the previous values - never a false zero
+    }
 
     static constexpr std::array<const char*, 3> kStatus{"normalized", "unnormalized", "pending"};
     for (std::size_t i = 0; i < kStatus.size(); ++i)

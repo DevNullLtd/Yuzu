@@ -5580,14 +5580,19 @@ groups:
         # Sized to the HOURLY cadence. The job adds at most ONE error increment per hour (a
         # failed tick is never re-armed early), so a rate()/15m window with a 15m hold (the
         # sibling YuzuInventoryCatalogRollupFailing shape) can never observe it: the single
-        # increment ages out of a 15m window long before `for` elapses. increase()[2h] > 1
+        # increment ages out of a 15m window long before `for` elapses. increase()[2h] >= 2
         # fires on the second failed hourly tick and stays firing for the hour both
         # increments remain in the window; one isolated failure followed by a success stays
-        # quiet. A job that never succeeded (the case the Stale rule's `> 0` guard skips)
-        # fires at its second failed tick: both outcome series are seeded at 0 when the job
-        # is constructed, so the first failure is already an increase.
+        # quiet. The threshold is >= 2, not > 1: increase() extrapolates to the window edges
+        # (factor >= 1, never below), so a SINGLE increment on a non-zero baseline (an earlier
+        # failure that has aged out of the window) reads a little above 1 (~1.01 on a 1m
+        # scrape) for the whole hour it stays in the window, while two increments read >= 2.
+        # That holds while the scrape interval is far below 2h. A job that never succeeded
+        # (the case the Stale rule's `> 0` guard skips) fires at its second failed tick: both
+        # outcome series are seeded at 0 when the job is constructed, so the first failure is
+        # already an increase.
         expr: |
-          sum by (instance) (increase(yuzu_software_normalization_pass_total{outcome="error"}[2h])) > 1
+          sum by (instance) (increase(yuzu_software_normalization_pass_total{outcome="error"}[2h])) >= 2
         for: 10m
         labels:
           severity: warning

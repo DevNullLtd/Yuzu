@@ -542,6 +542,55 @@ TEST_CASE("owner tick reconciles open queue device counts against a refreshed ti
                        "WHERE raw_name = 'Rejected Tool'") == "rejected");
 }
 
+TEST_CASE("owner tick re-queues an unknown title that returns to the fleet without touching its "
+          "dimension row, and does not reopen a rejected row",
+          "[pg][product_registry][normalization]") {
+    TD_ENV(db, pool, inv, reg, metrics, owner);
+    triple(pool, "Gone Tool", "Nobody", "windows", 3);
+    triple(pool, "Rejected Tool", "Nobody", "windows", 4);
+    REQUIRE_FALSE(owner.run_tick().errored);
+    sql(pool, "UPDATE product_registry_store.curation_queue SET status = 'rejected' "
+              "WHERE raw_name = 'Rejected Tool'");
+
+    // Both titles leave the fleet: the open row is pruned, the rejected one is kept; the
+    // permanent dimension rows stay current-pack 'unnormalized'.
+    sql(pool, "DELETE FROM software_inventory_store.title_triples");
+    REQUIRE_FALSE(owner.run_tick().errored);
+    REQUIRE(scalar(pool, "SELECT count(*) FROM product_registry_store.curation_queue "
+                         "WHERE raw_name = 'Gone Tool'") == "0");
+
+    // Pin the dimension row's updated_at so any rewrite of it is visible without a clock.
+    sql(pool, "UPDATE product_registry_store.title_dimension SET updated_at = 1");
+    const std::string pack_before = dim(pool, "Gone Tool", "pack_version");
+
+    // Both titles return with new device counts.
+    triple(pool, "Gone Tool", "Nobody", "windows", 6);
+    triple(pool, "Rejected Tool", "Nobody", "windows", 8);
+    REQUIRE_FALSE(owner.run_tick().errored);
+
+    CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.curation_queue "
+                       "WHERE raw_name = 'Gone Tool'") == "1");
+    CHECK(scalar(pool, "SELECT status FROM product_registry_store.curation_queue "
+                       "WHERE raw_name = 'Gone Tool'") == "open");
+    CHECK(scalar(pool, "SELECT device_count FROM product_registry_store.curation_queue "
+                       "WHERE raw_name = 'Gone Tool'") == "6");
+    CHECK(dim(pool, "Gone Tool", "norm_status") == "unnormalized");
+    CHECK(dim(pool, "Gone Tool", "pack_version") == pack_before);
+    CHECK(dim(pool, "Gone Tool", "updated_at") == "1");
+    CHECK(scalar(pool, "SELECT status FROM product_registry_store.curation_queue "
+                       "WHERE raw_name = 'Rejected Tool'") == "rejected");
+
+    // A further tick is a no-op for the re-queued row: first_queued_at is pinned to a
+    // sentinel, so a rewrite would show.
+    sql(pool, "UPDATE product_registry_store.curation_queue SET first_queued_at = 1");
+    REQUIRE_FALSE(owner.run_tick().errored);
+    CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.curation_queue "
+                       "WHERE raw_name = 'Gone Tool'") == "1");
+    CHECK(scalar(pool, "SELECT first_queued_at FROM product_registry_store.curation_queue "
+                       "WHERE raw_name = 'Gone Tool'") == "1");
+    CHECK(dim(pool, "Gone Tool", "updated_at") == "1");
+}
+
 TEST_CASE("gauges report normalized unnormalized and pending titles and the device-weighted ratio",
           "[pg][product_registry][normalization]") {
     TD_ENV(db, pool, inv, reg, metrics, owner);

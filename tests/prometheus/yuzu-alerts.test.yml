@@ -6609,7 +6609,7 @@ tests:
   # ── YuzuSoftwareNormalizationStale / YuzuSoftwareNormalizationFailing (SAM.4) ──
   #
   # The job ticks HOURLY and adds one outcome counter increment per tick. The Failing
-  # rule is increase(...[2h]) > 1 with `for: 10m`, sized to that cadence (a 15m window
+  # rule is increase(...[2h]) >= 2 with `for: 10m`, sized to that cadence (a 15m window
   # cannot observe an hourly increment). 1m samples; the counter steps at the hour.
 
   # Healthy: the stamp tracks wall-clock (promtool's time() is the sample time, so a
@@ -6656,7 +6656,7 @@ tests:
 
   # Failing: two failed hourly ticks inside one 2h window. The error counter steps at
   # t=60m (1) and t=120m (2). Quiet after the first failure; the second brings
-  # increase([2h]) above 1, and after the 10m hold it fires and is still firing at 2h20m.
+  # increase([2h]) to 2, and after the 10m hold it fires and is still firing at 2h20m.
   # The leading zeros model the job's construction-time seed (the server creates the
   # series at 0 before the first tick), so this series is the state the server produces.
   - interval: 1m
@@ -6687,3 +6687,35 @@ tests:
       - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing"}'
         eval_time: 4h
         exp_samples: []
+
+  # Failing, positive baseline: the counter already sits at 1 (an earlier failure that has
+  # aged out of the window) and ONE new failure steps it to 2. The first in-window sample
+  # is then non-zero, so increase() extrapolates the single increment to the window edge
+  # and reads a little above 1 for the whole hour it stays in the window; `> 1` fired on
+  # it. The rule is `>= 2`: only two increments in the window reach 2.
+  - interval: 1m
+    name: software normalization - one failure after an aged-out earlier failure stays quiet
+    input_series:
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "1x59 2x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing"}'
+        eval_time: 80m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing"}'
+        eval_time: 4h
+        exp_samples: []
+
+  # Failing, positive baseline: two failures on top of an aged-out earlier one (1 -> 2 -> 3)
+  # still fire after the hold.
+  - interval: 1m
+    name: software normalization - two failures after an aged-out earlier failure fire
+    input_series:
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "1x59 2x60 3x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 2h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1

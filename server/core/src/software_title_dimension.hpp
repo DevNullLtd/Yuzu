@@ -150,9 +150,11 @@ public:
     [[nodiscard]] TickResult run_tick(const std::function<bool()>& cancelled = {},
                                       int max_passes = kMaxPassesPerTick);
 
-    /// Refresh the curation-queue device counts against the current `title_triples`
-    /// and drop `open` rows whose title vanished (rejected rows persist). One
-    /// transaction under the same try-lock; true on success or peer skip.
+    /// Refresh the curation-queue device counts against the current `title_triples`,
+    /// re-queue a present current-pack `unnormalized` title whose open row was pruned
+    /// while it was away, and drop `open` rows whose title vanished (rejected rows
+    /// persist, and are never reopened). One transaction under the same try-lock; true
+    /// on success or peer skip.
     [[nodiscard]] bool reconcile_queue(const std::function<bool()>& cancelled = {});
 
     /// Recompute the exposed gauges. A degraded read leaves the previous values
