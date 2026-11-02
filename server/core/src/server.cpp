@@ -15224,8 +15224,7 @@ private:
             //
             // This handler cannot close the connection itself: its signature carries only
             // `(const Request&, Response&)`, no stream and no socket. What it CAN do is
-            // set `Connection: close` on the response, and httplib honours that. What
-            // happens to the unread body then depends on the status:
+            // set `Connection: close` on the response, and httplib honours that. By status:
             //
             //   * 400 and above: httplib stamps `Connection: close` itself.
             //   * below 400 (the sign-in 302 below, any future 2xx/3xx): from httplib 0.59 a response that
@@ -15234,13 +15233,13 @@ private:
             //
             // So the rule is applied ONCE, for every response, in the POST-ROUTING handler
             // below (httplib runs it after it has chosen the Connection header and before the
-            // headers are written): `close_if_unread_framed_body` (web_utils.hpp) sets
+            // headers are written): `close_if_unread_framed_body` (body_cap_httplib.hpp) sets
             // `Connection: close` on a response below 400 whose declared body was never read.
             // Do not add a per-return `set_header` in this handler. Pinned by
-            // test_body_cap_policy.cpp ("Pre-routing answer: a response below 400 ... closes the
-            // connection"), which
-            // reads the socket to EOF for a 302 and a 200, and by test_step_up_wiring.cpp's
-            // lexical row for the call below.
+            // test_body_cap_policy.cpp ("Pre-routing answer: a response to a request with an
+            // unread framed body closes the connection"), which reads the socket to EOF for a
+            // 302, a 200, a 413 and a 400, and by test_step_up_wiring.cpp's lexical row for the
+            // call below.
             //
             // Returns true (and has already populated `res`) when the
             // request was refused; false means "not this gate's business,
@@ -15281,7 +15280,8 @@ private:
                     // `evaluate_body_cap`'s doc comment (body_cap_policy.hpp)
                     // for the D1-D5 ordering it encodes and why it stays
                     // httplib-free; `is_chunked` MUST come from httplib's own
-                    // `is_chunked_transfer_encoding`, never a re-derived
+                    // `is_chunked_transfer_encoding` (through `is_chunked_for_body_cap`),
+                    // never a re-derived
                     // reading of the header text (third time this change was
                     // bitten by re-deciding a framing/length header
                     // ourselves instead of asking httplib — see
@@ -15291,7 +15291,7 @@ private:
                         content_length_for_body_cap(req),
                         transfer_encoding_for_body_cap(req),
                         content_encoding_for_body_cap(req),
-                        httplib::detail::is_chunked_transfer_encoding(req.headers));
+                        is_chunked_for_body_cap(req));
 
                     if (!decision.refuse)
                         return false;

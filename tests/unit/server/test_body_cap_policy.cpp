@@ -595,7 +595,7 @@ struct UnifiedBodyCapTestServer {
             // `transfer_encoding_for_body_cap`); a raw first-line
             // `get_header_value("Transfer-Encoding")` would miss an empty first
             // line followed by `chunked`. `is_chunked` still
-            // MUST come from httplib's own `is_chunked_transfer_encoding`
+            // MUST come from httplib's own chunked decision, `is_chunked_for_body_cap`
             // (unchanged from before this extraction — a prior version of
             // this fixture called `req.get_header_value_u64` directly for
             // Content-Length while production hand-rolled a
@@ -609,7 +609,7 @@ struct UnifiedBodyCapTestServer {
                 req.method, req.path, req.has_header("Content-Length"),
                 content_length_for_body_cap(req), transfer_encoding_for_body_cap(req),
                 content_encoding_for_body_cap(req),
-                httplib::detail::is_chunked_transfer_encoding(req.headers));
+                yuzu::server::is_chunked_for_body_cap(req));
             if (decision.refuse) {
                 res.status = decision.status;
                 pre_routing_rejections.fetch_add(1);

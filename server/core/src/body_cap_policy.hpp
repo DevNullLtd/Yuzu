@@ -731,13 +731,13 @@ struct BodyCapDecision {
 /// exists, because the gate only tests non-emptiness),
 /// `content_encoding_for_body_cap(req)` (body_cap_httplib.hpp, the combined
 /// value httplib decodes against) and
-/// `httplib::detail::is_chunked_transfer_encoding(req.headers)`. An empty first
+/// `is_chunked_for_body_cap(req)` (body_cap_httplib.hpp, httplib's own chunked
+/// decision). An empty first
 /// `Transfer-Encoding` or `Content-Encoding` line hides a later one that httplib
 /// still honours. `has_content_length` is the presence of any `Content-Length`
 /// line. `server.cpp`'s one call is pinned in full (the whole argument list, in
-/// order) by test_step_up_wiring.cpp, which sees the `has_content_length`
-/// identifier but not how it is derived; both test fixtures use the same
-/// accessors.
+/// order) by test_step_up_wiring.cpp, which also pins the two statements that derive
+/// `has_content_length`; the test fixture uses the same accessors.
 ///
 /// Composes `resolve_body_cap` (this header) with the framing/encoding
 /// predicates in `web_utils.hpp` (`has_non_identity_content_encoding`,
@@ -759,13 +759,13 @@ struct BodyCapDecision {
 ///
 /// NO `httplib::Request` IN THE SIGNATURE, deliberately, even though every
 /// production caller has one at hand: `is_chunked` MUST come from httplib's
-/// own `httplib::detail::is_chunked_transfer_encoding(req.headers)` (see
+/// own chunked decision, `is_chunked_for_body_cap(req)` (see
 /// `content_length_is_authoritative`'s doc comment for why re-deciding that
 /// bit from the raw header text was a live bypass, twice). Accepting
 /// `const httplib::Request&` here would tempt a future caller to re-derive
 /// `is_chunked` (or `content_length`, or `has_content_length`) INSIDE this
 /// function from the request instead of from the caller's own
-/// `content_length_for_body_cap`/`is_chunked_transfer_encoding` calls — at
+/// `content_length_for_body_cap`/`is_chunked_for_body_cap` calls — at
 /// which point the production call site and the test fixture below are back
 /// to two independent implementations of the same httplib quirk, which is
 /// precisely the class of defect #2407 R2 was. Taking the already-extracted

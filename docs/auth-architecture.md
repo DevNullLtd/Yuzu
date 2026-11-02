@@ -4872,7 +4872,7 @@ Header construction lives in `server/core/src/security_headers.{hpp,cpp}` (`yuzu
 ### Close rule for an unread request body (cpp-httplib 0.59)
 
 The main listener's post-routing handler calls `close_if_unread_framed_body`
-(`server/core/src/web_utils.hpp`) on every response, a pre-routing `Handled`
+(`server/core/src/body_cap_httplib.hpp`) on every response, a pre-routing `Handled`
 answer included: a response below `400` that left a declared request body
 unread carries `Connection: close` (httplib closes a `400`-or-above response
 itself). Keep that single call in the post-routing handler: never add a

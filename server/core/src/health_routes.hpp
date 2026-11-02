@@ -296,8 +296,9 @@ namespace health {
 /// reads a body (httplib.h v0.59.0:14079-14080, read_content at 14209), so declining those keeps
 /// the plaintext listener from ever buffering one. That ordering is a dependency on httplib; a
 /// version that read the body first would invalidate this reasoning. It is pinned by
-/// test_body_cap_policy.cpp ("a pre-routing refusal closes the connection without draining the
-/// declared body"), which goes red if a refused body is read.
+/// test_body_cap_policy.cpp's "Pre-routing answer" and "a pre-routing refusal closes the
+/// connection" cases, which declare a body they never complete and go red if httplib waits for
+/// it before answering.
 /// Because no body is ever admitted here, this listener needs no row in
 /// `body_cap_policy.hpp`'s table (the #2407 routed-concerns row).
 [[nodiscard]] inline bool is_plaintext_probe_request(const httplib::Request& req) {

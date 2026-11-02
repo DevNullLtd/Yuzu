@@ -765,8 +765,8 @@ has_non_identity_content_encoding(std::string_view content_encoding) noexcept {
 /// `test_mcp_body_cap.cpp`'s `BodyCapTestServer`), gives all three the same
 /// Content-Length reading, so a call site that is touched later need not be re-checked
 /// by hand. A genuinely malformed
-/// (non-numeric / negative / whitespace-padded) `Content-Length` still
-/// reads as 0 here — that is fine, NOT a re-opened gap: httplib's OWN
+/// (non-numeric or negative) `Content-Length` still
+/// reads as 0 here (httplib trims surrounding whitespace, so `Content-Length:  5` reads as 5) — that is fine, NOT a re-opened gap: httplib's OWN
 /// reader answers 400 and refuses to read the body at all for that case,
 /// so no handler is ever reached regardless of what this gate alone
 /// decides. (httplib 0.59.0 also answers 400 to an all-digit value above
@@ -1192,32 +1192,6 @@ template <typename Req>
 template <typename Req>
 [[nodiscard]] inline bool declares_framed_body(const Req& req) {
     return content_length_for_body_cap(req) > 0 || transfer_encoding_present(req);
-}
-
-/// THE close rule for a response written without reading the request's declared body. The main
-/// listener's POST-ROUTING handler calls it on every response (httplib runs that hook for each one,
-/// including a pre-routing `Handled` answer), so a new early return cannot forget it; it is the
-/// single copy. Nothing happens when the body was consumed (`body_consumed_`), when the status is
-/// 400 or more, or when no body was declared. The plaintext redirect listener closes
-/// unconditionally instead (health_routes.cpp): its redirect answer closes with or without a
-/// declared body.
-///
-/// DEPENDS ON an httplib 0.59.0 public member: `body_consumed_` is set after the request body is
-/// read (httplib.h ~13745). A future httplib bump must re-check that it is still set there and
-/// still public.
-///
-/// WHY: a pre-routing handler answers before httplib reads the request body. From httplib 0.59 a
-/// response below 400 that leaves a declared request body unread must carry `Connection: close`
-/// (httplib.h v0.59.0:14797-14806); the response therefore closes the connection. httplib sets that
-/// header itself for a status of 400 or more (13455-13461), so only a status below 400 is left to
-/// us. A request with no declared body is left alone so ordinary keep-alive GETs keep their
-/// connection.
-template <typename Req, typename Res>
-inline void close_if_unread_framed_body(const Req& req, Res& res) {
-    if (res.status >= 400 || req.body_consumed_)
-        return;
-    if (declares_framed_body(req))
-        res.set_header("Connection", "close");
 }
 
 } // namespace yuzu::server
