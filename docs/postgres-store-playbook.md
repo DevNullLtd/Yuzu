@@ -563,6 +563,17 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   such counter, so only the HTTP 5xx rate shows it. A NEW store adds its `/readyz` (and
   `/health`) row for boot-state parity AND a `*_read_degrade_total{reason}` counter, so this
   decision holds for it.
+- **Version-ahead warning (#3894):** when a store's recorded `schema_meta` version is HIGHER than
+  the highest version in the calling binary's own `migrations()` vector (an older replica
+  restarted, or rolled back, after a newer one migrated), `run()` logs one `warn` naming the store
+  and both versions, applies nothing and still returns true (`PgMigrationRunner::is_schema_ahead`
+  is the pure decision). It is **warn-only on purpose**, not a refusal: many releases are additive
+  and document that an older build still runs against the upgraded database, and a refusal would
+  break a replica that restarts mid-roll. It is log-only (the `pg/` layer has no metrics registry)
+  and protects only binaries that contain it — builds shipped earlier are silent. A migration
+  that drops or reshapes a table is therefore still a rolling-upgrade hazard for an older build:
+  say so in that release's `upgrading.md` section. General guidance:
+  `upgrading.md` "Rolling upgrade and rollback (every Postgres store)".
 - **Runner guards**: schema-drift guard — a schema at version 0 that already contains tables is
   refused (never blindly re-run migration 1). Concurrent runners (multi-process boot) are
   serialized by a cluster-wide `pg_advisory_xact_lock`. Store/schema names must match

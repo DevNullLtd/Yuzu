@@ -7,6 +7,7 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <libpq-fe.h>
 
@@ -238,5 +239,80 @@ TEST_CASE("PgMigrationRunner #3013 duplicate/non-monotonic version guard", "[pg]
         CHECK_FALSE(PgMigrationRunner::run(conn.get(), "store_a", zero_start));
         CHECK(PgMigrationRunner::current_version(conn.get(), "store_a") == 0);
         CHECK_FALSE(table_exists(conn.get(), "store_a", "items"));
+    }
+}
+
+// #3894: an older binary booting against a database a newer replica already
+// migrated. Before this, run() applied nothing and said nothing — the older
+// binary failed later (or misbehaved) with no pointer to the cause. The
+// decision is WARN-ONLY (never a refusal): the upgrade guide promises an older
+// build can run against an additively-upgraded database.
+TEST_CASE("PgMigrationRunner is_schema_ahead decision (#3894)", "[pg][migration]") {
+    const std::vector<PgMigration> v2 = {{1, "SELECT 1"}, {2, "SELECT 1"}};
+
+    CHECK(PgMigrationRunner::is_schema_ahead(3, v2));       // database ahead
+    CHECK_FALSE(PgMigrationRunner::is_schema_ahead(2, v2)); // equal
+    CHECK_FALSE(PgMigrationRunner::is_schema_ahead(1, v2)); // behind (normal upgrade)
+    CHECK_FALSE(PgMigrationRunner::is_schema_ahead(0, v2)); // untracked store
+    CHECK_FALSE(PgMigrationRunner::is_schema_ahead(5, {})); // nothing declared
+}
+
+TEST_CASE("PgMigrationRunner version-ahead warning (#3894)", "[pg][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgConn conn = connect(db.dsn());
+
+    const std::vector<PgMigration> v3 = {
+        {1, "CREATE TABLE items (id INT PRIMARY KEY)"},
+        {2, "ALTER TABLE items ADD COLUMN name TEXT"},
+        {3, "CREATE INDEX items_name_idx ON items (name)"},
+    };
+    const std::vector<PgMigration> v2 = {v3[0], v3[1]}; // the "older binary"
+
+    SECTION("an older vector against a newer database warns, applies nothing, still succeeds") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_a", v3)); // the newer replica
+
+        std::string logs;
+        bool ok = false;
+        {
+            yuzu::test::LogCapture capture{spdlog::level::warn};
+            ok = PgMigrationRunner::run(conn.get(), "store_a", v2);
+            capture.stop();
+            logs = capture.text();
+        }
+        CHECK(ok);
+        // Nothing downgraded or re-run.
+        CHECK(PgMigrationRunner::current_version(conn.get(), "store_a") == 3);
+        // The warning is actionable: names the store and both versions.
+        CHECK(logs.find("store 'store_a'") != std::string::npos);
+        CHECK(logs.find("schema v3") != std::string::npos);
+        CHECK(logs.find("up to v2") != std::string::npos);
+        CHECK(logs.find("newer build has already migrated") != std::string::npos);
+    }
+
+    SECTION("an up-to-date store does not warn (negative control)") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_a", v3));
+
+        std::string logs;
+        {
+            yuzu::test::LogCapture capture{spdlog::level::warn};
+            REQUIRE(PgMigrationRunner::run(conn.get(), "store_a", v3));
+            capture.stop();
+            logs = capture.text();
+        }
+        CHECK(logs.find("newer build has already migrated") == std::string::npos);
+    }
+
+    SECTION("a normal upgrade (database behind the vector) does not warn") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_a", v2));
+
+        std::string logs;
+        {
+            yuzu::test::LogCapture capture{spdlog::level::warn};
+            REQUIRE(PgMigrationRunner::run(conn.get(), "store_a", v3));
+            capture.stop();
+            logs = capture.text();
+        }
+        CHECK(logs.find("newer build has already migrated") == std::string::npos);
+        CHECK(PgMigrationRunner::current_version(conn.get(), "store_a") == 3);
     }
 }

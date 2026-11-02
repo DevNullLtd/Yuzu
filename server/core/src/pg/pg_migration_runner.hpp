@@ -80,8 +80,26 @@ public:
     /// (e.g. two independent branches both allocating the next number) fails
     /// the WHOLE call closed rather than silently skipping whichever one
     /// loses the `<= current` race in the apply loop below.
+    ///
+    /// #3894: the complementary case — a database already AHEAD of this
+    /// binary's vector (an older replica restarted, or rolled back, after a
+    /// newer one migrated). That is WARN-ONLY, never a refusal: the upgrade
+    /// guide promises in many places that an older build can still run against
+    /// an additively-upgraded database, and refusing would break a replica that
+    /// restarts mid-rollout. `run()` applies nothing, logs one actionable
+    /// warning naming the store and both versions, and returns true. Log-only
+    /// by design (the pg/ layer has no metrics registry). The warning protects
+    /// only binaries that contain it; builds shipped before it stay exposed.
     [[nodiscard]] static bool run(PGconn* conn, std::string_view store_name,
                                   const std::vector<PgMigration>& migrations);
+
+    /// #3894: true when the database's recorded version for a store is HIGHER
+    /// than the highest version this binary's `migrations` vector declares —
+    /// i.e. a newer build already migrated it. False for an empty vector, an
+    /// untracked store (0) and an equal or lower version. Pure; exposed so the
+    /// decision is testable without a database.
+    [[nodiscard]] static bool is_schema_ahead(int db_version,
+                                              const std::vector<PgMigration>& migrations);
 
     /// Current schema version for a store. Returns 0 if the store (or the
     /// schema_meta table itself) is untracked, -1 on query error.

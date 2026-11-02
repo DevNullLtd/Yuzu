@@ -104,6 +104,11 @@ bool PgMigrationRunner::valid_store_name(std::string_view name) {
     return true;
 }
 
+bool PgMigrationRunner::is_schema_ahead(int db_version,
+                                        const std::vector<PgMigration>& migrations) {
+    return !migrations.empty() && db_version > migrations.back().version;
+}
+
 bool PgMigrationRunner::ensure_meta_and_schema(PGconn* conn, std::string_view store_name) {
     const std::string store{store_name};
     if (!exec_ok(conn, "BEGIN", "BEGIN (meta)", store))
@@ -230,6 +235,24 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
                           store);
             return false;
         }
+    }
+
+    // Version-ahead warning (#3894). This binary's vector stops below what the
+    // database has already recorded: a newer build migrated it first. Nothing
+    // below would apply (every `m.version <= current`), so without this the
+    // older binary says nothing and fails later, or misbehaves, on schema it
+    // does not know. WARN, never refuse — see the run() header comment for why.
+    // The vector is non-empty and strictly increasing here (checked above), so
+    // back() is its highest version.
+    if (is_schema_ahead(current, migrations)) {
+        spdlog::warn(
+            "PgMigrationRunner: store '{}' is at schema v{} in the database but this binary only "
+            "knows migrations up to v{} — a newer build has already migrated this database. "
+            "Nothing was applied and the store will still start, but this binary may fail or "
+            "misbehave on schema it does not know. Finish the rolling upgrade so every replica "
+            "runs the newer build, or restore the pre-upgrade backup if you are rolling back "
+            "(docs/user-manual/upgrading.md, \"Upgrading the Server\").",
+            store, current, migrations.back().version);
     }
 
     bool any_applied = false;
