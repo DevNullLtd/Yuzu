@@ -902,6 +902,15 @@ public:
                 command_dedup_ =
                     std::make_unique<CommandDedupStore>(std::move(*dedup_result));
                 spdlog::info("Command dedup store ready: {}", dedup_path.string());
+                // #3665: open() recovered from a corrupt file. Protection is back, but the
+                // history is gone — surface it (the store already logged the reason).
+                if (const auto& q = command_dedup_->quarantined_this_open()) {
+                    spdlog::warn("Command dedup history before this boot was lost (corrupt "
+                                 "store quarantined as {}) — a command redelivered after "
+                                 "its original execution may re-execute",
+                                 *q);
+                    metrics_.counter("yuzu_agent_dedup_quarantined_total").increment();
+                }
             } else {
                 spdlog::error("Failed to open command dedup store: {}",
                               dedup_result.error().message);
@@ -1701,22 +1710,35 @@ public:
                     sleep_for(kFirstDelay);
                     LocalDispatcher dispatcher;
                     while (!stop_requested_.load(std::memory_order_acquire)) {
-                        // #1001 / arch-S3 — local-dispatch concerns
-                        // (capture buffer, byte cap, truncation sentinel)
-                        // live in LocalDispatcher. The pump just decides
-                        // what to do with each cycle's result.
-                        auto result = dispatcher.run(echo_descriptor, "fleet_snapshot");
-                        if (result.truncated) {
-                            spdlog::warn("Snapshot pump: capture truncated at {}B; "
-                                         "dropping this cycle's snapshot",
-                                         result.captured.size());
-                        } else if (result.rc == 0 && !result.captured.empty()) {
-                            std::lock_guard lock(snapshot_mu_);
-                            latest_snapshot_ = std::move(result.captured);
-                            latest_snapshot_seq_.fetch_add(1, std::memory_order_acq_rel);
-                        } else if (result.rc != 0) {
-                            spdlog::warn("Snapshot pump: echo.fleet_snapshot rc={}, captured={}B",
-                                         result.rc, result.captured.size());
+                        // This runs on snapshot_pump_thread_ (joined at shutdown); an
+                        // exception escaping a std::thread body calls std::terminate, so a
+                        // cycle's failure (the Echo plugin's process enumeration reads /proc,
+                        // which can throw when a process exits mid-read) is caught here and
+                        // logged. A failed cycle costs one snapshot; the pump goes on.
+                        try {
+                            // #1001 / arch-S3 — local-dispatch concerns
+                            // (capture buffer, byte cap, truncation sentinel)
+                            // live in LocalDispatcher. The pump just decides
+                            // what to do with each cycle's result.
+                            auto result = dispatcher.run(echo_descriptor, "fleet_snapshot");
+                            if (result.truncated) {
+                                spdlog::warn("Snapshot pump: capture truncated at {}B; "
+                                             "dropping this cycle's snapshot",
+                                             result.captured.size());
+                            } else if (result.rc == 0 && !result.captured.empty()) {
+                                std::lock_guard lock(snapshot_mu_);
+                                latest_snapshot_ = std::move(result.captured);
+                                latest_snapshot_seq_.fetch_add(1, std::memory_order_acq_rel);
+                            } else if (result.rc != 0) {
+                                spdlog::warn(
+                                    "Snapshot pump: echo.fleet_snapshot rc={}, captured={}B",
+                                    result.rc, result.captured.size());
+                            }
+                        } catch (const std::exception& e) {
+                            spdlog::warn("Snapshot pump: cycle aborted by an exception: {}",
+                                         e.what());
+                        } catch (...) {
+                            spdlog::warn("Snapshot pump: cycle aborted by an unknown exception");
                         }
                         sleep_for(kInterval);
                     }
@@ -2645,6 +2667,12 @@ public:
                             // which is not separately detectable. "replays" counts
                             // served terminal replays.
                             tags["yuzu.dedup_degraded"] = command_dedup_ ? "0" : "1";
+                            // #3665: >0 when THIS process start recovered from a corrupt
+                            // command_dedup.db (history before the boot was lost). Without
+                            // this tag the recovery would be visible only in the endpoint's
+                            // own log, since the agent has no /metrics endpoint.
+                            tags["yuzu.dedup_quarantined"] = std::to_string(static_cast<int64_t>(
+                                metrics_.counter("yuzu_agent_dedup_quarantined_total").value()));
                             tags["yuzu.dedup_replays"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_dedup_replays_total").value()));
                             tags["yuzu.dedup_claim_errors"] = std::to_string(static_cast<int64_t>(
