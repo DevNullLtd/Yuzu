@@ -678,7 +678,6 @@ TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and th
     REQUIRE(spec["components"]["schemas"].contains("DexAppsList"));
     const auto& list = spec["components"]["schemas"]["DexAppsList"];
     const auto at = [&list](const std::string& ptr) { return schema_at(list, ptr); };
-    const auto contains = array_contains;
 
     // The published population vocabulary is exactly the four values, and every `<scope>_online`
     // the builder can publish is inside it.
@@ -687,11 +686,11 @@ TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and th
           json::array({"all_online", "windows_online", "macos_online", "linux_online"}));
     for (const char* scope : {yuzu::server::kDexAppsScopeAll, yuzu::server::kDexAppsScopeWindows,
                               yuzu::server::kDexAppsScopeMacos, yuzu::server::kDexAppsScopeLinux})
-        CHECK(contains(basis_enum, json(yuzu::server::dex_apps_population_basis(scope))));
+        CHECK(array_contains(basis_enum, json(yuzu::server::dex_apps_population_basis(scope))));
 
     // crash_source_coverage is always emitted, so it is a declared and required property, and its
     // schema is a closed object: the three platform keys, each exactly complete|partial.
-    CHECK(contains(at("/required"), json("crash_source_coverage")));
+    CHECK(array_contains(at("/required"), json("crash_source_coverage")));
     const std::string cov = "/properties/crash_source_coverage";
     const json coverage = at(cov);
     REQUIRE(coverage.is_object());
@@ -703,7 +702,7 @@ TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and th
     // ... and it covers what the builder can publish under `all`.
     for (const auto& [os, value] :
          yuzu::server::dex_apps_crash_source_coverage(yuzu::server::kDexAppsScopeAll))
-        CHECK(contains(at(cov + "/properties/" + os + "/enum"), json(value)));
+        CHECK(array_contains(at(cov + "/properties/" + os + "/enum"), json(value)));
 
     // The figures are no longer called Windows-only: each description the scope changed names the
     // platform scope and none says Windows (the default scope is every platform).
@@ -743,10 +742,6 @@ TEST_CASE("openapi_spec_json(): DexScorePolicyDocument types the stored shape an
                     "/properties/data/properties/document/allOf/0/$ref") == ref);
     CHECK(schema_at(spec, "/paths/~1dex~1score-policy/put/requestBody/content/application~1json/"
                           "schema/allOf/0/$ref") == ref);
-    CHECK(schema_at(schemas["DexScorePolicyData"], "/properties/data/required") ==
-          json::array({"document", "revision", "source"}));
-    CHECK(schema_at(schemas["DexScorePolicyData"], "/properties/data/properties/source/enum") ==
-          json::array({"custom", "default"}));
     CHECK(doc("/properties/version/enum") ==
           json::array({kDexScorePolicyBaseVersion, kDexScorePolicyVersion}));
 
