@@ -116,6 +116,12 @@ Siblings become compliant store-by-store as they migrate to Postgres.
 | `CommandOutboxStore` (#6096) | No reaper exists today. Its rows are the schedule runner's SPENT-TICKET LEDGER (`approval_id`, read by `occurrences_for_approval`), so any future reaper must retain approval-bearing rows at least 7 days from creation (`kApprovalTicketTtlSeconds`), or a reaped row makes a spent ticket look unspent. Stated at the store header as well. |
 | `ApprovalManager` expiry sweeps (#6061, #6096) | Status transitions to `expired`, never a DELETE. Every stamp and cutoff is Postgres `now()` in-SQL, including `submitted_at` since #6096, so the sweep clock is no longer split between the submitting process and the database. Disposition and residuals: "`ApprovalManager` ticket liveness" below. |
 
+### Recorded dispositions, Echo agent store
+
+| Store | Notes |
+|---|---|
+| Echo dictionary GC (agent, `EchoFold::gc_dictionary`, `echo_fold.cpp`) | **Declines the guard, with the reason recorded.** The pass deletes interned strings that no roll-up table references (an orphan test over the `_r` tables), never rows by age, so there is no wall-clock cutoff, no persisted anchor and nothing a wrong clock could make it delete: parts 1-4, 6 and 7 do not apply. **Part 5 (a cap) is adopted in a different shape:** each statement deletes at most 2000 strings, and the loop stops at a cooperative deadline, a `sqlite3_progress_handler` that interrupts a running batch (which rolls back, losing nothing) plus a check before each batch starts. The deadline does NOT cover mutex acquisition, `BEGIN IMMEDIATE`'s 5 s busy wait or `COMMIT` I/O, so it is a bound on statement execution, not end to end. Not wired into any pass yet. |
+
 ### Still issuing bare wall-clock deletes
 
 The three tracked **#2508** background sweeps (`app_perf_fleet_store`,

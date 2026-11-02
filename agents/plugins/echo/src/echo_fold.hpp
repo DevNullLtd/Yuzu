@@ -1,0 +1,880 @@
+#pragma once
+
+/**
+ * echo_fold.hpp -- roll-up fold: pure bucket math, the tier accumulator, the 17
+ * per-source deltas and the transactional fold writer.
+ *
+ * ROLL-UP IS THE ONLY STORAGE MODEL. Raw capture rows are not kept, and there is
+ * no setting, flag, mode switch or environment variable that selects between the
+ * two; none is to be added. This header is staged ahead of the switch-over:
+ * nothing opens, writes or reads these tables yet (open(), the collectors, the
+ * aggregator and every config surface are untouched).
+ *
+ * Two halves:
+ *   - PURE CORE (this header, no I/O): bucket_start, Value, TierRow,
+ *     TierAccumulator, tier_upsert_sql, identity_digest and the *_delta
+ *     functions. Fixture-fed in tests; nothing here opens a database.
+ *   - SHELL (echo_fold.cpp): class EchoFold, the only code that touches SQLite.
+ *
+ * EVENT TIMES ARE TRUSTED AS GIVEN. A bucket comes from the event's own stamp
+ * (UTC, floor division; calendar month via std::chrono). There is no clamp
+ * against the wall clock and no counter for far-future stamps. Accepted
+ * residual: a stamp inside the representable domain but far in the future
+ * creates a bucket only age-based eviction removes.
+ *
+ * The ONE exception is an UNREPRESENTABLE stamp (outside kFoldMinStamp ..
+ * kFoldMaxStamp, 0001-01-01..9999-12-31 UTC), which no calendar can bucket.
+ * Such an event is rejected INDIVIDUALLY: the rest of its batch folds normally.
+ * The rejection is counted in the persisted echo_config counter
+ * `fold_rejected_events_total` (kFoldRejectedCounterKey), added inside the same
+ * transaction as the fold so a rollback leaves the counter unchanged, and
+ * logged once per batch naming the first offending stamp only (never the
+ * payload). Surfacing the counter in echo.status is a later change.
+ *
+ * kLast merge: the incoming value replaces the stored one iff its guard column
+ * is >= the stored guard, so an older event never overwrites a newer one and two
+ * events in the same second resolve to the later arrival.
+ */
+
+#include "echo_db.hpp"
+#include "echo_fold_schema.hpp"
+#include "echo_usage.hpp"
+
+#include <sha256.hpp>
+
+#include <algorithm>
+#include <bit>
+#include <charconv>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <format>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+#include <vector>
+
+namespace yuzu::echo {
+
+// ── Bucket math ─────────────────────────────────────────────────────────────
+
+/// The representable event-time domain: 0001-01-01T00:00:00Z .. 9999-12-31T23:59:59Z.
+/// Floor-division arithmetic is overflow-free inside it and std::chrono's calendar
+/// is defined over it.
+inline constexpr int64_t kFoldMinStamp = -62135596800LL;
+inline constexpr int64_t kFoldMaxStamp = 253402300799LL;
+
+/// True iff `ts` can be bucketed by every tier.
+[[nodiscard]] inline bool fold_stamp_representable(int64_t ts) noexcept {
+    return ts >= kFoldMinStamp && ts <= kFoldMaxStamp;
+}
+
+/// Start of the `tier` bucket ("hourly" | "daily" | "monthly") containing `ts`,
+/// in UTC epoch seconds. Refuses a stamp outside the representable domain with a
+/// message naming it. Every in-domain stamp, past or future, is bucketed exactly.
+[[nodiscard]] inline std::expected<int64_t, std::string> bucket_start(int64_t ts,
+                                                                       std::string_view tier) {
+    if (!fold_stamp_representable(ts))
+        return std::unexpected(std::format("event time {} is outside the representable range {}..{}",
+                                           ts, kFoldMinStamp, kFoldMaxStamp));
+    const auto floor_to = [ts](int64_t n) {
+        const int64_t r = ts % n;
+        return ts - (r < 0 ? r + n : r);
+    };
+    if (tier == "hourly")
+        return floor_to(3600);
+    if (tier == "daily")
+        return floor_to(86400);
+    if (tier == "monthly") {
+        using namespace std::chrono;
+        const sys_days day = floor<days>(sys_seconds{seconds{ts}});
+        const year_month_day ymd{day};
+        // days::rep is a 32-bit int: widen BEFORE multiplying.
+        return static_cast<int64_t>(sys_days{ymd.year() / ymd.month() / 1}.time_since_epoch().count()) *
+               86400;
+    }
+    return std::unexpected(std::format("unknown tier '{}'", tier));
+}
+
+// ── Values and rows ─────────────────────────────────────────────────────────
+
+using Value = std::variant<int64_t, double, std::string>;
+/// Column name -> value. Names point at string literals / static column names.
+using NamedValues = std::vector<std::pair<std::string_view, Value>>;
+
+[[nodiscard]] inline Value vi(int64_t v) { return v; }
+[[nodiscard]] inline Value vr(double v) { return v; }
+[[nodiscard]] inline Value vt(std::string_view v) { return std::string{v}; }
+
+/// `s` cut to at most `max_bytes`, backing off to a UTF-8 character boundary.
+[[nodiscard]] inline std::string clip_utf8(std::string_view s, std::size_t max_bytes) {
+    if (s.size() <= max_bytes)
+        return std::string{s};
+    std::size_t cut = max_bytes;
+    while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80)
+        --cut;
+    return std::string{s.substr(0, cut)};
+}
+
+/// One roll-up row: the bucket, the key values in FoldSourceDef key order and the
+/// merged measures in measure order (generated columns are never carried).
+struct TierRow {
+    int64_t bucket{0};
+    std::vector<Value> keys;
+    std::vector<Value> measures;
+};
+
+// ── Accumulator ─────────────────────────────────────────────────────────────
+
+/// Pre-aggregates one batch of events into every tier of one source, merging by
+/// each measure's MergeOp. Pure: no I/O, no clock.
+///
+/// A key or measure the caller does not name defaults to 0 / 0.0 / "" -- which is
+/// how enrichment columns that no producer fills yet stay at zero. A name that is
+/// not a column of the source throws std::invalid_argument (a declaration typo,
+/// caught by the per-delta tests), never a silently dropped value.
+class TierAccumulator {
+public:
+    explicit TierAccumulator(const FoldSourceDef& def) : def_(&def) {
+        for (const auto& c : def.columns) {
+            if (c.role == ColumnRole::kKey) {
+                key_index_.emplace(c.name, key_cols_.size());
+                key_cols_.push_back(c);
+            } else if (c.role == ColumnRole::kMeasure) {
+                measure_index_.emplace(c.name, measure_cols_.size());
+                measure_cols_.push_back(c);
+            }
+        }
+        for (const auto& c : measure_cols_) {
+            std::size_t guard = 0;
+            if (c.merge == MergeOp::kLast) {
+                const auto it = measure_index_.find(c.guard);
+                if (it == measure_index_.end() || measure_cols_[it->second].sql_type != "INTEGER")
+                    throw std::invalid_argument(std::format(
+                        "{}.{}: kLast guard '{}' is not an INTEGER measure", def.name, c.name,
+                        c.guard));
+                guard = it->second;
+            }
+            guards_.push_back(guard);
+        }
+        for (auto t : def.tiers)
+            tiers_.push_back({t, {}});
+    }
+
+    /// Fold one event. Returns false -- folding nothing -- when `ts` is
+    /// unrepresentable (counted in rejected()); the caller keeps folding the rest.
+    bool add(int64_t ts, const NamedValues& keys, const NamedValues& measures) {
+        std::vector<int64_t> buckets;
+        buckets.reserve(tiers_.size());
+        for (const auto& t : tiers_) {
+            const auto b = bucket_start(ts, t.name);
+            if (!b) {
+                ++rejected_;
+                if (!first_rejected_)
+                    first_rejected_ = ts;
+                return false;
+            }
+            buckets.push_back(*b);
+        }
+        std::vector<Value> kv = resolve(key_cols_, key_index_, keys, "key");
+        std::vector<Value> mv = resolve(measure_cols_, measure_index_, measures, "measure");
+        const std::string key_enc = encode_keys(kv);
+        for (std::size_t i = 0; i < tiers_.size(); ++i) {
+            std::string enc;
+            append_be(enc, static_cast<uint64_t>(buckets[i]) ^ (uint64_t{1} << 63));
+            enc += key_enc;
+            auto& slots = tiers_[i].slots;
+            const auto it = slots.find(enc);
+            if (it == slots.end())
+                slots.emplace(std::move(enc), Slot{buckets[i], kv, mv});
+            else
+                merge(it->second.measures, mv);
+        }
+        return true;
+    }
+
+    /// The tier's rows ordered by bucket, then by an unspecified but stable key order;
+    /// empty for an unknown tier.
+    [[nodiscard]] std::vector<TierRow> rows(std::string_view tier) const {
+        std::vector<TierRow> out;
+        for (const auto& t : tiers_) {
+            if (t.name != tier)
+                continue;
+            out.reserve(t.slots.size());
+            for (const auto& [enc, slot] : t.slots)
+                out.push_back({slot.bucket, slot.keys, slot.measures});
+        }
+        return out;
+    }
+
+    [[nodiscard]] const FoldSourceDef& def() const noexcept { return *def_; }
+    [[nodiscard]] const std::vector<ColumnDef>& key_columns() const noexcept { return key_cols_; }
+    [[nodiscard]] const std::vector<ColumnDef>& measure_columns() const noexcept {
+        return measure_cols_;
+    }
+    /// Events refused for an unrepresentable stamp.
+    [[nodiscard]] std::size_t rejected() const noexcept { return rejected_; }
+    /// The first refused stamp -- the only thing the batch warning names.
+    [[nodiscard]] std::optional<int64_t> first_rejected_stamp() const noexcept {
+        return first_rejected_;
+    }
+
+    /// Convenience for tests and callers: the named measure / key of a row, or
+    /// nullptr when the source has no such column.
+    [[nodiscard]] const Value* measure(const TierRow& r, std::string_view name) const {
+        const auto it = measure_index_.find(name);
+        return it == measure_index_.end() ? nullptr : &r.measures[it->second];
+    }
+    [[nodiscard]] const Value* key(const TierRow& r, std::string_view name) const {
+        const auto it = key_index_.find(name);
+        return it == key_index_.end() ? nullptr : &r.keys[it->second];
+    }
+
+private:
+    struct Slot {
+        int64_t bucket;
+        std::vector<Value> keys;
+        std::vector<Value> measures;
+    };
+    // Slots are keyed by a byte encoding of (bucket, keys): comparing strings is far cheaper
+    // than comparing vectors of variants, and the bucket leads so rows come out bucket-ordered.
+    struct Tier {
+        std::string_view name;
+        std::map<std::string, Slot> slots;
+    };
+
+    static void append_be(std::string& out, uint64_t v) {
+        for (int shift = 56; shift >= 0; shift -= 8)
+            out += static_cast<char>((v >> shift) & 0xFF);
+    }
+
+    static std::string encode_keys(const std::vector<Value>& keys) {
+        std::string out;
+        for (const auto& v : keys) {
+            if (const auto* i = std::get_if<int64_t>(&v)) {
+                append_be(out, static_cast<uint64_t>(*i));
+            } else if (const auto* d = std::get_if<double>(&v)) {
+                append_be(out, std::bit_cast<uint64_t>(*d));
+            } else {
+                const auto& s = std::get<std::string>(v);
+                append_be(out, s.size()); // length-prefixed: no key value can forge a boundary
+                out += s;
+            }
+        }
+        return out;
+    }
+
+    static Value zero_of(const ColumnDef& c) {
+        if (c.sql_type == "TEXT")
+            return std::string{};
+        if (c.sql_type == "REAL")
+            return 0.0;
+        return int64_t{0};
+    }
+
+    static Value coerce(const ColumnDef& c, const Value& v) {
+        if (c.sql_type == "TEXT") {
+            if (const auto* s = std::get_if<std::string>(&v))
+                return *s;
+        } else if (c.sql_type == "REAL") {
+            if (const auto* d = std::get_if<double>(&v))
+                return *d;
+            if (const auto* i = std::get_if<int64_t>(&v))
+                return static_cast<double>(*i);
+        } else {
+            if (const auto* i = std::get_if<int64_t>(&v))
+                return *i;
+            if (const auto* d = std::get_if<double>(&v))
+                return static_cast<int64_t>(*d);
+        }
+        throw std::invalid_argument(
+            std::format("value type does not fit column '{}' ({})", c.name, c.sql_type));
+    }
+
+    std::vector<Value> resolve(const std::vector<ColumnDef>& cols,
+                               const std::unordered_map<std::string_view, std::size_t>& index,
+                               const NamedValues& given, std::string_view what) const {
+        std::vector<Value> out;
+        out.reserve(cols.size());
+        for (const auto& c : cols)
+            out.push_back(zero_of(c));
+        for (const auto& [name, v] : given) {
+            const auto it = index.find(name);
+            if (it == index.end())
+                throw std::invalid_argument(
+                    std::format("{} is not a {} column of source {}", name, what, def_->name));
+            out[it->second] = coerce(cols[it->second], v);
+        }
+        return out;
+    }
+
+    // Merge `in` into `cur`. kLast reads the guard values as they were BEFORE this
+    // event, exactly as the SQL UPSERT does (every right-hand side sees the old row).
+    void merge(std::vector<Value>& cur, const std::vector<Value>& in) const {
+        std::vector<char> take(cur.size(), 0);
+        for (std::size_t j = 0; j < measure_cols_.size(); ++j)
+            if (measure_cols_[j].merge == MergeOp::kLast)
+                take[j] = std::get<int64_t>(in[guards_[j]]) >= std::get<int64_t>(cur[guards_[j]]);
+        for (std::size_t j = 0; j < measure_cols_.size(); ++j) {
+            const bool real = measure_cols_[j].sql_type == "REAL";
+            switch (measure_cols_[j].merge) {
+            case MergeOp::kSum:
+                if (real)
+                    std::get<double>(cur[j]) += std::get<double>(in[j]);
+                else
+                    std::get<int64_t>(cur[j]) += std::get<int64_t>(in[j]);
+                break;
+            case MergeOp::kMax:
+                if (real)
+                    cur[j] = std::max(std::get<double>(cur[j]), std::get<double>(in[j]));
+                else
+                    cur[j] = std::max(std::get<int64_t>(cur[j]), std::get<int64_t>(in[j]));
+                break;
+            case MergeOp::kMin:
+                if (real)
+                    cur[j] = std::min(std::get<double>(cur[j]), std::get<double>(in[j]));
+                else
+                    cur[j] = std::min(std::get<int64_t>(cur[j]), std::get<int64_t>(in[j]));
+                break;
+            case MergeOp::kLast:
+                if (take[j])
+                    cur[j] = in[j];
+                break;
+            case MergeOp::kNone:
+                break;
+            }
+        }
+    }
+
+    const FoldSourceDef* def_;
+    std::vector<ColumnDef> key_cols_;
+    std::vector<ColumnDef> measure_cols_;
+    std::unordered_map<std::string_view, std::size_t> key_index_;
+    std::unordered_map<std::string_view, std::size_t> measure_index_;
+    std::vector<std::size_t> guards_; // per measure: index of its kLast guard (unused otherwise)
+    std::vector<Tier> tiers_;
+    std::size_t rejected_{0};
+    std::optional<int64_t> first_rejected_;
+};
+
+// ── UPSERT builder ──────────────────────────────────────────────────────────
+
+/// The fold-time UPSERT for one (source, tier): bound as (bucket, keys...,
+/// measures...) in exactly TierAccumulator's order (keys then measures, each in
+/// declaration order), merged by each measure's MergeOp, and RETURNING id so the
+/// caller counts rows touched without sqlite3_changes(). Generated columns are
+/// never written. Every right-hand side of the DO UPDATE sees the stored row, so
+/// a kLast guard compares against the OLD guard value.
+[[nodiscard]] inline std::string tier_upsert_sql(const FoldSourceDef& def, std::string_view tier) {
+    std::vector<std::string> keys, measures, sets;
+    const auto bucket = std::string{ts_column_for_suffix(tier)};
+    for (const auto& c : def.columns) {
+        const std::string name = physical_column_name(c);
+        if (c.role == ColumnRole::kKey) {
+            keys.push_back(name);
+        } else if (c.role == ColumnRole::kMeasure) {
+            measures.push_back(name);
+            switch (c.merge) {
+            case MergeOp::kSum:
+                sets.push_back(std::format("{0}={0}+excluded.{0}", name));
+                break;
+            case MergeOp::kMax:
+                sets.push_back(std::format("{0}=MAX({0},excluded.{0})", name));
+                break;
+            case MergeOp::kMin:
+                sets.push_back(std::format("{0}=MIN({0},excluded.{0})", name));
+                break;
+            case MergeOp::kLast:
+                sets.push_back(std::format(
+                    "{0}=CASE WHEN excluded.{1}>={1} THEN excluded.{0} ELSE {0} END", name, c.guard));
+                break;
+            case MergeOp::kNone:
+                break;
+            }
+        }
+    }
+    const auto join = [](const std::vector<std::string>& v, std::string_view sep) {
+        std::string out;
+        for (const auto& x : v)
+            out += (out.empty() ? "" : std::string{sep}) + x;
+        return out;
+    };
+    std::vector<std::string> insert_cols{bucket};
+    insert_cols.insert(insert_cols.end(), keys.begin(), keys.end());
+    insert_cols.insert(insert_cols.end(), measures.begin(), measures.end());
+    std::vector<std::string> conflict{bucket};
+    conflict.insert(conflict.end(), keys.begin(), keys.end());
+    return std::format("INSERT INTO {0}({1}) VALUES({2}) ON CONFLICT({3}) DO UPDATE SET {4} "
+                       "RETURNING id",
+                       physical_table_name(def.name, tier), join(insert_cols, ","),
+                       join(std::vector<std::string>(insert_cols.size(), "?"), ","),
+                       join(conflict, ","), join(sets, ","));
+}
+
+// ── Replay identity (cursor sources) ────────────────────────────────────────
+
+/// One cursor-source event as a roll-up contribution. `record_key` is the OS
+/// record's replay key; `identity_digest` is what the replay ring compares to tell
+/// a legitimate replay (same digest) from a key collision (different digest).
+struct KeyedContribution {
+    std::string record_key;
+    int64_t identity_digest{0};
+    int64_t ts{0};
+    NamedValues keys;
+    NamedValues measures;
+};
+
+/// First 8 bytes of SHA-256 over the length-prefixed field list, as a signed 64-bit
+/// value. Length prefixes (not a separator) so no field value can forge a boundary.
+/// 64 bits distinguish payloads; this is a replay check, not an adversarial boundary.
+[[nodiscard]] inline int64_t identity_digest(const std::vector<std::string>& fields) {
+    std::string buf;
+    for (const auto& f : fields) {
+        buf += std::to_string(f.size());
+        buf += ':';
+        buf += f;
+    }
+    const std::string hex = yuzu::shared::sha256_hex(buf);
+    uint64_t v = 0;
+    std::from_chars(hex.data(), hex.data() + 16, v, 16);
+    return static_cast<int64_t>(v);
+}
+
+// ── The 13 snapshot-diff deltas ─────────────────────────────────────────────
+//
+// Each folds one batch of already-derived events into `acc`. Enrichment columns
+// (the starred ones in echo_fold_schema.cpp) that the event structs cannot yet
+// supply are left unnamed and so stay 0 / ''. An unrecognised action token is
+// ignored, never guessed at.
+
+inline void process_delta(const std::vector<ProcessEvent>& events, TierAccumulator& acc) {
+    for (const auto& e : events) {
+        const char* measure = e.action == "started" ? "start_count"
+                              : e.action == "stopped" ? "stop_count"
+                                                      : nullptr;
+        if (!measure)
+            continue;
+        // parent_name, abnormal_exit_count, elevated_count, spoofed_parent_count: zero.
+        acc.add(e.ts, {{"name", vt(e.name)}, {"user", vt(e.user)}}, {{measure, vi(1)}});
+    }
+}
+
+inline void tcp_delta(const std::vector<NetworkEvent>& events, TierAccumulator& acc) {
+    for (const auto& e : events) {
+        // duration_s_sum: zero.
+        if (e.action == "listen_open" || e.action == "listen_close") {
+            // A listening socket folds into tcp as remote_addr='*', remote_port=local_port.
+            acc.add(e.ts,
+                    {{"remote_addr", vt("*")}, {"remote_port", vi(e.local_port)},
+                     {"proto", vt(e.proto)}, {"process_name", vt(e.process_name)}},
+                    {{e.action == "listen_open" ? "listen_open_count" : "listen_close_count",
+                      vi(1)}});
+            continue;
+        }
+        const char* measure = e.action == "connected"      ? "connect_count"
+                              : e.action == "disconnected" ? "disconnect_count"
+                              : e.action == "failed"       ? "failed_count"
+                                                           : nullptr;
+        if (!measure)
+            continue;
+        acc.add(e.ts,
+                {{"remote_addr", vt(e.remote_addr)}, {"remote_port", vi(e.remote_port)},
+                 {"proto", vt(e.proto)}, {"process_name", vt(e.process_name)}},
+                {{measure, vi(1)}});
+    }
+}
+
+inline void module_delta(const std::vector<ModuleRow>& events, TierAccumulator& acc) {
+    for (const auto& e : events) {
+        // An unload is not stored; rebased_count: zero.
+        const char* measure = (e.action == "loaded" || e.action == "seed") ? "load_count"
+                              : e.action == "blocked"                       ? "blocked_count"
+                                                                            : nullptr;
+        if (!measure)
+            continue;
+        acc.add(e.ts,
+                {{"module_name", vt(e.module_name)}, {"signer", vt(e.signer)},
+                 {"signed_state", vt(e.signed_state)}, {"is_kernel", vi(e.is_kernel ? 1 : 0)},
+                 {"module_dir", vt(e.module_dir)}, {"process_name", vt(e.process_name)}},
+                {{measure, vi(1)}});
+    }
+}
+
+// compute_service_events() emits exactly three tokens. Install/remove are new
+// columns; status_changes keeps today's meaning (state_changed only).
+inline void service_delta(const std::vector<ServiceEvent>& events, TierAccumulator& acc) {
+    for (const auto& e : events) {
+        const char* measure = e.action == "started"         ? "install_count"
+                              : e.action == "stopped"       ? "remove_count"
+                              : e.action == "state_changed" ? "status_changes"
+                                                            : nullptr;
+        if (!measure)
+            continue;
+        // last_exit_code, last_start_account, last_binary_path, failed_count: zero / ''.
+        acc.add(e.ts, {{"name", vt(e.name)}},
+                {{measure, vi(1)}, {"last_status", vt(e.status)}, {"last_ts", vi(e.ts)}});
+    }
+}
+
+inline void user_delta(const std::vector<UserEvent>& events, TierAccumulator& acc) {
+    for (const auto& e : events) {
+        const char* measure = e.action == "login"    ? "login_count"
+                              : e.action == "logout" ? "logout_count"
+                                                     : nullptr;
+        if (!measure)
+            continue;
+        // disconnect_count, session_s_sum: zero.
+        acc.add(e.ts,
+                {{"user", vt(e.user)}, {"domain", vt(e.domain)}, {"logon_type", vt(e.logon_type)}},
+                {{measure, vi(1)}});
+    }
+}
+
+inline void software_delta(const std::vector<SoftwareEvent>& events, TierAccumulator& acc) {
+    for (const auto& e : events) {
+        const char* measure = e.action == "installed"  ? "install_count"
+                              : e.action == "removed"  ? "remove_count"
+                              : e.action == "upgraded" ? "upgrade_count"
+                                                       : nullptr;
+        if (!measure)
+            continue;
+        // arch, downgrade_count: zero / ''.
+        acc.add(e.ts,
+                {{"name", vt(e.name)}, {"version", vt(e.version)}, {"publisher", vt(e.publisher)}},
+                {{measure, vi(1)}});
+    }
+}
+
+inline void arp_delta(const std::vector<ArpEvent>& events, TierAccumulator& acc) {
+    for (const auto& e : events) {
+        const char* measure = e.action == "appeared"  ? "appear_count"
+                              : e.action == "removed" ? "remove_count"
+                                                      : nullptr;
+        if (!measure)
+            continue;
+        // is_router, rebind_count: zero.
+        acc.add(e.ts,
+                {{"interface", vt(e.iface)}, {"ip_address", vt(e.ip_address)},
+                 {"mac_address", vt(e.mac_address)}},
+                {{measure, vi(1)}});
+    }
+}
+
+inline void dns_delta(const std::vector<DnsEvent>& events, TierAccumulator& acc) {
+    for (const auto& e : events) {
+        const char* measure = e.action == "appeared"  ? "appear_count"
+                              : e.action == "removed" ? "remove_count"
+                                                      : nullptr;
+        if (!measure)
+            continue;
+        // negative_count: zero.
+        acc.add(e.ts, {{"name", vt(e.name)}, {"record_type", vt(e.record_type)}, {"data", vt(e.data)}},
+                {{measure, vi(1)}});
+    }
+}
+
+inline void netconn_delta(const std::vector<NetConnRow>& events, TierAccumulator& acc) {
+    for (const auto& e : events) {
+        // phy_type, auth_alg, cipher_alg: ''.
+        acc.add(e.ts,
+                {{"action", vt(e.action)}, {"channel", vt(e.channel)},
+                 {"category", vt(e.category)}, {"capability", vt(e.capability)},
+                 {"iface_kind", vt(e.iface_kind)}, {"reason_code", vi(e.reason_code)}},
+                {{"event_count", vi(1)}, {"last_ts", vi(e.ts)}});
+    }
+}
+
+inline void mapdrive_delta(const std::vector<MapDriveEvent>& events, TierAccumulator& acc) {
+    for (const auto& e : events) {
+        const char* measure = e.action == "appeared"     ? "appear_count"
+                              : e.action == "removed"    ? "remove_count"
+                              : e.action == "historical" ? "historical_count"
+                                                         : nullptr;
+        if (!measure)
+            continue;
+        // last_dialect, guest_count: zero / ''.
+        acc.add(e.ts,
+                {{"direction", vt(e.direction)}, {"local_mount", vt(e.local_mount)},
+                 {"remote_path", vt(e.remote_path)}, {"remote_host", vt(e.remote_host)}},
+                {{measure, vi(1)}, {"first_ts", vi(e.ts)}, {"last_ts", vi(e.ts)}});
+    }
+}
+
+inline void perf_delta(const std::vector<PerfRow>& events, TierAccumulator& acc) {
+    for (const auto& e : events) {
+        // cpu_kernel_sum, rx_bps_max, tx_bps_max, procs_sum, threads_sum, handles_sum: zero.
+        acc.add(e.ts, {},
+                {{"samples", vi(1)},
+                 {"cpu_sum", vr(e.cpu_pct)},
+                 {"cpu_max", vr(e.cpu_pct)},
+                 {"mem_sum", vr(e.mem_used_pct)},
+                 {"mem_max", vr(e.mem_used_pct)},
+                 {"commit_sum", vr(e.commit_pct)},
+                 {"read_bps_sum", vi(e.disk_read_bps)},
+                 {"write_bps_sum", vi(e.disk_write_bps)},
+                 {"read_lat_us_sum", vi(e.disk_read_lat_us)},
+                 {"write_lat_us_sum", vi(e.disk_write_lat_us)},
+                 {"read_lat_us_max", vi(e.disk_read_lat_us)},
+                 {"write_lat_us_max", vi(e.disk_write_lat_us)},
+                 {"rx_bps_sum", vi(e.net_rx_bps)},
+                 {"tx_bps_sum", vi(e.net_tx_bps)}});
+    }
+}
+
+inline void procperf_delta(const std::vector<ProcPerfRow>& events, TierAccumulator& acc) {
+    for (const auto& e : events) {
+        // private_bytes_max, handles_max, threads_max, io_read_bytes_sum,
+        // io_write_bytes_sum: zero.
+        acc.add(e.ts,
+                {{"name", vt(e.name)}, {"version", vt(e.version)},
+                 {"is_kthread", vi(e.is_kthread ? 1 : 0)}},
+                {{"samples", vi(1)},
+                 {"instances_max", vi(e.instances)},
+                 {"cpu_sum", vr(e.cpu_pct)},
+                 {"cpu_max", vr(e.cpu_pct)},
+                 {"ws_sum", vi(e.ws_bytes)},
+                 {"ws_max_bytes", vi(e.ws_bytes)}});
+    }
+}
+
+inline void netqual_delta(const std::vector<NetQualRow>& events, TierAccumulator& acc) {
+    for (const auto& e : events) {
+        // rtt_us_min, bytes_in_sum, bytes_out_sum: zero.
+        acc.add(e.ts,
+                {{"proto", vt(e.proto)}, {"remote_bucket", vt(e.remote_bucket)},
+                 {"process_name", vt(e.process_name)}},
+                {{"samples", vi(1)},
+                 {"rtt_us_sum", vi(e.rtt_us)},
+                 {"rtt_us_max", vi(e.rtt_us)},
+                 {"rtt_var_us_sum", vi(e.rtt_var_us)},
+                 {"lost_sum", vi(e.lost)},
+                 {"lost_max", vi(e.lost)},
+                 {"degraded_samples", vi(e.lost > 0 ? 1 : 0)}});
+    }
+}
+
+// ── The 3 cursor-source deltas ──────────────────────────────────────────────
+//
+// Each returns one contribution per event. The digest covers exactly the fields
+// the raw store compared when it recognised a replay: the payload minus
+// snapshot_id, minus `ts` where `ts` is not identity, and (registry) minus the
+// attribution fields, because the registry key does not depend on attribution
+// and a replay may derive a different writer.
+
+inline std::vector<KeyedContribution> power_delta(const std::vector<PowerEvent>& events) {
+    std::vector<KeyedContribution> out;
+    out.reserve(events.size());
+    for (const auto& e : events) {
+        std::vector<std::string> id{e.action, e.detail};
+        if (e.action != "capture_gap")
+            id.push_back(std::to_string(e.ts));
+        // resume_kind, source: ''.
+        out.push_back({e.record_key, identity_digest(id), e.ts,
+                       {{"action", vt(e.action)}},
+                       {{"event_count", vi(1)}, {"last_ts", vi(e.ts)},
+                        {"last_detail", vt(clip_utf8(e.detail, 256))}}});
+    }
+    return out;
+}
+
+inline std::vector<KeyedContribution> removable_delta(const std::vector<RemovableEvent>& events) {
+    std::vector<KeyedContribution> out;
+    out.reserve(events.size());
+    for (const auto& e : events) {
+        std::vector<std::string> id{e.action,       e.device_key, e.vendor,
+                                    e.product,      e.serial,     e.bus,
+                                    e.volume,       std::to_string(e.size_bytes),
+                                    e.image_path,   std::to_string(e.pid), e.evidence};
+        if (e.action != "capture_gap" && e.action != "present_at_baseline")
+            id.push_back(std::to_string(e.ts));
+        // disk_id, partition_count: zero / ''.
+        out.push_back({e.record_key, identity_digest(id), e.ts,
+                       {{"action", vt(e.action)}, {"device_key", vt(e.device_key)},
+                        {"vendor", vt(e.vendor)}, {"product", vt(e.product)},
+                        {"serial", vt(e.serial)}, {"bus", vt(e.bus)}, {"volume", vt(e.volume)},
+                        {"image_path", vt(e.image_path)}},
+                       {{"event_count", vi(1)}, {"first_ts", vi(e.ts)}, {"last_ts", vi(e.ts)},
+                        {"size_bytes", vi(e.size_bytes)}}});
+    }
+    return out;
+}
+
+inline std::vector<KeyedContribution> registry_delta(const std::vector<RegistryEvent>& events) {
+    std::vector<KeyedContribution> out;
+    out.reserve(events.size());
+    for (const auto& e : events) {
+        std::vector<std::string> id{e.action};
+        if (e.action != "capture_gap") {
+            id.insert(id.end(),
+                      {e.hive, e.key_path, e.value_name, e.data_type, e.data,
+                       std::to_string(e.data_size), e.prev_data_type, e.prev_data,
+                       std::to_string(e.prev_data_size), std::to_string(e.observed_at)});
+        }
+        out.push_back({e.record_key, identity_digest(id), e.ts,
+                       {{"hive", vt(e.hive)}, {"key_path", vt(e.key_path)},
+                        {"value_name", vt(e.value_name)}, {"action", vt(e.action)}},
+                       {{"change_count", vi(1)},
+                        {"last_data", vt(clip_utf8(e.data, 512))},
+                        {"last_data_type", vt(e.data_type)},
+                        {"last_actor_image", vt(e.actor_image)},
+                        {"last_ts", vi(e.ts)}}});
+    }
+    return out;
+}
+
+// ── The 17th delta: usage ───────────────────────────────────────────────────
+
+/// A pure adapter over usage::fold_daily (echo_usage.hpp): the day-bucketed run
+/// totals map onto the usage daily tier's columns; distinct_users and the
+/// enrichment columns are 0 / ''. No second fold is implemented here -- usage's
+/// own writer is untouched, and the switch-over decides whether it consumes this.
+inline void usage_delta(const std::vector<usage::ClosedRun>& runs, TierAccumulator& acc) {
+    for (const auto& d : usage::fold_daily(runs)) {
+        acc.add(d.day_ts, {{"exe_key", vt(d.exe_key)}},
+                {{"run_count", vi(d.run_count)},
+                 {"total_seconds", vi(d.total_seconds)},
+                 {"first_seen", vi(d.first_seen)},
+                 {"last_seen", vi(d.last_seen)},
+                 {"superseded_runs", vi(d.superseded_runs)},
+                 {"expired_runs", vi(d.expired_runs)}});
+    }
+}
+
+// ── The transactional fold writer ───────────────────────────────────────────
+
+/// Persisted counter (echo_config) of events refused for an unrepresentable stamp.
+inline constexpr std::string_view kFoldRejectedCounterKey = "fold_rejected_events_total";
+/// Replay-ring depth per cursor source.
+inline constexpr std::size_t kReplayRingDepth = 4096;
+/// Dictionary cache bound; cleared when a fold would overflow it.
+inline constexpr std::size_t kDictCacheCap = 50'000;
+/// Orphan strings deleted per GC statement.
+inline constexpr int kGcBatch = 2000;
+
+/// The orphan-delete statement: one batch of dictionary strings no roll-up table
+/// references (an EXCEPT chain over every interned key column), RETURNING id.
+/// Pure text so the compound-select term count can be pinned by a test.
+[[nodiscard]] inline std::string dictionary_gc_sql(int batch) {
+    std::string sql = std::format("DELETE FROM {0} WHERE id IN (SELECT id FROM {0}", kDictTable);
+    for (const auto& def : fold_sources()) {
+        if (def.own_tables)
+            continue;
+        for (auto tier : def.tiers)
+            for (const auto& c : def.columns)
+                if (c.interned)
+                    sql += std::format(" EXCEPT SELECT {} FROM {}", physical_column_name(c),
+                                       physical_table_name(def.name, tier));
+    }
+    sql += std::format(" LIMIT {}) RETURNING id", batch);
+    return sql;
+}
+
+struct FoldResult {
+    std::size_t rows_touched{0};     ///< RETURNING row count, summed over tiers
+    std::size_t rejected_events{0};  ///< events refused for an unrepresentable stamp
+};
+
+struct CursorFoldError {
+    enum class Kind {
+        Transient,    ///< nothing advanced; retrying the same batch is correct
+        KeyCollision, ///< PERMANENT: an empty / NUL record_key, or a key already in the
+                      ///< ring with a different digest. The same batch is re-derived and
+                      ///< re-refused every tick; surface it, never retry indefinitely.
+    };
+    Kind kind{Kind::Transient};
+    std::string text;
+};
+
+struct CursorFoldResult {
+    std::size_t folded{0};        ///< contributions folded
+    std::size_t replayed{0};      ///< contributions recognised as replays (same digest), not folded
+    std::size_t rejected{0};      ///< contributions refused for an unrepresentable stamp
+    std::size_t rows_touched{0};
+};
+
+struct GcResult {
+    int64_t deleted{0};
+    bool deadline_hit{false};
+};
+
+/**
+ * The only code that touches SQLite on behalf of the fold. Owns the dictionary
+ * cache and ONE operation mutex.
+ *
+ * LOCKING. `op_mu_` is held for the ENTIRE duration of every public method:
+ * cache reads, the transaction, the post-commit cache publication and cache
+ * invalidation. Lock order is op_mu_ THEN EchoDatabase::mu_ (taken inside
+ * checked_transaction); nothing may ever take op_mu_ while holding mu_. There is
+ * no second cache lock. ONE EchoFold instance must front a database: a second
+ * instance would have its own cache and its own mutex and could race a GC.
+ *
+ * INTERNING. Strings are interned INSIDE the transaction into a local staging map
+ * and published to the cache only after the transaction commits, still under
+ * op_mu_. A rollback therefore never leaves the cache holding an id the database
+ * does not have. Counts come from RETURNING row counts, never sqlite3_changes().
+ *
+ * GC DEADLINE IS COOPERATIVE. It bounds statement EXECUTION between batches
+ * (sqlite3_progress_handler) and is checked before each batch starts. It does
+ * NOT cover mutex acquisition, BEGIN IMMEDIATE's busy wait (5 s), or COMMIT I/O.
+ *
+ * NOT wired into EchoDatabase::open(), the collectors or the aggregator.
+ */
+class EchoFold {
+public:
+    using Clock = std::chrono::steady_clock;
+    /// Clock seam for the GC deadline; null means steady_clock::now.
+    using NowFn = std::function<Clock::time_point()>;
+
+    explicit EchoFold(NowFn now = nullptr);
+    ~EchoFold();
+    EchoFold(const EchoFold&) = delete;
+    EchoFold& operator=(const EchoFold&) = delete;
+
+    /// Create the dictionary, the replay ring and every roll-up table, index and
+    /// view in one transaction. A LEGACY TABLE whose name a view will take is
+    /// dropped first (a view cannot be created over an existing table of the same
+    /// name, and CREATE VIEW IF NOT EXISTS would then silently do nothing). That
+    /// drop is destructive: it exists as the migration precursor and has NO
+    /// production caller in this change. Clears the dictionary cache.
+    [[nodiscard]] std::expected<void, std::string> install_fold_schema(EchoDatabase& db);
+
+    /// Fold a snapshot-diff source's accumulated batch (plus its optional baseline
+    /// StateWrite) in ONE transaction. Rejected events (acc.rejected()) are added
+    /// to the persisted counter in the same transaction.
+    [[nodiscard]] std::expected<FoldResult, std::string>
+    fold_rows(EchoDatabase& db, std::string_view source, const TierAccumulator& acc,
+              const std::optional<StateWrite>& state = std::nullopt);
+
+    /// Fold a cursor source's contributions through the digest-checked replay ring,
+    /// and commit the cursor and the baseline StateWrites in the SAME transaction.
+    /// A replay (same key, same digest) is not folded; the cursor still advances.
+    /// A key collision rolls everything back and is PERMANENT.
+    [[nodiscard]] std::expected<CursorFoldResult, CursorFoldError>
+    fold_cursor_rows(EchoDatabase& db, std::string_view source,
+                     const std::vector<KeyedContribution>& contributions,
+                     const std::string& cursor_json,
+                     const std::vector<StateWrite>& baseline_writes);
+
+    /// Delete orphaned dictionary strings in batches until none remain or the
+    /// deadline passes. A deadline hit is a result, not an error; any OTHER
+    /// failure is returned as an error, never as an empty success.
+    [[nodiscard]] std::expected<GcResult, std::string> gc_dictionary(EchoDatabase& db,
+                                                                      Clock::time_point deadline);
+
+private:
+    [[nodiscard]] Clock::time_point now() const { return now_ ? now_() : Clock::now(); }
+
+    NowFn now_;
+    std::mutex op_mu_;
+    std::unordered_map<std::string, int64_t> cache_;
+};
+
+} // namespace yuzu::echo

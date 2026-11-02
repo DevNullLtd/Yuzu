@@ -123,6 +123,79 @@ PR M14, but `kCreateSchema` kept recreating it on every open — v5 stops that a
 drops it from already-migrated databases, #2093). Bumps go in the same
 function, never in `applies_*` collectors.
 
+### 3.1 Roll-up-only storage model (substrate staged, switch-over in the next change)
+
+**Roll-up is the only model.** The recorded design ruling is: "roll-up mode should be the only way
+of operating for echo at all, I don't want this as a configurable thing, it's the only method of
+operation." So there is no config key, flag, mode switch, environment variable or runtime toggle
+between raw capture rows and roll-ups, and none is to be added. The code in this section is
+staged: it is built and tested, but `EchoDatabase::open()`, the collectors, the aggregator and
+every setting are untouched, so nothing opens, writes or reads it yet. The next change flips the
+registry onto it for good.
+
+**Where it lives.** `echo_fold_schema.{hpp,cpp}` declare the 17 sources' tier columns and
+generate the DDL; `echo_fold.{hpp,cpp}` hold the pure fold core (bucket math, `TierAccumulator`,
+the 17 `*_delta` functions) and the `EchoFold` writer. Per-column `role`, `merge`, `interned`,
+`generated_expr` and `guard` are additive fields on `ColumnDef` (`echo_schema_registry.hpp`).
+
+**Shape.**
+- `echo_dict(id, text)` holds every interned string once. A text key is stored as `<key>_id`.
+- `<src>_<tier>_r` is the physical table: bucket column (`hour_ts` / `day_ts` / `month_ts`), keys,
+  merged measures and `VIRTUAL` generated `*_avg` columns. ONE unique index
+  `<src>_<tier>_r_uq (bucket, keys...)` is both the UPSERT target and the bucket index retention
+  and the byte budget use.
+- `<src>_<tier>` is a view with today's column names, today's order first and new columns after.
+  A text key resolves through a correlated dictionary lookup, not a `JOIN`: SQLite reports an
+  unselected join table as a column-less top-level read, which the operator-SQL authorizer cannot
+  tell from a direct dictionary read. `usage` keeps its own tables and has no roll-up DDL.
+- The starred enrichment columns are declared now and written as 0 / empty until a producer fills
+  them, so the switch-over needs no second schema change.
+
+**Merge.** `kSum` adds, `kMax` / `kMin` keep the extreme, `kLast` takes the incoming value only if
+its guard column (`last_ts`, ...) is >= the stored one, so a late older event never overwrites a
+newer one (a tie takes the later arrival). Averages are `*_sum` plus `samples`; the `*_avg` names
+are generated, so consumers keep their columns and every average is an exact weighted mean.
+
+**Cursor sources.** `power`, `removable` and `registry` fold through `fold_cursor_rows`, with a
+durable per-source ring (`echo_fold_seen`, newest 4096 keys). A key already in the ring is a replay
+when its 64-bit digest matches (not folded, cursor still advances) and a permanent key collision
+when it does not (everything rolls back). The digest covers exactly what the raw store compared:
+the record minus `snapshot_id`, minus `ts` for a `capture_gap` (and `present_at_baseline` for
+removable), and for `registry` minus `actor_pid`, `actor_image` and `detail`. An empty or
+NUL-bearing `record_key` refuses the batch.
+
+**Event times are trusted as given.** A bucket comes from the event's own UTC stamp: no clamp, no
+counter. Accepted residual: a stamp inside the representable domain but far in the future makes a
+bucket only age-based eviction removes. The one refusal is a stamp outside 0001-01-01 ..
+9999-12-31 UTC, which no calendar can bucket: that single event is rejected and the rest of its
+batch folds. Rejections are counted in `echo_config` `fold_rejected_events_total`, in the same
+transaction as the fold (a rollback leaves it unchanged), and logged once per batch with the first
+offending stamp only. The counter is not yet in `echo.status`.
+
+**One lock, one order.** `EchoFold` holds a single `op_mu_` across every fold, GC, cache read and
+cache publication; lock order is `op_mu_` then `EchoDatabase::mu_`. New strings are interned
+inside the transaction and join the cache only after COMMIT. One `EchoFold` instance fronts a
+database. Counts come from `RETURNING`, never `sqlite3_changes()`.
+
+**Dictionary GC.** `gc_dictionary` deletes strings no `_r` table references, 2000 per statement,
+until none remain or the deadline passes. The deadline is cooperative: a progress handler
+interrupts a running batch (it rolls back) and the loop checks before each batch. It does not
+cover mutex acquisition, `BEGIN IMMEDIATE`'s 5 s busy wait or COMMIT I/O. A real failure is
+returned as an error, never as an empty success.
+
+**`echo.sql` and the authorizer.** The views read the dictionary and the `_r` tables, so
+`echo_query_authorizer` lets those tables be read ONLY when SQLite reports the access under a
+roll-up view (plus a column-less `COUNT(*)`-style read of a `_r` table, which exposes only a row
+count the view already shows). That rule is sound only because `validate_and_translate_sql`
+refuses `WITH`: SQLite reports a CTE's reads under the CTE's name, so a CTE named after a view
+would otherwise reach the dictionary. The authorizer rule is defence in depth behind that
+refusal, not the closure. Direct reads of `echo_dict`, `echo_fold_seen` and any `_r` table, and
+the `usage_*` tables, stay denied.
+
+**`install_fold_schema` is destructive.** A view cannot take the name of an existing table, so it
+drops a legacy tier table first. It exists as the migration precursor and has no production caller
+in this change.
+
 ---
 
 ## 4. Persistence across upgrade / uninstall / reinstall

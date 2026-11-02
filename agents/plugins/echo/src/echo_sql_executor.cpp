@@ -171,6 +171,10 @@ bool contains_dangerous_keyword(const std::string& stripped_sql) {
         "INSERT",    "UPDATE",  "DELETE",   "DROP",           "ALTER",   "CREATE",
         "ATTACH",    "DETACH",  "PRAGMA",   "REPLACE",        "REINDEX", "VACUUM",
         "SAVEPOINT", "RELEASE", "ROLLBACK", "LOAD_EXTENSION",
+        // WITH (a CTE) is refused so a CTE can never shadow a roll-up view name:
+        // echo_query_authorizer lets the dictionary and `_r` tables be read by a
+        // roll-up view, and SQLite reports a CTE's inner reads under the CTE's name.
+        "WITH",
     };
 
     for (auto kw : dangerous) {
