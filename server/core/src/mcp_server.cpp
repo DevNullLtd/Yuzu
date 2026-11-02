@@ -8569,7 +8569,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         bool rs_store_fault = false;
                         bool rs_store_unwired = false;
                         const auto rs_lookup_pair = [&](const std::string& instruction_id) {
-                            if (instruction_id.empty() || instruction_id.size() > kInstructionIdMaxLen)
+                            if (instruction_id.empty() ||
+                                instruction_id.size() > kInstructionIdMaxLen)
                                 return;
                             if (!instruction_store) {
                                 rs_store_unwired = true;
@@ -8594,7 +8595,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             if (!rs_id.empty() && rs_id.size() <= kResultSetIdMaxLen) {
                                 if (!result_set_store_) {
                                     rs_store_unwired = true;
-                                } else if (auto row_read = result_set_store_->get(rs_id); !row_read) {
+                                } else if (auto row_read = result_set_store_->get(rs_id);
+                                           !row_read) {
                                     rs_store_fault = true;
                                 } else if (const auto& row = *row_read;
                                            row && row->owner_principal == session->username &&
@@ -8602,7 +8604,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                                                kMcpMaxJsonDepth)) {
                                     if (row->source_kind == source_kind::kEchoQuery) {
                                         rs_pair.emplace("echo", "sql");
-                                    } else if (row->source_kind == source_kind::kInstructionResult) {
+                                    } else if (row->source_kind ==
+                                               source_kind::kInstructionResult) {
                                         const auto sp = nlohmann::json::parse(row->source_payload,
                                                                               nullptr, false);
                                         if (sp.is_object() && sp.contains("instruction_id") &&
@@ -13865,9 +13868,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // reevaluate_result_set) comes from a STORED definition that an editor can
                 // repoint between ticket approval and recall. Since L1 the C8 ticket binds that
                 // resolved pair (`ticket_bound_effect`, checked just above), so a repoint
-                // between approval and recall is refused; the Ticket stamp is STILL withheld,
-                // because a ticket approves the pair at the moment of approval and the pair's own
-                // ExecuteGate must still decide for a caller who is not an administrator.
+                // between approval and recall is refused; the Ticket stamp is STILL withheld, as
+                // a policy line (dispatch_caller.hpp): the pair is resolved from a store, not
+                // named in the call's arguments, so the pair's own ExecuteGate still decides
+                // for a caller who is not an administrator.
                 // A definition-resolved producer therefore NEVER carries Ticket.
                 // Only the echo-query source keeps the stamp: its pair is the fixed
                 // echo.sql, not read from anything an editor can change.

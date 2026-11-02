@@ -37,16 +37,16 @@
 /// operator-tier token's auto-approval and a supervised-tier ticket that C8 consumed are TIER
 /// facts about the caller; neither is an input to this module, and `Request` deliberately has no
 /// field through which one could arrive (`Request::expected_effect` is not one: it carries the
-/// effect a ticket was bound to, never an approval). `auto` dispatches; `always` and any unknown value
-/// (fail closed) need approval; `role-gated` needs approval unless the caller is an effective
+/// effect a ticket was bound to, never an approval). `auto` dispatches; `always` and any unknown
+/// value (fail closed) need approval; `role-gated` needs approval unless the caller is an effective
 /// administrator (`DispatchCaller::principal_is_admin`, JIT-elevation aware). A call that needs
 /// approval is answered `PendingApproval` and dispatches NOTHING. There is no redemption path
 /// for such a ticket: it is minted with `ApprovalOrigin::kInstruction`, which the MCP recall
 /// refuses (`origin_redeemable_as`), and no interactive redemption exists. Such a ticket records
 /// the definition, the scope expression and the resolved `target_plugin`/`target_action` ONLY: it
-/// does NOT approve explicit `agent_ids` or `params`
-/// (they are not stored with it), so any future redemption must bind them (a bound request,
-/// `ApprovalManager::submit_bound`) before it ships. An administrator
+/// does NOT approve explicit `agent_ids` or `params` (they are not stored with it), so any
+/// future redemption must bind them (a bound request, `ApprovalManager::submit_bound`) before it
+/// ships. An administrator
 /// still reaches `role-gated` definitions because the token or session carries the creator's
 /// role: that is a ROLE fact, not a tier fact.
 ///
