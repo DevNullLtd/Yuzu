@@ -4079,6 +4079,13 @@ TEST_CASE("registry offline: a path first learned for a pathless profile is take
     };
     OfflineDiscovery cut;
     cut.complete = false;
+    // An INCOMPLETE walk still fills a pathless known profile from what it did list, so its
+    // path needs the confirming walk too (the second walk is not limited to complete first walks).
+    const auto cut_listing = [&](const std::string& path) {
+        OfflineDiscovery d = listing(kSidA, path);
+        d.complete = false;
+        return d;
+    };
     struct Case {
         const char* name;
         OfflineDiscovery first, second;
@@ -4091,7 +4098,12 @@ TEST_CASE("registry offline: a path first learned for a pathless profile is take
                           Case{"walk 1 lists the TEMP folder, walk 2 lists a different path", misses_bak,
                                listing(kSidA, prof(kSidA).path), false},
                           Case{"walk 1 lists a path, walk 2 is incomplete and lists none", misses_bak, cut,
-                               false}}) {
+                               false},
+                          Case{"walk 1 is incomplete and lists the TEMP folder, walk 2 sees the pair",
+                               cut_listing(temp), sees_bak, false},
+                          Case{"walk 1 is incomplete and lists a path, walk 2 lists the same one",
+                               cut_listing(prof(kSidA).path), listing(kSidA, prof(kSidA).path),
+                               true}}) {
         INFO(c.name);
         OfflineRig r;
         const auto root = uroot(kSidA);
