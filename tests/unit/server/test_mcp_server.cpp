@@ -4124,6 +4124,90 @@ TEST_CASE("MCP confirm_engine_rotation: replay after success is kInvalidParams +
     CHECK(confirm_metric("success") == 1.0); // unchanged by the replay
 }
 
+TEST_CASE("MCP confirm_engine_rotation: retry_after_ms only on a transient store fault, never "
+          "on a conflict or a malformed pair (#6716)",
+          "[mcp][pg][engine_principal][confirm][retry_hint]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-hint";
+    const std::string malformed = "engine:mcp-confirm-malformed";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+    // Two active credentials that no rotation linked together.
+    REQUIRE(store.create_token("svc-a", malformed, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.create_token("svc-b", malformed, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+
+    auto rot = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"rotate_engine_credential","arguments":{"principal_id":"engine:mcp-confirm-hint"}}})");
+    REQUIRE(rot->status == 200);
+    const auto rot_payload = nlohmann::json::parse(
+        nlohmann::json::parse(rot->body)["result"]["content"][0]["text"].get<std::string>());
+    const auto token_id = rot_payload["token_id"].get<std::string>();
+    const auto secret = rot_payload["raw_token"].get<std::string>();
+    const auto confirm_call = [&](const std::string& pid, const std::string& tid,
+                                  const std::string& sec) {
+        return ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                      {"method", "tools/call"},
+                                      {"id", 7},
+                                      {"params",
+                                       {{"name", "confirm_engine_rotation"},
+                                        {"arguments",
+                                         {{"principal_id", pid},
+                                          {"token_id", tid},
+                                          {"secret", sec}}}}}}
+                           .dump());
+    };
+
+    // Transient: every store lease is held, so the confirm cannot read. kInternalError with the
+    // retry hint, like rotate_engine_credential.
+    {
+        auto held = hold_all_leases(pool);
+        auto r = confirm_call(principal, token_id, secret);
+        REQUIRE(r);
+        const auto body = nlohmann::json::parse(r->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"].get<int>() == -32603);
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultRetryMs);
+    }
+
+    // Success, then the replay: a terminal conflict (kInvalidParams) with a null hint.
+    auto ok = confirm_call(principal, token_id, secret);
+    REQUIRE(ok);
+    CHECK(nlohmann::json::parse(ok->body).contains("result"));
+    auto replay = confirm_call(principal, token_id, "irrelevant-secret");
+    REQUIRE(replay);
+    const auto replay_body = nlohmann::json::parse(replay->body);
+    REQUIRE(replay_body.contains("error"));
+    CHECK(replay_body["error"]["code"].get<int>() == -32602);
+    CHECK(replay_body["error"]["data"]["retry_after_ms"].is_null());
+
+    // A malformed pair is a conflict now, never the retryable class.
+    const auto active = store.list_active_for_principal(malformed);
+    REQUIRE(active.size() == 2);
+    auto bad = confirm_call(malformed, active.at(0).token_id, "irrelevant-secret");
+    REQUIRE(bad);
+    const auto bad_body = nlohmann::json::parse(bad->body);
+    REQUIRE(bad_body.contains("error"));
+    CHECK(bad_body["error"]["code"].get<int>() == -32602);
+    CHECK(bad_body["error"]["message"].get<std::string>().find("rotation pair is malformed") !=
+          std::string::npos);
+    CHECK(bad_body["error"]["data"]["retry_after_ms"].is_null());
+}
+
 // ── Human API-token rotation (P2 #11, SOC 2 CC6.3) ──────────────────────────
 //
 // rotate_api_token / confirm_api_token_rotation — MCP twins of POST
