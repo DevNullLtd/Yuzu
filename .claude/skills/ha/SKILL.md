@@ -68,7 +68,8 @@ three-model adversarial review's strongest, unanimous finding:
 > and its rollout item for any fleet that still connects directly.** (The last two
 > clauses were added 2026-10-13, and the WS-13 wording was changed 2026-11-02 —
 > agent failover answers losing a GATEWAY node, not a server replica, so slice 13.6 and
-> #5648/#5649 sit in no clause of this gate; the rest of
+> #5648/#5649 sit in no clause of this gate, and a one-gateway deployment is no longer gated on
+> WS-13 at all (the lead's call whether it should be; see the matrix decision note); the rest of
 > WS-11 does not gate. Shipping #4014 satisfies only
 > that one clause: **the gate is NOT lifted**, and a durable cluster-capability
 > admission gate, #6528, is separately unbuilt. The epoch fence across a lossy

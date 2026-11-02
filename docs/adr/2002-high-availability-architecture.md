@@ -30,9 +30,11 @@ be scoped to any single customer, and we must **not assume the customer runs HA 
 Three groundwork facts make this tractable rather than a rewrite:
 
 1. **The Erlang gateway already clusters** (OTP `pg` process groups, ETS registry) and already
-   tolerates *server* failover — on upstream reconnect it re-proxies a `ProxyRegister` for every
-   held agent because the new server "may be a fresh instance with an empty registry"
-   (`yuzu_gw_upstream.erl`). **But** per-agent *targeted* routing is today a **node-local ETS lookup**
+   tolerates *server* failover — it re-proxies a `ProxyRegister` for the agents a restarted or
+   replaced server no longer knows, because the new server "may be a fresh instance with an empty registry"
+   (`yuzu_gw_upstream.erl`). Since #5695 that replay is evidence-driven (a targeted replay of the
+   ids a heartbeat verdict lists as unknown; a full replay only when at least half of a batch is unknown or
+   a CONNECTED notice was lost), not an unconditional replay of every held agent on reconnect. **But** per-agent *targeted* routing is today a **node-local ETS lookup**
    (`yuzu_gw_registry:lookup`, `yuzu_gw_registry.erl:90`) — `pg` is used only for broadcast groups —
    so distributed intra-cluster agent→node routing is **net-new work**, not a free property (see §7).
 2. **ADR-0031 (presentation/core/engine decomposition)** already commits the direction: sessions and
@@ -470,8 +472,10 @@ cluster unit; intra-zone scale is more nodes.
   (#1894) is unchanged. **Deviation from an owner decision, recorded here and not resolved:** #5990
   (owner decision 2026-10-17) specifies decorrelated jitter, `min(cap, random_between(base, previous*3))`
   with a reset after a successful Register, and a 10,000-agent simulation test. 13.1 is a stateless window
-  with no previous-delay state, so the "never more than 3x the previous delay" and "reset after success"
-  acceptance items are not met by construction; #5990 stays open until the project lead rules whether this
+  with no previous-delay state, so the "never more than 3x the previous delay" acceptance item and the
+  previous-delay state are not met by construction. The reset after a successful Register holds
+  (`reconnect_count` returns to 0), and the 10,000-agent simulation exists as the "simulated fleet" case in
+  `tests/unit/test_reconnect_backoff.cpp`. #5990 stays open until the project lead rules whether this
   shape satisfies, amends or replaces it.
 - **Known gap, unconfirmed.** A gateway node that is up but has lost its server still acknowledges proxied
   heartbeats from node-local state (`yuzu_gw_agent_service:heartbeat/2`; an unknown session gets `NOT_FOUND`),
@@ -491,8 +495,12 @@ cluster unit; intra-zone scale is more nodes.
   losing a gateway node. What the reword does not cover: on a one-gateway deployment the failover items are
   vacuous, and slice 13.6 (a node that is up but has lost its server), the gateway's single circuit breaker
   across all upstream endpoints (#5648) and reconcile convergence on two replicas (#5649) are in no clause of
-  the gate and stay open. It tightens the gate for direct-connect fleets and loosens nothing for a deployment
-  with more than one gateway node. The gate is **not lifted**.
+  the gate and stay open. By deployment shape: a fleet that still connects directly is newly gated (the rollout
+  item); a deployment with several gateway nodes keeps the failover items but the gate no longer reaches slice
+  13.6, which did not exist when the old clause was written and which the matrix row now says belongs to
+  WS-13; a one-gateway deployment is no longer gated on any of WS-13, where the old clause required all of
+  it. Whether 13.6, or the one-gateway case, belongs in the gate is the project lead's decision and is not
+  made here. The gate is **not lifted**.
 
 **Status (WS-4): 4.1 done; 4.2a (writer-path hardening) done; 4.2b (Tasks A–D: store layer, per-site
 fail-closed posture + renew correlation, dispatch-wiring, `route_unreadable` consumer + alert rule) done;

@@ -161,7 +161,8 @@ TEST_CASE("the mean schedule is unchanged below the ceiling (only the spread is 
 
 TEST_CASE("simulated fleet: no one-second bucket holds more than a bounded share of retries",
           "[agent][reconnect_backoff]") {
-    // The #5990 acceptance shape: 10,000 agents lose their stream at t=0 and every retry
+    // The #5990 simulation shape (this test does not cover #5990's previous-delay or
+    // 3x-previous items): 10,000 agents lose their stream at t=0 and every retry
     // fails, so each agent's retry times are the running sum of its delays. The old fixed
     // ladder put ALL 10,000 in one bucket in every round. The source is a plain
     // `lo + engine() % range` on mt19937 (whose raw output is fixed by the standard), not
@@ -172,7 +173,7 @@ TEST_CASE("simulated fleet: no one-second bucket holds more than a bounded share
     // remove the first wave, only to break it into three and to widen it every round.
     constexpr int kAgents = 10'000;
     constexpr int kRounds = 8;
-    // Observed with this engine and seed: 3342 2016 1144 608 321 177 92 72. Bounds leave
+    // Observed with this engine and seed: 3351 2067 1127 620 344 171 96 67. Bounds leave
     // headroom for sampling noise only; the old ladder would read 10000 in every round.
     constexpr int kBound[kRounds] = {3500, 2200, 1300, 700, 400, 250, 150, 120};
 
@@ -184,7 +185,6 @@ TEST_CASE("simulated fleet: no one-second bucket holds more than a bounded share
     std::vector<int> when(kAgents, 0);
     std::set<int> round_eight_buckets;
     for (int round = 1; round <= kRounds; ++round) {
-        std::vector<int> bucket;
         for (int& t : when)
             t += reconnect_delay_secs(round, uniform);
         // Absolute retry second -> agents retrying in it.
@@ -210,14 +210,19 @@ TEST_CASE("simulated fleet: no one-second bucket holds more than a bounded share
 TEST_CASE("reconnect_seed: a working entropy source supplies the words and is not degraded",
           "[agent][reconnect_backoff]") {
     int next = 100;
+    int entropy_calls = 0;
     int fallback_calls = 0;
-    const auto seed = reconnect_seed([&next] { return static_cast<unsigned>(next++); },
+    const auto seed = reconnect_seed([&next, &entropy_calls] {
+                                         ++entropy_calls;
+                                         return static_cast<unsigned>(next++);
+                                     },
                                      [&fallback_calls] {
                                          ++fallback_calls;
                                          return 0u;
                                      });
     CHECK_FALSE(seed.degraded);
     CHECK(fallback_calls == 0);
+    CHECK(entropy_calls == 4);
     CHECK(seed.words == std::array<std::uint32_t, 4>{100, 101, 102, 103});
 }
 

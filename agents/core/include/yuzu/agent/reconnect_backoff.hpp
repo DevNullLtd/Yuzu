@@ -10,7 +10,7 @@
  * held loses its Subscribe stream in the same instant. A deterministic 2, 4, 8 ...
  * ladder sends all of them back at exactly the same moments, so the surviving nodes
  * (and the server behind them) take the failed node's whole share (about 1/N of the
- * fleet) as synchronised waves. Spreading each delay over a window removes the waves.
+ * fleet) as synchronised waves. Spreading each delay over a window flattens the waves.
  *
  * The window is centred on the old ladder value up to the 128 s step, so the MEAN delay
  * is unchanged there:
@@ -88,7 +88,7 @@ struct ReconnectSeed {
 /// comes from `fallback()` instead and `degraded` is set, so a failed entropy source costs
 /// the agent seed quality (a weak seed is fine for jitter, which is not a secret) and never
 /// a std::terminate on a path that has no handler. `fallback` must not throw and should
-/// return a different value per call and per process (clocks, addresses, a counter), never
+/// return a different value per call and per process (clocks, a thread id, a counter), never
 /// a constant, or agents cloned from one image would share a sequence.
 template <class Entropy, class Fallback>
 ReconnectSeed reconnect_seed(Entropy&& entropy, Fallback&& fallback) {

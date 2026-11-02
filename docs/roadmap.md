@@ -1587,7 +1587,7 @@ Agent mesh for peer content sharing within subnets:
 ### Issue 14.2: Multi-Gateway Topology
 **Capability:** 22.5 (extension) | **Scope:** Gateway + Server | **Status:** Open | **Issue:** #291 (HA WS-13, `docs/ha-delivery-matrix.md`)
 **Depends on:** 7.1, 7.1.1
-**Progress:** slice 13.1 (jittered agent reconnect delay) is done; failover, the WS-9 scenario and the rollout are not (see `docs/ha-delivery-matrix.md`, WS-13).
+**Progress:** WS-13 slice 1 (jittered agent reconnect delay) is done; failover, the WS-9 scenario and the rollout are not (see `docs/ha-delivery-matrix.md`, WS-13).
 
 Server supports multiple concurrent gateway registrations:
 - Gateway affinity: agents assigned to nearest gateway via latency probing

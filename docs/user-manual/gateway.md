@@ -427,8 +427,8 @@ from those two settings, not an observed figure. Plan for these requirements:
   agent connects at once with no wait, and the heartbeat-driven re-registration cooldown is
   unchanged and not randomised. Survivors absorb the returning share at the registration
   rates and limits described under the gateway's upstream admission settings
-  (`upstream_register_concurrency`, `upstream_register_queue_max`); size N-1 capacity from
-  those, and watch `yuzu_gw_agents_connected_total` and `yuzu_gw_upstream_permits_waiting`.
+  (`upstream_register_concurrency`, `upstream_register_queue_max`); plan N-1 capacity against
+  these limits, and watch `yuzu_gw_agents_connected_total` and `yuzu_gw_upstream_permits_waiting`.
 - **Quarantine.** A quarantined agent can reach only the server addresses it resolved at
   startup (this is deliberate: a compromised host's DNS must not decide what survives
   containment). Use addresses that stay the same (a virtual IP or fixed node addresses) for
@@ -439,8 +439,9 @@ from those two settings, not an observed figure. Plan for these requirements:
   whatever the state of its upstream (an unknown session gets `NOT_FOUND`), and the agent
   re-registers only on `NOT_FOUND` or `UNAUTHENTICATED`, so the agent sees every heartbeat
   succeed and its keepalives to the gateway stay healthy. It would stay on that node while
-  the server's 90 s route lease expires and the agent stops being dispatchable; look for the
-  gateway's upstream-unavailable signals, not for `UNAVAILABLE` lines in the agent log. This
+  the server's 90 s route lease expires and the agent stops being dispatchable; look at the
+  gateway's `yuzu_gw_upstream_circuit_transitions_total`, `yuzu_gw_upstream_rpc_errors_total` and
+  `/readyz`, not for `UNAVAILABLE` lines in the agent log. This
   has not been observed end to end; the HA WS-13 spike measures it.
 - **Agents older than 0.15.0** may wedge in their reconnect path and need a restart (see
   [Heartbeat admission](#heartbeat-admission)).
@@ -1342,7 +1343,7 @@ against a server that accepts TCP and never answers), is not
 retried elsewhere by the balancer, holds kernel socket memory that counts against a
 container's memory limit, and is accepted in one burst with all the others when the
 shedder resumes. Agents randomise each reconnect delay (see Agent reconnect and
-failover), so a refused fleet does not retry in step; the first retry is spread over only
+failover), so a refused fleet does not all retry at the same instant; the first retry is spread over only
 three seconds and the backoff widens it over the following minutes. While shedding, `/readyz`
 reports not-ready (the agent listener reads as not running, `"listeners":false`), so a
 load balancer drains this node automatically.
