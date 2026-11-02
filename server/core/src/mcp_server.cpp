@@ -26537,7 +26537,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 const std::string success_detail =
                     revoked_by_concurrent_request
                         ? revoked_count_detail + "; revoked_by_concurrent_request" +
-                              (superseded_by.empty() ? "" : "; superseded_by_not_persisted")
+                              (superseded_by.empty() ? "" : "; superseded_by_not_persisted") +
+                              (reason.empty() ? "" : "; reason=" + audit_token(reason))
                         : reason;
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "engine_principal.revoke", "success", "EnginePrincipal",

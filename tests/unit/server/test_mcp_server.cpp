@@ -4236,10 +4236,13 @@ TEST_CASE("MCP revoke_engine_principal: a fault after the credential revoke is r
     ts.engine_credential_store_for_test = &store;
     ts.engine_principal_store_for_test = &eps;
     ts.start();
-    const auto revoke_call = [&](const std::string& pid, const std::string& superseded_by = "") {
+    const auto revoke_call = [&](const std::string& pid, const std::string& superseded_by = "",
+                                 const std::string& reason = "") {
         nlohmann::json args{{"principal_id", pid}};
         if (!superseded_by.empty())
             args["superseded_by"] = superseded_by;
+        if (!reason.empty())
+            args["reason"] = reason;
         return ts.call(nlohmann::json{{"jsonrpc", "2.0"},
                                       {"method", "tools/call"},
                                       {"id", 5},
@@ -4317,7 +4320,7 @@ TEST_CASE("MCP revoke_engine_principal: a fault after the credential revoke is r
         make(pid);
         yuzu::server::test::IdentityRevokeFault fault{
             pool, yuzu::server::test::IdentityRevokeFault::Mode::Race};
-        auto r = revoke_call(pid, "engine:mcp-rv-successor");
+        auto r = revoke_call(pid, "engine:mcp-rv-successor", "rotate-out");
         REQUIRE(r);
         const auto p = payload_of(r);
         CHECK(p["revoked"].get<bool>() == true);
@@ -4326,8 +4329,8 @@ TEST_CASE("MCP revoke_engine_principal: a fault after the credential revoke is r
         const auto rows = revoke_rows();
         REQUIRE(rows.size() == 1); // a success row and no failure row for the same call
         CHECK(rows[0].first == "success");
-        CHECK(rows[0].second ==
-              "credentials_revoked=1; revoked_by_concurrent_request; superseded_by_not_persisted");
+        CHECK(rows[0].second == "credentials_revoked=1; revoked_by_concurrent_request; "
+                                "superseded_by_not_persisted; reason=rotate-out");
         // The row must not claim the caller's value was persisted.
         CHECK(rows[0].second.find("superseded_by=") == std::string::npos);
     }
