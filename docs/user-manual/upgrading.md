@@ -2236,7 +2236,8 @@ than 2048 bytes:
 
 - **Results page.** A static hint in the results summary, "A filter value is longer than 2048 bytes.
   Newly stored responses do not index values that long, so this filter may match nothing. Clear the
-  filter, or tick 'View without saved filters', and use the Search box." The hint never repeats the value, and
+  filter and use the Search box; if the filter comes from the View, tick 'View without saved
+  filters'." The hint never repeats the value, and
   the results, counts, Create Group button and the `422` are unchanged.
 - **REST agent-count preview and MCP preview tool.** `GET /api/v1/management-groups/agent-count-preview`
   and `preview_management_group_agent_count` add `unindexed_filter_keys` to the result: the filter keys

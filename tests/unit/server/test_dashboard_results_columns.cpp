@@ -129,10 +129,10 @@ struct DashboardResultsColumnsTestAccess {
         return routes.render_results(command_id, tier, plugin, sort_col, sort_dir, page, per_page,
                                      filters, text_query, /*definition_id=*/"", template_id);
     }
-    std::optional<std::vector<std::string>>
+    std::optional<DashboardRoutes::TextMatch>
     agents_matching(const std::string& command_id, const std::string& plugin,
-                    const std::string& text_query, bool* truncated) {
-        return routes.agents_matching_text(command_id, tier, plugin, {}, text_query, truncated);
+                    const std::string& text_query) {
+        return routes.agents_matching_text(command_id, tier, plugin, {}, text_query);
     }
     DashboardRoutes::MatchingResponses load(const std::string& command_id,
                                             const std::vector<FacetFilter>& filters) {
@@ -1318,6 +1318,14 @@ TEST_CASE("load_matching_responses: the filtered read reports a cut at the row c
         const auto html = acc.render_view(cmd, "registry", "agent", "asc", 1, 50, filters, "");
         CHECK_FALSE(contains(html, "data-result-truncated"));
     }
+    SECTION("the unfiltered read honours the same cap") {
+        yuzu::test::ResultsRowCapGuard cap{2};
+        const auto loaded = acc.load(cmd, {});
+        CHECK_FALSE(loaded.store_degraded);
+        CHECK(loaded.result_truncated);
+        yuzu::test::ResultsRowCapGuard roomy{3};
+        CHECK_FALSE(acc.load(cmd, {}).result_truncated);
+    }
 }
 
 TEST_CASE("agents_matching_text: one entry per matching agent, however many rows match",
@@ -1333,13 +1341,12 @@ TEST_CASE("agents_matching_text: one entry per matching agent, however many rows
     DashboardResultsColumnsTestAccess acc;
     acc.set_stores(nullptr, &rs);
 
-    bool truncated = true;
-    const auto ids = acc.agents_matching(cmd, "registry", "alp", &truncated);
-    REQUIRE(ids.has_value());
-    CHECK_FALSE(truncated);
-    CHECK(std::set<std::string>(ids->begin(), ids->end()) ==
+    const auto match = acc.agents_matching(cmd, "registry", "alp");
+    REQUIRE(match.has_value());
+    CHECK_FALSE(match->truncated);
+    CHECK(std::set<std::string>(match->ids.begin(), match->ids.end()) ==
           std::set<std::string>{"agent-1", "agent-3"});
-    CHECK(ids->size() == 2); // agent-1 owns two matching rows but appears once
+    CHECK(match->ids.size() == 2); // agent-1 owns two matching rows but appears once
 }
 
 TEST_CASE("render_filter_bar: every control joins the newest-wins scope; the form drops a "

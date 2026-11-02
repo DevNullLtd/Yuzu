@@ -136,6 +136,23 @@ static std::string refusal_toast_header(const char* message) {
     return trigger.dump(-1, ' ', true, nlohmann::ordered_json::error_handler_t::replace);
 }
 
+/// The refusal sentence for a group set cut by the read cap (toast and body say the same thing).
+static constexpr const char* kGroupPartialRefusal =
+    "The result set was cut by the read cap, so the agent list is partial. "
+    "Nothing was created. Narrow the filters and try again.";
+
+/// Intersects @p ids with the caller's visible @p scope (nullopt = sees all); returns how many
+/// ids were dropped. The one scope intersection the group preview and the group POST share.
+static std::size_t keep_visible(std::vector<std::string>& ids,
+                                const std::optional<std::vector<std::string>>& scope) {
+    if (!scope)
+        return 0;
+    const std::unordered_set<std::string> scope_set(scope->begin(), scope->end());
+    const auto before = ids.size();
+    std::erase_if(ids, [&scope_set](const std::string& id) { return !scope_set.contains(id); });
+    return before - ids.size();
+}
+
 static bool any_filter_value_too_long(const std::vector<FacetFilter>& filters) {
     return std::any_of(filters.begin(), filters.end(),
                        [](const FacetFilter& f) { return facet_filter_value_over_bound(f.value); });
@@ -647,18 +664,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                         if (text_query.empty()) {
                             agent_count = response_store_->facet_agent_count(
                                 command_id, *tier, filters, agent_scope);
-                        } else if (auto ids = agents_matching_text(command_id, *tier, plugin,
-                                                                    filters, text_query,
-                                                                    &partial)) {
+                        } else if (auto match = agents_matching_text(command_id, *tier, plugin,
+                                                                      filters, text_query)) {
                             // Same scope intersection the POST applies before it counts.
-                            if (agent_scope) {
-                                const std::unordered_set<std::string> scope_set(
-                                    agent_scope->begin(), agent_scope->end());
-                                std::erase_if(*ids, [&scope_set](const std::string& id) {
-                                    return !scope_set.contains(id);
-                                });
-                            }
-                            agent_count = static_cast<int64_t>(ids->size());
+                            keep_visible(match->ids, agent_scope);
+                            agent_count = static_cast<int64_t>(match->ids.size());
+                            partial = match->truncated;
                         }
                     }
                 }
@@ -757,10 +768,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // this 200: they answer the shared retryable A4 503
                      // (`respond_forensics_tier_unknown`, with `retry_after_ms`), as the
                      // read-side twin does.
-                     res.set_header(
-                         "HX-Trigger",
-                         R"({"showToast":{"message":"The permission check for this action could )"
-                         R"(not be completed. Nothing was created. Retry shortly.","level":"error"}})");
+                     res.set_header("HX-Trigger", refusal_toast_header(
+                         "The permission check for this action could not be completed. "
+                         "Nothing was created. Retry shortly."));
                      res.set_content(
                          "<span class=\"feedback-error\">"
                          "The permission check for this action could not be completed. "
@@ -771,18 +781,20 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // A Search term narrows the set by the same per-line predicate the results table
                  // renders (agents_matching_text); filters alone keep the facet-index lookup.
                  bool read_truncated = false;
-                 auto agent_ids_opt =
-                     text_query.empty()
-                         ? response_store_->facet_agent_ids(command_id, *tier, filters)
-                         : agents_matching_text(command_id, *tier, plugin, filters, text_query,
-                                                &read_truncated);
+                 std::optional<std::vector<std::string>> agent_ids_opt;
+                 if (text_query.empty()) {
+                     agent_ids_opt = response_store_->facet_agent_ids(command_id, *tier, filters);
+                 } else if (auto match =
+                                agents_matching_text(command_id, *tier, plugin, filters, text_query)) {
+                     read_truncated = match->truncated;
+                     agent_ids_opt = std::move(match->ids);
+                 }
                  if (!agent_ids_opt.has_value()) {
                      res.status = 503;
                      // Same toast channel as the refusal above (the form never swaps a body).
-                     res.set_header(
-                         "HX-Trigger",
-                         R"({"showToast":{"message":"Agent count unavailable. The response store )"
-                         R"(could not be read. Nothing was created. Retry shortly.","level":"error"}})");
+                     res.set_header("HX-Trigger", refusal_toast_header(
+                         "Agent count unavailable. The response store could not be read. "
+                         "Nothing was created. Retry shortly."));
                      res.set_content(
                          "<span class=\"feedback-error\">"
                          "Agent count unavailable — the response store could not be read. "
@@ -796,14 +808,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // body/HX-Retarget is never shown; the toast is the operator's signal.
                      res.status = 422;
                      res.set_header("HX-Retarget", "#group-form-slot");
-                     res.set_header("HX-Trigger", refusal_toast_header(
-                         "The result set was cut by the read cap, so the agent list is partial. "
-                         "Nothing was created. Narrow the filters and try again."));
-                     res.set_content(
-                         "<span class=\"feedback-error\">"
-                         "The result set was cut by the read cap, so the agent list is partial. "
-                         "Nothing was created. Narrow the filters and try again.</span>",
-                         "text/html; charset=utf-8");
+                     res.set_header("HX-Trigger", refusal_toast_header(kGroupPartialRefusal));
+                     res.set_content(std::string("<span class=\"feedback-error\">") +
+                                         kGroupPartialRefusal + "</span>",
+                                     "text/html; charset=utf-8");
                      return;
                  }
                  auto& agent_ids = *agent_ids_opt;
@@ -815,23 +823,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // bespoke error. JIT-elevated: full-fleet view (see
                  // render_filter_bar's identical comment).
                  auto agent_scope = resolve_visible_scope(*session);
-                 if (agent_scope) {
-                     std::unordered_set<std::string> scope_set(agent_scope->begin(),
-                                                                agent_scope->end());
-                     std::size_t before = agent_ids.size();
-                     std::erase_if(agent_ids, [&scope_set](const std::string& id) {
-                         return !scope_set.contains(id);
-                     });
-                     std::size_t dropped = before - agent_ids.size();
-                     if (dropped > 0) {
-                         // target_type "Execution" matches the existing response.read
-                         // denied-row convention (server.cpp's aggregate surface), not
-                         // "Response" — so SIEM rules filtering on the established
-                         // taxonomy see this row too.
-                         audit_fn_(req, "response.read", "denied", "Execution", command_id,
-                                   "scope_dropped=" + std::to_string(dropped) +
-                                       " surface=group_from_results");
-                     }
+                 if (const auto dropped = keep_visible(agent_ids, agent_scope); dropped > 0) {
+                     // target_type "Execution" matches the existing response.read
+                     // denied-row convention (server.cpp's aggregate surface), not
+                     // "Response" — so SIEM rules filtering on the established
+                     // taxonomy see this row too.
+                     audit_fn_(req, "response.read", "denied", "Execution", command_id,
+                               "scope_dropped=" + std::to_string(dropped) +
+                                   " surface=group_from_results");
                  }
 
                  if (agent_ids.empty()) {
@@ -2567,7 +2566,7 @@ DashboardRoutes::load_matching_responses(const std::string& command_id,
         // cut is therefore reported even when every dropped row was out of this caller's scope
         // (conservative, never silent).
         ResponseQuery q;
-        q.limit = 10000; // upper bound
+        q.limit = results_row_cap().load(); // the same row bound the filtered branch reads
         auto bounded_opt = response_store_->query_bounded(command_id, tier, q, std::nullopt,
                                                           export_body_byte_cap().load());
         out.store_degraded = !bounded_opt.has_value();
@@ -2601,23 +2600,22 @@ DashboardRoutes::load_matching_responses(const std::string& command_id,
     return out;
 }
 
-std::optional<std::vector<std::string>>
+std::optional<DashboardRoutes::TextMatch>
 DashboardRoutes::agents_matching_text(const std::string& command_id, const ResponseTierFilter& tier,
                                       const std::string& plugin,
                                       const std::vector<FacetFilter>& filters,
-                                      const std::string& text_query, bool* truncated) const {
+                                      const std::string& text_query) const {
     auto loaded = load_matching_responses(command_id, tier, filters);
     if (loaded.store_degraded)
         return std::nullopt;
-    if (truncated)
-        *truncated = loaded.result_truncated;
 
     std::vector<std::string> stored_values;
     stored_values.reserve(filters.size());
     for (const auto& f : filters)
         stored_values.push_back(facet_filter_stored_form(f.value));
 
-    std::vector<std::string> ids;
+    TextMatch match;
+    match.truncated = loaded.result_truncated;
     std::unordered_set<std::string> seen;
     for (const auto& resp : loaded.responses) {
         if (seen.contains(resp.agent_id))
@@ -2627,12 +2625,12 @@ DashboardRoutes::agents_matching_text(const std::string& command_id, const Respo
             if (result_line_matches(split_fields(plugin, line), agent_name, filters, stored_values,
                                     text_query)) {
                 seen.insert(resp.agent_id);
-                ids.push_back(resp.agent_id);
+                match.ids.push_back(resp.agent_id);
                 break;
             }
         }
     }
-    return ids;
+    return match;
 }
 
 // ---------------------------------------------------------------------------
@@ -3004,8 +3002,8 @@ std::string DashboardRoutes::render_results(
         html += " <span class=\"result-degrade-banner\" data-filter-too-long=\"true\">"
                 "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
                 " bytes. Newly stored responses do not index values that long, so this "
-                "filter may match nothing. Clear the filter, or tick 'View without saved filters', "
-                "and use the Search box.</span>";
+                "filter may match nothing. Clear the filter and use the Search box; if the filter "
+                "comes from the View, tick 'View without saved filters'.</span>";
     }
     html += "</div>";
 

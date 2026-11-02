@@ -373,12 +373,16 @@ private:
 
     /// Distinct agent ids (first-seen order) with at least one line matching both the column
     /// @p filters and the free-text @p text_query, using exactly the predicate the results table
-    /// renders. nullopt = the store is degraded. @p truncated is set when the read behind the set
+    /// renders. nullopt = the store is degraded. `truncated` is set when the read behind the set
     /// was cut by the row/byte cap, i.e. the set is partial.
-    std::optional<std::vector<std::string>>
+    struct TextMatch {
+        std::vector<std::string> ids;
+        bool truncated{false};
+    };
+    std::optional<TextMatch>
     agents_matching_text(const std::string& command_id, const ResponseTierFilter& tier,
                          const std::string& plugin, const std::vector<FacetFilter>& filters,
-                         const std::string& text_query, bool* truncated) const;
+                         const std::string& text_query) const;
 
     /// Render filtered/sorted/paginated result rows + OOB thead, pagination,
     /// summary. Every sort/pager link carries only the identity of the view (command, plugin,

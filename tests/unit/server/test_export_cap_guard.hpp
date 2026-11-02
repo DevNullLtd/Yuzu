@@ -27,7 +27,7 @@ private:
     std::size_t saved_;
 };
 
-/// Scoped override of the `/fragments/results` filtered-read row cap (twin of the guard above).
+/// Scoped override of the `/fragments/results` read row cap (twin of the guard above).
 class ResultsRowCapGuard {
 public:
     explicit ResultsRowCapGuard(int cap) : saved_(yuzu::server::results_row_cap().exchange(cap)) {}

@@ -460,12 +460,10 @@ TEST_CASE("dashboard execute: only a dispatched send carries X-Yuzu-Dispatched, 
     }
 }
 
-// Same-site gate (browser_write_is_cross_site): a cookie session needs an Origin or Referer naming
-// this site. The refusal comes before any parsing, the audit-before-dispatch row and the dispatch.
 // ── #5677 / #6075: a Send (or help) replaces the results, so it aborts the old request ─────
 
-TEST_CASE("dashboard execute: a dispatch aborts an in-flight results request and stamps the pager "
-          "with the new command id",
+TEST_CASE("dashboard execute: a dispatch aborts an in-flight results request and replaces the "
+          "pager",
           "[server][dashboard][execute][sync]") {
     Harness h;
     auto res = h.post("instruction=version&scope=__all__");
@@ -511,6 +509,8 @@ TEST_CASE("dashboard execute: help aborts an in-flight results request and repla
     CHECK(h.calls.empty());
 }
 
+// Same-site gate (browser_write_is_cross_site): a cookie session needs an Origin or Referer naming
+// this site. The refusal comes before any parsing, the audit-before-dispatch row and the dispatch.
 TEST_CASE("dashboard execute: a cookie-session write without a same-site Origin is refused",
           "[server][dashboard][execute][csrf][security]") {
     Harness h;

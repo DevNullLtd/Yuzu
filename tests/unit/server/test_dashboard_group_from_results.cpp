@@ -55,7 +55,9 @@
  * exactly as test_dashboard_echo_fragments.cpp:563-582 documents.
  */
 
+#include "agent_registry.hpp"
 #include "dashboard_routes.hpp"
+#include "event_bus.hpp"
 #include "management_group_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -67,10 +69,14 @@
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
 #include <libpq-fe.h>
+
+#include "agent.pb.h"
 
 #include <initializer_list>
 #include <memory>
@@ -86,6 +92,7 @@ using namespace yuzu::server;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
+namespace agent_pb = ::yuzu::agent::v1;
 
 namespace {
 
@@ -170,6 +177,11 @@ struct GroupFromResultsHarness {
     // #4990: the caller's Forensics visibility (admin by default so the cases that are not about
     // the tier keep their meaning). Declared before `routes`: the resolver borrows it.
     yuzu::server::test::ForensicsCaller forensics;
+    // The Search term also matches an agent's registry display name. Unwired (nullptr) unless the
+    // case asks for it; declared before `routes`, which borrows the registry by raw pointer.
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::EventBus bus;
+    std::unique_ptr<yuzu::server::detail::AgentRegistry> registry;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
 
@@ -204,8 +216,12 @@ struct GroupFromResultsHarness {
     ///        documented contract (dashboard_routes.hpp) -- CDX-FV-05 needs
     ///        this to actually prove the route reads a configured allowlist,
     ///        which a post-construction call would not exercise correctly.
+    /// @param with_registry true → wire an AgentRegistry (see @ref register_host).
     explicit GroupFromResultsHarness(bool degrade_response_store = false,
-                                     std::vector<std::string> csrf_trusted_origins = {}) {
+                                     std::vector<std::string> csrf_trusted_origins = {},
+                                     bool with_registry = false) {
+        if (with_registry)
+            registry = std::make_unique<yuzu::server::detail::AgentRegistry>(bus, metrics);
         // ManagementGroupStorePg's own constructor already SKIPs the whole
         // TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset (before this body
         // runs, per member-initialization order) — REQUIRE here is a
@@ -263,7 +279,7 @@ struct GroupFromResultsHarness {
 
         routes.register_routes(
             sink, auth_fn, perm_fn, audit_fn, rs_.get(), &mg,
-            /*registry=*/nullptr, /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+            registry.get(), /*tag_store=*/nullptr, /*event_bus=*/nullptr,
             /*agents_json_fn=*/[] { return std::string{"[]"}; },
             /*dispatch_fn=*/DashboardRoutes::DispatchFn{},
             /*caller_fn=*/DashboardRoutes::CallerFn{},
@@ -277,6 +293,19 @@ struct GroupFromResultsHarness {
     }
 
     ResponseStore& rs() const { return *rs_; }
+
+    /// Registers @p agent_id under @p hostname (the registry's display name for it). Needs the
+    /// harness built with `with_registry`.
+    void register_host(const std::string& agent_id, const std::string& hostname) {
+        REQUIRE(registry != nullptr);
+        agent_pb::AgentInfo info;
+        info.set_agent_id(agent_id);
+        info.set_hostname(hostname);
+        info.mutable_platform()->set_os("linux");
+        info.mutable_platform()->set_arch("x86_64");
+        info.set_agent_version("0.13.0");
+        (void)registry->register_agent(info);
+    }
 
     static std::unordered_map<std::string, std::string> same_site_headers() {
         return {{"Host", kHost}, {"Origin", std::string{"https://"} + kHost}};
@@ -945,6 +974,72 @@ TEST_CASE("create-group-form: previews the Search-term count and carries q as a 
     auto plain = h.sink.Get(base + "&f_category=cat-a");
     REQUIRE(plain != nullptr);
     CHECK_FALSE(contains(plain->body, "name=\"q\""));
+}
+
+// A Search set is still confined to the caller's visible scope: the preview and the persisted
+// membership both drop an agent the caller may not read, even though its lines match the term.
+TEST_CASE("group-from-results: a Search set is confined to the visible scope, in the preview and "
+          "in the persisted membership",
+          "[pg][server][dashboard][group_from_results][search][scope]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-B", "cat-a", "alpha2"); // matches q, out of scope
+    seed_titled_response(h.rs(), "agent-C", "cat-a", "beta");   // in scope, not a match
+    h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{"agent-A", "agent-C"};
+    };
+    const std::string base = std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                             "&plugin=" + kPlugin;
+
+    SECTION("the preview counts, and the group holds, only the visible match") {
+        auto form = h.sink.Get(base + "&q=alp");
+        REQUIRE(form != nullptr);
+        CHECK(contains(form->body, "1 agent will be added"));
+        CHECK_FALSE(contains(form->body, "2 agents will be added"));
+
+        auto res = h.post(q_form_body("q-confined", "&q=alp"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("q-confined");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
+        REQUIRE(h.audits_for("response.read", "denied") == 1);
+        CHECK(h.audit_detail("response.read", "denied") ==
+              "scope_dropped=1 surface=group_from_results");
+    }
+    SECTION("every match out of scope: the existing 422, and no group") {
+        auto res = h.post(q_form_body("q-all-dropped", "&q=alpha2"));
+        CHECK(res->status == 422);
+        CHECK(res->body ==
+              "<span class=\"feedback-error\">No agents match the current filters.</span>");
+        CHECK_FALSE(h.mg.find_group_by_name("q-all-dropped").has_value());
+        CHECK(h.audit_detail("response.read", "denied") ==
+              "scope_dropped=1 surface=group_from_results");
+    }
+}
+
+// The Search term also matches the agent's registry display name (the same predicate the results
+// table renders), so an agent whose stored lines do not contain the term still joins the group.
+TEST_CASE("group-from-results: a Search term matching only an agent's registry display name "
+          "includes that agent, in the preview and in the persisted membership",
+          "[pg][server][dashboard][group_from_results][search]") {
+    GroupFromResultsHarness h(/*degrade_response_store=*/false, /*csrf_trusted_origins=*/{},
+                              /*with_registry=*/true);
+    h.register_host("agent-D", "zeta-box");
+    h.register_host("agent-E", "plain-box");
+    seed_titled_response(h.rs(), "agent-D", "cat-a", "alpha"); // no "zeta" in any stored field
+    seed_titled_response(h.rs(), "agent-E", "cat-a", "alpha");
+    const std::string base = std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                             "&plugin=" + kPlugin;
+
+    auto form = h.sink.Get(base + "&q=zeta");
+    REQUIRE(form != nullptr);
+    CHECK(contains(form->body, "1 agent will be added"));
+
+    auto res = h.post(q_form_body("q-by-host", "&q=zeta"));
+    CHECK(res->status == 200);
+    auto group = h.mg.find_group_by_name("q-by-host");
+    REQUIRE(group.has_value());
+    CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-D"});
 }
 
 // A set cut by a read cap is partial; a group is never materialised from it.

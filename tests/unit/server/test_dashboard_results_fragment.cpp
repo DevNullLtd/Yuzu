@@ -536,8 +536,8 @@ constexpr std::string_view kTooLongMarker = "data-filter-too-long";
 std::string expected_hint_text() {
     return "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
            " bytes. Newly stored responses do not index values that long, so this filter may "
-           "match nothing. Clear the filter, or tick 'View without saved filters', and use the "
-           "Search box.";
+           "match nothing. Clear the filter and use the Search box; if the filter comes from the "
+           "View, tick 'View without saved filters'.";
 }
 
 // The whole hint element, from its opening `<span` through `</span>`, so an echo check covers
