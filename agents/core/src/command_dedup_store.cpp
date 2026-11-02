@@ -542,14 +542,14 @@ void CommandDedupStore::refresh_row_count_locked() noexcept {
     std::int64_t rows = kRowCountUnknown;
     if (db_) {
         sqlite3_stmt* raw_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM command_outcomes", -1, &raw_stmt,
-                               nullptr) == SQLITE_OK) {
-            StmtPtr stmt(raw_stmt);
-            if (sqlite3_step(stmt.get()) == SQLITE_ROW)
-                rows = sqlite3_column_int64(stmt.get(), 0);
-        } else if (raw_stmt) {
-            sqlite3_finalize(raw_stmt);
-        }
+        const int prep =
+            sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM command_outcomes", -1, &raw_stmt, nullptr);
+        // Owned from here on EVERY path, including a failed prepare: SQLite leaves *ppStmt
+        // NULL on error and sqlite3_finalize(NULL) is a documented no-op, so there is no
+        // manual cleanup branch to forget.
+        StmtPtr stmt(raw_stmt);
+        if (prep == SQLITE_OK && sqlite3_step(stmt.get()) == SQLITE_ROW)
+            rows = sqlite3_column_int64(stmt.get(), 0);
     }
     cached_rows_.store(rows, std::memory_order_relaxed);
 }
