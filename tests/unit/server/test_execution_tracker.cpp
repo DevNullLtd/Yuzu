@@ -2964,6 +2964,85 @@ TEST_CASE("ExecutionTracker: WS-2a mark_cancelled durably appends a terminal "
     CHECK(rows[0].data.find("cancelled") != std::string::npos);
 }
 
+// #3845: `mark_cancelled_checked` is the three-way form of `mark_cancelled`. The cancel route
+// maps the three outcomes to 200 / 409 / 503, so a regression that collapses kNoOp into kFailed
+// (the pre-#3845 shape) would turn "unknown or already finished" back into a false "store
+// degraded" 503. Pin each outcome and its side effects directly.
+TEST_CASE("ExecutionTracker: #3845 mark_cancelled_checked reports kCancelled for a running "
+          "execution and kNoOp (not kFailed) for an already-terminal one",
+          "[pg][execution_tracker][outbox]") {
+    using Outcome = ExecutionTracker::MarkCancelledOutcome;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution()); // status "running"
+    REQUIRE(id.has_value());
+
+    CHECK(tracker.mark_cancelled_checked(*id, "admin") == Outcome::kCancelled);
+    auto after_first = fetch_outbox(tracker_bundle.pool(), *id);
+    REQUIRE(after_first.size() == 1);
+
+    // Second cancel of the same (now terminal) execution: a clean no-op, not a store failure,
+    // and it must not append a second, contradictory terminal frame.
+    CHECK(tracker.mark_cancelled_checked(*id, "admin") == Outcome::kNoOp);
+    CHECK(fetch_outbox(tracker_bundle.pool(), *id).size() == 1);
+
+    auto exec = tracker.get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
+}
+
+TEST_CASE("ExecutionTracker: #3845 mark_cancelled_checked reports kNoOp for an unknown id and "
+          "writes nothing",
+          "[pg][execution_tracker][outbox]") {
+    using Outcome = ExecutionTracker::MarkCancelledOutcome;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    CHECK(tracker.mark_cancelled_checked("does-not-exist", "admin") == Outcome::kNoOp);
+    // No phantom event-without-state (ADR-2002 §5 pairing).
+    CHECK(fetch_outbox(tracker_bundle.pool(), "does-not-exist").empty());
+}
+
+// No [pg] tag: an unreachable port fails construction deterministically, so this needs no
+// database (same construction as "a store bound to an unreachable pool degrades every method").
+// It pins the `!open_` early return; it cannot tell that guard from a failing pool, which also
+// yields kFailed.
+TEST_CASE("ExecutionTracker: #3845 mark_cancelled_checked reports kFailed for a store that "
+          "never opened",
+          "[execution_tracker]") {
+    using Outcome = ExecutionTracker::MarkCancelledOutcome;
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid());
+    ExecutionTracker closed(unreachable);
+    REQUIRE(!closed.is_open());
+    CHECK(closed.mark_cancelled_checked("exec-1", "tester") == Outcome::kFailed);
+}
+
+TEST_CASE("ExecutionTracker: #3845 mark_cancelled_checked reports kFailed when the paired "
+          "outbox append fails, and rolls the cancel back",
+          "[pg][execution_tracker][outbox]") {
+    using Outcome = ExecutionTracker::MarkCancelledOutcome;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(lease.get(), "DROP TABLE execution_tracker.event_outbox",
+                                   std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+    CHECK(tracker.mark_cancelled_checked(*id, "admin") == Outcome::kFailed);
+    auto exec = tracker.get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running");
+}
+
 TEST_CASE("ExecutionTracker: WS-2a events appended on one instance are durable "
           "and readable from a SEPARATE instance (WS-9 failover scenario)",
           "[pg][execution_tracker][outbox]") {
