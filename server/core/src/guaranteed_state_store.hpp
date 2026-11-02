@@ -55,8 +55,9 @@
 ///    failure) bump the existing `yuzu_server_guardian_events_{dropped,ingest_errors}_total` family (ADR-0037
 ///    label convention) IN ADDITION to the existing four-way
 ///    `EventInsertOutcome` classification + its per-outcome atomics below.
-///  - **Status upserts — fail-soft with the same counter**; status READS stay
-///    type-distinguishable (see above).
+///  - **Status upserts — fail-soft**; the census upsert has its own failure counter and runs in
+///    the event transaction under a savepoint (ADR-0038 Update, 2026-10-31, #5674); status READS
+///    stay type-distinguishable (see above).
 ///  - **DEX analytic reads — deferred widening (ADR-0038, follow-up #2659).**
 ///    The ~20 `dex_*` aggregate reads plus `query_events` / `rule_activity` /
 ///    `daily_remediations` / `query_observations` KEEP their plain
@@ -492,6 +493,7 @@ public:
     uint64_t observations_proj_failures_total() const noexcept {
         return observations_proj_failures_.load();
     }
+    uint64_t census_proj_failures_total() const noexcept { return census_proj_failures_.load(); }
     uint64_t observations_reaped_total() const noexcept { return observations_reaped_.load(); }
     uint64_t events_dropped_total() const noexcept { return events_dropped_.load(); }
     uint64_t events_redelivered_total() const noexcept { return events_redelivered_.load(); }
@@ -530,6 +532,9 @@ private:
     std::atomic<uint64_t> events_written_{0};
     std::atomic<uint64_t> events_reaped_{0};
     std::atomic<uint64_t> observations_proj_failures_{0};
+    // census upsert failed for a reason other than a 23503 refusal; the failure does not discard
+    // the event (counted before the caller's COMMIT)
+    std::atomic<uint64_t> census_proj_failures_{0};
     std::atomic<uint64_t> observations_reaped_{0};
     std::atomic<uint64_t> events_dropped_{0};      // event_id conflict, MISMATCHED payload
     std::atomic<uint64_t> events_redelivered_{0};  // event_id conflict, MATCHING payload

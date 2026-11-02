@@ -2,7 +2,7 @@
 """Behavioural check of the /swagger page's renderer.
 
 test_swagger_page.cpp pins the page text (no innerHTML and so on); this runs the script. The
-two script pieces (kSwaggerJs1 and kSwaggerJs2) are cut out of server/core/src/swagger_page_ui.cpp
+script pieces (kSwaggerJs1, kSwaggerJs2, ...) are cut out of server/core/src/swagger_page_ui.cpp
 and executed under node against a minimal fake DOM and a queued fetch, then asserts what an
 operator would see: one panel per group and one row per operation, the typed / untyped /
 unavailable pills, a guide that opens on demand, oneOf alternatives rendered as tables, hostile
@@ -247,6 +247,7 @@ const out = {};
   out.model_c = models.C.textContent;
   out.model_a = models.A.textContent;
   out.model_d_text = models.D.textContent;
+  out.model_d_logged = consoleErrors.some(e => e.includes('could not draw model D'));
   const dBtn = models.D.byClass('sw-model-h')[0];
   out.model_d_state = dBtn.getAttribute('aria-expanded') + '/' + dBtn.lastChild.textContent + '/' + models.D.byClass('sw-error').length;
   dBtn.click();
@@ -341,12 +342,21 @@ const out = {};
   out.f_500_body_cid = root.textContent;
   await reload({ fail: true });                                                          // the network is down
   out.f_net = root.textContent; out.f_net_retry = root.byTag('button').length;
-  await reload({ status: 200, body: null });                                              // build() throws on a null document
+  await reload({ status: 200, body: { paths: {}, get tags() { throw new Error('boom-build'); } } });   // build() throws on a document that has paths
   out.f_null_doc = root.textContent; out.f_null_doc_retry = root.byTag('button').length;
   await reload({ status: 200, body: { tags: [], paths: {} } });                           // an empty but valid document renders
   out.f_empty_panels = root.byTag('section').length;
   out.f_empty_text = root.textContent;
   out.console_errors = consoleErrors.length;
+  await reload({ status: 200, body: null });                                              // JSON null is not a document either
+  out.f_null_msg = root.textContent;
+  await reload({ status: 200, body: {} });                                                // JSON, but not an API description
+  out.f_obj_doc = root.textContent; out.f_obj_doc_retry = root.byTag('button').length;
+  out.f_paths_bad = [];
+  for (const bad of [[], 'text', 5, [{ '/a': {} }]]) {   // build() reads a non-object `paths` as empty; the page must not show that as a reference
+    await reload({ status: 200, body: { paths: bad } });
+    out.f_paths_bad.push(root.textContent.includes('not with an API description') && root.byTag('button').length === 1);
+  }
 
   // ---- the live regions: loading and failure are announced, the success view is not ----
   queue.push({ status: 503 }); location.hash = ''; (0, eval)(js);
@@ -418,6 +428,46 @@ const out = {};
   out.f_none_toc = tocHidden();
   setQ(''); out.f_back_toc = tocHidden(); out.f_back_empty = emptyEl().hidden; out.f_back_shown = shown().length;
 
+  // ---- a part that cannot be drawn is logged by name; a $ref'd header and a cut model list ----
+  let armed = false;
+  const boomOp = { summary: 'boom op', tags: ['Boom'], responses: R() };
+  Object.defineProperty(boomOp, 'requestBody', { get() { if (armed) throw new Error('boom-op'); return undefined; }, enumerable: true });
+  const boomGuide = { summary: '' };
+  Object.defineProperty(boomGuide, 'overview', { get() { if (armed) throw new Error('boom-guide'); return ['x']; }, enumerable: true });
+  const hdrs = { ETag: { $ref: '#/components/headers/ETag' }, Gone: { $ref: '#/components/headers/Nope' }, Own: { description: 'inline one' }, Num: { $ref: 7 }, constructor: { $ref: '#/components/headers/constructor' } };
+  const specB = {
+    openapi: '3.0.3', info: { title: 't', version: '1' },
+    tags: [{ name: 'Boom', description: 'b', 'x-yuzu-guide': boomGuide }],
+    paths: { '/boom': { get: boomOp }, '/hdr': { get: { summary: 'hdr row', tags: ['Boom'], responses: { '200': { description: 'ok', headers: hdrs } } } } },
+    components: { headers: { ETag: { description: 'quoted revision' } } }
+  };
+  consoleErrors.length = 0;
+  await reload({ status: 200, body: specB });
+  armed = true;
+  const bsec = root.byTag('section')[0];
+  bsec.byClass('sw-gbtn')[0].click();
+  const boomRow = root.byClass('sw-op').filter(r => r.textContent.includes('boom op'))[0];
+  boomRow.byClass('sw-op-h')[0].click();
+  armed = false;
+  out.b_guide_msg = bsec.textContent.includes('This guide could not be shown.');
+  out.b_op_msg = boomRow.textContent.includes('This operation could not be shown.');
+  out.b_logs = consoleErrors.slice();
+  const hdrRow = root.byClass('sw-op').filter(r => r.textContent.includes('hdr row'))[0];
+  hdrRow.byClass('sw-op-h')[0].click();
+  out.b_hdrs = hdrRow.byClass('sw-hdrs')[0].textContent;
+  const manyModels = n => {
+    const sch = {}, props = {};
+    for (let i = 0; i < n; i++) { sch['Mod' + i] = { type: 'object', properties: { v: { type: 'string' } } }; props['m' + i] = { $ref: '#/components/schemas/Mod' + i }; }
+    return { openapi: '3.0.3', info: { title: 't', version: '1' }, tags: [{ name: 'Many', description: 'm', 'x-yuzu-guide': { overview: ['o'] } }],
+      paths: { '/many': { get: { summary: 'many', tags: ['Many'], responses: R({ content: { 'application/json': { schema: { type: 'object', properties: props } } } }) } } },
+      components: { schemas: sch } };
+  };
+  for (const n of [60, 61]) {
+    await reload({ status: 200, body: manyModels(n) });
+    root.byClass('sw-gbtn')[0].click();
+    out['cap_' + n] = root.byClass('sw-model').length + '/' + root.textContent.includes('Only the first 60 models are listed.');
+  }
+
   // ---- the real document: every operation drawn, every pill and filter agreeing with it ----
   const real = JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8'));
   const M = ['get', 'post', 'put', 'patch', 'delete'];
@@ -462,6 +512,60 @@ const out = {};
   out.r_console_errors = consoleErrors.length;
   out.r_guides = root.byClass('sw-gbtn').length;
   out.r_expect_guides = (real.tags || []).filter(t => t['x-yuzu-guide']).length;
+  // Every guide, operation and model of the real document opens: no error box, no console error.
+  await reload({ status: 200, body: real });
+  consoleErrors.length = 0;
+  root.byClass('sw-gbtn').forEach(b => b.click());
+  root.byClass('sw-op-h').forEach(b => b.click());
+  root.byClass('sw-model-h').forEach(b => b.click());
+  const isOpen = b => b.getAttribute('aria-expanded') === 'true';
+  out.x_ops = root.byClass('sw-op-h').length; out.x_ops_open = root.byClass('sw-op-h').filter(isOpen).length;
+  out.x_guides = root.byClass('sw-gbtn').length; out.x_guides_open = root.byClass('sw-gbtn').filter(isOpen).length;
+  out.x_models = root.byClass('sw-model-h').length; out.x_models_open = root.byClass('sw-model-h').filter(isOpen).length;
+  out.x_errors = root.byClass('sw-error').length; out.x_console = consoleErrors.length;
+  // What each operation says about its credential: the note and the request snippet.
+  out.x_auth = root.byClass('sw-op').map(r => ({ k: r.byClass('pill')[0].textContent + ' ' + pathOf(r),
+    note: r.byClass('sw-auth').length ? r.byClass('sw-auth')[0].lastChild.textContent : null,
+    curl: r.byTag('pre').length ? r.byTag('pre')[0].textContent : '' }));
+  out.x_chips = root.byClass('chip').map(c => c.textContent);
+  // Credential shapes the real document does not use: an AND of schemes, a non-first
+  // alternative, an unknown scheme, a hostile header name and scheme key, an apiKey in a query,
+  // http basic, an optional credential, no schemes declared at all. Each is drawn and opened.
+  const SO = (sec, extra) => Object.assign({ operationId: 'o', summary: 's', tags: ['T'], responses: R() }, sec === undefined ? {} : { security: sec }, extra || {});
+  const authRows = async body => {
+    consoleErrors.length = 0;
+    await reload({ status: 200, body });
+    root.byClass('sw-op-h').forEach(b => b.click());
+    const rows = {};
+    root.byClass('sw-op').forEach(r => { rows[r.byClass('pill')[0].textContent + ' ' + pathOf(r)] = {
+      note: r.byClass('sw-auth').length ? r.byClass('sw-auth')[0].lastChild.textContent : null,
+      curl: r.byTag('pre').length ? r.byTag('pre')[0].textContent : '' }; });
+    return { rows, errors: root.byClass('sw-error').length, console: consoleErrors.length };
+  };
+  out.s_shapes = await authRows({ openapi: '3.0.3', info: { title: 't', version: '1' }, tags: [{ name: 'T', description: 't' }],
+    security: [{ bearerAuth: [] }],
+    paths: {
+      '/and': { get: SO([{ keyA: [], cookieB: [] }]), post: SO([{ keyA: [], cookieB: [] }]) },
+      '/alt': { get: SO([{ cookieB: [] }, { bearerAuth: [] }]) },
+      '/unknown': { get: SO([{ mystery: [] }]) },
+      '/hostile': { get: SO([{ evilName: [] }]) },
+      '/hostilekey': { get: SO([{ 'x"$(id)': [] }]) },
+      '/query': { get: SO([{ queryKey: [] }]) },
+      '/basic': { get: SO([{ basicAuth: [] }]) },
+      '/optional': { get: SO([{}, { bearerAuth: [] }]) },
+      '/inherit': { get: SO() },
+      '/none': { get: SO([]) }
+    },
+    components: { securitySchemes: {
+      bearerAuth: { type: 'http', scheme: 'bearer' },
+      keyA: { type: 'apiKey', in: 'header', name: 'X-Key-A' },
+      cookieB: { type: 'apiKey', in: 'cookie', name: 'sid' },
+      evilName: { type: 'apiKey', in: 'header', name: 'X-A"; rm -rf ~; echo "' },
+      'x"$(id)': { type: 'apiKey', in: 'header', name: 'X-Ok' },
+      queryKey: { type: 'apiKey', in: 'query', name: 'k' },
+      basicAuth: { type: 'http', scheme: 'basic' } } } });
+  out.s_nosch = await authRows({ openapi: '3.0.3', info: { title: 't', version: '1' }, tags: [{ name: 'T', description: 't' }],
+    security: [{ bearerAuth: [] }], paths: { '/nos': { get: SO() } } });
   console.log(JSON.stringify(out));
 })().catch(e => { console.log(JSON.stringify({ crash: String(e && e.stack || e) })); process.exit(1); });
 """
@@ -469,13 +573,13 @@ const out = {};
 
 def extract_js():
     text = SRC.read_text(encoding="utf-8")
-    parts = []
-    for name in ("kSwaggerJs1", "kSwaggerJs2"):
-        m = re.search(r'extern const char\* const %s = R"SWG\((.*?)\)SWG";' % name, text, re.S)
-        if not m:
-            raise SystemExit("cannot find %s in %s" % (name, SRC))
-        parts.append(m.group(1))
-    return "".join(parts)
+    # Every kSwaggerJs<N> piece, in file order: a new piece is picked up without editing this list.
+    found = re.findall(r'extern const char\* const (kSwaggerJs\d+) = R"SWG\((.*?)\)SWG";', text, re.S)
+    if not found:
+        raise SystemExit("cannot find the kSwaggerJs pieces in %s" % SRC)
+    if [n for n, _ in found] != ["kSwaggerJs%d" % (i + 1) for i in range(len(found))]:
+        raise SystemExit("kSwaggerJs pieces are not numbered 1..N in order: %r" % [n for n, _ in found])
+    return "".join(body for _, body in found)
 
 
 def real_spec():
@@ -515,6 +619,22 @@ def main():
         return 77
     js = extract_js()
     page = SRC.read_text(encoding="utf-8")
+    # Every raw literal of the page is under the MSVC ceiling and named in the C++ size gate, so a
+    # new piece cannot ship unmeasured (the list in test_swagger_page.cpp is otherwise by hand).
+    gate = (ROOT / "tests/unit/server/test_swagger_page.cpp").read_text(encoding="utf-8")
+    declared = re.findall(r"^extern const char\* const (kSwagger\w+) = R", page, re.M)
+    pieces = re.findall(r'^extern const char\* const (kSwagger\w+) = R"SWG\((.*?)\)SWG";', page, re.S | re.M)
+    # kSwaggerPageHtml is the baked result, not a literal piece.
+    if sorted(n for n in declared if n != "kSwaggerPageHtml") != sorted(n for n, _ in pieces):
+        print("FAIL\n  - a kSwagger piece does not use the R\"SWG( delimiter, so the size gate would skip it: %r" % declared)
+        return 1
+    for name, body in pieces:
+        if len(body.encode("utf-8")) >= 15000:
+            print("FAIL\n  - %s is %d bytes, over the 15,000 byte gate" % (name, len(body.encode("utf-8"))))
+            return 1
+        if not re.search(r"\{\"\w+\", %s\}" % name, gate):
+            print("FAIL\n  - %s is not in the piece list of tests/unit/server/test_swagger_page.cpp" % name)
+            return 1
     body = re.search(r'kSwaggerBody = R"SWG\((.*?)\)SWG";', page, re.S).group(1)
     if not re.search(r'<div id="sw-root"[^>]*><noscript>[^<]*JavaScript[^<]*</noscript>', body):
         print("FAIL")
@@ -586,6 +706,7 @@ def main():
     # A schema that cannot be drawn must show a message and keep the button honest.
     check("These fields could not be shown." in out["model_d_text"] and out["model_d_state"] == "true/Hide fields/1",
           "a model that throws must open to an inline message: %r" % out["model_d_state"])
+    check(out["model_d_logged"], "a model that cannot be drawn must be logged by name")
     check(out["model_d_closed"] == "false/Show fields/true", "a failed model block must still close: %r" % out["model_d_closed"])
     # Breadth: wide and deep acyclic schemas stop at the budget and say so.
     check(out["wide_rows"] == 2000 and out["wide_note"], "a 3000-field schema must stop at 2000 rows and say 1000 more: %r" % out["wide_rows"])
@@ -623,6 +744,7 @@ def main():
     check("req-body-3" in out["f_500_body_cid"] and "req-hdr-3" not in out["f_500_body_cid"], "the A4 body id wins over the header: %r" % out["f_500_body_cid"])
     check("could not be reached" in out["f_net"] and "NETRAW" not in out["f_net"] and out["f_net_retry"] == 1,
           "a network failure must be explained, not echoed: %r" % out["f_net"])
+    check("not with an API description" in out["f_null_msg"], "a JSON null must read as not an API description: %r" % out["f_null_msg"])
     check("could not be shown" in out["f_null_doc"] and "Cannot read" not in out["f_null_doc"] and out["f_null_doc_retry"] == 1,
           "a build failure must be a fixed message with Retry: %r" % out["f_null_doc"])
     check(out["console_errors"] == 5, "each failure must be logged to the console for diagnosis, got %r" % out["console_errors"])
@@ -683,6 +805,112 @@ def main():
           "a GET snippet carries -g and no body: %r" % out["r_get_curl"])
     check(out["r_post_curl"].startswith("curl -s -g -X POST") and "Content-Type: application/json" in out["r_post_curl"] and "-d '{}'" in out["r_post_curl"],
           "a POST snippet carries -g, a JSON content type and a body placeholder: %r" % out["r_post_curl"])
+    # The credential each operation shows. The expected lines are derived here from the document's
+    # own `security` (the top-level default, replaced by an operation's own key), through a fixed
+    # table, not by the page's logic. A route that takes only the session cookie, or an upload
+    # credential, must not be shown with a Bearer example, and a public route with none.
+    cred_lines = {
+        "bearerAuth": '-H "Authorization: Bearer $YUZU_TOKEN"',
+        "apiKeyHeader": '-H "X-Yuzu-Token: $YUZU_TOKEN"',
+        "cookieAuth": '-b "yuzu_session=$YUZU_SESSION"',
+        "uploadGrantAuth": '-H "X-Yuzu-Upload-Grant: $YUZU_UPLOAD_GRANT"',
+        "uploadSessionAuth": '-H "X-Yuzu-Upload-Session: $YUZU_UPLOAD_SESSION"',
+    }
+    # What the note calls each scheme, written out here, not read from the page.
+    cred_names = {
+        "bearerAuth": "Bearer token",
+        "apiKeyHeader": "X-Yuzu-Token header",
+        "cookieAuth": "yuzu_session cookie",
+        "uploadGrantAuth": "X-Yuzu-Upload-Grant header",
+        "uploadSessionAuth": "X-Yuzu-Upload-Session header",
+    }
+    # The routes that carry their own credential, pinned by name: a route that gains or loses
+    # one fails here and has to be looked at, not just counted.
+    own_expected = {
+        "POST /users/me/password": [["cookieAuth"]],
+        "POST /users/{username}/password": [["cookieAuth"]],
+        "POST /elevate": [["cookieAuth"]],
+        "POST /elevate/revoke": [["cookieAuth"]],
+        "POST /uploads": [["uploadGrantAuth"]],
+        "PUT /uploads/{upload_id}/chunk": [["uploadSessionAuth"]],
+        "GET /uploads/{upload_id}": [["uploadSessionAuth"]],
+        "DELETE /uploads/{upload_id}": [["uploadSessionAuth"]],
+        "POST /uploads/{upload_id}/commit": [["uploadSessionAuth"]],
+        "GET /ca/root": [],
+        "GET /ca/crl": [],
+    }
+    # Lines of the snippet that carry a credential or the origin a cookie write needs.
+    cred_prefixes = ('-H "Authorization', '-H "X-', '-H "Origin', "-b ")
+    shown = {a["k"]: a for a in out["x_auth"]}
+    own_found = {}
+    for path, path_item in real["paths"].items():
+        for method in ("get", "post", "put", "patch", "delete"):
+            op = path_item.get(method)
+            if not isinstance(op, dict):
+                continue
+            key = method.upper() + " " + path
+            if "security" in op:
+                own_found[key] = [list(entry) for entry in op["security"]]
+            sec = op["security"] if "security" in op else real.get("security", [])
+            ways = [list(entry) for entry in sec if entry]
+            check(all(entry for entry in sec), "%s has an empty security entry; the page's optional-credential wording must be checked against it" % key)
+            unknown = [n for w in ways for n in w if n not in cred_lines]
+            check(not unknown, "%s uses a scheme this test does not know (add it to cred_lines): %r" % (key, unknown))
+            if unknown or key not in shown:
+                check(key in shown, "no rendered row for %s" % key)
+                continue
+            want = sorted(cred_lines[n] for n in (ways[0] if ways else []))
+            if any(n == "cookieAuth" for n in (ways[0] if ways else [])) and method != "get":
+                want.append('-H "Origin: https://yuzu.test"')
+            got = sorted(line.strip().rstrip("\\").strip() for line in shown[key]["curl"].split("\n")
+                         if line.strip().startswith(cred_prefixes))
+            check(got == sorted(want), "%s request snippet credentials: want %r, got %r" % (key, sorted(want), got))
+            if ways:
+                want_note = "Send " + ", or ".join(" and ".join(cred_names[n] for n in w) for w in ways)
+            else:
+                want_note = "No credential needed" if "security" in op else "No credential declared"
+            check(shown[key]["note"] == want_note, "%s credential note: want %r, got %r" % (key, want_note, shown[key]["note"]))
+    drift = sorted(set(own_found) ^ set(own_expected)) + sorted(k for k in own_found if k in own_expected and own_found[k] != own_expected[k])
+    check(own_found == own_expected,
+          "the routes carrying their own security changed; update own_expected after checking each handler: %r" % drift)
+    own_keys = len(own_found)
+    check(any(c == "AuthBearer token, or X-Yuzu-Token header, or yuzu_session cookie" for c in out["x_chips"]),
+          "the Auth chip must come from the document's default security: %r" % out["x_chips"])
+    check(any(c == "Own credentials%d" % own_keys for c in out["x_chips"]),
+          "the Own credentials chip must count the operations that carry their own security: %r" % out["x_chips"])
+    # Shapes the real document does not use. Every credential line is written out; the page must
+    # never turn a hostile name or scheme key into shell text.
+    sh = out["s_shapes"]
+    check(sh["errors"] == 0 and sh["console"] == 0, "odd security shapes must draw without an error: %r" % sh)
+    def creds(row):
+        return sorted(line.strip().rstrip("\\").strip() for line in row["curl"].split("\n") if line.strip().startswith(cred_prefixes))
+    expect_shapes = {
+        "GET /and": (['-H "X-Key-A: $KEY_A"', '-b "sid=$SID"'], "Send X-Key-A header and sid cookie"),
+        "POST /and": (['-H "Origin: https://yuzu.test"', '-H "X-Key-A: $KEY_A"', '-b "sid=$SID"'], "Send X-Key-A header and sid cookie"),
+        "GET /alt": (['-b "sid=$SID"'], "Send sid cookie, or Bearer token"),
+        "GET /unknown": ([], "Send mystery (the example below cannot show mystery)"),
+        "GET /hostile": ([], "Send evilName (the example below cannot show evilName)"),
+        "GET /hostilekey": (['-H "X-Ok: $OK"'], "Send X-Ok header"),
+        "GET /query": ([], "Send queryKey (the example below cannot show queryKey)"),
+        "GET /basic": ([], "Send basicAuth (the example below cannot show basicAuth)"),
+        "GET /optional": (['-H "Authorization: Bearer $YUZU_TOKEN"'], "Send Bearer token, or no credential"),
+        "GET /inherit": (['-H "Authorization: Bearer $YUZU_TOKEN"'], "Send Bearer token"),
+        "GET /none": ([], "No credential needed"),
+    }
+    check(sorted(sh["rows"]) == sorted(expect_shapes), "odd-shape rows drawn: %r" % sorted(sh["rows"]))
+    for k, (want_creds, want_note) in expect_shapes.items():
+        row = sh["rows"].get(k)
+        if row is None:
+            continue
+        check(creds(row) == sorted(want_creds), "%s credential lines: want %r, got %r" % (k, sorted(want_creds), creds(row)))
+        check(row["note"] == want_note, "%s note: want %r, got %r" % (k, want_note, row["note"]))
+    hostile_text = "".join(r["curl"] for r in sh["rows"].values())
+    check("rm -rf" not in hostile_text and "$(id)" not in hostile_text and 'x"' not in hostile_text,
+          "a hostile header name or scheme key reached the request snippet: %r" % hostile_text[:300])
+    ns = out["s_nosch"]
+    check(ns["errors"] == 0 and ns["console"] == 0 and creds(ns["rows"].get("GET /nos", {"curl": ""})) == []
+          and ns["rows"].get("GET /nos", {}).get("note") == "Send bearerAuth (the example below cannot show bearerAuth)",
+          "a document with no securitySchemes must name the scheme and show no credential: %r" % ns)
     # The expected pill counts are derived here, in Python, from the document, not by the
     # page's own predicate.
     py = {"typed": 0, "untyped": 0, "unavail": 0}
@@ -715,6 +943,25 @@ def main():
     check((out["r_typed"], out["r_untyped"], out["r_unavail"]) == (py["typed"], py["untyped"], py["unavail"]),
           "page pills %r/%r/%r differ from the counts derived from the document %r" % (
               out["r_typed"], out["r_untyped"], out["r_unavail"], py))
+    check(out["x_ops"] == out["r_expect"] and out["x_ops_open"] == out["x_ops"] and out["x_guides"] == out["r_expect_guides"]
+          and out["x_guides_open"] == out["x_guides"] and out["x_models"] > 100 and out["x_models_open"] == out["x_models"],
+          "every operation, guide and model of the real document must open: ops %r/%r guides %r/%r models %r/%r"
+          % (out["x_ops_open"], out["x_ops"], out["x_guides_open"], out["x_guides"], out["x_models_open"], out["x_models"]))
+    check(out["x_errors"] == 0 and out["x_console"] == 0,
+          "opening everything in the real document must draw no error box and log nothing: %r boxes, %r console" % (out["x_errors"], out["x_console"]))
+    check(out["b_guide_msg"] and out["b_op_msg"], "a guide or operation that throws must still show its inline message")
+    check(any("could not draw guide Boom" in e for e in out["b_logs"]) and any("could not draw operation GET /boom" in e for e in out["b_logs"]),
+          "a guide and an operation that cannot be drawn must be logged by name: %r" % out["b_logs"])
+    check("quoted revision" in out["b_hdrs"] and "inline one" in out["b_hdrs"],
+          "a $ref'd response header must show the description of the header it names: %r" % out["b_hdrs"])
+    check(out["f_paths_bad"] == [True, True, True, True],
+          "a `paths` that is not an object (array, string, number) must read as not an API description: %r" % out["f_paths_bad"])
+    check("ETag" in out["b_hdrs"] and "Gone" in out["b_hdrs"] and "constructor" in out["b_hdrs"] and "Num" in out["b_hdrs"],
+          "an unresolvable or prototype-named header $ref must still list its name: %r" % out["b_hdrs"])
+    check(out["cap_60"] == "60/false" and out["cap_61"] == "60/true",
+          "the model list must say when it is cut, and not at exactly the cap: %r %r" % (out["cap_60"], out["cap_61"]))
+    check("not with an API description" in out["f_obj_doc"] and "Operations" not in out["f_obj_doc"] and out["f_obj_doc_retry"] == 1,
+          "a JSON body with no paths must read as not an API description, with Retry: %r" % out["f_obj_doc"])
     check(out["r_console_errors"] == 0, "the real document must draw without a console error: %r" % out["r_console_errors"])
     if errors:
         print("FAIL")

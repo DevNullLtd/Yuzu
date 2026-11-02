@@ -3336,18 +3336,20 @@ public:
                           "between the verify read and the row-locked recheck",
                           "counter");
         metrics_.counter("yuzu_auth_credential_changed_during_verify_total");
-        // Gate 5 chaos-injector CH-3/UP-6 follow-up (#4020): the ONE
-        // caller-visible signal that get_user_role() is about to floor a
-        // legacy-API-token-authenticated request's role to Role::user
-        // (auth_routes.cpp's `.value_or(Role::user)`) on a genuine AuthDB
-        // store error - not a plain not-found. Single call site, single
-        // failure shape reaches it (AuthDBError::QueryFailed; UserNotFound/
-        // InvalidUsername are excluded before the increment), so no label
+        // Gate 5 chaos-injector CH-3/UP-6 follow-up (#4020): the caller-visible
+        // signal that get_user_role() hit a genuine AuthDB store error - not a
+        // plain not-found. Counts EVERY caller (#4068): the legacy-API-token
+        // session synthesis floors the request to Role::user, the Settings
+        // create-user / role-change routes and SCIM active:false answer 503,
+        // and the SCIM create-race re-read records it in its audit detail (the
+        // answer stays 500, #6837). Any AuthDBError other than UserNotFound /
+        // InvalidUsername reaches it (in practice QueryFailed), so no label
         // set - pre-seeded to 0 so an increase() alert is meaningful.
         metrics_.describe("yuzu_auth_get_user_role_store_error_total",
-                          "get_user_role() AuthDB lookups that failed on a genuine store error "
-                          "(not a plain not-found/invalid-username miss) - each one floors the "
-                          "caller's legacy-API-token-authenticated request to Role::user",
+                          "get_user_role() AuthDB lookups (any caller) that failed on a genuine "
+                          "store error (not a plain not-found/invalid-username miss); the "
+                          "legacy-API-token path floors that request to Role::user, the "
+                          "Settings and SCIM active:false callers refuse with 503",
                           "counter");
         metrics_.counter("yuzu_auth_get_user_role_store_error_total");
         // HA WS-1/1a: durable SessionStore degradation on the auth hot path
@@ -4012,6 +4014,16 @@ public:
                           "(degrade-don't-destroy); only the derived guardian_observations read "
                           "model row is lost. >0 means /dex is under-counting - investigate "
                           "(commonly a stale-schema dev DB; see docs/user-manual/dex.md).",
+                          "counter");
+        metrics_.describe("yuzu_server_guardian_census_proj_failures_total",
+                          "Compliance-census (guardian_agent_rule_status) writes that failed "
+                          "for a reason other than the rule not existing. The failure does not "
+                          "discard the source event; only the census row update is lost, so "
+                          "the pair keeps its previous state until a later state-changing "
+                          "event for it arrives. >0 means the census may be stale; the server "
+                          "log line 'census upsert failed' names the agent and rule. A write "
+                          "refused because the rule is not defined on this server (SQLSTATE "
+                          "23503) is a normal outcome and is not counted.",
                           "counter");
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
@@ -9847,6 +9859,9 @@ public:
                     metrics_.gauge("yuzu_server_guardian_proj_failures_total")
                         .set(static_cast<double>(
                             guaranteed_state_store_->observations_proj_failures_total()));
+                    metrics_.gauge("yuzu_server_guardian_census_proj_failures_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->census_proj_failures_total()));
                     metrics_.gauge("yuzu_server_guardian_observations_reaped_total")
                         .set(static_cast<double>(
                             guaranteed_state_store_->observations_reaped_total()));
@@ -18961,10 +18976,8 @@ private:
                         f.connected_os.push_back(os);
                     // Normalized (id, os) for the Overview score distribution +
                     // the segment breakdown.
-                    const std::string nos = os.starts_with("win")            ? "windows"
-                                            : os.starts_with("lin")          ? "linux"
-                                            : (os == "darwin" || os == "macos") ? "macos"
-                                                                                : os;
+                    // Fleet label: prefix-normalised, unknown passes through raw.
+                    const std::string nos = detail::dex_fleet_os_label(os);
                     f.connected_agents.emplace_back(id, nos);
                 }
             }
