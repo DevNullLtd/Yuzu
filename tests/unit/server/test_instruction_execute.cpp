@@ -105,11 +105,23 @@ TEST_CASE("execute: an unwired or failing definition store is 503-class and disp
     SECTION("read error") {
         r.store_error = true;
     }
+    const bool unwired = r.store_unwired;
     auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
     const auto* ref = as_refusal(out);
     REQUIRE(ref);
     CHECK(ref->kind == RefusalKind::kStoreUnavailable);
-    CHECK(ref->retry_after_ms == 5000);
+    CHECK(ref->reason == "store_unavailable");
+    if (unwired) {
+        // A port that was NEVER wired is a server defect that does not clear by itself: no retry
+        // hint, and a remediation that says so (the kMisconfigured class).
+        CHECK_FALSE(ref->retry_after_ms.has_value());
+        CHECK(ref->remediation.find("retrying will not help") != std::string::npos);
+        CHECK(ref->remediation.find("retry shortly") == std::string::npos);
+    } else {
+        // A wired port whose read FAILED is a fault a retry can clear: it keeps its hint.
+        CHECK(ref->retry_after_ms == 5000);
+        CHECK(ref->remediation.find("retry shortly") != std::string::npos);
+    }
     CHECK(r.calls.empty());
     CHECK(r.rows.empty());
     CHECK(r.approvals.empty());
@@ -260,7 +272,7 @@ TEST_CASE("execute: a definition id that is not valid UTF-8 is refused at step 0
 // authorizer, any audit row of the `requested` family, any execution row or any send.
 TEST_CASE("execute: an expected_effect that no longer matches the looked-up definition is refused "
           "before the authorizer, any row or any send; a matching one runs",
-          "[instruction_execute][security][l1]") {
+          "[instruction_execute][security][c8_effect]") {
     const auto bound = effect_binding("testplug", "ping", "auto", "per-device");
     CHECK(bound == "effect=[\"testplug\",\"ping\",\"auto\",\"per-device\"]\n");
     {
@@ -317,7 +329,7 @@ TEST_CASE("execute: an expected_effect that no longer matches the looked-up defi
 
 TEST_CASE("effect_binding: JSON-encoded so a hostile stored value cannot forge a field or a line, "
           "and invalid UTF-8 does not throw",
-          "[instruction_execute][security][l1]") {
+          "[instruction_execute][security][c8_effect]") {
     const auto hostile = effect_binding("p\n\"x", "a,b\"]", "m\r", std::string("c\xFF", 2));
     // Exactly one raw newline: the terminator. Every control byte in a value is escaped.
     CHECK(std::count(hostile.begin(), hostile.end(), '\n') == 1);

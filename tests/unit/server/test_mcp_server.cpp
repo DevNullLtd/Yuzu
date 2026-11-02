@@ -44987,6 +44987,36 @@ TEST_CASE("MCP execute_instruction_definition: an unwired classifier is -32603 "
     CHECK(rig.calls.empty());
 }
 
+TEST_CASE("MCP execute_instruction_definition: a NEVER-wired definition store carries no retry "
+          "hint; a wired store whose read fails keeps its hint",
+          "[mcp][integration][execute][idef][retryhint]") {
+    for (const bool unwired : {true, false}) {
+        INFO("unwired=" << unwired);
+        McpTestServer ts;
+        Rig rig;
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+        rig.store_unwired = unwired;
+        rig.store_error = !unwired;
+        idef_start(ts, rig, "operator");
+        auto res = ts.call(idef_call({{"definition_id", "d"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["reason"] == "store_unavailable");
+        REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+        const auto remediation = body["error"]["data"]["remediation"].get<std::string>();
+        if (unwired) {
+            CHECK(body["error"]["data"]["retry_after_ms"].is_null()); // a wiring defect: no hint
+            CHECK(remediation.find("retrying will not help") != std::string::npos);
+        } else {
+            CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+            CHECK(remediation.find("retry shortly") != std::string::npos);
+        }
+        CHECK(rig.calls.empty());
+    }
+}
+
 TEST_CASE("MCP execute_instruction_definition: an operator-tier auto-approval can NOT skip a "
           "non-auto definition (the binding rule)",
           "[mcp][integration][execute][idef][approval][security]") {
@@ -46065,10 +46095,12 @@ TEST_CASE("MCP execute_instruction_definition: the definition-changed answer and
     REQUIRE(first);
     const std::string ticket = nlohmann::json::parse(first->body)["error"]["data"]["approval_id"];
 
+    std::string last_header_cid; // the X-Correlation-Id header of the latest recall
     const auto recall_moved = [&](int id) {
         rig.defs["d"].action = "scrub"; // the editor repoints the stored definition
         auto r = ts.call(idef_call({{"definition_id", "d"}, {"approval_id", ticket}}, id));
         REQUIRE(r);
+        last_header_cid = r->get_header_value("X-Correlation-Id");
         return nlohmann::json::parse(r->body);
     };
     const auto says_not_consumed = [&] {
@@ -46084,6 +46116,17 @@ TEST_CASE("MCP execute_instruction_definition: the definition-changed answer and
         CHECK(msg.find("does not match") != std::string::npos);
         CHECK(msg.find("definition changed") == std::string::npos);
         CHECK_FALSE(says_not_consumed()); // the audit row must not claim an unspent ticket
+        // The row names the (store-confirmed) ticket and the call's correlation id, which is the
+        // body's and the response header's id too, so the refusal is traceable to its approval.
+        const auto cid = b["error"]["data"]["correlation_id"].get<std::string>();
+        CHECK(last_header_cid == cid);
+        bool traced = false;
+        for (const auto& d : idef_denied_details(ts))
+            if (d.starts_with("approval_id=" + ticket + " status=") &&
+                d.find("does not match this request") != std::string::npos &&
+                d.ends_with(" correlation_id=" + cid))
+                traced = true;
+        CHECK(traced);
     };
 
     SECTION("pending (not yet approved) with a moved effect: the distinct, truthful answer") {
@@ -46101,6 +46144,9 @@ TEST_CASE("MCP execute_instruction_definition: the definition-changed answer and
         CHECK(d.find("(ticket not consumed)") != std::string::npos);
         CHECK(d.ends_with(" correlation_id=" +
                           b["error"]["data"]["correlation_id"].get<std::string>()));
+        // ONE id per call (p10-1): the response header carries the body's and the row's id.
+        CHECK_FALSE(last_header_cid.empty());
+        CHECK(last_header_cid == b["error"]["data"]["correlation_id"].get<std::string>());
         CHECK(appr.get(ticket)->consumed_at == 0);
     }
 
@@ -46145,6 +46191,38 @@ TEST_CASE("MCP execute_instruction_definition: the definition-changed answer and
         expect_ordinary_mismatch(recall_moved(2));
         CHECK(rig.calls.empty());
     }
+}
+
+// compliance p10-1: the mismatch row names the ticket only when the store returned one. An unknown
+// approval_id is raw caller input: it is NOT echoed into the audit row (the row still carries the
+// call's correlation id, equal to the body's and the response header's).
+TEST_CASE("MCP execute_instruction_definition: an UNKNOWN approval_id is a mismatch whose audit "
+          "row carries the correlation id and never echoes the supplied id",
+          "[pg][mcp][integration][execute][idef][approval][security][c8_effect]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "auto");
+    idef_start(ts, rig, "supervised", /*admin=*/false);
+    const std::string bogus = "zz-unknown-approval-id-7f3a91";
+    auto res = ts.call(idef_call({{"definition_id", "d"}, {"approval_id", bogus}}));
+    REQUIRE(res);
+    const auto b = nlohmann::json::parse(res->body);
+    REQUIRE(b.contains("error"));
+    CHECK(b["error"]["message"].get<std::string>().find("does not match") != std::string::npos);
+    const auto cid = b["error"]["data"]["correlation_id"].get<std::string>();
+    CHECK(res->get_header_value("X-Correlation-Id") == cid);
+    bool saw = false;
+    for (const auto& d : idef_denied_details(ts)) {
+        CHECK(d.find(bogus) == std::string::npos); // never echoed
+        CHECK(d.find("approval_id=") == std::string::npos);
+        if (d == "approval_id does not match this request correlation_id=" + cid)
+            saw = true;
+    }
+    CHECK(saw);
+    CHECK(rig.calls.empty());
 }
 
 // unhappy p9-4: the distinct answer is shown only to the principal who REQUESTED the ticket. A
@@ -46384,6 +46462,9 @@ void check_definition_changed_refusal(const httplib::Response& res) {
           std::string::npos);
     CHECK(body["error"]["data"]["reason"] == "definition_changed"); // machine-readable
     CHECK(body["error"]["data"]["retry_after_ms"].is_null());       // permanent, not retryable
+    // ONE id per call: the response header carries the id the body carries.
+    CHECK(res.get_header_value("X-Correlation-Id") ==
+          body["error"]["data"]["correlation_id"].get<std::string>());
 }
 
 std::string rs_make_definition(yuzu::server::InstructionStore& instr) {
@@ -46846,10 +46927,11 @@ TEST_CASE("MCP result-set producers: a repoint AFTER the recall's C8 check but b
         CHECK(appr_bundle.get()->get(ticket)->consumed_at != 0);
         check_no_execution_rows(*tracker_bundle.get());
         bool saw_row = false;
+        const auto body_cid = body["error"]["data"]["correlation_id"].get<std::string>();
         for (std::size_t i = 0; i < ts.audit_log.size() && i < ts.audit_details.size(); ++i)
             if (ts.audit_log[i] == "result_set.create|denied" &&
                 ts.audit_details[i].find("reason=definition_changed") != std::string::npos &&
-                ts.audit_details[i].find(" correlation_id=") != std::string::npos)
+                ts.audit_details[i].ends_with(" correlation_id=" + body_cid))
                 saw_row = true;
         CHECK(saw_row);
         std::string next;
@@ -46930,6 +47012,9 @@ TEST_CASE("MCP result-set producers: ghost instruction binds effect=unresolved; 
         CHECK(b["error"]["message"].get<std::string>().find("INSTRUCTION_NOT_FOUND") !=
               std::string::npos);
         CHECK(log.dispatch_calls == 0);
+        // The title's claim, asserted: the C8 match passed (unresolved == unresolved), so the
+        // ticket WAS consumed by the recall that the handler then refused.
+        CHECK(appr_bundle.get()->get(id)->consumed_at != 0);
     }
 
     SECTION("an echo-sourced re-evaluation binds the fixed echo.sql and its approved recall runs") {
@@ -46986,6 +47071,15 @@ TEST_CASE("MCP result-set producers: a supervised token without Execution:Execut
         REQUIRE(b.contains("error"));
         return b["error"];
     };
+    // An audit row that begins with `prefix` and ends with the SAME correlation id as the body.
+    const auto has_row_with_cid = [](const McpTestServer& ts, const std::string& prefix,
+                                     const nlohmann::json& err) {
+        const auto want = " correlation_id=" + err["data"]["correlation_id"].get<std::string>();
+        for (const auto& d : ts.audit_details)
+            if (d.starts_with(prefix) && d.ends_with(want))
+                return true;
+        return false;
+    };
 
     SECTION("no Execution:Execute: 403, identical for any input, nothing minted") {
         RsGateLog log;
@@ -47024,6 +47118,7 @@ TEST_CASE("MCP result-set producers: a supervised token without Execution:Execut
         CHECK(e["data"]["reason"] == "effect_unresolvable_store_unwired");
         CHECK(e["data"]["retry_after_ms"].is_null()); // retrying cannot help
         CHECK(appr.pending_count() == 0);
+        CHECK(has_row_with_cid(ts, "reason=effect_unresolvable_store_unwired", e));
     }
 
     SECTION("reevaluate_*: a result-set store that was never wired is a permanent wiring defect") {
@@ -47039,6 +47134,29 @@ TEST_CASE("MCP result-set producers: a supervised token without Execution:Execut
         CHECK(e["data"]["reason"] == "effect_unresolvable_store_unwired");
         CHECK(e["data"]["retry_after_ms"].is_null());
         CHECK(appr.pending_count() == 0);
+        CHECK(has_row_with_cid(ts, "reason=effect_unresolvable_store_unwired", e));
+    }
+
+    SECTION("reevaluate_*: a wired result-set store that cannot answer is a retryable fault") {
+        yuzu::server::pg::PgPool bad_pool{
+            {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1",
+             .size = 1}};
+        yuzu::server::ResultSetStore broken{bad_pool};
+        REQUIRE_FALSE(broken.is_open());
+        RsGateLog log;
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        ts.result_set_store_for_test = &broken; // non-null but unusable
+        rs_gate_wire(ts, log, /*admin=*/false);
+        auto res = ts.call(rs_tool_call("reevaluate_result_set", reeval_args, 1));
+        REQUIRE(res);
+        const auto e = refusal(*res);
+        CHECK(e["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(e["data"]["reason"] == "effect_unresolvable_store_fault");
+        CHECK(e["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(appr.pending_count() == 0);
+        CHECK(log.dispatch_calls == 0);
+        CHECK(has_row_with_cid(ts, "reason=effect_unresolvable_store_fault", e));
     }
 
     SECTION("create_*: a wired instruction store that cannot answer is a retryable store fault") {
