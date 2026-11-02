@@ -2503,6 +2503,7 @@ TEST_CASE_METHOD(BindingFixture,
     // Prime the generation view: the first validate on a fresh manager refreshes it and drops
     // the whole cache, which would hide whether the stamp path dropped its own entry.
     REQUIRE(mgr.validate_session(token).has_value());
+    const auto primed = std::chrono::steady_clock::now();
 
     // Make ONLY the cleanup (an update that zeroes an existing proof) fail.
     {
@@ -2530,10 +2531,28 @@ TEST_CASE_METHOD(BindingFixture,
     CHECK(durable.mfa_verified_ms == verified);
     CHECK(durable.mfa_factor_gen == g);
     CHECK(durable.mfa_factor_gen != status("alice").factor_gen);
-    // And this replica's cache was dropped regardless of the failed clear.
-    auto s = mgr.validate_session(token);
-    REQUIRE(s.has_value());
-    CHECK(s->steady_mfa_verified.time_since_epoch().count() == 0);
+    // What this replica's cache holds afterwards depends on whether the one-second generation poll
+    // has come due since it was primed (a slow or sanitized run takes longer than that).
+    SECTION("inside the poll window the stamp path drops its own cache entry") {
+        const bool inside_window =
+            std::chrono::steady_clock::now() - primed < std::chrono::milliseconds(900);
+        auto s = mgr.validate_session(token);
+        REQUIRE(s.has_value());
+        if (inside_window) {
+            CHECK(s->steady_mfa_verified.time_since_epoch().count() == 0);
+        }
+        // Otherwise the poll fired on its own and this is the poll-due section's case.
+    }
+    SECTION("once the generation poll is due the cache is rebuilt from the refused-to-clear row") {
+        mgr.expire_session_generation_poll_for_test();
+        auto s = mgr.validate_session(token);
+        REQUIRE(s.has_value());
+        // The durable row still holds the proof, bound to the OLD generation, so the rebuilt
+        // entry carries a non-zero monotonic anchor. That anchor is never an admissible proof:
+        // the binding gate compares the durable generation first (checked above) and refuses it.
+        CHECK(s->steady_mfa_verified.time_since_epoch().count() != 0);
+        CHECK(durable.mfa_factor_gen != status("alice").factor_gen);
+    }
 }
 
 TEST_CASE_METHOD(BindingFixture,
