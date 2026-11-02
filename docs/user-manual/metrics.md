@@ -1722,8 +1722,9 @@ heartbeat as the status tags `yuzu.dedup_degraded` (0 or 1), `yuzu.dedup_replays
 - A quiet graph is only good news if `yuzu_fleet_agents_dedup_reporting` is non-zero. Agents that
   predate these tags contribute nothing to any of the gauges.
 - Not covered here: an agent that recovered from a **corrupt** dedup store (#3665) loses its replay
-  history but is not degraded, and no gauge reports it yet; that restart-surviving signal is a
-  follow-up.
+  history but is not degraded. It reports the per-process `yuzu.dedup_quarantined` tag, which the
+  server does not read yet and which returns to 0 on the next agent restart, so no gauge counts it;
+  a restart-surviving signal designed with its consumer is a follow-up.
 
 ## Fleet performance gauges (DEX)
 

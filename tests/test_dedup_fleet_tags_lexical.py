@@ -11,7 +11,8 @@ are written inline in the heartbeat block rather than by a callable emitter, so 
 source-text, not a linked test. It enforces:
 
   1. EVERY `yuzu.dedup_*` tag agent.cpp emits is consumed by a row of the server table (or
-     `kDedupRowsTag`), and every tag the server table reads is emitted by the agent. A new agent
+     `kDedupRowsTag`) or is listed, with a reason, in DELIBERATELY_UNCONSUMED, and every tag the
+     server table reads is emitted by the agent. A new agent
      tag with no server row is a red test here, not a write nobody reads (the enterprise-architect
      ruling on #6912: a marker with no consumer is a write nobody reads).
   2. The presence row is `yuzu.dedup_degraded` and is FIRST in the table (`kDedupPresenceIndex`
@@ -46,6 +47,19 @@ METRICS_MD = ROOT / "docs" / "user-manual" / "metrics.md"
 ALERTS_YML = ROOT / "docs" / "prometheus" / "yuzu-alerts.yml"
 ALERTS_TEST = ROOT / "tests" / "prometheus" / "yuzu-alerts.test.yml"
 TAG = "test_dedup_fleet_tags_lexical"
+
+# Tags the agent emits that NO server row consumes, on purpose, each with the reason. An entry
+# must still be emitted by the agent (a stale entry is a failure) and must NOT be consumed by the
+# server table (once it is, delete the entry). This is the only way past check 1 below.
+DELIBERATELY_UNCONSUMED = {
+    # #3665 corrupt-store recovery. A per-process 0/1 that returns to 0 on the next agent restart
+    # while the quarantined files stay on the endpoint, so a gauge derived from it alone loses the
+    # signal. The consumer needs a restart-surviving marker designed WITH it (the enterprise-
+    # architect ruling on #6912: a marker with no consumer is a write nobody reads, so the two
+    # ship together). Tracked as the follow-up on #3663; the owner chose to leave it out of the
+    # first change.
+    "yuzu.dedup_quarantined": "per-process; needs a restart-surviving marker designed with its consumer",
+}
 
 ALERT = "YuzuDedupStoreDegraded"
 DEGRADED_GAUGE = "yuzu_fleet_agents_dedup_store_degraded"
@@ -103,9 +117,13 @@ def problems() -> list:
 
     if not emitted:
         out.append("no `tags[\"yuzu.dedup_*\"] =` assignment found in agent.cpp (stale pattern)")
-    for t in sorted(emitted - consumed):
+    for t in sorted(emitted - consumed - set(DELIBERATELY_UNCONSUMED)):
         out.append(f"agent.cpp emits {t} but no server row consumes it (add a row, or the tag is a "
                    f"write nobody reads)")
+    for t in sorted(set(DELIBERATELY_UNCONSUMED) - emitted):
+        out.append(f"DELIBERATELY_UNCONSUMED lists {t} but agent.cpp no longer emits it (stale entry)")
+    for t in sorted(set(DELIBERATELY_UNCONSUMED) & consumed):
+        out.append(f"{t} is now consumed by the server table: remove it from DELIBERATELY_UNCONSUMED")
     for t in sorted(consumed - emitted):
         out.append(f"the server table reads {t} but agent.cpp never emits it (dead gauge)")
 

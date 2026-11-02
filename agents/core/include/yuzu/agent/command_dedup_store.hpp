@@ -134,8 +134,24 @@ class YUZU_EXPORT CommandDedupStore {
 public:
     /**
      * Open (or create) the store at the given path. Sets WAL + synchronous=FULL
-     * + busy_timeout=5000 and creates the schema if absent. Fails only on an
-     * unusable path/DB — the caller treats a failure as "durable dedup
+     * + busy_timeout=5000 and creates the schema if absent.
+     *
+     * CORRUPTION RECOVERY (#3665): when the file CANNOT BE OPENED because it is corrupt
+     * (SQLITE_CORRUPT / SQLITE_NOTADB from sqlite3_open_v2, the pragmas, or creating the two
+     * tables; damage confined to the unused `meta` table only logs a warning), the main file is
+     * moved aside to
+     * `<path>.corrupt-<unix-epoch-seconds>[-n]` (a non-empty -wal/-shm/-journal goes with it as
+     * `<that name>-wal` etc; empty or unmovable sidecars are removed) and a fresh store is opened,
+     * ONCE — never a loop. Only the newest 3 quarantined stores are kept. The dedup history in
+     * the corrupt file is gone either way (it was unreadable); the recovery restores protection
+     * going forward instead of leaving the agent degraded on every boot. Transient/environmental
+     * errors (BUSY, IOERR, FULL, CANTOPEN, PERM) never quarantine, and NEITHER does a file that
+     * opens but has damaged pages: there is deliberately no integrity scan, because discarding a
+     * mostly-usable file would discard in-flight claims too (invariants 4 and 5). See
+     * quarantined_this_open().
+     *
+     * Otherwise fails only on an unusable path/DB, or a corrupt file that could not be
+     * moved aside (left untouched) — the caller treats a failure as "durable dedup
      * unavailable" and runs degraded (fail-open), which it MUST surface.
      */
     static std::expected<CommandDedupStore, CommandDedupError>
@@ -183,6 +199,16 @@ public:
      * leak), Error only on an actual failed DELETE.
      */
     ReleaseOutcome release(std::string_view command_id) noexcept;
+
+    /**
+     * Filename (not full path) of the quarantined corrupt database when THIS open() recovered
+     * from corruption (#3665); nullopt on a normal open. The caller MUST surface it (log +
+     * counter): the prior dedup history is lost, so a command executed before the corruption
+     * and redelivered afterwards may re-execute.
+     */
+    [[nodiscard]] const std::optional<std::string>& quarantined_this_open() const noexcept {
+        return quarantined_file_;
+    }
 
     /** Row count (TEST/observability). nullopt on error/closed store. Takes the store
      *  mutex and runs a COUNT(*) -- NOT for the heartbeat; use cached_row_count(). */
@@ -245,6 +271,7 @@ private:
     /// Heartbeat capacity signal; see cached_row_count(). Relaxed ordering: it is a
     /// monitoring value, it synchronises nothing.
     std::atomic<std::int64_t> cached_rows_{kRowCountUnknown};
+    std::optional<std::string> quarantined_file_{}; ///< set by open() when it recovered (#3665)
     mutable std::mutex mu_;
     /// Prune is triggered from record_terminal() (a worker thread), NOT claim()
     /// (the latency-critical reader): the ring evicts TERMINAL rows, which only
