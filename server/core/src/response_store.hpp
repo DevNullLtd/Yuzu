@@ -245,10 +245,8 @@ struct AggregationResult {
 /// Default retention (days) — matches the pre-migration SQLite default.
 inline constexpr int kDefaultResponseRetentionDays = 90;
 
-/// Default cap on stored rows per (instruction_id, agent_id) pair (#561). The agent flushes a
-/// RUNNING frame once its buffer reaches 64 KiB (after appending a whole output callback, so a
-/// frame can be larger), so 256 rows is about 16 MiB of streamed output: an illustration, never
-/// a byte guarantee.
+/// Default rows per (instruction_id, agent_id) pair (#561): about 16 MiB at the agent's
+/// ~64 KiB flush size; see response_cap_rules.hpp.
 inline constexpr int kDefaultResponseMaxRowsPerAgent = 256;
 
 class ResponseStore {
@@ -302,13 +300,10 @@ public:
     /// lesson); only the response INSERT itself failing aborts the whole
     /// call.
     ///
-    /// Two independent ingest bounds: each ROW's output/error_detail is
-    /// byte-capped (kMaxIngestBytes), and each (instruction_id, agent_id)
-    /// PAIR is row-capped at `max_rows_per_agent` (#561). Past the cap a frame
-    /// is refused and counted on
-    /// `yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}`
-    /// (newest frames dropped, oldest kept); one terminal-status row is still
-    /// admitted while none exists for the pair (see response_cap_rules.hpp).
+    /// Two independent bounds: per-row bytes (kMaxIngestBytes) and per-pair rows
+    /// (max_rows_per_agent, #561); refused frames count on
+    /// yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}.
+    /// Exact semantics: response_cap_rules.hpp.
     void store(const StoredResponse& resp);
 
     /// Tri-state outcome of `finalize_terminal_status` so callers can

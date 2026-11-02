@@ -563,14 +563,13 @@ void ResponseStore::store(const StoredResponse& resp) {
     std::size_t facets_batch_failed = 0;
     const bool ok = pool_.with_txn_for(kIngestTimeout, [&](PGconn* conn) -> bool {
         reached_txn = true;
-        // Per-pair row cap (#561). One round trip, both halves index-bounded on
-        // idx_resp_instr_agent_status: a LIMIT-bounded count (never a full count) and, for a
+        // Per-pair row cap (#561; the bound: response_cap_rules.hpp). One round trip, both
+        // halves index-bounded on idx_resp_instr_agent_status: the pair's row count and, for a
         // terminal frame only (the CASE skips the probe for RUNNING), whether the pair already
         // holds a terminal row. `status > 0` equals `status <> 0` (CommandResponse.Status is
         // 0..4) and is an index range. A probe that cannot run refuses the row (query_error)
-        // rather than admit it unbounded. No advisory lock: two concurrent writers for one pair
-        // (direct stream + gateway forward) can overshoot by the number of writers; the bound
-        // is exact per writer, O(cap) overall.
+        // rather than admit it unbounded. No advisory lock; bound under concurrency:
+        // response_cap_rules.hpp.
         if (max_rows_per_agent_ > 0) {
             const bool is_terminal = resp.status != 0;
             pg::PgResult probe = pg::exec_params(

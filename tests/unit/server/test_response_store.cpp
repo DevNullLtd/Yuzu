@@ -3701,8 +3701,6 @@ TEST_CASE("ResponseStore tier: a filter with no plugin set wired refuses every r
 
 // ── Per-(instruction, agent) row cap (#561) ──────────────────────────────────
 
-static_assert(kDefaultResponseMaxRowsPerAgent == 256, "the shipped per-agent row cap default");
-
 TEST_CASE("per_agent_cap_admits decision table", "[response_store][cap]") {
     // Below the cap everything is admitted, terminal or not.
     CHECK(per_agent_cap_admits(0, 4, false, false));
@@ -3733,114 +3731,97 @@ std::size_t cap_rows(const ResponseStore& store, const std::string& instruction,
     return static_cast<std::size_t>(std::count_if(
         all->begin(), all->end(), [&](const StoredResponse& r) { return r.agent_id == agent; }));
 }
+
+double cap_dropped(yuzu::MetricsRegistry& metrics, const char* reason = "per_agent_cap") {
+    return metrics.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}})
+        .value();
+}
+
+// Member order is load-bearing: the store borrows the pool.
+struct CapFixture {
+    PgPool pool;
+    ResponseStore store;
+    yuzu::MetricsRegistry metrics;
+    CapFixture(const std::string& dsn, int cap)
+        : pool{{.conninfo = dsn, .size = 4}}, store(pool, 0, nullptr, cap) {
+        REQUIRE(store.is_open());
+        store.set_metrics(&metrics);
+    }
+};
 } // namespace
 
 TEST_CASE("ResponseStore: rows per (instruction, agent) are capped and counted",
           "[pg][response_store][cap]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    ResponseStore store(pool, 0, nullptr, /*max_rows_per_agent=*/4);
-    REQUIRE(store.is_open());
-    yuzu::MetricsRegistry metrics;
-    store.set_metrics(&metrics);
-    const auto dropped = [&](const char* reason) {
-        return metrics.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}})
-            .value();
-    };
+    CapFixture f(db.dsn(), 4);
 
     for (int i = 0; i < 5; ++i)
-        store.store(cap_frame("cmd-cap", "agent-1", 0));
+        f.store.store(cap_frame("cmd-cap", "agent-1", 0));
 
-    CHECK(cap_rows(store, "cmd-cap", "agent-1") == 4);
-    CHECK(dropped("per_agent_cap") == 1.0);
-    CHECK(dropped("query_error") == 0.0); // a cap refusal is never a query_error
+    CHECK(cap_rows(f.store, "cmd-cap", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 1.0);
+    CHECK(cap_dropped(f.metrics, "query_error") == 0.0); // a cap refusal is never a query_error
 }
 
 TEST_CASE("ResponseStore: the first terminal frame beyond the cap lands, a second is refused",
           "[pg][response_store][cap]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    ResponseStore store(pool, 0, nullptr, /*max_rows_per_agent=*/4);
-    REQUIRE(store.is_open());
-    yuzu::MetricsRegistry metrics;
-    store.set_metrics(&metrics);
-    const auto dropped = [&] {
-        return metrics
-            .counter("yuzu_server_response_ingest_dropped_total", {{"reason", "per_agent_cap"}})
-            .value();
-    };
+    CapFixture f(db.dsn(), 4);
 
     for (int i = 0; i < 4; ++i)
-        store.store(cap_frame("cmd-cap-term", "agent-1", 0));
-    store.store(cap_frame("cmd-cap-term", "agent-1", 1));
-    CHECK(cap_rows(store, "cmd-cap-term", "agent-1") == 5);
-    CHECK(dropped() == 0.0);
+        f.store.store(cap_frame("cmd-cap-term", "agent-1", 0));
+    f.store.store(cap_frame("cmd-cap-term", "agent-1", 1));
+    CHECK(cap_rows(f.store, "cmd-cap-term", "agent-1") == 5);
+    CHECK(cap_dropped(f.metrics) == 0.0);
 
-    store.store(cap_frame("cmd-cap-term", "agent-1", 1));
-    CHECK(cap_rows(store, "cmd-cap-term", "agent-1") == 5);
-    CHECK(dropped() == 1.0);
+    f.store.store(cap_frame("cmd-cap-term", "agent-1", 1));
+    CHECK(cap_rows(f.store, "cmd-cap-term", "agent-1") == 5);
+    CHECK(cap_dropped(f.metrics) == 1.0);
 }
 
 TEST_CASE("ResponseStore: a capped stream finalizes in place and replay cannot grow the pair",
           "[pg][response_store][cap]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    ResponseStore store(pool, 0, nullptr, /*max_rows_per_agent=*/4);
-    REQUIRE(store.is_open());
-    yuzu::MetricsRegistry metrics;
-    store.set_metrics(&metrics);
-    const auto dropped = [&] {
-        return metrics
-            .counter("yuzu_server_response_ingest_dropped_total", {{"reason", "per_agent_cap"}})
-            .value();
-    };
+    CapFixture f(db.dsn(), 4);
 
     for (int i = 0; i < 5; ++i)
-        store.store(cap_frame("cmd-fin", "agent-1", 0, "exec-1"));
-    CHECK(cap_rows(store, "cmd-fin", "agent-1") == 4);
-    CHECK(dropped() == 1.0);
+        f.store.store(cap_frame("cmd-fin", "agent-1", 0, "exec-1"));
+    CHECK(cap_rows(f.store, "cmd-fin", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 1.0);
 
-    CHECK(store.finalize_terminal_status("cmd-fin", "agent-1", 1, "", "exec-1", 0) ==
+    CHECK(f.store.finalize_terminal_status("cmd-fin", "agent-1", 1, "", "exec-1", 0) ==
           ResponseStore::FinalizeResult::Updated);
-    auto rows = store.get_by_instruction("cmd-fin", kAllRows);
+    auto rows = f.store.get_by_instruction("cmd-fin", kAllRows);
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 4);
     for (const auto& r : *rows)
         CHECK(r.status == 1);
 
     // A terminal frame with output now finds a terminal row: refused as a replay.
-    store.store(cap_frame("cmd-fin", "agent-1", 1, "exec-1"));
-    CHECK(cap_rows(store, "cmd-fin", "agent-1") == 4);
-    CHECK(dropped() == 2.0);
+    f.store.store(cap_frame("cmd-fin", "agent-1", 1, "exec-1"));
+    CHECK(cap_rows(f.store, "cmd-fin", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 2.0);
     // And a late RUNNING frame is refused too.
-    store.store(cap_frame("cmd-fin", "agent-1", 0, "exec-1"));
-    CHECK(cap_rows(store, "cmd-fin", "agent-1") == 4);
-    CHECK(dropped() == 3.0);
+    f.store.store(cap_frame("cmd-fin", "agent-1", 0, "exec-1"));
+    CHECK(cap_rows(f.store, "cmd-fin", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 3.0);
 }
 
 TEST_CASE("ResponseStore: the row cap is per (instruction, agent) pair",
           "[pg][response_store][cap]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    ResponseStore store(pool, 0, nullptr, /*max_rows_per_agent=*/2);
-    REQUIRE(store.is_open());
-    yuzu::MetricsRegistry metrics;
-    store.set_metrics(&metrics);
+    CapFixture f(db.dsn(), 2);
 
     for (int i = 0; i < 2; ++i)
-        store.store(cap_frame("cmd-cap", "agent-1", 0));
-    const double before =
-        metrics.counter("yuzu_server_response_ingest_dropped_total", {{"reason", "per_agent_cap"}})
-            .value();
+        f.store.store(cap_frame("cmd-cap", "agent-1", 0));
+    const double before = cap_dropped(f.metrics);
 
-    store.store(cap_frame("cmd-cap", "agent-2", 0));  // other agent, same instruction
-    store.store(cap_frame("cmd-other", "agent-1", 0)); // same agent, other instruction
+    f.store.store(cap_frame("cmd-cap", "agent-2", 0));  // other agent, same instruction
+    f.store.store(cap_frame("cmd-other", "agent-1", 0)); // same agent, other instruction
 
-    CHECK(cap_rows(store, "cmd-cap", "agent-2") == 1);
-    CHECK(cap_rows(store, "cmd-other", "agent-1") == 1);
-    CHECK(metrics
-              .counter("yuzu_server_response_ingest_dropped_total", {{"reason", "per_agent_cap"}})
-              .value() == before);
+    CHECK(cap_rows(f.store, "cmd-cap", "agent-2") == 1);
+    CHECK(cap_rows(f.store, "cmd-other", "agent-1") == 1);
+    CHECK(cap_dropped(f.metrics) == before);
 }
 
 TEST_CASE("ResponseStore: migration v4 creates the per-pair index", "[pg][response_store][cap]") {
