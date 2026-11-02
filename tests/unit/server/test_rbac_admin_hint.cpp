@@ -218,6 +218,24 @@ void make_regime_store_unreadable(RbacRoleHarness& h) {
     REQUIRE(r.status() == PGRES_COMMAND_OK);
 }
 
+/// The audit detail the assign/unassign handlers write when the REGIME check (the second gate)
+/// refuses, as opposed to `kRbacAdminGateDeniedAuditReason`, which the predicate (the first gate)
+/// writes. Both answer 403 "administrator role required", so `classify` cannot tell them apart;
+/// a case that must bind to the regime gate asserts this row.
+constexpr const char* kRegimeRefusalAuditDetail =
+    "caller does not hold authority under the regime that is durably true right now";
+
+/// The last `denied` row for `action` is the regime gate's, not the predicate's.
+void check_regime_gate_refused(RbacRoleHarness& h, const std::string& action) {
+    const AuditRecord* last = nullptr;
+    for (const auto& r : h.audit_log)
+        if (r.action == action && r.result == "denied")
+            last = &r;
+    REQUIRE(last != nullptr);
+    INFO("denied detail=" << last->detail);
+    CHECK(last->detail == kRegimeRefusalAuditDetail);
+}
+
 /// A persona the hint calls kMay is held to the exact status its route answers, not to "any of
 /// 2xx/400/409": a 400 or 409 from a gate the hint does not model would otherwise pass for
 /// "authority admitted". `admitted_status` is mandatory for a kMay persona and ignored otherwise
@@ -231,7 +249,11 @@ void check_admitted_status(RbacAdminHint expected, int admitted_status, int actu
 }
 
 /// The hint equals the real POST assign answer, and the hint wrote no audit row.
-void check_assign(RbacRoleHarness& h, RbacAdminHint expected, int admitted_status = 0) {
+///
+/// `regime_refusal` additionally requires the refusal to come from the regime gate (the second
+/// gate), not the predicate; see `kRegimeRefusalAuditDetail`.
+void check_assign(RbacRoleHarness& h, RbacAdminHint expected, int admitted_status = 0,
+                  bool regime_refusal = false) {
     AuditWatch watch{h};
     const auto audits_before = watch.rows();
     const auto hint = hint_of(h);
@@ -246,12 +268,15 @@ void check_assign(RbacRoleHarness& h, RbacAdminHint expected, int admitted_statu
     REQUIRE(classified.has_value());
     CHECK(*classified == hint);
     check_admitted_status(expected, admitted_status, res->status);
+    if (regime_refusal)
+        check_regime_gate_refused(h, "rbac.role.assigned");
 }
 
 /// The hint equals the real DELETE unassign answer. The target holds the grant first, so a
 /// request that clears both gates succeeds (2xx) instead of answering 404, which is not an
 /// authority answer and fails the classification loudly.
-void check_unassign(RbacRoleHarness& h, RbacAdminHint expected, int admitted_status = 0) {
+void check_unassign(RbacRoleHarness& h, RbacAdminHint expected, int admitted_status = 0,
+                    bool regime_refusal = false) {
     REQUIRE(h.rbac->assign_role({"user", "hint-target", "Viewer"}).has_value());
     AuditWatch watch{h};
     const auto audits_before = watch.rows();
@@ -267,12 +292,14 @@ void check_unassign(RbacRoleHarness& h, RbacAdminHint expected, int admitted_sta
     REQUIRE(classified.has_value());
     CHECK(*classified == hint);
     check_admitted_status(expected, admitted_status, res->status);
+    if (regime_refusal)
+        check_regime_gate_refused(h, "rbac.role.unassigned");
 }
 
 /// The hint equals the real PUT enforcement answer for a REAL transition (`target` is the
 /// opposite of the current state, so the idempotent no-op path never hides the gates).
 void check_enforcement(RbacRoleHarness& h, RbacAdminHint expected, bool target,
-                       int admitted_status = 0) {
+                       int admitted_status = 0, bool source_regime_refusal = false) {
     AuditWatch watch{h};
     const auto audits_before = watch.rows();
     const auto hint = hint_of(h);
@@ -286,6 +313,11 @@ void check_enforcement(RbacRoleHarness& h, RbacAdminHint expected, bool target,
     REQUIRE(classified.has_value());
     CHECK(*classified == hint);
     check_admitted_status(expected, admitted_status, res->status);
+    if (source_regime_refusal) {
+        // The store's source-regime refusal, not the predicate's "administrator role required".
+        CHECK(res->body.find("caller does not currently hold a fleet-wide Administrator grant") !=
+              std::string::npos);
+    }
 }
 
 void make_user(RbacRoleHarness& h, const std::string& name, auth::Role role) {
@@ -404,21 +436,22 @@ TEST_CASE("rbac_admin_hint == POST assign: SAML principal with the grant but NO 
     // refused earlier by the MFA step-up chokepoint (#4935), which runs before the route
     // handler and is not part of the hint.
     make_saml_caller(h);
-    check_assign(h, RbacAdminHint::kMayNot);
+    check_assign(h, RbacAdminHint::kMayNot, /*admitted_status=*/0, /*regime_refusal=*/true);
 }
 
 TEST_CASE("rbac_admin_hint == DELETE unassign: SAML principal with the grant but NO auth.users row (P7c)",
           "[pg][rbac_admin_predicate][rbac_admin_hint]") {
     RbacRoleHarness h;
     make_saml_caller(h);
-    check_unassign(h, RbacAdminHint::kMayNot);
+    check_unassign(h, RbacAdminHint::kMayNot, /*admitted_status=*/0, /*regime_refusal=*/true);
 }
 
 TEST_CASE("rbac_admin_hint == PUT enforcement: SAML principal with the grant and no row, RBAC on (P7c)",
           "[pg][rbac_admin_predicate][rbac_admin_hint]") {
     RbacRoleHarness h;
     make_saml_caller(h);
-    check_enforcement(h, RbacAdminHint::kMayNot, /*target=*/false); // the store's source check
+    check_enforcement(h, RbacAdminHint::kMayNot, /*target=*/false, /*admitted_status=*/0,
+                      /*source_regime_refusal=*/true);
 }
 
 TEST_CASE("rbac_admin_hint == POST assign: durable demotion after sign-in, RBAC off (P14)",
