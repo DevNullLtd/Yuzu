@@ -375,6 +375,9 @@ constexpr const char* kModelBody =
     R"("overrides":[{"image":"Foo.EXE","model":{"per_device_event_cap":2}}]})";
 
 void check_model_document(const json& d) {
+    REQUIRE(d.contains("version"));
+    REQUIRE(d.contains("model"));
+    REQUIRE(d.contains("overrides"));
     CHECK(d["version"] == 2);
     CHECK(d["model"]["per_device_event_cap"] == 7);
     CHECK(d["model"]["regression_start_ratio"] == 1.5);
@@ -408,6 +411,13 @@ TEST_CASE("score-policy routes: model parameters round-trip PUT then GET with th
         CHECK(gj["data"]["document"] == pj["data"]["document"]);
         CHECK(gj["data"]["revision"] == pj["data"]["revision"]);
         CHECK(get->get_header_value("ETag") == put->get_header_value("ETag"));
+
+        // A PUT of what GET returned is a fixed point: same text, same revision.
+        const auto again = h.send("PUT", kPath, gj["data"]["document"].dump(),
+                                  Harness::if_match(gj["data"]["revision"].get<std::string>()));
+        REQUIRE(again->status == 200);
+        CHECK(json::parse(again->body)["data"]["revision"] == gj["data"]["revision"]);
+        CHECK(*h.stored == dex_score_policy_canonical(*expected));
     }
     SECTION("dry run reports the model and stores nothing") {
         const auto res = h.send("PUT", std::string(kPath) + "?dry_run=true", kModelBody,
@@ -420,7 +430,11 @@ TEST_CASE("score-policy routes: model parameters round-trip PUT then GET with th
         CHECK(h.cas_calls == 0);
         REQUIRE(h.rows.size() == 1);
         CHECK(h.rows[0].action == "dex.score_policy.validate");
-        CHECK(json::parse(h.rows[0].detail)["document"]["model"]["per_device_event_cap"] == 7);
+        // The audit row records exactly the canonical text a real write would store.
+        const auto expected = dex_score_policy_validate_text(kModelBody);
+        REQUIRE(expected.has_value());
+        CHECK(json::parse(h.rows[0].detail)["document"] ==
+              json::parse(dex_score_policy_canonical(*expected)));
     }
     SECTION("a model in a version 1 document is refused") {
         const auto res = h.send("PUT", kPath, R"({"model":{"per_device_event_cap":7}})",

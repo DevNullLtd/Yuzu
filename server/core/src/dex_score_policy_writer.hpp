@@ -40,8 +40,8 @@
  * store state they describe already exists, and the handler's Sec-Audit-Failed header carries
  * the signal.
  *
- * Audit row size. The whole canonical document (about 130 KB at the override limit, at most
- * about 185 KB when image keys and names need escaping, always under the 256 KiB cap) rides
+ * Audit row size. The whole canonical document (about 150 KB at the override limit, at most
+ * about 220 KB when image keys and names need escaping, always under the 256 KiB cap) rides
  * only on the rows that record a proposal or an applied change: `attempted`, `success` and
  * `validate`. Every other row (denied, failure, no_change) carries `document_bytes`, the size
  * of the canonical text, instead, so a refused or failed request cannot multiply the document

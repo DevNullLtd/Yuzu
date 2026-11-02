@@ -735,6 +735,8 @@ TEST_CASE("openapi_spec_json(): DexScorePolicyDocument types the stored shape an
     REQUIRE_FALSE(spec.is_discarded());
     const json& schemas = spec["components"]["schemas"];
     REQUIRE(schemas.contains("DexScorePolicyDocument"));
+    REQUIRE(schemas.contains("DexScorePolicyData"));
+    REQUIRE(spec["paths"].contains("/dex/score-policy"));
     const std::string ref = "#/components/schemas/DexScorePolicyDocument";
     const auto doc = [&schemas](const std::string& ptr) {
         return schema_at(schemas["DexScorePolicyDocument"], ptr);
@@ -745,6 +747,8 @@ TEST_CASE("openapi_spec_json(): DexScorePolicyDocument types the stored shape an
                     "/properties/data/properties/document/allOf/0/$ref") == ref);
     CHECK(schema_at(spec, "/paths/~1dex~1score-policy/put/requestBody/content/application~1json/"
                           "schema/allOf/0/$ref") == ref);
+    CHECK(doc("/properties/version/type") == "integer");
+    CHECK(doc("/properties/version/default") == kDexScorePolicyBaseVersion);
     CHECK(doc("/properties/version/enum") ==
           json::array({kDexScorePolicyBaseVersion, kDexScorePolicyVersion}));
 
@@ -756,20 +760,81 @@ TEST_CASE("openapi_spec_json(): DexScorePolicyDocument types the stored shape an
     o.per_device_event_cap = 2;
     o.regression_start_ratio = 1.5;
     o.regression_full_ratio = 4.0;
+    // Every partial override key set, so the override tiers and weights are compared whole.
+    o.excellent = 95.0;
+    o.good = 80.0;
+    o.fair = 60.0;
+    o.names = {"A", "B", "C", "D"};
+    o.breadth = 1.0;
+    o.crashes = 2.0;
+    o.hangs = 3.0;
+    o.regression = 4.0;
     p.overrides.push_back(o);
     const json emitted = dex_score_policy_to_json(p);
     REQUIRE(emitted.contains("model"));
+    REQUIRE(emitted.contains("tiers"));
+    REQUIRE(emitted.contains("weights"));
+    REQUIRE(emitted.contains("overrides"));
+    REQUIRE(emitted["overrides"].size() == 1);
+    const json& eov = emitted["overrides"][0];
+    REQUIRE(eov.contains("model"));
+    REQUIRE(eov.contains("tiers"));
+    REQUIRE(eov.contains("weights"));
     CHECK(object_keys(doc("/properties/model/properties")) == object_keys(emitted["model"]));
     const auto override_keys =
         object_keys(doc("/properties/overrides/items/properties/model/properties"));
-    CHECK(override_keys == object_keys(emitted["overrides"][0]["model"]));
+    CHECK(override_keys == object_keys(eov["model"]));
     CHECK_FALSE(override_keys.contains("interval_confidence"));
     CHECK(doc("/properties/model/additionalProperties") == false);
     CHECK(doc("/properties/overrides/items/properties/model/additionalProperties") == false);
     CHECK(doc("/properties/overrides/maxItems") == kDexPolicyMaxOverrides);
 
-    // An override is read-required on `image` alone (always emitted).
-    CHECK(doc("/properties/overrides/items/required") == json::array({"image"}));
+    // An override is read-required on `image` alone (always emitted); no other object has a
+    // required key, and every object the parser closes (`unknown_key`) is closed here too.
+    const std::string ov = "/properties/overrides/items";
+    CHECK(doc(ov + "/required") == json::array({"image"}));
+    const std::vector<std::string> closed = {
+        "",
+        "/properties/tiers",
+        "/properties/tiers/properties/edges",
+        "/properties/tiers/properties/names",
+        "/properties/weights",
+        "/properties/model",
+        ov,
+        ov + "/properties/tiers",
+        ov + "/properties/tiers/properties/edges",
+        ov + "/properties/tiers/properties/names",
+        ov + "/properties/weights",
+        ov + "/properties/model"};
+    for (const auto& base : closed) {
+        INFO("object: " << base);
+        CHECK(doc(base + "/additionalProperties") == false);
+        if (base != ov)
+            CHECK(doc(base + "/required").is_null());
+    }
+
+    // The key sets are the serializer's, for the global document and for a fully-set override.
+    CHECK(object_keys(doc("/properties")) == object_keys(emitted));
+    CHECK(object_keys(doc(ov + "/properties")) == object_keys(eov));
+    for (const std::string& base : {std::string(""), ov}) {
+        const json& src = base.empty() ? emitted : eov;
+        INFO("object: " << base);
+        CHECK(object_keys(doc(base + "/properties/tiers/properties")) ==
+              object_keys(src["tiers"]));
+        CHECK(object_keys(doc(base + "/properties/tiers/properties/edges/properties")) ==
+              object_keys(src["tiers"]["edges"]));
+        CHECK(object_keys(doc(base + "/properties/tiers/properties/names/properties")) ==
+              object_keys(src["tiers"]["names"]));
+        CHECK(object_keys(doc(base + "/properties/weights/properties")) ==
+              object_keys(src["weights"]));
+        // The name length and the non-negative weight bound are the validator's.
+        for (const auto& [k, v] : src["tiers"]["names"].items())
+            CHECK(doc(base + "/properties/tiers/properties/names/properties/" + k +
+                      "/maxLength") == kDexPolicyMaxNameBytes);
+        for (const auto& [k, v] : src["weights"].items())
+            CHECK(doc(base + "/properties/weights/properties/" + k + "/minimum") == 0);
+    }
+    CHECK(doc(ov + "/properties/image/maxLength") == kDexPolicyMaxKeyBytes);
 
     // Type, bounds and defaults are the serializer's and the core constants'. The type comes from
     // what the serializer emits (a whole-number parameter is an integer, a ratio a number).
@@ -781,11 +846,16 @@ TEST_CASE("openapi_spec_json(): DexScorePolicyDocument types the stored shape an
         CHECK(doc(at + "/minimum") == lo);
         CHECK(doc(at + "/maximum") == hi);
         CHECK(doc(at + "/default") == (def ? *def : json()));
+        // nlohmann compares 5 equal to 5.0, so pin the kind of the default separately.
+        if (def) {
+            CHECK(doc(at + "/default").is_number_integer() == sample.is_number_integer());
+            CHECK(doc(at + "/default").is_number_float() == sample.is_number_float());
+        }
     };
     const std::string gm = "/properties/model/properties/";
     const std::string om = "/properties/overrides/items/properties/model/properties/";
     const json& em = emitted["model"];
-    const json& eo = emitted["overrides"][0]["model"];
+    const json& eo = eov["model"];
     const json cap_def = kStabilityModel.per_device_event_cap;
     const json start_def = kStabilityModel.regression_start_ratio;
     const json full_def = kStabilityModel.regression_full_ratio;
@@ -819,6 +889,14 @@ TEST_CASE("openapi_spec_json(): DexScorePolicyDocument types the stored shape an
     const std::string put_desc =
         spec["paths"]["/dex/score-policy"]["put"].value("description", "");
     CHECK(put_desc.find("rolling upgrade") != std::string::npos);
+
+    // The GET text and the component agree on when `model` is present.
+    const std::string get_desc =
+        spec["paths"]["/dex/score-policy"]["get"].value("description", "");
+    CHECK(get_desc.find("model only when a parameter is in use") != std::string::npos);
+    const json model_desc = doc("/properties/model/description");
+    REQUIRE(model_desc.is_string());
+    CHECK(model_desc.get<std::string>().find("A parameter is in use when") != std::string::npos);
 }
 
 TEST_CASE("openapi_spec_json(): the execution-statistics reads document their degraded-read 503 "

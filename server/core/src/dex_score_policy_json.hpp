@@ -102,9 +102,9 @@ inline constexpr std::int64_t kDexScorePolicyVersion = 2;
 inline constexpr std::int64_t kDexScorePolicyBaseVersion = 1;
 /// Revision reported when no document is stored.
 inline constexpr std::string_view kDexScorePolicyDefaultRevision = "default";
-/// Largest stored text that is parsed. A legitimate document is about 130 KB at the
-/// override limit (at most about 185 KB when image keys and names need escaping); anything
-/// larger is refused unread.
+/// Largest stored text that is parsed. A legitimate document is about 150 KB at the
+/// override limit with every field set at full precision (at most about 220 KB when image
+/// keys and names need escaping); anything larger is refused unread.
 inline constexpr std::size_t kDexScorePolicyMaxBytes = 256 * 1024;
 
 /// A document that is not the expected shape. `field` is the dotted path of the
