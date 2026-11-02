@@ -1104,10 +1104,10 @@ TEST_CASE("classify_offline_discovery: a <sid>.bak record is its base sid's part
         return ProfileInfo{sid, "", std::move(path), HiveState::not_loaded, false};
     };
     const std::vector<ProfileInfo> profiles{
-       info(kSidA + ".bak", "C:\\Users\\a.bak"), // the temporary-profile leftover of A
-       info(kSidB, "C:\\Users\\b"),
-       info(entra, "C:\\Users\\entra"),          // an Entra user: S-1-12-1-*, listed
-       info("S-1-5-82-1-2", "C:\\Users\\DefaultAppPool"),
+       info(kSidA + ".bak", "C:\\Users\\" "user.bak"), // the temporary-profile leftover of A
+       info(kSidB, "C:\\Users\\foo"),
+       info(entra, "C:\\Users\\example"),          // an Entra user: S-1-12-1-*, listed
+       info("S-1-5-82-1-2", "C:\\Users\\svc"),
        info("S-1-5-80-9", "C:\\Windows\\ServiceProfiles\\x"),
     };
     const std::vector<std::string> failed{"S-1-5-82-7", kSidB + ".bak"};
@@ -1115,14 +1115,14 @@ TEST_CASE("classify_offline_discovery: a <sid>.bak record is its base sid's part
     CHECK(d.complete);
     // B is listed with a path but has a `.bak` sibling (its failed record), so its own record is the
     // temporary profile's: partial, never a profile of this walk (see the temporary-profile test below)
-    CHECK(d.profiles == std::vector<OfflineProfile>{{entra, "C:\\Users\\entra"}});
+    CHECK(d.profiles == std::vector<OfflineProfile>{{entra, "C:\\Users\\example"}});
     // A is proved to exist by its .bak record (partial: its known entry stands), but is not a
     // profile of this walk; the virtual service SIDs are in neither list. B's failed .bak record
     // proves B the same way: the partial entry is the base sid, never the `.bak` name.
     CHECK(d.partial == std::vector<std::string>{kSidA, kSidB});
     // so a complete walk that saw only A's .bak (mid-rename) keeps A's known baseline scope
     CHECK(reconcile_offline({prof(kSidA)}, {}, {}, d) ==
-          std::vector<OfflineProfile>{prof(kSidA), {entra, "C:\\Users\\entra"}});
+          std::vector<OfflineProfile>{prof(kSidA), {entra, "C:\\Users\\example"}});
 
     // A complete walk whose ONLY evidence for a known profile is its failed .bak record (any
     // case) keeps that profile: the record's base sid is what names it, not the `.bak` text.
@@ -1143,12 +1143,12 @@ TEST_CASE("a listed <sid> beside <sid>.bak (a temporary profile) never replaces 
     const auto info = [](const std::string& sid, std::string path) {
         return ProfileInfo{sid, "", std::move(path), HiveState::not_loaded, false};
     };
-    const OfflineProfile real{kSidA, "C:\\Users\\a"};
-    const std::string temp = "C:\\Users\\TEMP";
+    const OfflineProfile real{kSidA, "C:\\Users\\user"};
+    const std::string temp = "C:\\Users\\tmp";
     const std::vector<std::string> none;
 
     // the temporary-profile signature: the base sid's record now names a TEMP folder, beside the .bak
-    const std::vector<ProfileInfo> pair{info(kSidA, temp), info(kSidA + ".bak", "C:\\Users\\a")};
+    const std::vector<ProfileInfo> pair{info(kSidA, temp), info(kSidA + ".bak", "C:\\Users\\user")};
     const auto d = classify_offline_discovery(true, false, false, pair, none);
     CHECK(d.complete);
     CHECK(d.profiles.empty()); // neither record is a hive to mount
@@ -1189,10 +1189,10 @@ TEST_CASE("classify_offline_discovery: a loaded profile is skipped, an unreadabl
         return ProfileInfo{sid, "", std::move(path), st, unreadable};
     };
     const std::vector<ProfileInfo> profiles{
-       info(kSidA, HiveState::loaded, "C:\\Users\\a"),               // logged in: not offline
-       info(kSidB, HiveState::not_loaded, "C:\\Users\\b"),           // offline
-       info(sid_c, HiveState::loaded_classes_only, "C:\\Users\\c"),  // its NTUSER.DAT is not loaded
-       info(sid_d, HiveState::not_loaded, "C:\\Users\\d", true),     // path unreadable: partial
+       info(kSidA, HiveState::loaded, "C:\\Users\\user"),               // logged in: not offline
+       info(kSidB, HiveState::not_loaded, "C:\\Users\\foo"),           // offline
+       info(sid_c, HiveState::loaded_classes_only, "C:\\Users\\bar"),  // its NTUSER.DAT is not loaded
+       info(sid_d, HiveState::not_loaded, "C:\\Users\\baz", true),     // path unreadable: partial
        info(sid_e, HiveState::not_loaded, ""),                         // no path: partial
     };
     const std::vector<std::string> none;
@@ -1201,12 +1201,12 @@ TEST_CASE("classify_offline_discovery: a loaded profile is skipped, an unreadabl
     const auto d = classify_offline_discovery(true, false, false, profiles, none);
     CHECK(d.complete);
     CHECK(d.profiles ==
-          std::vector<OfflineProfile>{{kSidB, "C:\\Users\\b"}, {sid_c, "C:\\Users\\c"}});
+          std::vector<OfflineProfile>{{kSidB, "C:\\Users\\foo"}, {sid_c, "C:\\Users\\bar"}});
     CHECK(d.partial == std::vector<std::string>{sid_d, sid_e});
     const std::vector<OfflineProfile> known{prof(sid_d), prof(sid_f)};
     CHECK(reconcile_offline(known, {}, {}, d) ==
           std::vector<OfflineProfile>{
-             prof(sid_d), {kSidB, "C:\\Users\\b"}, {sid_c, "C:\\Users\\c"}});
+             prof(sid_d), {kSidB, "C:\\Users\\foo"}, {sid_c, "C:\\Users\\bar"}});
 
     // a record that failed to read is partial too, once (named by the walk and by the list)
     const std::vector<std::string> failed{sid_d, sid_f};
@@ -3636,13 +3636,13 @@ TEST_CASE("classify_offline_discovery: a profile missing from collect's HKU snap
     // is not in it: classified against that snapshot A is offline and is carried, not dropped.
     // (A logon after the snapshot is handled by the next tick: the HKU name watch moves A to
     // the loaded list, and the live arm of the mount reads the loaded hive meanwhile.)
-    const std::vector<RawProfileRecord> records{{kSidA, "C:\\Users\\a", false}};
+    const std::vector<RawProfileRecord> records{{kSidA, "C:\\Users\\user", false}};
     const std::vector<std::string> snapshot{kSidB};
     const std::vector<std::string> none;
     const auto profiles = yuzu::profiles::build_profile_list(records, snapshot);
     const auto d = classify_offline_discovery(true, false, false, profiles, none);
     CHECK(d.complete);
-    CHECK(d.profiles == std::vector<OfflineProfile>{{kSidA, "C:\\Users\\a"}});
+    CHECK(d.profiles == std::vector<OfflineProfile>{{kSidA, "C:\\Users\\user"}});
     CHECK(reconcile_offline({}, {}, snapshot, d) == d.profiles);
     // the same record against a snapshot that holds A classifies it loaded, not offline
     const auto loaded =
@@ -4317,7 +4317,7 @@ TEST_CASE("registry offline: a path first learned for a pathless profile is take
     // The failed-logon signature: `S` names the TEMP folder and `S.bak` the real one. A walk that
     // sees only `S` (the `.bak` was skipped as the index shifted) lists the TEMP folder as a
     // normal profile; a walk that sees both flags `S` partial and lists nothing for it.
-    const std::string temp = "C:\\Users\\TEMP";
+    const std::string temp = "C:\\Users\\tmp";
     const std::vector<ProfileInfo> alone_records{ProfileInfo{kSidA, "", temp, HiveState::not_loaded, false}};
     const std::vector<ProfileInfo> pair_records{
        ProfileInfo{kSidA, "", temp, HiveState::not_loaded, false},
@@ -4457,7 +4457,7 @@ TEST_CASE("registry offline: a temporary profile (a listed <sid> beside <sid>.ba
           "[echo][registry][lifecycle]") {
     using yuzu::profiles::HiveState;
     using yuzu::profiles::ProfileInfo;
-    const std::string temp = "C:\\Users\\TEMP";
+    const std::string temp = "C:\\Users\\tmp";
     const std::vector<ProfileInfo> records{
        ProfileInfo{kSidA, "", temp, HiveState::not_loaded, false},
        ProfileInfo{kSidA + ".bak", "", prof(kSidA).path, HiveState::not_loaded, false}};
