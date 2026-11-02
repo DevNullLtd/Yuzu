@@ -30,6 +30,10 @@ are this gate's own items:
   7. The claim block precedes the plugin-match loop and the thread-pool submit.
   8. The reserved-name dispatch compares against `kDedupBypassPlugin`, and no inline
      `cmd.plugin() ==/!= "__guard__"` comparison exists (3: one literal, not two that drift).
+  9. (#3665) Corruption recovery stays observable: `yuzu_agent_dedup_quarantined_total` is
+     incremented inside `if (const auto& q = command_dedup_->quarantined_this_open())` (7: a
+     lost dedup history must be metered, not just logged), and the heartbeat reports it as
+     `tags["yuzu.dedup_quarantined"]` (the agent has no /metrics endpoint).
 
 Robustness: `//` comments are stripped and whitespace is collapsed before matching, so line
 wrapping, re-indentation and comment text mentioning a token cannot satisfy or break a check.
@@ -167,6 +171,25 @@ def problems(src):
     if re.search(r"cmd\.plugin\(\) ?[!=]= ?\"__guard__\"", t):
         out.append("agent.cpp compares cmd.plugin() against an inline \"__guard__\" literal; use "
                    "kDedupBypassPlugin so the claim bypass and the dispatch cannot drift (#3668)")
+
+    # 9. (#3665) a recovered-from-corruption open is metered INSIDE the guard. block_after is
+    # brace-matched and string-aware, so an increment hoisted after the closing brace (or an
+    # unconditional one, which would make every boot report "history lost") is not satisfied by a
+    # lookahead window.
+    q_blk = block_after(t, r"if \( ?const auto& ?q = command_dedup_->quarantined_this_open\( ?\) ?\) \{")
+    if q_blk is None or not re.search(
+            r"metrics_\.counter\( ?\"yuzu_agent_dedup_quarantined_total\" ?\)\.increment\( ?\);", q_blk):
+        out.append("the open-time `quarantined_this_open()` branch no longer increments "
+                   "yuzu_agent_dedup_quarantined_total INSIDE its guard; a lost dedup history would go "
+                   "unmetered, or every boot would report one (#3665)")
+    if len(re.findall(r"yuzu_agent_dedup_quarantined_total\" ?\)\.increment", t)) != 1:
+        out.append("yuzu_agent_dedup_quarantined_total must be incremented exactly once in agent.cpp, "
+                   "inside the quarantined_this_open() guard (#3665)")
+    if not re.search(r"tags\[\"yuzu\.dedup_quarantined\"\] = std::to_string\( ?static_cast<int64_t>\( ?"
+                     r"metrics_\.counter\( ?\"yuzu_agent_dedup_quarantined_total\" ?\)\.value\( ?\)", t):
+        out.append("the heartbeat no longer reports yuzu.dedup_quarantined from yuzu_agent_dedup_quarantined_total; "
+                   "the agent has no /metrics endpoint, so a lost dedup history would be visible only in the "
+                   "endpoint's own log (#3665)")
     return out
 
 
@@ -204,6 +227,16 @@ MUTATIONS = [
      "kDedupBypassPlugin"),
     (r"bool claimed_here = false;", 'bool claimed_here = false; (void)(cmd.plugin() != "__guard__");', 0, 0,
      "inline"),
+    # 9. the recovery counter unguarded from the store's answer
+    (r"if \(const auto& q = command_dedup_->quarantined_this_open\(\)\)", "if (false)", 0, 0,
+     "quarantined_this_open"),
+    # 9a. the increment hoisted out of its guard (unconditional: every boot would report a loss)
+    (r'(metrics_\.counter\("yuzu_agent_dedup_quarantined_total"\)\.increment\(\);)(\s*\}\s*\} else \{)',
+     r'\g<2> metrics_.counter("yuzu_agent_dedup_quarantined_total").increment();', 0, 0,
+     "INSIDE its guard"),
+    # 9b. the heartbeat tag dropped
+    (r'tags\["yuzu\.dedup_quarantined"\]', 'tags["yuzu.dedup_quarantined_x"]', 0, 0,
+     "yuzu.dedup_quarantined"),
     # the empty-id warning demoted (operators lose the signal)
     (r'spdlog::warn\("Received command with empty command_id', 'spdlog::debug("Received command with empty command_id', 0, 0,
      "empty command_id"),
