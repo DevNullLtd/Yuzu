@@ -197,6 +197,12 @@ constexpr std::string_view kSyncKvNamespace = "__sync__";
 static_assert(is_reserved_plugin_name(kSyncKvNamespace),
               "kSyncKvNamespace must be a reserved plugin name (plugin_loader.hpp)");
 
+// #3668. The command-dedup claim bypass (kDedupBypassPlugin, command_dedup_decision.hpp) names the
+// Guardian side channel, which is dispatched by its reserved name. Bind it to kReservedPluginNames
+// so the constant cannot drift from the loader's reserved list.
+static_assert(is_reserved_plugin_name(kDedupBypassPlugin),
+              "kDedupBypassPlugin must be a reserved plugin name (plugin_loader.hpp)");
+
 #if defined(_WIN32)
 constexpr const char* kAgentOs = "windows";
 constexpr const char* kAgentArch = "x86_64";
@@ -3400,7 +3406,8 @@ public:
                                              "terminal outcome",
                                              cmd.command_id());
                             } else {
-                                if (claim.state == DedupState::Terminal)
+                                if (claim.status == ClaimStatus::Duplicate &&
+                                    claim.state == DedupState::Terminal)
                                     spdlog::error("Stored terminal outcome for {} failed to "
                                                   "parse — answering RUNNING",
                                                   cmd.command_id());
