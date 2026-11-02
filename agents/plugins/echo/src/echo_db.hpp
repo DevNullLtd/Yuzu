@@ -896,6 +896,7 @@ public:
 
 private:
     explicit EchoDatabase(sqlite3* db);
+    friend class EchoFold; // upsert_state_locked, inside the fold's transaction (echo_fold.cpp)
 
     /// echo_state UPSERT on an already-locked handle; shared by set_state() and
     /// the diff-source inserts (which run it inside their transaction).

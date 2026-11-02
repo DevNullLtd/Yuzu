@@ -38,12 +38,12 @@
 
 #include "echo_db.hpp"
 #include "echo_fold_schema.hpp"
+#include "echo_registry_parsers.hpp"
 #include "echo_usage.hpp"
 
 #include <sha256.hpp>
 
 #include <algorithm>
-#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -51,6 +51,7 @@
 #include <expected>
 #include <format>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -92,7 +93,7 @@ inline constexpr int64_t kFoldMaxStamp = 253402300799LL;
     if (tier == "hourly")
         return floor_to(3600);
     if (tier == "daily")
-        return floor_to(86400);
+        return usage::day_ts_for(ts);
     if (tier == "monthly") {
         using namespace std::chrono;
         const sys_days day = floor<days>(sys_seconds{seconds{ts}});
@@ -114,16 +115,6 @@ using NamedValues = std::vector<std::pair<std::string_view, Value>>;
 [[nodiscard]] inline Value vr(double v) { return v; }
 [[nodiscard]] inline Value vt(std::string_view v) { return std::string{v}; }
 
-/// `s` cut to at most `max_bytes`, backing off to a UTF-8 character boundary.
-[[nodiscard]] inline std::string clip_utf8(std::string_view s, std::size_t max_bytes) {
-    if (s.size() <= max_bytes)
-        return std::string{s};
-    std::size_t cut = max_bytes;
-    while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80)
-        --cut;
-    return std::string{s.substr(0, cut)};
-}
-
 /// One roll-up row: the bucket, the key values in FoldSourceDef key order and the
 /// merged measures in measure order (generated columns are never carried).
 struct TierRow {
@@ -139,8 +130,9 @@ struct TierRow {
 ///
 /// A key or measure the caller does not name defaults to 0 / 0.0 / "" -- which is
 /// how enrichment columns that no producer fills yet stay at zero. A name that is
-/// not a column of the source throws std::invalid_argument (a declaration typo,
-/// caught by the per-delta tests), never a silently dropped value.
+/// not a column of the source, or a value whose type is not its column's declared
+/// type, throws std::invalid_argument (a declaration typo, caught by the per-delta
+/// tests), never a silently dropped or converted value.
 class TierAccumulator {
 public:
     explicit TierAccumulator(const FoldSourceDef& def) : def_(&def) {
@@ -186,17 +178,10 @@ public:
         }
         std::vector<Value> kv = resolve(key_cols_, key_index_, keys, "key");
         std::vector<Value> mv = resolve(measure_cols_, measure_index_, measures, "measure");
-        const std::string key_enc = encode_keys(kv);
         for (std::size_t i = 0; i < tiers_.size(); ++i) {
-            std::string enc;
-            append_be(enc, static_cast<uint64_t>(buckets[i]) ^ (uint64_t{1} << 63));
-            enc += key_enc;
-            auto& slots = tiers_[i].slots;
-            const auto it = slots.find(enc);
-            if (it == slots.end())
-                slots.emplace(std::move(enc), Slot{buckets[i], kv, mv});
-            else
-                merge(it->second.measures, mv);
+            const auto [it, fresh] = tiers_[i].slots.try_emplace(SlotKey{buckets[i], kv}, mv);
+            if (!fresh)
+                merge(it->second, mv);
         }
         return true;
     }
@@ -209,8 +194,8 @@ public:
             if (t.name != tier)
                 continue;
             out.reserve(t.slots.size());
-            for (const auto& [enc, slot] : t.slots)
-                out.push_back({slot.bucket, slot.keys, slot.measures});
+            for (const auto& [k, measures] : t.slots)
+                out.push_back({k.first, k.second, measures});
         }
         return out;
     }
@@ -239,38 +224,12 @@ public:
     }
 
 private:
-    struct Slot {
-        int64_t bucket;
-        std::vector<Value> keys;
-        std::vector<Value> measures;
-    };
-    // Slots are keyed by a byte encoding of (bucket, keys): comparing strings is far cheaper
-    // than comparing vectors of variants, and the bucket leads so rows come out bucket-ordered.
+    using SlotKey = std::pair<int64_t, std::vector<Value>>; // (bucket, keys)
+    // (bucket, keys) -> merged measures. The bucket leads, so rows come out bucket-ordered.
     struct Tier {
         std::string_view name;
-        std::map<std::string, Slot> slots;
+        std::map<SlotKey, std::vector<Value>> slots;
     };
-
-    static void append_be(std::string& out, uint64_t v) {
-        for (int shift = 56; shift >= 0; shift -= 8)
-            out += static_cast<char>((v >> shift) & 0xFF);
-    }
-
-    static std::string encode_keys(const std::vector<Value>& keys) {
-        std::string out;
-        for (const auto& v : keys) {
-            if (const auto* i = std::get_if<int64_t>(&v)) {
-                append_be(out, static_cast<uint64_t>(*i));
-            } else if (const auto* d = std::get_if<double>(&v)) {
-                append_be(out, std::bit_cast<uint64_t>(*d));
-            } else {
-                const auto& s = std::get<std::string>(v);
-                append_be(out, s.size()); // length-prefixed: no key value can forge a boundary
-                out += s;
-            }
-        }
-        return out;
-    }
 
     static Value zero_of(const ColumnDef& c) {
         if (c.sql_type == "TEXT")
@@ -280,23 +239,15 @@ private:
         return int64_t{0};
     }
 
+    // A value must already be of its column's declared type: no int<->real conversion.
     static Value coerce(const ColumnDef& c, const Value& v) {
-        if (c.sql_type == "TEXT") {
-            if (const auto* s = std::get_if<std::string>(&v))
-                return *s;
-        } else if (c.sql_type == "REAL") {
-            if (const auto* d = std::get_if<double>(&v))
-                return *d;
-            if (const auto* i = std::get_if<int64_t>(&v))
-                return static_cast<double>(*i);
-        } else {
-            if (const auto* i = std::get_if<int64_t>(&v))
-                return *i;
-            if (const auto* d = std::get_if<double>(&v))
-                return static_cast<int64_t>(*d);
-        }
-        throw std::invalid_argument(
-            std::format("value type does not fit column '{}' ({})", c.name, c.sql_type));
+        const bool ok = c.sql_type == "TEXT"   ? std::holds_alternative<std::string>(v)
+                        : c.sql_type == "REAL" ? std::holds_alternative<double>(v)
+                                               : std::holds_alternative<int64_t>(v);
+        if (!ok)
+            throw std::invalid_argument(
+                std::format("value type does not fit column '{}' ({})", c.name, c.sql_type));
+        return v;
     }
 
     std::vector<Value> resolve(const std::vector<ColumnDef>& cols,
@@ -458,11 +409,19 @@ struct KeyedContribution {
 // supply are left unnamed and so stay 0 / ''. An unrecognised action token is
 // ignored, never guessed at.
 
+/// The measure `action` maps to in `table`, or nullptr for a token the delta does
+/// not know (the caller skips the event).
+[[nodiscard]] inline const char*
+pick(std::string_view action, std::initializer_list<std::pair<std::string_view, const char*>> table) {
+    for (const auto& [token, measure] : table)
+        if (action == token)
+            return measure;
+    return nullptr;
+}
+
 inline void process_delta(const std::vector<ProcessEvent>& events, TierAccumulator& acc) {
     for (const auto& e : events) {
-        const char* measure = e.action == "started" ? "start_count"
-                              : e.action == "stopped" ? "stop_count"
-                                                      : nullptr;
+        const char* measure = pick(e.action, {{"started", "start_count"}, {"stopped", "stop_count"}});
         if (!measure)
             continue;
         // parent_name, abnormal_exit_count, elevated_count, spoofed_parent_count: zero.
@@ -482,10 +441,9 @@ inline void tcp_delta(const std::vector<NetworkEvent>& events, TierAccumulator& 
                       vi(1)}});
             continue;
         }
-        const char* measure = e.action == "connected"      ? "connect_count"
-                              : e.action == "disconnected" ? "disconnect_count"
-                              : e.action == "failed"       ? "failed_count"
-                                                           : nullptr;
+        const char* measure = pick(e.action, {{"connected", "connect_count"},
+                                              {"disconnected", "disconnect_count"},
+                                              {"failed", "failed_count"}});
         if (!measure)
             continue;
         acc.add(e.ts,
@@ -498,9 +456,8 @@ inline void tcp_delta(const std::vector<NetworkEvent>& events, TierAccumulator& 
 inline void module_delta(const std::vector<ModuleRow>& events, TierAccumulator& acc) {
     for (const auto& e : events) {
         // An unload is not stored; rebased_count: zero.
-        const char* measure = (e.action == "loaded" || e.action == "seed") ? "load_count"
-                              : e.action == "blocked"                       ? "blocked_count"
-                                                                            : nullptr;
+        const char* measure =
+            pick(e.action, {{"loaded", "load_count"}, {"seed", "load_count"}, {"blocked", "blocked_count"}});
         if (!measure)
             continue;
         acc.add(e.ts,
@@ -515,10 +472,9 @@ inline void module_delta(const std::vector<ModuleRow>& events, TierAccumulator& 
 // columns; status_changes keeps today's meaning (state_changed only).
 inline void service_delta(const std::vector<ServiceEvent>& events, TierAccumulator& acc) {
     for (const auto& e : events) {
-        const char* measure = e.action == "started"         ? "install_count"
-                              : e.action == "stopped"       ? "remove_count"
-                              : e.action == "state_changed" ? "status_changes"
-                                                            : nullptr;
+        const char* measure = pick(e.action, {{"started", "install_count"},
+                                              {"stopped", "remove_count"},
+                                              {"state_changed", "status_changes"}});
         if (!measure)
             continue;
         // last_exit_code, last_start_account, last_binary_path, failed_count: zero / ''.
@@ -529,9 +485,7 @@ inline void service_delta(const std::vector<ServiceEvent>& events, TierAccumulat
 
 inline void user_delta(const std::vector<UserEvent>& events, TierAccumulator& acc) {
     for (const auto& e : events) {
-        const char* measure = e.action == "login"    ? "login_count"
-                              : e.action == "logout" ? "logout_count"
-                                                     : nullptr;
+        const char* measure = pick(e.action, {{"login", "login_count"}, {"logout", "logout_count"}});
         if (!measure)
             continue;
         // disconnect_count, session_s_sum: zero.
@@ -543,10 +497,9 @@ inline void user_delta(const std::vector<UserEvent>& events, TierAccumulator& ac
 
 inline void software_delta(const std::vector<SoftwareEvent>& events, TierAccumulator& acc) {
     for (const auto& e : events) {
-        const char* measure = e.action == "installed"  ? "install_count"
-                              : e.action == "removed"  ? "remove_count"
-                              : e.action == "upgraded" ? "upgrade_count"
-                                                       : nullptr;
+        const char* measure = pick(e.action, {{"installed", "install_count"},
+                                              {"removed", "remove_count"},
+                                              {"upgraded", "upgrade_count"}});
         if (!measure)
             continue;
         // arch, downgrade_count: zero / ''.
@@ -558,9 +511,7 @@ inline void software_delta(const std::vector<SoftwareEvent>& events, TierAccumul
 
 inline void arp_delta(const std::vector<ArpEvent>& events, TierAccumulator& acc) {
     for (const auto& e : events) {
-        const char* measure = e.action == "appeared"  ? "appear_count"
-                              : e.action == "removed" ? "remove_count"
-                                                      : nullptr;
+        const char* measure = pick(e.action, {{"appeared", "appear_count"}, {"removed", "remove_count"}});
         if (!measure)
             continue;
         // is_router, rebind_count: zero.
@@ -573,9 +524,7 @@ inline void arp_delta(const std::vector<ArpEvent>& events, TierAccumulator& acc)
 
 inline void dns_delta(const std::vector<DnsEvent>& events, TierAccumulator& acc) {
     for (const auto& e : events) {
-        const char* measure = e.action == "appeared"  ? "appear_count"
-                              : e.action == "removed" ? "remove_count"
-                                                      : nullptr;
+        const char* measure = pick(e.action, {{"appeared", "appear_count"}, {"removed", "remove_count"}});
         if (!measure)
             continue;
         // negative_count: zero.
@@ -597,10 +546,9 @@ inline void netconn_delta(const std::vector<NetConnRow>& events, TierAccumulator
 
 inline void mapdrive_delta(const std::vector<MapDriveEvent>& events, TierAccumulator& acc) {
     for (const auto& e : events) {
-        const char* measure = e.action == "appeared"     ? "appear_count"
-                              : e.action == "removed"    ? "remove_count"
-                              : e.action == "historical" ? "historical_count"
-                                                         : nullptr;
+        const char* measure = pick(e.action, {{"appeared", "appear_count"},
+                                              {"removed", "remove_count"},
+                                              {"historical", "historical_count"}});
         if (!measure)
             continue;
         // last_dialect, guest_count: zero / ''.
@@ -679,11 +627,12 @@ inline std::vector<KeyedContribution> power_delta(const std::vector<PowerEvent>&
         std::vector<std::string> id{e.action, e.detail};
         if (e.action != "capture_gap")
             id.push_back(std::to_string(e.ts));
+        std::string detail = e.detail;
+        registry_detail::clip_utf8(detail, 256);
         // resume_kind, source: ''.
         out.push_back({e.record_key, identity_digest(id), e.ts,
                        {{"action", vt(e.action)}},
-                       {{"event_count", vi(1)}, {"last_ts", vi(e.ts)},
-                        {"last_detail", vt(clip_utf8(e.detail, 256))}}});
+                       {{"event_count", vi(1)}, {"last_ts", vi(e.ts)}, {"last_detail", vt(detail)}}});
     }
     return out;
 }
@@ -721,11 +670,13 @@ inline std::vector<KeyedContribution> registry_delta(const std::vector<RegistryE
                        std::to_string(e.data_size), e.prev_data_type, e.prev_data,
                        std::to_string(e.prev_data_size), std::to_string(e.observed_at)});
         }
+        std::string data = e.data;
+        registry_detail::clip_utf8(data, 512);
         out.push_back({e.record_key, identity_digest(id), e.ts,
                        {{"hive", vt(e.hive)}, {"key_path", vt(e.key_path)},
                         {"value_name", vt(e.value_name)}, {"action", vt(e.action)}},
                        {{"change_count", vi(1)},
-                        {"last_data", vt(clip_utf8(e.data, 512))},
+                        {"last_data", vt(data)},
                         {"last_data_type", vt(e.data_type)},
                         {"last_actor_image", vt(e.actor_image)},
                         {"last_ts", vi(e.ts)}}});
@@ -874,6 +825,9 @@ public:
 
 private:
     [[nodiscard]] Clock::time_point now() const { return now_ ? now_() : Clock::now(); }
+
+    /// echo_state UPSERT inside a fold transaction (a member: it needs EchoDatabase's friendship).
+    static bool write_state(TransactionHandle& h, const StateWrite& w);
 
     NowFn now_;
     std::mutex op_mu_;

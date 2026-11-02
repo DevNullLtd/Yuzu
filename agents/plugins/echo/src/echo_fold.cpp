@@ -172,46 +172,33 @@ bool upsert_tiers(TransactionHandle& h, const FoldSourceDef& def, const TierAccu
     return true;
 }
 
-// echo_state UPSERT (same SQL as EchoDatabase::upsert_state_locked, which is private).
-bool write_state(TransactionHandle& h, const StateWrite& w) {
+// Prepare `sql`, bind `args` in order, step to completion. Statements with no result rows.
+bool exec_bound(TransactionHandle& h, const std::string& sql, std::initializer_list<Value> args) {
     StmtPtr st;
-    if (!prep(h, st,
-              "INSERT INTO echo_state (collector, state_json, updated_at) VALUES (?, ?, ?) "
-              "ON CONFLICT(collector) DO UPDATE SET state_json = excluded.state_json, "
-              "updated_at = excluded.updated_at"))
+    if (!prep(h, st, sql))
         return false;
-    bind_text(st.get(), 1, w.collector);
-    bind_text(st.get(), 2, w.json);
-    sqlite3_bind_int64(st.get(), 3, now_epoch_seconds());
+    int i = 1;
+    for (const auto& a : args)
+        bind_value(st.get(), i++, a);
     return run(h, st.get());
 }
 
 // echo_cursor UPSERT (same SQL as the raw-store cursor commit).
 bool write_cursor(TransactionHandle& h, std::string_view source, const std::string& json) {
-    StmtPtr st;
-    if (!prep(h, st,
-              "INSERT INTO echo_cursor (source, cursor_json, updated_at) VALUES (?, ?, ?) "
-              "ON CONFLICT(source) DO UPDATE SET cursor_json = excluded.cursor_json, "
-              "updated_at = excluded.updated_at"))
-        return false;
-    bind_text(st.get(), 1, source);
-    bind_text(st.get(), 2, json);
-    sqlite3_bind_int64(st.get(), 3, now_epoch_seconds());
-    return run(h, st.get());
+    return exec_bound(h,
+                      "INSERT INTO echo_cursor (source, cursor_json, updated_at) VALUES (?, ?, ?) "
+                      "ON CONFLICT(source) DO UPDATE SET cursor_json = excluded.cursor_json, "
+                      "updated_at = excluded.updated_at",
+                      {vt(source), vt(json), vi(now_epoch_seconds())});
 }
 
 // Add `n` to the persisted rejected-events counter. An UPSERT-add inside the fold's
 // own transaction, so a rollback leaves the counter exactly as it was.
 bool bump_rejected(TransactionHandle& h, std::size_t n) {
-    StmtPtr st;
-    if (!prep(h, st,
-              "INSERT INTO echo_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET "
-              "value = CAST(CAST(value AS INTEGER) + CAST(excluded.value AS INTEGER) AS TEXT)"))
-        return false;
-    bind_text(st.get(), 1, kFoldRejectedCounterKey);
-    const std::string add = std::to_string(n);
-    bind_text(st.get(), 2, add);
-    return run(h, st.get());
+    return exec_bound(h,
+                      "INSERT INTO echo_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE "
+                      "SET value = CAST(CAST(value AS INTEGER) + CAST(excluded.value AS INTEGER) AS TEXT)",
+                      {vt(kFoldRejectedCounterKey), vt(std::to_string(n))});
 }
 
 void warn_rejected(std::string_view source, std::size_t n, std::optional<int64_t> first) {
@@ -249,6 +236,17 @@ struct GcProgress {
 
 EchoFold::EchoFold(NowFn now) : now_(std::move(now)) {}
 EchoFold::~EchoFold() = default;
+
+// echo_state UPSERT through the store's own statement (EchoDatabase befriends EchoFold for it).
+// upsert_state_locked only logs and returns false, so the failure is recorded on the handle here.
+bool EchoFold::write_state(TransactionHandle& h, const StateWrite& w) {
+    if (h.poisoned())
+        return false;
+    if (EchoDatabase::upsert_state_locked(h.raw(), w.collector, w.json))
+        return true;
+    h.fail("echo_state write failed");
+    return false;
+}
 
 std::expected<void, std::string> EchoFold::install_fold_schema(EchoDatabase& db) {
     std::lock_guard lock(op_mu_);

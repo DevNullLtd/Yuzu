@@ -41,8 +41,8 @@ inline constexpr std::string_view kDictTable = "echo_dict";
 inline constexpr std::string_view kSeenTable = "echo_fold_seen";
 
 /// One capture source's roll-up declaration. `columns` excludes the bucket
-/// column (it is derived from the tier by ts_column_for_suffix()); see
-/// fold_tier_columns() for the full per-tier list.
+/// column: it is derived from the tier by ts_column_for_suffix() and leads every
+/// tier's table, unique index and view.
 struct FoldSourceDef {
     std::string_view name;                 ///< registry name ("process", "tcp", ...)
     std::vector<std::string_view> tiers;   ///< "hourly" | "daily" | "monthly"
@@ -62,12 +62,6 @@ struct FoldSourceDef {
 
 /// `<src>_<tier>_r` -- the physical table behind the view.
 [[nodiscard]] std::string physical_table_name(std::string_view source, std::string_view tier);
-
-/// The tier's logical columns: the bucket column (role kBucket) first, then
-/// `def.columns`. Used by the DDL generator, the upsert builder and the
-/// accumulator, so the three can never disagree about order.
-[[nodiscard]] std::vector<ColumnDef> fold_tier_columns(const FoldSourceDef& def,
-                                                       std::string_view tier);
 
 /// Physical column name: `<name>_id` for an interned key, else `name`.
 [[nodiscard]] std::string physical_column_name(const ColumnDef& col);

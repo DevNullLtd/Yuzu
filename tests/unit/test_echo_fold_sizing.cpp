@@ -28,7 +28,6 @@
 #include <string>
 #include <vector>
 
-namespace fs = std::filesystem;
 using namespace yuzu::echo;
 
 namespace {
@@ -138,7 +137,9 @@ struct Sizes {
 };
 
 Sizes measure(const FoldSourceDef& def) {
-    const auto path = yuzu::test::unique_temp_path("yuzu_test_echo_fold_size_");
+    // Declared first so it is destroyed last, after the reader, the control copies and the database.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_fold_size_"};
+    const auto& path = tmp.path;
     auto opened = EchoDatabase::open(path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
@@ -200,11 +201,6 @@ Sizes measure(const FoldSourceDef& def) {
         ring_total = used_bytes(mem.db) - base;
     }
     s.row_bytes = static_cast<double>(grown - dict_total - ring_total) / static_cast<double>(s.rows);
-
-    { EchoDatabase discard = std::move(db); }
-    std::error_code ec;
-    for (const char* suffix : {"", "-wal", "-shm", "-journal"})
-        fs::remove(fs::path{path.string() + suffix}, ec);
     return s;
 }
 

@@ -192,29 +192,6 @@ const std::unordered_set<std::string>& view_set() {
     return s;
 }
 
-const std::unordered_set<std::string>& row_table_set() {
-    static const std::unordered_set<std::string> s = [] {
-        std::unordered_set<std::string> out;
-        for (const auto& def : fold_sources()) {
-            if (def.own_tables)
-                continue;
-            for (auto tier : def.tiers)
-                out.insert(physical_table_name(def.name, tier));
-        }
-        return out;
-    }();
-    return s;
-}
-
-const std::unordered_set<std::string>& internal_set() {
-    static const std::unordered_set<std::string> s = [] {
-        std::unordered_set<std::string> out{std::string{kDictTable}, std::string{kSeenTable}};
-        out.insert(row_table_set().begin(), row_table_set().end());
-        return out;
-    }();
-    return s;
-}
-
 } // namespace
 
 const std::vector<FoldSourceDef>& fold_sources() {
@@ -235,14 +212,6 @@ std::string fold_view_name(std::string_view source, std::string_view tier) {
 
 std::string physical_table_name(std::string_view source, std::string_view tier) {
     return std::format("{}_{}_r", source, tier);
-}
-
-std::vector<ColumnDef> fold_tier_columns(const FoldSourceDef& def, std::string_view tier) {
-    std::vector<ColumnDef> cols;
-    cols.reserve(def.columns.size() + 1);
-    cols.push_back({ts_column_for_suffix(tier), "INTEGER", ColumnRole::kBucket});
-    cols.insert(cols.end(), def.columns.begin(), def.columns.end());
-    return cols;
 }
 
 std::string physical_column_name(const ColumnDef& col) {
@@ -274,12 +243,13 @@ std::string generate_fold_ddl() {
         if (def.own_tables)
             continue;
         for (auto tier : def.tiers) {
-            const auto cols = fold_tier_columns(def, tier);
+            const std::string bucket{ts_column_for_suffix(tier)};
             const std::string table = physical_table_name(def.name, tier);
             const std::string view = fold_view_name(def.name, tier);
 
-            d << "CREATE TABLE IF NOT EXISTS " << table << " (\n    id INTEGER PRIMARY KEY";
-            for (const auto& c : cols) {
+            d << "CREATE TABLE IF NOT EXISTS " << table << " (\n    id INTEGER PRIMARY KEY,\n    "
+              << bucket << " INTEGER NOT NULL DEFAULT 0";
+            for (const auto& c : def.columns) {
                 // An interned key is stored as its dictionary id, whatever its logical type.
                 d << ",\n    " << physical_column_name(c) << ' ' << (c.interned ? "INTEGER" : c.sql_type);
                 if (c.role == ColumnRole::kGenerated) {
@@ -294,14 +264,10 @@ std::string generate_fold_ddl() {
 
             // ONE unique index: the UPSERT target and the retention/budget bucket
             // index (bucket first, so a bucket-ordered scan needs no second index).
-            d << "CREATE UNIQUE INDEX IF NOT EXISTS " << table << "_uq ON " << table << "(";
-            bool first = true;
-            for (const auto& c : cols) {
-                if (c.role != ColumnRole::kBucket && c.role != ColumnRole::kKey)
-                    continue;
-                d << (first ? "" : ", ") << physical_column_name(c);
-                first = false;
-            }
+            d << "CREATE UNIQUE INDEX IF NOT EXISTS " << table << "_uq ON " << table << "(" << bucket;
+            for (const auto& c : def.columns)
+                if (c.role == ColumnRole::kKey)
+                    d << ", " << physical_column_name(c);
             d << ");\n";
 
             // The view: the names every consumer already queries. A text key resolves
@@ -310,8 +276,9 @@ std::string generate_fold_ddl() {
             // at the top level, which the operator-SQL authorizer cannot tell from a direct
             // read of the dictionary. A lookup is only present for the columns a query
             // selects, and its reads are reported under the view's name.
-            d << "CREATE VIEW IF NOT EXISTS " << view << " AS SELECT r.id AS id";
-            for (const auto& c : cols) {
+            d << "CREATE VIEW IF NOT EXISTS " << view << " AS SELECT r.id AS id, r." << bucket << " AS "
+              << bucket;
+            for (const auto& c : def.columns) {
                 if (c.interned)
                     d << ", (SELECT text FROM " << kDictTable << " WHERE id = r." << physical_column_name(c)
                       << ") AS " << c.name;
@@ -328,12 +295,13 @@ bool is_fold_view(std::string_view name) {
     return view_set().contains(std::string(name));
 }
 
-bool is_fold_internal_table(std::string_view name) {
-    return internal_set().contains(std::string(name));
+// A row table is `<view>_r` for a roll-up view: derived from the view set, not a second set.
+bool is_fold_row_table(std::string_view name) {
+    return name.ends_with("_r") && is_fold_view(name.substr(0, name.size() - 2));
 }
 
-bool is_fold_row_table(std::string_view name) {
-    return row_table_set().contains(std::string(name));
+bool is_fold_internal_table(std::string_view name) {
+    return name == kDictTable || name == kSeenTable || is_fold_row_table(name);
 }
 
 std::vector<std::string> legacy_live_shim_names() {

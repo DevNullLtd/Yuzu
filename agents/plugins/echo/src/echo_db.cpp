@@ -1294,9 +1294,7 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
             // on a normal C++ stack — never lazily inside the authorizer callback
             // while it runs in SQLite's C prepare frames.
             (void)is_queryable_table("");
-            (void)is_fold_view("");
-            (void)is_fold_internal_table("");
-            (void)is_fold_row_table("");
+            (void)is_fold_view(""); // the view set; the fold-internal checks derive from it
             db.query_db_ = ro;
         } else {
             spdlog::warn("EchoDatabase: read-only query connection unavailable ({}); "

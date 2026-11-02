@@ -95,17 +95,11 @@ int64_t count(sqlite3* db, const std::string& sql) {
 
 // A temp-file EchoDatabase with the roll-up schema installed.
 struct FoldDb {
+    yuzu::test::TempDbFile tmp; // first member: destroyed last, after the database has closed
     EchoDatabase db;
-    fs::path path;
     EchoFold fold;
     explicit FoldDb(EchoDatabase d, fs::path p, EchoFold::NowFn now = nullptr)
-        : db(std::move(d)), path(std::move(p)), fold(std::move(now)) {}
-    ~FoldDb() {
-        { EchoDatabase discard = std::move(db); }
-        std::error_code ec;
-        for (const char* suffix : {"", "-wal", "-shm", "-journal"})
-            fs::remove(fs::path{path.string() + suffix}, ec);
-    }
+        : tmp(std::move(p)), db(std::move(d)), fold(std::move(now)) {}
     int64_t n(const std::string& sql) {
         const auto r = db.execute_query(sql);
         REQUIRE(r.has_value());
@@ -966,10 +960,6 @@ TEST_CASE("cursor deltas: power, removable and registry clipping and digests", "
     CHECK(ms(gacc, gr, "last_data").size() == 512);
     CHECK(ms(gacc, gr, "last_actor_image") == "a.exe");
     CHECK(mi(gacc, gr, "change_count") == 1);
-
-    // A multi-byte character is never split by the clip.
-    CHECK(clip_utf8(std::string(255, 'a') + "\xC3\xA9", 256) == std::string(255, 'a'));
-    CHECK(clip_utf8("short", 256) == "short");
 }
 
 TEST_CASE("usage_delta: a pure adapter over fold_daily", "[echo][fold][delta]") {
