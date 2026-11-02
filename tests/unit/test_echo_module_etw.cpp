@@ -638,12 +638,16 @@ TEST_CASE("Windows module drain: the by-handle verdict equals the by-name verdic
 
 TEST_CASE("Windows module drain: a catalog-signed system image reads signed, with a signer",
           "[echo][module][etw][windows]") {
-    // A System32 binary with no embedded signature whose hash a system catalog lists (kernel32.dll
-    // and its neighbours; Get-AuthenticodeSignature reports SignatureType=Catalog). The embedded
-    // check says unsigned (the oracle); the catalog lookup must turn that into signed.
+    // A System32 binary with no embedded signature whose hash a system catalog lists
+    // (Get-AuthenticodeSignature reports SignatureType=Catalog). The embedded check says
+    // unsigned (the oracle); the catalog lookup must turn that into signed. Which binaries
+    // qualify depends on the Windows build: on some, WinVerifyTrust already resolves the
+    // catalog for the system DLLs (the oracle reads them signed) and only the executables
+    // below still read unsigned, so the list carries both kinds and the first qualifying
+    // image is used.
     std::optional<std::pair<std::wstring, std::string>> candidate;
-    for (const wchar_t* rel :
-         {L"\\kernel32.dll", L"\\kernelbase.dll", L"\\user32.dll", L"\\advapi32.dll"}) {
+    for (const wchar_t* rel : {L"\\kernel32.dll", L"\\kernelbase.dll", L"\\user32.dll",
+                               L"\\advapi32.dll", L"\\cmd.exe", L"\\ping.exe", L"\\notepad.exe"}) {
         const std::wstring w = system_dir() + rel;
         if (GetFileAttributesW(w.c_str()) != INVALID_FILE_ATTRIBUTES &&
             oracle_state(w) == ModuleSignedState::kUnsigned) {
