@@ -2670,33 +2670,6 @@ TEST_CASE("registry source: a control-set switch re-baselines CurrentControlSet 
     CHECK(read_cursor(t.db).ccs == "ControlSet002");
 }
 
-TEST_CASE("registry source: a logged-off user's roots leave scope without a removal storm",
-          "[echo][registry][lifecycle]") {
-    auto t = make_db();
-    Fake f;
-    f.sids = {"S-1-5-21-1"};
-    const std::string user_root = "HKU\\S-1-5-21-1\\Software\\yuzu_test_u";
-    auto src = make_registry_cursor_source(RegistryScope{{}, {"Software\\yuzu_test_u"}}, f.reader());
-    f.reads[user_root] = complete({{user_root, {{"v", vread(4, dword(1))}}}});
-    tick(t.db, *src);
-    CHECK(f.watch_calls.back() == std::vector<std::string>{user_root});
-    const std::string empty_baseline = R"({"v":1,"keys":{}})";
-    CHECK(*t.db.try_get_state("registry:" + user_root).value() != empty_baseline);
-    f.sids.clear();
-    f.clock = T0 + 100 * SEC;
-    f.dirty->mark_hku();
-    f.reads.erase(user_root); // the hive is unloaded: the path reads Absent
-    tick(t.db, *src);
-    CHECK(f.watch_calls.back().empty());
-    CHECK(count_rows(t.db) == 0); // not read, so no mass removal
-    CHECK(*t.db.try_get_state("registry:" + user_root).value() == empty_baseline); // and no values kept
-    CHECK(read_cursor(t.db).roots.empty());
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Offline (unloaded) hives over an injected reader
-// ═══════════════════════════════════════════════════════════════════════════
-
 namespace {
 
 // Does this stored baseline row hold no key at all (what an Absent read, the shrink on leaving
@@ -2707,6 +2680,64 @@ bool empty_baseline(const std::string& json) {
     const auto d = decode_registry_baseline(json);
     return !d.malformed && d.baseline.keys.empty();
 }
+
+// Is a USABLE baseline stored: a row that decodes and holds at least one key? `!empty_baseline`
+// is also true for a missing row and for malformed text, so "the baseline was kept" is asserted
+// with this, never with the negation.
+bool nonempty_baseline(const std::string& json) {
+    const auto d = decode_registry_baseline(json);
+    return !d.malformed && !d.baseline.keys.empty();
+}
+
+} // namespace
+
+TEST_CASE("registry test helpers: empty_baseline and nonempty_baseline decode the row, whatever its key order",
+          "[echo][registry]") {
+    const std::string populated = encode_registry_baseline(
+       RegistryBaseline{{{"HKU\\S\\k", {{"v", BaselineEntry{4, 4, "h", "1", false}}}}}});
+    struct Case {
+        const char* name;
+        std::string json;
+        bool empty, nonempty;
+    };
+    for (const auto& c : {Case{"empty, the literal's own key order", R"({"v":1,"keys":{}})", true, false},
+                          Case{"empty, the encoder's key order", R"({"keys":{},"v":1})", true, false},
+                          Case{"populated", populated, false, true},
+                          Case{"missing row", "", false, false},
+                          Case{"malformed text", "not-json", false, false}}) {
+        INFO(c.name);
+        CHECK(empty_baseline(c.json) == c.empty);
+        CHECK(nonempty_baseline(c.json) == c.nonempty);
+    }
+}
+
+TEST_CASE("registry source: a logged-off user's roots leave scope without a removal storm",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    f.sids = {"S-1-5-21-1"};
+    const std::string user_root = "HKU\\S-1-5-21-1\\Software\\yuzu_test_u";
+    auto src = make_registry_cursor_source(RegistryScope{{}, {"Software\\yuzu_test_u"}}, f.reader());
+    f.reads[user_root] = complete({{user_root, {{"v", vread(4, dword(1))}}}});
+    tick(t.db, *src);
+    CHECK(f.watch_calls.back() == std::vector<std::string>{user_root});
+    CHECK(nonempty_baseline(t.db.try_get_state("registry:" + user_root).value().value_or("")));
+    f.sids.clear();
+    f.clock = T0 + 100 * SEC;
+    f.dirty->mark_hku();
+    f.reads.erase(user_root); // the hive is unloaded: the path reads Absent
+    tick(t.db, *src);
+    CHECK(f.watch_calls.back().empty());
+    CHECK(count_rows(t.db) == 0); // not read, so no mass removal
+    CHECK(empty_baseline(t.db.try_get_state("registry:" + user_root).value().value_or(""))); // and no values kept
+    CHECK(read_cursor(t.db).roots.empty());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Offline (unloaded) hives over an injected reader
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
 
 SubtreeRead uread(const std::string& root, std::uint32_t v) {
     return complete({{root, {{"v", vread(4, dword(v))}}}});
@@ -2783,7 +2814,7 @@ TEST_CASE("registry offline: first sight baselines silently; one mount per hive 
     CHECK(r.f.offline_calls[0].roots == std::vector<std::string>{root});
     CHECK(r.f.offline_calls[0].deadline > T0);
     CHECK(count_rows(r.t.db) == 0);
-    CHECK(!empty_baseline(r.state(root)));
+    CHECK(nonempty_baseline(r.state(root)));
     CHECK(r.f.read_calls.empty()); // the loaded-hive reader is not used for an offline root
 
     r.tick_to(12); // eleven ordinary ticks: no hive mount and no profile walk
@@ -2809,7 +2840,7 @@ TEST_CASE("registry offline: first sight baselines silently; one mount per hive 
     CHECK(row[7] == "offline");
     CHECK_THAT(row[8], ContainsSubstring("offline:"));
     CHECK(read_cursor(r.t.db).held.empty());
-    CHECK(!empty_baseline(r.state(root)));
+    CHECK(nonempty_baseline(r.state(root)));
 
     // an HKU name-watch mark re-walks too; the cursor's list otherwise stands
     r.f.dirty->mark_hku();
@@ -2887,7 +2918,7 @@ TEST_CASE("registry offline: a hive with several roots is mounted once, and a re
     CHECK(r.f.offline_calls[0].roots.size() == 2);
     CHECK(r.f.offline_calls[1].roots.size() == 2);
     const auto before = r.state(a2);
-    REQUIRE(!empty_baseline(before));
+    REQUIRE(nonempty_baseline(before));
 
     // the SECOND root of A changes while the source is disabled: the re-enable must re-baseline it
     // together with the first (a member left baselined would report the change as a row)
@@ -2903,7 +2934,7 @@ TEST_CASE("registry offline: a hive with several roots is mounted once, and a re
     const auto cur = read_cursor(r.t.db);
     for (const auto& root : {a1, a2, b1, b2}) {
         CHECK(cur.roots.at(root).baselined);
-        CHECK(!empty_baseline(r.state(root)));
+        CHECK(nonempty_baseline(r.state(root)));
     }
 
     // a refusal is one gap row PER ROOT: both of A's roots report it
@@ -3012,7 +3043,7 @@ TEST_CASE("registry offline: a mount that was not attempted writes no baseline a
     const auto after = read_cursor(r.t.db).roots.at(root);
     CHECK_FALSE(after.deferred);
     CHECK(after.baselined);
-    CHECK(!empty_baseline(r.state(root)));
+    CHECK(nonempty_baseline(r.state(root)));
     CHECK(count_rows(r.t.db) == 0);
 }
 
@@ -3178,7 +3209,7 @@ TEST_CASE("registry offline: an incomplete profile walk keeps the known scope an
     CHECK(read_cursor(r.t.db).offline ==
           std::vector<OfflineProfile>{prof(kSidA)}); // no scope removal
     CHECK(read_cursor(r.t.db).roots.contains(root));
-    CHECK(!empty_baseline(r.state(root))); // the baseline was not erased
+    CHECK(nonempty_baseline(r.state(root))); // the baseline was not erased
     CHECK(r.state(root) != baseline);       // the known path was still read: the change is not lost
     const auto rows = q(r.t.db, "SELECT prev_data, data, detail FROM registry_live");
     REQUIRE(rows.rows.size() == 1);
@@ -3208,7 +3239,7 @@ TEST_CASE("registry offline: a user who logs off on a tick whose walk is incompl
         r.f.reads[root] = uread(root, 1);
         r.next(); // A is loaded and baselined
         const auto baseline = r.state(root);
-        REQUIRE(!empty_baseline(baseline));
+        REQUIRE(nonempty_baseline(baseline));
         REQUIRE(read_cursor(r.t.db).roots.at(root).window_base != 0);
 
         // A logs off on the tick the walk is bad: nothing says A's profile is gone
@@ -3228,13 +3259,14 @@ TEST_CASE("registry offline: a user who logs off on a tick whose walk is incompl
         CHECK(r.config("registry_offline_discovery_incomplete") == (walk.complete ? "0" : "1"));
 
         // The next ORDINARY tick walks again (the path is unknown), the complete walk lists A,
+        // a second walk lists the SAME path (a path first learned is taken only on agreement),
         // and A is read at once -- not at the next hourly reconcile -- against the loaded baseline.
         const int walks = r.f.offline_profile_calls;
         r.f.offline_discovery = OfflineDiscovery{};
         r.f.offline_discovery.profiles = {prof(kSidA)};
         r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
         r.next();
-        CHECK(r.f.offline_profile_calls == walks + 1);
+        CHECK(r.f.offline_profile_calls == walks + 2);
         REQUIRE(r.f.offline_calls.size() == 1);
         CHECK(r.f.offline_calls[0].path == prof(kSidA).path);
         const auto rows = q(r.t.db, "SELECT action, prev_data, data, detail FROM registry_live");
@@ -3249,7 +3281,7 @@ TEST_CASE("registry offline: a user who logs off on a tick whose walk is incompl
         CHECK(r.config("registry_offline_discovery_incomplete") == "0");
 
         r.next(); // settled: no more walks, no more mounts until the hour
-        CHECK(r.f.offline_profile_calls == walks + 1);
+        CHECK(r.f.offline_profile_calls == walks + 2);
         CHECK(r.f.offline_calls.size() == 1);
     }
 }
@@ -3294,7 +3326,7 @@ TEST_CASE("registry offline: a user who logs off while the walk stays incomplete
         r.next();
         CHECK(r.f.offline_profile_calls == walks + i);
         CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{{kSidA, ""}});
-        CHECK(!empty_baseline(r.state(root)));
+        CHECK(nonempty_baseline(r.state(root)));
     }
     CHECK(r.f.offline_calls.empty());
     CHECK(count_rows(r.t.db) == 0);
@@ -3405,7 +3437,7 @@ TEST_CASE("registry offline: a re-enable does not retry a refused offline hive u
         r.next();
         CHECK(r.f.offline_calls.size() == attempts + 1);
         CHECK(read_cursor(r.t.db).roots.at(root).baselined);
-        CHECK(!empty_baseline(r.state(root)));
+        CHECK(nonempty_baseline(r.state(root)));
         CHECK(r.state(root) != kept);
         CHECK(count_rows(r.t.db) == 2);
     }
@@ -3466,7 +3498,7 @@ TEST_CASE("registry offline: a hive refused on first sight is retried only at re
     r.next();
     CHECK(r.f.offline_calls.size() == 3);
     CHECK(read_cursor(r.t.db).roots.at(root).baselined);
-    CHECK(!empty_baseline(r.state(root)));
+    CHECK(nonempty_baseline(r.state(root)));
     CHECK(count_rows(r.t.db) == 1); // only the first-sight gap row
 }
 
@@ -3543,7 +3575,7 @@ TEST_CASE("registry offline: an empty complete discovery (an older build lists n
     r.f.offline_discovery.profiles = {prof(kSidA)};
     r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
     r.next();
-    REQUIRE(!empty_baseline(r.state(root)));
+    REQUIRE(nonempty_baseline(r.state(root)));
     REQUIRE(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
 
     // An older build never lists a logged-off profile. An empty, complete discovery answer stands
@@ -3570,7 +3602,7 @@ TEST_CASE("registry offline: an empty complete discovery (an older build lists n
     r.next();
     CHECK(r.f.offline_calls.size() == calls + 1);
     CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
-    CHECK(!empty_baseline(r.state(root)));
+    CHECK(nonempty_baseline(r.state(root)));
     CHECK(count_rows(r.t.db) == 0);
 }
 
@@ -3829,8 +3861,10 @@ TEST_CASE("registry offline: a user who has just logged off is protected by the 
         const char* incomplete;
     };
     // A is loaded and baselined; it logs off on a tick whose FIRST walk is complete but misses it
-    // (the profile is mid-rename), which is the very race the confirmation exists for.
-    for (const auto& c : {Case{"the second walk lists them", lists, true, prof(kSidA).path, "0"},
+    // (the profile is mid-rename), which is the very race the confirmation exists for. A second
+    // walk that lists it keeps the profile in scope but does NOT supply its path (a path walk 1
+    // never listed is unconfirmed): it stays pathless and deferred, and the next tick resolves it.
+    for (const auto& c : {Case{"the second walk lists them", lists, true, "", "0"},
                           Case{"the second walk omits them too", OfflineDiscovery{}, false, "", "0"},
                           Case{"the second walk is incomplete", cut, true, "", "1"}}) {
         INFO(c.name);
@@ -3840,7 +3874,7 @@ TEST_CASE("registry offline: a user who has just logged off is protected by the 
         r.f.reads[root] = uread(root, 1);
         r.next();
         const auto baseline = r.state(root);
-        REQUIRE(!empty_baseline(baseline));
+        REQUIRE(nonempty_baseline(baseline));
         const int walks = r.f.offline_profile_calls;
         const int enumerations = r.f.loaded_sids_calls;
 
@@ -3862,6 +3896,8 @@ TEST_CASE("registry offline: a user who has just logged off is protected by the 
             continue;
         }
         CHECK(cur.offline == std::vector<OfflineProfile>{{kSidA, c.path}});
+        CHECK(cur.roots.at(root).deferred); // due the moment a path is confirmed
+        CHECK(r.f.offline_calls.empty());   // no confirmed path, no mount
         CHECK(r.state(root) == baseline);
 
         // The change made while it was logged out is reported against the ORIGINAL baseline.
@@ -3877,7 +3913,7 @@ TEST_CASE("registry offline: a user who has just logged off is protected by the 
     }
 }
 
-TEST_CASE("registry offline: a pathless profile carried from an EARLIER tick is protected by the same two-walk rule, and the confirming walk resolves its path",
+TEST_CASE("registry offline: a pathless profile carried from an EARLIER tick is protected by the same two-walk rule; a path only the confirming walk lists is not adopted, and the next tick resolves it",
           "[echo][registry][lifecycle]") {
     OfflineDiscovery lists;
     lists.profiles = {prof(kSidA)};
@@ -3886,7 +3922,7 @@ TEST_CASE("registry offline: a pathless profile carried from an EARLIER tick is 
     struct Case {
         const char* name;
         OfflineDiscovery second;
-        bool resolved;
+        bool resolves_next_tick;
         const char* incomplete;
     };
     for (const auto& c : {Case{"the confirming walk lists it", lists, true, "0"},
@@ -3898,7 +3934,7 @@ TEST_CASE("registry offline: a pathless profile carried from an EARLIER tick is 
         r.f.reads[root] = uread(root, 1);
         r.next(); // A is loaded and baselined
         const auto baseline = r.state(root);
-        REQUIRE(!empty_baseline(baseline));
+        REQUIRE(nonempty_baseline(baseline));
 
         // A logs off on a tick whose walk fails outright: it is carried as {A, ""} (no path yet)
         r.f.sids.clear();
@@ -3921,17 +3957,23 @@ TEST_CASE("registry offline: a pathless profile carried from an EARLIER tick is 
         const auto cur = read_cursor(r.t.db);
         REQUIRE(cur.roots.contains(root));
         CHECK(cur.roots.at(root).baselined);
-        if (!c.resolved) {
-            CHECK(cur.offline == std::vector<OfflineProfile>{{kSidA, ""}}); // kept, still pathless
-            CHECK(cur.roots.at(root).deferred);                            // due once a path is known
-            CHECK(r.f.offline_calls.size() == mounts);                     // no path, no mount
-            CHECK(r.state(root) == baseline);
-            CHECK(count_rows(r.t.db) == 0);
+        // walk 1 omitted A, so a path only walk 2 listed is unconfirmed either way
+        CHECK(cur.offline == std::vector<OfflineProfile>{{kSidA, ""}}); // kept, still pathless
+        CHECK(cur.roots.at(root).deferred);                            // due once a path is known
+        CHECK(r.f.offline_calls.size() == mounts);                     // no path, no mount
+        CHECK(r.state(root) == baseline);
+        CHECK(count_rows(r.t.db) == 0);
+        if (!c.resolves_next_tick)
             continue;
-        }
-        CHECK(cur.offline == std::vector<OfflineProfile>{prof(kSidA)}); // the path is resolved
-        CHECK_FALSE(cur.roots.at(root).deferred);
-        // ... and read in that very tick, against the ORIGINAL baseline
+
+        // The next ordinary tick: A is pathless, so the walk repeats; both walks now list the
+        // path, it is taken and A is read in that very tick, against the ORIGINAL baseline.
+        r.f.offline_discovery = OfflineDiscovery{};
+        r.f.offline_discovery.profiles = {prof(kSidA)};
+        r.next();
+        const auto resolved = read_cursor(r.t.db);
+        CHECK(resolved.offline == std::vector<OfflineProfile>{prof(kSidA)}); // the path is resolved
+        CHECK_FALSE(resolved.roots.at(root).deferred);
         REQUIRE(r.f.offline_calls.size() == mounts + 1);
         CHECK(r.f.offline_calls.back().path == prof(kSidA).path);
         const auto rows = q(r.t.db, "SELECT action, prev_data, data, detail FROM registry_live");
@@ -3943,7 +3985,7 @@ TEST_CASE("registry offline: a pathless profile carried from an EARLIER tick is 
     }
 }
 
-TEST_CASE("registry offline: a confirming walk fills a pathless profile's path, adopts a profile only it listed, and removes one both complete walks omit",
+TEST_CASE("registry offline: a confirming walk adopts a profile only it listed and removes one both complete walks omit, but supplies no path to a pathless known profile",
           "[echo][registry][lifecycle]") {
     const std::string sid_c = "S-1-5-21-3";
     OfflineRig r;
@@ -3957,8 +3999,8 @@ TEST_CASE("registry offline: a confirming walk fills a pathless profile's path, 
     r.f.offline_reads[kSidB] = hive_read({{root_b, uread(root_b, 1)}});
     r.next();
     const auto base_a = r.state(root_a);
-    REQUIRE(!empty_baseline(base_a));
-    REQUIRE(!empty_baseline(r.state(root_b)));
+    REQUIRE(nonempty_baseline(base_a));
+    REQUIRE(nonempty_baseline(r.state(root_b)));
 
     // A logs off on a tick whose walk fails outright: {A, ""} joins B in the cursor
     r.f.sids.clear();
@@ -3981,20 +4023,165 @@ TEST_CASE("registry offline: a confirming walk fills a pathless profile's path, 
     r.next();
     CHECK(r.f.offline_profile_calls == walks + 2);
 
-    // A: the path walk 2 supplied fills the empty one; C: adopted from walk 2 alone; B: gone.
-    const auto cur = read_cursor(r.t.db);
-    CHECK(cur.offline == (std::vector<OfflineProfile>{prof(kSidA), prof(sid_c)}));
+    // A: the path only walk 2 supplied is unconfirmed, so A stays pathless and deferred;
+    // C: adopted from walk 2 alone (no earlier entry to protect); B: gone.
+    auto cur = read_cursor(r.t.db);
+    CHECK(cur.offline == (std::vector<OfflineProfile>{{kSidA, ""}, prof(sid_c)}));
     CHECK(cur.roots.contains(root_a));
+    CHECK(cur.roots.at(root_a).deferred);
     CHECK(cur.roots.contains(root_c));
     CHECK_FALSE(cur.roots.contains(root_b));
-    REQUIRE(r.f.offline_calls.size() == mounts + 2);
-    CHECK(r.f.offline_calls[mounts].sid == kSidA);     // the deferred hive first ...
-    CHECK(r.f.offline_calls[mounts].path == prof(kSidA).path); // ... at the resolved path
-    CHECK(r.f.offline_calls[mounts + 1].sid == sid_c);
+    REQUIRE(r.f.offline_calls.size() == mounts + 1);
+    CHECK(r.f.offline_calls[mounts].sid == sid_c); // A has no confirmed path, so it is not mounted
     CHECK(r.state(root_a) == base_a);
-    CHECK(!empty_baseline(r.state(root_c))); // silently baselined
-    CHECK(empty_baseline(r.state(root_b)));  // its scope removed: the baseline shrunk
-    CHECK(count_rows(r.t.db) == 0);          // no fabricated row for any of them
+    CHECK(nonempty_baseline(r.state(root_c))); // silently baselined
+    CHECK(empty_baseline(r.state(root_b)));    // its scope removed: the baseline shrunk
+    CHECK(count_rows(r.t.db) == 0);            // no fabricated row for any of them
+
+    // The next ordinary tick: A is still pathless, both walks now list its path, and the
+    // deferred hive is read at the resolved path.
+    r.f.offline_discovery = OfflineDiscovery{};
+    r.f.offline_discovery.profiles = {prof(kSidA), prof(sid_c)};
+    r.next();
+    cur = read_cursor(r.t.db);
+    CHECK(cur.offline == (std::vector<OfflineProfile>{prof(kSidA), prof(sid_c)}));
+    CHECK_FALSE(cur.roots.at(root_a).deferred);
+    REQUIRE(r.f.offline_calls.size() == mounts + 2);
+    CHECK(r.f.offline_calls[mounts + 1].sid == kSidA);
+    CHECK(r.f.offline_calls[mounts + 1].path == prof(kSidA).path);
+    CHECK(r.state(root_a) == base_a);
+    CHECK(count_rows(r.t.db) == 0);
+}
+
+TEST_CASE("registry offline: a path first learned for a pathless profile is taken only when both walks of the tick list the same one",
+          "[echo][registry][lifecycle]") {
+    using yuzu::profiles::HiveState;
+    using yuzu::profiles::ProfileInfo;
+    // The failed-logon signature: `S` names the TEMP folder and `S.bak` the real one. A walk that
+    // sees only `S` (the `.bak` was skipped as the index shifted) lists the TEMP folder as a
+    // normal profile; a walk that sees both flags `S` partial and lists nothing for it.
+    const std::string temp = "C:\\Users\\TEMP";
+    const std::vector<ProfileInfo> alone_records{ProfileInfo{kSidA, "", temp, HiveState::not_loaded, false}};
+    const std::vector<ProfileInfo> pair_records{
+       ProfileInfo{kSidA, "", temp, HiveState::not_loaded, false},
+       ProfileInfo{kSidA + ".bak", "", prof(kSidA).path, HiveState::not_loaded, false}};
+    const std::vector<std::string> none;
+    const OfflineDiscovery misses_bak = classify_offline_discovery(true, false, false, alone_records, none);
+    const OfflineDiscovery sees_bak = classify_offline_discovery(true, false, false, pair_records, none);
+    REQUIRE(misses_bak.profiles == std::vector<OfflineProfile>{{kSidA, temp}});
+    REQUIRE(sees_bak.profiles.empty());
+    REQUIRE(sees_bak.partial == std::vector<std::string>{kSidA});
+
+    const auto listing = [](const std::string& sid, const std::string& path) {
+        OfflineDiscovery d;
+        d.profiles = {{sid, path}};
+        return d;
+    };
+    OfflineDiscovery cut;
+    cut.complete = false;
+    struct Case {
+        const char* name;
+        OfflineDiscovery first, second;
+        bool taken;
+    };
+    for (const auto& c : {Case{"both walks list the same path", listing(kSidA, prof(kSidA).path),
+                               listing(kSidA, prof(kSidA).path), true},
+                          Case{"walk 1 misses the .bak and lists the TEMP folder, walk 2 sees the pair",
+                               misses_bak, sees_bak, false},
+                          Case{"walk 1 lists the TEMP folder, walk 2 lists a different path", misses_bak,
+                               listing(kSidA, prof(kSidA).path), false},
+                          Case{"walk 1 lists a path, walk 2 is incomplete and lists none", misses_bak, cut,
+                               false}}) {
+        INFO(c.name);
+        OfflineRig r;
+        const auto root = uroot(kSidA);
+        r.f.sids = {kSidA};
+        r.f.reads[root] = uread(root, 1);
+        r.next(); // A is loaded and baselined
+        const auto baseline = r.state(root);
+        REQUIRE(nonempty_baseline(baseline));
+
+        // A logs off on a tick whose walk fails outright: it is carried as {A, ""} (no path yet)
+        r.f.sids.clear();
+        r.f.offline_discovery = OfflineDiscovery{false, {}, {}};
+        r.f.dirty->mark_hku();
+        r.next();
+        REQUIRE(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{{kSidA, ""}});
+
+        // The next ordinary tick walks twice; what the hive holds now differs from the baseline
+        r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+        r.f.offline_discovery_queue = {c.first, c.second};
+        const int walks = r.f.offline_profile_calls;
+        const int enumerations = r.f.loaded_sids_calls;
+        const std::size_t mounts = r.f.offline_calls.size();
+        r.next();
+        CHECK(r.f.offline_profile_calls == walks + 2);
+        CHECK(r.f.loaded_sids_calls == enumerations + 1); // one HKU snapshot for the whole tick
+        const auto cur = read_cursor(r.t.db);
+        REQUIRE(cur.roots.contains(root));
+        if (c.taken) {
+            CHECK(cur.offline == std::vector<OfflineProfile>{prof(kSidA)});
+            CHECK_FALSE(cur.roots.at(root).deferred);
+            REQUIRE(r.f.offline_calls.size() == mounts + 1);
+            CHECK(r.f.offline_calls.back().path == prof(kSidA).path);
+            const auto rows = q(r.t.db, "SELECT action, prev_data, data, detail FROM registry_live");
+            REQUIRE(rows.rows.size() == 1);
+            CHECK(rows.rows[0][0] == "changed");
+            continue;
+        }
+        // not taken: still pathless and deferred, nothing mounted, the baseline kept, no row
+        CHECK(cur.offline == std::vector<OfflineProfile>{{kSidA, ""}});
+        CHECK(cur.roots.at(root).deferred);
+        CHECK(cur.roots.at(root).baselined);
+        CHECK(r.f.offline_calls.size() == mounts);
+        CHECK(r.state(root) == baseline);
+        CHECK(count_rows(r.t.db) == 0); // no removed row either
+    }
+}
+
+TEST_CASE("registry offline: a known profile's changed path is taken only when both walks list it; otherwise its previous path stands",
+          "[echo][registry][lifecycle]") {
+    const OfflineProfile moved{kSidA, "D:\\Users\\" + kSidA};
+    const OfflineProfile other{kSidA, "E:\\Users\\" + kSidA};
+    const auto listing = [](const OfflineProfile& p) {
+        OfflineDiscovery d;
+        d.profiles = {p};
+        return d;
+    };
+    OfflineDiscovery cut;
+    cut.complete = false;
+    struct Case {
+        const char* name;
+        OfflineDiscovery first, second;
+        OfflineProfile expected;
+    };
+    for (const auto& c : {Case{"both walks list the new path", listing(moved), listing(moved), moved},
+                          Case{"walk 2 lists a different path", listing(moved), listing(other), prof(kSidA)},
+                          Case{"walk 2 omits it (a complete walk)", listing(moved), OfflineDiscovery{},
+                               prof(kSidA)},
+                          Case{"walk 2 is incomplete", listing(moved), cut, prof(kSidA)}}) {
+        INFO(c.name);
+        OfflineRig r;
+        const auto root = uroot(kSidA);
+        r.f.offline_discovery.profiles = {prof(kSidA)};
+        r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+        r.next();
+        r.tick_to(12);
+        const auto baseline = r.state(root);
+        const int walks = r.f.offline_profile_calls;
+        const int enumerations = r.f.loaded_sids_calls;
+        const std::size_t mounts = r.f.offline_calls.size();
+
+        r.f.offline_discovery_queue = {c.first, c.second}; // the hourly tick
+        r.next();
+        CHECK(r.f.offline_profile_calls == walks + 2);
+        CHECK(r.f.loaded_sids_calls == enumerations + 1);
+        CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{c.expected});
+        REQUIRE(r.f.offline_calls.size() == mounts + 1); // still read this hour, never removed
+        CHECK(r.f.offline_calls.back().path == c.expected.path);
+        CHECK(r.state(root) == baseline);
+        CHECK(count_rows(r.t.db) == 0);
+    }
 }
 
 TEST_CASE("registry offline: a temporary profile (a listed <sid> beside <sid>.bak) is never mounted at its TEMP path or diffed against the real baseline",
@@ -4052,7 +4239,7 @@ TEST_CASE("registry offline: a virtual service or system SID whose hive unloads 
         r.f.sids = {sid};
         r.f.reads[root] = uread(root, 1);
         r.next(); // loaded and baselined
-        REQUIRE(!empty_baseline(r.state(root)));
+        REQUIRE(nonempty_baseline(r.state(root)));
         const int walks = r.f.offline_profile_calls;
 
         r.f.sids.clear(); // the hive unloads; the (complete) walk rightly lists nothing for it
@@ -4122,7 +4309,7 @@ TEST_CASE("registry offline: an incomplete walk that lists a profile discovers i
     CHECK(r.config("registry_offline_discovery_incomplete") == "1");
     CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
     CHECK(r.f.offline_calls.size() == 1);
-    CHECK(!empty_baseline(r.state(root)));
+    CHECK(nonempty_baseline(r.state(root)));
     CHECK(count_rows(r.t.db) == 0);
 
     for (int i = 1; i <= 3; ++i) {
@@ -4285,7 +4472,7 @@ TEST_CASE("registry offline: a restart does not mount a settled offline hive aga
     r.next();
     CHECK(r.f.offline_calls.size() == 1);   // no mount: it is not the hourly tick
     CHECK(r.f.offline_profile_calls == 2);  // the profile list IS re-walked (cheap, no mount)
-    CHECK(!empty_baseline(r.state(root)));
+    CHECK(nonempty_baseline(r.state(root)));
 }
 
 

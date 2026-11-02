@@ -185,29 +185,42 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
             OfflineDiscovery d = reader_.offline_profiles(sids);
             offline = reconcile_offline(cur.offline, prev_hku, sids, d);
             // The ProfileList walk is index-driven: a profile deleted or renamed (X -> X.bak) while
-            // it runs can be skipped though it is healthy. A profile is therefore removed only
-            // when two complete walks of this tick both omit it, a user who has just logged off
-            // (no path yet) included. When a complete walk would drop a known profile, or one that
-            // was loaded last tick, walk ONCE more and keep every profile either walk listed or
-            // named in `partial` (an incomplete second walk removes nothing).
-            // `owed` is every profile a complete walk must still name (reconcile_offline's own
-            // `known`, so a virtual service or system SID that unloaded is not one of them).
+            // it runs can be skipped though it is healthy, or its `.bak` sibling can be skipped so a
+            // temporary profile's folder is listed alone. A change to a KNOWN profile's scope is
+            // therefore taken only when two walks of this tick agree: a profile is removed only
+            // when two complete walks both omit it (a user who has just logged off included), and
+            // a path first learned or changed for it is adopted only when both walks list the SAME
+            // path, otherwise its previous entry stands (pathless stays pathless and deferred) and
+            // the next tick walks again. An incomplete second walk removes nothing.
+            // `owed` is every profile a walk must still name (reconcile_offline's own `known`, so a
+            // virtual service or system SID that unloaded is not one of them).
             const auto owed =
                reconcile_offline(cur.offline, prev_hku, sids, OfflineDiscovery{false, {}, {}});
-            const auto would_drop = [&](const OfflineProfile& k) {
-                return std::none_of(offline.begin(), offline.end(),
-                                    [&](const OfflineProfile& o) { return o.sid == k.sid; });
+            const auto find_sid = [](auto& v, const std::string& sid) {
+                return std::find_if(v.begin(), v.end(),
+                                    [&](const OfflineProfile& o) { return o.sid == sid; });
             };
-            if (d.complete && std::any_of(owed.begin(), owed.end(), would_drop)) {
+            const auto changed = [&](const OfflineProfile& k) {
+                const auto it = find_sid(offline, k.sid);
+                return it == offline.end() || it->path != k.path; // dropped, filled or changed
+            };
+            if (std::any_of(owed.begin(), owed.end(), changed)) {
                 d = reader_.offline_profiles(sids);
-                for (const auto& p : reconcile_offline(cur.offline, prev_hku, sids, d)) {
-                    const auto it = std::find_if(offline.begin(), offline.end(),
-                                                 [&](const OfflineProfile& o) { return o.sid == p.sid; });
-                    if (it == offline.end())
-                        offline.push_back(p);
-                    else if (it->path.empty())
-                        it->path = p.path; // prefer the entry that has a path
+                const auto second = reconcile_offline(cur.offline, prev_hku, sids, d);
+                for (const auto& k : owed) {
+                    const auto p1 = find_sid(offline, k.sid);
+                    const auto p2 = find_sid(second, k.sid);
+                    if ((p1 == offline.end()) == (p2 == second.end()) &&
+                        (p1 == offline.end() || p1->path == p2->path))
+                        continue; // the walks agree: what walk 1 decided stands
+                    if (p1 != offline.end())
+                        *p1 = k; // the walks disagree: the previous entry stands
+                    else
+                        offline.push_back(k);
                 }
+                for (const auto& p : second) // a sid no earlier walk knew: adopt as before
+                    if (find_sid(offline, p.sid) == offline.end())
+                        offline.push_back(p);
             }
             discovery_incomplete = !d.complete;
         } else {
@@ -1401,8 +1414,9 @@ SubtreeRead read_root(const std::string& root, std::int64_t deadline) noexcept {
             // collect() took its HKU snapshot (or before a missed name-watch mark refreshed it)
             // answers the same way. Absent would be read as "every value was deleted" and blank
             // the baseline; Unreadable keeps it, and the next HKU refresh moves the root offline,
-            // where it is diffed against that baseline. A key missing under a hive that is still
-            // loaded stays Absent.
+            // where it stays Unreadable (counted in registry_offline_roots_unreadable) until the
+            // hourly tick reads the hive and diffs it against that baseline. A key missing under
+            // a hive that is still loaded stays Absent.
             const std::string sid = hku_sid_of(root);
             if (!sid.empty() && hku_hive_unloaded(sid)) {
                 out.status = RegistryReadStatus::Unreadable;
@@ -1588,8 +1602,8 @@ OfflineHiveRead read_offline_hive_bounded(const std::string& sid, const std::str
            } catch (...) {
                r = std::move(failed);
            }
-           // The second statement outside the try. A leaked mount is system-wide and keeps
-           // NTUSER.DAT locked until something releases it.
+           // The second statement outside the try (building `failed` above is the first). A
+           // leaked mount is system-wide and keeps NTUSER.DAT locked until something releases it.
            if (report.unload_failed) {
                // Every failure is recorded (which hive, which mount); the alert is raised once.
                spdlog::info("Echo registry: hive unload failed for {} (mount HKU\\{})", sid,

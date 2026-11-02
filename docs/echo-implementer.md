@@ -502,28 +502,39 @@ cursor.** What it adds to the pattern:
     notify-sourced row with a window starting at the notify). An offline root never
     advances `window_base`, takes no part in the retention floor, and is excluded
     from `pending_first`.
-  - *Scope.* A profile is dropped only when two complete walks in the same tick
-    both omit it, a user who has just logged off (no path yet) included: when a
-    complete walk would drop a known profile or one that was loaded last tick,
-    `collect()` walks once more (never a second HKU enumeration) and keeps every
-    profile either walk listed or named in `partial`, because the enumeration is
-    index-driven and a concurrent delete or rename can skip a healthy profile, a
-    different one on each walk. A second walk that is incomplete removes nothing. An incomplete walk (the list unopenable, cut short, or
+  - *Scope.* A change to a known profile's scope is taken only when two walks in
+    the same tick agree. A profile is dropped only when two complete walks both omit
+    it, a user who has just logged off (no path yet) included; a path first learned
+    for it (the first path of a pathless entry, or a changed one) is taken only when
+    both walks list the SAME path, otherwise its previous entry stands (a pathless
+    one stays pathless and deferred) and the next tick walks again. When a walk
+    would drop a known profile or one that was loaded last tick, or fill or change
+    a path, `collect()` walks once more (never a second HKU enumeration) and decides
+    per profile: the walks' agreement stands, a disagreement reverts that profile to
+    its previous entry, and a profile only the second walk names for the first time
+    is adopted. The enumeration is index-driven, so a concurrent delete or rename
+    can skip a healthy profile, or a `<sid>.bak` sibling (the temporary profile's
+    folder is then listed alone), a different one on each walk. A second walk that
+    is incomplete removes nothing and supplies no path. An incomplete walk (the list unopenable, cut short, or
     stopped at the 512-entry cap) keeps the known list (`registry_offline_discovery_incomplete`)
     and ADDS the profiles it did list, so a host over the cap still gets the
     profiles the walk reaches. A record whose path was unreadable keeps its cursor
     entry. A `<sid>.bak` record is proof that its base sid exists (it joins `partial`)
     and is never mounted under the `.bak` name, and neither is its base sid's own
     record when both are listed (the pair is the temporary-profile signature: the base
-    record then names the TEMP folder, so the base sid stays `partial` and its known path
-    stands, `classify_offline_discovery` and `reconcile_offline`); virtual service SIDs
+    record then names the TEMP folder, so the base sid stays `partial`, `classify_offline_discovery`
+    and `reconcile_offline`: a known non-empty path keeps being read while the pair persists,
+    and a sid with no path yet is not read, a known pathless entry being counted by
+    `registry_offline_roots_deferred` and walked every tick, a first-seen one reported by
+    nothing while the leftover exists); virtual service SIDs
     (`is_virtual_service_sid`) and the well-known system SIDs (`is_system_sid`) are never
     offline profiles, and one whose hive unloads leaves scope silently (it was never a
     logged-off user, so it costs no confirming walk and leaves no pathless entry). A sid loaded on the
     previous tick and gone now (a logoff) is a known profile whose path is not yet
     known (`{sid, ""}`, the `prev_loaded` argument), so a user who logs off during an
     incomplete or partial walk keeps the baseline too: a complete walk that lists it
-    supplies the path, and it is dropped only when two complete walks name it nowhere. A root whose path is
+    supplies the path once a second walk in the same tick lists the same one, and it is
+    dropped only when two complete walks name it nowhere. A root whose path is
     empty is never mounted: it is marked `deferred` each tick (baseline and status
     untouched, no row) and read the first tick a walk supplies the path; a profile
     whose own record stays unreadable on complete walks stays unpathed, is walked

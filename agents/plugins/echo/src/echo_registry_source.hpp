@@ -265,8 +265,9 @@ struct RegistryReader {
     /// own `loaded_sids` for this tick (never a second HKU enumeration). Asked on an HKU
     /// name-watch mark, on the full re-read and on a re-baseline, while the known list is empty,
     /// and while the last walk was incomplete or a known profile has no path yet (see collect());
-    /// asked a second time in one tick only to confirm the removal of a known profile (one with
-    /// no path yet, or that was loaded last tick, included).
+    /// asked a second time in one tick only to confirm a change to a known profile's scope: its
+    /// removal, or a path first learned or changed for it (one with no path yet, or that was
+    /// loaded last tick, included).
     /// `complete == false` means "keep what you knew" (and add what the walk did list), never
     /// "nothing exists" (see reconcile_offline). Must not throw.
     std::function<OfflineDiscovery(const std::vector<std::string>& loaded_sids)> offline_profiles;

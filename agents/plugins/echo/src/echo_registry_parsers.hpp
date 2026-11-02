@@ -69,7 +69,9 @@
 // again its first loaded read happens at once and diffs against the offline baseline. A failed
 // mount is an Unreadable read with a named reason (one gap row per transition); an INCOMPLETE
 // profile discovery keeps the known offline list (reconcile_offline): scope is removed only
-// when two complete walks of one tick both omit the profile (collect() confirms a removal).
+// when two complete walks of one tick both omit the profile, and a path first learned or changed
+// for a known profile is taken only when both walks list the same one (collect() confirms both
+// with a second walk).
 
 #include "echo_db.hpp" // RegistryEvent
 
@@ -299,15 +301,20 @@ RegistryScope::roots_for(const std::vector<std::string>& hku_subkeys,
 /// joins `known` as `{sid, ""}` before the rules above run. A real `known` entry wins (first
 /// seen); an incomplete walk carries it; a complete walk carries it only when it names the sid
 /// in `partial` or lists it in `profiles` (which supplies the path). A complete walk that names
-/// it nowhere still drops it from THIS list; collect() confirms such a removal with a second
-/// complete walk and keeps what either walk listed. Only SID-named hives count
+/// it nowhere still drops it from THIS list, and a listed path for a known sid is taken here as
+/// the walk gave it; collect() confirms both with a second walk of the same tick: a removal
+/// needs both complete walks to omit the profile, and a path first learned or changed for a known
+/// profile is taken only when both walks list the SAME path, otherwise the profile reverts to
+/// its previous entry (a pathless one stays pathless). Only SID-named hives count
 /// (`.DEFAULT` and `<sid>_Classes` leave HKU too, and are not profiles), and a virtual service
 /// SID or a well-known system SID that unloads is not a logged-off user either: it is never
 /// carried, so it costs no confirming walk and leaves no entry behind.
 ///
 /// A sid the walk flagged `partial` keeps its known path when it has one, even if the same walk
 /// also lists it: the pair `S` + `S.bak` is the temporary-profile signature, and a listed `S` then
-/// points at the TEMP folder, whose hive must never be diffed against the real baseline.
+/// points at the TEMP folder, whose hive must never be diffed against the real baseline. Such a
+/// profile keeps being read from its known path while the pair persists; one with no path yet (a
+/// known pathless entry, or a sid first seen beside a stale `.bak`) has none to read.
 [[nodiscard]] inline std::vector<OfflineProfile>
 reconcile_offline(const std::vector<OfflineProfile>& known_in,
                   const std::vector<std::string>& prev_loaded,
@@ -368,8 +375,11 @@ reconcile_offline(const std::vector<OfflineProfile>& known_in,
 /// and is mid-rename: the base sid is `partial` (its known entry stands) and the record is never
 /// a profile, so it is never mounted under the `.bak` name. The base sid's OWN record is then not
 /// listed either: beside a `.bak` it names the temporary profile's folder, whose hive must never
-/// be mounted against the real baseline, so the pair stays `partial` and nothing is read until
-/// the `.bak` is gone. A virtual service SID is skipped outright (is_virtual_service_sid).
+/// be mounted against the real baseline, so the pair is `partial`: a known profile with a
+/// non-empty path is still read from that path (reconcile_offline pushes it), and one with no
+/// path yet is not read until the `.bak` is gone (a known pathless entry is counted by
+/// registry_offline_roots_deferred; a first-seen sid is reported by nothing). A virtual service
+/// SID is skipped outright (is_virtual_service_sid).
 [[nodiscard]] inline OfflineDiscovery
 classify_offline_discovery(bool walk_complete, bool root_failed, bool truncated,
                            std::span<const yuzu::profiles::ProfileInfo> profiles,

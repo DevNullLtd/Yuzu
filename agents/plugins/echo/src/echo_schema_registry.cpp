@@ -1069,7 +1069,8 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // (a lead to verify, not proof) and are 0 / '' when none is named; `detail`
         // says why (attr:corr | ambiguous | none | degraded | off | lost-restart | offline).
         // A logged-off user's hive is mounted through the guarded offline-hive ladder and
-        // read on the full re-read (every 12 slow ticks: hourly at the default 300 s): those
+        // read on the hourly tick (every 12 slow ticks: hourly at the default 300 s; also on
+        // first sight, after a re-enable, and while a read is capped or owed a retry): those
         // rows carry source=offline and attr:offline, never a writer.
         // Values are stored UNMASKED: `data`/`prev_data` are readable through
         // echo.sql. Retention is a row count.
@@ -1085,9 +1086,10 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "value) and a write-only Kernel-Registry ETW session that names the writing "
                  "process by correlation; cursor-model (echo_cursor.hpp). Without an elevated "
                  "agent the session cannot open and rows carry attr:off. The per-user roots of "
-                 "logged-off users' unloaded hives are read on the full re-read (every 12 slow "
-                 "ticks: hourly at the default 300 s) through the guarded offline-hive ladder "
-                 "(rows attr:offline)."},
+                 "logged-off users' unloaded hives are read on the hourly tick (every 12 slow "
+                 "ticks: hourly at the default 300 s), and sooner on first sight, after a "
+                 "re-enable or while a read is capped or owed a retry, through the guarded "
+                 "offline-hive ladder (rows attr:offline)."},
                 {"linux",   OsSupportStatus::kUnsupported, "",
                  "The Windows registry does not exist on this platform."},
                 {"macos",   OsSupportStatus::kUnsupported, "",
