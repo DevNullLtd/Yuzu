@@ -36,3 +36,12 @@ No subprocess, thread, socket, temporary file, registry handle, timer or stored 
 - **EACCES coverage.** The tests that need an unreadable file or directory SKIP at euid 0 and under `CAP_DAC_OVERRIDE`, so a root or lane run does not exercise them. They run, and passed, as a non-root user on the macOS build host; the symlink, cap and oversize cases cover the same constrained paths when privileged.
 - **Landing note.** The shared collector hunks (`escaped` split flag, `ConstrainedPolicy::drop_source`, `AdaptedRows::Status::withheld`, the `adapt_pkg_inventory` branch, the driver's `withheld` block and their header comments) are copied identically into the runtimes change that lands after this one. Edit them in both or in neither; the later change must merge with no conflict in those hunks.
 - **Duplicated code.** `touches_network_mount`, `finish_dir_open`, `open_child`, `scan_mounts`, `production_config` and the `kMountinfo*` constants are private copies of the runtimes plugin's; hoisting them to `agents/shared` is an owed follow-up once both plugins are on `dev`. This copy alone carries the `t_touch_log` seam.
+
+## Addendum: the Found-by chip row (commit c79498d55)
+
+Adds `server/core/src/software_catalog_rules.hpp`, `tests/unit/server/test_software_catalog_rules.cpp` and `tests/unit/server/test_software_page_ui.cpp` to the files above. Supplements the list; nothing above is changed.
+
+- **`kSoftwareSources` row.** A seventh `VocabEntry` of three `std::string_view` members pointing at string literals in a `constexpr std::array`: static storage, no owner, no acquisition or release. `vocab_table_well_formed` (a `consteval` check) and the `static_assert` over it still hold at size 7.
+- **Tests.** The catalogue-rules case builds a local `std::vector<std::string>` from the table and compares it with an initializer list; the page case calls `has(h, ...)` on the rendered `std::string`. Value types only; no file, thread, process or clock.
+
+No new fd, HANDLE, SOCKET, `FILE*`, sqlite3 object, OpenSSL or BCrypt object, thread, subprocess, callback context, mapped library or temp path. No manual cleanup in new C++.
