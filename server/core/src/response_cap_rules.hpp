@@ -14,6 +14,10 @@
 ///   - concurrent writers for one pair (direct stream + gateway forward) are not serialised
 ///     and can overshoot by the number of concurrent writers.
 ///
+/// "Terminal" is `status != 0` everywhere (CommandResponse.Status is an open proto3 enum, so a
+/// value outside 0..4 is terminal too): the caller must compute `is_terminal` and
+/// `terminal_exists` with that one definition, or such a frame is admitted past the cap forever.
+///
 /// `rows_at_or_below_cap` is the LIMIT-bounded count (never a full count): it is only ever
 /// compared with `cap`.
 

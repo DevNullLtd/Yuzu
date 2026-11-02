@@ -5584,7 +5584,8 @@ public:
         // the deliberate reset.
         if (pg_pool_ && !startup_failed_) {
             response_store_ =
-                std::make_unique<ResponseStore>(*pg_pool_, cfg_.response_retention_days, nullptr,
+                std::make_unique<ResponseStore>(*pg_pool_, cfg_.response_retention_days,
+                                                /*now_fn=*/nullptr,
                                                 cfg_.response_max_rows_per_agent);
             if (!response_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: response store migration/open failed "

@@ -420,13 +420,14 @@ const std::vector<pg::PgMigration>& migrations() {
                 WHERE instruction_id LIKE 'crossplatform.tar.%';
             UPDATE responses SET plugin = 'echo' WHERE plugin = 'tar';
         )"},
-        // v4 (#561): serves store()'s per-pair row count (the (instruction_id, agent_id) prefix)
-        // and its terminal probe (a `status > 0` range on the third column), so neither touches
-        // every retained row of a pair. SET LOCAL for the same reason v3 states: a multi-million
-        // row build past the 30 s pool statement_timeout would cancel, roll the version back and
-        // leave the store "persistence disabled" on every boot. IF NOT EXISTS: a re-run against
-        // a database whose version stamp was rewound (the Echo rename upgrade-window tests do
-        // exactly that) must not fail on the index it already built.
+        // v4 (#561): serves store()'s per-pair row count and its terminal probe (`status <> 0`,
+        // carried by the third column): both are bounded by the (instruction_id, agent_id)
+        // prefix, so neither touches more than the pair's own rows. SET LOCAL for the same
+        // reason v3 states: a multi-million row build past the 30 s pool statement_timeout would
+        // cancel, roll the version back and leave the store "persistence disabled" on every
+        // boot. IF NOT EXISTS: a re-run against a database whose version stamp was rewound (the
+        // Echo rename upgrade-window tests do exactly that) must not fail on the index it
+        // already built.
         {4, R"(
             SET LOCAL statement_timeout = 0;
             CREATE INDEX IF NOT EXISTS idx_resp_instr_agent_status
@@ -564,36 +565,36 @@ void ResponseStore::store(const StoredResponse& resp) {
     const bool ok = pool_.with_txn_for(kIngestTimeout, [&](PGconn* conn) -> bool {
         reached_txn = true;
         // Per-pair row cap (#561; the bound: response_cap_rules.hpp). One round trip, both
-        // halves index-bounded on idx_resp_instr_agent_status: the pair's row count and, for a
+        // halves bounded by the pair's prefix on idx_resp_instr_agent_status (at most cap +
+        // overshoot entries, whatever the status values): the pair's row count and, for a
         // terminal frame only (the CASE skips the probe for RUNNING), whether the pair already
-        // holds a terminal row. `status > 0` equals `status <> 0` (CommandResponse.Status is
-        // 0..4) and is an index range. A probe that cannot run refuses the row (query_error)
-        // rather than admit it unbounded. No advisory lock; bound under concurrency:
-        // response_cap_rules.hpp.
-        if (max_rows_per_agent_ > 0) {
-            const bool is_terminal = resp.status != 0;
-            pg::PgResult probe = pg::exec_params(
-                conn,
-                "SELECT (SELECT count(*) FROM (SELECT 1 FROM response_store.responses "
-                "WHERE instruction_id=$1 AND agent_id=$2 LIMIT $3::bigint) s), "
-                "CASE WHEN $4::boolean THEN EXISTS(SELECT 1 FROM response_store.responses "
-                "WHERE instruction_id=$1 AND agent_id=$2 AND status > 0) ELSE false END",
-                std::vector<std::string>{resp.instruction_id, resp.agent_id,
-                                         std::to_string(max_rows_per_agent_),
-                                         is_terminal ? "true" : "false"});
-            if (probe.status() != PGRES_TUPLES_OK || PQntuples(probe.get()) != 1) {
-                spdlog::warn("ResponseStore: per-agent cap probe failed for instruction={} "
-                             "agent={}: {}",
-                             ::yuzu::log_id_token(resp.instruction_id),
-                             ::yuzu::log_id_token(resp.agent_id), PQerrorMessage(conn));
-                return false;
-            }
-            if (!per_agent_cap_admits(to_i64(PQgetvalue(probe.get(), 0, 0)),
-                                      max_rows_per_agent_, is_terminal,
-                                      to_bool(PQgetvalue(probe.get(), 0, 1)))) {
-                capped = true;
-                return true; // commits an empty transaction; not a query_error
-            }
+        // holds a terminal row. "Terminal" is `status <> 0` in BOTH places (the admit predicate
+        // and the probe): CommandResponse.Status is an open proto3 enum, so an agent can put a
+        // value outside 0..4 on the wire (the callers cast it unchecked), and two different
+        // definitions would let such a frame be admitted past the cap forever. A probe that
+        // cannot run refuses the row (query_error) rather than admit it unbounded. No advisory
+        // lock; bound under concurrency: response_cap_rules.hpp.
+        const bool is_terminal = resp.status != 0;
+        pg::PgResult probe = pg::exec_params(
+            conn,
+            "SELECT (SELECT count(*) FROM (SELECT 1 FROM response_store.responses "
+            "WHERE instruction_id=$1 AND agent_id=$2 LIMIT $3::bigint) s), "
+            "CASE WHEN $4::boolean THEN EXISTS(SELECT 1 FROM response_store.responses "
+            "WHERE instruction_id=$1 AND agent_id=$2 AND status <> 0) ELSE false END",
+            std::vector<std::string>{resp.instruction_id, resp.agent_id,
+                                     std::to_string(max_rows_per_agent_),
+                                     is_terminal ? "true" : "false"});
+        if (probe.status() != PGRES_TUPLES_OK || PQntuples(probe.get()) != 1) {
+            spdlog::warn("ResponseStore: per-agent cap probe failed for instruction={} "
+                         "agent={}: {}",
+                         ::yuzu::log_id_token(resp.instruction_id),
+                         ::yuzu::log_id_token(resp.agent_id), PQerrorMessage(conn));
+            return false;
+        }
+        if (!per_agent_cap_admits(to_i64(PQgetvalue(probe.get(), 0, 0)), max_rows_per_agent_,
+                                  is_terminal, to_bool(PQgetvalue(probe.get(), 0, 1)))) {
+            capped = true;
+            return true; // commits an empty transaction; not a query_error
         }
         pg::PgResult ins = pg::exec_params(
         conn,
@@ -774,16 +775,14 @@ void ResponseStore::store(const StoredResponse& resp) {
         // an agent cannot turn its refusals into unbounded log volume.
         note_ingest_dropped(metrics_, kReasonPerAgentCap);
         const auto admit = cap_log_budget_.try_admit(resp.agent_id);
+        if (admit.closed_window_suppressed > 0)
+            spdlog::warn("ResponseStore: per-agent cap refusals suppressed in the last window: {}",
+                         admit.closed_window_suppressed);
         if (admit.admitted)
             spdlog::warn("ResponseStore: per-agent row cap ({}) reached for instruction={} "
-                         "agent={}; frame dropped{}",
+                         "agent={}; frame dropped",
                          max_rows_per_agent_, ::yuzu::log_id_token(resp.instruction_id),
-                         ::yuzu::log_id_token(resp.agent_id),
-                         admit.closed_window_suppressed
-                             ? fmt::format(" ({} further refusals suppressed in the previous "
-                                           "window)",
-                                           admit.closed_window_suppressed)
-                             : std::string{});
+                         ::yuzu::log_id_token(resp.agent_id));
         return;
     }
     note_facets_dropped(metrics_, kFacetDropValueTooLong, facets_too_long);

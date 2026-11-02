@@ -3779,6 +3779,23 @@ TEST_CASE("ResponseStore: the first terminal frame beyond the cap lands, a secon
     CHECK(cap_dropped(f.metrics) == 1.0);
 }
 
+TEST_CASE("ResponseStore: an out-of-range terminal status is capped like any terminal frame",
+          "[pg][response_store][cap]") {
+    // CommandResponse.Status is an open proto3 enum and the ingest callers cast it unchecked, so a
+    // negative value is "terminal" (status != 0). The admit predicate and the terminal-exists probe
+    // must agree on that, or every such frame past the cap is admitted forever.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+
+    for (int i = 0; i < 4; ++i)
+        f.store.store(cap_frame("cmd-cap-neg", "agent-1", 0));
+    for (int i = 0; i < 6; ++i)
+        f.store.store(cap_frame("cmd-cap-neg", "agent-1", -1));
+
+    CHECK(cap_rows(f.store, "cmd-cap-neg", "agent-1") == 5); // the cap + one overflow terminal
+    CHECK(cap_dropped(f.metrics) == 5.0);
+}
+
 TEST_CASE("ResponseStore: a capped stream finalizes in place and replay cannot grow the pair",
           "[pg][response_store][cap]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -3822,6 +3839,11 @@ TEST_CASE("ResponseStore: the row cap is per (instruction, agent) pair",
     CHECK(cap_rows(f.store, "cmd-cap", "agent-2") == 1);
     CHECK(cap_rows(f.store, "cmd-other", "agent-1") == 1);
     CHECK(cap_dropped(f.metrics) == before);
+
+    // The filled pair itself is still refused (fails under a revert of the cap).
+    f.store.store(cap_frame("cmd-cap", "agent-1", 0));
+    CHECK(cap_rows(f.store, "cmd-cap", "agent-1") == 2);
+    CHECK(cap_dropped(f.metrics) == before + 1.0);
 }
 
 TEST_CASE("ResponseStore: migration v4 creates the per-pair index", "[pg][response_store][cap]") {

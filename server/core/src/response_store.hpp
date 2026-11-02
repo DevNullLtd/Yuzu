@@ -537,9 +537,9 @@ private:
     std::atomic<uint64_t> responses_reaped_{0};
     std::atomic<uint64_t> facets_predrained_{0};
     std::function<int64_t()> now_fn_; // test seam only; see ctor doc
-    // Rows per (instruction_id, agent_id) pair before store() refuses (#561). <= 0 disables the
-    // probe (test opt-out; production passes >= 1, the flag rejects 0). No public accessor: the
-    // read tripwire freezes the public method list.
+    // Rows per (instruction_id, agent_id) pair before store() refuses (#561). Callers pass >= 1
+    // (the flag's CLI::Range enforces it). No public accessor: the read tripwire freezes the
+    // public method list.
     int max_rows_per_agent_;
     // Bounds the cap-refusal WARN line per agent (the counter is unsampled). Keys are agent ids,
     // so the key bound is the agent-id limit (auth::kMaxAgentIdLength, 256).
