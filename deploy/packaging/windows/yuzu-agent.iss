@@ -89,11 +89,11 @@ Source: "{#BuildDir}\agents\plugins\msi_packages\msi_packages.dll"; DestDir: "{a
 Source: "{#BuildDir}\agents\plugins\asset_tags\asset_tags.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\power_health\power_health.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\autoruns\autoruns.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
-; app_usage's only data source is tar.dll (reads tar.db directly), which is
+; app_usage's only data source is echo.dll (reads echo.db directly), which is
 ; itself gated on plugins\advanced alone (see that Source line below) --
 ; app_usage.dll must be gated on the SAME single component, not a narrower
 ; "and" of two: a custom install selecting Advanced without System has a
-; working tar.dll but would otherwise silently skip app_usage.dll despite
+; working echo.dll but would otherwise silently skip app_usage.dll despite
 ; its dependency being present (governance Gate 7, cross-platform finding).
 Source: "{#BuildDir}\agents\plugins\app_usage\app_usage.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\execution_artifacts\execution_artifacts.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
@@ -146,7 +146,7 @@ Source: "{#BuildDir}\agents\plugins\interaction\interaction.dll"; DestDir: "{app
 
 ; --- Plugins: advanced ---
 Source: "{#BuildDir}\agents\plugins\discovery\discovery.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
-Source: "{#BuildDir}\agents\plugins\tar\tar.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\echo\echo.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\procfetch\procfetch.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\chargen\chargen.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\example\example.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
@@ -216,10 +216,10 @@ Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--install-service"; StatusMsg
 Filename: "{sys}\sc.exe"; Parameters: "config YuzuAgent binPath= ""\""{app}\bin\yuzu-agent.exe\"" --service --server {code:GetServerAddress} --data-dir \""{commonappdata}\Yuzu\"" --plugin-dir \""{app}\plugins\"" --log-file \""{app}\logs\yuzu-agent.log\"" --enrollment-token-file \""{commonappdata}\Yuzu\enrollment-token\""{code:GetExtraArgs}"""; StatusMsg: "Configuring service..."; Flags: runhidden waituntilterminated
 Filename: "{sys}\sc.exe"; Parameters: "start YuzuAgent"; StatusMsg: "Starting Yuzu Agent service..."; Flags: runhidden waituntilterminated; Check: ShouldStartService
 ; Configure the boot-window ETW AutoLogger so the kernel captures process
-; start/stop from early boot to <data-dir>\procboot.etl; the TAR plugin drains it
+; start/stop from early boot to <data-dir>\procboot.etl; the Echo plugin drains it
 ; at startup to backfill processes that started AND exited before its live ETW
 ; session opened. Takes effect on the NEXT boot. Scoped to plugins\advanced (the
-; component that ships tar.dll) — pointless without the consumer. Best-effort:
+; component that ships echo.dll) — pointless without the consumer. Best-effort:
 ; -ErrorAction SilentlyContinue + trailing `exit 0` keep a failure here from
 ; aborting the install (live capture is unaffected). Leads with
 ; Remove-AutologgerConfig so an upgrade-over-install refreshes a changed recipe
@@ -273,6 +273,11 @@ Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Com
 ; delete closes that.
 [InstallDelete]
 Type: files; Name: "{app}\plugins\sockwho.dll"
+; The activity-record plugin was renamed from tar to echo. The old DLL must not survive an
+; upgrade: the loader globs the plugin directory, so a stale tar.dll would load beside echo.dll
+; and register the retired plugin name. (deb/rpm file lists and the macOS package manifest
+; already remove the old binary.)
+Type: files; Name: "{app}\plugins\tar.dll"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"

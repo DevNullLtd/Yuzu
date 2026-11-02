@@ -411,7 +411,7 @@ yuzu::agent::ScopedFd open_rtnetlink_socket() {
     if (fd.get() >= 0) {
         // Bound the recvmsg wait, matching the two existing netlink sites in
         // this tree (agents/core/src/net_quality_sampler.cpp,
-        // agents/plugins/tar/src/tar_network_collector.cpp). Without this a
+        // agents/plugins/echo/src/echo_network_collector.cpp). Without this a
         // dump the kernel never terminates with NLMSG_DONE wedges the agent's
         // command-execution thread forever; the drain loops below treat the
         // resulting EAGAIN as an incomplete dump and report CONSTRAINED.
@@ -1575,10 +1575,10 @@ private:
     // kernel neighbour cache via GetIpNetTable2(AF_UNSPEC); Linux reads /proc/net/arp
     // natively; macOS reads the PF_ROUTE NET_RT_FLAGS/RTF_LLINFO sysctl via
     // agents/shared/route_sysctl_arp.hpp, reused as-is. Mirrors the proven
-    // enumeration in tar_arp_collector.cpp (reimplemented here — the TAR plugin
+    // enumeration in echo_arp_collector.cpp (reimplemented here — the Echo plugin
     // internals aren't linked into network_config).
     // Cap entries so a large or forged neighbour table can't produce an
-    // unbounded response (mirrors the TAR collector's posture). Shared by all
+    // unbounded response (mirrors the Echo collector's posture). Shared by all
     // three platform legs -- /proc/net/arp and the PF_ROUTE RTF_LLINFO dump
     // are just as capable of an oversized or spoofed table as GetIpNetTable2.
     static constexpr std::size_t kArpEntryCap = 20000;

@@ -51,9 +51,9 @@
 ///   GET /api/help/palette                   (perm_fn Infrastructure:Read)
 ///   GET /help                               -
 ///   GET /swagger                            (auth_fn + perm_fn Infrastructure:Read)
-///   GET /tar                                (auth_fn)
-///   GET /tar/timeline                       (auth_fn; only when Deps::tar_timeline_ui)
-///   GET /static/yuzu-tar-timeline.js        -  (only when Deps::tar_timeline_ui)
+///   GET /echo                                (auth_fn)
+///   GET /echo/timeline                       (auth_fn; only when Deps::echo_timeline_ui)
+///   GET /static/yuzu-echo-timeline.js        -  (only when Deps::echo_timeline_ui)
 ///   GET /result-sets                        (auth_fn)
 ///   GET /viz/fleet                          (auth_fn + viz kill switch)
 ///   GET /viz/host/:agent_id                 (auth_fn + viz kill switch)
@@ -72,7 +72,7 @@
 /// `R"(/viz/([^/]+))"`, which WOULD swallow `fleet` as a path parameter if
 /// registered first — preserve this order if such a route is ever added.
 
-#include "tar_timeline_page_ui.hpp" // kTarTimelineUi: the default of Deps::tar_timeline_ui
+#include "echo_timeline_page_ui.hpp" // kEchoTimelineUi: the default of Deps::echo_timeline_ui
 
 #include <yuzu/server/auth.hpp>
 
@@ -112,9 +112,9 @@ struct Deps {
     /// `ServerImpl::registry_`. Null -> the `/api/help*` routes fail closed
     /// (503) rather than dereferencing a null pointer.
     const yuzu::server::detail::AgentRegistry* registry{nullptr};
-    /// Register GET /tar/timeline and its script. False (the shipped state): neither path
-    /// exists. The default is kTarTimelineUi, so a test can drive both states.
-    bool tar_timeline_ui{kTarTimelineUi};
+    /// Register GET /echo/timeline and its script. False (the shipped state): neither path
+    /// exists. The default is kEchoTimelineUi, so a test can drive both states.
+    bool echo_timeline_ui{kEchoTimelineUi};
 };
 
 /// Register all the page-shell / static-asset routes against `sink`.

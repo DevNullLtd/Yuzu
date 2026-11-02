@@ -92,6 +92,19 @@ struct StmtDeleter {
 };
 using StmtPtr = std::unique_ptr<sqlite3_stmt, StmtDeleter>;
 
+// RAII: ROLLBACK on ANY early return between BEGIN and a successful COMMIT unless disarmed,
+// so a hand-rolled transaction stays balanced against a future added early-return
+// (cpp-safety review). Disarmed only after COMMIT succeeds. Shared by del_keys and
+// rename_plugin.
+struct TxnGuard {
+    sqlite3* db;
+    bool committed{false};
+    ~TxnGuard() {
+        if (!committed)
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+    }
+};
+
 } // namespace
 
 // The busy handler's context (see KvBusyState's declaration in kv_store.hpp).
@@ -731,17 +744,7 @@ int KvStore::del_keys(std::string_view plugin, const std::vector<std::string>& k
         return 0;
     }
 
-    // RAII: ROLLBACK on ANY early return between BEGIN and a successful COMMIT unless disarmed,
-    // so the hand-rolled transaction stays balanced against a future added early-return
-    // (cpp-safety review). Disarmed only after COMMIT succeeds.
-    struct TxnGuard {
-        sqlite3* db;
-        bool committed{false};
-        ~TxnGuard() {
-            if (!committed)
-                sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        }
-    } txn{db_};
+    TxnGuard txn{db_};
 
     const char* sql = "DELETE FROM kv_store WHERE plugin = ? AND key = ? RETURNING 1";
     sqlite3_stmt* raw_stmt = nullptr;
@@ -776,6 +779,52 @@ int KvStore::del_keys(std::string_view plugin, const std::vector<std::string>& k
     }
     txn.committed = true;
     return deleted;
+}
+
+bool KvStore::rename_plugin(std::string_view from, std::string_view to) {
+    CallLock lock(mu_);
+    if (!db_)
+        return false;
+
+    if (sqlite3_exec(db_, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        spdlog::error("KvStore::rename_plugin BEGIN failed: {}", sqlite3_errmsg(db_));
+        return false;
+    }
+    TxnGuard txn{db_};
+
+    static constexpr const char* kSql[] = {
+        "INSERT OR IGNORE INTO kv_store(plugin, key, value, updated_at) "
+        "SELECT ?2, key, value, updated_at FROM kv_store WHERE plugin = ?1",
+        "DELETE FROM kv_store WHERE plugin = ?1",
+    };
+    for (const char* sql : kSql) {
+        sqlite3_stmt* raw_stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("KvStore::rename_plugin prepare failed: {}", sqlite3_errmsg(db_));
+            return false;
+        }
+        StmtPtr stmt(raw_stmt);
+        // An unbound parameter is NULL: the copy would move nothing and the delete match nothing
+        // while the call reports success, so a failed bind aborts the whole transaction.
+        if (sqlite3_bind_text(stmt.get(), 1, from.data(), static_cast<int>(from.size()),
+                              SQLITE_STATIC) != SQLITE_OK ||
+            (sqlite3_bind_parameter_count(stmt.get()) >= 2 &&
+             sqlite3_bind_text(stmt.get(), 2, to.data(), static_cast<int>(to.size()),
+                               SQLITE_STATIC) != SQLITE_OK)) {
+            spdlog::error("KvStore::rename_plugin bind failed: {}", sqlite3_errmsg(db_));
+            return false;
+        }
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            spdlog::error("KvStore::rename_plugin step failed: {}", sqlite3_errmsg(db_));
+            return false;
+        }
+    }
+    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        spdlog::error("KvStore::rename_plugin COMMIT failed: {}", sqlite3_errmsg(db_));
+        return false;
+    }
+    txn.committed = true;
+    return true;
 }
 
 int KvStore::pragma_synchronous() {

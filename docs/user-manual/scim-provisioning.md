@@ -478,6 +478,36 @@ administrator and no other exists. The old administrator keeps the role, the new
 one is promoted afterwards, the request says `recompute=incomplete`, and the old
 administrator has to be demoted by hand (see the remedy below).
 
+**When the user store cannot answer a deactivation (#4068).** A `PUT` or `PATCH` with
+`active:false` for a resource whose Yuzu mirror already reads inactive does not trust the
+mirror: it checks the real account first, because a failed earlier deprovision can leave the
+mirror inactive while the account is still live. If the user store cannot answer that check,
+Yuzu now refuses with `503` and `Retry-After: 2` (audit `scim.user.deactivated`, result
+`failure`, detail `store_unavailable: verifying account state`) instead of reporting the
+deprovision complete. Nothing is changed, and a retry once the store answers repairs the account.
+Configure your IdP to retry `5xx` responses.
+
+*What this does not cover.* It narrows one gap and does not make deprovisioning
+outage-proof:
+
+- During a full database outage the SCIM endpoint rejects the request at bearer-token
+  validation with `401`, before any of this runs. Your IdP may pause or quarantine provisioning
+  after repeated `401` responses; check its provisioning log and resume it after the outage.
+- For a resource whose mirror reads *active*, the provenance and role checks inside the
+  deactivation can still turn the same outage into a `404` rather than a `503`.
+- Yuzu runs no reconciliation sweep. If your IdP stops retrying, an account that was never
+  deactivated stays active until an operator acts. To find such accounts, list SCIM resources
+  that read inactive and whose account is still active
+  (`scim_store.scim_resources` with `active = false`, joined on `username` to `auth.users`
+  with `is_active = TRUE`), then re-send `active:false` from the IdP or deactivate the user in
+  Settings → Users. The `yuzu_auth_get_user_role_store_error_total` counter and the
+  `store_unavailable` audit rows are the evidence trail; the audit row is itself written to the
+  database that is down, so it can be missing for the outage window (the server log still
+  carries an `ERROR` line).
+- `DELETE` of a resource whose mirror is already inactive does not run this check.
+
+These gaps are tracked in #6835, #6836 and #6838.
+
 **Known limits of the Group role recompute.** These are real gaps, tracked in
 #5673. Until then they are documented rather than engineered
 around:

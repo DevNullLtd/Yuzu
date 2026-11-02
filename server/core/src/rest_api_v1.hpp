@@ -279,13 +279,13 @@ public:
     /// is deliberate:
     ///
     ///   - Routes whose primary authorization is the per-target `scoped_perm_fn`
-    ///     gate (POST /api/v1/bundles, the TAR retention purge, the live device
+    ///     gate (POST /api/v1/bundles, the Echo retention purge, the live device
     ///     query) thread this in as a SECOND, independent confinement check —
     ///     defense-in-depth. Unwired substitutes a present-EMPTY set (deny-all),
     ///     NEVER nullopt: ADR-0033 §1 forbids reading a missing derivation as
     ///     "no filter". `scoped_perm_fn` already 500s when IT is unwired, so the
     ///     primary gate reports the misconfiguration.
-    ///   - The async result-set producers (`from-tar-query`,
+    ///   - The async result-set producers (`from-echo-query`,
     ///     `from-instruction-result`, `{id}/re-eval`) admit on a bare GLOBAL
     ///     `perm_fn("Execution","Execute")` and dispatch by scope/broadcast, so
     ///     this derivation is their ONLY per-device authorization — the PRIMARY

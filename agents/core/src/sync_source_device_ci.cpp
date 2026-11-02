@@ -18,12 +18,11 @@ namespace yuzu::agent {
 
 namespace {
 
-// Caps — MUST match the server seam (device_ci_ingestion.cpp) so the server's
-// parse never truncates/drops differently from what this source hashed.
+// Caps. The field cap MUST match the server seam (device_ci_ingestion.cpp) so the server's
+// parse never truncates differently from what this source hashed. The blob cap
+// (kDeviceCiMaxBlobBytes, sync_source_device_ci.hpp) must stay <= the server's (server >= agent):
+// the server accepts everything this source can send; the two are equal by contract.
 constexpr std::size_t kMaxFieldLen = 1024;
-// The device-CI canonical blob is a single small record (~22 short fields); 64 KiB
-// is far above any real machine and well below the gRPC 4 MiB receive ceiling.
-constexpr std::size_t kMaxBlobBytes = 64u * 1024;
 
 // ── UTF-8 scrub + field clamp ───────────────────────────────────────────────
 // sanitize_utf8_strict / clamp_field live in sync_canonical.{hpp,cpp} — one
@@ -149,8 +148,9 @@ CiRecord build_device_ci_record(const CiPluginOutputs& out) {
     rec.os_build = scalar(out.os_build, "os_build");
     rec.arch = scalar(out.os_arch, "os_arch");
 
-    // processors: `cpu|<id>|<model>|<cores>|<threads>|<mhz>` — model from the first
-    // CPU, cores/threads summed across sockets.
+    // processors: `cpu|<id>|<model>|<cores>|<threads>|<mhz>[|<socket_designation>|<stepping>]`
+    // (trailing columns are placeholders and ignored here) — model from the first CPU,
+    // cores/threads summed across sockets.
     long long cores = 0;
     long long threads = 0;
     for (auto line : split_lines(out.processors)) {
@@ -165,7 +165,8 @@ CiRecord build_device_ci_record(const CiPluginOutputs& out) {
     rec.cpu_cores = std::to_string(cores);
     rec.cpu_threads = std::to_string(threads);
 
-    // memory: `dimm|<slot>|<size_mb>|<type>|<speed_mhz>` — sum size_mb → bytes.
+    // memory: `dimm|<slot>|<size_mb>|<type>|<speed_mhz>[|<manufacturer>|<part_number>|<serial>]`
+    // (trailing columns are placeholders and ignored here) — sum size_mb → bytes.
     long long total_mb = 0;
     for (auto line : split_lines(out.memory)) {
         auto t = split_pipe(line);
@@ -292,9 +293,9 @@ SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
         }
 
         std::string blob = device_ci_canonical_blob(rec);
-        if (blob.size() > kMaxBlobBytes) {
+        if (blob.size() > kDeviceCiMaxBlobBytes) {
             spdlog::warn("sync: device_ci blob {} B exceeds {} B cap — skipping this cycle",
-                         blob.size(), kMaxBlobBytes);
+                         blob.size(), kDeviceCiMaxBlobBytes);
             return std::nullopt;
         }
         std::string hash = sha256_hex(blob);

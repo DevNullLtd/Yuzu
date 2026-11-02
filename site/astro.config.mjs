@@ -11,10 +11,20 @@ import stripFirstH1 from './src/remark/strip-first-h1.mjs';
 // transfer the way it redirects repo URLs — a stale host here silently emits
 // wrong canonical URLs and a wrong sitemap. Updated for the DevNullLtd org
 // transfer (2026-09-28).
+const BASE = '/Yuzu';
+
 export default defineConfig({
   site: 'https://devnullltd.github.io',
-  base: '/Yuzu',
+  base: BASE,
   trailingSlash: 'always',
+  // The activity-record feature was renamed from TAR to Echo; keep the old public URLs working.
+  // Astro emits a meta-refresh page at each key (static output). It applies `base` to the key
+  // but not to the destination, so the destinations carry BASE themselves.
+  redirects: {
+    '/manual/tar/': `${BASE}/manual/echo/`,
+    '/manual/tar-dashboard/': `${BASE}/manual/echo-dashboard/`,
+    '/plugins/tar/': `${BASE}/plugins/echo/`,
+  },
   markdown: {
     // Astro 7: remark plugins ride the explicit unified() processor —
     // markdown.remarkPlugins is deprecated (shikiConfig is not; it stays

@@ -122,6 +122,23 @@ enum class AuthDBError : std::uint8_t {
     /// login, a "sign in again" fragment in Settings), reveals nothing and
     /// spends any pending token.
     CredentialChanged,
+    /// #3808: `mfa_verify_enrollment` verified a code against the provisional
+    /// secret it loaded, but by the time its guarded UPDATE ran that secret was
+    /// no longer the stored one. Several things do that and the classifier CANNOT
+    /// tell them apart (it reads only "stored blob differs from the loaded blob"):
+    /// `mfa_disable`, a disable + `mfa_init_enrollment` re-init, the stale-
+    /// provisional sweep (`cleanup_provisional_mfa`, no actor, every replica),
+    /// the `--mfa-reset` boot CLI, and an online KEK rewrap (`rewrap_all`, which
+    /// rewrites the envelope blob in place with the plaintext UNCHANGED). Nothing
+    /// was enrolled. A benign business outcome, NOT a store fault
+    /// (`is_store_unavailable` is false): the caller reports "start enrollment
+    /// again", never a 503 or a secret-unavailable degrade signal.
+    /// CALLERS MUST NOT NAME A CAUSE in an audit row, message or doc: an auditor
+    /// reading "disable" goes looking for an `mfa.disabled` row that may never
+    /// have existed. Ranked BELOW `MfaAlreadyEnrolled` and `CredentialChanged` —
+    /// a password reset also wipes the provisional secret, and that refusal must
+    /// win.
+    MfaEnrollmentCancelled,
 };
 
 /// True iff `e` reflects the AuthDB store itself being unavailable (PG
@@ -140,6 +157,33 @@ enum class AuthDBError : std::uint8_t {
     return e == AuthDBError::SecretUnavailable || e == AuthDBError::QueryFailed ||
            e == AuthDBError::WriteFailed || e == AuthDBError::StoreBusy;
 }
+
+namespace detail {
+/// #3808: the ONE precedence ladder for `mfa_verify_enrollment`'s guarded-UPDATE
+/// 0-row branch, over the four facts the classify SELECT reads in a single
+/// statement. Pure so every combination is unit-testable without a database.
+/// A TEST SEAM, exposed here only so the unit test can call it: not for callers
+/// outside `auth_db.cpp` (the only production caller) and its tests.
+///   1. inactive/deleted row            -> WriteFailed (fail-closed 503, unchanged)
+///   2. already enrolled                -> MfaAlreadyEnrolled (a concurrent verify won)
+///   3. password hash moved             -> CredentialChanged (MUST outrank 4: a
+///                                          password reset also wipes the secret)
+///   4. stored secret != loaded secret  -> MfaEnrollmentCancelled (benign cancel)
+///   5. nothing explains the miss       -> WriteFailed (fail-closed, never a silent success)
+[[nodiscard]] constexpr AuthDBError classify_enroll_verify_miss(bool active, bool enrolled,
+                                                                 bool credential_changed,
+                                                                 bool secret_differs) noexcept {
+    if (!active)
+        return AuthDBError::WriteFailed;
+    if (enrolled)
+        return AuthDBError::MfaAlreadyEnrolled;
+    if (credential_changed)
+        return AuthDBError::CredentialChanged;
+    if (secret_differs)
+        return AuthDBError::MfaEnrollmentCancelled;
+    return AuthDBError::WriteFailed;
+}
+} // namespace detail
 
 /// `list_users_including_inactive()` row — same fields as `auth::UserEntry`
 /// plus the `is_active` flag `list_users()` deliberately filters out. A NEW
@@ -724,7 +768,11 @@ public:
     /// raw, hashed in DB), and returns the codes for the one-time reveal.
     /// Idempotent on already-enrolled rows: returns MfaAlreadyEnrolled.
     /// Returns SecretUnavailable if the provisional secret fails to decrypt
-    /// (never silently rejects the code as wrong).
+    /// (never silently rejects the code as wrong). Returns MfaEnrollmentCancelled
+    /// (#3808) when the provisional secret the code was verified against is no
+    /// longer the stored one — nothing is enrolled. The cause is NOT distinguished
+    /// (a disable, a re-init, the stale-provisional sweep, `--mfa-reset` or a KEK
+    /// rewrap all look the same); see `AuthDBError::MfaEnrollmentCancelled`.
     ///
     /// `expected_password_hash_hex` (#5342 Gate 8, F2/F4 — REQUIRED, no
     /// default, so every caller decides) is the CREDENTIAL ANCHOR, always

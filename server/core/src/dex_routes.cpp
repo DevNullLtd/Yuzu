@@ -1966,7 +1966,7 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
                placeholder("Reliability data unavailable", "The signal store is not open.");
 
     // A4: click-to-load device perf panel. Deliberately NOT auto-loaded: the
-    // route behind the hx-get dispatches a real tar.sql to the device AND
+    // route behind the hx-get dispatches a real echo.sql to the device AND
     // probes Execution:Execute (which audit-logs a denial) — auto-loading
     // would fire a command + possible denied-audit row on every page view by
     // every operator (grill finding 1). A click is an attempted action, so
@@ -2120,15 +2120,15 @@ std::string render_dex_apps_fragment(const GuaranteedStateStore* store, const st
     return h;
 }
 
-// ── A4: device perf sparklines (federated TAR query) ────────────────────────
+// ── A4: device perf sparklines (federated Echo query) ────────────────────────
 
 namespace {
 
 // The canned per-device warehouse query — last 48 hourly rollups, reversed to
 // chronological at parse. `$Perf_Hourly` is the operator-SQL dollar name; the
-// agent translates it and runs it through TarDatabase::execute_user_query (the
+// agent translates it and runs it through EchoDatabase::execute_user_query (the
 // read-only authorizer chokepoint, #760/#631), exactly like operator SQL from
-// the TAR page. The raw samples never leave the device until this on-demand,
+// the Echo page. The raw samples never leave the device until this on-demand,
 // per-device, permission-gated query (ADR-0004 federated model).
 constexpr const char* kDexPerfSql =
     "SELECT hour_ts, cpu_avg, mem_avg, read_lat_us_avg, write_lat_us_avg "
@@ -2377,7 +2377,7 @@ std::vector<DexProcPerfRow> parse_dex_procperf_output(const std::string& output)
 std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points) {
     if (points.empty())
         return "<div class=\"gp-note\">No performance history on this device yet &mdash; the "
-               "TAR perf sampler may be disabled, or this platform has no collector.</div>";
+               "Echo perf sampler may be disabled, or this platform has no collector.</div>";
 
     struct Row {
         const char* label;
@@ -3123,7 +3123,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         // `version` is REQUIRED-PRESENT here (unlike the trend route's "" =
         // all-versions convention): this drill is always scoped to ONE exact
         // version, and Linux's procperf emits "" for EVERY app
-        // (tar_proc_perf.cpp) — treating a missing `version` as "all versions"
+        // (echo_proc_perf.cpp) — treating a missing `version` as "all versions"
         // would silently collapse to the single Linux bucket instead of
         // surfacing a genuine parameter error.
         if (!req.has_param("version") || app.empty() || !app_perf_param_valid(app) ||
@@ -3185,11 +3185,11 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                         "text/html; charset=utf-8");
     });
 
-    // -- A4: device perf panel — live federated TAR query + result poll --------
+    // -- A4: device perf panel — live federated Echo query + result poll --------
     //
-    // The panel mechanically EXECUTES a (canned, server-authored) tar.sql on the
+    // The panel mechanically EXECUTES a (canned, server-authored) echo.sql on the
     // device, so beyond GuaranteedState:Read it requires the same securable the
-    // TAR SQL page does (Execution:Execute). The Execute check is PROBED against
+    // Echo SQL page does (Execution:Execute). The Execute check is PROBED against
     // a throwaway response so a read-only operator gets an honest in-panel note
     // instead of a swallowed 403 (htmx leaves the target untouched on 4xx).
     auto note = [](httplib::Response& res, const std::string& text) {
@@ -3219,7 +3219,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             return;
         if (!can_execute(req, id)) {
             note(res, "Live device performance needs the <b>Execute</b> permission &mdash; "
-                      "this panel runs a read-only TAR query on the device.");
+                      "this panel runs a read-only Echo query on the device.");
             return;
         }
         if (!dispatch_fn_ || !responses_fn_) {
@@ -3231,7 +3231,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             return;
         }
         std::unordered_map<std::string, std::string> params{{"sql", kDexPerfSql}};
-        const auto dispatch_outcome = dispatch_fn_("tar", "sql", {id}, "", params);
+        const auto dispatch_outcome = dispatch_fn_("echo", "sql", {id}, "", params);
         const auto& command_id = dispatch_outcome.command_id;
         const auto sent = dispatch_outcome.sent;
         // Surface a dropped evidence row on this usage-class dispatch via
@@ -3240,7 +3240,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         (void)detail::emit_behavioral_audit(
             audit_fn_, req, res, "dex.device.perf.query", sent > 0 ? "success" : "no_agents",
             "Agent", id,
-            "canned tar.sql $Perf_Hourly -> " + std::to_string(sent) +
+            "canned echo.sql $Perf_Hourly -> " + std::to_string(sent) +
                 " agent(s) command_id=" + command_id);
         if (sent == 0) {
             note(res, "Device offline &mdash; the live performance query needs a connected "
@@ -3269,9 +3269,9 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             note(res, "Live device query unavailable on this server.");
             return;
         }
-        // Only tar dispatches are pollable here, only for the named agent —
+        // Only echo dispatches are pollable here, only for the named agent —
         // narrows what a guessed/stolen command_id can read via this route.
-        if (id.empty() || command_id.size() > 64 || !command_id.starts_with("tar-")) {
+        if (id.empty() || command_id.size() > 64 || !command_id.starts_with("echo-")) {
             res.status = 400;
             return;
         }
@@ -3358,7 +3358,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      return;
                  if (!can_execute(req, id)) {
                      note(res, "Per-application data needs the <b>Execute</b> permission "
-                               "&mdash; this panel runs a read-only TAR query on the device.");
+                               "&mdash; this panel runs a read-only Echo query on the device.");
                      return;
                  }
                  if (!dispatch_fn_ || !responses_fn_) {
@@ -3373,7 +3373,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  const std::string w = window_token(window_to_days(
                      req.has_param("window") ? req.get_param_value("window") : "7d"));
                  std::unordered_map<std::string, std::string> params{{"sql", dex_procperf_sql()}};
-                 const auto dispatch_outcome = dispatch_fn_("tar", "sql", {id}, "", params);
+                 const auto dispatch_outcome = dispatch_fn_("echo", "sql", {id}, "", params);
                  const auto& command_id = dispatch_outcome.command_id;
                  const auto sent = dispatch_outcome.sent;
                  // The procperf probe is usage-class (works-council-relevant); surface a
@@ -3382,7 +3382,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  (void)detail::emit_behavioral_audit(
                      audit_fn_, req, res, "dex.device.procperf.query",
                      sent > 0 ? "success" : "no_agents", "Agent", id,
-                     "canned tar.sql $ProcPerf_Hourly (usage-class) -> " + std::to_string(sent) +
+                     "canned echo.sql $ProcPerf_Hourly (usage-class) -> " + std::to_string(sent) +
                          " agent(s) command_id=" + command_id);
                  if (sent == 0) {
                      note(res, "Device offline &mdash; the live per-app query needs a connected "
@@ -3413,7 +3413,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      note(res, "Live device query unavailable on this server.");
                      return;
                  }
-                 if (id.empty() || command_id.size() > 64 || !command_id.starts_with("tar-")) {
+                 if (id.empty() || command_id.size() > 64 || !command_id.starts_with("echo-")) {
                      res.status = 400;
                      return;
                  }

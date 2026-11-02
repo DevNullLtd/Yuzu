@@ -3,9 +3,9 @@
 /**
  * es_client.hpp -- shared, pure Endpoint Security helpers.
  *
- * es_seq_gap() and es_stream_is_stalled() are lifted from TAR's
- * tar_proc_es.cpp (A0, macOS Spark/Reflex/DEX programme) into agent-core so
- * a future shared ES client (a later slice) and TAR's own process collector
+ * es_seq_gap() and es_stream_is_stalled() are lifted from Echo's
+ * echo_proc_es.cpp (A0, macOS Spark/Reflex/DEX programme) into agent-core so
+ * a future shared ES client (a later slice) and Echo's own process collector
  * both consume ONE copy. Pure integer arithmetic -- no ES headers, no
  * platform API -- so, like every other pure-decision-code header in this
  * tree, this compiles and is unit-tested on every host even though only a

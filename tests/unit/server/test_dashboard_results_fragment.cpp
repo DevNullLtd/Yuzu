@@ -22,8 +22,8 @@
  * directly, without an HTTP round-trip, in
  * test_dashboard_results_columns.cpp's "scope filter drops out-of-scope
  * agents" test; this file proves the ROUTE wires the gate correctly, same
- * division of labour as test_dashboard_tar_fragments.cpp (route wiring)
- * vs. test_dashboard_tar_retention.cpp (render-time logic) for the TAR
+ * division of labour as test_dashboard_echo_fragments.cpp (route wiring)
+ * vs. test_dashboard_echo_retention.cpp (render-time logic) for the Echo
  * fragments.
  */
 
@@ -77,7 +77,7 @@ bool contains(const std::string& hay, std::string_view needle) {
 }
 
 struct FragmentResultsHarness {
-    // MEMBER ORDER IS LOAD-BEARING (mirrors test_dashboard_tar_fragments.cpp):
+    // MEMBER ORDER IS LOAD-BEARING (mirrors test_dashboard_echo_fragments.cpp):
     // `sink` is declared LAST so it is destroyed FIRST, while the
     // `DashboardRoutes` whose `this` its handlers captured is still alive.
     yuzu::MetricsRegistry metrics;
@@ -212,19 +212,19 @@ TEST_CASE("/fragments/results: admitted + scoped gate hides out-of-scope rows "
     CHECK_FALSE(contains(res->body, "2 agents"));
 }
 
-// #4027 fix round 2 (adversarial review CDX-P2-08): GET /api/v1/tar/retention-paused's
+// #4027 fix round 2 (adversarial review CDX-P2-08): GET /api/v1/echo/retention-paused's
 // explicit service-scoped-token 403 (dashboard_routes.cpp, ahead of fleet_read_fn_)
 // must emit a durable audit row, not just a metric — this is the exact regression the
 // finding caught (the check replaced perm_fn_/require_permission's service-scope
 // default-deny branch, which DID audit via AuthRoutes::audit_log). Lives here rather
-// than test_dashboard_tar_fragments.cpp because the path under test returns before
-// gather_tar_retention_paused/response_store/mgmt_group_store are ever touched, so it
+// than test_dashboard_echo_fragments.cpp because the path under test returns before
+// gather_echo_retention_paused/response_store/mgmt_group_store are ever touched, so it
 // needs none of that file's real-Postgres ManagementGroupStorePg fixture — same
 // minimal-registration pattern as the /fragments/results tests above, self-contained
 // rather than reusing FragmentResultsHarness (whose auth_fn has no service-scope hook).
-TEST_CASE("GET /api/v1/tar/retention-paused: service-scoped token denial is audited, "
+TEST_CASE("GET /api/v1/echo/retention-paused: service-scoped token denial is audited, "
           "not just counted",
-          "[server][dashboard][tar][auth]") {
+          "[server][dashboard][echo][auth]") {
     yuzu::MetricsRegistry metrics;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
@@ -263,13 +263,13 @@ TEST_CASE("GET /api/v1/tar/retention-paused: service-scoped token denial is audi
     // deny (and audit) BEFORE the route ever reaches it; if this test somehow
     // needed a wired gate to pass, that would itself prove the ordering broke.
 
-    auto res = sink.Get("/api/v1/tar/retention-paused");
+    auto res = sink.Get("/api/v1/echo/retention-paused");
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(contains(res->body, "service-scoped"));
 
     REQUIRE(audits.size() == 1);
-    CHECK(audits[0].action == "tar.retention_paused.view");
+    CHECK(audits[0].action == "echo.retention_paused.view");
     CHECK(audits[0].result == "denied");
     CHECK(audits[0].target_type == "Infrastructure");
 }

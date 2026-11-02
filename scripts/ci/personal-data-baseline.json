@@ -99,17 +99,17 @@
   {
    "detector": "mac-address",
    "max_hits": 1,
-   "path": "tests/unit/test_tar_capture_status.cpp"
+   "path": "tests/unit/test_echo_capture_status.cpp"
   },
   {
    "detector": "home-path",
    "max_hits": 2,
-   "path": "tests/unit/test_tar_mapdrive.cpp"
+   "path": "tests/unit/test_echo_mapdrive.cpp"
   },
   {
    "detector": "tailnet-ip",
    "max_hits": 1,
-   "path": "tests/unit/test_tar_store.cpp"
+   "path": "tests/unit/test_echo_store.cpp"
   }
  ]
 }

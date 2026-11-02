@@ -5,20 +5,20 @@
 // shorthand -- the real prior spread was wider and uneven.) #1681/#1682 migrated the
 // plugins that carried a NAMED wide<->UTF-8 helper to this header:
 //   - vuln_scan / os_info / sccm / windows_updates -- the previously-ANSI Reg*A siblings (#1682);
-//   - registry / wmi / services / interaction / tar_module_etw -- de-dup of the trio /
+//   - registry / wmi / services / interaction / echo_module_etw -- de-dup of the trio /
 //     single-direction local copies;
-//   - network_config / procfetch / sockwho / users / wifi / tar_service_collector /
-//     tar_user_collector -- de-dup of the process_enum-style `wide_to_utf8`.
+//   - network_config / procfetch / sockwho / users / wifi / echo_service_collector /
+//     echo_user_collector -- de-dup of the process_enum-style `wide_to_utf8`.
 // Most switch via `using yuzu::win::...;` (the local name coincided); wmi (`from_bstr`)
-// and tar_module_etw (`std::wstring`/`std::string` signatures) keep thin delegating shims.
+// and echo_module_etw (`std::wstring`/`std::string` signatures) keep thin delegating shims.
 //
 // This header was relocated from agents/plugins/shared/ to agents/shared/ (#1681) so BOTH
 // agents/core/ and agents/plugins/ can reach it -- core could not include a plugin-shared
 // header without inverting the dependency direction. With that move, the agent-core files
 // (process_enum, dex_observer, guard_registry, guard_service, trigger_engine; guard_file's
 // dead, uncalled copy was deleted) and the remaining plugins (processes, device_identity,
-// filesystem, hardware, ioc, content_dist, disk_space, and the tar_dns_collector /
-// tar_proc_etw / tar_proc_perf / tar_arp_collector siblings) all delegate here.
+// filesystem, hardware, ioc, content_dist, disk_space, and the echo_dns_collector /
+// echo_proc_etw / echo_proc_perf / echo_arp_collector siblings) all delegate here.
 //
 // Two sites deliberately remain on their own conversion -- by design, NOT pending work:
 //   - temp_file.cpp: writes UTF-8 into a CALLER-provided char* buffer and returns a status

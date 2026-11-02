@@ -697,7 +697,7 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
 
 **MCP clients cannot approve.** MCP callers authenticate with a bearer token and the MCP transport runs no MFA step-up, so the MCP tools
 `approve_request` and `reject_request` always return a typed refusal, whatever credential the caller used
-(a browser cookie session that reaches `/mcp/v1/` is refused too). This is an exception
+(a browser cookie session is refused at `/mcp/v1/` before any tool runs, because it carries no MCP tier). This is an exception
 recorded in ADR-1005's exception ledger (entry 2026-10-18): human review is a human-session act. The tools stay registered, and listing
 pending approvals through MCP (`list_pending_approvals`, `get_pending_approval_count`) is
 unchanged. A supervised-tier agentic worker still gets its ticket from the first call and still

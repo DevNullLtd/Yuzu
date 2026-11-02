@@ -2363,6 +2363,18 @@ TEST_CASE("AuthRoutes::audit_as_session_fn stamps the session it is handed, the 
         CHECK(e.principal_class == "engine");
     }
 
+    SECTION("a session the engine token authenticated audits as the engine class even when its "
+            "stored kind says human (#2343: the classification the server applies, not the field)") {
+        auth::Session s;
+        s.username = "engine:ci";
+        s.role = auth::Role::user;
+        s.auth_source = "engine_token";
+        s.principal_kind = "human";
+        REQUIRE(write(req, s, "user", "quarantine.disable", "success", "Security", "agent-1", ""));
+        const auto e = one_row("quarantine.disable");
+        CHECK(e.principal_class == "engine");
+    }
+
     SECTION("a failed write logs the principal and target id neutralised, one record, no "
             "forged line (the persisted row keeps the raw value; here the store is broken)") {
         {

@@ -358,7 +358,7 @@ TEST_CASE("EnablementStore: schema v3 applies over an existing v2 plugin_config_
     }
     PluginConfigStore pcs{pool, codec};
     REQUIRE(pcs.is_open());
-    CHECK(query1(db.dsn(), "SELECT version FROM public.schema_meta WHERE store='plugin_config_store'") == "3");
+    CHECK(query1(db.dsn(), "SELECT version FROM public.schema_meta WHERE store='plugin_config_store'") == "4");
 
     EnablementStore store{pool, make_overlay(), kinds()};
     REQUIRE(store.is_open());

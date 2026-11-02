@@ -11,7 +11,7 @@
 /// inventory/system plugins group B declares ABI4 descriptors for
 /// (agents/plugins/hardware, users, status, os_info, storage,
 /// installed_apps, processes, procfetch, disk_space, device_identity,
-/// agent_logging, diagnostics, example, chargen) — 55 rows, one per action
+/// agent_logging, diagnostics, example, chargen) — 59 rows, one per action
 /// in each plugin's `actions()` table. Every other `capability_decls/*.hpp`
 /// fragment belongs to a different package and is composed alongside this
 /// one only at the `CommandCapabilityRegistry` construction site — never
@@ -53,10 +53,12 @@ namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
+inline constexpr std::array<CommandCapability, 59> kPluginActionCatalogueB{{
     // ── hardware (agents/plugins/hardware/src/hardware_plugin.cpp) ────────
-    // 8 actions, all pure fact-collection (manufacturer/model/BIOS/CPU/
-    // memory/disks/drivers/serial+UUID) — no host-state write anywhere.
+    // 12 actions, all pure fact-collection (manufacturer/model/BIOS/CPU/
+    // memory/disks/drivers/serial+UUID, plus chassis/baseboard/swap/machine_id,
+    // which are planned placeholders that read nothing yet) — no host-state
+    // write anywhere.
     {
         .plugin = "hardware",
         .action = "manufacturer",
@@ -137,6 +139,50 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
     {
         .plugin = "hardware",
         .action = "system",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "hardware",
+        .action = "chassis",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "hardware",
+        .action = "baseboard",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "hardware",
+        .action = "swap",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "hardware",
+        .action = "machine_id",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Inventory",

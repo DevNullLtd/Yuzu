@@ -40,7 +40,7 @@ class InstructionStore;
 class HttpRouteSink; // http_route_sink.hpp — the in-process-testable seam (#438)
 struct FacetFilter;
 struct ForensicsServed; // forensics_read_audit.hpp - #4990
-struct TarRetentionPausedScan; // tar_tree_routes.hpp — #4027 REST+MCP twin shape
+struct EchoRetentionPausedScan; // echo_tree_routes.hpp — #4027 REST+MCP twin shape
 
 namespace detail {
 class AgentRegistry;
@@ -118,7 +118,7 @@ public:
                          VisibleSetFn visible_set_fn = {});
 
     /// HttpRouteSink overload — identical registration against the polymorphic
-    /// seam so the fragment handlers (notably the destructive TAR
+    /// seam so the fragment handlers (notably the destructive Echo
     /// retention-paused purge/reenable POSTs) are reachable from an in-process
     /// TestRouteSink without an httplib acceptor thread (#438 TSan trap; #1786).
     /// The httplib::Server& overload wraps + delegates here.
@@ -226,9 +226,9 @@ public:
     /// injection after `register_routes` still takes live effect.
     void set_capability_classify_fn(ClassifyFn fn) { classify_fn_ = std::move(fn); }
 
-    /// #4027: the data-gathering half of render_tar_retention_paused, extracted so
-    /// the HTML fragment renderer, the new `GET /api/v1/tar/retention-paused` REST
-    /// twin, and the `list_tar_retention_paused` MCP twin share ONE read of the scan
+    /// #4027: the data-gathering half of render_echo_retention_paused, extracted so
+    /// the HTML fragment renderer, the new `GET /api/v1/echo/retention-paused` REST
+    /// twin, and the `list_echo_retention_paused` MCP twin share ONE read of the scan
     /// state / response store / visibility filter (api-twin-recipe.md Rule 1) instead
     /// of the REST/MCP surface re-deriving it. Public (unlike the private renderer
     /// above) — `McpServer` calls it via a `DashboardRoutes*` threaded in through
@@ -262,18 +262,18 @@ public:
     /// When `true` (the REST/MCP twins), `extra_scope` (= `gate.scope`, the
     /// ADR-0017-authorized set) is the SOLE filter — `visible_set` is skipped
     /// entirely, matching the two device pickers' identical fix
-    /// (`TarTreeRoutes::all_devices_fn_`). Default `false` preserves the HTML
+    /// (`EchoTreeRoutes::all_devices_fn_`). Default `false` preserves the HTML
     /// fragment caller's existing membership-only behavior unchanged (it has
     /// no `fleet_read_fn_` gate to defer to yet — out of scope this round,
     /// same recorded exception as the two un-migrated device-picker
     /// fragments).
-    TarRetentionPausedScan
-    gather_tar_retention_paused(const std::string& username,
+    EchoRetentionPausedScan
+    gather_echo_retention_paused(const std::string& username,
                                 const authz::VisibleSet& extra_scope = std::nullopt,
                                 bool extra_scope_is_authoritative = false) const;
 
 private:
-    /// Same-site gate for the cookie-authorised dashboard dispatch routes (execute, tar-execute):
+    /// Same-site gate for the cookie-authorised dashboard dispatch routes (execute, echo-execute):
     /// see `browser_write_is_cross_site`. Defence in depth: the server-wide pre-routing gate
     /// answers a cookie-session write first. This copy runs after the permission gate and BEFORE
     /// any parsing, audit-before-dispatch row or dispatch, so a refused request does no work.
@@ -402,47 +402,47 @@ private:
     /// Render scope list with groups section.
     std::string render_scope_list(const std::string& selected, const std::string& username);
 
-    /// Render the TAR retention-paused source list (Phase 15.A — issue #547).
-    /// Reads the most recent `tar.status` scan **for the calling operator**,
+    /// Render the Echo retention-paused source list (Phase 15.A — issue #547).
+    /// Reads the most recent `echo.status` scan **for the calling operator**,
     /// filters the responses to agents the operator can see (per
     /// `ManagementGroupStore::get_visible_agents`), parses each agent's
     /// output for `<source>_enabled=false` rows, and renders an HTML table
     /// body fragment. The username + visibility filter close the
     /// Gate 2 cross-operator data-leak finding.
-    std::string render_tar_retention_paused(const std::string& username, bool can_execute,
+    std::string render_echo_retention_paused(const std::string& username, bool can_execute,
                                             bool can_delete) const;
 
     /// Parse f_* filter params from request into FacetFilter vector.
     std::vector<FacetFilter> parse_filters(const httplib::Request& req,
                                             const std::string& plugin) const;
 
-    // -- TAR retention scan tracking (Phase 15.A) -----------------------------
+    // -- Echo retention scan tracking (Phase 15.A) -----------------------------
     //
-    // Tracks the most-recent operator-triggered `tar.status` scan, **keyed by
-    // operator username**, so two operators viewing /tar do not see each
+    // Tracks the most-recent operator-triggered `echo.status` scan, **keyed by
+    // operator username**, so two operators viewing /echo do not see each
     // other's scan results. The Gate 2 governance review caught the prior
     // single-shared-slot design as a HIGH cross-operator data-leak (operator
-    // B opens /tar after operator A scans → sees A's data, including agents
+    // B opens /echo after operator A scans → sees A's data, including agents
     // outside B's RBAC scope). Per-username state plus visibility-scoped
-    // rendering (see render_tar_retention_paused) close that gap.
+    // rendering (see render_echo_retention_paused) close that gap.
     //
     // Bounded LRU: hard-cap at 256 entries; oldest evicted on overflow.
     // Persistence + multi-server coordination land in Phase 15.G.
-    struct TarScanState {
+    struct EchoScanState {
         std::string command_id;
         int dispatched_count{0};
         int64_t dispatched_at{0};
     };
-    mutable std::mutex tar_scan_mu_;
-    std::unordered_map<std::string, TarScanState> tar_scans_by_user_;
-    static constexpr std::size_t kTarScanStateCap = 256;
+    mutable std::mutex echo_scan_mu_;
+    std::unordered_map<std::string, EchoScanState> echo_scans_by_user_;
+    static constexpr std::size_t kEchoScanStateCap = 256;
 
-    // Unit-test seam (#562): render_tar_retention_paused and its inputs
-    // (response_store_, mgmt_group_store_, tar_scans_by_user_) are private, and
+    // Unit-test seam (#562): render_echo_retention_paused and its inputs
+    // (response_store_, mgmt_group_store_, echo_scans_by_user_) are private, and
     // exercising the XSS-escaping / dedup / sort logic without standing up an
     // HTTP server needs to wire them directly. Test-only; grants no runtime
-    // surface. See tests/unit/server/test_dashboard_tar_retention.cpp.
-    friend struct DashboardTarRetentionTestAccess;
+    // surface. See tests/unit/server/test_dashboard_echo_retention.cpp.
+    friend struct DashboardEchoRetentionTestAccess;
 
     // Unit-test seam (PR1.7 remediation, Gate 3 architect + quality-engineer
     // finding): resolve_render_columns/render_results and their inputs

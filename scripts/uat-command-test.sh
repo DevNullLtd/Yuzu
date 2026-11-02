@@ -398,11 +398,11 @@ echo -e "${BOLD}[Content Distribution]${NC}"
 dispatch_and_poll content_dist list_staged
 echo ""
 
-# ── Group 20: TAR (read-only) ───────────────────────────────────────────
-echo -e "${BOLD}[TAR (Telemetry & Response)]${NC}"
-dispatch_and_poll tar status
-dispatch_and_poll tar query '{"limit":"5"}'
-dispatch_and_poll tar export '{"type":"all","limit":"5"}'
+# ── Group 20: Echo (read-only) ───────────────────────────────────────────
+echo -e "${BOLD}[Echo (Telemetry & Response)]${NC}"
+dispatch_and_poll echo status
+dispatch_and_poll echo query '{"limit":"5"}'
+dispatch_and_poll echo export '{"type":"all","limit":"5"}'
 echo ""
 
 # ── Group 21: Vulnerability Scanning ────────────────────────────────────
@@ -468,11 +468,11 @@ dispatch_and_poll tags count
 dispatch_and_poll tags delete '{"key":"uat_env"}'
 echo ""
 
-# ── Group 30: TAR Extended (Telemetry & Response) ─────────────────────
-echo -e "${BOLD}[TAR Extended]${NC}"
-dispatch_and_poll tar status
-dispatch_and_poll tar sql '{"query":"SELECT count(*) as cnt FROM events LIMIT 1"}'
-dispatch_and_poll tar configure '{"interval":"60"}'
+# ── Group 30: Echo Extended (Telemetry & Response) ─────────────────────
+echo -e "${BOLD}[Echo Extended]${NC}"
+dispatch_and_poll echo status
+dispatch_and_poll echo sql '{"query":"SELECT count(*) as cnt FROM events LIMIT 1"}'
+dispatch_and_poll echo configure '{"interval":"60"}'
 echo ""
 
 # ── Group 31: Vulnerability Scanning Extended ─────────────────────────

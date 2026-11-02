@@ -64,7 +64,7 @@ The branch is governance-clean and visually verified:
 
 ## Verification performed (`94a4075`)
 
-- Server build clean (macOS); C++ server/agent/tar Catch2 suites all pass.
+- Server build clean (macOS); C++ server/agent/echo Catch2 suites all pass.
 - Gateway: `rebar3 compile` + `rebar3 dialyzer` clean; eunit 135 pass / 0 fail.
   (Note: a pre-existing `yuzu_gw_circuit_breaker_nf_tests:backoff_capped`
   timeout/`cancelled` is a known flake, unrelated — present in the baseline run

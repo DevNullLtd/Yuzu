@@ -148,10 +148,10 @@ const GROUPS = [
   ['Content Distribution', [
     ['content_dist list_staged', 0],
   ]],
-  ['TAR (Telemetry & Response)', [
-    ['tar status', 1],
-    ['tar query limit=5', 0],
-    ['tar export type=all limit=5', 0],
+  ['Echo (Telemetry & Response)', [
+    ['echo status', 1],
+    ['echo query limit=5', 0],
+    ['echo export type=all limit=5', 0],
   ]],
   ['Vulnerability Scanning', [
     ['vuln_scan summary', 1],

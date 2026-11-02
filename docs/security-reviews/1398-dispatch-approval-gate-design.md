@@ -23,7 +23,7 @@ labels (`endpoint-admin`, `security-admin`, ...) match no seeded RBAC role.
 
 Both reviewers independently verified every factual claim in this doc against
 `origin/dev@06da83a12` (chokepoint singularity via `ClassifiedCommand`'s private
-constructor, the 184-row/six-fragment catalogue, the N:1 `tar.sql` mapping, the
+constructor, the 184-row/six-fragment catalogue, the N:1 `echo.sql` mapping, the
 `authz_model.hpp:174` doctrine, the `embed_content.py` extraction behavior, the
 `script_exec.*` bonus-closure claim, the `firewall`/`bitlocker` audit spot-check,
 and the empty-shipped-`AlwaysApproval`-set claim) and found no factual error in
@@ -32,7 +32,7 @@ found during review, not corrections to the underlying analysis.
 
 ## Decision 1 — governance unit is the (plugin, action) pair, not the definition
 
-`(plugin, action) -> InstructionDefinition` is N:1 (`tar.sql` has 15 shipped
+`(plugin, action) -> InstructionDefinition` is N:1 (`echo.sql` has 15 shipped
 definitions). Threading definition identity through every dispatch surface would
 require a new reverse index and a runtime YAML re-parse (`executeRoles` survives
 only inside the opaque `yaml_source` blob) for a control the platform doctrine
@@ -182,7 +182,7 @@ values so an audit reader or future maintainer cannot infer a ticket existed
 when it did not.
 
 **`principal_is_admin` stamped at:** `derive_dispatch_caller` (server.cpp,
-feeds `/api/command`, `forward_legacy_command`, workflow/dashboard/tar-tree
+feeds `/api/command`, `forward_legacy_command`, workflow/dashboard/echo-tree
 caller_fn, MCP deriver), `derive_dispatch_caller_for_username` (schedule, new
 bool param — **resolved from the auth store at fire time**, matching the
 existing fire-time principal re-resolution posture; `false` on any resolution
@@ -382,7 +382,7 @@ excluded by construction per Decision 1):
   `quarantine.{quarantine,unquarantine,whitelist}`, `rdp_control.set_state`,
   `registry.{delete_key,delete_value,get_user_value,set_value}`,
   `script_exec.{bash,exec,powershell}`, `services.set_start_mode`,
-  `storage.{clear,delete,set}`, `tags.clear`, `tar.configure`,
+  `storage.{clear,delete,set}`, `tags.clear`, `echo.configure`,
   `wol.{wake,check}`.
 - `AlwaysApproval`: **0 agent-dispatched pairs** — all 11 genuinely-`always`
   pairs (`policy.delete`, `policy.invalidate_all`, `product_pack.uninstall`,
@@ -413,7 +413,7 @@ actions).
 | `wol.{wake,check}` | manual | role-gated | same dual effect as above |
 | `discovery.scan_subnet` | manual | role-gated | same dual effect as above |
 | `chargen.chargen_start` (testing plugin) | manual | role-gated | same dual effect; keeps `/api/chargen/start` usable by admins |
-| `tar.configure` | manual | role-gated | same dual effect; keeps tar-tree capture-source config usable by admins |
+| `echo.configure` | manual | role-gated | same dual effect; keeps echo-tree capture-source config usable by admins |
 | 7 `server`/`server_internal` defs (webhooks x2, deployment create_job, directory_sync x2, patch_management x2) | manual | always | no dispatch surface (server-side only) — zero behavior delta on raw dispatch; same governed-path fail-closed-for-everyone status is UNCHANGED (`always` still requires approval for all, matching intent) |
 | `server.deployment.list_jobs` | none | auto | read-only listing, server-side only, verified inert |
 

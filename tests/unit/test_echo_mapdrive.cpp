@@ -1,0 +1,1364 @@
+// test_echo_mapdrive.cpp -- Mapped-drive capture source (capability-map §3.8).
+//
+// The live/history enumeration is platform-gated (WNet / NetApi / registry /
+// subprocess / getfsstat), so coverage rides on:
+//   * the PURE text parsers (parse_proc_mounts / parse_fstab / parse_smbstatus /
+//     parse_win_security_logons / parse_samba_logs), exercised from captured
+//     sample output — these compile and run on every OS;
+//   * the PURE macOS mount classifier (classify_macos_mounts /
+//     apply_entry_cap / run_getfsstat_with_retry, echo_mapdrive_macos_parsers.hpp),
+//     exercised from getfsstat(2) records and injected count/fill sequences
+//     — also compiles and runs on every OS; and
+//   * an insert round-trip through EchoDatabase for both origin='historical'
+//     (incl. ts=0) and origin='live' rows.
+// The diff (compute_mapdrive_events) is covered in test_echo_diff.cpp.
+
+#include "echo_collectors.hpp"
+#include "echo_db.hpp"
+#include "echo_mapdrive_backfill.hpp"
+#include "echo_mapdrive_macos_parsers.hpp"
+#include "test_helpers.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <string>
+#include <vector>
+
+using namespace yuzu::echo;
+using HiveAccessStatus = yuzu::profiles::HiveAccessStatus;
+
+// ── /proc/mounts (Linux outbound live) ────────────────────────────────────────
+// Captured on a Linux dev host via `cat /proc/mounts` with a CIFS/NFS mount
+// present; the escaped-space rows are real octal-escape output from the
+// kernel's mounts formatter, not invented.
+
+TEST_CASE("mapdrive parse_proc_mounts: keeps network fstypes, decodes escapes",
+          "[echo][mapdrive][parse]") {
+    const std::string text =
+        "//fileserver/public /mnt/pub cifs rw,vers=3.0 0 0\n"
+        "nfshost:/export/home /home/nfs nfs4 rw 0 0\n"
+        "/dev/sda1 / ext4 rw,relatime 0 0\n"
+        "tmpfs /tmp tmpfs rw 0 0\n"
+        "//srv/with\\040space /mnt/s\\040p cifs rw 0 0\n";
+    auto out = parse_proc_mounts(text).entries;
+    REQUIRE(out.size() == 3); // ext4 + tmpfs are not network fstypes
+
+    CHECK(out[0].direction == "outbound");
+    CHECK(out[0].remote_path == "//fileserver/public");
+    CHECK(out[0].remote_host == "fileserver");
+    CHECK(out[0].local_mount == "/mnt/pub");
+    CHECK(out[0].provider == "cifs");
+
+    CHECK(out[1].remote_host == "nfshost");
+    CHECK(out[1].provider == "nfs4");
+
+    // \040 octal escapes decode to spaces in both device and mountpoint.
+    CHECK(out[2].remote_path == "//srv/with space");
+    CHECK(out[2].local_mount == "/mnt/s p");
+    CHECK(out[2].remote_host == "srv");
+}
+
+TEST_CASE("mapdrive parse_proc_mounts: a well-formed table is never flagged malformed",
+          "[echo][mapdrive][parse]") {
+    // Regression guard for a false positive: a genuinely well-formed table
+    // (including a legitimate non-network-fstype skip) must never set
+    // `malformed` -- a non-network row is a routine skip, not a structural
+    // defect (BUG 2 fix).
+    const std::string text = "//fileserver/public /mnt/pub cifs rw,vers=3.0 0 0\n"
+                             "/dev/sda1 / ext4 rw,relatime 0 0\n";
+    auto result = parse_proc_mounts(text);
+    CHECK_FALSE(result.malformed);
+    CHECK(result.entries.size() == 1);
+}
+
+TEST_CASE("mapdrive parse_proc_mounts: a structurally short row is dropped and "
+          "flagged malformed, not silently omitted",
+          "[echo][mapdrive][parse]") {
+    // Synthetic edge case: a row with fewer than the 3 whitespace-separated
+    // fields every real /proc/mounts row carries (device, mountpoint,
+    // fstype at minimum) -- a truncated read or a corrupted line, not a
+    // real kernel-emitted row. BUG 2: this previously vanished via a bare
+    // `continue`, so the returned entry count could silently be LESS than
+    // the true outbound-mount count with no signal reaching the caller.
+    const std::string text = "//fileserver/public /mnt/pub cifs rw,vers=3.0 0 0\n"
+                             "truncated-row\n" // synthetic: only 1 field, no fstype column
+                             "nfshost:/export/home /home/nfs nfs4 rw 0 0\n";
+    auto result = parse_proc_mounts(text);
+    CHECK(result.malformed);
+    // The two well-formed rows around the malformed one still decode --
+    // same defensive-tolerance shape as echo_arp_parsers.hpp's BR4-005.
+    REQUIRE(result.entries.size() == 2);
+    CHECK(result.entries[0].remote_host == "fileserver");
+    CHECK(result.entries[1].remote_host == "nfshost");
+}
+
+// ── /etc/fstab (Linux outbound historic; ts=0) ────────────────────────────────
+
+TEST_CASE("mapdrive parse_fstab: network entries only, ts=0", "[echo][mapdrive][parse]") {
+    const std::string text =
+        "# /etc/fstab\n"
+        "UUID=abcd / ext4 defaults 0 1\n"
+        "//nas/backup /mnt/backup cifs credentials=/etc/creds 0 0\n"
+        "nfshost:/srv /mnt/srv nfs defaults 0 0\n";
+    auto out = parse_fstab(text);
+    REQUIRE(out.size() == 2);
+    CHECK(out[0].ts == 0); // fstab carries no timestamp
+    CHECK(out[0].entry.direction == "outbound");
+    CHECK(out[0].entry.remote_host == "nas");
+    CHECK(out[0].entry.provider == "cifs");
+    CHECK(out[1].entry.remote_host == "nfshost");
+}
+
+// ── smbstatus -b (Linux inbound live) ─────────────────────────────────────────
+// Captured on a Linux dev host via `smbstatus -b` against a live Samba server
+// with two connected clients; the "domain users" group-with-space case is a
+// real observed value, not invented.
+
+TEST_CASE("mapdrive parse_smbstatus: client + user from sessions table",
+          "[echo][mapdrive][parse]") {
+    // Note the first session's group column ("domain users") contains a space —
+    // the parenthetical IP is what makes remote_host robust to that.
+    const std::string text =
+        "Samba version 4.15.13\n"
+        "\n"
+        "PID     Username     Group        Machine                          Protocol\n"
+        "-------------------------------------------------------------------------------\n"
+        "3456    alice        domain users 192.168.1.50 (ipv4:192.168.1.50:44556)  SMB3_11\n"
+        "3789    bob          bob          ws7 (ipv4:10.0.0.7:50012)               SMB3_11\n";
+    auto parsed = parse_smbstatus(text);
+    CHECK_FALSE(parsed.malformed);
+    auto out = parsed.entries;
+    REQUIRE(out.size() == 2);
+    CHECK(out[0].direction == "inbound");
+    CHECK(out[0].username == "alice");
+    CHECK(out[0].remote_host == "192.168.1.50");
+    CHECK(out[0].provider == "SMB");
+    CHECK(out[1].username == "bob");
+    CHECK(out[1].remote_host == "10.0.0.7");
+}
+
+TEST_CASE("mapdrive parse_smbstatus: header/separator/blank lines are a legitimate "
+          "skip, never flagged malformed",
+          "[echo][mapdrive][parse]") {
+    // Regression guard for a false positive, same shape as parse_proc_mounts's
+    // "well-formed table never flagged malformed" test above: the header row,
+    // the blank line, and the dashed separator all have a non-numeric (or
+    // absent) first token, so none of them look like an attempted data row.
+    const std::string text =
+        "Samba version 4.15.13\n"
+        "\n"
+        "PID     Username     Group        Machine                          Protocol\n"
+        "-------------------------------------------------------------------------------\n"
+        "3456    alice        domain users 192.168.1.50 (ipv4:192.168.1.50:44556)  SMB3_11\n";
+    auto parsed = parse_smbstatus(text);
+    CHECK_FALSE(parsed.malformed);
+    REQUIRE(parsed.entries.size() == 1);
+    CHECK(parsed.entries[0].username == "alice");
+}
+
+TEST_CASE("mapdrive parse_smbstatus: a truncated numeric-PID-looking row is dropped "
+          "and flagged malformed, not silently omitted",
+          "[echo][mapdrive][parse][finding4]") {
+    // Finding 4 (adversarial-review round 5, BR-mapdrive-001 missed site):
+    // this row's first token IS a bare numeric PID -- it is clearly
+    // attempting to be a data row -- but it has fewer than the 4 fields a
+    // real session row carries (a truncated/corrupt capture). Previously
+    // this vanished via a bare `continue`, identical to the pre-fix
+    // parse_proc_mounts bug: the returned inbound-session count could
+    // silently be LESS than the true count with no signal reaching the
+    // caller.
+    const std::string text =
+        "PID     Username     Group        Machine                          Protocol\n"
+        "3456    alice        domain users 192.168.1.50 (ipv4:192.168.1.50:44556)  SMB3_11\n"
+        "9999 bob\n" // synthetic: numeric PID, only 2 fields -- truncated
+        "3789    bob          bob          ws7 (ipv4:10.0.0.7:50012)               SMB3_11\n";
+    auto parsed = parse_smbstatus(text);
+    CHECK(parsed.malformed);
+    // The two well-formed rows around the malformed one still decode --
+    // same defensive-tolerance shape as parse_proc_mounts's equivalent test.
+    REQUIRE(parsed.entries.size() == 2);
+    CHECK(parsed.entries[0].username == "alice");
+    CHECK(parsed.entries[1].username == "bob");
+    CHECK(parsed.entries[1].remote_host == "10.0.0.7");
+}
+
+// ── wevtutil Security 4624/4634 (Windows inbound historic) ────────────────────
+
+TEST_CASE("mapdrive parse_win_security_logons: 4624 type-3 kept, others filtered",
+          "[echo][mapdrive][parse]") {
+    const std::string text =
+        "Event[0]:\n"
+        "  Date: 2026-07-01T10:20:30.123\n"
+        "  Event ID: 4624\n"
+        "  Description:\n"
+        "Subject:\n"
+        "\tAccount Name:\t\tHOST$\n"
+        "Logon Type:\t\t3\n"
+        "New Logon:\n"
+        "\tAccount Name:\t\talice\n"
+        "Network Information:\n"
+        "\tSource Network Address:\t192.168.1.50\n"
+        "Event[1]:\n"
+        "  Date: 2026-07-01T11:00:00.000\n"
+        "  Event ID: 4624\n"
+        "Logon Type:\t\t2\n" // interactive — must be filtered out
+        "New Logon:\n"
+        "\tAccount Name:\t\tbob\n"
+        "\tSource Network Address:\t-\n"
+        "Event[2]:\n"
+        "  Date: 2026-07-01T11:30:00.000\n"
+        "  Event ID: notanumber\n" // unparseable id keeps the 0 initializer → filtered
+        "Logon Type:\t\t3\n"
+        "New Logon:\n"
+        "\tAccount Name:\t\tmallory\n"
+        "\tSource Network Address:\t192.168.1.66\n"
+        "Event[3]:\n"
+        "  Date: 2026-07/01 10:20:30\n" // mixed date separators → ts unparseable, row kept
+        "  Event ID: 4624\n"
+        "Logon Type:\t\t3\n"
+        "New Logon:\n"
+        "\tAccount Name:\t\tdave\n"
+        "\tSource Network Address:\t192.168.1.77\n";
+    auto out = parse_win_security_logons(text);
+    REQUIRE(out.size() == 2); // only the type-3 network logons survive
+    CHECK(out[0].entry.direction == "inbound");
+    CHECK(out[0].entry.username == "alice"); // the 2nd Account Name, not HOST$
+    CHECK(out[0].entry.remote_host == "192.168.1.50");
+    // Exact epoch pins the 'T' form incl. width-capped seconds + fraction tolerance
+    // (2026-07-01T10:20:30 UTC).
+    CHECK(out[0].ts == 1782901230);
+    CHECK(out[1].entry.username == "dave");
+    CHECK(out[1].ts == 0); // separator-consistency rejection, without dropping the row
+}
+
+// The flexible-timestamp parser replaced sscanf ("%4d-%2d-%2dT%2d:%2d:%2d" and
+// siblings) for glibc 2.38 __isoc23_* compatibility; these cases pin the scanf
+// quirks the rewrite must preserve (width caps, sign-in-width, zero-or-more
+// format whitespace, unparseable-field filtering, CRLF tolerance).
+TEST_CASE("mapdrive timestamp/field parsing: scanf quirk pins", "[echo][mapdrive][parse]") {
+    const std::string text =
+        "Event[0]:\n"
+        "  Date: 2026-07-01T10:20:301\n" // three-digit seconds: %2d width cap binds → 30
+        "  Event ID: 4624\n"
+        "Logon Type:\t\t3\n"
+        "New Logon:\n"
+        "\tAccount Name:\t\talice\n"
+        "\tSource Network Address:\t192.168.1.50\n"
+        "Event[1]:\n"
+        "  Date: 2026-+7-01T10:20:30\n" // signed month within width: accepted as 7
+        "  Event ID: 4624\n"
+        "Logon Type:\t\t3\n"
+        "New Logon:\n"
+        "\tAccount Name:\t\tbob\n"
+        "\tSource Network Address:\t192.168.1.51\n"
+        "Event[2]:\n"
+        "  Date: 2026-07-01T10:20:30\n"
+        "  Event ID: 4624\n"
+        "Logon Type:\t\tbad\n" // unparseable logon type keeps -1 → filtered
+        "New Logon:\n"
+        "\tAccount Name:\t\tcarol\n"
+        "\tSource Network Address:\t192.168.1.52\n"
+        "Event[3]:\r\n" // CRLF line endings (Windows-collected text): '\r' is
+        "  Date: 2026-07-01T10:20:30\r\n" // whitespace to the tokenizer + parsers
+        "  Event ID: 4624\r\n"
+        "Logon Type:\t\t3\r\n"
+        "New Logon:\r\n"
+        "\tAccount Name:\t\terin\r\n"
+        "\tSource Network Address:\t192.168.1.53\r\n";
+    auto out = parse_win_security_logons(text);
+    REQUIRE(out.size() == 3);
+    CHECK(out[0].ts == 1782901230); // width-capped seconds (2026-07-01T10:20:30 UTC)
+    CHECK(out[1].ts == 1782901230); // signed month
+    CHECK(out[2].entry.username == "erin");
+    CHECK(out[2].ts == 1782901230); // CRLF text parses identically
+    const std::string samba =
+        "[2026/07/01   10:20:30,  3] hdr\n" // multiple format-space whitespace
+        "  s1 (ipv4:10.0.0.1:445) connect to service s1 initially as user u1\n"
+        "[2026/07/0110:20:30,  3] hdr\n" // ZERO format-space whitespace (accepted quirk)
+        "  s2 (ipv4:10.0.0.2:445) connect to service s2 initially as user u2\n";
+    auto sout = parse_samba_logs(samba);
+    REQUIRE(sout.size() == 2);
+    CHECK(sout[0].ts == 1782901230);
+    CHECK(sout[1].ts == 1782901230);
+}
+
+// ── Samba logs / journalctl (Linux inbound historic) ──────────────────────────
+
+TEST_CASE("mapdrive parse_samba_logs: connect events from both log shapes",
+          "[echo][mapdrive][parse]") {
+    const std::string text =
+        "[2026/07/01 10:20:30.123456,  3] ../../source3/smbd/service.c:1055(make_connection_snum)\n"
+        "  public (ipv4:192.168.1.50:445) connect to service public initially as user alice "
+        "(uid=1000, gid=1000)\n"
+        "[2026/07/01T10:25:00,  3] ../../source3/smbd/service.c:1055(make_connection_snum)\n" //
+        // slash-date + 'T' is unparseable — the next row falls back to the previous header's ts
+        "  private (ipv4:10.0.0.7:445) connect to service private initially as user dave "
+        "(uid=1001, gid=1001)\n"
+        "2026-07-02T08:15:00+0000 host smbd[1234]: srv (ipv4:10.0.0.9:445) connect to service srv "
+        "initially as user carol\n";
+    auto out = parse_samba_logs(text);
+    REQUIRE(out.size() == 3);
+    CHECK(out[0].entry.direction == "inbound");
+    CHECK(out[0].entry.local_mount == "public");
+    CHECK(out[0].entry.remote_host == "192.168.1.50");
+    CHECK(out[0].entry.username == "alice");
+    // Exact epoch pins the bracket form "[YYYY/MM/DD HH:MM:SS.us, 3]" at pos=1
+    // (2026-07-01 10:20:30 UTC), incl. width-capped seconds + fraction tolerance.
+    CHECK(out[0].ts == 1782901230);
+    CHECK(out[1].entry.username == "dave");
+    CHECK(out[1].ts == 1782901230); // unparseable header → previous header's ts
+    CHECK(out[2].entry.local_mount == "srv");
+    CHECK(out[2].entry.remote_host == "10.0.0.9");
+    CHECK(out[2].entry.username == "carol");
+    CHECK(out[2].ts == 1782980100); // inline ISO timestamp (2026-07-02T08:15:00 UTC)
+}
+
+// ── insert round-trip: historical (incl. ts=0) + live rows ────────────────────
+
+TEST_CASE("mapdrive insert: historical + live rows round-trip through EchoDatabase",
+          "[echo][mapdrive][db]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"echo-mapdrive-"}};
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    // MapDriveEvent field order: {ts, snapshot_id, action, direction,
+    // local_mount, remote_path, remote_host, username, provider, origin}.
+    std::vector<MapDriveEvent> rows = {
+        {1000, 5, "historical", "outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB",
+         "historical"},
+        {0, 5, "historical", "outbound", "", "\\\\nas\\pub", "nas", "bob", "SMB", "historical"},
+        {2000, 6, "appeared", "inbound", "", "", "client1", "carol", "SMB", "live"},
+    };
+    REQUIRE(db.insert_mapdrive_events(rows));
+
+    auto res = db.execute_query(
+        "SELECT ts, action, direction, local_mount, remote_path, remote_host, username, "
+        "provider, origin FROM mapdrive_live ORDER BY id");
+    REQUIRE(res.has_value());
+    REQUIRE(res->rows.size() == 3);
+
+    // Historical row with a real timestamp. Assert the string columns individually
+    // (remote_path/remote_host/username/provider) so a bind-order transposition in
+    // insert_mapdrive_events cannot pass undetected.
+    CHECK(res->rows[0][0] == "1000");
+    CHECK(res->rows[0][1] == "historical");
+    CHECK(res->rows[0][2] == "outbound");
+    CHECK(res->rows[0][3] == "Z:");
+    CHECK(res->rows[0][4] == "\\\\srv\\share"); // remote_path
+    CHECK(res->rows[0][5] == "srv");            // remote_host
+    CHECK(res->rows[0][6] == "alice");          // username
+    CHECK(res->rows[0][7] == "SMB");            // provider
+    CHECK(res->rows[0][8] == "historical");     // origin
+
+    // Historical row with ts=0 is preserved as 0 (not dropped / defaulted away).
+    CHECK(res->rows[1][0] == "0");
+    CHECK(res->rows[1][3] == ""); // deviceless — empty local_mount round-trips
+    CHECK(res->rows[1][8] == "historical");
+
+    // Live inbound row.
+    CHECK(res->rows[2][1] == "appeared");
+    CHECK(res->rows[2][2] == "inbound");
+    CHECK(res->rows[2][8] == "live");
+
+    // Empty batch is a success (matches the arp/dns/software insert contract).
+    CHECK(db.insert_mapdrive_events({}));
+}
+
+// ── \x1f key collision safety with ':' / '\\' / space fields ──────────────────
+
+TEST_CASE("mapdrive diff: fields with ':' '\\' and spaces do not collide",
+          "[echo][mapdrive][diff]") {
+    std::vector<MapDriveEntry> prev;
+    std::vector<MapDriveEntry> cur = {
+        {"outbound", "Z:", "\\\\srv\\share one", "srv", "alice", "SMB"},
+        {"outbound", "Y:", "\\\\srv\\share two", "srv", "alice", "SMB"},
+        {"inbound", "", "", "srv", "alice", "SMB"}};
+    auto ev = compute_mapdrive_events(prev, cur, 100, 1);
+    // Three distinct mappings — no key collision despite shared host/user and the
+    // ':' / '\\' / space characters in the fields.
+    REQUIRE(ev.size() == 3);
+}
+
+// ── dedup_history: identity collapse keeps the earliest non-zero ts ────────────
+
+TEST_CASE("mapdrive dedup_history: collapses by identity, keeps earliest non-zero ts",
+          "[echo][mapdrive][history]") {
+    auto row = [](int64_t ts, const char* host) {
+        MapDriveHistoryRow r;
+        r.ts = ts;
+        r.entry.direction = "outbound";
+        r.entry.remote_path = std::string("\\\\") + host + "\\share";
+        r.entry.remote_host = host;
+        r.entry.username = "alice";
+        r.entry.provider = "SMB";
+        return r;
+    };
+    // Same identity three times (ts 0, 300, 100) collapses to one row keeping the
+    // smallest NON-ZERO ts (100); a distinct host stays separate.
+    std::vector<MapDriveHistoryRow> in = {row(0, "srv"), row(300, "srv"), row(100, "srv"),
+                                          row(0, "nas")};
+    auto out = dedup_history(in);
+    REQUIRE(out.size() == 2);
+    // Find the srv row.
+    const MapDriveHistoryRow* srv = nullptr;
+    for (auto& r : out)
+        if (r.entry.remote_host == "srv")
+            srv = &r;
+    REQUIRE(srv != nullptr);
+    CHECK(srv->ts == 100); // earliest non-zero sighting wins over 0 and 300
+}
+
+// ── classify_macos_mounts (macOS outbound live, capability-map §3.8) ──────────
+//
+// Fixture provenance: the local-fstype rows below are a REAL getfsstat(2)
+// capture, taken on an arm64 macOS 15 host by compiling and running a
+// standalone `getfsstat(nullptr, 0, MNT_NOWAIT)` size-then-fill probe
+// (matching echo_mapdrive_collector.cpp's read_getfsstat) and printing
+// f_fstypename/f_mntfromname/f_mntonname for every returned struct statfs —
+// exactly the ten local volumes/pseudo-filesystems (apfs/devfs/autofs) this
+// particular out-of-the-box macOS install mounts (a `csrutil`-sealed system
+// volume splits into more apfs rows than a stock install — /, VM, Preboot,
+// xarts, iSCPreboot, Hardware, Update, Data — plus devfs and the auto_home
+// autofs map), none of them network.
+//
+// BR-004 remediation: the network-fstype rows below are now REAL getfsstat(2)
+// captures too, taken on this same host on 2026-08-25 against locally-hosted
+// SMB/NFS/AFP servers rather than transcribed from mount(8) manual-page
+// syntax (a manual page documents accepted CLIENT input syntax, not what the
+// kernel actually returns in f_mntfromname):
+//
+//   - smbfs: `dperson/samba` (Alpine, Samba 4.13.7) in Docker, published on
+//     127.0.0.1:445, one share `public` with user `alice`; mounted via
+//     `mount_smbfs "//alice:alicepass@127.0.0.1/public" <dir>` (exit 0).
+//     getfsstat returned f_fstypename="smbfs",
+//     f_mntfromname="//alice@127.0.0.1/public" — confirms the credentialed
+//     form (username embedded ahead of the host, password never present)
+//     that remote_host_of's userinfo-stripping path (and BR-003) depend on.
+//   - nfs: `itsthenetwork/nfs-server-alpine` in Docker exporting /nfsshare
+//     with `fsid=0` (NFSv4 pseudo-root); mounted via
+//     `mount_nfs -o vers=4,tcp 127.0.0.1:/ <dir>` (exit 0). getfsstat
+//     returned f_fstypename="nfs", f_mntfromname="127.0.0.1:/" — the
+//     `host:/path` colon form remote_host_of's user@host:/path branch parses.
+//   - afpfs: `cptactionhank/netatalk` in Docker, published on 127.0.0.1:1548,
+//     one share `Share` with user `alice`; mounted via
+//     `mount_afp "afp://alice:alicepass@127.0.0.1:1548/Share" <dir>`
+//     (exit 0, with the macOS "AFP client is deprecated" warning — the
+//     protocol still works today, which is why this repo still ships an AFP
+//     leg). getfsstat returned f_fstypename="afpfs",
+//     f_mntfromname="//alice@127.0.0.1:1548/Share" — an AFP mount surfaces
+//     through getfsstat as a UNC-shaped string (not an `afp://` URI, contra
+//     the previous synthetic fixture), with the credentialed username ahead
+//     of a host:port pair.
+//
+// webdav was ATTEMPTED (bytemark/webdav and hacdias/webdav in Docker, both
+// reachable and PROPFIND-verified via curl) but never captured: macOS's
+// mount_webdav(8) requires an interactive Keychain/GUI authentication step
+// (even with -S/-i and a pre-seeded `security add-internet-password` entry)
+// that this non-interactive session cannot satisfy — every attempt hung
+// waiting on that prompt rather than failing cleanly. Per this remediation's
+// instructions, the synthetic webdav row is DELETED rather than kept
+// invented; classify_macos_mounts's "webdav" -> "WebDAV" mapping itself is
+// untouched (unreachable by any test here now) and remains to be verified
+// against a real capture in a follow-up that has an interactive macOS
+// session available.
+//
+// The "cifs" row is kept as a clearly-separate, explicitly-labeled defensive
+// case below (NOT represented as a live capture) — macOS's own SMB client
+// always reports f_fstypename="smbfs" via smbfs.kext, never "cifs" (that
+// name is the Linux kernel module's); classify_macos_mounts's "cifs" branch
+// only exists in case a third-party FUSE-based CIFS client ever reports the
+// Linux-style name, so a real macOS getfsstat capture cannot exercise it.
+
+TEST_CASE("mapdrive classify_macos_mounts: real local-fstype capture is entirely filtered",
+          "[echo][mapdrive][macos][parse]") {
+    // Real capture (see provenance note above) — apfs/devfs/autofs, no network fstype.
+    std::vector<MacMountRec> mounts = {
+        {"apfs", "/dev/disk3s1s1", "/"},
+        {"devfs", "devfs", "/dev"},
+        {"apfs", "/dev/disk3s6", "/System/Volumes/VM"},
+        {"apfs", "/dev/disk3s2", "/System/Volumes/Preboot"},
+        {"apfs", "/dev/disk3s4", "/System/Volumes/Update"},
+        {"apfs", "/dev/disk1s2", "/System/Volumes/xarts"},
+        {"apfs", "/dev/disk1s1", "/System/Volumes/iSCPreboot"},
+        {"apfs", "/dev/disk1s3", "/System/Volumes/Hardware"},
+        {"apfs", "/dev/disk3s5", "/System/Volumes/Data"},
+        {"autofs", "map auto_home", "/System/Volumes/Data/home"},
+    };
+    auto resolve_host = [](const std::string&) -> std::string {
+        FAIL("resolve_host must not be called for a filtered-out (non-network) row");
+        return {};
+    };
+    auto out = classify_macos_mounts(mounts, resolve_host);
+    CHECK(out.empty());
+}
+
+TEST_CASE("mapdrive classify_macos_mounts: network fstypes populate the full MapDriveEntry "
+          "contract",
+          "[echo][mapdrive][macos][parse]") {
+    // Real getfsstat(2) captures (see provenance note above) — smbfs/nfs/afpfs
+    // against locally-hosted Docker SMB/NFS/AFP servers on 2026-08-25. Row 0's
+    // embedded username (`//alice@127.0.0.1/public`) is exactly what a real
+    // credentialed SMB mount surfaces via f_mntfromname, exercising the
+    // user-info-stripping path (matches remote_host_of's fix for B2-001: a
+    // credentialed UNC or URI authority must yield the bare host, not the
+    // embedded username) against a genuine, not invented, value.
+    std::vector<MacMountRec> mounts = {
+        {"smbfs", "//alice@127.0.0.1/public", "/Volumes/public"},
+        {"nfs", "127.0.0.1:/", "/Volumes/export"},
+        {"afpfs", "//alice@127.0.0.1:1548/Share", "/Volumes/shared"},
+        {"apfs", "/dev/disk3s5", "/System/Volumes/Data"}, // still dropped even mixed in
+    };
+    // Fixture-equivalent host resolver (the collector injects the real
+    // remote_host_of instead — see the header comment on classify_macos_mounts
+    // for why this header cannot call it directly). Mirrors remote_host_of's
+    // URI-authority + UNC + user@host: forms, including user-info stripping,
+    // so this double stays a faithful stand-in for the production helper.
+    auto resolve_host = [](const std::string& from) -> std::string {
+        auto strip_userinfo = [](std::string authority) {
+            if (auto at = authority.rfind('@'); at != std::string::npos)
+                authority.erase(0, at + 1);
+            return authority;
+        };
+        if (auto scheme = from.find("://"); scheme != std::string::npos) {
+            auto rest = from.substr(scheme + 3);
+            return strip_userinfo(rest.substr(0, rest.find('/')));
+        }
+        if (from.rfind("//", 0) == 0) {
+            auto rest = from.substr(2);
+            return strip_userinfo(rest.substr(0, rest.find('/')));
+        }
+        if (auto colon = from.find(':'); colon != std::string::npos)
+            return from.substr(0, colon);
+        return {};
+    };
+    auto out = classify_macos_mounts(mounts, resolve_host);
+    REQUIRE(out.size() == 3); // the apfs row is dropped
+
+    CHECK(out[0].direction == "outbound");
+    CHECK(out[0].local_mount == "/Volumes/public");
+    CHECK(out[0].remote_path == "//alice@127.0.0.1/public"); // raw f_mntfromname, userinfo intact (BR-003)
+    CHECK(out[0].remote_host == "127.0.0.1"); // username stripped
+    CHECK(out[0].username == ""); // unavailable via getfsstat, like the Linux leg
+    CHECK(out[0].provider == "SMB");
+
+    CHECK(out[1].direction == "outbound");
+    CHECK(out[1].local_mount == "/Volumes/export");
+    CHECK(out[1].remote_path == "127.0.0.1:/");
+    CHECK(out[1].remote_host == "127.0.0.1");
+    CHECK(out[1].username == "");
+    CHECK(out[1].provider == "NFS");
+
+    CHECK(out[2].direction == "outbound");
+    CHECK(out[2].local_mount == "/Volumes/shared");
+    CHECK(out[2].remote_path == "//alice@127.0.0.1:1548/Share"); // raw f_mntfromname, userinfo intact
+    CHECK(out[2].remote_host == "127.0.0.1:1548"); // username stripped, host:port kept
+    CHECK(out[2].username == "");
+    CHECK(out[2].provider == "AFP");
+}
+
+TEST_CASE("mapdrive classify_macos_mounts: cifs fstype maps to SMB (defensive, not a live capture)",
+          "[echo][mapdrive][macos][parse]") {
+    // NOT a getfsstat capture — macOS's own SMB client always reports
+    // f_fstypename="smbfs" (see provenance note above); this only exercises
+    // classify_macos_mounts's defensive alias for a third-party FUSE-based
+    // CIFS client that might report the Linux-style fstype name.
+    std::vector<MacMountRec> mounts = {
+        {"cifs", "//nas.example.com/backup", "/Volumes/backup"},
+    };
+    auto resolve_host = [](const std::string& from) -> std::string {
+        auto rest = from.substr(2);
+        return rest.substr(0, rest.find('/'));
+    };
+    auto out = classify_macos_mounts(mounts, resolve_host);
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].provider == "SMB"); // cifs maps to SMB same as smbfs
+}
+
+// remote_host_of itself (echo_mapdrive_collector.cpp) is anonymous-namespace
+// scoped and unreachable directly from this TU (see the header comment on
+// classify_macos_mounts) — but it is exercised for real, not via a double,
+// through parse_proc_mounts/parse_fstab. This case adds the two forms the
+// B2-001 fix taught remote_host_of to strip correctly: a scheme:// authority
+// (`davfs` device strings are commonly a WebDAV https:// URL, per davfs2's
+// fstab documentation) and a credentialed UNC (`mount.cifs` accepts a
+// username embedded ahead of the host in the device field). This proves the
+// production fix at the same helper the macOS getfsstat leg calls, without
+// needing a network mount live on the test host.
+TEST_CASE("mapdrive parse_fstab: scheme:// and credentialed-UNC hosts resolve to the bare host",
+          "[echo][mapdrive][parse]") {
+    const std::string text = "https://dav.example.com/files /mnt/dav davfs defaults 0 0\n"
+                             "//alice@fileserver/share /mnt/smb cifs defaults 0 0\n";
+    auto out = parse_fstab(text);
+    REQUIRE(out.size() == 2);
+    CHECK(out[0].entry.remote_host == "dav.example.com");
+    CHECK(out[1].entry.remote_host == "fileserver"); // username stripped, not "alice@fileserver"
+}
+
+// BR-003: an IPv6 NFS host embeds colons of its own, so the first-bare-colon
+// split previously used truncated it at the host's first hextet (`2001` for
+// "2001:db8::1:/export", `[2001` for the bracketed form). remote_host_of now
+// splits on the LAST ":/" (the export path's leading slash), which an IPv6
+// address's own colons never contain.
+TEST_CASE("mapdrive parse_proc_mounts: IPv6 NFS hosts resolve in full, bracketed and not",
+          "[echo][mapdrive][parse]") {
+    const std::string text = "2001:db8::1:/export /mnt/v6a nfs4 rw 0 0\n"
+                             "[2001:db8::1]:/export /mnt/v6b nfs4 rw 0 0\n"
+                             "alice@2001:db8::1:/export /mnt/v6c nfs4 rw 0 0\n";
+    auto out = parse_proc_mounts(text).entries;
+    REQUIRE(out.size() == 3);
+    CHECK(out[0].remote_host == "2001:db8::1");
+    CHECK(out[1].remote_host == "2001:db8::1"); // brackets stripped
+    CHECK(out[2].remote_host == "2001:db8::1"); // username stripped, full host kept
+}
+
+// ── apply_entry_cap (kMapDriveEntryCap parity with the Linux leg) ─────────────
+
+TEST_CASE("mapdrive apply_entry_cap: truncates at kMapDriveEntryCap, reports truncation",
+          "[echo][mapdrive][macos][cap]") {
+    auto make_entry = [](int i) {
+        MapDriveEntry e;
+        e.direction = "outbound";
+        e.remote_host = "host" + std::to_string(i);
+        e.provider = "NFS";
+        return e;
+    };
+
+    // Exactly at the cap: no truncation.
+    std::vector<MapDriveEntry> at_cap;
+    for (std::size_t i = 0; i < kMapDriveEntryCap; ++i)
+        at_cap.push_back(make_entry(static_cast<int>(i)));
+    CHECK_FALSE(apply_entry_cap(at_cap, kMapDriveEntryCap));
+    CHECK(at_cap.size() == kMapDriveEntryCap);
+
+    // cap + 1 constructed records: truncates to exactly the cap.
+    std::vector<MapDriveEntry> over_cap;
+    for (std::size_t i = 0; i < kMapDriveEntryCap + 1; ++i)
+        over_cap.push_back(make_entry(static_cast<int>(i)));
+    CHECK(apply_entry_cap(over_cap, kMapDriveEntryCap));
+    REQUIRE(over_cap.size() == kMapDriveEntryCap);
+    // The kept rows are the first kMapDriveEntryCap, in order.
+    CHECK(over_cap.front().remote_host == "host0");
+    CHECK(over_cap.back().remote_host == "host" + std::to_string(kMapDriveEntryCap - 1));
+}
+
+// ── run_getfsstat_with_retry (BR-002/BR-006: exactly-full-vs-truncated) ───────
+//
+// getfsstat(2) is a native syscall (rung 1) with no test-double process to
+// spawn, so the count_fn/fill_fn injection points let these tests drive the
+// REAL retry/give-up/cap algorithm (the same function
+// echo_mapdrive_collector.cpp's read_getfsstat wires the real getfsstat(2)
+// calls into) against synthetic sequences, rather than reimplementing the
+// logic under test.
+
+TEST_CASE("run_getfsstat_with_retry: ordinary fill under capacity succeeds on the first attempt",
+          "[echo][mapdrive][macos][getfsstat]") {
+    int count_calls = 0;
+    int fill_calls = 0;
+    auto out = run_getfsstat_with_retry(
+        [&]() {
+            ++count_calls;
+            return 2; // two mounts, no churn
+        },
+        [&](std::size_t capacity, std::vector<MacMountRec>& mounts) {
+            ++fill_calls;
+            REQUIRE(capacity == 3); // n + 1 headroom slot
+            mounts = {MacMountRec{"nfs", "host:/a", "/mnt/a"}, MacMountRec{"nfs", "host:/b", "/mnt/b"}};
+            return 2; // < capacity -- not exactly full
+        },
+        kMapDriveEntryCap);
+
+    CHECK(out.ok);
+    REQUIRE(out.mounts.size() == 2);
+    CHECK(out.mounts[0].on == "/mnt/a");
+    CHECK(count_calls == 1);
+    CHECK(fill_calls == 1);
+}
+
+TEST_CASE("run_getfsstat_with_retry: a mount growing the table between count and fill is "
+          "retried, not accepted as complete",
+          "[echo][mapdrive][macos][getfsstat]") {
+    // Attempt 1: count()=1 -> capacity=2, but a mount appears before fill()
+    // runs, so fill() exactly fills the padded buffer (2) -- indistinguishable
+    // from truncation, must be retried rather than returned as a 1-mount
+    // snapshot that silently dropped the new mount.
+    // Attempt 2: the table has stabilized at 2 -- count()=2 -> capacity=3,
+    // fill() returns 2 (< capacity), a genuine complete snapshot.
+    int attempt = 0;
+    auto out = run_getfsstat_with_retry(
+        [&]() { return attempt == 0 ? 1 : 2; },
+        [&](std::size_t capacity, std::vector<MacMountRec>& mounts) {
+            ++attempt;
+            if (attempt == 1) {
+                REQUIRE(capacity == 2);
+                mounts = {MacMountRec{"nfs", "host:/a", "/mnt/a"},
+                          MacMountRec{"nfs", "host:/b", "/mnt/b"}};
+                return 2; // == capacity -- exactly full, churn signal
+            }
+            REQUIRE(capacity == 3);
+            mounts = {MacMountRec{"nfs", "host:/a", "/mnt/a"}, MacMountRec{"nfs", "host:/b", "/mnt/b"}};
+            return 2; // < capacity -- stabilized, complete
+        },
+        kMapDriveEntryCap);
+
+    CHECK(out.ok);
+    REQUIRE(out.mounts.size() == 2);
+    CHECK(attempt == 2); // retried exactly once
+}
+
+TEST_CASE("run_getfsstat_with_retry: a mount table that never stabilizes gives up rather than "
+          "loop forever, retaining the previous baseline",
+          "[echo][mapdrive][macos][getfsstat]") {
+    // Every attempt's fill() exactly fills the padded buffer -- a
+    // pathologically churning table. After max_attempts the helper must give
+    // up (ok=false) so the caller throws IncompleteCaptureError, not loop
+    // forever or accept a partial table as complete.
+    int attempts = 0;
+    auto out = run_getfsstat_with_retry(
+        [&]() { return 1; },
+        [&](std::size_t capacity, std::vector<MacMountRec>& mounts) {
+            ++attempts;
+            mounts = {MacMountRec{"nfs", "host:/a", "/mnt/a"}};
+            return static_cast<int>(capacity); // always exactly full
+        },
+        kMapDriveEntryCap, /*max_attempts=*/4);
+
+    CHECK_FALSE(out.ok);
+    CHECK(out.mounts.empty());
+    CHECK(attempts == 4); // bounded, not unbounded
+}
+
+TEST_CASE("run_getfsstat_with_retry: a raw count at/over the cap is rejected before any "
+          "allocation (BR-006)",
+          "[echo][mapdrive][macos][getfsstat]") {
+    bool fill_called = false;
+    auto out = run_getfsstat_with_retry(
+        [&]() { return 5; }, // n >= cap
+        [&](std::size_t, std::vector<MacMountRec>&) {
+            fill_called = true;
+            return 0;
+        },
+        /*cap=*/5);
+
+    CHECK_FALSE(out.ok);
+    CHECK(out.mounts.empty());
+    CHECK_FALSE(fill_called); // never allocates/fills an over-cap raw table
+}
+
+TEST_CASE("run_getfsstat_with_retry: count()/fill() errno failures and the vanished/empty "
+          "cases are reported honestly",
+          "[echo][mapdrive][macos][getfsstat]") {
+    // count() failure (e.g. EIO) -- not a genuinely empty table.
+    auto count_fail = run_getfsstat_with_retry(
+        [] { return -1; }, [](std::size_t, std::vector<MacMountRec>&) { return 0; },
+        kMapDriveEntryCap);
+    CHECK_FALSE(count_fail.ok);
+
+    // Genuinely empty mount table (n == 0) -- ok, no fill() call needed.
+    auto genuinely_empty = run_getfsstat_with_retry(
+        [] { return 0; },
+        [](std::size_t, std::vector<MacMountRec>&) -> int { FAIL("fill_fn should not run"); return -1; },
+        kMapDriveEntryCap);
+    CHECK(genuinely_empty.ok);
+    CHECK(genuinely_empty.mounts.empty());
+
+    // fill() failure (e.g. EIO) after a successful count().
+    auto fill_fail = run_getfsstat_with_retry(
+        [] { return 2; }, [](std::size_t, std::vector<MacMountRec>&) { return -1; }, kMapDriveEntryCap);
+    CHECK_FALSE(fill_fail.ok);
+
+    // Every mount vanished between count() and fill() -- genuinely empty
+    // this tick, not an error.
+    auto vanished = run_getfsstat_with_retry(
+        [] { return 2; }, [](std::size_t, std::vector<MacMountRec>&) { return 0; }, kMapDriveEntryCap);
+    CHECK(vanished.ok);
+    CHECK(vanished.mounts.empty());
+}
+
+// ── argv re-home: same blob -> same entries ────────────────────────────────
+//
+// echo_mapdrive_collector.cpp's run_command()/popen()/_popen() sites were
+// re-homed onto run_bounded_subprocess (rung 2 argv), which hands the exact
+// same parsers below the exact same output blob via SubprocessResult::output
+// (see run_bounded_subprocess's ADR-3002 contract). These pins prove the
+// three blob-oriented parsers the migration touched (parse_smbstatus /
+// parse_win_security_logons / parse_samba_logs) are byte-for-byte unmodified
+// by the migration: the same captured-shape blob still yields the same
+// entries, independent of how that blob was obtained.
+
+TEST_CASE("mapdrive argv re-home: parse_smbstatus/parse_win_security_logons/parse_samba_logs "
+          "are unchanged by the popen->runner migration",
+          "[echo][mapdrive][parse][regression]") {
+    const std::string smb_blob =
+        "PID     Username     Group        Machine                          Protocol\n"
+        "3456    alice        domain users 192.168.1.50 (ipv4:192.168.1.50:44556)  SMB3_11\n";
+    auto smb_parsed = parse_smbstatus(smb_blob);
+    CHECK_FALSE(smb_parsed.malformed);
+    auto smb = smb_parsed.entries;
+    REQUIRE(smb.size() == 1);
+    CHECK(smb[0].username == "alice");
+    CHECK(smb[0].remote_host == "192.168.1.50");
+
+    const std::string wevt_blob =
+        "Event[0]:\n"
+        "  Date: 2026-07-01T10:20:30\n"
+        "  Event ID: 4624\n"
+        "Logon Type:\t\t3\n"
+        "New Logon:\n"
+        "\tAccount Name:\t\talice\n"
+        "\tSource Network Address:\t192.168.1.50\n";
+    auto wevt = parse_win_security_logons(wevt_blob);
+    REQUIRE(wevt.size() == 1);
+    CHECK(wevt[0].entry.username == "alice");
+    CHECK(wevt[0].entry.remote_host == "192.168.1.50");
+
+    const std::string samba_blob =
+        "2026-07-02T08:15:00+0000 host smbd[1234]: srv (ipv4:10.0.0.9:445) connect to service "
+        "srv initially as user carol\n";
+    auto samba = parse_samba_logs(samba_blob);
+    REQUIRE(samba.size() == 1);
+    CHECK(samba[0].entry.username == "carol");
+    CHECK(samba[0].entry.local_mount == "srv");
+}
+
+// ── enumerate_mapdrive(): real macOS getfsstat leg (Finding 4) ──────────────
+//
+// Everything above exercises only the pure text/mount-record parsers and
+// classify_macos_mounts/run_getfsstat_with_retry fed synthetic records.
+// Nothing called the real macOS enumerate_mapdrive() itself, so a
+// regression in the actual getfsstat(2) size-then-fill wiring
+// (read_getfsstat, echo_mapdrive_collector.cpp) -- a wrong flag, a broken
+// retry loop, a buffer-sizing bug -- would still pass every test in this
+// file. Live-host smoke test: calls the REAL enumerate_mapdrive() against
+// this machine's actual live mount table and asserts only that it returns
+// without throwing and the shape is sane -- no timing assumption, no
+// process spawn (getfsstat is a local syscall). Same established exception
+// as test_echo_arp.cpp's enumerate_arp() live smoke test; kept minimal so it
+// stays fast and non-flaky regardless of what's actually mounted on the
+// host at test time (empty/no network mounts is the common, legitimate
+// case on a dev machine).
+#ifdef __APPLE__
+TEST_CASE("enumerate_mapdrive (macOS getfsstat leg): runs against the live "
+          "host without throwing, entries are internally consistent",
+          "[echo][mapdrive][macos][live]") {
+    std::vector<MapDriveEntry> entries;
+    REQUIRE_NOTHROW(entries = enumerate_mapdrive());
+
+    for (const auto& e : entries) {
+        CHECK(e.direction == "outbound");
+        CHECK_FALSE(e.local_mount.empty());
+        CHECK_FALSE(e.provider.empty());
+    }
+}
+#endif
+
+// ── Bounded per-profile backfill retry state (related issue #5291) ─────────
+// Pure logic in echo_mapdrive_backfill.hpp; the impure shell
+// (echo_mapdrive_collector.cpp's enum_registry_outbound_history,
+// echo_plugin.cpp's retry_pending_mapdrive_backfill) is Windows-only and is
+// exercised on kingsley as part of /test, not here.
+
+TEST_CASE("mapdrive backfill not_found_cause: key rc outranks the others", "[echo][mapdrive][backfill]") {
+    CHECK(not_found_cause(true, 5L, 0) == "profile_key_win32_5");
+    CHECK(not_found_cause(true, std::nullopt, 0) == "profile_image_path_unreadable");
+    CHECK(not_found_cause(false, std::nullopt, 5) == "hku_open_win32_5");
+    CHECK(not_found_cause(false, std::nullopt, kErrorFileNotFound) == "no_profile_image_path");
+    // key_open_rc wins even when path_unreadable is also set.
+    CHECK(not_found_cause(true, 1234L, 7) == "profile_key_win32_1234");
+}
+
+TEST_CASE("mapdrive backfill profile_list_complete: mirrors classify_subkey_enum",
+          "[echo][mapdrive][backfill]") {
+    CHECK(profile_list_complete(0, kErrorNoMoreItems, 7));     // genuinely exhausted
+    CHECK(profile_list_complete(0, 0, kErrorNoMoreItems));     // exactly at the cap, no more
+    CHECK_FALSE(profile_list_complete(0, 0, 0));                // cap hit, probe found another
+    CHECK_FALSE(profile_list_complete(0, 0, 5));                // cap hit, probe itself failed
+    CHECK_FALSE(profile_list_complete(0, 5, 259));              // a terminating error mid-walk
+    CHECK_FALSE(profile_list_complete(5, kErrorNoMoreItems, kErrorNoMoreItems)); // root failed
+}
+
+TEST_CASE("mapdrive backfill parse_pending_state/format_pending_state: round-trip keeps the "
+          "timestamp and the list in one value",
+          "[echo][mapdrive][backfill]") {
+    const PendingState st = parse_pending_state("1700000000;S-1-5-21-1-2-3-1001:2;S-1-5-21-1-2-3-1002:1",
+                                                7);
+    CHECK(st.last_ts == 1700000000);
+    REQUIRE(st.profiles.size() == 2);
+    CHECK(st.profiles[0].sid == "S-1-5-21-1-2-3-1001");
+    CHECK(st.profiles[0].attempts == 2);
+    CHECK(st.profiles[1].attempts == 1);
+    CHECK(format_pending_state(st) ==
+          "1700000000;S-1-5-21-1-2-3-1001:2;S-1-5-21-1-2-3-1002:1");
+}
+
+TEST_CASE("mapdrive backfill parse_pending_state: a missing or unparsable leading ts is due (0)",
+          "[echo][mapdrive][backfill]") {
+    CHECK(parse_pending_state("", 7).last_ts == 0);
+    CHECK(parse_pending_state(";S-1-5-21-1-2-3-1001:1", 7).last_ts == 0);
+    CHECK(parse_pending_state("notanumber;S-1-5-21-1-2-3-1001:1", 7).last_ts == 0);
+}
+
+TEST_CASE("mapdrive backfill parse_pending_state: malformed segments are dropped, never thrown on",
+          "[echo][mapdrive][backfill]") {
+    // Bad SID shape (no S-1- prefix, letters in the suffix, the bare prefix with no suffix at
+    // all), non-numeric/negative count, and an empty segment are all dropped silently. A zero
+    // count is VALID (listed, not yet tried) and survives a round trip.
+    const PendingState st = parse_pending_state(
+        "0;not-a-sid:1;S-1-5-abc:1;S-1-:1;S-1-5-21-1:0;S-1-5-21-2:-3;S-1-5-21-3:notanumber;;"
+        "S-1-5-21-4:2",
+        7);
+    REQUIRE(st.profiles.size() == 2);
+    CHECK(st.profiles[0].sid == "S-1-5-21-1");
+    CHECK(st.profiles[0].attempts == 0);
+    CHECK(st.profiles[1].sid == "S-1-5-21-4");
+    CHECK(st.profiles[1].attempts == 2);
+    CHECK(format_pending_state(st) == "0;S-1-5-21-1:0;S-1-5-21-4:2");
+}
+
+TEST_CASE("mapdrive backfill parse_pending_state: a count above max is clamped; duplicate SIDs "
+          "collapse to the highest",
+          "[echo][mapdrive][backfill]") {
+    const PendingState clamped = parse_pending_state("0;S-1-5-21-1:99", 7);
+    REQUIRE(clamped.profiles.size() == 1);
+    CHECK(clamped.profiles[0].attempts == 7);
+
+    const PendingState dup = parse_pending_state("0;S-1-5-21-1:2;S-1-5-21-1:5;S-1-5-21-1:3", 7);
+    REQUIRE(dup.profiles.size() == 1);
+    CHECK(dup.profiles[0].attempts == 5);
+}
+
+TEST_CASE("mapdrive backfill retry_sids: only entries below max_attempts are selected",
+          "[echo][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 1}, {"S-1-5-21-2", 6}, {"S-1-5-21-3", 7}};
+    const auto sids = retry_sids(st, 7);
+    CHECK(sids == std::vector<std::string>{"S-1-5-21-1", "S-1-5-21-2"});
+}
+
+TEST_CASE("mapdrive backfill initial_pending: every unresolved outcome seeds attempt 1; a "
+          "resolved one is excluded",
+          "[echo][mapdrive][backfill]") {
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::not_found, "not_found:no_profile_image_path", true, true},
+        {"S-1-5-21-2", HiveAccessStatus::privilege_missing, "privilege_missing", true, true},
+        {"S-1-5-21-3", HiveAccessStatus::mount_failed, "mount_failed", true, true},
+        {"S-1-5-21-4", HiveAccessStatus::file_refused, "hive_owner_unexpected", true, true},
+        {"S-1-5-21-5", HiveAccessStatus::ok, "read_failed:win32_5", true, false},
+        {"S-1-5-21-6", HiveAccessStatus::ok, "ok", false, true}, // cap-cut
+        {"S-1-5-21-7", HiveAccessStatus::ok, "ok", true, true},  // fully resolved
+    };
+    const auto pending = initial_pending(outcomes);
+    REQUIRE(pending.size() == 6);
+    for (const auto& p : pending) {
+        CHECK(p.attempts == 1);
+        CHECK(p.sid != "S-1-5-21-7");
+    }
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes (complete=true): ok+read_ok+complete removes",
+          "[echo][mapdrive][backfill]") {
+    PendingState st;
+    st.last_ts = 1000;
+    st.profiles = {{"S-1-5-21-1", 2}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::ok, "ok", true, true}};
+    const auto r = apply_outcomes(st, outcomes, /*complete=*/true, 7);
+    CHECK(r.next.profiles.empty());
+    CHECK(r.abandoned.empty());
+    CHECK(r.vanished.empty());
+    CHECK(r.retained.empty());
+    CHECK(r.failed.empty());
+    CHECK(r.next.last_ts == 1000); // carried
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes (complete=true): ok+incomplete counts as an attempt "
+          "and is listed in failed",
+          "[echo][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 2}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::ok, "row_cap", /*complete=*/false, /*read_ok=*/true}};
+    const auto r = apply_outcomes(st, outcomes, true, 7);
+    REQUIRE(r.next.profiles.size() == 1);
+    CHECK(r.next.profiles[0].attempts == 3); // bumped: a cap-cut read is a real acquisition
+    REQUIRE(r.failed.size() == 1);
+    CHECK(r.failed[0].sid == "S-1-5-21-1");
+    CHECK(r.failed[0].attempts == 3);
+    CHECK(r.failed[0].token == "row_cap");
+    CHECK(r.abandoned.empty());
+    CHECK(r.retained.empty());
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes: a cap-cut profile is abandoned when the bump reaches "
+          "the maximum and is never retried forever",
+          "[echo][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 6}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::ok, "row_cap", /*complete=*/false, /*read_ok=*/true}};
+    const auto r = apply_outcomes(st, outcomes, true, 7);
+    CHECK(r.next.profiles.empty());
+    REQUIRE(r.abandoned.size() == 1);
+    CHECK(r.abandoned[0].sid == "S-1-5-21-1");
+    CHECK(r.abandoned[0].token == "row_cap");
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes: an outcome that was never attempted is retained "
+          "unchanged and costs no attempt",
+          "[echo][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 3}, {"S-1-5-21-2", 6}};
+    ProfileHiveOutcome rejected{"S-1-5-21-1", HiveAccessStatus::mount_failed, "mount_rejected"};
+    rejected.attempted = false;
+    ProfileHiveOutcome skipped{"S-1-5-21-2", HiveAccessStatus::mount_failed,
+                               "skipped_after_timeout"};
+    skipped.attempted = false;
+    const auto r = apply_outcomes(st, {rejected, skipped}, true, 7);
+    REQUIRE(r.next.profiles.size() == 2);
+    CHECK(r.next.profiles[0].attempts == 3); // unchanged
+    CHECK(r.next.profiles[1].attempts == 6); // unchanged, and not abandoned at the maximum - 1
+    CHECK(r.failed.empty());
+    CHECK(r.abandoned.empty());
+    REQUIRE(r.retained.size() == 2);
+    CHECK(r.retained[0].cause == "mount_rejected");
+    CHECK(r.retained[1].cause == "skipped_after_timeout");
+}
+
+TEST_CASE("mapdrive backfill initial_pending: a profile the first pass did not try is seeded at "
+          "zero attempts so it is retried and not lost",
+          "[echo][mapdrive][backfill]") {
+    ProfileHiveOutcome skipped{"S-1-5-21-2", HiveAccessStatus::mount_failed,
+                               "skipped_after_timeout"};
+    skipped.attempted = false;
+    const auto pending = initial_pending({skipped});
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].sid == "S-1-5-21-2");
+    CHECK(pending[0].attempts == 0); // listed so it is retried; no attempt was made, none charged
+}
+
+TEST_CASE("mapdrive backfill decide_mount_call: a timeout counts and halts the walk; a refusal "
+          "halts without counting; a completed call is untouched",
+          "[echo][mapdrive][backfill]") {
+    const auto done = decide_mount_call(MountCallResult::completed);
+    CHECK(done.attempted);
+    CHECK_FALSE(done.halt_walk);
+
+    const auto timed_out = decide_mount_call(MountCallResult::timed_out);
+    CHECK(timed_out.attempted);
+    CHECK(timed_out.halt_walk);
+
+    const auto rejected = decide_mount_call(MountCallResult::rejected);
+    CHECK_FALSE(rejected.attempted);
+    CHECK(rejected.halt_walk);
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes (complete=true): ok+read_failed bumps attempts and "
+          "is listed in failed",
+          "[echo][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 2}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::ok, "read_failed:win32_5", true, /*read_ok=*/false}};
+    const auto r = apply_outcomes(st, outcomes, true, 7);
+    REQUIRE(r.next.profiles.size() == 1);
+    CHECK(r.next.profiles[0].attempts == 3); // bumped
+    REQUIRE(r.failed.size() == 1);
+    CHECK(r.failed[0].attempts == 3);
+    CHECK(r.failed[0].token == "read_failed:win32_5");
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes (complete=true): every non-ok status bumps and is "
+          "listed in failed with the post-bump count",
+          "[echo][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 1}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::not_found, "not_found:no_profile_image_path", true, true}};
+    const auto r = apply_outcomes(st, outcomes, true, 7);
+    REQUIRE(r.next.profiles.size() == 1);
+    CHECK(r.next.profiles[0].attempts == 2);
+    REQUIRE(r.failed.size() == 1);
+    CHECK(r.failed[0].attempts == 2);
+    CHECK(r.failed[0].token == "not_found:no_profile_image_path");
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes (complete=true): a live pending SID with no "
+          "outcome vanishes",
+          "[echo][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 2}};
+    const auto r = apply_outcomes(st, {}, /*complete=*/true, 7);
+    CHECK(r.next.profiles.empty());
+    REQUIRE(r.vanished.size() == 1);
+    CHECK(r.vanished[0] == "S-1-5-21-1");
+    CHECK(r.retained.empty());
+    CHECK(r.failed.empty());
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes: an entry at max attempts is abandoned with token "
+          "'exhausted', whether or not an outcome exists; next.last_ts is carried",
+          "[echo][mapdrive][backfill]") {
+    PendingState st;
+    st.last_ts = 42;
+    st.profiles = {{"S-1-5-21-1", 7}, {"S-1-5-21-2", 7}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::not_found, "not_found:no_profile_image_path", true, true}};
+    const auto r = apply_outcomes(st, outcomes, true, 7);
+    CHECK(r.next.profiles.empty());
+    CHECK(r.next.last_ts == 42);
+    REQUIRE(r.abandoned.size() == 2);
+    CHECK(r.abandoned[0].sid == "S-1-5-21-1");
+    CHECK(r.abandoned[0].token == "exhausted");
+    CHECK(r.abandoned[1].sid == "S-1-5-21-2");
+    CHECK(r.abandoned[1].token == "exhausted");
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes (complete=false): a pending SID with no outcome is "
+          "retained unchanged; observed outcomes still apply; exhausted entries still abandoned",
+          "[echo][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 2}, {"S-1-5-21-2", 3}, {"S-1-5-21-3", 7}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-2", HiveAccessStatus::ok, "ok", true, true}}; // resolved
+    const auto r = apply_outcomes(st, outcomes, /*complete=*/false, 7);
+    REQUIRE(r.next.profiles.size() == 1); // S-1-5-21-1 retained; -2 resolved; -3 abandoned
+    CHECK(r.next.profiles[0].sid == "S-1-5-21-1");
+    CHECK(r.next.profiles[0].attempts == 2);
+    REQUIRE(r.retained.size() == 1);
+    CHECK(r.retained[0].sid == "S-1-5-21-1");
+    CHECK(r.retained[0].cause == "profile_list_incomplete");
+    CHECK(r.vanished.empty()); // never vanished when the walk was incomplete
+    REQUIRE(r.abandoned.size() == 1);
+    CHECK(r.abandoned[0].sid == "S-1-5-21-3");
+}
+
+TEST_CASE("mapdrive backfill lifecycle: first pass seeds 1; six consecutive not_found retries "
+          "abandon on the sixth (7 attempts total), never the fifth",
+          "[echo][mapdrive][backfill]") {
+    const std::vector<ProfileHiveOutcome> first_pass = {
+        {"S-1-5-21-1", HiveAccessStatus::not_found, "not_found:no_profile_image_path", true, true}};
+    PendingState st{0, initial_pending(first_pass)};
+    REQUIRE(st.profiles.size() == 1);
+    CHECK(st.profiles[0].attempts == 1);
+
+    const std::vector<ProfileHiveOutcome> retry_outcome = first_pass; // same not_found each time
+    for (int attempt = 2; attempt <= 6; ++attempt) {
+        const auto r = apply_outcomes(st, retry_outcome, true, 7);
+        REQUIRE(r.abandoned.empty()); // never abandoned before the sixth retry
+        REQUIRE(r.next.profiles.size() == 1);
+        CHECK(r.next.profiles[0].attempts == attempt);
+        st = r.next;
+    }
+    // Sixth retry: attempts go 6 -> 7, which reaches max_attempts -> abandoned, not retained.
+    const auto final_r = apply_outcomes(st, retry_outcome, true, 7);
+    CHECK(final_r.next.profiles.empty());
+    REQUIRE(final_r.abandoned.size() == 1);
+    CHECK(final_r.abandoned[0].token == "not_found:no_profile_image_path");
+
+    // A persisted 7 is abandoned at the next apply without ever appearing in retry_sids.
+    PendingState exhausted;
+    exhausted.profiles = {{"S-1-5-21-1", 7}};
+    CHECK(retry_sids(exhausted, 7).empty());
+    const auto re_r = apply_outcomes(exhausted, {}, true, 7);
+    REQUIRE(re_r.abandoned.size() == 1);
+    CHECK(re_r.abandoned[0].token == "exhausted");
+}
+
+TEST_CASE("mapdrive backfill lifecycle: not_found recovers through an incomplete retry, then a "
+          "complete one",
+          "[echo][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 2}};
+
+    // Retry 1: the overall walk was incomplete and this SID was never reached -- retained.
+    const auto r1 = apply_outcomes(st, {}, /*complete=*/false, 7);
+    REQUIRE(r1.next.profiles.size() == 1);
+    CHECK(r1.next.profiles[0].attempts == 2);
+    REQUIRE(r1.retained.size() == 1);
+
+    // Retry 2: the walk completed and this SID resolved cleanly -- removed, next empty.
+    const std::vector<ProfileHiveOutcome> resolved = {
+        {"S-1-5-21-1", HiveAccessStatus::ok, "ok", true, true}};
+    const auto r2 = apply_outcomes(r1.next, resolved, /*complete=*/true, 7);
+    CHECK(r2.next.profiles.empty());
+    CHECK(r2.vanished.empty());
+    CHECK(r2.failed.empty());
+}
+
+TEST_CASE("mapdrive backfill retry_due: 0 is always due; below/at-or-above the interval",
+          "[echo][mapdrive][backfill]") {
+    // Pin the production constants directly: a drift in either one must fail this file.
+    CHECK(kMapDriveBackfillMaxAttempts == 7);
+    CHECK(kMapDriveBackfillRetryIntervalS == 86400);
+
+    CHECK(retry_due(100, 0, 86400));
+    CHECK_FALSE(retry_due(100, 50, 86400)); // 50s elapsed, interval not reached
+    CHECK_FALSE(retry_due(86400, 0 + 1, 86400)); // 86399 elapsed
+    CHECK(retry_due(86400, 0, 86400)); // last_ts==0: always due regardless of elapsed time
+
+    // The real >= boundary, isolated from the last_ts==0 shortcut above (a nonzero last_ts
+    // forces the actual elapsed-time comparison, so an off-by-one >/>= regression fails here).
+    CHECK_FALSE(retry_due(kMapDriveBackfillRetryIntervalS, 1, kMapDriveBackfillRetryIntervalS));
+    CHECK(retry_due(kMapDriveBackfillRetryIntervalS + 1, 1, kMapDriveBackfillRetryIntervalS));
+
+    CHECK(retry_due(100000, 0, 86400)); // well past it
+}
+
+TEST_CASE("mapdrive backfill commit_first_pass: a failing pending write never writes done; an "
+          "empty pending text writes only done; a succeeding writer sees pending then done",
+          "[echo][mapdrive][backfill]") {
+    {
+        std::vector<std::pair<std::string, std::string>> calls;
+        const bool ok = commit_first_pass(
+            [&](std::string_view k, std::string_view v) {
+                calls.emplace_back(k, v);
+                return false; // pending write fails
+            },
+            "0;S-1-5-21-1:1", "1700000000");
+        CHECK_FALSE(ok);
+        REQUIRE(calls.size() == 1); // done was never attempted
+        CHECK(calls[0].first == "mapdrive_backfill_pending");
+    }
+    {
+        std::vector<std::pair<std::string, std::string>> calls;
+        const bool ok = commit_first_pass(
+            [&](std::string_view k, std::string_view v) {
+                calls.emplace_back(k, v);
+                return true;
+            },
+            /*pending_text=*/"", "1700000000");
+        CHECK(ok);
+        REQUIRE(calls.size() == 1); // pending write skipped (empty text)
+        CHECK(calls[0].first == "mapdrive_backfill_done");
+    }
+    {
+        std::vector<std::pair<std::string, std::string>> calls;
+        const bool ok = commit_first_pass(
+            [&](std::string_view k, std::string_view v) {
+                calls.emplace_back(k, v);
+                return true;
+            },
+            "0;S-1-5-21-1:1", "1700000000");
+        CHECK(ok);
+        REQUIRE(calls.size() == 2);
+        CHECK(calls[0].first == "mapdrive_backfill_pending"); // pending before done
+        CHECK(calls[1].first == "mapdrive_backfill_done");
+    }
+}
+
+// ── skip_known_historical: duplicate-free retry insert, first-recorded-ts rule ─
+
+TEST_CASE("mapdrive insert: skip_known_historical adds no duplicate on an identity already "
+          "recorded as historical, and keeps that row's first-recorded ts",
+          "[echo][mapdrive][backfill][db]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_mapdrive_backfill_"}};
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    // First pass: one historical row recorded at ts=1000.
+    const std::vector<MapDriveEvent> first_pass = {
+        {1000, 5, "historical", "outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB",
+         "historical"},
+    };
+    REQUIRE(db.insert_mapdrive_events(first_pass));
+
+    const auto count_historical = [&]() {
+        auto res = db.execute_query(
+            "SELECT COUNT(*) FROM mapdrive_live WHERE origin='historical'");
+        REQUIRE(res.has_value());
+        return res->rows[0][0];
+    };
+    CHECK(count_historical() == "1");
+
+    // Retry batch: the SAME identity, re-observed with a LATER ts (as a real retry would see
+    // it), plus one genuinely NEW identity. skip_known_historical=true must add only the new row.
+    const std::vector<MapDriveEvent> retry_batch = {
+        {9999, 6, "historical", "outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB",
+         "historical"}, // same identity as above, later ts
+        {9999, 6, "historical", "outbound", "Y:", "\\\\srv\\other", "srv", "alice", "SMB",
+         "historical"}, // new identity
+    };
+    REQUIRE(db.insert_mapdrive_events(retry_batch, std::nullopt, /*skip_known_historical=*/true));
+    CHECK(count_historical() == "2"); // one new row, the duplicate skipped
+
+    auto res = db.execute_query(
+        "SELECT ts FROM mapdrive_live WHERE direction='outbound' AND local_mount='Z:' AND "
+        "remote_path='\\\\srv\\share' AND remote_host='srv' AND username='alice'");
+    REQUIRE(res.has_value());
+    REQUIRE(res->rows.size() == 1);
+    CHECK(res->rows[0][0] == "1000"); // first-recorded ts, unchanged by the later retry
+
+    // A LIVE row sharing the same identity does not suppress a historical insert (the NOT
+    // EXISTS subquery is scoped to origin='historical' only).
+    const std::vector<MapDriveEvent> live_same_identity = {
+        {5000, 7, "appeared", "outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB", "live"},
+    };
+    REQUIRE(db.insert_mapdrive_events(live_same_identity));
+    const std::vector<MapDriveEvent> retry_again = {
+        {20000, 8, "historical", "outbound", "W:", "\\\\srv\\third", "srv", "alice", "SMB",
+         "historical"},
+    };
+    REQUIRE(db.insert_mapdrive_events(retry_again, std::nullopt, true));
+    CHECK(count_historical() == "3"); // the live row never counted; one more historical added
+}
+
+TEST_CASE("mapdrive backfill decide_walk_gate: a failed pin or a still-running abandoned worker "
+          "stops all mounting",
+          "[echo][mapdrive][backfill]") {
+    CHECK(decide_walk_gate(true, 0) == WalkGate::open);
+    CHECK(decide_walk_gate(false, 0) == WalkGate::pin_failed);
+    CHECK(decide_walk_gate(true, 1) == WalkGate::prior_mount_running);
+    CHECK(decide_walk_gate(true, 3) == WalkGate::prior_mount_running);
+    CHECK(decide_walk_gate(false, 2) == WalkGate::pin_failed); // the pin comes first
+    CHECK(std::string(walk_gate_token(WalkGate::pin_failed)) == "pin_failed");
+    CHECK(std::string(walk_gate_token(WalkGate::prior_mount_running)) ==
+          "prior_mount_still_running");
+}
+
+TEST_CASE("mapdrive backfill zero count: a not yet tried entry is selected for retry and costs "
+          "its first attempt only when a mount is really made",
+          "[echo][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 0}, {"S-1-5-21-2", 7}};
+    CHECK(retry_sids(st, 7) == std::vector<std::string>{"S-1-5-21-1"});
+
+    // Tried and failed: 0 -> 1.
+    const auto failed = apply_outcomes(
+        st, {{"S-1-5-21-1", HiveAccessStatus::mount_failed, "timeout", true, true}}, true, 7);
+    REQUIRE(failed.next.profiles.size() == 1);
+    CHECK(failed.next.profiles[0].attempts == 1);
+
+    // Not tried again: stays 0.
+    ProfileHiveOutcome skipped{"S-1-5-21-1", HiveAccessStatus::mount_failed,
+                               "prior_mount_still_running"};
+    skipped.attempted = false;
+    const auto kept = apply_outcomes(st, {skipped}, true, 7);
+    REQUIRE(kept.next.profiles.size() == 1);
+    CHECK(kept.next.profiles[0].attempts == 0);
+}
+
+TEST_CASE("mapdrive backfill parse_pending_state: a zero and a positive count for one sid keep "
+          "the positive one",
+          "[echo][mapdrive][backfill]") {
+    const PendingState st = parse_pending_state("0;S-1-5-21-1:0;S-1-5-21-1:3;S-1-5-21-2:0", 7);
+    REQUIRE(st.profiles.size() == 2);
+    CHECK(st.profiles[0].attempts == 3);
+    CHECK(st.profiles[1].attempts == 0);
+    // And in the other order: the zero must not overwrite the positive count.
+    const PendingState rev = parse_pending_state("0;S-1-5-21-1:3;S-1-5-21-1:0", 7);
+    REQUIRE(rev.profiles.size() == 1);
+    CHECK(rev.profiles[0].attempts == 3);
+}
+
+TEST_CASE("mapdrive backfill initial_pending: an outcome that was not attempted is never "
+          "resolved even when its other fields read as clean",
+          "[echo][mapdrive][backfill]") {
+    ProfileHiveOutcome o{"S-1-5-21-9", HiveAccessStatus::ok, "ok", true, true};
+    o.attempted = false;
+    const auto pending = initial_pending({o});
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].attempts == 0);
+}

@@ -444,7 +444,8 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
             // even looks up an id with one) — this fallback fires ONLY for a
             // candidate this replica has no local session for at all.
             if (auto cluster = route_fallback->cluster_for(aid))
-                return registry.send_via_directory(aid, cmd, *cluster);
+                return registry.send_via_directory(aid, cmd, *cluster,
+                                                   route_fallback->legacy_wire_for(aid));
             return registry.send_to(aid, cmd);
         },
         [&registry, &cmd] { return registry.send_to_all(cmd); },

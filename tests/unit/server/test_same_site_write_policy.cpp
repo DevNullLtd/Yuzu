@@ -938,9 +938,9 @@ TEST_CASE("guarded read: the table content is pinned literally", "[csrf][same_si
     // replacing an entry with a bogus path fails here and not only in the inventory test.
     constexpr std::array<std::string_view, 10> expected{
         "/fragments/device/live/run",
-        "/fragments/tar/process-tree/run",
-        "/fragments/tar/process-tree/device-net",
-        "/fragments/tar/capture-sources/load",
+        "/fragments/echo/process-tree/run",
+        "/fragments/echo/process-tree/device-net",
+        "/fragments/echo/capture-sources/load",
         "/fragments/dex/device/perf",
         "/fragments/dex/device/procperf",
         "/fragments/auto/deploy/result",

@@ -21,7 +21,7 @@ vcpkg_installed/
 *.md
 docs/
 # …except the TSV server/core/meson.build embeds at build time (files('../../docs/...')).
-!docs/capability-registries/tar_retention_tiers.tsv
+!docs/capability-registries/echo_retention_tiers.tsv
 
 # Tests (excluded from production builds)
 tests/

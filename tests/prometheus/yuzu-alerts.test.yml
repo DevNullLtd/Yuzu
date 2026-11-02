@@ -2615,7 +2615,7 @@ tests:
   # There is no rule for yuzu_server_system_reserved_push_total. That was
   # tried and withdrawn: `send_to` returns false whenever an agent's stream is
   # null, which is what an ordinary suspended laptop looks like, and
-  # tar.fleet_snapshot fans out over the whole fleet on every viz fetch. A
+  # echo.fleet_snapshot fans out over the whole fleet on every viz fetch. A
   # `> 0` rule on that family is permanently firing on any real fleet, and a
   # permanently-firing rule gets silenced — taking the genuine
   # "__guard__.push_rules never landed" signal with it. Same self-defeating

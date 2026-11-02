@@ -254,7 +254,7 @@ then re-arms only after consecutive valid samples below the (lower) exit
 threshold — flap-proof and bounded at ~4 observations/hour/type worst case. An
 invalid sample (read failure, reboot counter reset) resets the streaks but
 never clears the latch. Thresholds are hardcoded sane defaults until F1 makes
-them operator-tunable (the D3 blast-radius precedent). The A1 TAR perf
+them operator-tunable (the D3 blast-radius precedent). The A1 Echo perf
 warehouse is the *history* of these same counters; this is the *alerting* leg
 (the BRD's "real-time + historical + alerting" decomposition).
 

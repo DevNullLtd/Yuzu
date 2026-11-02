@@ -97,7 +97,7 @@ bool send_dump(int fd, uint8_t family) {
 
 // Cap on retained per-connection RTTs. The retrans/segs accumulators are scalar
 // sums (no cap needed); only the RTT vector grows per-connection. We keep doubles
-// for a single device-level median, so this can be far larger than TAR's
+// for a single device-level median, so this can be far larger than Echo's
 // kNetQualTopN=50 (which bounds persisted warehouse rows). 4096 established
 // connections is already extraordinary, and the kernel returns them in arbitrary
 // (hash) order, so a 4096-sample median stays an unbiased device aggregate while
@@ -136,7 +136,7 @@ void collect(int fd, uint8_t family, std::vector<double>& rtts_ms, uint64_t& ret
                 return;
             if (h->nlmsg_type != SOCK_DIAG_BY_FAMILY)
                 continue;
-            // Full mirror of tar_network_collector.cpp's nq_collect guard:
+            // Full mirror of echo_network_collector.cpp's nq_collect guard:
             //  (1) nlmsg_seq != family — discard a reply left over from the
             //      previous family's dump (a mid-dump SO_RCVTIMEO can leave
             //      AF_INET replies queued when we send the AF_INET6 dump on the
@@ -326,7 +326,7 @@ static_assert(!std::is_copy_constructible_v<MibIfTableGuard> &&
 
 NetCounters read_net_counters() {
     // Coarse device aggregate: the sum of every non-loopback interface's 64-bit
-    // octet counters (mirrors the Linux /proc/net/dev path and tar_perf.cpp's
+    // octet counters (mirrors the Linux /proc/net/dev path and echo_perf.cpp's
     // read_network). Same over-counting caveat as Linux for stacked interfaces —
     // an upper bound, not wire-accurate (docs/user-manual/network.md "Throughput").
     NetCounters c;

@@ -100,7 +100,7 @@ inline std::string json_escape(std::string_view in) {
 /// Agent replies are newline-separated records, so a byte-count truncation of
 /// the RAW output is wrong in both directions. Too small and it cuts the
 /// operator's recovery instruction mid-sentence; too large and it runs past the
-/// newline and renders the head of the NEXT record as debris -- `tar status`'s
+/// newline and renders the head of the NEXT record as debris -- `echo status`'s
 /// offline reply is `error|...` followed by `storage_state|offline`, and a
 /// 300-byte window ends in a trailing `storage_stat`. Bounding the FIRST LINE is
 /// the property that holds whatever the message length becomes.
@@ -272,7 +272,7 @@ inline std::string html_escape(const std::string& s) {
 /// html-escaped, json-escaped). The mapping itself is yuzu::log_token in
 /// common/include/yuzu/log_token.hpp, shared with the agent so the rule can't drift; this
 /// name stays as the audit-detail spelling for its call sites (server.cpp CA audits,
-/// tar_tree_routes.cpp).
+/// echo_tree_routes.cpp).
 [[nodiscard]] inline std::string audit_token(std::string_view s) {
     return ::yuzu::log_token(s); // shared mapping: common/include/yuzu/log_token.hpp
 }
@@ -960,7 +960,7 @@ inline bool form_value_supplied(const std::string& body, const std::string& key)
 }
 
 // ============================================================================
-// Time formatting and now-epoch — used by the executions surface and the TAR
+// Time formatting and now-epoch — used by the executions surface and the Echo
 // dashboard. Both surfaces standardise on UTC; relative time goes in the cell
 // text, ISO-8601 UTC goes in the title= attribute for forensic copy/paste.
 // Mixing local time anywhere is a known failure mode (BST/UTC drift).

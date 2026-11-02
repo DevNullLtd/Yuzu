@@ -75,8 +75,8 @@ Memory Device
 )";
     auto rows = parse_dmidecode_memory(kDmi);
     REQUIRE(rows.size() == 2);
-    CHECK(rows[0] == "dimm|ChannelA-DIMM0|16384|DDR4|3200");
-    CHECK(rows[1] == "dimm|ChannelB-DIMM0|16384|DDR4|3200");
+    CHECK(rows[0] == "dimm|ChannelA-DIMM0|16384|DDR4|3200|-|-|-");
+    CHECK(rows[1] == "dimm|ChannelB-DIMM0|16384|DDR4|3200|-|-|-");
 }
 
 TEST_CASE("parse_dmidecode_memory: empty slot ('No Module Installed') is skipped",
@@ -97,7 +97,7 @@ Memory Device
 )";
     auto rows = parse_dmidecode_memory(kDmi);
     REQUIRE(rows.size() == 1);
-    CHECK(rows[0] == "dimm|ChannelB-DIMM0|8192|DDR4|2666");
+    CHECK(rows[0] == "dimm|ChannelB-DIMM0|8192|DDR4|2666|-|-|-");
 }
 
 TEST_CASE("parse_dmidecode_memory: EPERM/empty output -> empty (caller falls back to "
@@ -119,7 +119,7 @@ TEST_CASE("parse_dmidecode_memory: 'Type Detail:' line does not get mistaken for
 )";
     auto rows = parse_dmidecode_memory(kDmi);
     REQUIRE(rows.size() == 1);
-    CHECK(rows[0] == "dimm|DIMM0|4096|DDR3|1600");
+    CHECK(rows[0] == "dimm|DIMM0|4096|DDR3|1600|-|-|-");
 }
 
 TEST_CASE("parse_dmidecode_memory: 'Size: N GB' is converted to MB, not mislabeled "
@@ -133,7 +133,7 @@ TEST_CASE("parse_dmidecode_memory: 'Size: N GB' is converted to MB, not mislabel
 )";
     auto rows = parse_dmidecode_memory(kDmi);
     REQUIRE(rows.size() == 1);
-    CHECK(rows[0] == "dimm|DIMM0|16384|DDR5|5600"); // 16 GB -> 16384 MB
+    CHECK(rows[0] == "dimm|DIMM0|16384|DDR5|5600|-|-|-"); // 16 GB -> 16384 MB
 }
 
 TEST_CASE("parse_dmidecode_memory: 'Size: N TB' is converted to MB (CDX BR-003)",
@@ -146,7 +146,7 @@ TEST_CASE("parse_dmidecode_memory: 'Size: N TB' is converted to MB (CDX BR-003)"
 )";
     auto rows = parse_dmidecode_memory(kDmi);
     REQUIRE(rows.size() == 1);
-    CHECK(rows[0] == "dimm|DIMM0|1048576|DDR5|4800"); // 1 TB -> 1048576 MB
+    CHECK(rows[0] == "dimm|DIMM0|1048576|DDR5|4800|-|-|-"); // 1 TB -> 1048576 MB
 }
 
 TEST_CASE("parse_dmidecode_memory: unrecognized size unit is skipped, not mislabeled",
@@ -165,7 +165,7 @@ Memory Device
 )";
     auto rows = parse_dmidecode_memory(kDmi);
     REQUIRE(rows.size() == 1);
-    CHECK(rows[0] == "dimm|DIMM1|8192|DDR5|5600");
+    CHECK(rows[0] == "dimm|DIMM1|8192|DDR5|5600|-|-|-");
 }
 
 // ── build_linux_disk_rows ─────────────────────────────────────────────────────
