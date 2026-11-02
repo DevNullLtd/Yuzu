@@ -2194,7 +2194,8 @@ TEST_CASE("Engine-principal REST: DELETE revokes both the identity AND every "
     const auto* first_row = last_audit_for(h.audit_log, "engine_principal.revoke");
     REQUIRE(first_row != nullptr);
     CHECK(first_row->result == "success");
-    CHECK(first_row->detail == "credentials_revoked=1; superseded_by=engine:revoke-cascade-successor");
+    CHECK(first_row->detail ==
+          "credentials_revoked=1; superseded_by=engine:revoke-cascade-successor");
 
     // Identity: lifecycle_state flips to revoked (GET-by-id still returns
     // the row — revoke is soft-retain, never a hard delete).
@@ -2220,6 +2221,29 @@ TEST_CASE("Engine-principal REST: DELETE revokes both the identity AND every "
     CHECK(second_row->result == "success");
     CHECK(second_row->detail == "credentials_revoked=0");
     CHECK(second_row->detail.find("revoked_by_concurrent_request") == std::string::npos);
+}
+
+TEST_CASE("Engine-principal REST: a hostile superseded_by cannot forge a second key=value "
+          "token in the revoke success audit row",
+          "[pg][rest][engine_principal][revoke]") {
+    RestEngineHarness h;
+    auto [principal_id, raw] = h.create_and_mint("revoke-hostile-successor");
+    (void)raw;
+
+    // Spaces and '=' are the delimiters a forged token needs; audit_token maps both to '_'.
+    // ';' and ':' are not mapped, so they survive.
+    auto res = h.revoke(principal_id, "x; credentials_revoked=9; revoked_by_concurrent_request");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(nlohmann::json::parse(res->body)["data"]["credentials_revoked"].get<int64_t>() == 1);
+
+    const auto* row = last_audit_for(h.audit_log, "engine_principal.revoke");
+    REQUIRE(row != nullptr);
+    CHECK(row->result == "success");
+    CHECK(row->detail == "credentials_revoked=1; superseded_by="
+                         "x;_credentials_revoked_9;_revoked_by_concurrent_request");
+    // The only `credentials_revoked=` in the row is the real count.
+    CHECK(row->detail.find("credentials_revoked=", 1) == std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

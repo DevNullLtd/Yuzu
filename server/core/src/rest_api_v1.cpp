@@ -6423,7 +6423,9 @@ void RestApiV1::register_routes(
                              ? ""
                              : (revoked_by_concurrent_request
                                     ? "; superseded_by_not_persisted"
-                                    : "; superseded_by=" + superseded_by)))) {
+                                    // Caller-supplied: neutralise so it cannot forge a
+                                    // sibling `key=value` token in the row.
+                                    : "; superseded_by=" + audit_token(superseded_by))))) {
                 res.status = 503;
                 res.set_content(
                     detail::a4_error(res, "the engine principal was revoked but its audit record "
