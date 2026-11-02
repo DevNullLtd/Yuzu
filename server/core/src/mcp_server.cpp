@@ -2747,9 +2747,9 @@ static const ToolDef kTools[] = {
 
     {"rotate_api_token",
      "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3): mints "
-     "a successor token alongside the still-valid predecessor for the overlap window (default+"
-     "minimum 7 days, floor 24h). BOUNDED-IDEMPOTENT, not generally idempotent: a re-call within "
-     "a short grace window after the original mint re-serves the SAME successor secret (each "
+     "a successor token alongside the still-valid predecessor for the overlap window (default "
+     "7 days, minimum 1 day = 24h). BOUNDED-IDEMPOTENT, not generally idempotent: a re-call "
+     "within a short grace window after the original mint re-serves the SAME successor secret (each "
      "reveal — original or replay — is independently audited as api_token.reveal); once the "
      "grace window lapses, a re-call errors and the caller must fall back to an explicit new "
      "token or the compromise runbook — never an indefinite retry. Self-service ONLY: the "
