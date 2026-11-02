@@ -591,7 +591,7 @@ dex_score_policy_projection_remediation(std::string_view field) noexcept {
                                      "source", "revision", "fault", "policy"})
         if (field == f)
             return "the Apps policy block is a projection; send the stored shape "
-                   "(tiers.edges, tiers.names, weights, overrides)";
+                   "(tiers.edges, tiers.names, weights, model, overrides)";
     return {};
 }
 

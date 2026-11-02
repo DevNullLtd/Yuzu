@@ -937,6 +937,27 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `STRICT_EXCEPTION_PINS`; like the 2026-10-22 API-parity ledger reconcile entry this is a session
      statement by the ADR owner, not a signed decision.
 
+   - **2026-11-02 - DEX score policy model parameters on the REST route (AP-2.18).**
+     REST-only, still no MCP twin: the `GET`, `PUT` and `DELETE
+     /api/v1/dex/score-policy` contract widened (a version 2 document with a
+     `model` block: per-device event cap, regression start and full-weight
+     ratios, each also per application override, and the global interval
+     confidence level; typed as `DexScorePolicyDocument` in `openapi_spec()`),
+     while the #6087 twins have not landed, so the 2026-10-23 exception now
+     covers a larger surface.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
+       as **#6087**; **revisit by 2027-01-31**. When the twins land they take
+       the same document shape and the one write function
+       (`apply_dex_score_policy`), so there is no second validator; this entry
+       retires with the 2026-10-23 one.
+     - **The exception relaxes no control.** Same gates, `If-Match`, audit-first
+       and fail-closed audit, A4 envelope, and discovery in `openapi_spec()` and
+       `/api/v1/discover/routes`; the new parameters are validated by the same
+       validator the reader uses.
+     - Wire reference: `docs/user-manual/rest-api.md`, "GET / PUT / DELETE
+       /api/v1/dex/score-policy"; the version 2 rolling-upgrade rule is in
+       `docs/user-manual/upgrading.md`.
+
    - **2026-10-23 - DEX customer score policy (`GET`, `PUT` and `DELETE
      /api/v1/dex/score-policy`, #6086).** REST-only, no MCP twin: a "no" on
      Decision 1's both-surfaces requirement, recorded rather than fixed in the

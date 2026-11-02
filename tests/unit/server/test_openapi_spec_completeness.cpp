@@ -42,6 +42,7 @@
 #include "crypto_library_model.hpp"
 #include "device_token_store.hpp"
 #include "dex_read_model.hpp" // the scope tokens and the basis/coverage the builder can emit
+#include "dex_score_policy_json.hpp" // the serializer the DexScorePolicyDocument schema mirrors
 #include "license_store.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
@@ -650,6 +651,25 @@ TEST_CASE("openapi_spec_json(): /dex/apps documents the platform scope parameter
           std::string::npos);
 }
 
+// A lookup by JSON pointer that yields null for a missing node: a regression that deletes part
+// of a schema fails an assertion instead of aborting the whole test binary.
+static json schema_at(const json& node, const std::string& ptr) {
+    return node.value(json::json_pointer(ptr), json());
+}
+
+static bool array_contains(const json& array, const json& v) {
+    return std::find(array.begin(), array.end(), v) != array.end();
+}
+
+// Sorted key names of an object (empty for a non-object), so key sets compare regardless of order.
+static std::set<std::string> object_keys(const json& obj) {
+    std::set<std::string> keys;
+    if (obj.is_object())
+        for (const auto& [k, v] : obj.items())
+            keys.insert(k);
+    return keys;
+}
+
 TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and the coverage the "
           "/dex/apps builder can emit",
           "[openapi][dex]") {
@@ -657,14 +677,8 @@ TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and th
     REQUIRE_FALSE(spec.is_discarded());
     REQUIRE(spec["components"]["schemas"].contains("DexAppsList"));
     const auto& list = spec["components"]["schemas"]["DexAppsList"];
-    // A lookup by JSON pointer that yields null for a missing node: a regression that deletes part
-    // of the schema fails an assertion here instead of aborting the whole test binary.
-    const auto at = [&list](const std::string& ptr) {
-        return list.value(json::json_pointer(ptr), json());
-    };
-    const auto contains = [](const json& array, const json& v) {
-        return std::find(array.begin(), array.end(), v) != array.end();
-    };
+    const auto at = [&list](const std::string& ptr) { return schema_at(list, ptr); };
+    const auto contains = array_contains;
 
     // The published population vocabulary is exactly the four values, and every `<scope>_online`
     // the builder can publish is inside it.
@@ -709,6 +723,74 @@ TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and th
         CHECK(scoped(app + key));
         CHECK(scoped(app + "versions/items/properties/" + key));
     }
+}
+
+TEST_CASE("openapi_spec_json(): DexScorePolicyDocument types the stored shape and its model "
+          "bounds against the serializer",
+          "[openapi][dex][score_policy]") {
+    using namespace yuzu::server;
+    json spec = json::parse(openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const json& schemas = spec["components"]["schemas"];
+    REQUIRE(schemas.contains("DexScorePolicyDocument"));
+    const std::string ref = "#/components/schemas/DexScorePolicyDocument";
+    const auto doc = [&schemas](const std::string& ptr) {
+        return schema_at(schemas["DexScorePolicyDocument"], ptr);
+    };
+
+    // Both the answer and the request body point at the one typed component.
+    CHECK(schema_at(schemas["DexScorePolicyData"],
+                    "/properties/data/properties/document/allOf/0/$ref") == ref);
+    CHECK(schema_at(spec, "/paths/~1dex~1score-policy/put/requestBody/content/application~1json/"
+                          "schema/allOf/0/$ref") == ref);
+    CHECK(schema_at(schemas["DexScorePolicyData"], "/properties/data/required") ==
+          json::array({"document", "revision", "source"}));
+    CHECK(schema_at(schemas["DexScorePolicyData"], "/properties/data/properties/source/enum") ==
+          json::array({"custom", "default"}));
+    CHECK(doc("/properties/version/enum") ==
+          json::array({kDexScorePolicyBaseVersion, kDexScorePolicyVersion}));
+
+    // The model key sets are exactly what the serializer emits.
+    DexScorePolicy p;
+    p.model.per_device_event_cap = 6;
+    DexScoreOverride o;
+    o.image = "a.exe";
+    o.per_device_event_cap = 2;
+    o.regression_start_ratio = 1.5;
+    o.regression_full_ratio = 4.0;
+    p.overrides.push_back(o);
+    const json emitted = dex_score_policy_to_json(p);
+    REQUIRE(emitted.contains("model"));
+    CHECK(object_keys(doc("/properties/model/properties")) == object_keys(emitted["model"]));
+    const auto override_keys =
+        object_keys(doc("/properties/overrides/items/properties/model/properties"));
+    CHECK(override_keys == object_keys(emitted["overrides"][0]["model"]));
+    CHECK_FALSE(override_keys.contains("interval_confidence"));
+    CHECK(doc("/properties/model/additionalProperties") == false);
+    CHECK(doc("/properties/overrides/items/properties/model/additionalProperties") == false);
+    CHECK(doc("/properties/overrides/maxItems") == kDexPolicyMaxOverrides);
+
+    // Bounds and defaults are the core constants.
+    const auto bound = [&doc](const std::string& key, const json& lo, const json& hi,
+                              const json& def) {
+        INFO("parameter: " << key);
+        const std::string base = "/properties/model/properties/" + key;
+        CHECK(doc(base + "/minimum") == lo);
+        CHECK(doc(base + "/maximum") == hi);
+        CHECK(doc(base + "/default") == def);
+    };
+    bound("per_device_event_cap", 1, kStabilityMaxPerDeviceEventCap,
+          kStabilityModel.per_device_event_cap);
+    bound("regression_start_ratio", 1.0, kStabilityMaxRegressionRatio,
+          kStabilityModel.regression_start_ratio);
+    bound("regression_full_ratio", 1.0, kStabilityMaxRegressionRatio,
+          kStabilityModel.regression_full_ratio);
+    bound("interval_confidence", kDexStatsConfidenceMin, kDexStatsConfidenceMax,
+          kDexStatsConfidence);
+
+    const std::string put_desc =
+        spec["paths"]["/dex/score-policy"]["put"].value("description", "");
+    CHECK(put_desc.find("rolling upgrade") != std::string::npos);
 }
 
 TEST_CASE("openapi_spec_json(): the execution-statistics reads document their degraded-read 503 "

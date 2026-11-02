@@ -209,7 +209,7 @@ struct DexScorePolicyWriteResult {
 
 /// {document, revision, source, fault?} of a policy in force: the data shape of GET and the
 /// base of every 200 write answer. `document` is the stored shape (version, tiers.edges,
-/// tiers.names, weights, overrides), never the Apps projection.
+/// tiers.names, weights, model, overrides), never the Apps projection.
 [[nodiscard]] inline nlohmann::json dex_score_policy_in_force_json(const DexPolicyInForce& p) {
     nlohmann::json j{{"document", dex_score_policy_to_json(p.policy)},
                      {"revision", p.revision},
