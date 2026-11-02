@@ -627,9 +627,8 @@ struct PidName {
 };
 
 /// How long a name stays usable after its process exited (120 s; two fast ticks at the default
-/// interval): a socket or module
-/// load of a just-exited process still resolves, but a reused pid whose start event was
-/// missed does not inherit a stale name beyond this window.
+/// interval): a socket or module load of a just-exited process still resolves, but a reused pid
+/// whose start event was missed does not inherit a stale name beyond this window.
 inline constexpr int64_t kPidNameGraceSec = 120;
 
 /// Fill an EMPTY process_name from the map. Ignores pid 0; uses an entry only while it is

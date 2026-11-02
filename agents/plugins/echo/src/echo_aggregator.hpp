@@ -201,12 +201,19 @@ struct RetentionGuardState {
     /// "this table is not being retained", which is why the status surface sums
     /// them into one total.
     std::map<std::string, int64_t> delete_failures;
+    /// Byte-budget passes skipped because a retention pass above saw the clock refused. Not a
+    /// table and not a verdict of its own: it is a consequence of a decline or failure already
+    /// counted above, so it is surfaced as `retention_guard|__budget__|<n>` and counts toward
+    /// neither status total (counting it would double a clock decline and turn a failures-only
+    /// event into a non-zero declines total).
+    int64_t budget_skips{0};
 };
 
 /// Snapshot of the operator-facing counters, taken under `RetentionGuardState::mu`.
 struct RetentionGuardCounters {
     std::map<std::string, int64_t> declines;
     std::map<std::string, int64_t> failures;
+    int64_t budget_skips{0};
 };
 
 [[nodiscard]] RetentionGuardCounters retention_guard_counters(const RetentionGuardState& guard);
@@ -215,7 +222,8 @@ struct RetentionGuardCounters {
 /// a `retention_guard|<table>|<declines>` line per table that has declined, a
 /// `retention_guard_failed|<table>|<failures>` line per table whose probes OR
 /// deletes have failed (the two are merged -- both mean "not being retained"),
-/// then the always-present totals. Split out from `do_status` purely so
+/// then, when non-zero, `retention_guard|__budget__|<n>` (excluded from both totals), then the
+/// always-present totals. Split out from `do_status` purely so
 /// the operator-facing format has a test seam -- `EchoPlugin` is a
 /// translation-unit-local class and cannot be reached from a test.
 [[nodiscard]] std::vector<std::string>
@@ -410,7 +418,7 @@ struct BudgetPassResult {
 /**
  * Evict warehouse rows until used data pages are at or under `target_bytes`.
  *
- * Order (Alex, 2026-10-30): raw capture rows first, from the table holding the most rows,
+ * Order: raw capture rows first, from the table holding the most rows,
  * oldest first; only once no raw row is eligible, hourly rows, never newer than 48 h (5 d for
  * procperf_hourly, kBudgetProcPerfHourlyFloorSec). Daily,
  * monthly, `usage_*`, netqual and the sources with no summary tier (netconn, power,

@@ -33,8 +33,8 @@ metadata:
     retention_guard|<table>|<n> and retention_guard_failed|<table>|<n> lines for
     any table with a non-zero count (retention_guard|__budget__|<n> is not a
     table: the byte-budget pass was skipped because the retention clock guard
-    refused this pass's clock). Read the two totals TOGETHER - a zero
-    declines total only means the endpoint's clock is behaving if the failures
+    refused this pass's clock; it is counted in neither total). Read the two
+    totals TOGETHER - a zero declines total only means the endpoint's clock is behaving if the failures
     total is also zero. Scrape this across the fleet to find hosts whose clocks
     need attention; the agent has no /metrics endpoint.
     Reports the byte budget: db_budget_bytes (the configured cap; unknown when
@@ -416,7 +416,7 @@ spec:
           monthly rows are never removed, nor are the usage tables, sources
           with no summary tier (netconn, netqual, power, removable, registry),
           or paused or errored sources (an unreadable <source>_enabled counts
-          as errored). Requires an agent newer than v0.14.1; an older agent
+          as errored). Requires an agent newer than v0.15.0; an older agent
           ignores this key beside other keys and refuses it alone
           (error|no valid configuration parameters provided). Lowering it
           permanently deletes the oldest eligible history within 15 minutes,

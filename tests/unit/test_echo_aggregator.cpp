@@ -1615,6 +1615,40 @@ TEST_CASE("Echo #2361: the status lines always carry both totals",
     CHECK(lines[3] == "retention_guard_failures_total|2");
 }
 
+TEST_CASE("Echo budget: the __budget__ skip line is in neither retention guard total",
+          "[echo][retention][clock-guard][budget]") {
+    // A skipped byte-budget pass is the consequence of a decline or failure that is already
+    // counted, so it must surface as its own line and stay out of both totals. Folding it into
+    // declines would double a clock decline and turn a failures-only event (an anchor write
+    // failure) into a non-zero declines total, the misread the status text warns against.
+    yuzu::echo::RetentionGuardState g;
+    {
+        std::lock_guard lock(g.mu);
+        g.budget_skips = 2;
+        g.declines["process_hourly"] = 1;
+    }
+    auto lines = yuzu::echo::format_retention_guard_lines(g);
+    REQUIRE(lines.size() == 4);
+    CHECK(lines[0] == "retention_guard|process_hourly|1");
+    CHECK(lines[1] == "retention_guard|__budget__|2");
+    CHECK(lines[2] == "retention_guard_declines_total|1");
+    CHECK(lines[3] == "retention_guard_failures_total|0");
+
+    // Failures only (no decline): the skip line appears and the declines total stays 0.
+    yuzu::echo::RetentionGuardState f;
+    {
+        std::lock_guard lock(f.mu);
+        f.budget_skips = 1;
+        f.failures["__clock_state__"] = 1;
+    }
+    lines = yuzu::echo::format_retention_guard_lines(f);
+    REQUIRE(lines.size() == 4);
+    CHECK(lines[0] == "retention_guard_failed|__clock_state__|1");
+    CHECK(lines[1] == "retention_guard|__budget__|1");
+    CHECK(lines[2] == "retention_guard_declines_total|0");
+    CHECK(lines[3] == "retention_guard_failures_total|1");
+}
+
 TEST_CASE("Echo #2361: every registered granularity declares the ts column its suffix maps to",
           "[echo][retention][clock-guard][registry]") {
     // `ts_column_for_suffix` is public API with three consumers now (the DDL's
@@ -2635,8 +2669,8 @@ const auto kAlwaysTime = [] { return true; };
 
 // The ruled literals, pinned independently of the constants the engine derives them from: a
 // changed floor or batch is a changed product promise, and must show up as a failing test here
-// rather than silently moving every expectation with it (Alex 2026-10-30: raw capture rows are
-// never evicted inside 24 h, hourly rows never inside 48 h, 1,000 rows per batch, 2 s per pass).
+// rather than silently moving every expectation with it (raw capture rows are never evicted
+// inside 24 h, hourly rows never inside 48 h, 1,000 rows per batch, 2 s per pass).
 static_assert(kBudgetRawFloorSec == 86400);
 static_assert(kBudgetHourlyFloorSec == 172800);
 static_assert(kBudgetBatchRows == 1000);

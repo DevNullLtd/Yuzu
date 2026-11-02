@@ -4482,9 +4482,10 @@ private:
         yuzu::echo::run_retention(*db_, ts, retention_guard_);
         if (guard_events() > guard_before) {
             {
-                // Surfaced as `retention_guard|__budget__|N` on the existing status contract.
+                // Surfaced as `retention_guard|__budget__|N`; counted in neither status total,
+                // because the decline or failure that caused it is already counted.
                 std::lock_guard guard_lock(retention_guard_.mu);
-                ++retention_guard_.declines["__budget__"];
+                ++retention_guard_.budget_skips;
             }
             // A catch-up slice armed by an earlier pass must not run on this clock either.
             budget_catch_up_.store(false, std::memory_order_relaxed);
@@ -4596,9 +4597,10 @@ private:
     // records the time and retries at most daily; status shows db_auto_vacuum|deferred until a
     // conversion succeeds (the marker is not cleared when a later pass finds the freelist too
     // small to warrant one). The VACUUM runs on the single interval-trigger thread with the
-    // database lock held, so it stalls the agent's triggers for its duration; it is bounded by
-    // the operator's budget (it runs only when the used data is under it and copies used pages
-    // only) and happens once per database.
+    // database lock held, so it stalls the agent's triggers for its duration. It copies used
+    // pages only, so its duration (and the free disk it needs, twice that size) follows the used
+    // data at the time of the conversion: at or under the target, or, when eviction is exhausted,
+    // whatever exempt data remains, which can sit above the target. It happens once per database.
     void maybe_vacuum_to_incremental(std::int64_t now_ts, std::int64_t target,
                                      bool eviction_exhausted) {
         const auto sb = db_->storage_bytes();

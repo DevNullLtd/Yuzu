@@ -320,10 +320,13 @@ NetworkEvent network_event_from_nstat_flow(const NstatFlowEvent& e, std::int64_t
     ev.remote_addr = e.remote_addr;
     ev.remote_port = e.remote_port;
     // An open event keeps the descriptor's state only when the socket is already ending
-    // (TIME_WAIT, CLOSE_WAIT, ...): that is what the closing-state rules and the hourly
-    // de-duplication key on. Every other state a live flow can report (SYN_SENT, SYN_RCVD,
-    // LISTEN, an unresolved one) stays the ESTABLISHED label this stream always stored, because
-    // the fleet-snapshot reader keeps only ESTABLISHED rows and nstat never upgrades a row.
+    // (TIME_WAIT, CLOSE_WAIT, ...), so the stored row says what the socket was. Every other
+    // state a live flow can report (SYN_SENT, SYN_RCVD, LISTEN, an unresolved one) stays the
+    // ESTABLISHED label this stream always stored, because the fleet-snapshot reader keeps only
+    // ESTABLISHED rows and nstat never upgrades a row. The closing-state rules and the hourly
+    // de-duplication apply to the poll leg (compute_network_events), not to this stream: it
+    // reports a flow in a closing state only in the one-off dump of existing flows at
+    // subscription, so there is no volume to cut.
     ev.state = !e.is_open ? std::string{"CLOSED"}
                           : (tcp_state_is_closing(e.state) ? e.state : std::string{"ESTABLISHED"});
     ev.pid = e.pid;

@@ -535,7 +535,7 @@ RetentionGuardCounters retention_guard_counters(const RetentionGuardState& guard
     // Probe failures and delete failures are merged: both mean "this table is
     // not being retained", which is the only distinction the operator surface
     // needs to draw against a clock decline.
-    RetentionGuardCounters out{guard.declines, guard.failures};
+    RetentionGuardCounters out{guard.declines, guard.failures, guard.budget_skips};
     for (const auto& [table, count] : guard.delete_failures)
         out.failures[table] += count;
     return out;
@@ -557,6 +557,10 @@ std::vector<std::string> format_retention_guard_lines(const RetentionGuardState&
         total_failures += count;
         lines.push_back(std::format("retention_guard_failed|{}|{}", table, count));
     }
+    // Not a table, and in neither total: a skipped byte-budget pass is the consequence of a
+    // decline or failure already counted above.
+    if (counters.budget_skips > 0)
+        lines.push_back(std::format("retention_guard|__budget__|{}", counters.budget_skips));
     // Both totals are ALWAYS emitted, including zeros: an absent line is
     // ambiguous between "no declines" and "an agent too old to report", and the
     // failures total is what stops a zero declines total from being read as

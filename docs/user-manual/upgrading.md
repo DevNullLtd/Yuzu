@@ -10,7 +10,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 1. Upgrade the server first, as for every release.
 2. On the older agents, record `db_size_bytes` per host from `echo.status`.
-3. Export what you need from the hosts above the threshold with `echo.sql`, by `ts` range (it reaches every table and tier; `echo.query` and `echo.export` read only the live tables).
+3. Export what you need from the hosts above the threshold with `echo.sql`, by `ts` range (it reaches every table and tier; `echo.query` and `echo.export` read only the raw capture (`<source>_live`) tables).
 4. Upgrade a pilot group of hosts first and watch `budget_evicted_raw_rows_total` and `db_size_bytes` there before the rest.
 5. Or, within 15 minutes of an agent's restart, send `echo.configure db_budget_bytes=<bytes>` with a larger figure. The budget cannot be set ahead of the upgrade (see Mixed fleet).
 
@@ -21,7 +21,7 @@ Lowering `db_budget_bytes` later deletes history the same way, within 15 minutes
 **What to expect.**
 
 - After the trim `db_size_bytes` falls at once, but the file on disk shrinks only after a one-off `VACUUM` converts an older database to incremental auto_vacuum. It runs once used pages are at or under the target (the budget less the 16 MiB log allowance), or once eviction has nothing left to take, and the free pages are at least 32 MiB and a quarter of the file. It needs twice the used size free on the volume; otherwise `db_auto_vacuum|deferred` is reported and the conversion is retried at most once a day.
-- While the `VACUUM` runs, collectors, `echo.status` and `echo.configure` wait for it. Its duration follows the used data (bounded by the budget), not the file size, and the agent log records it (`auto_vacuum conversion finished in N ms`).
+- While the `VACUUM` runs, collectors, `echo.status` and `echo.configure` wait for it. Its duration follows the used data at that moment (at or under the target, or the exempt data that remains once eviction has nothing more to take), not the file size, and the agent log records it (`auto_vacuum conversion finished in N ms`).
 - A database far over budget converges over successive passes and fast-tick slices (each at most 2 seconds of deletes) rather than in one pass.
 - New capture is also lighter by design: a socket first seen already closing is recorded once per hour per process and remote, module loads once per hour per loader, module and folder, unloads are not stored, and a registry change stores the new value up to 512 bytes and not the old value. See "Raw capture row volume" in the Echo manual.
 - Watch `budget_evicted_raw_rows_total`, `budget_evicted_hourly_rows_total`, `budget_over_bytes` and `db_auto_vacuum` in `echo.status`; "If `budget_over_bytes` stays above 0" in the Echo manual lists the causes. Nothing server-side aggregates them: dispatch `echo.status` to a group and filter.
