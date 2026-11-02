@@ -4257,8 +4257,9 @@ TEST_CASE("MCP revoke_engine_principal: a fault after the credential revoke is r
         REQUIRE(ts.audit_log.size() == ts.audit_details.size());
         for (std::size_t i = 0; i < ts.audit_log.size(); ++i)
             if (ts.audit_log[i].starts_with("engine_principal.revoke|"))
-                rows.emplace_back(ts.audit_log[i].substr(std::string("engine_principal.revoke|").size()),
-                                  ts.audit_details[i]);
+                rows.emplace_back(
+                    ts.audit_log[i].substr(std::string("engine_principal.revoke|").size()),
+                    ts.audit_details[i]);
         return rows;
     };
     const auto payload_of = [](const std::unique_ptr<httplib::Response>& r) -> nlohmann::json {
@@ -4287,6 +4288,50 @@ TEST_CASE("MCP revoke_engine_principal: a fault after the credential revoke is r
         CHECK(rows[0].second.find("revoked_by_concurrent_request") == std::string::npos);
     }
 
+    SECTION("normal revoke: the success detail is the sanitised reason") {
+        make("engine:mcp-rv-reason");
+        auto r = revoke_call("engine:mcp-rv-reason", "", "rotate out, now");
+        REQUIRE(r);
+        CHECK(payload_of(r)["revoked"].get<bool>() == true);
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].first == "success");
+        CHECK(rows[0].second == "rotate_out__now"); // space and ',' become '_'
+    }
+
+    SECTION("normal revoke: a hostile reason cannot forge the count or race markers") {
+        make("engine:mcp-rv-hostile");
+        auto r = revoke_call("engine:mcp-rv-hostile", "",
+                             "credentials_revoked=0; revoked_by_concurrent_request");
+        REQUIRE(r);
+        CHECK(payload_of(r)["credentials_revoked"].get<int>() == 1);
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].first == "success");
+        // '=' and the spaces are neutralised, so no `key=value` marker and no "; " separator
+        // survives to be read as a real field of a row that is not a race row.
+        CHECK(rows[0].second == "credentials_revoked_0;_revoked_by_concurrent_request");
+        CHECK(rows[0].second.find('=') == std::string::npos);
+        CHECK(rows[0].second.find("; ") == std::string::npos);
+    }
+
+    SECTION("a second revoke of the same principal is a plain success, not a race row") {
+        const std::string pid = "engine:mcp-rv-twice";
+        make(pid);
+        REQUIRE(revoke_call(pid));
+        auto again = revoke_call(pid);
+        REQUIRE(again);
+        const auto p = payload_of(again);
+        CHECK(p["revoked"].get<bool>() == true);
+        CHECK(p["credentials_revoked"].get<int>() == 0);
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].first == "success");
+        // The principal was already terminal before the call: nothing raced, so the row must
+        // not claim a concurrent revoke.
+        CHECK(rows[1].second.find("revoked_by_concurrent_request") == std::string::npos);
+    }
+
     SECTION("(d) the identity revoke errors: retry hint, failure row ends with the count") {
         const std::string pid = "engine:mcp-rv-raise";
         make(pid);
@@ -4305,6 +4350,9 @@ TEST_CASE("MCP revoke_engine_principal: a fault after the credential revoke is r
         CHECK(rows[0].first == "failure");
         CHECK(rows[0].second.ends_with("; credentials_revoked=1"));
         CHECK(rows[0].second.find("yuzu_test identity revoke fault") != std::string::npos);
+        // A libpq error text ends with a newline: the count must not land on its own line.
+        CHECK(rows[0].second.find('\n') == std::string::npos);
+        CHECK(rows[0].second.find('\r') == std::string::npos);
 
         fault.remove();
         auto again = revoke_call(pid);
@@ -4333,6 +4381,53 @@ TEST_CASE("MCP revoke_engine_principal: a fault after the credential revoke is r
         CHECK(rows[0].second == "credentials_revoked=1; revoked_by_concurrent_request; "
                                 "superseded_by_not_persisted; reason=rotate-out");
         // The row must not claim the caller's value was persisted.
+        CHECK(rows[0].second.find("superseded_by=") == std::string::npos);
+    }
+
+    SECTION("(e) race row with only superseded_by") {
+        const std::string pid = "engine:mcp-rv-race-sup";
+        make(pid);
+        yuzu::server::test::IdentityRevokeFault fault{
+            pool, yuzu::server::test::IdentityRevokeFault::Mode::Race};
+        auto r = revoke_call(pid, "engine:mcp-rv-successor");
+        REQUIRE(r);
+        CHECK(payload_of(r)["revoked"].get<bool>() == true);
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].first == "success");
+        CHECK(rows[0].second ==
+              "credentials_revoked=1; revoked_by_concurrent_request; superseded_by_not_persisted");
+    }
+
+    SECTION("(e) race row with only reason") {
+        const std::string pid = "engine:mcp-rv-race-reason";
+        make(pid);
+        yuzu::server::test::IdentityRevokeFault fault{
+            pool, yuzu::server::test::IdentityRevokeFault::Mode::Race};
+        auto r = revoke_call(pid, "", "rotate-out");
+        REQUIRE(r);
+        CHECK(payload_of(r)["revoked"].get<bool>() == true);
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].first == "success");
+        CHECK(rows[0].second ==
+              "credentials_revoked=1; revoked_by_concurrent_request; reason=rotate-out");
+    }
+
+    SECTION("(e) race row: a hostile reason stays confined after reason=") {
+        const std::string pid = "engine:mcp-rv-race-hostile";
+        make(pid);
+        yuzu::server::test::IdentityRevokeFault fault{
+            pool, yuzu::server::test::IdentityRevokeFault::Mode::Race};
+        auto r = revoke_call(pid, "", "credentials_revoked=9; superseded_by=engine:evil");
+        REQUIRE(r);
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].second ==
+              "credentials_revoked=1; revoked_by_concurrent_request; "
+              "reason=credentials_revoked_9;_superseded_by_engine:evil");
+        // Exactly one real count marker and no real superseded_by marker.
+        CHECK(rows[0].second.find("credentials_revoked=", 1) == std::string::npos);
         CHECK(rows[0].second.find("superseded_by=") == std::string::npos);
     }
 

@@ -6367,7 +6367,8 @@ void RestApiV1::register_routes(
                                 "application/json");
                 (void)detail::emit_behavioral_audit(
                     audit_fn, req, res, "engine_principal.revoke", "failure", "EnginePrincipal",
-                    principal_id, revoke_res.error() + "; " + revoked_count_detail);
+                    principal_id,
+                    flatten_audit_text(revoke_res.error()) + "; " + revoked_count_detail);
                 return;
             }
             bool revoked = *revoke_res;
@@ -6405,7 +6406,7 @@ void RestApiV1::register_routes(
                         "application/json");
                     (void)detail::emit_behavioral_audit(
                         audit_fn, req, res, "engine_principal.revoke", "failure", "EnginePrincipal",
-                        principal_id, why + "; " + revoked_count_detail);
+                        principal_id, flatten_audit_text(why) + "; " + revoked_count_detail);
                     return;
                 }
             }

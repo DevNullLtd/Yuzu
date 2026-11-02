@@ -2632,6 +2632,13 @@ static const ToolDef kTools[] = {
      "revoked identity with a still-valid credential). TERMINAL and irreversible — never "
      "un-revocable; a false-positive response mints a successor principal instead (pass "
      "superseded_by on the successor's own creation, then reference this principal here). "
+     "Order matters: the credentials die first, then the identity. A retryable error "
+     "(retry_after_ms 5000) after the credentials died means the principal may still be active "
+     "with zero credentials; repeating the call finishes the revoke. The call is idempotent "
+     "(a revoke by a concurrent request that wins is reported as success; the repeat reports "
+     "credentials_revoked 0), but cap your retries at a few attempts, then read the principal "
+     "with get_engine_principal and report its state to an administrator. The failure audit "
+     "row carries the number of credentials the failed call revoked. "
      "Mirrors DELETE /api/v1/engine-principals/{id}. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
@@ -2669,10 +2676,10 @@ static const ToolDef kTools[] = {
      "generally idempotent: a re-call within a short grace window after the original mint "
      "re-serves the SAME successor secret (each reveal — original or replay — is independently "
      "audited as engine_principal.credential.reveal); once the grace window lapses, a re-call "
-     "errors and the caller must recover over REST (find the stuck successor with GET "
-     "/api/v1/engine-principals/{id}, revoke it with DELETE /api/v1/tokens/{token_id} as an "
-     "administrator, then rotate again), never an indefinite retry, and never revoke the "
-     "principal, which is terminal. If the read-back answers but finds no linked successor, the "
+     "errors and the caller must recover (find the stuck successor with GET "
+     "/api/v1/engine-principals/{id}, revoke it with DELETE /api/v1/tokens/{token_id} or the "
+     "revoke_api_token tool as an administrator, then rotate again), never an indefinite retry, "
+     "and never revoke the principal, which is terminal. If the read-back answers but finds no linked successor, the "
      "secret is withheld with NO retry hint: inspect the principal's credentials first. Mirrors POST "
      "/api/v1/engine-principals/{id}/credentials/rotate. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
@@ -2698,8 +2705,10 @@ static const ToolDef kTools[] = {
      "re-rotate if a fresh rotation is needed. If confirm instead reports 'rotation confirmation "
      "unavailable' (the initiator binding is lost or in dispute), do NOT call "
      "revoke_engine_principal - that is TERMINAL and destroys BOTH credentials plus the "
-     "principal itself; there is no MCP twin for per-credential revoke, so resolve this case via "
-     "REST: DELETE /api/v1/tokens/{token_id} on the SPECIFIC credential you no longer trust. "
+     "principal itself. Revoke the SPECIFIC credential you no longer trust instead, with "
+     "DELETE /api/v1/tokens/{token_id} or the revoke_api_token tool (approval-gated at the "
+     "supervised tier, ApiToken:Delete; only an effective administrator or the token's owner "
+     "can revoke it, anyone else gets 'token not found'). "
      "Note: the approval gate applies two independent "
      "checks before this logic runs. (1) An exact replay carrying an already-consumed "
      "approval_id is denied ('approval already used'; submit a new request for a fresh ticket). "
@@ -26479,7 +26488,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 const std::string revoked_count_detail =
                     "credentials_revoked=" + std::to_string(credentials_revoked);
                 const auto fail_after_credentials = [&](const std::string& why) {
-                    const std::string detail = why + "; " + revoked_count_detail;
+                    // `why` may be a multi-line store error: one line, so the count stays
+                    // on the same physical line as the rest of the detail.
+                    const std::string detail =
+                        flatten_audit_text(why) + "; " + revoked_count_detail;
                     mcp_audit("failure", detail);
                     (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
                                    principal_id, detail);
@@ -26539,7 +26551,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         ? revoked_count_detail + "; revoked_by_concurrent_request" +
                               (superseded_by.empty() ? "" : "; superseded_by_not_persisted") +
                               (reason.empty() ? "" : "; reason=" + audit_token(reason))
-                        : reason;
+                        // The caller's reason is sanitised here too: a raw one could carry
+                        // `credentials_revoked=0; revoked_by_concurrent_request` and read as
+                        // the race row of a revoke that did not race.
+                        : audit_token(reason);
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "engine_principal.revoke", "success", "EnginePrincipal",
                     principal_id, success_detail);

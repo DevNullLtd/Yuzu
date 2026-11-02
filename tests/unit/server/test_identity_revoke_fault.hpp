@@ -3,16 +3,16 @@
 // Header-only and file-agnostic: the caller passes the pool of the database under test.
 #pragma once
 
-#include "pg/pg_exec.hpp"
-#include "pg/pg_pool.hpp"
-#include "pg/pg_raii.hpp"
+#include <exception>
+#include <string>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 
-#include <exception>
-#include <string>
-#include <vector>
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 namespace yuzu::server::test {
 
@@ -92,7 +92,8 @@ class IdentityRevokeFault {
                 err = "no pool lease";
                 return false;
             }
-            yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+            yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+                lease.get(), sql.c_str(), std::vector<std::string>{});
             if (!r.ok()) {
                 err = PQresultErrorMessage(r.get());
                 return false;
@@ -119,8 +120,8 @@ class IdentityRevokeFault {
         if (!trig || !fn) {
             try {
                 FAIL_CHECK("IdentityRevokeFault cleanup failed (the engine clone may "
-                               "still carry the trigger): trigger: "
-                               << e1 << " function: " << e2);
+                           "still carry the trigger): trigger: "
+                           << e1 << " function: " << e2);
             } catch (...) {
             }
         }

@@ -1535,6 +1535,11 @@ TEST_CASE("Engine-principal REST: DELETE retries after the credentials are revok
         CHECK(failure->result == "failure");
         CHECK(failure->detail.find("credentials_revoked=1") != std::string::npos);
         CHECK(failure->detail.find("yuzu_test identity revoke fault") != std::string::npos);
+        // A libpq error text ends with a newline: the count must not land on its own line, so
+        // the detail is one line and still ends with the count.
+        CHECK(failure->detail.find('\n') == std::string::npos);
+        CHECK(failure->detail.find('\r') == std::string::npos);
+        CHECK(failure->detail.ends_with("; credentials_revoked=1"));
         fault.remove();
         auto again = h.revoke(pid);
         REQUIRE(again);
@@ -1601,13 +1606,23 @@ TEST_CASE("Engine-principal REST: DELETE answers 200 idempotent, not 503, when a
     const auto* row = last_audit_for(h.audit_log, "engine_principal.revoke");
     REQUIRE(row != nullptr);
     CHECK(row->result == "success");
-    CHECK(row->detail.find("credentials_revoked=1") != std::string::npos);
-    CHECK(row->detail.find("revoked_by_concurrent_request") != std::string::npos);
     // The winner's write stands: the caller's superseded_by was not persisted, and the row must
     // not claim it was.
-    CHECK(row->detail.find("superseded_by_not_persisted") != std::string::npos);
+    CHECK(row->detail ==
+          "credentials_revoked=1; revoked_by_concurrent_request; superseded_by_not_persisted");
     CHECK(row->detail.find("superseded_by=") == std::string::npos);
     CHECK(audit_count_for(h.audit_log, "engine_principal.revoke", "failure") == failures_before);
+
+    // Without a superseded_by the race row carries only the count and the race marker.
+    auto [pid2, raw2] = h.create_and_mint("revoke-race-nosup");
+    (void)raw2;
+    auto res2 = h.revoke(pid2);
+    REQUIRE(res2);
+    CHECK(res2->status == 200);
+    const auto* row2 = last_audit_for(h.audit_log, "engine_principal.revoke");
+    REQUIRE(row2 != nullptr);
+    CHECK(row2->result == "success");
+    CHECK(row2->detail == "credentials_revoked=1; revoked_by_concurrent_request");
 
     auto got = h.get(pid);
     REQUIRE(got);
@@ -2169,12 +2184,17 @@ TEST_CASE("Engine-principal REST: DELETE revokes both the identity AND every "
     (void)raw;
     REQUIRE(h.token_store->list_active_for_principal(principal_id).size() == 1);
 
-    auto res = h.revoke(principal_id);
+    auto res = h.revoke(principal_id, "engine:revoke-cascade-successor");
     REQUIRE(res);
     CHECK(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["data"]["revoked"].get<bool>() == true);
     CHECK(body["data"]["credentials_revoked"].get<int64_t>() == 1);
+    // A revoke that did not race records the caller's superseded_by as persisted.
+    const auto* first_row = last_audit_for(h.audit_log, "engine_principal.revoke");
+    REQUIRE(first_row != nullptr);
+    CHECK(first_row->result == "success");
+    CHECK(first_row->detail == "credentials_revoked=1; superseded_by=engine:revoke-cascade-successor");
 
     // Identity: lifecycle_state flips to revoked (GET-by-id still returns
     // the row — revoke is soft-retain, never a hard delete).
@@ -2192,6 +2212,14 @@ TEST_CASE("Engine-principal REST: DELETE revokes both the identity AND every "
     auto res2 = h.revoke(principal_id);
     REQUIRE(res2);
     CHECK(res2->status == 200);
+    CHECK(nlohmann::json::parse(res2->body)["data"]["credentials_revoked"].get<int64_t>() == 0);
+    // The principal was already terminal before the repeat: nothing raced, so its row is a plain
+    // success and must not claim a concurrent revoke.
+    const auto* second_row = last_audit_for(h.audit_log, "engine_principal.revoke");
+    REQUIRE(second_row != nullptr);
+    CHECK(second_row->result == "success");
+    CHECK(second_row->detail == "credentials_revoked=0");
+    CHECK(second_row->detail.find("revoked_by_concurrent_request") == std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
