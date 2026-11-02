@@ -28,6 +28,7 @@
 #include "bounded_wait.hpp" // yuzu::shared::bounded_call_ex — ../../shared include dir
 #include "echo_capture_status.hpp" // classify_subprocess_capture, IncompleteCaptureError, would_exceed_cap
 #include "echo_collectors.hpp"
+#include "echo_hive_mount_gate.hpp" // g_mount_workers_in_flight, MountWorkerGuard, kHiveMountBoundMs, pin_plugin_module
 
 #include <yuzu/agent/subprocess_runner.hpp> // run_bounded_subprocess (rung 2 argv sites)
 
@@ -1103,24 +1104,14 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
     return result;
 }
 
-// Mount workers currently running (spawned by bounded_call_ex, not yet returned from their
-// closure). A plugin static, safe because the module is pinned before any worker exists. A
-// worker the caller abandoned on a timeout stays counted until it really returns, which is how a
-// LATER walk learns that mounting would only queue behind it (decide_walk_gate).
-std::atomic<int> g_mount_workers_in_flight{0};
-
-struct MountWorkerGuard {
-    MountWorkerGuard() noexcept { g_mount_workers_in_flight.fetch_add(1); }
-    ~MountWorkerGuard() { g_mount_workers_in_flight.fetch_sub(1); }
-    MountWorkerGuard(const MountWorkerGuard&) = delete;
-    MountWorkerGuard& operator=(const MountWorkerGuard&) = delete;
-};
+} // namespace
 
 // Pins this plugin's module so FreeLibrary can never unmap it (the pin is for the life of the
-// process), once, and answers whether it holds. Called on the dispatching thread BEFORE the first
-// bounded mount spawns a worker: a worker that completes is detached too, and destroys its
-// plugin-resident closure after publishing the result, so a pin taken only on a timeout would
-// leave that tail exposed to an unload.
+// process), once, and answers whether it holds. Declared in echo_hive_mount_gate.hpp (the
+// registry source's offline reads share the gate, one in-flight counter per plugin DLL).
+// Called on the dispatching thread BEFORE the first bounded mount spawns a worker: a worker
+// that completes is detached too, and destroys its plugin-resident closure after publishing
+// the result, so a pin taken only on a timeout would leave that tail exposed to an unload.
 bool pin_plugin_module() noexcept {
     static const bool pinned = [] {
         HMODULE module = nullptr;
@@ -1138,6 +1129,8 @@ bool pin_plugin_module() noexcept {
     }();
     return pinned;
 }
+
+namespace {
 
 // Walk every profile in ProfileList; read the outbound artifacts from the live
 // HKU\<SID> hive, or load NTUSER.DAT for offline users (RAII-unloaded).
@@ -1182,10 +1175,6 @@ bool pin_plugin_module() noexcept {
 // first timeout (decide_mount_call), and a LATER walk does not mount while that worker is still
 // running (decide_walk_gate, g_mount_workers_in_flight): either would only queue behind the stuck
 // mount, time out, and burn attempts it never made.
-constexpr std::chrono::milliseconds kHiveMountBoundMs{30000}; // generous for a legitimately slow
-                                                              // network-share read; see dism's 17s
-                                                              // for a comparable Windows API bound
-
 void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::string>* only_sids) {
     const auto disc = yuzu::win::enumerate_profile_list();
     h.complete = profile_list_complete(disc.root_rc, disc.last_rc, disc.probe_rc);

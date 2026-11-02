@@ -1060,14 +1060,16 @@ const std::vector<CaptureSourceDef>& build_sources() {
         },
         // ── registry (cursor-model seam, echo_cursor.hpp) — registry value and key
         // changes under a curated persistence/policy watch list (HKLM and each
-        // loaded HKU hive): what changed, with its old and new value. LIVE TIER
+        // profile hive, loaded or not): what changed, with its old and new value. LIVE TIER
         // ONLY, no rollups (P-008, same rationale as power above). Mechanism: a
         // RegNotifyChangeKeyValue subtree watch + a per-root baseline diff
         // (echo_state `registry:<root>`) say WHAT changed; a write-only
         // Kernel-Registry ETW session says WHO, by correlation on value name, type,
         // size and time window. actor_pid / actor_image hold the correlated writer
         // (a lead to verify, not proof) and are 0 / '' when none is named; `detail`
-        // says why (attr:corr | ambiguous | none | degraded | off | lost-restart).
+        // says why (attr:corr | ambiguous | none | degraded | off | lost-restart | offline).
+        // A logged-off user's hive is mounted through the guarded offline-hive ladder and
+        // read hourly: those rows carry source=offline and attr:offline, never a writer.
         // Values are stored UNMASKED: `data`/`prev_data` are readable through
         // echo.sql. Retention is a row count.
         // Replay idempotence via the UNIQUE record_key index below.
@@ -1081,7 +1083,9 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "RegNotifyChangeKeyValue subtree watch + baseline diff (what changed, old/new "
                  "value) and a write-only Kernel-Registry ETW session that names the writing "
                  "process by correlation; cursor-model (echo_cursor.hpp). Without an elevated "
-                 "agent the session cannot open and rows carry attr:off."},
+                 "agent the session cannot open and rows carry attr:off. The per-user roots of "
+                 "logged-off users' unloaded hives are read hourly through the guarded "
+                 "offline-hive ladder (rows attr:offline)."},
                 {"linux",   OsSupportStatus::kUnsupported, "",
                  "The Windows registry does not exist on this platform."},
                 {"macos",   OsSupportStatus::kUnsupported, "",
@@ -1110,7 +1114,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"prev_data_truncated", "INTEGER"},
                         {"actor_pid",           "INTEGER"}, // 0 = no writer named (see detail)
                         {"actor_image",         "TEXT"},    // '' when no writer is named
-                        {"source",              "TEXT"},    // notify | reconcile
+                        {"source",              "TEXT"},    // notify | reconcile | offline
                         {"observed_at",         "INTEGER"}, // unix ms the read saw it
                         {"detail",              "TEXT"},    // attr:* on a change row; the gap text on a gap
                         {"record_key",          "TEXT"},    // UNIQUE — replay idempotence

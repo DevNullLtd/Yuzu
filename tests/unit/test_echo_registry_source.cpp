@@ -35,6 +35,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #ifdef _WIN32
@@ -47,7 +48,9 @@
 #include <windows.h>
 #include <evntrace.h> // ControlTraceW QUERY: no session may outlive stop()
 #include <sddl.h>
+#include <win_profiles.hpp> // enumerate_hku_subkeys, PrivilegeScope: the offline-hive cases
 #include <win_str.hpp>
+#include "echo_hive_mount_gate.hpp"  // g_mount_workers_in_flight
 #include "echo_win_process_name.hpp" // process_basename_for_pid
 #endif
 
@@ -918,6 +921,140 @@ TEST_CASE("cursor and baseline codecs", "[echo][registry][pure]") {
     CHECK_NOTHROW(encode_registry_baseline(b));
 }
 
+
+// ── Offline (unloaded) hives: the pure core ─────────────────────────────────
+
+namespace {
+
+const std::string kSidA = "S-1-5-21-1";
+const std::string kSidB = "S-1-5-21-2";
+const std::string kSuffix = "Software\\yuzu_test_u";
+const std::string kSuffix2 = "Software\\yuzu_test_u2";
+
+std::string uroot(const std::string& sid, const std::string& suffix = kSuffix) {
+    return "HKU\\" + sid + "\\" + suffix;
+}
+OfflineProfile prof(const std::string& sid) { return {sid, "C:\\Users\\" + sid}; }
+
+} // namespace
+
+TEST_CASE("roots_for: loaded sids, then offline sids, same suffixes, each sid once",
+          "[echo][registry][pure]") {
+    const RegistryScope sc{{"SOFTWARE\\yuzu_test_r"}, {kSuffix, kSuffix2}};
+    const auto roots = sc.roots_for({kSidA}, {prof(kSidB)});
+    REQUIRE(roots.size() == 5);
+    CHECK(roots[0] == "HKLM\\SOFTWARE\\yuzu_test_r");
+    CHECK(roots[1] == uroot(kSidA));
+    CHECK(roots[2] == uroot(kSidA, kSuffix2));
+    CHECK(roots[3] == uroot(kSidB)); // the offline root is named exactly like a loaded one
+    CHECK(roots[4] == uroot(kSidB, kSuffix2));
+
+    // a sid in BOTH lists (and an offline duplicate) is emitted once, from the loaded list
+    CHECK(sc.roots_for({kSidA}, {prof(kSidA), prof(kSidB), prof(kSidB)}).size() == 5);
+    // the one-argument overload is the loaded list alone
+    CHECK(sc.roots_for({kSidA}).size() == 3);
+
+    // `.bak`, `_Classes`, `.DEFAULT` and the temporary mounts sibling plugins make are not profiles
+    const auto none = sc.roots_for({}, {prof(kSidA + ".bak"), prof(kSidA + "_Classes"),
+                                        prof(".DEFAULT"), prof("YUZU_HIVE_" + kSidA + "_1_2")});
+    CHECK(none.size() == 1); // HKLM only
+
+    CHECK(is_offline_root(uroot(kSidB), {prof(kSidB)}));
+    CHECK_FALSE(is_offline_root(uroot(kSidA), {prof(kSidB)}));
+    CHECK_FALSE(is_offline_root("HKLM\\SOFTWARE\\yuzu_test_r", {prof(kSidB)}));
+    CHECK_FALSE(is_offline_root(uroot(kSidB + "9"), {prof(kSidB)})); // sid component, not a prefix
+}
+
+TEST_CASE("reconcile_offline: a complete walk replaces, an incomplete one keeps, a loaded sid never stays",
+          "[echo][registry][pure]") {
+    const std::vector<OfflineProfile> known{prof(kSidA), prof(kSidB)};
+
+    OfflineDiscovery complete;
+    complete.profiles = {prof(kSidA)};
+    CHECK(reconcile_offline(known, {}, complete) == std::vector<OfflineProfile>{prof(kSidA)});
+
+    OfflineDiscovery incomplete;
+    incomplete.complete = false;
+    CHECK(reconcile_offline(known, {}, incomplete) == known);
+
+    // a sid whose record exists but whose path was unreadable keeps its cursor entry
+    OfflineDiscovery partial;
+    partial.partial = {kSidB};
+    partial.profiles = {prof(kSidA)};
+    CHECK(reconcile_offline(known, {}, partial) == known);
+    // ... but not when it is NOT named: a complete walk that omits it says the profile is gone
+    CHECK(reconcile_offline(known, {}, complete).size() == 1);
+
+    // a loaded sid is removed in every case
+    CHECK(reconcile_offline(known, {kSidA}, incomplete) == std::vector<OfflineProfile>{prof(kSidB)});
+    CHECK(reconcile_offline(known, {kSidA}, partial) == std::vector<OfflineProfile>{prof(kSidB)});
+    complete.profiles = {prof(kSidA), prof(kSidB)};
+    CHECK(reconcile_offline(known, {kSidA, kSidB}, complete).empty());
+}
+
+TEST_CASE("cursor codec carries `offline` and `deferred`, both optional on decode",
+          "[echo][registry][pure]") {
+    RegistryCursor cur;
+    cur.present = true;
+    cur.tick = 3;
+    cur.hku = {kSidA};
+    cur.offline = {prof(kSidB), {kSidA + "9", "D:\\profiles\\x"}};
+    RegistryRootState st;
+    st.baselined = true;
+    st.status = "unreadable";
+    st.deferred = true;
+    cur.roots[uroot(kSidB)] = st;
+    const auto back = decode_registry_cursor(encode_registry_cursor(cur));
+    REQUIRE_FALSE(back.malformed);
+    CHECK(back.offline == cur.offline);
+    CHECK(back.roots.at(uroot(kSidB)).deferred);
+    CHECK(back.roots.at(uroot(kSidB)) == st);
+
+    // not written when empty / false: a cursor without either decodes as before
+    RegistryCursor plain;
+    plain.present = true;
+    plain.roots["HKLM\\R"] = RegistryRootState{};
+    const auto json = nlohmann::json::parse(encode_registry_cursor(plain));
+    CHECK_FALSE(json.contains("offline"));
+    CHECK_FALSE(json.at("roots").at("HKLM\\R").contains("deferred"));
+    const auto old = decode_registry_cursor(encode_registry_cursor(plain));
+    REQUIRE_FALSE(old.malformed);
+    CHECK(old.offline.empty());
+    CHECK_FALSE(old.roots.at("HKLM\\R").deferred);
+
+    // a malformed element is a lost cursor, never a half-read scope
+    for (const char* bad : {R"({"v":1,"tick":0,"roots":{},"hku":[],"offline":[["S-1-5-21-1"]]})",
+                            R"({"v":1,"tick":0,"roots":{},"hku":[],"offline":[["a","b","c"]]})",
+                            R"({"v":1,"tick":0,"roots":{},"hku":[],"offline":["S-1-5-21-1"]})",
+                            R"({"v":1,"tick":0,"roots":{},"hku":[],"offline":[[1,2]]})"}) {
+        INFO(bad);
+        CHECK(decode_registry_cursor(std::string{bad}).malformed);
+    }
+}
+
+TEST_CASE("stitch_registry_tick: an offline candidate is written at once as attr:offline, never correlated",
+          "[echo][registry][pure]") {
+    auto c = cand("changed", "Start", 4, 4, 100 * SEC, 110 * SEC);
+    c.source = "offline";
+    // a matching write event inside the window, a loss epoch over it, the session down and a
+    // restart floor after it: none of them changes the marker
+    const auto evs = std::vector<RegistryEtwEvent>{ev(105 * SEC, 7, RegistryEtwOp::Set, "Start")};
+    const std::vector<LossEpoch> epochs{{100 * SEC, 110 * SEC}};
+    for (const bool etw : {true, false}) {
+        INFO("etw=" << etw);
+        const auto r = stitch_registry_tick({c}, evs, epochs, StitchFlags{etw, 200 * SEC},
+                                            111 * SEC /* inside the settle hold */, 1);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.held_next.empty());
+        CHECK(r.rows[0].detail == "attr:offline");
+        CHECK(r.rows[0].actor_pid == 0);
+        CHECK(r.rows[0].source == "offline");
+        CHECK(r.rows[0].record_key.starts_with("offline:"));
+        CHECK(r.counters.none == 1);
+        CHECK(r.counters.attributed == 0);
+    }
+}
+
 TEST_CASE("registry schema constants agree with the registry", "[echo][registry][pure]") {
     const CaptureSourceDef* def = nullptr;
     for (const auto& s : capture_sources())
@@ -979,6 +1116,15 @@ struct Fake {
     std::function<void()> on_loss_query; // runs inside session_loss(): the callback thread never stops
     bool etw{true}; // the write-event session is delivering
     std::vector<std::string> sids;
+    OfflineDiscovery offline_discovery; // complete, no logged-off profile
+    int offline_profile_calls{0};
+    std::map<std::string, OfflineHiveRead> offline_reads; // by sid; unscripted = every root Absent
+    struct OfflineCall {
+        std::string sid, path;
+        std::vector<std::string> roots;
+        std::int64_t deadline{0};
+    };
+    std::vector<OfflineCall> offline_calls;
     int ccs{1};
     std::set<std::string> unarmed;
     std::vector<std::vector<std::string>> watch_calls;
@@ -1001,6 +1147,24 @@ struct Fake {
             return it->second;
         };
         r.loaded_sids = [this] { return sids; };
+        r.offline_profiles = [this] {
+            ++offline_profile_calls;
+            return offline_discovery;
+        };
+        r.read_offline_hive = [this](const std::string& sid, const std::string& path,
+                                     const std::vector<std::string>& roots, std::int64_t deadline) {
+            offline_calls.push_back({sid, path, roots, deadline});
+            const auto it = offline_reads.find(sid);
+            if (it != offline_reads.end())
+                return it->second;
+            OfflineHiveRead absent;
+            for (const auto& root : roots) {
+                SubtreeRead a;
+                a.status = RegistryReadStatus::Absent;
+                absent.roots[root] = a;
+            }
+            return absent;
+        };
         r.now_ts = [this] { return clock += 1000; }; // strictly increasing
         r.etw_running = [this] { return etw; };
         r.session_loss = [this] {
@@ -2275,6 +2439,504 @@ TEST_CASE("registry source: a logged-off user's roots leave scope without a remo
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Offline (unloaded) hives over an injected reader
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+const std::string kEmptyBaseline = R"({"v":1,"keys":{}})";
+
+SubtreeRead uread(const std::string& root, std::uint32_t v) {
+    return complete({{root, {{"v", vread(4, dword(v))}}}});
+}
+
+OfflineHiveRead hive_read(std::map<std::string, SubtreeRead> roots) {
+    OfflineHiveRead h;
+    h.roots = std::move(roots);
+    return h;
+}
+
+// What read_offline_hive answers when the guard refuses the hive: every root Unreadable, the
+// refusal token on the hive and on each root.
+OfflineHiveRead refused_hive(const std::vector<std::string>& roots, const std::string& reason) {
+    OfflineHiveRead h;
+    h.reason = reason;
+    for (const auto& root : roots) {
+        SubtreeRead u;
+        u.status = RegistryReadStatus::Unreadable;
+        u.reason = reason;
+        h.roots[root] = u;
+    }
+    return h;
+}
+
+// One scripted reader, one database, the source over them.
+struct OfflineRig {
+    TestDb t = make_db();
+    Fake f;
+    std::unique_ptr<RegistryCursorSource> src;
+
+    explicit OfflineRig(RegistryScope scope = RegistryScope{{}, {kSuffix}}) {
+        src = make_registry_cursor_source(std::move(scope), f.reader());
+    }
+    // Ordinary ticks until the persisted cursor says `cursor_tick` ticks have run (the next
+    // tick is then the one with cur.tick == cursor_tick: 12 is the hourly reconcile).
+    void tick_to(std::int64_t cursor_tick) {
+        while (read_cursor(t.db).tick < cursor_tick) {
+            f.clock += SEC;
+            tick(t.db, *src);
+        }
+    }
+    CursorCollectResult next() {
+        f.clock += SEC;
+        return tick(t.db, *src);
+    }
+    std::string state(const std::string& root) {
+        const auto r = t.db.try_get_state("registry:" + root);
+        REQUIRE(r.has_value());
+        return r->value_or("");
+    }
+    std::string config(const std::string& key) { return t.db.get_config(key, ""); }
+    std::int64_t gap_unreadable_rows() {
+        return std::stoll(
+           q(t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
+              .rows.at(0).at(0));
+    }
+};
+
+} // namespace
+
+TEST_CASE("registry offline: first sight baselines silently; one mount per hive per hour, and discovery only when the loaded list is re-enumerated",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+
+    CHECK(r.next().outcome == CursorOutcome::Baseline);
+    CHECK(r.f.offline_profile_calls == 1);
+    REQUIRE(r.f.offline_calls.size() == 1);
+    CHECK(r.f.offline_calls[0].sid == kSidA);
+    CHECK(r.f.offline_calls[0].path == prof(kSidA).path);
+    CHECK(r.f.offline_calls[0].roots == std::vector<std::string>{root});
+    CHECK(r.f.offline_calls[0].deadline > T0);
+    CHECK(count_rows(r.t.db) == 0);
+    CHECK(r.state(root) != kEmptyBaseline);
+    CHECK(r.f.read_calls.empty()); // the loaded-hive reader is not used for an offline root
+
+    r.tick_to(12); // eleven ordinary ticks: no hive mount and no profile walk
+    CHECK(r.f.offline_profile_calls == 1);
+    CHECK(r.f.offline_calls.size() == 1);
+
+    // the hourly reconcile re-walks and re-reads; a changed value lands in THAT tick
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+    CHECK(r.next().events_emitted == 1);
+    CHECK(r.f.offline_profile_calls == 2);
+    CHECK(r.f.offline_calls.size() == 2);
+    const auto rows = q(r.t.db, "SELECT action, hive, key_path, data, prev_data, actor_pid, detail, "
+                                "source, record_key FROM registry_live");
+    REQUIRE(rows.rows.size() == 1);
+    const auto& row = rows.rows[0];
+    CHECK(row[0] == "changed");
+    CHECK(row[1] == "HKU");
+    CHECK(row[2] == kSidA + "\\" + kSuffix); // the logical name, never a salted mount name
+    CHECK(row[3] == "2");
+    CHECK(row[4] == "1");
+    CHECK(row[5] == "0");
+    CHECK(row[6] == "attr:offline");
+    CHECK(row[7] == "offline");
+    CHECK_THAT(row[8], ContainsSubstring("offline:"));
+    CHECK(read_cursor(r.t.db).held.empty());
+    CHECK(r.state(root) != kEmptyBaseline);
+
+    // an HKU name-watch mark re-walks too; the cursor's list otherwise stands
+    r.f.dirty->mark_hku();
+    r.next();
+    CHECK(r.f.offline_profile_calls == 3);
+    CHECK(r.f.offline_calls.size() == 2);
+}
+
+TEST_CASE("registry offline: offline roots are never watched, never counted as watch roots; a capped read stays visible",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r(RegistryScope{{"SOFTWARE\\yuzu_test_r"}, {kSuffix}});
+    const auto live = uroot(kSidB);
+    const auto off = uroot(kSidA);
+    r.f.sids = {kSidB};
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.reads[kRoot] = svc(1);
+    r.f.reads[live] = uread(live, 1);
+    SubtreeRead capped = uread(off, 1);
+    capped.status = RegistryReadStatus::Capped;
+    r.f.offline_reads[kSidA] = hive_read({{off, capped}});
+    r.next();
+
+    REQUIRE_FALSE(r.f.watch_calls.empty());
+    for (const auto& call : r.f.watch_calls)
+        CHECK(std::find(call.begin(), call.end(), off) == call.end());
+    CHECK(r.f.watch_calls.back() == std::vector<std::string>{kRoot, live});
+    CHECK(r.config("registry_watch_roots") == "2");
+    CHECK(r.config("registry_watch_roots_unarmed") == "0");
+    CHECK(r.config("registry_offline_roots") == "1");
+    CHECK(r.config("registry_offline_roots_unreadable") == "0");
+    CHECK(r.config("registry_offline_discovery_incomplete") == "0");
+    CHECK(r.config("registry_roots_capped") == "1"); // aggregate: the capped offline read counts
+    CHECK(read_cursor(r.t.db).roots.at(off).armed);
+}
+
+TEST_CASE("registry offline: a sid in both snapshots is live - watched, dirty-driven, never in cursor.offline",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.sids = {kSidA};
+    r.f.offline_discovery.profiles = {prof(kSidA)}; // the profile list lags the HKU snapshot
+    r.f.reads[root] = uread(root, 1);
+    r.next();
+    CHECK(r.f.offline_calls.empty());
+    CHECK(r.f.read_calls == std::vector<std::string>{root});
+    CHECK(r.f.watch_calls.back() == std::vector<std::string>{root});
+    CHECK(read_cursor(r.t.db).offline.empty());
+    CHECK(r.config("registry_watch_roots") == "1");
+    CHECK(r.config("registry_offline_roots") == "0");
+
+    // dirty-driven like any loaded root
+    r.f.read_calls.clear();
+    r.f.dirty->mark(root, r.f.clock);
+    r.f.reads[root] = uread(root, 2);
+    r.next();
+    CHECK(r.f.read_calls == std::vector<std::string>{root});
+    CHECK(r.f.offline_calls.empty());
+}
+
+TEST_CASE("registry offline: whichever root the rotation starts at, a hive is mounted once and every member ends baselined",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r(RegistryScope{{"SOFTWARE\\yuzu_test_r"}, {kSuffix, kSuffix2}});
+    r.f.offline_discovery.profiles = {prof(kSidA), prof(kSidB)};
+    r.f.reads[kRoot] = svc(1);
+    std::vector<std::string> offline_roots;
+    for (const auto& sid : {kSidA, kSidB}) {
+        const auto a = uroot(sid), b = uroot(sid, kSuffix2);
+        r.f.offline_reads[sid] = hive_read({{a, uread(a, 1)}, {b, uread(b, 1)}});
+        offline_roots.push_back(a);
+        offline_roots.push_back(b);
+    }
+    // Five roots: HKLM and four offline. A re-baseline every tick makes cur.tick % 5 walk every
+    // start position (0..4), each of which falls on a different member of a group.
+    for (int i = 0; i < 5; ++i) {
+        INFO("rotation start " << i);
+        if (i > 0) {
+            r.src->on_enabled_changed(false);
+            r.src->on_enabled_changed(true);
+        }
+        const auto before = r.f.offline_calls.size();
+        r.next();
+        REQUIRE(r.f.offline_calls.size() == before + 2); // exactly one mount per sid
+        CHECK(r.f.offline_calls[before].sid != r.f.offline_calls[before + 1].sid);
+        CHECK(r.f.offline_calls[before].roots.size() == 2);
+        CHECK(r.f.offline_calls[before + 1].roots.size() == 2);
+        const auto cur = read_cursor(r.t.db);
+        for (const auto& root : offline_roots) {
+            CHECK(cur.roots.at(root).baselined);
+            CHECK(r.state(root) != kEmptyBaseline);
+        }
+    }
+}
+
+TEST_CASE("registry offline: a refused hive keeps its baseline, writes ONE gap row naming the reason, and costs one attempt an hour",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    const std::string why = "offline:file_refused:hive_path_unc";
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    const auto baseline = r.state(root);
+
+    r.f.offline_reads[kSidA] = refused_hive({root}, why);
+    r.tick_to(12);
+    CHECK(r.f.offline_calls.size() == 1); // between reconciles: no attempt
+    r.next();                             // the reconcile
+    CHECK(r.f.offline_calls.size() == 2);
+    CHECK(r.gap_unreadable_rows() == 1);
+    const auto gap = q(r.t.db, "SELECT action, detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'");
+    CHECK(gap.rows.at(0).at(0) == "capture_gap");
+    CHECK_THAT(gap.rows.at(0).at(1), ContainsSubstring(why));
+    CHECK_THAT(gap.rows.at(0).at(1), ContainsSubstring(root));
+    CHECK(r.state(root) == baseline); // kept
+    CHECK(r.config("registry_offline_roots_unreadable") == "1");
+    CHECK(r.config("registry_roots_unreadable") == "1");
+
+    r.tick_to(24);
+    CHECK(r.f.offline_calls.size() == 2);
+    r.next(); // the next hour: tried again, still refused, no second row
+    CHECK(r.f.offline_calls.size() == 3);
+    CHECK(r.gap_unreadable_rows() == 1);
+    CHECK(count_rows(r.t.db) == 1);
+}
+
+TEST_CASE("registry offline: a refused hive the budget defers keeps status unreadable and is retried NEXT tick, with no second gap row",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r(RegistryScope{{"SOFTWARE\\yuzu_test_r"}, {kSuffix}});
+    const auto root = uroot(kSidA);
+    bool burn = false;
+    auto reader = r.f.reader();
+    auto read = reader.read_subtree;
+    reader.read_subtree = [&r, &burn, read](const std::string& rt, std::int64_t deadline) {
+        auto res = read(rt, deadline);
+        if (burn && rt == kRoot)
+            r.f.clock += kSnapshotBudget100ns + SEC; // the budget is spent by the first read
+        return res;
+    };
+    r.src = make_registry_cursor_source(RegistryScope{{"SOFTWARE\\yuzu_test_r"}, {kSuffix}},
+                                        std::move(reader));
+    r.f.reads[kRoot] = svc(1);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    r.f.offline_reads[kSidA] = refused_hive({root}, "offline:file_refused:hive_path_unc");
+    r.tick_to(12);
+    r.next(); // reconcile: refused, one row
+    REQUIRE(r.f.offline_calls.size() == 2);
+    REQUIRE(r.gap_unreadable_rows() == 1);
+
+    r.tick_to(24);
+    burn = true;
+    r.next(); // reconcile: the HKLM root spends the budget, the refused hive is deferred
+    burn = false;
+    CHECK(r.f.offline_calls.size() == 2);
+    const auto deferred = read_cursor(r.t.db).roots.at(root);
+    CHECK(deferred.deferred);
+    CHECK(deferred.status == "unreadable"); // untouched: one gap row per transition
+    r.next();                               // NEXT tick, not the next reconcile
+    CHECK(r.f.offline_calls.size() == 3);
+    CHECK_FALSE(read_cursor(r.t.db).roots.at(root).deferred);
+    CHECK(r.gap_unreadable_rows() == 1);
+    r.next();
+    CHECK(r.f.offline_calls.size() == 3); // back to hourly
+}
+
+TEST_CASE("registry offline: a mount that was not attempted writes no baseline and no row, and is retried next tick",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    OfflineHiveRead skipped;
+    skipped.attempted = false;
+    skipped.reason = "offline:skipped_after_timeout";
+    r.f.offline_reads[kSidA] = skipped;
+    r.next();
+    CHECK(r.f.offline_calls.size() == 1);
+    const auto st = r.t.db.try_get_state("registry:" + root);
+    REQUIRE(st.has_value());
+    CHECK_FALSE(st->has_value()); // no baseline written
+    CHECK(count_rows(r.t.db) == 0);
+    const auto cur = read_cursor(r.t.db);
+    CHECK(cur.roots.at(root).deferred);
+    CHECK_FALSE(cur.roots.at(root).baselined);
+
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next(); // not the next reconcile: the next tick
+    CHECK(r.f.offline_calls.size() == 2);
+    const auto after = read_cursor(r.t.db).roots.at(root);
+    CHECK_FALSE(after.deferred);
+    CHECK(after.baselined);
+    CHECK(r.state(root) != kEmptyBaseline);
+    CHECK(count_rows(r.t.db) == 0);
+}
+
+TEST_CASE("registry offline: a re-enable re-baselines an offline root in THAT tick, silently",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    r.tick_to(3);
+    REQUIRE(r.f.offline_calls.size() == 1);
+    const auto before = r.state(root);
+
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}}); // changed while disabled
+    r.src->on_enabled_changed(false);
+    r.src->on_enabled_changed(true);
+    r.next();
+    CHECK(r.f.offline_calls.size() == 2); // not the next hourly reconcile
+    CHECK(r.state(root) != before);       // the new state is the baseline ...
+    CHECK(count_rows(r.t.db) == 1);       // ... and only the disabled-window gap was written
+    CHECK(q(r.t.db, "SELECT COUNT(*) FROM registry_live WHERE action = 'changed'").rows.at(0).at(0) == "0");
+}
+
+TEST_CASE("registry offline: logoff keeps scope, resets the retention term and consumes the stale notify; a failed commit restores it",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r(RegistryScope{{"SOFTWARE\\yuzu_test_r"}, {kSuffix}});
+    const auto root = uroot(kSidA);
+    r.f.sids = {kSidA};
+    r.f.reads[kRoot] = svc(1);
+    r.f.reads[root] = uread(root, 1);
+    r.next();
+    const auto live = read_cursor(r.t.db);
+    REQUIRE(live.roots.at(root).window_base != 0);
+    REQUIRE(live.roots.at(kRoot).window_base != 0);
+    const auto baseline = r.state(root);
+
+    // an unread notify on the user's root, then the user logs off
+    const std::int64_t notify = r.f.clock + 5 * SEC;
+    r.f.dirty->mark(root, notify);
+    r.f.sids.clear();
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.dirty->mark_hku();
+    r.f.loss.events_lost = 1; // a gap:loss row, so the commit has a row to fail on
+    r.f.clock += 10 * SEC;
+    {
+        InsertTrap trap(r.t.path);
+        CHECK_THROWS_AS(r.next(), IncompleteCaptureError);
+    }
+    CHECK(r.f.dirty->first(root) == notify); // the take was restored
+    CHECK(r.f.dirty->peek_dirty(root));
+
+    r.next(); // the retry commits
+    CHECK(r.f.dirty->first(root) == 0);        // consumed
+    CHECK_FALSE(r.f.dirty->peek_dirty(root));
+    CHECK(r.f.offline_calls.empty());          // no hive read: it is not due
+    const auto cur = read_cursor(r.t.db);
+    REQUIRE(cur.roots.contains(root));         // still in scope ...
+    CHECK(cur.roots.at(root).window_base == 0); // ... with nothing from its loaded life
+    CHECK(cur.roots.at(root).baselined);
+    CHECK(cur.offline == std::vector<OfflineProfile>{prof(kSidA)});
+    CHECK(r.state(root) == baseline);          // no leave-scope drop
+    CHECK(q(r.t.db, "SELECT COUNT(*) FROM registry_live WHERE action != 'capture_gap'").rows.at(0).at(0) == "0");
+    // the retention floor is the other root's base alone
+    CHECK(retention_watermark(cur.roots, {}) == cur.roots.at(kRoot).window_base);
+
+    // the hourly offline read diffs against the baseline the loaded hive left behind
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+    r.tick_to(12);
+    r.next();
+    REQUIRE(r.f.offline_calls.size() == 1);
+    const auto rows = q(r.t.db, "SELECT prev_data, data, detail FROM registry_live WHERE action = 'changed'");
+    REQUIRE(rows.rows.size() == 1);
+    CHECK(rows.rows[0][0] == "1");
+    CHECK(rows.rows[0][1] == "2");
+    CHECK(rows.rows[0][2] == "attr:offline");
+}
+
+TEST_CASE("registry offline: logon reads the loaded hive at once against the offline baseline (a RunOnce consumed at logon is removed, lost-restart)",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    r.src->start(r.t.db); // the buffer holds nothing from before this instant
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] =
+       hive_read({{root, complete({{root, {{"once", vread(4, dword(1))}}}})}});
+    r.next();
+    REQUIRE(r.f.offline_calls.size() == 1);
+    REQUIRE(read_cursor(r.t.db).roots.at(root).window_base == 0);
+
+    // the user logs on: the value is gone, no notify was ever marked
+    r.f.sids = {kSidA};
+    r.f.offline_discovery.profiles.clear();
+    r.f.dirty->mark_hku();
+    r.f.reads[root] = complete({{root, {}}});
+    r.next();
+    CHECK(r.f.read_calls == std::vector<std::string>{root}); // read in THIS tick
+    CHECK(r.f.offline_calls.size() == 1);
+    CHECK(r.f.watch_calls.back() == std::vector<std::string>{root});
+    const auto rows = q(r.t.db, "SELECT action, value_name, detail, source FROM registry_live");
+    REQUIRE(rows.rows.size() == 1);
+    CHECK(rows.rows[0][0] == "removed");
+    CHECK(rows.rows[0][1] == "once");
+    CHECK(rows.rows[0][2] == "attr:lost-restart"); // window_base 0, so the floor says it
+    CHECK(rows.rows[0][3] == "reconcile");
+    const auto cur = read_cursor(r.t.db);
+    CHECK(cur.roots.at(root).window_base != 0); // advances from here
+    CHECK(cur.offline.empty());
+}
+
+TEST_CASE("registry offline: an offline root never pins the retention floor",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r(RegistryScope{{"SOFTWARE\\yuzu_test_r"}, {kSuffix}});
+    const auto root = uroot(kSidA);
+    r.f.reads[kRoot] = svc(1);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    const auto first_base = read_cursor(r.t.db).roots.at(kRoot).window_base;
+    REQUIRE(first_base != 0);
+    r.tick_to(12);
+
+    // one event the live root's base has already passed, one far ahead of it
+    r.src->push_event_for_test(ev(first_base + 1, 1, RegistryEtwOp::Set, "old"));
+    r.src->push_event_for_test(ev(first_base + 100000 * SEC, 2, RegistryEtwOp::Set, "new"));
+    r.next(); // reconcile: both roots are read; the offline one at an hour's age
+    const auto cur = read_cursor(r.t.db);
+    CHECK(r.f.offline_calls.size() == 2);
+    CHECK(cur.roots.at(root).window_base == 0); // an offline read never advances it
+    CHECK(retention_watermark(cur.roots, {}) == cur.roots.at(kRoot).window_base);
+    CHECK(cur.roots.at(kRoot).window_base > first_base + 1);
+    CHECK(r.src->buffer_for_test().size() == 1); // the old event was released, the new one kept
+}
+
+TEST_CASE("registry offline: an incomplete profile walk keeps the known scope and is flagged; a complete one clears the flag",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    const auto baseline = r.state(root);
+    r.tick_to(12);
+
+    // the reconcile's walk fails (ProfileList unopenable, cut short, ...) and the hive changed
+    r.f.offline_discovery = OfflineDiscovery{false, {}, {}};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+    r.next();
+    CHECK(r.config("registry_offline_discovery_incomplete") == "1");
+    CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)}); // no scope removal
+    CHECK(read_cursor(r.t.db).roots.contains(root));
+    CHECK(r.state(root) != kEmptyBaseline); // the baseline was not erased
+    CHECK(r.state(root) != baseline);       // the known path was still read: the change is not lost
+    const auto rows = q(r.t.db, "SELECT prev_data, data, detail FROM registry_live");
+    REQUIRE(rows.rows.size() == 1);
+    CHECK(rows.rows[0][0] == "1");
+    CHECK(rows.rows[0][1] == "2");
+    CHECK(rows.rows[0][2] == "attr:offline");
+
+    // the next complete walk lists it again: the flag clears, nothing is re-baselined or repeated
+    r.f.offline_discovery = OfflineDiscovery{};
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.dirty->mark_hku();
+    r.next();
+    CHECK(r.config("registry_offline_discovery_incomplete") == "0");
+    CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
+    CHECK(count_rows(r.t.db) == 1);
+}
+
+TEST_CASE("registry offline: a record with an unreadable path keeps its entry; a complete walk that omits the profile drops it without a removal storm",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    r.tick_to(12);
+
+    // complete walk, the record is there, its ProfileImagePath was not readable this time
+    r.f.offline_discovery = OfflineDiscovery{true, {kSidA}, {}};
+    r.next();
+    REQUIRE(r.f.offline_calls.size() == 2);
+    CHECK(r.f.offline_calls.back().path == prof(kSidA).path); // the cursor's path was used
+    CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
+
+    // complete walk that does not list it at all: the profile left ProfileList
+    r.tick_to(24);
+    r.f.offline_discovery = OfflineDiscovery{};
+    r.next();
+    CHECK(r.f.offline_calls.size() == 2); // not read
+    CHECK(read_cursor(r.t.db).roots.empty());
+    CHECK(read_cursor(r.t.db).offline.empty());
+    CHECK(r.state(root) == kEmptyBaseline); // shrunk, not a removal storm
+    CHECK(count_rows(r.t.db) == 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // [windows] live cases: the real key watch and the real Kernel-Registry ETW session.
 // Writing HKLM and opening the session need an elevated token; each case SKIPs with a
 // named reason otherwise, so a green run under a non-elevated task proves nothing --
@@ -2689,6 +3351,155 @@ TEST_CASE("registry live: a pid is named only if its process already existed whe
     CHECK_FALSE(process_basename_for_pid(pid, created_at).empty());         // stamped at creation
     CHECK_FALSE(process_basename_for_pid(pid, created_at - kSlack).empty()); // exactly the slack: named
     CHECK(process_basename_for_pid(pid, created_at - kSlack - 1).empty());   // past it: the pid was reused
+}
+
+// ── Offline (unloaded) hives: the real guarded mount ─────────────────────────
+// A hive file is saved from a scratch HKCU key (RegSaveKeyExW under SeBackupPrivilege) and
+// read back through the production read_offline_hive: the real with_user_hive ladder, the real
+// default hive-file guard, the real bounded worker. Each case SKIPs, naming the reason, when the
+// token cannot save or load a hive or the guard (correctly) refuses a fixture owned by an
+// account outside its allow-set; the run that counts as evidence reports RUN, not SKIP.
+
+namespace {
+
+// A SID no real profile carries, salted per process (a fixed width, so no SID is a prefix of
+// another): concurrent jobs on a shared runner never see each other's mounts (CLAUDE.md #1871).
+const std::string& offline_fake_sid() {
+    static const std::string sid = [] {
+        const auto salted = 1'000'000'000u + yuzu::test::process_random_salt() % 3'000'000'000u;
+        return "S-1-5-21-1-2-3-" + std::to_string(salted); // always 10 digits
+    }();
+    return sid;
+}
+
+// Any HKEY_USERS subkey CONTAINING the fake sid: the mount name is salted
+// (unique_hive_mount_name), so an exact-name check would never see a leak.
+bool offline_fake_mount_present() {
+    for (const auto& n : yuzu::win::enumerate_hku_subkeys())
+        if (n.find(offline_fake_sid()) != std::string::npos)
+            return true;
+    return false;
+}
+
+// Unconditional on every exit path: the shared box must never keep a mount of ours.
+struct OfflineMountSweep {
+    ~OfflineMountSweep() {
+        if (!offline_fake_mount_present())
+            return;
+        const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
+        const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+        for (const auto& n : yuzu::win::enumerate_hku_subkeys())
+            if (n.find(offline_fake_sid()) != std::string::npos)
+                RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(n).c_str());
+    }
+};
+
+// A per-process-salted non-volatile HKCU scratch key, removed on exit.
+struct ScratchHiveKey {
+    std::wstring path;
+    HKEY h{nullptr};
+    ScratchHiveKey()
+        : path(L"Software\\yuzu_test_regoff_" + yuzu::win::to_wide(salt())) {
+        REQUIRE(RegCreateKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
+                                KEY_ALL_ACCESS, nullptr, &h, nullptr) == ERROR_SUCCESS);
+    }
+    ~ScratchHiveKey() {
+        if (h != nullptr)
+            RegCloseKey(h);
+        RegDeleteTreeW(HKEY_CURRENT_USER, path.c_str());
+    }
+    ScratchHiveKey(const ScratchHiveKey&) = delete;
+    ScratchHiveKey& operator=(const ScratchHiveKey&) = delete;
+};
+
+// stop() is idempotent and safe on a reader that never started.
+struct ReaderStop {
+    RegistryReader& r;
+    ~ReaderStop() { r.stop(); }
+};
+
+} // namespace
+
+TEST_CASE("registry live: an offline hive is mounted once through the guarded ladder, read under its logical name, and unloaded",
+          "[echo][registry][windows]") {
+    OfflineMountSweep sweep;
+    ScratchHiveKey scratch;
+    {
+        yuzu::win::RegKey run;
+        REQUIRE(RegCreateKeyExW(scratch.h, L"Software\\yuzu_test_u\\Run", 0, nullptr,
+                                REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, nullptr, run.put(),
+                                nullptr) == ERROR_SUCCESS);
+        const std::wstring v = L"1";
+        REQUIRE(RegSetValueExW(run.get(), L"v", 0, REG_SZ, reinterpret_cast<const BYTE*>(v.c_str()),
+                               static_cast<DWORD>((v.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS);
+    }
+    yuzu::test::TempDir tmp("yuzu_test_regoffline_");
+    fs::create_directories(tmp.path);
+    {
+        const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+        if (!backup.ok())
+            SKIP("saving a mountable hive needs SeBackupPrivilege: not held here");
+        const LONG rc = RegSaveKeyExW(scratch.h, (tmp.path / "NTUSER.DAT").c_str(), nullptr,
+                                      REG_LATEST_FORMAT);
+        if (rc == ERROR_PRIVILEGE_NOT_HELD)
+            SKIP("RegSaveKeyExW: privilege not held");
+        REQUIRE(rc == ERROR_SUCCESS);
+    }
+    const std::string profile = yuzu::win::from_wide(tmp.path.c_str());
+    const std::string sid = offline_fake_sid();
+    const std::string logical = "HKU\\" + sid + "\\Software\\yuzu_test_u\\Run";
+
+    auto reader = make_windows_registry_reader();
+    const ReaderStop stop{reader};
+    const auto hv = reader.read_offline_hive(sid, profile, {logical}, reader.now_ts() + 60 * SEC);
+    if (hv.reason == "offline:privilege_missing")
+        SKIP("the offline arm needs SeBackupPrivilege and SeRestorePrivilege: not held here");
+    if (hv.reason.starts_with("offline:hive_owner"))
+        SKIP("the default guard refuses a fixture hive owned by an account outside its allow-set "
+             "(run elevated)");
+    INFO("reason=" << hv.reason);
+    REQUIRE(hv.attempted);
+    REQUIRE(hv.roots.contains(logical));
+    const auto& rd = hv.roots.at(logical);
+    REQUIRE(rd.status == RegistryReadStatus::Complete);
+    REQUIRE(rd.keys.contains(logical));
+    const auto& values = rd.keys.at(logical);
+    REQUIRE(values.contains("v"));
+    CHECK(values.at("v").type == 1); // REG_SZ
+    CHECK(values.at("v").bytes == utf16("1"));
+    for (const auto& [key, _] : rd.keys) { // labelled with the logical name, never the salted mount
+        CHECK(key.starts_with("HKU\\" + sid + "\\"));
+        CHECK(key.find("YUZU_HIVE") == std::string::npos);
+    }
+    CHECK_FALSE(offline_fake_mount_present());
+    CHECK(g_mount_workers_in_flight.load() == 0);
+}
+
+TEST_CASE("registry live: a profile path with no NTUSER.DAT answers every root Unreadable with an offline: reason and leaves no mount",
+          "[echo][registry][windows]") {
+    OfflineMountSweep sweep;
+    yuzu::test::TempDir tmp("yuzu_test_regoffline_empty_");
+    fs::create_directories(tmp.path);
+    const std::string profile = yuzu::win::from_wide(tmp.path.c_str());
+    const std::string sid = offline_fake_sid();
+    const std::string a = "HKU\\" + sid + "\\Software\\yuzu_test_u\\Run";
+    const std::string b = "HKU\\" + sid + "\\Software\\yuzu_test_u\\RunOnce";
+
+    auto reader = make_windows_registry_reader();
+    const ReaderStop stop{reader};
+    const auto hv = reader.read_offline_hive(sid, profile, {a, b}, reader.now_ts() + 60 * SEC);
+    if (hv.reason == "offline:privilege_missing")
+        SKIP("the offline arm needs SeBackupPrivilege and SeRestorePrivilege: not held here");
+    INFO("reason=" << hv.reason);
+    CHECK(hv.reason.starts_with("offline:"));
+    CHECK(hv.reason != "offline:ok");
+    for (const auto& root : {a, b}) {
+        REQUIRE(hv.roots.contains(root));
+        CHECK(hv.roots.at(root).status == RegistryReadStatus::Unreadable);
+        CHECK(hv.roots.at(root).reason.starts_with("offline:"));
+    }
+    CHECK_FALSE(offline_fake_mount_present());
+    CHECK(g_mount_workers_in_flight.load() == 0);
 }
 
 #endif // _WIN32

@@ -261,6 +261,20 @@ struct RegistryReader {
     /// One bounded read of `root`. Must not throw. `deadline` is an absolute now_ts() value.
     std::function<SubtreeRead(const std::string& root, std::int64_t deadline)> read_subtree;
     std::function<std::vector<std::string>()> loaded_sids; // subkey names under HKEY_USERS
+    /// The profiles whose hive is NOT loaded, from the profile list. Asked only on the
+    /// ticks that re-enumerate loaded hives (an HKU name change, a reconcile tick, a
+    /// re-baseline, or an empty known list), so it runs about hourly. `complete == false`
+    /// means "keep what you knew": it is never read as "nothing exists" (see
+    /// reconcile_offline). Must not throw.
+    std::function<OfflineDiscovery()> offline_profiles;
+    /// Mounts one offline hive through the shared guarded ladder and reads every root in
+    /// `roots` (this hive's logical `HKU\<sid>\...` roots) from that one mount. Called
+    /// at most once per hive per tick, only for a hive with a due root. `attempted == false`
+    /// means the mount was not tried (retried next tick). Must not throw; `deadline` is an
+    /// absolute now_ts() value.
+    std::function<OfflineHiveRead(const std::string& sid, const std::string& path,
+                                  const std::vector<std::string>& roots, std::int64_t deadline)>
+       read_offline_hive;
     std::function<std::int64_t()> now_ts;                  // FILETIME, the ETW header's clock
     std::function<bool()> etw_running;         // the write-event session is delivering
     std::function<SessionLoss()> session_loss; // the session's own loss counters
@@ -306,6 +320,7 @@ private:
     bool was_disabled_{false};
 
     std::vector<std::string> armed_roots_;
+    bool offline_incomplete_{false}; // the last profile discovery was incomplete (warn once per transition)
 
     // Loss accounting; advanced only after a successful commit, so a failed commit
     // re-derives and re-reports the same loss on the next tick.

@@ -24,6 +24,13 @@ test_echo_mapdrive.cpp), so this pins the wiring lexically. Invariants:
      pending SID is logged.
   6. The banner no longer cites dism_bounded_call.hpp as the pattern it follows (that header
      keeps its work in agent-core, which is never unloaded: the opposite stance).
+  7. The in-flight counter, MountWorkerGuard and the mount bound live in echo_hive_mount_gate.hpp,
+     shared with the registry source (one counter per plugin DLL); the registry source's offline
+     reader (echo_registry_source.cpp, read_offline_hive_bounded) follows the same wiring: it asks
+     decide_walk_gate(pin_plugin_module(), ...) before its first bounded_call_ex, refuses without
+     mounting when the gate is closed or an earlier mount this tick halted the rest, counts its
+     worker in flight before with_user_hive, bounds the wait with kHiveMountBoundMs and halts the
+     tick on a timeout/rejection.
 
 Robustness: `//` comments are stripped and whitespace is collapsed before matching, so a
 commented-out call cannot satisfy a check. Lexical only: it cannot see a relocation that keeps
@@ -40,6 +47,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 COLLECTOR = ROOT / "agents" / "plugins" / "echo" / "src" / "echo_mapdrive_collector.cpp"
 PLUGIN = ROOT / "agents" / "plugins" / "echo" / "src" / "echo_plugin.cpp"
+GATE = ROOT / "agents" / "plugins" / "echo" / "src" / "echo_hive_mount_gate.hpp"
+REGISTRY = ROOT / "agents" / "plugins" / "echo" / "src" / "echo_registry_source.cpp"
 HINT = (" (this gate pins the #5291 hive-mount wiring; if the collector was legitimately"
         " restructured, update tests/test_echo_mapdrive_pin_lexical.py)")
 
@@ -66,10 +75,12 @@ def body_of(text, signature):
     return None
 
 
-def problems(collector_src, plugin_src):
+def problems(collector_src, plugin_src, gate_src, registry_src):
     out = []
     c = normalise(collector_src)
     p = normalise(plugin_src)
+    g = normalise(gate_src)
+    r = normalise(registry_src)
 
     pin = body_of(c, "bool pin_plugin_module() noexcept")
     if pin is None:
@@ -84,8 +95,41 @@ def problems(collector_src, plugin_src):
 
     if not re.search(r"MountWorkerGuard\(\) noexcept \{ g_mount_workers_in_flight\.fetch_add\(1\);"
                      r" \} ~MountWorkerGuard\(\) \{ g_mount_workers_in_flight\.fetch_sub\(1\); \}",
-                     c):
-        out.append("MountWorkerGuard no longer counts the worker in and out")
+                     g):
+        out.append("MountWorkerGuard (echo_hive_mount_gate.hpp) no longer counts the worker in and out")
+    if "inline std::atomic<int> g_mount_workers_in_flight{0};" not in g:
+        out.append("echo_hive_mount_gate.hpp no longer owns the in-flight counter")
+    if "kHiveMountBoundMs{30000}" not in g:
+        out.append("echo_hive_mount_gate.hpp no longer owns the mount bound")
+    if "bool pin_plugin_module() noexcept;" not in g:
+        out.append("echo_hive_mount_gate.hpp no longer declares pin_plugin_module")
+    if "echo_hive_mount_gate.hpp" not in c or "echo_hive_mount_gate.hpp" not in r:
+        out.append("the mapdrive collector and the registry source must both include the shared gate")
+
+    offline = body_of(r, "OfflineHiveRead read_offline_hive_bounded(")
+    if offline is None:
+        out.append("read_offline_hive_bounded() is missing")
+    else:
+        gate_at = offline.find("decide_walk_gate(pin_plugin_module(), g_mount_workers_in_flight.load())")
+        mount_at = offline.find("bounded_call_ex(")
+        if gate_at < 0 or mount_at < 0 or gate_at > mount_at:
+            out.append("the offline reader must pin the module and ask decide_walk_gate (pin + in-flight "
+                       "workers) before its first bounded_call_ex")
+        if not re.search(r"if \(gate != yuzu::echo::WalkGate::open\) return unreadable_hive\(roots, false,",
+                         offline):
+            out.append("a closed gate must answer not-attempted without mounting")
+        if not re.search(r"if \(tick\.halted\) return unreadable_hive\(roots, false,", offline):
+            out.append("a halted tick must answer not-attempted without mounting")
+        if not re.search(r"bounded_call_ex\(\s*kHiveMountBoundMs\b", offline):
+            out.append("the offline mount is no longer bounded by kHiveMountBoundMs")
+        if not re.search(r"const MountWorkerGuard \w+;[^}]*?with_user_hive\(", offline):
+            out.append("the offline mount worker no longer counts itself in flight before with_user_hive")
+        if not re.search(r"tick\.halted = decision\.halt_walk;", offline):
+            out.append("a timed-out or rejected offline mount no longer halts the tick")
+        if "decide_mount_call(" not in offline:
+            out.append("the offline reader no longer asks decide_mount_call")
+    if not re.search(r"r\.read_offline_hive = .*?read_offline_hive_bounded\(", r):
+        out.append("the Windows reader no longer wires read_offline_hive to read_offline_hive_bounded")
 
     walk = body_of(c, "void enum_registry_outbound_history(")
     if walk is None:
@@ -157,65 +201,95 @@ class EchoMapdrivePinLexical(unittest.TestCase):
     def setUp(self):
         self.collector = COLLECTOR.read_text(encoding="utf-8")
         self.plugin = PLUGIN.read_text(encoding="utf-8")
+        self.gate = GATE.read_text(encoding="utf-8")
+        self.registry = REGISTRY.read_text(encoding="utf-8")
+
+    def probe(self, **over):
+        return problems(over.get("c", self.collector), over.get("p", self.plugin),
+                        over.get("g", self.gate), over.get("r", self.registry))
 
     def test_source_is_clean(self):
-        self.assertEqual(problems(self.collector, self.plugin), [], HINT)
+        self.assertEqual(self.probe(), [], HINT)
 
     def test_mutations_are_caught(self):
-        c, p = self.collector, self.plugin
+        c, p, g, r = self.collector, self.plugin, self.gate, self.registry
         cases = {
-            "gate decision deleted": (mutate(
+            "gate decision deleted": dict(c=mutate(
                 c, "decide_walk_gate(pin_plugin_module(),\n"
                    "                                                   g_mount_workers_in_flight.load())",
-                   "decide_walk_gate(true, 0)"), p),
-            "gate decision commented out": (mutate(
+                   "decide_walk_gate(true, 0)")),
+            "gate decision commented out": dict(c=mutate(
                 c, "const auto gate = yuzu::echo::decide_walk_gate(pin_plugin_module(),",
-                   "const auto gate = yuzu::echo::WalkGate::open; // decide_walk_gate(pin_plugin_module(),"), p),
-            "pin flag dropped": (mutate(c, "GET_MODULE_HANDLE_EX_FLAG_PIN", "0"), p),
-            "closed gate no longer halts": (mutate(
+                   "const auto gate = yuzu::echo::WalkGate::open; // decide_walk_gate(pin_plugin_module(),")),
+            "pin flag dropped": dict(c=mutate(c, "GET_MODULE_HANDLE_EX_FLAG_PIN", "0")),
+            "closed gate no longer halts": dict(c=mutate(
                 c, "bool mounts_halted = gate != yuzu::echo::WalkGate::open;",
-                   "bool mounts_halted = false;"), p),
-            "halt assignment dropped": (mutate(c, "mounts_halted = decision.halt_walk;",
-                                               "(void)decision;"), p),
-            "outcome attempted flag dropped": (mutate(
-                c, "outcome.attempted = decision.attempted;", "(void)decision;"), p),
-            "worker no longer counted in flight": (mutate(
-                c, "const MountWorkerGuard in_flight;", "(void)0;"), p),
-            "in-flight guard stops counting": (mutate(
-                c, "g_mount_workers_in_flight.fetch_sub(1);", "(void)0;"), p),
-            "halted block loses attempted=false": (
-                mutate(c, "skipped.attempted = false;", "skipped.attempted = true;"), p),
-            "halted block loses its append": (mutate(
-                c, "h.profiles.push_back(std::move(skipped));", "(void)skipped;"), p),
-            "halted block loses its cause token": (mutate(
-                c, "skipped.token = halted_token;", 'skipped.token = "x";'), p),
-            "halted block loses its continue": (mutate(
+                   "bool mounts_halted = false;")),
+            "halt assignment dropped": dict(c=mutate(c, "mounts_halted = decision.halt_walk;",
+                                                     "(void)decision;")),
+            "outcome attempted flag dropped": dict(c=mutate(
+                c, "outcome.attempted = decision.attempted;", "(void)decision;")),
+            "worker no longer counted in flight": dict(c=mutate(
+                c, "const MountWorkerGuard in_flight;", "(void)0;")),
+            "in-flight guard stops counting": dict(g=mutate(
+                g, "g_mount_workers_in_flight.fetch_sub(1);", "(void)0;")),
+            "gate header loses the counter": dict(g=mutate(
+                g, "inline std::atomic<int> g_mount_workers_in_flight{0};",
+                   "inline std::atomic<int> g_other{0};")),
+            "gate header loses the mount bound": dict(g=mutate(
+                g, "kHiveMountBoundMs{30000}", "kHiveMountBoundMs{0}")),
+            "collector stops including the shared gate": dict(c=mutate(
+                c, '#include "echo_hive_mount_gate.hpp"', "#include <atomic>")),
+            "halted block loses attempted=false": dict(
+                c=mutate(c, "skipped.attempted = false;", "skipped.attempted = true;")),
+            "halted block loses its append": dict(c=mutate(
+                c, "h.profiles.push_back(std::move(skipped));", "(void)skipped;")),
+            "halted block loses its cause token": dict(c=mutate(
+                c, "skipped.token = halted_token;", 'skipped.token = "x";')),
+            "halted block loses its continue": dict(c=mutate(
                 mutate(c, "skipped.token = halted_token;", "skipped.token = halted_token;"),
                 "h.profiles.push_back(std::move(skipped));\n            continue;",
-                "h.profiles.push_back(std::move(skipped));"), p),
-            "a mount is started before the halted block": (mutate(
+                "h.profiles.push_back(std::move(skipped));")),
+            "a mount is started before the halted block": dict(c=mutate(
                 c, "if (mounts_halted) {\n            // Not tried",
                    "{ auto early = yuzu::shared::bounded_call_ex(kHiveMountBoundMs, [] { return 0; });"
-                   " (void)early; }\n        if (mounts_halted) {\n            // Not tried"), p),
-            "pin returns true on failure": (mutate(
-                c, "        return false;\n    }();", "        return true;\n    }();"), p),
-            "timeout outcome loses its halt": (mutate(
+                   " (void)early; }\n        if (mounts_halted) {\n            // Not tried")),
+            "pin returns true on failure": dict(c=mutate(
+                c, "        return false;\n    }();", "        return true;\n    }();")),
+            "timeout outcome loses its halt": dict(c=mutate(
                 c, "h.profiles.push_back(std::move(outcome));\n            mounts_halted =",
-                   "h.profiles.push_back(std::move(outcome));\n            (void)"), p),
-            "row_cap label dropped": (mutate(c, '"row_cap"', '"ok"'), p),
-            "MountPoints2 failure no longer skips": (mutate(
-                c, "note_failure(sk_rc);\n                        idx++;", "idx++;"), p),
-            "dism reference restored": (
-                c + "\n// plugin's first consumer; see dism_bounded_call.hpp/power_health_plugin.cpp\n",
-                p),
-            "first-pass dedupe dropped": (c, mutate_after(
+                   "h.profiles.push_back(std::move(outcome));\n            (void)")),
+            "row_cap label dropped": dict(c=mutate(c, '"row_cap"', '"ok"')),
+            "MountPoints2 failure no longer skips": dict(c=mutate(
+                c, "note_failure(sk_rc);\n                        idx++;", "idx++;")),
+            "dism reference restored": dict(c=(
+                c + "\n// plugin's first consumer; see dism_bounded_call.hpp/power_health_plugin.cpp\n")),
+            "first-pass dedupe dropped": dict(p=mutate_after(
                 p, "typed.empty() ||", "/*skip_known_historical=*/true",
                 "/*skip_known_historical=*/false")),
-            "vanished-SID log dropped": (c, mutate(p, "dropped from the pending set", "dropped")),
+            "vanished-SID log dropped": dict(p=mutate(p, "dropped from the pending set", "dropped")),
+            # the registry source's offline reader
+            "registry gate decision deleted": dict(r=mutate(
+                r, "decide_walk_gate(pin_plugin_module(), g_mount_workers_in_flight.load())",
+                   "yuzu::echo::WalkGate::open")),
+            "registry closed gate no longer refuses": dict(r=mutate(
+                r, "if (gate != yuzu::echo::WalkGate::open)", "if (false)")),
+            "registry halted tick still mounts": dict(r=mutate(
+                r, "if (tick.halted)\n", "if (false)\n")),
+            "registry mount unbounded": dict(r=mutate(
+                r, "kHiveMountBoundMs, [sid, path, roots, deadline]",
+                   "std::chrono::milliseconds{0}, [sid, path, roots, deadline]")),
+            "registry worker not counted in flight": dict(r=mutate(
+                r, "const MountWorkerGuard in_flight;", "(void)0;")),
+            "registry timeout no longer halts the tick": dict(r=mutate(
+                r, "tick.halted = decision.halt_walk;", "(void)decision;")),
+            "registry hook no longer wired": dict(r=mutate(
+                r, "return read_offline_hive_bounded(sid, path, roots, deadline, *tick);",
+                   "return OfflineHiveRead{};")),
         }
-        for name, (cs, ps) in cases.items():
+        for name, over in cases.items():
             with self.subTest(mutation=name):
-                self.assertNotEqual(problems(cs, ps), [], f"mutation not caught: {name}")
+                self.assertNotEqual(self.probe(**over), [], f"mutation not caught: {name}")
 
 
 if __name__ == "__main__":

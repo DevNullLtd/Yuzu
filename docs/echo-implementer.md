@@ -448,12 +448,33 @@ cursor.** What it adds to the pattern:
   that is not running, an unarmed root) and a child that became denied after the
   last read: the watch mask is `NAME | LAST_SET`, so a permission change raises
   nothing.
-- **A root's first read is silent.** A root not yet baselined (first run, a user
-  hive loaded at logon, a user who logged off and back on, a re-enable) has its
-  first read taken as the baseline, with no rows. Writes made to it between the
-  hive loading and that read, up to one slow interval, are folded into the
-  baseline and are not recorded; no per-root gap row is written, since a logon
-  would add one per root per user.
+- **A root's first read is silent.** A root not yet baselined (first run, a
+  profile first seen at its first logon, a re-enable) has its first read taken as
+  the baseline, with no rows. Writes made to it between the hive loading and that
+  read, up to one slow interval, are folded into the baseline and are not
+  recorded; no per-root gap row is written, since a logon would add one per root
+  per user. A user who logs off and back on is NOT in this list: their baseline
+  carries across (below).
+- **Offline hives keep the baseline across logoff and logon.** A profile whose
+  hive is not loaded stays in scope under the same root names
+  (`HKU\<sid>\<suffix>`). It has no watch and no ETW attribution; it is read
+  hourly (the reconcile tick, or the next tick for a deferred or not-attempted
+  mount) by one guarded, bounded, process-lock-serialised mount per hive, all of
+  that hive's roots from the one mount, and its rows are `source=offline`,
+  `attr:offline`, finalised in the tick that sees them. Transitions are explicit
+  in `collect()`: a root that was loaded and is offline now has its `window_base`
+  reset and its stale notify consumed (restored on a failed commit like every
+  take), so nothing from its loaded life pins the ETW retention floor; a root that
+  was offline and is loaded now is due at once, so its first loaded read diffs
+  against the offline baseline (a `RunOnce` value consumed at logon becomes a
+  `removed` row with `attr:lost-restart`, since its window starts at 0). An
+  offline root never advances `window_base`, takes no part in the retention
+  floor, and is excluded from `pending_first`. Scope is removed only by a
+  COMPLETE profile walk (`reconcile_offline`): an incomplete walk keeps the known
+  list (`registry_offline_discovery_incomplete`), and a record whose path was
+  unreadable keeps its cursor entry. A failed mount is an Unreadable read with a
+  named reason (`offline:<token>`), one gap row per transition; the `deferred`
+  flag on the root's state, not its status, schedules the next-tick retry.
 - **Rows land in the tick that observes the change, or the next one, and the writer is
   correlated, not verified.** A candidate is held only while `now - window_hi <
   kEtwSettle100ns` (5 s), and a notify window closes 1 s after the last notify, so a
