@@ -476,7 +476,7 @@ cluster unit; intra-zone scale is more nodes.
   its first retry, then keeps growing its delay across its Register calls, with each of its waits at least 8 s so that
   the four waits outlast the server's 30 s one-certificate-per-agent window (the old fixed 2+4+8+16 s ladder summed
   to exactly 30 s). The average return after an outage is usually sooner, but the slowest 1% of agents can wait
-  longer than under the old ladder (simulated p99 about 285 s against 250 s). A restarted agent has no wait, and the heartbeat-driven re-registration cooldown (#1894) is
+  longer than under the old ladder (simulated for outages of 30 to 600 s: p99 about 285 s against 250 s). A restarted agent has no wait, and the heartbeat-driven re-registration cooldown (#1894) is
   unchanged.
 - **Known gap, unconfirmed.** A gateway node that is up but has lost its server still acknowledges proxied
   heartbeats from node-local state (`yuzu_gw_agent_service:heartbeat/2`; an unknown session gets `NOT_FOUND`),

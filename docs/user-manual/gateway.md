@@ -427,7 +427,7 @@ from those two settings, not an observed figure. Plan for these requirements:
   minutes against 13, and a mean wait of about 135 s once settled, against 256 s); these
   figures come from a simulation, not a fleet measurement. The average return after an
   outage is usually sooner, but the slowest 1% of agents can wait longer than before
-  (simulated: about 285 s against 250 s). The 300 s is
+  (simulated for outages of 30 to 600 s: about 285 s against 250 s). The 300 s ceiling is
   the wait only; one attempt can then take up to 30 s (the Register deadline). A restarted
   agent connects at once with no wait, and the heartbeat-driven re-registration cooldown is
   unchanged and not randomised. Survivors absorb the returning share at the registration

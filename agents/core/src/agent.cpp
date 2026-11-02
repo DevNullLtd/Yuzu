@@ -3223,7 +3223,7 @@ public:
                                 if (hb_code == grpc::StatusCode::NOT_FOUND ||
                                     hb_code == grpc::StatusCode::UNAUTHENTICATED) {
                                     // A successful Register resets reconnect_count
-                                    // and the backoff delay (the normal backoff), so without a damper here
+                                    // and the backoff delay, so without a damper here
                                     // a server that reaps every fresh session would
                                     // drive a fleet-wide register→beat→reject→
                                     // register storm (governance UP-1). Apply an
