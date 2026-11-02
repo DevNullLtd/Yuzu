@@ -164,6 +164,17 @@ inline std::atomic<std::size_t>& export_body_byte_cap() {
     return cap;
 }
 
+/// Row bound for the `/fragments/results` FILTERED read (the facet-id lookup). The read asks
+/// for one row more than this so a cut is detectable; production reads the default and a unit
+/// test lowers it so truncation is reachable without storing 10,000 responses.
+inline constexpr int kResultsRowCap = 10000;
+
+/// Test seam over `kResultsRowCap`, same shape as `export_body_byte_cap()`.
+inline std::atomic<int>& results_row_cap() {
+    static std::atomic<int> cap{kResultsRowCap};
+    return cap;
+}
+
 /// Why an export was cut. Both can be set; `cause()` names the tighter one.
 struct ExportCut {
     bool row_cap{false};  ///< more matching rows existed beyond `limit`

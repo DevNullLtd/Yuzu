@@ -27,4 +27,19 @@ private:
     std::size_t saved_;
 };
 
+/// Scoped override of the `/fragments/results` filtered-read row cap (twin of the guard above).
+class ResultsRowCapGuard {
+public:
+    explicit ResultsRowCapGuard(int cap) : saved_(yuzu::server::results_row_cap().exchange(cap)) {}
+    ~ResultsRowCapGuard() { yuzu::server::results_row_cap().store(saved_); }
+
+    ResultsRowCapGuard(const ResultsRowCapGuard&) = delete;
+    ResultsRowCapGuard& operator=(const ResultsRowCapGuard&) = delete;
+    ResultsRowCapGuard(ResultsRowCapGuard&&) = delete;
+    ResultsRowCapGuard& operator=(ResultsRowCapGuard&&) = delete;
+
+private:
+    int saved_;
+};
+
 } // namespace yuzu::test

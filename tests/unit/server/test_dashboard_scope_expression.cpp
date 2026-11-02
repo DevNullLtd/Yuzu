@@ -25,13 +25,17 @@
 #include "dashboard_routes.hpp"
 #include "test_route_sink.hpp"
 
+#include "agent_registry.hpp"
 #include "dispatch_destructive_gate.hpp"
 #include "dispatch_target_shape.hpp"
+#include "event_bus.hpp"
 #include "mcp_input_bounds.hpp"
 #include "test_real_capability_registry.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -58,6 +62,10 @@ struct AuditRow {
 // Member order is load-bearing: `sink` last so it is destroyed first.
 struct Harness {
     yuzu::MetricsRegistry metrics;
+    // Only the built-in `help` command needs a registry (it renders the registry's help table);
+    // every other case runs with none, exactly as before.
+    detail::EventBus bus;
+    std::unique_ptr<detail::AgentRegistry> registry;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
     std::vector<DispatchCall> calls;
@@ -69,7 +77,9 @@ struct Harness {
     int sent = 3;
     std::pair<std::string, std::string> resolve_to{kReadOnly.first, kReadOnly.second};
 
-    Harness() {
+    explicit Harness(bool with_registry = false) {
+        if (with_registry)
+            registry = std::make_unique<detail::AgentRegistry>(bus, metrics);
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -95,7 +105,7 @@ struct Harness {
         };
         routes.register_routes(
             sink, auth_fn, perm_fn, audit_fn, /*response_store=*/nullptr, /*mg=*/nullptr,
-            /*registry=*/nullptr, /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+            registry.get(), /*tag_store=*/nullptr, /*event_bus=*/nullptr,
             [] { return std::string{"[]"}; }, dispatch,
             [](const httplib::Request&) -> yuzu::server::DispatchCaller {
                 return yuzu::server::DispatchCaller{.principal = "expr-op",
@@ -452,6 +462,51 @@ TEST_CASE("dashboard execute: only a dispatched send carries X-Yuzu-Dispatched, 
 
 // Same-site gate (browser_write_is_cross_site): a cookie session needs an Origin or Referer naming
 // this site. The refusal comes before any parsing, the audit-before-dispatch row and the dispatch.
+// ── #5677 / #6075: a Send (or help) replaces the results, so it aborts the old request ─────
+
+TEST_CASE("dashboard execute: a dispatch aborts an in-flight results request and stamps the pager "
+          "with the new command id",
+          "[server][dashboard][execute][sync]") {
+    Harness h;
+    auto res = h.post("instruction=version&scope=__all__");
+    REQUIRE(res->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    const std::string cmd = "cmd-1";
+
+    // HX-Trigger is JSON: the toast first, the abort LAST (htmx processes the header before the
+    // swap, and the in-flight xhr lives on the OLD #filter-bar).
+    const auto trigger = nlohmann::ordered_json::parse(res->get_header_value("HX-Trigger"));
+    REQUIRE(trigger.is_object());
+    REQUIRE(trigger.size() == 2);
+    CHECK(trigger.begin().key() == "showToast");
+    CHECK(std::prev(trigger.end()).key() == "htmx:abort");
+    CHECK(trigger.at("htmx:abort").at("target") == "#filter-bar");
+
+    // The stamp the page's swap guard compares a late /fragments/results response against.
+    CHECK(contains(res->body, "<nav id=\"result-pagination\" hx-swap-oob=\"true\" "
+                              "data-command-id=\"" + cmd + "\"></nav>"));
+    // The initializer exists for every dispatch, with or without a definition.
+    CHECK(contains(res->body, "<div id=\"chart-deck-host\" hx-swap-oob=\"true\" "
+                              "hx-get=\"/fragments/results?command_id=" + cmd +
+                                  "&amp;plugin=os_info\" hx-trigger=\"load delay:2s\" "
+                                  "hx-swap=\"none\"></div>"));
+    // Residual tripwire: there is no sort/page control in the placeholder window, so nothing in
+    // the dispatch body may re-read the filter bar (it would race the abort above).
+    CHECK_FALSE(contains(res->body, "hx-include=\"#filter-bar\""));
+}
+
+TEST_CASE("dashboard execute: help aborts an in-flight results request and clears the pager stamp",
+          "[server][dashboard][execute][sync]") {
+    Harness h(/*with_registry=*/true);
+    auto res = h.post("instruction=help&scope=__all__");
+    REQUIRE(res->status == 200);
+    CHECK(res->get_header_value("HX-Trigger") == R"({"htmx:abort":{"target":"#filter-bar"}})");
+    // outerHTML (not innerHTML): replacing the element also drops data-command-id.
+    CHECK(contains(res->body, "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>"));
+    CHECK_FALSE(contains(res->body, "<nav id=\"result-pagination\" hx-swap-oob=\"innerHTML\""));
+    CHECK(h.calls.empty());
+}
+
 TEST_CASE("dashboard execute: a cookie-session write without a same-site Origin is refused",
           "[server][dashboard][execute][csrf][security]") {
     Harness h;

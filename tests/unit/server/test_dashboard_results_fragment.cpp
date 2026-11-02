@@ -536,8 +536,8 @@ constexpr std::string_view kTooLongMarker = "data-filter-too-long";
 std::string expected_hint_text() {
     return "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
            " bytes. Newly stored responses do not index values that long, so this filter may "
-           "match nothing. Clear the filter (or switch the View to Default) and use the Search "
-           "box.";
+           "match nothing. Clear the filter, or tick 'View without saved filters', and use the "
+           "Search box.";
 }
 
 // The whole hint element, from its opening `<span` through `</span>`, so an echo check covers
@@ -938,6 +938,94 @@ TEST_CASE("/fragments/results: saved View defaults and the over-bound hint",
         REQUIRE(res);
         CHECK(contains(res->body, kTooLongMarker));
     }
+}
+
+// #5638: the View's authored equals filters are defaults; "View without saved filters" shows the
+// data without them for one request, and never drops a filter the operator set.
+TEST_CASE("/fragments/results: view_filters=off skips the View's equals defaults only",
+          "[pg][server][dashboard][fragment][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_frag_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+    is.set_require_signed_definitions(false);
+
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-view-off-1";
+    store_registry_output(rs, command_id, "short output");
+
+    InstructionDefinition def;
+    def.name = "view-off";
+    def.version = "1.0";
+    def.plugin = "registry";
+    def.action = "query";
+    def.type = "question";
+    def.description = "view_filters test";
+    def.enabled = true;
+    def.platforms = "windows,linux,darwin";
+    def.approval_mode = "auto";
+    // An AUTHORED DEFAULT whose equals filter matches nothing the agent returned.
+    def.response_templates_spec =
+        R"([{"id":"vw1","name":"v","default":true,"filters":[{"column":"Output","op":"equals","value":"nothing like it"}]}])";
+    auto id = is.create_definition(def);
+    REQUIRE(id.has_value());
+
+    FragmentResultsHarness h(&rs, &is);
+    wire_unfiltered_gate(h);
+    const std::string base = "/fragments/results?command_id=" + command_id +
+                             "&plugin=registry&definition_id=" + *id + "&template_id=vw1";
+
+    SECTION("without the switch the default applies and hides the row") {
+        auto res = h.get(base);
+        REQUIRE(res);
+        CHECK_FALSE(contains(res->body, "class=\"result-row\""));
+        CHECK(contains(res->body, "No results match your filters."));
+    }
+    SECTION("with the switch the row is shown") {
+        auto res = h.get(base + "&view_filters=off");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "class=\"result-row\""));
+        CHECK_FALSE(contains(res->body, "No results match your filters."));
+    }
+    SECTION("the switch never drops an operator filter") {
+        auto miss = h.get(base + "&view_filters=off&f_output=nothing+like+it");
+        REQUIRE(miss);
+        CHECK_FALSE(contains(miss->body, "class=\"result-row\""));
+        auto hit = h.get(base + "&view_filters=off&f_output=short+output");
+        REQUIRE(hit);
+        CHECK(contains(hit->body, "class=\"result-row\""));
+    }
+}
+
+// #5669: an operator-driven results response empties the Create Group slot (the form it holds was
+// built for the previous filters); the background refresh carries the same live filters and does not.
+TEST_CASE("/fragments/results: only an operator-driven response clears the Create Group slot",
+          "[pg][server][dashboard][fragment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-slot-1";
+    store_registry_output(rs, command_id, "some output");
+
+    FragmentResultsHarness h(&rs);
+    wire_unfiltered_gate(h);
+    const std::string url = "/fragments/results?command_id=" + command_id + "&plugin=registry";
+
+    auto operator_driven = h.get(url);
+    REQUIRE(operator_driven);
+    CHECK(contains(operator_driven->body, "<div id=\"group-form-slot\" hx-swap-oob=\"true\"></div>"));
+
+    auto refresh = h.get(url + "&refresh=1");
+    REQUIRE(refresh);
+    CHECK(refresh->status == 200);
+    CHECK_FALSE(contains(refresh->body, "group-form-slot"));
+    // The refresh still renders the summary it exists to update.
+    CHECK(contains(refresh->body, "id=\"result-summary\""));
 }
 
 // #4644: `page` / `per_page` are ONE base-10 integer or a 400: a malformed page used to

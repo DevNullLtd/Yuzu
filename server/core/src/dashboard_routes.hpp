@@ -39,6 +39,7 @@ class TagStore;
 class InstructionStore;
 class HttpRouteSink; // http_route_sink.hpp — the in-process-testable seam (#438)
 struct FacetFilter;
+struct StoredResponse; // response_store.hpp
 struct ForensicsServed; // forensics_read_audit.hpp - #4990
 struct EchoRetentionPausedScan; // echo_tree_routes.hpp — #4027 REST+MCP twin shape
 
@@ -46,6 +47,23 @@ namespace detail {
 class AgentRegistry;
 class EventBus;
 } // namespace detail
+
+/// The ONE htmx sync scope every console results request shares (View select, per-column
+/// controls, Search, sortable headers, Prev/Next, the Create Group button).
+///
+/// WHY `replace`: in the bundled htmx 2.0.4 `abort` DROPS a request issued while another is in
+/// flight (`d==="abort"){if(u.xhr){...return e}`), so `closest form:abort` / `this:abort` lose the
+/// operator's SECOND keystroke or click. `replace` is newest-wins: the in-flight request is
+/// aborted and the new one issued. The sync element is the filter bar, so a header or pager
+/// request (whose own element is not the form) still competes with a form request.
+inline constexpr std::string_view kResultsSyncScope = "#filter-bar:replace";
+
+/// `HX-Trigger` member that aborts whatever results request is in flight on the filter bar.
+/// A new dispatch (or a help answer) replaces the results; a late response for the previous
+/// command must not land on top. It is emitted LAST in the header: htmx processes the trigger
+/// before the swap, and the xhr lives on the sync element, which is the OLD #filter-bar.
+inline constexpr std::string_view kResultsAbortTrigger =
+    R"("htmx:abort":{"target":"#filter-bar"})";
 
 class DashboardRoutes {
 public:
@@ -341,8 +359,36 @@ private:
     std::vector<std::string> resolve_render_columns(const std::string& plugin,
                                                      const std::string& definition_id) const;
 
+    /// Phase-1 read shared by @ref render_results and @ref agents_matching_text: the stored
+    /// responses behind the column filters (all of them when @p filters is empty).
+    struct MatchingResponses {
+        std::vector<StoredResponse> responses;
+        bool store_degraded{false};  ///< a read failed: not "no results"
+        bool result_truncated{false}; ///< the row/byte cap cut the read: counts are partial
+        int64_t facet_agent_count{0}; ///< filtered branch only: agents behind @p filters
+    };
+    MatchingResponses load_matching_responses(const std::string& command_id,
+                                              const ResponseTierFilter& tier,
+                                              const std::vector<FacetFilter>& filters) const;
+
+    /// Distinct agent ids (first-seen order) with at least one line matching both the column
+    /// @p filters and the free-text @p text_query, using exactly the predicate the results table
+    /// renders. nullopt = the store is degraded. @p truncated is set when the read behind the set
+    /// was cut by the row/byte cap, i.e. the set is partial.
+    std::optional<std::vector<std::string>>
+    agents_matching_text(const std::string& command_id, const ResponseTierFilter& tier,
+                         const std::string& plugin, const std::vector<FacetFilter>& filters,
+                         const std::string& text_query, bool* truncated) const;
+
     /// Render filtered/sorted/paginated result rows + OOB thead, pagination,
-    /// summary. When @p definition_id is non-empty AND the definition has a
+    /// summary. Every sort/pager link carries only the identity of the view (command, plugin,
+    /// sort, dir, page, per_page, definition) and re-reads the LIVE filter bar through
+    /// `hx-include="#filter-bar"`, so a changed filter is never reverted by a stale baked URL.
+    /// `#result-pagination` carries `data-command-id` / `data-sort` / `data-dir` / `data-page` /
+    /// `data-per-page` for the client-side refresh and stale-command guard. The "N agents" count
+    /// is DISTINCT agents (a stored row is one frame, so one agent can own several), and when
+    /// @p text_query is set it counts only agents with a matching line; the Create Group button is
+    /// offered for a text query alone. When @p definition_id is non-empty AND the definition has a
     /// `spec.visualization`, an OOB chart deck fragment is appended to
     /// re-populate `#chart-deck-host` (issue #587).
     ///
@@ -375,7 +421,11 @@ private:
                                const authz::VisibleSet& scope = std::nullopt,
                                ForensicsServed* served = nullptr);
 
-    /// Render filter controls for a plugin schema. When @p definition_id is
+    /// Render filter controls for a plugin schema. Every control carries
+    /// @ref kResultsSyncScope; the form itself is `hx-sync="this:drop"` so the SSE-driven summary
+    /// refresh (issued from the form) is discarded, never queued, while a request is in flight.
+    /// When the definition has a template with an `equals` filter, a per-request
+    /// "View without saved filters" checkbox (`view_filters=off`) is rendered. When @p definition_id is
     /// non-empty it's emitted as a hidden form input so subsequent
     /// `hx-include="#filter-bar"` requests propagate it through to
     /// `/fragments/results` (which uses it to keep the chart deck live).
@@ -394,10 +444,16 @@ private:
     /// number — the store read that produces it can degrade, and "0 agents
     /// will be added" is a materially different, wrong claim from "the count
     /// could not be determined".
+    ///
+    /// @p text_query is the results page's Search term: it is part of the group definition
+    /// and travels as a hidden `q`. @p partial = the read behind the count was cut by the read
+    /// cap, so the count is not the group: the form says so and the submit is disabled.
     std::string render_create_group_form(const std::string& command_id,
                                           const std::string& plugin,
                                           const std::vector<FacetFilter>& filters,
-                                          std::optional<int64_t> agent_count);
+                                          std::optional<int64_t> agent_count,
+                                          const std::string& text_query = {},
+                                          bool partial = false);
 
     /// Render scope list with groups section.
     std::string render_scope_list(const std::string& selected, const std::string& username);

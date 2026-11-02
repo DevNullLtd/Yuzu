@@ -60,6 +60,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "response_store.hpp"
+#include "test_export_cap_guard.hpp"
 #include "test_forensics_tier_fixture.hpp"
 #include "test_mgmt_group_pg_helper.hpp"
 #include "test_route_sink.hpp"
@@ -134,6 +135,22 @@ void seed_matching_responses(ResponseStore& rs, std::initializer_list<std::strin
         r.output = "high|cat-a|title|detail\n";
         rs.store(r);
     }
+}
+
+/// One frame for `agent` with an explicit category and title (the Search term matches the title).
+void seed_titled_response(ResponseStore& rs, const std::string& agent, const std::string& category,
+                          const std::string& title) {
+    StoredResponse r;
+    r.instruction_id = kCommandId;
+    r.agent_id = agent;
+    r.status = 1;
+    r.plugin = kPlugin;
+    r.output = "high|" + category + "|" + title + "|detail\n";
+    rs.store(r);
+}
+
+std::string q_form_body(const std::string& group_name, const std::string& extra) {
+    return "group_name=" + group_name + "&command_id=" + kCommandId + "&plugin=" + kPlugin + extra;
 }
 
 struct GroupFromResultsHarness {
@@ -853,4 +870,147 @@ TEST_CASE("group-from-results: the success toast is valid single-line ASCII JSON
         CHECK(msg.find("...' created with 1 agents") != std::string::npos);
         CHECK(h.mg.find_group_by_name(name).has_value()); // the store keeps the full name
     }
+}
+
+// ── #5700: the results page's Search term is part of the group ──────────────
+
+TEST_CASE("group-from-results: the Search term alone defines the group (ground-truthed against "
+          "the store), and with a column filter the two intersect",
+          "[pg][server][dashboard][group_from_results][search]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-B", "cat-a", "beta");
+    seed_titled_response(h.rs(), "agent-C", "cat-b", "alpha2");
+
+    SECTION("q alone: exactly the agents with a matching line, whatever their category") {
+        auto res = h.post(q_form_body("q-only", "&q=alp"));
+        CHECK(res->status == 200);
+        CHECK(contains(res->get_header_value("HX-Trigger"), "created with 2 agents"));
+        auto group = h.mg.find_group_by_name("q-only");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A", "agent-C"});
+        // The audit row records that a Search term shaped the set, never the term itself.
+        CHECK(contains(h.audit_detail("group.create_from_results", "success"), "text_query=1"));
+        CHECK_FALSE(contains(h.audit_detail("group.create_from_results", "success"), "alp"));
+    }
+    SECTION("q with a column filter: the intersection, not either alone") {
+        auto res = h.post(q_form_body("q-and-filter", "&f_category=cat-a&q=alp"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("q-and-filter");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
+    }
+    SECTION("no q: the filter-only path is unchanged and carries no marker") {
+        auto res = h.post(q_form_body("filter-only", "&f_category=cat-a"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("filter-only");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A", "agent-B"});
+        CHECK_FALSE(contains(h.audit_detail("group.create_from_results", "success"), "text_query"));
+    }
+    SECTION("a q that matches nothing: the existing 422, now with a toast, and no group row") {
+        auto res = h.post(q_form_body("q-none", "&q=zzznomatch"));
+        CHECK(res->status == 422);
+        CHECK(contains(res->body, "No agents match the current filters."));
+        CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
+        CHECK(contains(res->get_header_value("HX-Trigger"), "showToast"));
+        CHECK_FALSE(h.mg.find_group_by_name("q-none").has_value());
+    }
+}
+
+TEST_CASE("create-group-form: previews the Search-term count and carries q as a hidden field",
+          "[pg][server][dashboard][group_from_results][search]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-B", "cat-a", "beta");
+    seed_titled_response(h.rs(), "agent-C", "cat-b", "alpha2");
+    const std::string base = std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                             "&plugin=" + kPlugin;
+
+    auto res = h.sink.Get(base + "&q=alp");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    CHECK(contains(res->body, "2 agents will be added"));
+    CHECK(contains(res->body, "<input type=\"hidden\" name=\"q\" value=\"alp\">"));
+    CHECK_FALSE(contains(res->body, "disabled"));
+
+    // A quote in the term is HTML-escaped once, never raw and never double-escaped.
+    auto quoted = h.sink.Get(base + "&q=a%22b");
+    REQUIRE(quoted != nullptr);
+    CHECK(contains(quoted->body, "name=\"q\" value=\"a&quot;b\""));
+    CHECK_FALSE(contains(quoted->body, "a\"b"));
+    CHECK_FALSE(contains(quoted->body, "&amp;quot;"));
+
+    // No q: no hidden q field (the filter-only form is byte-compatible with before).
+    auto plain = h.sink.Get(base + "&f_category=cat-a");
+    REQUIRE(plain != nullptr);
+    CHECK_FALSE(contains(plain->body, "name=\"q\""));
+}
+
+// A set cut by a read cap is partial; a group is never materialised from it.
+TEST_CASE("group-from-results: a Search over a read cut by the byte cap is refused with a toast",
+          "[pg][server][dashboard][group_from_results][search][truncation]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-B", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-C", "cat-a", "alpha");
+    yuzu::test::ExportByteCapGuard cap{1}; // every row past the first is cut
+    const std::string base = std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                             "&plugin=" + kPlugin;
+
+    auto form = h.sink.Get(base + "&q=alp");
+    REQUIRE(form != nullptr);
+    CHECK(contains(form->body, "agent count is partial"));
+    CHECK(contains(form->body, "<button type=\"submit\" disabled>"));
+    CHECK_FALSE(contains(form->body, "agents will be added"));
+
+    auto res = h.post(q_form_body("cut-by-bytes", "&q=alp"));
+    CHECK(res->status == 422);
+    CHECK(contains(res->get_header_value("HX-Trigger"), "showToast"));
+    CHECK(contains(res->get_header_value("HX-Trigger"), "partial"));
+    CHECK_FALSE(h.mg.find_group_by_name("cut-by-bytes").has_value());
+}
+
+TEST_CASE("group-from-results: a Search plus a column filter over a read cut by the row cap is "
+          "refused, not materialised as a smaller group",
+          "[pg][server][dashboard][group_from_results][search][truncation]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-B", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-C", "cat-a", "alpha");
+    yuzu::test::ResultsRowCapGuard cap{2};
+    const std::string base = std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                             "&plugin=" + kPlugin + "&f_category=cat-a&q=alp";
+
+    auto form = h.sink.Get(base);
+    REQUIRE(form != nullptr);
+    CHECK(contains(form->body, "agent count is partial"));
+    CHECK(contains(form->body, "<button type=\"submit\" disabled>"));
+
+    auto res = h.post(q_form_body("cut-by-rows", "&f_category=cat-a&q=alp"));
+    CHECK(res->status == 422);
+    CHECK(contains(res->get_header_value("HX-Trigger"), "showToast"));
+    CHECK_FALSE(h.mg.find_group_by_name("cut-by-rows").has_value());
+
+    // Control: a cap that holds every match lets the same request through.
+    yuzu::test::ResultsRowCapGuard roomy{3};
+    auto ok = h.post(q_form_body("not-cut", "&f_category=cat-a&q=alp"));
+    CHECK(ok->status == 200);
+    auto group = h.mg.find_group_by_name("not-cut");
+    REQUIRE(group.has_value());
+    CHECK(member_ids_of(h.mg, group->id) ==
+          std::set<std::string>{"agent-A", "agent-B", "agent-C"});
+}
+
+TEST_CASE("group-from-results: a duplicate group name is refused with the same toast channel",
+          "[pg][server][dashboard][group_from_results]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    REQUIRE(h.post(GroupFromResultsHarness::form_body("dup-name"))->status == 200);
+
+    auto res = h.post(GroupFromResultsHarness::form_body("dup-name"));
+    CHECK(res->status == 400);
+    CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
+    CHECK(contains(res->body, "A group with that name already exists."));
+    CHECK(contains(res->get_header_value("HX-Trigger"), "showToast"));
 }

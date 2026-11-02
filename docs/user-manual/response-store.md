@@ -353,6 +353,10 @@ operator-visible notes:
     page shows a hint when a filter value is over 2048 bytes, the REST and MCP agent-count previews
     name such a filter in `unindexed_filter_keys`, and the create-group form and the group-from-results
     `422` say the count may be wrong.
+  - **Search term.** On the results page the Search term is part of the group-from-results definition
+    and of the "N agents" count (distinct agents with a matching line); the facet-index caveats on
+    this page apply to the column filters only. A set whose read was cut by the read cap is partial
+    and is refused rather than made into a smaller group.
   - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column
     index ascending, then value ascending, so the same output always keeps the same facets. A rare
     value (one line, such as a single package on one host) sorts late and is the first to be cut.
