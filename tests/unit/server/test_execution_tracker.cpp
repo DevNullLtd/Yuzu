@@ -12,20 +12,26 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "test_execution_tracker_pg_helper.hpp"
+#include "source_scan.hpp" // #3834: wiring pin for the server.cpp seed call
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
 
+#include <yuzu/metrics.hpp>
+
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <expected>
+#include <functional>
 #include <latch>
 #include <memory>
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -4355,4 +4361,350 @@ TEST_CASE("ExecutionTracker: reap_stuck_running_executions does NOT recover "
         REQUIRE(PQntuples(res.get()) == 1);
         CHECK(std::string(PQgetvalue(res.get(), 0, 0)) == std::to_string(anchor_a) + ":forward");
     }
+}
+
+// ── #3834: read-degrade counter ─────────────────────────────────────────────
+//
+// yuzu_server_execution_tracker_read_degrade_total{method,reason} is bumped at every degrade
+// branch of the five `_checked` readers. These tests pin: the closed label sets (5 x 3 = 15
+// series, all pre-seeded to 0, label VALUES included), that each reason is attributed to the
+// right (method, reason) pair and to NOTHING else, that the unchecked wrappers that delegate are
+// counted, that a healthy read - including an empty or not-found one - is not a degrade, and that
+// server.cpp still seeds the family once.
+//
+// The label values below are spelled here independently of production on purpose: a typo in a
+// production constant must fail a test, not be mirrored by it.
+
+static constexpr const char* kDegradeMetric = "yuzu_server_execution_tracker_read_degrade_total";
+static constexpr std::array<const char*, 5> kDegradeMethods{
+    "query_executions", "get_execution", "get_agent_statuses", "get_agent_statuses_for_executions",
+    "get_children"};
+static constexpr std::array<const char*, 3> kDegradeReasons{"store_not_open", "pool_acquire_timeout",
+                                                            "query_error"};
+
+static double degrade_count(yuzu::MetricsRegistry& m, const std::string& method,
+                            const std::string& reason) {
+    return m.counter(kDegradeMetric, {{"method", method}, {"reason", reason}}).value();
+}
+
+// Every series of the family must be 0 except (method, reason), which must be exactly `expected`.
+// Checking all 15 (not just the one) is what catches a branch attributed to the wrong label.
+// Pass method == "" to assert that NOTHING moved.
+static void check_only_degrade_series(yuzu::MetricsRegistry& m, const std::string& method,
+                                      const std::string& reason, double expected = 1.0) {
+    for (const char* mm : kDegradeMethods)
+        for (const char* rr : kDegradeReasons) {
+            INFO("series method=" << mm << " reason=" << rr << " (expected hit: " << method << "/"
+                                  << reason << ")");
+            CHECK(degrade_count(m, mm, rr) == ((method == mm && reason == rr) ? expected : 0.0));
+        }
+}
+
+namespace {
+
+// Wires `m` into the tracker for one scope and ALWAYS unwires it on exit, including when a
+// REQUIRE throws mid-scope, so the tracker can never be left holding a pointer to a registry that
+// has gone out of scope. Declare it AFTER the registry so it is destroyed (unwired) first.
+class MetricsWire {
+public:
+    MetricsWire(ExecutionTracker& tracker, yuzu::MetricsRegistry& m) : tracker_(tracker) {
+        tracker_.set_metrics(&m);
+    }
+    ~MetricsWire() { tracker_.set_metrics(nullptr); }
+    MetricsWire(const MetricsWire&) = delete;
+    MetricsWire& operator=(const MetricsWire&) = delete;
+
+private:
+    ExecutionTracker& tracker_;
+};
+
+struct DegradeReader {
+    const char* method;
+    std::function<void(ExecutionTracker&)> call;
+};
+
+// One call per `_checked` reader, on arguments that make each reach its pool/query path (a
+// non-empty execution-id list for the batch reader, which short-circuits success-empty otherwise).
+std::vector<DegradeReader> degrade_readers() {
+    return {
+        {"query_executions",
+         [](ExecutionTracker& t) { (void)t.query_executions_checked(ExecutionQuery{}); }},
+        {"get_execution", [](ExecutionTracker& t) { (void)t.get_execution_checked("exec-1"); }},
+        {"get_agent_statuses",
+         [](ExecutionTracker& t) { (void)t.get_agent_statuses_checked("exec-1"); }},
+        {"get_agent_statuses_for_executions",
+         [](ExecutionTracker& t) { (void)t.get_agent_statuses_for_executions_checked({"exec-1"}); }},
+        {"get_children",
+         [](ExecutionTracker& t) { (void)t.get_children_checked("exec-1", std::nullopt); }},
+    };
+}
+
+} // namespace
+
+TEST_CASE("ExecutionTracker: seed_read_degrade_metrics pre-seeds exactly the 15 closed series at 0",
+          "[execution_tracker]") {
+    yuzu::MetricsRegistry m;
+    ExecutionTracker::seed_read_degrade_metrics(m);
+
+    const std::string out = m.serialize();
+    // Count this family's sample lines: `<name>{...} 0`. HELP/TYPE lines also contain the name,
+    // so anchor on the sample shape (the name immediately followed by `{`).
+    const std::string prefix = std::string(kDegradeMetric) + "{";
+    std::size_t samples = 0;
+    for (std::size_t pos = out.find(prefix); pos != std::string::npos;
+         pos = out.find(prefix, pos + 1)) {
+        ++samples;
+        const auto eol = out.find('\n', pos);
+        REQUIRE(eol != std::string::npos);
+        const std::string line = out.substr(pos, eol - pos);
+        INFO("sample line: " << line);
+        CHECK(line.ends_with(" 0")); // pre-seeded, nothing has degraded
+    }
+    CHECK(samples == kDegradeMethods.size() * kDegradeReasons.size());
+    CHECK(out.find(std::string("# TYPE ") + kDegradeMetric + " counter") != std::string::npos);
+
+    // The label VALUES, from this test's own literals: a typo in a production constant would still
+    // give 15 samples, so counting alone is not evidence of what was seeded.
+    for (const char* method : kDegradeMethods)
+        for (const char* reason : kDegradeReasons) {
+            const std::string expected = std::string(kDegradeMetric) + "{method=\"" + method +
+                                         "\",reason=\"" + reason + "\"} 0\n";
+            INFO("expected sample: " << expected);
+            CHECK(out.find(expected) != std::string::npos);
+        }
+
+    // HELP must stay 7-bit ASCII (scripts/ci/check-metrics-help-ascii.sh).
+    CHECK(std::ranges::all_of(out, [](unsigned char ch) { return ch < 0x80; }));
+
+    // Seeding is idempotent: a second call neither duplicates series nor bumps a value.
+    ExecutionTracker::seed_read_degrade_metrics(m);
+    CHECK(m.serialize() == out);
+}
+
+TEST_CASE("ExecutionTracker: ServerImpl still seeds the read-degrade counter, exactly once",
+          "[execution_tracker]") {
+    // Wiring pin for the issue's "pre-seed to 0 at startup" criterion: the seed function is only
+    // useful while server.cpp still calls it. Counted in comment-free source so a commented-out
+    // call or a prose mention does not satisfy it. A count of 0 fails loudly, including if the
+    // comment stripper (it keeps string literals intact, see source_scan.hpp) ever swallows the
+    // call site. Limits: it does not see preprocessor exclusion (`#if 0`), and it proves the call
+    // EXISTS, not that it runs in the store-open branch - that placement is reviewed, not
+    // machine-checked.
+    const std::string& src = yuzu::test::source_scan::comment_free_source("server.cpp");
+    const std::string call = "ExecutionTracker::seed_read_degrade_metrics(metrics_)";
+    std::size_t live_calls = 0;
+    for (auto pos = src.find(call); pos != std::string::npos; pos = src.find(call, pos + 1))
+        ++live_calls;
+    INFO("expected exactly one live call to "
+         << call << " in server.cpp; 0 means it was removed, renamed (the member `metrics_`?) or "
+                    "moved out of server.cpp - the pre-seed at startup would be lost");
+    CHECK(live_calls == 1);
+}
+
+TEST_CASE("ExecutionTracker: a closed store counts store_not_open against the right method only",
+          "[execution_tracker]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid());
+    ExecutionTracker closed(unreachable);
+    REQUIRE(!closed.is_open());
+
+    for (const auto& reader : degrade_readers()) {
+        INFO("method " << reader.method);
+        yuzu::MetricsRegistry m;
+        ExecutionTracker::seed_read_degrade_metrics(m);
+        {
+            MetricsWire wire(closed, m);
+            reader.call(closed);
+        }
+        check_only_degrade_series(m, reader.method, "store_not_open");
+    }
+
+    SECTION("the unchecked wrappers that delegate to a _checked body are counted too") {
+        yuzu::MetricsRegistry m;
+        ExecutionTracker::seed_read_degrade_metrics(m);
+        {
+            MetricsWire wire(closed, m);
+            (void)closed.query_executions(ExecutionQuery{});
+            (void)closed.get_agent_statuses("exec-1");
+            (void)closed.get_agent_statuses_for_executions({"exec-1"});
+            (void)closed.get_children("exec-1");
+        }
+        for (const char* method : {"query_executions", "get_agent_statuses",
+                                   "get_agent_statuses_for_executions", "get_children"})
+            CHECK(degrade_count(m, method, "store_not_open") == 1.0);
+        // get_execution() (unchecked) has its own body and does NOT delegate to the _checked one.
+        CHECK(degrade_count(m, "get_execution", "store_not_open") == 0.0);
+    }
+
+    SECTION("a success-empty read (empty execution-id list) is not a degrade") {
+        yuzu::MetricsRegistry m;
+        ExecutionTracker::seed_read_degrade_metrics(m);
+        std::optional<std::unordered_map<std::string, std::vector<AgentExecStatus>>> empty_ids;
+        {
+            MetricsWire wire(closed, m);
+            empty_ids = closed.get_agent_statuses_for_executions_checked({});
+        }
+        REQUIRE(empty_ids.has_value());
+        check_only_degrade_series(m, "", "", 0.0); // nothing moved anywhere
+    }
+
+    SECTION("a tracker with no metrics wired degrades without crashing") {
+        closed.set_metrics(nullptr);
+        for (const auto& reader : degrade_readers())
+            reader.call(closed);
+    }
+}
+
+TEST_CASE("ExecutionTracker: pool exhaustion counts pool_acquire_timeout for every _checked reader",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg bundle;
+
+    // A second tracker over a size-1 pool whose only connection we hold: every reader's bounded
+    // acquire must fail and be attributed to pool_acquire_timeout. The tracker is constructed
+    // BEFORE the lease is taken (its constructor acquires unboundedly and would block on a held
+    // connection). The wait is clamped by the pool's saturated fast-fail, so no timing is asserted.
+    pg::PgPool tiny{{.conninfo = bundle.dsn(), .size = 1}};
+    REQUIRE(tiny.valid());
+    ExecutionTracker tracker(tiny);
+    REQUIRE(tracker.is_open());
+    auto held = tiny.acquire();
+    REQUIRE(held);
+
+    for (const auto& reader : degrade_readers()) {
+        INFO("method " << reader.method);
+        yuzu::MetricsRegistry m;
+        ExecutionTracker::seed_read_degrade_metrics(m);
+        {
+            MetricsWire wire(tracker, m);
+            reader.call(tracker);
+        }
+        check_only_degrade_series(m, reader.method, "pool_acquire_timeout");
+    }
+}
+
+TEST_CASE("ExecutionTracker: a failing statement counts query_error for every _checked reader",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg bundle;
+    ExecutionTracker& tracker = *bundle;
+
+    // Drop both tables out from under the open store (this fixture's database is ephemeral and
+    // private to the test): the store is still open_ and a lease is available, so the ONLY thing
+    // that can go wrong is the statement - exactly the query_error branch.
+    {
+        auto lease = bundle.pool().acquire();
+        REQUIRE(lease);
+        for (const char* ddl : {"DROP TABLE execution_tracker.agent_exec_status CASCADE",
+                                "DROP TABLE execution_tracker.executions CASCADE"}) {
+            pg::PgResult r = pg::exec_params(lease.get(), ddl, std::vector<std::string>{});
+            REQUIRE(r.status() == PGRES_COMMAND_OK);
+        }
+    }
+
+    for (const auto& reader : degrade_readers()) {
+        INFO("method " << reader.method);
+        yuzu::MetricsRegistry m;
+        ExecutionTracker::seed_read_degrade_metrics(m);
+        {
+            MetricsWire wire(tracker, m);
+            reader.call(tracker);
+        }
+        check_only_degrade_series(m, reader.method, "query_error");
+    }
+}
+
+TEST_CASE("ExecutionTracker: get_children_checked's statement timeout counts query_error, not "
+          "pool_acquire_timeout",
+          "[pg][execution_tracker]") {
+    // The real timeout path (a held ACCESS EXCLUSIVE lock, as in the statement_timeout test
+    // above), as opposed to the dropped-table path: a lease IS acquired and the SET LOCAL
+    // statement_timeout fires inside the transaction, so it must be attributed to query_error.
+    yuzu::test::ExecutionTrackerPg bundle;
+    ExecutionTracker& tracker = *bundle;
+
+    auto parent = tracker.create_execution(make_execution());
+    REQUIRE(parent.has_value());
+
+    pg::PgConn locker{PQconnectdb(bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE execution_tracker.executions IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    yuzu::MetricsRegistry m;
+    ExecutionTracker::seed_read_degrade_metrics(m);
+    std::optional<ExecutionChildrenResult> checked;
+    {
+        MetricsWire wire(tracker, m);
+        checked = tracker.get_children_checked(*parent, std::nullopt);
+    }
+
+    (void)pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{});
+
+    CHECK_FALSE(checked.has_value());
+    check_only_degrade_series(m, "get_children", "query_error");
+}
+
+TEST_CASE("ExecutionTracker: healthy reads, including empty and not-found ones, never move the "
+          "degrade counter",
+          "[pg][execution_tracker]") {
+    // The negative control the degraded-path tests above cannot give: an emit that drifted onto a
+    // SUCCESS path (a not-found get_execution, an empty list, a parent with no children) would pass
+    // every one of them. Success-empty is the documented non-degrade, so it is pinned here.
+    yuzu::test::ExecutionTrackerPg bundle;
+    ExecutionTracker& tracker = *bundle;
+
+    auto parent = tracker.create_execution(make_execution());
+    REQUIRE(parent.has_value());
+    AgentExecStatus status;
+    status.agent_id = "agent-1";
+    status.status = "success";
+    tracker.update_agent_status(*parent, status);
+
+    yuzu::MetricsRegistry m;
+    ExecutionTracker::seed_read_degrade_metrics(m);
+    {
+        MetricsWire wire(tracker, m);
+
+        // Populated.
+        CHECK(tracker.query_executions_checked(ExecutionQuery{}).has_value());
+        auto found = tracker.get_execution_checked(*parent);
+        REQUIRE(found.has_value());
+        CHECK(found->has_value());
+        auto statuses = tracker.get_agent_statuses_checked(*parent);
+        REQUIRE(statuses.has_value());
+        CHECK_FALSE(statuses->empty());
+        CHECK(tracker.get_agent_statuses_for_executions_checked({*parent}).has_value());
+
+        // Success-empty: absent id, a filter that matches nothing, an empty id list, no children.
+        auto missing = tracker.get_execution_checked("no-such-execution");
+        REQUIRE(missing.has_value());
+        CHECK_FALSE(missing->has_value());
+        ExecutionQuery matches_nothing;
+        matches_nothing.definition_id = "no-such-definition";
+        auto none = tracker.query_executions_checked(matches_nothing);
+        REQUIRE(none.has_value());
+        CHECK(none->empty());
+        auto no_statuses = tracker.get_agent_statuses_checked("no-such-execution");
+        REQUIRE(no_statuses.has_value());
+        CHECK(no_statuses->empty());
+        CHECK(tracker.get_agent_statuses_for_executions_checked({"no-such-execution"}).has_value());
+        CHECK(tracker.get_agent_statuses_for_executions_checked({}).has_value());
+        auto no_children = tracker.get_children_checked(*parent, std::nullopt);
+        REQUIRE(no_children.has_value());
+        CHECK(no_children->children.empty());
+
+        // The unchecked wrappers on the healthy path.
+        (void)tracker.query_executions(ExecutionQuery{});
+        (void)tracker.get_execution(*parent);
+        (void)tracker.get_agent_statuses(*parent);
+        (void)tracker.get_agent_statuses_for_executions({*parent});
+        (void)tracker.get_children(*parent);
+    }
+
+    check_only_degrade_series(m, "", "", 0.0); // nothing moved anywhere
 }
