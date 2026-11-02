@@ -237,8 +237,9 @@ AGPL-3.0-or-later. The `yuzu_drogon_canary` executable is not installed
 trantor libraries may be staged there. BSD-3-Clause requires its notice in binary
 redistribution, so `NOTICE` now lists drogon and trantor with their copyright holders (taken
 from the vcpkg port's `copyright` files). No release path ships `NOTICE` or the vcpkg `copyright` files (checked: `release.yml`, the Inno
-Setup files, and the rpm and debian packaging); staging them in the release archives is a
-separate follow-up. Drogon's other bundled libraries were not checked.
+Setup files, the rpm and debian packaging, and the `deploy/docker` Dockerfiles, whose shipped
+images copy only the binaries, plugins and gateway release); staging them in the release
+archives and images is a separate follow-up. Drogon's other bundled libraries were not checked.
 
 A future cpp-httplib bump should follow the BUMP CHECKLIST comment in
 `server/core/src/body_cap_httplib.hpp`.
