@@ -633,6 +633,7 @@ yuzu_server_core_lib = static_library(
     'src/auth_routes.cpp',
     'src/authz_gates.cpp',
     'src/mfa_step_up.cpp',
+    'src/post_read_stage.cpp', # per-server post-read stage (body cap + step-up) the HttplibRouteSink wraps handlers with
     'src/route_inventory.cpp', # process-wide record of HttplibRouteSink registrations (boot-time step-up sweep)
     'src/step_up_gate.cpp', # MFA step-up decide/render split + request chokepoint (policy table: src/step_up_policy.hpp)
     'src/mfa_qr.cpp',

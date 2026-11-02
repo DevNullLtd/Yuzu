@@ -374,8 +374,9 @@ handler gate. Other mutating routes (73 REST rows are still
 `kPendingRuling`) and all MCP tools are not MFA-step-up gated in this
 release. The decision no longer lives only in each handler:
 `step_up_policy.hpp`'s `kStepUpPolicy` classifies every mutating route by its
-exact `(method, registered pattern)`, and the pre-request stage
-(`run_pre_request_stage` in `step_up_wiring.hpp`, installed by `server.cpp`)
+exact `(method, registered pattern)`, and the post-read stage
+(`run_post_read_stage` in `step_up_wiring.hpp`, installed by `server.cpp` through
+`PostReadStageRegistry` and run by the route sink)
 evaluates it before any handler runs. The gate's decision tree is unchanged;
 only where it is invoked, the order relative to the handler's authorization
 and its own CSRF copy (step-up first; for a cookie session the server-wide
@@ -735,8 +736,9 @@ regress:
 
 9. **There is one step-up table, and it fails closed.** The set of routes that
    need a fresh MFA proof is `kStepUpPolicy` in `step_up_policy.hpp`, evaluated
-   once per request by the chokepoint in the pre-request stage
-   (`run_pre_request_stage` in `step_up_wiring.hpp`, installed by `server.cpp`).
+   once per request by the chokepoint in the post-read stage
+   (`run_post_read_stage` in `step_up_wiring.hpp`, installed by `server.cpp` through
+   `PostReadStageRegistry` and run by the route sink).
    Regressions to guard against: (a) a second list of gated routes, or a new
    per-handler `step_up_fn` call used as the only enforcement for a route (a
    handler can forget it; the table cannot be bypassed by omission); (b) a

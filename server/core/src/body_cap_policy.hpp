@@ -85,16 +85,19 @@
 /// above for why — kept in sync with `docs/user-manual/rest-api.md` "Pre-Auth
 /// Request Body Caps".
 ///
-/// That gap is narrower than it once was: `server.cpp`'s `set_pre_request_
-/// handler` (body-cap-post-read-stage) is a SECOND chokepoint, driven by the
+/// That gap is narrower than it once was: the post-read stage (body-cap-post-read-stage,
+/// `step_up_wiring.hpp`'s `run_post_read_stage`) is a SECOND chokepoint, driven by the
 /// SAME `resolve_body_cap` table, that runs after httplib has read the body
 /// into `req.body` but before the route handler runs — so a chunked body
 /// that turns out to be over this table's cap is still refused, just after
 /// being buffered rather than before. It closes "reaches a handler
-/// uncapped", not "gets buffered uncapped" — see that handler's own doc
-/// comment for what it does and does not cover (notably: it cannot see a
+/// uncapped", not "gets buffered uncapped" — see the comment at its install
+/// in `server.cpp` for what it does and does not cover (notably: it cannot see a
 /// multipart request's body at all, since httplib never copies multipart
-/// content into `req.body`).
+/// content into `req.body`). It is installed through `PostReadStageRegistry`
+/// (`post_read_stage.hpp`) and run by `HttplibRouteSink`'s handler wrapper, NOT as
+/// `httplib::Server::set_pre_request_handler`: from cpp-httplib v0.47.0 that handler
+/// runs BEFORE the body is read, so a body-size check hung there would always see 0 bytes.
 ///
 ///
 /// ROUTED-CONCERN ROW: `.claude/routed-concerns-access-control.md`, which

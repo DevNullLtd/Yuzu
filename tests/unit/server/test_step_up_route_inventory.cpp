@@ -438,6 +438,66 @@ TEST_CASE("step-up route inventory L3 (lexical): L1 never sees a route the scan 
     CHECK(scanned.size() >= l1_registered().size());
 }
 
+TEST_CASE("step-up route inventory: only the redirect listener's sink opts out of the post-read "
+          "stage, and no source registers a verb on a server directly",
+          "[stepup][inventory][l3][postread]") {
+    // `HttplibRouteSink` fails closed when its server has no post-read stage (body cap + step-up),
+    // so the one way to register an unstaged route is `StageRequirement::ExemptNoStage`, or a verb
+    // call on the httplib server itself that skips the sink (and so the stage and the inventory).
+    // Both are pinned here by a lexical scan, comment text excluded. Tests are not scanned: they
+    // opt out freely, and that is not a production route.
+    const auto code_of = [](const std::string& text) {
+        std::string out;
+        std::size_t pos = 0;
+        while (pos < text.size()) {
+            const auto nl = text.find('\n', pos);
+            const auto end = nl == std::string::npos ? text.size() : nl;
+            auto line = text.substr(pos, end - pos);
+            if (const auto c = line.find("//"); c != std::string::npos)
+                line.resize(c);
+            out += line;
+            out += '\n';
+            pos = end + 1;
+        }
+        return out;
+    };
+    const auto count_of = [](const std::string& hay, std::string_view needle) {
+        std::size_t n = 0;
+        for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+
+    std::size_t exempt_total = 0;
+    std::vector<std::string> exempt_in, direct;
+    std::size_t files_checked = 0;
+    const auto scan_corpus = [&](const auto& files) {
+        for (const auto& [file, text] : files) {
+            if (file.find("http_route_sink.hpp") != std::string::npos)
+                continue; // the sink itself defines the verbs and the exemption
+            ++files_checked;
+            const auto code = code_of(text);
+            if (const auto n = count_of(code, "StageRequirement::ExemptNoStage"); n > 0) {
+                exempt_total += n;
+                exempt_in.push_back(file);
+            }
+            for (const char* recv : {"web_server_->", "redirect_server_->"})
+                for (const char* verb : {"Get(", "Post(", "Put(", "Delete(", "Patch(", "Options("})
+                    if (count_of(code, std::string(recv) + verb) > 0)
+                        direct.push_back(file + " " + recv + verb);
+        }
+    };
+    scan_corpus(scan::read_all_cpp_files(YUZU_SERVER_SRC_DIR));
+    scan_corpus(scan::read_all_header_files(YUZU_SERVER_SRC_DIR));
+    CHECK(files_checked > 500);
+    INFO("ExemptNoStage appears in: " << join(exempt_in));
+    CHECK(exempt_total == 1);
+    REQUIRE(exempt_in.size() == 1);
+    CHECK(exempt_in.front().find("server.cpp") != std::string::npos);
+    INFO("Direct verb calls on a server, bypassing the sink:\n" << join(direct));
+    CHECK(direct.empty());
+}
+
 TEST_CASE("step-up route inventory: no server source registers a route on a receiver other than "
           "the sink",
           "[stepup][inventory][l3]") {
@@ -653,7 +713,7 @@ TEST_CASE("step-up boot sweep: a synthetic unclassified mutating route is named 
           "[stepup][inventory][boot]") {
     httplib::Server svr; // never listens: no port, no thread (#438)
     RouteInventory::instance().forget(&svr);
-    HttplibRouteSink sink(svr);
+    HttplibRouteSink sink(svr, yuzu::server::StageRequirement::ExemptNoStage);
     const httplib::Server::Handler noop = [](const httplib::Request&, httplib::Response&) {};
 
     SECTION("a classified route and read-only verbs pass") {
@@ -686,7 +746,7 @@ TEST_CASE("step-up boot sweep: a synthetic unclassified mutating route is named 
     SECTION("another server's registrations are not this server's") {
         httplib::Server other;
         RouteInventory::instance().forget(&other);
-        HttplibRouteSink other_sink(other);
+        HttplibRouteSink other_sink(other, yuzu::server::StageRequirement::ExemptNoStage);
         other_sink.Post("/yuzu_test_on_the_other_server", noop);
         CHECK(step_up_unclassified_registrations(&svr).empty());
         CHECK(step_up_unclassified_registrations(&other).size() == 1);

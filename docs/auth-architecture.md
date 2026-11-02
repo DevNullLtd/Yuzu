@@ -695,10 +695,17 @@ by each handler.
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
   table has 235 REST rows: 37 `kRequired`, 3 `kOwnGate`, 122 `kExempt` and 73
   `kPendingRuling`.
-- **Where it runs.** In `run_pre_request_stage` (`step_up_wiring.hpp`), the
-  body of the pre-request handler `server.cpp` installs: after the route
-  is matched and the body is read (and after the post-read body cap, which
-  lives in the same function), before any handler. The order for a `kRequired` route is therefore: session
+- **Where it runs.** In `run_post_read_stage` (`step_up_wiring.hpp`), the
+  body of the post-read stage `server.cpp` installs through
+  `PostReadStageRegistry` and the route sink runs in front of every handler:
+  after the route is matched and the body is read (and after the post-read body
+  cap, which lives in the same function), before the handler. The sink fails
+  closed: registering a route on a server with no stage installed throws, so a
+  route owner on such a server cannot serve an ungated route; the plaintext
+  redirect listener is the one production server built with the explicit
+  `StageRequirement::ExemptNoStage`. It is not
+  httplib's `set_pre_request_handler`, which runs before the body is read from
+  cpp-httplib v0.47.0. The order for a `kRequired` route is therefore: session
   resolution (`401` when there is none), for a cookie session the server-wide
   same-site gate (`403` `cross-site request refused`; pre-routing, see
   [Same-site gate for cookie-session writes](#same-site-gate-for-cookie-session-writes);

@@ -608,8 +608,8 @@ public:
     /// Guardian rule create/update/delete/push, software package create,
     /// software deploy start, user delete/role-change, and the engine-principal
     /// and RBAC assignment routes). The routes that need step-up are classified
-    /// in step_up_policy.hpp; for those, the central check in server.cpp's
-    /// pre-request handler (step_up_gate.hpp) evaluates the same decision
+    /// in step_up_policy.hpp; for those, the central check in the post-read
+    /// stage `server.cpp` installs (step_up_gate.hpp) evaluates the same decision
     /// BEFORE the handler runs, ahead of the handler's own permission and
     /// its own cross-site copy (a cookie write has already met the server-wide
     /// same-site gate in pre-routing), and this functor repeats it from that
