@@ -177,6 +177,21 @@ code.
 
 ## Gates outside the tier ladder
 
+### Browser smoke (`/test` Phase 5, `tests/puppeteer/ui-smoke.mjs`)
+
+A local gate in `/test`, not a CI job. It drives a headless browser against the running
+dashboard: it crawls every route the shell nav links to (200, the `Content-Security-Policy`
+header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
+discovered routes against `EXPECTED`, a hand-copied list of the nav in `app_shell.cpp`, in both
+directions, checks that submit controls stay inside their form or dialog at two viewport sizes,
+and runs four scenarios (stubbed where they write: those requests are answered in the browser,
+so nothing reaches the server). The gate first runs
+`ui-smoke.mjs --selftest`, which checks against a local fixture (no stack) that each crawl and
+layout check fails when it should; a selftest failure fails the gate. A failure records FAIL (the
+older `Puppeteer` gate is warn-only); a missing `tests/puppeteer/node_modules/puppeteer`
+records SKIP with the `npm ci` hint. Shared mechanics are in `tests/puppeteer/lib/harness.mjs`;
+`tests/puppeteer/README.md` covers running it by hand.
+
 ### Release re-publish guard (`release-guard`, #5282)
 
 The first job in `release.yml`. It refuses any run whose ref is not a tag
