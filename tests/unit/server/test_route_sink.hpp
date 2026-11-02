@@ -142,6 +142,11 @@ public:
                 req.headers.erase(name);
                 req.set_header(name, value);
             }
+            // Repeated field lines, which the map above cannot carry: each pair is added as
+            // another occurrence, in order, as a client sending the header twice would.
+            for (const auto& [name, value] : repeated_headers) {
+                req.headers.emplace(name, value);
+            }
 
             // httplib::Server parses an `application/x-www-form-urlencoded` body
             // into `req.params` — the same multimap as the query string, and after
@@ -181,6 +186,11 @@ public:
 
     /// Sent with every dispatch before per-call headers (which override by name).
     std::unordered_map<std::string, std::string> default_headers;
+
+    /// Request header lines added to every dispatch AFTER the per-call headers, one occurrence
+    /// per pair and never replacing one already set, so a test can send the same field twice.
+    /// Clear it when the case is done.
+    std::vector<std::pair<std::string, std::string>> repeated_headers;
 
     /// Convenience wrappers for common verbs.
     auto Get(const std::string& path) { return dispatch("GET", path); }
