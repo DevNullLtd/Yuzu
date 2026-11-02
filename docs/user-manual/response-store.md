@@ -61,7 +61,7 @@ filtering and pagination.
 `app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions` and
 `remote_access_audit` are absent, with no marker, for any other caller, and counts and truncation
 flags cover only the rows that caller may read, so an empty result does not prove that no data
-exists. A stored response is labelled with the plugin the server recorded when it dispatched the command; one whose command id has no server record is stored as `~unverified`, which is served under the same tier. See "Forensics-tier rows" in the REST API guide. The dashboard's create-group-from-results action reads facets through the same tier; when the server cannot determine the caller's authority it creates nothing, answers HTTP `200`, and shows an error toast ("The permission check for this action could not be completed. Nothing was created. Retry shortly.") through an `HX-Trigger` `showToast` header, because the create-group form swaps no response body into the page; its store-degraded case answers `503` with its own error toast on the same channel and also creates nothing. The action writes `group.create_from_results` but no `response.forensics.read` row, even when the matching agents come from Forensics-tier rows (a documented gap in audit coverage; see the audit log guide).
+exists. A stored response is labelled with the plugin the server recorded when it dispatched the command; one whose command id has no server record is stored as `~unverified`, which is served under the same tier. See "Forensics-tier rows" in the REST API guide. The dashboard's create-group-from-results action reads facets through the same tier; when the server cannot determine the caller's authority it creates nothing, answers HTTP `200`, and shows an error toast ("The permission check for this action could not be completed. Nothing was created. Retry shortly.") through an `HX-Trigger` `showToast` header, because the create-group form swaps no response body into the page; its store-degraded case answers `503` with its own error toast on the same channel and also creates nothing. Its other refusals travel on the same toast channel: the `422` for no matching agent or for a result set cut by the read cap, and the `400` for a duplicate group name. The action writes `group.create_from_results` but no `response.forensics.read` row, even when the matching agents come from Forensics-tier rows (a documented gap in audit coverage; see the audit log guide).
 
 **Path parameters:**
 
@@ -351,12 +351,15 @@ operator-visible notes:
     dropdowns and the group-from-results count show nothing or "0 agents" for such a value; this
     includes values between 2049 bytes and about 2.6 KB that older servers indexed. The results
     page shows a hint when a filter value is over 2048 bytes, the REST and MCP agent-count previews
-    name such a filter in `unindexed_filter_keys`, and the create-group form and the group-from-results
-    `422` say the count may be wrong.
+    name such a filter in `unindexed_filter_keys`, and the create-group form's hint says the count may be
+    wrong (the group-from-results `422` body carries the same caveat, but the form swaps no body, so
+    its toast stays one fixed sentence).
   - **Search term.** On the results page the Search term is part of the group-from-results definition
     and of the "N agents" count (distinct agents with a matching line); the facet-index caveats on
     this page apply to the column filters only. A set whose read was cut by the read cap is partial
-    and is refused rather than made into a smaller group.
+    and is refused rather than made into a smaller group. A Search term also needs `Response:Read`
+    on the create-group form and the group-from-results action (a substring match over stored
+    output is a content read), in addition to `ManagementGroup:Write`.
   - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column
     index ascending, then value ascending, so the same output always keeps the same facets. A rare
     value (one line, such as a single package on one host) sorts late and is the first to be cut.

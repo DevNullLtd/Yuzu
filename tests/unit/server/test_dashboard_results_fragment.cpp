@@ -1219,6 +1219,28 @@ TEST_CASE("/fragments/results: response.forensics.read is written only when the 
         REQUIRE(rows.size() == 1);
         CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=dashboard");
     }
+    SECTION("the background refresh reads for its counts and leaves no verb row; its operator-"
+            "driven twin of the same page does") {
+        h.forensics.admin();
+        auto refresh = h.get(url + "&refresh=1");
+        REQUIRE(refresh);
+        CHECK(refresh->status == 200);
+        CHECK(contains(refresh->body, "id=\"result-summary\"")); // still renders what it is for
+        CHECK(verb_rows().empty());
+        // Even a persist failure has nothing to report: no row was attempted.
+        h.persist_fail_action = "response.forensics.read";
+        auto failing = h.get(url + "&refresh=1");
+        REQUIRE(failing);
+        CHECK(failing->get_header_value("Sec-Audit-Failed").empty());
+        h.persist_fail_action.clear();
+        // The twin: the same page, operator-driven, is audited as before.
+        auto driven = h.get(url);
+        REQUIRE(driven);
+        CHECK(contains(driven->body, "TOKEN-FORENSICS-A"));
+        const auto rows = verb_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=dashboard");
+    }
     SECTION("a persist failure sets Sec-Audit-Failed and still renders the page") {
         h.forensics.admin();
         h.persist_fail_action = "response.forensics.read";
@@ -1289,6 +1311,15 @@ TEST_CASE("/fragments/results and filter-bar: an Unknown Forensics decision show
     CHECK_FALSE(contains(results->body, "TOKEN-FORENSICS-A"));
     // A Forensics-read row is for rows actually shown; none were.
     CHECK(h.persisted_audits.empty());
+    // The refusal closes a Create Group form built for the previous filters (#5669), like any
+    // operator-driven response; the background refresh does not.
+    CHECK(contains(results->body, "<div id=\"group-form-slot\" hx-swap-oob=\"true\"></div>"));
+    auto refresh = h.get("/fragments/results?command_id=" + command_id +
+                         "&plugin=vuln_scan&refresh=1");
+    REQUIRE(refresh);
+    CHECK(refresh->status == 200);
+    CHECK(contains(refresh->body, "data-forensics-tier-unknown=\"true\"")); // notice still shown
+    CHECK_FALSE(contains(refresh->body, "group-form-slot"));
 
     auto bar = h.get("/fragments/results/filter-bar?command_id=" + command_id + "&plugin=vuln_scan");
     REQUIRE(bar);

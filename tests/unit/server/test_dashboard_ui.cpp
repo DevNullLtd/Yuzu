@@ -242,9 +242,51 @@ TEST_CASE("dashboard page: SSE output and status drive a throttled summary refre
     CHECK(html.find("refresh: '1'") != std::string::npos);
     // Throttled, not debounced: a timer that is not reset by later events, so continuous output
     // still refreshes once per window. No clearTimeout on the results timer.
-    CHECK(html.find("if (rrTimer) return;") != std::string::npos);
+    CHECK(html.find("if (rrTimer || !rrArmedUntil) return;") != std::string::npos);
     CHECK(html.find("clearTimeout(rrTimer)") == std::string::npos);
 
     // CSP: the dashboard forbids eval, and htmx compiles hx-on:* with new Function().
     CHECK(html.find("hx-on") == std::string::npos);
+}
+
+// The refresh is armed only by this tab's own Send, for a bounded window: /events carries every
+// operator's frames, so an unarmed or expired tab must not read (a refresh is a full read).
+TEST_CASE("dashboard page: the results refresh is armed by this tab's own dispatch, for a window",
+          "[dashboard][ui]") {
+    const std::string html = page();
+
+    // Armed only by the console form's own Send that was dispatched (the marker header a refusal
+    // and help do not carry), never by an autocomplete input inside the form.
+    CHECK(count_of(html, "rrArmedUntil = Date.now() + RR_WINDOW_MS") == 1);
+    CHECK(html.find("instrForm.addEventListener('htmx:afterRequest'") != std::string::npos);
+    CHECK(html.find("e.target === instrForm && x && x.getResponseHeader('X-Yuzu-Dispatched')") !=
+          std::string::npos);
+    // Unarmed -> no timer; the first refresh due after expiry is the one trailing refresh.
+    CHECK(html.find("if (rrTimer || !rrArmedUntil) return;") != std::string::npos);
+    CHECK(html.find("if (Date.now() >= rrArmedUntil) rrArmedUntil = 0;") != std::string::npos);
+    CHECK(html.find("var RR_WINDOW_MS = 300000;") != std::string::npos);
+}
+
+// The busy counter that gates the refresh must always come back down: a decrement hung on a DOM
+// event is lost when the request's source element is detached, which would stall every refresh
+// until reload. It is paired with the XHR's own loadend instead.
+TEST_CASE("dashboard page: the results busy counter is released by the request's own loadend",
+          "[dashboard][ui]") {
+    const std::string html = page();
+
+    CHECK(html.find("var rrTimer = null, rrBusy = 0, rrDirty = false, rrArmedUntil = 0;") !=
+          std::string::npos);
+    // One beforeRequest listener increments and hooks the XHR; there is no afterRequest body
+    // listener (the source-element event that a detached source never delivers to body).
+    CHECK(count_of(html, "document.body.addEventListener('htmx:beforeRequest'") == 1);
+    CHECK(html.find("x.addEventListener('loadend'") != std::string::npos);
+    CHECK(html.find("document.body.addEventListener('htmx:afterRequest'") == std::string::npos);
+    CHECK(html.find("rrBusy++;") != std::string::npos);
+    CHECK(html.find("rrBusy--;") != std::string::npos);
+    // The scope it counts: the results fragment and the Create Group form GET.
+    CHECK(html.find("/^\\/fragments\\/(results|create-group-form)\\b/") != std::string::npos);
+    // A refresh that falls due while busy is remembered and re-armed once idle.
+    CHECK(html.find("if (rrBusy > 0) { rrDirty = true; return; }") != std::string::npos);
+    CHECK(html.find("if (rrBusy === 0 && rrDirty) { rrDirty = false; scheduleResultsRefresh(); }") !=
+          std::string::npos);
 }

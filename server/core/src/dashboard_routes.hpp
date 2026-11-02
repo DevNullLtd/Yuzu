@@ -60,8 +60,9 @@ inline constexpr std::string_view kResultsSyncScope = "#filter-bar:replace";
 
 /// `HX-Trigger` member that aborts whatever results request is in flight on the filter bar.
 /// A new dispatch (or a help answer) replaces the results; a late response for the previous
-/// command must not land on top. It is emitted LAST in the header: htmx processes the trigger
-/// before the swap, and the xhr lives on the sync element, which is the OLD #filter-bar.
+/// command must not land on top. The target is the sync element, which holds the xhr (the OLD
+/// #filter-bar). It is emitted LAST in the header because htmx keeps a key's `target` for the keys
+/// after it: an earlier `target:#filter-bar` would retarget the showToast that follows it too.
 inline constexpr std::string_view kResultsAbortTrigger =
     R"("htmx:abort":{"target":"#filter-bar"})";
 
@@ -299,6 +300,16 @@ private:
     /// refused.
     bool refuse_cross_site_write(const httplib::Request& req, httplib::Response& res) const;
 
+    /// #5700 Search-term admission. A Search term substring-matches stored output, so the Create
+    /// Group preview and POST that carry one run the same `Response:Read` admission the results
+    /// table does (`fleet_read_fn_`, there too the sole gate for that pair), after their
+    /// `ManagementGroup:Write` gate: the count and the membership otherwise tell a caller who may
+    /// not read responses which agents' output holds a string. Writes the refusal (the gate's own
+    /// A4 body, or 503 when `fleet_read_fn_` is unwired -- fail closed) and returns false. A
+    /// confined caller is admitted; their set is still cut to their visible scope by
+    /// `keep_visible`. Filters-only requests do not call it (their path is unchanged).
+    bool admit_search_read(const httplib::Request& req, httplib::Response& res) const;
+
     std::vector<std::string> csrf_trusted_origins_;
     PersistAuditFn persist_audit_fn_;
     AuthFn auth_fn_;
@@ -365,7 +376,6 @@ private:
         std::vector<StoredResponse> responses;
         bool store_degraded{false};  ///< a read failed: not "no results"
         bool result_truncated{false}; ///< the row/byte cap cut the read: counts are partial
-        int64_t facet_agent_count{0}; ///< filtered branch only: agents behind @p filters
     };
     MatchingResponses load_matching_responses(const std::string& command_id,
                                               const ResponseTierFilter& tier,

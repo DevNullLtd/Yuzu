@@ -207,6 +207,15 @@ struct GroupFromResultsHarness {
     /// unobservable in the response.
     int visible_set_fn_calls{0};
 
+    /// The Response:Read admission a Search term needs (#5700: it matches stored output content).
+    /// Admits by default (unconfined: scope nullopt); a case sets `fleet_read_admit = false` to
+    /// deny, or `fleet_read_wired = false` for the unwired fail-closed contract. Both are read live
+    /// per request; `fleet_read_calls` proves whether the gate ran at all.
+    bool fleet_read_admit{true};
+    int fleet_read_calls{0};
+    std::string fleet_read_securable;
+    std::string fleet_read_operation;
+
     /// @param degrade_response_store true → wire a ResponseStore pointed at
     ///        an unreachable pool (never open), so the 503-before-scope-logic
     ///        path is reachable. `mg` (the confinement substrate the group
@@ -277,6 +286,19 @@ struct GroupFromResultsHarness {
         if (!csrf_trusted_origins.empty())
             routes.set_csrf_trusted_origins(std::move(csrf_trusted_origins));
         yuzu::server::test::wire_forensics(routes, forensics);
+        routes.set_fleet_read_fn([this](const httplib::Request&, httplib::Response& res,
+                                        const std::string& securable, const std::string& op)
+                                     -> authz::FleetReadGate {
+            ++fleet_read_calls;
+            fleet_read_securable = securable;
+            fleet_read_operation = op;
+            if (!fleet_read_admit) {
+                res.status = 403;
+                res.set_content(R"({"error":"permission denied"})", "application/json");
+                return {false, authz::deny_all()};
+            }
+            return {true, std::nullopt};
+        });
 
         routes.register_routes(
             sink, auth_fn, perm_fn, audit_fn, rs_.get(), &mg,
@@ -1168,10 +1190,11 @@ TEST_CASE("group-from-results: a Search over a read cut by the byte cap is refus
     // so the toast is the operator's only signal).
     CHECK(res->get_header_value("HX-Trigger") ==
           R"({"showToast":{"message":"The result set was cut by the read cap, so the agent list is )"
-          R"(partial. Nothing was created. Narrow the filters and try again.","level":"error"}})");
+          R"(partial. Nothing was created. Narrow the filters or the Search term and try again.")"
+          R"(,"level":"error"}})");
     CHECK(res->body == "<span class=\"feedback-error\">The result set was cut by the read cap, so "
-                       "the agent list is partial. Nothing was created. Narrow the filters and try "
-                       "again.</span>");
+                       "the agent list is partial. Nothing was created. Narrow the filters or the "
+                       "Search term and try again.</span>");
     CHECK_FALSE(h.mg.find_group_by_name("cut-by-bytes").has_value());
 }
 
@@ -1194,7 +1217,8 @@ TEST_CASE("group-from-results: a Search plus a column filter over a read cut by 
     auto res = h.post(q_form_body("cut-by-rows", "&f_category=cat-a&q=alp"));
     CHECK(res->status == 422);
     CHECK(contains(res->get_header_value("HX-Trigger"), "showToast"));
-    CHECK(contains(res->get_header_value("HX-Trigger"), "Narrow the filters and try again."));
+    CHECK(contains(res->get_header_value("HX-Trigger"),
+                   "Narrow the filters or the Search term and try again."));
     CHECK_FALSE(h.mg.find_group_by_name("cut-by-rows").has_value());
 
     // Control: a cap that holds every match lets the same request through.
@@ -1218,4 +1242,143 @@ TEST_CASE("group-from-results: a duplicate group name is refused with the same t
     CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
     CHECK(contains(res->body, "A group with that name already exists."));
     CHECK(contains(res->get_header_value("HX-Trigger"), "showToast"));
+}
+
+// A degraded store never reads as "no agents match" on the Search path either: the POST refuses
+// before the visible scope is even resolved, and the preview says the count is unavailable.
+TEST_CASE("group-from-results: a Search-only request on a degraded store 503s before any scope "
+          "resolution, and the preview says the count is unavailable",
+          "[pg][server][dashboard][group_from_results][search][degrade]") {
+    GroupFromResultsHarness h{/*degrade_response_store=*/true};
+    h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{"agent-A"};
+    };
+
+    auto res = h.post(q_form_body("q-degrade", "&q=alp"));
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("HX-Trigger") ==
+          R"({"showToast":{"message":"Agent count unavailable. The response store could not be read. )"
+          R"(Nothing was created. Retry shortly.","level":"error"}})");
+    CHECK(h.visible_set_fn_calls == 0);
+    CHECK(h.audits_for("response.read", "denied") == 0);
+    CHECK_FALSE(h.mg.find_group_by_name("q-degrade").has_value());
+
+    const std::string preview_url = std::string{"/fragments/create-group-form?command_id="} +
+                                    kCommandId + "&plugin=" + kPlugin + "&q=alp";
+    auto form = h.sink.Get(preview_url);
+    REQUIRE(form != nullptr);
+    CHECK(form->status == 200);
+    CHECK(contains(form->body, "agent count unavailable"));
+    CHECK_FALSE(contains(form->body, "agents will be added"));
+    CHECK_FALSE(contains(form->body, "0 agents"));
+}
+
+// A urlencoded body is read by key, not by substring: a column named `seq` posts `f_seq=`, which
+// must never be taken for the Search term `q`. With no real `q` the request is a filters-only one
+// (no Response:Read admission, no marker); with a real `q` the real term wins.
+TEST_CASE("group-from-results: a form key that merely ends in q is never the Search term",
+          "[pg][server][dashboard][group_from_results][search]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-B", "cat-b", "beta");
+    h.fleet_read_admit = false; // a Search term would be refused; filters alone are not
+
+    SECTION("no real q: the filters-only path runs and records no Search marker") {
+        auto res = h.post(q_form_body("seq-key", "&f_category=cat-a&f_seq=5"));
+        CHECK(res->status == 200);
+        CHECK(h.fleet_read_calls == 0);
+        auto group = h.mg.find_group_by_name("seq-key");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
+        CHECK_FALSE(contains(h.audit_detail("group.create_from_results", "success"), "text_query"));
+    }
+    SECTION("a real q after it is the Search term") {
+        h.fleet_read_admit = true;
+        auto res = h.post(q_form_body("seq-and-q", "&f_seq=5&q=bet"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("seq-and-q");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-B"});
+    }
+}
+
+// R2: a Search term substring-matches stored output, so the preview and the POST that carry one
+// run the results table's own Response:Read admission after ManagementGroup:Write; a filters-only
+// request keeps ManagementGroup:Write alone, exactly as before.
+TEST_CASE("group-from-results: a Search term needs the results table's Response:Read admission, in "
+          "the preview and the POST; filters alone do not",
+          "[pg][server][dashboard][group_from_results][search][auth]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-B", "cat-a", "beta");
+    const std::string base = std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                             "&plugin=" + kPlugin;
+
+    SECTION("denied: the preview and the POST answer the gate's refusal and touch nothing") {
+        h.fleet_read_admit = false;
+
+        auto form = h.sink.Get(base + "&q=alp");
+        REQUIRE(form != nullptr);
+        CHECK(form->status == 403);
+        CHECK(contains(form->body, "permission denied"));
+        CHECK_FALSE(contains(form->body, "agents will be added"));
+        CHECK(h.fleet_read_securable == "Response");
+        CHECK(h.fleet_read_operation == "Read");
+
+        auto res = h.post(q_form_body("q-denied", "&q=alp"));
+        CHECK(res->status == 403);
+        CHECK(contains(res->body, "permission denied"));
+        CHECK(h.fleet_read_calls == 2);
+        CHECK_FALSE(h.mg.find_group_by_name("q-denied").has_value());
+        // The refusal precedes every store read and the visible-scope resolve.
+        CHECK(h.visible_set_fn_calls == 0);
+        CHECK(h.audits_for("group.create_from_results", "success") == 0);
+        CHECK(h.audits_for("response.read", "denied") == 0);
+    }
+    SECTION("filters alone never reach the gate, whatever it would answer") {
+        h.fleet_read_admit = false;
+
+        auto form = h.sink.Get(base + "&f_category=cat-a");
+        REQUIRE(form != nullptr);
+        CHECK(form->status == 200);
+        CHECK(contains(form->body, "2 agents will be added"));
+
+        auto res = h.post(GroupFromResultsHarness::form_body("filters-only"));
+        CHECK(res->status == 200);
+        CHECK(h.mg.find_group_by_name("filters-only").has_value());
+        CHECK(h.fleet_read_calls == 0);
+    }
+    SECTION("unwired: the Search path fails closed with a 503, never an open read") {
+        h.routes.set_fleet_read_fn(DashboardRoutes::FleetReadFn{});
+
+        auto form = h.sink.Get(base + "&q=alp");
+        REQUIRE(form != nullptr);
+        CHECK(form->status == 503);
+        CHECK_FALSE(contains(form->body, "agents will be added"));
+
+        auto res = h.post(q_form_body("q-unwired", "&q=alp"));
+        CHECK(res->status == 503);
+        CHECK_FALSE(h.mg.find_group_by_name("q-unwired").has_value());
+        CHECK(h.visible_set_fn_calls == 0);
+
+        // Filters alone are unaffected by the missing gate.
+        CHECK(h.post(GroupFromResultsHarness::form_body("unwired-filters"))->status == 200);
+    }
+    SECTION("admitted: the gate runs once per request on the Search path, and scoping still applies") {
+        h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+            return std::set<std::string>{"agent-A"};
+        };
+        auto form = h.sink.Get(base + "&q=a");
+        REQUIRE(form != nullptr);
+        CHECK(form->status == 200);
+        CHECK(contains(form->body, "1 agent will be added")); // agent-B's match is out of scope
+        CHECK(h.fleet_read_calls == 1);
+
+        auto res = h.post(q_form_body("q-admitted", "&q=a"));
+        CHECK(res->status == 200);
+        CHECK(h.fleet_read_calls == 2);
+        auto group = h.mg.find_group_by_name("q-admitted");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
+    }
 }

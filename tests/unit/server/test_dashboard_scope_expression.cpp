@@ -29,8 +29,12 @@
 #include "dispatch_destructive_gate.hpp"
 #include "dispatch_target_shape.hpp"
 #include "event_bus.hpp"
+#include "instruction_store.hpp"
 #include "mcp_input_bounds.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_real_capability_registry.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -38,7 +42,9 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -77,7 +83,7 @@ struct Harness {
     int sent = 3;
     std::pair<std::string, std::string> resolve_to{kReadOnly.first, kReadOnly.second};
 
-    explicit Harness(bool with_registry = false) {
+    explicit Harness(bool with_registry = false, InstructionStore* instruction_store = nullptr) {
         if (with_registry)
             registry = std::make_unique<detail::AgentRegistry>(bus, metrics);
         auto auth_fn = [this](const httplib::Request&,
@@ -111,8 +117,7 @@ struct Harness {
                 return yuzu::server::DispatchCaller{.principal = "expr-op",
                                                     .exec_visible = std::nullopt};
             },
-            [this](const std::string&) { return resolve_to; }, &metrics,
-            /*instruction_store=*/nullptr);
+            [this](const std::string&) { return resolve_to; }, &metrics, instruction_store);
         routes.set_capability_classify_fn(yuzu::test::real_classify_fn());
         routes.set_persist_audit_fn([this](const httplib::Request&, const std::string& a,
                                            const std::string& r, const std::string&,
@@ -175,6 +180,16 @@ std::string enc(const std::string& s) {
 bool contains(const std::string& hay, std::string_view needle) {
     return hay.find(needle) != std::string::npos;
 }
+
+// Same key as test_dashboard_results_fragment.cpp's instruction-store template (one migration run
+// across the suite; shared keys are verified by structural replay).
+yuzu::test::PgTestTemplate dashboard_exec_instr_tpl{
+    "dashfraginstr", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        InstructionStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("dashboard_exec_instr template: store failed to migrate");
+    }};
 
 } // namespace
 
@@ -471,8 +486,8 @@ TEST_CASE("dashboard execute: a dispatch aborts an in-flight results request and
     REQUIRE(h.calls.size() == 1);
     const std::string cmd = "cmd-1";
 
-    // HX-Trigger is JSON: the toast first, the abort LAST (htmx processes the header before the
-    // swap, and the in-flight xhr lives on the OLD #filter-bar).
+    // HX-Trigger is JSON: the toast first, the abort LAST (htmx keeps a key's target for the keys
+    // after it, so an earlier target:#filter-bar would retarget the toast too).
     const auto trigger = nlohmann::ordered_json::parse(res->get_header_value("HX-Trigger"));
     REQUIRE(trigger.is_object());
     REQUIRE(trigger.size() == 2);
@@ -489,6 +504,38 @@ TEST_CASE("dashboard execute: a dispatch aborts an in-flight results request and
     // Residual tripwire: there is no sort/page control in the placeholder window, so nothing in
     // the dispatch body may re-read the filter bar (it would race the abort above).
     CHECK_FALSE(contains(res->body, "hx-include=\"#filter-bar\""));
+}
+
+// The chart-deck initializer is how the first results fetch learns the definition the dispatch
+// resolved; with one, its request carries the id so the deck and the template columns follow.
+TEST_CASE("dashboard execute: the chart-deck initializer carries the definition the dispatch "
+          "resolved",
+          "[pg][server][dashboard][execute][sync]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashboard_exec_instr_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore is{pool};
+    REQUIRE(is.is_open());
+    is.set_require_signed_definitions(false);
+    InstructionDefinition def;
+    def.name = "os-version-deck";
+    def.version = "1.0";
+    def.plugin = kReadOnly.first;
+    def.action = kReadOnly.second;
+    def.type = "question";
+    def.description = "definition resolved by the dispatch";
+    def.enabled = true;
+    def.platforms = "windows,linux,darwin";
+    def.approval_mode = "auto";
+    def.result_schema = R"([{"name":"hostname","type":"string"}])";
+    const auto id = is.create_definition(def);
+    REQUIRE(id.has_value());
+
+    Harness h(/*with_registry=*/false, &is);
+    auto res = h.post("instruction=version&scope=__all__");
+    REQUIRE(res->status == 200);
+    CHECK(contains(res->body, "hx-get=\"/fragments/results?command_id=cmd-1&amp;plugin=os_info"
+                              "&amp;definition_id=" + *id +
+                                  "\" hx-trigger=\"load delay:2s\" hx-swap=\"none\""));
 }
 
 TEST_CASE("dashboard execute: help aborts an in-flight results request and replaces the "

@@ -1351,7 +1351,9 @@ constexpr char kDashJs7[] = R"HTM(    /* ── Global Keyboard Shortcuts ──
        and header land (rows are untouched). The filter bar is hx-sync="this:drop": htmx discards
        a refresh issued while a request is in flight and never queues it, so the page defers it
        itself (below). Throttled (not debounced) to one call per second: a trailing-only debounce
-       never fires under continuous output. */
+       never fires under continuous output. /events is the global bus with no per-command filter,
+       so the refresh is armed only by THIS tab's own Send and only for a bounded window (below):
+       an idle tab, or one showing a finished command, never reads. */
     function refreshResultsSummary() {
       var f = document.getElementById('filter-bar');
       var nav = document.getElementById('result-pagination');
@@ -1362,28 +1364,45 @@ constexpr char kDashJs7[] = R"HTM(    /* ── Global Keyboard Shortcuts ──
     }
     /* The drop has no retry, so the page tracks the scope itself: a request that parks on the
        filter bar (a results fragment or the Create Group form GET, a refresh included) counts as
-       busy from htmx:beforeRequest to htmx:afterRequest, which an abort fires too. A refresh that
-       falls due while one is in flight is marked dirty and re-armed once the scope is idle, so the
-       last event is never left unrendered. The re-arm is a timer, not a call: htmx frees the sync
-       slot only after afterRequest returns. Nothing is captured: the retry reads the pager stamp and
-       the live filter bar when it fires, so a dispatch in between turns it into a no-op. */
-    var rrTimer = null, rrBusy = 0, rrDirty = false;
+       busy from htmx:beforeRequest to its XHR's loadend, which fires for load, error, abort and
+       timeout and does not depend on the DOM (htmx:afterRequest is delivered to the request's
+       source element, so a detached source never reaches a body listener). A refresh that falls
+       due while one is in flight is marked dirty and re-armed once the scope is idle, so the
+       last event is never left unrendered. The re-arm is a timer, not a call. Nothing is
+       captured: the retry reads the pager stamp and the live filter bar when it fires, so a
+       dispatch in between turns it into a no-op. */
+    var rrTimer = null, rrBusy = 0, rrDirty = false, rrArmedUntil = 0;
+    /* 300 s: the deadline the gateway forward gives a dispatched command (SendCommand). Frames
+       after it get one trailing refresh (below), then the tab stops reading. */
+    var RR_WINDOW_MS = 300000;
     function scheduleResultsRefresh() {
-      if (rrTimer) return;
+      if (rrTimer || !rrArmedUntil) return;
       rrTimer = setTimeout(function() {
         rrTimer = null;
         if (rrBusy > 0) { rrDirty = true; return; }
+        if (Date.now() >= rrArmedUntil) rrArmedUntil = 0; /* this refresh is the trailing one */
         refreshResultsSummary();
       }, 1000);
     }
-    function trackResultsScope(evt, delta) {
-      var cfg = evt.detail && evt.detail.requestConfig;
-      if (!cfg || !/^\/fragments\/(results|create-group-form)\b/.test(cfg.path || '')) return;
-      rrBusy = Math.max(0, rrBusy + delta);
-      if (rrBusy === 0 && rrDirty) { rrDirty = false; scheduleResultsRefresh(); }
+    document.body.addEventListener('htmx:beforeRequest', function(e) {
+      var cfg = e.detail && e.detail.requestConfig, x = e.detail && e.detail.xhr;
+      if (!x || e.defaultPrevented || !cfg ||
+          !/^\/fragments\/(results|create-group-form)\b/.test(cfg.path || '')) return;
+      rrBusy++;
+      x.addEventListener('loadend', function() {
+        rrBusy--; /* one loadend per counted request */
+        if (rrBusy === 0 && rrDirty) { rrDirty = false; scheduleResultsRefresh(); }
+      });
+    });
+    /* Armed by this tab's own Send that was actually dispatched (X-Yuzu-Dispatched is set on a
+       dispatch only: a refusal and help also answer 200 but carry no such header). */
+    if (instrForm) {
+      instrForm.addEventListener('htmx:afterRequest', function(e) {
+        var x = e.detail && e.detail.xhr;
+        if (e.target === instrForm && x && x.getResponseHeader('X-Yuzu-Dispatched'))
+          rrArmedUntil = Date.now() + RR_WINDOW_MS;
+      });
     }
-    document.body.addEventListener('htmx:beforeRequest', function(e) { trackResultsScope(e, 1); });
-    document.body.addEventListener('htmx:afterRequest', function(e) { trackResultsScope(e, -1); });
     ['[sse-swap="output"]', '[sse-swap="command-status"]'].forEach(function(sel) {
       var el = document.querySelector(sel);
       if (el) el.addEventListener('htmx:sseMessage', scheduleResultsRefresh);

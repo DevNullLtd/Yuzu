@@ -139,10 +139,12 @@ static std::string refusal_toast_header(const char* message) {
 /// The refusal sentence for a group set cut by the read cap (toast and body say the same thing).
 static constexpr const char* kGroupPartialRefusal =
     "The result set was cut by the read cap, so the agent list is partial. "
-    "Nothing was created. Narrow the filters and try again.";
+    "Nothing was created. Narrow the filters or the Search term and try again.";
 
 /// Intersects @p ids with the caller's visible @p scope (nullopt = sees all); returns how many
-/// ids were dropped. The one scope intersection the group preview and the group POST share.
+/// ids were dropped. The intersection the group POST and the preview's Search-term path share:
+/// both read unscoped (the Search predicate runs in the server), so they scope after the read.
+/// The filters-only preview scopes in SQL (`facet_agent_count`) instead.
 static std::size_t keep_visible(std::vector<std::string>& ids,
                                 const std::optional<std::vector<std::string>>& scope) {
     if (!scope)
@@ -227,6 +229,20 @@ bool DashboardRoutes::refuse_cross_site_write(const httplib::Request& req,
                     "Cross-site request refused. Nothing was sent.</span>",
                     "text/html; charset=utf-8");
     return true;
+}
+
+bool DashboardRoutes::admit_search_read(const httplib::Request& req,
+                                        httplib::Response& res) const {
+    if (!fleet_read_fn_) {
+        spdlog::error("group Search path: fleet_read_fn_ unwired -- misconfigured call site; "
+                      "failing closed");
+        res.status = 503;
+        res.set_content("<span class=\"feedback-error\">Service unavailable.</span>",
+                        "text/html; charset=utf-8");
+        return false;
+    }
+    // On a refusal the gate has already written the A4 error body and status.
+    return fleet_read_fn_(req, res, "Response", "Read").admitted;
 }
 
 // ---------------------------------------------------------------------------
@@ -478,10 +494,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 }
                 const ResponseTierFilter& tier = *tier_resolved;
                 ForensicsServed served;
+                // The background refresh only reads for its counts: its rows are discarded
+                // client-side (swap none), so it leaves no response.forensics.read row -- a null
+                // `served` keeps the audit to rows an operator was actually shown.
                 auto html = render_results(command_id, tier, plugin, sort_col, sort_dir,
                                            page, per_page, filters, text_query,
                                            definition_id, template_id,
-                                           visible_columns, gate.scope, &served);
+                                           visible_columns, gate.scope,
+                                           background_refresh ? nullptr : &served);
                 // #5669: every operator-driven results response empties the Create Group slot --
                 // the form it holds was built for the previous filters. The background refresh
                 // carries the same live filters the table shows, so it leaves the form alone.
@@ -637,10 +657,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // Flat ManagementGroup:Write admission stays until ADR-0017
                 // PR-B; management-group-scoped Response:Read is applied only
                 // as a filter below and does not compose into this gate
-                // (auth_routes.hpp).
+                // (auth_routes.hpp). A Search term (#5700) additionally needs
+                // the results table's own Response:Read admission, because it
+                // matches stored output content (admit_search_read); the
+                // filters-only path keeps this gate alone.
                 if (!perm_fn_(req, res, "ManagementGroup", "Write")) return;
                 auto session = auth_fn_(req, res);
                 if (!session) return;
+
+                // #5700: the results page's Search term is part of the group definition.
+                const auto text_query = req.get_param_value("q");
+                if (!text_query.empty() && !admit_search_read(req, res)) return;
 
                 auto command_id = req.get_param_value("command_id");
                 auto plugin = req.get_param_value("plugin");
@@ -656,13 +683,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // degrade must not render as "0 agents", not that the
                 // no-store/no-filter cases need a NEW distinction from it.
                 std::optional<int64_t> agent_count;
-                // #5700: the results page's Search term is part of the group definition.
-                const auto text_query = req.get_param_value("q");
                 bool partial = false;
                 if (response_store_ && (!filters.empty() || !text_query.empty())) {
                     // #4990: after the ManagementGroup:Write gate; the tier filter alone closes
-                    // the Forensics half (no Response:Read gate is added to this route).
-                    // Unknown leaves `agent_count` empty: the form then says the count is
+                    // the Forensics half (the Response:Read admission is added only for a Search
+                    // term, above). Unknown leaves `agent_count` empty: the form then says the count is
                     // unavailable, never a number computed over a partial row set.
                     if (const auto tier =
                             tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_)) {
@@ -695,7 +720,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // Flat ManagementGroup:Write admission stays until ADR-0017
                  // PR-B; management-group-scoped Response:Read is applied only
                  // as a filter below and does not compose into this gate
-                 // (auth_routes.hpp).
+                 // (auth_routes.hpp). A Search term (#5700) additionally needs
+                 // the results table's own Response:Read admission, because it
+                 // matches stored output content (admit_search_read); the
+                 // filters-only path keeps this gate alone.
                  if (!perm_fn_(req, res, "ManagementGroup", "Write")) return;
                  auto session = auth_fn_(req, res);
                  if (!session) return;
@@ -727,10 +755,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto group_name = extract_form_value(req.body, "group_name");
                  auto command_id = extract_form_value(req.body, "command_id");
                  auto plugin = extract_form_value(req.body, "plugin");
-                 // #5700: the Search term is part of the group definition (query, else form body).
-                 auto text_query = req.get_param_value("q");
-                 if (text_query.empty())
-                     text_query = extract_form_value(req.body, "q");
+                 // #5700: the Search term is part of the group definition. Read from the parsed
+                 // parameters only: `extract_form_value` is an unanchored substring scan (#2527), so
+                 // a field whose name merely ends in `q` would be read as the Search term.
+                 const auto text_query = req.get_param_value("q");
+                 // After the same-site gate, before any store read or the visible-scope resolve.
+                 if (!text_query.empty() && !admit_search_read(req, res)) return;
 
                  if (group_name.empty()) {
                      res.status = 400;
@@ -1598,8 +1628,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  html += "<div id=\"group-form-slot\" hx-swap-oob=\"true\"></div>";
 
                  // Toast via HX-Trigger, then abort any results request still in flight for the
-                 // previous command. The abort key is LAST: htmx processes the header before the
-                 // swap, and the in-flight xhr lives on the OLD #filter-bar (the sync element).
+                 // previous command. The abort key is LAST: htmx keeps a key's target for the keys
+                 // after it, so an earlier target:#filter-bar would retarget the toast too (the
+                 // in-flight xhr lives on the OLD #filter-bar, the sync element).
                  res.set_header("HX-Trigger",
                      "{\"showToast\":{\"message\":\"Command sent to " +
                      std::to_string(sent) +
@@ -2584,24 +2615,20 @@ DashboardRoutes::load_matching_responses(const std::string& command_id,
     // Faceted index: matching response ids, then load them. Ask for one row more than the cap so
     // a cut is detectable exactly like the unfiltered branch (a silent cut would let a partial
     // set be presented -- and made into a group -- as complete). query_by_ids returns every
-    // requested id or nullopt (one IN-list SELECT, no byte cut), so there is no second cut here.
+    // requested id that still exists and the tier admits, or nullopt (one IN-list SELECT, no byte
+    // cut), so there is no second cut here to detect. Moved, not copied (`value_or` on an lvalue
+    // would copy up to the row cap's worth of bodies).
     const int cap = results_row_cap().load();
     auto resp_ids_opt = response_store_->facet_response_ids(command_id, tier, filters, cap + 1, 0);
     out.store_degraded = !resp_ids_opt.has_value();
-    auto resp_ids = resp_ids_opt.value_or(std::vector<int64_t>{});
+    auto resp_ids = std::move(resp_ids_opt).value_or(std::vector<int64_t>{});
     if (static_cast<int>(resp_ids.size()) > cap) {
         out.result_truncated = true;
         resp_ids.pop_back();
     }
     auto responses_opt = response_store_->query_by_ids(resp_ids, tier);
     out.store_degraded = out.store_degraded || !responses_opt.has_value();
-    out.responses = responses_opt.value_or(std::vector<StoredResponse>{});
-    // A degraded count also hides the "Create Group" button, the safer default for a
-    // write-adjacent action on an uncertain count. Left unscoped, like facet_response_ids above
-    // (superseded by the #1712 in-handler recompute plan).
-    auto count_opt = response_store_->facet_agent_count(command_id, tier, filters);
-    out.store_degraded = out.store_degraded || !count_opt.has_value();
-    out.facet_agent_count = count_opt.value_or(0);
+    out.responses = std::move(responses_opt).value_or(std::vector<StoredResponse>{});
     return out;
 }
 
@@ -2694,11 +2721,22 @@ std::string DashboardRoutes::render_results(
     // genuine zero-match answer through to the tbody empty-state and #result-summary below.
     auto loaded = load_matching_responses(command_id, tier, filters);
     std::vector<StoredResponse> responses = std::move(loaded.responses);
-    const bool store_degraded = loaded.store_degraded;
+    bool store_degraded = loaded.store_degraded;
     // #4644 (row 6a): the read was cut by the row or byte cap, so the render says "partial".
     const bool result_truncated = loaded.result_truncated;
-    int64_t total_agent_count = filters.empty() ? distinct_agent_count(responses)
-                                                : loaded.facet_agent_count;
+    int64_t total_agent_count = 0;
+    if (filters.empty()) {
+        total_agent_count = distinct_agent_count(responses);
+    } else {
+        // The agents behind the column filters, from the facet index. Only the table's summary
+        // needs it (the Search-term group path counts agents itself, in agents_matching_text). A
+        // degraded count also hides the "Create Group" button, the safer default for a
+        // write-adjacent action on an uncertain count. Left unscoped, like facet_response_ids
+        // (superseded by the #1712 in-handler recompute below).
+        auto count_opt = response_store_->facet_agent_count(command_id, tier, filters);
+        store_degraded = store_degraded || !count_opt.has_value();
+        total_agent_count = count_opt.value_or(0);
+    }
 
     // #1712 / #3290 Phase 2 — scope filter (the gate's composed
     // meet(management-group, service-scope) VisibleSet), applied BEFORE
@@ -2960,17 +2998,12 @@ std::string DashboardRoutes::render_results(
                     "rows and counts are partial</span>";
         }
 
-        // Confined-caller withhold (Gate 6 enterprise-readiness finding, this
-        // round): /fragments/create-group-form and /api/dashboard/group-from-
-        // results gate on ManagementGroup:Write only — a DIFFERENT securable,
-        // unrelated to this caller's Response:Read confinement — and apply no
-        // per-agent scope filter of their own (tracked, deliberately deferred:
-        // ADR-0017 "Doc honesty"/#3489). Before this migration a confined-only
-        // (AdmitScoped) caller could not reach /fragments/results at all, so
-        // could never see this button. Now that require_fleet_read admits
-        // them, withhold the button itself when scope is engaged rather than
-        // surface an entry point into a flow that would silently re-widen to
-        // the unscoped facet count/ids on submit.
+        // Confined-caller withhold (Gate 6 enterprise-readiness finding): /fragments/create-group-
+        // form and /api/dashboard/group-from-results gate on ManagementGroup:Write only -- a
+        // DIFFERENT securable, unrelated to this caller's Response:Read confinement. Both do
+        // intersect their agent set with the caller's visible scope (ADR-0017 "Doc honesty"/#3489),
+        // but when scope is engaged the button is withheld rather than offering an entry point
+        // whose count is then scoped down by a route gated on another securable.
         if ((!filters.empty() || !text_query.empty()) && total_agent_count > 0 && !scope) {
             // Build filter params for the create-group-form URL
             std::string filter_params;
@@ -3255,7 +3288,7 @@ std::string DashboardRoutes::render_create_group_form(
         // The read behind the count was cut by the read cap: the count is not the group, and the
         // POST refuses a cut read, so the submit is disabled rather than offered and refused.
         count_hint = "The result set was cut by the read cap, so the agent count is partial. "
-                     "Narrow the filters before creating a group.";
+                     "Narrow the filters or the Search term before creating a group.";
     } else if (agent_count.has_value() && any_filter_value_too_long(filters)) {
         // #5623: a value over the ingest bound is not indexed in newly stored responses, so the
         // count can be 0 or an undercount. Say so instead of presenting it as the answer; static
