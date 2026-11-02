@@ -340,16 +340,17 @@ left the malformed pair behind.
    `DELETE /api/v1/engine-principals/{id}` for this: it is terminal.
 
 A sole credential whose predecessor has simply expired is refused by the
-one-credential `rotate` (`409`) until the rotation's overlap window has elapsed
-(the predecessor's `overlap_expires_at`; the window is 7 days by default and
-never under 24 hours). After that the rotation sweep (it runs every 60 seconds)
-clears the leftover rotation linkage, typically within a few ticks, and then
-`rotate` works again. A tick can skip the work (the clock guard can decline it,
-the sweep lock can be held elsewhere, a tick can fail, and at most 200 pairs are
-handled per tick), and the pair is picked up on a later tick. The sweep only
-does this for a successor that has been presented at least once. A successor
-that was never used is not cleared: it keeps its linkage, and `rotate` keeps
-refusing it, until it is used, revoked or expires.
+one-credential `rotate` (`409`) until the rotation sweep (it runs every 60
+seconds) clears the leftover rotation linkage. `rotate` never accepts an overlap
+window that would outlive the predecessor's own expiry, so by the time a
+predecessor has expired its overlap window has already ended and the next sweep
+tick that runs clears the linkage; `rotate` then works again. A tick can skip the
+work (the clock guard can decline it, the sweep lock can be held elsewhere, a
+tick can fail, and at most 200 pairs are handled per tick), and the pair is
+picked up on a later tick. The sweep only does this for a successor that has been
+presented at least once. A successor that was never used is not cleared: it keeps
+its linkage, and `rotate` keeps refusing it, until it is used, revoked or
+expires.
 
 **Revoking one credential over MCP.** The tool `revoke_api_token` (token id from
 `GET /api/v1/engine-principals/{id}`) revokes a single credential. It needs the
