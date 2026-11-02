@@ -2365,8 +2365,18 @@ AuthDB::mfa_consume_recovery_code(const std::string& username, std::string_view 
             return std::unexpected(AuthDBError::WriteFailed);
         pg::PgResult res = pg::exec_params(
             lease.get(),
-            "SELECT id, code_hash, code_salt, (extract(epoch from now())*1000)::bigint "
-            "FROM auth.mfa_recovery_codes WHERE username = $1 AND consumed_at IS NULL",
+            // #4058, defence in depth: an inactive account has no usable recovery
+            // codes, mirroring mfa_verify_login_code's `is_active = TRUE` filter.
+            // remove_user already deletes the codes with the soft-delete; this
+            // covers an account deactivated outside that path (a direct database
+            // edit). Lock-free by design: holding the user-row lock
+            // across the PBKDF2 walk below is the hazard
+            // mfa_regenerate_recovery_codes documents. The consuming statement
+            // below re-checks `is_active` under the row lock.
+            "SELECT c.id, c.code_hash, c.code_salt, (extract(epoch from now())*1000)::bigint "
+            "FROM auth.mfa_recovery_codes c "
+            "WHERE c.username = $1 AND c.consumed_at IS NULL "
+            "AND EXISTS (SELECT 1 FROM auth.users u WHERE u.username = c.username AND u.is_active = TRUE)",
             std::vector<std::string>{username});
         if (res.status() != PGRES_TUPLES_OK)
             return std::unexpected(AuthDBError::WriteFailed);
