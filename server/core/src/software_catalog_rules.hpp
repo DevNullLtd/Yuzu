@@ -48,7 +48,7 @@ struct EcosystemFamily {
 
 /// Row order is the published order of the OpenAPI and MCP ecosystem enums; a mid-table insert
 /// shifts positions, so say so in the changelog.
-inline constexpr std::array<EcosystemFamily, 12> kEcosystemFamilies{{
+inline constexpr std::array<EcosystemFamily, 13> kEcosystemFamilies{{
     {"windows", "windows"},
     {"optional_feature", "windows"},
     {"msi", "windows"},
@@ -61,6 +61,7 @@ inline constexpr std::array<EcosystemFamily, 12> kEcosystemFamilies{{
     {"pacman", "linux"},
     {"snap", "linux"},
     {"flatpak", "linux"},
+    {"python", "other"},
 }};
 
 /// The table is non-empty, every ecosystem is `[a-z_]+` and every family `[a-z]+` (so none is
@@ -121,7 +122,7 @@ inline constexpr std::array<VocabEntry, 4> kSoftwareKinds{{
 /// One row per collector source, in the collector's kInventoryActions order
 /// (agents/core/src/sync_source_installed_software.cpp); the vocabulary test compares the ordered
 /// lists. A new source is one row here.
-inline constexpr std::array<VocabEntry, 6> kSoftwareSources{{
+inline constexpr std::array<VocabEntry, 7> kSoftwareSources{{
     {"installed_apps.list_inventory", "installed_apps.list_inventory",
      "Windows Uninstall registry, Linux dpkg/rpm/pacman/apk, macOS applications and installer "
      "receipts"},
@@ -133,6 +134,8 @@ inline constexpr std::array<VocabEntry, 6> kSoftwareSources{{
      "Windows optional features (state in the version column)"},
     {"msi_packages.list_inventory", "msi_packages.list_inventory",
      "Machine-context Windows Installer (MSI) products"},
+    {"runtimes.python", "runtimes.python",
+     "Python interpreters at the standard machine-wide locations (Windows, macOS, Linux)"},
 }};
 
 /// Non-empty, every value `[a-z_.]+` (the chips splice it into attributes and URLs), non-empty

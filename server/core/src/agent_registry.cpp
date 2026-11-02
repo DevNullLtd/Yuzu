@@ -1156,6 +1156,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"runtimes.jvm",
          "List installed JVMs by image type, version, home and vendor from each home's "
          "release file (Linux only; standard roots only, no subprocess)"},
+        {"runtimes.python",
+         "List installed Python interpreters by flavour, version, install path and vendor "
+         "(Windows PEP 514 registry keys, macOS python.org framework, Linux python3.<minor> "
+         "files with major.minor only; standard roots only, no subprocess)"},
         // storage
         {"storage.set", "Store a key-value pair in persistent storage"},
         {"storage.get", "Retrieve a value by key from persistent storage"},
