@@ -710,8 +710,8 @@ by each handler.
   registered on the server outside the sink would be neither wrapped nor
   inventoried; a best-effort source scan flags literal verb calls on `web_server_->` and
   `redirect_server_->`, literal-path mutating registrations (Post, Put, Patch, Delete) on any
-  receiver other than `sink`, in sources and headers (so an alias with a literal path is seen),
-  and any second `ExemptNoStage`. It does not see an alias with a variable path, a
+  receiver other than `sink` in sources, any literal mutating registration in a header (so an alias
+  with a literal path is seen), and any second `ExemptNoStage`. It does not see an alias with a variable path, a
   `ContentReader` overload or a custom-method route (a review concern). The stage is not
   httplib's `set_pre_request_handler`, which runs before the body is read from
   cpp-httplib v0.47.0. The order for a `kRequired` route is therefore: session

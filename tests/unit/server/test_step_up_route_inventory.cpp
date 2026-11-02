@@ -478,10 +478,10 @@ TEST_CASE("step-up route inventory: only the redirect listener's sink opts out o
     // call on the httplib server that skips the sink (and so the stage and the inventory). This
     // scan pins the literal `StageRequirement::ExemptNoStage` count and the six literal verb calls
     // on the receivers `web_server_->` and `redirect_server_->`, comment text excluded. It does NOT
-    // see a route registered through an alias or another receiver (a later case covers literal
-    // mutating registrations on any receiver), a `ContentReader` overload, or a custom-method
-    // route: those stay a review concern. Tests are not scanned: they opt out freely, and that is
-    // not a production route.
+    // see a route registered through an alias with a variable path, a `ContentReader` overload or
+    // a custom-method route (a later case covers literal-path mutating registrations on any
+    // receiver): those stay a review concern. Tests are not scanned: they opt out freely, and
+    // that is not a production route.
     const auto count_of = [](const std::string& hay, std::string_view needle) {
         std::size_t n = 0;
         for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))

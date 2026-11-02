@@ -40,7 +40,7 @@
 /// (httplib.h, `dispatch_request_for_content_reader`). The wrapper covers only the routes a sink
 /// registered, which is why a sink registration with no stage is refused at boot rather than
 /// left to chance. A registration on the raw server is not refused at boot: only the CI source
-/// scan (literal verb calls) catches it. The stage still runs for a MATCHED route only (an
+/// scan (literal registrations) catches it. The stage still runs for a MATCHED route only (an
 /// unmatched path never reaches a handler), and for a multipart request `req.body` stays empty so
 /// the cap cannot see it. See `body_cap_policy.hpp`.
 
