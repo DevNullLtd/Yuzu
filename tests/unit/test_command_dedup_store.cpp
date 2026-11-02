@@ -605,6 +605,7 @@ TEST_CASE("dedup_quarantine: non-empty sidecars travel with the main file, empty
     REQUIRE(dest.has_value());
     CHECK(dest->filename().string() == "command_dedup.db.corrupt-1234");
     CHECK(read_bytes(*dest) == "main");
+    CHECK(fs::hard_link_count(*dest) == 1); // the original name was dropped after the claim
     CHECK(read_bytes(fs::path(dest->string() + "-wal")) == "wal bytes");
     CHECK(read_bytes(fs::path(dest->string() + "-journal")) == "journal bytes");
     CHECK_FALSE(fs::exists(fs::path(dest->string() + "-shm"))); // removed, not carried

@@ -93,29 +93,66 @@ inline std::optional<std::pair<long long, long long>> parse_quarantine_name(std:
 /// which is vanishingly unlikely; echo carries a post-reopen integrity backstop, dedup deliberately
 /// does not, because an integrity scan would also discard a usable file.)
 ///
+/// NEVER OVERWRITES an earlier quarantine, even against a concurrent second process: the name is
+/// CLAIMED with a hard link, which fails with EEXIST if the name is taken (a check-then-rename would
+/// not: rename() replaces its destination on both POSIX and Windows, so two processes recovering in
+/// the same second could destroy each other's evidence). The original name is then dropped. Only
+/// where a hard link is impossible (a filesystem without them) does it fall back to a check-then-
+/// rename. If 10,000 names are taken it FAILS (nullopt) rather than overwrite.
+///
 /// `epoch_seconds` is clamped to >= 0: a clock before 1970 would otherwise write `.corrupt--5`,
-/// which parse_quarantine_name rejects, so the file could never be pruned. rename() keeps the
-/// file's existing mode/ACL (0600 on POSIX after a normal open).
+/// which parse_quarantine_name rejects, so the file could never be pruned. The moved file keeps its
+/// existing mode/ACL (0600 on POSIX after a normal open).
 inline std::optional<std::filesystem::path> quarantine_corrupt_db(const std::filesystem::path& path,
                                                                  std::int64_t epoch_seconds) {
     const std::int64_t epoch = epoch_seconds < 0 ? 0 : epoch_seconds;
-    std::filesystem::path dest = path;
-    dest += std::format(".corrupt-{}", epoch);
-    {
-        // The epoch is 1 s granular and the wall clock can step backward, so a name can already
-        // exist: add `-n`, and if 10,000 names are taken (or the check fails) refuse to overwrite.
-        std::error_code exists_ec;
-        for (int n = 1; n < 10'000 && std::filesystem::exists(dest, exists_ec); ++n) {
-            dest = path;
-            dest += std::format(".corrupt-{}-{}", epoch, n);
+    const auto name_for = [&](int n) {
+        std::filesystem::path dest = path;
+        dest += n == 0 ? std::format(".corrupt-{}", epoch) : std::format(".corrupt-{}-{}", epoch, n);
+        return dest;
+    };
+
+    std::optional<std::filesystem::path> claimed;
+    bool hard_link_unavailable = false;
+    for (int n = 0; n < 10'000; ++n) {
+        const auto dest = name_for(n);
+        std::error_code lec;
+        std::filesystem::create_hard_link(path, dest, lec);
+        if (!lec) {
+            // The name is ours, atomically. Drop the original name; if that fails the file is still
+            // at `path` (also at `dest`), so give the claim back and report "could not move".
+            std::error_code rec;
+            std::filesystem::remove(path, rec);
+            if (rec) {
+                std::error_code undo;
+                std::filesystem::remove(dest, undo);
+                return std::nullopt;
+            }
+            claimed = dest;
+            break;
         }
-        if (std::filesystem::exists(dest, exists_ec) || exists_ec)
-            return std::nullopt;
+        if (lec == std::errc::file_exists)
+            continue; // taken: try the next suffix
+        hard_link_unavailable = true; // no hard links here, or a real error: fall back below
+        break;
     }
-    std::error_code ec;
-    std::filesystem::rename(path, dest, ec);
-    if (ec)
+    if (!claimed && hard_link_unavailable) {
+        for (int n = 0; n < 10'000; ++n) {
+            const auto dest = name_for(n);
+            std::error_code exists_ec;
+            if (std::filesystem::exists(dest, exists_ec) || exists_ec)
+                continue;
+            std::error_code ec;
+            std::filesystem::rename(path, dest, ec);
+            if (ec)
+                return std::nullopt;
+            claimed = dest;
+            break;
+        }
+    }
+    if (!claimed)
         return std::nullopt;
+    const auto& dest = *claimed;
     for (std::string_view sfx : kSidecars) {
         std::filesystem::path side = path;
         side += std::string{sfx};

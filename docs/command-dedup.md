@@ -37,7 +37,9 @@ regressible — nothing fails loudly when one is broken.
    **Corruption recovery (#3665).** A `command_dedup.db` that CANNOT BE OPENED because it is corrupt is
    quarantined and recreated, once, rather than leaving the agent degraded on every boot.
    `CommandDedupStore::open` moves the main file to `command_dedup.db.corrupt-<unix-epoch-seconds>[-n]`
-   (never overwriting an earlier one; if every `-n` is taken it fails instead), carries any non-empty
+   (never overwriting an earlier one, even against a second process recovering in the same second: the name is
+   claimed with an atomic hard link, falling back to check-then-rename only where hard links are impossible;
+   if every `-n` is taken it fails instead), carries any non-empty
    `-wal`/`-shm`/`-journal` with it as `<that name>-wal` etc (empty or unmovable sidecars are removed, best
    effort), and opens a fresh store. The filesystem half lives in `agents/core/src/command_dedup_quarantine.hpp`
    (header-only, unit-tested directly). What counts is deliberately narrow:
@@ -60,17 +62,27 @@ regressible — nothing fails loudly when one is broken.
    - **Only the newest 3 quarantined stores are kept** (owner ruling). Each holds up to a ring's worth of
      serialized responses, which can include command output, so they are not kept forever. The prune is
      count-based, not a clock cutoff, orders by the number in the name, and never removes the file the same
-     open just created (a backward clock step can mis-order names). It runs on the NEXT recovery, never throws,
-     and a failed remove is logged and left. It only ever touches names of the exact form
+     open just created (a clock step can mis-order names: a backward step can make the newest file sort
+     oldest, and an endpoint whose clock was once set far into the future leaves a name that sorts as newest
+     and keeps one of the 3 slots). It runs at the end of every recovery, including the one that creates the
+     newest file, whether or not the fresh store then opened. It never throws, and a failed remove is logged
+     and retried at the next recovery. It only ever touches names of the exact form
      `command_dedup.db.corrupt-<digits>[-<digits>][-wal|-shm|-journal]`.
    - It is observable: an `error` log naming the reason and the quarantine path, a `warn` from the agent, the
      agent-local counter `yuzu_agent_dedup_quarantined_total`, and the `yuzu.dedup_quarantined` heartbeat tag
      (the counter value, nonzero for the lifetime of THAT agent process; it resets on restart because the
      agent has no `/metrics` endpoint). Recovery restores protection, so `yuzu.dedup_degraded` stays `0`. A
      corrupt file that cannot be moved aside fails the open instead and takes the normal degraded path
-     (`yuzu_agent_dedup_open_failed_total`, `yuzu.dedup_degraded=1`).
+     (`yuzu_agent_dedup_open_failed_total`, `yuzu.dedup_degraded=1`). So does a fresh store that cannot be
+     created after a successful quarantine: the history is then lost AND the agent is degraded, the error names
+     the quarantined file, and `yuzu_agent_dedup_quarantined_total` is NOT incremented (that branch is
+     untested; see `docs/test-coverage.md`).
+   - **The fleet signal does not survive a restart.** The heartbeat tag is a per-process counter, so one agent
+     restart returns it to 0 while up to 3 quarantined files remain on the endpoint. A durable marker (derived
+     from the `.corrupt-*` files, or a row in the fresh store) is a candidate follow-up that has not been filed.
    - The helper is a copy of echo's `quarantine_corrupt_db` (`echo_db.cpp`). Hoisting both into
-     `agents/shared` is a candidate follow-up that has not been filed.
+     `agents/shared` is a candidate follow-up that has not been filed. Echo does not yet have this code's
+     no-overwrite claim or negative-epoch clamp.
 
 Invariants 3 and 4, the claim-error leg of 7 (`count_claim_error`), and the `owns_claim` result that
 gates 1's queue-full release are decided by the pure, proto-free `agents/core/src/command_dedup_decision.hpp`

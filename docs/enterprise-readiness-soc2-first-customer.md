@@ -859,6 +859,16 @@ The fleet visualization cache (`FleetTopologyStore`) is the highest-resolution e
 
 The Guardian events table is sized for **~10k events/s during a fleet-wide incident** (design doc §9.1), i.e. ~864M rows/day. The 30-day default is the retention/recovery trade-off: long enough to correlate an incident across the standard forensic window, short enough to keep steady-state disk under ~25GB per million endpoints at typical drift rates. Tenants with longer forensic SLAs should raise `guardian_event_retention_days` _and_ provision storage — the product does not auto-trim disk.
 
+#### Agent-side `command_dedup.db` (replay protection, per device)
+
+`command_dedup.db` is the agent's durable command-idempotency store (HA WS-0, ADR-2002; `docs/command-dedup.md`). It is
+listed here because it holds saved command responses, which can include command output.
+
+| Data | Data class | Default | Retention | Deletion mechanism | Configurable via |
+|---|---|---|---|---|---|
+| `command_dedup.db`: one row per recent `command_id` with the stored terminal `CommandResponse` (a command's status and up to 64 KiB of its output) | Command responses, which **may contain personal data** if a command emitted it. Local to the endpoint, never sent anywhere by this store; owner-only file mode on POSIX, the data directory's inherited ACL on Windows | **On** | A fixed-size, clock-free ring over the most recent terminal commands (20,000); in-flight rows are never evicted | Ring eviction; removed with the data directory on uninstall | Not configurable |
+| `command_dedup.db.corrupt-<unix-epoch-seconds>[-n]` (+ `-wal`/`-shm`/`-journal`): the previous store, kept when it was too corrupt to open | Same content and sensitivity as above (up to the same ring of saved responses) | Created only on a corruption recovery | **The newest 3 are kept; there is no age expiry.** Older ones are removed at the end of each recovery | Automatic prune at the next recovery, or manual deletion by the operator once reviewed | Not configurable (the count is a compile-time constant) |
+
 #### Agent-side, transient (no durable store)
 
 Read results that are never written to a database on either side — computed fresh per invocation and streamed to the caller. Listed here so a data-inventory pass finds them instead of assuming an omission.

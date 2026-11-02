@@ -284,16 +284,17 @@ CommandDedupStore::open(const std::filesystem::path& db_path) {
                       reason, moved->string());
         quarantined_file = moved->filename().string();
         attempt = open_and_init(db_path);
-        if (attempt) {
-            // Owner ruling: keep the newest few only. Never throws (best effort).
-            dedup_quarantine::prune_old_quarantines(db_path, *moved);
-        }
+        // Owner ruling: keep the newest few only. Runs whether or not the retry succeeded, so the
+        // bound also holds on a disk where every boot quarantines and the fresh create fails.
+        // Never throws (best effort).
+        dedup_quarantine::prune_old_quarantines(db_path, *moved);
     }
     if (!attempt) {
         return std::unexpected(CommandDedupError{
             quarantined_file
-                ? std::format("command_dedup.db re-initialised after quarantine still failed: {}",
-                              attempt.error().message)
+                ? std::format("command_dedup.db re-initialised after quarantine (the corrupt file "
+                              "was kept as {}; its history is lost) still failed: {}",
+                              *quarantined_file, attempt.error().message)
                 : attempt.error().message});
     }
 
