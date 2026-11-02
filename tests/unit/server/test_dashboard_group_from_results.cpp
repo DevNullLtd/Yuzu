@@ -1305,6 +1305,13 @@ TEST_CASE("group-from-results: a form key that merely ends in q is never the Sea
 // R2: a Search term substring-matches stored output, so the preview and the POST that carry one
 // run the results table's own Response:Read admission after ManagementGroup:Write; a filters-only
 // request keeps ManagementGroup:Write alone, exactly as before.
+namespace {
+// The constant toast a refused Search admission answers (JSON as refusal_toast_header builds it).
+const std::string kSearchRefusalToast =
+    R"({"showToast":{"message":"The Search term could not be used: reading responses is not )"
+    R"(permitted or the permission check is unavailable. Nothing was created.","level":"error"}})";
+} // namespace
+
 TEST_CASE("group-from-results: a Search term needs the results table's Response:Read admission, in "
           "the preview and the POST; filters alone do not",
           "[pg][server][dashboard][group_from_results][search][auth]") {
@@ -1322,12 +1329,15 @@ TEST_CASE("group-from-results: a Search term needs the results table's Response:
         CHECK(form->status == 403);
         CHECK(contains(form->body, "permission denied"));
         CHECK_FALSE(contains(form->body, "agents will be added"));
+        // The form never swaps a 4xx body: the toast is the operator's signal.
+        CHECK(form->get_header_value("HX-Trigger") == kSearchRefusalToast);
         CHECK(h.fleet_read_securable == "Response");
         CHECK(h.fleet_read_operation == "Read");
 
         auto res = h.post(q_form_body("q-denied", "&q=alp"));
         CHECK(res->status == 403);
         CHECK(contains(res->body, "permission denied"));
+        CHECK(res->get_header_value("HX-Trigger") == kSearchRefusalToast);
         CHECK(h.fleet_read_calls == 2);
         CHECK_FALSE(h.mg.find_group_by_name("q-denied").has_value());
         // The refusal precedes every store read and the visible-scope resolve.
@@ -1355,9 +1365,11 @@ TEST_CASE("group-from-results: a Search term needs the results table's Response:
         REQUIRE(form != nullptr);
         CHECK(form->status == 503);
         CHECK_FALSE(contains(form->body, "agents will be added"));
+        CHECK(form->get_header_value("HX-Trigger") == kSearchRefusalToast);
 
         auto res = h.post(q_form_body("q-unwired", "&q=alp"));
         CHECK(res->status == 503);
+        CHECK(res->get_header_value("HX-Trigger") == kSearchRefusalToast);
         CHECK_FALSE(h.mg.find_group_by_name("q-unwired").has_value());
         CHECK(h.visible_set_fn_calls == 0);
 

@@ -141,6 +141,11 @@ static constexpr const char* kGroupPartialRefusal =
     "The result set was cut by the read cap, so the agent list is partial. "
     "Nothing was created. Narrow the filters or the Search term and try again.";
 
+/// The toast for a Search term the caller may not use (Response:Read refused or unavailable).
+static constexpr const char* kSearchAdmissionRefusal =
+    "The Search term could not be used: reading responses is not permitted or the permission "
+    "check is unavailable. Nothing was created.";
+
 /// Intersects @p ids with the caller's visible @p scope (nullopt = sees all); returns how many
 /// ids were dropped. The intersection the group POST and the preview's Search-term path share:
 /// both read unscoped (the Search predicate runs in the server), so they scope after the read.
@@ -237,12 +242,17 @@ bool DashboardRoutes::admit_search_read(const httplib::Request& req,
         spdlog::error("group Search path: fleet_read_fn_ unwired -- misconfigured call site; "
                       "failing closed");
         res.status = 503;
+        res.set_header("HX-Trigger", refusal_toast_header(kSearchAdmissionRefusal));
         res.set_content("<span class=\"feedback-error\">Service unavailable.</span>",
                         "text/html; charset=utf-8");
         return false;
     }
-    // On a refusal the gate has already written the A4 error body and status.
-    return fleet_read_fn_(req, res, "Response", "Read").admitted;
+    // On a refusal the gate has already written the A4 error body and status; the form never
+    // swaps a 4xx/5xx body, so the toast is the operator's only signal.
+    if (fleet_read_fn_(req, res, "Response", "Read").admitted)
+        return true;
+    res.set_header("HX-Trigger", refusal_toast_header(kSearchAdmissionRefusal));
+    return false;
 }
 
 // ---------------------------------------------------------------------------

@@ -276,9 +276,13 @@ TEST_CASE("dashboard page: the results busy counter is released by the request's
 
     CHECK(html.find("var rrTimer = null, rrBusy = 0, rrDirty = false, rrArmedUntil = 0;") !=
           std::string::npos);
-    // One beforeRequest listener increments and hooks the XHR; there is no afterRequest body
-    // listener (the source-element event that a detached source never delivers to body).
-    CHECK(count_of(html, "document.body.addEventListener('htmx:beforeRequest'") == 1);
+    // One beforeSend listener increments and hooks the XHR (beforeSend is the last event before
+    // send(): a listener that cancels the request at beforeRequest can never strand the counter);
+    // there is no afterRequest body listener (the source-element event that a detached source
+    // never delivers to body).
+    CHECK(count_of(html, "document.body.addEventListener('htmx:beforeSend'") == 1);
+    CHECK(html.find("document.body.addEventListener('htmx:beforeRequest'") == std::string::npos);
+    CHECK(html.find("!x || e.defaultPrevented") == std::string::npos);
     CHECK(html.find("x.addEventListener('loadend'") != std::string::npos);
     CHECK(html.find("document.body.addEventListener('htmx:afterRequest'") == std::string::npos);
     CHECK(html.find("rrBusy++;") != std::string::npos);

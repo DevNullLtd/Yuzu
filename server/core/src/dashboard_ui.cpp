@@ -1364,7 +1364,7 @@ constexpr char kDashJs7[] = R"HTM(    /* ── Global Keyboard Shortcuts ──
     }
     /* The drop has no retry, so the page tracks the scope itself: a request that parks on the
        filter bar (a results fragment or the Create Group form GET, a refresh included) counts as
-       busy from htmx:beforeRequest to its XHR's loadend, which fires for load, error, abort and
+       busy from htmx:beforeSend (the last event before send(), after any listener could cancel the request) to its XHR's loadend, which fires for load, error, abort and
        timeout and does not depend on the DOM (htmx:afterRequest is delivered to the request's
        source element, so a detached source never reaches a body listener). A refresh that falls
        due while one is in flight is marked dirty and re-armed once the scope is idle, so the
@@ -1386,10 +1386,9 @@ constexpr char kDashJs7[] = R"HTM(    /* ── Global Keyboard Shortcuts ──
         refreshResultsSummary();
       }, 1000);
     }
-    document.body.addEventListener('htmx:beforeRequest', function(e) {
+    document.body.addEventListener('htmx:beforeSend', function(e) {
       var cfg = e.detail && e.detail.requestConfig, x = e.detail && e.detail.xhr;
-      if (!x || e.defaultPrevented || !cfg ||
-          !/^\/fragments\/(results|create-group-form)\b/.test(cfg.path || '')) return;
+      if (!x || !cfg || !/^\/fragments\/(results|create-group-form)\b/.test(cfg.path || '')) return;
       rrBusy++;
       x.addEventListener('loadend', function() {
         rrBusy--; /* one loadend per counted request */
