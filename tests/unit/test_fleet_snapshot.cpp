@@ -447,6 +447,10 @@ TEST_CASE("parse_proc_status: an empty stream leaves the struct untouched", "[ec
 TEST_CASE("parse_proc_status: a stream that throws part-way keeps what parsed", "[echo][fleet][procread]") {
     ThrowingBuf buf{"Name:\tgone\nPPid:\t4\n"};
     std::istream in(&buf);
+    // Without a badbit exception mask std::getline swallows the streambuf's exception into
+    // badbit and the loop just ends, so the catch under test would never be entered. The mask
+    // makes getline rethrow it, so it is the catch in parse_proc_status that keeps the fields.
+    in.exceptions(std::ios::badbit);
     ProcessInfo pi;
     REQUIRE_NOTHROW(yuzu::agent::detail::parse_proc_status(in, pi));
     CHECK(pi.name == "gone");

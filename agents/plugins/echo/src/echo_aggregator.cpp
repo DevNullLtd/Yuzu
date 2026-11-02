@@ -541,6 +541,17 @@ RetentionGuardCounters retention_guard_counters(const RetentionGuardState& guard
     return out;
 }
 
+int64_t retention_clock_events(const RetentionGuardState& guard) {
+    std::lock_guard lock(guard.mu);
+    // `delete_failures` is deliberately left out: see the header comment.
+    int64_t n = 0;
+    for (const auto& kv : guard.declines)
+        n += kv.second;
+    for (const auto& kv : guard.failures)
+        n += kv.second;
+    return n;
+}
+
 std::vector<std::string> format_retention_guard_lines(const RetentionGuardState& guard) {
     const auto counters = retention_guard_counters(guard);
     std::vector<std::string> lines;

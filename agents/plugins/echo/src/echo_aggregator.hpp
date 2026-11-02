@@ -218,6 +218,13 @@ struct RetentionGuardCounters {
 
 [[nodiscard]] RetentionGuardCounters retention_guard_counters(const RetentionGuardState& guard);
 
+/// Running total of the events that say the retention pass could not trust this pass's clock:
+/// clock declines plus probe-read and `__clock_state__` failures. Delete failures are NOT
+/// counted: the guard admitted the clock and only a DELETE failed, which says nothing about the
+/// reading the byte budget derives its floors from. The budget pass compares this total before
+/// and after `run_retention` and skips when it rose.
+[[nodiscard]] int64_t retention_clock_events(const RetentionGuardState& guard);
+
 /// The exact `echo status` lines for the retention guard, in emission order:
 /// a `retention_guard|<table>|<declines>` line per table that has declined, a
 /// `retention_guard_failed|<table>|<failures>` line per table whose probes OR

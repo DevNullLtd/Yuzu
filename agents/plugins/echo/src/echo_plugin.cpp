@@ -1139,6 +1139,7 @@ public:
             // database under it. collect_mu_ is already released, so the lock order
             // rollup_mu_ -> collect_mu_ -> mu_ holds.
             std::lock_guard rollup_lock(rollup_mu_);
+            set_budget_catch_up({}); // a collect_fast past the db_ check must not arm a slice
             db_.reset();
         }
         spdlog::info("Echo plugin shut down");
@@ -2710,6 +2711,10 @@ private:
                 ctx.write_output(std::format("echo|collect_{}|0|{}", src_name,
                                              yuzu::echo::kCollectStatusCaptureIncomplete));
             } catch (const std::exception& e) {
+                // A source's events+cursor write opens a raw BEGIN IMMEDIATE; an unwind between
+                // it and COMMIT would leave the shared connection mid-transaction and every
+                // later write would refuse. noexcept, and a no-op in autocommit.
+                db_->rollback_open_transaction();
                 // ABI containment. The SDK's execute trampoline
                 // (sdk/include/yuzu/plugin.hpp) is an extern "C" boundary with
                 // no try/catch of its own, so ANY exception that escapes here
@@ -2738,6 +2743,7 @@ private:
                 ctx.write_output(std::format("echo|collect_{}|0|{}", src_name,
                                              yuzu::echo::kCollectStatusCaptureIncomplete));
             } catch (...) {
+                db_->rollback_open_transaction(); // same reason as the std::exception arm above
                 spdlog::error("ECHO: {} cursor collect threw a non-std exception -- source "
                               "skipped this tick", src_name);
                 note_health(src_name, yuzu::echo::kCollectStatusCaptureIncomplete);
@@ -4475,18 +4481,9 @@ private:
         // and aggregation has just stamped its marks with it, so a clock the guard refused must
         // not drive eviction either. Same semantics as retention: a FRESH anomaly declines the
         // pass; a suppressed repeat is paced and drains on a later pass.
-        const auto guard_events = [this] {
-            const auto c = yuzu::echo::retention_guard_counters(retention_guard_);
-            std::int64_t n = 0;
-            for (const auto& kv : c.declines)
-                n += kv.second;
-            for (const auto& kv : c.failures)
-                n += kv.second;
-            return n;
-        };
-        const std::int64_t guard_before = guard_events();
+        const std::int64_t guard_before = yuzu::echo::retention_clock_events(retention_guard_);
         yuzu::echo::run_retention(*db_, ts, retention_guard_);
-        if (guard_events() > guard_before) {
+        if (yuzu::echo::retention_clock_events(retention_guard_) > guard_before) {
             {
                 // Surfaced as `retention_guard|__budget__|N`; counted in neither status total,
                 // because the decline or failure that caused it is already counted.
@@ -4573,9 +4570,10 @@ private:
             const auto sb = db_->storage_bytes();
             return sb.ok && sb.auto_vacuum == 2 && sb.freelist_count > 0;
         };
-        do {
-            db_->incremental_vacuum(256);
-        } while (time_left() && has_free_pages());
+        // A failing PRAGMA (disk full, I/O error, read-only) ends the loop: re-issuing it would
+        // only spin to the deadline with a warning per call.
+        while (db_->incremental_vacuum(256) && time_left() && has_free_pages()) {
+        }
         const auto wal = db_->storage_bytes();
         const bool truncate = evicted > 0 || (wal.ok && wal.wal_bytes >
                                                             yuzu::echo::kEchoWalAllowanceBytes);
@@ -4682,7 +4680,8 @@ private:
         if (!budget_catch_up_.load(std::memory_order_relaxed))
             return;
         std::unique_lock lock(rollup_mu_, std::try_to_lock);
-        if (!lock.owns_lock() || !budget_catch_up_.load(std::memory_order_relaxed))
+        // db_ is reset under rollup_mu_ in shutdown(), so it is checked under the lock.
+        if (!lock.owns_lock() || !db_ || !budget_catch_up_.load(std::memory_order_relaxed))
             return;
         enforce_budget(budget_catch_up_now_.load(std::memory_order_relaxed),
                        /*maintenance_pass=*/false);

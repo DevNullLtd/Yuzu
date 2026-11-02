@@ -3683,14 +3683,17 @@ std::expected<int64_t, std::string> EchoDatabase::delete_counted(const std::stri
     return deleted;
 }
 
-void EchoDatabase::incremental_vacuum(int pages) {
+bool EchoDatabase::incremental_vacuum(int pages) {
     std::lock_guard lock(mu_);
     if (!db_ || pages <= 0)
-        return;
+        return false;
     SqliteErrMsg err;
     if (sqlite3_exec(db_, std::format("PRAGMA incremental_vacuum({})", pages).c_str(), nullptr,
-                     nullptr, err.addr()) != SQLITE_OK)
+                     nullptr, err.addr()) != SQLITE_OK) {
         spdlog::warn("EchoDatabase: incremental_vacuum failed: {}", err.text());
+        return false;
+    }
+    return true;
 }
 
 CheckpointResult EchoDatabase::checkpoint(CheckpointMode mode) {

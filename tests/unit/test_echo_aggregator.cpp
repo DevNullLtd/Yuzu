@@ -1649,6 +1649,30 @@ TEST_CASE("Echo budget: the __budget__ skip line is in neither retention guard t
     CHECK(lines[3] == "retention_guard_failures_total|1");
 }
 
+TEST_CASE("Echo budget: retention_clock_events counts clock refusals and not delete failures",
+          "[echo][retention][clock-guard][budget]") {
+    // The budget pass skips when this total rises across run_retention. A table whose DELETE
+    // fails every pass is a delete problem, not a clock problem (the guard admitted the clock),
+    // so it must not switch the byte cap off.
+    yuzu::echo::RetentionGuardState g;
+    CHECK(yuzu::echo::retention_clock_events(g) == 0);
+    {
+        std::lock_guard lock(g.mu);
+        g.delete_failures["x"] = 5;
+    }
+    CHECK(yuzu::echo::retention_clock_events(g) == 0);
+    {
+        std::lock_guard lock(g.mu);
+        g.declines["x"] = 1;
+    }
+    CHECK(yuzu::echo::retention_clock_events(g) == 1);
+    {
+        std::lock_guard lock(g.mu);
+        g.failures["__clock_state__"] = 1;
+    }
+    CHECK(yuzu::echo::retention_clock_events(g) == 2);
+}
+
 TEST_CASE("Echo #2361: every registered granularity declares the ts column its suffix maps to",
           "[echo][retention][clock-guard][registry]") {
     // `ts_column_for_suffix` is public API with three consumers now (the DDL's

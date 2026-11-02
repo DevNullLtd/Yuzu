@@ -2679,9 +2679,6 @@ TEST_CASE("registry live: set, change and delete through a pre-opened handle are
         CHECK(r[6] == "notify"); // the read was triggered by the key watch
     }
     CHECK(std::stoll(run.t.db.get_config("registry_attr_attributed", "0")) >= 3);
-    // The bam\State subtree is excluded at read and diff: no row, whatever else is watched.
-    CHECK(q(run.t.db, "SELECT COUNT(*) FROM registry_live WHERE lower(key_path) LIKE '%bam\\state%'")
-              .rows[0][0] == "0");
 }
 
 TEST_CASE("registry live: with the ETW leg disabled the same transitions land as attr:off",

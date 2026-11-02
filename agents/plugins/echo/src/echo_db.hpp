@@ -548,7 +548,8 @@ public:
                                                                      std::string_view counter_key);
 
     /// Return up to `pages` free pages to the OS (no-op unless auto_vacuum is incremental).
-    void incremental_vacuum(int pages);
+    /// False when the call did not run (closed handle, `pages <= 0`) or the PRAGMA failed.
+    bool incremental_vacuum(int pages);
 
     /// WAL checkpoint with the busy timeout dropped to 0 for the call, so a reader that pins
     /// the WAL yields kBusy at once instead of stalling the lock for the 5 s busy timeout.
