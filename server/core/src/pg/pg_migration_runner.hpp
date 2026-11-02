@@ -83,18 +83,20 @@ public:
     ///
     /// #3894: the complementary case — a database already AHEAD of this
     /// binary's vector (an older build started against a database a newer one
-    /// migrated). That is WARN-ONLY, never a refusal: the upgrade guide says in
-    /// many places that an older build can still run against an
-    /// additively-upgraded database, and refusing would break a restart that is
-    /// otherwise harmless. `run()` applies nothing, logs one actionable warning
-    /// per CALL naming the store and both versions, and returns true. Some
-    /// stores call `run()` more than once per process start (the auth and
-    /// secrets stores are opened twice; `LeaderElector` re-runs it on every
-    /// reconnect), so the warning can repeat. A store's own constructor can
-    /// still refuse afterwards (e.g. a projection smoke-check), so "returns
-    /// true" is not "the store will start". Log-only by design (the pg/ layer
-    /// has no metrics registry). The warning protects only binaries that
-    /// contain it; builds shipped before it stay exposed.
+    /// migrated). That situation is outside the supported procedure (rolling
+    /// upgrades and a return to an earlier build are not supported at this
+    /// stage), so this is WARN-ONLY, never a refusal: a refusal would add a
+    /// second failure to a situation that is already off-procedure, and the
+    /// owner chose to end the silence without changing what boots. `run()`
+    /// applies nothing, logs one actionable warning per CALL naming the store
+    /// and both versions, and returns true. Some stores call `run()` more than
+    /// once per process start (the auth and secrets stores are opened twice;
+    /// `LeaderElector` re-runs it on every reconnect), so the warning can
+    /// repeat. A store's own constructor can still refuse afterwards (e.g. a
+    /// projection smoke-check), so "returns true" is not "the store will
+    /// start". Log-only by design (the pg/ layer has no metrics registry). The
+    /// warning protects only binaries that contain it; builds shipped before
+    /// it stay silent.
     [[nodiscard]] static bool run(PGconn* conn, std::string_view store_name,
                                   const std::vector<PgMigration>& migrations);
 

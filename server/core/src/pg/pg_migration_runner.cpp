@@ -247,12 +247,13 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
     if (is_schema_ahead(current, migrations)) {
         spdlog::warn(
             "PgMigrationRunner: store '{}' is at schema v{} in the database but this binary only "
-            "knows migrations up to v{} — a newer build has already migrated this database. "
-            "Nothing was applied and this check does not refuse the start, but this binary may "
-            "fail or misbehave on schema it does not know. Run the build that matches this "
-            "database, or recover by rolling forward or restoring this deployment's own backup "
+            "knows migrations up to v{} — a newer build has already migrated this database (or "
+            "the version record is wrong). Nothing was applied and this check does not refuse "
+            "the start, but this binary may fail, misbehave or enforce less than the newer build "
+            "on schema it does not know. Run the build that matches this database, or recover by "
+            "rolling forward or restoring this deployment's own backup into a fresh deployment "
             "(docs/user-manual/upgrading.md, \"When a server build finds its database ahead of "
-            "it\").",
+            "it (every Postgres store)\").",
             store, current, migrations.back().version);
     }
 
