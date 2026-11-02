@@ -45240,7 +45240,12 @@ TEST_CASE("MCP execute_instruction_definition: unwired ports fail closed",
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(body["error"]["data"]["reason"] == "store_unavailable");
-    CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+    // NEVER wired is a server defect that does not clear by itself: no retry hint, and a
+    // remediation that says so (a wired store whose read fails keeps its 5000, see retryhint).
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    CHECK(body["error"]["data"]["remediation"].get<std::string>().find("retrying will not help") !=
+          std::string::npos);
 }
 
 TEST_CASE("MCP execute_instruction_definition: a chokepoint denial names the definition's plugin.action",
