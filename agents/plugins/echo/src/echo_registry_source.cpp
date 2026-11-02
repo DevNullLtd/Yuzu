@@ -162,17 +162,24 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
         std::vector<std::string> sids = cur.hku;
         if (hku_changed || reconcile || rebaseline_all || sids.empty())
             sids = reader_.loaded_sids();
-        // The unloaded profiles, asked for under exactly the conditions the loaded ones are. A
-        // sid that is loaded is never offline, whatever the two snapshots say. An incomplete
-        // walk keeps the known list (reconcile_offline): scope is removed only when a complete
-        // walk shows the profile gone, never because a walk failed.
+        // The unloaded profiles, asked for under exactly the conditions the loaded ones are,
+        // and again while the last walk was incomplete or a known profile has no path yet (a
+        // user who just logged off during an incomplete walk). The walk is classified against
+        // THIS tick's `sids`, the one HKU snapshot every decision below uses, so a profile is
+        // offline exactly when it is not in `sids`. An incomplete walk keeps the known list, and
+        // a sid loaded last tick that is not now joins it (reconcile_offline): scope is removed
+        // only when a complete walk shows the profile gone, never because a walk failed.
         const std::vector<std::string> prev_hku = cur.hku;
         const std::vector<OfflineProfile> prev_offline = cur.offline;
         std::vector<OfflineProfile> offline = cur.offline;
         bool discovery_incomplete = offline_incomplete_;
-        if (hku_changed || reconcile || rebaseline_all || offline.empty()) {
-            const OfflineDiscovery d = reader_.offline_profiles();
-            offline = reconcile_offline(cur.offline, sids, d);
+        const bool offline_unresolved =
+           offline_incomplete_ ||
+           std::any_of(offline.begin(), offline.end(),
+                       [](const OfflineProfile& o) { return o.path.empty(); });
+        if (hku_changed || reconcile || rebaseline_all || offline.empty() || offline_unresolved) {
+            const OfflineDiscovery d = reader_.offline_profiles(sids);
+            offline = reconcile_offline(cur.offline, prev_hku, sids, d);
             discovery_incomplete = !d.complete;
         } else {
             std::erase_if(offline, [&](const OfflineProfile& o) {
@@ -367,6 +374,18 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
                 // refused on its first sight (unreadable, not baselined) has been attempted, so
                 // it waits for the hour too: a hive that stays refused costs one attempt an hour.
                 st.armed = true;
+                // A profile whose path is not known yet (it logged off while the walk was
+                // incomplete) cannot be mounted: it is never passed to the reader, keeps its
+                // baseline and status, and is marked deferred so the first tick a complete walk
+                // supplies the path reads it, not the next hour.
+                std::string path;
+                for (const auto& o : offline)
+                    if (o.sid == hku_sid_of(root))
+                        path = o.path;
+                if (path.empty()) {
+                    st.deferred = true;
+                    continue;
+                }
                 const bool offline_due = reconcile || st.deferred || st.status.empty() ||
                                          st.status == "due" ||
                                          (!st.baselined && st.status != "unreadable");
@@ -384,10 +403,6 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
                 for (const auto& r : roots)
                     if (hku_sid_of(r) == sid)
                         group.push_back(r);
-                std::string path;
-                for (const auto& o : offline)
-                    if (o.sid == sid)
-                        path = o.path;
                 for (const auto& g : group) {
                     init_state(g, cur.roots[g]);
                     done.insert(g);
@@ -1358,10 +1373,12 @@ std::vector<std::string> enumerate_hku() {
 // The profiles whose hive is not loaded, from one ProfileList walk. This shell only gathers
 // the facts (the walk's Win32 codes, the merged profile list, the sids whose record failed);
 // classify_offline_discovery (echo_registry_parsers.hpp, unit-tested on every OS) decides.
-// `complete` is mapdrive's own rule (profile_list_complete, plus "not truncated"): a walk that
-// was cut short, that hit an unreadable ProfileList or that stopped at the profile cap proves
-// nothing about what is absent, so the core keeps the scope it knew.
-OfflineDiscovery discover_offline_profiles() noexcept {
+// `loaded` is collect()'s own HKU snapshot for this tick, not a second enumeration: a profile
+// is offline exactly when collect() does not hold it as loaded, so none can fall between two
+// snapshots. `complete` is mapdrive's own rule (profile_list_complete, plus "not truncated"): a
+// walk that was cut short, that hit an unreadable ProfileList or that stopped at the profile
+// cap proves nothing about what is absent, so the core keeps the scope it knew.
+OfflineDiscovery discover_offline_profiles(const std::vector<std::string>& loaded) noexcept {
     try {
         const auto disc = yuzu::win::enumerate_profile_list();
         if (disc.truncated) {
@@ -1371,8 +1388,7 @@ OfflineDiscovery discover_offline_profiles() noexcept {
                              "profiles beyond that are not discovered (repeats suppressed)",
                              yuzu::win::kMaxProfiles);
         }
-        const auto profiles =
-           yuzu::profiles::build_profile_list(disc.records, yuzu::win::enumerate_hku_subkeys());
+        const auto profiles = yuzu::profiles::build_profile_list(disc.records, loaded);
         std::vector<std::string> failed;
         for (const auto& f : disc.record_failures)
             failed.push_back(f.sid);
@@ -1522,7 +1538,9 @@ RegistryReader make_windows_registry_reader() {
         return read_root(normalise_registry_path(root, read_current_control_set()), deadline);
     };
     r.loaded_sids = [] { return enumerate_hku(); };
-    r.offline_profiles = [] { return discover_offline_profiles(); };
+    r.offline_profiles = [](const std::vector<std::string>& loaded) {
+        return discover_offline_profiles(loaded);
+    };
     r.read_offline_hive = [tick = std::make_shared<OfflineMountTick>()](
                              const std::string& sid, const std::string& path,
                              const std::vector<std::string>& roots, std::int64_t deadline) {

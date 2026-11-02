@@ -472,19 +472,31 @@ cursor.** What it adds to the pattern:
   floor, and is excluded from `pending_first`. Scope is removed only by a
   COMPLETE profile walk (`reconcile_offline`): an incomplete walk keeps the known
   list (`registry_offline_discovery_incomplete`), and a record whose path was
-  unreadable keeps its cursor entry. A failed mount is an Unreadable read with a
+  unreadable keeps its cursor entry. A sid loaded on the previous tick and gone now
+  (a logoff) is a known profile whose path is not yet known (`{sid, ""}`, the
+  `prev_loaded` argument), so a user who logs off during an incomplete or partial
+  walk keeps the baseline too: an incomplete walk or a `partial` record carries the
+  entry, a complete walk that lists it supplies the path, and one that names it
+  nowhere drops it. A root whose path is empty is never mounted: it is marked
+  `deferred` each tick (baseline and status untouched, no row) and read the first
+  tick a complete walk supplies the path. A failed mount is an Unreadable read with a
   named reason (`offline:<token>`), one gap row per transition; the `deferred`
   flag on the root's state, not its status, schedules the next-tick retry. A hive
   refused at its first sight has been attempted, so it waits for the hour like any
-  other refusal; only a root never tried, or re-baselined, is due outside the
-  reconcile. A mount the shared worker ceiling refuses (`decide_mount_call`:
+  other refusal, and so does a refused root across a re-enable (the re-enable clears
+  `baselined`, but a root whose status is `unreadable` is not due on that clause: it
+  is re-baselined silently at its next hourly read). Only a root never tried, or
+  re-baselined after a successful read, is due outside the reconcile. A mount the shared worker ceiling refuses (`decide_mount_call`:
   rejected means nothing ran) is not an attempt: `offline:mount_rejected`, later
   hives that tick `offline:skipped_after_rejection`, no gap row, retried next tick;
   a timeout is an attempt (`offline:timeout`, one gap row) and halts the rest of the
   tick. Profile discovery runs hourly and on an HKU name-watch mark, and on every
-  tick while no logged-off profile is known (a ProfileList and HKU registry
-  enumeration, never a mount), which is also how a cursor from a build without
-  offline hives picks them up.
+  tick while no logged-off profile is known, while the last walk was incomplete or
+  while a known profile has no path yet (a ProfileList registry walk, never a
+  mount), which is also how a cursor from a build without offline hives picks them
+  up. It is classified against the loaded list collect() took for that tick (the
+  `loaded_sids` argument of the hook), never a second HKU enumeration: a logon
+  between two snapshots cannot leave a baselined profile in neither list.
 - **Rows land in the tick that observes the change, or the next one, and the writer is
   correlated, not verified.** A candidate is held only while `now - window_hi <
   kEtwSettle100ns` (5 s), and a notify window closes 1 s after the last notify, so a

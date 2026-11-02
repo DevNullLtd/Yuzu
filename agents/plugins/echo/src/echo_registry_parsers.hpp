@@ -69,7 +69,9 @@
 // again its first loaded read happens at once and diffs against the offline baseline. A failed
 // mount is an Unreadable read with a named reason (one gap row per transition); an INCOMPLETE
 // profile discovery keeps the known offline list (reconcile_offline): scope is removed only
-// when a complete walk says the profile is gone.
+// when a complete walk says the profile is gone. That holds for a user who logs off on the very
+// tick the walk is incomplete: the profile stays in scope with no path yet, is not read, and is
+// read once a later complete walk supplies the path.
 
 #include "echo_db.hpp" // RegistryEvent
 
@@ -278,9 +280,22 @@ RegistryScope::roots_for(const std::vector<std::string>& hku_subkeys,
 /// The offline profile list after a discovery: the ONE rule collect() and the tests share.
 /// A complete walk replaces the known list (keeping the entry of a sid it could not read the
 /// path for); an incomplete walk keeps it whole. A loaded sid is never offline.
+///
+/// `prev_loaded` is the loaded list the previous tick committed. A sid that was loaded then and
+/// is not now has just logged off: it is a known profile whose path is not yet known, so it
+/// joins `known` as `{sid, ""}` before the rules above run. A real `known` entry wins (first
+/// seen); an incomplete walk carries it; a complete walk carries it only when it names the sid
+/// in `partial` or lists it in `profiles` (which supplies the path). A complete walk that names
+/// it nowhere still drops it: that walk is authoritative. Only SID-named hives count
+/// (`.DEFAULT` and `<sid>_Classes` leave HKU too, and are not profiles).
 [[nodiscard]] inline std::vector<OfflineProfile>
-reconcile_offline(const std::vector<OfflineProfile>& known, const std::vector<std::string>& loaded,
-                  const OfflineDiscovery& d) {
+reconcile_offline(const std::vector<OfflineProfile>& known_in,
+                  const std::vector<std::string>& prev_loaded,
+                  const std::vector<std::string>& loaded, const OfflineDiscovery& d) {
+    std::vector<OfflineProfile> known = known_in;
+    for (const auto& sid : prev_loaded)
+        if (is_user_hive_name(sid) && std::find(loaded.begin(), loaded.end(), sid) == loaded.end())
+            known.push_back({sid, {}});
     std::vector<OfflineProfile> out;
     const auto is_loaded = [&](const std::string& sid) {
         return std::find(loaded.begin(), loaded.end(), sid) != loaded.end();

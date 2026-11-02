@@ -140,12 +140,22 @@ def problems(collector_src, plugin_src, gate_src, registry_src):
         out.append("the Windows reader no longer wires read_offline_hive to read_offline_hive_bounded")
     # The profile-list classification is unit-tested (classify_offline_discovery); the Windows
     # shell must feed it, or an empty-but-complete discovery would leave every test green.
-    discovery = body_of(r, "OfflineDiscovery discover_offline_profiles() noexcept")
+    discovery = body_of(
+        r, "OfflineDiscovery discover_offline_profiles(const std::vector<std::string>& loaded) noexcept")
     if discovery is None:
-        out.append("discover_offline_profiles() is missing")
-    elif "classify_offline_discovery(" not in discovery:
-        out.append("discover_offline_profiles() no longer classifies through classify_offline_discovery")
-    if not re.search(r"r\.offline_profiles = \[\] \{ return discover_offline_profiles\(\); \}", r):
+        out.append("discover_offline_profiles(loaded) is missing")
+    else:
+        if "classify_offline_discovery(" not in discovery:
+            out.append("discover_offline_profiles() no longer classifies through "
+                       "classify_offline_discovery")
+        # One HKU snapshot per tick: the shell classifies against collect()'s own list, never a
+        # second enumeration (a logon between the two would drop a baselined offline profile).
+        if "build_profile_list(disc.records, loaded)" not in discovery:
+            out.append("discover_offline_profiles() no longer classifies against collect()'s loaded list")
+        if "enumerate_hku" in discovery:
+            out.append("discover_offline_profiles() enumerates HKU a second time")
+    if not re.search(r"r\.offline_profiles = \[\]\(const std::vector<std::string>& loaded\) \{ "
+                     r"return discover_offline_profiles\(loaded\); \}", r):
         out.append("the Windows reader no longer wires offline_profiles to discover_offline_profiles")
 
     walk = body_of(c, "void enum_registry_outbound_history(")
@@ -306,8 +316,12 @@ class EchoMapdrivePinLexical(unittest.TestCase):
             "registry discovery stops classifying": dict(r=mutate(
                 r, "return classify_offline_discovery(", "return classify_offline(")),
             "registry discovery hook no longer wired": dict(r=mutate(
-                r, "r.offline_profiles = [] { return discover_offline_profiles(); };",
-                   "r.offline_profiles = [] { return OfflineDiscovery{}; };")),
+                r, "return discover_offline_profiles(loaded);", "return OfflineDiscovery{};")),
+            "registry discovery enumerates HKU a second time": dict(r=mutate(
+                r, "build_profile_list(disc.records, loaded)",
+                   "build_profile_list(disc.records, yuzu::win::enumerate_hku_subkeys())")),
+            "registry discovery ignores collect's loaded list": dict(r=mutate(
+                r, "build_profile_list(disc.records, loaded)", "build_profile_list(disc.records, {})")),
             "registry closed gate answers attempted": dict(r=mutate(
                 r, "if (gate != yuzu::echo::WalkGate::open)\n        return unreadable_hive(roots, false,",
                    "if (gate != yuzu::echo::WalkGate::open)\n        return unreadable_hive(roots, true,")),

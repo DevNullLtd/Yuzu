@@ -261,17 +261,20 @@ struct RegistryReader {
     /// One bounded read of `root`. Must not throw. `deadline` is an absolute now_ts() value.
     std::function<SubtreeRead(const std::string& root, std::int64_t deadline)> read_subtree;
     std::function<std::vector<std::string>()> loaded_sids; // subkey names under HKEY_USERS
-    /// The profiles whose hive is NOT loaded, from the profile list. Asked only on the
-    /// ticks that re-enumerate loaded hives (an HKU name change, a reconcile tick, a
-    /// re-baseline, or an empty known list), so it runs about hourly. `complete == false`
-    /// means "keep what you knew": it is never read as "nothing exists" (see
-    /// reconcile_offline). Must not throw.
-    std::function<OfflineDiscovery()> offline_profiles;
+    /// The profiles whose hive is NOT loaded, from the profile list. Asked on the ticks that
+    /// re-enumerate loaded hives (an HKU name change, a reconcile tick, a re-baseline), on every
+    /// tick while the known offline list is empty, and on every tick while the last walk was
+    /// incomplete or a known profile has no path yet -- so an ordinary tick with a settled list
+    /// does not walk. `complete == false` means "keep what you knew": it is never read as
+    /// "nothing exists" (see reconcile_offline). Classified against collect's own HKU snapshot
+    /// for this tick (`loaded_sids`, as it will use it), never a second enumeration: a profile
+    /// is offline exactly when its sid is not in that list. Must not throw.
+    std::function<OfflineDiscovery(const std::vector<std::string>& loaded_sids)> offline_profiles;
     /// Mounts one offline hive through the shared guarded ladder and reads every root in
     /// `roots` (this hive's logical `HKU\<sid>\...` roots) from that one mount. Called
-    /// at most once per hive per tick, only for a hive with a due root. `attempted == false`
-    /// means the mount was not tried (retried next tick). Must not throw; `deadline` is an
-    /// absolute now_ts() value.
+    /// at most once per hive per tick, only for a hive with a due root and a known path.
+    /// `attempted == false` means the mount was not tried (retried next tick). Must not throw;
+    /// `deadline` is an absolute now_ts() value.
     std::function<OfflineHiveRead(const std::string& sid, const std::string& path,
                                   const std::vector<std::string>& roots, std::int64_t deadline)>
        read_offline_hive;
