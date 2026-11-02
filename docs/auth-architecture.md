@@ -985,8 +985,8 @@ gate applied.
   by the row trigger `users_mfa_factor_gen` (`BEFORE UPDATE OF mfa_enrolled_at, mfa_factor_gen`, created
   `ENABLE ALWAYS` so it fires under every `session_replication_role`) a fresh random positive value (about
   60 bits, from `gen_random_uuid`, always different from the value it replaces; the function is created with
-  `SET search_path = pg_catalog`, so `replace()` and `gen_random_uuid()` resolve to the system functions whatever
-  schema order the writing session has) whenever
+  `SET search_path = pg_catalog, pg_temp`, so `replace()`, `gen_random_uuid()` and the types it names resolve to the
+  system objects whatever the writing session's `search_path`, temp objects included: `pg_temp` is listed last) whenever
   `mfa_enrolled_at` changes: enrolment, clear, soft delete, or a direct UPDATE by any binary. It is not a
   counter, so a value is never reissued in practice: after an auth-only restore over a newer session store,
   a re-enrolment cannot land on a generation a surviving stored proof carries. A logical-replication or
@@ -1064,7 +1064,7 @@ gate applied.
 - **Enforcement of the triggers is checked, not assumed.** At boot each store verifies that its trigger
   exists, is `ENABLE ALWAYS`, fires per row `BEFORE UPDATE` on the watched columns, and that the function
   body equals the pinned text (for the `auth` function, also that its `pg_proc.proconfig` is exactly
-  `{search_path=pg_catalog}`, so a `CREATE OR REPLACE FUNCTION` without the `SET` clause is refused); if not, the store does not open and the server refuses to start. The one
+  `search_path=pg_catalog, pg_temp`, so a `CREATE OR REPLACE FUNCTION` without the `SET` clause, or with another path, is refused); if not, the store does not open and the server refuses to start. The one
   exception is the two host recovery one-shots, `--mfa-reset` and `--break-glass-arm`: each passes
   `MfaBindingCheck::kBypassForRecovery` to its bootstrap `AuthDB` (and `--mfa-reset` also to the
   `SessionStore` it opens to end the account's sessions), logs

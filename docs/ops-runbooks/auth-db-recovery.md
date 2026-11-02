@@ -1983,11 +1983,12 @@ alert on the unit being `failed` or on `up == 0` as well.
    trigger to be a `BEFORE UPDATE` row trigger over the guarded columns with no `WHEN` clause (`tgtype` must be
    `19`: row, before, update, and nothing else; `no_when_clause` must be `t`), calling a function of the pinned
    name, in the same schema as the table, in language `plpgsql`, whose body is byte-identical to the pinned text. For the `auth` trigger the function must also
-   carry the setting `search_path=pg_catalog` and no other (`function_settings` must read `{search_path=pg_catalog}`; the
-   `session` function carries none and reads empty), so a `CREATE OR REPLACE FUNCTION` without `SET search_path = pg_catalog`
-   is refused at boot even when its body is correct. So
-   `A` and `t` alone do not prove the boot check will pass, and the body comparison below checks the body only. If
-   `tgtype` is not `19`, or the function's name, schema or language is in doubt, use the repair below: it recreates the
+   carry the setting `search_path=pg_catalog, pg_temp` and no other (`function_settings` must read `{"search_path=pg_catalog, pg_temp"}`, the
+   array text quoting the one element; the `session` function carries none and reads empty), so a `CREATE OR REPLACE FUNCTION` without
+   `SET search_path = pg_catalog, pg_temp`, or with `pg_catalog` alone, is refused at boot even when its body is correct. So
+   `A` and `t` alone do not prove the boot check will pass, and the body comparison below checks the body and,
+   for the `auth` function, its settings in a separate statement. If
+   `tgtype` is not `19`, or the function's name, schema, language or settings is in doubt, use the repair below: it recreates the
    function schema-qualified in the right schema, drops the trigger and creates it again. A missing row, or `O`, `R` or `D`, is a
    fault. For a row that reads `A`, compare the function bodies with the statements under
    [Function body comparison](#function-body-comparison) below. If you cannot tell, the repair
@@ -2010,7 +2011,7 @@ alert on the unit being `failed` or on `up == 0` as well.
    For a trigger that was dropped, or whose function body, columns or timing were changed, restore
    the function and the trigger as they are in the migrations. If the trigger exists but is altered,
    `DROP TRIGGER` first and then re-create it; `CREATE OR REPLACE FUNCTION` is safe whether or not
-   the function still exists, provided the `auth` function is created with `SET search_path = pg_catalog` (the
+   the function still exists, provided the `auth` function is created with `SET search_path = pg_catalog, pg_temp` (the
    repair statements below carry it; a replacement without it resets the setting and the boot check refuses). The function bodies must match the pinned text **byte for byte**, or the
    boot check still refuses: the `auth` body begins with a newline directly after `$$` and ends with a
    newline before the closing `$$`; the `session` body begins the same way and ends `END $$`, with a
@@ -2062,7 +2063,7 @@ through `/login/mfa/stepup`.
 
 ### Function body comparison
 
-Each statement must return `t`. For the `auth` function, `SELECT p.proconfig FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid WHERE t.tgrelid = 'auth.users'::regclass AND t.tgname = 'users_mfa_factor_gen' AND NOT t.tgisinternal;` must return `{search_path=pg_catalog}`. The session body ends with `END` followed by one space; the `E'...'` form keeps it visible.
+Each body statement must return `t`. For the `auth` function, a separate check applies: `SELECT p.proconfig FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid WHERE t.tgrelid = 'auth.users'::regclass AND t.tgname = 'users_mfa_factor_gen' AND NOT t.tgisinternal;` must return exactly `{"search_path=pg_catalog, pg_temp"}`. The session body ends with `END` followed by one space; the `E'...'` form keeps it visible.
 
 ```bash
 psql "$YUZU_POSTGRES_DSN" <<'SQL'
@@ -2087,7 +2088,7 @@ For `store="auth"`:
 psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
 SET lock_timeout = '10s';
 BEGIN;
-CREATE OR REPLACE FUNCTION auth.users_mfa_factor_gen() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+CREATE OR REPLACE FUNCTION auth.users_mfa_factor_gen() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
   IF NEW.mfa_enrolled_at IS DISTINCT FROM OLD.mfa_enrolled_at THEN
     NEW.mfa_factor_gen := ('x' || substr(replace(gen_random_uuid()::text, '-', ''), 18, 15))::bit(60)::bigint + 1;
