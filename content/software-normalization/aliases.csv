@@ -95,8 +95,6 @@ windows,FileZilla Client 3.66.1,,Tim Kosse,FileZilla,,other,filezilla
 windows,Docker Desktop,,Docker,Docker Desktop,,other,desktop
 windows,Oracle VM VirtualBox 7.0.12,,Oracle,VirtualBox,,other,vm_virtualbox
 windows,VMware Workstation,,VMware,Workstation,,other,workstation
-windows,TeamViewer,,TeamViewer,TeamViewer,,other,teamviewer
-windows,AnyDesk,,AnyDesk,AnyDesk,,other,anydesk
 windows,LibreOffice 7.6.4.1,,The Document Foundation,LibreOffice,,other,libreoffice
 # -- macOS applications and Homebrew formulae ---------------------------------------
 macos,Firefox,,Mozilla,Firefox,,other,firefox

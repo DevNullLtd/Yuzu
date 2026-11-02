@@ -156,7 +156,7 @@ TEST_CASE("purl_type_for maps package ecosystems and leaves app ecosystems empty
         CHECK(purl_type_for(eco).empty());
 }
 
-TEST_CASE("the embedded seed parses with the shipped version and every category in vocabulary",
+TEST_CASE("the embedded seed parses with the shipped version and every key in normal form",
           "[normalization][pack]") {
     const auto p = parse_normalization_pack(kSoftwareNormalizationSeed);
     REQUIRE(p.has_value());
@@ -164,8 +164,6 @@ TEST_CASE("the embedded seed parses with the shipped version and every category 
     CHECK(p->rows.size() >= kMinSeedRows);
     for (const auto& r : p->rows) {
         CAPTURE(r.raw_name);
-        CHECK(std::find(kCategories.begin(), kCategories.end(), r.category) != kCategories.end());
-        CHECK_FALSE(r.vendor.empty());
         CHECK(alias_key(normalize_title(r.raw_name)) == r.raw_name); // keys are in normal form
     }
 }

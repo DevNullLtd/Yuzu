@@ -7,7 +7,6 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
-#include "software_inventory_store.hpp"
 #include "software_normalization_pack.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -20,6 +19,7 @@
 #include <cstdlib>
 #include <exception>
 #include <set>
+#include <unordered_map>
 #include <utility>
 
 namespace yuzu::server {
@@ -55,20 +55,6 @@ std::size_t token_count(std::string_view s) {
     return n;
 }
 
-const char* tier_name(MatchTier t) {
-    switch (t) {
-    case MatchTier::exact_norm:
-        return "exact_norm";
-    case MatchTier::title_vendor:
-        return "title_vendor";
-    case MatchTier::token_set:
-        return "token_set";
-    case MatchTier::birth:
-        break;
-    }
-    return "birth";
-}
-
 /// Statement failure -> one structured log line carrying the SQLSTATE.
 bool log_failed(std::string_view label, const pg::PgResult& r) {
     const char* state = PQresultErrorField(r.get(), PG_DIAG_SQLSTATE);
@@ -76,6 +62,32 @@ bool log_failed(std::string_view label, const pg::PgResult& r) {
     spdlog::warn("SoftwareTitleDimension: '{}' failed (sqlstate {}): {}", label,
                  state ? state : "-", err.empty() ? "unexpected result shape" : err);
     return false;
+}
+
+/// `pg::exec_params`, with a failed statement logged (label + SQLSTATE).
+pg::PgResult exec_logged(PGconn* c, const char* label, const char* sql,
+                         const std::vector<std::string>& params) {
+    pg::PgResult r = pg::exec_params(c, sql, params);
+    if (r.status() != PGRES_COMMAND_OK && r.status() != PGRES_TUPLES_OK)
+        log_failed(label, r);
+    return r;
+}
+
+/// The cluster-wide single-writer lock, taken as the first statement of a pass and of the
+/// queue reconcile. `nullopt` = the statement failed; `false` = a peer holds it (skip).
+std::optional<bool> try_norm_lock(PGconn* c) {
+    pg::PgResult lk = exec_logged(
+        c, "advisory lock",
+        "SELECT pg_try_advisory_xact_lock(hashtextextended('software_normalization', 0))", {});
+    if (lk.status() != PGRES_TUPLES_OK)
+        return std::nullopt;
+    return !(PQntuples(lk.get()) == 1 && std::string_view(PQgetvalue(lk.get(), 0, 0)) == "f");
+}
+
+/// Distinct values as views (the keyed reads take a de-duplicated array).
+std::vector<std::string_view> distinct_views(const std::vector<std::string>& v) {
+    const std::set<std::string_view> u(v.begin(), v.end());
+    return {u.begin(), u.end()};
 }
 
 std::string text_array(const std::vector<std::string>& v) {
@@ -92,22 +104,9 @@ struct Candidate {
 
 // ── pure core ────────────────────────────────────────────────────────────────
 
-ProductIndex::ProductIndex(std::vector<ProductRow> products) : products_(std::move(products)) {
-    candidates_.reserve(products_.size());
-    for (std::size_t i = 0; i < products_.size(); ++i) {
-        candidates_.push_back({products_[i].norm_key, products_[i].title, products_[i].vendor});
-        by_key_.emplace(products_[i].norm_key, i);
-    }
-}
-
-const ProductRow* ProductIndex::find(std::string_view norm_key) const {
-    const auto it = by_key_.find(std::string{norm_key});
-    return it == by_key_.end() ? nullptr : &products_[it->second];
-}
-
 TitleResolution resolve_title(const TitleKey& key,
                               const std::vector<NormalizationAliasRow>& aliases_for_key,
-                              const ProductIndex& products, bool auto_birth) {
+                              const ProductRow* exact_product, bool auto_birth) {
     const NormalizedTitle nt = normalize_title(key.raw_name);
     const std::string ak = alias_key(nt);
     const std::string nv = normalize_vendor(key.raw_publisher);
@@ -150,15 +149,12 @@ TitleResolution resolve_title(const TitleKey& key,
         }
     }
 
-    // Matcher fallback. EDITION GUARD: title_vendor/token_set relate editions across
-    // SKUs by design (right for the SLE matcher, wrong for an identity dimension), so a
-    // hit on a product of a different edition is treated as no match.
-    const MatchResult m = match_product(key.raw_name, key.raw_publisher, products.candidates());
-    if (m.tier != MatchTier::birth) {
-        if (const ProductRow* p = products.find(m.norm_key); p != nullptr && p->edition == nt.edition) {
-            adopt(*p, tier_name(m.tier));
-            return out;
-        }
+    // The product whose norm_key is exactly norm_key(raw_name, raw_publisher). The key embeds
+    // the edition, so a title can never land on another edition's product. The matcher's
+    // title_vendor/token_set tiers are guesses and are not used here (see the header).
+    if (exact_product != nullptr) {
+        adopt(*exact_product, "exact_norm");
+        return out;
     }
 
     if (auto_birth && !nv.empty() && token_count(nt.title) >= kAutoBirthMinTokens) {
@@ -171,12 +167,13 @@ TitleResolution resolve_title(const TitleKey& key,
 
 // ── owner ────────────────────────────────────────────────────────────────────
 
-SoftwareTitleDimension::SoftwareTitleDimension(pg::PgPool& pool, ProductRegistryStore& registry,
-                                               SoftwareInventoryStore& inventory,
+SoftwareTitleDimension::SoftwareTitleDimension(pg::PgPool& pool, ProductRegistryStore&,
+                                               SoftwareInventoryStore&,
                                                yuzu::MetricsRegistry* metrics)
-    : pool_(pool), registry_(registry), inventory_(inventory), metrics_(metrics) {}
+    : pool_(pool), metrics_(metrics) {}
 
-PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancelled) {
+PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancelled,
+                                            std::chrono::seconds budget) {
     PassResult out;
     PassOutcome inner = PassOutcome::failed;
     int processed = 0;
@@ -184,7 +181,7 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
     int unnormalized = 0;
 
     const auto started = std::chrono::steady_clock::now();
-    const auto deadline = started + kPassBudget;
+    const auto deadline = started + budget;
     // Polled every 256 titles and before each write. A trip records WHY and rolls back.
     const auto abort_requested = [&]() -> bool {
         if (cancelled && cancelled()) {
@@ -201,33 +198,24 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
     bool ok = false;
     try {
         ok = pool_.with_txn_for(kAcquireTimeout, [&](PGconn* c) -> bool {
-            const auto run = [&](const char* label, const char* sql,
-                                 const std::vector<std::string>& params) -> pg::PgResult {
-                pg::PgResult r = pg::exec_params(c, sql, params);
-                if (r.status() != PGRES_COMMAND_OK && r.status() != PGRES_TUPLES_OK)
-                    log_failed(label, r);
-                return r;
-            };
-            if (run("statement_timeout", "SET LOCAL statement_timeout = '60s'", {}).status() !=
-                PGRES_COMMAND_OK)
+            if (exec_logged(c, "statement_timeout", "SET LOCAL statement_timeout = '60s'", {})
+                    .status() != PGRES_COMMAND_OK)
                 return false;
 
             // Cluster-wide single writer: a peer holding the lock is already normalising.
-            pg::PgResult lk = run("advisory lock",
-                                  "SELECT pg_try_advisory_xact_lock(hashtextextended("
-                                  "'software_normalization', 0))",
-                                  {});
-            if (lk.status() != PGRES_TUPLES_OK)
+            const auto locked = try_norm_lock(c);
+            if (!locked)
                 return false;
-            if (PQntuples(lk.get()) == 1 && std::string_view(PQgetvalue(lk.get(), 0, 0)) == "f") {
+            if (!*locked) {
                 inner = PassOutcome::skipped_peer;
                 return true;
             }
 
             pg::PgResult pk =
-                run("pack version",
-                    "SELECT pack_version FROM product_registry_store.normalization_pack WHERE id = 1",
-                    {});
+                exec_logged(c, "pack version",
+                            "SELECT pack_version FROM product_registry_store.normalization_pack "
+                            "WHERE id = 1",
+                            {});
             if (pk.status() != PGRES_TUPLES_OK)
                 return false;
             if (PQntuples(pk.get()) == 0) {
@@ -238,8 +226,8 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
 
             // The `<>` arm also catches the '' stale sentinel (D14); the third arm is a
             // product deleted under a normalized row (ON DELETE SET NULL).
-            pg::PgResult cand = run(
-                "candidates",
+            pg::PgResult cand = exec_logged(
+                c, "candidates",
                 "SELECT t.name, t.publisher, t.ecosystem, t.device_count "
                 "FROM software_inventory_store.title_triples t "
                 "LEFT JOIN product_registry_store.title_dimension d "
@@ -262,27 +250,34 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
                 return true;
             }
 
-            // Alias keys of the batch, then the aliases and the matcher's products on
-            // THIS connection (one snapshot-ish transaction, no nested lease).
-            std::set<std::string> key_set;
-            for (const auto& t : titles)
-                key_set.insert(alias_key(normalize_title(t.key.raw_name)));
-            const std::vector<std::string> keys(key_set.begin(), key_set.end());
-            const std::vector<std::string_view> key_views(keys.begin(), keys.end());
-            auto aliases = ProductRegistryStore::read_normalization_aliases(c, key_views);
+            // Each title's alias key and exact product key, then the aliases and the products
+            // for exactly those keys on THIS connection (one transaction, no nested lease).
+            // Both reads are keyed, so the work holding the lease is O(batch): normalise each
+            // title once, two indexed reads, hash lookups - no scan of the product registry.
+            std::vector<std::string> alias_keys;
+            std::vector<std::string> product_keys;
+            alias_keys.reserve(titles.size());
+            product_keys.reserve(titles.size());
+            for (const auto& t : titles) {
+                alias_keys.push_back(alias_key(normalize_title(t.key.raw_name)));
+                product_keys.push_back(norm_key(t.key.raw_name, t.key.raw_publisher));
+            }
+            auto aliases =
+                ProductRegistryStore::read_normalization_aliases(c, distinct_views(alias_keys));
             if (!aliases)
                 return false;
-            std::unordered_map<std::string, std::vector<NormalizationAliasRow>> by_key;
+            std::unordered_map<std::string, std::vector<NormalizationAliasRow>> aliases_by_key;
             for (auto& a : *aliases)
-                by_key[a.raw_name].push_back(std::move(a));
-            auto products = ProductRegistryStore::read_products(c, kMatcherCandidateCap);
+                aliases_by_key[a.raw_name].push_back(std::move(a));
+            auto products =
+                ProductRegistryStore::read_products_by_norm_key(c, distinct_views(product_keys));
             if (!products)
                 return false;
-            if (products->size() >= static_cast<std::size_t>(kMatcherCandidateCap))
-                spdlog::warn("SoftwareTitleDimension: product list hit the {}-row matcher cap; "
-                             "resolution may miss products",
-                             kMatcherCandidateCap);
-            const ProductIndex index{std::move(*products)};
+            std::unordered_map<std::string, ProductRow> products_by_key;
+            for (auto& pr_row : *products) {
+                std::string k = pr_row.norm_key;
+                products_by_key.emplace(std::move(k), std::move(pr_row));
+            }
 
             static const std::vector<NormalizationAliasRow> kNoAliases;
             std::vector<TitleResolution> resolved;
@@ -290,10 +285,11 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
             for (std::size_t i = 0; i < titles.size(); ++i) {
                 if (i % kCancelCheckEvery == 0 && abort_requested())
                     return false;
-                const auto it = by_key.find(alias_key(normalize_title(titles[i].key.raw_name)));
-                resolved.push_back(resolve_title(titles[i].key,
-                                                 it == by_key.end() ? kNoAliases : it->second,
-                                                 index, kAutoBirthEnabled));
+                const auto al = aliases_by_key.find(alias_keys[i]);
+                const auto pr_it = products_by_key.find(product_keys[i]);
+                resolved.push_back(resolve_title(
+                    titles[i].key, al == aliases_by_key.end() ? kNoAliases : al->second,
+                    pr_it == products_by_key.end() ? nullptr : &pr_it->second, kAutoBirthEnabled));
             }
 
             // Parallel arrays for the set-based writes.
@@ -333,7 +329,7 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
             const std::string now = std::to_string(now_secs());
             if (abort_requested())
                 return false;
-            if (run("dimension upsert",
+            if (exec_logged(c, "dimension upsert",
                     "INSERT INTO product_registry_store.title_dimension "
                     "(raw_name, raw_publisher, ecosystem, norm_status, method, product_id, vendor, "
                     " product, edition, title_version, category, purl_type, cpe_product, "
@@ -350,17 +346,7 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
                     "  product = EXCLUDED.product, edition = EXCLUDED.edition, "
                     "  title_version = EXCLUDED.title_version, category = EXCLUDED.category, "
                     "  purl_type = EXCLUDED.purl_type, cpe_product = EXCLUDED.cpe_product, "
-                    "  pack_version = EXCLUDED.pack_version, updated_at = EXCLUDED.updated_at "
-                    "WHERE (title_dimension.norm_status, title_dimension.method, "
-                    "       title_dimension.product_id, title_dimension.vendor, "
-                    "       title_dimension.product, title_dimension.edition, "
-                    "       title_dimension.title_version, title_dimension.category, "
-                    "       title_dimension.purl_type, title_dimension.cpe_product, "
-                    "       title_dimension.pack_version) "
-                    "  IS DISTINCT FROM (EXCLUDED.norm_status, EXCLUDED.method, EXCLUDED.product_id, "
-                    "       EXCLUDED.vendor, EXCLUDED.product, EXCLUDED.edition, "
-                    "       EXCLUDED.title_version, EXCLUDED.category, EXCLUDED.purl_type, "
-                    "       EXCLUDED.cpe_product, EXCLUDED.pack_version)",
+                    "  pack_version = EXCLUDED.pack_version, updated_at = EXCLUDED.updated_at",
                     {text_array(n), text_array(p), text_array(e), text_array(st), text_array(m),
                      text_array(pid), text_array(v), text_array(pr), text_array(ed), text_array(tv),
                      text_array(cat), text_array(pt), text_array(cp), pack_version, now})
@@ -371,7 +357,7 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
                 if (abort_requested())
                     return false;
                 // status is not in the SET list: a 'rejected' row stays rejected.
-                if (run("queue upsert",
+                if (exec_logged(c, "queue upsert",
                         "INSERT INTO product_registry_store.curation_queue "
                         "(raw_name, raw_publisher, ecosystem, device_count, status, first_queued_at, "
                         " last_seen_at) "
@@ -387,7 +373,7 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
             if (!dn.empty()) {
                 if (abort_requested())
                     return false;
-                if (run("queue delete",
+                if (exec_logged(c, "queue delete",
                         "DELETE FROM product_registry_store.curation_queue "
                         "WHERE (raw_name, raw_publisher, ecosystem) IN "
                         "  (SELECT a, b, c FROM unnest($1::text[], $2::text[], $3::text[]) "
@@ -414,7 +400,7 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
         if (out.outcome == PassOutcome::timed_out)
             spdlog::warn("SoftwareTitleDimension: pass exceeded its {} s budget (elapsed {} s) - "
                          "rolled back",
-                         kPassBudget.count(),
+                         budget.count(),
                          std::chrono::duration_cast<std::chrono::seconds>(
                              std::chrono::steady_clock::now() - started)
                              .count());
@@ -432,46 +418,36 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
 bool SoftwareTitleDimension::reconcile_queue(const std::function<bool()>& cancelled) {
     try {
         return pool_.with_txn_for(kAcquireTimeout, [&](PGconn* c) -> bool {
-            const auto run = [&](const char* label, const char* sql,
-                                 const std::vector<std::string>& params) -> pg::PgResult {
-                pg::PgResult r = pg::exec_params(c, sql, params);
-                if (r.status() != PGRES_COMMAND_OK && r.status() != PGRES_TUPLES_OK)
-                    log_failed(label, r);
-                return r;
-            };
-            if (run("statement_timeout", "SET LOCAL statement_timeout = '60s'", {}).status() !=
-                PGRES_COMMAND_OK)
+            if (exec_logged(c, "statement_timeout", "SET LOCAL statement_timeout = '60s'", {})
+                    .status() != PGRES_COMMAND_OK)
                 return false;
-            pg::PgResult lk = run("reconcile lock",
-                                  "SELECT pg_try_advisory_xact_lock(hashtextextended("
-                                  "'software_normalization', 0))",
-                                  {});
-            if (lk.status() != PGRES_TUPLES_OK)
+            const auto locked = try_norm_lock(c);
+            if (!locked)
                 return false;
-            if (PQntuples(lk.get()) == 1 && std::string_view(PQgetvalue(lk.get(), 0, 0)) == "f")
+            if (!*locked)
                 return true; // a peer is normalising; it reconciles
             if (cancelled && cancelled())
                 return false;
             // ponytail: one set-based UPDATE over the whole queue; partition it if the
             // queue ever exceeds ~10^5 rows.
-            if (run("queue refresh",
-                    "UPDATE product_registry_store.curation_queue q "
-                    "SET device_count = t.device_count, last_seen_at = $1::bigint "
-                    "FROM software_inventory_store.title_triples t "
-                    "WHERE q.raw_name = t.name AND q.raw_publisher = t.publisher "
-                    "  AND q.ecosystem = t.ecosystem",
-                    {std::to_string(now_secs())})
+            if (exec_logged(c, "queue refresh",
+                            "UPDATE product_registry_store.curation_queue q "
+                            "SET device_count = t.device_count, last_seen_at = $1::bigint "
+                            "FROM software_inventory_store.title_triples t "
+                            "WHERE q.raw_name = t.name AND q.raw_publisher = t.publisher "
+                            "  AND q.ecosystem = t.ecosystem",
+                            {std::to_string(now_secs())})
                     .status() != PGRES_COMMAND_OK)
                 return false;
             if (cancelled && cancelled())
                 return false;
-            return run("queue prune",
-                       "DELETE FROM product_registry_store.curation_queue q "
-                       "WHERE q.status = 'open' AND NOT EXISTS ("
-                       "  SELECT 1 FROM software_inventory_store.title_triples t "
-                       "  WHERE t.name = q.raw_name AND t.publisher = q.raw_publisher "
-                       "    AND t.ecosystem = q.ecosystem)",
-                       {})
+            return exec_logged(c, "queue prune",
+                               "DELETE FROM product_registry_store.curation_queue q "
+                               "WHERE q.status = 'open' AND NOT EXISTS ("
+                               "  SELECT 1 FROM software_inventory_store.title_triples t "
+                               "  WHERE t.name = q.raw_name AND t.publisher = q.raw_publisher "
+                               "    AND t.ecosystem = q.ecosystem)",
+                               {})
                        .status() == PGRES_COMMAND_OK;
         });
     } catch (const std::exception& ex) {
@@ -552,10 +528,11 @@ void SoftwareTitleDimension::refresh_gauges() {
     last_pack_version_label_ = pack_version;
 }
 
-TickResult SoftwareTitleDimension::run_tick(const std::function<bool()>& cancelled) {
+TickResult SoftwareTitleDimension::run_tick(const std::function<bool()>& cancelled,
+                                            int max_passes) {
     TickResult tick;
     const auto stop = [&] { return cancelled && cancelled(); };
-    for (int pass = 0; pass < kMaxPassesPerTick; ++pass) {
+    for (int pass = 0; pass < max_passes; ++pass) {
         if (stop()) {
             tick.cancelled = true;
             break;
@@ -574,6 +551,8 @@ TickResult SoftwareTitleDimension::run_tick(const std::function<bool()>& cancell
         }
         if (r.outcome == PassOutcome::skipped_peer || r.processed < kPassLimit)
             break; // a peer is normalising, or a short page: nothing left to do
+        if (pass + 1 == max_passes)
+            tick.capped = true; // a full page on the last allowed pass: a backlog remains
     }
     if (!tick.cancelled && !stop()) {
         if (!reconcile_queue(cancelled) && !stop())
@@ -581,7 +560,11 @@ TickResult SoftwareTitleDimension::run_tick(const std::function<bool()>& cancell
     }
     if (stop())
         tick.cancelled = !tick.errored;
-    refresh_gauges();
+    tick.capped = tick.capped && !tick.errored && !tick.cancelled;
+    // A shutdown cancel skips the gauges: they keep their last values (the same posture as a
+    // degraded read) and the stop path avoids a lease plus the title_triples join.
+    if (!tick.cancelled)
+        refresh_gauges();
     return tick;
 }
 

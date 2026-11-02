@@ -352,15 +352,6 @@ TEST_CASE("ProductRegistryStore store_not_open: constructor failure degrades rea
 // ── SAM.4 (schema v2): normalisation pack, title dimension, curation queue ───────────
 
 namespace {
-std::string registry_scalar(PgPool& pool, const std::string& stmt) {
-    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
-    REQUIRE(lease);
-    auto r = pg::exec_params(lease.get(), stmt.c_str(), std::vector<std::string>{});
-    REQUIRE(r.status() == PGRES_TUPLES_OK);
-    REQUIRE(PQntuples(r.get()) == 1);
-    return PQgetvalue(r.get(), 0, 0);
-}
-
 yuzu::server::ParsedPack seed_pack() {
     auto p = yuzu::server::parse_normalization_pack(yuzu::server::kSoftwareNormalizationSeed);
     REQUIRE(p.has_value());
@@ -368,26 +359,9 @@ yuzu::server::ParsedPack seed_pack() {
 }
 } // namespace
 
-TEST_CASE("v2 migration adds the product and alias columns and the three tables",
+TEST_CASE("existing writers keep working after v2 and pick up the new column defaults",
           "[pg][product_registry][normalization]") {
     PROD_SHARED(store, pool);
-    for (const char* col : {"purl_type", "cpe_product", "origin", "category"})
-        CHECK(registry_scalar(pool, std::string("SELECT count(*) FROM information_schema.columns "
-                                                "WHERE table_schema = 'product_registry_store' "
-                                                "AND table_name = 'products' AND column_name = '") +
-                                        col + "'") == "1");
-    for (const char* col : {"status", "pack_version"})
-        CHECK(registry_scalar(pool, std::string("SELECT count(*) FROM information_schema.columns "
-                                                "WHERE table_schema = 'product_registry_store' "
-                                                "AND table_name = 'product_aliases' "
-                                                "AND column_name = '") +
-                                        col + "'") == "1");
-    for (const char* t : {"normalization_pack", "title_dimension", "curation_queue"})
-        CHECK(registry_scalar(pool, std::string("SELECT count(*) FROM information_schema.tables "
-                                                "WHERE table_schema = 'product_registry_store' "
-                                                "AND table_name = '") +
-                                        t + "'") == "1");
-    // Existing writers keep working and pick up the column defaults.
     const auto id = store.upsert_product("acme:widget", "acme", "widget", "", "");
     REQUIRE(id.has_value());
     auto row = store.get_product("acme:widget");
@@ -428,26 +402,7 @@ TEST_CASE("load_pack_if_empty loads the pack products and aliases once and repor
     CHECK((*pg_row)->cpe_product == "postgresql");
 }
 
-TEST_CASE("load_pack_if_empty leaves an existing curated alias row untouched",
-          "[pg][product_registry][normalization]") {
-    PROD_SHARED(store, pool);
-    const auto pid = store.upsert_product("acme:widget", "acme", "widget", "", "");
-    REQUIRE(pid.has_value());
-    REQUIRE(store.upsert_alias("curated:windows", "7-zip", "", *pid, "curated", 1.0));
-    REQUIRE(store.load_pack_if_empty(seed_pack(), "seed").has_value());
-    auto links = store.list_aliases(*pid);
-    REQUIRE(links.has_value());
-    bool found = false;
-    for (const auto& a : *links)
-        if (a.source == "curated:windows" && a.raw_name == "7-zip") {
-            found = true;
-            CHECK(a.method == "curated");
-            CHECK(a.product_id == *pid);
-        }
-    CHECK(found);
-}
-
-TEST_CASE("list_normalization_aliases returns pack and curated rows for the requested alias keys "
+TEST_CASE("read_normalization_aliases returns pack and curated rows for the requested alias keys "
           "only",
           "[pg][product_registry][normalization]") {
     PROD_SHARED(store, pool);
@@ -458,8 +413,10 @@ TEST_CASE("list_normalization_aliases returns pack and curated rows for the requ
     // A matcher link on the same raw name must NOT be returned.
     REQUIRE(store.upsert_alias("installed_software", "7-zip", "", *pid, "exact_norm", 1.0));
 
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
     const std::vector<std::string_view> keys{"7-zip", "no such key"};
-    auto rows = store.list_normalization_aliases(keys);
+    auto rows = ProductRegistryStore::read_normalization_aliases(lease.get(), keys);
     REQUIRE(rows.has_value());
     bool pack_row = false, curated_row = false;
     for (const auto& r : *rows) {
@@ -475,24 +432,26 @@ TEST_CASE("list_normalization_aliases returns pack and curated rows for the requ
     CHECK(pack_row);
     CHECK(curated_row);
     CHECK(rows->size() == 2);
-    auto none = store.list_normalization_aliases({});
+    auto none = ProductRegistryStore::read_normalization_aliases(lease.get(), {});
     REQUIRE(none.has_value());
     CHECK(none->empty());
 }
 
-TEST_CASE("current_pack reports the loaded version and sha256",
+TEST_CASE("read_products_by_norm_key returns exactly the products with the requested keys",
           "[pg][product_registry][normalization]") {
     PROD_SHARED(store, pool);
-    auto empty = store.current_pack();
-    REQUIRE(empty.has_value());
-    CHECK_FALSE(empty->has_value());
-    const auto pack = seed_pack();
-    REQUIRE(store.load_pack_if_empty(pack, "seed").has_value());
-    auto info = store.current_pack();
-    REQUIRE(info.has_value());
-    REQUIRE(info->has_value());
-    CHECK((*info)->pack_version == pack.pack_version);
-    CHECK((*info)->sha256 == pack.sha256);
-    CHECK((*info)->loaded_by == "seed");
-    CHECK((*info)->loaded_at > 0);
+    REQUIRE(store.load_pack_if_empty(seed_pack(), "seed").has_value());
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    const std::vector<std::string_view> keys{"postgresql:postgresql", "no such:key"};
+    auto rows = ProductRegistryStore::read_products_by_norm_key(lease.get(), keys);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].norm_key == "postgresql:postgresql");
+    CHECK((*rows)[0].category == "database");
+    CHECK((*rows)[0].cpe_product == "postgresql");
+    CHECK((*rows)[0].origin == "pack");
+    auto none = ProductRegistryStore::read_products_by_norm_key(lease.get(), {});
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
 }

@@ -2453,8 +2453,9 @@ public:
                           "/inventory catalogue silently stale)",
                           "gauge");
         metrics_.describe("yuzu_software_normalization_pass_total",
-                          "Hourly software-title normalisation ticks by outcome (success/error). "
-                          "A cancelled tick (shutdown) is neither. Keep-last-good on error.",
+                          "Software-title normalisation ticks by outcome (success/error); hourly, "
+                          "or every 60 s while a backlog remains. A cancelled tick (shutdown) is "
+                          "neither. Keep-last-good on error.",
                           "counter");
         metrics_.describe("yuzu_software_normalization_duration_seconds",
                           "Wall-clock of the last software-title normalisation tick",

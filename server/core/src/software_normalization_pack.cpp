@@ -131,7 +131,9 @@ std::expected<ParsedPack, std::string> parse_normalization_pack(std::string_view
         if (!valid_cpe_product(f[7]))
             return std::unexpected(line_error(line_no, "cpe_product has an invalid character"));
         row.cpe_product = std::string{f[7]};
-        row.norm_key = product_norm_key(row.vendor, row.title, row.edition);
+        // The shape `norm_key()` produces from a raw title, so a pack product is found by
+        // the dimension's exact-key read and by the SLE matcher's exact tier alike.
+        row.norm_key = make_norm_key(row.vendor, row.title, row.edition);
 
         if (!seen.emplace(row.ecosystem, row.raw_name, row.raw_publisher).second)
             return std::unexpected(line_error(line_no, "duplicate (ecosystem, raw_name, raw_publisher)"));

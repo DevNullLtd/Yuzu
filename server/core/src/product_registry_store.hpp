@@ -54,15 +54,15 @@
 /// store's own mutations (the seed load, which stamps the pack version, and the
 /// `ON DELETE SET NULL` foreign key) need no sentinel write.
 
+#include <libpq-fe.h> // PGconn: the static reads below take a caller-pinned connection (see
+                      // pg_migration_runner.hpp - include libpq, never re-declare pg_conn)
+
 #include <cstdint>
 #include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
-
-struct pg_conn;
-using PGconn = pg_conn; // identical to libpq's typedef; avoids pulling libpq-fe.h into this header
 
 namespace yuzu {
 class MetricsRegistry;
@@ -124,14 +124,6 @@ struct NormalizationAliasRow {
     std::string raw_publisher; ///< normalised vendor ("" = wildcard)
     std::string method;        ///< "pack" | "curated"
     ProductRow product;
-};
-
-/// The loaded alias pack (singleton row `normalization_pack.id = 1`).
-struct PackInfo {
-    std::string pack_version;
-    std::string sha256;
-    std::string loaded_by;
-    std::int64_t loaded_at{0};
 };
 
 enum class PackLoadOutcome { loaded, already_present };
@@ -226,24 +218,19 @@ public:
     [[nodiscard]] std::expected<PackLoadOutcome, std::string>
     load_pack_if_empty(const ParsedPack& pack, std::string_view loaded_by);
 
-    /// The loaded pack. AUTHORITATIVE read: kDegraded on a failure; a value holding
-    /// `std::nullopt` when no pack has been loaded.
-    [[nodiscard]] std::expected<std::optional<PackInfo>, RegistryReadError> current_pack();
-
-    /// Active pack/curated aliases whose `raw_name` (alias key) is in `alias_keys`,
-    /// joined to their products. AUTHORITATIVE read: `std::nullopt` on a degrade.
-    [[nodiscard]] std::optional<std::vector<NormalizationAliasRow>>
-    list_normalization_aliases(const std::vector<std::string_view>& alias_keys);
-
-    /// The two reads above/below on a CALLER-PINNED connection, for the title
-    /// dimension owner's single transaction (a nested lease would need a second
-    /// pool connection). `std::nullopt` on a SQL failure (no degrade accounting:
-    /// the caller's pass fails and is retried). `limit` is capped like
-    /// `list_products`.
+    /// The alias read on a CALLER-PINNED connection, for the title dimension owner's
+    /// single transaction (a nested lease would need a second pool connection): active
+    /// pack/curated aliases whose `raw_name` (alias key) is in `alias_keys`, joined to
+    /// their products. `std::nullopt` on a SQL failure (no degrade accounting: the
+    /// caller's pass fails and is retried).
     [[nodiscard]] static std::optional<std::vector<NormalizationAliasRow>>
     read_normalization_aliases(PGconn* conn, const std::vector<std::string_view>& alias_keys);
-    [[nodiscard]] static std::optional<std::vector<ProductRow>> read_products(PGconn* conn,
-                                                                              int limit);
+
+    /// The products whose `norm_key` is in `norm_keys` (UNIQUE, so at most one row per
+    /// key), on a caller-pinned connection - the dimension's exact-key read. Same
+    /// failure contract as `read_normalization_aliases`.
+    [[nodiscard]] static std::optional<std::vector<ProductRow>>
+    read_products_by_norm_key(PGconn* conn, const std::vector<std::string_view>& norm_keys);
 
 private:
     pg::PgPool& pool_;

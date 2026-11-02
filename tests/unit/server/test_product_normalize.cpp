@@ -21,6 +21,7 @@ using yuzu::server::is_lapsed;
 using yuzu::server::kExpiryAlertBuckets;
 using yuzu::server::kExpiryWarnDays;
 using yuzu::server::kRearmSecs;
+using yuzu::server::make_norm_key;
 using yuzu::server::match_confidence;
 using yuzu::server::match_product;
 using yuzu::server::norm_key;
@@ -148,6 +149,11 @@ TEST_CASE("norm_key is deterministic and stable across raw form variants", "[nor
 
     SECTION("repeated calls agree") {
         CHECK(norm_key("7-Zip 23.01", "Igor Pavlov") == norm_key("7-Zip 23.01", "Igor Pavlov"));
+    }
+
+    SECTION("make_norm_key owns the shape norm_key ends in") {
+        CHECK(make_norm_key("microsoft", "microsoft office", "professional") == k);
+        CHECK(make_norm_key("google", "google chrome", "") == "google:google chrome");
     }
 }
 

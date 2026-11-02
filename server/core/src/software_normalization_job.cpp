@@ -19,7 +19,16 @@ SoftwareNormalizationJob::SoftwareNormalizationJob(SoftwareTitleDimension& dimen
                                                    yuzu::MetricsRegistry* metrics)
     : dimension_(dimension),
       interval_(interval <= std::chrono::seconds{0} ? std::chrono::seconds{3600} : interval),
-      metrics_(metrics) {}
+      metrics_(metrics) {
+    // Seeded BEFORE the first tick: a lazily created error counter would first appear at 1,
+    // an increase the Failing rule cannot see, and the Stale rule needs the timestamp series
+    // to exist (it guards `> 0`; a never-successful job is the Failing rule's case).
+    if (metrics_) {
+        metrics_->counter("yuzu_software_normalization_pass_total", {{"outcome", "success"}});
+        metrics_->counter("yuzu_software_normalization_pass_total", {{"outcome", "error"}});
+        metrics_->gauge("yuzu_software_normalization_last_success_timestamp").set(0);
+    }
+}
 
 SoftwareNormalizationJob::~SoftwareNormalizationJob() {
     stop();
@@ -42,50 +51,51 @@ void SoftwareNormalizationJob::stop() {
         thread_.join();
 }
 
+TickResult SoftwareNormalizationJob::tick_once() {
+    const auto t0 = std::chrono::steady_clock::now();
+    YUZU_ASSERT_BACKGROUND_JOB("software_normalization_job.run_tick"); // ReplicaSafe
+    const TickResult r = dimension_.run_tick([this] { return stop_.load(std::memory_order_acquire); });
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (metrics_) {
+        if (!r.cancelled)
+            metrics_
+                ->counter("yuzu_software_normalization_pass_total",
+                          {{"outcome", r.errored ? "error" : "success"}})
+                .increment();
+        metrics_->gauge("yuzu_software_normalization_duration_seconds").set(secs);
+        if (!r.errored && !r.cancelled) {
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+            metrics_->gauge("yuzu_software_normalization_last_success_timestamp")
+                .set(static_cast<double>(now));
+        }
+    }
+    if (r.cancelled)
+        spdlog::info("Software normalisation: tick cancelled by shutdown");
+    else if (r.errored)
+        spdlog::warn("Software normalisation: tick had a failed pass or reconcile "
+                     "({} passes, {} titles)",
+                     r.passes, r.processed);
+    return r;
+}
+
 void SoftwareNormalizationJob::run() {
     spdlog::info("Software normalisation thread started (interval={}s)", interval_.count());
-    // Seeded 0 BEFORE the first tick so the series always exists and the staleness alert
-    // (which guards `> 0`) can evaluate; a never-successful job is the Failing rule's.
-    if (metrics_)
-        metrics_->gauge("yuzu_software_normalization_last_success_timestamp").set(0);
     bool first = true;
+    auto wait = interval_;
     while (!stop_.load(std::memory_order_acquire)) {
         if (!first) {
-            const long steps = (interval_.count() + 4) / 5;
+            const long steps = (wait.count() + 4) / 5;
             for (long i = 0; i < steps && !stop_.load(std::memory_order_acquire); ++i)
                 std::this_thread::sleep_for(std::chrono::seconds{5});
             if (stop_.load(std::memory_order_acquire))
                 break;
         }
         first = false;
+        wait = interval_; // an exception below keeps the quiet cadence
         try {
-            const auto t0 = std::chrono::steady_clock::now();
-            YUZU_ASSERT_BACKGROUND_JOB("software_normalization_job.run_tick"); // ReplicaSafe
-            const TickResult r =
-                dimension_.run_tick([this] { return stop_.load(std::memory_order_acquire); });
-            const double secs =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            if (metrics_) {
-                if (!r.cancelled)
-                    metrics_
-                        ->counter("yuzu_software_normalization_pass_total",
-                                  {{"outcome", r.errored ? "error" : "success"}})
-                        .increment();
-                metrics_->gauge("yuzu_software_normalization_duration_seconds").set(secs);
-                if (!r.errored && !r.cancelled) {
-                    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                                         std::chrono::system_clock::now().time_since_epoch())
-                                         .count();
-                    metrics_->gauge("yuzu_software_normalization_last_success_timestamp")
-                        .set(static_cast<double>(now));
-                }
-            }
-            if (r.cancelled)
-                spdlog::info("Software normalisation: tick cancelled by shutdown");
-            else if (r.errored)
-                spdlog::warn("Software normalisation: tick had a failed pass or reconcile "
-                             "({} passes, {} titles)",
-                             r.passes, r.processed);
+            wait = rearm_interval(tick_once(), interval_);
         } catch (const std::exception& e) {
             spdlog::error("Software normalisation: tick threw ({}) - thread continuing", e.what());
         } catch (...) {

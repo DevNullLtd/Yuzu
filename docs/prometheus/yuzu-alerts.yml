@@ -5551,14 +5551,16 @@ groups:
             catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuSoftwareNormalizationStale
-        # The SAM.4 title normalisation job (SoftwareNormalizationJob) ticks hourly and
-        # stamps yuzu_software_normalization_last_success_timestamp on a tick with no failed
-        # pass. If ticks stop succeeding, the title dimension and curation queue stop
-        # following the fleet. `> 0` GUARD IS LOAD-BEARING: the gauge is seeded to 0 at
-        # thread start, so a naive `now - ts` fires on every cold boot; the guard skips the
-        # building window. A job that has NEVER succeeded is the Failing rule's case. 7200 s
-        # is twice the hourly cadence (kCatalogueRefreshIntervalSeconds), as for the
-        # sibling YuzuInventoryCatalogRollupStale.
+        # The SAM.4 title normalisation job (SoftwareNormalizationJob) ticks hourly (after a
+        # full capped tick it ticks again in 60 s until the backlog is drained; a failed tick
+        # always waits the hour) and stamps yuzu_software_normalization_last_success_timestamp
+        # on a tick with no failed pass. If ticks stop succeeding, the title dimension and
+        # curation queue stop following the fleet. `> 0` GUARD IS LOAD-BEARING: the gauge is
+        # seeded to 0 when the job is constructed, so a naive `now - ts` fires on every cold
+        # boot; the guard skips the building window. A job that has NEVER succeeded is the
+        # Failing rule's case. 7200 s is twice the hourly cadence
+        # (kCatalogueRefreshIntervalSeconds), as for the sibling
+        # YuzuInventoryCatalogRollupStale.
         expr: |
           (time() - yuzu_software_normalization_last_success_timestamp) > 7200
           and yuzu_software_normalization_last_success_timestamp > 0
@@ -5575,13 +5577,15 @@ groups:
             catalogue rollup that feeds title_triples).
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuSoftwareNormalizationFailing
-        # Sized to the HOURLY cadence. The job adds ONE counter increment per hour, so a
-        # rate()/15m window with a 15m hold (the sibling YuzuInventoryCatalogRollupFailing
-        # shape) can never observe it: the single increment ages out of a 15m window long
-        # before `for` elapses. increase()[2h] > 1 fires on the second failed hourly tick
-        # and stays firing for the hour both increments remain in the window; one isolated
-        # failure followed by a success stays quiet. A job that never succeeded (the case
-        # the Stale rule's `> 0` guard skips) fires at its second failed tick.
+        # Sized to the HOURLY cadence. The job adds at most ONE error increment per hour (a
+        # failed tick is never re-armed early), so a rate()/15m window with a 15m hold (the
+        # sibling YuzuInventoryCatalogRollupFailing shape) can never observe it: the single
+        # increment ages out of a 15m window long before `for` elapses. increase()[2h] > 1
+        # fires on the second failed hourly tick and stays firing for the hour both
+        # increments remain in the window; one isolated failure followed by a success stays
+        # quiet. A job that never succeeded (the case the Stale rule's `> 0` guard skips)
+        # fires at its second failed tick: both outcome series are seeded at 0 when the job
+        # is constructed, so the first failure is already an increase.
         expr: |
           sum by (instance) (increase(yuzu_software_normalization_pass_total{outcome="error"}[2h])) > 1
         for: 10m

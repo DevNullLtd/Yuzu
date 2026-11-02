@@ -6657,6 +6657,8 @@ tests:
   # Failing: two failed hourly ticks inside one 2h window. The error counter steps at
   # t=60m (1) and t=120m (2). Quiet after the first failure; the second brings
   # increase([2h]) above 1, and after the 10m hold it fires and is still firing at 2h20m.
+  # The leading zeros model the job's construction-time seed (the server creates the
+  # series at 0 before the first tick), so this series is the state the server produces.
   - interval: 1m
     name: software normalization - two failed hourly ticks fire
     input_series:

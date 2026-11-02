@@ -71,21 +71,6 @@ struct ParsedPack {
     return nt.edition.empty() ? nt.title : nt.title + ' ' + nt.edition;
 }
 
-/// The canonical product key for (normalised vendor, title, edition) - the same
-/// shape `norm_key()` produces from a raw title, so the SLE matcher's exact tier
-/// finds pack products.
-[[nodiscard]] inline std::string product_norm_key(std::string_view vendor, std::string_view title,
-                                                  std::string_view edition) {
-    std::string key{vendor};
-    key += ':';
-    key += title;
-    if (!edition.empty()) {
-        key += ':';
-        key += edition;
-    }
-    return key;
-}
-
 /// Parse and validate a pack. The error string names the first defect (with its
 /// line number where one applies).
 [[nodiscard]] std::expected<ParsedPack, std::string> parse_normalization_pack(std::string_view csv);

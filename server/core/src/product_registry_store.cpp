@@ -628,47 +628,6 @@ ProductRegistryStore::load_pack_if_empty(const ParsedPack& pack, std::string_vie
     return outcome;
 }
 
-std::expected<std::optional<PackInfo>, RegistryReadError> ProductRegistryStore::current_pack() {
-    if (!open_) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
-            spdlog::warn("ProductRegistryStore: current_pack degraded - store not open "
-                         "(occurrence {})",
-                         d.occurrence);
-        return std::unexpected(RegistryReadError::kDegraded);
-    }
-    auto lease = pool_.try_acquire_for(kAcquireTimeout);
-    if (!lease) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
-            spdlog::warn("ProductRegistryStore: current_pack degraded - no connection ({}) "
-                         "(occurrence {})",
-                         pool_.last_error(), d.occurrence);
-        return std::unexpected(RegistryReadError::kDegraded);
-    }
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT pack_version, sha256, loaded_by, loaded_at "
-        "FROM product_registry_store.normalization_pack WHERE id = 1",
-        std::vector<std::string>{});
-    if (res.status() != PGRES_TUPLES_OK) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
-            spdlog::warn("ProductRegistryStore: current_pack degraded - query failed: {} "
-                         "(occurrence {})",
-                         PQerrorMessage(lease.get()), d.occurrence);
-        return std::unexpected(RegistryReadError::kDegraded);
-    }
-    if (PQntuples(res.get()) == 0)
-        return std::optional<PackInfo>{};
-    PackInfo info;
-    info.pack_version = PQgetvalue(res.get(), 0, 0);
-    info.sha256 = PQgetvalue(res.get(), 0, 1);
-    info.loaded_by = PQgetvalue(res.get(), 0, 2);
-    info.loaded_at = result_i64(res, 0, 3);
-    return std::optional<PackInfo>{std::move(info)};
-}
-
 std::optional<std::vector<NormalizationAliasRow>>
 ProductRegistryStore::read_normalization_aliases(PGconn* conn,
                                                  const std::vector<std::string_view>& alias_keys) {
@@ -703,18 +662,21 @@ ProductRegistryStore::read_normalization_aliases(PGconn* conn,
     return out;
 }
 
-std::optional<std::vector<ProductRow>> ProductRegistryStore::read_products(PGconn* conn, int limit) {
-    const int eff = limit > 0 && limit < kListRowCap ? limit : kListRowCap;
+std::optional<std::vector<ProductRow>>
+ProductRegistryStore::read_products_by_norm_key(PGconn* conn,
+                                                const std::vector<std::string_view>& norm_keys) {
+    std::vector<ProductRow> out;
+    if (norm_keys.empty())
+        return out;
     const std::string sql = std::string("SELECT ") + kProductCols +
-                            " FROM product_registry_store.products ORDER BY norm_key LIMIT $1::bigint";
+                            " FROM product_registry_store.products WHERE norm_key = ANY($1::text[])";
     pg::PgResult res =
-        pg::exec_params(conn, sql.c_str(), std::vector<std::string>{std::to_string(eff)});
+        pg::exec_params(conn, sql.c_str(), std::vector<std::string>{pg::to_text_array(norm_keys)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("ProductRegistryStore: product read failed: {}", PQerrorMessage(conn));
         return std::nullopt;
     }
     const int n = PQntuples(res.get());
-    std::vector<ProductRow> out;
     out.reserve(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i) {
         ProductRow r;
@@ -722,38 +684,6 @@ std::optional<std::vector<ProductRow>> ProductRegistryStore::read_products(PGcon
         out.push_back(std::move(r));
     }
     return out;
-}
-
-std::optional<std::vector<NormalizationAliasRow>>
-ProductRegistryStore::list_normalization_aliases(const std::vector<std::string_view>& alias_keys) {
-    if (!open_) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
-            spdlog::warn("ProductRegistryStore: list_normalization_aliases degraded - store not "
-                         "open (occurrence {})",
-                         d.occurrence);
-        return std::nullopt;
-    }
-    if (alias_keys.empty())
-        return std::vector<NormalizationAliasRow>{}; // precondition miss -> empty value
-    auto lease = pool_.try_acquire_for(kAcquireTimeout);
-    if (!lease) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
-            spdlog::warn("ProductRegistryStore: list_normalization_aliases degraded - no "
-                         "connection ({}) (occurrence {})",
-                         pool_.last_error(), d.occurrence);
-        return std::nullopt;
-    }
-    auto rows = read_normalization_aliases(lease.get(), alias_keys);
-    if (!rows) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
-            spdlog::warn("ProductRegistryStore: list_normalization_aliases degraded - query "
-                         "failed (occurrence {})",
-                         d.occurrence);
-    }
-    return rows;
 }
 
 } // namespace yuzu::server

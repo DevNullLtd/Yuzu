@@ -84,6 +84,12 @@ std::string normalize_vendor(std::string_view raw);
 /// match tier below still relates them across editions.
 std::string norm_key(std::string_view title, std::string_view vendor);
 
+/// The key shape itself, from already-normalised parts: the ONE owner of
+/// `<vendor>:<title>[:<edition>]`. `norm_key()` ends in it, and the SAM.4 alias-pack
+/// parser calls it for a pack product's key, so the two can never drift.
+std::string make_norm_key(std::string_view norm_vendor, std::string_view norm_title,
+                          std::string_view edition);
+
 /// Strictly ordered deterministic match tiers (ADR-0024 Decision 6). Lower
 /// enumerators are stronger matches; the matcher returns the first tier that
 /// yields a candidate.

@@ -18,7 +18,9 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -41,7 +43,7 @@ ProductRow prod(std::int64_t id, const std::string& vendor, const std::string& t
     p.edition = edition;
     p.category = category;
     p.cpe_product = cpe;
-    p.norm_key = product_norm_key(vendor, title, edition);
+    p.norm_key = make_norm_key(vendor, title, edition);
     return p;
 }
 
@@ -57,9 +59,18 @@ NormalizationAliasRow alias(const std::string& source, const std::string& raw_na
     return a;
 }
 
+// Mirrors the owner's keyed read: only the product whose norm_key equals
+// norm_key(raw_name, raw_publisher) is handed to resolve_title.
 TitleResolution resolve(const TitleKey& k, const std::vector<NormalizationAliasRow>& aliases,
                         const std::vector<ProductRow>& products, bool birth = false) {
-    return resolve_title(k, aliases, ProductIndex{products}, birth);
+    const std::string nk = norm_key(k.raw_name, k.raw_publisher);
+    const auto it = std::find_if(products.begin(), products.end(),
+                                 [&](const ProductRow& p) { return p.norm_key == nk; });
+    return resolve_title(k, aliases, it == products.end() ? nullptr : &*it, birth);
+}
+
+ProductCandidate candidate_of(const ProductRow& p) {
+    return {p.norm_key, p.title, p.vendor};
 }
 
 // ── pg helpers ────────────────────────────────────────────────────────────────
@@ -176,7 +187,7 @@ TEST_CASE("resolve_title resolves a Standard title and an Enterprise title to th
 }
 
 TEST_CASE("resolve_title with only a Standard alias labels an Enterprise title unnormalized and "
-          "refuses the matcher's cross-edition title_vendor hit",
+          "never reaches the matcher's cross-edition title_vendor hit",
           "[normalization][title]") {
     // The matcher relates editions of one product (title_vendor ignores the edition).
     const auto std_p = prod(1, "microsoft", "microsoft sql server", "standard");
@@ -184,10 +195,11 @@ TEST_CASE("resolve_title with only a Standard alias labels an Enterprise title u
         alias("pack:windows", "microsoft sql server standard", "", std_p)};
     const TitleKey ent{"Microsoft SQL Server 2019 Enterprise", "Microsoft Corporation", "windows"};
     // Positive control: the matcher WOULD hit the Standard product for this title ...
-    const auto hit = match_product(ent.raw_name, ent.raw_publisher,
-                                   ProductIndex{{std_p}}.candidates());
+    const auto hit = match_product(ent.raw_name, ent.raw_publisher, {candidate_of(std_p)});
     REQUIRE(hit.tier == MatchTier::title_vendor);
-    // ... and the edition guard refuses it.
+    // ... but the key the dimension reads by embeds the edition, so that product is never
+    // the one handed to resolve_title.
+    CHECK(norm_key(ent.raw_name, ent.raw_publisher) != std_p.norm_key);
     const auto r = resolve(ent, aliases, {std_p});
     CHECK(r.norm_status == "unnormalized");
     CHECK_FALSE(r.product_id.has_value());
@@ -197,20 +209,38 @@ TEST_CASE("resolve_title with only a Standard alias labels an Enterprise title u
               .product_id == 1);
 }
 
-TEST_CASE("resolve_title falls through to match_product and records the winning tier when the "
-          "editions agree",
+TEST_CASE("resolve_title takes the exact-key product with method exact_norm",
           "[normalization][title]") {
     const auto exact = prod(1, "acme", "widget tool", {}, "database", "widget");
-    const auto exact_r = resolve({"Widget Tool 2.0", "Acme Inc", "windows"}, {}, {exact});
-    CHECK(exact_r.norm_status == "normalized");
-    CHECK(exact_r.method == "exact_norm");
-    CHECK(exact_r.cpe_product == "widget");
-    CHECK(exact_r.category == "database");
+    const auto r = resolve({"Widget Tool 2.0", "Acme Inc", "windows"}, {}, {exact});
+    CHECK(r.norm_status == "normalized");
+    CHECK(r.method == "exact_norm");
+    CHECK(r.product_id == 1);
+    CHECK(r.cpe_product == "widget");
+    CHECK(r.category == "database");
+}
 
+TEST_CASE("resolve_title never labels a merely similar product: a subset-title product is not "
+          "taken and a companion title does not resolve to the main product",
+          "[normalization][title]") {
+    // The matcher's token_set tier would hit both of these; an identity must not guess.
     const auto subset = prod(2, "acme", "widget");
-    const auto token_r = resolve({"Widget Tool", "Acme", "windows"}, {}, {subset});
-    CHECK(token_r.method == "token_set");
-    CHECK(token_r.product_id == 2);
+    const TitleKey widget_tool{"Widget Tool", "Acme", "windows"};
+    REQUIRE(match_product(widget_tool.raw_name, widget_tool.raw_publisher, {candidate_of(subset)})
+                .tier == MatchTier::token_set);
+    const auto near = resolve(widget_tool, {}, {subset});
+    CHECK(near.norm_status == "unnormalized");
+    CHECK_FALSE(near.product_id.has_value());
+
+    const auto chrome = prod(1, "google", "chrome", {}, "other", "chrome");
+    const TitleKey companion{"Chrome Remote Desktop Host", "Google LLC", "windows"};
+    REQUIRE(match_product(companion.raw_name, companion.raw_publisher, {candidate_of(chrome)})
+                .tier == MatchTier::token_set);
+    const auto r = resolve(companion, {}, {chrome});
+    CHECK(r.norm_status == "unnormalized");
+    CHECK(r.method.empty());
+    CHECK_FALSE(r.product_id.has_value());
+    CHECK(r.cpe_product.empty());
 }
 
 TEST_CASE("resolve_title with auto birth off labels an unmatched title unnormalized with a null "
@@ -293,9 +323,29 @@ TEST_CASE("owner pass writes one dimension row per candidate triple and is idemp
     CHECK(dim(pool, "Mystery Tool", "norm_status") == "unnormalized");
     CHECK(dim(pool, "Mystery Tool", "product_id").empty()); // NULL, never guessed
 
+    // updated_at is second-granular, so a sentinel is the only way to see a rewrite.
+    sql(pool, "UPDATE product_registry_store.title_dimension SET updated_at = 1");
     const auto replay = owner.run_pass();
     CHECK(replay.outcome == PassOutcome::ok);
     CHECK(replay.processed == 0); // nothing pending or below the pack version
+    CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.title_dimension "
+                       "WHERE updated_at <> 1") == "0"); // and nothing rewritten
+}
+
+TEST_CASE("owner pass leaves a companion title unnormalized although the main product is in the "
+          "registry",
+          "[pg][product_registry][normalization]") {
+    TD_ENV(db, pool, inv, reg, metrics, owner);
+    // Positive control: the product the matcher's token_set tier would have picked exists.
+    REQUIRE(scalar(pool, "SELECT count(*) FROM product_registry_store.products "
+                         "WHERE norm_key = 'google:chrome'") == "1");
+    triple(pool, "Chrome Remote Desktop Host", "Google LLC", "windows", 3);
+    triple(pool, "Google Chrome", "Google LLC", "windows", 9);
+    REQUIRE(owner.run_pass().processed == 2);
+    CHECK(dim(pool, "Chrome Remote Desktop Host", "norm_status") == "unnormalized");
+    CHECK(dim(pool, "Chrome Remote Desktop Host", "product_id").empty());
+    CHECK(dim(pool, "Google Chrome", "norm_status") == "normalized");
+    CHECK(dim(pool, "Google Chrome", "cpe_product") == "chrome");
 }
 
 TEST_CASE("owner pass re-normalises every row when the pack version changes",
@@ -413,15 +463,57 @@ TEST_CASE("owner tick stops at a short page and reports processed counts",
     TD_ENV(db, pool, inv, reg, metrics, owner);
     triple(pool, "7-Zip", "Igor Pavlov", "windows", 5);
     triple(pool, "Mystery Tool", "Nobody", "windows", 2);
-    const auto t = owner.run_tick();
-    CHECK_FALSE(t.errored);
-    CHECK_FALSE(t.cancelled);
-    CHECK(t.passes == 1);
-    CHECK(t.processed == 2);
-    // A tick with the cancel flag already set does nothing and is not an error.
+    // A tick with the cancel flag already set does nothing, is not an error, and skips the
+    // gauge refresh (no lease or title_triples join on the stop path).
     const auto c = owner.run_tick([] { return true; });
     CHECK(c.cancelled);
     CHECK_FALSE(c.errored);
+    CHECK(c.processed == 0);
+    CHECK(metrics.serialize().find("yuzu_software_titles") == std::string::npos);
+
+    const auto t = owner.run_tick();
+    CHECK_FALSE(t.errored);
+    CHECK_FALSE(t.cancelled);
+    CHECK_FALSE(t.capped);
+    CHECK(t.passes == 1);
+    CHECK(t.processed == 2);
+    CHECK(metrics.serialize().find("yuzu_software_titles") != std::string::npos);
+}
+
+TEST_CASE("owner tick pages through a backlog, reports a capped tick, and a spent budget rolls "
+          "back with nothing written",
+          "[pg][product_registry][normalization]") {
+    TD_ENV(db, pool, inv, reg, metrics, owner);
+    // One more than a full page: every title unnormalized, so each pass queues its page.
+    sql(pool, "INSERT INTO software_inventory_store.title_triples "
+              "(name, publisher, ecosystem, device_count) "
+              "SELECT 'Backlog Tool ' || g, 'Nobody', 'windows', 1 FROM generate_series(1, 2001) g");
+
+    SECTION("the default cap drains the backlog in two passes and is not capped") {
+        const auto t = owner.run_tick();
+        CHECK_FALSE(t.errored);
+        CHECK(t.passes == 2);
+        CHECK(t.processed == 2001);
+        CHECK_FALSE(t.capped); // the second page was short
+        CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.title_dimension") == "2001");
+    }
+    SECTION("a one-pass cap on a full page reports capped and the next tick finishes") {
+        const auto t = owner.run_tick({}, 1);
+        CHECK_FALSE(t.errored);
+        CHECK(t.capped);
+        CHECK(t.passes == 1);
+        CHECK(t.processed == 2000);
+        CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.title_dimension") == "2000");
+        const auto rest = owner.run_tick({}, 1);
+        CHECK(rest.processed == 1);
+        CHECK_FALSE(rest.capped); // a short page is never capped, even at the cap
+    }
+    SECTION("a spent wall budget rolls the pass back and reports timed_out") {
+        const auto r = owner.run_pass({}, std::chrono::seconds{0});
+        CHECK(r.outcome == PassOutcome::timed_out);
+        CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.title_dimension") == "0");
+        CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.curation_queue") == "0");
+    }
 }
 
 TEST_CASE("owner tick reconciles open queue device counts against a refreshed title_triples and "
