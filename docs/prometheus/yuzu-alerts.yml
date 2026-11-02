@@ -83,13 +83,16 @@ groups:
       # last degraded sample, so a degradation spanning MORE than 10 minutes (first to last
       # degraded sample) fires and one spanning 10 minutes or less never does; at a 1 m scrape
       # interval that is 12 samples versus 11 (cases I and J), and it is the scrape interval,
-      # not the rule evaluation interval, that sets the sample spacing. The alert resolves about
-      # 5 minutes after the condition clears, so it can fire shortly after an agent was fixed;
-      # and across a failover the sum counts one agent on two replicas for up to about 6
-      # minutes, so the text says "about N". Do NOT
-      # widen the window: it adds directly to the effective `for:`. Keep `--heartbeat` below
-      # 90 s, preferably 60 s or less: at 90 s or more the agent can age out between beats and
-      # every yuzu_fleet_* gauge flaps, not only this one.
+      # not the rule evaluation interval, that sets the sample spacing. That boundary is
+      # Prometheus 3.x behaviour (3.0 made range selectors left-open); on 2.x the window is
+      # closed on the left, so the boundary likely moves by one sample (not tested).
+      #
+      # The alert resolves about 5 minutes after the condition clears, so it can fire shortly
+      # after an agent was fixed; and across a failover the sum counts one agent on two replicas
+      # for up to about 6 minutes, so the text says "about N". Do NOT widen the window: it adds
+      # directly to the effective `for:`. Keep `--heartbeat` below 90 s, preferably 60 s or
+      # less: at 90 s or more the agent can age out between beats and every yuzu_fleet_* gauge
+      # flaps, not only this one.
       #
       # The `job` label is the only identity the alert keeps: unrelated Yuzu deployments that
       # share one Prometheus need distinct `job`s (as for the yuzu-ha-leader rules), or their

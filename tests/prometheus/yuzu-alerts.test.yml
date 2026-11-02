@@ -6951,8 +6951,8 @@ tests:
   # CASE I -- the measured lower bound of the firing window. The 5m window carries the condition
   # 5 minutes past the LAST degraded sample, so a degradation SPANNING 10 minutes (11 samples at a
   # 1m scrape, first to last) is NOT enough to fire: a fixed agent is not paged for it. RED if the
-  # window is widened (the same condition then fires). Measured with promtool: 11 samples never
-  # fire.
+  # window is widened (the same condition then fires). Measured with promtool 3.x: 11 samples
+  # never fire (3.0 made range selectors left-open; the 2.x boundary likely differs by a sample).
   - interval: 1m
     name: dedup store degraded - a 10 minute span of degradation does not fire
     input_series:
