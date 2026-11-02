@@ -59,9 +59,8 @@
 // OFFLINE HIVES. A profile whose hive is not loaded (a logged-off user) keeps its per-user
 // roots in scope under the SAME root names as when it is loaded (`HKU\<sid>\<suffix>`), so
 // one baseline carries across logoff and logon. Such a root has no key watch and no ETW
-// attribution: it is read on the HOURLY tick (not on a restart's full re-read), and at once when
-// it was never read, was Capped, or is owed a retry, by mounting the hive file through the
-// shared guarded ladder, once per hive, and its rows carry source=offline and
+// attribution: it is read on the HOURLY tick (not on a restart's full re-read) by mounting the
+// hive file through the shared guarded ladder, once per hive, and its rows carry source=offline and
 // detail=attr:offline -- an unloaded hive is written by file-level tools or by another
 // process's mount, never by a registry call this session could attribute, so nothing is
 // correlated and nothing is held. An offline root never advances window_base and takes no part
