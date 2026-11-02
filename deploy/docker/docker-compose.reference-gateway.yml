@@ -66,8 +66,9 @@
 ## Mgmt-plane reachability: the gateway co-hosts the agent edge (:50051) and the
 ## privileged mgmt plane (:50063) on 0.0.0.0, so on this single demo bridge an
 ## agent could reach :50063 at the network layer. Two controls reject it: strict
-## mutual TLS (#1314 — no CA-issued cert, no handshake) and the SPKI peer pin
-## (#1422 — a CA-issued cert that is not the server's default-server leaf, an
+## mutual TLS (#1314 — no CA-issued cert, no handshake) and peer authorization
+## (the server identity, or an SPKI pin: see docs/user-manual/gateway.md; #1422 —
+## a CA-issued cert that is not the server's default-server leaf, an
 ## enrolled agent's included, gets UNAUTHENTICATED before any handler runs). A
 ## *production* deployment additionally isolates/firewalls the mgmt plane from
 ## agents at the infra layer.

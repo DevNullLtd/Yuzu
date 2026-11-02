@@ -66,7 +66,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `rdp_control` | ✅ ⛔ ⛔ | Remote Desktop control — enable/disable RDP (registry + firewall + TermService) | [README](../../agents/plugins/rdp_control/README.md) |
 | `registry` | ✅ 🟡 🟡 | Windows Registry -- get, set (six types, verified), delete value, delete key (optionally recursive), enumerate, per-user reads and writes, bulk apply with an undo manifest | [README](../../agents/plugins/registry/README.md) |
 | `remote_access_audit` | 🟡 ✅ 🟡 | SSH inbound-access audit: sshd_config as written, per-account authorized_keys fingerprints, sshd service state; never key comments, option values or paths | [README](../../agents/plugins/remote_access_audit/README.md) |
-| `runtimes` | 🟡 🟡 ✅ | Installed .NET and JVM runtime inventory | [README](../../agents/plugins/runtimes/README.md) |
+| `runtimes` | ✅ ✅ ✅ | Installed .NET, JVM and Python runtime inventory | [README](../../agents/plugins/runtimes/README.md) |
 | `sccm` | ✅ ⛔ ⛔ | Reports SCCM/ConfigMgr client status, version, and site assignment | [README](../../agents/plugins/sccm/README.md) |
 | `script_exec` | ✅ ✅ ✅ | Executes commands and scripts with streaming output (admin-only) | [README](../../agents/plugins/script_exec/README.md) |
 | `services` | ✅ ✅ ✅ | System services — enumerate, query, and configure service startup types | [README](../../agents/plugins/services/README.md) |

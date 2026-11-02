@@ -119,11 +119,17 @@ template <class Fn> void for_each_line(const std::string& out, Fn&& fn) {
 }
 
 // Split on '|' into at most `max` tokens; anything past the max-th token is dropped.
-std::vector<std::string_view> split_tokens(std::string_view line, std::size_t max) {
+// `escaped` additionally treats `\|` as field text, not a separator (the wire form
+// yuzu::util::safe_output_field gives a literal pipe; a literal backslash is never emitted, it
+// is replaced by '/'). Tokens stay views of the raw line, so an escaped pipe keeps its `\`.
+std::vector<std::string_view> split_tokens(std::string_view line, std::size_t max,
+                                           bool escaped = false) {
     std::vector<std::string_view> tok;
     std::size_t fp = 0;
     while (tok.size() < max) {
         std::size_t bar = line.find('|', fp);
+        while (escaped && bar != std::string_view::npos && bar > fp && line[bar - 1] == '\\')
+            bar = line.find('|', bar + 1);
         if (bar == std::string_view::npos) {
             tok.push_back(line.substr(fp));
             break;
@@ -167,7 +173,7 @@ AdaptedRows failed(std::string reason) {
 // as `reason` only under constrained; supported and unsupported leave it empty.
 template <class OnRow>
 AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action, OnRow on_row,
-                                ConstrainedPolicy policy) {
+                                ConstrainedPolicy policy, bool escaped = false) {
     AdaptedRows res;
     int status_rows = 0;
     std::optional<yuzu::shared::StatusLevel> level;
@@ -176,7 +182,7 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
     for_each_line(out, [&](std::string_view line) {
         // One more than the widest row (store rows are nine tokens) so an over-wide row
         // fails the `!= N` width checks instead of being truncated to a valid width.
-        const auto tok = split_tokens(line, 10);
+        const auto tok = split_tokens(line, 10, escaped);
         if (yuzu::shared::is_status_line(tok)) {
             if (auto row = yuzu::shared::parse_status_row(tok, action)) {
                 ++status_rows;
@@ -193,6 +199,15 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
         return failed("bad status");
     if (*level == yuzu::shared::StatusLevel::constrained) {
         // Keeping rows is the opt-in: any other value (an out-of-range cast too) fails closed.
+        if (policy == ConstrainedPolicy::drop_source) {
+            // A known-incomplete set is never published: no rows, the cycle continues. The
+            // cycle's aggregate replaces the stored inventory, so these rows are
+            // REMOVED from the stored inventory until the source recovers (see the header).
+            res.entries.clear();
+            res.status = AdaptedRows::Status::withheld;
+            res.reason = std::move(reason);
+            return res;
+        }
         if (policy != ConstrainedPolicy::keep_rows_if_present_seen || seen == 0)
             return failed(reason);
         res.reason = reason; // ok + non-empty reason = constrained, rows kept
@@ -297,6 +312,12 @@ const InventoryAction kInventoryActions[] = {
     {.plugin = "msi_packages",
      .action = "list_inventory",
      .adapt = parse_msi_packages_list_inventory_output},
+    // Metadata-only source whose constraint is a host fact (an NFS /usr/local, a cap, an access-
+    // denied registry key): a constrained answer withholds just the python rows, not the cycle.
+    {.plugin = "runtimes",
+     .action = "python",
+     .adapt = parse_runtimes_python_output,
+     .constrained = ConstrainedPolicy::drop_source},
 };
 
 } // namespace
@@ -462,6 +483,33 @@ AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out,
     }, policy);
 }
 
+AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPolicy policy) {
+    // python|<flavour>|<version or ->|<install_path or ->|<vendor or ->, one row per interpreter the
+    // runtimes plugin found at the standard machine roots (agents/plugins/runtimes/src/
+    // runtimes_python_parsers.hpp). The status row is the shared inventory grammar. Every row
+    // becomes one {name Python, kind app, ecosystem python} entry whose version is the row's
+    // (`-` = unknown -> empty; on Linux it is major.minor, the patch level is not available there).
+    // The flavour, path and vendor have no installed_software slot and are dropped. A constrained
+    // status withholds these rows only: see the table row's ConstrainedPolicy::drop_source.
+    // The producer escapes a literal pipe in the free-text fields (runtimes_parsers.hpp
+    // field_or_dash -> safe_output_field gives `\|`), so the split is escape-aware: width stays
+    // strict (five logical fields) and only the version, which is dotted digits by construction
+    // on every leg, is stored, so no unescape is needed.
+    return adapt_pkg_inventory(out, "python",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
+        if (tok[0] != "python" || tok.size() != 5)
+            return false;
+        SwEntry e;
+        e.name = "Python";
+        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
+        e.kind = "app";
+        e.ecosystem = "python";
+        entries.push_back(std::move(e));
+        return true;
+    }, policy, /*escaped=*/true);
+}
+
 AdaptedRows parse_windows_optional_features_output(const std::string& out) {
     // windows_optional_features_parsers.hpp: `feature|<name>|<state>|<0/1>` per
     // feature (no status row in this grammar); sentinels are 3-token
@@ -557,7 +605,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
     SyncSource src;
     src.name = "installed_software";
     src.interval = std::chrono::hours{24};
-    // A retry re-runs at most the six table actions in-process (no fan-out); the backoff
+    // A retry re-runs at most one call per table action in-process (no fan-out); the backoff
     // caps that at four extra runs per outage.
     src.skip_backoff = true;
     auto last_reason = std::make_shared<std::string>();
@@ -618,6 +666,11 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
             if (rows.status == AdaptedRows::Status::unsupported) {
                 spdlog::debug("sync: {}.{} unsupported on this OS — skipped", row.plugin,
                               row.action);
+                continue;
+            }
+            if (rows.status == AdaptedRows::Status::withheld) {
+                spdlog::warn("sync: {}.{} constrained ({}) — rows withheld this cycle", row.plugin,
+                             row.action, rows.reason);
                 continue;
             }
             if (rows.status == AdaptedRows::Status::failed) {

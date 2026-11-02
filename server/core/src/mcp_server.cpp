@@ -1799,22 +1799,28 @@ static const ToolDef kTools[] = {
      R"j("audit_persisted":{"type":"boolean"}},"required":["process_name","window","crashes","hangs","signals","distinct_devices","first_seen","last_seen","modules","exceptions","devices"]})j"},
 
     {"list_dex_apps",
-     "Application and per-version stability list: every application with a Windows crash/hang "
-     "signal in the window - the 100 applications affecting the most Windows devices (then "
+     "Application and per-version stability list: every application with a crash/hang "
+     "signal in the window on the chosen platform scope - the 100 applications affecting the most devices (then "
      "crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then "
-     "name in byte order); apps_total counts every application with a Windows crash or hang signal in the "
-     "window and apps_truncated flags the cut; up to 20 versions each, versions_truncated flags "
+     "name in byte order); apps_total counts every application with a crash or hang signal in the "
+     "window on that scope and apps_truncated flags the cut; up to 20 versions each, versions_truncated flags "
      "that cut. Each row carries crashes, hangs and devices affected over the window "
-     "(distinct_devices), then the figures over one population, the Windows devices online now: "
+     "(distinct_devices), then the figures over one population, the online devices of the chosen scope: "
      "distinct_devices_online (those of the affected devices that are online now; null when no fleet source is wired), the share of "
      "that population affected (Wilson interval at the score policy's confidence level, 95 percent "
      "unless the policy sets model.interval_confidence), the online devices' events per "
      "1,000 online devices (exact interval at the same level) and the stability score with its decomposition, so a "
      "device that crashed and went offline is in the counts but not in the share, and the score is "
      "withheld as offline_affected while any affected device is offline. "
-     "Counts are Windows-scoped (the Apps tab, the Overview top apps and get_dex_app still count "
-     "every platform) and the population is Windows devices online now (population: null = no "
-     "fleet source wired, 0 = no Windows device online now; population_basis). No device floor is applied. "
+     "platform selects the scope: all (default; one row per application across operating systems, "
+     "including agents whose operating system is not recognised, so not the sum of the per-platform "
+     "results), windows, macos or linux. The population is that scope's devices online now "
+     "(population: null = no fleet source wired, 0 = no device of the scope online now; "
+     "population_basis names it, e.g. all_online or windows_online). crash_source_coverage says "
+     "per platform whether its crash sources are complete (windows) or partial (linux, macos), so "
+     "a short list for linux or macos is not proof of a healthy fleet. An empty apps list means no "
+     "crash or hang signal in the window on that scope, not a failure. "
+     "Pass platform=windows for the Windows scope only; get_dex_app is the per-application drill-down and counts every platform. An invalid platform or window is invalid params (-32602, terminal: do not retry it unchanged). No device floor is applied. "
      "The policy object names the score policy every figure was scored under (source default or custom, "
      "revision, fault - a reason string when a stored policy document was refused and the shipped "
      "defaults are in force, otherwise null - and the four tier edges and display names); each "
@@ -1822,14 +1828,18 @@ static const ToolDef kTools[] = {
      "else default. No per-agent identity (a distinct-device "
      "COUNT, never an agent_id) - not audited. A degraded read, including a stored policy that cannot be "
      "read within its staleness bound, is an error, never an empty list. "
-     "Mirrors GET /api/v1/dex/apps. Requires GuaranteedState:Read.",
-     R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
-     R"j({"type":"object","properties":{"window":{"type":"string"},"population":{"type":["integer","null"]},"population_basis":{"type":"string"},"apps_total":{"type":"integer"},"apps_truncated":{"type":"boolean"},)j"
+     "Mirrors GET /api/v1/dex/apps. Not audited beyond the generic tool-call row. A degraded read "
+     "is a retryable error (retry_after_ms). Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("platform":{"type":"string","enum":["all","windows","macos","linux"],"default":"all","description":"Platform scope of the counts and the online population."},)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Look-back window for crash and hang signals."})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{"window":{"type":"string"},"population":{"type":["integer","null"]},"population_basis":{"type":"string"},"crash_source_coverage":{"type":"object","additionalProperties":{"type":"string","enum":["complete","partial"]}},"apps_total":{"type":"integer"},"apps_truncated":{"type":"boolean"},)j"
      R"j("policy":{"type":"object","properties":{"source":{"type":"string","enum":["default","custom"]},"revision":{"type":"string"},"fault":{"type":["string","null"]},"tiers":{"type":"object","properties":{"excellent":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"good":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"fair":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"poor":{"type":"object","properties":{"edge":{"type":"number","description":"The fixed 0, not a stored value."},"name":{"type":"string"}},"required":["edge","name"]}},"required":["excellent","good","fair","poor"]}},"required":["source","revision","fault","tiers"]},)j"
      R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"profile":{"type":"string","enum":["default","override"]},)j"
      R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},)j"
      R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]}},"required":["version","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score"]}},"version_count":{"type":"integer"},"versions_truncated":{"type":"boolean"}},"required":["subject","profile","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score","versions","version_count","versions_truncated"]}}},)j"
-     R"j("required":["window","apps","policy","population","population_basis","apps_total","apps_truncated"]})j"},
+     R"j("required":["window","apps","policy","population","population_basis","crash_source_coverage","apps_total","apps_truncated"]})j"},
 
     {"get_dex_catalogue",
      "Signal catalogue family cards (Catalogue View 1): every catalogued signal family's "
@@ -17336,7 +17346,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
                     return;
                 }
-                const auto model = dex_api_->apps(window);
+                // Present-but-non-string is invalid, never the default (`param_str` would
+                // turn `5` or `null` into the all-platform scope; same defect as #4644).
+                const auto platform = param_string_strict(args, "platform", kDexAppsScopeAll);
+                const std::string scope = platform ? dex_normalize_apps_scope(*platform) : "";
+                if (scope.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid platform (expected all|windows|macos|linux)"),
+                        "application/json");
+                    return;
+                }
+                const auto model = dex_api_->apps(window, scope);
                 // A failed read or an invalid score policy is an error, never
                 // an empty or perfect list (matches the REST 503, reason included).
                 if (model.degraded) {

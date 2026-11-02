@@ -1,19 +1,24 @@
 ## Runtimes Definitions
-## Reports installed .NET (Core/5+) and JVM runtimes. Read-only, zero subprocess.
-## Plugin: runtimes | Actions: dotnet, jvm
+## Reports installed .NET (Core/5+), JVM and Python runtimes. Read-only, zero subprocess.
+## Plugin: runtimes | Actions: dotnet, jvm, python
 ##
-## SHIPPED LEG: Linux only, rung 1 (directory names and metadata-file reads;
-## no `java` or `dotnet` process is ever started).
+## SHIPPED LEGS: Linux (dotnet, jvm, python) and, for python only, macOS and Windows. Rung 1
+## (directory names and metadata-file reads; no `java`, `dotnet` or `python` process is ever
+## started).
 ##   Linux:   /usr/share/dotnet, /usr/lib/dotnet, /usr/lib64/dotnet shared/<framework>/<version>
 ##            and sdk/<version> directory walk (dotnet);
 ##            <home>/release file reads under /usr/lib/jvm, /opt/java, /usr/lib64/jvm and
-##            /var/opt/java, plus a bin/java probe for a home with no release file (jvm).
+##            /var/opt/java, plus a bin/java probe for a home with no release file (jvm);
+##            python3.<minor> regular files in /usr/bin and /usr/local/bin (python; the version
+##            is major.minor from the file name, the patch level is not available).
 ##            Network mounts are skipped (read from /proc/self/mountinfo).
+##   macOS:   /Library/Frameworks/Python.framework/Versions/<x.y>/Resources/Info.plist (python).
+##   Windows: HKLM\SOFTWARE\Python\PythonCore\<tag> in both registry views, PEP 514 (python);
+##            per-user hives are never read.
 ##
-## macOS AND WINDOWS: planned; the action answers a single unsupported status row on this OS.
-## Until then every action on those hosts answers a single
-## `status|<action>|unsupported|<macos|windows>:planned` row. The planned mechanisms
-## are declared in the plugin descriptor (runtimes_plugin.cpp):
+## macOS AND WINDOWS dotnet / jvm: planned; the action answers a single unsupported status row on
+## this OS. Until then it answers `status|<action>|unsupported|<macos|windows>:planned`. The
+## planned mechanisms are declared in the plugin descriptor (runtimes_plugin.cpp):
 ##   macOS:   /usr/local/share/dotnet/shared walk (dotnet);
 ##            /Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict +
 ##            Contents/Home/release (jvm).
@@ -176,6 +181,92 @@ spec:
         platforms: [linux]
 
   readablePayload: "List installed JVMs"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [runtimes]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.runtimes.python
+  displayName: Python Inventory
+  version: 1.0.0
+  description: >
+    Reports installed Python interpreters: one row per interpreter found at the standard
+    machine roots (flavour, version, install path, vendor), from install metadata only — no
+    `python` process is started. Windows: the python.org PEP 514 keys under
+    HKLM\SOFTWARE\Python\PythonCore in both registry views, with the full x.y.z version
+    (per-user installs and other PEP 514 publishers are not listed). macOS: the python.org
+    framework under /Library/Frameworks/Python.framework/Versions, with the full x.y.z from
+    each version's Info.plist. Linux: python3.<minor> files in /usr/bin and /usr/local/bin,
+    with major.minor ONLY (for example 3.11) — the patch level is not stored anywhere without
+    running the interpreter, so it is not guessed. A `supported` status with no rows means
+    none was found at those roots (Homebrew, pyenv, conda and virtual environments are not
+    looked for); a `constrained` status means a read failed or was skipped and the list may
+    be incomplete.
+  tags: [runtimes, python, inventory]
+
+spec:
+  type: question
+  platforms: [windows, darwin, linux]
+
+  execution:
+    plugin: runtimes
+    action: python
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|python|<level>|<reason>   (always first)
+    # python|<flavour>|<version>|<install_path>|<vendor or ->
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), python (one per interpreter found).'
+        values: [status, python]
+        example: python
+        platforms: [windows, darwin, linux]
+      - name: flavour
+        type: string
+        description: 'Interpreter kind. Values: cpython (a python.org PythonCore registry tag on Windows, or the python.org framework on macOS, identified by its bundle identifier), unmodelled (any other bundle identifier on macOS; every Linux row — a file name does not say what implementation it is). Status rows: the action name.'
+        values: [cpython, unmodelled]
+        example: cpython
+        platforms: [windows, darwin, linux]
+      - name: version
+        type: string
+        description: 'Interpreter version. Windows: the PythonCore Version value (x.y.z), else SysVersion, else the tag''s major.minor. macOS: the full x.y.z from Info.plist, else the version directory name (x.y). Linux: major.minor from the python3.<minor> file name — the patch level is not available. - when none could be determined. Status rows: the level (supported, constrained or unsupported).'
+        example: 3.14.6
+        platforms: [windows, darwin, linux]
+      - name: install_path
+        type: string
+        description: 'Windows: the InstallPath key''s default value (backslashes are written as /), or - when the tag has none. macOS: the framework version directory. Linux: the interpreter file. Status rows: the comma-joined failure tokens, or -.'
+        example: /usr/bin/python3.11
+        platforms: [windows, darwin, linux]
+      - name: vendor
+        type: string
+        description: 'Windows: PythonCore. macOS: the framework''s CFBundleIdentifier (org.python.python), or - when the plist could not be read. Linux: always "-".'
+        example: PythonCore
+        platforms: [windows, darwin, linux]
+
+  readablePayload: "List installed Python interpreters"
 
   gather:
     ttlSeconds: 300
