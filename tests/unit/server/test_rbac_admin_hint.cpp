@@ -31,6 +31,7 @@
  */
 
 #include "rbac_admin_predicate.hpp"
+#include "saml_principal.hpp"
 
 #include "audit_store.hpp"
 
@@ -291,6 +292,21 @@ void make_user(RbacRoleHarness& h, const std::string& name, auth::Role role) {
     REQUIRE(h.auth_db->upsert_user(name, "hash", "salt", role).has_value());
 }
 
+/// A SAML session of the production shape: the principal comes from the shared builder (the one
+/// `create_saml_session` mints through), and the precondition the SAML cases rest on is asserted,
+/// not assumed: such a name can never be an auth.users row, so the regime check must refuse it.
+void make_saml_caller(RbacRoleHarness& h) {
+    h.session_user = saml::saml_principal_id("https://idp.example", "alice");
+    h.session_auth_source = "saml";
+    REQUIRE_FALSE(is_valid_username(h.session_user));
+    h.rbac->set_rbac_enabled(true);
+    REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
+    // The predicate admits (bare principal_roles membership), so only the regime check separates
+    // this caller from an administrator.
+    REQUIRE(is_rbac_administrator(h.rest_session(), h.auth_db.get(), h.rbac.get(),
+                                  RbacAdminSurface::kRest) == RbacAdminGate::kAdmin);
+}
+
 template <typename S>
 concept HintCallableWithoutSurface =
     requires(S s) { rbac_admin_hint(s, static_cast<AuthDB*>(nullptr), static_cast<const RbacStore*>(nullptr)); };
@@ -382,19 +398,27 @@ TEST_CASE("rbac_admin_hint == POST assign: SSO-labelled principal WITH a break-g
 TEST_CASE("rbac_admin_hint == POST assign: SAML principal with the grant but NO auth.users row (P7c)",
           "[pg][rbac_admin_predicate][rbac_admin_hint]") {
     RbacRoleHarness h;
-    h.session_user = "saml:https://idp.example#alice";
-    h.session_auth_source = "saml";
-    h.rbac->set_rbac_enabled(true);
-    REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
-
     // The SAML twin of P7: `saml:<idp>#<NameID>` can never be an auth.users name
     // (`is_valid_username` refuses ':' and '#'), so the regime check refuses and the hint is
     // kMayNot although the predicate admits. This pins the hint only: a SAML session is also
     // refused earlier by the MFA step-up chokepoint (#4935), which runs before the route
     // handler and is not part of the hint.
-    REQUIRE(is_rbac_administrator(h.rest_session(), h.auth_db.get(), h.rbac.get(),
-                                  RbacAdminSurface::kRest) == RbacAdminGate::kAdmin);
+    make_saml_caller(h);
     check_assign(h, RbacAdminHint::kMayNot);
+}
+
+TEST_CASE("rbac_admin_hint == DELETE unassign: SAML principal with the grant but NO auth.users row (P7c)",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    make_saml_caller(h);
+    check_unassign(h, RbacAdminHint::kMayNot);
+}
+
+TEST_CASE("rbac_admin_hint == PUT enforcement: SAML principal with the grant and no row, RBAC on (P7c)",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    make_saml_caller(h);
+    check_enforcement(h, RbacAdminHint::kMayNot, /*target=*/false); // the store's source check
 }
 
 TEST_CASE("rbac_admin_hint == POST assign: durable demotion after sign-in, RBAC off (P14)",
