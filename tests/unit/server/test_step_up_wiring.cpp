@@ -1934,9 +1934,13 @@ TEST_CASE("wiring: server.cpp owns the post-read stage registration through a sc
     CHECK(count_of(src, "PostReadStageRegistry::instance().forget(web_server_.get());") == 1);
 }
 
-// A route the sink refuses at boot (no step-up policy row, or no post-read stage installed) must
-// become a startup failure, not an exception unwinding out of run() after the gRPC listeners are
-// bound.
+// A `std::logic_error` out of start_web_server() must become a startup failure, not an exception
+// unwinding out of run() after the gRPC listeners are bound. The triggers are (a) a sink
+// registration with no stage installed, (b) `PostReadStageRegistry::install` misuse (a route is
+// already recorded), (c) a registration after the route table is sealed, and (d) any incidental
+// `std::logic_error` subtype. An unclassified route BEFORE the seal is not a trigger: the pre-seal
+// sweep sets `startup_failed_` without throwing, and is not redundant with this catch. Exceptions
+// that are not logic errors (bad_alloc, std::system_error, filesystem_error) still unwind to main.
 TEST_CASE("wiring: server.cpp turns a refused route registration into a startup failure",
           "[stepup][wiring][lexical]") {
     const auto stripped = strip_comments_and_literals(read_server_cpp());
@@ -1956,7 +1960,9 @@ TEST_CASE("wiring: server.cpp turns a refused route registration into a startup 
     REQUIRE(recheck != std::string::npos);
     const auto recheck_return = flat.find("return;", recheck);
     REQUIRE(recheck_return != std::string::npos);
-    CHECK(flat.substr(recheck, recheck_return - recheck).find("stop();") != std::string::npos);
+    // `stop();return;` adjacent: the recheck block stops the listeners and returns straight after.
+    CHECK(flat.substr(recheck, recheck_return + 7 - recheck).find("stop();return;") !=
+          std::string::npos);
 }
 
 // The stripper behind the validator floor below. A desync (a digit separator read as the start of

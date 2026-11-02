@@ -332,6 +332,8 @@ TEST_CASE("post-read stage: Handled from the stage answers the request and skips
         CHECK(res->status == 413);
     }
     CHECK(s.handler_calls.load() == 0);
+    // The stage ran once for the POST above and once for each of the five verbs here.
+    CHECK(s.stage_calls.load() == 6);
 }
 
 TEST_CASE("post-read stage: an exempt server with no stage installed serves its handlers "

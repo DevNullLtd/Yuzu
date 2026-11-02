@@ -377,6 +377,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <shared_mutex>
 #include <ranges>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <string_view>
@@ -8980,13 +8981,17 @@ public:
         // fail-closed deny-at-login) even though the feature is off.
         auth_routes_->set_scim_store(cfg_.scim_enable ? scim_store_.get() : nullptr);
 
-        // A route registered through `HttplibRouteSink` that the step-up policy does not classify, or
-        // with no post-read stage installed, is refused with `std::logic_error` (the sink fails
-        // closed). Left to escape, that unwinds run() into main's catch only after the gRPC
-        // listeners are bound, so agents and the gateway see accept-then-exit churn. Route it
-        // through the same `startup_failed_` check as the other web-server boot failures. Any
-        // other `std::logic_error` from start_web_server() is a refusal to start too, and is
-        // logged with its text.
+        // The route sink fails closed with `std::logic_error` on: (a) a registration on a server
+        // with no post-read stage installed, (b) `PostReadStageRegistry::install` misuse (a route
+        // is already recorded), (c) a registration after the route table is sealed that the
+        // step-up policy does not classify. Any other `std::logic_error` subtype is a refusal to
+        // start too and is logged with its text. Left to escape, these unwind run() into main's
+        // catch only after the gRPC listeners are bound, so agents and the gateway see
+        // accept-then-exit churn; route them through the same `startup_failed_` check as the other
+        // web-server boot failures. An unclassified route BEFORE the seal is not one of these
+        // triggers: the pre-seal sweep sets `startup_failed_` without throwing, and is not
+        // redundant with this catch. Exceptions that are not `std::logic_error` (bad_alloc,
+        // std::system_error from a thread constructor, filesystem_error) still unwind to main.
         try {
             start_web_server();
         } catch (const std::logic_error& e) {
@@ -9010,8 +9015,9 @@ public:
         // time (same thread, sequential — not a wait).
         if (startup_failed_) {
             spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
-                         "(among others: SCIM boot failure, HTTPS cipher-pin failure or the MFA "
-                         "step-up route classification abort; see the preceding critical log); "
+                         "(among others: SCIM boot failure, HTTPS cipher-pin failure, the MFA "
+                         "step-up route classification abort or a route-registration refusal; "
+                         "see the preceding critical log); "
                          "stopping the already-started agent/management gRPC listeners.");
             stop();
             return;
@@ -15830,8 +15836,9 @@ private:
         // the only placement whose position in the request does not depend on
         // the httplib version. No `set_pre_request_handler` is installed here.
         // Coverage is therefore PER ROUTE registered through the sink: a route
-        // registered on the server outside the sink loses the body cap AND the
-        // step-up chokepoint, not only the cap.
+        // registered on the server outside the sink loses the post-read body cap
+        // and the step-up chokepoint (the pre-routing declared-length cap still
+        // applies).
         //
         // INSTALL BEFORE THE FIRST ROUTE: the sink looks the stage up when a
         // route is registered, so a route registered earlier would be left
@@ -15880,9 +15887,10 @@ private:
         // overload, and httplib's `dispatch_request_for_content_reader` leaves
         // `req.body` EMPTY (the body is streamed through the reader), so a
         // route registered that way on `*web_server_` directly would be
-        // neither wrapped, capped nor step-up gated. This codebase registers
-        // none; it is the same blind spot as multipart and will not announce
-        // itself.
+        // neither wrapped nor post-read capped, and carry no step-up
+        // chokepoint (the pre-routing declared-length cap still applies). This
+        // codebase registers none; it is the same blind spot as multipart and
+        // will not announce itself.
         //
         // Same table, same `path_class` label (never the attacker-controlled
         // `req.path`), same 413 A4/SCIM envelope shapes, and the same

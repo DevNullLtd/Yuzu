@@ -4,10 +4,11 @@
 /// The per-server registry of the POST-READ STAGE, and the contract `HttplibRouteSink` honours
 /// when it consults it.
 ///
-/// WHAT the stage is: one function, run for every matched route after the request body has been
-/// read and before the route's own handler. In production it is `detail::run_post_read_stage`
-/// (`step_up_wiring.hpp`): the #2407 post-read body cap, then the MFA step-up chokepoint, in that
-/// order. `Handled` means the stage already wrote the response and the handler must not run.
+/// WHAT the stage is: one function, run for every route registered through the sink after the
+/// request body has been read and before the route's own handler. In production it is
+/// `detail::run_post_read_stage` (`step_up_wiring.hpp`): the #2407 post-read body cap, then the
+/// MFA step-up chokepoint, in that order. `Handled` means the stage already wrote the response and
+/// the handler must not run.
 ///
 /// WHY it is a handler wrapper and not `httplib::Server::set_pre_request_handler`: from
 /// cpp-httplib v0.47.0 `Server::dispatch_request` runs the pre-request handler BEFORE
@@ -37,10 +38,11 @@
 /// COVERAGE is PER ROUTE registered through the sink. The pre-request hook this replaces was
 /// server-wide: httplib ran it for every matched route, ContentReader routes included
 /// (httplib.h, `dispatch_request_for_content_reader`). The wrapper covers only the routes a sink
-/// registered, which is why an unwrapped registration is refused at boot rather than left to
-/// chance. The stage still runs for a MATCHED route only (an unmatched path never reaches a
-/// handler), and for a multipart request `req.body` stays empty so the cap cannot see it. See
-/// `body_cap_policy.hpp`.
+/// registered, which is why a sink registration with no stage is refused at boot rather than
+/// left to chance. A registration on the raw server is not refused at boot: only the CI source
+/// scan (literal verb calls) catches it. The stage still runs for a MATCHED route only (an
+/// unmatched path never reaches a handler), and for a multipart request `req.body` stays empty so
+/// the cap cannot see it. See `body_cap_policy.hpp`.
 
 #include <httplib.h>
 

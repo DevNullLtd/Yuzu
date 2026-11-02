@@ -8,8 +8,9 @@
 // Why: httplib::Server's `bind_to_any_port + listen_after_bind on a
 // std::thread` pattern crashes under TSan with no TSan report — the
 // segfault is in httplib's internal state machine, not a race TSan caught
-// (issue #438). Test fixtures that bind real ports therefore can't run
-// under the Sanitizers (TSan) CI job.
+// (issue #438). Most loopback fixtures are therefore compiled out under
+// the Sanitizers (TSan) CI job; the socket cases in test_post_read_stage.cpp
+// are the exception and run there with the CI gai shim.
 //
 // The fix is a thin polymorphic seam at the route-registration boundary:
 //   - Production code constructs HttplibRouteSink(svr) and passes a
@@ -36,8 +37,10 @@
 namespace yuzu::server {
 
 /// Interface that mirrors the subset of httplib::Server's route-registration
-/// API that Yuzu's route owners use. Production code keeps using
-/// httplib::Server end-to-end; this seam exists for in-process test dispatch.
+/// API that Yuzu's route owners use. Production registers through
+/// `HttplibRouteSink` below (which wraps and records each handler); an
+/// in-process test sink (tests/unit/server/test_route_sink.hpp) dispatches
+/// without a socket.
 class HttpRouteSink {
 public:
     using Handler = httplib::Server::Handler;

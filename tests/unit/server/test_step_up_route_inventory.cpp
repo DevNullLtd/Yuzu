@@ -36,11 +36,11 @@
  * whichever runs first) and the kRequired label-pin case (its own pass). The other three (the
  * post-read exemption, foreign-receiver and header scans) use plain string search over the cached
  * corpus and stay untagged. `[body_cap]` is a placement tag, not a topic: it routes the six to the
- * non-pg 'server unit tests shard D' (see tests/meson.build), which already holds the other in-process
- * route-source cases, instead of leaving them in shard B. All six move together on purpose: the
- * discovery pass is cached per process, so moving only some would just move the cost to the next
- * case in B that reads it. A new case that uses `discover_mutating_routes` should carry the tag
- * too.
+ * non-pg 'server unit tests shard D' (see tests/meson.build), which already holds the other
+ * in-process route-source cases, instead of leaving them in shard B. All six move together on
+ * purpose: the discovery pass is cached per process, so moving only some would just move the cost
+ * to the next case in B that reads it. A new case that uses `discover_mutating_routes` should
+ * carry the tag too.
  */
 
 #include "../../../server/core/src/step_up_gate.hpp"
@@ -491,6 +491,7 @@ TEST_CASE("step-up route inventory: only the redirect listener's sink opts out o
 
     std::size_t exempt_total = 0;
     std::vector<std::string> exempt_in, direct;
+    bool exempt_builds_redirect_sink = false;
     std::size_t files_checked = 0;
     const auto scan_corpus = [&](const auto& files) {
         for (const auto& [file, text] : files) {
@@ -501,6 +502,13 @@ TEST_CASE("step-up route inventory: only the redirect listener's sink opts out o
             if (const auto n = count_of(code, "StageRequirement::ExemptNoStage"); n > 0) {
                 exempt_total += n;
                 exempt_in.push_back(file);
+                // The statement that builds the redirect listener's sink: the exemption's own
+                // construction, read from the 200 characters of code just before it (the call
+                // wraps and is indented, so the member name sits well over 100 characters back).
+                const auto at = code.find("StageRequirement::ExemptNoStage");
+                exempt_builds_redirect_sink =
+                    code.substr(at > 200 ? at - 200 : 0, at > 200 ? 200 : at)
+                        .find("redirect_sink_") != std::string::npos;
             }
             for (const char* recv : {"web_server_->", "redirect_server_->"})
                 for (const char* verb : {"Get(", "Post(", "Put(", "Delete(", "Patch(", "Options("})
@@ -514,7 +522,9 @@ TEST_CASE("step-up route inventory: only the redirect listener's sink opts out o
     INFO("ExemptNoStage appears in: " << join(exempt_in));
     CHECK(exempt_total == 1);
     REQUIRE(exempt_in.size() == 1);
-    CHECK(exempt_in.front().find("server.cpp") != std::string::npos);
+    // Exactly server.cpp (not `mcp_server.cpp`), and the sink it builds is the redirect listener's.
+    CHECK(exempt_in.front().substr(exempt_in.front().find_last_of("/\\") + 1) == "server.cpp");
+    CHECK(exempt_builds_redirect_sink);
     INFO("Direct verb calls on a server, bypassing the sink:\n" << join(direct));
     CHECK(direct.empty());
 }

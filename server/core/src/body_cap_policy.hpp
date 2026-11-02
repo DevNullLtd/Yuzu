@@ -203,7 +203,8 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // (session open POST, chunk PUT, status GET, commit POST, cancel DELETE).
     // ANY method: only the chunk PUT carries a large body, but scoping to PUT
     // would silently drop every sibling verb on this prefix to the catch-all
-    // (rule 4 in the routed-concern row; any-method rows are preferred). Cap = the
+    // (rule 4 in the routed-concern row: a mutating route needs its own entry).
+    // Any-method rows are preferred. Cap = the
     // protocol's own per-chunk maximum, `upload_grant::kDefaultChunkMaxBytes`
     // (upload_grant_parsers.hpp; bound by a static_assert in
     // file_retrieval_routes.cpp so the two cannot drift). requires_measurable

@@ -708,7 +708,9 @@ by each handler.
   an ungated route; the plaintext redirect listener is the one production
   server built with the explicit `StageRequirement::ExemptNoStage`. A route
   registered on the server outside the sink would be neither wrapped nor
-  inventoried, which a lexical source scan pins. It is not
+  inventoried; a best-effort source scan flags literal verb calls on the two server members and
+  literal mutating registrations on any receiver, and does not see aliases, `ContentReader`
+  overloads or custom-method routes (a review concern). It is not
   httplib's `set_pre_request_handler`, which runs before the body is read from
   cpp-httplib v0.47.0. The order for a `kRequired` route is therefore: session
   resolution (`401` when there is none), for a cookie session the server-wide
