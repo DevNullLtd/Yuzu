@@ -22,7 +22,7 @@ name: "CodeQL"
 # job spanning Linux + Windows; a job-level `if` cannot reference the
 # `matrix` context, so a fail-closed per-leg gate would require splitting
 # the job — out of scope for the cutover. If Big Tam is offline at the
-# weekly run, the Linux leg queues until its job timeout (same as the
+# scheduled run, the Linux leg queues until its job timeout (same as the
 # pre-cutover Shulgi-offline behaviour); CodeQL is not a required check.
 #
 # The two runs are separate matrix legs with `fail-fast: false`, so a
@@ -55,7 +55,8 @@ name: "CodeQL"
 #     build-{linux,windows}-{asan,tsan,coverage}/
 #   - Pre-build runner disk-free assertion (≥40 GB Linux, ≥45 GB Windows;
 #     MSVC debug builds are chunkier)
-#   - Daily scheduled run (04:00 UTC, low-activity window)
+#   - Daily scheduled run (cron 04:00 UTC; GitHub starts it late — observed
+#     starts 08:00-12:00 UTC, 2026-10 to 2026-11)
 #   - Manual workflow_dispatch
 #
 # Known remaining coverage gaps:
@@ -115,12 +116,16 @@ on:
   pull_request:
     branches: [dev, main]
   schedule:
-    # Daily 04:00 UTC — off-hours, both runners available. Tightens C++
-    # vuln detection from <=7 days to <=24h (folds CodeQL into the Tier-3
-    # nightly cadence; it stays a ~20-25 min trace, NOT the PR fast-path).
-    # 04:00 is 2h ahead of nightly.yml's 06:00 cron so the two self-hosted
-    # Linux workloads don't contend for the Big Tam pool. Both Linux and
-    # Windows legs start simultaneously on their respective runners.
+    # Daily 04:00 UTC cron. Tightens C++ vuln detection from <=7 days to
+    # <=24h (folds CodeQL into the Tier-3 nightly cadence; it is a long
+    # trace, NOT the PR fast-path — last green run 2026-10-21: Linux 50m,
+    # Windows 66m; see timeout-minutes below for why that no longer holds).
+    # The 04:00 slot was chosen to be 2h ahead of nightly.yml's 06:00 cron,
+    # but GitHub starts both late (observed: this 08:00-12:00 UTC, nightly
+    # 11:00-13:00 UTC), so the two now overlap in practice and CodeQL's Linux
+    # leg can contend with nightly's sanitizer/coverage legs for Big Tam
+    # runner agents. Both Linux and Windows legs start simultaneously on
+    # their respective runners.
     - cron: "0 4 * * *"
 
 concurrency:
@@ -177,23 +182,28 @@ jobs:
       security-events: write   # github/codeql-action/upload-sarif
     # Verified Linux wall-clock (2026-04-13, dev@9b16d3c, security-extended,
     # build_tests=false): 14m49s with 155/156 compiles being real misses
-    # on a 32-thread runner. Current config (+security-and-quality +
-    # build_tests=true + c-cpp,actions) should fit under 60 min on
-    # Linux. Windows is typically 1.5-2x slower per TU under MSVC —
-    # budget extra headroom.
+    # on a 32-thread runner. The current config (+security-and-quality +
+    # build_tests=true + c-cpp,actions) was expected to fit under 60 min on
+    # Linux, with Windows 1.5-2x slower per TU under MSVC; the 2026-10-21
+    # figures below are what it actually measured.
     #
     # 90 min stopped covering either leg after the 2026-10-21 dev→main
     # promotion (C++ TUs 1157 → 1437). Last green run (2026-10-21):
     # Linux build 15m + analysis 35m; Windows build 48m + analysis 18m.
-    # From 2026-10-23: Windows build 75-85m, leaving the analysis 2-6m;
-    # Linux build 22-25m, then analysis cancelled at 65m+ — 183 of 184
-    # queries done by ~16m, the last one
-    # (Security/CWE/CWE-119/OverrunWriteProductFlow, 21m alone on
+    # From 2026-10-23: Windows build 71-84m and still growing, leaving the
+    # analysis 2-16m; Linux build 21-25m, then analysis cancelled after
+    # 65m+ of analysis (job at 90m) — 183 of 184 queries done by ~16m, the
+    # last one (Security/CWE/CWE-119/OverrunWriteProductFlow, 21m alone on
     # 2026-10-21) never finished. 180 min is a ceiling chosen to let
-    # Windows fit and to measure how long that query actually needs on
-    # Linux; it is not a derived bound. If Linux still cancels, the
-    # remedy is a per-query evaluation timeout or a query-filters
-    # exclude in codeql-config.yml, not another bump.
+    # Windows fit (build ~80m + analysis ~18m leaves ~75m headroom) and to
+    # measure how long that query actually needs on Linux; it is not a
+    # derived bound. If Linux still cancels, the remedy is a per-query
+    # evaluation timeout (not an analyze-action input; it would need
+    # CODEQL_ACTION_EXTRA_OPTIONS `database run-queries --timeout`,
+    # unverified) or a query-filters exclude in codeql-config.yml (drops a
+    # CWE-119 security query on both legs and requires updating
+    # scripts/ci/test_runner_health_check.py's pin of exactly two
+    # excludes) — not another bump.
     timeout-minutes: 180
     strategy:
       # fail-fast: false so Linux completes its SARIF upload even if
