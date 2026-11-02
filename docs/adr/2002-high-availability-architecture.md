@@ -33,8 +33,8 @@ Three groundwork facts make this tractable rather than a rewrite:
    tolerates *server* failover — it re-proxies a `ProxyRegister` for the agents a restarted or
    replaced server no longer knows, because the new server may be a fresh instance with an empty registry.
    Since #5695 that replay is evidence-driven (a targeted replay of the ids a heartbeat verdict lists as
-   unknown; a full replay on enough unknown ids, a truncated verdict or a lost CONNECTED notice, with a
-   cooldown; the exact triggers are in the header block of `yuzu_gw_upstream.erl`), not an unconditional
+   unknown; a full replay on enough unknown ids or a truncated verdict (both limited by a cooldown), or
+   on a lost CONNECTED notice; the exact triggers are in the header block of `yuzu_gw_upstream.erl`), not an unconditional
    replay of every held agent on reconnect.
    **But** per-agent *targeted* routing is today a **node-local ETS lookup**
    (`yuzu_gw_registry:lookup`, `yuzu_gw_registry.erl:90`) — `pg` is used only for broadcast groups —
