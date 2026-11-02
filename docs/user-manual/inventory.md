@@ -1150,7 +1150,8 @@ sync, defeating the hash-skip protocol.
 
 - **Scope / privacy.** Machine-scope only (no per-user data), but serial/UUID/MAC
   are device-persistent identifiers — treat as potentially personal data where a
-  device is person-assigned. The same **`--inventory-disable`** flag suppresses
+  device is person-assigned. A volume or partition mount point under a user profile
+  or under `/Volumes` is replaced with `[redacted]` before it is sent. The same **`--inventory-disable`** flag suppresses
   `device_ci` along with the other sources (it gates the whole daily-sync thread).
 - **Observability.** Ingest shares
   `yuzu_inventory_ingest_total{source="device_ci"}` +
@@ -1174,14 +1175,19 @@ sync, defeating the hash-skip protocol.
   before the agents. No page or API reads the per-device rows yet: these values are stored
   now and become visible when the device-CI read surface ships.
 - **What the agent sends.** An agent that carries this change always sends the versioned
-  record; there is no setting to turn it off. Each section reports one of four levels:
+  record; there is no flag to fall back to the earlier format, and `--inventory-disable`
+  still stops the collection. Each section reports one of four levels:
   `ok`, `constrained` (partial: read the reason), `unavailable` (the data could not be
   read on this host) and `permission_denied` (the agent was refused). A section that is
   `unavailable` or `permission_denied` carries **no rows**, so an empty list under those
   levels means "not collected", not "the device has none". A reason of the form
   `<os>:planned` means the collector for that OS is not shipped yet; `agent:action_absent`
   means the installed plugin predates the section; `agent:plugin_not_loaded` means the
-  disk plugin is not loaded on that host. A reason ending `agent_cap:<kept>/<total>`
+  disk plugin is not loaded on that host; `agent:windows_volumes_unbounded` means the
+  Windows volume probe was not run, because it has no deadline and the daily sync must not
+  block on a wedged drive, so the Windows `volume` section is `unavailable` with no rows;
+  `agent:mount_points_redacted` means at least one mount point under a user profile or under
+  `/Volumes` was replaced with `[redacted]` and the rest of the row is unchanged. A reason ending `agent_cap:<kept>/<total>`
   means the agent kept only the first `kept` of `total` rows (it caps each list to
   the same limits the server applies, and trims the least valuable lists first if the whole
   record would be too large); `server_cap:<n>` is the server's own cap. Sections fail

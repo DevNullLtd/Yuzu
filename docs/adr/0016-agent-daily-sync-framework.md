@@ -669,15 +669,16 @@ chassis, board and machine-id values and stale child rows to be served as curren
 agent's next full report on the upgraded server.
 
 **Personal data.** `chassis_serial`, `board_serial` and the DIMM `serial` column join the
-serial/UUID/MAC behavioural-PII tier. The sections read has no REST/MCP/UI route yet; the
-later REST read-surface change must serve it behind the same fail-closed audit as the
+serial/UUID/MAC behavioural-PII tier. The `volume` and `partition` mount-point column can name an
+account or a personal label as the OS reports it, so the agent redacts such entries before sending
+(2026-11-01 entry, "Mount points (personal data)"). The sections read has no REST/MCP/UI route yet;
+the later REST read-surface change must serve it behind the same fail-closed audit as the
 audited `inventory.device.ci` read.
 
 ### 2026-11-01 — `device_ci` blob v2 (agent writer)
 
 The agent now emits the v2 record defined in the 2026-10-29 entry. This entry records
-what the writer does and the rollout behaviour that was verified against a server without the
-v2 store.
+what the writer does and the order in which a fresh deployment brings its components up.
 
 **v2 is emitted unconditionally.** There is no capability negotiation and no agent-side
 fallback flag; this supersedes the 2026-10-29 sentence that the agent change "may
@@ -702,11 +703,44 @@ section-bearing actions, including the three that already existed (`processors`,
 | rc != 0 | `unavailable` | `agent:action_absent` when the output starts `unknown action`, else `agent:rc=<n>` |
 | capture truncated | `unavailable` | `agent:truncated` |
 | `disk_actions` not loaded | `unavailable` | `agent:plugin_not_loaded` |
+| Windows `volumes` | `unavailable` | `agent:windows_volumes_unbounded` (the action is not run; see below) |
+| a mount point was redacted | `constrained` | `agent:mount_points_redacted`, placed before any plugin reason |
 
 **No rows from a failed section.** A section whose level is `unavailable` or
 `permission_denied` carries its status record and no rows, and its appended scalar positions
 stay blank. Nothing from a failed, truncated, absent or refused capture is projected, and the
 cap token below can never promote such a section to `constrained`.
+
+**Mount points (personal data).** The `volume` and `partition` mount-point column is forwarded as
+the OS reports it, so a volume folder-mounted under a user profile (`C:\Users\<name>\...`,
+`/Users/<name>/...`) or an APFS volume mounted at `/Volumes/<label>` would put an account name or
+a personal label into a record stored centrally on every cycle. The statement "machine-scope (no
+username/SID/user path)" in the data-classification paragraph above therefore holds for this column
+only because the writer minimises it: before the blob is built, every entry that lies under
+`/Users`, `/home`, `\Users` or `\Documents and Settings` (behind a drive letter), or under
+`/Volumes`, is replaced with `[redacted]`. The boot volume's label is user-chosen, so every
+`/Volumes` entry goes. A piece that is not a path (the tail of a label that held a comma) is
+replaced with it. A section in which any entry was replaced is `constrained` with
+`agent:mount_points_redacted`, placed before any plugin reason so the reason clamp cannot drop it.
+Drive letters, `/`, `/System/Volumes/*` and any other folder mount pass through as the OS reported
+them, so the column can still name a folder an administrator chose; it is minimised, not proven free of
+names. The serial, board-serial and DIMM-serial columns of the 2026-10-29 "Personal data" paragraph
+are unchanged.
+
+**Windows `volumes` is not run.** The Windows `volumes` leg issues synchronous `DeviceIoControl`
+calls on handles opened without a deadline (`disk_actions_win.cpp`, "BOUNDING"). The daily sync runs
+on the thread the agent joins on reconnect and on shutdown, so one wedged drive would leave the
+endpoint unable to reconnect or to stop cleanly. Until those calls have a bound, the Windows writer
+does not run the action: the `volume` section is `unavailable` with `agent:windows_volumes_unbounded`
+and carries no rows. The operator-triggered `volumes` action is unchanged, and the Windows
+`partitions` and `topology` legs are status-only (`windows:planned`), so no other section is
+affected. The Windows volume rows return when the platform gap named in `disk_actions_win.cpp` is
+closed.
+
+**Pipes inside a field.** The plugins write a literal `|` as `\|` and fold a literal `\` to `/`
+(`safe_output_field`). The writer splits the list rows and the three scalar groups on an unescaped
+pipe and unescapes before the clamp, so a pipe in a label or a firmware string stays in its field and
+moves no later column. The 22 v1 positions keep the raw split: their bytes are frozen.
 
 **Caps and the reserved reason slot.** Rows are projected to the wire columns, sorted
 lexicographically on the wire row (so the blob and its hash do not depend on the plugin's
@@ -727,21 +761,7 @@ row-bearing kind (the scalar record and status records are never trimmed, and th
 worst case is `static_assert`ed under the ceiling on both sides). In practice the earlier kinds
 absorb any realistic overflow first, so `swap` is a defensive tail.
 
-**Rollout against a server without the v2 store (verified in code).** Agents are served by
-the server, so upgrading the server first is the normal order; an out-of-band agent install must
-follow it. Against a pre-v2 server:
-
-- Every upgraded agent's first v2 report is a full upload with no nack: the changed content
-  hash selects the full path in the scheduler.
-- A blob of 64 KiB or less (the old server's cap) is parsed as v1: the first record's 22 positions
-  land with the manufacturer prefixed by the `0x02` byte, and the appended scalars and every
-  section are ignored. The full path stores the server-recomputed hash without comparing the
-  claimed one, so the next daily hash-only report mismatches and is nacked once, and the agent
-  resends in full 30 s plus a per-agent jitter of up to 5 minutes later. That is one extra
-  hash-only report and one full resend per daily cycle, not an exponential climb.
-- A blob over 64 KiB is dropped and nacked every time, so that agent sits on the `need_full`
-  backoff ladder (30 s doubling toward about 10 minutes, plus the same per-agent jitter, so a
-  retry roughly every 10 to 15 minutes) until the server is upgraded. Each retry is a full
-  re-upload of a blob of up to 96 KiB. A pre-v2 server shows this as a `warn` log line,
-  `device_ci: oversized blob from agent=<id> (<n> B > 65536 B) — dropping + nacking`, and a count
-  on `yuzu_inventory_ingest_total{source="device_ci",outcome="dropped"}` for every rejection.
+**Component order in a fresh deployment.** The server of this build is brought up before agents of
+the same build enroll, and every replica is on that build. The deployment contract (a fresh
+database, every writer on this build; `docs/user-manual/upgrading.md`, "Deployment contract (hard
+cutover)") excludes an earlier server, so this entry states no behaviour of an agent against one.
