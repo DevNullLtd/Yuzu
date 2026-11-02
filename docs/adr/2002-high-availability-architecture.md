@@ -185,10 +185,86 @@ coordination connections) are in §10.
 **Fencing token, made explicit (finding 3):** the advisory lock provides mutual exclusion only while
 its owning connection lives — it says nothing about a *paused* former leader resuming work after the
 lock silently moved. So leadership carries an explicit **monotonically-increasing epoch** (a Postgres
-sequence bumped on each acquisition; the acquirer records `current_leader_epoch`). Every
+sequence bumped on each acquisition; the acquirer records `current_leader_epoch`; since #6535 the epoch also carries the Postgres timeline, see the Update below). Every
 side-effecting claim (§6) checks `claim.epoch == current_leader_epoch` **in the same transaction as
 the claim**, independent of whether the actor still *believes* it holds the lock. A stale ex-leader
 therefore cannot commit a claim even in the window before it notices its lock dropped.
+
+**Update (2026-11-01, #6535) — the epoch is timeline-packed and floored by the surviving row.** A sequence
+alone is not monotonic across a *lossy* promotion: under asynchronous replication, or a degraded non-strict
+quorum, the promoted standby can lack the latest mint (both the sequence advance and the `leader_state` row),
+so a new leader can re-mint the sequence value a paused ex-leader still holds, and the equality fence admits
+both. (Postgres WAL-logs a sequence 32 values ahead, so a promoted standby normally resumes past a lost value
+and does not repeat it; the repeat needs the lost mint to be one that crossed a 32-value boundary, so the
+exposure was narrow, not absent. `scripts/ha/ha-leader-epoch-lossy-promotion.sh` forces that case.) Reading
+the surviving row cannot repair that on its own (the promoted node may have lost the row too), so the epoch
+carries the one coordinate every promotion advances regardless of what WAL was lost:
+`epoch = GREATEST((GREATEST(timeline, prev_row_epoch >> 32) << 32) + nextval(leader_epoch_seq), prev_row_epoch + 1)`.
+
+* The timeline is the Postgres WAL-insertion timeline of the primary the elector is connected to, read inside
+  the mint statement from `pg_walfile_name(pg_current_wal_lsn())` (not `pg_control_checkpoint()`, which lags
+  a fast promotion). A promotion moves it from T to T+1, so the new leader's epoch is strictly greater than
+  anything the old timeline issued. The epoch stays a single `bigint`, so `epoch_fence_sql()` and every fenced
+  claim site are unchanged.
+* `prev_row_epoch` is the `leader_state.current_leader_epoch` row for the same lock, read in the same
+  statement under the advisory lock (same schema, so ADR-0012 §3 is respected). It is a **floor**, not the
+  protection: the enablement store orders epochs (`issuer_epoch <= epoch`), so a logical restore, a
+  `pg_upgrade` or a logical-replication cutover (the new cluster restarts at timeline 1 while the restored row
+  and `issuer_epoch` keep the old, higher timeline) or a sequence older than the row (a table-only restore, or
+  `ALTER SEQUENCE ... RESTART`) must never mint below the surviving row. The packed term takes
+  `GREATEST(timeline, prev_row_epoch >> 32)` so the **sequence stays live** while a restored row pins a higher
+  timeline than the real one: with the floor alone every mint there would be exactly `prev + 1`, and a lossy
+  promotion that loses the latest mint would re-mint the very epoch a paused ex-leader holds. A row of
+  `INT64_MAX` makes the mint fail loudly (`bigint out of range`), never wrap; repair is to delete the row (or
+  `UPDATE` it to a value no higher than the epoch you want next), then run the `issuer_epoch` reset from
+  `docs/user-manual/upgrading.md`. The floor assumes the lock holder is the only writer
+  of the row: a manual `UPDATE` racing a mint can still be overwritten, as before #6535.
+* Refusals enforced rather than assumed: the sequence is capped at `MAXVALUE 4294967295` (migration v2; at
+  the cap `nextval` raises, and `ALTER SEQUENCE ... RESTART` is a safe remedy because of the floor: the first mint after it is monotonic but lands one timeline above the real one with a count of 0, so it pins the timeline as in item 3 until the real timeline catches up; the elector warns, and reaching the cap takes 2^32 elections), and a
+  timeline outside `1..2^31-1` is refused before `nextval`; both land in the existing `epoch_record` acquire
+  failure, fail closed. At boot (and on every reconnect) the elector probes the timeline and **refuses to
+  open** if it cannot read it (a DSN that resolves to a standby already fails earlier, in the migration
+  step; a Postgres platform without the WAL functions fails here); the leader-only passes stay paused and the
+  failure is counted as `acquire_failures{cause="connect"}`, the log line being the attribution.
+
+**What this covers:** a lossy promotion of a streaming standby, and a restore / `pg_upgrade` / cutover in
+which the `leader_state` row survives. **What this does not cover** (the canonical list, stated so it is not
+read as "the epoch is monotonic across any promotion"; every other document defers to it):
+
+1. two live primaries (the fence is per database, §3 above is unchanged on that);
+2. a restore or cutover that loses the `leader_state` row but keeps `plugin_config_store.enablement_meta.
+   issuer_epoch` (the elector must not read another store's schema): enablement batches are rejected as fenced
+   until `issuer_epoch` is reset (`docs/user-manual/upgrading.md`);
+3. a lossy promotion while the surviving row pins a HIGHER timeline than the real one (a restored cluster):
+   the timeline cannot separate epochs there, so only the sequence does, which is the pre-#6535 protection (a
+   repeat needs the lost mint to have crossed a 32-value boundary). A sequence that is BEHIND the row's low
+   32 bits (a logical-replication cutover or a table-only restore does not carry it) would make every mint
+   exactly the row plus one, so the elector advances the sequence to the minted count part at the first such
+   (floored) mint, best-effort and never lowering it below its current value (clamped one below the cap so the repair cannot park the sequence there; a runtime role without `SELECT` and `UPDATE` on the sequence cannot run it,
+   and then every election stays at the stored epoch plus one). The first election, and the election after it
+   (`setval` resets Postgres' sequence pre-logging, so that one always crosses a pre-log boundary), remain
+   exposed, as does any election whose `setval` record a lossy promotion also loses; the elector logs a
+   warning at every acquisition until the real timeline reaches the pinned one (the promotion that reaches
+   it is itself still unprotected);
+4. same-timeline loss: a crash recovery that loses an unflushed mint (`synchronous_commit=off`, `fsync=off`)
+   keeps the timeline;
+5. a physical-snapshot restore started without archive recovery, which keeps its timeline while the sequence
+   and the row roll back together;
+6. consecutive lossy promotions under orchestration that lets a node promote without having seen the previous
+   promotion's timeline history, and a PITR with a pinned `recovery_target_timeline` that reuses a timeline
+   (Patroni's candidate check is believed to refuse the former; **unverified, verify before relying on it**);
+7. a rolling upgrade while a pre-#6535 binary can still lead, and a downgrade: an older binary mints small
+   epochs, which are different (so the equality fence still works) but not larger (so the enablement ordering
+   rejects its batches until `issuer_epoch` is reset).
+
+Out of scope here and tracked as follow-ups: other sequence-backed ordering fences share the lossy-promotion
+class and are unchanged (`gateway_route_store`'s `connection_epoch`, and `policy_store`'s
+`remediation_claim_seq` claim ids). The enablement-store wedge described in item 2 is latent today because
+nothing in the server calls `EnablementStore::set_desired_batch`; re-derive its severity in whichever change
+first adds a production caller.
+
+Epochs are now `>= 2^32`. The evidence is the `[leader-elector]` Catch2 cases (deterministic SQL-level
+simulation of the loss) and **one** manual scenario of the WS-9 script on a 3-node Patroni async rig (passed on 2026-11-01 against the final, row-floored mint, and earlier against the timeline-only form); no workflow runs it. This update does **not** lift the safe-to-scale gate. **Decided (2026-11-01):** the project lead accepted the residuals above for this change. They are tracked as #6845 (Patroni stale-timeline promotion and consecutive lossy promotions), #6846 (database restore), #6847 (`issuer_epoch` after a downgrade), #6848 (managed-Postgres probe), #6849 (tests for the timeline source and the probe refusal), #6851 (sibling sequence fences) and #6852 (observability and test follow-ups).
 
 ### 4. Operator sessions — durable in Postgres, absolute wall-clock (Q4)
 Sessions move from the in-memory map (`AuthManager::sessions_`, `steady_clock`) to durable Postgres

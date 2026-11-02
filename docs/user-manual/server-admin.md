@@ -963,7 +963,7 @@ startup log lines — these are routine, not a fault:
 
 - `leader_elector: coordination connection established (host=… port=… dbname=…; dedicated, never-recycled)`
 - `leader_elector: election loop started (poll=5s)`
-- `leader_elector: acquired leadership 'server_background_leader' at epoch N (holder_id=srv-…)`
+- `leader_elector: acquired leadership 'server_background_leader' at epoch N (timeline_part=T count_part=C, holder_id=srv-…)`
 
 If instead you see `[HA] leader_elector could not open its coordination
 connection; FencedLeaderOnly background loops are PAUSED …`, the server could not
@@ -1039,10 +1039,11 @@ that holds it).
   whichever primary the DSN resolves to. Only when every replica
   shares **one** database is the stale replica the one whose
   `yuzu_server_leader_epoch` differs from `leader_state.current_leader_epoch`;
-  restart it. Within one database fenced claims stay safe (assuming no committed
-  transaction was lost on a promotion, that is, synchronous replication, the
-  shipped quorum default; the fence is not claimed safe across a lossy
-  asynchronous promotion) and what runs twice is the unfenced background passes. **What it does not catch:** a *paused*
+  restart it. Within one database fenced claims stay safe across a
+  lossy promotion of a streaming standby (the epoch carries the Postgres timeline, so
+  promoting a streaming standby yields a higher epoch; the cases this does not cover
+  are listed in `docs/user-manual/ha-postgres.md`, and claim rows lost in an
+  asynchronous promotion are the RPO, not the fence) and what runs twice is the unfenced background passes. **What it does not catch:** a *paused*
   ex-leader (the case the epoch fence exists for) — its process is frozen, so its
   series goes stale, not `1`, and a frozen process serves no `/metrics`, so no
   alert on its own series can evaluate. That case is covered by the fence itself
@@ -1059,10 +1060,18 @@ that holds it).
   this is a scrape problem, not a leader problem (a leader whose own scrape target
   is down leaves only the followers' zeros, which sums to 0). Otherwise check, in
   order: the server log for
-  `[HA] leader_elector could not open its coordination connection` and the
+  `[HA] leader_elector could not open its coordination connection` or
+  `leader_elector: cannot read the Postgres timeline` and the
   `yuzu_server_leader_acquire_failures_total{cause}` series (`connect` rising
-  means the dedicated connection cannot be made, or its schema migration failed:
-  reach the primary directly, not through a transaction-mode pooler); then, in
+  means the dedicated connection cannot be made, its schema migration failed, or
+  the timeline could not be read: reach the read-write primary directly, not
+  through a transaction-mode pooler or to a standby, and make sure the database
+  role can run `pg_current_wal_lsn()` and `pg_walfile_name()`; this affects a
+  single-replica server too; `cause="epoch_record"` rising means the sequence cap was reached
+  (`ALTER SEQUENCE leader_elector.leader_epoch_seq RESTART` is safe for ordering, but the next election pins the timeline one above the real one and the server logs a warning) or the
+  `leader_state` row was corrupted to exactly 9223372036854775807 (the log line
+  `failed to record epoch ... (server said: ...)` names which): see
+  [Upgrading](upgrading.md#behaviour-change-the-leader-epoch-now-carries-the-postgres-timeline-ha-6535)); then, in
   Postgres,
   `SELECT a.pid, a.client_addr, a.state, a.backend_start, a.state_change FROM pg_locks l JOIN pg_stat_activity a USING (pid) WHERE l.locktype = 'advisory' AND l.classid = 1735291205;`
   Compare `client_addr` with the replicas: a lock held by a backend that **no live
@@ -4942,6 +4951,8 @@ pg_restore --clean --if-exists --no-owner --role=yuzu \
 docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
   --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump"
 ```
+
+**Leader epoch after a restore.** The leader epoch packs the Postgres timeline of the cluster that minted it, and a restore into a fresh cluster may start on a lower timeline (it does when the source cluster had ever failed over). The server floors every new epoch by the `leader_elector.leader_state` row the dump carries, so the restore works as written; while the stored epoch carries a higher timeline than the new cluster's, the server logs a `leader_elector: minted epoch's timeline part ... is above the real Postgres timeline` warning at each election (only the sequence, not the timeline, separates epochs against a lossy promotion until the cluster's timeline reaches it, and a sequence behind the stored epoch is advanced automatically: see `ha-postgres.md`). Only if `leader_elector.leader_state` was lost or recreated while `plugin_config_store.enablement_meta` was restored, run the `issuer_epoch` reset from [Upgrading](upgrading.md#behaviour-change-the-leader-epoch-now-carries-the-postgres-timeline-ha-6535).
 
 Restore `enablement-anchor` with the `--data-dir` files. Restoring a dump onto the data directory it came from is consistent; restoring an OLDER dump under a newer anchor starts the server with enablement regressed by design, and a restore onto a host with no anchor is reported as unwitnessed, as is a restore-then-upgrade while nothing has yet been issued (the anchor names the old store id, both counters are `0`). See [Enablement continuity anchor](#enablement-continuity-anchor) for what each means and for the exit.
 
