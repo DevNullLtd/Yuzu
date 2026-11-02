@@ -183,15 +183,18 @@ This section applies to development and pre-release servers built with the #6535
 
 ## New: fleet gauges and a sample alert for agents whose command-dedup store failed to open (#3663)
 
-Additive; nothing to do. The server now exposes nine `yuzu_fleet_agents_dedup_*` / `yuzu_fleet_dedup_rows_max`
-series on `/metrics` (reference: `docs/user-manual/metrics.md`, "Agent command-dedup store telemetry"), agents add
-one heartbeat tag, `yuzu.dedup_rows`, and `docs/prometheus/yuzu-alerts.yml` gains the sample alert
-`YuzuDedupStoreDegraded`. Reload your Prometheus rule file to pick it up and route `severity=warning`; no compose or
-Helm file the project ships loads it. Upgrade agents and servers in either order: an old agent contributes
-nothing, and an old server ignores the new tag. `yuzu_fleet_agents_dedup_reporting` rises as agents upgrade; until it
-matches your fleet size, a 0 in the other series means nothing. The alert covers only a store that failed to
-open, counts agents seen in the last 90 s, and is per core replica; the full list of limits is in
-`docs/user-manual/security-hardening.md`, "Fleet monitoring of the dedup store".
+Additive; no behaviour change. **To get the alert, load `docs/prometheus/yuzu-alerts.yml` into your
+Prometheus and route `severity=warning` in Alertmanager; no compose or Helm file the project ships does
+either.** The server now exposes nine `yuzu_fleet_agents_dedup_*` / `yuzu_fleet_dedup_rows_max` series on
+`/metrics` (reference: `docs/user-manual/metrics.md`, "Agent command-dedup store telemetry"), agents add one
+heartbeat tag, `yuzu.dedup_rows`, and the rule file gains the sample alert `YuzuDedupStoreDegraded`. Upgrade
+agents and servers in either order: an old agent contributes nothing, and an old server ignores the new tag.
+Until `yuzu_fleet_agents_dedup_reporting` matches your fleet size, a 0 in the other series means nothing.
+
+**Preview:** the fleet count tells you how many agents are affected, not which; locating them is manual until
+#6931. The alert covers only a store that failed to open, counts agents seen in the last 90 s, and is per core
+replica; the full list of limits is in `docs/user-manual/security-hardening.md`, "Fleet monitoring of the dedup
+store".
 
 ## New: leader-election metrics and alerts (HA WS-11, #4014)
 

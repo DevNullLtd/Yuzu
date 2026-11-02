@@ -26,15 +26,16 @@ issue #5417's seam), so this pin is source-text, not a linked test. It enforces:
      and the two meta-gauges; the header is 7-bit ASCII (the HELP strings live in it).
   5. The capacity HELP's "20000" is the agent's `kMaxDedupRows` (parsed from the agent header, not
      restated here), so a change to the ring bound without the HELP is a red test.
-  6. The agent emits `yuzu.dedup_rows` only from the store's `cached_row_count()` and never via
-     `value_or(...)`: an unknown count must stay ABSENT, because the server reads a present "0"
-     as an empty store.
+  6. The agent emits `yuzu.dedup_rows` exactly once, only from the store's `cached_row_count()`
+     and never via `value_or(...)`: an unknown count must stay ABSENT, because the server reads a
+     present "0" as an empty store.
   7. server.cpp registers HELP for the whole family through the table (a hand-copied name list
      there would drift from what recompute_metrics publishes).
   8. Every gauge has a TABLE ROW in docs/user-manual/metrics.md (a bare mention in prose does
      not count), and the YuzuDedupStoreDegraded alert exists, evaluates the degraded gauge, has a
-     runbook_url, and has a behaviour case in tests/prometheus/yuzu-alerts.test.yml (an alert with
-     no case is the #2553 "parses but cannot fire" trap).
+     runbook_url, and still has all its behaviour cases in tests/prometheus/yuzu-alerts.test.yml
+     (an alert with no case is the #2553 "parses but cannot fire" trap; what each case catches is
+     recorded in that file's comments, the gate only stops them being deleted).
 
 Lexical only: it cannot see that recompute_metrics reads a row correctly (that is
 tests/unit/server/test_agent_health_store.cpp, "REAL AgentHealthStore: dedup ...", and
@@ -60,6 +61,7 @@ ALERTS_YML = ROOT / "docs" / "prometheus" / "yuzu-alerts.yml"
 ALERTS_TEST = ROOT / "tests" / "prometheus" / "yuzu-alerts.test.yml"
 
 ALERT = "YuzuDedupStoreDegraded"
+MIN_PROMTOOL_CASES = 11  # A, B, C, C-1, D, E, F, G, H, I, J; lower it only by removing a case on purpose
 DEGRADED_GAUGE = "yuzu_fleet_agents_dedup_store_degraded"
 
 # Tags the agent emits that NO server row consumes, on purpose. Each value MUST carry the issue
@@ -150,9 +152,9 @@ def problems() -> list:
             out.append(f"DELIBERATELY_UNCONSUMED lists {t} but agent.cpp no longer emits it (stale entry)")
         if t in consumed:
             out.append(f"{t} is now consumed by the server table: remove it from DELIBERATELY_UNCONSUMED")
-        if not re.search(r"#\d+", why):
-            out.append(f"DELIBERATELY_UNCONSUMED[{t}] names no issue number (#<digits>): an exemption "
-                       f"with no tracker is how a tag ships unread")
+        if not re.search(r"#[1-9]\d*", why):
+            out.append(f"DELIBERATELY_UNCONSUMED[{t}] names no issue number (#<digits>, not #0): an "
+                       f"exemption with no tracker is how a tag ships unread")
 
     # 3. presence row
     if rows[0][0] != "yuzu.dedup_degraded":
@@ -184,7 +186,7 @@ def problems() -> list:
     else:
         m = re.search(r'kDedupRowsMaxHelp\s*=(.*?)";', strip_line_comments(read(TAGS_HPP)), re.S)
         help_text = "".join(re.findall(r'"([^"]*)"', m.group(1) + '"')) if m else ""
-        if str(kmax) not in help_text:
+        if not re.search(r"(?<!\d)" + str(kmax) + r"(?!\d)", help_text):
             out.append(f"kDedupRowsMaxHelp does not state the agent's kMaxDedupRows ({kmax}): the ring "
                        f"bound changed without the HELP")
         near = re.search(r"near (\d+)", help_text)
@@ -197,6 +199,10 @@ def problems() -> list:
                      r'tags\["yuzu\.dedup_rows"\]\s*=', re.sub(r"\s+", " ", agent_src)):
         out.append('agent.cpp must emit yuzu.dedup_rows only inside `if (const auto rows = '
                    'command_dedup_->cached_row_count())` (an unknown count stays ABSENT)')
+    if agent_src.count('"yuzu.dedup_rows"') != 1:
+        out.append('agent.cpp must contain exactly one "yuzu.dedup_rows" emission (found '
+                   f'{agent_src.count(chr(34) + "yuzu.dedup_rows" + chr(34))}): a second one is how a '
+                   'defaulted 0 reaches the wire')
     if "value_or" in "".join(re.findall(r'[^;{}]*cached_row_count\(\)[^;{}]*', agent_src)):
         out.append("agent.cpp must not default cached_row_count() with value_or: the server reads a "
                    "present 0 as an empty store")
@@ -227,8 +233,11 @@ def problems() -> list:
             out.append(f"{ALERT} must evaluate {DEGRADED_GAUGE}")
         if "runbook_url" not in m.group(1):
             out.append(f"{ALERT} has no runbook_url")
-    if ALERT not in read(ALERTS_TEST):
-        out.append(f"no behaviour case for {ALERT} in tests/prometheus/yuzu-alerts.test.yml")
+    cases = len(re.findall(r"(?m)^\s*name:\s*dedup store degraded - ", read(ALERTS_TEST)))
+    if cases < MIN_PROMTOOL_CASES:
+        out.append(f"tests/prometheus/yuzu-alerts.test.yml has {cases} 'dedup store degraded' cases, "
+                   f"expected at least {MIN_PROMTOOL_CASES}: deleting cases leaves a rule that parses "
+                   f"but is no longer behaviour-tested (#2553)")
     return out
 
 
@@ -273,6 +282,25 @@ class DedupFleetTagsLexical(unittest.TestCase):
         found = self._problems_with(
             AGENT_CPP, lambda s: s.replace("cached_row_count())", "cached_row_count().value_or(0))", 1))
         self.assertTrue(found, "value_or on the rows count must be reported")
+
+    def test_self_check_detects_a_second_rows_emission(self):
+        found = self._problems_with(
+            AGENT_CPP, lambda s: s.replace('tags["yuzu.dedup_rows"] =', 'tags["yuzu.dedup_rows"] = "0"; tags["yuzu.dedup_rows"] =', 1))
+        self.assertTrue(any("exactly one" in p for p in found), found)
+
+    def test_self_check_detects_deleted_promtool_cases(self):
+        found = self._problems_with(ALERTS_TEST, lambda s: s.replace("name: dedup store degraded - ", "name: x - "))
+        self.assertTrue(any("behaviour-tested" in p for p in found), found)
+
+    def test_self_check_detects_a_zero_issue_number(self):
+        global DELIBERATELY_UNCONSUMED
+        real = dict(DELIBERATELY_UNCONSUMED)
+        try:
+            DELIBERATELY_UNCONSUMED = {k: "tracked in #0" for k in real}
+            found = problems()
+        finally:
+            DELIBERATELY_UNCONSUMED = real
+        self.assertTrue(any("names no issue number" in p for p in found), found)
 
     def test_self_check_detects_a_stale_ring_bound_in_the_help(self):
         found = self._problems_with(STORE_HPP, lambda s: re.sub(r"(kMaxDedupRows\s*=\s*)20000", r"\g<1>30000", s))

@@ -408,13 +408,31 @@ TEST_CASE("CommandDedupStore: cached_row_count survives a move of the store",
     CHECK_FALSE(t.store.cached_row_count().has_value());
 }
 
+namespace {
+// Joins the thread on EVERY exit path, including the exception a failed REQUIRE throws: a
+// std::thread destroyed while joinable calls std::terminate, which would abort the whole test
+// binary and hide every other result. (std::jthread would do this, but libc++ 15-17, i.e. Apple
+// Clang 15, does not ship it by default.)
+struct StopAndJoin {
+    std::atomic<bool>& stop;
+    std::thread& thread;
+    ~StopAndJoin() {
+        stop.store(true, std::memory_order_release);
+        if (thread.joinable())
+            thread.join();
+    }
+};
+} // namespace
+
 TEST_CASE("CommandDedupStore: cached_row_count is safe to read while claims and prunes run",
           "[command_dedup][row_count][concurrent]") {
     // The heartbeat thread reads cached_row_count() lock-free while the reader thread claims and
     // a worker thread records/prunes under mu_. This is the one cross-thread read the cache adds,
     // so it is the case TSan (nightly) needs: a data race on cached_rows_ or db_ would be flagged
-    // here. Without TSan it still pins the bounds: never negative once known, never beyond the
-    // rows ever inserted, and exact against the table once the writer has stopped.
+    // here (verified: with cached_rows_ made a plain int64_t, TSan reports the race; without TSan
+    // the same mutant passes, so this case alone is not a race detector). Without TSan it still
+    // pins the bounds: never negative once known, never beyond the rows ever inserted, and exact
+    // against the table once the writer has stopped.
     auto t = make_store();
     t.store.set_max_dedup_rows_for_test(50);
     constexpr int kCycles = 600; // > kPruneInterval (512), so at least one prune + recount runs
@@ -424,7 +442,9 @@ TEST_CASE("CommandDedupStore: cached_row_count is safe to read while claims and 
     std::atomic<std::int64_t> lowest{INT64_MAX};
     std::atomic<std::int64_t> highest{-1};
     std::thread reader([&] {
-        while (!stop.load(std::memory_order_acquire)) {
+        // do/while: the reader always reads once before it looks at `stop`, so a reader that is
+        // scheduled late still records a value.
+        do {
             if (const auto rows = t.store.cached_row_count()) {
                 reads.fetch_add(1, std::memory_order_relaxed);
                 std::int64_t cur = lowest.load(std::memory_order_relaxed);
@@ -433,8 +453,15 @@ TEST_CASE("CommandDedupStore: cached_row_count is safe to read while claims and 
                 while (*rows > cur && !highest.compare_exchange_weak(cur, *rows)) {}
             }
             std::this_thread::yield();
-        }
+        } while (!stop.load(std::memory_order_acquire));
     });
+    StopAndJoin guard{stop, reader};
+
+    // Do not start writing until the reader has observed a value, so `reads > 0` below cannot
+    // fail on a loaded runner that has not yet scheduled the reader. The count is known (0) after
+    // construction, so this cannot spin forever.
+    while (reads.load(std::memory_order_relaxed) == 0)
+        std::this_thread::yield();
 
     for (int i = 0; i < kCycles; ++i) {
         const auto id = "conc-" + std::to_string(i);

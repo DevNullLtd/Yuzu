@@ -263,8 +263,8 @@ private:
     /// Clock-free ring eviction over TERMINAL rows only. Caller holds mu_.
     void prune_locked() noexcept;
 
-    /// COUNT(*) into cached_rows_; on failure the previous value is kept. Caller holds mu_ (or is the
-    /// sole owner, as in the constructor).
+    /// COUNT(*) into cached_rows_; on failure the previous value is kept. Caller holds
+    /// mu_ (or is the sole owner, as in the constructor).
     void refresh_row_count_locked() noexcept;
 
     /// Sentinel for "row count unknown" in cached_rows_.

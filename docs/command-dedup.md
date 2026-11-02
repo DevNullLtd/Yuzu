@@ -93,7 +93,8 @@ regressible — nothing fails loudly when one is broken.
      from the `.corrupt-*` files, or a row in the fresh store) is to be designed WITH its server consumer, tracked in
      #6933. The first server consumer of the `yuzu.dedup_*` tags (#3663) deliberately does not read this tag: the
      owner shipped it without the marker, so the enterprise-architect ruling on #6912 ("consumer and durable marker
-     ship together") is deferred, not satisfied, until #6933 lands.
+     ship together"; recorded in `governance.d/3665-dedup-corrupt-db-recovery.yrFs4G.jsonl`) is deferred, not
+     satisfied, until #6933 lands.
    - The helper is a copy of echo's `quarantine_corrupt_db` (`echo_db.cpp`). Hoisting both into
      `agents/shared` is tracked in #6914. Echo does not yet have this code's
      no-overwrite claim or negative-epoch clamp.

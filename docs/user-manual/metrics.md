@@ -1710,12 +1710,13 @@ heartbeat as the status tags `yuzu.dedup_degraded` (0 or 1), `yuzu.dedup_replays
 **Population and scope: read this before trusting a number.**
 
 - Every gauge counts the agents with a **heartbeat in the last 90 seconds**. An agent that is
-  offline, or that heartbeats slower than 90 s (keep `--heartbeat` at 90 s or less), drops out of
-  every count, including `reporting`. A degraded agent that goes offline therefore leaves the count
-  **without having been fixed**.
+  offline, or that heartbeats slower than 90 s (keep `--heartbeat` below 90 s, preferably 60 s or
+  less), drops out of every count, including `reporting`. A degraded agent that goes offline
+  therefore leaves the count **without having been fixed**.
 - The health store is **per core replica**: each replica exports only the agents attached to it.
-  Scrape every replica and sum them (`sum by (job) (...)`); during a failover one agent can briefly
-  be counted on two replicas.
+  Scrape every replica and sum the counts (`sum by (job) (...)`) but take the **max** of
+  `yuzu_fleet_dedup_rows_max` (`max by (job) (...)`); during a failover one agent can be counted on
+  two replicas for a few minutes.
 - Agents that predate these tags contribute nothing, and `yuzu.dedup_rows` only exists on agents
   that include #3663. `yuzu_fleet_agents_dedup_reporting` is the denominator: a 0 in the counts is
   only reassuring when `reporting` is close to the number of agents you expect (compare it with
@@ -1745,13 +1746,17 @@ heartbeat as the status tags `yuzu.dedup_degraded` (0 or 1), `yuzu.dedup_replays
 affected (tracked in #6931), so the count tells you how many to find. Check the agent log on
 suspect endpoints for `Failed to open command dedup store` (the usual causes are a full or
 read-only data directory or a permissions fault on `command_dedup.db`), fix the cause, and restart
-the agent. The count drops up to about 45 seconds after the restarted agent's next heartbeat (the
-agent sends its first heartbeat one interval, 30 s by default, after it starts, and the server
-sweeps every 15 s), and the alert resolves a few minutes after that. A restart does **not** re-send
-an in-flight operator command to the agent: an offline agent gets no queued commands. The one path
-that can run a command twice is a scheduled command the server re-drives after a fault while the
-agent has no durable record of it (a double fault; a staging run to measure it is tracked in
-#6935). "Resolved" means the agent is back, counted in `reporting`, with `store_degraded` at 0; a
+the agent. The count drops within about 45 seconds of the restart (the agent sends its first
+heartbeat one interval, 30 s by default, after it starts, then the server sweeps every 15 s), and
+the alert resolves about 5 minutes after that, so it can still fire for an agent that was just fixed.
+A restart does **not** re-send an in-flight operator command to the agent: an offline agent gets no
+queued commands (by code reading; a chaos run to measure it is tracked in #6935). But while an
+endpoint has no durable dedup record, a command redelivered to it by **any** path is not absorbed:
+the server retries a gateway forward up to three times with the same command id, and a scheduled
+command can be re-driven after a fault (the backlog is visible as
+`yuzu_server_command_outbox_pending`). You cannot see from the product whether a redelivery is in
+flight, so do not delay the fix for it; restarting after the fix restores protection for later
+commands. "Resolved" means the agent is back, counted in `reporting`, with `store_degraded` at 0; a
 count that fell only because the agent went offline is not resolved.
 
 **The capacity gauge.** `yuzu_fleet_dedup_rows_max` is the largest store, in rows, that any agent
@@ -1759,11 +1764,10 @@ reports. The store keeps the newest 20,000 terminal rows, so a healthy value top
 20,500. It is an **approximate cached count that can over-read**, for example after a burst of
 queue-full releases, so treat it as a hint: investigate sustained values above about 25,000 (in-flight
 rows left by crashed commands are never evicted and are one way to get there). It is a MAX of
-agent-reported values, so one forged value below 1,000,000,000 owns it and it names no agent. There
-is no alert on it.
+agent-reported values, so one forged value up to 1,000,000,000 owns it and it names no agent. It is
+also per core replica: take the max across replicas, not the sum. There is no alert on it.
 
-**Not covered:**
-an agent that recovered from a **corrupt** dedup store (#3665) loses its replay history but is not
+**Not covered:** an agent that recovered from a **corrupt** dedup store (#3665) loses its replay history but is not
 degraded. It reports the per-process `yuzu.dedup_quarantined` tag, which the server does not read
 and which returns to 0 on the next agent restart, so no gauge counts it (a restart-surviving
 marker with its consumer is tracked in #6933). An agent whose heartbeat carries more than 512
@@ -1786,7 +1790,7 @@ non-finite / out-of-range readings are rejected).
 | `yuzu_fleet_echo_db_corruption_agents` | gauge | Agents whose Echo database has **ever** been quarantined as corrupt (#1567) — cumulative per agent since install, so read a **rising** value as the signal, not the absolute number; an agent that recovered still counts. Derived from the heartbeat tag `yuzu.plugin.echo.db_corruption_total`, published by the echo plugin (the agent has no `/metrics` endpoint, so a per-agent counter is not scrapable). Counts only agents currently reporting heartbeats. Example alert: `delta(yuzu_fleet_echo_db_corruption_agents[1h]) > 0` (a gauge, so use `delta`; an agent returning from offline after a quarantine re-raises it once). |
 | `yuzu_fleet_plugin_init_failed{plugin}` | gauge | Agents reporting a plugin that failed init, per plugin name (heartbeat tag `yuzu.plugins_failed`); distinguishes "failed to load" from "not installed". Absent-not-zero: the family is empty when no agent reports a failure. At most 64 named labels per sweep (lexicographically first); the rest are summed under `plugin="other"`. |
 | `yuzu_fleet_inventory_sync_skipping{source}` | gauge | Agents currently reporting heartbeats whose daily-sync `source` skipped its most recent collection cycle(s) (#5332), from the heartbeat tag `yuzu.sync.<source>.skip_streak` (> 0; today only `source="installed_software"`, written by agents that include the skip-visibility change, #5327); the cause is in the agent's own log, and the agent also publishes it as the `yuzu.sync.<source>.last_skip` heartbeat tag (no server page or API returns that tag yet). Published every sweep, 0 included. Counts only agents currently reporting heartbeats. The gauge only counts agents that emit the skip-streak heartbeat tag: an agent that does not emit it (older agents, during a rollout, or in a mixed-version fleet) contributes zero even when its collector is skipping, so a zero gauge does not establish that all collectors are healthy. Correlate with `yuzu_inventory_stale_agents{source="installed_software"}` (see the inventory manual) to tell an online host whose collector is skipping from an offline one, but do not subtract one from the other: they count different populations (live heartbeats vs stored-receipt age). |
-| `yuzu_fleet_agents_dedup_store_degraded` | gauge | Agents whose durable command-dedup store **could not be opened** (#3663), from the heartbeat tag `yuzu.dedup_degraded` = 1. These agents still run commands but **without replay protection**, so a redelivered command may execute twice (at-least-once, fail-open by design). Covers a store that failed to OPEN only: a store that opened and later failed writes shows on `yuzu_fleet_agents_dedup_claim_erroring`, which has no alert. A **live** 0/1 reading recomputed every sweep, over agents with a heartbeat in the last 90 s, exported per core replica (sum across replicas): it clears up to about 45 s after a restarted agent's next heartbeat, and an agent offline for more than 90 s leaves it without having been fixed. Published every sweep, 0 included. Sample alert: `YuzuDedupStoreDegraded`. See [Agent command-dedup store telemetry](#agent-command-dedup-store-telemetry-3663). |
+| `yuzu_fleet_agents_dedup_store_degraded` | gauge | Agents whose durable command-dedup store **could not be opened** (#3663), from the heartbeat tag `yuzu.dedup_degraded` = 1. These agents still run commands but **without replay protection**, so a redelivered command may execute twice (at-least-once, fail-open by design). Covers a store that failed to OPEN only: a store that opened and later failed writes shows on `yuzu_fleet_agents_dedup_claim_erroring`, which has no alert. A **live** 0/1 reading recomputed every sweep, over agents with a heartbeat in the last 90 s, exported per core replica (sum across replicas): it clears within about 45 s of the restart, and an agent offline for more than 90 s leaves it without having been fixed. Published every sweep, 0 included. Sample alert: `YuzuDedupStoreDegraded`. See [Agent command-dedup store telemetry](#agent-command-dedup-store-telemetry-3663). |
 | `yuzu_fleet_agents_dedup_replaying` | gauge | Agents that have served at least one durable terminal-outcome replay **since their last restart** (`yuzu.dedup_replays` > 0). Informational: a replay is the store doing its job, so non-zero is normal. Latches until the agent restarts. Published every sweep, 0 included. No alert. |
 | `yuzu_fleet_agents_dedup_claim_erroring` | gauge | Agents whose dedup store has failed at least one claim since their last restart (`yuzu.dedup_claim_errors` > 0): each is a command that ran undeduplicated because a store write failed **after** boot (full disk, I/O error). Unlike `dedup_store_degraded`, the store did open. Latches until restart. Published every sweep, 0 included. No alert. |
 | `yuzu_fleet_agents_dedup_record_terminal_missing` | gauge | Agents that have recorded at least one terminal outcome matching no in-flight row since their last restart (`yuzu.dedup_record_terminal_misses` > 0): the command ran undeduplicated, or a duplicate terminal arrived. Not a measure of the ring-eviction double-execute, which is not separately detectable. Latches until restart. Published every sweep, 0 included. No alert. |
@@ -1794,7 +1798,7 @@ non-finite / out-of-range readings are rejected).
 | `yuzu_fleet_agents_dedup_release_erroring` | gauge | Agents whose store failed at least one claim release since their last restart (`yuzu.dedup_release_errors` > 0): a possibly-leaked claim, which answers `RUNNING` to every redelivery of that command and never re-runs it. Latches until restart. Published every sweep, 0 included. No alert. |
 | `yuzu_fleet_agents_dedup_reporting` | gauge | Agents with a heartbeat in the last 90 s whose latest heartbeat carried a valid `yuzu.dedup_degraded` flag, i.e. the agents the `yuzu_fleet_agents_dedup_*` counts are measuring. Per core replica (sum across replicas). An agent that predates the tag, or whose flag was rejected, is not counted, so a 0 in the counts is only reassuring when this is non-zero and close to the number of agents you expect; the counts can exceed it when an agent's flag was rejected but another of its dedup tags was valid. Published every sweep, 0 included. |
 | `yuzu_fleet_agents_dedup_tag_rejected` | gauge | Agents whose latest heartbeat carried at least one `yuzu.dedup_*` value the server rejected: non-numeric, empty, longer than 10 characters, above 1,000,000,000, or a degraded flag other than 0 or 1. A rejected value is dropped from the counts, never clamped; an agent is counted once however many of its tags are bad. >0 means an agent is sending malformed or forged dedup tags. Published every sweep, 0 included. |
-| `yuzu_fleet_dedup_rows_max` | gauge | The largest durable command-dedup store, in rows (in-flight + terminal), reported by any agent (heartbeat tag `yuzu.dedup_rows`, an **approximate cached count** that can over-read after a burst of released claims). The store is a ring that keeps the newest 20,000 terminal rows, so a healthy value tops out near 20,500; in-flight rows left by crashed commands are never evicted and are one way it grows beyond that. A MAX of agent-reported values: one forged value below 1,000,000,000 owns it and it names no agent, so treat it as a hint and investigate sustained values above about 25,000. **Absent** (not 0) when no agent reports a valid value; an old agent without the tag contributes nothing. No alert. |
+| `yuzu_fleet_dedup_rows_max` | gauge | The largest durable command-dedup store, in rows (in-flight + terminal), reported by any agent (heartbeat tag `yuzu.dedup_rows`, an **approximate cached count** that can over-read after a burst of released claims). The store is a ring that keeps the newest 20,000 terminal rows, so a healthy value tops out near 20,500; in-flight rows left by crashed commands are never evicted and are one way it grows beyond that. A MAX of agent-reported values, per core replica (take the max across replicas, not the sum): one forged value up to 1,000,000,000 owns it and it names no agent, so treat it as a hint and investigate sustained values above about 25,000. **Absent** (not 0) when no agent reports a valid value; an old agent without the tag contributes nothing. No alert. |
 | `yuzu_fleet_perf_reporting` | gauge | Devices contributing at least one perf metric this sweep (the same any-of-three definition the `/dex` Performance tab's Reporting card uses) |
 | `yuzu_fleet_perf_cpu_pct{stat}` | gauge | Fleet CPU busy %, `stat` = `avg` / `p50` / `p90` / `max` |
 | `yuzu_fleet_perf_commit_pct{stat}` | gauge | Fleet memory commit % of limit, same `stat` labels |

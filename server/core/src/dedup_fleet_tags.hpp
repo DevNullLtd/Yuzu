@@ -24,7 +24,7 @@
 /// cumulative value that resets to 0 on an agent restart, so an unlabelled fleet SUM of them
 /// has no churn-robust `increase()` alert (docs/observability-conventions.md). Counting the
 /// agents whose value is non-zero sidesteps that: a restart that zeroes one agent's counter
-/// removes it from the count within one sweep, and the question an operator actually has -
+/// removes it from the count once its next heartbeat arrives, and the question an operator actually has -
 /// "how many endpoints are affected?" - is the thing published. Same shape as
 /// `yuzu_fleet_ota_signature_refusing_agents`. Consequence, stated in every HELP string below:
 /// a counter-derived gauge means "since that agent's last restart", NOT "currently". Only the
@@ -96,9 +96,10 @@ inline constexpr DedupAgentCountMetric kDedupAgentCountMetrics[] = {
      "ADR-2002 WS-0). Covers a store that failed to OPEN only: a store that opened and later "
      "failed writes shows on yuzu_fleet_agents_dedup_claim_erroring, which has no alert. A "
      "live reading over agents with a heartbeat in the last 90 s, recomputed every sweep and "
-     "exported per core replica (sum across replicas): it clears about 45 s after a restarted "
-     "agent's next heartbeat, and an agent offline for more than 90 s leaves it without having "
-     "been fixed. >0 sustained is the YuzuDedupStoreDegraded sample alert"},
+     "exported per core replica (sum across replicas): it clears within about 45 s of the "
+     "restart (the first heartbeat comes one interval, 30 s by default, after the agent starts, "
+     "then up to one 15 s sweep), and an agent offline for more than 90 s leaves it without "
+     "having been fixed. >0 sustained is the YuzuDedupStoreDegraded sample alert"},
     {"yuzu.dedup_replays", DedupCountKind::kPositiveCounter, "yuzu_fleet_agents_dedup_replaying",
      "Agents that have served at least one durable terminal-outcome replay since their last "
      "restart (heartbeat tag yuzu.dedup_replays > 0). Informational: a replay is the dedup "
@@ -149,10 +150,10 @@ inline constexpr const char* kDedupRowsMaxHelp =
     "(heartbeat tag yuzu.dedup_rows, an approximate cached count that can over-read after a "
     "burst of released claims). The store is a ring that keeps the newest 20000 terminal rows, "
     "so a healthy value tops out near 20500; in-flight rows from crashed commands are never "
-    "evicted and are one way it grows past that. It is a MAX of agent-reported values: one "
-    "agent's forged value below the plausibility ceiling owns it and it names no agent, so "
-    "treat it as a hint and investigate sustained values above about 25000. Absent when no "
-    "agent reports it";
+    "evicted and are one way it grows past that. It is a MAX of agent-reported values, per "
+    "core replica (take the max across replicas, not the sum): one agent's forged value up to "
+    "the plausibility ceiling owns it and it names no agent, so treat it as a hint and "
+    "investigate sustained values above about 25000. Absent when no agent reports it";
 
 /// Meta-gauges, the coverage denominators that absence would otherwise hide.
 inline constexpr const char* kDedupReportingGauge = "yuzu_fleet_agents_dedup_reporting";

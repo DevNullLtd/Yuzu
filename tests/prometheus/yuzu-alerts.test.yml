@@ -6756,10 +6756,12 @@ tests:
   # rule is `sum by (job) (max_over_time(<gauge>[5m])) > 0`, `for: 15m`, severity=warning.
   #
   # The expression exists because of cases F, G and H below: on the bare gauge each one resets the
-  # 15 m `for:` clock and a persistently degraded agent never alerts. Mutation-checked (each case
-  # run alone against each mutant): dropping or shrinking the 5m window reddens F and G; a bare
-  # gauge without `sum by (job)` additionally reddens H; widening the window to 20m reddens D and
-  # E; `>= 0` reddens C, C-1, D and E; `== 1` reddens B and H; `for: 12m` or `20m` reddens A.
+  # 15 m `for:` clock and a persistently degraded agent never alerts. Cases I and J pin the
+  # window's width: 11 consecutive degraded minutes must NOT fire and 12 must. Mutation-checked
+  # (each case run alone against each mutant): removing the window, or shrinking it to 1m or 2m,
+  # reddens F and G; a bare gauge without `sum by (job)` additionally reddens H; a wider or
+  # narrower window than 5m reddens I or J; `>= 0` reddens C, C-1, D and E; `== 1` reddens B and
+  # H; `for: 12m`, `16m` or `20m` reddens A.
   #
   # The sibling yuzu_fleet_agents_dedup_* counters deliberately have NO alert and so no case:
   # they count agents whose per-process counter is > 0 "since its last restart", which latches
@@ -6768,7 +6770,8 @@ tests:
   # is the documented coverage limit, not an accident.
 
   # CASE A -- fires once the condition has held for the full 15m, and not before. RED if `for:`
-  # is dropped (fires at 14m) or lengthened past 16m (quiet at 16m).
+  # is dropped (fires at 14m) or lengthened to 16m or more (the 15m eval is the only one that
+  # catches 16m exactly).
   - interval: 1m
     name: dedup store degraded - sustained for 15m fires, and not before
     input_series:
@@ -6778,6 +6781,11 @@ tests:
       - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
         eval_time: 14m
         exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
       - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
         eval_time: 16m
         exp_samples:
@@ -6938,3 +6946,41 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
             value: 1
+
+  # CASE I -- the measured lower bound of the firing window. The 5m window lags the END of the
+  # condition, so a degradation of 11 consecutive minutes (samples at 1m) is NOT enough to fire
+  # and a fixed agent is not paged for it. RED if the window is widened (the same condition then
+  # fires). Measured with promtool at this evaluation interval: 11 samples never fire.
+  - interval: 1m
+    name: dedup store degraded - 11 minutes of degradation does not fire
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "1x10 0x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded"}'
+        eval_time: 16m
+        exp_samples: []
+
+  # CASE J -- 12 consecutive degraded minutes DO fire, at exactly the 15 minute mark, and the
+  # alert is already gone a minute later (it can fire for an agent that was fixed at minute 12).
+  # RED if the window is narrowed (the same condition then never fires).
+  - interval: 1m
+    name: dedup store degraded - 12 minutes of degradation fires at the 15 minute mark
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "1x11 0x49"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples: []

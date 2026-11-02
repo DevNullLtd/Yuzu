@@ -84,10 +84,10 @@
 #include "compliance_eval.hpp"
 #include "custom_properties_store.hpp"
 #include "data_export.hpp"
+#include "dedup_fleet_tags.hpp" // agent command-dedup store fleet gauge names + HELP (#3663)
 #include "deployment_store.hpp"
 #include "developer_routes.hpp" // System > Developer and API page + fragments (read-only)
 #include "dispatch_record_policy.hpp" // #4990: per-loop latch + short lease budget for the dispatch-record write
-#include "dedup_fleet_tags.hpp" // agent command-dedup store fleet gauge names + HELP (#3663)
 #include "discover_routes.hpp" // A2 discovery surface: /api/v1/discover/* (roadmap Issue 17.1)
 #include "discovered_devices_reader.hpp" // make_discovered_devices_reader (core wiring)
 #include "discovery_store.hpp"
