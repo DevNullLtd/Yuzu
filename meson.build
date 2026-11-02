@@ -248,7 +248,12 @@ if host_os == 'windows'
   # (same name in both variant dirs). Check `debug/lib/` layout via the
   # inspect-vcpkg.sh diagnostic if a new transitive lib surfaces and you
   # aren't sure which convention it follows.
-  _libzlib = _cxx.find_library('zlib' + _pbd, dirs: [_vcpkg_lib_win], required: true)
+  # zlib 1.3.2 (vcpkg 2026.10.16 baseline) renamed these to z.lib / zd.lib (the same `d` debug
+  # suffix); older baselines ship zlib.lib / zlibd.lib. Try the old name first, then the new one.
+  _libzlib = _cxx.find_library('zlib' + _pbd, dirs: [_vcpkg_lib_win], required: false)
+  if not _libzlib.found()
+    _libzlib = _cxx.find_library('z' + _pbd, dirs: [_vcpkg_lib_win], required: true)
+  endif
 
   # Construct the meson dep objects yuzu's build graph consumes. These
   # REPLACE the `dependency('protobuf', method: 'cmake')` / `dependency('gRPC',
@@ -282,14 +287,31 @@ else
   # don't have MSVC's runtime-library variant ABI — debug user code can
   # safely link against release-built .a static libs, and the cmake dep
   # translator's IMPORTED_LOCATION_RELEASE bias is harmless.
+  # On a tree installed for a triplet other than the host's (x64-linux-asan/-tsan/-static, the
+  # RHEL 8 triplet; host != target by design there) the Protobuf CMake probe fails even though
+  # this tree's tools/protobuf/protoc exists: "Could NOT find Protobuf (missing:
+  # Protobuf_PROTOC_EXECUTABLE)", raised from share/protobuf/protobuf-module.cmake via
+  # protobuf-config.cmake, so gRPC's CMake config is reported "not found". Hand the probe the
+  # protoc from this tree's own tools directory, found the same way proto/meson.build finds it.
+  # Measured with the protobuf 6.33.4 port at vcpkg 2026.10.16 (port-version 2); the port's
+  # vcpkg-cmake-wrapper.cmake is byte-identical to the one at the previous baseline, so which
+  # change in the port moved this was not established. Without the argument meson falls back to
+  # grpc.pc, which in vcpkg's grpc 1.81.1 names a library that does not exist
+  # (-lutf8_range_lib) and fails to link.
+  _protoc_hint_dirs = []
+  foreach _prefix : get_option('cmake_prefix_path')
+    _protoc_hint_dirs += _prefix / 'tools' / 'protobuf'
+  endforeach
+  _protoc_probe = find_program('protoc', dirs: _protoc_hint_dirs, required: false)
+  _protoc_cmake_args = _protoc_probe.found() ? ['-DProtobuf_PROTOC_EXECUTABLE=' + _protoc_probe.full_path()] : []
   grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'],
-    required: false, include_type: 'system')
+    required: false, include_type: 'system', cmake_args: _protoc_cmake_args)
   if not grpcpp_dep.found()
     grpcpp_dep = dependency('grpc++', method: 'pkg-config', required: true,
       include_type: 'system')
   endif
   protobuf_dep = dependency('protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'],
-    required: false, include_type: 'system')
+    required: false, include_type: 'system', cmake_args: _protoc_cmake_args)
   if not protobuf_dep.found()
     protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true,
       include_type: 'system')
@@ -352,8 +374,12 @@ if not build_server
   libpq_dep = disabler()
 elif host_os == 'windows'
   _libpq_libs = []
+  # libpq 18 (meson-based vcpkg port) no longer installs libpgcommon.lib / libpgport.lib on
+  # Windows (only libpgcommon_shlib.a / libpgport_shlib.a, which MSVC cannot link); libpq 16 did.
+  # They are only needed for a static libpq, so require libpq alone.
   foreach _pq_name : ['libpq', 'libpgcommon', 'libpgport']
-    _libpq_libs += _cxx.find_library(_pq_name, dirs: [_vcpkg_lib_win], required: true)
+    _libpq_libs += _cxx.find_library(_pq_name, dirs: [_vcpkg_lib_win],
+                                     required: _pq_name == 'libpq')
   endforeach
   # With dynamic libpq (the current triplet posture) the DLL self-contains
   # these; they are listed so a future flip of libpq to the static override
