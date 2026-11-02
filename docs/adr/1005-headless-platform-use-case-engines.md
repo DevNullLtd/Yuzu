@@ -949,14 +949,17 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        as **#6087**; **revisit by 2027-01-31**. When the twins land they take
        the same document shape and the one write function
        (`apply_dex_score_policy`), so there is no second validator; this entry
-       retires with the 2026-10-23 one.
+       retires with the 2026-10-23 one. No ledger row is added, as for the
+       2026-10-23 entry: the parity ledger admits an `exception:` row for a
+       `/api/v1` route but does not require one.
      - **The exception relaxes no control.** Same gates, `If-Match`, audit-first
        and fail-closed audit, A4 envelope, and discovery in `openapi_spec()` and
        `/api/v1/discover/routes`; the new parameters are validated by the same
        validator the reader uses.
      - Wire reference: `docs/user-manual/rest-api.md`, "GET / PUT / DELETE
        /api/v1/dex/score-policy"; the version 2 rolling-upgrade rule is in
-       `docs/user-manual/upgrading.md`.
+       `docs/user-manual/upgrading.md`; audit rows:
+       `docs/user-manual/audit-log.md` (unchanged by this entry).
 
    - **2026-10-23 - DEX customer score policy (`GET`, `PUT` and `DELETE
      /api/v1/dex/score-policy`, #6086).** REST-only, no MCP twin: a "no" on

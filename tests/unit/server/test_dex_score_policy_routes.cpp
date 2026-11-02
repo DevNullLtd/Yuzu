@@ -397,6 +397,9 @@ TEST_CASE("score-policy routes: model parameters round-trip PUT then GET with th
         const auto pj = json::parse(put->body);
         check_model_document(pj["data"]["document"]);
         REQUIRE(h.stored.has_value());
+        const auto expected = dex_score_policy_validate_text(kModelBody);
+        REQUIRE(expected.has_value());
+        CHECK(*h.stored == dex_score_policy_canonical(*expected));
         CHECK(pj["data"]["revision"] == dex_score_policy_revision(*h.stored));
 
         const auto get = h.send("GET", kPath);

@@ -43,6 +43,7 @@
 #include "device_token_store.hpp"
 #include "dex_read_model.hpp" // the scope tokens and the basis/coverage the builder can emit
 #include "dex_score_policy_json.hpp" // the serializer the DexScorePolicyDocument schema mirrors
+#include "dex_score_policy_writer.hpp" // dex_score_policy_in_force_json: the data envelope's keys
 #include "license_store.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
@@ -653,22 +654,24 @@ TEST_CASE("openapi_spec_json(): /dex/apps documents the platform scope parameter
 
 // A lookup by JSON pointer that yields null for a missing node: a regression that deletes part
 // of a schema fails an assertion instead of aborting the whole test binary.
-static json schema_at(const json& node, const std::string& ptr) {
+namespace {
+json schema_at(const json& node, const std::string& ptr) {
     return node.value(json::json_pointer(ptr), json());
 }
 
-static bool array_contains(const json& array, const json& v) {
+bool array_contains(const json& array, const json& v) {
     return std::find(array.begin(), array.end(), v) != array.end();
 }
 
 // Sorted key names of an object (empty for a non-object), so key sets compare regardless of order.
-static std::set<std::string> object_keys(const json& obj) {
+std::set<std::string> object_keys(const json& obj) {
     std::set<std::string> keys;
     if (obj.is_object())
         for (const auto& [k, v] : obj.items())
             keys.insert(k);
     return keys;
 }
+} // namespace
 
 TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and the coverage the "
           "/dex/apps builder can emit",
@@ -765,23 +768,53 @@ TEST_CASE("openapi_spec_json(): DexScorePolicyDocument types the stored shape an
     CHECK(doc("/properties/overrides/items/properties/model/additionalProperties") == false);
     CHECK(doc("/properties/overrides/maxItems") == kDexPolicyMaxOverrides);
 
-    // Bounds and defaults are the core constants.
-    const auto bound = [&doc](const std::string& key, const json& lo, const json& hi,
-                              const json& def) {
-        INFO("parameter: " << key);
-        const std::string base = "/properties/model/properties/" + key;
-        CHECK(doc(base + "/minimum") == lo);
-        CHECK(doc(base + "/maximum") == hi);
-        CHECK(doc(base + "/default") == def);
+    // An override is read-required on `image` alone (always emitted).
+    CHECK(doc("/properties/overrides/items/required") == json::array({"image"}));
+
+    // Type, bounds and defaults are the serializer's and the core constants'. The type comes from
+    // what the serializer emits (a whole-number parameter is an integer, a ratio a number).
+    const auto bound = [&doc](const std::string& base, const std::string& key, const json& sample,
+                              const json& lo, const json& hi, const json* def) {
+        INFO("parameter: " << base << key);
+        const std::string at = base + key;
+        CHECK(doc(at + "/type") == (sample.is_number_integer() ? "integer" : "number"));
+        CHECK(doc(at + "/minimum") == lo);
+        CHECK(doc(at + "/maximum") == hi);
+        CHECK(doc(at + "/default") == (def ? *def : json()));
     };
-    bound("per_device_event_cap", 1, kStabilityMaxPerDeviceEventCap,
-          kStabilityModel.per_device_event_cap);
-    bound("regression_start_ratio", 1.0, kStabilityMaxRegressionRatio,
-          kStabilityModel.regression_start_ratio);
-    bound("regression_full_ratio", 1.0, kStabilityMaxRegressionRatio,
-          kStabilityModel.regression_full_ratio);
-    bound("interval_confidence", kDexStatsConfidenceMin, kDexStatsConfidenceMax,
-          kDexStatsConfidence);
+    const std::string gm = "/properties/model/properties/";
+    const std::string om = "/properties/overrides/items/properties/model/properties/";
+    const json& em = emitted["model"];
+    const json& eo = emitted["overrides"][0]["model"];
+    const json cap_def = kStabilityModel.per_device_event_cap;
+    const json start_def = kStabilityModel.regression_start_ratio;
+    const json full_def = kStabilityModel.regression_full_ratio;
+    const json conf_def = kDexStatsConfidence;
+    bound(gm, "per_device_event_cap", em["per_device_event_cap"], 1,
+          kStabilityMaxPerDeviceEventCap, &cap_def);
+    bound(gm, "regression_start_ratio", em["regression_start_ratio"], 1.0,
+          kStabilityMaxRegressionRatio, &start_def);
+    bound(gm, "regression_full_ratio", em["regression_full_ratio"], 1.0,
+          kStabilityMaxRegressionRatio, &full_def);
+    bound(gm, "interval_confidence", em["interval_confidence"], kDexStatsConfidenceMin,
+          kDexStatsConfidenceMax, &conf_def);
+    bound(om, "per_device_event_cap", eo["per_device_event_cap"], 1,
+          kStabilityMaxPerDeviceEventCap, nullptr);
+    bound(om, "regression_start_ratio", eo["regression_start_ratio"], 1.0,
+          kStabilityMaxRegressionRatio, nullptr);
+    bound(om, "regression_full_ratio", eo["regression_full_ratio"], 1.0,
+          kStabilityMaxRegressionRatio, nullptr);
+
+    // The data envelope: its required keys are the ones the serializer always emits, and
+    // `source` is exactly the two values the store can report.
+    const json& data = schemas["DexScorePolicyData"];
+    const json required = schema_at(data, "/properties/data/required");
+    std::set<std::string> required_keys;
+    for (const auto& k : required)
+        required_keys.insert(k.get<std::string>());
+    CHECK(required_keys == object_keys(dex_score_policy_in_force_json(DexPolicyInForce{})));
+    CHECK(schema_at(data, "/properties/data/properties/source/enum") ==
+          json::array({"custom", "default"}));
 
     const std::string put_desc =
         spec["paths"]["/dex/score-policy"]["put"].value("description", "");
