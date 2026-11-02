@@ -82,14 +82,19 @@ public:
     /// loses the `<= current` race in the apply loop below.
     ///
     /// #3894: the complementary case — a database already AHEAD of this
-    /// binary's vector (an older replica restarted, or rolled back, after a
-    /// newer one migrated). That is WARN-ONLY, never a refusal: the upgrade
-    /// guide promises in many places that an older build can still run against
-    /// an additively-upgraded database, and refusing would break a replica that
-    /// restarts mid-rollout. `run()` applies nothing, logs one actionable
-    /// warning naming the store and both versions, and returns true. Log-only
-    /// by design (the pg/ layer has no metrics registry). The warning protects
-    /// only binaries that contain it; builds shipped before it stay exposed.
+    /// binary's vector (an older build started against a database a newer one
+    /// migrated). That is WARN-ONLY, never a refusal: the upgrade guide says in
+    /// many places that an older build can still run against an
+    /// additively-upgraded database, and refusing would break a restart that is
+    /// otherwise harmless. `run()` applies nothing, logs one actionable warning
+    /// per CALL naming the store and both versions, and returns true. Some
+    /// stores call `run()` more than once per process start (the auth and
+    /// secrets stores are opened twice; `LeaderElector` re-runs it on every
+    /// reconnect), so the warning can repeat. A store's own constructor can
+    /// still refuse afterwards (e.g. a projection smoke-check), so "returns
+    /// true" is not "the store will start". Log-only by design (the pg/ layer
+    /// has no metrics registry). The warning protects only binaries that
+    /// contain it; builds shipped before it stay exposed.
     [[nodiscard]] static bool run(PGconn* conn, std::string_view store_name,
                                   const std::vector<PgMigration>& migrations);
 

@@ -294,11 +294,15 @@ TEST_CASE("PgMigrationRunner version-ahead warning (#3894)", "[pg][migration]") 
 
         std::string logs;
         {
-            yuzu::test::LogCapture capture{spdlog::level::warn};
+            // debug level so the runner's own "(up to date)" line is captured:
+            // an in-section liveness control proving the absence assertion
+            // below is not vacuous (capture really reaches the runner).
+            yuzu::test::LogCapture capture{spdlog::level::debug};
             REQUIRE(PgMigrationRunner::run(conn.get(), "store_a", v3));
             capture.stop();
             logs = capture.text();
         }
+        CHECK(logs.find("up to date") != std::string::npos); // liveness control
         CHECK(logs.find("newer build has already migrated") == std::string::npos);
     }
 
@@ -307,12 +311,34 @@ TEST_CASE("PgMigrationRunner version-ahead warning (#3894)", "[pg][migration]") 
 
         std::string logs;
         {
-            yuzu::test::LogCapture capture{spdlog::level::warn};
+            // info level so the runner's "migrated to v3" line is captured —
+            // the in-section liveness control (see the section above).
+            yuzu::test::LogCapture capture{spdlog::level::info};
             REQUIRE(PgMigrationRunner::run(conn.get(), "store_a", v3));
             capture.stop();
             logs = capture.text();
         }
+        CHECK(logs.find("migrated to v3") != std::string::npos); // liveness control
         CHECK(logs.find("newer build has already migrated") == std::string::npos);
         CHECK(PgMigrationRunner::current_version(conn.get(), "store_a") == 3);
+    }
+
+    SECTION("the warning fires on every call (some stores call run() more than once)") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_a", v3));
+
+        std::string logs;
+        {
+            yuzu::test::LogCapture capture{spdlog::level::warn};
+            REQUIRE(PgMigrationRunner::run(conn.get(), "store_a", v2));
+            REQUIRE(PgMigrationRunner::run(conn.get(), "store_a", v2));
+            capture.stop();
+            logs = capture.text();
+        }
+        const std::string needle = "newer build has already migrated";
+        std::size_t count = 0;
+        for (auto pos = logs.find(needle); pos != std::string::npos;
+             pos = logs.find(needle, pos + needle.size()))
+            ++count;
+        CHECK(count == 2); // pins the documented per-call (not per-process) contract
     }
 }
