@@ -49,6 +49,20 @@ class KeyProvider;
 /// closes that gap for the three triggers `CrlPublisher` itself now understands).
 enum class CrlTrigger { Startup, Freshness, SelfHeal, Operator };
 
+// How long a published CRL claims to be valid (nextUpdate - build time), and how close to
+// nextUpdate the leader's freshness pass republishes. #6016 PR 4d: validity was 7 days, so a
+// relying party that fetched once and then lost the server could admit on a CRL a week stale;
+// 48 h bounds that to about 3 days once the gateway's 24 h grace is added (docs/adr/2004). The
+// republish threshold is unchanged, so on a fleet with no revocations the CRL is now rebuilt about
+// once a day (one `ca_crl_versions` row per day).
+inline constexpr std::chrono::hours kCrlValidity{48};
+inline constexpr std::chrono::hours kCrlRepublishThreshold{24};
+// The freshness pass fires when LESS than the threshold remains. If validity ever fell to the
+// threshold, a fresh CRL would be "stale" on its first tick and the leader would republish every
+// 15 s; the hour of slack keeps that from being a one-character edit.
+static_assert(kCrlValidity >= kCrlRepublishThreshold + std::chrono::hours{1},
+              "CRL validity must exceed the republish threshold or the freshness pass loops");
+
 class CrlPublisher {
 public:
     struct Deps {

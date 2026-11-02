@@ -809,8 +809,10 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   "Gateway-proxied agents: revocation scope").
 - **CRL distribution:** point external consumers at `GET /api/v1/ca/crl`. The
   server keeps the CRL fresh on its own — a background freshness check
-  re-publishes when the latest CRL is missing or within 24h of `nextUpdate`, so a
-  fleet with no revocations never serves an expired CRL and a failed startup
+  re-publishes when the latest CRL is missing or within 24h of `nextUpdate`. A CRL
+  is valid for 48 hours from the moment it is built (`kCrlValidity`, #6016; it was
+  7 days), so a fleet with no revocations gets a new CRL about once a day and never
+  serves an expired CRL and a failed startup
   pre-publish self-heals on the next **successful leader** tick. That freshness
   re-publish is `FencedLeaderOnly` (WS-3, ADR-2002) — under a leadership pause (a
   lost coordination connection; look for `[HA] … FencedLeaderOnly background loops
