@@ -347,7 +347,7 @@ operator-visible notes:
   - **Terminal frame.** The cap bounds total rows. At the cap, one extra terminal-status row is still
     admitted, and only while no terminal row exists for that command and device, so a capped command
     still shows its outcome. A terminal frame with no output instead finalizes the retained rows in
-    place (no new row), after which a further terminal frame is refused as a replay.
+    place (no new row), after which a further terminal frame at the cap is refused as a replay.
   - **Counting.** Each refused frame counts on
     `yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}` (see [metrics.md](metrics.md))
     and logs a rate-limited warning.

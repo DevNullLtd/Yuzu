@@ -534,6 +534,17 @@ contract (a boot guard, tracked as a follow-up, would enforce it). An earlier pl
 `executions` was removed from this store as a policy-floor violation (the v6 comment block in
 `execution_tracker.cpp`); the difference is that this table is created empty by the same boot.
 
+A fifth plain build, `ResponseStore` `responses` v4 (#561, `idx_resp_instr_agent_status` on
+`(instruction_id, agent_id, status)`, which serves the per-pair row cap's count and terminal probe),
+rests on the same basis as the fourth: the 0.15.0 deployment contract is a fresh database only
+(`docs/user-manual/upgrading.md` "Deployment contract"), so `responses` is empty when v4 runs and
+the empty-table rule above already applies. What the entry records is that the contract is
+procedural (the executable does not verify it). On a carried-forward database the build would hold a
+`SHARE` lock on this high-write table (writes blocked, reads allowed) for its duration; the
+migration's own `SET LOCAL statement_timeout = 0` keeps the pool's statement timeout from rolling it
+back, and `IF NOT EXISTS` keeps a re-run after a rewound version stamp safe. It ends with the
+contract. ADR-0039 "Update (2026-11-02) — migration v4" records the index.
+
 ## Substrate quick facts (pool / runner / helpers)
 
 Design facts every store author inherits (previously recorded only in CLAUDE.md and the

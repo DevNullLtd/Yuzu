@@ -3851,4 +3851,19 @@ TEST_CASE("ResponseStore: migration v4 creates the per-pair index", "[pg][respon
     CHECK(query_scalar(db.dsn(),
                        "SELECT count(*) FROM pg_indexes WHERE schemaname='response_store' AND "
                        "indexname='idx_resp_instr_agent_status'") == "1");
+
+    // The ordered key is what serves the terminal probe's `status` range, so a same-named index on
+    // other columns, in another order, partial or not valid must fail here. Column names (not
+    // attnums) so a future column reorder in CREATE TABLE cannot false-fail it.
+    CHECK(query_scalar(db.dsn(),
+                       "SELECT string_agg(a.attname::text, ',' ORDER BY k.ord) "
+                       "FROM pg_class c "
+                       "JOIN pg_index i ON i.indexrelid = c.oid "
+                       "CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) "
+                       "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum "
+                       "WHERE c.relname = 'idx_resp_instr_agent_status' "
+                       "AND c.relnamespace = 'response_store'::regnamespace "
+                       "AND i.indrelid = 'response_store.responses'::regclass "
+                       "AND i.indisvalid AND i.indpred IS NULL") ==
+          "instruction_id,agent_id,status");
 }

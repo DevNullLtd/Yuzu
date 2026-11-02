@@ -12,6 +12,7 @@
 
 #include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
+#include <yuzu/server/auth.hpp>
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
@@ -27,6 +28,11 @@
 #include <unordered_map>
 
 namespace yuzu::server {
+
+// The cap-refusal warning budget keys on a whole agent id (the budget treats keys that share its
+// key bound as one agent, bounded_audit_budget.hpp).
+static_assert(kCapLogBudgetKeyBytes >= auth::kMaxAgentIdLength,
+              "the cap-refusal warning budget must key on a whole agent id");
 
 namespace {
 

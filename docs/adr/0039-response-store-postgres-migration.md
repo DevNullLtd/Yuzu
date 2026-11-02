@@ -32,7 +32,9 @@ Migrate to PostgreSQL schema **`response_store`** (ADR-0008), construction fail-
 
 `responses` + `response_facets` port column-for-column (INTEGER→BOOLEAN/BIGINT as apt; TEXT
 timestamps/output stay TEXT — behavior-preserving). All indexes carry over incl. the partial
-`idx_resp_ttl WHERE ttl_expires_at > 0` the reaper uses.
+`idx_resp_ttl WHERE ttl_expires_at > 0` the reaper uses. Migration v4 (#561) adds
+`idx_resp_instr_agent_status ON responses(instruction_id, agent_id, status)` for the per-pair row
+cap — see the 2026-11-02 Update below.
 
 `plugin_result_status` (the ABI3→4 typed plugin-result column, `dev`'s `12b97f5f`/`d103ac54`)
 lands as **migration v2** (`ALTER TABLE responses ADD COLUMN plugin_result_status INTEGER NOT
@@ -312,3 +314,24 @@ should reach for one batch-under-one-savepoint, not a savepoint per row (subxid 
   a delete-time false verdict on a row that should have survived), and bounded by the retention
   window itself. Recorded as a deliberate accepted residual rather than left silent; revisit if
   `response_retention_days` is ever tightened enough for ordinary clock drift to matter.
+
+## Update (2026-11-02) — migration v4: `idx_resp_instr_agent_status` for the per-pair row cap (#561)
+
+`ResponseStore::store` bounds the rows kept per `(instruction_id, agent_id)` pair (default 256,
+`--response-max-rows-per-agent`). Before each insert it reads the pair's row count (bounded by a
+`LIMIT` at the cap) and, for a terminal frame at the cap, whether the pair already has a terminal
+row (`status <> 0`, the same definition of terminal the admit predicate uses). Migration v4 adds `idx_resp_instr_agent_status ON responses(instruction_id,
+agent_id, status)` so both reads touch only the pair's own index entries. It sits beside the
+`idx_resp_ttl` partial index (§Schema); no column or constraint changes, and v1 to v3 are untouched.
+
+**The transactional build.** v4 is a plain `CREATE INDEX IF NOT EXISTS` inside the migration
+transaction, on the high-write `responses` table. The non-transactional migration kind is not built
+(#4432), so this is a recorded exception in `docs/postgres-store-playbook.md` "Non-transactional
+migrations" (the fifth). It rests on the same basis as `ExecutionTracker` `command_execution` v7:
+the 0.15.0 deployment contract is a fresh database only (`docs/user-manual/upgrading.md`), so the
+table is empty when the build runs, and the entry records that the contract is procedural. On a
+carried-forward database the build would hold a `SHARE` lock for its duration; `SET LOCAL
+statement_timeout = 0` (the v3 precedent) stops the pool's statement timeout from cancelling it and
+leaving the store "persistence disabled" on every boot, and `IF NOT EXISTS` keeps a re-run safe.
+The exception ends with the contract, or when #4432 delivers the non-transactional kind; after
+either, a new index on `responses` uses that kind.

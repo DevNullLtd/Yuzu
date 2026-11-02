@@ -249,6 +249,11 @@ inline constexpr int kDefaultResponseRetentionDays = 90;
 /// ~64 KiB flush size; see response_cap_rules.hpp.
 inline constexpr int kDefaultResponseMaxRowsPerAgent = 256;
 
+/// The cap-refusal warning budget treats two keys that share this many leading bytes as ONE agent,
+/// so it covers a whole agent id (auth::kMaxAgentIdLength, 256; asserted in response_store.cpp
+/// where both are visible).
+inline constexpr std::size_t kCapLogBudgetKeyBytes = 256;
+
 class ResponseStore {
 public:
     /// Borrows the shared pool and runs the `response_store` schema
@@ -542,9 +547,9 @@ private:
     // public method list.
     int max_rows_per_agent_;
     // Bounds the cap-refusal WARN line per agent (the counter is unsampled). Keys are agent ids,
-    // so the key bound is the agent-id limit (auth::kMaxAgentIdLength, 256).
+    // so the key bound is kCapLogBudgetKeyBytes (the agent-id limit).
     DenialAuditBudget cap_log_budget_{kDefaultAuditMaxRows, kDefaultAuditWindowMs, {},
-                                      kDefaultAuditMaxKeys, 256};
+                                      kDefaultAuditMaxKeys, kCapLogBudgetKeyBytes};
 
     int64_t compute_ttl_epoch() const;
 };

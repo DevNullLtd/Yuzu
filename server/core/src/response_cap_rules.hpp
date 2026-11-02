@@ -10,7 +10,7 @@
 ///   - at the cap, ONE overflow terminal row is admitted, and only while no terminal row
 ///     exists for the pair (so a capped command still shows its outcome; bound = cap + 1);
 ///   - `finalize_terminal_status` converts retained RUNNING rows in place (no new row), after
-///     which a further terminal insert is refused as a replay;
+///     which a further terminal insert at the cap is refused as a replay;
 ///   - concurrent writers for one pair (direct stream + gateway forward) are not serialised
 ///     and can overshoot by the number of concurrent writers.
 ///
