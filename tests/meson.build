@@ -1785,6 +1785,7 @@ if build_server
       'unit/server/test_settings_plugins_page.cpp', # System > Plugins and updates: page pins and fragment gates
       'unit/server/test_settings_plugins_authz.cpp', # System > Plugins and updates: [pg] the fragments through the REAL probe gates (denial rows: token yes, cookie no)
       'unit/server/test_settings_engine_panel_authz.cpp', # #5882: [pg] Settings Engine Principals panel vs its REST twin through the REAL gates (RBAC off/on personas)
+      'unit/server/test_settings_access_review_engine_authz.cpp', # #6744: [pg] Settings Access reviews fragments refuse an engine session (custom-role AccessReview:Read), as the REST twins do
       'unit/server/test_ca_panel_render.cpp', # System > Certificates and secrets: pure CA panel goldens
       'unit/server/test_kek_panel_render.cpp', # System > Certificates and secrets: pure KEK status panel goldens
       'unit/server/test_settings_pki_page.cpp', # System > Certificates and secrets: page pins, page gate, KEK fragment
@@ -4052,6 +4053,17 @@ test('Echo adoption boot wiring lexical gate',
 test('access users production wiring lexical gate',
   _python3_test,
   args: [files('test_access_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #6744: the engine-session belt of the Settings fragments (engine-principals, access-reviews and its
+# campaign view). Pins that is_engine() is called once (inside refuse_engine_session), that each of the
+# three handlers calls the belt in the order permission gate, auth_fn_, belt, render, and that no second
+# copy reappears. The unit tests need Postgres; this one needs nothing. Source-text only, so Python.
+test('settings engine session belt lexical gate',
+  _python3_test,
+  args: [files('test_settings_engine_belt_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
