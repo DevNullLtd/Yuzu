@@ -136,7 +136,9 @@ public:
      * + busy_timeout=5000 and creates the schema if absent.
      *
      * CORRUPTION RECOVERY (#3665): when the file CANNOT BE OPENED because it is corrupt
-     * (SQLITE_CORRUPT / SQLITE_NOTADB from any open step), the main file is moved aside to
+     * (SQLITE_CORRUPT / SQLITE_NOTADB from sqlite3_open_v2, the pragmas, or creating the two
+     * tables; damage confined to the unused `meta` table only logs a warning), the main file is
+     * moved aside to
      * `<path>.corrupt-<unix-epoch-seconds>[-n]` (a non-empty -wal/-shm/-journal goes with it as
      * `<that name>-wal` etc; empty or unmovable sidecars are removed) and a fresh store is opened,
      * ONCE — never a loop. Only the newest 3 quarantined stores are kept. The dedup history in

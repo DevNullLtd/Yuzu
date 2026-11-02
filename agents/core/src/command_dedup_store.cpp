@@ -9,20 +9,21 @@
 
 #include <yuzu/agent/command_dedup_store.hpp>
 
+#include "command_dedup_quarantine.hpp"
+
 #include <sqlite3.h>
 
 #include <spdlog/spdlog.h>
 
 #include <cctype>
-#include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <format>
-#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <utility>
-#include <vector>
+#include <system_error>
 
 namespace yuzu::agent {
 
@@ -90,19 +91,23 @@ constexpr int kStateTerminal = 1;
 // command_dedup.db is a regenerable safety net: a file that cannot be opened protects nothing,
 // and staying degraded forever (fail-open on every boot) is strictly worse than starting a fresh
 // one. So a CORRUPTION-class OPEN failure moves the file aside and recreates it, as echo.db does
-// (#559, agents/plugins/echo/src/echo_db.cpp quarantine_corrupt_db — kept as a separate copy on
-// purpose; hoisting both into agents/shared is a candidate follow-up, not yet filed).
+// (#559; the filesystem half is command_dedup_quarantine.hpp).
+//
+// "Cannot be opened" means: SQLITE_CORRUPT / SQLITE_NOTADB from sqlite3_open_v2, the
+// journal_mode/synchronous pragmas, or creating the two tables. Damage confined to the unused
+// `meta` table is tolerated (see the schema_version seed below).
 //
 // Deliberately STRICTER than echo's integrity_ok(), in two ways:
 //  1. Only SQLITE_CORRUPT / SQLITE_NOTADB counts. BUSY / LOCKED / IOERR / FULL / CANTOPEN / PERM are
 //     transient or environmental; quarantining on them would discard good history, which lets an
 //     already-run command re-execute (the outcome invariants 4 and 5 forbid).
 //  2. There is NO whole-file integrity scan (no PRAGMA quick_check / integrity_check). A file that
-//     OPENS but has a few damaged pages is still mostly usable — measured: with one page damaged,
-//     ~99.6% of ids still resolved — and only the claims that touch a bad page fail open (counted
-//     by yuzu_agent_dedup_claim_errors_total). Quarantining it on an integrity scan would discard
-//     ALL history, including in-flight claims, which is worse than the damage (owner ruling,
-//     #3665). Do not add such a scan without re-opening that ruling.
+//     OPENS but has a few damaged pages is still mostly usable: in one experiment with a single
+//     damaged leaf page nearly every id still resolved (damage to an interior or root page costs
+//     many more), and only the claims that touch a bad page fail open (counted by
+//     yuzu_agent_dedup_claim_errors_total). Quarantining it on an integrity scan would discard ALL
+//     history, including in-flight claims, which is worse than the damage (owner ruling, #3665).
+//     Do not add such a scan without re-opening that ruling.
 
 // True for SQLITE_CORRUPT / SQLITE_NOTADB, including extended codes (SQLITE_CORRUPT_VTAB etc).
 bool is_corruption_rc(int rc) noexcept {
@@ -114,136 +119,6 @@ struct OpenFailure {
     std::string message;
     bool corrupt = false; ///< corruption-class: the caller may quarantine and retry ONCE
 };
-
-// Move a corrupt command_dedup.db aside to `<path>.corrupt-<epoch>[-n]` and carry any NON-EMPTY
-// -wal/-shm/-journal sidecars with it (`<that name>-wal`, ...). Never overwrites an earlier
-// quarantine: the epoch is 1 s granular and the wall clock can step backward, so a collision gets
-// a `-n` suffix, and if 10,000 suffixes are all taken it FAILS rather than overwrite. Returns the
-// main file's new path, or nullopt if the main file could not be moved — the caller then fails
-// (observably, fail-open) and the original file is untouched. An EMPTY sidecar holds no evidence
-// and is removed; a sidecar that cannot be renamed is removed instead, best effort, so the fresh
-// database does not replay a stale WAL belonging to the quarantined file. (If that remove also
-// fails the stale sidecar can survive beside the fresh file; the retry's open-time checks would
-// not necessarily notice a stale WAL that is itself valid. That needs the main rename to succeed
-// while both sidecar operations fail, which is vanishingly unlikely; echo carries a post-reopen
-// integrity backstop, dedup deliberately does not — see above.) rename() keeps the file's 0600
-// mode (it holds serialized responses).
-std::optional<std::filesystem::path> quarantine_corrupt_db(const std::filesystem::path& path) {
-    const auto epoch = now_epoch_seconds();
-    std::filesystem::path dest = path;
-    dest += std::format(".corrupt-{}", epoch);
-    {
-        std::error_code exists_ec;
-        for (int n = 1; n < 10'000 && std::filesystem::exists(dest, exists_ec); ++n) {
-            dest = path;
-            dest += std::format(".corrupt-{}-{}", epoch, n);
-        }
-        if (std::filesystem::exists(dest, exists_ec) || exists_ec)
-            return std::nullopt; // every name taken (or unreadable): refuse rather than overwrite
-    }
-    std::error_code ec;
-    std::filesystem::rename(path, dest, ec);
-    if (ec)
-        return std::nullopt;
-    for (const char* suffix : {"-wal", "-shm", "-journal"}) {
-        std::filesystem::path side = path;
-        side += suffix;
-        std::error_code ec2;
-        if (!std::filesystem::exists(side, ec2))
-            continue;
-        std::error_code size_ec;
-        if (std::filesystem::file_size(side, size_ec) == 0) {
-            std::filesystem::remove(side, ec2);
-            continue;
-        }
-        std::filesystem::path side_dest = dest;
-        side_dest += suffix;
-        std::filesystem::rename(side, side_dest, ec2);
-        if (ec2) {
-            std::error_code ec3;
-            std::filesystem::remove(side, ec3);
-        }
-    }
-    return dest;
-}
-
-// The owner ruled (#3665) that only the newest kKeepQuarantined quarantined stores are kept: each
-// holds up to a ring's worth of serialized CommandResponse frames (possibly command output) and a
-// disk that corrupts the file on every boot would otherwise leave one per boot, forever.
-// COUNT-based, not a wall-clock cutoff (the clock-guarded-retention hazard does not apply): the
-// groups are ordered by the (epoch, n) in their NAME, which a backward clock step can mis-order, so
-// the file this very call just created is never a candidate. Best effort: a failed remove is
-// logged and left for the next recovery.
-constexpr std::size_t kKeepQuarantined = 3;
-
-// `<db filename>.corrupt-<epoch>[-<n>]` with an optional -wal/-shm/-journal suffix -> (epoch, n).
-std::optional<std::pair<long long, long long>> parse_quarantine_name(std::string_view stem,
-                                                                     std::string_view name) {
-    if (!name.starts_with(stem))
-        return std::nullopt;
-    name.remove_prefix(stem.size());
-    for (std::string_view sfx : {"-wal", "-shm", "-journal"}) {
-        if (name.ends_with(sfx)) {
-            name.remove_suffix(sfx.size());
-            break;
-        }
-    }
-    long long epoch = 0;
-    long long n = 0;
-    const char* first = name.data();
-    const char* last = name.data() + name.size();
-    auto r = std::from_chars(first, last, epoch);
-    if (r.ec != std::errc{} || r.ptr == first || epoch < 0)
-        return std::nullopt;
-    if (r.ptr == last)
-        return std::pair{epoch, 0LL};
-    if (*r.ptr != '-')
-        return std::nullopt;
-    const char* n_first = r.ptr + 1;
-    auto r2 = std::from_chars(n_first, last, n);
-    if (r2.ec != std::errc{} || r2.ptr != last || n < 0)
-        return std::nullopt;
-    return std::pair{epoch, n};
-}
-
-void prune_old_quarantines(const std::filesystem::path& db_path,
-                           const std::filesystem::path& just_created) {
-    const std::string stem = db_path.filename().string() + ".corrupt-";
-    const auto keep_key = parse_quarantine_name(stem, just_created.filename().string());
-    auto dir = db_path.parent_path();
-    if (dir.empty())
-        dir = ".";
-
-    std::map<std::pair<long long, long long>, std::vector<std::filesystem::path>> groups;
-    std::error_code ec;
-    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end;
-         it.increment(ec)) {
-        if (auto key = parse_quarantine_name(stem, it->path().filename().string()))
-            groups[*key].push_back(it->path());
-    }
-    if (groups.size() <= kKeepQuarantined)
-        return;
-    std::size_t excess = groups.size() - kKeepQuarantined;
-    for (const auto& [key, files] : groups) { // ascending: oldest name first
-        if (excess == 0)
-            break;
-        if (keep_key && key == *keep_key)
-            continue;
-        for (const auto& f : files) {
-            std::error_code rec;
-            std::filesystem::remove(f, rec);
-            if (rec) {
-                spdlog::warn("CommandDedupStore: could not remove old quarantined store {}: {}",
-                             f.string(), rec.message());
-            } else {
-                spdlog::info("CommandDedupStore: removed old quarantined store {} (keeping the "
-                             "newest {})",
-                             f.string(), kKeepQuarantined);
-            }
-        }
-        --excess;
-    }
-}
 
 } // namespace
 
@@ -339,14 +214,26 @@ std::expected<DbGuard, OpenFailure> open_and_init(const std::filesystem::path& d
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-        INSERT INTO meta(key, value) VALUES('schema_version', '1')
-            ON CONFLICT(key) DO NOTHING;
     )";
     rc = sqlite3_exec(raw_db, create_sql, nullptr, nullptr, nullptr);
     if (rc != SQLITE_OK) {
         return std::unexpected(OpenFailure{
             std::format("failed to create command_dedup schema: {}", sqlite3_errmsg(raw_db)),
             is_corruption_rc(rc)});
+    }
+    // The schema_version seed is NOT part of "can this file be opened": nothing reads `meta` yet,
+    // and the INSERT probes the meta table's own b-tree pages, which command_outcomes never uses.
+    // Damage confined to them must not make a file whose command table is intact get quarantined
+    // (that would discard its in-flight claims, invariants 4 and 5; owner ruling, #3665). So a
+    // failure here is a warning, whatever its cause, and never `corrupt`.
+    rc = sqlite3_exec(raw_db,
+                      "INSERT INTO meta(key, value) VALUES('schema_version', '1') "
+                      "ON CONFLICT(key) DO NOTHING",
+                      nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::warn("CommandDedupStore: could not seed meta.schema_version ({}); continuing — "
+                     "nothing reads it yet",
+                     sqlite3_errmsg(raw_db));
     }
 
     // Owner-only (0600), matching the security-hardening.md "chmod 600 *.db" rule
@@ -384,7 +271,8 @@ CommandDedupStore::open(const std::filesystem::path& db_path) {
         // a disk that corrupts every fresh file degrades (observably) instead of spinning. The
         // failed attempt's handle is already closed (DbGuard) before the rename.
         const std::string reason = attempt.error().message;
-        auto moved = quarantine_corrupt_db(db_path);
+        auto moved =
+            dedup_quarantine::quarantine_corrupt_db(db_path, now_epoch_seconds());
         if (!moved) {
             // Fail-open, observable (invariant 7): the original file is untouched.
             return std::unexpected(CommandDedupError{
@@ -396,8 +284,10 @@ CommandDedupStore::open(const std::filesystem::path& db_path) {
                       reason, moved->string());
         quarantined_file = moved->filename().string();
         attempt = open_and_init(db_path);
-        if (attempt)
-            prune_old_quarantines(db_path, *moved); // owner ruling: keep the newest few only
+        if (attempt) {
+            // Owner ruling: keep the newest few only. Never throws (best effort).
+            dedup_quarantine::prune_old_quarantines(db_path, *moved);
+        }
     }
     if (!attempt) {
         return std::unexpected(CommandDedupError{

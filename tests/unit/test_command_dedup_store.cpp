@@ -14,9 +14,13 @@
 
 #include <yuzu/agent/command_dedup_store.hpp>
 
+#include "command_dedup_quarantine.hpp"
+
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <sqlite3.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -388,7 +392,7 @@ TEST_CASE("CommandDedupStore: a non-database file is quarantined and recreated",
     CHECK(dup.status == ClaimStatus::Duplicate);
 }
 
-TEST_CASE("CommandDedupStore: a file whose schema step hits corruption is quarantined",
+TEST_CASE("CommandDedupStore: a file whose schema page is garbage is quarantined",
           "[command_dedup][lifecycle][corruption]") {
     const auto path = fresh_db_path();
     yuzu::test::TempDbFile guard{path};
@@ -400,12 +404,12 @@ TEST_CASE("CommandDedupStore: a file whose schema step hits corruption is quaran
             REQUIRE(opened->claim("cmd-" + std::to_string(i)).status == ClaimStatus::Claimed);
     } // last connection closes -> WAL checkpointed into the main file
 
-    // Keep page 1 (header + schema, so open_v2 and the pragmas succeed) and trash the rest, so the
-    // schema step's own read of `meta` fails with SQLITE_CORRUPT: the store cannot be initialised,
-    // which is an OPEN failure and the one thing that justifies discarding the file.
+    // Keep the 100-byte SQLite header (so open_v2 and the pragmas succeed) and trash the rest of
+    // page 1, which holds sqlite_schema: the store cannot be initialised. That is an OPEN failure
+    // and the one thing that justifies discarding the file.
     auto bytes = read_bytes(path);
-    REQUIRE(bytes.size() > 8192);
-    for (std::size_t i = 4096; i < bytes.size(); ++i)
+    REQUIRE(bytes.size() > 4096);
+    for (std::size_t i = 100; i < 4096; ++i)
         bytes[i] = static_cast<char>(0xAB);
     write_bytes(path, bytes);
 
@@ -451,11 +455,54 @@ TEST_CASE("CommandDedupStore: a file that still opens with damaged data pages is
     CHECK(fs::exists(path));
 
     int still_known = 0;
+    int silently_reclaimed = 0;
+    for (int i = 0; i < kRows; ++i) {
+        const auto status = result->claim("cmd-" + std::to_string(i)).status;
+        if (status == ClaimStatus::Duplicate)
+            ++still_known;
+        else if (status == ClaimStatus::Claimed)
+            ++silently_reclaimed;
+    }
+    // History on intact pages survives (a leaf page holds a handful of rows), and an id on the
+    // damaged page fails open with Error: it must NEVER read as a fresh Claimed, which would be a
+    // silent re-execution.
+    CHECK(still_known >= kRows - 10);
+    CHECK(silently_reclaimed == 0);
+}
+
+TEST_CASE("CommandDedupStore: damage confined to the unused meta table does not quarantine",
+          "[command_dedup][lifecycle][corruption]") {
+    // The schema_version seed probes the meta table's own pages, which command_outcomes never
+    // uses. Damage there must not discard a file whose command table is intact (invariants 4, 5).
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    QuarantineCleanup qc{path};
+    constexpr int kRows = 100;
+    {
+        auto opened = CommandDedupStore::open(path);
+        REQUIRE(opened.has_value());
+        for (int i = 0; i < kRows; ++i)
+            REQUIRE(opened->claim("cmd-" + std::to_string(i)).status == ClaimStatus::Claimed);
+    }
+    // Page layout is fixed by the schema's creation order: 1 = sqlite_schema, 2 = command_outcomes,
+    // 3 = its autoindex, 4 = meta, 5 = meta's autoindex.
+    auto bytes = read_bytes(path);
+    constexpr std::size_t kPage = 4096;
+    REQUIRE(bytes.size() >= 5 * kPage);
+    for (std::size_t i = 3 * kPage; i < 5 * kPage; ++i)
+        bytes[i] = static_cast<char>(0xAB);
+    write_bytes(path, bytes);
+
+    auto result = CommandDedupStore::open(path);
+    REQUIRE(result.has_value());
+    CHECK_FALSE(result->quarantined_this_open().has_value());
+    CHECK(quarantine_siblings(path).empty());
+    int still_known = 0;
     for (int i = 0; i < kRows; ++i) {
         if (result->claim("cmd-" + std::to_string(i)).status == ClaimStatus::Duplicate)
             ++still_known;
     }
-    CHECK(still_known > 0); // history on intact pages survives
+    CHECK(still_known == kRows); // every id survived: nothing was discarded
 }
 
 TEST_CASE("CommandDedupStore: only the newest 3 quarantined stores are kept",
@@ -515,7 +562,7 @@ TEST_CASE("CommandDedupStore: pruning never removes the quarantine it just made"
     CHECK(fs::exists(future[2]));
 }
 
-TEST_CASE("CommandDedupStore: a stale -wal beside a corrupt file is never adopted by the fresh store",
+TEST_CASE("CommandDedupStore: a garbage -wal beside a corrupt file does not poison the fresh store",
           "[command_dedup][lifecycle][corruption]") {
     const auto path = fresh_db_path();
     yuzu::test::TempDbFile guard{path};
@@ -528,26 +575,213 @@ TEST_CASE("CommandDedupStore: a stale -wal beside a corrupt file is never adopte
         auto result = CommandDedupStore::open(path);
         REQUIRE(result.has_value());
         REQUIRE(result->quarantined_this_open().has_value());
-
-        // SQLite may itself discard a garbage WAL when the failed attempt's connection closes, in
-        // which case there is nothing to move. Either way the stale bytes must not be live: a
-        // surviving `-wal` beside the fresh DB must not be the stale one, and if the quarantine
-        // kept a copy it must be intact.
+        // SQLite may itself discard a garbage WAL when the failed attempt closes; either way the
+        // stale bytes must not be live beside the fresh store. (The sidecar-move branches are
+        // driven directly in the dedup_quarantine tests below, where they are not at SQLite's mercy.)
         if (fs::exists(wal))
             CHECK(read_bytes(wal) != "stale wal bytes");
-        const fs::path qwal =
-            (path.parent_path() / *result->quarantined_this_open()).string() + "-wal";
-        if (fs::exists(qwal))
-            CHECK(read_bytes(qwal) == "stale wal bytes");
-
         CHECK(result->claim("cmd-fresh").status == ClaimStatus::Claimed);
     }
-
-    // The fresh store is self-consistent across a restart: no second quarantine, claim kept.
     auto reopened = CommandDedupStore::open(path);
     REQUIRE(reopened.has_value());
     CHECK_FALSE(reopened->quarantined_this_open().has_value());
     CHECK(reopened->claim("cmd-fresh").status == ClaimStatus::Duplicate);
+}
+
+// ── The filesystem half, driven directly (command_dedup_quarantine.hpp) ──────────────────────
+
+namespace dq = yuzu::agent::dedup_quarantine;
+
+TEST_CASE("dedup_quarantine: non-empty sidecars travel with the main file, empty ones are removed",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    write_bytes(fs::path(db.string() + "-wal"), "wal bytes");
+    write_bytes(fs::path(db.string() + "-journal"), "journal bytes");
+    write_bytes(fs::path(db.string() + "-shm"), ""); // empty: holds no evidence
+
+    const auto dest = dq::quarantine_corrupt_db(db, 1234);
+    REQUIRE(dest.has_value());
+    CHECK(dest->filename().string() == "command_dedup.db.corrupt-1234");
+    CHECK(read_bytes(*dest) == "main");
+    CHECK(read_bytes(fs::path(dest->string() + "-wal")) == "wal bytes");
+    CHECK(read_bytes(fs::path(dest->string() + "-journal")) == "journal bytes");
+    CHECK_FALSE(fs::exists(fs::path(dest->string() + "-shm"))); // removed, not carried
+    CHECK_FALSE(fs::exists(db));
+    CHECK_FALSE(fs::exists(fs::path(db.string() + "-wal")));
+    CHECK_FALSE(fs::exists(fs::path(db.string() + "-shm")));
+    CHECK_FALSE(fs::exists(fs::path(db.string() + "-journal")));
+}
+
+TEST_CASE("dedup_quarantine: a taken name gets a -n suffix and an earlier quarantine is untouched",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    fs::path taken = db;
+    taken += ".corrupt-1234";
+    write_bytes(taken, "earlier");
+    write_bytes(db, "second");
+
+    const auto dest = dq::quarantine_corrupt_db(db, 1234);
+    REQUIRE(dest.has_value());
+    CHECK(dest->filename().string() == "command_dedup.db.corrupt-1234-1");
+    CHECK(read_bytes(taken) == "earlier");
+    CHECK(read_bytes(*dest) == "second");
+}
+
+TEST_CASE("dedup_quarantine: a clock before 1970 still yields a name the pruner can see",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const auto dest = dq::quarantine_corrupt_db(db, -5);
+    REQUIRE(dest.has_value());
+    CHECK(dest->filename().string() == "command_dedup.db.corrupt-0");
+    CHECK(dq::parse_quarantine_name("command_dedup.db.corrupt-", dest->filename().string())
+              .has_value());
+}
+
+TEST_CASE("dedup_quarantine: parse_quarantine_name accepts only the documented grammar",
+          "[command_dedup][corruption][quarantine_fs]") {
+    constexpr std::string_view stem = "x.db.corrupt-";
+    const auto parse = [&](std::string_view tail) {
+        return dq::parse_quarantine_name(stem, std::string{stem} + std::string{tail});
+    };
+    using Key = std::pair<long long, long long>;
+    CHECK(parse("5") == std::optional<Key>{Key{5, 0}});
+    CHECK(parse("5-3") == std::optional<Key>{Key{5, 3}});
+    CHECK(parse("5-wal") == std::optional<Key>{Key{5, 0}});
+    CHECK(parse("5-3-journal") == std::optional<Key>{Key{5, 3}});
+    CHECK(parse("007") == std::optional<Key>{Key{7, 0}}); // folds into the canonical key
+    for (const char* bad : {"", "-5", "+5", "5-", "-0", "5--0", "5-+3", "5-3-4", "5.5", "5-wal-wal",
+                            "abc", "5 ", " 5", "99999999999999999999", "5-99999999999999999999"}) {
+        INFO("tail: '" << bad << "'");
+        CHECK_FALSE(parse(bad).has_value());
+    }
+    CHECK_FALSE(dq::parse_quarantine_name(stem, "y.db.corrupt-5").has_value()); // other database
+}
+
+TEST_CASE("dedup_quarantine: prune keeps the newest groups and touches only well-formed names",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    const auto named = [&](const std::string& tail) {
+        fs::path f = db;
+        f += ".corrupt-" + tail;
+        return f;
+    };
+    for (const char* e : {"10", "9", "8", "7", "6"})
+        write_bytes(named(e), e);
+    write_bytes(named("6-wal"), "wal");
+    // Shapes that merely RESEMBLE a quarantine name must be left alone.
+    for (const char* odd : {"99999999999999999999", "-0", "5--0", "abc", "6-wal-wal"})
+        write_bytes(named(odd), "bystander");
+    write_bytes(dir.path / "echo.db.corrupt-1", "someone else's");
+
+    const auto just_created = named("10");
+    dq::prune_old_quarantines(db, just_created);
+
+    // Groups 6..10 = 5; the 2 oldest (6, with its -wal, and 7) go.
+    for (const char* gone : {"6", "6-wal", "7"})
+        CHECK_FALSE(fs::exists(named(gone)));
+    for (const char* kept : {"8", "9", "10"})
+        CHECK(fs::exists(named(kept)));
+    for (const char* odd : {"99999999999999999999", "-0", "5--0", "abc", "6-wal-wal"})
+        CHECK(fs::exists(named(odd)));
+    CHECK(fs::exists(dir.path / "echo.db.corrupt-1"));
+}
+
+#ifndef _WIN32
+TEST_CASE("dedup_quarantine: a symlink named like a quarantine loses the link, never the target",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    const auto victim = dir.path / "victim.txt";
+    write_bytes(victim, "do not delete");
+    fs::path link = db;
+    link += ".corrupt-1";
+    std::error_code ec;
+    fs::create_symlink(victim, link, ec);
+    REQUIRE_FALSE(ec);
+    for (const char* e : {"2", "3", "4"}) {
+        fs::path f = db;
+        f += std::string(".corrupt-") + e;
+        write_bytes(f, e);
+    }
+    fs::path newest = db;
+    newest += ".corrupt-4";
+
+    dq::prune_old_quarantines(db, newest); // 4 groups -> the oldest (the symlink) goes
+
+    CHECK_FALSE(fs::is_symlink(link));
+    CHECK(read_bytes(victim) == "do not delete");
+}
+#endif
+
+TEST_CASE("dedup_quarantine: prune never throws on a missing directory",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "does_not_exist" / "command_dedup.db";
+    CHECK_NOTHROW(dq::prune_old_quarantines(db, db.string() + ".corrupt-1"));
+}
+
+TEST_CASE("CommandDedupStore: move assignment carries the quarantine record and clears the source",
+          "[command_dedup][lifecycle][corruption]") {
+    const auto bad = fresh_db_path();
+    yuzu::test::TempDbFile bad_guard{bad};
+    QuarantineCleanup qc{bad};
+    write_bytes(bad, "garbage main file");
+    auto recovered = CommandDedupStore::open(bad);
+    REQUIRE(recovered.has_value());
+    REQUIRE(recovered->quarantined_this_open().has_value());
+
+    const auto good = fresh_db_path();
+    yuzu::test::TempDbFile good_guard{good};
+    auto healthy = CommandDedupStore::open(good);
+    REQUIRE(healthy.has_value());
+
+    *healthy = std::move(*recovered);
+    CHECK(healthy->quarantined_this_open().has_value());
+    CHECK_FALSE(recovered->quarantined_this_open().has_value());
+    CHECK(healthy->claim("cmd-after-move").status == ClaimStatus::Claimed);
+}
+
+TEST_CASE("CommandDedupStore: a locked rollback-journal file is BUSY, not corruption",
+          "[command_dedup][lifecycle][corruption]") {
+    // `PRAGMA journal_mode=WAL` needs an exclusive lock on a rollback-journal file; another
+    // connection holding one makes it BUSY. That is transient: the file must be left exactly as
+    // found, with its history, and opened normally once the lock is released.
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    QuarantineCleanup qc{path};
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    REQUIRE_FALSE(ec);
+
+    sqlite3* holder = nullptr;
+    REQUIRE(sqlite3_open(path.string().c_str(), &holder) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(holder,
+                         "PRAGMA journal_mode=DELETE;"
+                         "CREATE TABLE command_outcomes (command_id TEXT PRIMARY KEY, state "
+                         "INTEGER NOT NULL, response BLOB, claimed_at INTEGER NOT NULL);"
+                         "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+                         "INSERT INTO command_outcomes VALUES('cmd-keep', 1, x'00', 0);"
+                         "BEGIN EXCLUSIVE;",
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+    {
+        auto blocked = CommandDedupStore::open(path);
+        CHECK_FALSE(blocked.has_value());
+        CHECK(quarantine_siblings(path).empty());
+        CHECK(fs::exists(path));
+    }
+    REQUIRE(sqlite3_exec(holder, "COMMIT;", nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(holder);
+
+    auto opened = CommandDedupStore::open(path);
+    REQUIRE(opened.has_value());
+    CHECK_FALSE(opened->quarantined_this_open().has_value());
+    CHECK(opened->claim("cmd-keep").status == ClaimStatus::Duplicate); // history intact
 }
 
 TEST_CASE("CommandDedupStore: a second corruption never overwrites an earlier quarantine",

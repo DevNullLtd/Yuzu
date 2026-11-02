@@ -172,11 +172,19 @@ def problems(src):
         out.append("agent.cpp compares cmd.plugin() against an inline \"__guard__\" literal; use "
                    "kDedupBypassPlugin so the claim bypass and the dispatch cannot drift (#3668)")
 
-    # 9. (#3665) a recovered-from-corruption open is metered
-    if not re.search(r"if \( ?const auto& ?q = command_dedup_->quarantined_this_open\( ?\) ?\) \{"
-                     r".{0,500}?metrics_\.counter\( ?\"yuzu_agent_dedup_quarantined_total\" ?\)\.increment\( ?\);", t):
+    # 9. (#3665) a recovered-from-corruption open is metered INSIDE the guard. block_after is
+    # brace-matched and string-aware, so an increment hoisted after the closing brace (or an
+    # unconditional one, which would make every boot report "history lost") is not satisfied by a
+    # lookahead window.
+    q_blk = block_after(t, r"if \( ?const auto& ?q = command_dedup_->quarantined_this_open\( ?\) ?\) \{")
+    if q_blk is None or not re.search(
+            r"metrics_\.counter\( ?\"yuzu_agent_dedup_quarantined_total\" ?\)\.increment\( ?\);", q_blk):
         out.append("the open-time `quarantined_this_open()` branch no longer increments "
-                   "yuzu_agent_dedup_quarantined_total; a lost dedup history would go unmetered (#3665)")
+                   "yuzu_agent_dedup_quarantined_total INSIDE its guard; a lost dedup history would go "
+                   "unmetered, or every boot would report one (#3665)")
+    if len(re.findall(r"yuzu_agent_dedup_quarantined_total\" ?\)\.increment", t)) != 1:
+        out.append("yuzu_agent_dedup_quarantined_total must be incremented exactly once in agent.cpp, "
+                   "inside the quarantined_this_open() guard (#3665)")
     if not re.search(r"tags\[\"yuzu\.dedup_quarantined\"\] = std::to_string\( ?static_cast<int64_t>\( ?"
                      r"metrics_\.counter\( ?\"yuzu_agent_dedup_quarantined_total\" ?\)\.value\( ?\)", t):
         out.append("the heartbeat no longer reports yuzu.dedup_quarantined from yuzu_agent_dedup_quarantined_total; "
@@ -222,6 +230,10 @@ MUTATIONS = [
     # 9. the recovery counter unguarded from the store's answer
     (r"if \(const auto& q = command_dedup_->quarantined_this_open\(\)\)", "if (false)", 0, 0,
      "quarantined_this_open"),
+    # 9a. the increment hoisted out of its guard (unconditional: every boot would report a loss)
+    (r'(metrics_\.counter\("yuzu_agent_dedup_quarantined_total"\)\.increment\(\);)(\s*\}\s*\} else \{)',
+     r'\g<2> metrics_.counter("yuzu_agent_dedup_quarantined_total").increment();', 0, 0,
+     "INSIDE its guard"),
     # 9b. the heartbeat tag dropped
     (r'tags\["yuzu\.dedup_quarantined"\]', 'tags["yuzu.dedup_quarantined_x"]', 0, 0,
      "yuzu.dedup_quarantined"),

@@ -38,15 +38,18 @@ regressible — nothing fails loudly when one is broken.
    quarantined and recreated, once, rather than leaving the agent degraded on every boot.
    `CommandDedupStore::open` moves the main file to `command_dedup.db.corrupt-<unix-epoch-seconds>[-n]`
    (never overwriting an earlier one; if every `-n` is taken it fails instead), carries any non-empty
-   `-wal`/`-shm`/`-journal` with it as `<that name>-wal` etc (empty or unmovable sidecars are removed), and
-   opens a fresh store. What counts is deliberately narrow:
+   `-wal`/`-shm`/`-journal` with it as `<that name>-wal` etc (empty or unmovable sidecars are removed, best
+   effort), and opens a fresh store. The filesystem half lives in `agents/core/src/command_dedup_quarantine.hpp`
+   (header-only, unit-tested directly). What counts is deliberately narrow:
    - `SQLITE_CORRUPT` / `SQLITE_NOTADB` from any open step (open, the `journal_mode`/`synchronous` pragmas,
-     the schema step). BUSY, IOERR, FULL, CANTOPEN and PERM are NOT corruption and never quarantine (that
+     creating the two tables). Damage confined to the unused `meta` table is tolerated: the
+     `schema_version` seed that touches it only logs a warning. BUSY, IOERR, FULL, CANTOPEN and PERM are NOT corruption and never quarantine (that
      would discard good history). Do not copy echo's `integrity_ok`, which treats any prepare failure as
      corrupt.
    - **There is no whole-file integrity scan, by owner ruling.** A file that opens but has a few damaged pages
-     keeps serving the ids on intact pages (measured: about 99.6% with one page damaged), and only the claims
-     that touch a bad page fail open, counted in `yuzu_agent_dedup_claim_errors_total`. Quarantining it would
+     keeps serving the ids on intact pages (in one experiment with a single damaged leaf page nearly every id
+     still resolved; damage to an interior or root page costs many more), and only the claims that touch a bad
+     page fail open, counted in `yuzu_agent_dedup_claim_errors_total`. Quarantining it would
      discard ALL history, including IN-FLIGHT claims, which invariants 4 and 5 forbid. Do not add
      `quick_check`/`integrity_check` to `open()` without re-opening that ruling.
 
@@ -57,7 +60,9 @@ regressible — nothing fails loudly when one is broken.
    - **Only the newest 3 quarantined stores are kept** (owner ruling). Each holds up to a ring's worth of
      serialized responses, which can include command output, so they are not kept forever. The prune is
      count-based, not a clock cutoff, orders by the number in the name, and never removes the file the same
-     open just created (a backward clock step can mis-order names). A failed remove is logged and left.
+     open just created (a backward clock step can mis-order names). It runs on the NEXT recovery, never throws,
+     and a failed remove is logged and left. It only ever touches names of the exact form
+     `command_dedup.db.corrupt-<digits>[-<digits>][-wal|-shm|-journal]`.
    - It is observable: an `error` log naming the reason and the quarantine path, a `warn` from the agent, the
      agent-local counter `yuzu_agent_dedup_quarantined_total`, and the `yuzu.dedup_quarantined` heartbeat tag
      (the counter value, nonzero for the lifetime of THAT agent process; it resets on restart because the
