@@ -68,7 +68,10 @@ constexpr int kStateTerminal = 1;
 
 } // namespace
 
-CommandDedupStore::CommandDedupStore(sqlite3* db) : db_{db} {}
+CommandDedupStore::CommandDedupStore(sqlite3* db) : db_{db} {
+    // Sole owner here (the store is not yet shared), so no lock is needed.
+    refresh_row_count_locked();
+}
 
 CommandDedupStore::~CommandDedupStore() {
     if (db_) {
@@ -77,8 +80,10 @@ CommandDedupStore::~CommandDedupStore() {
     }
 }
 
-CommandDedupStore::CommandDedupStore(CommandDedupStore&& other) noexcept : db_{other.db_} {
+CommandDedupStore::CommandDedupStore(CommandDedupStore&& other) noexcept
+    : db_{other.db_}, cached_rows_{other.cached_rows_.load(std::memory_order_relaxed)} {
     other.db_ = nullptr;
+    other.cached_rows_.store(kRowCountUnknown, std::memory_order_relaxed);
 }
 
 CommandDedupStore& CommandDedupStore::operator=(CommandDedupStore&& other) noexcept {
@@ -86,7 +91,10 @@ CommandDedupStore& CommandDedupStore::operator=(CommandDedupStore&& other) noexc
         if (db_)
             sqlite3_close(db_);
         db_ = other.db_;
+        cached_rows_.store(other.cached_rows_.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
         other.db_ = nullptr;
+        other.cached_rows_.store(kRowCountUnknown, std::memory_order_relaxed);
     }
     return *this;
 }
@@ -222,7 +230,11 @@ ClaimResult CommandDedupStore::claim(std::string_view command_id) noexcept {
         }
         // NB: prune is NOT triggered here — it runs from record_terminal() (a
         // worker thread), off the latency-critical reader, since the ring evicts
-        // terminal rows.
+        // terminal rows. The cached row count (heartbeat capacity signal, #3663)
+        // is bumped with one relaxed atomic add -- no SQL, no extra lock -- and
+        // only when a count is known (a -1 "unknown" must stay unknown).
+        if (auto rows = cached_rows_.load(std::memory_order_relaxed); rows >= 0)
+            cached_rows_.store(rows + 1, std::memory_order_relaxed);
         return ClaimResult{.status = ClaimStatus::Claimed};
     }
     if (rc != SQLITE_DONE) {
@@ -397,6 +409,34 @@ void CommandDedupStore::prune_locked() noexcept {
     rc = sqlite3_step(stmt.get());
     if (rc != SQLITE_DONE)
         spdlog::error("CommandDedupStore::prune step failed: {}", sqlite3_errmsg(db_));
+    // Re-anchor the heartbeat's cached count on the real table after the delete (and
+    // even after a failed one -- the count is read, not derived). This is the only
+    // place a COUNT(*) runs after open, on the worker thread that already pays for
+    // the prune, once per kPruneInterval terminal records (#3663).
+    refresh_row_count_locked();
+}
+
+void CommandDedupStore::refresh_row_count_locked() noexcept {
+    std::int64_t rows = kRowCountUnknown;
+    if (db_) {
+        sqlite3_stmt* raw_stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM command_outcomes", -1, &raw_stmt,
+                               nullptr) == SQLITE_OK) {
+            StmtPtr stmt(raw_stmt);
+            if (sqlite3_step(stmt.get()) == SQLITE_ROW)
+                rows = sqlite3_column_int64(stmt.get(), 0);
+        } else if (raw_stmt) {
+            sqlite3_finalize(raw_stmt);
+        }
+    }
+    cached_rows_.store(rows, std::memory_order_relaxed);
+}
+
+std::optional<std::int64_t> CommandDedupStore::cached_row_count() const noexcept {
+    const auto rows = cached_rows_.load(std::memory_order_relaxed);
+    if (rows < 0)
+        return std::nullopt;
+    return rows;
 }
 
 void CommandDedupStore::set_max_dedup_rows_for_test(std::int64_t n) {

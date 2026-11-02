@@ -96,6 +96,7 @@
 #include "gateway.grpc.pb.h"
 #include "grpc_on_behalf_interceptor.hpp"
 #include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet gauge names + HELP (rung 9c PR-3)
+#include "dedup_fleet_tags.hpp" // agent command-dedup store fleet gauge names + HELP (#3663)
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet gauge names + HELP (#2298 item 6d)
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
@@ -2489,6 +2490,17 @@ public:
                           "yuzu_inventory_stale_agents, never subtract (different populations, "
                           "see metrics.md)",
                           "gauge");
+        // #3663: agent command-dedup store fleet telemetry. Table-driven off
+        // detail::kDedupAgentCountMetrics (dedup_fleet_tags.hpp), the single source of truth
+        // for these names and their HELP text, so the registration cannot drift from the
+        // gauges AgentHealthStore::recompute_metrics publishes. Fully qualified: yuzu::detail
+        // also exists in this file.
+        namespace dedup = yuzu::server::detail;
+        for (const auto& m : dedup::kDedupAgentCountMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        metrics_.describe(dedup::kDedupReportingGauge, dedup::kDedupReportingHelp, "gauge");
+        metrics_.describe(dedup::kDedupTagRejectedGauge, dedup::kDedupTagRejectedHelp, "gauge");
+        metrics_.describe(dedup::kDedupRowsMaxGauge, dedup::kDedupRowsMaxHelp, "gauge");
         metrics_.describe("yuzu_fleet_agents_dex_observer_disarmed",
                           "Windows agents (DEX enabled) reporting their DEX signal observer is not "
                           "fully healthy (no channel armed, or a channel subscription dropped at "

@@ -292,6 +292,110 @@ TEST_CASE("CommandDedupStore: release reports Released on a healthy store",
     CHECK(t.store.release("never-claimed") == ReleaseOutcome::Released);
 }
 
+// ── cached_row_count(): the lock-free heartbeat capacity signal (#3663) ─────────
+
+TEST_CASE("CommandDedupStore: cached_row_count is 0 (known) on a fresh store",
+          "[command_dedup][row_count]") {
+    auto t = make_store();
+    const auto cached = t.store.cached_row_count();
+    REQUIRE(cached.has_value()); // 0 is a reading; nullopt would mean "unknown"
+    CHECK(*cached == 0);
+}
+
+TEST_CASE("CommandDedupStore: cached_row_count tracks claims and agrees with count()",
+          "[command_dedup][row_count]") {
+    auto t = make_store();
+    for (int i = 0; i < 5; ++i)
+        REQUIRE(t.store.claim("cmd-" + std::to_string(i)).status == ClaimStatus::Claimed);
+
+    // A Duplicate claim inserts nothing, so it must not move the count.
+    REQUIRE(t.store.claim("cmd-0").status == ClaimStatus::Duplicate);
+    // Flipping in-flight -> terminal is not a new row either.
+    REQUIRE(t.store.record_terminal("cmd-1", "SUCCESS") == RecordOutcome::Recorded);
+
+    const auto cached = t.store.cached_row_count();
+    const auto real = t.store.count();
+    REQUIRE(cached.has_value());
+    REQUIRE(real.has_value());
+    CHECK(*cached == 5);
+    CHECK(*cached == *real);
+}
+
+TEST_CASE("CommandDedupStore: cached_row_count is exact again after a restart",
+          "[command_dedup][row_count][restart]") {
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    {
+        auto opened = CommandDedupStore::open(path);
+        REQUIRE(opened.has_value());
+        REQUIRE(opened->claim("a").status == ClaimStatus::Claimed);
+        REQUIRE(opened->claim("b").status == ClaimStatus::Claimed);
+        REQUIRE(opened->record_terminal("a", "SUCCESS") == RecordOutcome::Recorded);
+    }
+    // The process-local atomic is gone; the reopened store must re-anchor on the file.
+    auto reopened = CommandDedupStore::open(path);
+    REQUIRE(reopened.has_value());
+    const auto cached = reopened->cached_row_count();
+    REQUIRE(cached.has_value());
+    CHECK(*cached == 2);
+}
+
+TEST_CASE("CommandDedupStore: cached_row_count is re-anchored by the prune and stays bounded",
+          "[command_dedup][row_count][retention]") {
+    auto t = make_store();
+    t.store.set_max_dedup_rows_for_test(50);
+
+    const std::int64_t overflow =
+        50 + static_cast<std::int64_t>(CommandDedupStore::kPruneInterval) + 100;
+    for (std::int64_t i = 0; i < overflow; ++i) {
+        auto id = "fill-" + std::to_string(i);
+        REQUIRE(t.store.claim(id).status == ClaimStatus::Claimed);
+        REQUIRE(t.store.record_terminal(id, "SUCCESS") == RecordOutcome::Recorded);
+    }
+
+    const auto cached = t.store.cached_row_count();
+    const auto real = t.store.count();
+    REQUIRE(cached.has_value());
+    REQUIRE(real.has_value());
+    // Without a release() the cache must equal the table exactly, not merely be near it.
+    CHECK(*cached == *real);
+    // ...and the eviction must be visible in it: the ring held the table to the bound
+    // plus at most one prune interval, so the cache cannot have kept counting claims.
+    CHECK(*cached <= 50 + static_cast<std::int64_t>(CommandDedupStore::kPruneInterval));
+    CHECK(*cached < overflow);
+}
+
+TEST_CASE("CommandDedupStore: cached_row_count may over-read after a release, never under-read",
+          "[command_dedup][row_count][release]") {
+    auto t = make_store();
+    REQUIRE(t.store.claim("cmd-1").status == ClaimStatus::Claimed);
+    REQUIRE(t.store.release("cmd-1") == ReleaseOutcome::Released);
+
+    const auto cached = t.store.cached_row_count();
+    const auto real = t.store.count();
+    REQUIRE(cached.has_value());
+    REQUIRE(real.has_value());
+    CHECK(*real == 0);
+    // The documented, accepted drift: release() does not decrement. It is an over-read of a
+    // capacity gauge, never an under-read that would hide a store approaching its bound.
+    CHECK(*cached >= *real);
+}
+
+TEST_CASE("CommandDedupStore: cached_row_count survives a move of the store",
+          "[command_dedup][row_count][lifecycle]") {
+    auto t = make_store();
+    REQUIRE(t.store.claim("cmd-1").status == ClaimStatus::Claimed);
+    REQUIRE(t.store.claim("cmd-2").status == ClaimStatus::Claimed);
+
+    CommandDedupStore moved{std::move(t.store)};
+    const auto cached = moved.cached_row_count();
+    REQUIRE(cached.has_value());
+    CHECK(*cached == 2);
+    // The moved-from store no longer owns a database: its count is unknown, not stale.
+    // NOLINTNEXTLINE(bugprone-use-after-move) -- deliberately probing the moved-from state
+    CHECK_FALSE(t.store.cached_row_count().has_value());
+}
+
 TEST_CASE("CommandDedupStore: open fails on an unusable path (a directory)",
           "[command_dedup][lifecycle]") {
     yuzu::test::TempDir dir{"yuzu_test_cmddedup_dir_"};

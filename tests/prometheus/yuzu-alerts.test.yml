@@ -6747,3 +6747,93 @@ tests:
       - expr: 'ALERTS{alertname="YuzuLeaderCoordinationStale", alertstate="firing"}'
         eval_time: 8m
         exp_samples: []
+
+  # ── YuzuDedupStoreDegraded (#3663) ───────────────────────────────────────
+  #
+  # yuzu_fleet_agents_dedup_store_degraded counts agents whose durable command-dedup store never
+  # opened (they run commands WITHOUT replay protection). It is an unlabelled server-owned gauge
+  # recomputed every sweep, so these cases feed it directly. `for: 15m`, severity=warning.
+  #
+  # The sibling yuzu_fleet_agents_dedup_* counters deliberately have NO alert and so no case:
+  # they count agents whose per-process counter is > 0 "since its last restart", which latches
+  # until that restart and cannot back a sustained-condition alert.
+
+  # CASE A -- fires once the condition has held for the full 15m, and not before. RED if `for:`
+  # is dropped (fires at 14m), lengthened past 16m (quiet at 16m), or the comparison is inverted.
+  - interval: 1m
+    name: dedup store degraded - sustained for 15m fires, and not before
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 50m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE B -- several degraded agents fire the same single alert (the gauge is a COUNT, so the
+  # threshold is `> 0`, not `== 1`). RED if the rule were written as `== 1`.
+  - interval: 1m
+    name: dedup store degraded - more than one degraded agent still fires
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "3x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE C -- the healthy fleet stays quiet: a flat 0 is the published "nobody degraded" reading.
+  # RED if the rule were `>= 0`, which would page a healthy fleet forever.
+  - interval: 1m
+    name: dedup store degraded - zero degraded agents stays quiet
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded"}'
+        eval_time: 50m
+        exp_samples: []
+
+  # CASE D -- a transient (a restart, or a brief disk-full that clears) never fires: 10 samples of
+  # 1 then 0 is shorter than `for: 15m`. RED if `for:` is removed or shortened below 10m.
+  - interval: 1m
+    name: dedup store degraded - a 10 minute blip stays quiet
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "1x10 0x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE E -- it clears when the agent restarts with a working store. The gauge is a live reading,
+  # so the alert resolves within a sweep of the recovery rather than latching.
+  - interval: 1m
+    name: dedup store degraded - resolves after recovery
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "1x30 0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples: []

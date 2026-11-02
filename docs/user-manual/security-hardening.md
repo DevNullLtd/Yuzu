@@ -475,11 +475,24 @@ The agent deduplicates commands by `command_id` so a captured or redelivered com
 - **In-flight duplicate.** A command still executing (or one that was mid-execution when the agent last stopped) is answered with a non-terminal `RUNNING` frame (output `"duplicate command still in flight"`) and is **never re-executed** — re-running a possibly-destructive command is deliberately avoided. This is *effectively-once*, not exactly-once.
 - **Guardian control exemption.** Commands to the reserved `__guard__` plugin (real-time Guardian control/reconcile signals, not endpoint command executions) are deliberately **exempt** from deduplication — they are idempotent control messages meant to be re-applied, so they always run.
 - **Retention.** The store keeps the most recent commands (a fixed-size, clock-free ring); an outcome older than the retention window is forgotten, after which a redelivery would run again. The server generates a unique `command_id` per invocation, so legitimate commands are never affected.
-- **Degraded (fail-open) mode.** If the store cannot be opened or written (e.g. a full disk), the agent continues executing commands **undeduplicated** rather than refusing them (so a single disk fault does not drop the endpoint out of remote-control reach). This is surfaced, not silent: the `yuzu.dedup_degraded` heartbeat tag reports an agent whose store never **opened**, and the `yuzu.dedup_claim_errors` / `dedup_record_errors` / `dedup_release_errors` counters report **post-open write failures** (a full disk after boot) — together an operator can detect an agent running without replay protection. (Fleet-wide `yuzu_fleet_*` gauges and an alert derived from these tags land with the HA observability workstream.)
+- **Degraded (fail-open) mode.** If the store cannot be opened or written (e.g. a full disk), the agent continues executing commands **undeduplicated** rather than refusing them (so a single disk fault does not drop the endpoint out of remote-control reach). This is surfaced, not silent: the `yuzu.dedup_degraded` heartbeat tag reports an agent whose store never **opened**, and the `yuzu.dedup_claim_errors` / `dedup_record_errors` / `dedup_release_errors` counters report **post-open write failures** (a full disk after boot) — together an operator can detect an agent running without replay protection. The server aggregates these tags into fleet gauges and an alert; see [Fleet monitoring of the dedup store](#fleet-monitoring-of-the-dedup-store).
 
 No configuration is required — replay protection is always active.
 
 > **Changed in this release (automation/SIEM):** older agents rejected a redelivered command with a `REJECTED` response whose reason was `"command replay rejected: duplicate command_id"`. That fixed string **no longer exists** on the terminal path — a duplicate now replays the command's *real* terminal status (or an in-flight `RUNNING`). Any detection rule that keyed on the old rejection string must be updated. See the corresponding entry in `docs/user-manual/upgrading.md`.
+
+### Fleet monitoring of the dedup store
+
+Because the degraded mode is fail-open, an agent can run for a long time without replay protection and nothing on the endpoint tells the operator. The server therefore derives fleet gauges from the agents' heartbeat tags (full reference: [Agent command-dedup store telemetry](metrics.md#agent-command-dedup-store-telemetry-3663)):
+
+- `yuzu_fleet_agents_dedup_store_degraded` — agents whose store never opened. This is the one live reading, and it drives the `YuzuDedupStoreDegraded` alert (`> 0` for 15 minutes, severity warning).
+- `yuzu_fleet_agents_dedup_claim_erroring`, `..._record_erroring`, `..._release_erroring`, `..._record_terminal_missing`, `..._replaying` — agents whose per-process counter is above zero **since their last restart**. They latch until the agent restarts, so they are for investigation, not paging.
+- `yuzu_fleet_dedup_rows_max` — the largest store, in rows. A healthy value tops out near 20,500 (the 20,000-row terminal ring plus one prune interval); a value well above that means in-flight rows from crashed commands are accumulating, because those are never evicted.
+- `yuzu_fleet_agents_dedup_reporting` / `..._tag_rejected` — how many agents are being measured, and how many sent a malformed value. A flat 0 elsewhere only means "healthy" when `reporting` is non-zero.
+
+**When `YuzuDedupStoreDegraded` fires:** find the affected devices (heartbeat tag `yuzu.dedup_degraded` = 1 in the device view), read the agent log for `Failed to open command dedup store`, fix the cause (a full or read-only data directory, or a permissions fault on `command_dedup.db`), and restart the agent. The count drops within one sweep (~15 s). Until then, avoid dispatching non-idempotent commands to those endpoints: a redelivered command can execute twice.
+
+**Known gap:** an agent that recovered from a *corrupt* store (#3665) loses its replay history but is not degraded, and no fleet gauge reports it yet.
 
 ## Device Quarantine
 

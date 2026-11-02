@@ -4032,6 +4032,18 @@ test('agent command-dedup wiring lexical gate (#3668)',
   timeout: 30,
 )
 
+# Command-dedup fleet telemetry (#3663): the agent's `yuzu.dedup_*` heartbeat tags and the
+# server's yuzu_fleet_agents_dedup_* table share no header (no upward server -> agent edge), so
+# nothing in the compiler binds them. This pins that every emitted tag has a server row and vice
+# versa, plus the HELP registration, metrics.md, and the YuzuDedupStoreDegraded alert + its
+# promtool case. Carries its own in-memory mutation self-test. No build required.
+test('agent command-dedup fleet telemetry drift gate (#3663)',
+  _python3_test,
+  args: [files('test_dedup_fleet_tags_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # Echo rename upgrade window: static lexical gate pinning that agent.cpp still CALLS the tested
 # tar.db adoption helper and the KV re-key after KvStore::open( and before the first plugin
 # init (no Agent::run() seam exists to test that, #1492). Carries its own in-memory mutation

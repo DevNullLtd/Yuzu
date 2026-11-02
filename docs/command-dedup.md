@@ -32,7 +32,10 @@ regressible — nothing fails loudly when one is broken.
 6. **The store opens `synchronous=FULL`** — host-failure durability, not just process-crash.
 
 7. **Store open/write failure is a DELIBERATE fail-OPEN** (run undeduplicated) that **MUST stay
-   observable** (`yuzu.dedup_degraded` heartbeat plus local counters), never silent.
+   observable** (`yuzu.dedup_degraded` heartbeat plus local counters), never silent. The server
+   turns those heartbeat tags into `yuzu_fleet_agents_dedup_*` gauges (`server/core/src/dedup_fleet_tags.hpp`)
+   and the `YuzuDedupStoreDegraded` alert (#3663); `tests/test_dedup_fleet_tags_lexical.py` fails if an
+   emitted `yuzu.dedup_*` tag has no server row, so a new tag cannot be a write nobody reads.
 
 Invariants 3 and 4, the claim-error leg of 7 (`count_claim_error`), and the `owns_claim` result that
 gates 1's queue-full release are decided by the pure, proto-free `agents/core/src/command_dedup_decision.hpp`
