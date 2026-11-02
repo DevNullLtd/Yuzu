@@ -41,6 +41,9 @@
 #include "content_etag.hpp"
 #include "crypto_library_model.hpp"
 #include "device_token_store.hpp"
+#include "dex_read_model.hpp" // the scope tokens and the basis/coverage the builder can emit
+#include "dex_score_policy_json.hpp" // the serializer the DexScorePolicyDocument schema mirrors
+#include "dex_score_policy_writer.hpp" // dex_score_policy_in_force_json: the data envelope's keys
 #include "license_store.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
@@ -623,6 +626,277 @@ TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query
             CHECK(enabled_desc.find("no dispatch effect") != std::string::npos);
         }
     }
+}
+
+TEST_CASE("openapi_spec_json(): /dex/apps documents the platform scope parameter and coverage",
+          "[openapi][dex]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/dex/apps"));
+    const auto& op = spec["paths"]["/dex/apps"]["get"];
+
+    REQUIRE(op.contains("parameters")); // const operator[] on a missing key asserts
+    const json* platform = nullptr;
+    for (const auto& p : op["parameters"])
+        if (p.value("name", "") == "platform")
+            platform = &p;
+    REQUIRE(platform != nullptr);
+    CHECK((*platform)["in"] == "query");
+    CHECK((*platform)["required"] == false);
+    CHECK((*platform)["schema"]["enum"] == json::array({"all", "windows", "macos", "linux"}));
+    CHECK((*platform)["schema"]["default"] == "all");
+
+    CHECK(op["responses"]["200"].value("description", "").find("crash_source_coverage") !=
+          std::string::npos);
+    CHECK(op["responses"]["400"].value("description", "").find("invalid platform") !=
+          std::string::npos);
+}
+
+// A lookup by JSON pointer that yields null for a missing node: a regression that deletes part
+// of a schema fails an assertion instead of aborting the whole test binary.
+namespace {
+json schema_at(const json& node, const std::string& ptr) {
+    return node.value(json::json_pointer(ptr), json());
+}
+
+bool array_contains(const json& array, const json& v) {
+    return std::find(array.begin(), array.end(), v) != array.end();
+}
+
+// Sorted key names of an object (empty for a non-object), so key sets compare regardless of order.
+std::set<std::string> object_keys(const json& obj) {
+    std::set<std::string> keys;
+    if (obj.is_object())
+        for (const auto& [k, v] : obj.items())
+            keys.insert(k);
+    return keys;
+}
+} // namespace
+
+TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and the coverage the "
+          "/dex/apps builder can emit",
+          "[openapi][dex]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["components"]["schemas"].contains("DexAppsList"));
+    const auto& list = spec["components"]["schemas"]["DexAppsList"];
+    const auto at = [&list](const std::string& ptr) { return schema_at(list, ptr); };
+
+    // The published population vocabulary is exactly the four values, and every `<scope>_online`
+    // the builder can publish is inside it.
+    const json basis_enum = at("/properties/population_basis/enum");
+    CHECK(basis_enum ==
+          json::array({"all_online", "windows_online", "macos_online", "linux_online"}));
+    for (const char* scope : {yuzu::server::kDexAppsScopeAll, yuzu::server::kDexAppsScopeWindows,
+                              yuzu::server::kDexAppsScopeMacos, yuzu::server::kDexAppsScopeLinux})
+        CHECK(array_contains(basis_enum, json(yuzu::server::dex_apps_population_basis(scope))));
+
+    // crash_source_coverage is always emitted, so it is a declared and required property, and its
+    // schema is a closed object: the three platform keys, each exactly complete|partial.
+    CHECK(array_contains(at("/required"), json("crash_source_coverage")));
+    const std::string cov = "/properties/crash_source_coverage";
+    const json coverage = at(cov);
+    REQUIRE(coverage.is_object());
+    CHECK(coverage.value("type", "") == "object");
+    CHECK(coverage.value("additionalProperties", true) == false); // absent must fail, not assert
+    CHECK(at(cov + "/properties").size() == 3);
+    for (const char* os : {"windows", "macos", "linux"})
+        CHECK(at(cov + "/properties/" + os + "/enum") == json::array({"complete", "partial"}));
+    // ... and it covers what the builder can publish under `all`.
+    for (const auto& [os, value] :
+         yuzu::server::dex_apps_crash_source_coverage(yuzu::server::kDexAppsScopeAll))
+        CHECK(array_contains(at(cov + "/properties/" + os + "/enum"), json(value)));
+
+    // The figures are no longer called Windows-only: each description the scope changed names the
+    // platform scope and none says Windows (the default scope is every platform).
+    const auto scoped = [&at](const std::string& node) {
+        const json d = at(node + "/description");
+        if (!d.is_string())
+            return false;
+        const auto text = d.get<std::string>();
+        return text.find("scope") != std::string::npos && text.find("Windows") == std::string::npos;
+    };
+    CHECK(scoped(""));
+    CHECK(scoped("/properties/population"));
+    CHECK(scoped("/properties/apps_total"));
+    CHECK(scoped("/properties/population_basis"));
+    const std::string app = "/properties/apps/items/properties/";
+    for (const char* key : {"crashes", "hangs", "distinct_devices"}) {
+        CHECK(scoped(app + key));
+        CHECK(scoped(app + "versions/items/properties/" + key));
+    }
+}
+
+TEST_CASE("openapi_spec_json(): DexScorePolicyDocument types the stored shape and its model "
+          "bounds against the serializer",
+          "[openapi][dex][score_policy]") {
+    using namespace yuzu::server;
+    json spec = json::parse(openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const json& schemas = spec["components"]["schemas"];
+    REQUIRE(schemas.contains("DexScorePolicyDocument"));
+    REQUIRE(schemas.contains("DexScorePolicyData"));
+    REQUIRE(spec["paths"].contains("/dex/score-policy"));
+    const std::string ref = "#/components/schemas/DexScorePolicyDocument";
+    const auto doc = [&schemas](const std::string& ptr) {
+        return schema_at(schemas["DexScorePolicyDocument"], ptr);
+    };
+
+    // Both the answer and the request body point at the one typed component.
+    CHECK(schema_at(schemas["DexScorePolicyData"],
+                    "/properties/data/properties/document/allOf/0/$ref") == ref);
+    CHECK(schema_at(spec, "/paths/~1dex~1score-policy/put/requestBody/content/application~1json/"
+                          "schema/allOf/0/$ref") == ref);
+    CHECK(doc("/properties/version/type") == "integer");
+    CHECK(doc("/properties/version/default") == kDexScorePolicyBaseVersion);
+    CHECK(doc("/properties/version/enum") ==
+          json::array({kDexScorePolicyBaseVersion, kDexScorePolicyVersion}));
+
+    // The model key sets are exactly what the serializer emits.
+    DexScorePolicy p;
+    p.model.per_device_event_cap = 6;
+    DexScoreOverride o;
+    o.image = "a.exe";
+    o.per_device_event_cap = 2;
+    o.regression_start_ratio = 1.5;
+    o.regression_full_ratio = 4.0;
+    // Every partial override key set, so the override tiers and weights are compared whole.
+    o.excellent = 95.0;
+    o.good = 80.0;
+    o.fair = 60.0;
+    o.names = {"A", "B", "C", "D"};
+    o.breadth = 1.0;
+    o.crashes = 2.0;
+    o.hangs = 3.0;
+    o.regression = 4.0;
+    p.overrides.push_back(o);
+    const json emitted = dex_score_policy_to_json(p);
+    REQUIRE(emitted.contains("model"));
+    REQUIRE(emitted.contains("tiers"));
+    REQUIRE(emitted.contains("weights"));
+    REQUIRE(emitted.contains("overrides"));
+    REQUIRE(emitted["overrides"].size() == 1);
+    const json& eov = emitted["overrides"][0];
+    REQUIRE(eov.contains("model"));
+    REQUIRE(eov.contains("tiers"));
+    REQUIRE(eov.contains("weights"));
+    CHECK(object_keys(doc("/properties/model/properties")) == object_keys(emitted["model"]));
+    const auto override_keys =
+        object_keys(doc("/properties/overrides/items/properties/model/properties"));
+    CHECK(override_keys == object_keys(eov["model"]));
+    CHECK_FALSE(override_keys.contains("interval_confidence"));
+    CHECK(doc("/properties/model/additionalProperties") == false);
+    CHECK(doc("/properties/overrides/items/properties/model/additionalProperties") == false);
+    CHECK(doc("/properties/overrides/maxItems") == kDexPolicyMaxOverrides);
+
+    // An override is read-required on `image` alone (always emitted); no other object has a
+    // required key, and every object the parser closes (`unknown_key`) is closed here too.
+    const std::string ov = "/properties/overrides/items";
+    CHECK(doc(ov + "/required") == json::array({"image"}));
+    const std::vector<std::string> closed = {
+        "",
+        "/properties/tiers",
+        "/properties/tiers/properties/edges",
+        "/properties/tiers/properties/names",
+        "/properties/weights",
+        "/properties/model",
+        ov,
+        ov + "/properties/tiers",
+        ov + "/properties/tiers/properties/edges",
+        ov + "/properties/tiers/properties/names",
+        ov + "/properties/weights",
+        ov + "/properties/model"};
+    for (const auto& base : closed) {
+        INFO("object: " << base);
+        CHECK(doc(base + "/additionalProperties") == false);
+        if (base != ov)
+            CHECK(doc(base + "/required").is_null());
+    }
+
+    // The key sets are the serializer's, for the global document and for a fully-set override.
+    CHECK(object_keys(doc("/properties")) == object_keys(emitted));
+    CHECK(object_keys(doc(ov + "/properties")) == object_keys(eov));
+    for (const std::string& base : {std::string(""), ov}) {
+        const json& src = base.empty() ? emitted : eov;
+        INFO("object: " << base);
+        CHECK(object_keys(doc(base + "/properties/tiers/properties")) ==
+              object_keys(src["tiers"]));
+        CHECK(object_keys(doc(base + "/properties/tiers/properties/edges/properties")) ==
+              object_keys(src["tiers"]["edges"]));
+        CHECK(object_keys(doc(base + "/properties/tiers/properties/names/properties")) ==
+              object_keys(src["tiers"]["names"]));
+        CHECK(object_keys(doc(base + "/properties/weights/properties")) ==
+              object_keys(src["weights"]));
+        // The name length and the non-negative weight bound are the validator's.
+        for (const auto& [k, v] : src["tiers"]["names"].items())
+            CHECK(doc(base + "/properties/tiers/properties/names/properties/" + k +
+                      "/maxLength") == kDexPolicyMaxNameBytes);
+        for (const auto& [k, v] : src["weights"].items())
+            CHECK(doc(base + "/properties/weights/properties/" + k + "/minimum") == 0);
+    }
+    CHECK(doc(ov + "/properties/image/maxLength") == kDexPolicyMaxKeyBytes);
+
+    // Type, bounds and defaults are the serializer's and the core constants'. The type comes from
+    // what the serializer emits (a whole-number parameter is an integer, a ratio a number).
+    const auto bound = [&doc](const std::string& base, const std::string& key, const json& sample,
+                              const json& lo, const json& hi, const json* def) {
+        INFO("parameter: " << base << key);
+        const std::string at = base + key;
+        CHECK(doc(at + "/type") == (sample.is_number_integer() ? "integer" : "number"));
+        CHECK(doc(at + "/minimum") == lo);
+        CHECK(doc(at + "/maximum") == hi);
+        CHECK(doc(at + "/default") == (def ? *def : json()));
+        // nlohmann compares 5 equal to 5.0, so pin the kind of the default separately.
+        if (def) {
+            CHECK(doc(at + "/default").is_number_integer() == sample.is_number_integer());
+            CHECK(doc(at + "/default").is_number_float() == sample.is_number_float());
+        }
+    };
+    const std::string gm = "/properties/model/properties/";
+    const std::string om = "/properties/overrides/items/properties/model/properties/";
+    const json& em = emitted["model"];
+    const json& eo = eov["model"];
+    const json cap_def = kStabilityModel.per_device_event_cap;
+    const json start_def = kStabilityModel.regression_start_ratio;
+    const json full_def = kStabilityModel.regression_full_ratio;
+    const json conf_def = kDexStatsConfidence;
+    bound(gm, "per_device_event_cap", em["per_device_event_cap"], 1,
+          kStabilityMaxPerDeviceEventCap, &cap_def);
+    bound(gm, "regression_start_ratio", em["regression_start_ratio"], 1.0,
+          kStabilityMaxRegressionRatio, &start_def);
+    bound(gm, "regression_full_ratio", em["regression_full_ratio"], 1.0,
+          kStabilityMaxRegressionRatio, &full_def);
+    bound(gm, "interval_confidence", em["interval_confidence"], kDexStatsConfidenceMin,
+          kDexStatsConfidenceMax, &conf_def);
+    bound(om, "per_device_event_cap", eo["per_device_event_cap"], 1,
+          kStabilityMaxPerDeviceEventCap, nullptr);
+    bound(om, "regression_start_ratio", eo["regression_start_ratio"], 1.0,
+          kStabilityMaxRegressionRatio, nullptr);
+    bound(om, "regression_full_ratio", eo["regression_full_ratio"], 1.0,
+          kStabilityMaxRegressionRatio, nullptr);
+
+    // The data envelope: its required keys are the ones the serializer always emits, and
+    // `source` is exactly the two values the store can report.
+    const json& data = schemas["DexScorePolicyData"];
+    const json required = schema_at(data, "/properties/data/required");
+    std::set<std::string> required_keys;
+    for (const auto& k : required)
+        required_keys.insert(k.get<std::string>());
+    CHECK(required_keys == object_keys(dex_score_policy_in_force_json(DexPolicyInForce{})));
+    CHECK(schema_at(data, "/properties/data/properties/source/enum") ==
+          json::array({"custom", "default"}));
+
+    const std::string put_desc =
+        spec["paths"]["/dex/score-policy"]["put"].value("description", "");
+    CHECK(put_desc.find("rolling upgrade") != std::string::npos);
+
+    // The GET text and the component agree on when `model` is present.
+    const std::string get_desc =
+        spec["paths"]["/dex/score-policy"]["get"].value("description", "");
+    CHECK(get_desc.find("model only when a parameter is in use") != std::string::npos);
+    const json model_desc = doc("/properties/model/description");
+    REQUIRE(model_desc.is_string());
+    CHECK(model_desc.get<std::string>().find("A parameter is in use when") != std::string::npos);
 }
 
 TEST_CASE("openapi_spec_json(): the execution-statistics reads document their degraded-read 503 "

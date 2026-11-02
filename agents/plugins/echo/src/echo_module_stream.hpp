@@ -29,14 +29,15 @@
  * not a command line. No command line is ever captured.
  */
 
+#include "echo_hour_dedup.hpp"  // HourlySeenSet (apply_module_risk_filter)
 #include "echo_proc_stream.hpp" // EventRing<T>
 
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -46,7 +47,7 @@ namespace yuzu::echo {
 /// the lower-case token from `module_action_token()`.
 enum class ModuleAction : std::uint8_t {
     kLoaded = 0,   ///< image mapped into a process / driver loaded
-    kUnloaded = 1, ///< image unmapped (lower forensic value; captured where free)
+    kUnloaded = 1, ///< never stored: apply_module_risk_filter drops it; kept for the ETW mapping
     kSeed = 2,     ///< baseline: already-loaded at agent start (boot-gap seed)
     kBlocked = 3,  ///< load denied by the OS (e.g. CodeIntegrity 3033/3034)
 };
@@ -168,47 +169,46 @@ inline bool module_is_risky(const ModuleEvent& e) {
            e.signed_state == ModuleSignedState::kRevoked;
 }
 
-/// Minimal §5 edge risk-filter (docs/echo-module-loads.md) — bounds `module_live`
-/// at the write edge so a module-load storm can't flood it. Keeps EVERY risky
-/// load (module_is_risky); for normally-signed loads, dedups within the drain
-/// batch by (action, process, module_name, module_dir, signer, signed_state) —
-/// module_dir is in the key so the same-named DLL loaded from two directories
-/// (the search-order-hijack signal: a `version.dll` in an app dir vs System32)
-/// is NOT collapsed, and `action` is in the key so a signed `unloaded` is not
-/// folded into its `loaded` row (which would erase unload visibility) — and
-/// caps the number of DISTINCT signed loads kept per drain. The 100k row-count
-/// retention on `module_live` is the deterministic backstop behind this. M2
-/// simply DROPS the deduped duplicate (it is not retained and not counted);
-/// the full first-seen-per-window-**then-count** fold into
-/// `module_hourly.load_count` is deferred to M7 (docs §5). Pure +
-/// cross-platform (collector-agnostic), applied plugin-side between drain and
-/// insert — parity with the process stabilization-exclusion / proc-perf top-N.
+/// §5 edge filter (docs/echo-module-loads.md) — bounds `module_live` at the write edge so a
+/// module-load storm can't flood it, without losing the rare high-signal rows.
+///
+///   - `kUnloaded` events are dropped: an unmap is the lowest-value observation and roughly
+///     halves the volume.
+///   - EVERY risky load (module_is_risky: unsigned / invalid / revoked, kernel, blocked) is
+///     kept, one row per event.
+///   - Every other event (a signed load, an unknown-signature load on a platform that cannot
+///     attest, a boot seed) is kept once per hour per (action, loader process, module name,
+///     module directory), through `seen`. module_dir stays in the key so a same-named DLL from
+///     two directories (the search-order-hijack signal) is not collapsed; `action` stays in it
+///     so a boot seed never consumes the slot of a later `loaded` row, which is the row
+///     module_hourly.load_count counts. The hourly load count for ordinary modules is
+///     therefore distinct loader/module/folder combinations, not raw loads.
+///   - `max_signed` caps the ordinary rows kept per drain. The cap is checked BEFORE `seen`, so
+///     only an admitted row is marked and a capped load is admitted by a later drain.
+///
+/// `seen` is mutated; filter against a COPY and keep it only after the rows are committed so
+/// a rolled-back drain is re-filtered identically. Pure and cross-platform, applied
+/// plugin-side between drain and insert. The 100k row-count retention on `module_live` is the
+/// deterministic backstop behind this.
 inline std::vector<ModuleEvent> apply_module_risk_filter(std::vector<ModuleEvent> events,
+                                                         HourlySeenSet& seen,
                                                          std::size_t max_signed = 4096) {
     std::vector<ModuleEvent> out;
     out.reserve(events.size());
-    std::unordered_set<std::string> seen_signed;
     std::size_t signed_kept = 0;
     for (auto& e : events) {
+        if (e.action == ModuleAction::kUnloaded)
+            continue;
         if (module_is_risky(e)) {
             out.push_back(std::move(e));
             continue;
         }
-        std::string key = e.process_name;
-        key += '\x1f';
-        key += e.module_name;
-        key += '\x1f';
-        key += e.module_dir; // keep same-named DLLs from different dirs distinct
-        key += '\x1f';
-        key += e.signer;
-        key += '\x1f';
-        key += module_signed_token(e.signed_state);
-        key += '\x1f';
-        key += module_action_token(e.action); // keep loaded vs unloaded distinct
-        if (!seen_signed.insert(std::move(key)).second)
-            continue; // duplicate normally-signed load already kept this drain
         if (signed_kept >= max_signed)
-            continue; // per-drain cap on distinct signed loads (the hard bound)
+            continue; // per-drain cap (the hard bound); do NOT mark the key
+        auto key = std::format("{}\x1f{}\x1f{}\x1f{}", module_action_token(e.action),
+                               e.process_name, e.module_name, e.module_dir);
+        if (!seen.first_this_hour(e.ts_unix, std::move(key)))
+            continue; // already stored this hour
         ++signed_kept;
         out.push_back(std::move(e));
     }
