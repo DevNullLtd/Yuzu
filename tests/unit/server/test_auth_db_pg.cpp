@@ -3120,7 +3120,19 @@ TEST_CASE("AuthDB factor generation ignores a type shadowed in the caller's temp
             PgResult dropped{PQexec(c, ("DROP ROLE IF EXISTS \"" + role + "\"").c_str())};
         }
     } guard{h.conn.get(), role};
-    run_sql(h.conn.get(), "CREATE ROLE \"" + role + "\" NOSUPERUSER");
+    {
+        // Creating a role needs CREATEROLE or superuser. Skip ONLY on "insufficient privilege"
+        // (SQLSTATE 42501) so any other failure still fails loudly.
+        PgResult created{
+            PQexec(h.conn.get(), ("CREATE ROLE \"" + role + "\" NOSUPERUSER").c_str())};
+        if (!created.ok()) {
+            const char* state = PQresultErrorField(created.get(), PG_DIAG_SQLSTATE);
+            if (state != nullptr && std::string_view{state} == "42501") {
+                SKIP("test role cannot CREATE ROLE: the temp-schema shadow case needs CREATEROLE");
+            }
+            FAIL("CREATE ROLE failed: " << PQerrorMessage(h.conn.get()));
+        }
+    }
     run_sql(h.conn.get(), "GRANT USAGE ON SCHEMA auth TO \"" + role + "\"");
     run_sql(h.conn.get(), "GRANT SELECT, UPDATE ON auth.users TO \"" + role + "\"");
     run_sql(h.conn.get(), "GRANT TEMP ON DATABASE \"" + dbname + "\" TO \"" + role + "\"");
@@ -3128,6 +3140,13 @@ TEST_CASE("AuthDB factor generation ignores a type shadowed in the caller's temp
     PgConn session = connect(db.dsn()); // fresh session: no cached plan of the trigger function
     run_sql(session.get(), "SET ROLE \"" + role + "\"");
     run_sql(session.get(), "CREATE TYPE pg_temp.text AS (a int)");
+    // Prove the shadow is live in this session: with the old pg_catalog-only path the cast below
+    // would hand the trigger a temp type, so this must resolve through the temporary schema.
+    // (No `::text` here: in this session that name now resolves to the temporary type.)
+    REQUIRE(scalar(session.get(),
+                   "SELECT CASE WHEN (SELECT n.nspname LIKE 'pg\\_temp\\_%' FROM pg_type t "
+                   "JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.oid = "
+                   "pg_typeof(ROW(1)::pg_temp.text)) THEN 'yes' ELSE 'no' END") == "yes");
     run_sql(session.get(), "CREATE FUNCTION pg_temp.mk(uuid) RETURNS pg_temp.text LANGUAGE sql "
                            "AS 'SELECT ROW(1)::pg_temp.text'");
     run_sql(session.get(), "CREATE FUNCTION pg_temp.back(pg_temp.text) RETURNS pg_catalog.text "
