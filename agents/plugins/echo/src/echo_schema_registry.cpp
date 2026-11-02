@@ -1088,8 +1088,8 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .os_support = {
                 {"windows", OsSupportStatus::kSupported, "regnotify+etw",
                  "RegNotifyChangeKeyValue subtree watch + baseline diff (what changed: the new "
-                 "value, and the old value's type and size) and a write-only Kernel-Registry ETW "
-                 "session that names the writing "
+                 "value up to 512 bytes, and the old value's type and size) and a write-only "
+                 "Kernel-Registry ETW session that names the writing "
                  "process by correlation; cursor-model (echo_cursor.hpp). Without an elevated "
                  "agent the session cannot open and rows carry attr:off."},
                 {"linux",   OsSupportStatus::kUnsupported, "",

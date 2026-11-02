@@ -86,17 +86,36 @@ Flow:
    (`db_budget_bytes`), in this fixed order: aggregation, retention,
    `run_budget`, the one-off conversion `VACUUM` gate, file hygiene
    (`incremental_vacuum(256)` and a WAL checkpoint). `run_budget` takes only
-   raw capture rows the hourly rollup has already passed (never the newest
-   24 hours, and for `process` only rows the usage fold has read), then hourly
-   rows older than 48 hours, in 1,000-row transactions that also bump the
-   persisted eviction counter, stopping after 2 seconds. A pass that ends on
-   the deadline with rows left to evict arms a catch-up slice that
-   `do_collect_fast` runs after its collect (outside `collect_mu_`, under
-   `try_lock` on `rollup_mu_`, so it never waits on a rollup). The budget is
-   hard for data pages and soft for the WAL; `budget_over_bytes` in `status`
-   reports the difference. A new source with a summary tier is picked up by
-   the budget from the registry with no change; a source with raw capture
-   rows only (no `rollup_sql`) is never evicted.
+   raw capture rows that their first summary tier has already passed (hourly,
+   or daily for `user` and `software`; never the newest 24 hours, and for
+   `process` only rows the usage fold has read), then hourly rows older than
+   48 hours (5 days for `procperf`), in 1,000-row transactions that also bump
+   the persisted eviction counter, stopping after 2 seconds. It pauses while an
+   `echo.sql` read holds the WAL above its allowance and retries on the next
+   pass. A table whose probe or delete fails is skipped for the rest of that
+   pass while the others continue; the pass counts as failed and arms no
+   catch-up. A pass that ends on the deadline with rows left to evict arms a
+   catch-up slice that `do_collect_fast` runs after its collect (outside
+   `collect_mu_`, under `try_lock` on `rollup_mu_`, so it never waits on a
+   rollup). The conversion `VACUUM` writes its deferral marker before it runs
+   and clears it on success, and `incremental_vacuum(256)` repeats while the
+   pass's deadline allows (at least one step). The budget is hard for eligible
+   data pages and soft for the WAL, and rows that are never evicted can hold
+   used pages above the target; `budget_over_bytes` in `status` reports the
+   overage, measured when `status` runs. A new source with a summary tier is
+   picked up by the budget from the registry with no change; a source with raw
+   capture rows only (no `rollup_sql`) is never evicted.
+
+Two in-memory structures keep the raw capture volume down. `HourlySeenSet`
+(`echo_hour_dedup.hpp`) is membership-only, holds at most 20,000 keys, is
+cleared on any change of hour (forward or backward) and on overflow (counted in
+`status`), and is used through copy-filter-commit, so a failed insert re-filters
+identically. Rows it drops are not counted, so `load_count` and `connect_count`
+for de-duplicated rows are distinct combinations per hour. `pid_name_` is the
+plugin's in-memory pid-to-name map under `collect_mu_` (capped at 65,536; a name
+stays usable 120 s after its process exits; exited entries past that grace are
+erased before any wholesale clear) and fills `process_name` on `tcp` and
+`module` rows.
 
 The schema registry (`echo_schema_registry.cpp`) is the single source of
 truth for table shape, retention behavior, rollup SQL, and per-OS
@@ -147,11 +166,11 @@ function, never in `applies_*` collectors.
 
 | Operation | echo.db behavior |
 |-----------|-----------------|
-| **In-place agent upgrade** | echo.db is preserved (lives in the agent data dir, not the install dir). Schema migration runs at first open of the new binary. Live-tier rows captured by the old binary remain queryable; rollups continue. On Windows, the first open also re-secures `echo.db` and its sidecars, and refuses the open when the files are owned by an account other than SYSTEM, Administrators or the agent's (for example after the agent's service account changed; the new account also needs access to the files): see `docs/user-manual/echo.md` "Data storage". |
+| **In-place agent upgrade** | echo.db is preserved (lives in the agent data dir, not the install dir). Schema migration runs at first open of the new binary. Rows captured by the old binary are trimmed to `db_budget_bytes` on the first maintenance pass (used pages above the budget less 16 MiB; raw capture rows older than 24 h that their first summary tier has passed, then hourly rows older than 48 h, 5 days for `procperf`), and an older file is converted to incremental auto_vacuum by one `VACUUM` once it is at or under the target or eviction is exhausted and the volume has twice the used size free; rollups continue. On Windows, the first open also re-secures `echo.db` and its sidecars, and refuses the open when the files are owned by an account other than SYSTEM, Administrators or the agent's (for example after the agent's service account changed; the new account also needs access to the files): see `docs/user-manual/echo.md` "Data storage". |
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | echo.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe Echo data, delete `<data_dir>/echo.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing echo.db, runs migration if the schema version differs, and resumes collection. State in `echo_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/echo.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no echo.db — the next collect_fast creates it from scratch. The old echo.db at the previous path is orphaned but not deleted. Operator concern, not Echo's. |
-| **Roll back to an older agent** | The older binary opens the same `echo.db` (the registry source adds no schema version) but does not know the `registry` source, so the `registry_live` table, the `registry` row of `echo_cursor` and every `registry:%` baseline in `echo_state` stay on disk, with the per-key baselines holding each watched value's type, size and hash (a baseline an older build wrote also holds a rendered prefix of each value) and the cursor row, for about one tick, the rendered new value of changes still waiting for their writer, and the older binary has no way to erase them. An older agent that does know the `registry` source (the key-watch-only build) reads a cursor that holds changes (`held` or `loss`, written as cursor version 2) as lost: one `gap:cursorlost` row and a re-baseline, and those changes are never rows. Run `echo.purge_source` on the paused `registry` source BEFORE the rollback. |
+| **Roll back to an older agent** | The older binary opens the same `echo.db` (the registry source adds no schema version) but does not know the `registry` source, so the `registry_live` table, the `registry` row of `echo_cursor` and every `registry:%` baseline in `echo_state` stay on disk, with the per-key baselines holding each watched value's type, size and hash (a baseline an older build wrote also holds a rendered prefix of each value) and the cursor row, for about one tick, the rendered new value of changes still waiting for their writer, and the older binary has no way to erase them. An older agent that does know the `registry` source (the key-watch-only build) reads a cursor that holds changes (`held` or `loss`, written as cursor version 2) as lost: one `gap:cursorlost` row and a re-baseline, and those changes are never rows. Run `echo.purge_source` on the paused `registry` source BEFORE the rollback. No schema version changes for the budget: an older build opens the file; the `auto_vacuum` header flag and the new `echo_config` keys (`db_budget_bytes`, the two eviction counters, the deferral marker) are inert to it, no budget is enforced, and its registry reader re-reads `bam\State`, giving one burst of `added` rows. |
 | **Corruption detected at open** (#559) | `EchoDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `echo.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `echo_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `echo.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — Echo refuses to load rather than trust the corrupt DB. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.echo.*` heartbeat tags; the server exposes `yuzu_fleet_echo_db_corruption_agents` and writes an `echo.db.corruption_quarantined` audit row — see docs/user-manual/echo.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
@@ -289,7 +308,7 @@ Routine debugging entry points:
 | "Echo isn't recording anything for source X" | `echo.status` output → `<source>_enabled` row. Then `compatibility` action to confirm OS support. Then check the agent log for "Echo plugin initialized". |
 | "Query returns 0 rows but I know the event happened" | Check the collect interval (`fast_interval` / `slow_interval`) vs the event lifetime — anything shorter than the interval is sub-resolution. |
 | "TCP collector shows a flood of `connected` events" | Almost always a restart artifact. Confirm against the agent's start time. |
-| "echo.db is huge" | `status` returns `db_size_bytes` (used pages plus the WAL, not the file size) against `db_budget_bytes`. If it's growing without bound the rollup trigger may not be firing — check trigger registration in `init()`. A file that stays large while `db_size_bytes` is within budget is an older database waiting for its one-off `VACUUM` (`db_auto_vacuum|deferred` means a conversion was wanted and could not run: the volume lacked twice the used size free, or the `VACUUM` failed; the marker clears only when a conversion succeeds). `budget_over_bytes` above 0 with no `sql` query running means everything left is exempt (newest 24 hours, paused sources, daily and monthly rows). |
+| "echo.db is huge" | `status` returns `db_size_bytes` (used pages plus the WAL, not the file size) against `db_budget_bytes`. If it's growing without bound the rollup trigger may not be firing — check trigger registration in `init()`. A file that stays large while `db_size_bytes` is within budget is an older database waiting for its one-off `VACUUM` (`db_auto_vacuum|deferred` means a conversion was wanted and could not run: the volume lacked twice the used size free, or the `VACUUM` failed; the marker clears only when a conversion succeeds). `budget_over_bytes` above 0 has several causes: a long `echo.sql` read pinning the log (clears at the next checkpoint), an eviction pass that failed (retried next pass), a pass skipped by the retention clock guard (`retention_guard|__budget__|<n>`), an unreadable setting (`db_budget_bytes|unknown`), a catch-up still draining, or only exempt rows left (newest 24 hours of raw capture rows, hourly rows under 48 hours, daily and monthly rows, the `usage` tables, paused or errored sources and `netconn`, `netqual`, `power`, `removable`, `registry`); see the user manual, "If `budget_over_bytes` stays above 0". |
 | "Schema migration failed at startup" | `agent.log` will show `EchoDatabase: migrated to schema version N` on success or the SQLite error on failure. Migrations are idempotent — fixing the underlying issue and restarting will retry. |
 
 For new-source bring-up, the smallest viable change is: add a
@@ -340,7 +359,13 @@ header):
    operator input to it.
    Declare a row for **every** OS (`kSupported`/`kSupportedConstrained`/`kPlanned`/
    `kUnsupported`) — the schema-invariant test requires it. Add a `rollup_sql`
-   branch per non-live tier. **Every capture source ships `default_enabled =
+   branch per non-live tier. Budget eligibility is structural: a source whose
+   first non-live tier carries `rollup_sql` has its raw capture rows evicted
+   below that tier's mark (24 h floor), and any `hourly` tier is evicted past
+   48 h (5 days for `procperf`); a second reader of a source's raw rows (as
+   `usage` reads `process_live`) needs its own high-water predicate like
+   `usage_hwm_id`, and the drift-guard test in `test_echo_aggregator.cpp` pins
+   both eligible sets, so a new source fails loudly until it is added there. **Every capture source ships `default_enabled =
    true`** (Alex ruling 2026-10-21: all sources, every OS, no exceptions). The
    registry-wide test in `test_echo_schema_registry.cpp` fails any source that
    declares `false`, so a new source must ship enabled. The retrospective-reach

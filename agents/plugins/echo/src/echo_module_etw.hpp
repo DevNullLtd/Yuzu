@@ -6,8 +6,9 @@
  * The Windows peer of the $Module capture source, structurally mirroring
  * echo_proc_etw.hpp. Subscribes a real-time ETW session to the
  * Microsoft-Windows-Kernel-Process provider with the IMAGE keyword (0x40) and
- * decodes image load (event 5) / unload (event 6) into the shared
- * ModuleEventRing the Echo plugin drains and persists. Answers "what did a
+ * decodes image load (event 5) into the shared ModuleEventRing the Echo
+ * plugin drains and persists; event 6 (unload) is not consumed, unloads are
+ * not stored. Answers "what did a
  * process LOAD" — the DLL-search-order-hijack / injection / BYOVD surface
  * $Process cannot see.
  *
@@ -47,7 +48,7 @@ namespace yuzu::echo {
 /// EVENT_RECORD keeps the ModuleEvent mapping unit-testable without ETW headers.
 struct EtwImageSample {
     std::int64_t ts_unix{0};
-    bool is_load{true};     ///< true = image load (event 5); false = unload (event 6)
+    bool is_load{true};     ///< always true from the ETW callback; false only in the pure mapping
     std::uint32_t pid{0};   ///< loading process id (System/Idle ⇒ kernel/driver load)
     std::string image_path; ///< full image path (NT \Device\... or drive form)
 };
@@ -55,11 +56,12 @@ struct EtwImageSample {
 /// Pure mapping: ETW sample → ModuleEvent. Splits image_path into module_name
 /// (basename) + module_dir (directory — NOT yet redacted; the collector redacts
 /// at drain, AFTER signing, since signing needs the real path). is_kernel =
-/// pid <= 4 (System/Idle own kernel/driver image loads). action = loaded/unloaded
-/// from is_load (a 'blocked' verdict comes only from the M3 CodeIntegrity overlay,
-/// never this provider). signed_state/signer/process_name stay default —
-/// resolved by the collector at drain. Defined in the .cpp, exercised on every
-/// platform by the unit tests.
+/// pid <= 4 (System/Idle own kernel/driver image loads). action = loaded, or
+/// unloaded when is_load is false (only this pure mapping produces that; the ETW
+/// callback never does, and apply_module_risk_filter drops it). A 'blocked'
+/// verdict comes only from the M3 CodeIntegrity overlay, never this provider.
+/// signed_state/signer/process_name stay default — resolved by the collector at
+/// drain. Defined in the .cpp, exercised on every platform by the unit tests.
 ModuleEvent etw_image_sample_to_module_event(const EtwImageSample& s);
 
 /// A code-signing verdict for one image, returned by a ModuleVerifier.
@@ -143,10 +145,10 @@ using ImageHandle = std::unique_ptr<void, ImageHandleCloser>;
 #endif // _WIN32
 
 /// Owns a real-time ETW session on Microsoft-Windows-Kernel-Process (IMAGE
-/// keyword) and decodes image load/unload into a ModuleEventRing on a dedicated
-/// ProcessTrace thread. The $Module peer of ProcEtwCollector. The
-/// ImageStreamCollector base is non-copyable/non-movable (it owns a live
-/// session). Windows-only; every method is a no-op off-Windows and start()
+/// keyword) and decodes image load (event 5; unloads are not consumed) into a
+/// ModuleEventRing on a dedicated ProcessTrace thread. The $Module peer of
+/// ProcEtwCollector. The ImageStreamCollector base is non-copyable/non-movable
+/// (it owns a live session). Windows-only; every method is a no-op off-Windows and start()
 /// returns false so the source simply produces nothing (no poll fallback for
 /// modules — unlike process, there is no snapshot-diff equivalent).
 class ModuleEtwCollector : public ImageStreamCollector {

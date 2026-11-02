@@ -1149,11 +1149,13 @@ public:
     // std::ios_base::failure from a /proc read, a bad_alloc, a std::length_error) terminated the
     // agent. The catch also rolls back a transaction the unwind left open on the shared write
     // connection (purge_source and the other raw-BEGIN paths allocate between BEGIN and COMMIT).
-    // What that guarantees: the connection is back in autocommit before this action returns.
-    // What it does not: the unwind releases mu_ before the catch re-takes it, so another thread
-    // can write in between. A transactional writer fails its own BEGIN; the two standalone
-    // writers (set_config, set_state) refuse while a transaction is open and report failure
-    // instead of a success the rollback would discard. The one per-call-locked writer left,
+    // What it does: fail_internal asks for a ROLLBACK before this action returns and logs the
+    // result (a warning with the SQLite return code when the ROLLBACK itself fails); it does
+    // not promise the connection is back in autocommit. What it cannot cover: the unwind
+    // releases mu_ before the catch re-takes it, so another thread can write in between. A
+    // transactional writer fails its own BEGIN; the two standalone writers (set_config,
+    // set_state) refuse while a transaction is open and report failure instead of a success
+    // the rollback would discard. The one per-call-locked writer left,
     // the roll-up's execute_sql_range, can still join and be discarded. Its mark is written by
     // set_config, which refuses while the transaction is open, so that window is rolled up
     // again at the next pass; if the rollback lands first the mark is written and the window
@@ -1170,8 +1172,9 @@ public:
     }
 
     int fail_internal(yuzu::CommandContext& ctx, const char* what) noexcept {
-        // Roll back FIRST (it is noexcept): the logger and the output sink can throw, and a
-        // swallowed throw must not leave the unwound transaction open on the shared connection.
+        // Ask for the rollback FIRST (it is noexcept and logs its own result): the logger and
+        // the output sink can throw, and a swallowed throw must not skip the rollback request
+        // for a transaction the unwind left open on the shared connection.
         if (db_)
             db_->rollback_open_transaction();
         try {
@@ -4532,9 +4535,11 @@ private:
         }
         if (maintenance_pass && res.exhausted) {
             spdlog::warn("ECHO: echo.db data ({} bytes) is above its {} byte target and nothing "
-                         "more is eligible to evict (newest 24 h of raw capture rows, hourly "
-                         "rows under 48 h (5 d for procperf), daily and monthly rows, paused "
-                         "sources and sources without a summary tier are never evicted)",
+                         "more is eligible to evict (newest 24 h of raw capture rows, raw "
+                         "capture rows the first summary tier or the usage fold has not yet "
+                         "read, hourly rows under 48 h (5 d for procperf), daily and monthly "
+                         "rows, the usage tables, paused or errored sources and sources "
+                         "without a summary tier are never evicted)",
                          res.data_bytes_after, target);
         }
 

@@ -358,10 +358,13 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
 // ── Byte budget (echo.db size cap) ────────────────────────────────────────────
 //
 // `db_budget_bytes` caps what echo.db holds: used pages plus the WAL file. The cap is HARD for
-// data pages and SOFT for the WAL: journal_size_limit only truncates the WAL when a checkpoint
-// resets it, and a long echo.sql read on the read-only query connection can pin it, so
-// data + WAL can sit above the budget until that reader ends. The overage is measured after
-// every pass and surfaced as `budget_over_bytes`, never hidden.
+// eligible data pages (the pass stops only at the target) and SOFT for the WAL:
+// journal_size_limit only truncates the WAL when a checkpoint resets it, and a long echo.sql
+// read on the read-only query connection can pin it, so data + WAL can sit above the budget
+// until that reader ends. Rows that are never evicted (the newest 24 h of raw capture rows,
+// rows the summary tier or the usage fold has not read, daily and monthly rows, the usage
+// tables, paused or errored sources) can hold used pages above the target. The overage is
+// measured whenever `status` runs and surfaced as `budget_over_bytes`, never hidden.
 
 /// Default and minimum `db_budget_bytes` (250 MiB and 32 MiB). Eviction targets the budget less
 /// kEchoWalAllowanceBytes (echo_db.hpp) of data pages.

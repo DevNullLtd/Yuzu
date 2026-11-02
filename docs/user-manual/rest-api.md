@@ -5609,7 +5609,12 @@ case) and `guaranteed_depth_seconds`. Roll-up rows age from the start of their b
 a time-based tier is guaranteed for `limit - bucket_seconds` (a 365-day monthly tier is
 guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depends on how
 fast a device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not
-where it sits: a record is still in its finer tier until the coarser roll-up closes. It is a
+where it sits: a record is still in its finer tier until the coarser roll-up closes. It holds while
+the device is within its `db_budget_bytes` (default 250 MiB): a device over its byte budget removes
+raw capture rows older than 24 h that their first summary tier has passed and hourly rows older
+than 48 h (5 days for `procperf`) inside these depths, oldest first, until it is back under;
+`echo.status` reports it as `budget_evicted_raw_rows_total` and `budget_evicted_hourly_rows_total`
+(see the Echo manual, The database byte budget). It is a
 floor on rows that exist, not on coverage: after an agent is offline longer than a tier's
 roll-up catch-up window (2 h hourly, 2 d daily, about 62 d monthly) the missed span is a gap in
 that tier, not a deeper tier. The

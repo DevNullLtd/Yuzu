@@ -6,7 +6,8 @@
  *
  * Windows section (#ifdef _WIN32): a real-time ETW session on
  * Microsoft-Windows-Kernel-Process with the IMAGE keyword, ProcessTrace on a
- * dedicated thread, TDH decode of image load (5) / unload (6) by property name,
+ * dedicated thread, TDH decode of image load (5) by property name (unload, 6, is not
+ * consumed; unloads are not stored),
  * signing resolved at drain through a no-reparse handle (NtCreateFile +
  * WinVerifyTrust(hFile) + the provider-chain signer). Mirrors echo_proc_etw.cpp.
  *

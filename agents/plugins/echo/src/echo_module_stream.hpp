@@ -47,7 +47,7 @@ namespace yuzu::echo {
 /// the lower-case token from `module_action_token()`.
 enum class ModuleAction : std::uint8_t {
     kLoaded = 0,   ///< image mapped into a process / driver loaded
-    kUnloaded = 1, ///< image unmapped (lower forensic value; captured where free)
+    kUnloaded = 1, ///< never stored: apply_module_risk_filter drops it; kept for the ETW mapping
     kSeed = 2,     ///< baseline: already-loaded at agent start (boot-gap seed)
     kBlocked = 3,  ///< load denied by the OS (e.g. CodeIntegrity 3033/3034)
 };

@@ -1694,10 +1694,11 @@ public:
                     sleep_for(kFirstDelay);
                     LocalDispatcher dispatcher;
                     while (!stop_requested_.load(std::memory_order_acquire)) {
-                        // This is a detached thread: an exception out of a cycle (the Echo
-                        // plugin's process enumeration reads /proc, which can throw when a
-                        // process exits mid-read) would terminate the whole agent. A failed
-                        // cycle costs one snapshot; the pump logs it and goes on.
+                        // This runs on snapshot_pump_thread_ (joined at shutdown); an
+                        // exception escaping a std::thread body calls std::terminate, so a
+                        // cycle's failure (the Echo plugin's process enumeration reads /proc,
+                        // which can throw when a process exits mid-read) is caught here and
+                        // logged. A failed cycle costs one snapshot; the pump goes on.
                         try {
                             // #1001 / arch-S3 — local-dispatch concerns
                             // (capture buffer, byte cap, truncation sentinel)

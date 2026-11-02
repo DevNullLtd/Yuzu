@@ -3737,8 +3737,11 @@ void EchoDatabase::rollback_open_transaction() noexcept {
         sqlite3* db = db_;
         if (!db || sqlite3_get_autocommit(db) != 0)
             return;
-        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        spdlog::warn("EchoDatabase: rolled back a transaction left open by an exception");
+        const int rc = sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        if (rc == SQLITE_OK)
+            spdlog::warn("EchoDatabase: rolled back a transaction left open by an exception");
+        else
+            spdlog::warn("EchoDatabase: ROLLBACK after an exception failed (rc={})", rc);
     } catch (...) {
         // noexcept containment: a failed lock or log must not escape the catch handler.
     }
