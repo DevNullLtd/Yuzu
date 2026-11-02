@@ -55,8 +55,9 @@ like a real agent's (hostname, platform, version, three scopable tags and one
 version, description and actions, about 9 KB encoded), then a `Subscribe`
 stream held open, and a `Heartbeat` every 30 s. It answers every command with
 `SUCCESS`. After a failed `Register`, a lost connection or an ended stream it
-waits 2, 4, 8 ... seconds (capped at 300 s, no jitter) before trying again, as
-`agents/core/src/agent.cpp` does.
+waits 2, 4, 8 ... seconds (capped at 300 s, no jitter) before trying again. The real
+agent (`agents/core/src/agent.cpp`) now randomises each delay (HA WS-13, #291), so this
+simulator models a harsher, in-step fleet than production.
 
 The management client is shaped like the server's: one connection, one
 `SendCommand` call per target agent, at most 4096 calls open at once (the

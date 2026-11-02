@@ -1587,6 +1587,7 @@ Agent mesh for peer content sharing within subnets:
 ### Issue 14.2: Multi-Gateway Topology
 **Capability:** 22.5 (extension) | **Scope:** Gateway + Server | **Status:** Open | **Issue:** #291 (HA WS-13, `docs/ha-delivery-matrix.md`)
 **Depends on:** 7.1, 7.1.1
+**Progress:** slice 13.1 (jittered agent reconnect delay) is done; failover, the WS-9 scenario and the rollout are not (see `docs/ha-delivery-matrix.md`, WS-13).
 
 Server supports multiple concurrent gateway registrations:
 - Gateway affinity: agents assigned to nearest gateway via latency probing
@@ -2142,7 +2143,7 @@ High Availability (ADR-2002, `docs/ha-delivery-matrix.md`) — supersedes Phase 
   │                                                 DONE at the pin — #4092 merged 2026-09-07 12:58 UTC,
   │                                                 ~1h AFTER the pin, confirmed NOT an ancestor; stays
   │                                                 PR #4092 open / not started here
-  ├── Phase B (WS-3..WS-6, WS-8-readyz, WS-13) ── ALL required before a 2nd server replica; mostly not
+  ├── Phase B (WS-3..WS-6, WS-8-readyz, WS-13*) ── ALL required before a 2nd server replica (*WS-13 as scoped by the gate, see ha-delivery-matrix.md); mostly not
   │                                                 started, EXCEPT WS-3 slice 3.1 (fenced `LeaderElector`
   │                                                 primitive, #4011 merged 2026-09-06, IS an ancestor)
   │                                                 — done but INERT, no loop wired yet

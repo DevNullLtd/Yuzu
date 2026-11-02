@@ -67,7 +67,8 @@ three-model adversarial review's strongest, unanimous finding:
 > is done: its failover items for a deployment with more than one gateway node,
 > and its rollout item for any fleet that still connects directly.** (The last two
 > clauses were added 2026-10-13, and the WS-13 wording was changed 2026-11-02 —
-> agent failover answers losing a GATEWAY node, not a server replica; the rest of
+> agent failover answers losing a GATEWAY node, not a server replica, so slice 13.6 and
+> #5648/#5649 sit in no clause of this gate; the rest of
 > WS-11 does not gate. Shipping #4014 satisfies only
 > that one clause: **the gate is NOT lifted**, and a durable cluster-capability
 > admission gate, #6528, is separately unbuilt. The epoch fence across a lossy
@@ -206,8 +207,9 @@ cascade, plugin-capability visibility, fleet gauge and its WS-9 scenario remain.
 `pg_reachable` probe + `--shutdown-drain-seconds` drain grace + WS-9 scenarios
 `scripts/ha/ha-readyz-scenarios.sh`; tier-split readyz lands with the ADR-1005
 split; the BYO-LB doc (P2) is open and not in the gate.
-**Remaining gate items: the rest of WS-5, the rest of WS-6, and WS-13 for
-gateway-fronted fleets.**
+**Remaining gate items: the rest of WS-5, the rest of WS-6, and WS-13 (its failover
+items for more than one gateway node and its rollout item for direct-connect fleets; reworded
+2026-11-02).**
 
 **Re-verified 2026-09-29 (against `origin/dev` + `gh`; no PR number yet — commits
 97e24ec6e..a81938ada on a feature branch): WS-6 slice 6.2 DONE** (enrollment tokens
@@ -224,12 +226,13 @@ boot closed). **WS-6's WS-9 scenario for 6.2 also DONE**:
 `docs/ha-delivery-matrix.md`'s WS-6 row for the full mechanism. **WS-6 is now
 6.1 + 6.2 done; 6.1b (shared KEK custody/versioning polish) and 6.3 (node-admission
 readyz proof) remain — see `docs/ha-delivery-matrix.md`.**
-**Remaining gate items: the rest of WS-5, WS-6's 6.1b/6.3, and WS-13 for
-gateway-fronted fleets.**
+**Remaining gate items: the rest of WS-5, WS-6's 6.1b/6.3, and WS-13 (its failover
+items for more than one gateway node and its rollout item for direct-connect fleets; reworded
+2026-11-02).**
 
 **Re-verified 2026-10-11 (against the `feat/ha-ws5-session-lookup` worktree branch; since MERGED as PR #5694, see the 2026-10-13 re-stamp below): WS-5 slice 2 (durable cross-replica gateway session resolution, closes `#4246` item #3, ADR-2002 §7f)** — `resolve_sessions` is store-authoritative via `GatewayRouteStore::lookup_by_sessions`; BatchHeartbeat / ProxyInventory / NotifyStreamStatus resolve on any replica; ambiguous `session_id` refused; BatchHeartbeat also LISTS store-only sessions (known to the directory, no local entry) so the gateway replays and the local registry rehydrates after a server-only restart. NotifyStreamStatus CONNECTED on a degraded directory read is accepted only for a session this replica holds locally, else refused (`connected_unverified`); on a successful read the local fallback applies only to an absent/tombstoned row or a lost-race id; DISCONNECTED and BatchHeartbeat are deliberately fail-soft. ProxyRegister adopt refuses an id another agent's committed row holds (`session_held_by_other_agent`; not a lock, the ambiguity refusal is the backstop). `hostname` is newly blank-preserved in presence (`os` since #5294). Unique partial index on `agent_routes(session_id)`, hp-1/hp-2 and the WS-9 script (PR-B) are NOT in it. **The safe-to-scale gate is NOT lifted** — remaining gate items are unchanged in kind (the rest of WS-5, WS-6's 6.1b/6.3, WS-13 for gateway-fronted fleets); see `docs/ha-delivery-matrix.md`.
 
-**Re-verified 2026-11-02 (WS-13 only, against `origin/dev` at `5662c5f07`): the WS-13 plan was written and Fable-reviewed and its six open questions decided** (see the WS-13 row of `docs/ha-delivery-matrix.md`): a VIP or multi-address DNS name with no agent code first (measured at the gRPC layer only, not yet with a real agent or TLS), a spike before any list syntax, jittered reconnect (13.1) done, quarantine needs stable addresses, the rollout refuses while OTA through a gateway is broken (#5619), and an unconfirmed gap for a gateway node that is up but has lost its server. WS-13 is NOT done; the gate is NOT lifted.
+**Re-verified 2026-11-02 (WS-13 only, against `origin/dev` at `5662c5f07`): the WS-13 plan was written and Fable-reviewed and its six open questions decided** (see the WS-13 row of `docs/ha-delivery-matrix.md`): a VIP or multi-address DNS name with no agent code first (measured at the gRPC layer only, not yet with a real agent or TLS), a spike before any list syntax, jittered reconnect (13.1) done, quarantine needs stable addresses, the 13.4 rollout runbook must refuse while OTA through a gateway is broken (#5619), and an unconfirmed gap for a gateway node that is up but has lost its server. WS-13 is NOT done; the gate is NOT lifted.
 
 **Re-verified 2026-10-13 (status re-stamp against `origin/dev` at `d81109688`, with `gh`; other rows NOT re-audited): WS-5 slice 2 MERGED** (PR #5694, merge `eabc2b639`); follow-ups merged 2026-10-12: PR #5736 (`d81109688`, closes #5682, `OfflineEndpointStore` is the cascade's seventh member) and PR #5743 (`0a4b60ac5`, closes #5684 and #5686). WS-9 is in-progress, not planned: `scripts/ha/` carries scenarios for WS-6 (CRL publication, enrollment), WS-7 and WS-8. The safe-to-scale gate is NOT lifted; remaining gate items are unchanged in kind (the rest of WS-5, WS-6's 6.1b/6.3, WS-13 for gateway-fronted fleets). See `docs/ha-delivery-matrix.md`.
 >
@@ -418,7 +421,7 @@ gateway-fronted fleets.**
 | **WS-10** | **Background-job replica-safety classification** — checked-in, CI-auditable table (job → fenced-leader-only / replica-safe / disabled-until-fixed); bring #2508 wall-clock passes to clock-guard | audit+disable need nothing; `fenced-leader-only` enforcement needs WS-3 | **Y** | `cpp-safety`+`sre`+`compliance-officer` | P0 | **10.1/10.2 done (#4092); 10.3 enforcement wired by WS-3 3.2** |
 | **WS-11** | **HA-state observability** (NEW): leader identity/epoch, replica lag, quorum state, outbox backlog, failover duration, routing re-homes, split-brain alerts — Prometheus metrics + rules | WS-3, WS-7 | N, except the #4014 leader-observability subset, which **gates** (2026-10-13) and is now shipped (the gate is not lifted); the rest ships *with* the 2nd replica | `sre`+`docs-writer` (+ alert-rule gate) | P1 | **leader-observability subset DONE (#4014: `yuzu_server_leader_*` + the four `yuzu-ha-leader` alerts; `SplitBrain` promtool-verified only); the rest planned; #6526 / #6527 / #6528 open** |
 | **WS-12** | **Single→HA cutover + DR** (NEW): runbook to move an existing single deployment to HA-PG + gateway-front rollout; **backup/PITR/WAL under HA-PG** (replaces superseded `disaster-recovery.md`) | WS-7 | N | `release-deploy`+`sre`+`docs-writer` | P1 | planned |
-| **WS-13** | **Agent-side gateway failover rollout** (NEW): agent endpoint discovery/failover + fleet rollout flipping direct-connect fleets to gateway-front. **Tracker #291** (roadmap 14.2). Failover is one-way without WS-15. Decided 2026-11-02: VIP or multi-address DNS first, no agent code; spike before any list syntax; gateway-fronted quarantine needs stable addresses; rollout refuses while #5619 is open | WS-4 | Y (failover items for >1 gateway node; rollout item for direct-connect fleets) | `cross-platform`+`security-guardian` | P1 | **13.1 jittered reconnect DONE; rest planned; not done** |
+| **WS-13** | **Agent-side gateway failover rollout** (NEW): agent endpoint discovery/failover + fleet rollout flipping direct-connect fleets to gateway-front. **Tracker #291** (roadmap 14.2). Failover is one-way without WS-15. Decided 2026-11-02: VIP or multi-address DNS first, no agent code; spike before any list syntax; gateway-fronted quarantine needs stable addresses; 13.4 rollout runbook must refuse while #5619 is open | WS-4 | Y (failover items for >1 gateway node; rollout item for direct-connect fleets) | `cross-platform`+`security-guardian` | P1 | **13.1 jittered reconnect DONE; rest planned; not done** |
 | **WS-14** | **Coordination-substrate security & capacity review** (NEW): threat review of advisory locks / etcd / Patroni / HAProxy / fencing tokens; capacity + failure-domain + sync-quorum latency validation | WS-3, WS-7 | N | `security-guardian`+`sre` | P2 | planned |
 | **WS-15** | **Gateway adjacency, load shedding, failback + rebalance** (NEW, 2026-10-13): roadmap **7.1.1**, **#5759**: adjacency table, rate-limited/jittered GOAWAY shedding, gradual failback, hysteresis, optional latency affinity. `yuzu_gw_cluster.erl` does not exist yet | WS-4, WS-13 | N (capacity) | `gateway-erlang`+`sre`+`architect` | P2 | planned |
 

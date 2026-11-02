@@ -406,29 +406,42 @@ behaviour is not tested with a real agent (a two-node registry unit test exists)
 and re-registers on a new session after every lost `Subscribe` stream. When its gateway
 node dies it therefore reaches a surviving node only if that address leads to one: an L4
 virtual IP or balancer in front of the nodes, or a DNS name with one address per node. At
-the gRPC layer the second form was measured to move to the surviving address within about a
-second of the connected one dying, with two test servers behind one multi-address name and
-the agent's channel settings; it was not measured with a real agent, real TLS or a silent
-network partition (a dead peer that sends nothing is found by the 60 s keepalive ping plus
-its 20 s timeout, about 80 s). Plan for these requirements:
+the gRPC layer the second form was seen (a one-off check, no retained record) to move to the
+surviving address within about a second of the connected one dying, with two test servers
+behind one multi-address name and the agent's channel settings; it was not measured with a
+real agent, real TLS or a silent network partition. A dead peer that sends nothing is found
+by the 60 s keepalive ping plus its 20 s timeout, which is a worst case of about 80 s derived
+from those two settings, not an observed figure. Plan for these requirements:
 
 - **Certificates.** The agent checks the gateway certificate against the name in `--server`
   and has no override, so every node's certificate must carry that name or address as a
-  subject alternative name (`--cert-san`, see TLS).
-- **Reconnect timing.** Each retry waits a random time centred on 2, 4, 8 ... seconds (the
-  first retry 1 to 3 s, at most 300 s), so the agents of a failed node do not return in
-  waves.
+  subject alternative name. `--cert-san` adds names to the server's auto-generated default
+  certificates only; certificates you supply yourself must carry the name already.
+- **Reconnect timing.** After a lost `Subscribe` stream each retry waits a random whole
+  number of seconds from a window around 2, 4, 8 ... seconds: the first retry 1 to 3 s, the
+  second 2 to 6 s, up to 64 to 192 s, then 128 to 300 s from the eighth retry on (never less
+  than 1 s, never more than 300 s). The first retry therefore lands in only three one-second
+  steps, about a third of a failed node's agents in each, and later retries spread wider, so
+  the agents of a failed node return in flatter bursts rather than all at once. The 300 s is
+  the wait only; one attempt can then take up to 30 s (the Register deadline). A restarted
+  agent connects at once with no wait, and the heartbeat-driven re-registration cooldown is
+  unchanged and not randomised. Survivors absorb the returning share at the registration
+  rates and limits described under the gateway's upstream admission settings
+  (`upstream_register_concurrency`, `upstream_register_queue_max`); size N-1 capacity from
+  those, and watch `yuzu_gw_agents_connected_total` and `yuzu_gw_upstream_permits_waiting`.
 - **Quarantine.** A quarantined agent can reach only the server addresses it resolved at
   startup (this is deliberate: a compromised host's DNS must not decide what survives
   containment). Use addresses that stay the same (a virtual IP or fixed node addresses) for
   gateway-fronted fleets; if the addresses behind the name change, a quarantined agent
   cannot reach any node and cannot be released remotely.
 - **A node that is up but has lost its server.** Failover does not cover this case. From
-  the agent source, the agent only logs an `UNAVAILABLE` heartbeat answer (it re-registers
-  only on `NOT_FOUND` or `UNAUTHENTICATED`) and its keepalives to the gateway stay healthy,
-  so it would stay on that node while the server's 90 s route lease expires and the agent
-  stops being dispatchable. This has not been observed end to end; the HA WS-13 spike
-  measures it.
+  the sources, the gateway acknowledges proxied heartbeats from its own node-local state
+  whatever the state of its upstream (an unknown session gets `NOT_FOUND`), and the agent
+  re-registers only on `NOT_FOUND` or `UNAUTHENTICATED`, so the agent sees every heartbeat
+  succeed and its keepalives to the gateway stay healthy. It would stay on that node while
+  the server's 90 s route lease expires and the agent stops being dispatchable; look for the
+  gateway's upstream-unavailable signals, not for `UNAVAILABLE` lines in the agent log. This
+  has not been observed end to end; the HA WS-13 spike measures it.
 - **Agents older than 0.15.0** may wedge in their reconnect path and need a restart (see
   [Heartbeat admission](#heartbeat-admission)).
 
@@ -1321,15 +1334,16 @@ listen socket, so a new connection to the agent port is **refused** at once
 (`ECONNREFUSED`); connections the kernel had queued but the gateway had not yet
 accepted are reset. Every connection already established is untouched and keeps
 working. This is deliberate, rather than leaving new connections waiting in the kernel's
-listen backlog: a refused agent goes straight into its reconnect backoff (centred on 2, 4,
-8 ... seconds, each spread by up to half either way, at most 300 s) and a load balancer retries a refused connect on another node,
+listen backlog: a refused agent goes straight into its reconnect backoff (a random wait
+from a window around 2, 4, 8 ... seconds, at most 300 s) and a load balancer retries a refused connect on another node,
 while a connection parked in the backlog completes the TCP handshake, makes the agent
 wait for a TLS handshake nobody answers until gRPC gives up (about 18 s, measured
 against a server that accepts TCP and never answers), is not
 retried elsewhere by the balancer, holds kernel socket memory that counts against a
 container's memory limit, and is accepted in one burst with all the others when the
-shedder resumes. Agents reconnect without jitter today (#5990), so a refused fleet
-retries in step; the backoff still spreads it over minutes. While shedding, `/readyz`
+shedder resumes. Agents randomise each reconnect delay (see Agent reconnect and
+failover), so a refused fleet does not retry in step; the first retry is spread over only
+three seconds and the backoff widens it over the following minutes. While shedding, `/readyz`
 reports not-ready (the agent listener reads as not running, `"listeners":false`), so a
 load balancer drains this node automatically.
 

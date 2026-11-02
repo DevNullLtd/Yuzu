@@ -10,11 +10,15 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <random>
 #include <set>
+#include <stdexcept>
 #include <utility>
+#include <vector>
 
 using namespace yuzu::agent;
 
@@ -153,4 +157,97 @@ TEST_CASE("the mean schedule is unchanged below the ceiling (only the spread is 
         CHECK(mean > ladder * 0.97);
         CHECK(mean < ladder * 1.03);
     }
+}
+
+TEST_CASE("simulated fleet: no one-second bucket holds more than a bounded share of retries",
+          "[agent][reconnect_backoff]") {
+    // The #5990 acceptance shape: 10,000 agents lose their stream at t=0 and every retry
+    // fails, so each agent's retry times are the running sum of its delays. The old fixed
+    // ladder put ALL 10,000 in one bucket in every round. The source is a plain
+    // `lo + engine() % range` on mt19937 (whose raw output is fixed by the standard), not
+    // std::uniform_int_distribution, whose output differs between standard libraries.
+    //
+    // The FIRST round is deliberately bounded loosely: delays are whole seconds in [1,3],
+    // so a third of the fleet lands in each of three buckets. This design does not claim to
+    // remove the first wave, only to break it into three and to widen it every round.
+    constexpr int kAgents = 10'000;
+    constexpr int kRounds = 8;
+    // Observed with this engine and seed: 3342 2016 1144 608 321 177 92 72. Bounds leave
+    // headroom for sampling noise only; the old ladder would read 10000 in every round.
+    constexpr int kBound[kRounds] = {3500, 2200, 1300, 700, 400, 250, 150, 120};
+
+    std::mt19937 engine{20261102u};
+    const auto uniform = [&engine](int lo, int hi) {
+        return lo + static_cast<int>(engine() % static_cast<std::uint32_t>(hi - lo + 1));
+    };
+
+    std::vector<int> when(kAgents, 0);
+    std::set<int> round_eight_buckets;
+    for (int round = 1; round <= kRounds; ++round) {
+        std::vector<int> bucket;
+        for (int& t : when)
+            t += reconnect_delay_secs(round, uniform);
+        // Absolute retry second -> agents retrying in it.
+        std::vector<int> sorted(when);
+        std::sort(sorted.begin(), sorted.end());
+        int peak = 0;
+        for (std::size_t i = 0; i < sorted.size();) {
+            std::size_t j = i;
+            while (j < sorted.size() && sorted[j] == sorted[i])
+                ++j;
+            peak = std::max(peak, static_cast<int>(j - i));
+            if (round == kRounds)
+                round_eight_buckets.insert(sorted[i]);
+            i = j;
+        }
+        CAPTURE(round, peak);
+        CHECK(peak <= kBound[round - 1]);
+    }
+    // By the last round the fleet is spread over hundreds of distinct seconds.
+    CHECK(round_eight_buckets.size() >= 200);
+}
+
+TEST_CASE("reconnect_seed: a working entropy source supplies the words and is not degraded",
+          "[agent][reconnect_backoff]") {
+    int next = 100;
+    int fallback_calls = 0;
+    const auto seed = reconnect_seed([&next] { return static_cast<unsigned>(next++); },
+                                     [&fallback_calls] {
+                                         ++fallback_calls;
+                                         return 0u;
+                                     });
+    CHECK_FALSE(seed.degraded);
+    CHECK(fallback_calls == 0);
+    CHECK(seed.words == std::array<std::uint32_t, 4>{100, 101, 102, 103});
+}
+
+TEST_CASE("reconnect_seed: an entropy source that throws degrades to the fallback, never throws",
+          "[agent][reconnect_backoff]") {
+    // std::random_device throws when no entropy source can be opened. run() has no handler
+    // on this path, so an escape would be a std::terminate at agent boot.
+    int fallback_calls = 0;
+    const auto throwing = []() -> unsigned { throw std::runtime_error{"random_device"}; };
+    const auto counting = [&fallback_calls] {
+        return 7u + static_cast<unsigned>(fallback_calls++);
+    };
+
+    ReconnectSeed seed;
+    REQUIRE_NOTHROW(seed = reconnect_seed(throwing, counting));
+    CHECK(seed.degraded);
+    CHECK(fallback_calls == 4);
+    CHECK(seed.words == std::array<std::uint32_t, 4>{7, 8, 9, 10});
+}
+
+TEST_CASE("reconnect_seed: a throw part-way through discards the partial words",
+          "[agent][reconnect_backoff]") {
+    int calls = 0;
+    const auto flaky = [&calls]() -> unsigned {
+        if (++calls == 3)
+            throw std::runtime_error{"entropy went away"};
+        return 5u;
+    };
+    const auto seed = reconnect_seed(flaky, [] { return 9u; });
+    CHECK(seed.degraded);
+    // All four words come from the fallback; none is a mix of the two sources.
+    CHECK(seed.words == std::array<std::uint32_t, 4>{9, 9, 9, 9});
 }

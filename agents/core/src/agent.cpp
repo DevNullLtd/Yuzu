@@ -1728,8 +1728,39 @@ public:
         // back in lock step. Main-thread only, so no lock; seeded from several OS words so two
         // agents started from one cloned image do not share a sequence.
         std::mt19937 reconnect_rng{[] {
-            std::random_device rd;
-            std::seed_seq seed{rd(), rd(), rd(), rd()};
+            // std::random_device THROWS when no entropy source can be opened, and run() has no
+            // handler on this path (main.cpp calls it bare), so a throw here would be a
+            // std::terminate at boot. reconnect_seed() routes a throw to a clock-derived
+            // fallback instead: weaker seeds, same jitter, and the agent still starts.
+            std::optional<std::random_device> rd;
+            const auto seed_words = yuzu::agent::reconnect_seed(
+                [&rd]() -> std::uint32_t {
+                    if (!rd)
+                        rd.emplace();
+                    return (*rd)();
+                },
+                [i = std::uint64_t{0}]() mutable noexcept -> std::uint32_t {
+                    // splitmix64 over two clocks, the thread id and a call index: not secret,
+                    // but different per call and per process start.
+                    std::uint64_t x =
+                        static_cast<std::uint64_t>(
+                            std::chrono::steady_clock::now().time_since_epoch().count()) ^
+                        (static_cast<std::uint64_t>(
+                             std::chrono::system_clock::now().time_since_epoch().count()) *
+                         0x9E3779B97F4A7C15ULL) ^
+                        (static_cast<std::uint64_t>(
+                             std::hash<std::thread::id>{}(std::this_thread::get_id()))
+                         << 17) ^
+                        (++i * 0xBF58476D1CE4E5B9ULL);
+                    x += 0x9E3779B97F4A7C15ULL;
+                    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+                    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+                    return static_cast<std::uint32_t>(x ^ (x >> 31));
+                });
+            if (seed_words.degraded)
+                spdlog::warn("No OS entropy for the reconnect jitter; using a clock-derived "
+                             "seed (jitter still applies, less well spread across cloned hosts)");
+            std::seed_seq seed(seed_words.words.begin(), seed_words.words.end());
             return std::mt19937{seed};
         }()};
         /// Ceiling on a single Register attempt. Generous — a busy server plus TLS plus an
