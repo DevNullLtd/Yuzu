@@ -83,10 +83,13 @@ regressible — nothing fails loudly when one is broken.
      tested; the agent.cpp counter non-increment is not; see `docs/test-coverage.md`).
    - **The fleet signal does not survive a restart.** The heartbeat tag is a per-process counter, so one agent
      restart returns it to 0 while up to 3 quarantined files remain on the endpoint. A durable marker (derived
-     from the `.corrupt-*` files, or a row in the fresh store) is a candidate follow-up that has not been filed.
+     from the `.corrupt-*` files, or a row in the fresh store) is to be designed with the first server consumer of the
+     `yuzu.dedup_*` tags, tracked in #3663.
    - The helper is a copy of echo's `quarantine_corrupt_db` (`echo_db.cpp`). Hoisting both into
-     `agents/shared` is a candidate follow-up that has not been filed. Echo does not yet have this code's
+     `agents/shared` is tracked in #6914. Echo does not yet have this code's
      no-overwrite claim or negative-epoch clamp.
+   - Tracked follow-ups: a Windows rename retry and a Windows test leg for the hard-link claim (#6913); moving the
+     sidecars before the main file so a crash cannot lose the newest WAL (#6915).
 
 Invariants 3 and 4, the claim-error leg of 7 (`count_claim_error`), and the `owns_claim` result that
 gates 1's queue-full release are decided by the pure, proto-free `agents/core/src/command_dedup_decision.hpp`

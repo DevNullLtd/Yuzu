@@ -17,7 +17,7 @@
 ///  - Both only ever touch names of the exact form
 ///    `<db filename>.corrupt-<digits>[-<digits>][-wal|-shm|-journal]` in the db's own directory.
 ///  - This is a copy of the idea in agents/plugins/echo/src/echo_db.cpp (quarantine_corrupt_db,
-///    #559); hoisting both into agents/shared is a candidate follow-up that has not been filed.
+///    #559); hoisting both into agents/shared is tracked in #6914.
 
 #include <spdlog/spdlog.h>
 
