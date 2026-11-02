@@ -890,6 +890,61 @@ TEST_CASE("POST /api/v1/elevate: a proof bound to a factor since replaced is cha
     CHECK(auth::is_elevated(*h.auth_mgr.validate_session(current)));
 }
 
+// #6079: an ENROLLED account whose stored factor generation reads 0 (a database carried over from
+// before the binding, or a tampered row) has no decidable binding. Every elevation surface refuses
+// it with a 503 that names `mfa_proof_unavailable`, however fresh the session's proof is, and
+// nothing is granted or changed.
+TEST_CASE("the elevation routes refuse an enrolled account at factor generation 0 with a 503, "
+          "granting nothing",
+          "[pg][jit][routes][binding]") {
+    JitHarness h;
+    auto alice = h.session_for("alice");              // minted bound and fresh, before the cutover
+    auto admin = h.session_for("admin", Role::admin); // the caller of the eligibility routes
+    {
+        auto lease = h.auth_db.pool().acquire();
+        REQUIRE(lease);
+        const auto run = [&](const char* statement, std::vector<std::string> params) {
+            auto r = yuzu::server::pg::exec_params(lease.get(), statement, params);
+            INFO(PQresultErrorMessage(r.get()));
+            REQUIRE(r.status() == PGRES_COMMAND_OK);
+        };
+        run("ALTER TABLE auth.users DISABLE TRIGGER users_mfa_factor_gen", {});
+        run("UPDATE auth.users SET mfa_factor_gen = 0 WHERE username = ANY($1::text[])",
+            {"{alice,admin}"});
+        run("ALTER TABLE auth.users ENABLE ALWAYS TRIGGER users_mfa_factor_gen", {});
+    }
+    REQUIRE(h.auth_db->mfa_status("alice")->factor_gen == 0);
+    REQUIRE(h.auth_db->mfa_status("admin")->factor_gen == 0);
+
+    auto elevate = h.post("/api/v1/elevate", alice, R"({"justification":"gen0"})");
+    REQUIRE(elevate);
+    CHECK(elevate->status == 503);
+    CHECK(h.audit_detail("mfa.step_up.required", "alice").find("reason=mfa_proof_unavailable") !=
+          std::string::npos);
+    CHECK(h.count_audits("role.elevation.granted", "alice") == 0);
+    CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(alice)));
+
+    auto by_path =
+        h.post("/api/v1/users/bob/elevation-eligibility", admin, R"({"eligible":false})");
+    REQUIRE(by_path);
+    CHECK(by_path->status == 503);
+    CHECK(h.count_audits("mfa.step_up.required", "admin") == 1);
+    CHECK(h.audit_detail("mfa.step_up.required", "admin").find("reason=mfa_proof_unavailable") !=
+          std::string::npos);
+
+    auto by_query =
+        h.post("/api/v1/users/elevation-eligibility?username=bob", admin, R"({"eligible":false})");
+    REQUIRE(by_query);
+    CHECK(by_query->status == 503);
+    CHECK(h.count_audits("mfa.step_up.required", "admin") == 2);
+    CHECK(h.audit_detail("mfa.step_up.required", "admin").find("reason=mfa_proof_unavailable") !=
+          std::string::npos);
+
+    // Nothing was changed by either eligibility route, and no eligibility audit row was written.
+    CHECK(h.auth_db->is_elevation_eligible("bob").value() == true);
+    CHECK(h.count_audits("user.elevation_eligibility.set") == 0);
+}
+
 TEST_CASE("POST /api/v1/elevate: an ineligible operator is denied", "[pg][jit][routes]") {
     JitHarness h;
     REQUIRE(h.auth_db->set_elevation_eligible("alice", false).has_value()); // revoke eligibility

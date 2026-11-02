@@ -1918,6 +1918,10 @@ tests:
       - series: 'yuzu_auth_mfa_binding_enforcement_ok{job="yuzu",instance="s1",store="auth"}'
         values: "1 1 0 1 1 1 1 1 1 1"
     promql_expr_test:
+      # 2m is the sample that is 0: a rule with no `for:` would already fire here.
+      - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
+        eval_time: 2m
+        exp_samples: []
       - expr: 'ALERTS{alertname="YuzuMfaBindingNotEnforced", alertstate="firing"}'
         eval_time: 3m
         exp_samples: []

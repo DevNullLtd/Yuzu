@@ -2083,6 +2083,23 @@ TEST_CASE("POST /login/mfa/stepup by TOTP stores the verifier's generation and i
     check_plumbing(h, seen, "/login/mfa/stepup", token, "admin");
 }
 
+// Every `auth.login` row for `user` is a refusal, and exactly one of them carries the mint
+// refusal's cause, so a 401 for any other reason cannot satisfy the caller's assertions.
+static void check_login_refused_for_factor_change(AuthRoutesHarness& h, const std::string& user) {
+    AuditQuery q;
+    q.action = "auth.login";
+    q.principal = user;
+    const auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    int factor_cause_rows = 0;
+    for (const auto& row : *rows) {
+        CHECK(row.result != "ok");
+        if (row.detail.find("session_mint_failed;cause=factor_changed") != std::string::npos)
+            ++factor_cause_rows;
+    }
+    CHECK(factor_cause_rows == 1);
+}
+
 // A factor replaced between the verification and the session write must not leave an admissible
 // proof. Login routes: the mint is DENIED (no cookie); step-up: the stamp is CLEARED.
 TEST_CASE("a factor replaced between verification and mint denies the mint on every login route "
@@ -2104,20 +2121,8 @@ TEST_CASE("a factor replaced between verification and mint denies the mint on ev
         CHECK(seen[0].proof.factor_gen != h.auth_db->mfa_status("admin")->factor_gen);
         // The code was genuinely consumed, so its true row stands; the login row is an honest
         // failure.
-        CHECK(h.count_audits("mfa.login.verified", "admin") >= 1);
-        AuditQuery q;
-        q.action = "auth.login";
-        q.principal = "admin";
-        const auto rows = h.audit_store->query(q);
-        REQUIRE(rows.has_value());
-        bool saw_factor_cause = false;
-        for (const auto& row : *rows) {
-            CHECK(row.result != "ok");
-            saw_factor_cause =
-                saw_factor_cause ||
-                row.detail.find("session_mint_failed;cause=factor_changed") != std::string::npos;
-        }
-        CHECK(saw_factor_cause);
+        CHECK(h.count_audits("mfa.login.verified", "admin") == 1);
+        check_login_refused_for_factor_change(h, "admin");
     }
     SECTION("/login/mfa recovery code") {
         (void)h.enroll_mfa("admin");
@@ -2133,7 +2138,7 @@ TEST_CASE("a factor replaced between verification and mint denies the mint on ev
         CHECK(res->status == 401);
         CHECK(res->get_header_value("Set-Cookie").empty());
         CHECK(h.count_audits("mfa.recovery_code.used", "admin") == 1);
-        CHECK(h.count_audits("auth.login", "admin") >= 1);
+        check_login_refused_for_factor_change(h, "admin");
     }
     SECTION("/login/mfa/enroll") {
         h.cfg.mfa_enforcement = "required";
@@ -2154,7 +2159,8 @@ TEST_CASE("a factor replaced between verification and mint denies the mint on ev
         CHECK(res->get_header_value("Set-Cookie").empty());
         // The one-time codes are withheld with the session.
         CHECK(res->body.find("recovery_codes") == std::string::npos);
-        CHECK(h.count_audits("mfa.enroll.verified", "alice") >= 1);
+        CHECK(h.count_audits("mfa.enroll.verified", "alice") == 1);
+        check_login_refused_for_factor_change(h, "alice");
     }
 }
 
