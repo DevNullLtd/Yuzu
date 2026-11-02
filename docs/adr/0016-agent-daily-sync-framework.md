@@ -717,14 +717,22 @@ the OS reports it, so a volume folder-mounted under a user profile (`C:\Users\<n
 a personal label into a record stored centrally on every cycle. The statement "machine-scope (no
 username/SID/user path)" in the data-classification paragraph above therefore holds for this column
 only because the writer minimises it: before the blob is built, every entry that lies under
-`/Users`, `/home`, `\Users` or `\Documents and Settings` (behind a drive letter), or under
-`/Volumes`, is replaced with `[redacted]`. The boot volume's label is user-chosen, so every
+`/Users`, `/home`, `/Documents and Settings` or `/Volumes` is replaced with `[redacted]`. The match
+ignores case, reads `\` as `/`, ignores a leading drive letter and looks through a
+`/System/Volumes/Data` prefix, which macOS can use to spell the firmlinked user tree. The boot volume's label is user-chosen, so every
 `/Volumes` entry goes. A piece that is not a path (the tail of a label that held a comma) is
 replaced with it. A section in which any entry was replaced is `constrained` with
 `agent:mount_points_redacted`, placed before any plugin reason so the reason clamp cannot drop it.
-Drive letters, `/`, `/System/Volumes/*` and any other folder mount pass through as the OS reported
-them, so the column can still name a folder an administrator chose; it is minimised, not proven free of
-names. The serial, board-serial and DIMM-serial columns of the 2026-10-29 "Personal data" paragraph
+Drive letters, `/`, the `/System/Volumes/*` volumes themselves and any other folder mount pass
+through as the OS reported them, so the column can still name a folder an administrator chose; it is
+minimised, not proven free of names. Not covered by this paragraph: those other folder mounts; the
+user-chosen roots the Linux legs will report once they emit mount points (`/media/<user>`,
+`/run/media/<user>`), which the leg that adds them must add to the roots table and to this paragraph;
+free text in the other columns once a leg fills them with user-chosen labels; and the v1 `hostname`,
+`domain` and `ou` fields, which name a machine and are frozen. Redaction removes one route to a personal
+name. It does not change the stable-identifier capability (serial, UUID, MAC, chassis, board) that makes
+works-council review applicable, and it is not a consent mechanism: `--inventory-disable` remains the only
+control over the collection. The serial, board-serial and DIMM-serial columns of the 2026-10-29 "Personal data" paragraph
 are unchanged.
 
 **Windows `volumes` is not run.** The Windows `volumes` leg issues synchronous `DeviceIoControl`
@@ -734,8 +742,9 @@ endpoint unable to reconnect or to stop cleanly. Until those calls have a bound,
 does not run the action: the `volume` section is `unavailable` with `agent:windows_volumes_unbounded`
 and carries no rows. The operator-triggered `volumes` action is unchanged, and the Windows
 `partitions` and `topology` legs are status-only (`windows:planned`), so no other section is
-affected. The Windows volume rows return when the platform gap named in `disk_actions_win.cpp` is
-closed.
+affected. The Windows volume rows return when the platform gap named in `disk_actions_win.cpp` (plugin OS
+calls have no deadline, #3925) is closed. The reason is expected on every Windows host and needs no
+operator action; the operator-triggered `volumes` action still works there.
 
 **Pipes inside a field.** The plugins write a literal `|` as `\|` and fold a literal `\` to `/`
 (`safe_output_field`). The writer splits the list rows and the three scalar groups on an unescaped

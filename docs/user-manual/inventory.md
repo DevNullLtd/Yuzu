@@ -1153,7 +1153,9 @@ sync, defeating the hash-skip protocol.
   device is person-assigned. The same **`--inventory-disable`** flag suppresses
   `device_ci` along with the other sources (it gates the whole daily-sync thread). A volume
   or partition mount point under a user profile or under `/Volumes` is replaced with
-  `[redacted]` before it is sent.
+  `[redacted]` before it is sent. That removes one route to a personal name and is not a
+  consent mechanism; other folder mounts, free text in the other columns, and the device
+  name, domain and OU are sent as the machine reports them.
 - **Observability.** Ingest shares
   `yuzu_inventory_ingest_total{source="device_ci"}` +
   `yuzu_inventory_ingest_duration_seconds{source="device_ci"}`; read degrades use
@@ -1188,7 +1190,11 @@ sync, defeating the hash-skip protocol.
   Windows volume probe was not run, because it has no deadline and the daily sync must not
   block on a wedged drive, so the Windows `volume` section is `unavailable` with no rows;
   `agent:mount_points_redacted` means at least one mount point under a user profile or under
-  `/Volumes` was replaced with `[redacted]` and the rest of the row is unchanged. A reason ending `agent_cap:<kept>/<total>`
+  `/Volumes` was replaced with `[redacted]` and the rest of the row is unchanged. The Windows reason
+  is expected on every Windows host and needs no action; the operator-triggered `volumes` action
+  still works there. To see how many devices report each state, query
+  `SELECT kind, level, reason, count(*) FROM device_inventory_store.device_ci_section GROUP BY kind, level, reason ORDER BY kind, count(*) DESC;`.
+  A reason ending `agent_cap:<kept>/<total>`
   means the agent kept only the first `kept` of `total` rows (it caps each list to
   the same limits the server applies, and trims the least valuable lists first if the whole
   record would be too large); `server_cap:<n>` is the server's own cap. Sections fail

@@ -163,10 +163,11 @@ struct CiActionResult {
 YUZU_EXPORT CiActionResult windows_volumes_deferred_result();
 
 /// Replace every entry of a comma-separated mount-point list that sits under a user profile
-/// (`/Users`, `/home`, `\Users` and `\Documents and Settings` behind a drive letter) or under
-/// `/Volumes` (the label is user-chosen) with `[redacted]`, and set `redacted` when any entry was.
+/// (`/Users`, `/home`, `/Documents and Settings`) or under `/Volumes` (the label is user-chosen)
+/// with `[redacted]`, and set `redacted` when any entry was. The match ignores case, takes `\` as
+/// `/`, ignores a leading drive letter and looks through a `/System/Volumes/Data` prefix.
 /// A piece that is not a path (the tail of a label that contained a comma) is redacted too. `-` (no
-/// mount) and drive roots, `/` and `/System/Volumes/*` pass through. Never clears `redacted`.
+/// mount), drive roots, `/` and `/System/Volumes/*` itself pass through. Never clears `redacted`.
 YUZU_EXPORT std::string redact_mount_points(std::string_view csv, bool& redacted);
 
 /// The ten section-bearing actions' outcomes (the three pre-existing actions carry their typed

@@ -502,6 +502,12 @@ TEST_CASE("device_ci v2: an escaped pipe stays inside its field and shifts no co
         CHECK(p.rows.at("volume")[0] ==
               Rec{"My|Vol", "C:/", "//?/Volume{1}/", "NTFS", "511705088", "-"});
     }
+    SECTION("list rows: several escaped pipes in one field stay in that field") {
+        in.disks = cap("disk|0|A\\|B\\|C|512|SSD|NVMe");
+        const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
+        REQUIRE(p.rows.at("disk").size() == 1);
+        CHECK(p.rows.at("disk")[0] == Rec{"0", "A|B|C", "512", "SSD", "NVMe"});
+    }
     SECTION("scalar rows: a pipe in the chassis serial leaves the later fields in place") {
         in.chassis = cap("chassis|laptop|CHS\\|0001|AT-0001|dmi");
         const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
@@ -558,6 +564,13 @@ TEST_CASE("redact_mount_points: user-profile and /Volumes entries are replaced a
     CHECK(run("c:\\documents and settings\\bob") == R{"[redacted]", true});
     CHECK(run("/Volumes/Backup") == R{"[redacted]", true});
 
+    // macOS can spell the firmlinked user tree under the Data volume; the bare volume stays.
+    CHECK(run("/System/Volumes/Data/Users/alice") == R{"[redacted]", true});
+    CHECK(run("/System/Volumes/Data/home/x") == R{"[redacted]", true});
+    CHECK(run("/System/Volumes/Data") == R{"/System/Volumes/Data", false});
+    CHECK(run("/System/Volumes/Data/Applications") == R{"/System/Volumes/Data/Applications", false});
+    CHECK(run("/System/Volumes/DataX/Users/a") == R{"/System/Volumes/DataX/Users/a", false});
+
     // The root match is on a segment boundary.
     CHECK(run("/Usersx/a") == R{"/Usersx/a", false});
     CHECK(run("/Volumes2") == R{"/Volumes2", false});
@@ -596,6 +609,15 @@ TEST_CASE("device_ci v2: a redacted mount point marks the section constrained an
         CHECK(level_of(p, "partition") == "constrained");
         CHECK(reason_of(p, "partition") == "agent:mount_points_redacted;macos:partial");
     }
+    SECTION("a framing byte inside a root segment cannot hide a personal path") {
+        in.volumes = cap(std::string("volume|A|/Us\x1f") + "ers/alice|d1|apfs|1|-\n" +
+                         "volume|B|/Vol" + '\0' + "umes/x|d2|apfs|1|-");
+        const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
+        REQUIRE(p.rows.at("volume").size() == 2);
+        CHECK(p.rows.at("volume")[0][1] == "[redacted]");
+        CHECK(p.rows.at("volume")[1][1] == "[redacted]");
+        CHECK(level_of(p, "volume") == "constrained");
+    }
     SECTION("only the mount column is redacted: the same text elsewhere in a row is untouched") {
         in.volumes = cap("volume|/Volumes/Label|/|disk1s1|apfs|1000|-");
         const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
@@ -610,7 +632,7 @@ TEST_CASE("device_ci v2: a redacted mount point marks the section constrained an
     }
 }
 
-TEST_CASE("device_ci v2: the Windows volumes probe is reported unavailable, not run",
+TEST_CASE("device_ci v2: the Windows volumes probe is reported unavailable and not run",
           "[sync][device_ci][v2][windows]") {
     const auto deferred = yuzu::agent::windows_volumes_deferred_result();
     CHECK(deferred.rc == 0);

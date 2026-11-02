@@ -261,8 +261,12 @@ std::optional<std::string> project_row(const CiV2Section& sec, std::string_view 
         row += '\x1f';
         if (src < t.size()) {
             std::string cell = unescape_pipes(t[src]);
-            if (src == mount_col)
+            if (src == mount_col) {
+                // clamp_field strips the framing bytes later; strip them first so one inside a root
+                // ("/Us\x1fers") cannot hide a personal path from the match.
+                std::erase_if(cell, [](char ch) { return ch == '\x1f' || ch == '\x1e' || ch == '\0'; });
                 cell = redact_mount_points(cell, redacted);
+            }
             row += clamp_field(cell, kMaxFieldLen);
         }
     }
@@ -474,6 +478,10 @@ bool mount_entry_is_personal(std::string_view entry) {
         v.remove_prefix(2);
     else if (v.empty() || v.front() != '/')
         return true; // not a path: the tail of a label that itself held a comma
+    // macOS can spell the firmlinked user tree under the Data volume; judge it as the bare path.
+    constexpr std::string_view kDataVolume = "/system/volumes/data";
+    if (v.starts_with(kDataVolume) && v.size() > kDataVolume.size() && v[kDataVolume.size()] == '/')
+        v.remove_prefix(kDataVolume.size());
     for (const auto root : kPersonalMountRoots)
         if (v.starts_with(root) && (v.size() == root.size() || v[root.size()] == '/'))
             return true;
