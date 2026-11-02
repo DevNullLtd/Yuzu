@@ -100,7 +100,7 @@ CiRecord dirty() {
 // Placeholder serials only; the DIMM serial is '-'. The literals here MUST be
 // byte-identical to the server twin; this is the layout the agent-side
 // device_ci_canonical_blob_v2 must reproduce.
-constexpr const char* kCrossPinHashV2 = "26037f18de08a8a21facd746eef7ec0a722479ee2009df9b6f14edea35ef0a62";
+constexpr const char* kCrossPinHashV2 = "e810ec4a9b2db6286a30f7eddc72beb9090ad52f59d5529be769cec2a3acb36d";
 
 std::string rec_bytes(const std::vector<std::string>& f) {
     std::string b;
@@ -138,7 +138,7 @@ std::string v2_blob_by_hand() {
         {"status", "swap", "ok", ""},
         {"swap", "/swapfile", "2048", "proc_swaps"},
         {"status", "volume", "ok", ""},
-        {"volume", "C:", "C:\\", "\\\\?\\Volume{1}", "NTFS", "511705088", "-"},
+        {"volume", "C:", "C:/", "\\\\?\\Volume{1}", "NTFS", "511705088", "-"},
         {"status", "partition", "ok", ""},
         {"partition", "0", "1", "536870912", "EFI", "-", "-"},
         {"status", "topology", "ok", ""},
@@ -182,7 +182,7 @@ CiSectionInputs all_ok_inputs() {
     in.memory = cap("dimm|DIMM0|8192|DDR4|3200|Samsung|M471A1K43|-");
     in.disks = cap("disk|0|Samsung SSD 980|512|SSD|NVMe");
     in.swap = cap("swap|/swapfile|2048|0|proc_swaps");
-    in.volumes = cap("volume|C:|C:\\|\\\\?\\Volume{1}|NTFS|511705088|-");
+    in.volumes = cap("volume|C:|C:/|\\\\?\\Volume{1}|NTFS|511705088|-");
     in.partitions = cap("partition|0|1|536870912|EFI|-|-");
     in.topology = cap("topology|lvm|vg0|uuid-0001|sda2|-");
     in.disk_actions_loaded = true;
@@ -251,8 +251,17 @@ std::string wide_rows(const std::string& kind, int cols, int n, int width, int f
         char idx[16];
         std::snprintf(idx, sizeof idx, "%04d", i);
         out += kind + "|" + idx;
-        for (int c = 1; c < cols; ++c)
-            out += "|" + std::string(static_cast<std::size_t>(width), static_cast<char>('a' + c));
+        for (int c = 1; c < cols; ++c) {
+            // The mount-point column (volume col 1, partition col 4) is a path in real output, and
+            // a non-path there is redacted: keep the row's byte width, start it with '/'.
+            const bool mount = (kind == "volume" && c == 1) || (kind == "partition" && c == 4);
+            if (mount && width > 0)
+                out += "|/" + std::string(static_cast<std::size_t>(width - 1),
+                                          static_cast<char>('a' + c));
+            else
+                out += "|" + std::string(static_cast<std::size_t>(width),
+                                         static_cast<char>('a' + c));
+        }
         out += "\n";
     }
     return out;
@@ -477,6 +486,146 @@ TEST_CASE("device_ci v2 row projection", "[sync][device_ci][v2]") {
         CHECK(p.rows.at("disk")[0][1] == "Model"); // interior 0x1F stripped
         CHECK(p.rows.at("disk")[0][2].size() == 1023); // 1024 cut back to a codepoint boundary
     }
+}
+
+TEST_CASE("device_ci v2: an escaped pipe stays inside its field and shifts no column",
+          "[sync][device_ci][v2][pipe]") {
+    auto in = all_ok_inputs();
+
+    SECTION("list rows: a pipe in the disk model and in the volume label") {
+        in.disks = cap("disk|0|Model\\|X|512|SSD|NVMe");
+        in.volumes = cap("volume|My\\|Vol|C:/|//?/Volume{1}/|NTFS|511705088|-");
+        const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
+        REQUIRE(p.rows.at("disk").size() == 1);
+        CHECK(p.rows.at("disk")[0] == Rec{"0", "Model|X", "512", "SSD", "NVMe"});
+        REQUIRE(p.rows.at("volume").size() == 1);
+        CHECK(p.rows.at("volume")[0] ==
+              Rec{"My|Vol", "C:/", "//?/Volume{1}/", "NTFS", "511705088", "-"});
+    }
+    SECTION("scalar rows: a pipe in the chassis serial leaves the later fields in place") {
+        in.chassis = cap("chassis|laptop|CHS\\|0001|AT-0001|dmi");
+        const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
+        REQUIRE(p.scalar.size() == 33);
+        CHECK(p.scalar[22] == "laptop");
+        CHECK(p.scalar[23] == "CHS|0001");
+        CHECK(p.scalar[24] == "AT-0001");
+        CHECK(p.scalar[25] == "dmi");
+    }
+    SECTION("scalar rows: two chassis rows give the same record in either order") {
+        in.chassis = cap("chassis|laptop|CHS-B|AT-B|dmi\nchassis|desktop|CHS-A|AT-A|dmi");
+        const auto a = device_ci_canonical_blob_v2(sample(), in);
+        in.chassis = cap("chassis|desktop|CHS-A|AT-A|dmi\nchassis|laptop|CHS-B|AT-B|dmi");
+        CHECK(device_ci_canonical_blob_v2(sample(), in) == a);
+        CHECK(parse_blob(a).scalar[23] == "CHS-A"); // the row that sorts first
+    }
+    SECTION("an unescaped pipe still separates columns") {
+        in.disks = cap("disk|0|Model|512|SSD|NVMe");
+        const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
+        CHECK(p.rows.at("disk")[0] == Rec{"0", "Model", "512", "SSD", "NVMe"});
+    }
+}
+
+TEST_CASE("redact_mount_points: user-profile and /Volumes entries are replaced, system roots kept",
+          "[sync][device_ci][v2][mounts]") {
+    const auto run = [](std::string_view csv) {
+        bool redacted = false;
+        auto out = yuzu::agent::redact_mount_points(csv, redacted);
+        return std::pair{out, redacted};
+    };
+    using R = std::pair<std::string, bool>;
+
+    CHECK(run("-") == R{"-", false});
+    CHECK(run("") == R{"", false});
+    CHECK(run("/") == R{"/", false});
+    CHECK(run("C:/") == R{"C:/", false});
+    CHECK(run("C:/,D:/") == R{"C:/,D:/", false});
+    CHECK(run("C:") == R{"C:", false});
+    CHECK(run("/System/Volumes/Data") == R{"/System/Volumes/Data", false});
+    CHECK(run("/mnt/data") == R{"/mnt/data", false});
+    CHECK(run("D:/Data/vol1") == R{"D:/Data/vol1", false});
+
+    CHECK(run("/Users/alice/vol") == R{"[redacted]", true});
+    CHECK(run("/USERS") == R{"[redacted]", true});
+    CHECK(run("/home/dave") == R{"[redacted]", true});
+    CHECK(run("C:/Users/Bob/mnt") == R{"[redacted]", true});
+    CHECK(run("c:\\documents and settings\\bob") == R{"[redacted]", true});
+    CHECK(run("/Volumes/Backup") == R{"[redacted]", true});
+
+    // The root match is on a segment boundary.
+    CHECK(run("/Usersx/a") == R{"/Usersx/a", false});
+    CHECK(run("/Volumes2") == R{"/Volumes2", false});
+
+    // A list keeps its clean entries and its order.
+    CHECK(run("/,/Volumes/Data") == R{"/,[redacted]", true});
+    CHECK(run("C:/,D:/Users/x") == R{"C:/,[redacted]", true});
+
+    // A label that held a comma is split into pieces; the tail is not a path, so it goes too.
+    CHECK(run("/Volumes/Alice, Backup") == R{"[redacted],[redacted]", true});
+
+    // The flag is only ever raised.
+    bool redacted = true;
+    CHECK(yuzu::agent::redact_mount_points("/", redacted) == "/");
+    CHECK(redacted);
+}
+
+TEST_CASE("device_ci v2: a redacted mount point marks the section constrained and is disclosed",
+          "[sync][device_ci][v2][mounts]") {
+    auto in = all_ok_inputs();
+
+    SECTION("volume: a /Volumes entry, no plugin reason") {
+        in.volumes = cap("volume|Data|/,/Volumes/Alice|disk1s5|apfs|1000|-");
+        const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
+        REQUIRE(p.rows.at("volume").size() == 1);
+        CHECK(p.rows.at("volume")[0][1] == "/,[redacted]");
+        CHECK(level_of(p, "volume") == "constrained");
+        CHECK(reason_of(p, "volume") == "agent:mount_points_redacted");
+    }
+    SECTION("partition: the mount column is column 5, and the plugin's own reason is kept after the token") {
+        in.partitions = cap("partition|0|2|1000|APFS|/Users/alice/x|-", YUZU_RESULT_STATUS_CONSTRAINED,
+                            "macos:partial");
+        const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
+        REQUIRE(p.rows.at("partition").size() == 1);
+        CHECK(p.rows.at("partition")[0] == Rec{"0", "2", "1000", "APFS", "[redacted]", "-"});
+        CHECK(level_of(p, "partition") == "constrained");
+        CHECK(reason_of(p, "partition") == "agent:mount_points_redacted;macos:partial");
+    }
+    SECTION("only the mount column is redacted: the same text elsewhere in a row is untouched") {
+        in.volumes = cap("volume|/Volumes/Label|/|disk1s1|apfs|1000|-");
+        const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
+        CHECK(p.rows.at("volume")[0][0] == "/Volumes/Label");
+        CHECK(level_of(p, "volume") == "ok");
+    }
+    SECTION("clean mount points leave the section ok") {
+        const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
+        CHECK(level_of(p, "volume") == "ok");
+        CHECK(level_of(p, "partition") == "ok");
+    }
+    SECTION("the redaction is deterministic: row order does not change the bytes") {
+        in.volumes = cap("volume|A|/Volumes/x|d1|apfs|1|-\nvolume|B|C:/|d2|ntfs|2|-");
+        const auto a = device_ci_canonical_blob_v2(sample(), in);
+        in.volumes = cap("volume|B|C:/|d2|ntfs|2|-\nvolume|A|/Volumes/x|d1|apfs|1|-");
+        CHECK(device_ci_canonical_blob_v2(sample(), in) == a);
+    }
+}
+
+TEST_CASE("device_ci v2: the Windows volumes probe is reported unavailable, not run",
+          "[sync][device_ci][v2][windows]") {
+    const auto deferred = yuzu::agent::windows_volumes_deferred_result();
+    CHECK(deferred.rc == 0);
+    CHECK_FALSE(deferred.truncated);
+    CHECK(deferred.captured.empty());
+    CHECK(deferred.status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(deferred.provenance == "agent:windows_volumes_unbounded");
+
+    auto in = all_ok_inputs();
+    in.volumes = deferred;
+    const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
+    CHECK(p.status.at("volume") == Rec{"unavailable", "agent:windows_volumes_unbounded"});
+    CHECK(p.rows.count("volume") == 0);
+    // Only the volume section is affected.
+    CHECK(level_of(p, "partition") == "ok");
+    CHECK(level_of(p, "topology") == "ok");
+    CHECK(level_of(p, "disk") == "ok");
 }
 
 TEST_CASE("device_ci v2: rows are sorted and capped first-N with the cap disclosed",
@@ -722,12 +871,36 @@ TEST_CASE("device_ci collect(): all actions ok yields a v2 blob and its hash",
     REQUIRE(p.status.size() == std::size(kCiV2Sections));
     for (const auto& [sec, st] : p.status) {
         CAPTURE(sec);
+#ifdef _WIN32
+        if (sec == "volume") // the Windows volumes probe is not run on the sync thread
+            continue;
+#endif
         CHECK(st == Rec{"ok", ""});
     }
     CHECK(p.scalar[0] == "Dell Inc.");
     CHECK(p.scalar[23] == "CHS-0001"); // chassis serial reached the scalar record
     CHECK(p.rows.at("cpu").size() == 1);
     CHECK(p.rows.at("topology").size() == 1);
+}
+
+TEST_CASE("device_ci collect(): the volumes action is dispatched off Windows and never on it",
+          "[sync][device_ci][v2][collect][windows]") {
+    reset_ci_fakes();
+    const auto r = collect_ci();
+    REQUIRE(r.has_value());
+    const auto p = parse_blob(r->first);
+#ifdef _WIN32
+    CHECK_FALSE(dispatched("volumes"));
+    CHECK(p.status.at("volume") == Rec{"unavailable", "agent:windows_volumes_unbounded"});
+    CHECK(p.rows.count("volume") == 0);
+#else
+    CHECK(dispatched("volumes"));
+    CHECK(p.status.at("volume") == Rec{"ok", ""});
+    CHECK(p.rows.at("volume").size() == 1);
+#endif
+    // partitions and topology are status-only on Windows and always run.
+    CHECK(dispatched("partitions"));
+    CHECK(dispatched("topology"));
 }
 
 TEST_CASE("device_ci collect(): a failing section action never aborts the cycle",

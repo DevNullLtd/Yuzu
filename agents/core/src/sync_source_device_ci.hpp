@@ -114,9 +114,20 @@ YUZU_EXPORT std::string device_ci_canonical_blob(const CiRecord& rec);
 //
 // Level vocabulary: `ok` | `constrained` | `unavailable` | `permission_denied`.
 // Reason tokens the agent authors: `agent:action_absent` (an older plugin answered `unknown
-// action`), `agent:rc=<n>`, `agent:truncated`, `agent:plugin_not_loaded`, and the cap disclosure
-// `agent_cap:<kept>/<total>`; otherwise the plugin's own typed provenance / status-row token
-// passes through verbatim (e.g. `linux:planned`).
+// action`), `agent:rc=<n>`, `agent:truncated`, `agent:plugin_not_loaded`,
+// `agent:windows_volumes_unbounded` (the Windows `volumes` probe is not run on the sync thread),
+// `agent:mount_points_redacted` (a mount point under a user profile or a /Volumes label was
+// replaced), and the cap disclosure `agent_cap:<kept>/<total>`; otherwise the plugin's own typed
+// provenance / status-row token passes through verbatim (e.g. `linux:planned`).
+//
+// PIPES IN A FIELD: the plugins write a literal `|` as `\|` (and fold a literal backslash to `/`),
+// so the v2 row and scalar projections split on an UNESCAPED pipe and unescape before the clamp. The
+// 22 v1 positions keep the raw split: their bytes are frozen.
+//
+// MOUNT POINTS: the `volume` and `partition` mount-point column can name an account (a volume
+// folder-mounted under a user profile) or carry a personal label (/Volumes/<label>). Such an entry
+// is replaced by `[redacted]` before the blob is built and the section is `constrained`; see
+// redact_mount_points.
 //
 // FAILURE PROVENANCE: a section whose level is `unavailable` or `permission_denied` carries its
 // status record and NO rows (and its scalar positions stay blank). Nothing from a failed,
@@ -134,7 +145,8 @@ YUZU_EXPORT std::string device_ci_canonical_blob(const CiRecord& rec);
 // field contract, and the server's clamp can never cut the disclosure. A later ceiling trim
 // REPLACES the token; a record never carries two.
 
-/// Reason-slot reserve: strlen(";agent_cap:") + 2 x 10 digits + strlen("/") = 32 bytes.
+/// Reason-slot reserve: strlen(";agent_cap:") + 2 x 10 digits + strlen("/") = 32 bytes. Ten digits
+/// hold any row count a capture can reach: LocalDispatcher bounds a capture to 2 MiB.
 inline constexpr std::size_t kCiAgentCapReserve = 11 + 2 * 10 + 1;
 
 /// One plugin action's outcome as the device_ci source saw it: the ABI4 typed result and the
@@ -146,6 +158,26 @@ struct CiActionResult {
     std::string provenance; ///< typed provenance the plugin declared ("" when none)
     std::string captured;
 };
+
+/// Reason of the Windows `volumes` section while its probe is not run on the sync thread.
+inline constexpr std::string_view kReasonWindowsVolumesUnbounded = "agent:windows_volumes_unbounded";
+/// Reason of a `volume`/`partition` section in which at least one mount point was redacted.
+inline constexpr std::string_view kReasonMountPointsRedacted = "agent:mount_points_redacted";
+
+/// The `volumes` outcome on a Windows host: `unavailable` with kReasonWindowsVolumesUnbounded and
+/// no capture. The Windows `volumes` leg issues synchronous `DeviceIoControl` calls with no
+/// deadline (disk_actions_win.cpp, "BOUNDING"), and the sync thread is joined on reconnect and on
+/// shutdown, so one wedged drive would stop the agent from reconnecting. Until those calls have a
+/// bound the daily record reports the section instead of running it; the operator-triggered
+/// `volumes` dispatch is unchanged.
+YUZU_EXPORT CiActionResult windows_volumes_deferred_result();
+
+/// Replace every entry of a comma-separated mount-point list that sits under a user profile
+/// (`/Users`, `/home`, `\Users` and `\Documents and Settings` behind a drive letter) or under
+/// `/Volumes` (the label is user-chosen) with `[redacted]`, and set `redacted` when any entry was.
+/// A piece that is not a path (the tail of a label that contained a comma) is redacted too. `-` (no
+/// mount) and drive roots, `/` and `/System/Volumes/*` pass through. Never clears `redacted`.
+YUZU_EXPORT std::string redact_mount_points(std::string_view csv, bool& redacted);
 
 /// The ten section-bearing actions' outcomes (the three pre-existing actions carry their typed
 /// metadata too -- it is retained, never discarded).
