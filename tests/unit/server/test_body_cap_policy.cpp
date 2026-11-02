@@ -32,9 +32,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <set>
 #include <string>
@@ -1471,4 +1474,111 @@ TEST_CASE("transfer_encoding_for_body_cap: an empty first line still reads as pr
     CHECK(yuzu::server::body_unmeasurable(
         "POST", /*has_content_length=*/true,
         yuzu::server::transfer_encoding_for_body_cap(empty_then_chunked)));
+}
+
+// ── httplib's pre-request handler runs before the body is read (cpp-httplib >= 0.47) ─────────────
+//
+// The post-read body cap and the step-up stage measure `req.body`, so they must run AFTER httplib
+// has read it: they are installed through `PostReadStageRegistry` and the route sink, never as
+// `set_pre_request_handler`. These two cases keep that true when the baseline moves or when the
+// route-sink wrapper change is reverted on its own.
+
+namespace {
+
+/// `{major, minor}` of the httplib this build links, from `CPPHTTPLIB_VERSION` ("0.59.0").
+std::pair<int, int> httplib_major_minor() {
+    const std::string_view v = CPPHTTPLIB_VERSION;
+    int major = 0;
+    int minor = 0;
+    const auto dot = v.find('.');
+    REQUIRE(dot != std::string_view::npos);
+    std::from_chars(v.data(), v.data() + dot, major);
+    const auto rest = v.substr(dot + 1);
+    std::from_chars(rest.data(), rest.data() + rest.find('.'), minor);
+    return {major, minor};
+}
+
+bool httplib_reads_body_after_pre_request_handler() {
+    const auto [major, minor] = httplib_major_minor();
+    return major > 0 || minor >= 47;
+}
+
+} // namespace
+
+TEST_CASE("httplib pre-request handler: it runs before the request body is read from 0.47 on",
+          "[body_cap][httplib_version][integration]") {
+    // A real socket and a POST that carries a body. On 0.47 and later the pre-request handler
+    // sees an empty `req.body` (the body is read after it); on an earlier httplib it sees the
+    // body. The route handler sees the body either way. If this case changes its answer on a
+    // later httplib, the placement of the post-read stage must be re-examined.
+    httplib::Server svr;
+    std::atomic<std::size_t> pre_request_body_size{9999};
+    std::atomic<std::size_t> handler_body_size{9999};
+    svr.set_pre_request_handler(
+        [&](const httplib::Request& req, httplib::Response&) -> httplib::Server::HandlerResponse {
+            pre_request_body_size.store(req.body.size());
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+    svr.Post("/probe", [&](const httplib::Request& req, httplib::Response& res) {
+        handler_body_size.store(req.body.size());
+        res.set_content("ok", "text/plain");
+    });
+    const int port = svr.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread server_thread([&]() { svr.listen_after_bind(); });
+    svr.wait_until_ready();
+
+    const std::string body(2048, 'x');
+    httplib::Client cli("127.0.0.1", port);
+    cli.set_read_timeout(10, 0);
+    const auto r = cli.Post("/probe", body, "application/octet-stream");
+
+    svr.stop();
+    server_thread.join();
+
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(handler_body_size.load() == body.size());
+    INFO("httplib " << CPPHTTPLIB_VERSION);
+    if (httplib_reads_body_after_pre_request_handler())
+        CHECK(pre_request_body_size.load() == 0);
+    else
+        CHECK(pre_request_body_size.load() == body.size());
+}
+
+TEST_CASE("server.cpp never installs httplib's pre-request handler on a baseline that reads the "
+          "body after it",
+          "[body_cap][httplib_version][lexical]") {
+    // A source-text pin owned by the baseline change, not by the route-sink wrapper change: if
+    // the wrapper change is reverted alone on this baseline, server.cpp would again install the
+    // stage with `set_pre_request_handler`, which runs before the body is read, so the post-read
+    // body cap and the step-up check would silently see an empty body. Self-contained on purpose:
+    // it shares no helper with the wrapper change's own wiring tests.
+    if (!httplib_reads_body_after_pre_request_handler()) {
+        SUCCEED("this httplib reads the body before its pre-request handler");
+        return;
+    }
+    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/server.cpp", std::ios::binary);
+    REQUIRE(in.good());
+    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    // A call is a member access followed by the name and a parenthesis; prose that mentions the
+    // name does not match.
+    const auto skip_space_back = [&](std::size_t at) {
+        while (at > 0 && (src[at - 1] == ' ' || src[at - 1] == '\t' || src[at - 1] == '\n' ||
+                          src[at - 1] == '\r'))
+            --at;
+        return at;
+    };
+    constexpr std::string_view kName = "set_pre_request_handler";
+    std::size_t calls = 0;
+    for (auto at = src.find(kName); at != std::string::npos; at = src.find(kName, at + 1)) {
+        const auto before = skip_space_back(at);
+        const bool member = before > 0 && (src[before - 1] == '.' || src[before - 1] == '>');
+        const auto after = src.find_first_not_of(" \t\r\n", at + kName.size());
+        if (member && after != std::string::npos && src[after] == '(')
+            ++calls;
+    }
+    CHECK(calls == 0);
+    // ... and the stage still goes in through the registry.
+    CHECK(src.find("PostReadStageRegistry::instance().install(") != std::string::npos);
 }
