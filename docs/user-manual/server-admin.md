@@ -963,7 +963,7 @@ startup log lines — these are routine, not a fault:
 
 - `leader_elector: coordination connection established (host=… port=… dbname=…; dedicated, never-recycled)`
 - `leader_elector: election loop started (poll=5s)`
-- `leader_elector: acquired leadership 'server_background_leader' at epoch N (holder_id=srv-…)`
+- `leader_elector: acquired leadership 'server_background_leader' at epoch N (timeline_part=T count_part=C, holder_id=srv-…)`
 
 If instead you see `[HA] leader_elector could not open its coordination
 connection; FencedLeaderOnly background loops are PAUSED …`, the server could not
@@ -1039,10 +1039,11 @@ that holds it).
   whichever primary the DSN resolves to. Only when every replica
   shares **one** database is the stale replica the one whose
   `yuzu_server_leader_epoch` differs from `leader_state.current_leader_epoch`;
-  restart it. Within one database fenced claims stay safe (assuming no committed
-  transaction was lost on a promotion, that is, synchronous replication, the
-  shipped quorum default; the fence is not claimed safe across a lossy
-  asynchronous promotion) and what runs twice is the unfenced background passes. **What it does not catch:** a *paused*
+  restart it. Within one database fenced claims stay safe across a
+  lossy promotion of a streaming standby (the epoch carries the Postgres timeline, so
+  promoting a streaming standby yields a higher epoch; the cases this does not cover
+  are listed in `docs/user-manual/ha-postgres.md`, and claim rows lost in an
+  asynchronous promotion are the RPO, not the fence) and what runs twice is the unfenced background passes. **What it does not catch:** a *paused*
   ex-leader (the case the epoch fence exists for) — its process is frozen, so its
   series goes stale, not `1`, and a frozen process serves no `/metrics`, so no
   alert on its own series can evaluate. That case is covered by the fence itself
@@ -1059,10 +1060,18 @@ that holds it).
   this is a scrape problem, not a leader problem (a leader whose own scrape target
   is down leaves only the followers' zeros, which sums to 0). Otherwise check, in
   order: the server log for
-  `[HA] leader_elector could not open its coordination connection` and the
+  `[HA] leader_elector could not open its coordination connection` or
+  `leader_elector: cannot read the Postgres timeline` and the
   `yuzu_server_leader_acquire_failures_total{cause}` series (`connect` rising
-  means the dedicated connection cannot be made, or its schema migration failed:
-  reach the primary directly, not through a transaction-mode pooler); then, in
+  means the dedicated connection cannot be made, its schema migration failed, or
+  the timeline could not be read: reach the read-write primary directly, not
+  through a transaction-mode pooler or to a standby, and make sure the database
+  role can run `pg_current_wal_lsn()` and `pg_walfile_name()`; this affects a
+  single-replica server too; `cause="epoch_record"` rising means the sequence cap was reached
+  (`ALTER SEQUENCE leader_elector.leader_epoch_seq RESTART` is safe for ordering, but the next election pins the timeline one above the real one and the server logs a warning) or the
+  `leader_state` row was corrupted to exactly 9223372036854775807 (the log line
+  `failed to record epoch ... (server said: ...)` names which): see
+  [Upgrading](upgrading.md#behaviour-change-the-leader-epoch-now-carries-the-postgres-timeline-ha-6535)); then, in
   Postgres,
   `SELECT a.pid, a.client_addr, a.state, a.backend_start, a.state_change FROM pg_locks l JOIN pg_stat_activity a USING (pid) WHERE l.locktype = 'advisory' AND l.classid = 1735291205;`
   Compare `client_addr` with the replicas: a lock held by a backend that **no live
@@ -1277,17 +1286,20 @@ them (mode `identity`: without a resolvable server identity; mode
   `reference-gateway-sys.config` is ahead of the pinned release image until
   the next release ships.
 
-BYO-cert installs: point `mgmt_peer_pins` at your server certificate — which
-**must carry the `serverAuth` EKU** — or paste its SPKI SHA-256; pin-list
-edits take effect on gateway restart. A pin is not the only way to admit the
+BYO-cert installs: set `{mgmt_peer_auth_mode, pin}` (the shape copied from
+`sys.config.prod` is now `identity` with no pin, and a certificate that carries
+no identity is refused under it as `no_uri_san`) and point `mgmt_peer_pins` at
+your server certificate — which **must carry the `serverAuth` EKU** — or paste
+its SPKI SHA-256; pin-list edits take effect on gateway restart. A pin is not the only way to admit the
 server any more (#6016): with the built-in certificates the gateway can instead
 admit it by the identity URI SAN `yuzu://<install>/server` that the install CA
 puts on the server's certificate (`mgmt_peer_auth_mode` `identity_or_pin` or
 `identity`), which needs no gateway change when the server's key is renewed
 when no pin is configured (a pin kept in `identity` mode must follow the
-renewal). It is an opt-in: the shipped reference configs and an unset mode are
-`pin`, and the identity trusts the issuing CA's issuance policy, so it must not
-be enabled behind a CA that lets a requester choose a URI SAN. Rolling the
+renewal). From release N+1 the shipped reference configs set
+`identity` with no pin; an unset mode is still `pin`, so a config of your own
+changes nothing until you set the key (the boot logs a WARN that it was defaulted). The identity trusts the issuing CA's issuance
+policy, so it must not be used behind a CA that lets a requester choose a URI SAN. Rolling the
 gateway back to a binary from before #6016 ignores these settings: the
 deny-list is no longer honoured, and a configuration with no pins (dropped
 for `identity`, or `identity_or_pin` running on the identity alone) refuses to
@@ -1297,7 +1309,8 @@ first (see the "Rolling back" paragraph of that section). The rollback is a
 gateway restart, so do it only if the node's agents can take the disconnect,
 because agents without the #5183 fix stay wedged after it.
 Bring-your-own certificates, `--no-default-certs` and a server given its own `--cert`/`--key`
-carry no identity and stay on pins. See
+carry no identity: set `{mgmt_peer_auth_mode, pin}` and keep their pin, or every command
+is refused `no_uri_san`. See
 [Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity)
 and `docs/adr/2004-gateway-mgmt-server-identity.md`. `{allow_insecure_mgmt, true}` is a
 lab-rig acknowledgement only; never set it where `:50063` is reachable from
@@ -4871,7 +4884,7 @@ The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays
 
 — backup tooling, Grafana's data source, ad-hoc `psql`. Sized this way the servers cannot exhaust the database by themselves; only other clients can. To keep *them* out of the servers' share, the shipped `yuzu-postgres` images (single-node and the HA Patroni profile) set **`reserved_connections`** (PostgreSQL 16+; default **40**, env `YUZU_PG_RESERVED_CONNECTIONS`, `0` disables) and **grant `pg_use_reserved_connections` to the app role** at first boot. Once the free slots fall to `superuser_reserved_connections + reserved_connections`, only the app role (and superusers) can still connect — so a backup job or a stray session can never take the slot the `/readyz` probe needs to reconnect, which would otherwise turn a replica red on a database that still serves (the probe holds its connection in steady state and reconnects only after a failure; at the limit that reconnect was the connection refused first). The reserve covers the pool and the probe alike — the probe connects exactly as a pool connection does, so it is never green while the pool is refused. Set `YUZU_PG_RESERVED_CONNECTIONS` to `N_servers × (pool_size + 2)` (the default fits two servers at the default pool, e.g. 2 × (16 + 2) = 36 ≤ 40). **Never set it to `max_connections` minus `superuser_reserved_connections` or higher** — both scripts refuse to boot on that value (the boot-time check reads the live `max_connections`; the Patroni entrypoint checks against its own literal 200), because it would leave zero connection slots any ordinary (non-privileged) client could ever use, not merely under load. **On the single-node image this refusal happens AFTER the role/database/grant already exist** on the now-initialized data directory (Postgres's initdb-only-runs-once convention means those steps ran before this check) — restarting the SAME container with a corrected value does **not** retroactively apply anything; either start over on a fresh (wiped) data volume, or apply the fix by hand per "Existing databases" just below. The Patroni entrypoint's check runs before ANY of that (at bootstrap, before the cluster exists), so a Patroni refusal is a clean, no-op-safe retry. **This check runs once, at bootstrap.** A later `patronictl edit-config --set postgresql.parameters.max_connections=...` on an already-running Patroni cluster is not re-validated against the `reserved_connections` value already in force — re-check the arithmetic by hand after any live `max_connections` change (tracked for a real runtime check: #4943 fast-follow). **Existing databases:** first-boot init does not re-run; apply it by hand — `ALTER SYSTEM SET reserved_connections = 40;` (restart required; under Patroni, `patronictl edit-config --set postgresql.parameters.reserved_connections=40` then `patronictl restart <scope>` — `edit-config` alone only writes the DCS config and marks the member pending-restart, it does not apply a postmaster-context GUC like this one; the GRANT below is unchanged either way) and `GRANT pg_use_reserved_connections TO yuzu;`. Verify with `SHOW reserved_connections` and `SELECT pg_has_role('yuzu', 'pg_use_reserved_connections', 'MEMBER')`. On PostgreSQL 15 or older the grant is skipped with a notice and only the formula protects you. **Re-run this same verification** after anything that can silently undo it: a first boot interrupted between the `GRANT` and the `ALTER SYSTEM` (the init script never re-runs once the data directory exists, so a kill in that narrow window leaves the grant in place but the GUC at Postgres's own default of 0 — inert, not incorrect, but not protecting anything either), or any role recreation, credential rotation, or disaster-recovery restore that can drop and re-add the app role without this script running again.
 
-**Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. `Register` also draws a short-lived lease per call, and a mass-reconnect event (a fleet-wide server restart, or a network partition healing across many agents at once) can spike concurrent `Register` calls well above the steady-state heartbeat rate — size with that burst in mind, not just steady-state. A Software-page **Sync now** run can do the same on purpose: up to 500 agents (the per-request cap) re-send their inventory at nearly the same moment, a transient ingest burst on the pool. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing`, `YuzuServerPostgresUnreachable` in `docs/prometheus/yuzu-alerts.yml`). Pool saturation never affects `/readyz` — a busy but healthy server must stay in rotation — while an unreachable database turns `/readyz` red within seconds, well before those alerts' `for:` windows page. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
+**Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. `Register` also draws a short-lived lease per call, and a mass-reconnect event (a fleet-wide server restart, or a network partition healing across many agents at once) can spike concurrent `Register` calls well above the steady-state heartbeat rate — size with that burst in mind, not just steady-state. A Software-page **Sync now** run can do the same on purpose: up to 500 agents (the per-request cap) re-send their inventory at nearly the same moment, a transient ingest burst on the pool. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing`, `YuzuServerPostgresUnreachable` in `docs/prometheus/yuzu-alerts.yml`). Pool saturation never affects `/readyz` — a busy but healthy server must stay in rotation — while an unreachable database turns `/readyz` red within seconds, well before those alerts' `for:` windows page. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet. A rising `yuzu_server_execution_tracker_read_degrade_total{reason="pool_acquire_timeout"}` is not by itself a reason to raise the pool: it also counts a database that is unreachable or in connect backoff, so check `yuzu_server_pg_reachable` first (0 means the database, not the pool) and see [metrics.md](metrics.md#execution-tracker-read-degrade-metric-3834).
 
 **Saturation fast-fail (not operator-configurable).** When the pool is already saturated at the moment of acquire (no idle connection, no spare capacity to open one), every bounded acquire across every Postgres-backed store now gives up after a short, fixed ceiling (~500 ms) instead of running to the caller's own, often much longer, timeout, freeing the calling worker thread for other routes rather than pinning it on a connection unlikely to free up in time. This substantially reduces, but does not eliminate, the risk of a saturated pool cascading into broader worker-thread exhaustion (including on unrelated routes such as auth) under sustained load; the underlying pool-to-worker sizing ratio is unchanged, so a large enough sustained saturation event can still exhaust worker capacity, just at a materially higher load threshold than before this mitigation. This ceiling is a compiled-in default, not exposed via a CLI flag or environment variable; if it proves wrong for your deployment's connection-hold-time distribution, that is a code change, not a config change. The metrics and alert rules named above (particularly `yuzu_pg_acquire_wait_seconds` and `YuzuPgAcquireWaitHigh`) remain the right signals to watch; a rising rate of fast-failed acquires under this ceiling is visible via the same `yuzu_pg_acquire_timeout_total` counter as a genuine full-timeout exhaustion (the counter does not currently distinguish the two).
 
@@ -4943,6 +4956,8 @@ pg_restore --clean --if-exists --no-owner --role=yuzu \
 docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
   --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump"
 ```
+
+**Leader epoch after a restore.** The leader epoch packs the Postgres timeline of the cluster that minted it, and a restore into a fresh cluster may start on a lower timeline (it does when the source cluster had ever failed over). The server floors every new epoch by the `leader_elector.leader_state` row the dump carries, so the restore works as written; while the stored epoch carries a higher timeline than the new cluster's, the server logs a `leader_elector: minted epoch's timeline part ... is above the real Postgres timeline` warning at each election (only the sequence, not the timeline, separates epochs against a lossy promotion until the cluster's timeline reaches it, and a sequence behind the stored epoch is advanced automatically: see `ha-postgres.md`). Only if `leader_elector.leader_state` was lost or recreated while `plugin_config_store.enablement_meta` was restored, run the `issuer_epoch` reset from [Upgrading](upgrading.md#behaviour-change-the-leader-epoch-now-carries-the-postgres-timeline-ha-6535).
 
 Restore `enablement-anchor` with the `--data-dir` files. Restoring a dump onto the data directory it came from is consistent; restoring an OLDER dump under a newer anchor starts the server with enablement regressed by design, and a restore onto a host with no anchor is reported as unwitnessed, as is a restore-then-upgrade while nothing has yet been issued (the anchor names the old store id, both counters are `0`). See [Enablement continuity anchor](#enablement-continuity-anchor) for what each means and for the exit.
 

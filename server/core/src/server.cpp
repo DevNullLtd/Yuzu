@@ -6626,6 +6626,9 @@ public:
             } else {
                 execution_tracker_->set_event_bus(execution_event_bus_.get());
                 execution_tracker_->set_metrics(&metrics_); // ADR-1007
+                // #3834: describe + pre-seed the _checked readers' read-degrade counter
+                // (5 methods x 3 reasons) so absent-vs-zero is meaningful on a dashboard.
+                ExecutionTracker::seed_read_degrade_metrics(metrics_);
                 execution_tracker_->set_forensics_plugin_set(forensics_plugins()); // #4990
                 // ADR-1007: pre-seed to 0 so absent-vs-zero is meaningful —
                 // a healthy fleet with zero concurrency collisions/anomalies
@@ -18996,10 +18999,8 @@ private:
                         f.connected_os.push_back(os);
                     // Normalized (id, os) for the Overview score distribution +
                     // the segment breakdown.
-                    const std::string nos = os.starts_with("win")            ? "windows"
-                                            : os.starts_with("lin")          ? "linux"
-                                            : (os == "darwin" || os == "macos") ? "macos"
-                                                                                : os;
+                    // Fleet label: prefix-normalised, unknown passes through raw.
+                    const std::string nos = detail::dex_fleet_os_label(os);
                     f.connected_agents.emplace_back(id, nos);
                 }
             }

@@ -185,10 +185,29 @@ groups:
             to mgmt_peer_pins in sys.config applies only at the next gateway
             restart, which disconnects every agent on the node, and agents
             without the #5183 fix stay wedged after it); no_uri_san means the
-            peer's certificate has no server identity URI (in identity mode
-            the server's built-in certificate has not been re-issued with it:
-            check yuzu_server_identity_uri_present on the server, and keep
-            mgmt_peer_auth_mode at pin or identity_or_pin until it reads 1);
+            peer's certificate has no server identity URI; read
+            yuzu_server_identity_uri_present on the server: 0 means the
+            in-place re-issue was skipped or failed (see
+            YuzuServerIdentityUriAbsent: fix the cause, then restart the
+            server so it re-issues); 1 means the certificate the server
+            presents to the gateway is not default-server.pem (it has its own
+            --cert/--key): set {yuzu_gw, mgmt_peer_auth_mode} to pin with that
+            certificate's pin; absent means either the server runs a release
+            that does not mint the identity or is not being scraped (upgrade
+            the server first so it re-issues its certificate, THEN restart the
+            gateway only if it is not already on the shipped identity config
+            and only if its agents can take the disconnect, because agents
+            without the #5183 fix stay wedged; a gateway already on identity
+            needs only the server upgrade and restart) or no surface
+            uses the default certificates (own certificates: set
+            mgmt_peer_auth_mode to pin with your pin). Do not put a gateway in
+            identity mode until the server is upgraded and the gauge reads 1;
+            a gateway already in identity mode that refuses with no_uri_san
+            needs the server to re-issue, or your server certificate's pin
+            added with identity_or_pin set until it does (mgmt_peer_auth_mode
+            is read at boot: applying it restarts the gateway, only if its
+            agents can take the disconnect, because agents without the #5183
+            fix stay wedged after it);
             identity_mismatch means the certificate names another install or
             another role (a certificate of a different CA, or an agent-style
             URI): treat as a security incident unless the server was just
@@ -204,12 +223,88 @@ groups:
             if the gateway is restarted, which disconnects every agent on the
             node, and agents without the #5183 fix stay wedged after it;
             internal_error is a gateway defect (collect the gateway log and
-            report it). Rotation never produces these reasons, except identity_unresolved in
+            report it). no_uri_san and identity_mismatch with no admission at all
+            in the same five minutes also raise YuzuGatewayMgmtIdentityOutage
+            (critical). Rotation never produces these reasons, except identity_unresolved in
             identity_or_pin with an unresolved identity. With pins
             configured in identity_or_pin, no_uri_san and identity_mismatch
             are reported as pin_mismatch instead and raise
             YuzuGatewayMgmtPinMismatch, not this alert; identity_unresolved
             and revoked are always reported as themselves.
+
+      # The identity outage (#6016, release N+1). YuzuGatewayMgmtAuthRejected
+      # above is warning-grade because most of its reasons are a person's
+      # to-do. Two of them are a total command outage under the shipped
+      # identity configs: no_uri_san (the server presents a certificate with
+      # no identity: its own --cert/--key or a bring-your-own certificate on
+      # the pin-less shipped config, or a built-in certificate that has not
+      # been re-issued) and identity_mismatch (another install or role).
+      # pin_mismatch, the same outage under a pin, is already critical, so
+      # these two page too, and only when the gateway ADMITTED NOTHING in the
+      # same five minutes: a stray rejection amid normal traffic (a probe, the
+      # gateway's own leaf) stays warning-only, and a server that is working
+      # for most commands is not an outage. The admitted counter is created at
+      # 0 for both methods, so a gateway that never admitted anything still has
+      # the series; `unless on (job, instance)` is per gateway. In
+      # identity_or_pin with pins configured these reasons are reported as
+      # pin_mismatch and raise YuzuGatewayMgmtPinMismatch instead. Both this
+      # alert and YuzuGatewayMgmtAuthRejected fire for the same cause; there is
+      # no inhibit rule in this repository, so expect the pair (gateway.md shows
+      # an operator-side inhibit_rules snippet). `for: 1m` absorbs a scrape and
+      # evaluation race at the edge of the window; a gateway that was healthy
+      # pages about six minutes after the refusals begin (the five-minute window
+      # has to age its last admission out, then the minute). It needs a scrape
+      # interval of about 2m or less (Prometheus 3 range selectors are left-open,
+      # so increase() needs two samples inside the window): a 3m scrape makes it
+      # flap and a 5m scrape makes it blind; the 15-30 s the other gateway rules
+      # assume is ample. Known limit: it cannot tell an idle gateway from a dead
+      # one, and one un-re-issued server replica among several that still admit
+      # stays warning-only.
+      - alert: YuzuGatewayMgmtIdentityOutage
+        expr: |
+          sum by (job, instance, reason) (
+            increase(yuzu_gw_mgmt_auth_rejected_total{reason=~"no_uri_san|identity_mismatch"}[5m])
+          ) > 0
+          unless on (job, instance)
+          sum by (job, instance) (increase(yuzu_gw_mgmt_auth_admitted_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway refuses the server's identity and admits nothing ({{ $labels.instance }}, {{ $labels.reason }})"
+          description: >-
+            The gateway's :50063 management listener refused the server's
+            certificate with reason {{ $labels.reason }} and admitted nothing
+            in the same five minutes: every command the server forwards to
+            this gateway's agents is failing as gateway_unauthenticated (the
+            server does not retry). Under the shipped identity config this is
+            almost always one of two causes. (1) The server's certificate has
+            no server identity: read yuzu_server_identity_uri_present on the
+            server; 0 means the in-place re-issue was skipped or failed (see
+            YuzuServerIdentityUriAbsent: fix the cause and restart the server,
+            which needs no gateway restart); absent means the server runs a
+            release that does not mint the identity or is not being scraped
+            (upgrade the server first). (2) The server uses its own
+            certificates (bring-your-own, --no-default-certs, or its own
+            --cert/--key), which carry no identity: set {yuzu_gw,
+            mgmt_peer_auth_mode} to pin with that certificate's pin. That
+            change is read at boot, so it applies only when the gateway is
+            restarted, which disconnects every agent on the node; do it only
+            if they can take the disconnect, because agents without the #5183
+            fix stay wedged after it. identity_mismatch means the certificate
+            names another install or another role: treat it as a security
+            incident unless the server was just re-keyed under another CA or
+            the CA was re-rooted while this gateway kept running (it derives
+            its identity from the CA file at boot, so it refuses the new
+            certificate until it is restarted or given the new
+            mgmt_peer_identity; see the gateway guide, "During a CA re-root";
+            a restart disconnects the node's agents, and agents without the
+            #5183 fix stay wedged after it). If the gauge
+            yuzu_server_identity_uri_present reads 1, the certificate the
+            server presents is not default-server.pem: it has its own
+            --cert/--key, so set mgmt_peer_auth_mode to pin.
+            YuzuGatewayMgmtAuthRejected fires for the same cause (warning) and
+            lists every other reason.
 
       # pin_mismatch: the peer's key is not the pinned key. A routine rotation
       # produces a few: the server presents its new leaf up to one
@@ -874,13 +969,18 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Gateway mgmt-plane peer pin rejected this server ({{ $value }} in 1h)"
+          summary: "Gateway mgmt-plane peer authorization rejected this server ({{ $value }} in 1h)"
           description: >-
             forward_gateway_pending's SendCommand RPC was rejected
             UNAUTHENTICATED by a gateway's mgmt-plane peer pin (#1422) — the
             certificate this server presents does not satisfy that gateway's
             configured pin. Command forwarding to that gateway's agents is
-            DOWN until the pin and the server's leaf certificate agree. See
+            DOWN until the pin and the server's leaf certificate agree. Under
+            mgmt_peer_auth_mode identity (the shipped config) the refusal is the
+            server identity URI and no pin is involved: read
+            yuzu_gw_mgmt_auth_rejected_total{reason} on the gateway (no_uri_san
+            or identity_mismatch) and see YuzuGatewayMgmtAuthRejected for the
+            action. See
             ADR-2002 §7e and docs/user-manual/server-admin.md's `#4672`
             vNEXT entry for the `gateway_unauthenticated` reason code.
             Caveat: an occurrence in the ~1h window right after this
@@ -2942,8 +3042,15 @@ groups:
             unreachable. A gateway in mgmt_peer_auth_mode pin or
             identity_or_pin still admits this server by its pin (when it has
             one), so nothing is failing; a gateway in identity mode refuses
-            it (no_uri_san). Do not move a gateway to identity mode until this
-            reads 1 on every server replica. The gauge is set once, at server
+            it (no_uri_san). Do not move a gateway to identity mode until the
+            server is upgraded and this reads 1 on every server replica. A
+            gateway already in identity mode that refuses with no_uri_san
+            needs the server to re-issue (fix the cause above, then restart
+            the server), or your server certificate's pin added with
+            mgmt_peer_auth_mode set to identity_or_pin until it does (read at
+            boot: applying it restarts the gateway, only if its agents can take
+            the disconnect, because agents without the #5183 fix stay wedged
+            after it). The gauge is set once, at server
             boot, so it stays 0 until the server is restarted after the cause
             is fixed. It describes the file default-server.pem: a server given
             its own --cert/--key presents that certificate to the gateway,
@@ -3678,11 +3785,17 @@ groups:
   #  - `yuzu_server_leader_is_leader` is the replica's BELIEF (the attempt gate),
   #    not proof. Correctness for a leader-driven claim is the epoch fence in
   #    its WRITE (leader_elector.hpp), never this gauge. The fence is PER
-  #    DATABASE (see YuzuLeaderSplitBrain) and assumes no committed transaction
-  #    is lost on a promotion (synchronous replication, the shipped quorum
-  #    default): under asynchronous replication, or a degraded non-strict quorum,
-  #    a lagging promotion could re-mint an epoch, and "fenced claims remain
-  #    safe" below is NOT claimed for that case.
+  #    DATABASE (see YuzuLeaderSplitBrain). Since #6535 the epoch carries the
+  #    Postgres timeline (and the stored epoch is a floor), so a lossy promotion
+  #    of a streaming standby no longer lets a paused ex-leader's epoch equal the
+  #    new leader's; claim rows lost in an asynchronous promotion are the RPO, not
+  #    the fence. NOT claimed for: two primaries accepting writes at once, a
+  #    restore that loses leader_state, a lossy promotion while a restored row pins
+  #    a higher timeline, same-timeline loss, a physical snapshot restored without
+  #    archive recovery, promotion tooling that skips the previous timeline's
+  #    history or a PITR that reuses a timeline, or a rolling upgrade/downgrade
+  #    across #6535 (the canonical list is ADR-2002 section 3; ha-postgres.md
+  #    mirrors it).
   #  - Single replica (the supported default): SplitBrain cannot fire (one
   #    series), NoLeader fires only if the elector never leads (loops paused),
   #    Flapping usually does NOT see a single replica's restart loop (see that
@@ -3749,8 +3862,10 @@ groups:
             replicas share one database is the stale one the replica whose
             yuzu_server_leader_epoch differs from
             leader_elector.leader_state.current_leader_epoch; restart it. Within
-            one database (with synchronous replication) fenced claims remain
-            safe and the unfenced background passes may be running twice.
+            one database the epoch fence holds across a standby promotion (what it
+            does not cover is listed in docs/user-manual/ha-postgres.md); a paused
+            ex-leader is NOT caught by this alert, and the unfenced background
+            passes may be running twice.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#leader-election-metrics-and-alerts-ha-ws-11"
 
       - alert: YuzuLeaderNoLeader
