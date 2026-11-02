@@ -697,13 +697,18 @@ by each handler.
   `kPendingRuling`.
 - **Where it runs.** In `run_post_read_stage` (`step_up_wiring.hpp`), the
   body of the post-read stage `server.cpp` installs through
-  `PostReadStageRegistry` and the route sink runs in front of every handler:
-  after the route is matched and the body is read (and after the post-read body
-  cap, which lives in the same function), before the handler. The sink fails
-  closed: registering a route on a server with no stage installed throws, so a
-  route owner on such a server cannot serve an ungated route; the plaintext
-  redirect listener is the one production server built with the explicit
-  `StageRequirement::ExemptNoStage`. It is not
+  `PostReadStageRegistry` and the route sink runs in front of every handler
+  registered through the sink: after the route is matched and the body is read
+  (and after the post-read body cap, which lives in the same function), before
+  the handler. Coverage is per route registered through the sink, not
+  server-wide: the stage is installed before the first route (`install` throws
+  if the server already has a route recorded, and `ScopedPostReadStage` owns the
+  registration), and the sink fails closed, so registering a route on a server
+  with no stage installed throws and a route owner on such a server cannot serve
+  an ungated route; the plaintext redirect listener is the one production
+  server built with the explicit `StageRequirement::ExemptNoStage`. A route
+  registered on the server outside the sink would be neither wrapped nor
+  inventoried, which a lexical source scan pins. It is not
   httplib's `set_pre_request_handler`, which runs before the body is read from
   cpp-httplib v0.47.0. The order for a `kRequired` route is therefore: session
   resolution (`401` when there is none), for a cookie session the server-wide

@@ -739,6 +739,8 @@ regress:
    once per request by the chokepoint in the post-read stage
    (`run_post_read_stage` in `step_up_wiring.hpp`, installed by `server.cpp` through
    `PostReadStageRegistry` and run by the route sink).
+   The stage is a handler wrapper, so coverage is per route registered through the
+   sink, and the install must precede the first route.
    Regressions to guard against: (a) a second list of gated routes, or a new
    per-handler `step_up_fn` call used as the only enforcement for a route (a
    handler can forget it; the table cannot be bypassed by omission); (b) a
@@ -789,3 +791,9 @@ regress:
    or proof. Chokepoint PR 2: the pass and the in-handler calls may be deleted once handlers
    consume the centrally resolved session or the repeated resolves are removed (#6200); the
    binding stays until then, and ideally then carries the resolved session itself.
+   Also: (h) a route served with no stage, or a stage that runs before the body is read: a stage
+   not installed for the server (or installed after the first route, so that route is left
+   unwrapped), a registration that bypasses the sink, or an `ExemptNoStage` beyond the plaintext
+   redirect listener. The sink throws on a stageless server and `install` throws once a route
+   is recorded, and a source scan pins the single production exemption and the absence of a
+   direct verb call on the web server.

@@ -8980,7 +8980,19 @@ public:
         // fail-closed deny-at-login) even though the feature is off.
         auth_routes_->set_scim_store(cfg_.scim_enable ? scim_store_.get() : nullptr);
 
-        start_web_server();
+        // A route registered through `HttplibRouteSink` that the step-up policy does not classify, or
+        // with no post-read stage installed, is refused with `std::logic_error` (the sink fails
+        // closed). Left to escape, that unwinds run() into main's catch only after the gRPC
+        // listeners are bound, so agents and the gateway see accept-then-exit churn. Route it
+        // through the same `startup_failed_` check as the other web-server boot failures. Any
+        // other `std::logic_error` from start_web_server() is a refusal to start too, and is
+        // logged with its text.
+        try {
+            start_web_server();
+        } catch (const std::logic_error& e) {
+            spdlog::critical("run(): web server startup refused (std::logic_error): {}", e.what());
+            startup_failed_ = true;
+        }
 
         // M/H3 follow-up (2026-07-10 review): start_web_server() can set
         // startup_failed_ (SCIM boot failure, or #4722 HTTPS cipher-pin
@@ -15817,6 +15829,9 @@ private:
         // between reading the body and calling the handler, so the wrapper is
         // the only placement whose position in the request does not depend on
         // the httplib version. No `set_pre_request_handler` is installed here.
+        // Coverage is therefore PER ROUTE registered through the sink: a route
+        // registered on the server outside the sink loses the body cap AND the
+        // step-up chokepoint, not only the cap.
         //
         // INSTALL BEFORE THE FIRST ROUTE: the sink looks the stage up when a
         // route is registered, so a route registered earlier would be left
@@ -15865,8 +15880,9 @@ private:
         // overload, and httplib's `dispatch_request_for_content_reader` leaves
         // `req.body` EMPTY (the body is streamed through the reader), so a
         // route registered that way on `*web_server_` directly would be
-        // neither wrapped nor capped. This codebase registers none; it is the
-        // same blind spot as multipart and will not announce itself.
+        // neither wrapped, capped nor step-up gated. This codebase registers
+        // none; it is the same blind spot as multipart and will not announce
+        // itself.
         //
         // Same table, same `path_class` label (never the attacker-controlled
         // `req.path`), same 413 A4/SCIM envelope shapes, and the same

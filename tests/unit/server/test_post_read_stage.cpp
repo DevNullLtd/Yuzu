@@ -8,8 +8,9 @@
  * pin the wrapper's own contract (order, short-circuit, ordering guard, unwrapped servers); the
  * production stage's behaviour is pinned by test_step_up_wiring.cpp and test_body_cap_policy.cpp.
  *
- * The behavioural cases bind a loopback port, which crashes httplib under TSan (#438), so they
- * are compiled out of the TSan build; the registry cases need no socket and always run.
+ * The behavioural cases bind a loopback port. They run in every build, TSan included (the CI
+ * gai shim keeps httplib's resolver out of TSan's way, #438), alongside the socket-free registry
+ * cases.
  */
 
 #include "../../../server/core/src/http_route_sink.hpp"
@@ -175,8 +176,6 @@ TEST_CASE("post-read stage: a stage is per server and forget drops only that ser
     reg.install(&a, pass_stage()); // and the server may install again after a forget
 }
 
-#ifndef YUZU_TSAN_BUILD
-
 namespace {
 
 /// A loopback server whose routes are registered through the sink, with an optional stage.
@@ -208,10 +207,18 @@ struct StageServer {
             res.status = 200;
             res.set_content("handled", "text/plain");
         });
-        sink.Get("/yuzu_test_get", [this](const httplib::Request&, httplib::Response& res) {
+        // One handler on every other verb, all through the sink, so a verb that registered the
+        // unwrapped handler is visible to the all-verbs assertion below.
+        const auto plain = [this](const httplib::Request&, httplib::Response& res) {
             handler_calls.fetch_add(1);
-            res.set_content("got", "text/plain");
-        });
+            res.status = 200;
+            res.set_content("verb", "text/plain");
+        };
+        sink.Get("/yuzu_test_get", plain);
+        sink.Put("/yuzu_test_verb", plain);
+        sink.Delete("/yuzu_test_verb", plain);
+        sink.Patch("/yuzu_test_verb", plain);
+        sink.Options("/yuzu_test_verb", plain);
         port = svr.bind_to_any_port("127.0.0.1");
         REQUIRE(port > 0);
         th = std::thread([this] { svr.listen_after_bind(); });
@@ -308,14 +315,27 @@ TEST_CASE("post-read stage: Handled from the stage answers the request and skips
     CHECK(s.stage_calls.load() == 1);
     CHECK(s.handler_calls.load() == 0);
 
-    // The wrapper covers every verb the sink registers, GET included.
-    auto g = cli.Get("/yuzu_test_get");
-    REQUIRE(g);
-    CHECK(g->status == 413);
+    // The wrapper covers every verb the sink registers: each answers 413 and none reaches its
+    // handler.
+    const std::vector<std::pair<std::string, httplib::Result>> verbs = [&cli] {
+        std::vector<std::pair<std::string, httplib::Result>> v;
+        v.emplace_back("GET", cli.Get("/yuzu_test_get"));
+        v.emplace_back("PUT", cli.Put("/yuzu_test_verb", "x", "text/plain"));
+        v.emplace_back("DELETE", cli.Delete("/yuzu_test_verb"));
+        v.emplace_back("PATCH", cli.Patch("/yuzu_test_verb", "x", "text/plain"));
+        v.emplace_back("OPTIONS", cli.Options("/yuzu_test_verb"));
+        return v;
+    }();
+    for (const auto& [verb, res] : verbs) {
+        INFO(verb);
+        REQUIRE(res);
+        CHECK(res->status == 413);
+    }
     CHECK(s.handler_calls.load() == 0);
 }
 
-TEST_CASE("post-read stage: a server with no stage installed registers its handlers unwrapped",
+TEST_CASE("post-read stage: an exempt server with no stage installed serves its handlers "
+          "as registered",
           "[postread][wiring]") {
     StageServer s;
     s.start({});
@@ -378,5 +398,3 @@ TEST_CASE("post-read stage: one server's stage does not wrap another server's ro
     CHECK(r2->status == 200);
     CHECK(plain.handler_calls.load() == 1);
 }
-
-#endif // !YUZU_TSAN_BUILD

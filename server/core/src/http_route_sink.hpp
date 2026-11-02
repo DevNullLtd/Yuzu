@@ -13,8 +13,10 @@
 //
 // The fix is a thin polymorphic seam at the route-registration boundary:
 //   - Production code constructs HttplibRouteSink(svr) and passes a
-//     reference to register_routes — same calls, same handlers, same
-//     server, no behavioural change.
+//     reference to register_routes. The sink registers each handler on the
+//     same server wrapped in the server's post-read stage (body cap + step-up),
+//     and throws std::logic_error rather than register a route that stage
+//     could not cover.
 //   - Tests construct an in-process sink (see tests/unit/server/test_route_sink.hpp)
 //     that captures the (method, path, handler) triples, supports
 //     httplib-style :param and regex path matching, and dispatches a
@@ -50,9 +52,16 @@ public:
     virtual void Options(const std::string& pattern, Handler handler) = 0;
 };
 
-/// Concrete sink that forwards every registration to a wrapped
-/// httplib::Server. Production callers construct one of these on the
-/// stack at the register_routes call site and pass it through.
+/// Whether a `HttplibRouteSink` insists on a post-read stage for its server. `Required` is the
+/// default and fails closed; `ExemptNoStage` is the only opt-out and must be spelled out.
+enum class StageRequirement {
+    Required,
+    ExemptNoStage,
+};
+
+/// Concrete sink that registers every route on a wrapped httplib::Server, behind the server's
+/// post-read stage. Production callers construct one of these on the stack at the register_routes
+/// call site and pass it through.
 ///
 /// Each registration is also recorded in `RouteInventory` (method + pattern, keyed by the wrapped
 /// server) so the boot-time step-up coverage sweep can see every route the server will serve.
@@ -71,13 +80,6 @@ public:
 /// owner built on a server that forgot the install cannot serve an uncapped, ungated route. The one
 /// way out is the explicit, greppable `StageRequirement::ExemptNoStage`, used by the plaintext
 /// redirect listener (it only answers 301) and by tests that do not exercise the stage.
-/// Whether a `HttplibRouteSink` insists on a post-read stage for its server. `Required` is the
-/// default and fails closed; `ExemptNoStage` is the only opt-out and must be spelled out.
-enum class StageRequirement {
-    Required,
-    ExemptNoStage,
-};
-
 class HttplibRouteSink : public HttpRouteSink {
 public:
     explicit HttplibRouteSink(httplib::Server& svr,

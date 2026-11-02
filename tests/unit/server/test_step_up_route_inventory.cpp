@@ -28,15 +28,15 @@
  * No Postgres, no sockets. A change that adds a mutating route and does not classify it fails
  * here; the fix is a row in step_up_policy.hpp, never an entry in this file.
  *
- * SHARD PLACEMENT. Eight cases read the route-source tree (the text corpus is memoised per
+ * SHARD PLACEMENT. Nine cases read the route-source tree (the text corpus is memoised per
  * process). Six of them walk the whole tree with a linear scan (route_registration_scan.hpp; before
  * #4882 the five shared one cached pattern-engine pass, 24 s on macOS debug, and the label-pin case
  * made two, 19.7 s) and carry the `[body_cap]` tag: the five that
  * use `discover_mutating_routes` (directly or through `l3_scanned()`; one cached pass, paid by
- * whichever runs first) and the kRequired label-pin case (its own pass). The other two (the
- * foreign-receiver and header scans) use plain string search over the cached corpus and stay
- * untagged. `[body_cap]` is a placement tag, not a topic: it routes the six to the non-pg
- * 'server unit tests shard D' (see tests/meson.build), which already holds the other in-process
+ * whichever runs first) and the kRequired label-pin case (its own pass). The other three (the
+ * post-read exemption, foreign-receiver and header scans) use plain string search over the cached
+ * corpus and stay untagged. `[body_cap]` is a placement tag, not a topic: it routes the six to the
+ * non-pg 'server unit tests shard D' (see tests/meson.build), which already holds the other in-process
  * route-source cases, instead of leaving them in shard B. All six move together on purpose: the
  * discovery pass is cached per process, so moving only some would just move the cost to the next
  * case in B that reads it. A new case that uses `discover_mutating_routes` should carry the tag
@@ -352,6 +352,38 @@ std::string join(const std::vector<std::string>& v) {
     return s;
 }
 
+/// `text` with each line's `//` comment cut. A `//` inside a string or character literal (a URL)
+/// is not a comment and cuts nothing. Block comments are not modelled.
+std::string code_of(const std::string& text) {
+    std::string out;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        const auto nl = text.find('\n', pos);
+        const auto end = nl == std::string::npos ? text.size() : nl;
+        const auto line = text.substr(pos, end - pos);
+        char quote = 0; // the literal delimiter we are inside, or 0
+        std::size_t cut = line.size();
+        for (std::size_t i = 0; i < line.size(); ++i) {
+            const char ch = line[i];
+            if (quote != 0) {
+                if (ch == '\\')
+                    ++i; // skip the escaped character
+                else if (ch == quote)
+                    quote = 0;
+            } else if (ch == '"' || ch == '\'') {
+                quote = ch;
+            } else if (ch == '/' && i + 1 < line.size() && line[i + 1] == '/') {
+                cut = i;
+                break;
+            }
+        }
+        out.append(line, 0, cut);
+        out += '\n';
+        pos = end + 1;
+    }
+    return out;
+}
+
 } // namespace
 
 // -- L1 ----------------------------------------------------------------------------------------
@@ -439,28 +471,17 @@ TEST_CASE("step-up route inventory L3 (lexical): L1 never sees a route the scan 
 }
 
 TEST_CASE("step-up route inventory: only the redirect listener's sink opts out of the post-read "
-          "stage, and no source registers a verb on a server directly",
+          "stage, and the two server members take no verb call",
           "[stepup][inventory][l3][postread]") {
     // `HttplibRouteSink` fails closed when its server has no post-read stage (body cap + step-up),
-    // so the one way to register an unstaged route is `StageRequirement::ExemptNoStage`, or a verb
-    // call on the httplib server itself that skips the sink (and so the stage and the inventory).
-    // Both are pinned here by a lexical scan, comment text excluded. Tests are not scanned: they
-    // opt out freely, and that is not a production route.
-    const auto code_of = [](const std::string& text) {
-        std::string out;
-        std::size_t pos = 0;
-        while (pos < text.size()) {
-            const auto nl = text.find('\n', pos);
-            const auto end = nl == std::string::npos ? text.size() : nl;
-            auto line = text.substr(pos, end - pos);
-            if (const auto c = line.find("//"); c != std::string::npos)
-                line.resize(c);
-            out += line;
-            out += '\n';
-            pos = end + 1;
-        }
-        return out;
-    };
+    // so the ways to register an unstaged route are `StageRequirement::ExemptNoStage`, or a verb
+    // call on the httplib server that skips the sink (and so the stage and the inventory). This
+    // scan pins the literal `StageRequirement::ExemptNoStage` count and the six literal verb calls
+    // on the receivers `web_server_->` and `redirect_server_->`, comment text excluded. It does NOT
+    // see a route registered through an alias or another receiver (a later case covers literal
+    // mutating registrations on any receiver), a `ContentReader` overload, or a custom-method
+    // route: those stay a review concern. Tests are not scanned: they opt out freely, and that is
+    // not a production route.
     const auto count_of = [](const std::string& hay, std::string_view needle) {
         std::size_t n = 0;
         for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))
@@ -498,6 +519,20 @@ TEST_CASE("step-up route inventory: only the redirect listener's sink opts out o
     CHECK(direct.empty());
 }
 
+TEST_CASE("step-up route inventory: the comment cut ignores a slash pair inside a literal",
+          "[stepup][inventory][l3]") {
+    // A URL in a string literal must not hide the rest of its line from the scan.
+    CHECK(code_of("log(\"http://x\"); web_server_->Post(\"/p\", h);\n")
+              .find("web_server_->Post(") != std::string::npos);
+    CHECK(code_of("auto c = '\"'; web_server_->Put(\"/p\", h); // tail\n")
+              .find("web_server_->Put(") != std::string::npos);
+    // A real line comment is still cut, and a literal ending before it does not shield it.
+    CHECK(code_of("int a = 1; // web_server_->Post(\"/p\", h);\n").find("web_server_") ==
+          std::string::npos);
+    CHECK(code_of("f(\"s\"); // web_server_->Post(\"/p\", h);\n").find("web_server_") ==
+          std::string::npos);
+}
+
 TEST_CASE("step-up route inventory: no server source registers a route on a receiver other than "
           "the sink",
           "[stepup][inventory][l3]") {
@@ -509,7 +544,7 @@ TEST_CASE("step-up route inventory: no server source registers a route on a rece
     // the verb names but pass a variable path (`cli.Post(path, ...)`), so they are not literal
     // registrations and are not reported; if one ever is, allowlist that exact receiver in that
     // file here with the reason, never a whole file or a line number.
-    const auto is_sink_receiver = [](const std::string& r) { return r == "sink" || r == "svr"; };
+    const auto is_sink_receiver = [](const std::string& r) { return r == "sink"; };
 
     std::size_t files_checked = 0;
     std::vector<std::string> foreign;
@@ -526,7 +561,7 @@ TEST_CASE("step-up route inventory: no server source registers a route on a rece
     scan_corpus(scan::read_all_cpp_files(YUZU_SERVER_SRC_DIR));
     scan_corpus(scan::read_all_header_files(YUZU_SERVER_SRC_DIR));
     CHECK(files_checked > 500);
-    INFO("Literal mutating registrations on a receiver other than `sink`/`svr`:\n" << join(foreign));
+    INFO("Literal mutating registrations on a receiver other than `sink`:\n" << join(foreign));
     CHECK(foreign.empty());
 
     // The one spelling that was banned outright before this rule stays banned whatever the

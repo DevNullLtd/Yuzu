@@ -1934,6 +1934,31 @@ TEST_CASE("wiring: server.cpp owns the post-read stage registration through a sc
     CHECK(count_of(src, "PostReadStageRegistry::instance().forget(web_server_.get());") == 1);
 }
 
+// A route the sink refuses at boot (no step-up policy row, or no post-read stage installed) must
+// become a startup failure, not an exception unwinding out of run() after the gRPC listeners are
+// bound.
+TEST_CASE("wiring: server.cpp turns a refused route registration into a startup failure",
+          "[stepup][wiring][lexical]") {
+    const auto stripped = strip_comments_and_literals(read_server_cpp());
+    REQUIRE(stripped.clean);
+    std::string flat = stripped.text;
+    std::erase_if(flat, [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; });
+    constexpr std::string_view kGuarded =
+        "try{start_web_server();}catch(conststd::logic_error&e){"
+        "spdlog::critical(\"\",e.what());startup_failed_=true;}";
+    CHECK(count_of(flat, kGuarded) == 1);
+    // The only call: a second, unguarded one would escape.
+    CHECK(count_of(flat, "start_web_server();") == 1);
+    // ... and the recheck that follows it stops the already-bound listeners and returns.
+    const auto guarded = flat.find(kGuarded);
+    REQUIRE(guarded != std::string::npos);
+    const auto recheck = flat.find("if(startup_failed_){", guarded);
+    REQUIRE(recheck != std::string::npos);
+    const auto recheck_return = flat.find("return;", recheck);
+    REQUIRE(recheck_return != std::string::npos);
+    CHECK(flat.substr(recheck, recheck_return - recheck).find("stop();") != std::string::npos);
+}
+
 // The stripper behind the validator floor below. A desync (a digit separator read as the start of
 // a character literal, a raw string ended at an inner quote) would hide a real call from the floor
 // without any other symptom, so each failure mode has its own case.

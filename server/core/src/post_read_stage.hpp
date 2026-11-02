@@ -34,9 +34,13 @@
 /// the server by a path that does not go through the sink is neither recorded nor wrapped, which
 /// is why the L3 source scan (`route_inventory_scan.hpp`) exists.
 ///
-/// COVERAGE, unchanged from the pre-request-handler wiring it replaces: the stage runs for a
-/// MATCHED route only (an unmatched path never reaches a handler), and for a multipart request
-/// `req.body` stays empty so the cap cannot see it. See `body_cap_policy.hpp`.
+/// COVERAGE is PER ROUTE registered through the sink. The pre-request hook this replaces was
+/// server-wide: httplib ran it for every matched route, ContentReader routes included
+/// (httplib.h, `dispatch_request_for_content_reader`). The wrapper covers only the routes a sink
+/// registered, which is why an unwrapped registration is refused at boot rather than left to
+/// chance. The stage still runs for a MATCHED route only (an unmatched path never reaches a
+/// handler), and for a multipart request `req.body` stays empty so the cap cannot see it. See
+/// `body_cap_policy.hpp`.
 
 #include <httplib.h>
 

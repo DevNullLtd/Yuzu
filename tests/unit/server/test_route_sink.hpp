@@ -31,7 +31,12 @@
 //   - none of the request PIPELINE runs — no pre-routing chokepoint
 //     (on-behalf-of rejection, quotas, rate limiting), no post-routing
 //     handler (security headers). A gate that moves into pre-routing will
-//     leave every sink test green while the route-level gate is gone.
+//     leave every sink test green while the route-level gate is gone;
+//   - no post-read stage: this sink never consults `PostReadStageRegistry`,
+//     never records into `RouteInventory`, and never refuses an unclassified
+//     route once sealed, so the body cap, the step-up chokepoint and the
+//     fail-closed registration refusal are all absent here (a socket test
+//     with `PostReadStageScope`, post_read_stage_test_support.hpp, covers them).
 // A fixture that needs any of the above needs a live socket, not this sink.
 //
 // TWO INVARIANTS FOR FIXTURES USING THIS SINK:
