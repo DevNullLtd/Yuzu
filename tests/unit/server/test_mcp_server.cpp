@@ -45764,8 +45764,8 @@ TEST_CASE("MCP execute_instruction_definition: supervised non-admin on a gated p
 }
 
 // unhappy p4: the supervised pre-mint probe runs the SAME step-0 refusal as the dispatch, so a
-// hostile id is refused BEFORE a tier ticket exists (a ticket binds the arguments, and an approved
-// ticket for an id the core would refuse is a burned one-time capability).
+// hostile id is refused BEFORE a tier ticket exists (an approved ticket for an id the core would
+// refuse is a burned one-time capability).
 TEST_CASE("MCP execute_instruction_definition: supervised tier refuses a hostile definition_id "
           "at the pre-mint probe: no ticket is minted and nothing is read or dispatched",
           "[pg][mcp][integration][execute][idef][approval][security]") {
@@ -45843,7 +45843,8 @@ TEST_CASE("MCP execute_instruction_definition: an approved tier ticket for a ben
     REQUIRE(appr.approve(ticket, "admin", "ok").has_value());
 
     // An editor repoints the stored definition at a gated pair between approval and recall
-    // (update_definition edits in place; the ticket canon binds arguments, not the pair).
+    // (update_definition edits in place). The probe refuses this before the effect-bound ticket
+    // match is reached, so the answer is the pair gate's approval_required, not definition_changed.
     rig.defs["d"].action = "gated";
 
     auto second = ts.call(idef_call({{"definition_id", "d"}, {"approval_id", ticket}}, 2));

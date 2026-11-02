@@ -114,17 +114,21 @@ struct DispatchCaller {
     ///      an editor can repoint between approval and recall, and
     ///      `dispatch_pairs_for` returns no pair for them. Since L1 the ticket
     ///      binds the RESOLVED pair (`effect_binding`), so a repoint is refused
-    ///      at the ticket match; the stamp stays withheld because the ticket
-    ///      approves the pair as it stood, not its gate. They force `None`;
+    ///      at the ticket match. The stamp stays withheld as a POLICY line, not a
+    ///      technical necessity: the stamping tools take their pair(s) from the
+    ///      caller's own arguments (or a fixed pair), whereas these resolve it
+    ///      from a store, and an approval of that indirectly resolved effect has
+    ///      not been ruled to lift the pair's own ExecuteGate. They force `None`;
     ///      the pair's own gate decides.
     ///      `execute_instruction_definition` (#2146) is NOT a stamping site and
     ///      must never become one (sec-F1): its (plugin, action) comes from a
     ///      STORED definition that an editor can repoint between approval and
     ///      recall. Since L1 its C8 ticket binds that resolved effect as well as
-    ///      the arguments (a repoint is refused at the ticket match), but a stamp
-    ///      would still let an approval granted for a pair lift that pair's
-    ///      ExecuteGate. The handler forces `None`; the pair's own gate decides
-    ///      (a non-admin caller on a gated pair is refused).
+    ///      the arguments (a repoint is refused at the ticket match). The stamp
+    ///      stays withheld for the same policy reason as the producers above: the
+    ///      pair is resolved from a store, so an approval of it is not taken to
+    ///      lift that pair's ExecuteGate. The handler forces `None`; the pair's
+    ///      own gate decides (a non-admin caller on a gated pair is refused).
     ///   3. `DeploymentEngine` (`deployment_engine.cpp`, the pipeline caller it
     ///      builds for its content_dist dispatches) — `GovernedPipeline`. It is the
     ///      only file that stamps it; `deployment_routes.cpp` reaches the engine and

@@ -43,7 +43,8 @@
 /// approval is answered `PendingApproval` and dispatches NOTHING. There is no redemption path
 /// for such a ticket: it is minted with `ApprovalOrigin::kInstruction`, which the MCP recall
 /// refuses (`origin_redeemable_as`), and no interactive redemption exists. Such a ticket records
-/// the definition and the scope expression ONLY: it does NOT approve explicit `agent_ids` or `params`
+/// the definition, the scope expression and the resolved `target_plugin`/`target_action` ONLY: it
+/// does NOT approve explicit `agent_ids` or `params`
 /// (they are not stored with it), so any future redemption must bind them (a bound request,
 /// `ApprovalManager::submit_bound`) before it ships. An administrator
 /// still reaches `role-gated` definitions because the token or session carries the creator's
@@ -52,9 +53,10 @@
 /// DispatchCaller CONSTRUCTION. This module never builds a `DispatchCaller`: the surface hands
 /// one in, derived from its own session (REST: `caller_from_session`; MCP: `caller_fn`). The only
 /// field it reads that carries approval authority is `principal_is_admin`, and it never writes
-/// `approval_provenance`; NO adapter stamps `Ticket` for this capability, REST or MCP (sec-F1:
-/// a tier ticket binds arguments, not the stored definition's plugin/action, so it must never
-/// lift the pair's ExecuteGate; dispatch_caller.hpp, stamping site 2 excludes this tool).
+/// `approval_provenance`; NO adapter stamps `Ticket` for this capability, REST or MCP (sec-F1,
+/// kept as a policy line: the MCP ticket binds the resolved plugin/action since L1, but the
+/// pair comes from a stored definition, not from the caller's own arguments, so the ticket
+/// never lifts the pair's ExecuteGate; dispatch_caller.hpp, stamping site 2 excludes this tool).
 ///
 /// Everything impure arrives through `Ports` so the pipeline is testable without Postgres
 /// (InstructionStore, ApprovalManager and ExecutionTracker are all Postgres-backed).

@@ -8154,9 +8154,10 @@ McpServer::HandlerFn McpServer::build_handler(
             };
 
             // Canonical JSON of the tool arguments for approval-ticket binding
-            // (#289): a submitted ticket stores this string in scope_expression,
-            // and a recall recomputes it to prove the same tool+args are being
-            // executed. Default nlohmann::json is std::map-backed → object keys
+            // (#289): a submitted ticket stores this string in scope_expression
+            // (for the three L1 tools, after an `effect=` line, see `canon`), and a
+            // recall recomputes it to prove the same tool+args are being executed.
+            // Default nlohmann::json is std::map-backed → object keys
             // dump in sorted order, so client key order does not matter. The
             // `approval_id` argument is stripped on BOTH submit and recall so the
             // ticket-carrying re-call hashes identically to the original mint.
@@ -19514,10 +19515,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // (dispatch_caller.hpp). Since L1 the C8 tier ticket binds the resolved
                 // (plugin, action) as well as the call's arguments, so a repoint between
                 // approval and recall is refused (see `ticket_bound_effect` and
-                // `Request::expected_effect`). It is still not a stamping site: the ticket
-                // approves the pair as it stood at approval time, and a pair gated by the
-                // ExecuteGate must stay decided by the pair's own gate (an approval of one
-                // definition state must never lift AdminOrApproval/AlwaysApproval). The value is
+                // `Request::expected_effect`). It is still not a stamping site, as a policy
+                // line: the pair is resolved from a store, not named in the call's arguments,
+                // and a pair gated by the ExecuteGate stays decided by the pair's own gate
+                // (an approval of one definition state is not taken to lift
+                // AdminOrApproval/AlwaysApproval). The value is
                 // forced to None (not left to caller_fn) so no upstream stamp survives, and the
                 // pair's own gate decides: a non-admin caller on a gated pair is refused.
                 rq.caller.approval_provenance = yuzu::server::ApprovalProvenance::None;
