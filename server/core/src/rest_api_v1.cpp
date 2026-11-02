@@ -992,7 +992,11 @@ const std::string& openapi_spec() {
           },
           "meta": {"type": "object", "properties": {"api_version": {"type": "string"}}}
         }
-      },
+      },)json"
+        // Split again (MSVC C2026 16,380-byte cap): the DexScorePolicyDocument component grew the
+        // components segment to the 15,000-byte ceiling. Adjacent literals concatenate at compile
+        // time, so the emitted OpenAPI JSON is byte-identical to the unsplit form.
+        R"json(
       "DexScorePolicyDocument": {
         "type": "object",
         "description": "The stored policy document (what PUT takes and what GET, PUT, DELETE and a dry run return). Keys left out take the shipped defaults. Unknown keys are refused.",
