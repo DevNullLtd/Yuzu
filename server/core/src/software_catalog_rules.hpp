@@ -122,7 +122,7 @@ inline constexpr std::array<VocabEntry, 4> kSoftwareKinds{{
 /// One row per collector source, in the collector's kInventoryActions order
 /// (agents/core/src/sync_source_installed_software.cpp); the vocabulary test compares the ordered
 /// lists. A new source is one row here.
-inline constexpr std::array<VocabEntry, 6> kSoftwareSources{{
+inline constexpr std::array<VocabEntry, 7> kSoftwareSources{{
     {"installed_apps.list_inventory", "installed_apps.list_inventory",
      "Windows Uninstall registry, Linux dpkg/rpm/pacman/apk, macOS applications and installer "
      "receipts"},
@@ -134,6 +134,8 @@ inline constexpr std::array<VocabEntry, 6> kSoftwareSources{{
      "Windows optional features (state in the version column)"},
     {"msi_packages.list_inventory", "msi_packages.list_inventory",
      "Machine-context Windows Installer (MSI) products"},
+    {"middleware.ibm_mq", "middleware.ibm_mq",
+     "Registered IBM MQ installations, from installer metadata (Linux)"},
 }};
 
 /// Non-empty, every value `[a-z_.]+` (the chips splice it into attributes and URLs), non-empty

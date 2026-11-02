@@ -273,13 +273,14 @@ TEST_CASE("kSoftwareKinds and kSoftwareSources: UI vocabulary tables",
         CHECK(it->tooltip.find("snap") != std::string_view::npos);
         CHECK(it->tooltip.find("flatpak") != std::string_view::npos);
     }
-    SECTION("sources are exactly the six collector sources, in order") {
+    SECTION("sources are exactly the seven collector sources, in order") {
         std::vector<std::string> values;
         for (const auto& s : kSoftwareSources)
             values.emplace_back(s.value);
         CHECK(values == std::vector<std::string>{
                             "installed_apps.list_inventory", "pkg_inventory.managers",
                             "pkg_inventory.packages", "pkg_inventory.store_packages",
-                            "windows_optional_features.list", "msi_packages.list_inventory"});
+                            "windows_optional_features.list", "msi_packages.list_inventory",
+                            "middleware.ibm_mq"});
     }
 }
