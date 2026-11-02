@@ -9098,23 +9098,28 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── list_agents ───────────────────────────────────────────────
             if (tool_name == "list_agents") {
-                if (!tier_allows(tier, "Infrastructure", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                // #4041: a fan-out read of per-agent data — fleet_read_fn_
+                // (require_fleet_read, the ADR-0017 admit-then-filter chokepoint)
+                // is the SOLE gate, no separate tier_allows/perm_fn call: it
+                // applies the MCP tier itself (authz_gates.cpp, ahead of RBAC) and
+                // the C8 gate above has already checked this tool's pair. Mirrors
+                // the Echo device pickers below. Unwired fails closed.
+                if (!fleet_read_fn_) {
+                    spdlog::error("list_agents: fleet_read_fn_ unwired — misconfigured "
+                                  "call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
-                // ADR-0031 WS-A4 wave 2: sourced from the DeviceApi seam instead of
-                // the raw registry snapshot — BYTE-IDENTICAL gate/scope posture:
-                // still tier_allows + perm_fn ONLY, no scope filter at all (the
-                // known World-A confinement gap, #4041 — unconfined by design,
-                // tracked separately; do not "fix" it here).
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
                 std::vector<DeviceListRow> devices =
                     device_api ? device_api->list_devices() : std::vector<DeviceListRow>{};
                 JArr arr;
                 for (const auto& d : devices) {
+                    if (!authz::in_scope(gate.scope, d.agent_id))
+                        continue;
                     arr.add(JObj()
                                 .add("agent_id", d.agent_id)
                                 .add("hostname", d.hostname)

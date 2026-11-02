@@ -1083,6 +1083,25 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      old and new names. The ledger records the retirement because the policy
      requires it.
 
+   - **2026-11-02 - the `list_agents` exception (#4041) is resolved.** The
+     2026-10-23 entry above recorded `get.api-agents` and
+     `get.fragments-devices-list` as `exception:#4041 revisit:2027-01-31` because
+     MCP `list_agents` was unconfined. It is now gated by `fleet_read_fn_`
+     (`require_fleet_read`, the ADR-0017 admit-then-filter chokepoint) as its
+     sole gate, with no separate `tier_allows` or `perm_fn` call, and filters its
+     rows to the caller's scope; an unwired gate fails closed. Both rows return
+     to `twinned` with `list_agents` as the MCP twin. The two `(4041,
+     "2027-01-31")` pins are removed from `STRICT_EXCEPTION_PINS` and
+     `BASELINE_UNTWINNED` falls from 212 to 210. The 2026-10-23 entry is left as
+     written; this entry supersedes its `list_agents` paragraph. Not part of this
+     resolution, and still open: the per-guard drilldown
+     `GET /fragments/guardian/guard/{id}/page` (a fleet-wide per-agent read on a
+     bare `perm_fn_`, to follow in a separate change under #4041), and the legacy
+     `GET /api/compliance/{id}` (no confinement and no audit, tracked by #4333).
+     Open question recorded with the change: `list_agents` keeps its default
+     `ServiceScopeClass` row in `kToolSecurityRows`, which this change does not
+     alter.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

@@ -5757,6 +5757,117 @@ TEST_CASE("MCP Integration: tools/call list_agents", "[mcp][integration]") {
     CHECK(ts.audit_log.back() == "mcp.list_agents|success");
 }
 
+// ── #4041: list_agents is a fan-out read of per-agent data and must admit-then-filter
+// through fleet_read_fn_ (ADR-0017 World A), never a bare tier_allows + perm_fn. ──────
+
+namespace {
+// Agent ids a list_agents response names, from content[0].text (the bare array).
+std::vector<std::string> list_agents_ids(const std::unique_ptr<httplib::Response>& res) {
+    std::vector<std::string> ids;
+    auto body = nlohmann::json::parse(res->body);
+    if (!body.contains("result"))
+        return ids;
+    auto agents = nlohmann::json::parse(
+        body["result"]["content"][0]["text"].get<std::string>());
+    for (const auto& a : agents)
+        ids.push_back(a["agent_id"].get<std::string>());
+    return ids;
+}
+constexpr const char* kListAgentsCall =
+    R"({"jsonrpc":"2.0","method":"tools/call","id":4041,"params":{"name":"list_agents"}})";
+} // namespace
+
+TEST_CASE("MCP list_agents (#4041): a confined caller sees only in-scope agents, in both "
+          "content and structuredContent",
+          "[mcp][integration][security][confinement]") {
+    McpTestServer ts;
+    std::vector<std::pair<std::string, std::string>> asked;
+    ts.fleet_read_fn_for_test = [&asked](const httplib::Request&, httplib::Response&,
+                                         const std::string& sec, const std::string& op)
+        -> yuzu::server::authz::FleetReadGate {
+        asked.emplace_back(sec, op);
+        return {true, std::unordered_set<std::string>{"agent-001"}};
+    };
+    ts.start();
+
+    auto res = ts.call(kListAgentsCall);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001"});
+    CHECK(res->body.find("agent-002") == std::string::npos);
+    CHECK(res->body.find("db-01") == std::string::npos);
+    REQUIRE(asked.size() == 1);
+    CHECK(asked[0] == std::make_pair(std::string{"Infrastructure"}, std::string{"Read"}));
+}
+
+TEST_CASE("MCP list_agents (#4041): an unconfined caller (nullopt scope) still sees every agent",
+          "[mcp][integration][security][confinement]") {
+    McpTestServer ts;
+    int calls = 0;
+    ts.fleet_read_fn_for_test = [&calls](const httplib::Request&, httplib::Response&,
+                                         const std::string&, const std::string&)
+        -> yuzu::server::authz::FleetReadGate {
+        ++calls;
+        return {true, std::nullopt};
+    };
+    ts.start();
+
+    auto res = ts.call(kListAgentsCall);
+    REQUIRE(res);
+    CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001", "agent-002"});
+    CHECK(calls == 1); // the gate, not a bare perm_fn, decided
+}
+
+TEST_CASE("MCP list_agents (#4041): a deny-all scope (present, empty) lists no agents",
+          "[mcp][integration][security][confinement]") {
+    McpTestServer ts;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&, const std::string&)
+        -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::deny_all()};
+    };
+    ts.start();
+
+    auto res = ts.call(kListAgentsCall);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(list_agents_ids(res).empty());
+    CHECK(res->body.find("agent-001") == std::string::npos);
+}
+
+TEST_CASE("MCP list_agents (#4041): a gate that denies writes its own response and no agent "
+          "is served",
+          "[mcp][integration][security][confinement]") {
+    McpTestServer ts;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response& res,
+                                   const std::string&, const std::string&)
+        -> yuzu::server::authz::FleetReadGate {
+        res.status = 403;
+        res.set_content(R"({"error":{"message":"permission denied"}})", "application/json");
+        return {};
+    };
+    ts.start();
+
+    auto res = ts.call(kListAgentsCall);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("agent-001") == std::string::npos);
+    CHECK(res->body.find("agent-002") == std::string::npos);
+}
+
+TEST_CASE("MCP list_agents (#4041): fails closed when fleet_read_fn_ is genuinely unwired",
+          "[mcp][integration][security][confinement]") {
+    McpTestServer ts;
+    ts.fleet_read_fn_for_test = {};
+    ts.start();
+
+    auto res = ts.call(kListAgentsCall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(res->body.find("agent-001") == std::string::npos);
+}
+
 // ── #4027: Echo read-twin round-trip — proves registration (kTools/
 // kToolSecurityRows/kWriteTools/kToolAnnotation) actually dispatches through the
 // JSON-RPC surface, matching this file's own recipe-cited job for a round-trip

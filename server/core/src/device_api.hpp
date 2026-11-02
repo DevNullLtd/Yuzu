@@ -25,11 +25,8 @@
 /// confinement. This is a fan-out read of per-agent data (routed-concerns'
 /// `authorize_list_read`/`require_fleet_read` MUST, ADR-0017 World A) —
 /// EVERY consumer MUST apply the fleet-read/confinement gate appropriate to
-/// its surface before serving this result to a caller — with ONE deliberate,
-/// pre-existing exception: MCP `list_agents` serves these rows UNCONFINED by
-/// design (the tracked World-A gap #4041, unchanged by the seam and byte-
-/// identical to its pre-seam registry-callback behaviour). Do NOT replicate
-/// that exemption in a new consumer; a new fan-out read gates. The seam itself
+/// its surface before serving this result to a caller (MCP `list_agents` now
+/// does, via `fleet_read_fn_`, #4041). A new fan-out read gates. The seam itself
 /// is a store-free DATA PROVIDER only; auth, confinement and audit live in the
 /// consumer (route/MCP handler), not here.
 ///
