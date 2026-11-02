@@ -458,7 +458,9 @@ constexpr std::string_view kRedactedMount = "[redacted]";
 
 // Path roots, compared after any drive letter, lower-cased, with '\' folded to '/', on a segment
 // boundary. The first three name an account; /Volumes holds user-chosen labels (the boot volume's
-// name included), so every entry under it goes.
+// name included), so every entry under it goes. The Linux volumes and partitions legs emit no mount
+// points yet; the leg that does must add the roots it reports under a user name here
+// (/media/<user>, /run/media/<user>) and say so in the ADR-0016 "Mount points" paragraph.
 constexpr std::string_view kPersonalMountRoots[] = {"/users", "/documents and settings", "/home",
                                                     "/volumes"};
 

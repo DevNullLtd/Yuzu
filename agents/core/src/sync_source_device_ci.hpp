@@ -154,7 +154,7 @@ struct CiActionResult {
     std::string captured;
 };
 
-/// The `volumes` outcome on a Windows host: `unavailable` with kReasonWindowsVolumesUnbounded and
+/// The `volumes` outcome on a Windows host: `unavailable` with `agent:windows_volumes_unbounded` and
 /// no capture. The Windows `volumes` leg issues synchronous `DeviceIoControl` calls with no
 /// deadline (disk_actions_win.cpp, "BOUNDING"), and the sync thread is joined on reconnect and on
 /// shutdown, so one wedged drive would stop the agent from reconnecting. Until those calls have a

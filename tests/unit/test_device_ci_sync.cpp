@@ -518,6 +518,13 @@ TEST_CASE("device_ci v2: an escaped pipe stays inside its field and shifts no co
         CHECK(device_ci_canonical_blob_v2(sample(), in) == a);
         CHECK(parse_blob(a).scalar[23] == "CHS-A"); // the row that sorts first
     }
+    SECTION("an escaped pipe inside a mount path is unescaped before the redaction decision") {
+        in.volumes = cap("volume|A|/Users/al\\|ice/x|d1|apfs|1|-");
+        const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
+        REQUIRE(p.rows.at("volume").size() == 1);
+        CHECK(p.rows.at("volume")[0][1] == "[redacted]");
+        CHECK(level_of(p, "volume") == "constrained");
+    }
     SECTION("an unescaped pipe still separates columns") {
         in.disks = cap("disk|0|Model|512|SSD|NVMe");
         const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
@@ -525,7 +532,7 @@ TEST_CASE("device_ci v2: an escaped pipe stays inside its field and shifts no co
     }
 }
 
-TEST_CASE("redact_mount_points: user-profile and /Volumes entries are replaced, system roots kept",
+TEST_CASE("redact_mount_points: user-profile and /Volumes entries are replaced and system roots kept",
           "[sync][device_ci][v2][mounts]") {
     const auto run = [](std::string_view csv) {
         bool redacted = false;
@@ -641,6 +648,21 @@ TEST_CASE("device_ci v2: rows are sorted and capped first-N with the cap disclos
     in.topology = cap(rows, YUZU_RESULT_STATUS_CONSTRAINED, "linux:partial");
     p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
     CHECK(p.status.at("topology") == Rec{"constrained", "linux:partial;agent_cap:96/140"});
+}
+
+TEST_CASE("device_ci v2: the redaction token survives a maximal plugin reason and a cap",
+          "[sync][device_ci][v2][mounts]") {
+    auto in = all_ok_inputs();
+    // 131 rows, one with a personal mount (it sorts last, so the cap drops it: the section is still
+    // constrained because redaction is decided before the cap), and a reason past the clamp.
+    in.volumes = cap("volume|zz|/Volumes/x|d|apfs|1|-\n" + wide_rows("volume", 6, 130, 3),
+                     YUZU_RESULT_STATUS_CONSTRAINED, std::string(1100, 'p'));
+    const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
+    const auto& reason = p.status.at("volume")[1];
+    CHECK(level_of(p, "volume") == "constrained");
+    CHECK(reason.size() <= 1024);
+    CHECK(reason.starts_with("agent:mount_points_redacted;"));
+    CHECK(reason.ends_with(";agent_cap:128/131"));
 }
 
 TEST_CASE("device_ci v2: the cap token always fits the reason field", "[sync][device_ci][v2]") {
@@ -1033,6 +1055,19 @@ TEST_CASE("build_device_ci_record tolerates appended cpu/dimm columns", "[sync][
     CHECK(r.cpu_cores == "8");
     CHECK(r.cpu_threads == "16");
     CHECK(r.ram_bytes == std::to_string(16384LL * 1024 * 1024));
+}
+
+TEST_CASE("build_device_ci_record keeps the raw pipe split of the frozen v1 positions",
+          "[sync][device_ci][pipe]") {
+    // The v2 projections split on an UNESCAPED pipe; the 22 v1 positions deliberately do not, because
+    // their bytes (and so the hash of every fielded device) are frozen. A disk model holding an
+    // escaped pipe is therefore still cut at it here. Switching the v1 loops to the unescaped split
+    // would change disks_summary for such a device and must be a coordinated, versioned change.
+    using yuzu::agent::build_device_ci_record;
+    using yuzu::agent::CiPluginOutputs;
+    CiPluginOutputs o;
+    o.disks = "disk|0|Model\\|X|512|SSD|NVMe";
+    CHECK(build_device_ci_record(o).disks_summary == "Model\\ X 512");
 }
 
 TEST_CASE("build_device_ci_record parses + aggregates plugin outputs", "[sync][device_ci]") {

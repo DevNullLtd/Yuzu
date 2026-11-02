@@ -1150,9 +1150,10 @@ sync, defeating the hash-skip protocol.
 
 - **Scope / privacy.** Machine-scope only (no per-user data), but serial/UUID/MAC
   are device-persistent identifiers — treat as potentially personal data where a
-  device is person-assigned. A volume or partition mount point under a user profile
-  or under `/Volumes` is replaced with `[redacted]` before it is sent. The same **`--inventory-disable`** flag suppresses
-  `device_ci` along with the other sources (it gates the whole daily-sync thread).
+  device is person-assigned. The same **`--inventory-disable`** flag suppresses
+  `device_ci` along with the other sources (it gates the whole daily-sync thread). A volume
+  or partition mount point under a user profile or under `/Volumes` is replaced with
+  `[redacted]` before it is sent.
 - **Observability.** Ingest shares
   `yuzu_inventory_ingest_total{source="device_ci"}` +
   `yuzu_inventory_ingest_duration_seconds{source="device_ci"}`; read degrades use
