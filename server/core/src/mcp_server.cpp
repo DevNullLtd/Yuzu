@@ -7794,7 +7794,8 @@ McpServer::HandlerFn McpServer::build_handler(
             // 503 store-degrade of the sibling /sle/agents/{id} drill.
             auto a4_error = [&id](int code, std::string_view message,
                                   std::string_view remediation = {}, long retry_after_ms = -1,
-                                  std::string_view cid_override = {}, bool audit_ok = true) {
+                                  std::string_view cid_override = {}, bool audit_ok = true,
+                                  std::string_view reason = {}) {
                 // cid_override lets a caller mint the correlation id FIRST and
                 // stamp it into its log/audit records before building the
                 // envelope (#2423 review F4); default preserves mint-here.
@@ -7826,6 +7827,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // its own error.data, and the same fact `audit_persisted:false`
                 // already surfaces on every SUCCESS result in this file — passes
                 // its own audit_fn/mcp_audit return here instead.
+                // `reason` is an optional closed machine token (a server literal, never
+                // caller bytes), the same `error.data.reason` the shared execute core and
+                // the mint refusals carry, so a worker branches on it, not on prose.
+                if (!reason.empty())
+                    data += R"(,"reason":)" + json_quoted_string(reason);
                 if (!audit_ok)
                     data += R"(,"audit_persisted":false)";
                 data += "}";
@@ -8532,11 +8538,19 @@ McpServer::HandlerFn McpServer::build_handler(
                         if (!perm_fn(req, res, "Execution", "Execute"))
                             return;
                         std::optional<std::pair<std::string, std::string>> rs_pair;
+                        // A store that is wired but cannot answer is TRANSIENT (retryable); a
+                        // store pointer that was never wired is a permanent wiring defect (no
+                        // hint: retrying cannot help), exactly as rs_load_owned answers it.
                         bool rs_store_fault = false;
+                        bool rs_store_unwired = false;
                         const auto rs_lookup_pair = [&](const std::string& instruction_id) {
                             if (instruction_id.empty() || instruction_id.size() > kInstructionIdMaxLen)
                                 return;
-                            if (!instruction_store || !instruction_store->is_open()) {
+                            if (!instruction_store) {
+                                rs_store_unwired = true;
+                                return;
+                            }
+                            if (!instruction_store->is_open()) {
                                 rs_store_fault = true;
                                 return;
                             }
@@ -8554,7 +8568,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             const auto rs_id = param_str(args, "id");
                             if (!rs_id.empty() && rs_id.size() <= kResultSetIdMaxLen) {
                                 if (!result_set_store_) {
-                                    rs_store_fault = true;
+                                    rs_store_unwired = true;
                                 } else if (auto row_read = result_set_store_->get(rs_id); !row_read) {
                                     rs_store_fault = true;
                                 } else if (const auto& row = *row_read;
@@ -8573,16 +8587,27 @@ McpServer::HandlerFn McpServer::build_handler(
                                 }
                             }
                         }
-                        if (rs_store_fault) {
-                            const bool audit_ok =
-                                mcp_audit("failure", "reason=effect_unresolvable_store_fault");
+                        if (rs_store_fault || rs_store_unwired) {
+                            const std::string fault_cid =
+                                yuzu::server::detail::make_correlation_id();
+                            const std::string_view fault_reason =
+                                rs_store_unwired ? "effect_unresolvable_store_unwired"
+                                                 : "effect_unresolvable_store_fault";
+                            const bool audit_ok = mcp_audit(
+                                "failure", "reason=" + std::string(fault_reason) +
+                                               " correlation_id=" + fault_cid);
                             res.set_content(
                                 a4_error(kInternalError,
                                          "the definition this call would run could not be read; "
                                          "the store is unavailable",
-                                         "retry once the server reports ready; no approval ticket "
-                                         "was created or consumed",
-                                         mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                                         rs_store_unwired
+                                             ? "this is a server wiring fault, not a caller "
+                                               "error; no approval ticket was created or "
+                                               "consumed; contact an administrator"
+                                             : "retry once the server reports ready; no approval "
+                                               "ticket was created or consumed",
+                                         rs_store_unwired ? -1 : mcp::kMcpStoreFaultRetryMs,
+                                         fault_cid, audit_ok, fault_reason),
                                 "application/json");
                             return;
                         }
@@ -9134,7 +9159,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     // dump never contains a raw newline, so the arguments are recognised as
                     // the text after the first newline. Told apart from an ordinary mismatch
                     // ONLY for the principal who requested the ticket (they already hold the
-                    // arguments and the id, and the answer is about their own request).
+                    // arguments and the id, and the answer is about their own request), and
+                    // ONLY while the ticket is still UNSPENT (pending or approved with
+                    // consumed_at == 0): "not consumed" is untrue for a ticket already
+                    // consumed, and a rejected or expired one is dead, so those fall through
+                    // to the ordinary mismatch answer below.
                     const auto effect_moved_from = [&](const std::string& stored) {
                         return ticket_bound_effect.has_value() && stored != canon &&
                                stored.starts_with("effect=") &&
@@ -9142,17 +9171,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                stored.ends_with("\n" + args_canon);
                     };
                     if (appr && appr->definition_id == definition_id &&
-                        appr->submitted_by == session->username &&
+                        appr->submitted_by == session->username && appr->consumed_at == 0 &&
+                        (appr->status == "pending" || appr->status == "approved") &&
                         effect_moved_from(appr->scope_expression)) {
-                        mcp_audit("denied", "approval_id=" + supplied_id +
-                                                " refused: the definition changed since the "
-                                                "approval was requested (ticket not consumed)");
+                        const std::string moved_cid =
+                            yuzu::server::detail::make_correlation_id();
+                        const bool audit_ok = mcp_audit(
+                            "denied", "reason=definition_changed approval_id=" + supplied_id +
+                                          " refused: the definition changed since the approval "
+                                          "was requested (ticket not consumed) correlation_id=" +
+                                          moved_cid);
                         res.set_content(
                             a4_error(kPermissionDenied,
                                      "the definition changed since this approval was requested",
                                      "the approval ticket was not consumed but no longer matches; "
                                      "call again without approval_id to request approval for "
-                                     "the definition as it is now"),
+                                     "the definition as it is now",
+                                     -1, moved_cid, audit_ok, "definition_changed"),
                             "application/json");
                         return;
                     }
@@ -13782,16 +13817,20 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (ticket_bound_effect &&
                     *ticket_bound_effect !=
                         yuzu::server::instruction_execute::effect_binding(plugin, action, "", "")) {
+                    const std::string changed_cid =
+                        yuzu::server::detail::make_correlation_id();
                     const bool audit_ok = audit_fn(
                         req, "result_set.create", "denied", "ResultSet", "",
-                        "reason=definition_changed source_kind=" + audit_token(std::string(src_kind)));
+                        "reason=definition_changed source_kind=" +
+                            audit_token(std::string(src_kind)) +
+                            " correlation_id=" + changed_cid);
                     res.set_content(
                         a4_error(kPermissionDenied,
                                  "RESULT_SET_DEFINITION_CHANGED: the definition changed after "
                                  "this call's approval ticket was checked; nothing was dispatched",
                                  "the approval ticket is spent; call again without approval_id to "
                                  "request approval for the definition as it is now",
-                                 -1, {}, audit_ok),
+                                 -1, changed_cid, audit_ok, "definition_changed"),
                         "application/json");
                     return;
                 }
