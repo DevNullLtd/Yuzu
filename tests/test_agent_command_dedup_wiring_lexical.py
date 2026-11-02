@@ -32,7 +32,8 @@ are this gate's own items:
      `cmd.plugin() ==/!= "__guard__"` comparison exists (3: one literal, not two that drift).
   9. (#3665) Corruption recovery stays observable: `yuzu_agent_dedup_quarantined_total` is
      incremented inside `if (const auto& q = command_dedup_->quarantined_this_open())` (7: a
-     lost dedup history must be metered, not just logged).
+     lost dedup history must be metered, not just logged), and the heartbeat reports it as
+     `tags["yuzu.dedup_quarantined"]` (the agent has no /metrics endpoint).
 
 Robustness: `//` comments are stripped and whitespace is collapsed before matching, so line
 wrapping, re-indentation and comment text mentioning a token cannot satisfy or break a check.
@@ -176,6 +177,11 @@ def problems(src):
                      r".{0,500}?metrics_\.counter\( ?\"yuzu_agent_dedup_quarantined_total\" ?\)\.increment\( ?\);", t):
         out.append("the open-time `quarantined_this_open()` branch no longer increments "
                    "yuzu_agent_dedup_quarantined_total; a lost dedup history would go unmetered (#3665)")
+    if not re.search(r"tags\[\"yuzu\.dedup_quarantined\"\] = std::to_string\( ?static_cast<int64_t>\( ?"
+                     r"metrics_\.counter\( ?\"yuzu_agent_dedup_quarantined_total\" ?\)\.value\( ?\)", t):
+        out.append("the heartbeat no longer reports yuzu.dedup_quarantined from yuzu_agent_dedup_quarantined_total; "
+                   "the agent has no /metrics endpoint, so a lost dedup history would be visible only in the "
+                   "endpoint's own log (#3665)")
     return out
 
 
@@ -216,6 +222,9 @@ MUTATIONS = [
     # 9. the recovery counter unguarded from the store's answer
     (r"if \(const auto& q = command_dedup_->quarantined_this_open\(\)\)", "if (false)", 0, 0,
      "quarantined_this_open"),
+    # 9b. the heartbeat tag dropped
+    (r'tags\["yuzu\.dedup_quarantined"\]', 'tags["yuzu.dedup_quarantined_x"]', 0, 0,
+     "yuzu.dedup_quarantined"),
     # the empty-id warning demoted (operators lose the signal)
     (r'spdlog::warn\("Received command with empty command_id', 'spdlog::debug("Received command with empty command_id', 0, 0,
      "empty command_id"),

@@ -133,15 +133,19 @@ class YUZU_EXPORT CommandDedupStore {
 public:
     /**
      * Open (or create) the store at the given path. Sets WAL + synchronous=FULL
-     * + busy_timeout=5000, runs PRAGMA quick_check, and creates the schema if absent.
+     * + busy_timeout=5000 and creates the schema if absent.
      *
-     * CORRUPTION RECOVERY (#3665): a corruption-class failure (SQLITE_CORRUPT /
-     * SQLITE_NOTADB from any open step, or a quick_check that reports damage) moves the
-     * file and its -wal/-shm/-journal sidecars aside to `<path>.corrupt-<epoch>[-n]` and
-     * opens a fresh store, ONCE — never a loop. The dedup history in the corrupt file is
-     * gone either way (it was unreadable); the recovery restores protection going forward
-     * instead of leaving the agent degraded on every boot. Transient/environmental errors
-     * (BUSY, IOERR, FULL, CANTOPEN, PERM) never quarantine. See quarantined_this_open().
+     * CORRUPTION RECOVERY (#3665): when the file CANNOT BE OPENED because it is corrupt
+     * (SQLITE_CORRUPT / SQLITE_NOTADB from any open step), the main file is moved aside to
+     * `<path>.corrupt-<unix-epoch-seconds>[-n]` (a non-empty -wal/-shm/-journal goes with it as
+     * `<that name>-wal` etc; empty or unmovable sidecars are removed) and a fresh store is opened,
+     * ONCE — never a loop. Only the newest 3 quarantined stores are kept. The dedup history in
+     * the corrupt file is gone either way (it was unreadable); the recovery restores protection
+     * going forward instead of leaving the agent degraded on every boot. Transient/environmental
+     * errors (BUSY, IOERR, FULL, CANTOPEN, PERM) never quarantine, and NEITHER does a file that
+     * opens but has damaged pages: there is deliberately no integrity scan, because discarding a
+     * mostly-usable file would discard in-flight claims too (invariants 4 and 5). See
+     * quarantined_this_open().
      *
      * Otherwise fails only on an unusable path/DB, or a corrupt file that could not be
      * moved aside (left untouched) — the caller treats a failure as "durable dedup

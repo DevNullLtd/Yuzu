@@ -388,7 +388,7 @@ TEST_CASE("CommandDedupStore: a non-database file is quarantined and recreated",
     CHECK(dup.status == ClaimStatus::Duplicate);
 }
 
-TEST_CASE("CommandDedupStore: a damaged table page (opens cleanly) is quarantined by quick_check",
+TEST_CASE("CommandDedupStore: a file whose schema step hits corruption is quarantined",
           "[command_dedup][lifecycle][corruption]") {
     const auto path = fresh_db_path();
     yuzu::test::TempDbFile guard{path};
@@ -400,7 +400,9 @@ TEST_CASE("CommandDedupStore: a damaged table page (opens cleanly) is quarantine
             REQUIRE(opened->claim("cmd-" + std::to_string(i)).status == ClaimStatus::Claimed);
     } // last connection closes -> WAL checkpointed into the main file
 
-    // Keep page 1 (the header + schema, so open_v2 / the schema step succeed) and trash the rest.
+    // Keep page 1 (header + schema, so open_v2 and the pragmas succeed) and trash the rest, so the
+    // schema step's own read of `meta` fails with SQLITE_CORRUPT: the store cannot be initialised,
+    // which is an OPEN failure and the one thing that justifies discarding the file.
     auto bytes = read_bytes(path);
     REQUIRE(bytes.size() > 8192);
     for (std::size_t i = 4096; i < bytes.size(); ++i)
@@ -413,6 +415,104 @@ TEST_CASE("CommandDedupStore: a damaged table page (opens cleanly) is quarantine
     CHECK(quarantine_siblings(path).size() == 1);
     // History in the damaged file is gone (documented); the store itself is healthy again.
     CHECK(result->claim("cmd-0").status == ClaimStatus::Claimed);
+}
+
+TEST_CASE("CommandDedupStore: a file that still opens with damaged data pages is NOT quarantined",
+          "[command_dedup][lifecycle][corruption]") {
+    // Owner ruling (#3665): no whole-file integrity scan. A file that opens keeps serving the ids
+    // whose pages are intact; quarantining it would discard in-flight claims too (invariants 4, 5).
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    QuarantineCleanup qc{path};
+    const std::string blob(2000, 'x');
+    constexpr int kRows = 300;
+    {
+        auto opened = CommandDedupStore::open(path);
+        REQUIRE(opened.has_value());
+        for (int i = 0; i < kRows; ++i) {
+            const auto id = "cmd-" + std::to_string(i);
+            REQUIRE(opened->claim(id).status == ClaimStatus::Claimed);
+            REQUIRE(opened->record_terminal(id, blob) == RecordOutcome::Recorded);
+        }
+    }
+
+    auto bytes = read_bytes(path);
+    constexpr std::size_t kPage = 4096;
+    REQUIRE(bytes.size() > 40 * kPage);
+    const std::size_t victim = (bytes.size() / kPage) / 2; // a data page well away from page 1
+    for (std::size_t i = victim * kPage; i < (victim + 1) * kPage; ++i)
+        bytes[i] = static_cast<char>(0xAB);
+    write_bytes(path, bytes);
+
+    auto result = CommandDedupStore::open(path);
+    REQUIRE(result.has_value());
+    CHECK_FALSE(result->quarantined_this_open().has_value());
+    CHECK(quarantine_siblings(path).empty());
+    CHECK(fs::exists(path));
+
+    int still_known = 0;
+    for (int i = 0; i < kRows; ++i) {
+        if (result->claim("cmd-" + std::to_string(i)).status == ClaimStatus::Duplicate)
+            ++still_known;
+    }
+    CHECK(still_known > 0); // history on intact pages survives
+}
+
+TEST_CASE("CommandDedupStore: only the newest 3 quarantined stores are kept",
+          "[command_dedup][lifecycle][corruption]") {
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    QuarantineCleanup qc{path};
+    const auto q = [&](const std::string& tail) {
+        fs::path f = path;
+        f += ".corrupt-" + tail;
+        return f;
+    };
+    for (const char* e : {"1", "2", "3", "4", "5"})
+        write_bytes(q(e), std::string("old-") + e);
+    write_bytes(q("1-wal"), "old-1-wal"); // a sidecar travels with its group
+    write_bytes(q("notanumber"), "not ours"); // does not parse: never touched
+    write_bytes(path, "garbage main file");
+
+    auto result = CommandDedupStore::open(path);
+    REQUIRE(result.has_value());
+    REQUIRE(result->quarantined_this_open().has_value());
+
+    // groups 1..5 + the new one = 6; the 3 oldest (1, 2, 3) go, with group 1's sidecar.
+    for (const char* e : {"1", "2", "3", "1-wal"})
+        CHECK_FALSE(fs::exists(q(e)));
+    for (const char* e : {"4", "5"})
+        CHECK(fs::exists(q(e)));
+    CHECK(fs::exists(path.parent_path() / *result->quarantined_this_open()));
+    CHECK(read_bytes(q("notanumber")) == "not ours");
+}
+
+TEST_CASE("CommandDedupStore: pruning never removes the quarantine it just made",
+          "[command_dedup][lifecycle][corruption]") {
+    // A backward clock step makes the NEW name sort OLDEST. Count-based pruning orders by name, so
+    // it must skip the file it just created or it would delete the only fresh evidence.
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    QuarantineCleanup qc{path};
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    std::vector<fs::path> future;
+    for (long long d : {1000LL, 2000LL, 3000LL}) {
+        fs::path f = path;
+        f += ".corrupt-" + std::to_string(now + d);
+        write_bytes(f, "from the future");
+        future.push_back(f);
+    }
+    write_bytes(path, "garbage main file");
+
+    auto result = CommandDedupStore::open(path);
+    REQUIRE(result.has_value());
+    REQUIRE(result->quarantined_this_open().has_value());
+    CHECK(fs::exists(path.parent_path() / *result->quarantined_this_open())); // survived
+    CHECK_FALSE(fs::exists(future[0])); // the oldest OTHER group was the one pruned
+    CHECK(fs::exists(future[1]));
+    CHECK(fs::exists(future[2]));
 }
 
 TEST_CASE("CommandDedupStore: a stale -wal beside a corrupt file is never adopted by the fresh store",
@@ -456,13 +556,14 @@ TEST_CASE("CommandDedupStore: a second corruption never overwrites an earlier qu
     yuzu::test::TempDbFile guard{path};
     QuarantineCleanup qc{path};
 
-    // Occupy every `.corrupt-<epoch>` name the open could pick (the clock is 1 s granular and
-    // can step backward), so the collision-safe `-<n>` suffix MUST be used.
+    // Occupy the `.corrupt-<epoch>` names the open is most likely to pick (the clock is 1 s granular
+    // and can step backward), so the collision-safe `-<n>` suffix is used whenever it lands on one.
+    // Only two, so the keep-newest-3 rule does not prune them away.
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
     std::vector<fs::path> blockers;
-    for (long long e = now - 2; e <= now + 5; ++e) {
+    for (long long e : {now, now + 1}) {
         fs::path b = path;
         b += ".corrupt-" + std::to_string(e);
         write_bytes(b, "earlier quarantine");
