@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <format>
+#include <limits>
 #include <set>
 #include <string>
 
@@ -80,6 +81,7 @@ void RegistryCursorSource::start(EchoDatabase& db) {
     // A persisted cursor means a previous run: whatever was written while the agent
     // was down is found by the baseline diff, but the events that would name its
     // writer were never seen. An unreadable cursor is treated the same way.
+    stopping_.store(false, std::memory_order_release);
     const auto cursor = db.get_cursor("registry");
     if (!cursor || cursor->has_value()) {
         pending_gap_ = true;
@@ -95,6 +97,7 @@ void RegistryCursorSource::start(EchoDatabase& db) {
 }
 
 void RegistryCursorSource::stop() noexcept {
+    stopping_.store(true, std::memory_order_release); // first: a pass in flight mounts nothing more
     try {
         reader_.stop();
     } catch (...) {
@@ -153,7 +156,8 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
                     "contract)",
                now, snapshot_id));
         const bool rebaseline_all = fresh || (gap_pending && cause == GapCause::Disabled);
-        const bool reconcile = (cur.tick % kReconcileEveryTicks == 0) || force_all_;
+        const bool hourly = cur.tick % kReconcileEveryTicks == 0;
+        const bool reconcile = hourly || force_all_;
 
         // The loaded user hives: re-enumerated on a name-watch signal, a reconcile
         // tick or a re-baseline, otherwise the cursor's list stands.
@@ -162,9 +166,11 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
         std::vector<std::string> sids = cur.hku;
         if (hku_changed || reconcile || rebaseline_all || sids.empty())
             sids = reader_.loaded_sids();
-        // The unloaded profiles, asked for under exactly the conditions the loaded ones are,
-        // and again while the last walk was incomplete or a known profile has no path yet (a
-        // user who just logged off during an incomplete walk). The walk is classified against
+        // The unloaded profiles, asked for when the loaded list is re-enumerated for a reason
+        // other than being empty (a name-watch mark, the reconcile, a re-baseline), while the
+        // known list is empty, and again while the last walk was incomplete or a known profile
+        // has no path yet (a user who just logged off during an incomplete walk). Re-enumerating
+        // an empty loaded list does not walk by itself. The walk is classified against
         // THIS tick's `sids`, the one HKU snapshot every decision below uses, so a profile is
         // offline exactly when it is not in `sids`. An incomplete walk keeps the known list, and
         // a sid loaded last tick that is not now joins it (reconcile_offline): scope is removed
@@ -178,8 +184,22 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
            std::any_of(offline.begin(), offline.end(),
                        [](const OfflineProfile& o) { return o.path.empty(); });
         if (hku_changed || reconcile || rebaseline_all || offline.empty() || offline_unresolved) {
-            const OfflineDiscovery d = reader_.offline_profiles(sids);
+            OfflineDiscovery d = reader_.offline_profiles(sids);
             offline = reconcile_offline(cur.offline, prev_hku, sids, d);
+            // The ProfileList walk is index-driven: a profile deleted or renamed (X -> X.bak) while
+            // it runs can be skipped though it is healthy. A removal therefore needs two agreeing
+            // walks: when a complete walk would drop a profile with a known path, walk once more
+            // and believe that answer (an incomplete second walk keeps the known list).
+            const auto dropped = [&](const OfflineProfile& k) {
+                return !k.path.empty() &&
+                       std::find(sids.begin(), sids.end(), k.sid) == sids.end() &&
+                       std::none_of(offline.begin(), offline.end(),
+                                    [&](const OfflineProfile& o) { return o.sid == k.sid; });
+            };
+            if (d.complete && std::any_of(cur.offline.begin(), cur.offline.end(), dropped)) {
+                d = reader_.offline_profiles(sids);
+                offline = reconcile_offline(cur.offline, prev_hku, sids, d);
+            }
             discovery_incomplete = !d.complete;
         } else {
             std::erase_if(offline, [&](const OfflineProfile& o) {
@@ -190,10 +210,19 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
         const std::vector<std::string> roots = scope_.roots_for(sids, offline);
         // Offline roots are never armed: there is no watch on an unloaded hive.
         ensure_watch(live_roots);
+        std::set<std::string> offline_sids;
+        for (const auto& o : offline)
+            offline_sids.insert(o.sid);
+        const auto is_offline = [&](const std::string& root) {
+            const std::string sid = hku_sid_of(root);
+            return !sid.empty() && offline_sids.contains(sid);
+        };
 
-        // Roots that left scope (a logged-off user): drop their state and shrink the
-        // baseline row, so a logon later re-baselines from scratch, never as a mass
-        // removal of what the unloaded hive "lost".
+        // Roots that left scope -- a profile a COMPLETE walk shows gone from the profile list, or
+        // a name that is no longer a profile hive (a logged-off user stays in scope as an offline
+        // root, and a logon diffs against its baseline): drop their state and shrink the baseline
+        // row, so a profile that reappears re-baselines from scratch, never as a mass removal of
+        // what the unloaded hive "lost".
         std::vector<StateWrite> state_writes;
         for (auto it = cur.roots.begin(); it != cur.roots.end();) {
             if (std::find(roots.begin(), roots.end(), it->first) == roots.end()) {
@@ -227,7 +256,7 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
             if (sid.empty())
                 continue;
             const auto sit = cur.roots.find(root);
-            if (is_offline_root(root, offline)) {
+            if (is_offline(root)) {
                 if (std::find(prev_hku.begin(), prev_hku.end(), sid) != prev_hku.end()) {
                     if (sit != cur.roots.end())
                         sit->second.window_base = 0;
@@ -351,86 +380,24 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
             st.status = std::string(to_string(rd.status));
             if (rd.status != RegistryReadStatus::Unreadable)
                 st.baselined = true; // a Capped first read is a partial baseline, by design
+            if (offline_root && fresh_root && rd.status == RegistryReadStatus::Capped)
+                st.baselined = false; // ... but an offline one is retried (next tick) as a fresh root
             if (!offline_root &&
                 (rd.status == RegistryReadStatus::Complete || rd.status == RegistryReadStatus::Absent))
                 st.window_base = read_start; // the NEXT window starts here
         };
 
-        const std::size_t n = roots.size();
+        // The loaded roots first (HKLM and the loaded hives), rotated so a tick that runs out of
+        // budget resumes where it stopped. Offline hives come after them: a queue of logged-off
+        // profiles can only ever take what the loaded roots left, never the budget a notified
+        // loaded root was owed.
+        const std::size_t n = live_roots.size();
         const std::size_t start_idx = n == 0 ? 0 : static_cast<std::size_t>(cur.tick) % n;
         bool read_any = false;
-        std::set<std::string> done; // roots already read through their hive's one mount
         for (std::size_t i = 0; i < n; ++i) {
-            const std::string& root = roots[(start_idx + i) % n];
-            if (done.contains(root))
-                continue; // read with its hive's group: a rotation start must not reset it
+            const std::string& root = live_roots[(start_idx + i) % n];
             RegistryRootState& st = cur.roots[root];
             init_state(root, st);
-
-            if (is_offline_root(root, offline)) {
-                // Nothing to arm on an unloaded hive: that is not a defect. An offline root is
-                // due on the hourly reconcile, a never-attempted or re-baselined root (status
-                // empty / not baselined) or a retry (deferred) -- never on a notify. A hive
-                // refused on its first sight (unreadable, not baselined) has been attempted, so
-                // it waits for the hour too: a hive that stays refused costs one attempt an hour.
-                st.armed = true;
-                // A profile whose path is not known yet (it logged off while the walk was
-                // incomplete) cannot be mounted: it is never passed to the reader, keeps its
-                // baseline and status, and is marked deferred so the first tick a complete walk
-                // supplies the path reads it, not the next hour.
-                std::string path;
-                for (const auto& o : offline)
-                    if (o.sid == hku_sid_of(root))
-                        path = o.path;
-                if (path.empty()) {
-                    st.deferred = true;
-                    continue;
-                }
-                const bool offline_due = reconcile || st.deferred || st.status.empty() ||
-                                         st.status == "due" ||
-                                         (!st.baselined && st.status != "unreadable");
-                if (!offline_due)
-                    continue;
-                if (read_any && reader_.now_ts() >= deadline) {
-                    st.deferred = true; // status untouched: a refused hive keeps its one gap row
-                    continue;
-                }
-                read_any = true;
-
-                // One mount per hive: every root of this sid is read from it.
-                const std::string sid = hku_sid_of(root);
-                std::vector<std::string> group;
-                for (const auto& r : roots)
-                    if (hku_sid_of(r) == sid)
-                        group.push_back(r);
-                for (const auto& g : group) {
-                    init_state(g, cur.roots[g]);
-                    done.insert(g);
-                }
-                const std::int64_t read_start = reader_.now_ts();
-                OfflineHiveRead hv = reader_.read_offline_hive(sid, path, group, deadline);
-                const std::int64_t read_end = reader_.now_ts();
-                if (!hv.attempted) {
-                    for (const auto& g : group)
-                        cur.roots[g].deferred = true; // not tried: retried next tick, no row
-                    continue;
-                }
-                for (const auto& g : group) {
-                    RegistryRootState& gs = cur.roots[g];
-                    gs.armed = true;
-                    gs.deferred = false;
-                    SubtreeRead rd;
-                    if (const auto it = hv.roots.find(g); it != hv.roots.end()) {
-                        rd = std::move(it->second);
-                    } else {
-                        rd.status = RegistryReadStatus::Unreadable; // the mount answered nothing for it
-                    }
-                    if (rd.reason.empty() && rd.status == RegistryReadStatus::Unreadable)
-                        rd.reason = hv.reason;
-                    apply_read(g, gs, std::move(rd), read_start, read_end, {}, true);
-                }
-                continue;
-            }
 
             bool armed = reader_.root_armed(root);
             if (!armed)
@@ -461,6 +428,98 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
             SubtreeRead rd = reader_.read_subtree(root, deadline);
             const std::int64_t read_end = reader_.now_ts();
             apply_read(root, st, std::move(rd), read_start, read_end, snap, false);
+        }
+
+        // The offline hives, one mount each, in fairness order: a hive that was deferred (the
+        // budget ran out, or the mount was not attempted) goes first, then the one read longest
+        // ago (read_end is persisted per root, so no extra cursor state), the sid breaking ties.
+        // An offline root is due on the HOURLY tick (not on a restart's force_all_: the restart
+        // reconcile exists for a lost notify or ETW buffer, which an unloaded hive never had), when
+        // it has never been read or was re-baselined, when its last read was Capped (a partial
+        // baseline is retried, not trusted), or when it is a retry (deferred / due). Never on a
+        // notify: there is none.
+        struct HiveGroup {
+            std::string sid, path;
+            std::vector<std::string> roots;
+            bool deferred{false};
+            std::int64_t oldest_read{std::numeric_limits<std::int64_t>::max()};
+        };
+        std::map<std::string, std::vector<std::string>> roots_of_sid; // one pass, not one per hive
+        for (const auto& r : roots)
+            if (const std::string sid = hku_sid_of(r); !sid.empty())
+                roots_of_sid[sid].push_back(r);
+        std::vector<HiveGroup> groups;
+        for (const auto& o : offline) {
+            const auto found = roots_of_sid.find(o.sid);
+            if (found == roots_of_sid.end())
+                continue; // not a profile hive name: nothing to read
+            HiveGroup g{o.sid, o.path, found->second, false, std::numeric_limits<std::int64_t>::max()};
+            for (const auto& r : g.roots) {
+                RegistryRootState& st = cur.roots[r];
+                init_state(r, st);
+                st.armed = true; // nothing to arm on an unloaded hive: that is not a defect
+                g.deferred = g.deferred || st.deferred;
+                g.oldest_read = std::min(g.oldest_read, st.read_end);
+            }
+            groups.push_back(std::move(g));
+        }
+        std::sort(groups.begin(), groups.end(), [](const HiveGroup& a, const HiveGroup& b) {
+            if (a.deferred != b.deferred)
+                return a.deferred;
+            if (a.oldest_read != b.oldest_read)
+                return a.oldest_read < b.oldest_read;
+            return a.sid < b.sid;
+        });
+        for (const auto& g : groups) {
+            const auto defer = [&] {
+                for (const auto& r : g.roots)
+                    cur.roots[r].deferred = true; // status untouched: a refused hive keeps its one gap row
+            };
+            // A profile whose path is not known yet (it logged off while the walk was incomplete)
+            // cannot be mounted: it is never passed to the reader, keeps its baseline and status,
+            // and is marked deferred so the first tick a complete walk supplies the path reads it,
+            // not the next hour.
+            if (g.path.empty()) {
+                defer();
+                continue;
+            }
+            const bool offline_due = std::any_of(g.roots.begin(), g.roots.end(), [&](const std::string& r) {
+                const RegistryRootState& st = cur.roots[r];
+                return hourly || st.deferred || st.status.empty() || st.status == "due" ||
+                       st.status == "capped" || (!st.baselined && st.status != "unreadable");
+            });
+            if (!offline_due)
+                continue;
+            if (stopping_.load(std::memory_order_acquire)) {
+                defer(); // a stop mid-pass: no further mount, and no row for the hive left unread
+                continue;
+            }
+            if (read_any && reader_.now_ts() >= deadline) {
+                defer();
+                continue;
+            }
+            read_any = true;
+
+            const std::int64_t read_start = reader_.now_ts();
+            OfflineHiveRead hv = reader_.read_offline_hive(g.sid, g.path, g.roots, deadline);
+            const std::int64_t read_end = reader_.now_ts();
+            if (!hv.attempted) {
+                defer(); // not tried: retried next tick, no row
+                continue;
+            }
+            for (const auto& r : g.roots) {
+                RegistryRootState& gs = cur.roots[r];
+                gs.deferred = false;
+                SubtreeRead rd;
+                if (const auto it = hv.roots.find(r); it != hv.roots.end()) {
+                    rd = std::move(it->second);
+                } else {
+                    rd.status = RegistryReadStatus::Unreadable; // the mount answered nothing for it
+                }
+                if (rd.reason.empty() && rd.status == RegistryReadStatus::Unreadable)
+                    rd.reason = hv.reason;
+                apply_read(r, gs, std::move(rd), read_start, read_end, {}, true);
+            }
         }
 
         // The buffer is read BEFORE the loss counters: an eviction between the two would
@@ -561,14 +620,15 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
         // watch_roots / unarmed describe the LIVE roots (an offline root has nothing to arm);
         // unreadable / capped stay aggregate over every root, so a capped offline read is visible.
         std::size_t unarmed = 0, unreadable = 0, capped = 0;
-        std::size_t offline_roots = 0, offline_unreadable = 0;
+        std::size_t offline_roots = 0, offline_unreadable = 0, offline_deferred = 0;
         for (const auto& [name, st] : cur.roots) {
-            const bool off = is_offline_root(name, offline);
+            const bool off = is_offline(name);
             unarmed += (!off && !st.armed) ? 1 : 0;
             unreadable += st.status == "unreadable" ? 1 : 0;
             capped += st.status == "capped" ? 1 : 0;
             offline_roots += off ? 1 : 0;
             offline_unreadable += (off && st.status == "unreadable") ? 1 : 0;
+            offline_deferred += (off && st.deferred) ? 1 : 0;
         }
         if (discovery_incomplete && !offline_incomplete_)
             spdlog::warn("Echo registry: the profile list could not be read completely; the known "
@@ -589,6 +649,7 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
            {"registry_roots_capped", std::to_string(capped)},
            {"registry_offline_roots", std::to_string(offline_roots)},
            {"registry_offline_roots_unreadable", std::to_string(offline_unreadable)},
+           {"registry_offline_roots_deferred", std::to_string(offline_deferred)},
            {"registry_offline_discovery_incomplete", discovery_incomplete ? "1" : "0"},
         };
         for (const auto& [k, v] : keys) {
@@ -1408,7 +1469,25 @@ struct OfflineMountTick {
     std::int64_t deadline{0};
     bool halted{false};
     const char* halted_token{"skipped_after_timeout"};
+    bool gate_warned{false}; // the mount gate is closed and said so; cleared when it reopens
 };
+
+// One warning per open -> closed transition of the shared mount gate (a failed module pin, or a
+// worker abandoned on a timeout that is still running): while it stays closed every hive is
+// answered not-attempted and retried next tick, which would otherwise be silent -- the gate
+// closing is the one thing that stops ALL offline reads, so it is worth one line, not one per tick.
+void note_mount_gate(OfflineMountTick& tick, yuzu::echo::WalkGate gate) {
+    if (gate == yuzu::echo::WalkGate::open) {
+        tick.gate_warned = false;
+        return;
+    }
+    if (!tick.gate_warned) {
+        tick.gate_warned = true;
+        spdlog::warn("Echo registry: no offline hive mounts ({}); logged-off profiles are retried on "
+                     "the next tick (this repeats only after the gate has reopened)",
+                     yuzu::echo::walk_gate_token(gate));
+    }
+}
 
 OfflineHiveRead unreadable_hive(const std::vector<std::string>& roots, bool attempted,
                                 const std::string& reason) {
@@ -1440,6 +1519,7 @@ OfflineHiveRead read_offline_hive_bounded(const std::string& sid, const std::str
     if (tick.halted)
         return unreadable_hive(roots, false, std::string("offline:") + tick.halted_token);
     const auto gate = yuzu::echo::decide_walk_gate(pin_plugin_module(), g_mount_workers_in_flight.load());
+    note_mount_gate(tick, gate);
     if (gate != yuzu::echo::WalkGate::open)
         return unreadable_hive(roots, false,
                                std::string("offline:") + yuzu::echo::walk_gate_token(gate));
@@ -1448,6 +1528,9 @@ OfflineHiveRead read_offline_hive_bounded(const std::string& sid, const std::str
        kHiveMountBoundMs, [sid, path, roots, deadline]() -> OfflineHiveRead {
            const MountWorkerGuard in_flight; // counted until this closure really returns
            OfflineHiveRead r;
+           // Built before the try: the handler must not allocate (a bad_alloc there would leave
+           // the closure and the caller blocked for the whole bound), so it only moves this in.
+           OfflineHiveRead failed = unreadable_hive(roots, true, "offline:exception");
            yuzu::win::HiveAccessReport report;
            try {
                const auto status = yuzu::win::with_user_hive(
@@ -1479,10 +1562,13 @@ OfflineHiveRead read_offline_hive_bounded(const std::string& sid, const std::str
                       roots, true,
                       "offline:" + yuzu::profiles::hive_access_token(status, report.refusal));
            } catch (...) {
-               r = unreadable_hive(roots, true, "offline:exception");
+               r = std::move(failed);
            }
            // A leaked mount is system-wide and keeps NTUSER.DAT locked until something releases it.
            if (report.unload_failed) {
+               // Every failure is recorded (which hive, which mount); the alert is raised once.
+               spdlog::info("Echo registry: hive unload failed for {} (mount HKU\\{})", sid,
+                            report.mount_name);
                static std::atomic<bool> s_unload_warned{false};
                if (!s_unload_warned.exchange(true))
                    spdlog::warn("Echo registry: hive unload failed for HKU\\{} -- the profile's "

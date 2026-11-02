@@ -63,7 +63,10 @@
 // shared guarded ladder, once per hive, and its rows carry source=offline and
 // detail=attr:offline -- an unloaded hive is written by file-level tools or by another
 // process's mount, never by a registry call this session could attribute, so nothing is
-// correlated and nothing is held. An offline root never advances window_base and takes no part
+// correlated and nothing is held. Within a tick the loaded roots are read first and the
+// hives take what is left of the budget, deferred hives first and then the one read longest
+// ago, so a queue of logged-off profiles can never starve a loaded root. An offline root never
+// advances window_base and takes no part
 // in the retention floor; when a root goes offline its live window_base is reset and its stale
 // notify is consumed, so nothing from its loaded life pins the ETW buffer. When it is loaded
 // again its first loaded read happens at once and diffs against the offline baseline. A failed
@@ -275,9 +278,24 @@ RegistryScope::roots_for(const std::vector<std::string>& hku_subkeys,
                                        [&](const OfflineProfile& o) { return o.sid == sid; });
 }
 
+/// A virtual service account's SID (NT SERVICE\\*, IIS app pools, virtual machines, the Window
+/// Manager and Font Driver Host accounts). Their profile hives are loaded by the service that owns
+/// them, so an hourly exclusive mount from here could race that load; they are not logged-off
+/// users either, so offline discovery never lists them. Deliberately a prefix list, NOT "only
+/// S-1-5-21-": Entra-joined users are S-1-12-1-. A loaded hive of one of these is still watched
+/// like any loaded hive.
+[[nodiscard]] inline bool is_virtual_service_sid(std::string_view sid) {
+    constexpr std::array<std::string_view, 5> kPrefixes{"S-1-5-80-", "S-1-5-82-", "S-1-5-83-",
+                                                         "S-1-5-90-", "S-1-5-96-"};
+    return std::any_of(kPrefixes.begin(), kPrefixes.end(),
+                       [&](std::string_view p) { return sid.starts_with(p); });
+}
+
 /// The offline profile list after a discovery: the ONE rule collect() and the tests share.
 /// A complete walk replaces the known list (keeping the entry of a sid it could not read the
-/// path for); an incomplete walk keeps it whole. A loaded sid is never offline.
+/// path for); an incomplete walk keeps it whole and ADDS the profiles it did list (never removes:
+/// removal needs a complete walk, so a host with more profiles than the walk's cap still gets the
+/// ones the walk reaches). A loaded sid is never offline.
 ///
 /// `prev_loaded` is the loaded list the previous tick committed. A sid that was loaded then and
 /// is not now has just logged off: it is a known profile whose path is not yet known, so it
@@ -312,8 +330,17 @@ reconcile_offline(const std::vector<OfflineProfile>& known_in,
             if (std::find(d.partial.begin(), d.partial.end(), k.sid) != d.partial.end())
                 push(k);
     } else {
-        for (const auto& k : known)
-            push(k);
+        for (const auto& k : known) {
+            OfflineProfile e = k;
+            if (e.path.empty()) // a known profile with no path yet takes the one this walk did list
+                if (const auto it = std::find_if(d.profiles.begin(), d.profiles.end(),
+                                                 [&](const OfflineProfile& p) { return p.sid == k.sid; });
+                    it != d.profiles.end())
+                    e.path = it->path;
+            push(e);
+        }
+        for (const auto& p : d.profiles)
+            push(p); // additive: a sid already known keeps its entry
     }
     return out;
 }
@@ -324,6 +351,10 @@ reconcile_offline(const std::vector<OfflineProfile>& known_in,
 /// is `partial` (its previous cursor entry stands), as is a sid whose record failed outright.
 /// A failed ProfileList open walked nothing: incomplete, with no profiles. A walk cut short or
 /// stopped at the profile cap is incomplete too, but the profiles it did list are returned.
+/// A `<sid>.bak` record (the leftover of a temporary-profile event) proves its base sid exists
+/// and is mid-rename: the base sid is `partial` (its known entry stands) and the record is never
+/// a profile, so it is never mounted under the `.bak` name. A virtual service SID is skipped
+/// outright (is_virtual_service_sid).
 [[nodiscard]] inline OfflineDiscovery
 classify_offline_discovery(bool walk_complete, bool root_failed, bool truncated,
                            std::span<const yuzu::profiles::ProfileInfo> profiles,
@@ -341,13 +372,22 @@ classify_offline_discovery(bool walk_complete, bool root_failed, bool truncated,
     for (const auto& p : profiles) {
         if (p.state == yuzu::profiles::HiveState::loaded)
             continue;
+        if (yuzu::profiles::is_profile_backup_entry(p.sid)) {
+            const std::string base = p.sid.substr(0, p.sid.size() - 4);
+            if (is_user_hive_name(base) && !is_virtual_service_sid(base))
+                add_partial(base);
+            continue;
+        }
+        if (is_virtual_service_sid(p.sid))
+            continue;
         if (p.profile_path_unreadable || p.profile_path.empty())
             add_partial(p.sid);
         else
             d.profiles.push_back({p.sid, p.profile_path});
     }
     for (const auto& sid : failed_sids)
-        add_partial(sid); // a record that failed to read is not "gone"
+        if (!is_virtual_service_sid(sid))
+            add_partial(sid); // a record that failed to read is not "gone"
     return d;
 }
 
@@ -1143,7 +1183,13 @@ struct RegistryCursor {
     std::vector<RegistryCandidate> held;
     std::vector<LossEpoch> loss;
     std::vector<std::string> hku;
-    std::vector<OfflineProfile> offline; // known unloaded profiles (an older build ignores this)
+    // Known unloaded profiles, as [sid, ProfileImagePath] (the path names the user). Unlike `held`
+    // this is not version-gated: an older build has no offline coverage to lose, so it ignores
+    // the field and drops those roots through its own leave-scope path (baselines shrunk, no
+    // rows); a re-upgrade then decodes a cursor without the list and re-baselines the offline
+    // roots silently -- the same outcome a version gate would give after its gap:cursorlost, but
+    // without re-baselining every LOADED root on a rollback as well.
+    std::vector<OfflineProfile> offline;
     std::string ccs; // ControlSetNNN the machine was on when the baselines were taken
 };
 

@@ -1069,7 +1069,8 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // (a lead to verify, not proof) and are 0 / '' when none is named; `detail`
         // says why (attr:corr | ambiguous | none | degraded | off | lost-restart | offline).
         // A logged-off user's hive is mounted through the guarded offline-hive ladder and
-        // read hourly: those rows carry source=offline and attr:offline, never a writer.
+        // read on the full re-read (every 12 slow ticks: hourly at the default 300 s): those
+        // rows carry source=offline and attr:offline, never a writer.
         // Values are stored UNMASKED: `data`/`prev_data` are readable through
         // echo.sql. Retention is a row count.
         // Replay idempotence via the UNIQUE record_key index below.
@@ -1084,8 +1085,9 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "value) and a write-only Kernel-Registry ETW session that names the writing "
                  "process by correlation; cursor-model (echo_cursor.hpp). Without an elevated "
                  "agent the session cannot open and rows carry attr:off. The per-user roots of "
-                 "logged-off users' unloaded hives are read hourly through the guarded "
-                 "offline-hive ladder (rows attr:offline)."},
+                 "logged-off users' unloaded hives are read on the full re-read (every 12 slow "
+                 "ticks: hourly at the default 300 s) through the guarded offline-hive ladder "
+                 "(rows attr:offline)."},
                 {"linux",   OsSupportStatus::kUnsupported, "",
                  "The Windows registry does not exist on this platform."},
                 {"macos",   OsSupportStatus::kUnsupported, "",
@@ -1473,8 +1475,10 @@ bool is_queryable_table(std::string_view real_table_name) {
         // deleting echo.db, which destroys every OTHER source's history too.
         // Reading it exposes a source name, a position and updated_at; the
         // cursor payload is the source's own bookkeeping, not captured content --
-        // with one exception: the registry cursor row holds, for about one tick, the
-        // rendered old and new values of changes whose writer is not settled yet.
+        // with two exceptions: the registry cursor row holds, for about one tick, the
+        // rendered old and new values of changes whose writer is not settled yet, and its
+        // `offline` list holds [sid, ProfileImagePath] (the path names the user) for every
+        // logged-off profile.
         // echo_state carries the registry baselines (`registry:<root>`, rendered
         // values), readable here consistently with registry_live's own unmasked
         // values; purge_source("registry") erases the table, the cursor row and

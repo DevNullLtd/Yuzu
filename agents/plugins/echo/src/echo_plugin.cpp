@@ -3089,6 +3089,7 @@ private:
                 {"registry_attr_attributed", "0"},     {"registry_attr_ambiguous", "0"},
                 {"registry_attr_none", "0"},           {"registry_offline_roots", "0"},
                 {"registry_offline_roots_unreadable", "0"},
+                {"registry_offline_roots_deferred", "0"},
                 {"registry_offline_discovery_incomplete", "0"},
             };
             for (const auto& [key, def] : kRegistryKeys)

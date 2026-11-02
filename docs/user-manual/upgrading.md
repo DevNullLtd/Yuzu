@@ -369,6 +369,14 @@ human roles first and follow the prerequisites in [Role-Based Access Control](rb
 
 **What to expect.** New collection begins without operator action, on each OS where the source has a collector (OS compatibility matrix in `docs/user-manual/echo.md`), for `procperf` (and the daily per-application performance sync it feeds), `netqual`, `module` (Windows ETW), `software`, `arp`, `dns`, `netconn` and `mapdrive` (`netconn` and `mapdrive` also run history backfills; `netconn_lookback_seconds` bounds the first). A source whose `<source>_enabled` row cannot be read is treated as disabled for that tick and its stored rows are kept.
 
+## Behaviour change: the Echo registry source reads logged-off users' hives (Windows)
+
+**What changed.** The Echo `registry` source used to baseline only the hives that were loaded. It now also reads the `Run`, `RunOnce`, `Policies` and `Winlogon` roots of every logged-off profile, on the full re-read (every 12 `slow_interval`s: hourly at the default 300 s), by mounting the profile's `NTUSER.DAT` through the guarded offline-hive mount the other per-user plugins use. It is on by default, there is no offline-only switch (`registry_enabled=false` stops the whole registry source), and it needs no setting.
+
+**What to expect on the first start after the upgrade.** The agent mounts every logged-off profile's hive once and baselines it silently (no gap row); a host with many logged-off profiles spreads that over a few ticks (`registry_offline_roots_deferred` counts the ones waiting). The upgrade date is the start of offline coverage: changes made to a logged-off hive before it are not reported. After that, each logged-off profile is mounted once per full re-read with the backup and restore privileges enabled for the span of the mount, holding that profile's `NTUSER.DAT` exclusively for it. The values under those roots belong to other users and are stored unmasked, like those of loaded hives (`docs/user-manual/echo.md`, *Logged-off users*).
+
+**Rolling back.** A build without offline hives ignores the cursor's `offline` list and drops those roots' baselines without a row, so a change made to a logged-off hive while the older build runs is never reported, and a later re-upgrade re-baselines those roots silently (the `gap:restart` row's "found by the baseline diff" does not hold for them). Loaded roots are unaffected. Run `echo.purge_source` on the paused `registry` source before the rollback if the stored baselines and values must not stay on disk.
+
 ## ⚠️ Breaking: MFA step-up is checked once, before the route's own checks, and two more routes need a fresh proof
 
 A fresh MFA proof is required on 37 named high-risk routes (the list is in

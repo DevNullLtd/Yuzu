@@ -30,12 +30,16 @@ test_echo_mapdrive.cpp), so this pins the wiring lexically. Invariants:
      decide_walk_gate(pin_plugin_module(), ...) before its first bounded_call_ex, refuses without
      mounting when the gate is closed or an earlier mount this tick halted the rest, counts its
      worker in flight before with_user_hive, bounds the wait with kHiveMountBoundMs and halts the
-     tick on a timeout/rejection, and opens each root with REG_OPTION_OPEN_LINK. Its profile
+     tick on a timeout/rejection, and opens each root with REG_OPTION_OPEN_LINK. It mounts
+     through the DEFAULT-ON hive-file guard only (its with_user_hive call ends `&report)` and
+     never names kOfflineHiveFileUnguarded), logs a closed gate once per transition
+     (note_mount_gate, between the gate decision and the refusal), and its catch(...) handler
+     only moves in a fallback result built before the try (it must not allocate). Its profile
      discovery (discover_offline_profiles) routes through the unit-tested pure
      classify_offline_discovery.
 
 Robustness: `//` comments are stripped and whitespace is collapsed before matching, so a
-commented-out call cannot satisfy a check. Lexical only: it cannot see a relocation that keeps
+`//`-commented call cannot satisfy a check (`/* */` comments are deliberately NOT stripped). Lexical only: it cannot see a relocation that keeps
 the tokens but changes control flow (review-enforced). The self-test applies in-memory
 mutations and requires problems() to be non-empty on each; a mutation whose pattern no longer
 matches the source fails loudly (stale pattern) rather than passing vacuously.
@@ -128,6 +132,26 @@ def problems(collector_src, plugin_src, gate_src, registry_src):
             out.append("the offline mount worker no longer counts itself in flight before with_user_hive")
         if not re.search(r"tick\.halted = decision\.halt_walk;", offline):
             out.append("a timed-out or rejected offline mount no longer halts the tick")
+        # The default-on hive-file guard (#5291) is the whole point of sharing the ladder: the
+        # offline reader must never pass the opt-out, whatever name it goes by.
+        if "kOfflineHiveFileUnguarded" in offline:
+            out.append("the offline reader opts out of the default hive-file guard "
+                       "(kOfflineHiveFileUnguarded)")
+        if not re.search(r"with_user_hive\( sid, path, \[&\]\(HKEY root\) \{.*?\}, &report\);", offline):
+            out.append("the offline reader's with_user_hive call must end `&report)`: the default "
+                       "guard, no fifth argument")
+        decide_at = offline.find("decide_walk_gate(")
+        note_at = offline.find("note_mount_gate(tick, gate);")
+        refuse_at = offline.find("if (gate != yuzu::echo::WalkGate::open)")
+        if not (0 <= decide_at < note_at < refuse_at):
+            out.append("a closed mount gate must be logged (note_mount_gate) between the gate "
+                       "decision and the refusal")
+        fallback_at = offline.find("OfflineHiveRead failed = unreadable_hive(")
+        try_at = offline.find("try {")
+        handler = re.search(r"catch \(\.\.\.\) \{([^{}]*)\}", offline)
+        if not (0 <= fallback_at < try_at) or handler is None or "unreadable_hive(" in handler.group(1):
+            out.append("the worker's catch(...) handler must only move in a fallback result built "
+                       "before the try (a bad_alloc inside the handler would leave the closure)")
         if "decide_mount_call(" not in offline:
             out.append("the offline reader no longer asks decide_mount_call")
         # A root that is itself a symbolic-link key is read as the link, never followed: the
@@ -333,6 +357,17 @@ class EchoMapdrivePinLexical(unittest.TestCase):
                 r, "const auto gate = yuzu::echo::decide_walk_gate(",
                    "(void)yuzu::shared::bounded_call_ex(kHiveMountBoundMs, [] { return 0; });\n"
                    "    const auto gate = yuzu::echo::decide_walk_gate(")),
+            "registry opts out of the default hive-file guard": dict(r=mutate(
+                r, "                  &report);\n               if (status",
+                   "                  &report, &yuzu::win::kOfflineHiveFileUnguarded);\n"
+                   "               if (status")),
+            "registry gate closing is no longer logged": dict(r=mutate(
+                r, "note_mount_gate(tick, gate);", "(void)gate;")),
+            "registry catch handler allocates again": dict(r=mutate(
+                r, "r = std::move(failed);", 'r = unreadable_hive(roots, true, "offline:exception");')),
+            "registry fallback built inside the try": dict(r=mutate(
+                r, 'OfflineHiveRead failed = unreadable_hive(roots, true, "offline:exception");',
+                   "OfflineHiveRead failed;")),
             "registry root open drops the link flag": dict(r=mutate(
                 r, "REG_OPTION_OPEN_LINK, KEY_READ | KEY_WOW64_64KEY, key.put()",
                    "0, KEY_READ | KEY_WOW64_64KEY, key.put()")),

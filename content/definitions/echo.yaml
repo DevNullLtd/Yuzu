@@ -699,8 +699,10 @@ spec:
           every other capture source. Windows only; on Linux and macOS the source
           is listed as unsupported and records nothing. A curated watch list (Run and RunOnce, Services,
           Image File Execution Options, AppInit_DLLs, Winlogon, LSA, Policies and
-          Defender under HKLM, plus Run, RunOnce, Policies and Winlogon under every
-          user profile hive, loaded or unloaded) is watched for changes; each
+          Defender under HKLM, plus Run, RunOnce, Policies and Winlogon under each
+          user profile hive the agent can resolve a path for, loaded or unloaded: an
+          unloaded hive is found through the profile list, which is walked up to 512
+          entries) is watched for changes; each
           added, changed or removed value is recorded with its old and new data.
           VALUES ARE STORED UNMASKED: any value under a watched key, changed or
           not, is readable through echo.sql - the per-key baseline in echo_state
@@ -718,9 +720,10 @@ spec:
           or attr:offline.
           The ETW session needs an elevated agent; without one rows say attr:off
           and the key watch alone runs. The roots of a logged-off user's unloaded
-          hive have no watch: they are read hourly through the guarded offline-hive
-          mount, and their rows say source=offline and attr:offline, never naming
-          a process. A change is read at the slow tick that
+          hive have no watch: they are read on the full re-read (every 12 slow ticks,
+          hourly at the default 300 s) through the guarded offline-hive mount,
+          and their rows say source=offline and attr:offline, never naming
+          a process; such a change may predate the read or the logoff. A change is read at the slow tick that
           sees it (every slow_interval, 300 s by default) and its row lands in
           that tick once its writer is settled, or in the next one when the
           write was within a few seconds of the tick or was found by the full

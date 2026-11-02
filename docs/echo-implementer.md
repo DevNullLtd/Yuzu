@@ -133,7 +133,7 @@ function, never in `applies_*` collectors.
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | echo.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe Echo data, delete `<data_dir>/echo.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing echo.db, runs migration if the schema version differs, and resumes collection. State in `echo_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/echo.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no echo.db — the next collect_fast creates it from scratch. The old echo.db at the previous path is orphaned but not deleted. Operator concern, not Echo's. |
-| **Roll back to an older agent** | The older binary opens the same `echo.db` (the registry source adds no schema version) but does not know the `registry` source, so the `registry_live` table, the `registry` row of `echo_cursor` and every `registry:%` baseline in `echo_state` stay on disk, with the per-key baselines holding every watched value unmasked (and the cursor row, for about one tick, the rendered old and new values of changes still waiting for their writer), and the older binary has no way to erase them. An older agent that does know the `registry` source (the key-watch-only build) reads a cursor that holds changes (`held` or `loss`, written as cursor version 2) as lost: one `gap:cursorlost` row and a re-baseline, and those changes are never rows. Run `echo.purge_source` on the paused `registry` source BEFORE the rollback. |
+| **Roll back to an older agent** | The older binary opens the same `echo.db` (the registry source adds no schema version) but does not know the `registry` source, so the `registry_live` table, the `registry` row of `echo_cursor` and every `registry:%` baseline in `echo_state` stay on disk, with the per-key baselines holding every watched value unmasked (and the cursor row, for about one tick, the rendered old and new values of changes still waiting for their writer), and the older binary has no way to erase them. An older agent that does know the `registry` source (the key-watch-only build) reads a cursor that holds changes (`held` or `loss`, written as cursor version 2) as lost: one `gap:cursorlost` row and a re-baseline, and those changes are never rows. An older agent that also knows the `registry` source but predates offline hives ignores the cursor's `offline` list and the per-root `deferred` flag: it drops the logged-off profiles' roots through its leave-scope path (their baselines shrink, no rows), so a change made to a logged-off hive while the older build runs is never reported, and a later re-upgrade re-baselines those roots silently. Run `echo.purge_source` on the paused `registry` source BEFORE the rollback. |
 | **Corruption detected at open** (#559) | `EchoDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `echo.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `echo_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `echo.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — Echo refuses to load rather than trust the corrupt DB. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.echo.*` heartbeat tags; the server exposes `yuzu_fleet_echo_db_corruption_agents` and writes an `echo.db.corruption_quarantined` audit row — see docs/user-manual/echo.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
@@ -372,6 +372,14 @@ the schema/`$Name_Tier` translation/queryable-table allowlist machinery applies
 uniformly, but a new capture source should follow the numbered steps above, not
 `echo_usage.*`.
 
+**A source that mounts a user hive file** (today the mapped-drive history walk and the registry
+source's offline reads) goes through `yuzu::win::with_user_hive` behind the shared mount gate in
+`echo_hive_mount_gate.hpp`: `pin_plugin_module()` first, then `decide_walk_gate(pin_plugin_module(),
+g_mount_workers_in_flight.load())`, `bounded_call_ex(kHiveMountBoundMs, ...)` around a worker that
+holds a `MountWorkerGuard`, the default hive-file guard (never `kOfflineHiveFileUnguarded`), and
+`decide_mount_call` on a non-Completed result. The counter is one per plugin DLL, so a stuck worker of
+ONE source closes the gate for BOTH; `tests/test_echo_mapdrive_pin_lexical.py` pins the wiring of each.
+
 ### 8.1 Streaming sources and the `ProcStreamCollector` contract
 
 Most sources are snapshot-and-diff pollers (above). A **streaming source**
@@ -449,54 +457,96 @@ cursor.** What it adds to the pattern:
   last read: the watch mask is `NAME | LAST_SET`, so a permission change raises
   nothing.
 - **A root's first read is silent.** A root not yet baselined (first run, a
-  profile first seen at its first logon, a re-enable) has its first read taken as
-  the baseline, with no rows. Writes made to it between the hive loading and that
-  read, up to one slow interval, are folded into the baseline and are not
-  recorded; no per-root gap row is written, since a logon would add one per root
-  per user. A user who logs off and back on is NOT in this list: their baseline
-  carries across (below).
+  profile first seen at its first logon or first found as a logged-off profile,
+  a re-enable) has its first read taken as the baseline, with no rows. Writes
+  made to it between the hive loading and that read, up to one slow interval,
+  are folded into the baseline and are not recorded; no per-root gap row is
+  written, since a logon would add one per root per user. A user who logs off and
+  back on is NOT in this list: their baseline carries across (below).
 - **Offline hives keep the baseline across logoff and logon.** A profile whose
   hive is not loaded stays in scope under the same root names
-  (`HKU\<sid>\<suffix>`). It has no watch and no ETW attribution; it is read
-  hourly (the reconcile tick, or the next tick for a deferred or not-attempted
-  mount) by one guarded, bounded, process-lock-serialised mount per hive, all of
-  that hive's roots from the one mount, and its rows are `source=offline`,
-  `attr:offline`, finalised in the tick that sees them. Transitions are explicit
-  in `collect()`: a root that was loaded and is offline now has its `window_base`
-  reset and its stale notify consumed (restored on a failed commit like every
-  take), so nothing from its loaded life pins the ETW retention floor; a root that
-  was offline and is loaded now is due at once, so its first loaded read diffs
-  against the offline baseline (a `RunOnce` value consumed at logon becomes a
-  `removed` row with `attr:lost-restart`, since its window starts at 0). An
-  offline root never advances `window_base`, takes no part in the retention
-  floor, and is excluded from `pending_first`. Scope is removed only by a
-  COMPLETE profile walk (`reconcile_offline`): an incomplete walk keeps the known
-  list (`registry_offline_discovery_incomplete`), and a record whose path was
-  unreadable keeps its cursor entry. A sid loaded on the previous tick and gone now
-  (a logoff) is a known profile whose path is not yet known (`{sid, ""}`, the
-  `prev_loaded` argument), so a user who logs off during an incomplete or partial
-  walk keeps the baseline too: an incomplete walk or a `partial` record carries the
-  entry, a complete walk that lists it supplies the path, and one that names it
-  nowhere drops it. A root whose path is empty is never mounted: it is marked
-  `deferred` each tick (baseline and status untouched, no row) and read the first
-  tick a complete walk supplies the path. A failed mount is an Unreadable read with a
-  named reason (`offline:<token>`), one gap row per transition; the `deferred`
-  flag on the root's state, not its status, schedules the next-tick retry. A hive
-  refused at its first sight has been attempted, so it waits for the hour like any
-  other refusal, and so does a refused root across a re-enable (the re-enable clears
-  `baselined`, but a root whose status is `unreadable` is not due on that clause: it
-  is re-baselined silently at its next hourly read). Only a root never tried, or
-  re-baselined after a successful read, is due outside the reconcile. A mount the shared worker ceiling refuses (`decide_mount_call`:
-  rejected means nothing ran) is not an attempt: `offline:mount_rejected`, later
-  hives that tick `offline:skipped_after_rejection`, no gap row, retried next tick;
-  a timeout is an attempt (`offline:timeout`, one gap row) and halts the rest of the
-  tick. Profile discovery runs hourly and on an HKU name-watch mark, and on every
-  tick while no logged-off profile is known, while the last walk was incomplete or
-  while a known profile has no path yet (a ProfileList registry walk, never a
-  mount), which is also how a cursor from a build without offline hives picks them
-  up. It is classified against the loaded list collect() took for that tick (the
-  `loaded_sids` argument of the hook), never a second HKU enumeration: a logon
-  between two snapshots cannot leave a baselined profile in neither list.
+  (`HKU\<sid>\<suffix>`). It has no watch and no ETW attribution; one guarded,
+  bounded, process-lock-serialised mount per hive reads all of that hive's roots,
+  and its rows are `source=offline`, `attr:offline`, finalised in the tick that
+  sees them.
+  - *Due rule.* A hive is read on the hourly tick (`cur.tick %
+    kReconcileEveryTicks == 0`, so every 12 slow ticks), never on a notify. It is
+    NOT read on a restart's `force_all_`: that reconcile exists for a lost notify
+    or ETW buffer, which an unloaded hive never had, so a restart does not
+    re-mount settled hives. It is also due when never read or re-baselined (a
+    re-enable), when its last read was `Capped` (a first Capped read is not
+    trusted as a baseline: `baselined` stays false and it is read again next
+    tick, every tick while it stays Capped), and as a retry (`deferred`, or
+    status `due` carried over from a loaded root the budget deferred).
+  - *Scheduling.* `collect()` reads the live roots (HKLM and the loaded hives)
+    first, rotated by `tick % n_live`, then the offline hives in fairness order:
+    deferred hives first, then the one with the oldest persisted `read_end`, the
+    sid breaking ties. The shared 10 s budget is spent in that order, so a queue
+    of logged-off profiles can only take what the live roots left; a hive the
+    budget cut off keeps its status, is marked `deferred` (counted by
+    `registry_offline_roots_deferred`) and goes first next tick. At about one
+    mount per budget second the tail of a long list is read over the following
+    ticks. A stop (`stop()` sets `stopping_`) mid-pass leaves the remaining due
+    hives `deferred` with no row.
+  - *Transitions* are explicit in `collect()`: a root that was loaded and is
+    offline now has its `window_base` reset and its stale notify consumed
+    (restored on a failed commit like every take), so nothing from its loaded life
+    pins the ETW retention floor; a root that was offline and is loaded now is due
+    at once, so its first loaded read diffs against the offline baseline (a
+    `RunOnce` value consumed at logon becomes a `removed` row, `attr:lost-restart`
+    when the root has no pending notify since its window starts at 0, otherwise a
+    notify-sourced row with a window starting at the notify). An offline root never
+    advances `window_base`, takes no part in the retention floor, and is excluded
+    from `pending_first`.
+  - *Scope.* It is removed only by a COMPLETE profile walk, and a removal of a
+    profile with a known path needs a second complete walk in the same tick to
+    agree (the enumeration is index-driven, so a concurrent delete or rename can
+    skip a healthy profile). An incomplete walk (the list unopenable, cut short, or
+    stopped at the 512-entry cap) keeps the known list (`registry_offline_discovery_incomplete`)
+    and ADDS the profiles it did list, so a host over the cap still gets the
+    profiles the walk reaches. A record whose path was unreadable keeps its cursor
+    entry. A `<sid>.bak` record is proof that its base sid exists (it joins `partial`)
+    and is never mounted under the `.bak` name; virtual service SIDs
+    (`is_virtual_service_sid`) are never offline profiles. A sid loaded on the
+    previous tick and gone now (a logoff) is a known profile whose path is not yet
+    known (`{sid, ""}`, the `prev_loaded` argument), so a user who logs off during an
+    incomplete or partial walk keeps the baseline too: a complete walk that lists it
+    supplies the path, and one that names it nowhere drops it. A root whose path is
+    empty is never mounted: it is marked `deferred` each tick (baseline and status
+    untouched, no row) and read the first tick a walk supplies the path; a profile
+    whose own record stays unreadable on complete walks stays unpathed, is walked
+    again every tick, is never read and nothing but `registry_offline_roots_deferred`
+    says so.
+  - *Failures.* A failed mount is an Unreadable read with a named reason
+    (`offline:<token>`) and one gap row per ROOT per transition (up to five per
+    hive); the `deferred` flag on the root's state, not its status, schedules the
+    next-tick retry. A hive refused at its first sight has been attempted, so it
+    waits for the hour like any other refusal, and so does a refused root across a
+    re-enable (the re-enable clears `baselined`, but a root whose status is
+    `unreadable` is not due on that clause: it is re-baselined silently at its next
+    hourly read). A mount the shared worker ceiling refuses (`decide_mount_call`:
+    rejected means nothing ran) is not an attempt: `offline:mount_rejected`, later
+    hives that tick `offline:skipped_after_rejection`, no gap row, retried next
+    tick; a timeout is an attempt (`offline:timeout`, one gap row) and halts the rest
+    of the tick. The tokens a row can carry are listed in the user manual
+    (*Offline read outcomes*).
+  - *Discovery* (a ProfileList registry walk, never a mount) runs hourly, on an HKU
+    name-watch mark, and on every tick while no logged-off profile is known, while
+    the last walk was incomplete or while a known profile has no path yet, which is
+    also how a cursor from a build without offline hives picks them up. It is
+    classified against the loaded list collect() took for that tick (the
+    `loaded_sids` argument of the hook), never a second HKU enumeration: a logon
+    between two snapshots cannot leave a baselined profile in neither list.
+  - *The shared gate.* The in-flight counter, worker guard, bound and module pin
+    live in `echo_hive_mount_gate.hpp`, one per plugin DLL and shared with the
+    mapped-drive walk: a stuck mount worker from EITHER source closes the gate for
+    both, and the registry source logs the gate closing once per open -> closed
+    transition.
+  - *Cursor evolution.* `offline` and `deferred` are optional cursor fields and the
+    cursor version is not gated on them (unlike `held`): an older build has no offline
+    coverage to lose, so it ignores them and drops those roots through its own
+    leave-scope path (baselines shrunk, no rows), and a re-upgrade re-baselines the
+    offline roots silently.
 - **Rows land in the tick that observes the change, or the next one, and the writer is
   correlated, not verified.** A candidate is held only while `now - window_hi <
   kEtwSettle100ns` (5 s), and a notify window closes 1 s after the last notify, so a

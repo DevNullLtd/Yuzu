@@ -1122,9 +1122,9 @@ bool pin_plugin_module() noexcept {
                                    GET_MODULE_HANDLE_EX_FLAG_PIN,
                                reinterpret_cast<LPCWSTR>(&pin_plugin_module), &module))
             return true;
-        spdlog::error("Echo mapdrive: could not pin the plugin module (GetLastError {}); no hive "
-                      "is read (live or offline) until the agent restarts, because a detached "
-                      "mount thread must not outlive an unload",
+        spdlog::error("Echo hive mount: could not pin the plugin module (GetLastError {}); no "
+                      "hive is mounted (mapped-drive history or registry offline reads) until the "
+                      "agent restarts, because a detached mount thread must not outlive an unload",
                       GetLastError());
         return false;
     }();
@@ -1154,9 +1154,10 @@ namespace {
 // one-shot risk at init(); the retry now re-attempts specifically the profiles already known to be
 // problematic, on a recurring cadence, from the SAME single-threaded dispatch that also runs Echo's
 // other four interval triggers including retention -- an uncancellable hang here would wedge all
-// of them indefinitely, with no self-recovery (governance Gate 6, sre). bounded_call_ex (this
-// plugin's first consumer of the shared primitive) bounds the WAIT, not the call: the mount runs
-// on a detached thread, and the dispatching thread gives up and moves on after kHiveMountBoundMs.
+// of them indefinitely, with no self-recovery (governance Gate 6, sre). bounded_call_ex (the shared
+// primitive; the registry source's offline reads use it the same way) bounds the WAIT, not the
+// call: the mount runs on a detached thread, and the dispatching thread gives up and moves on
+// after kHiveMountBoundMs.
 //
 // The residual, stated plainly, because dism_bounded_call.hpp takes the OPPOSITE stance (its work
 // lives in agent-core, which is never unloaded): the abandoned thread keeps executing THIS

@@ -419,7 +419,7 @@ TEST_CASE("echo plugin: every source is enabled by default with no stored flag; 
         }
         CHECK(count_containing(rows, "source_disabled") == 0);
 
-        // The registry source's fourteen health keys are always present, at their "not
+        // The registry source's fifteen health keys are always present, at their "not
         // running" defaults before any tick has written them.
         for (const char* kv : {"registry_capture_method|none", "registry_watch_roots|0",
                                "registry_watch_roots_unarmed|0", "registry_roots_unreadable|0",
@@ -428,6 +428,7 @@ TEST_CASE("echo plugin: every source is enabled by default with no stored flag; 
                                "registry_attr_attributed|0", "registry_attr_ambiguous|0",
                                "registry_attr_none|0", "registry_offline_roots|0",
                                "registry_offline_roots_unreadable|0",
+                               "registry_offline_roots_deferred|0",
                                "registry_offline_discovery_incomplete|0"}) {
             INFO("key=" << kv);
             const auto expected = std::format("config|{}", kv);
