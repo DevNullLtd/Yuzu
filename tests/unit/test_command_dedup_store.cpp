@@ -31,6 +31,8 @@
 #include <vector>
 
 #ifndef _WIN32
+#include <csignal>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -631,6 +633,24 @@ TEST_CASE("dedup_quarantine: a taken name gets a -n suffix and an earlier quaran
     CHECK(read_bytes(*dest) == "second");
 }
 
+TEST_CASE("dedup_quarantine: create_hard_link onto a taken name reports file_exists",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // The atomicity of the name claim rests on this: a taken name must be told apart from "hard
+    // links are unavailable here", on every platform's error mapping. If this ever fails (say, an
+    // MSVC STL that maps ERROR_ALREADY_EXISTS differently), every collision would silently take the
+    // non-atomic check-then-rename fallback.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto a = dir.path / "a";
+    const auto b = dir.path / "b";
+    write_bytes(a, "a");
+    write_bytes(b, "b");
+    std::error_code ec;
+    fs::create_hard_link(a, b, ec);
+    REQUIRE(ec);
+    CHECK(ec == std::errc::file_exists);
+    CHECK(read_bytes(b) == "b"); // the taken name was not touched
+}
+
 TEST_CASE("dedup_quarantine: a clock before 1970 still yields a name the pruner can see",
           "[command_dedup][corruption][quarantine_fs]") {
     yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
@@ -692,6 +712,121 @@ TEST_CASE("dedup_quarantine: prune keeps the newest groups and touches only well
         CHECK(fs::exists(named(odd)));
     CHECK(fs::exists(dir.path / "echo.db.corrupt-1"));
 }
+
+#ifndef _WIN32
+TEST_CASE("dedup_quarantine: a dangling symlink on the wanted name is not replaced",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // exists() FOLLOWS a symlink, so the old check-then-rename saw a dangling link as "free" and
+    // rename() would have replaced it. The hard-link claim gets EEXIST and takes the next suffix.
+    // This passes ONLY on the hard-link path, so it is what distinguishes it from the fallback.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    fs::path wanted = db;
+    wanted += ".corrupt-1234";
+    const auto target = dir.path / "nowhere.txt";
+    std::error_code ec;
+    fs::create_directories(dir.path, ec);
+    REQUIRE_FALSE(ec);
+    fs::create_symlink(target, wanted, ec);
+    REQUIRE_FALSE(ec);
+    write_bytes(db, "corrupt");
+
+    const auto dest = dq::quarantine_corrupt_db(db, 1234);
+    REQUIRE(dest.has_value());
+    CHECK(dest->filename().string() == "command_dedup.db.corrupt-1234-1");
+    CHECK(fs::is_symlink(wanted));        // untouched
+    CHECK_FALSE(fs::exists(target));      // nothing was created through it
+    CHECK(read_bytes(*dest) == "corrupt");
+}
+
+TEST_CASE("dedup_quarantine: when the hard link fails the rename fallback still moves it aside",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // link(2) on a DIRECTORY fails with EPERM (not EEXIST), which is the "hard links are unavailable
+    // here" arm: the fallback must skip a taken name and rename onto the next free one.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    std::error_code ec;
+    fs::create_directories(db, ec);
+    REQUIRE_FALSE(ec);
+    write_bytes(db / "inside.txt", "payload");
+    fs::path taken = db;
+    taken += ".corrupt-1234";
+    write_bytes(taken, "earlier");
+
+    const auto dest = dq::quarantine_corrupt_db(db, 1234);
+    REQUIRE(dest.has_value());
+    CHECK(dest->filename().string() == "command_dedup.db.corrupt-1234-1");
+    CHECK(read_bytes(*dest / "inside.txt") == "payload");
+    CHECK_FALSE(fs::exists(db));
+    CHECK(read_bytes(taken) == "earlier"); // not replaced by the fallback either
+}
+
+namespace {
+// Make every regular-file write fail with EFBIG for the lifetime of the object (SIGXFSZ ignored).
+struct FileSizeLimit {
+    rlimit saved{};
+    void (*old_handler)(int) = SIG_DFL;
+    FileSizeLimit() {
+        ::getrlimit(RLIMIT_FSIZE, &saved);
+        old_handler = std::signal(SIGXFSZ, SIG_IGN);
+        rlimit zero = saved;
+        zero.rlim_cur = 0;
+        ::setrlimit(RLIMIT_FSIZE, &zero);
+    }
+    ~FileSizeLimit() {
+        ::setrlimit(RLIMIT_FSIZE, &saved);
+        std::signal(SIGXFSZ, old_handler);
+    }
+};
+} // namespace
+
+TEST_CASE("CommandDedupStore: a fresh store that cannot be created after a quarantine fails open "
+          "loudly, keeps the evidence intact and still prunes",
+          "[command_dedup][lifecycle][corruption]") {
+    // The branch "quarantine succeeded, then the retry failed": history is lost AND the agent is
+    // degraded. Chaos CH-3 (#3665).
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    QuarantineCleanup qc{path};
+    const auto named = [&](const std::string& tail) {
+        fs::path f = path;
+        f += ".corrupt-" + tail;
+        return f;
+    };
+    for (const char* e : {"1", "2", "3", "4"})
+        write_bytes(named(e), std::string("old-") + e);
+    write_bytes(path, "garbage main file");
+
+    {
+        FileSizeLimit no_writes; // reads, link and unlink still work; creating the schema cannot
+        auto result = CommandDedupStore::open(path);
+        REQUIRE_FALSE(result.has_value());
+        const auto& msg = result.error().message;
+        CHECK(msg.find("re-initialised after quarantine") != std::string::npos);
+        CHECK(msg.find("history is lost") != std::string::npos);
+        CHECK(msg.find(".corrupt-") != std::string::npos); // names the kept file
+    }
+
+    // Evidence intact: the quarantine holds the original bytes, prune ran (4 old + 1 new = 5 groups
+    // -> the 2 oldest go) even though the retry failed.
+    const auto q = quarantine_siblings(path);
+    int groups_with_bytes = 0;
+    for (const auto& f : q) {
+        if (read_bytes(f) == "garbage main file")
+            ++groups_with_bytes;
+    }
+    CHECK(groups_with_bytes == 1);
+    CHECK_FALSE(fs::exists(named("1")));
+    CHECK_FALSE(fs::exists(named("2")));
+    CHECK(fs::exists(named("3")));
+    CHECK(fs::exists(named("4")));
+
+    // Once writes work again the next boot opens a healthy store.
+    auto next = CommandDedupStore::open(path);
+    REQUIRE(next.has_value());
+    CHECK(next->claim("cmd-after-recovery").status == ClaimStatus::Claimed);
+}
+#endif
 
 #ifndef _WIN32
 TEST_CASE("dedup_quarantine: a symlink named like a quarantine loses the link, never the target",

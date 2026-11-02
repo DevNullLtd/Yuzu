@@ -38,11 +38,14 @@ regressible — nothing fails loudly when one is broken.
    quarantined and recreated, once, rather than leaving the agent degraded on every boot.
    `CommandDedupStore::open` moves the main file to `command_dedup.db.corrupt-<unix-epoch-seconds>[-n]`
    (never overwriting an earlier one, even against a second process recovering in the same second: the name is
-   claimed with an atomic hard link, falling back to check-then-rename only where hard links are impossible;
-   if every `-n` is taken it fails instead), carries any non-empty
+   claimed with an atomic hard link; if the hard link fails for any reason other than the name being taken, it
+   falls back to check-then-rename, for which that guarantee does not hold; if every `-n` is taken it fails
+   instead), carries any non-empty
    `-wal`/`-shm`/`-journal` with it as `<that name>-wal` etc (empty or unmovable sidecars are removed, best
    effort), and opens a fresh store. The filesystem half lives in `agents/core/src/command_dedup_quarantine.hpp`
-   (header-only, unit-tested directly). What counts is deliberately narrow:
+   (header-only, unit-tested directly). The claim protects the quarantined EVIDENCE only: two agent daemons on
+   one data dir are unsupported (there is no instance lock), and one can still drop the fresh store the other
+   just created. What counts is deliberately narrow:
    - `SQLITE_CORRUPT` / `SQLITE_NOTADB` from any open step (open, the `journal_mode`/`synchronous` pragmas,
      creating the two tables). Damage confined to the unused `meta` table is tolerated: the
      `schema_version` seed that touches it only logs a warning. BUSY, IOERR, FULL, CANTOPEN and PERM are NOT corruption and never quarantine (that
@@ -60,7 +63,8 @@ regressible — nothing fails loudly when one is broken.
      after it can re-execute. For a file that would not open at all that is no worse than staying degraded,
      which already permitted it.
    - **Only the newest 3 quarantined stores are kept** (owner ruling). Each holds up to a ring's worth of
-     serialized responses, which can include command output, so they are not kept forever. The prune is
+     serialized terminal responses (status, exit code, short error text; not streamed output), so they are
+     treated as sensitive as a precaution and are not kept forever. The prune is
      count-based, not a clock cutoff, orders by the number in the name, and never removes the file the same
      open just created (a clock step can mis-order names: a backward step can make the newest file sort
      oldest, and an endpoint whose clock was once set far into the future leaves a name that sorts as newest

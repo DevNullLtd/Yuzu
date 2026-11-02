@@ -862,12 +862,14 @@ The Guardian events table is sized for **~10k events/s during a fleet-wide incid
 #### Agent-side `command_dedup.db` (replay protection, per device)
 
 `command_dedup.db` is the agent's durable command-idempotency store (HA WS-0, ADR-2002; `docs/command-dedup.md`). It is
-listed here because it holds saved command responses, which can include command output.
+listed here so a data-inventory pass finds it. It stores each recent command's terminal response frame: status, exit
+code, plugin result status and a short error or reject text, capped at 64 KiB. It does **not** store streamed command
+output, but the files are still treated as sensitive as a precaution.
 
 | Data | Data class | Default | Retention | Deletion mechanism | Configurable via |
 |---|---|---|---|---|---|
-| `command_dedup.db`: one row per recent `command_id` with the stored terminal `CommandResponse` (a command's status and up to 64 KiB of its output) | Command responses, which **may contain personal data** if a command emitted it. Local to the endpoint, never sent anywhere by this store; owner-only file mode on POSIX, the data directory's inherited ACL on Windows | **On** | A fixed-size, clock-free ring over the most recent terminal commands (20,000); in-flight rows are never evicted | Ring eviction; removed with the data directory on uninstall | Not configurable |
-| `command_dedup.db.corrupt-<unix-epoch-seconds>[-n]` (+ `-wal`/`-shm`/`-journal`): the previous store, kept when it was too corrupt to open | Same content and sensitivity as above (up to the same ring of saved responses) | Created only on a corruption recovery | **The newest 3 are kept; there is no age expiry.** Older ones are removed at the end of each recovery | Automatic prune at the next recovery, or manual deletion by the operator once reviewed | Not configurable (the count is a compile-time constant) |
+| `command_dedup.db`: one row per recent `command_id` with the stored terminal `CommandResponse` (status, exit code, plugin result status, short error text; the frame is capped at 64 KiB) | Command metadata: which command ids ran and how they ended. Not streamed output. Local to the endpoint and never sent anywhere by this store; owner-only file mode on POSIX, the data directory's inherited ACL on Windows | **On** | A fixed-size, clock-free ring over the most recent terminal commands (20,000, plus up to 512 between prune passes); in-flight rows are never evicted | Ring eviction. **Not removed by uninstall by default:** the data directory is kept by the DEB, RPM and macOS uninstallers and by a silent Windows uninstall (an interactive Windows uninstall removes it only if the operator answers Yes). Delete the file by hand to erase it | Not configurable |
+| `command_dedup.db.corrupt-<unix-epoch-seconds>[-n]` (+ `-wal`/`-shm`/`-journal`): the previous store, kept when it was too corrupt to open | Same content and sensitivity as above | Created only on a corruption recovery | **The newest 3 are kept; there is no age expiry.** Older ones are removed at the end of each later recovery | Automatic prune at the end of each later recovery, or manual deletion by the operator once reviewed. Also **not removed by uninstall by default** (same installers as above) | Not configurable (the count is a compile-time constant) |
 
 #### Agent-side, transient (no durable store)
 

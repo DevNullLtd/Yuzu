@@ -38,7 +38,8 @@
 namespace yuzu::agent::dedup_quarantine {
 
 /// Owner ruling (#3665): only the newest kKeepQuarantined quarantined stores are kept. Each holds
-/// up to a ring's worth of serialized CommandResponse frames (possibly command output), and a disk
+/// up to a ring's worth of serialized terminal CommandResponse frames (status, exit code, short error
+/// text; not streamed output, but treated as sensitive as a precaution), and a disk
 /// that corrupts the file on every boot would otherwise leave one per boot, forever.
 inline constexpr std::size_t kKeepQuarantined = 3;
 
@@ -96,9 +97,14 @@ inline std::optional<std::pair<long long, long long>> parse_quarantine_name(std:
 /// NEVER OVERWRITES an earlier quarantine, even against a concurrent second process: the name is
 /// CLAIMED with a hard link, which fails with EEXIST if the name is taken (a check-then-rename would
 /// not: rename() replaces its destination on both POSIX and Windows, so two processes recovering in
-/// the same second could destroy each other's evidence). The original name is then dropped. Only
-/// where a hard link is impossible (a filesystem without them) does it fall back to a check-then-
-/// rename. If 10,000 names are taken it FAILS (nullopt) rather than overwrite.
+/// the same second could destroy each other's evidence). The original name is then dropped. If the
+/// hard link fails for ANY reason other than the name being taken (a filesystem without hard links,
+/// a permission rule), it falls back to check-then-rename, and the concurrent-process guarantee does
+/// not hold for that call. If 10,000 names are taken it FAILS (nullopt) rather than overwrite.
+///
+/// This protects the EVIDENCE only. It does not make recovery safe for two agent daemons on one data
+/// dir (unsupported; there is no instance lock): process B can still drop the fresh store that
+/// process A just created, leaving A on an orphaned inode.
 ///
 /// `epoch_seconds` is clamped to >= 0: a clock before 1970 would otherwise write `.corrupt--5`,
 /// which parse_quarantine_name rejects, so the file could never be pruned. The moved file keeps its
@@ -120,12 +126,19 @@ inline std::optional<std::filesystem::path> quarantine_corrupt_db(const std::fil
         std::filesystem::create_hard_link(path, dest, lec);
         if (!lec) {
             // The name is ours, atomically. Drop the original name; if that fails the file is still
-            // at `path` (also at `dest`), so give the claim back and report "could not move".
+            // at `path` (also at `dest`), so try to give the claim back and report "could not move".
+            // If the give-back also fails a stray `dest` name stays: harmless (it is prunable and
+            // names the same inode), but logged.
             std::error_code rec;
             std::filesystem::remove(path, rec);
             if (rec) {
                 std::error_code undo;
                 std::filesystem::remove(dest, undo);
+                if (undo) {
+                    spdlog::warn("CommandDedupStore: could not drop {} after claiming {} ({}); the "
+                                 "stray name is left in place",
+                                 path.string(), dest.string(), undo.message());
+                }
                 return std::nullopt;
             }
             claimed = dest;
@@ -153,11 +166,31 @@ inline std::optional<std::filesystem::path> quarantine_corrupt_db(const std::fil
     if (!claimed)
         return std::nullopt;
     const auto& dest = *claimed;
+    // Best effort: these files can hold saved command responses, and a corrupt file that never
+    // opened successfully may have kept a looser mode (a restored backup, say) because the owner-
+    // only chmod runs only after a good open. A no-op for the read-only attribute on Windows.
+    const auto owner_only =
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
+    {
+        std::error_code pec;
+        if (std::filesystem::is_regular_file(dest, pec)) {
+            std::filesystem::permissions(dest, owner_only, std::filesystem::perm_options::replace,
+                                         pec);
+        }
+    }
     for (std::string_view sfx : kSidecars) {
         std::filesystem::path side = path;
         side += std::string{sfx};
         std::error_code ec2;
-        if (!std::filesystem::exists(side, ec2))
+        const bool present = std::filesystem::exists(side, ec2);
+        if (ec2) {
+            // Cannot tell whether it is there: drop it rather than leave a possibly stale sidecar
+            // beside the fresh database. Best effort.
+            std::error_code ec3;
+            std::filesystem::remove(side, ec3);
+            continue;
+        }
+        if (!present)
             continue;
         std::error_code size_ec;
         if (std::filesystem::file_size(side, size_ec) == 0) {
@@ -170,6 +203,10 @@ inline std::optional<std::filesystem::path> quarantine_corrupt_db(const std::fil
         if (ec2) {
             std::error_code ec3;
             std::filesystem::remove(side, ec3);
+        } else {
+            std::error_code pec;
+            std::filesystem::permissions(side_dest, owner_only,
+                                         std::filesystem::perm_options::replace, pec);
         }
     }
     return dest;
