@@ -352,6 +352,49 @@ TEST_CASE("post-read stage: an exempt server with no stage installed serves its 
     CHECK(PostReadStageRegistry::instance().stage_for(&s.svr) == nullptr);
 }
 
+TEST_CASE("post-read stage: the two process-global registries are safe under concurrent "
+          "install, record, lookup and forget on distinct servers",
+          "[postread][registry][concurrency]") {
+    // No sockets, so it runs under TSan: the registry and the inventory are process-wide, and a
+    // production boot touches them from one thread while tests (and a future second listener)
+    // touch them from several. Each worker owns its own never-listening server.
+    constexpr int kThreads = 8;
+    constexpr int kRounds = 100;
+    std::atomic<int> failures{0};
+    std::atomic<int> lookups{0};
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&] {
+            httplib::Server svr;
+            auto& reg = PostReadStageRegistry::instance();
+            Clean clean(&svr);
+            for (int r = 0; r < kRounds; ++r) {
+                try {
+                    reg.install(&svr, pass_stage());
+                    HttplibRouteSink sink(svr);
+                    sink.Get("/yuzu_test_concurrent_registry", kNoop);
+                    if (reg.stage_for(&svr) == nullptr ||
+                        RouteInventory::instance().routes_for(&svr).empty())
+                        failures.fetch_add(1);
+                    lookups.fetch_add(1);
+                    RouteInventory::instance().forget(&svr);
+                    reg.forget(&svr);
+                    if (reg.stage_for(&svr) != nullptr ||
+                        !RouteInventory::instance().routes_for(&svr).empty())
+                        failures.fetch_add(1);
+                } catch (...) {
+                    failures.fetch_add(1);
+                }
+            }
+        });
+    }
+    for (auto& w : workers)
+        w.join();
+    CHECK(failures.load() == 0);
+    CHECK(lookups.load() == kThreads * kRounds);
+}
+
 TEST_CASE("post-read stage: a regex route does not match a path longer than httplib's regex "
           "route path limit, so neither the stage nor the handler runs for it",
           "[postread][wiring][regex_cap][body_cap][bounds][integration]") {
