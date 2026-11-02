@@ -165,6 +165,10 @@ constexpr std::string_view kLevelDenied = "permission_denied";
 
 constexpr std::size_t kBaseReasonMax = kMaxFieldLen - kCiAgentCapReserve;
 
+// Reasons the agent authors beyond the typed ones (the contract is in the header).
+constexpr std::string_view kReasonWindowsVolumesUnbounded = "agent:windows_volumes_unbounded";
+constexpr std::string_view kReasonMountPointsRedacted = "agent:mount_points_redacted";
+
 #ifdef _WIN32
 constexpr bool kWindowsHost = true;
 #else
@@ -463,7 +467,7 @@ bool mount_entry_is_personal(std::string_view entry) {
     for (char& c : p)
         c = c == '\\' ? '/' : (c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c);
     std::string_view v = p;
-    const bool drive = v.size() >= 2 && v[1] == ':' && ((v[0] >= 'a' && v[0] <= 'z'));
+    const bool drive = v.size() >= 2 && v[1] == ':' && (v[0] >= 'a' && v[0] <= 'z');
     if (drive)
         v.remove_prefix(2);
     else if (v.empty() || v.front() != '/')

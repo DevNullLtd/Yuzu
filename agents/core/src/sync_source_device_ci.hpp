@@ -124,11 +124,6 @@ YUZU_EXPORT std::string device_ci_canonical_blob(const CiRecord& rec);
 // so the v2 row and scalar projections split on an UNESCAPED pipe and unescape before the clamp. The
 // 22 v1 positions keep the raw split: their bytes are frozen.
 //
-// MOUNT POINTS: the `volume` and `partition` mount-point column can name an account (a volume
-// folder-mounted under a user profile) or carry a personal label (/Volumes/<label>). Such an entry
-// is replaced by `[redacted]` before the blob is built and the section is `constrained`; see
-// redact_mount_points.
-//
 // FAILURE PROVENANCE: a section whose level is `unavailable` or `permission_denied` carries its
 // status record and NO rows (and its scalar positions stay blank). Nothing from a failed,
 // truncated, absent or refused capture is ever projected, and the cap token can never promote
@@ -158,11 +153,6 @@ struct CiActionResult {
     std::string provenance; ///< typed provenance the plugin declared ("" when none)
     std::string captured;
 };
-
-/// Reason of the Windows `volumes` section while its probe is not run on the sync thread.
-inline constexpr std::string_view kReasonWindowsVolumesUnbounded = "agent:windows_volumes_unbounded";
-/// Reason of a `volume`/`partition` section in which at least one mount point was redacted.
-inline constexpr std::string_view kReasonMountPointsRedacted = "agent:mount_points_redacted";
 
 /// The `volumes` outcome on a Windows host: `unavailable` with kReasonWindowsVolumesUnbounded and
 /// no capture. The Windows `volumes` leg issues synchronous `DeviceIoControl` calls with no

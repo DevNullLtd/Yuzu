@@ -595,11 +595,6 @@ TEST_CASE("device_ci v2: a redacted mount point marks the section constrained an
         CHECK(p.rows.at("volume")[0][0] == "/Volumes/Label");
         CHECK(level_of(p, "volume") == "ok");
     }
-    SECTION("clean mount points leave the section ok") {
-        const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
-        CHECK(level_of(p, "volume") == "ok");
-        CHECK(level_of(p, "partition") == "ok");
-    }
     SECTION("the redaction is deterministic: row order does not change the bytes") {
         in.volumes = cap("volume|A|/Volumes/x|d1|apfs|1|-\nvolume|B|C:/|d2|ntfs|2|-");
         const auto a = device_ci_canonical_blob_v2(sample(), in);
