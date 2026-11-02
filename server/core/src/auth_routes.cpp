@@ -5241,12 +5241,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // literally named `oidc:x#y` that somehow has
         // `elevation_eligible=1`) would otherwise borrow that row's grant.
         // Require the row's `identity_source` to MATCH the session's own
-        // `auth_source`: an OIDC session may only elevate an
-        // `identity_source='oidc'` row; every other session (local,
-        // and — until SAML provisioning exists — saml) requires
-        // `identity_source='local'`. Read fresh via `get_user` rather than
-        // trusting anything cached on `session` (SQLite is the source of
-        // truth for identity_source).
+        // `auth_source`: a direct mapping (`local` to `local`, `oidc` to
+        // `oidc`, `saml` to `saml`), never an "oidc or else local" fallback
+        // (see the comparison below). Read fresh via `get_user` rather than
+        // trusting anything cached on `session` (the auth store, Postgres,
+        // is the source of truth for identity_source).
         auto row = db->get_user(session->username);
         if (!row) {
             audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,

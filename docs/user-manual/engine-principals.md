@@ -307,6 +307,23 @@ genuinely need a fresh credential. (The one case that stays `503`-retryable is
 a genuine store hiccup — an empty read, lock contention, or a persist failure —
 where retrying is the right move.)
 
+Two other confirm answers are terminal, not retryable. Two active credentials
+that are not a linked rotation pair answer `409` (it used to be a retryable
+`503`): the stored rows are malformed, which no retry can repair, so `GET` the
+principal, inspect both credentials, and revoke the unwanted one with
+`DELETE /api/v1/tokens/{token_id}` (REST only; the MCP tools have no
+per-credential revoke). And a `rotate` that finds one active credential still
+carrying unresolved rotation metadata (for example after its predecessor was
+revoked out of band) answers `409` instead of minting; inspect that credential
+before doing anything, and never re-rotate it.
+
+**Cap your retries.** `rotate` and `confirm` answer a `503` with `Retry-After: 2`
+when they find no active credential or no in-flight rotation, because that empty
+read cannot be told apart from a failed read. A revoked principal gives this
+answer every time, so a client that retries forever never stops. Retry a few
+times with growing delays; if the `503` persists, `GET` the principal and look
+at its credentials.
+
 ### 5. Transfer ownership
 
 Ownership transfer is **admin-forced** — it does not require the outgoing
@@ -337,6 +354,15 @@ Every active credential is revoked **first**, then the identity itself flips
 to `revoked` — a caller can never observe a revoked identity with a
 still-valid credential. Calling this again on an already-revoked principal is
 a no-op success, not an error.
+
+If a `503` interrupts the revoke after the credentials were revoked but before
+the identity was, the principal stays `active` with **zero credentials** until a
+repeat call completes. The repeat answers `200` with `credentials_revoked: 0`;
+the count from the interrupted call is only in that call's failure audit row
+(`credentials_revoked=<N>` in its detail). Every `503` from the revoke steps carries
+`Retry-After: 2` except the one for an audit row that could not be saved after
+the revoke committed. Cap your retries, and `GET` the principal if the `503`
+persists.
 
 ## The owner-delete interlock (two-mode enforcement)
 
