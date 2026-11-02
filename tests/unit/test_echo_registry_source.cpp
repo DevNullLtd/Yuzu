@@ -962,10 +962,11 @@ TEST_CASE("roots_for: loaded sids, then offline sids, same suffixes, each sid on
                                         prof(".DEFAULT"), prof("YUZU_HIVE_" + kSidA + "_1_2")});
     CHECK(none.size() == 1); // HKLM only
 
-    CHECK(is_offline_root(uroot(kSidB), {prof(kSidB)}));
-    CHECK_FALSE(is_offline_root(uroot(kSidA), {prof(kSidB)}));
-    CHECK_FALSE(is_offline_root("HKLM\\SOFTWARE\\yuzu_test_r", {prof(kSidB)}));
-    CHECK_FALSE(is_offline_root(uroot(kSidB + "9"), {prof(kSidB)})); // sid component, not a prefix
+    const std::set<std::string> only_b{kSidB};
+    CHECK(is_offline_root(uroot(kSidB), only_b));
+    CHECK_FALSE(is_offline_root(uroot(kSidA), only_b));
+    CHECK_FALSE(is_offline_root("HKLM\\SOFTWARE\\yuzu_test_r", only_b));
+    CHECK_FALSE(is_offline_root(uroot(kSidB + "9"), only_b)); // sid component, not a prefix
 }
 
 TEST_CASE("reconcile_offline: a complete walk replaces, an incomplete one keeps, a loaded sid never stays",

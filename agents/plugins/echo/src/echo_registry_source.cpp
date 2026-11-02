@@ -213,10 +213,6 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
         std::set<std::string> offline_sids;
         for (const auto& o : offline)
             offline_sids.insert(o.sid);
-        const auto is_offline = [&](const std::string& root) {
-            const std::string sid = hku_sid_of(root);
-            return !sid.empty() && offline_sids.contains(sid);
-        };
 
         // Roots that left scope -- a profile a COMPLETE walk shows gone from the profile list, or
         // a name that is no longer a profile hive (a logged-off user stays in scope as an offline
@@ -256,7 +252,7 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
             if (sid.empty())
                 continue;
             const auto sit = cur.roots.find(root);
-            if (is_offline(root)) {
+            if (is_offline_root(root, offline_sids)) {
                 if (std::find(prev_hku.begin(), prev_hku.end(), sid) != prev_hku.end()) {
                     if (sit != cur.roots.end())
                         sit->second.window_base = 0;
@@ -430,14 +426,11 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
             apply_read(root, st, std::move(rd), read_start, read_end, snap, false);
         }
 
-        // The offline hives, one mount each, in fairness order: a hive that was deferred (the
-        // budget ran out, or the mount was not attempted) goes first, then the one read longest
-        // ago (read_end is persisted per root, so no extra cursor state), the sid breaking ties.
-        // An offline root is due on the HOURLY tick (not on a restart's force_all_: the restart
-        // reconcile exists for a lost notify or ETW buffer, which an unloaded hive never had), when
-        // it has never been read or was re-baselined, when its last read was Capped (a partial
-        // baseline is retried, not trusted), or when it is a retry (deferred / due). Never on a
-        // notify: there is none.
+        // The offline hives, one mount each, deferred hives first, then the one read longest ago
+        // (read_end is persisted per root), the sid breaking ties. Due on the HOURLY tick -- not on
+        // a restart's force_all_, which exists for a lost notify or ETW buffer an unloaded hive
+        // never had -- or when never read, re-baselined, Capped last time, or a retry; never on
+        // a notify.
         struct HiveGroup {
             std::string sid, path;
             std::vector<std::string> roots;
@@ -453,7 +446,7 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
             const auto found = roots_of_sid.find(o.sid);
             if (found == roots_of_sid.end())
                 continue; // not a profile hive name: nothing to read
-            HiveGroup g{o.sid, o.path, found->second, false, std::numeric_limits<std::int64_t>::max()};
+            HiveGroup g{o.sid, o.path, found->second};
             for (const auto& r : g.roots) {
                 RegistryRootState& st = cur.roots[r];
                 init_state(r, st);
@@ -622,7 +615,7 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
         std::size_t unarmed = 0, unreadable = 0, capped = 0;
         std::size_t offline_roots = 0, offline_unreadable = 0, offline_deferred = 0;
         for (const auto& [name, st] : cur.roots) {
-            const bool off = is_offline(name);
+            const bool off = is_offline_root(name, offline_sids);
             unarmed += (!off && !st.armed) ? 1 : 0;
             unreadable += st.status == "unreadable" ? 1 : 0;
             capped += st.status == "capped" ? 1 : 0;

@@ -63,10 +63,7 @@
 // shared guarded ladder, once per hive, and its rows carry source=offline and
 // detail=attr:offline -- an unloaded hive is written by file-level tools or by another
 // process's mount, never by a registry call this session could attribute, so nothing is
-// correlated and nothing is held. Within a tick the loaded roots are read first and the
-// hives take what is left of the budget, deferred hives first and then the one read longest
-// ago, so a queue of logged-off profiles can never starve a loaded root. An offline root never
-// advances window_base and takes no part
+// correlated and nothing is held. An offline root never advances window_base and takes no part
 // in the retention floor; when a root goes offline its live window_base is reset and its stale
 // notify is consumed, so nothing from its loaded life pins the ETW buffer. When it is loaded
 // again its first loaded read happens at once and diffs against the offline baseline. A failed
@@ -270,12 +267,12 @@ RegistryScope::roots_for(const std::vector<std::string>& hku_subkeys,
     return std::string(rest.substr(0, rest.find('\\')));
 }
 
-/// Is `root` one of an offline profile's (sid component match)?
+/// Is `root` one of an offline profile's (sid component match, not a prefix)? Takes the SET of
+/// offline sids: collect() asks it for every root of every profile each tick.
 [[nodiscard]] inline bool is_offline_root(std::string_view root,
-                                          const std::vector<OfflineProfile>& offline) {
+                                          const std::set<std::string>& offline_sids) {
     const std::string sid = hku_sid_of(root);
-    return !sid.empty() && std::any_of(offline.begin(), offline.end(),
-                                       [&](const OfflineProfile& o) { return o.sid == sid; });
+    return !sid.empty() && offline_sids.contains(sid);
 }
 
 /// A virtual service account's SID (NT SERVICE\\*, IIS app pools, virtual machines, the Window
@@ -1183,12 +1180,9 @@ struct RegistryCursor {
     std::vector<RegistryCandidate> held;
     std::vector<LossEpoch> loss;
     std::vector<std::string> hku;
-    // Known unloaded profiles, as [sid, ProfileImagePath] (the path names the user). Unlike `held`
-    // this is not version-gated: an older build has no offline coverage to lose, so it ignores
-    // the field and drops those roots through its own leave-scope path (baselines shrunk, no
-    // rows); a re-upgrade then decodes a cursor without the list and re-baselines the offline
-    // roots silently -- the same outcome a version gate would give after its gap:cursorlost, but
-    // without re-baselining every LOADED root on a rollback as well.
+    // Known unloaded profiles, as [sid, ProfileImagePath] (the path names the user). Not
+    // version-gated like `held`: an older build has no offline coverage to lose, so it ignores
+    // the field and its leave-scope path drops those roots; a re-upgrade re-baselines them silently.
     std::vector<OfflineProfile> offline;
     std::string ccs; // ControlSetNNN the machine was on when the baselines were taken
 };
