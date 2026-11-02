@@ -29,6 +29,30 @@
 ///     A silent-empty registry read would let a compliance surface render
 ///     detected products as unmatched/absent — the fail-open lie ADR-0024
 ///     Decision 4 forbids. An empty *value* = a genuine zero-row result.
+///
+/// SAM.4 (schema v2) adds the software-title normalisation layer on the same
+/// schema: the versioned alias pack (`normalization_pack`), the permanent title
+/// dimension (`title_dimension`) and the curation queue (`curation_queue`). The
+/// dimension and queue are WRITTEN by `SoftwareTitleDimension` (the ADR-0012 §3
+/// cross-store query owner, which reads `software_inventory_store.title_triples`);
+/// this class owns the schema, the pack load and the alias reads.
+///
+/// Alias-key contract (D2): a pack/curated alias is keyed on
+/// `software_normalization_pack.hpp::alias_key()` - the normalised title with the
+/// extracted edition re-appended - stored in `product_aliases.raw_name`, plus the
+/// normalised vendor in `raw_publisher`. There is NO edition wildcard. The tier
+/// and ecosystem live in `source` (`pack:<ecosystem>` / `curated:<ecosystem>`,
+/// empty ecosystem = wildcard), so the v1 primary key is unchanged.
+///
+/// Dimension invalidation contract (D14, binding on every future writer): a
+/// registry mutation that can change a title's resolution without changing the
+/// pack version (a curated alias insert or status flip, a product attribute
+/// edit) MUST set `title_dimension.pack_version = ''` (the stale sentinel) for the
+/// affected rows - by alias key, or by `product_id` - in the SAME transaction. The
+/// normalisation job re-selects any row whose `pack_version` differs from the
+/// current pack, so no new column or generation counter is needed. This
+/// store's own mutations (the seed load, which stamps the pack version, and the
+/// `ON DELETE SET NULL` foreign key) need no sentinel write.
 
 #include <cstdint>
 #include <expected>
@@ -36,6 +60,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+struct pg_conn;
+using PGconn = pg_conn; // identical to libpq's typedef; avoids pulling libpq-fe.h into this header
 
 namespace yuzu {
 class MetricsRegistry;
@@ -46,6 +73,8 @@ class PgPool;
 }
 
 namespace yuzu::server {
+
+struct ParsedPack; // software_normalization_pack.hpp
 
 /// One canonical product identity. `norm_key` is the deterministic
 /// `product_normalize::norm_key` value (UNIQUE); vendor/title/edition are the
@@ -61,6 +90,11 @@ struct ProductRow {
     std::string platform;
     std::int64_t created_at{0};
     std::int64_t updated_at{0};
+    // v2 (SAM.4)
+    std::string purl_type;   ///< package-URL type ("" when none exists)
+    std::string cpe_product; ///< our own pack/curated column; "" when unset
+    std::string origin;      ///< "matcher" | "pack" | "curated" | "birth"
+    std::string category;    ///< closed vocabulary, see software_normalization_pack.hpp
 };
 
 /// One match link: how a raw (source, raw_name, raw_publisher) triple resolved
@@ -78,7 +112,29 @@ struct ProductAliasRow {
     double confidence{0.0};
     std::int64_t first_matched_at{0};
     std::int64_t last_seen_at{0};
+    std::string status{"active"}; ///< v2: "active" | "inactive"
+    std::string pack_version;     ///< v2: pack that wrote the link ("" for matcher links)
 };
+
+/// One pack/curated alias joined to its canonical product, as the title
+/// dimension's resolver consumes it. `source` is `pack:<eco>` / `curated:<eco>`.
+struct NormalizationAliasRow {
+    std::string source;
+    std::string raw_name;      ///< alias_key()
+    std::string raw_publisher; ///< normalised vendor ("" = wildcard)
+    std::string method;        ///< "pack" | "curated"
+    ProductRow product;
+};
+
+/// The loaded alias pack (singleton row `normalization_pack.id = 1`).
+struct PackInfo {
+    std::string pack_version;
+    std::string sha256;
+    std::string loaded_by;
+    std::int64_t loaded_at{0};
+};
+
+enum class PackLoadOutcome { loaded, already_present };
 
 /// Error type for the authoritative single-row reads. The success type is an
 /// `std::optional<T>`: a value == found, `std::nullopt` == absent (the read
@@ -160,6 +216,34 @@ public:
     /// never a false zero.
     [[nodiscard]] std::optional<std::int64_t> count_products();
     [[nodiscard]] std::optional<std::int64_t> count_aliases();
+
+    /// Load `pack` as the current alias pack ONLY when no pack row exists (the
+    /// boot-time seed path; D8). One transaction behind an advisory lock so two
+    /// booting replicas converge: pack row, one product per distinct `norm_key`
+    /// (`origin = 'pack'`) and one `pack:<ecosystem>` alias per row. A stored pack
+    /// of any version wins - a newer embedded seed is logged, never applied.
+    /// Fail-closed for the caller: `std::unexpected(reason)` on any failure.
+    [[nodiscard]] std::expected<PackLoadOutcome, std::string>
+    load_pack_if_empty(const ParsedPack& pack, std::string_view loaded_by);
+
+    /// The loaded pack. AUTHORITATIVE read: kDegraded on a failure; a value holding
+    /// `std::nullopt` when no pack has been loaded.
+    [[nodiscard]] std::expected<std::optional<PackInfo>, RegistryReadError> current_pack();
+
+    /// Active pack/curated aliases whose `raw_name` (alias key) is in `alias_keys`,
+    /// joined to their products. AUTHORITATIVE read: `std::nullopt` on a degrade.
+    [[nodiscard]] std::optional<std::vector<NormalizationAliasRow>>
+    list_normalization_aliases(const std::vector<std::string_view>& alias_keys);
+
+    /// The two reads above/below on a CALLER-PINNED connection, for the title
+    /// dimension owner's single transaction (a nested lease would need a second
+    /// pool connection). `std::nullopt` on a SQL failure (no degrade accounting:
+    /// the caller's pass fails and is retried). `limit` is capped like
+    /// `list_products`.
+    [[nodiscard]] static std::optional<std::vector<NormalizationAliasRow>>
+    read_normalization_aliases(PGconn* conn, const std::vector<std::string_view>& alias_keys);
+    [[nodiscard]] static std::optional<std::vector<ProductRow>> read_products(PGconn* conn,
+                                                                              int limit);
 
 private:
     pg::PgPool& pool_;

@@ -1,9 +1,11 @@
 #include "product_registry_store.hpp"
 
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "software_normalization_pack.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -17,6 +19,7 @@
 #include <cstdlib>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -40,7 +43,8 @@ const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for
     // the migration transaction, so these tables land in
     // `product_registry_store`. Runtime statements below schema-qualify
-    // explicitly. Migration v2 (product_tags) is PR4 — do NOT add it here.
+    // explicitly. v2 is the SAM.4 normalisation layer; the product_tags
+    // migration (PR4) is the next version, not part of v2.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          // Canonical product identities (roadmap §7.1). norm_key is the
@@ -75,6 +79,63 @@ const std::vector<pg::PgMigration>& migrations() {
          // The reverse lookup ("which raw names map onto this product") — the
          // posture rollup's install_count join walks aliases by product_id.
          "CREATE INDEX product_aliases_product_idx ON product_aliases (product_id);"},
+        {2,
+         // SAM.4 software-title normalisation layer. ONLINE: every ALTER adds a
+         // constant-default column (metadata-only, no table rewrite, the same
+         // precedent as software_inventory_store's additive columns) and every
+         // CREATE TABLE is a new empty table, so nothing here needs a rewrite or
+         // CREATE INDEX CONCURRENTLY.
+         "ALTER TABLE products "
+         "  ADD COLUMN IF NOT EXISTS purl_type   TEXT NOT NULL DEFAULT '',"
+         "  ADD COLUMN IF NOT EXISTS cpe_product TEXT NOT NULL DEFAULT '',"
+         "  ADD COLUMN IF NOT EXISTS origin      TEXT NOT NULL DEFAULT 'matcher',"
+         "  ADD COLUMN IF NOT EXISTS category    TEXT NOT NULL DEFAULT 'other';"
+         "ALTER TABLE product_aliases "
+         "  ADD COLUMN IF NOT EXISTS status       TEXT NOT NULL DEFAULT 'active',"
+         "  ADD COLUMN IF NOT EXISTS pack_version TEXT NOT NULL DEFAULT '';"
+         // The one loaded alias pack (id pinned to 1: a singleton).
+         "CREATE TABLE normalization_pack ("
+         "  id           INT PRIMARY KEY CHECK (id = 1),"
+         "  pack_version TEXT NOT NULL,"
+         "  sha256       TEXT NOT NULL,"
+         "  body         TEXT NOT NULL,"
+         "  loaded_by    TEXT NOT NULL,"
+         "  loaded_at    BIGINT NOT NULL);"
+         // The permanent title dimension: one row per distinct installed-software
+         // (raw_name, raw_publisher, ecosystem) triple. product_id is nullable
+         // with ON DELETE SET NULL (curating a product away must not leave a
+         // dangling identity); a 'normalized' row with a NULL product is re-queued.
+         // pack_version = '' is the stale sentinel (see the header, D14).
+         "CREATE TABLE title_dimension ("
+         "  raw_name       TEXT NOT NULL,"
+         "  raw_publisher  TEXT NOT NULL,"
+         "  ecosystem      TEXT NOT NULL,"
+         "  norm_status    TEXT NOT NULL,"
+         "  method         TEXT NOT NULL DEFAULT '',"
+         "  product_id     BIGINT REFERENCES products (product_id) ON DELETE SET NULL,"
+         "  vendor         TEXT NOT NULL DEFAULT '',"
+         "  product        TEXT NOT NULL DEFAULT '',"
+         "  edition        TEXT NOT NULL DEFAULT '',"
+         "  title_version  TEXT NOT NULL DEFAULT '',"
+         "  category       TEXT NOT NULL DEFAULT 'other',"
+         "  purl_type      TEXT NOT NULL DEFAULT '',"
+         "  cpe_product    TEXT NOT NULL DEFAULT '',"
+         "  pack_version   TEXT NOT NULL,"
+         "  first_seen_at  BIGINT NOT NULL,"
+         "  updated_at     BIGINT NOT NULL,"
+         "  PRIMARY KEY (raw_name, raw_publisher, ecosystem));"
+         "CREATE INDEX title_dimension_product_idx ON title_dimension (product_id);"
+         // Titles the pack could not resolve, weighted by device count. 'rejected'
+         // is a curator decision that outlives the title's absence.
+         "CREATE TABLE curation_queue ("
+         "  raw_name        TEXT NOT NULL,"
+         "  raw_publisher   TEXT NOT NULL,"
+         "  ecosystem       TEXT NOT NULL,"
+         "  device_count    BIGINT NOT NULL DEFAULT 0,"
+         "  status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'rejected')),"
+         "  first_queued_at BIGINT NOT NULL,"
+         "  last_seen_at    BIGINT NOT NULL,"
+         "  PRIMARY KEY (raw_name, raw_publisher, ecosystem));"},
     };
     return kMigrations;
 }
@@ -139,17 +200,23 @@ double result_f64(const pg::PgResult& res, int row, int col) {
 
 // Shared SELECT column list for product reads, order matched by fill_product.
 constexpr const char* kProductCols =
-    "product_id, norm_key, vendor, title, edition, platform, created_at, updated_at";
+    "product_id, norm_key, vendor, title, edition, platform, created_at, updated_at, "
+    "purl_type, cpe_product, origin, category";
 
-void fill_product(const pg::PgResult& res, int row, ProductRow& out) {
-    out.product_id = result_i64(res, row, 0);
-    out.norm_key = PQgetvalue(res.get(), row, 1);
-    out.vendor = PQgetvalue(res.get(), row, 2);
-    out.title = PQgetvalue(res.get(), row, 3);
-    out.edition = PQgetvalue(res.get(), row, 4);
-    out.platform = PQgetvalue(res.get(), row, 5);
-    out.created_at = result_i64(res, row, 6);
-    out.updated_at = result_i64(res, row, 7);
+// `c0` is the column offset of the product block (0 for a plain products read).
+void fill_product(const pg::PgResult& res, int row, ProductRow& out, int c0 = 0) {
+    out.product_id = result_i64(res, row, c0 + 0);
+    out.norm_key = PQgetvalue(res.get(), row, c0 + 1);
+    out.vendor = PQgetvalue(res.get(), row, c0 + 2);
+    out.title = PQgetvalue(res.get(), row, c0 + 3);
+    out.edition = PQgetvalue(res.get(), row, c0 + 4);
+    out.platform = PQgetvalue(res.get(), row, c0 + 5);
+    out.created_at = result_i64(res, row, c0 + 6);
+    out.updated_at = result_i64(res, row, c0 + 7);
+    out.purl_type = PQgetvalue(res.get(), row, c0 + 8);
+    out.cpe_product = PQgetvalue(res.get(), row, c0 + 9);
+    out.origin = PQgetvalue(res.get(), row, c0 + 10);
+    out.category = PQgetvalue(res.get(), row, c0 + 11);
 }
 
 } // namespace
@@ -397,7 +464,7 @@ ProductRegistryStore::list_aliases(std::int64_t product_id) {
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT source, raw_name, raw_publisher, product_id, method, confidence, "
-        "first_matched_at, last_seen_at "
+        "first_matched_at, last_seen_at, status, pack_version "
         "FROM product_registry_store.product_aliases "
         "WHERE product_id = $1::bigint ORDER BY source, raw_name, raw_publisher "
         "LIMIT $2::bigint",
@@ -422,6 +489,8 @@ ProductRegistryStore::list_aliases(std::int64_t product_id) {
         r.confidence = result_f64(res, i, 5);
         r.first_matched_at = result_i64(res, i, 6);
         r.last_seen_at = result_i64(res, i, 7);
+        r.status = PQgetvalue(res.get(), i, 8);
+        r.pack_version = PQgetvalue(res.get(), i, 9);
         out.push_back(std::move(r));
     }
     return out;
@@ -464,6 +533,227 @@ std::optional<std::int64_t> ProductRegistryStore::count_aliases() {
         return std::nullopt;
     }
     return result_i64(res, 0, 0);
+}
+
+std::expected<PackLoadOutcome, std::string>
+ProductRegistryStore::load_pack_if_empty(const ParsedPack& pack, std::string_view loaded_by) {
+    if (!open_)
+        return std::unexpected("product registry store is not open");
+    PackLoadOutcome outcome = PackLoadOutcome::already_present;
+    std::string error;
+    const auto fail = [&](std::string_view what, PGconn* c) {
+        error = std::string{what} + ": " + PQerrorMessage(c);
+        return false;
+    };
+    const bool ok = pool_.with_txn_for(kAcquireTimeout, [&](PGconn* c) -> bool {
+        // Blocking xact lock: two replicas booting together serialise here, and the
+        // loser then sees the winner's pack row and returns already_present.
+        pg::PgResult lk = pg::exec_params(
+            c, "SELECT pg_advisory_xact_lock(hashtextextended('product_registry_pack', 0))",
+            std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK)
+            return fail("pack advisory lock", c);
+        pg::PgResult cur = pg::exec_params(
+            c, "SELECT pack_version FROM product_registry_store.normalization_pack WHERE id = 1",
+            std::vector<std::string>{});
+        if (cur.status() != PGRES_TUPLES_OK)
+            return fail("pack read", c);
+        if (PQntuples(cur.get()) == 1) {
+            spdlog::info("ProductRegistryStore: alias pack {} already loaded; embedded pack {} "
+                         "not applied",
+                         PQgetvalue(cur.get(), 0, 0), pack.pack_version);
+            return true;
+        }
+        const std::string now = std::to_string(now_secs());
+        pg::PgResult ins = pg::exec_params(
+            c,
+            "INSERT INTO product_registry_store.normalization_pack "
+            "(id, pack_version, sha256, body, loaded_by, loaded_at) "
+            "VALUES (1, $1, $2, $3, $4, $5::bigint)",
+            std::vector<std::string>{pack.pack_version, pack.sha256, pack.body, std::string{loaded_by},
+                                     now});
+        if (ins.status() != PGRES_COMMAND_OK)
+            return fail("pack insert", c);
+
+        // ponytail: per-row statements inside the one txn; a pack is a few hundred rows.
+        // Switch to unnest() arrays past ~500 rows.
+        std::unordered_map<std::string, std::string> product_ids; // norm_key -> id
+        for (const auto& r : pack.rows) {
+            auto pit = product_ids.find(r.norm_key);
+            if (pit == product_ids.end()) {
+                pg::PgResult pr = pg::exec_params(
+                    c,
+                    "INSERT INTO product_registry_store.products "
+                    "(norm_key, vendor, title, edition, platform, created_at, updated_at, "
+                    " purl_type, cpe_product, origin, category) "
+                    "VALUES ($1, $2, $3, $4, '', $5::bigint, $5::bigint, $6, $7, 'pack', $8) "
+                    "ON CONFLICT (norm_key) DO UPDATE SET "
+                    "  category = EXCLUDED.category, "
+                    "  purl_type = CASE WHEN products.purl_type = '' THEN EXCLUDED.purl_type "
+                    "                   ELSE products.purl_type END, "
+                    "  cpe_product = CASE WHEN products.cpe_product = '' THEN EXCLUDED.cpe_product "
+                    "                     ELSE products.cpe_product END, "
+                    "  origin = CASE WHEN products.origin = 'curated' THEN 'curated' "
+                    "                ELSE 'pack' END, "
+                    "  updated_at = EXCLUDED.updated_at "
+                    "RETURNING product_id",
+                    std::vector<std::string>{r.norm_key, r.vendor, r.title, r.edition, now,
+                                             std::string{purl_type_for(r.ecosystem)}, r.cpe_product,
+                                             r.category});
+                if (pr.status() != PGRES_TUPLES_OK || PQntuples(pr.get()) != 1)
+                    return fail("pack product upsert", c);
+                pit = product_ids.emplace(r.norm_key, PQgetvalue(pr.get(), 0, 0)).first;
+            }
+            pg::PgResult al = pg::exec_params(
+                c,
+                "INSERT INTO product_registry_store.product_aliases "
+                "(source, raw_name, raw_publisher, product_id, method, confidence, "
+                " first_matched_at, last_seen_at, status, pack_version) "
+                "VALUES ($1, $2, $3, $4::bigint, 'pack', 1.0, $5::bigint, $5::bigint, 'active', $6) "
+                "ON CONFLICT (source, raw_name, raw_publisher) DO UPDATE SET "
+                "  product_id = EXCLUDED.product_id, pack_version = EXCLUDED.pack_version, "
+                "  status = 'active', last_seen_at = EXCLUDED.last_seen_at",
+                std::vector<std::string>{"pack:" + r.ecosystem, r.raw_name, r.raw_publisher,
+                                         pit->second, now, pack.pack_version});
+            if (al.status() != PGRES_COMMAND_OK)
+                return fail("pack alias upsert", c);
+        }
+        outcome = PackLoadOutcome::loaded;
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(error.empty() ? "pack load transaction failed (no connection or "
+                                               "commit failure): " + pool_.last_error()
+                                             : error);
+    return outcome;
+}
+
+std::expected<std::optional<PackInfo>, RegistryReadError> ProductRegistryStore::current_pack() {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("ProductRegistryStore: current_pack degraded - store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::unexpected(RegistryReadError::kDegraded);
+    }
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("ProductRegistryStore: current_pack degraded - no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::unexpected(RegistryReadError::kDegraded);
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT pack_version, sha256, loaded_by, loaded_at "
+        "FROM product_registry_store.normalization_pack WHERE id = 1",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("ProductRegistryStore: current_pack degraded - query failed: {} "
+                         "(occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::unexpected(RegistryReadError::kDegraded);
+    }
+    if (PQntuples(res.get()) == 0)
+        return std::optional<PackInfo>{};
+    PackInfo info;
+    info.pack_version = PQgetvalue(res.get(), 0, 0);
+    info.sha256 = PQgetvalue(res.get(), 0, 1);
+    info.loaded_by = PQgetvalue(res.get(), 0, 2);
+    info.loaded_at = result_i64(res, 0, 3);
+    return std::optional<PackInfo>{std::move(info)};
+}
+
+std::optional<std::vector<NormalizationAliasRow>>
+ProductRegistryStore::read_normalization_aliases(PGconn* conn,
+                                                 const std::vector<std::string_view>& alias_keys) {
+    std::vector<NormalizationAliasRow> out;
+    if (alias_keys.empty())
+        return out;
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "SELECT a.source, a.raw_name, a.raw_publisher, a.method, "
+        "  p.product_id, p.norm_key, p.vendor, p.title, p.edition, p.platform, p.created_at, "
+        "  p.updated_at, p.purl_type, p.cpe_product, p.origin, p.category "
+        "FROM product_registry_store.product_aliases a "
+        "JOIN product_registry_store.products p ON p.product_id = a.product_id "
+        "WHERE a.status = 'active' AND a.raw_name = ANY($1::text[]) "
+        "  AND (a.source LIKE 'pack:%' OR a.source LIKE 'curated:%')",
+        std::vector<std::string>{pg::to_text_array(alias_keys)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ProductRegistryStore: alias read failed: {}", PQerrorMessage(conn));
+        return std::nullopt;
+    }
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        NormalizationAliasRow r;
+        r.source = PQgetvalue(res.get(), i, 0);
+        r.raw_name = PQgetvalue(res.get(), i, 1);
+        r.raw_publisher = PQgetvalue(res.get(), i, 2);
+        r.method = PQgetvalue(res.get(), i, 3);
+        fill_product(res, i, r.product, 4);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::optional<std::vector<ProductRow>> ProductRegistryStore::read_products(PGconn* conn, int limit) {
+    const int eff = limit > 0 && limit < kListRowCap ? limit : kListRowCap;
+    const std::string sql = std::string("SELECT ") + kProductCols +
+                            " FROM product_registry_store.products ORDER BY norm_key LIMIT $1::bigint";
+    pg::PgResult res =
+        pg::exec_params(conn, sql.c_str(), std::vector<std::string>{std::to_string(eff)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ProductRegistryStore: product read failed: {}", PQerrorMessage(conn));
+        return std::nullopt;
+    }
+    const int n = PQntuples(res.get());
+    std::vector<ProductRow> out;
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        ProductRow r;
+        fill_product(res, i, r);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::optional<std::vector<NormalizationAliasRow>>
+ProductRegistryStore::list_normalization_aliases(const std::vector<std::string_view>& alias_keys) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("ProductRegistryStore: list_normalization_aliases degraded - store not "
+                         "open (occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (alias_keys.empty())
+        return std::vector<NormalizationAliasRow>{}; // precondition miss -> empty value
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("ProductRegistryStore: list_normalization_aliases degraded - no "
+                         "connection ({}) (occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+    auto rows = read_normalization_aliases(lease.get(), alias_keys);
+    if (!rows) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("ProductRegistryStore: list_normalization_aliases degraded - query "
+                         "failed (occurrence {})",
+                         d.occurrence);
+    }
+    return rows;
 }
 
 } // namespace yuzu::server

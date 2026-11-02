@@ -10,6 +10,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "product_registry_store.hpp"
+#include "software_normalization_pack.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -71,7 +72,11 @@ void prod_reset() {
     REQUIRE(lease);
     auto trunc = pg::exec_params(lease.get(),
                                  "TRUNCATE product_registry_store.products, "
-                                 "product_registry_store.product_aliases RESTART IDENTITY CASCADE",
+                                 "product_registry_store.product_aliases, "
+                                 "product_registry_store.normalization_pack, "
+                                 "product_registry_store.title_dimension, "
+                                 "product_registry_store.curation_queue "
+                                 "RESTART IDENTITY CASCADE",
                                  std::vector<std::string>{});
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
 }
@@ -342,4 +347,152 @@ TEST_CASE("ProductRegistryStore store_not_open: constructor failure degrades rea
     CHECK_FALSE(store.upsert_product("k", "v", "t", "", "").has_value());
     CHECK_FALSE(store.upsert_alias("s", "n", "p", 1, "m", 1.0));
     CHECK_FALSE(store.count_products().has_value());
+}
+
+// ── SAM.4 (schema v2): normalisation pack, title dimension, curation queue ───────────
+
+namespace {
+std::string registry_scalar(PgPool& pool, const std::string& stmt) {
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    auto r = pg::exec_params(lease.get(), stmt.c_str(), std::vector<std::string>{});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    return PQgetvalue(r.get(), 0, 0);
+}
+
+yuzu::server::ParsedPack seed_pack() {
+    auto p = yuzu::server::parse_normalization_pack(yuzu::server::kSoftwareNormalizationSeed);
+    REQUIRE(p.has_value());
+    return std::move(*p);
+}
+} // namespace
+
+TEST_CASE("v2 migration adds the product and alias columns and the three tables",
+          "[pg][product_registry][normalization]") {
+    PROD_SHARED(store, pool);
+    for (const char* col : {"purl_type", "cpe_product", "origin", "category"})
+        CHECK(registry_scalar(pool, std::string("SELECT count(*) FROM information_schema.columns "
+                                                "WHERE table_schema = 'product_registry_store' "
+                                                "AND table_name = 'products' AND column_name = '") +
+                                        col + "'") == "1");
+    for (const char* col : {"status", "pack_version"})
+        CHECK(registry_scalar(pool, std::string("SELECT count(*) FROM information_schema.columns "
+                                                "WHERE table_schema = 'product_registry_store' "
+                                                "AND table_name = 'product_aliases' "
+                                                "AND column_name = '") +
+                                        col + "'") == "1");
+    for (const char* t : {"normalization_pack", "title_dimension", "curation_queue"})
+        CHECK(registry_scalar(pool, std::string("SELECT count(*) FROM information_schema.tables "
+                                                "WHERE table_schema = 'product_registry_store' "
+                                                "AND table_name = '") +
+                                        t + "'") == "1");
+    // Existing writers keep working and pick up the column defaults.
+    const auto id = store.upsert_product("acme:widget", "acme", "widget", "", "");
+    REQUIRE(id.has_value());
+    auto row = store.get_product("acme:widget");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->origin == "matcher");
+    CHECK((*row)->category == "other");
+    CHECK((*row)->purl_type.empty());
+}
+
+TEST_CASE("load_pack_if_empty loads the pack products and aliases once and reports "
+          "already_present on the second call",
+          "[pg][product_registry][normalization]") {
+    PROD_SHARED(store, pool);
+    const auto pack = seed_pack();
+    auto first = store.load_pack_if_empty(pack, "seed");
+    REQUIRE(first.has_value());
+    CHECK(*first == yuzu::server::PackLoadOutcome::loaded);
+    const auto products = store.count_products();
+    const auto aliases = store.count_aliases();
+    REQUIRE(products.has_value());
+    REQUIRE(aliases.has_value());
+    CHECK(*products > 0);
+    CHECK(*aliases == static_cast<std::int64_t>(pack.rows.size()));
+
+    auto second = store.load_pack_if_empty(pack, "seed");
+    REQUIRE(second.has_value());
+    CHECK(*second == yuzu::server::PackLoadOutcome::already_present);
+    CHECK(*store.count_products() == *products);
+    CHECK(*store.count_aliases() == *aliases);
+
+    // Pack products carry origin 'pack' and the row's category / cpe_product.
+    auto pg_row = store.get_product("postgresql:postgresql");
+    REQUIRE(pg_row.has_value());
+    REQUIRE(pg_row->has_value());
+    CHECK((*pg_row)->origin == "pack");
+    CHECK((*pg_row)->category == "database");
+    CHECK((*pg_row)->cpe_product == "postgresql");
+}
+
+TEST_CASE("load_pack_if_empty leaves an existing curated alias row untouched",
+          "[pg][product_registry][normalization]") {
+    PROD_SHARED(store, pool);
+    const auto pid = store.upsert_product("acme:widget", "acme", "widget", "", "");
+    REQUIRE(pid.has_value());
+    REQUIRE(store.upsert_alias("curated:windows", "7-zip", "", *pid, "curated", 1.0));
+    REQUIRE(store.load_pack_if_empty(seed_pack(), "seed").has_value());
+    auto links = store.list_aliases(*pid);
+    REQUIRE(links.has_value());
+    bool found = false;
+    for (const auto& a : *links)
+        if (a.source == "curated:windows" && a.raw_name == "7-zip") {
+            found = true;
+            CHECK(a.method == "curated");
+            CHECK(a.product_id == *pid);
+        }
+    CHECK(found);
+}
+
+TEST_CASE("list_normalization_aliases returns pack and curated rows for the requested alias keys "
+          "only",
+          "[pg][product_registry][normalization]") {
+    PROD_SHARED(store, pool);
+    REQUIRE(store.load_pack_if_empty(seed_pack(), "seed").has_value());
+    const auto pid = store.upsert_product("acme:widget", "acme", "widget", "", "");
+    REQUIRE(pid.has_value());
+    REQUIRE(store.upsert_alias("curated:windows", "7-zip", "", *pid, "curated", 1.0));
+    // A matcher link on the same raw name must NOT be returned.
+    REQUIRE(store.upsert_alias("installed_software", "7-zip", "", *pid, "exact_norm", 1.0));
+
+    const std::vector<std::string_view> keys{"7-zip", "no such key"};
+    auto rows = store.list_normalization_aliases(keys);
+    REQUIRE(rows.has_value());
+    bool pack_row = false, curated_row = false;
+    for (const auto& r : *rows) {
+        CHECK(r.raw_name == "7-zip");
+        CHECK((r.source.starts_with("pack:") || r.source.starts_with("curated:")));
+        pack_row = pack_row || r.source == "pack:windows";
+        curated_row = curated_row || r.source == "curated:windows";
+        if (r.source == "pack:windows") {
+            CHECK(r.product.vendor == "igor pavlov");
+            CHECK(r.product.cpe_product == "7-zip");
+        }
+    }
+    CHECK(pack_row);
+    CHECK(curated_row);
+    CHECK(rows->size() == 2);
+    auto none = store.list_normalization_aliases({});
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+}
+
+TEST_CASE("current_pack reports the loaded version and sha256",
+          "[pg][product_registry][normalization]") {
+    PROD_SHARED(store, pool);
+    auto empty = store.current_pack();
+    REQUIRE(empty.has_value());
+    CHECK_FALSE(empty->has_value());
+    const auto pack = seed_pack();
+    REQUIRE(store.load_pack_if_empty(pack, "seed").has_value());
+    auto info = store.current_pack();
+    REQUIRE(info.has_value());
+    REQUIRE(info->has_value());
+    CHECK((*info)->pack_version == pack.pack_version);
+    CHECK((*info)->sha256 == pack.sha256);
+    CHECK((*info)->loaded_by == "seed");
+    CHECK((*info)->loaded_at > 0);
 }

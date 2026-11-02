@@ -310,6 +310,21 @@ const std::vector<pg::PgMigration>& migrations() {
          "  rpm_unsigned     BIGINT NOT NULL DEFAULT 0);"
          "INSERT INTO catalog_rollup_meta (id, refreshed_at) VALUES (1, 0) "
          "ON CONFLICT (id) DO NOTHING;"},
+        {9,
+         // SAM.4: the distinct (name, publisher, ecosystem) triples with their exact
+         // device counts - the candidate source of the title normalisation job
+         // (product_registry_store.title_dimension). Rebuilt inside the existing hourly
+         // refresh_catalog_rollup transaction beside version_rollup (one more GROUP BY on
+         // the REPEATABLE READ snapshot that already scans the table), so normalisation
+         // adds no new per-pass scan of installed_software. A new empty table with a plain
+         // PK: online, nothing to rewrite. Empty until the first refresh. IF NOT EXISTS keeps the
+         // step re-runnable (the v7 backfill test rewinds schema_meta over a fully migrated schema).
+         "CREATE TABLE IF NOT EXISTS title_triples ("
+         "  name         TEXT   NOT NULL,"
+         "  publisher    TEXT   NOT NULL DEFAULT '',"
+         "  ecosystem    TEXT   NOT NULL DEFAULT '',"
+         "  device_count BIGINT NOT NULL,"
+         "  PRIMARY KEY (name, publisher, ecosystem));"},
     };
     return kMigrations;
 }
@@ -636,6 +651,7 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
          "name, grain, kind, ecosystem, source, publisher, device_count, version_count, "
          "unsigned_count, ecosystems, kinds, sources, newest_version"},
         {"version_rollup", "name, version, device_count"},
+        {"title_triples", "name, publisher, ecosystem, device_count"},
         {"catalog_rollup_meta",
          "id, refreshed_at, total_titles, total_devices, total_publishers, total_installs, "
          "installs_windows, installs_macos, installs_linux, installs_other, current_installs, "
@@ -1807,6 +1823,15 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
         if (!cmd("INSERT INTO software_inventory_store.version_rollup (name, version, "
                  "device_count) SELECT name, version, count(DISTINCT agent_id) "
                  "FROM software_inventory_store.installed_software GROUP BY name, version"))
+            return false;
+
+        // title_triples: the normalisation job's candidate source, same snapshot.
+        if (!cmd("DELETE FROM software_inventory_store.title_triples"))
+            return false;
+        if (!cmd("INSERT INTO software_inventory_store.title_triples (name, publisher, "
+                 "ecosystem, device_count) SELECT name, publisher, ecosystem, "
+                 "count(DISTINCT agent_id) FROM software_inventory_store.installed_software "
+                 "GROUP BY name, publisher, ecosystem"))
             return false;
 
         // Fleet-newest version of EVERY title, bounded memory: stream version_rollup in

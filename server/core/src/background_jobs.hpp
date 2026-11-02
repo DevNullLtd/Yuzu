@@ -94,14 +94,15 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (48 passes). Verified against the source sweep
+/// The exhaustive inventory (49 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
 /// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
 /// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
 /// of `execution_tracker.reap_stuck_running_executions`, 2026-09-29, the #5678
 /// addition of `offline_endpoint_store.run_retention_prune`, 2026-10-12, and the #5513
-/// addition of `guardian_reconcile_gate.sweep`, and the 2a-1b addition of
-/// `inventory_store.purge_typed_sources`); keep the count
+/// addition of `guardian_reconcile_gate.sweep`, the 2a-1b addition of
+/// `inventory_store.purge_typed_sources`, and the SAM.4 addition of
+/// `software_normalization_job.run_tick`); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -257,6 +258,9 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"software_catalog_rollup.refresh_catalog_rollup", "SoftwareCatalogRollup::thread_",
      BackgroundJobClass::ReplicaSafe,
      "SHARED-PG, SINGLE-WRITER: refresh_catalog_rollup ALREADY takes a transaction-scoped pg_try_advisory_xact_lock (skip-if-held) before its one-txn DELETE+INSERT atomic replace of the catalogue rollup tables, and is keep-last-good on failure — so concurrent replicas serialize on the lock (a loser skips), never racing the unique-key replace"},
+    {"software_normalization_job.run_tick", "SoftwareNormalizationJob::thread_",
+     BackgroundJobClass::ReplicaSafe,
+     "SHARED-PG, SINGLE-WRITER: every pass opens with pg_try_advisory_xact_lock(hashtextextended('software_normalization', 0)) in its own transaction and a loser skips; the writes are deterministic changes-only upserts keyed on the title triple, so a replay converges"},
     {"auth_db.cleanup_provisional_mfa", "AuthDB::cleanup_thread_", BackgroundJobClass::ReplicaSafe,
      "SHARED-PG, idempotent: a single predicate-scoped UPDATE expiring stale provisional-MFA rows on a PG now() cutoff (shared clock) — an already-cleared row ceases to match, so concurrent replicas converge with no advisory lock. NOT row-count-bounded (no LIMIT; kWriteTimeout bounds the connection acquire, not the rows) and not a would-wipe reaper"},
     {"ota_transfer_watchdog.sweep_once", "OtaTransferWatchdog::sweeper_", BackgroundJobClass::ReplicaSafe,

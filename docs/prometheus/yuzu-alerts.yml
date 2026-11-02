@@ -5550,6 +5550,52 @@ groups:
             While it fires, /crypto reads its package names live (slower) if the shared
             catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuSoftwareNormalizationStale
+        # The SAM.4 title normalisation job (SoftwareNormalizationJob) ticks hourly and
+        # stamps yuzu_software_normalization_last_success_timestamp on a tick with no failed
+        # pass. If ticks stop succeeding, the title dimension and curation queue stop
+        # following the fleet. `> 0` GUARD IS LOAD-BEARING: the gauge is seeded to 0 at
+        # thread start, so a naive `now - ts` fires on every cold boot; the guard skips the
+        # building window. A job that has NEVER succeeded is the Failing rule's case. 7200 s
+        # is twice the hourly cadence (kCatalogueRefreshIntervalSeconds), as for the
+        # sibling YuzuInventoryCatalogRollupStale.
+        expr: |
+          (time() - yuzu_software_normalization_last_success_timestamp) > 7200
+          and yuzu_software_normalization_last_success_timestamp > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Software title normalisation is stale"
+          description: >-
+            The software title normalisation job has not completed a clean tick in over 2h
+            (cadence is 1h). The title dimension and curation queue are frozen at their last
+            good state. Check yuzu_software_normalization_pass_total{outcome="error"} and the
+            SoftwareNormalizationJob log (Postgres availability, the 60 s per-pass budget, the
+            catalogue rollup that feeds title_triples).
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuSoftwareNormalizationFailing
+        # Sized to the HOURLY cadence. The job adds ONE counter increment per hour, so a
+        # rate()/15m window with a 15m hold (the sibling YuzuInventoryCatalogRollupFailing
+        # shape) can never observe it: the single increment ages out of a 15m window long
+        # before `for` elapses. increase()[2h] > 1 fires on the second failed hourly tick
+        # and stays firing for the hour both increments remain in the window; one isolated
+        # failure followed by a success stays quiet. A job that never succeeded (the case
+        # the Stale rule's `> 0` guard skips) fires at its second failed tick.
+        expr: |
+          sum by (instance) (increase(yuzu_software_normalization_pass_total{outcome="error"}[2h])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Software title normalisation ticks are failing"
+          description: >-
+            Two or more hourly software title normalisation ticks failed within 2h. If
+            yuzu_software_normalization_last_success_timestamp is still 0 the job has never
+            completed a tick; otherwise the dimension is frozen at its last good state.
+            Investigate Postgres availability and the SoftwareNormalizationJob log (a pass
+            over its 60 s budget, a missing alias pack, a failed queue reconcile).
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       # YuzuInventoryStaleAgents — SHIPPED DISABLED. The freshness gauge
       # (yuzu_inventory_stale_agents{source}) is exported and graphable, but there
       # is no fleet-size-independent absolute threshold: >50 is day-one noise on a

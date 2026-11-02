@@ -38,10 +38,12 @@ inline constexpr std::int64_t kRearmSecs = 7 * 24 * 3600;
 /// architecture, and edition tokens removed, plus the first edition token
 /// extracted (empty when the raw title carries none). The matcher operates on
 /// the stripped `title`; `edition` feeds the `products.edition` column and
-/// the `norm_key` suffix.
+/// the `norm_key` suffix; `version` is the first version-ish token that was
+/// stripped (the title dimension's `title_version`).
 struct NormalizedTitle {
     std::string title;
     std::string edition;
+    std::string version; ///< first stripped version-ish token, leading 'v' removed; empty when none
 };
 
 /// Normalise a raw product title deterministically:

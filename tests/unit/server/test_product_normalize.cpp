@@ -61,6 +61,17 @@ TEST_CASE("normalize_title lowercases, collapses whitespace, strips version/arch
     }
 }
 
+TEST_CASE("normalize_title returns the first stripped version token as version", "[normalize]") {
+    CHECK(normalize_title("7-Zip 23.01 (x64)").version == "23.01");
+    CHECK(normalize_title("Visual Studio v2.1 2019").version == "2.1");
+    CHECK(normalize_title("Mozilla Firefox 120.0.1").title == "mozilla firefox");
+}
+
+TEST_CASE("normalize_title leaves version empty when the title carries none", "[normalize]") {
+    CHECK(normalize_title("Mozilla Firefox").version.empty());
+    CHECK(normalize_title("v").version.empty());
+}
+
 TEST_CASE("normalize_title extracts edition tokens", "[normalize]") {
     SECTION("edition is removed from the title and returned separately") {
         const NormalizedTitle nt = normalize_title("Microsoft Office Professional 2019 (64-bit)");

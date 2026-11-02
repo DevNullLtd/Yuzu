@@ -108,7 +108,8 @@ void swinv_reset() {
         lease.get(),
         "TRUNCATE software_inventory_store.installed_software, "
         "software_inventory_store.inventory_state, software_inventory_store.catalog_rollup, "
-        "software_inventory_store.version_rollup, software_inventory_store.catalog_rollup_meta "
+        "software_inventory_store.version_rollup, software_inventory_store.catalog_rollup_meta, "
+        "software_inventory_store.title_triples "
         "RESTART IDENTITY CASCADE",
         std::vector<std::string>{});
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
@@ -1149,7 +1150,7 @@ TEST_CASE("SoftwareInventoryStore reports !is_open when any column its queries u
     }
     // A catalog read that returned only part of the schema would pass vacuously; name the tables.
     for (const char* table : {"installed_software", "inventory_state", "catalog_rollup",
-                              "version_rollup", "catalog_rollup_meta"}) {
+                              "version_rollup", "title_triples", "catalog_rollup_meta"}) {
         CAPTURE(table);
         REQUIRE(std::any_of(columns.begin(), columns.end(),
                             [&](const auto& c) { return c.first == table; }));
@@ -2086,6 +2087,36 @@ std::int64_t count_rows(PgPool& pool, const char* table) {
     return std::stoll(PQgetvalue(r.get(), 0, 0));
 }
 } // namespace
+
+TEST_CASE("refresh_catalog_rollup rebuilds title_triples with exact distinct triples and device counts",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    // git/Git SCM/brew on d1+d2 (d1 twice via two versions), git/Git SCM/rpm on d3, and the
+    // same name with a different publisher on d3: three distinct triples.
+    put(store, "d1",
+        Rows{ent("git", "2.40", "Git SCM", "package", "brew", kSrcPkg),
+             ent("git", "2.41", "Git SCM", "package", "brew", kSrcPkg)});
+    put(store, "d2", Rows{ent("git", "2.39", "Git SCM", "package", "brew", kSrcPkg)});
+    put(store, "d3",
+        Rows{ent("git", "2.41", "Git SCM", "package", "rpm", kSrcPkg),
+             ent("git", "1.0", "Other", "package", "rpm", kSrcPkg)});
+    REQUIRE(store.refresh_catalog_rollup());
+
+    auto r = run_sql(pool, "SELECT name, publisher, ecosystem, device_count "
+                           "FROM software_inventory_store.title_triples "
+                           "ORDER BY publisher, ecosystem");
+    REQUIRE(PQntuples(r.get()) == 3);
+    CHECK(std::string(PQgetvalue(r.get(), 0, 1)) == "Git SCM");
+    CHECK(std::string(PQgetvalue(r.get(), 0, 2)) == "brew");
+    CHECK(std::string(PQgetvalue(r.get(), 0, 3)) == "2"); // d1 once + d2, not three rows
+    CHECK(std::string(PQgetvalue(r.get(), 1, 2)) == "rpm");
+    CHECK(std::string(PQgetvalue(r.get(), 1, 3)) == "1");
+    CHECK(std::string(PQgetvalue(r.get(), 2, 1)) == "Other");
+
+    // A second refresh replaces the table rather than appending.
+    REQUIRE(store.refresh_catalog_rollup());
+    CHECK(count_rows(pool, "title_triples") == 3);
+}
 
 TEST_CASE("catalogue Installs are exact distinct devices under every filter grain",
           "[pg][software_inventory]") {

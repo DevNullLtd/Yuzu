@@ -324,3 +324,20 @@ devices reading as a regression. A degraded read returns `std::nullopt` (the typ
 and MCP surfaces turn into a 503 / internal error), distinct from an engaged empty result. Nothing
 about the rule changes: the owner borrows the pool, issues schema-qualified SQL, and no per-store
 class gained a cross-schema method.
+
+## Update (2026-11-02) -- a sixth query owner: SoftwareTitleDimension
+
+A sixth query owner: `SoftwareTitleDimension` (`software_title_dimension.{hpp,cpp}`), the SAM.4
+software-title normalisation pass. It reads `software_inventory_store.title_triples` (the distinct
+installed-software titles with exact device counts, rebuilt hourly inside the catalogue rollup) and
+writes `product_registry_store.title_dimension` and `product_registry_store.curation_queue`, and
+reads the registry's aliases and products, all on ONE lease per pass (`pool.with_txn_for`, `SET
+LOCAL statement_timeout`, the first statement a `pg_try_advisory_xact_lock`, a loser skips). The
+alias and product reads go through static helpers on `ProductRegistryStore` that take the owner's
+pinned connection, so the pass never needs a second pool lease. Neither store grows a cross-schema
+method: the registry owns its schema, the pack load and the alias reads; the inventory store owns
+`title_triples`; the owner borrows the pool and issues schema-qualified SQL. Each pass is one
+transaction (a crash leaves no partial batch), writes are changes-only upserts keyed on the title
+triple (a replay is a no-op), and a cooperative cancel plus a 60 s wall budget are polled inside
+the resolve loop, since the CPU in that loop is bounded by no SQL timeout. A degraded pass rolls back
+and keeps last-good; the dimension's stale-sentinel contract is stated in `product_registry_store.hpp`.

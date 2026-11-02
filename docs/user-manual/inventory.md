@@ -1087,6 +1087,18 @@ the first `|` (`app` plus one merged cell) while the headers come from the defin
 seven tokens from `GET /api/v1/responses/{id}`, its `/export` or MCP `query_responses`, or search the merged cell
 with the results search box.
 
+### Software title normalisation (server job)
+
+The server turns every distinct installed-software title into a stable identity once an hour, so later software views can group by product instead of by whatever string each endpoint reported.
+
+- **What runs.** A background job reads the distinct (name, publisher, ecosystem) titles the catalogue rollup already computes, and writes one row per title to a permanent title dimension: the canonical publisher, product, edition, category (`web_server`, `database`, `message_broker`, `runtime` or `other`), the package-URL type for package ecosystems, and the version token embedded in the raw name. It works through the most widely installed titles first, in bounded passes, and each pass is a single transaction, so a restart never leaves half a batch. With several server replicas, one runs the job at a time.
+- **The alias pack.** Resolution is driven by a versioned alias pack (`YYYY.MM.N`) stored in Postgres. A provisional seed pack ships inside the server and is loaded on first boot only when no pack exists; a newer server build does not replace a pack that is already loaded (the boot log names both versions). A title changes only when the pack version changes or when its resolution is invalidated, so a quiet fleet costs almost nothing.
+- **Unnormalized never means guessed.** A title the pack and the product registry cannot resolve is labelled `unnormalized`, keeps its cleaned-up publisher, product and edition, and has no product. It is also added to the curation queue with its device count, so the most widely installed unknowns surface first. The queue follows the fleet: counts are refreshed every hour and a title that has left the fleet is dropped (titles a curator has rejected stay).
+- **Editions are distinct products.** An alias binds exactly one edition, and a title is never matched to a different edition of the same product, so SQL Server Standard and SQL Server Enterprise resolve separately and an edition the pack does not list lands in the queue rather than on its neighbour.
+- **Automatic product creation is off.** Pending the sizing measurement for the seed, the job does not create products for unmatched titles; they wait in the queue.
+- **Scope.** This change adds the server-side layer only: there is no REST route, MCP tool or page for it yet, and install-level normalisation status is not recorded.
+- **Metrics and alerts.** `yuzu_software_titles{norm_status}`, `yuzu_software_unnormalized_ratio` (device-weighted, the headline coverage figure), `yuzu_software_normalization_curation_queue_size`, `yuzu_software_normalization_pack_info{pack_version}` and the job's run, duration and last-success series. `YuzuSoftwareNormalizationStale` fires when no clean tick has completed for over two hours; `YuzuSoftwareNormalizationFailing` fires when two hourly ticks fail within two hours. Like the catalogue itself, the job's candidate list is refreshed by the hourly catalogue rollup, so it inherits that rollup's scale limit.
+
 ## Device-identity inventory (`device_ci`)
 
 A second daily-sync source, **`device_ci`** (ADR-0016 source #3), is live on the

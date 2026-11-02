@@ -6605,3 +6605,83 @@ tests:
       - expr: 'ALERTS{alertname="YuzuLeaderCoordinationStale", alertstate="firing"}'
         eval_time: 8m
         exp_samples: []
+
+  # ── YuzuSoftwareNormalizationStale / YuzuSoftwareNormalizationFailing (SAM.4) ──
+  #
+  # The job ticks HOURLY and adds one outcome counter increment per tick. The Failing
+  # rule is increase(...[2h]) > 1 with `for: 10m`, sized to that cadence (a 15m window
+  # cannot observe an hourly increment). 1m samples; the counter steps at the hour.
+
+  # Healthy: the stamp tracks wall-clock (promtool's time() is the sample time, so a
+  # value of 60*minute IS "now"), and no tick has failed. Both rules stay quiet.
+  - interval: 1m
+    name: software normalization - a healthy hourly job is quiet
+    input_series:
+      - series: 'yuzu_software_normalization_last_success_timestamp{job="yuzu",instance="s1"}'
+        values: "0+60x240"
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuSoftwareNormalization.*", alertstate="firing"}'
+        eval_time: 3h50m
+        exp_samples: []
+
+  # Stale: s2's stamp tracks wall-clock for 60m and then freezes at 3600. It is quiet
+  # while the age is under two cadences (7200 s), pending once the age passes it
+  # (3h00m), and firing after the 10m hold. s1 sits at the seeded 0 forever (building,
+  # or never succeeded): the `> 0` guard keeps the Stale rule quiet (the Failing rule
+  # owns that case). RED against dropping the guard.
+  - interval: 1m
+    name: software normalization - stale fires after two cadences and not while building
+    input_series:
+      - series: 'yuzu_software_normalization_last_success_timestamp{job="yuzu",instance="s1"}'
+        values: "0x300"
+      - series: 'yuzu_software_normalization_last_success_timestamp{job="yuzu",instance="s2"}'
+        values: "0+60x60 3600x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s1"}'
+        eval_time: 4h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s2"}'
+        eval_time: 2h50m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s2"}'
+        eval_time: 3h5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s2"}'
+        eval_time: 3h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s2", job="yuzu", severity="warning"}'
+            value: 1
+
+  # Failing: two failed hourly ticks inside one 2h window. The error counter steps at
+  # t=60m (1) and t=120m (2). Quiet after the first failure; the second brings
+  # increase([2h]) above 1, and after the 10m hold it fires and is still firing at 2h20m.
+  - interval: 1m
+    name: software normalization - two failed hourly ticks fire
+    input_series:
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x59 1x60 2x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 2h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # Failing: ONE isolated failure followed by successes never fires, however long we wait.
+  - interval: 1m
+    name: software normalization - one isolated hourly failure stays quiet
+    input_series:
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x59 1x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing"}'
+        eval_time: 80m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing"}'
+        eval_time: 4h
+        exp_samples: []

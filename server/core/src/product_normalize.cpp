@@ -148,8 +148,13 @@ NormalizedTitle normalize_title(std::string_view raw) {
     std::vector<std::string> kept;
     for (auto& token : split_tokens(ascii_lower(raw))) {
         const std::string_view t = trim_wrapping(token);
-        if (t.empty() || is_version_token(t) || is_arch_token(t))
+        if (t.empty() || is_arch_token(t))
             continue;
+        if (is_version_token(t)) {
+            if (out.version.empty())
+                out.version = std::string{t.front() == 'v' ? t.substr(1) : t};
+            continue;
+        }
         if (is_edition_token(t)) {
             if (out.edition.empty())
                 out.edition = std::string{t};
