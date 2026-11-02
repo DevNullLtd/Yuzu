@@ -9,7 +9,7 @@
 //   Layer 1 (WHAT changed): a RegNotifyChangeKeyValue subtree watch marks a root
 //     dirty; a budgeted subtree read is diffed against the root's persisted
 //     BASELINE (echo_state `registry:<root>`), giving added/changed/removed values
-//     with old and new data (diff_registry_snapshot).
+//     with their new data and the old value's type and size (diff_registry_snapshot).
 //   Layer 2 (WHO): a write-only Kernel-Registry ETW session (SetValueKey |
 //     DeleteValueKey | DeleteKey, mask 0x4300). Those events carry the writer's
 //     pid and the VALUE NAME, but the key-name field is empty on most of them, so
@@ -81,8 +81,7 @@ namespace yuzu::echo {
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-inline constexpr std::size_t kRegistryDataCap = 4096;       // rendered new value, bytes of text
-inline constexpr std::size_t kBaselineRenderCap = 512;      // rendered prefix kept in the baseline
+inline constexpr std::size_t kRegistryDataCap = 512;        // rendered new value, bytes of text
 inline constexpr std::size_t kBaselineValueCap = 50000;     // values per root read
 inline constexpr std::size_t kBaselineKeyCap = 20000;       // keys per root read
 inline constexpr std::size_t kBaselineDepthCap = 16;
@@ -385,12 +384,26 @@ struct SubtreeRead {
     RegistryReadStatus status{RegistryReadStatus::Unreadable};
     std::map<std::string, std::map<std::string, RegistryValueRead>> keys;
     std::vector<std::string> skipped;
+    /// key -> its LastWriteTime (FILETIME 100 ns) as the reader saw it. A row's time is the
+    /// moment the key was written, not the end of the read that noticed it.
+    std::map<std::string, std::int64_t> written;
 };
 
 /// True when `key` is `prefix` itself or a descendant of it (on a path-separator
 /// boundary, so `...\Run2` is not under `...\Run`).
 [[nodiscard]] inline bool registry_key_under(std::string_view key, std::string_view prefix) {
     return key.starts_with(prefix) && (key.size() == prefix.size() || key[prefix.size()] == '\\');
+}
+
+/// True for `HKLM\SYSTEM\CurrentControlSet\Services\bam\State` and everything beneath it
+/// (ASCII case-insensitive, on a separator boundary). The Background Activity Moderator rewrites
+/// a per-user value for every program launch, so its subtree is not configuration: it would
+/// produce a row per launch and, because its key times keep moving during a read, leave the
+/// whole Services root partial. The reader does not open it and the diff ignores it.
+[[nodiscard]] inline bool registry_path_excluded(std::string_view full) {
+    constexpr std::string_view kBam = "HKLM\\SYSTEM\\CurrentControlSet\\Services\\bam\\State";
+    return yuzu::profiles::iequals_ascii(full.substr(0, kBam.size()), kBam) &&
+           (full.size() == kBam.size() || full[kBam.size()] == '\\');
 }
 
 /// Pure budget accounting for the production reader (R9): one place decides when
@@ -409,8 +422,10 @@ private:
 };
 
 /// What the baseline remembers about a value: type, full stored size, a hash of
-/// every byte read (R8: a change anywhere in the value shows), a rendered prefix
-/// for the old-value column, and `dt` = the value exceeded kBaselineValueReadCap, so
+/// every byte read (R8: a change anywhere in the value shows), `d` (a rendered prefix of the
+/// old value, no longer filled: the old value is not stored in a row, so keeping it in every
+/// baseline only grew echo_state; the field is still written, empty, so a rolled-back build
+/// decodes the baseline), and `dt` = the value exceeded kBaselineValueReadCap, so
 /// `h` covers only what the reader returned (nothing, from the Windows API, which has
 /// no partial read) and a change that keeps the type and size is not detected.
 struct BaselineEntry {
@@ -432,7 +447,6 @@ struct BaselineEntry {
     yuzu::shared::Sha256 sha;
     sha.update(bytes.data(), bytes.size());
     e.h = sha.hex_digest().substr(0, 32); // 128 bits
-    e.d = render_reg_data(type, bytes, kBaselineRenderCap).text;
     e.dt = truncated;
     return e;
 }
@@ -511,6 +525,7 @@ struct RegistryCandidate {
     std::string prev_data;
     bool prev_truncated{false};
     std::int64_t observed_at{0}; // FILETIME of the read that saw it
+    std::int64_t key_written{0}; // the key's LastWriteTime when read (FILETIME); 0 = unknown
     std::int64_t window_lo{0}, window_hi{0}; // (lo, hi]: when the write must have happened
     std::string source;                      // notify | reconcile
 };
@@ -563,17 +578,23 @@ struct DiffResult {
         c.window_lo = window.lo;
         c.window_hi = window.hi;
         c.source = std::string(source);
+        // Known only for a key the read visited; a vanished key keeps 0.
+        if (read.keys.contains(key))
+            if (const auto w = read.written.find(key); w != read.written.end())
+                c.key_written = w->second;
         return c;
     };
     auto set_prev = [](RegistryCandidate& c, const BaselineEntry& e) {
         c.has_prev = true;
         c.prev_type = e.t;
         c.prev_size = e.s;
-        c.prev_data = e.d;
-        c.prev_truncated = e.dt || e.d.size() >= kBaselineRenderCap;
+        c.prev_data = e.d; // empty for any baseline this build wrote; a legacy one may carry text
+        c.prev_truncated = e.dt;
     };
 
     for (const auto& [key, values] : read.keys) {
+        if (registry_path_excluded(key))
+            continue;
         auto& out_vals = r.baseline.keys[key];
         const auto bk = base.keys.find(key);
         for (const auto& [name, v] : values) {
@@ -606,7 +627,7 @@ struct DiffResult {
             });
         };
         for (const auto& [key, values] : base.keys) {
-            if (read.keys.contains(key))
+            if (read.keys.contains(key) || registry_path_excluded(key))
                 continue;
             if (under_skipped(key)) {
                 r.baseline.keys[key] = values; // not readable now: nothing proves it is gone
@@ -626,7 +647,7 @@ struct DiffResult {
         // Values removed from a key that survived.
         for (const auto& [key, values] : read.keys) {
             const auto bk = base.keys.find(key);
-            if (bk == base.keys.end() || suppress)
+            if (bk == base.keys.end() || suppress || registry_path_excluded(key))
                 continue;
             for (const auto& [name, e] : bk->second) {
                 if (values.contains(name))
@@ -639,6 +660,8 @@ struct DiffResult {
     }
     // A Capped read started from a copy of the baseline: what it did not return
     // (it may simply be past the cap) stays, and only what it visited is updated.
+    // An excluded key a legacy baseline still holds is dropped, once, with no rows.
+    std::erase_if(r.baseline.keys, [](const auto& kv) { return registry_path_excluded(kv.first); });
     r.changed = !(r.baseline == base);
     return r;
 }
@@ -819,7 +842,11 @@ registry_row_from_candidate(const RegistryCandidate& c, std::uint32_t actor_pid,
                             std::int64_t snapshot_id) {
     RegistryEvent ev;
     const auto ms = filetime_to_unix_ms(c.observed_at);
-    ev.ts = ms / 1000;
+    // Row time is when the key was written, when the read saw a plausible stamp (after 1601 and
+    // not after the read that observed it); else the end of the read. observed_at and the
+    // record key stay on the read, so replay de-duplication is unchanged.
+    const bool key_time_ok = c.key_written > 0 && c.key_written <= c.observed_at;
+    ev.ts = (key_time_ok ? filetime_to_unix_ms(c.key_written) : ms) / 1000;
     ev.snapshot_id = snapshot_id;
     auto [hive, rest] = split_hive(c.key);
     ev.hive = std::move(hive);
@@ -834,9 +861,10 @@ registry_row_from_candidate(const RegistryCandidate& c, std::uint32_t actor_pid,
     }
     if (c.has_prev) {
         ev.prev_data_type = std::string(yuzu::profiles::reg_type_name(c.prev_type));
-        ev.prev_data = c.prev_data;
+        // The old value is not stored (it would double every changed row); its type and size
+        // are kept, and prev_data_truncated = 1 reads "there was a value, not stored".
         ev.prev_data_size = static_cast<std::int64_t>(c.prev_size);
-        ev.prev_data_truncated = c.prev_truncated ? 1 : 0;
+        ev.prev_data_truncated = c.prev_size > 0 ? 1 : 0;
     }
     ev.actor_pid = actor_pid;
     ev.actor_image = actor_image;
@@ -964,7 +992,8 @@ retention_watermark(const std::map<std::string, RegistryRootState>& roots,
 
 /// The cursor row is a content store: besides positions it holds the HELD candidates --
 /// changes the key watch saw whose attribution is not final yet -- with their rendered
-/// old and new values, for up to one settle interval. It is written as version 2
+/// new value (and the old one only when the baseline came from an older build), for up to
+/// one settle interval. It is written as version 2
 /// whenever it holds a candidate or a loss epoch, else as version 1: a build that
 /// predates `held` ignores the field and would re-encode the cursor without it, dropping
 /// changes whose baseline already advanced with no gap row. Such a build only reads
@@ -988,8 +1017,8 @@ inline nlohmann::json candidate_to_json(const RegistryCandidate& c) {
             {"a", c.action},       {"t", c.type},         {"s", c.size},
             {"d", c.data},         {"dtr", c.data_truncated}, {"hp", c.has_prev},
             {"pt", c.prev_type},   {"ps", c.prev_size},   {"pd", c.prev_data},
-            {"ptr", c.prev_truncated}, {"o", c.observed_at}, {"lo", c.window_lo},
-            {"hi", c.window_hi},   {"src", c.source}};
+            {"ptr", c.prev_truncated}, {"o", c.observed_at}, {"kw", c.key_written},
+            {"lo", c.window_lo},   {"hi", c.window_hi},   {"src", c.source}};
 }
 
 inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
@@ -1008,6 +1037,9 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
     c.prev_data = j.at("pd").get<std::string>();
     c.prev_truncated = j.at("ptr").get<bool>();
     c.observed_at = j.at("o").get<std::int64_t>();
+    // Optional: a candidate held by an earlier build has no key time (the row then takes the
+    // end of its read).
+    c.key_written = std::max<std::int64_t>(0, j.value("kw", std::int64_t{0}));
     // Clamped: now - window_hi is signed arithmetic, and a corrupt or tampered row must
     // not make it overflow. A valid window is non-negative and ordered.
     c.window_lo = std::max<std::int64_t>(0, j.at("lo").get<std::int64_t>());
