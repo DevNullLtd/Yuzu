@@ -283,6 +283,7 @@ agent_test_exe = executable(
     'unit/test_kv_store.cpp',
     'unit/test_fake_journal_store.cpp', # IJournalStore test double contract (#4153)
     'unit/test_command_dedup_store.cpp',
+    'unit/test_command_dedup_decision.cpp', # decide_after_claim/should_claim pure core (#3668)
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
     'unit/test_guardian_engine_legacy_sink.cpp', # #4783 commit 1: [!mayfail] red evidence only
@@ -4017,6 +4018,17 @@ test('Echo mapdrive hive-mount pin wiring lexical gate (#5291)',
 test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   _python3_test,
   args: [files('test_agent_ota_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Command-dedup claim wiring (#3668): the claim decision is a pure function with its own unit
+# tests; this pins that agent.cpp's Subscribe loop still CALLS it and acts on every field of the
+# answer (no gRPC seam to test the loop, #1492). Carries its own in-memory mutation self-test.
+# No build required.
+test('agent command-dedup wiring lexical gate (#3668)',
+  _python3_test,
+  args: [files('test_agent_command_dedup_wiring_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )

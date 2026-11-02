@@ -104,6 +104,11 @@ bool PgMigrationRunner::valid_store_name(std::string_view name) {
     return true;
 }
 
+bool PgMigrationRunner::is_schema_ahead(int db_version,
+                                        const std::vector<PgMigration>& migrations) {
+    return !migrations.empty() && db_version > migrations.back().version;
+}
+
 bool PgMigrationRunner::ensure_meta_and_schema(PGconn* conn, std::string_view store_name) {
     const std::string store{store_name};
     if (!exec_ok(conn, "BEGIN", "BEGIN (meta)", store))
@@ -230,6 +235,26 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
                           store);
             return false;
         }
+    }
+
+    // Version-ahead warning (#3894). This binary's vector stops below what the
+    // database has already recorded: a newer build migrated it first. Nothing
+    // below would apply (every `m.version <= current`), so without this the
+    // older binary says nothing and fails later, or misbehaves, on schema it
+    // does not know. WARN, never refuse — see the run() header comment for why.
+    // The vector is non-empty and strictly increasing here (checked above), so
+    // back() is its highest version.
+    if (is_schema_ahead(current, migrations)) {
+        spdlog::warn(
+            "PgMigrationRunner: store '{}' is at schema v{} in the database but this binary only "
+            "knows migrations up to v{} — a newer build has already migrated this database (or "
+            "the version record is wrong). Nothing was applied and this check does not refuse "
+            "the start, but this binary may fail, misbehave or enforce less than the newer build "
+            "on schema it does not know. Run the build that matches this database, or recover by "
+            "rolling forward or restoring this deployment's own backup into a fresh deployment "
+            "(docs/user-manual/upgrading.md, \"When a server build finds its database ahead of "
+            "it (every Postgres store)\").",
+            store, current, migrations.back().version);
     }
 
     bool any_applied = false;

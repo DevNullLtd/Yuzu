@@ -15,6 +15,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cstring>
+#include <ios>
+#include <istream>
+#include <sstream>
+#include <streambuf>
 #include <string>
 #include <vector>
 
@@ -333,3 +339,122 @@ TEST_CASE("fleet_snapshot: payload bound at full cap", "[echo][fleet][size]") {
     CHECK(out.size() < 2 * 1024 * 1024);
     CHECK(json::parse(out)["schema"] == "fleet_snapshot.v1");
 }
+
+// ── /proc readers: a process exiting mid-read must not unwind the snapshot pump ──
+
+namespace {
+
+// A stream buffer that yields `head` and then throws from underflow(), as libstdc++'s
+// filebuf does when the /proc entry's process exits mid-read.
+class ThrowingBuf : public std::streambuf {
+public:
+    explicit ThrowingBuf(std::string head) : head_(std::move(head)) {
+        setg(head_.data(), head_.data(), head_.data() + head_.size());
+    }
+
+protected:
+    int_type underflow() override { throw std::ios_base::failure("process exited mid-read"); }
+
+private:
+    std::string head_;
+};
+
+} // namespace
+
+TEST_CASE("read_proc_bytes returns what was read before a throwing underflow",
+          "[echo][fleet][procread]") {
+    ThrowingBuf buf{std::string("a\0b\0c", 5)};
+    std::istream in(&buf);
+    std::string got;
+    REQUIRE_NOTHROW(got = yuzu::agent::detail::read_proc_bytes(in));
+    CHECK(got == std::string("a\0b\0c", 5));
+}
+
+TEST_CASE("read_proc_bytes reads a whole stream and an empty one", "[echo][fleet][procread]") {
+    std::istringstream whole(std::string("one\0two", 7));
+    CHECK(yuzu::agent::detail::read_proc_bytes(whole) == std::string("one\0two", 7));
+    std::istringstream empty("");
+    CHECK(yuzu::agent::detail::read_proc_bytes(empty).empty());
+}
+
+#if defined(__linux__) || defined(__APPLE__)
+
+TEST_CASE("parse_proc_status: Name, PPid and Uid parse with many trailing lines",
+          "[echo][fleet][procread]") {
+    std::string status =
+        "Name:\tsystemd\n"
+        "Umask:\t0000\n"
+        "State:\tS (sleeping)\n"
+        "Tgid:\t1\n"
+        "Pid:\t1\n"
+        "PPid:\t0\n"
+        "Uid:\t0\t0\t0\t0\n"
+        "Gid:\t0\t0\t0\t0\n";
+    for (int i = 0; i < 40; ++i) // the many fields a modern kernel lists after Uid
+        status += "Field" + std::to_string(i) + ":\t" + std::to_string(i) + "\n";
+    status += "Threads:\t7\nVmRSS:\t1024 kB\nNSpid:\t1\nCapEff:\t000001ffffffffff\n";
+    std::istringstream in(status);
+    ProcessInfo pi;
+    pi.pid = 1;
+    yuzu::agent::detail::parse_proc_status(in, pi);
+    CHECK(pi.name == "systemd");
+    CHECK(pi.ppid == 0);
+    CHECK(pi.user == "root"); // uid 0 resolves through getpwuid_r
+    CHECK(in.eof());           // the whole stream was read, not cut after the third field
+}
+
+TEST_CASE("parse_proc_status: the first occurrence of a field wins", "[echo][fleet][procread]") {
+    std::istringstream in("Name:\tfirst\nPPid:\t7\nUid:\t0\t0\t0\t0\n"
+                          "Name:\tsecond\nPPid:\t99\nUid:\t12345\t0\t0\t0\n");
+    ProcessInfo pi;
+    yuzu::agent::detail::parse_proc_status(in, pi);
+    CHECK(pi.name == "first");
+    CHECK(pi.ppid == 7);
+    CHECK(pi.user == "root");
+}
+
+TEST_CASE("parse_proc_status: a malformed value leaves that field alone and never throws",
+          "[echo][fleet][procread]") {
+    ProcessInfo pi;
+    std::istringstream bad_ppid("Name:\tx\nPPid:\tnot-a-number\nUid:\t0\t0\t0\t0\n");
+    REQUIRE_NOTHROW(yuzu::agent::detail::parse_proc_status(bad_ppid, pi));
+    CHECK(pi.name == "x");
+    CHECK(pi.ppid == 0);
+    CHECK(pi.user == "root"); // the later, well-formed field is still read
+
+    ProcessInfo pj;
+    std::istringstream huge("PPid:\t99999999999999999999\nUid:\t-5\nName:\ty\n");
+    REQUIRE_NOTHROW(yuzu::agent::detail::parse_proc_status(huge, pj));
+    CHECK(pj.ppid == 0);
+    CHECK(pj.user.empty()); // an unparseable uid resolves to nothing
+    CHECK(pj.name == "y");
+}
+
+TEST_CASE("parse_proc_status: an empty stream leaves the struct untouched", "[echo][fleet][procread]") {
+    ProcessInfo pi;
+    pi.pid = 5;
+    pi.ppid = 3;
+    pi.name = "keep";
+    pi.user = "me";
+    std::istringstream in("");
+    yuzu::agent::detail::parse_proc_status(in, pi);
+    CHECK(pi.pid == 5);
+    CHECK(pi.ppid == 3);
+    CHECK(pi.name == "keep");
+    CHECK(pi.user == "me");
+}
+
+TEST_CASE("parse_proc_status: a stream that throws part-way keeps what parsed", "[echo][fleet][procread]") {
+    ThrowingBuf buf{"Name:\tgone\nPPid:\t4\n"};
+    std::istream in(&buf);
+    // Without a badbit exception mask std::getline swallows the streambuf's exception into
+    // badbit and the loop just ends, so the catch under test would never be entered. The mask
+    // makes getline rethrow it, so it is the catch in parse_proc_status that keeps the fields.
+    in.exceptions(std::ios::badbit);
+    ProcessInfo pi;
+    REQUIRE_NOTHROW(yuzu::agent::detail::parse_proc_status(in, pi));
+    CHECK(pi.name == "gone");
+    CHECK(pi.ppid == 4);
+}
+
+#endif // __linux__ || __APPLE__
