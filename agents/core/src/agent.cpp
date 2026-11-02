@@ -2057,6 +2057,9 @@ public:
                                 spdlog::error("PKI: failed to rebuild channel with issued cert");
                                 return;
                             }
+                            // This Register succeeded: the mTLS re-Register that follows starts
+                            // again from the base delay, not from an approval wait's long one.
+                            reconnect_backoff.reset();
                             continue; // re-Register over mTLS (binds the cert identity)
                         }
                         // Persist failed (disk full / perms). The server recorded the
@@ -2097,7 +2100,9 @@ public:
                         spdlog::warn("PKI: enrolled but no client cert issued (attempt {}/{}); "
                                      "backing off and retrying",
                                      csr_attempts, kMaxCsrAttempts);
-                        reconnect_count = csr_attempts; // drive exponential backoff
+                        if (csr_attempts == 1)
+                            reconnect_backoff.reset(); // grow from the base, not from an approval wait
+                        reconnect_count = csr_attempts; // gate the wait; the delay grows from here
                         continue;                       // retry Register with the same CSR
                     }
                 }
