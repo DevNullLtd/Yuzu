@@ -37,6 +37,8 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <iterator>
@@ -47,6 +49,7 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #if defined(__has_feature)
 #  if __has_feature(thread_sanitizer)
@@ -612,7 +615,7 @@ struct UnifiedBodyCapTestServer {
             // that specific gap, `evaluate_body_cap` closes the
             // decision-combination gap this same defect class lives in).
             const auto decision = evaluate_body_cap(
-                req.method, req.path, req.has_header("Content-Length"),
+                req.method, req.path, yuzu::server::has_content_length_for_body_cap(req),
                 content_length_for_body_cap(req), transfer_encoding_for_body_cap(req),
                 content_encoding_for_body_cap(req),
                 yuzu::server::is_chunked_for_body_cap(req));
@@ -1309,7 +1312,7 @@ namespace {
 struct PreRoutingAnswerServer {
     explicit PreRoutingAnswerServer(int status) {
         // 30 s read timeout, as production: a body that is still being read is then unambiguous
-        // against the probe's 2 s wait.
+        // against the probe's wait (5 s by default).
         svr.set_read_timeout(30, 0);
         svr.set_pre_routing_handler(
             [status](const httplib::Request&, httplib::Response& res)
@@ -1472,7 +1475,7 @@ TEST_CASE("transfer_encoding_for_body_cap: an empty first line still reads as pr
 //
 // The post-read body cap and the step-up check measure `req.body`, so they must run AFTER httplib
 // has read it: they are installed through `PostReadStageRegistry` and the route sink, never as
-// `set_pre_request_handler`. These two cases keep that true when the baseline moves or when the
+// `set_pre_request_handler`. These three cases keep that true when the baseline moves or when the
 // route-sink wrapper change is reverted on its own. The scan LOGIC below shares nothing with the
 // wrapper change's own wiring tests, but this file as a whole needs that change
 // (`post_read_stage_test_support.hpp`, `PostReadStageRegistry`), so it is the source scan that
@@ -1606,11 +1609,72 @@ std::size_t pre_request_handler_uses(const std::string& text) {
     return count_identifier(text, "set_pre_request_handler");
 }
 
-std::string read_server_src_file(const char* name) {
-    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/" + name, std::ios::binary);
-    INFO("reading " << name);
+std::string read_text_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    INFO("reading " << path.string());
     REQUIRE(in.good());
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+struct SrcFile {
+    std::string name; ///< path relative to the server source directory, '/' separated
+    std::string text; ///< comment- and literal-stripped text
+};
+
+/// Every `.cpp`, `.hpp` and `.h` file under the server source directory, stripped of comments
+/// and literals, loaded once. A file whose comments or literals do not balance fails the test
+/// loudly: it would otherwise hide code from every scan below. Test sources are not under this
+/// directory, so the negative-control strings in tests are never scanned.
+const std::vector<SrcFile>& server_src_corpus() {
+    static const std::vector<SrcFile> corpus = [] {
+        std::vector<SrcFile> out;
+        const std::filesystem::path root(YUZU_SERVER_SRC_DIR);
+        REQUIRE(std::filesystem::is_directory(root));
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+            if (!entry.is_regular_file())
+                continue;
+            const auto ext = entry.path().extension().string();
+            if (ext != ".cpp" && ext != ".hpp" && ext != ".h")
+                continue;
+            auto stripped = code_only(read_text_file(entry.path()));
+            INFO("stripping " << entry.path().string());
+            REQUIRE(stripped.clean);
+            out.push_back({std::filesystem::relative(entry.path(), root).generic_string(),
+                           std::move(stripped.text)});
+        }
+        return out;
+    }();
+    return corpus;
+}
+
+const SrcFile& server_src_file(std::string_view name) {
+    for (const auto& f : server_src_corpus())
+        if (f.name == name)
+            return f;
+    FAIL("server source file not found in the corpus: " << name);
+    std::abort();
+}
+
+/// Calls of `name` (an identifier followed by optional whitespace and `(`) in code-only text.
+std::size_t count_calls(const std::string& text, std::string_view name) {
+    std::size_t n = 0;
+    for (auto at = text.find(name); at != std::string::npos; at = text.find(name, at + 1)) {
+        const auto is_ident = [](char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                   c == '_';
+        };
+        if (at > 0 && is_ident(text[at - 1]))
+            continue;
+        const auto next = text.find_first_not_of(" \t\r\n", at + name.size());
+        if (next != std::string::npos && text[next] == '(')
+            ++n;
+    }
+    return n;
+}
+
+std::string without_space(std::string s) {
+    std::erase_if(s, [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; });
+    return s;
 }
 
 } // namespace
@@ -1663,30 +1727,89 @@ TEST_CASE("httplib pre-request handler: it runs before the request body is read 
         CHECK(pre_request_body_size.load() == body.size());
 }
 
-TEST_CASE("server.cpp and the route sink never use httplib's pre-request handler on a baseline "
-          "that reads the body after it",
+TEST_CASE("no server source file uses httplib's pre-request handler on a baseline that reads "
+          "the body after it",
           "[body_cap][httplib_version][lexical]") {
-    // A source-text pin, over comment- and literal-stripped text, that does not depend on the
-    // route-sink wrapper change's own tests: the bare token `set_pre_request_handler` must not
-    // appear as code in server.cpp or in the three files that implement the stage, in any form.
-    // If that wrapper change were reverted on its own on this baseline, server.cpp would again
-    // install the stage that way, which runs before the body is read, and the post-read body cap
-    // and the step-up check would see an empty body.
+    // A source-text pin, over comment- and literal-stripped text of EVERY file under the server
+    // source directory, that does not depend on the route-sink wrapper change's own tests: the
+    // bare token `set_pre_request_handler` must not appear as code anywhere, in any form. If that
+    // wrapper change were reverted on its own on this baseline, server.cpp would again install
+    // the stage that way, which runs before the body is read, and the post-read body cap and the
+    // step-up check would see an empty body. (There is no allowlist: the one deliberate use of
+    // the handler in this repository is in a test, outside the scanned directory.)
     if (!httplib_reads_body_after_pre_request_handler()) {
         SUCCEED("this httplib reads the body before its pre-request handler");
         return;
     }
-    for (const char* name :
-         {"server.cpp", "http_route_sink.hpp", "post_read_stage.hpp", "post_read_stage.cpp"}) {
-        INFO(name);
-        const auto stripped = code_only(read_server_src_file(name));
-        REQUIRE(stripped.clean);
-        CHECK(pre_request_handler_uses(stripped.text) == 0);
-    }
+    const auto& corpus = server_src_corpus();
+    REQUIRE(corpus.size() > 100);
+    std::string offenders;
+    for (const auto& f : corpus)
+        if (pre_request_handler_uses(f.text) != 0)
+            offenders += f.name + " ";
+    INFO("files using set_pre_request_handler: " << offenders);
+    CHECK(offenders.empty());
     // The stage still goes in through the registry.
-    const auto server = code_only(read_server_src_file("server.cpp"));
-    REQUIRE(server.clean);
-    CHECK(server.text.find("PostReadStageRegistry::instance().install(") != std::string::npos);
+    CHECK(server_src_file("server.cpp").text.find("PostReadStageRegistry::instance().install(") !=
+          std::string::npos);
+}
+
+TEST_CASE("the body-cap decision and the close rule have exactly one production caller each",
+          "[body_cap][lexical]") {
+    // Over the whole server source directory: a second `evaluate_body_cap(` call site (one that
+    // could read the headers raw) or a second `close_if_unread_framed_body(` call site would be a
+    // second copy of a rule that has one home. The defining headers are excluded by name.
+    std::string eval_sites;
+    std::string close_sites;
+    std::size_t eval_calls = 0;
+    std::size_t close_calls = 0;
+    for (const auto& f : server_src_corpus()) {
+        if (f.name != "body_cap_policy.hpp") {
+            if (const auto n = count_calls(f.text, "evaluate_body_cap")) {
+                eval_calls += n;
+                eval_sites += f.name + " ";
+            }
+        }
+        if (f.name != "body_cap_httplib.hpp") {
+            if (const auto n = count_calls(f.text, "close_if_unread_framed_body")) {
+                close_calls += n;
+                close_sites += f.name + " ";
+            }
+        }
+    }
+    INFO("evaluate_body_cap call sites: " << eval_sites);
+    INFO("close_if_unread_framed_body call sites: " << close_sites);
+    CHECK(eval_calls == 1);
+    CHECK(eval_sites == "server.cpp ");
+    CHECK(close_calls == 1);
+    CHECK(close_sites == "server.cpp ");
+}
+
+TEST_CASE("body_cap_httplib.hpp: the accessors stay thin wrappers over httplib's own rules",
+          "[body_cap][lexical]") {
+    // The accessors exist so the gate and httplib read the same bytes the same way. Pinned
+    // whole, whitespace aside, over the stripped text: a body replaced by another predicate, or by
+    // a constant, fails here.
+    const auto flat = without_space(server_src_file("body_cap_httplib.hpp").text);
+    CHECK(flat.find("inlineboolis_chunked_for_body_cap(consthttplib::Request&req){"
+                    "returnhttplib::detail::is_chunked_transfer_encoding(req.headers);}") !=
+          std::string::npos);
+    CHECK(flat.find("inlineboolhas_content_length_for_body_cap(consthttplib::Request&req){"
+                    "constautocl_range=req.headers.equal_range(\"\");"
+                    "returncl_range.first!=cl_range.second;}") != std::string::npos);
+    CHECK(flat.find("inlinestd::stringcontent_encoding_for_body_cap(consthttplib::Request&req){"
+                    "returnhttplib::detail::get_combined_header_value(req.headers,\"\");}") !=
+          std::string::npos);
+    // Literals are blanked in the stripped text, so the header NAME is pinned on the raw file.
+    const auto raw =
+        read_text_file(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "body_cap_httplib.hpp");
+    std::size_t names = 0;
+    for (auto at = raw.find("req.headers.equal_range(\"Content-Length\")"); at != std::string::npos;
+         at = raw.find("req.headers.equal_range(\"Content-Length\")", at + 1))
+        ++names;
+    CHECK(names == 1);
+    CHECK(raw.find("get_combined_header_value(req.headers, \"Content-Encoding\")") !=
+          std::string::npos);
 }
 
 TEST_CASE("pre-request handler scan: negative controls", "[body_cap][httplib_version][lexical]") {

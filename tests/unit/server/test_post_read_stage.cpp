@@ -362,7 +362,7 @@ TEST_CASE("post-read stage: a regex route does not match a path longer than http
     // refusal (httplib's own 404), never an ungated pass. The upgrade guide and the changelog
     // state the number, so a httplib that changes the limit, or a build that sets the macro, must
     // fail here before that text goes stale.
-    CHECK(CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH == 256);
+    REQUIRE(CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH == 256);
 
     httplib::Server svr;
     Clean clean(&svr);

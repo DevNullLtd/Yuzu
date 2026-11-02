@@ -2024,34 +2024,15 @@ TEST_CASE("wiring: server.cpp feeds the body-cap decision the header values http
     CHECK(only_space(te_arg + kTeArg.size(), ce_arg));
     // ... and inside that call's argument list, not a later statement.
     CHECK(ce_arg < src.find(';', evaluate));
-    // The whole argument list, whitespace aside: the method and path, the presence flag and the
+    // The whole argument list, whitespace aside: the method and path, the presence accessor and the
     // chunked-framing argument (`is_chunked_for_body_cap`, httplib's own decision) are pinned
     // too, so none can be swapped or replaced by another expression.
     std::string call = src.substr(evaluate, src.find(';', evaluate) - evaluate);
     std::erase_if(call, [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; });
-    CHECK(call == "evaluate_body_cap(req.method,req.path,has_content_length,"
+    CHECK(call == "evaluate_body_cap(req.method,req.path,has_content_length_for_body_cap(req),"
                   "content_length_for_body_cap(req),transfer_encoding_for_body_cap(req),"
                   "content_encoding_for_body_cap(req),"
                   "is_chunked_for_body_cap(req))");
-    // The presence flag has no named accessor, so how it is derived is pinned here: the
-    // range statement and the flag, back to back, inside the lambda and before the call. The
-    // stripped text blanks every literal, so the header NAME is pinned on the raw text below.
-    std::string flat = src;
-    std::erase_if(flat, [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; });
-    constexpr std::string_view kDerive =
-        "constautocl_range=req.headers.equal_range(\"\");"
-        "constboolhas_content_length=cl_range.first!=cl_range.second;";
-    REQUIRE(count_token(flat, kDerive) == 1);
-    const auto flat_def = flat.find("autoenforce_pre_auth_body_cap=[&]()");
-    const auto flat_derive = find_token(flat, kDerive);
-    const auto flat_call = find_token(flat, "evaluate_body_cap(");
-    REQUIRE(flat_def != std::string::npos);
-    CHECK(flat_def < flat_derive);
-    CHECK(flat_derive < flat_call);
-    constexpr std::string_view kRawRange =
-        "const auto cl_range = req.headers.equal_range(\"Content-Length\");";
-    REQUIRE(count_of(raw, kRawRange) == 1);
-    CHECK(raw.find("auto enforce_pre_auth_body_cap = [&]()") < raw.find(kRawRange));
 }
 
 // A `std::logic_error` out of start_web_server() must become a startup failure, not an exception

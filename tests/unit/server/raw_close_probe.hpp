@@ -69,6 +69,7 @@ inline CloseProbeResult probe_for_close(int port, const std::string& request,
     addr.sin_port = htons(static_cast<uint16_t>(port));
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     REQUIRE(::connect(sock.v, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    REQUIRE(wait.count() > 0);
     timeval tv{};
     tv.tv_sec = static_cast<time_t>(wait.count());
     REQUIRE(::setsockopt(sock.v, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0);
@@ -86,6 +87,10 @@ inline CloseProbeResult probe_for_close(int port, const std::string& request,
             continue;
         REQUIRE(n > 0);
         out.head.append(buf, static_cast<std::size_t>(n));
+        // A server that trickles bytes without ever finishing the head cannot hold the probe past
+        // the deadline either.
+        if (out.head.find("\r\n\r\n") == std::string::npos)
+            REQUIRE(std::chrono::steady_clock::now() < deadline);
     }
     for (;;) {
         const ssize_t n = ::recv(sock.v, buf, sizeof(buf), 0);
