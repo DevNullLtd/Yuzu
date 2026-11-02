@@ -65,14 +65,9 @@ constexpr int kFleetQueryRowCap = 100000;
 constexpr const char* kRollupStatementTimeout = "60s";
 
 /// Largest combined byte length of a (name, publisher, ecosystem) triple admitted to
-/// `title_triples`, whose PRIMARY KEY is a btree over those three TEXT columns. Postgres
-/// refuses an index entry larger than about 2704 bytes on an 8 kB page (a third of the page
-/// less its headers; "index row size ... exceeds btree version 4 maximum", SQLSTATE 54000),
-/// and that failure would roll back this whole refresh and freeze the catalogue. Ingest
-/// clamps each field to 1024 bytes but not their sum, and 3 x 1024 incompressible bytes
-/// reproduce the failure. 2704 less the index tuple header (8), three 4-byte varlena headers
-/// (12) and alignment leaves about 2680; 2400 keeps a comfortable margin. A longer triple is
-/// left out of title_triples (and so out of title normalisation), never the refresh.
+/// `title_triples`: its PK btree entry limit is ~2704 B (SQLSTATE 54000, which would roll
+/// back the whole refresh), so 2400 leaves margin. A longer triple is left out of
+/// title_triples, never the refresh; derivation in ADR-0012 "Input bound".
 constexpr int kTitleTripleMaxBytes = 2400;
 
 const std::vector<pg::PgMigration>& migrations() {

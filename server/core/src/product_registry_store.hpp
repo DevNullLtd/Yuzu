@@ -56,9 +56,9 @@
 /// selected a row before the mutation commits would otherwise upsert it afterwards,
 /// stamping the current `pack_version` over the sentinel and losing the invalidation.
 /// This store's own mutations (the seed load, which stamps the pack version, and the
-/// `ON DELETE SET NULL` foreign key) need no sentinel write. A writer of
-/// `products.category` must use a value from `kCategories`: the dimension's `category`
-/// column is constrained to that set and a pass writing another value would fail.
+/// `ON DELETE SET NULL` foreign key) need no sentinel write. A `products.category`
+/// outside `kCategories` is written to the dimension as `other` (its `category` column is
+/// constrained to that set).
 ///
 /// Normaliser contract: every stored key (`product_aliases.raw_name`, `products.norm_key`,
 /// `title_dimension` resolutions) is derived with `normalize_title`, `normalize_vendor` and
@@ -134,7 +134,6 @@ struct NormalizationAliasRow {
     std::string source;
     std::string raw_name;      ///< alias_key()
     std::string raw_publisher; ///< normalised vendor ("" = wildcard)
-    std::string method;        ///< "pack" | "curated"
     ProductRow product;
 };
 

@@ -85,6 +85,9 @@ private:
     yuzu::MetricsRegistry* metrics_;
     TickObserver on_tick_;
     std::atomic<bool> stop_{false};
+    /// `source_pending` of the last tick that neither errored nor was cancelled: the memory
+    /// that lets `tick_once` log a repeated wait once. Touched only by `tick_once`.
+    std::atomic<bool> source_pending_{false};
     std::thread thread_;
 };
 

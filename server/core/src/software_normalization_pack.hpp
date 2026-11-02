@@ -52,7 +52,8 @@ inline constexpr std::array<std::string_view, 5> kCategories{
 /// keeping a pack a bounded, in-memory parse and a bounded boot-time load).
 inline constexpr std::size_t kMaxPackBytes = 1U << 20; ///< 1 MiB of CSV text
 inline constexpr std::size_t kMaxPackRows = 5000;
-inline constexpr std::size_t kMaxFieldBytes = 256; ///< per field, so a key stays far below the btree row limit
+/// Per field, so a key stays far below the btree row limit.
+inline constexpr std::size_t kMaxFieldBytes = 256;
 
 /// Lower bound on rows in a pack. A pack thinner than this resolves almost
 /// nothing; the parser rejects it rather than ship a hollow seed.

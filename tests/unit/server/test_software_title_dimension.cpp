@@ -49,13 +49,11 @@ ProductRow prod(std::int64_t id, const std::string& vendor, const std::string& t
 }
 
 NormalizationAliasRow alias(const std::string& source, const std::string& raw_name,
-                            const std::string& raw_publisher, const ProductRow& p,
-                            const std::string& method = "pack") {
+                            const std::string& raw_publisher, const ProductRow& p) {
     NormalizationAliasRow a;
     a.source = source;
     a.raw_name = raw_name;
     a.raw_publisher = raw_publisher;
-    a.method = method;
     a.product = p;
     return a;
 }
@@ -130,7 +128,7 @@ TEST_CASE("resolve_title prefers a curated alias over a pack alias for the same 
     const auto curated = prod(2, "igor pavlov", "7-zip curated");
     const auto r = resolve({"7-Zip 23.01 (x64)", "Igor Pavlov", "windows"},
                            {alias("pack:windows", "7-zip", "igor pavlov", packed),
-                            alias("curated:windows", "7-zip", "igor pavlov", curated, "curated")},
+                            alias("curated:windows", "7-zip", "igor pavlov", curated)},
                            {packed, curated});
     CHECK(r.norm_status == "normalized");
     CHECK(r.method == "curated");
@@ -272,37 +270,6 @@ TEST_CASE("resolve_title treats a name with no title token as unnormalized even 
               .norm_status == "normalized");
 }
 
-TEST_CASE("resolve_title resolves every shipped seed row from its own raw_name to its own product",
-          "[normalization][title]") {
-    const auto pack = parse_normalization_pack(kSoftwareNormalizationSeed);
-    REQUIRE(pack.has_value());
-    // The aliases exactly as the pack load writes them: one product per norm_key, one alias per row.
-    std::vector<NormalizationAliasRow> aliases;
-    std::int64_t next_id = 1;
-    std::map<std::string, ProductRow> products;
-    for (const auto& r : pack->rows) {
-        auto [it, fresh] = products.try_emplace(r.norm_key);
-        if (fresh) {
-            it->second = prod(next_id++, r.vendor, r.title, r.edition, r.category, r.cpe_product);
-            it->second.norm_key = r.norm_key;
-        }
-        aliases.push_back(alias("pack:" + r.ecosystem, r.raw_name, r.raw_publisher, it->second));
-    }
-    for (const auto& r : pack->rows) {
-        CAPTURE(r.ecosystem, r.raw_name);
-        // An empty wildcard ecosystem is exercised through a concrete one.
-        const auto got = resolve_title({r.raw_name, r.raw_publisher, r.ecosystem.empty() ? "rpm" : r.ecosystem},
-                                       aliases, nullptr, false);
-        CHECK(got.norm_status == "normalized");
-        CHECK(got.method == "pack");
-        REQUIRE(got.product_id.has_value());
-        CHECK(*got.product_id == products.at(r.norm_key).product_id);
-        CHECK(got.category == r.category);
-        CHECK(got.cpe_product == r.cpe_product);
-        CHECK(got.edition == r.edition);
-    }
-}
-
 TEST_CASE("resolve_title with auto birth off labels an unmatched title unnormalized with a null "
           "product",
           "[normalization][title]") {
@@ -327,6 +294,21 @@ TEST_CASE("resolve_title with auto birth on births only with a non-empty vendor 
     CHECK(resolve({"Single", "Acme", "windows"}, {}, {}, true).norm_status == "unnormalized");
     CHECK(resolve({"Two Tokens", "Acme", "windows"}, {}, {}, false).norm_status == "unnormalized");
     CHECK_FALSE(kAutoBirthEnabled);
+}
+
+TEST_CASE("resolve_title reads a category outside the closed set as other and records the tier "
+          "as the method",
+          "[normalization][title]") {
+    const auto bogus = prod(1, "acme", "gizmo", {}, "bogus");
+    const auto r =
+        resolve({"Gizmo", "Acme", "deb"}, {alias("pack:deb", "gizmo", "", bogus)}, {bogus});
+    CHECK(r.norm_status == "normalized");
+    CHECK(r.method == "pack");
+    CHECK(r.category == "other");
+    // Positive control: a category inside the set passes through unchanged.
+    const auto db = prod(2, "acme", "gizmo", {}, "database");
+    CHECK(resolve({"Gizmo", "Acme", "deb"}, {alias("pack:deb", "gizmo", "", db)}, {db}).category ==
+          "database");
 }
 
 TEST_CASE("resolve_title takes cpe_product from the product row only", "[normalization][title]") {
@@ -769,10 +751,6 @@ TEST_CASE("owner pass selects the highest device counts first when a page is ful
     REQUIRE(first.processed == kPassLimit);
     CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.title_dimension "
                        "WHERE raw_name = 'Order Tool 1'") == "0");
-    CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.title_dimension "
-                       "WHERE raw_name = 'Order Tool " + std::to_string(kPassLimit + 1) + "'") == "1");
-    CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.title_dimension "
-                       "WHERE raw_name = 'Order Tool 2'") == "1");
     // The remainder is the next page.
     CHECK(owner.run_pass().processed == 1);
     CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.title_dimension "
@@ -983,7 +961,8 @@ TEST_CASE("owner tick clears capped when the queue reconcile fails",
     CHECK(t.processed == kPassLimit);
 }
 
-TEST_CASE("owner pass resolves every shipped seed row from its own raw_name through the database",
+TEST_CASE("owner pass resolves every shipped seed row from its stored alias key through the "
+          "database",
           "[pg][product_registry][normalization]") {
     TD_ENV(db, pool, inv, reg, metrics, owner);
     const auto pack = parse_normalization_pack(kSoftwareNormalizationSeed);

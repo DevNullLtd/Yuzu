@@ -673,7 +673,7 @@ ProductRegistryStore::read_normalization_aliases(PGconn* conn,
         return out;
     pg::PgResult res = pg::exec_params(
         conn,
-        "SELECT a.source, a.raw_name, a.raw_publisher, a.method, "
+        "SELECT a.source, a.raw_name, a.raw_publisher, "
         "  p.product_id, p.norm_key, p.vendor, p.title, p.edition, p.platform, p.created_at, "
         "  p.updated_at, p.purl_type, p.cpe_product, p.origin, p.category "
         "FROM product_registry_store.product_aliases a "
@@ -692,8 +692,7 @@ ProductRegistryStore::read_normalization_aliases(PGconn* conn,
         r.source = PQgetvalue(res.get(), i, 0);
         r.raw_name = PQgetvalue(res.get(), i, 1);
         r.raw_publisher = PQgetvalue(res.get(), i, 2);
-        r.method = PQgetvalue(res.get(), i, 3);
-        fill_product(res, i, r.product, 4);
+        fill_product(res, i, r.product, 3);
         out.push_back(std::move(r));
     }
     return out;

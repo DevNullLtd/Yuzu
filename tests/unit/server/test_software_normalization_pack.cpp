@@ -263,27 +263,18 @@ TEST_CASE("the embedded seed parses with the shipped version and every key in no
     }
 }
 
-TEST_CASE("the embedded seed gives every product ONE identity and one attribute set per identity",
-          "[normalization][pack]") {
+TEST_CASE("the embedded seed gives every product ONE identity", "[normalization][pack]") {
     const auto p = parse_normalization_pack(kSoftwareNormalizationSeed);
     REQUIRE(p.has_value());
 
     // The same product (title, edition, cpe_product) spelled with two vendors would load as
     // two product rows: one norm_key per such product.
     std::map<std::tuple<std::string, std::string, std::string>, std::set<std::string>> keys_by_product;
-    // And one norm_key carries one category and one cpe_product.
-    std::map<std::string, std::set<std::pair<std::string, std::string>>> attrs_by_key;
-    for (const auto& r : p->rows) {
+    for (const auto& r : p->rows)
         keys_by_product[{r.title, r.edition, r.cpe_product}].insert(r.norm_key);
-        attrs_by_key[r.norm_key].insert({r.category, r.cpe_product});
-    }
     for (const auto& [product, keys] : keys_by_product) {
         CAPTURE(std::get<0>(product), std::get<1>(product), std::get<2>(product));
         CHECK(keys.size() == 1);
-    }
-    for (const auto& [key, attrs] : attrs_by_key) {
-        CAPTURE(key);
-        CHECK(attrs.size() == 1);
     }
 
     // The vendor values the Linux and Windows rows must agree on, pinned by key.

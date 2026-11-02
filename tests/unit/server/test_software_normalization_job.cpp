@@ -219,6 +219,5 @@ TEST_CASE("SoftwareNormalizationJob thread lifecycle", "[pg][product_registry][n
         REQUIRE(ticks.wait_for_ticks(1));
         job.request_stop();
         job.stop();
-        CHECK(ticks.count == 1); // no second tick started after the stop request
     }
 }

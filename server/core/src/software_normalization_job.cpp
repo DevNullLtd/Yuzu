@@ -79,12 +79,23 @@ TickResult SoftwareNormalizationJob::tick_once() {
         spdlog::warn("Software normalisation: tick had a failed pass or reconcile "
                      "({} passes, {} titles)",
                      r.passes, r.processed);
-    else
-        spdlog::info("Software normalisation: tick complete ({} passes, {} titles, {}, next in {} s)",
-                     r.passes, r.processed,
-                     r.capped ? "backlog remains" : r.source_pending ? "waiting for the catalogue rollup"
-                                                                     : "caught up",
-                     rearm_interval(r, interval_).count());
+    else {
+        // A source-pending tick re-arms every kBacklogRearm for as long as the rollup has not
+        // produced a title list, so only the entry into and the exit from that state log at
+        // INFO; the ticks in between log at DEBUG.
+        const bool was_pending =
+            source_pending_.exchange(r.source_pending, std::memory_order_relaxed);
+        if (was_pending && !r.source_pending)
+            spdlog::info("Software normalisation: the candidate source (title_triples) is filled");
+        spdlog::log(r.source_pending && was_pending ? spdlog::level::debug : spdlog::level::info,
+                    "Software normalisation: tick complete ({} passes, {} titles, {}, "
+                    "next in {} s)",
+                    r.passes, r.processed,
+                    r.capped            ? "backlog remains"
+                    : r.source_pending ? "waiting for the catalogue rollup"
+                                        : "caught up",
+                    rearm_interval(r, interval_).count());
+    }
     if (on_tick_)
         on_tick_(r);
     return r;

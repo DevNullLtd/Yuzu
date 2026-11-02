@@ -86,9 +86,10 @@ bool set_statement_timeout(PGconn* c) {
 }
 
 /// The cluster-wide single-writer lock, taken (after the transaction's `SET LOCAL
-/// statement_timeout`) at the start of a pass and of the queue reconcile. `true` = this transaction now holds it; `false` = a peer holds it (skip);
-/// `nullopt` = the statement failed OR answered with any shape other than one row of exactly
-/// "t" or "f" (fail closed: an unexpected answer never reads as "we hold the lock").
+/// statement_timeout`) at the start of a pass and of the queue reconcile. `true` = this
+/// transaction now holds it; `false` = a peer holds it (skip); `nullopt` = the statement
+/// failed OR answered with any shape other than one row of exactly "t" or "f" (fail closed:
+/// an unexpected answer never reads as "we hold the lock").
 std::optional<bool> try_norm_lock(PGconn* c) {
     pg::PgResult lk = exec_logged(
         c, "advisory lock",
@@ -155,7 +156,12 @@ TitleResolution resolve_title(const TitleKey& key,
         out.vendor = p.vendor;
         out.product = p.title;
         out.edition = p.edition;
-        out.category = p.category.empty() ? "other" : p.category;
+        // The dimension's category is a closed set; a products.category outside it (the
+        // column has no CHECK of its own) reads as "other" rather than failing the page.
+        out.category = std::find(kCategories.begin(), kCategories.end(), p.category) !=
+                               kCategories.end()
+                           ? p.category
+                           : "other";
         out.cpe_product = p.cpe_product; // the product row's own column, never a resolver
     };
 
@@ -171,7 +177,7 @@ TitleResolution resolve_title(const TitleKey& key,
             const std::string source = std::string{tier} + ':' + std::string{eco};
             for (const auto& a : aliases_for_key) {
                 if (a.raw_name == ak && a.source == source && a.raw_publisher == pub) {
-                    adopt(a.product, a.method.empty() ? std::string{tier} : a.method);
+                    adopt(a.product, std::string{tier});
                     return out;
                 }
             }
@@ -252,8 +258,8 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
             }
             const std::string pack_version = PQgetvalue(pk.get(), 0, 0);
 
-            // The `<>` arm also catches the '' stale sentinel (see product_registry_store.hpp); the third arm is a
-            // product deleted under a normalized row (ON DELETE SET NULL).
+            // The `<>` arm also catches the '' stale sentinel (see product_registry_store.hpp);
+            // the third arm is a product deleted under a normalized row (ON DELETE SET NULL).
             pg::PgResult cand = exec_logged(
                 c, "candidates",
                 "SELECT t.name, t.publisher, t.ecosystem, t.device_count "
@@ -275,10 +281,12 @@ PassResult SoftwareTitleDimension::run_pass(const std::function<bool()>& cancell
             processed = static_cast<int>(titles.size());
             if (titles.empty()) {
                 // Nothing to normalise. If title_triples is itself empty while installed
-                // software exists, the rollup that fills it has not completed yet (a fresh
-                // boot or the table's own migration): say so, so the job looks again in a
-                // minute rather than after a full interval. Self-bounding - once the rollup
-                // has run, title_triples is empty only when there is no inventory.
+                // software exists, the rollup that fills it has not produced a title list
+                // (a fresh boot or the table's own migration): say so, so the job looks
+                // again in a minute rather than after a full interval. The probe re-arms at
+                // 60 s until the rollup first fills title_triples; on a fleet past the
+                // rollup's scale ceiling, or with every triple over kTitleTripleMaxBytes,
+                // that never happens and the probe stays at 60 s - one cheap statement a tick.
                 pg::PgResult src = exec_logged(
                     c, "source pending",
                     "SELECT (NOT EXISTS (SELECT 1 FROM software_inventory_store.title_triples)) "
