@@ -1475,8 +1475,8 @@ TEST_CASE("transfer_encoding_for_body_cap: an empty first line still reads as pr
 //
 // The post-read body cap and the step-up check measure `req.body`, so they must run AFTER httplib
 // has read it: they are installed through `PostReadStageRegistry` and the route sink, never as
-// `set_pre_request_handler`. These three cases keep that true when the baseline moves or when the
-// route-sink wrapper change is reverted on its own. The scan LOGIC below shares nothing with the
+// `set_pre_request_handler`. The cases in this section keep that true when the baseline moves or
+// when the route-sink wrapper change is reverted on its own. The scan LOGIC below shares nothing with the
 // wrapper change's own wiring tests, but this file as a whole needs that change
 // (`post_read_stage_test_support.hpp`, `PostReadStageRegistry`), so it is the source scan that
 // carries the pin, not the file's independence.
@@ -1621,26 +1621,36 @@ struct SrcFile {
     std::string text; ///< comment- and literal-stripped text
 };
 
-/// Every `.cpp`, `.hpp` and `.h` file under the server source directory, stripped of comments
-/// and literals, loaded once. A file whose comments or literals do not balance fails the test
-/// loudly: it would otherwise hide code from every scan below. Test sources are not under this
-/// directory, so the negative-control strings in tests are never scanned.
+/// Every `.cpp`, `.hpp`, `.h`, `.inc` and `.ipp` file under the server source directory and the
+/// public server header directory (`server/core/include/yuzu/server`, named with an `include/`
+/// prefix), stripped of comments and literals, loaded once. A file whose comments or literals do
+/// not balance fails the test loudly: it would otherwise hide code from every scan below. Test
+/// sources are not under either directory, so the negative-control strings in tests are never
+/// scanned.
 const std::vector<SrcFile>& server_src_corpus() {
     static const std::vector<SrcFile> corpus = [] {
         std::vector<SrcFile> out;
-        const std::filesystem::path root(YUZU_SERVER_SRC_DIR);
-        REQUIRE(std::filesystem::is_directory(root));
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
-            if (!entry.is_regular_file())
-                continue;
-            const auto ext = entry.path().extension().string();
-            if (ext != ".cpp" && ext != ".hpp" && ext != ".h")
-                continue;
-            auto stripped = code_only(read_text_file(entry.path()));
-            INFO("stripping " << entry.path().string());
-            REQUIRE(stripped.clean);
-            out.push_back({std::filesystem::relative(entry.path(), root).generic_string(),
-                           std::move(stripped.text)});
+        const std::filesystem::path src_root(YUZU_SERVER_SRC_DIR);
+        const auto include_root = src_root / ".." / "include" / "yuzu" / "server";
+        const std::pair<std::filesystem::path, std::string> roots[] = {{src_root, ""},
+                                                                       {include_root, "include/"}};
+        for (const auto& [root, prefix] : roots) {
+            INFO("scanning " << root.string());
+            REQUIRE(std::filesystem::is_directory(root));
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+                if (!entry.is_regular_file())
+                    continue;
+                const auto ext = entry.path().extension().string();
+                if (ext != ".cpp" && ext != ".hpp" && ext != ".h" && ext != ".inc" &&
+                    ext != ".ipp")
+                    continue;
+                auto stripped = code_only(read_text_file(entry.path()));
+                INFO("stripping " << entry.path().string());
+                REQUIRE(stripped.clean);
+                out.push_back(
+                    {prefix + std::filesystem::relative(entry.path(), root).generic_string(),
+                     std::move(stripped.text)});
+            }
         }
         return out;
     }();
@@ -1731,18 +1741,21 @@ TEST_CASE("no server source file uses httplib's pre-request handler on a baselin
           "the body after it",
           "[body_cap][httplib_version][lexical]") {
     // A source-text pin, over comment- and literal-stripped text of EVERY file under the server
-    // source directory, that does not depend on the route-sink wrapper change's own tests: the
+    // source and public header directories, that does not depend on the route-sink wrapper change's own tests: the
     // bare token `set_pre_request_handler` must not appear as code anywhere, in any form. If that
     // wrapper change were reverted on its own on this baseline, server.cpp would again install
     // the stage that way, which runs before the body is read, and the post-read body cap and the
     // step-up check would see an empty body. (There is no allowlist: the one deliberate use of
-    // the handler in this repository is in a test, outside the scanned directory.)
+    // the handler in this repository is in a test, outside the scanned directories.)
     if (!httplib_reads_body_after_pre_request_handler()) {
         SUCCEED("this httplib reads the body before its pre-request handler");
         return;
     }
     const auto& corpus = server_src_corpus();
     REQUIRE(corpus.size() > 100);
+    // Both directories are really in the corpus (a path that stopped resolving would shrink it).
+    CHECK(std::any_of(corpus.begin(), corpus.end(),
+                      [](const SrcFile& f) { return f.name.starts_with("include/"); }));
     std::string offenders;
     for (const auto& f : corpus)
         if (pre_request_handler_uses(f.text) != 0)
@@ -1756,7 +1769,7 @@ TEST_CASE("no server source file uses httplib's pre-request handler on a baselin
 
 TEST_CASE("the body-cap decision and the close rule have exactly one production caller each",
           "[body_cap][lexical]") {
-    // Over the whole server source directory: a second `evaluate_body_cap(` call site (one that
+    // Over the whole server source and public header directories: a second `evaluate_body_cap(` call site (one that
     // could read the headers raw) or a second `close_if_unread_framed_body(` call site would be a
     // second copy of a rule that has one home. The defining headers are excluded by name.
     std::string eval_sites;

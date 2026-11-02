@@ -924,20 +924,19 @@ constexpr const char* kEgressCleartextPublicReason = OidcProvider::kEgressCleart
 constexpr const char* kEgressUnresolvedReason = "the host name did not resolve";
 
 // Decides where ONE fetch may connect, BEFORE any socket exists. A host that is an IP literal is
-// classified directly (no DNS). Any other host (a name, or a numeric spelling the OS resolver
-// might read differently, such as `127.1`) is resolved here, with httplib's own resolver, and
-// EVERY returned address is classified by its bytes. On a glibc build that resolver is not held to
-// the caller's time bound: a lookup against an unresponsive resolver can take about 30 s. Returns
-// the numeric addresses the connection may be PINNED to (the permitted ones, in resolver order, at
-// most kMaxPinnedAddresses), or an EMPTY list when the host is an IP literal that needs no pin. A
-// refusal or a resolver
-// failure is a fixed reason (never the address, never resolver text). Pinning closes the window
-// between this check and the connect: httplib is told to connect to that numeric address and does
-// no second lookup, so a DNS answer that changes in between cannot redirect the request. The
-// caller tries the permitted addresses in order while a connect fails (a host whose first address
-// family is unreachable still works, as it did when httplib walked the resolver's list itself). TLS
-// server-name indication and certificate verification keep using the host NAME (httplib keys them
-// on the host, not on the pinned address).
+// classified directly (no DNS). Any other host (a name, or a numeric spelling the OS resolver might
+// read differently, such as `127.1`) is resolved here, with httplib's own resolver, and EVERY
+// returned address is classified by its bytes. On a glibc build that resolver is not held to the
+// caller's time bound: a lookup against an unresponsive resolver can take about 30 s. Returns the
+// numeric addresses the connection may be PINNED to (the permitted ones, in resolver order, at most
+// kMaxPinnedAddresses), or an EMPTY list when the host is an IP literal that needs no pin. A
+// refusal or a resolver failure is a fixed reason (never the address, never resolver text). Pinning
+// closes the window between this check and the connect: httplib is told to connect to that numeric
+// address and does no second lookup, so a DNS answer that changes in between cannot redirect the
+// request. The caller tries the permitted addresses in order while a connect fails (a host whose
+// first address family is unreachable still works, as it did when httplib walked the resolver's
+// list itself). TLS server-name indication and certificate verification keep using the host NAME
+// (httplib keys them on the host, not on the pinned address).
 constexpr std::size_t kMaxPinnedAddresses = 4;
 
 // The test resolver (OidcProvider::set_resolver_for_test); empty in production.
@@ -959,12 +958,11 @@ struct ResolvedAddress {
 // Resolves `host` (a name, not a literal) to its IPv4 and IPv6 addresses. The lookup is cancelled
 // after `timeout_sec` seconds, except on a glibc build where httplib then waits for the resolver
 // itself (about 30 s against an unresponsive one). False when the name did not resolve or the
-// lookup timed out. Own
-// function per platform because httplib's helper cannot be consumed generically: on Windows it
-// returns a GetAddrInfoExW result cast to `addrinfo`, whose layout differs after ai_addr (the
-// blob, blob length and provider fields precede ai_next) and which must be released with
-// FreeAddrInfoExW, so walking it as `addrinfo` misses addresses and freeing it with freeaddrinfo
-// is the wrong deleter.
+// lookup timed out. Own function per platform because httplib's helper cannot be consumed
+// generically: on Windows it returns a GetAddrInfoExW result cast to `addrinfo`, whose layout
+// differs after ai_addr (the blob, blob length and provider fields precede ai_next) and which must
+// be released with FreeAddrInfoExW, so walking it as `addrinfo` misses addresses and freeing it
+// with freeaddrinfo is the wrong deleter.
 #ifdef _WIN32
 // One GetAddrInfoExW lookup. It owns a HANDLE and a resolver-allocated list, and the OS references
 // it while the lookup is pending, so it may be destroyed only once the lookup has completed.

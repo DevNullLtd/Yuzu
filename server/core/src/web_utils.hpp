@@ -859,9 +859,9 @@ template <typename Req>
 /// against the real vendored httplib.
 ///
 /// `is_chunked` MUST come from httplib's own decision, through `is_chunked_for_body_cap`
-/// (body_cap_httplib.hpp), never from a local reading of the header. Third time this change was bitten
-/// by that same root cause — `Content-Encoding` and the `Content-Length`
-/// overflow parse were the first two — and all three were fixed the same way:
+/// (body_cap_httplib.hpp), never from a local reading of the header. Third time this
+/// change was bitten by that same root cause (`Content-Encoding` and the `Content-Length`
+/// overflow parse were the first two), and all three were fixed the same way:
 /// ask httplib instead of re-deciding.
 [[nodiscard]] inline bool content_length_is_authoritative(bool has_content_length,
                                                           bool is_chunked) noexcept {

@@ -730,14 +730,14 @@ struct BodyCapDecision {
 /// first line, or a "present" marker when that line is empty but the header
 /// exists, because the gate only tests non-emptiness),
 /// `content_encoding_for_body_cap(req)` (body_cap_httplib.hpp, the combined
-/// value httplib decodes against) and
-/// `is_chunked_for_body_cap(req)` (body_cap_httplib.hpp, httplib's own chunked
-/// decision). An empty first
+/// value httplib decodes against) and `is_chunked_for_body_cap(req)`
+/// (body_cap_httplib.hpp, httplib's own chunked decision). An empty first
 /// `Transfer-Encoding` or `Content-Encoding` line hides a later one that httplib
-/// still honours. `has_content_length` is the presence of any `Content-Length`
-/// line. `server.cpp`'s one call is pinned in full (the whole argument list, in
-/// order) by test_step_up_wiring.cpp, which also pins the two statements that derive
-/// `has_content_length`; the test fixture uses the same accessors.
+/// still honours. `has_content_length` comes from `has_content_length_for_body_cap(req)`
+/// (body_cap_httplib.hpp: the presence of any `Content-Length` line), whose body
+/// test_body_cap_policy.cpp pins. `server.cpp`'s one call is pinned in full (the whole
+/// argument list, in order) by test_step_up_wiring.cpp; the test fixture uses the same
+/// accessors.
 ///
 /// Composes `resolve_body_cap` (this header) with the framing/encoding
 /// predicates in `web_utils.hpp` (`has_non_identity_content_encoding`,
