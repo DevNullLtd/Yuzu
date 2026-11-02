@@ -1270,9 +1270,25 @@ check_mgmt_auth_config() ->
                 true ->
                     logger:warning(
                       "{yuzu_gw, mgmt_peer_identity} is set but mgmt_peer_auth_mode is "
-                      "pin (the default), so the identity is ignored and only a pin "
-                      "admits the server. Set mgmt_peer_auth_mode to identity_or_pin or "
+                      "pin, so the identity is ignored and only a pin admits the "
+                      "server. Set mgmt_peer_auth_mode to identity_or_pin or "
                       "identity to use the identity.");
+                false ->
+                    ok
+            end,
+            case Guarded andalso
+                 application:get_env(yuzu_gw, mgmt_peer_auth_mode, undefined) =:= undefined of
+                true ->
+                    logger:warning(
+                      "{yuzu_gw, mgmt_peer_auth_mode} is not set; defaulting to pin "
+                      "(the SPKI pins of mgmt_peer_pins only, as before #6016). Set it "
+                      "explicitly: identity admits the server by the install CA's "
+                      "server identity, which the shipped reference configs set and "
+                      "which a later release may make the default for an unset key; "
+                      "pin keeps pins only and is what bring-your-own certificates, "
+                      "--no-default-certs and a server given its own --cert/--key "
+                      "need, since they carry no identity. See "
+                      "docs/user-manual/gateway.md.");
                 false ->
                     ok
             end,

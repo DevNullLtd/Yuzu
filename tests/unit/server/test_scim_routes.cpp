@@ -6490,3 +6490,158 @@ TEST_CASE("RefusalLogThrottle: one warn per key per interval, bounded memory, cl
     // Once the old keys age out, the table accepts a new one again.
     CHECK(t.should_warn("c", t0 + seconds(130)));
 }
+
+// ── #4068 (CC6.8): the desync-repair read answering with a STORE ERROR ─────────────────────────
+//
+// PUT/PATCH `active:false` on a resource whose mirror already reads inactive must verify the REAL
+// account state before taking the "already deprovisioned" no-op. A store ERROR on that read is not
+// "genuinely inactive": the old `has_value()` branch took the no-op (a 200 reporting the
+// deprovision complete while the account may still be live). The fault moves ONLY `auth.users`
+// aside, so the SCIM mirror, the bearer token and the audit store keep working and the 503 can
+// only come from the new branch. RAII-restored.
+
+namespace {
+
+class AuthUsersFault : public yuzu::test::SqlFault {
+public:
+    explicit AuthUsersFault(yuzu::server::pg::PgPool& pool)
+        : SqlFault(pool, "ALTER TABLE auth.users RENAME TO users_4068_gone",
+                   "ALTER TABLE auth.users_4068_gone RENAME TO users") {}
+};
+
+/// The `scim.user.deactivated` rows of one resource, keyed by `scim_id` like every row of that
+/// action.
+std::vector<AuditEvent> deactivated_failure_rows(Fixture& f, const std::string& scim_id) {
+    std::vector<AuditEvent> out;
+    for (auto& r : audit_rows(f, "scim.user.deactivated", scim_id))
+        if (r.result == "failure")
+            out.push_back(std::move(r));
+    return out;
+}
+
+double get_user_role_store_errors(Fixture& f) {
+    return f.metrics.counter("yuzu_auth_get_user_role_store_error_total").value();
+}
+
+/// Hold every connection of the Fixture pool (a bounded probe per lease).
+std::vector<yuzu::server::pg::PgPool::Lease> drain_fixture_pool(yuzu::server::pg::PgPool& pool) {
+    std::vector<yuzu::server::pg::PgPool::Lease> held;
+    for (int i = 0; i < 64; ++i) {
+        auto lease = pool.try_acquire_for(std::chrono::milliseconds(50));
+        if (!lease)
+            break;
+        held.push_back(std::move(lease));
+    }
+    // The Fixture pool (AuthDbPg) has 4 connections: a short drain would let the request
+    // succeed and turn the 401 assertion into a flake, so fail loudly instead.
+    REQUIRE(held.size() == 4);
+    return held;
+}
+
+} // namespace
+
+TEST_CASE("ScimRoutes: PATCH active=false on a desynced mirror answers a retryable 503, not the "
+          "no-op, when the auth store cannot confirm the account state (#4068)",
+          "[pg][scim][routes][patch][deprovision][store-error]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "ursa"}})->body);
+    const auto id = created["id"].get<std::string>();
+    REQUIRE(f.scim_store->set_active(id, false)); // mirror inactive, account live
+    const auto errors_before = get_user_role_store_errors(f);
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    AuthUsersFault fault{f.auth_db.pool()};
+    fault.arm();
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    fault.repair();
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->body.find("authorization store unavailable") != std::string::npos);
+
+    // The refusal is the NEW branch's: one failure row keyed by scim_id, the store-error counter
+    // moved, and nothing was repaired (the account is still live).
+    const auto rows = deactivated_failure_rows(f, id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail.starts_with("store_unavailable"));
+    CHECK(get_user_role_store_errors(f) == errors_before + 1);
+    CHECK(f.auth_mgr.get_user_role("ursa").has_value());
+
+    // A retry once the store is healthy completes the deactivation.
+    auto retry = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(retry);
+    CHECK(retry->status == 200);
+    CHECK_FALSE(f.auth_mgr.get_user_role("ursa").has_value());
+}
+
+TEST_CASE("ScimRoutes: PUT active=false on a desynced mirror answers a retryable 503, not the "
+          "no-op, when the auth store cannot confirm the account state (#4068)",
+          "[pg][scim][routes][put][deprovision][store-error]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "ursula2"}})->body);
+    const auto id = created["id"].get<std::string>();
+    REQUIRE(f.scim_store->set_active(id, false)); // mirror inactive, account live
+    const auto errors_before = get_user_role_store_errors(f);
+
+    AuthUsersFault fault{f.auth_db.pool()};
+    fault.arm();
+    auto res = f.put("/scim/v2/Users/" + id, {{"userName", "ursula2"}, {"active", false}});
+    fault.repair();
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->body.find("authorization store unavailable") != std::string::npos);
+
+    const auto rows = deactivated_failure_rows(f, id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail.starts_with("store_unavailable"));
+    CHECK(get_user_role_store_errors(f) == errors_before + 1);
+    CHECK(f.auth_mgr.get_user_role("ursula2").has_value()); // still live, not reported done
+
+    auto retry = f.put("/scim/v2/Users/" + id, {{"userName", "ursula2"}, {"active", false}});
+    REQUIRE(retry);
+    CHECK(retry->status == 200);
+    CHECK_FALSE(f.auth_mgr.get_user_role("ursula2").has_value());
+}
+
+// CHARACTERISATION of what the #4068 fix does NOT cover (governance Gate 5, CH-1): the same store
+// outage answers differently depending on WHERE it bites. Each cell is a measured fact, pinned so
+// the follow-ups that make these retryable 503s (#6835: tri-state ScimStore reads / bearer
+// validation; #6836: deactivate()'s provenance and role checks) are a deliberate, visible edit of
+// these values.
+TEST_CASE("ScimRoutes: characterisation - store-outage answers the #4068 fix does not cover",
+          "[pg][scim][routes][patch][deprovision][store-error][characterisation]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "chara"}})->body);
+    const auto id = created["id"].get<std::string>();
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+
+    SECTION("mirror ACTIVE + auth.users unreadable: deactivate()'s provenance check -> 404") {
+        AuthUsersFault fault{f.auth_db.pool()};
+        fault.arm();
+        auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+        fault.repair();
+        REQUIRE(res);
+        // KNOWN GAP (pre-existing): a store error read as "not ours" -> 404 provenance_denied,
+        // not a retryable 503. The IdP is told the resource is gone for a deprovision that did
+        // not happen.
+        CHECK(res->status == 404);
+        CHECK(f.auth_mgr.get_user_role("chara").has_value()); // still live
+    }
+
+    SECTION("whole-pool outage: the bearer check fails first -> 401") {
+        std::unique_ptr<httplib::Response> res;
+        {
+            auto held = drain_fixture_pool(f.auth_db.pool());
+            REQUIRE_FALSE(held.empty());
+            res = f.patch("/scim/v2/Users/" + id, patch_body);
+        }
+        REQUIRE(res);
+        // KNOWN GAP (pre-existing): validate_token returns false when it cannot lease, so a pool
+        // outage is a credential failure on this surface, before any #4068 code runs.
+        CHECK(res->status == 401);
+        CHECK(f.auth_mgr.get_user_role("chara").has_value());
+    }
+}

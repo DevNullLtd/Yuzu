@@ -391,6 +391,13 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
             // admin). get_user_role() queries the current role on every call, so
             // a creator who's been demoted since the token was issued will
             // produce a user-role session.
+            //
+            // #4068: both NotFound and DbError floor to Role::user HERE ON
+            // PURPOSE - flooring only lowers privilege, so it is safe in either
+            // case, and a 503 on every token request during a PG blip is a much
+            // larger behaviour change. A DbError is still signalled by
+            // `yuzu_auth_get_user_role_store_error_total` (incremented inside
+            // get_user_role()).
             auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
             synth.role = legacy_role.value_or(auth::Role::user);
         }
