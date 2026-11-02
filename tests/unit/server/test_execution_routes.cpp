@@ -36,12 +36,16 @@
 #include "test_route_sink.hpp"
 
 #include "execution_tracker.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_execution_tracker_pg_helper.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
+
+#include <libpq-fe.h>
 
 #include <filesystem>
 #include <fstream>
@@ -592,6 +596,43 @@ TEST_CASE("execution_routes: cancel success audits + emits; an unconfined caller
     REQUIRE(unknown);
     CHECK(unknown->status == 404);
     CHECK(h.audits.size() == 2); // unchanged
+}
+
+// #3845: a genuine store failure on the cancel write is the ONE case that answers 503. Break the
+// outbox append (the cancel and its event commit in one transaction) so `mark_cancelled_checked`
+// returns kFailed on a row the route has already read and admitted.
+TEST_CASE("execution_routes: #3845 cancel answers 503 + audited 'failure' only on a real store "
+          "failure, and the row is left running",
+          "[pg][server][routes][execution_routes]") {
+    yuzu::test::ExecutionTrackerPg tracker;
+    Harness h;
+    h.execution_tracker = tracker.get();
+    h.fleet_scope = std::nullopt;
+    h.wire();
+
+    auto id = tracker->create_execution(make_execution("def-degrade", "bob"));
+    REQUIRE(id.has_value());
+
+    {
+        auto lease = tracker.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(lease.get(), "DROP TABLE execution_tracker.event_outbox",
+                                   std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto r = h.sink.Post("/api/executions/" + *id + "/cancel", "{}");
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    CHECK(r->body.find("execution store degraded") != std::string::npos);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "execution.cancel");
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.emits.empty());
+
+    auto exec = tracker->get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
