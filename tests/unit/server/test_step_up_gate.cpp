@@ -3458,12 +3458,15 @@ TEST_CASE("the central 503 for an unverifiable binding names the runbook and doe
         v.decision = StepUpDecision::kStoreUnavailable;
         v.reason = reason;
         const auto err = nlohmann::json::parse(step_up_refusal_json_rpc_error(v, "cid-1"));
-        CHECK(err["message"] == "this account's second-factor state cannot be verified");
+        CHECK(err["message"] ==
+              "this account's second-factor state cannot be verified; if it persists, ask an "
+              "administrator to follow the MFA binding enforcement runbook");
         CHECK(err["data"]["http_status"] == 503);
         CHECK(err["data"]["mfa_step_up_required"] == false);
         const std::string remediation = err["data"]["remediation"].get<std::string>();
         CHECK(remediation.find("runbook") != std::string::npos);
-        CHECK(remediation.find("--mfa-reset") != std::string::npos);
+        CHECK(remediation.find("--mfa-reset <user>") != std::string::npos);
+        CHECK(remediation.find("retrying helps only if") != std::string::npos);
         CHECK(remediation.find("retry shortly") == std::string::npos);
         CHECK_FALSE(err["data"].contains("challenge_url"));
     }

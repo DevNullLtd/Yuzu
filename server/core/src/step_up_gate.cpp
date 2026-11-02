@@ -51,13 +51,17 @@ RefusalText refusal_text(const StepUpVerdict& v) {
         // before the factor-generation cutover, generation 0; a trigger that is not in force).
         // The text must not promise that a retry helps and must not tell the caller to re-prove
         // (re-proving cannot help: the proof cannot be judged), so `mfa_step_up_required` is
-        // false; the audit row carries the same `reason=` token that tells the causes apart.
+        // false; the audit row carries the same `reason=` token that tells the causes apart. The
+        // message carries the actionable step itself because some UIs (the Settings toasts)
+        // show only the message, never the remediation.
         if (!v.reason.empty()) {
             return {503,
-                    "this account's second-factor state cannot be verified",
-                    "if retrying does not clear it, an administrator must follow the MFA binding "
-                    "enforcement runbook (an account enrolled before the upgrade needs "
-                    "`yuzu-server --mfa-reset`)",
+                    "this account's second-factor state cannot be verified; if it persists, ask "
+                    "an administrator to follow the MFA binding enforcement runbook",
+                    "retrying helps only if the read failed transiently; for an account enrolled "
+                    "before the upgrade (factor generation not positive) an administrator resets "
+                    "it with `yuzu-server --mfa-reset <user>` after checking, otherwise they "
+                    "restore the MFA binding triggers and restart per the runbook",
                     {},
                     false};
         }
