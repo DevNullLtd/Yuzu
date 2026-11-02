@@ -67,7 +67,7 @@ inputs ever change (a new manifest, a new pinned commit, a key-format migration)
 ENTRIES BEHIND that fallback stop being reachable by a fresh primary key but stay immortal
 via the open prefix — the same quota-crowding failure mode as below, just gated on how
 often the key's inputs change rather than guaranteed on every run. The vcpkg example
-further down carries this risk today, tracked but not yet fixed (#3888).
+further down describes the pre-bump shape; the canary's restore-key was narrowed in the 2026.10.16 baseline bump (#3888).
 
 It is a WRONG shape outright — correctness-safe or not — for a time-bucket key (see "For
 ccache" below), where the key's inputs change on every run by construction: a bare
@@ -148,8 +148,8 @@ quota-crowding risk as an unfixed time-bucket key. That risk is gated on how oft
 `VCPKG_COMMIT` itself changes, not the manifest or triplet hash: a manifest-only change is
 already absorbed by the first tier (`vcpkg-<triplet>-<COMMIT>-`, still matching since
 `VCPKG_COMMIT` is unchanged), so the bare tier only gets reached when `VCPKG_COMMIT` moves
-or every first-tier entry has aged out. The canary's live copy of this pattern has this
-risk today, tracked as #3888.
+or every first-tier entry has aged out. The canary's copy of this pattern had this
+risk until the 2026.10.16 baseline bump narrowed its restore-key (#3888).
 
 For ccache: a TIME-BUCKET key, not a source hash. ccache hashes the real
 preprocessed input per object, so the GHA cache key needs no source identity —

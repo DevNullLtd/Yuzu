@@ -204,8 +204,8 @@ toolchain-contract inventory test finds an unlisted active reference.
 
 ### Baseline bump 2026.10.16
 
-`builtin-baseline` moved from `4b77da7fed37817f124936239197833469f1b9a8` to
-`9eec002df1cd109f8f104cd966a763daf9751489` (committed 2026-10-17 UTC, tagged
+`builtin-baseline` moved from `4b77da7fed37` to `9eec002df1cd` (short SHAs; the full
+values are in `vcpkg.json`; committed 2026-10-17 UTC, tagged
 `2026.10.16` upstream). Versions and licenses are read from
 `ports/<port>/vcpkg.json` at each commit; `pv` is `port-version`.
 
@@ -230,13 +230,15 @@ toolchain-contract inventory test finds an unlisted active reference.
 direct dependencies in `vcpkg.json` only; transitive dependencies were not
 checked.
 
+The drogon change is a permissive one (MIT to MIT AND BSD-3-Clause), compatible with
+AGPL-3.0-or-later. drogon is used only by the `yuzu_drogon_canary` build target
+(`server/core/meson.build`, `install: false`) and is not distributed.
+
 **Resolver use-after-free, closed on glibc only.** The cpp-httplib 0.59.0
 header carries the fix for upstream issue 2431 (a use-after-free around
 `getaddrinfo_a` cancellation), in its glibc branch only; the 0.43.2 header
 already carries the same fix. No CVE id is cited: none appears in the vcpkg
-tree. The Windows `GetAddrInfoEx` cancel path and the macOS `CFHost` path are
-not fixed by it. The Windows hazard has no tracking issue yet (it is planned
-with the outbound DNS work) and must stay open until fixed.
+tree. The Windows `GetAddrInfoEx` and macOS `CFHost` resolver paths are unchanged by this bump.
 
 **New behaviour.** On glibc builds a timed-out outbound name lookup now waits for the
 resolver itself (cpp-httplib estimates about 30 seconds with default resolver

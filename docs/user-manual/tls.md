@@ -34,7 +34,9 @@ credentials still negotiate whatever gRPC's library default offers
 (AEAD-only suites, TLS 1.2 floor) — the agent side is not yet pinned; tracked
 under [#4722](https://github.com/Tr3kkR/Yuzu/issues/4722).
 
-**Windows outbound HTTPS trust store.** On Windows, a cpp-httplib HTTPS client
+## Windows outbound HTTPS trust store
+
+On Windows, a cpp-httplib HTTPS client
 that keeps default trust verifies the server certificate chain through the
 Windows certificate store (Schannel) alone. In cpp-httplib 0.59 Schannel asks
 Windows to build a chain to a trusted root and requires the `serverAuth`
