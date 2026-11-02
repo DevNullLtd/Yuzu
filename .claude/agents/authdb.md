@@ -197,7 +197,8 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
 
 - **MFA proofs bind to a DATABASE-OWNED factor generation (#6079).**
   `auth.users.mfa_factor_gen` is assigned only by the row trigger
-  `users_mfa_factor_gen` (`ENABLE ALWAYS`, auth migration v3), a fresh random
+  `users_mfa_factor_gen` (`ENABLE ALWAYS`, auth migration v3; its function is
+  created `SET search_path = pg_catalog` and the boot check pins `proconfig`), a fresh random
   positive value (about 60 bits) on every change of `mfa_enrolled_at`, never a
   counter; application code never writes it. The TOTP and recovery-code
   verifiers return `MfaVerification{ok, factor_gen, verified_ms}` and
