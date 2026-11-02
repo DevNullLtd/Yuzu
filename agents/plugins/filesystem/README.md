@@ -809,5 +809,4 @@ total_lines_after|1
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
 - Tests: `tests/test_filesystem_definition.py` · `tests/unit/test_filesystem_acl_parsers.cpp` · `tests/unit/test_filesystem_actions.cpp` · `tests/unit/test_filesystem_find_by_hash.cpp` · `tests/unit/test_filesystem_find_by_hash_dispatcher.cpp` · `tests/unit/test_filesystem_get_acl_dispatcher.cpp` · `tests/unit/test_filesystem_local_dispatcher.cpp` · `tests/unit/test_filesystem_macos_sig.cpp` · `tests/unit/test_filesystem_posture_local_dispatcher.cpp` · `tests/unit/test_filesystem_posture_parsers.cpp` · `tests/unit/test_filesystem_read.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-04-filesystem-acl.added.md`
 <!-- END GENERATED -->

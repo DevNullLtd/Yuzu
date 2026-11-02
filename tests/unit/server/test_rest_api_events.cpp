@@ -714,7 +714,7 @@ TEST_CASE("OpenAPI spec lists /events under the agentic-first surface", "[pg][ev
     // documented OpenAPI surface. The text-shape check is enough — the
     // JSON parse is exercised by the OpenAPI ecosystem, not here.
     REQUIRE(res->body.find(R"("/events":)") != std::string::npos);
-    REQUIRE(res->body.find("agentic-first JSON Server-Sent Events") != std::string::npos);
+    REQUIRE(res->body.find("Authenticated JSON Server-Sent Events channel") != std::string::npos);
     REQUIRE(res->body.find("Execution:Read") != std::string::npos);
 }
 

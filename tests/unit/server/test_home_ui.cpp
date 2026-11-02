@@ -5,6 +5,7 @@
 /// menu), no fragment loads, the signed-out and signed-in variants, the
 /// `next` allow-list, and the redirect location the auth chokepoint uses.
 
+#include "app_shell.hpp"
 #include "home_ui.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -132,7 +133,7 @@ TEST_CASE("landing: the head carries the first-paint theme boot; one inline scri
         CHECK_THAT(script, ContainsSubstring("try{"));
         CHECK_THAT(script, ContainsSubstring("}catch(e){}"));
         CHECK_THAT(script, ContainsSubstring("localStorage.getItem('yuzu-theme')"));
-        CHECK_THAT(script, ContainsSubstring("/^(slate|navy|jade|light|light-baby|light-hot)$/.test("));
+        CHECK_THAT(script, ContainsSubstring("/" + std::string(shell::kThemeWhitelistRe) + "/.test("));
         CHECK_THAT(script, ContainsSubstring("document.documentElement.setAttribute('data-theme',"));
     }
 }

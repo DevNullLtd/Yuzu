@@ -218,5 +218,4 @@ config|port|-|-
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_remote_access_audit.hpp`
 - Tests: `tests/test_remote_access_audit_definition.py` · `tests/unit/test_remote_access_audit_config_parsers.cpp` · `tests/unit/test_remote_access_audit_keys_parsers.cpp` · `tests/unit/test_remote_access_audit_legs.cpp` · `tests/unit/test_remote_access_audit_local_dispatcher.cpp` · `tests/unit/test_remote_access_audit_posix_fs.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-17-remote_access_audit.added.md`
 <!-- END GENERATED -->

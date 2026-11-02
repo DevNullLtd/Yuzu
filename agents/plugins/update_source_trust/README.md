@@ -209,5 +209,4 @@ apt_keyring|/etc/apt/trusted.gpg.d/debian-archive-trixie-stable.asc|trusted_gpg_
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_update_source_trust.hpp`
 - Tests: `tests/test_update_source_trust_definition.py` · `tests/test_update_source_trust_tokens.py` · `tests/unit/test_update_source_trust_linux_parsers.cpp` · `tests/unit/test_update_source_trust_local_dispatcher.cpp` · `tests/unit/test_update_source_trust_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/wave10-pr10.1d-update_source_trust.added.md`
 <!-- END GENERATED -->

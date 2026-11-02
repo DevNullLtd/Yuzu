@@ -461,7 +461,7 @@ TEST_CASE("app shell: the colour-scheme boot script runs first; whitelisted and 
     CHECK(boot < html.find("<nav"));
     // Exact-match whitelist of the six schemes, a try/catch around the store, and the attribute
     // goes on <html> (the :root element the token aliases resolve on).
-    CHECK_THAT(html, ContainsSubstring("/^(slate|navy|jade|light|light-baby|light-hot)$/.test(t)"));
+    CHECK_THAT(html, ContainsSubstring("/" + std::string(kThemeWhitelistRe) + "/.test(t)"));
     CHECK_THAT(html, ContainsSubstring("document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>"));
     // Nothing else reads the key: one boot per shell render.
     CHECK(count_of(html, "yuzu-theme") == 1);

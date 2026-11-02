@@ -859,10 +859,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_local_security_policy.hpp"
     ],
-    "changelog": [
-      "changelog.d/2026-09-29-local_security_policy-windows-sudoers.added.md",
-      "changelog.d/5069-local_security_policy.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/local_security_policy.yaml"
     ],

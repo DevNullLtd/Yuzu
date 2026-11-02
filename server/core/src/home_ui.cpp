@@ -79,13 +79,16 @@ const Screen* screen_by_href(std::string_view href) {
     return nullptr;
 }
 
-constexpr std::string_view kHead = R"HTM(<!DOCTYPE html>
+constexpr std::string_view kHeadPre = R"HTM(<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Yuzu</title>
 <link rel="icon" href="data:,"><link rel="stylesheet" href="/static/yuzu.css">
 <script src="/static/htmx.js"></script>
-<script>try{var t=localStorage.getItem('yuzu-theme');if(/^(slate|navy|jade|light|light-baby|light-hot)$/.test(t))document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<script>try{var t=localStorage.getItem('yuzu-theme');if(/)HTM";
+
+// The whitelist regex (shell::kThemeWhitelistRe) is spliced between kHeadPre and kHeadPost.
+constexpr std::string_view kHeadPost = R"HTM(/.test(t))document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
 </head><body>
 <div class="land">
 <header class="lh"><a class="brand" href="/home" aria-label="Yuzu home">Yuzu<i></i></a>)HTM";
@@ -106,7 +109,7 @@ constexpr std::string_view kMfaNote =
 constexpr std::string_view kSignedInLine =
     "You are signed in. Open the Console, or pick an area below.";
 
-static_assert(kHead.size() < 15000 && kHeadline.size() < 15000,
+static_assert(kHeadPre.size() < 15000 && kHeadPost.size() < 15000 && kHeadline.size() < 15000,
               "MSVC C2026: keep every raw string literal under the 16,380-byte cap");
 
 void append_tiles(std::string& out) {
@@ -229,7 +232,9 @@ std::string render_landing(const LandingView& v) {
     const std::string host = html_escape(std::string(v.server_name));
     std::string out;
     out.reserve(24000);
-    out += kHead;
+    out += kHeadPre;
+    out += shell::kThemeWhitelistRe;
+    out += kHeadPost;
     out += R"(<span class="srv">)";
     // The page is reachable without a session, so the server name and the running
     // version (what an attacker looks up CVEs against) are shown to a signed-in

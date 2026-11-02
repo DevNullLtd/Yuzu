@@ -1421,9 +1421,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
     ],
-    "changelog": [
-      "changelog.d/2026-10-04-network_config-routes.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/network_config.yaml"
     ],
