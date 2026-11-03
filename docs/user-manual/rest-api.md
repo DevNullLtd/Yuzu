@@ -11073,7 +11073,8 @@ These endpoints drive the **Settings → Security and sign-in → Two-factor sig
 - **Effect:** Atomic DELETE + 10×INSERT inside a Postgres transaction, serialized on the caller's `auth.users` row (`SELECT … FOR UPDATE`) so two concurrent regenerations cannot interleave (#3779). All prior codes (consumed and unconsumed) are invalidated. If the account has been deactivated, the codes are **not** reissued and the request fails.
 - **Response (200):** HTML fragment with the fresh 10 codes as a one-time reveal. Same `Cache-Control: no-store` headers.
 - **Response (409):** the account's factor changed after the step-up check admitted the request (compared under the account's row lock, in the same transaction as the write). Nothing was regenerated and the committed code set is untouched; the fragment asks the user to reload, and the session is not ended. Counted `yuzu_auth_mfa_factor_changed_total{route="recovery_codes"}`.
-- **Audit:** `mfa.recovery_codes.generated` / `ok` (detail = `10 codes issued (rotation)`); `denied` with detail `reason=factor_changed expected_gen=<n>` for the `409`.
+- **Response (200, failure):** a store or random-source fault during regeneration. The fragment is a notice, not codes: the transaction rolled back, so the existing recovery codes should be unchanged, and the user is asked to regenerate again if unsure (a lost COMMIT acknowledgement cannot be told apart from a rollback). No counter moves.
+- **Audit:** `mfa.recovery_codes.generated` / `ok` (detail = `10 codes issued (rotation)`); `denied` with detail `reason=factor_changed expected_gen=<n>` for the `409`; `error` with detail `regeneration failed` for the failure notice.
 
 **`POST /api/settings/mfa/disable`** — Clear MFA state for the logged-in admin.
 
