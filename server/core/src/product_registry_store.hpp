@@ -56,8 +56,9 @@
 /// selected a row before the mutation commits would otherwise upsert it afterwards,
 /// stamping the current `pack_version` over the sentinel and losing the invalidation.
 /// `upsert_product` and `upsert_alias` ARE such mutations and follow the contract themselves
-/// (the lock, the write and the sentinel in one transaction; `upsert_alias` marks every row
-/// stale because the alias key cannot be reproduced in SQL). The store's other own mutations
+/// (the lock, the write and the sentinel in one transaction, only when the write changes a
+/// resolution; `upsert_alias` marks every row stale because the alias key cannot be
+/// reproduced in SQL). The store's other own mutations
 /// (the seed load, which stamps the pack version, and the `ON DELETE SET NULL` foreign key)
 /// need no sentinel write. A `products.category`
 /// outside `kCategories` is written to the dimension as `other` (its `category` column is
@@ -73,6 +74,7 @@
                       // pg_migration_runner.hpp - include libpq, never re-declare pg_conn)
 
 #include <cstdint>
+#include <chrono>
 #include <expected>
 #include <optional>
 #include <string>
@@ -88,6 +90,14 @@ class PgPool;
 }
 
 namespace yuzu::server {
+
+/// The advisory-lock key every normalisation pass TRIES and every registry writer that can change
+/// a title's resolution BLOCKS on (the dimension invalidation contract above). One spelling:
+/// two copies of a catastrophic-if-violated lock key drift apart.
+inline constexpr std::string_view kNormalizationLockKey = "software_normalization";
+/// How long such a writer waits for a pass to release the lock. It must exceed a pass's budget
+/// (`kPassBudget`, software_title_dimension.hpp, which static_asserts that).
+inline constexpr std::chrono::seconds kNormalizationLockWait{90};
 
 struct ParsedPack; // software_normalization_pack.hpp
 
@@ -177,9 +187,11 @@ public:
     /// the row's product_id via `RETURNING`; `std::nullopt` on a store/pool/
     /// query failure (fail-soft — the evaluator retries next cycle; never
     /// throws). An empty `norm_key` is a precondition miss → `std::nullopt`. Follows the
-    /// dimension invalidation contract: blocks on the normalisation lock (bounded by a 90 s
-    /// transaction timeout, a failed wait is a `std::nullopt`), then upserts and marks the
-    /// title-dimension rows resolved to this product, and every unnormalized row, stale.
+    /// dimension invalidation contract: blocks on the normalisation lock (bounded by
+    /// `kNormalizationLockWait`, 90 s; a failed wait is a `std::nullopt`), reads the current row
+    /// under it, upserts, and marks title-dimension rows stale in the same transaction: the
+    /// rows resolved to this product when its vendor/title/edition/platform changed, every
+    /// unnormalized row when the product is new, and nothing when the write changes nothing.
     [[nodiscard]] std::optional<std::int64_t>
     upsert_product(std::string_view norm_key, std::string_view vendor, std::string_view title,
                    std::string_view edition, std::string_view platform);
@@ -190,8 +202,10 @@ public:
     /// preserved). `product_id` must reference an existing products row (FK) —
     /// a dangling id fails the statement and returns false. Fail-soft: false
     /// on any failure, never throws. Follows the dimension invalidation contract: blocks on
-    /// the normalisation lock (bounded by a 90 s transaction timeout), then upserts and marks
-    /// EVERY title-dimension row stale in the same transaction.
+    /// the normalisation lock (bounded by `kNormalizationLockWait`, 90 s), then upserts and, when
+    /// the link is new or re-points the product or changes the method, marks EVERY title-dimension
+    /// row stale in the same transaction (the alias key cannot be reproduced in SQL). A refresh
+    /// that changes neither marks nothing, so a per-cycle caller does not re-queue the dimension.
     [[nodiscard]] bool upsert_alias(std::string_view source, std::string_view raw_name,
                                     std::string_view raw_publisher, std::int64_t product_id,
                                     std::string_view method, double confidence);

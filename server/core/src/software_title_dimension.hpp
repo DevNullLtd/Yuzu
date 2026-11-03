@@ -37,7 +37,7 @@
 ///
 /// Dimension invalidation: a row is re-normalised when its `pack_version`
 /// differs from the current pack, when its product was deleted, or when its
-/// `pack_version` is '' (the stale sentinel a future curation write sets - see
+/// `pack_version` is '' (the stale sentinel a registry write sets - see
 /// product_registry_store.hpp).
 
 #include "product_normalize.hpp"
@@ -76,6 +76,11 @@ inline constexpr int kMaxPassesPerTick = 100; ///< passes per tick (up to 200,00
 /// Wall budget per pass == statement_timeout. A GUARD, not the bound: the in-lease C++ is
 /// O(batch) (normalise + hash lookups over two keyed reads), milliseconds for a full page.
 inline constexpr std::chrono::seconds kPassBudget{60};
+/// A later pass of a tick starts only while at least this much of the tick budget is left, so a
+/// pass (milliseconds of work for a full page) cannot be given a remainder it could outrun.
+inline constexpr std::chrono::seconds kMinLaterPassBudget{5};
+static_assert(kNormalizationLockWait > kPassBudget,
+              "a registry writer must outwait a normalisation pass that holds the lock");
 
 /// A raw installed-software triple (exactly as `title_triples` holds it).
 struct TitleKey {
@@ -127,7 +132,8 @@ struct TickResult {
     /// created. A clean tick; the job re-arms early so the first titles are not an hour late.
     /// False on any error or cancel, like `capped`.
     bool source_pending{false};
-    /// The tick ran its pass cap and the last pass was a full page: a backlog remains.
+    /// The tick ran its pass cap, or spent its tick budget, and the last pass was a full page: a
+    /// backlog remains.
     /// False on any error, cancel or peer skip (an immediate retry would re-select the same
     /// batch and repeat the failure), so the job re-arms early ONLY on a healthy backlog.
     bool capped{false};
@@ -159,9 +165,9 @@ public:
     /// (production: `kMaxPassesPerTick`; a parameter so a test can reach the cap with
     /// a small fixture). `tick_budget` is ONE wall deadline for the passes of the whole
     /// tick (production: `kPassBudget`, the 60 s the backlog re-arm assumes): the first pass
-    /// always runs, a later pass starts only while the budget remains and is given what
-    /// is left of it, and a tick that stops on the budget reports `capped` (a full page
-    /// preceded it, so a backlog remains). Does not throw, because `run_pass`, `reconcile_queue` and
+    /// always runs, a later pass starts only while `kMinLaterPassBudget` or more of the budget
+    /// is left and is given what is left of it, and a tick that stops on the budget reports
+    /// `capped` (a full page preceded it, so a backlog remains). Does not throw, because `run_pass`, `reconcile_queue` and
     /// `refresh_gauges` each catch internally; the `cancelled` predicate must not throw.
     [[nodiscard]] TickResult run_tick(const std::function<bool()>& cancelled = {},
                                       int max_passes = kMaxPassesPerTick,

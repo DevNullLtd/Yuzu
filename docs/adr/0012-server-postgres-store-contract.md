@@ -348,7 +348,7 @@ milliseconds; no product scan or fuzzy matching runs in the lease. A cooperative
 wall budget are still polled inside the resolve loop as a guard, not as the bound, since that loop
 is covered by no SQL timeout. A degraded pass rolls back and keeps last-good.
 
-Stale-sentinel contract, binding on the curation routes that will write registry aliases: a registry write that can change
+Stale-sentinel contract, binding on every registry writer (`ProductRegistryStore::upsert_product` and `upsert_alias` implement it, and the curation routes that will call them inherit it): a registry write that can change
 a title's resolution sets the affected `title_dimension.pack_version = ''` in the same transaction,
 and that write MUST first take the blocking `pg_advisory_xact_lock(hashtextextended(
 'software_normalization', 0))` that every pass tries. Without the lock a pass that selected the row

@@ -678,8 +678,8 @@ TEST_CASE("ADVERSARIAL: disposed_clean overlapping the sweep set — DELETE wins
 //    fix). `pg_advisory_xact_lock` keys are a SINGLE 64-bit space shared by the
 //    whole Postgres backend/cluster — NOT scoped per schema/table. Before the
 //    fix, VulnFindingStore's reconcile_agent computed the IDENTICAL lock formula
-//    as SoftwareInventoryStore's full-replace ingest
-//    (`hashtextextended(agent_id, 0)`, software_inventory_store.cpp:~467), so the
+//    as SoftwareInventoryStore's full-replace ingest USED TO
+//    (`hashtextextended(agent_id, 0)`; that store now prefixes its key too), so the
 //    two UNRELATED stores collided on the exact same key for a given agent — a
 //    long-running software-inventory ingest for agent X needlessly serialized a
 //    concurrent vuln-finding reconcile for the SAME agent X even though they
@@ -734,7 +734,8 @@ TEST_CASE("ADVERSARIAL: VulnFindingStore's advisory lock key is namespaced away 
     // once). pg_advisory_xact_lock returns void, so we don't route it through the
     // try-lock witness helper.
     REQUIRE(yuzu::server::pg::exec_params(
-                leaseA.get(), "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                leaseA.get(),
+                "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || $1, 0))",
                 std::vector<std::string>{agent})
                 .status() == PGRES_TUPLES_OK);
     // B try-locks the namespaced vuln key — disjoint → TRUE.

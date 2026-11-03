@@ -91,9 +91,9 @@ bool set_statement_timeout(PGconn* c) {
 /// failed OR answered with any shape other than one row of exactly "t" or "f" (fail closed:
 /// an unexpected answer never reads as "we hold the lock").
 std::optional<bool> try_norm_lock(PGconn* c) {
-    pg::PgResult lk = exec_logged(
-        c, "advisory lock",
-        "SELECT pg_try_advisory_xact_lock(hashtextextended('software_normalization', 0))", {});
+    static const std::string lock_sql = "SELECT pg_try_advisory_xact_lock(hashtextextended('" +
+                                        std::string(kNormalizationLockKey) + "', 0))";
+    pg::PgResult lk = exec_logged(c, "advisory lock", lock_sql.c_str(), {});
     if (lk.status() != PGRES_TUPLES_OK)
         return std::nullopt;
     if (PQntuples(lk.get()) == 1) {
@@ -650,7 +650,7 @@ TickResult SoftwareTitleDimension::run_tick(const std::function<bool()>& cancell
         if (pass > 0) {
             const auto left = std::chrono::duration_cast<std::chrono::seconds>(
                 tick_deadline - std::chrono::steady_clock::now());
-            if (left <= std::chrono::seconds{0}) {
+            if (left < kMinLaterPassBudget) {
                 tick.capped = true;
                 break;
             }
