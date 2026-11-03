@@ -8,7 +8,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 - **Now refused with `400` (was accepted):**
   - a `tags` or `managementGroups` inline `[ ]` list that does not close on its own line (an unclosed `tags: [prod` used to be stored with the tag missing; a multi-line `managementGroups: [g1,` list used to target `g1` plus junk);
   - a block list whose `- item` lines are not at one indent, or whose item continues on the next line;
-  - a list followed directly by another list's next item (end the list with another key, or write `key: []`);
+  - a list followed directly by another list's next item (end the list with another key first);
   - a list line missing its `- `, or a `- item` line indented to `selector:`'s own column;
   - a single value where a list is expected (`tags: prod` or `managementGroups: abc123def456`; write `tags: [prod]`), and list lines written after a value on the key line (`tags: null` or `tags: [a]` followed by `- prod`). `tags: null` and `managementGroups: null` on their own still mean none;
   - a `managementGroups` entry outside letters, digits and `_ . : * -`. Group ids are server-assigned, so no working reference is affected. A display name inside that charset (e.g. `web-servers`) is still accepted and, as before, matches no group (tracked in #3182).

@@ -149,7 +149,7 @@ std::vector<std::string> scan_block_list(const std::string& yaml, const KeyLine&
     // refused rather than stored with a different meaning (governance G2-SEC-F1,
     // G3-DSL-F1, G4-CON-F3, Gate 8 C8-1 / F8). The valid YAML this refuses is a
     // list (or an empty `key:`) followed directly by an OUTER list's next item;
-    // end the list with another key first, or write `key: []`. Blank and
+    // end the list with another key first (`key: []` there is refused too). Blank and
     // comment lines are skipped. A quirk kept deliberately: `-b` AT the item
     // column is read as the item `b` (at any other column it is the raw `- b`).
     const auto key_col = kl.key_pos - kl.line.begin;

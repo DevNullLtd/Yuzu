@@ -172,8 +172,8 @@ Policy and fragment YAML is read by the server's own line scanner (#2123):
   out of line with the others, or an item continued on the next line, makes
   the list unreadable as written, and the policy is refused with `400` rather
   than stored with a different scope. The same applies when a list is followed
-  directly by another list's next item: end the list with another key first,
-  or write `key: []` for an explicitly empty list. A line missing its `- `,
+  directly by another list's next item: end the list with another key first.
+  A line missing its `- `,
   an empty-string item (`- ""`), and a `- item` line indented to
   `selector:`'s own column, are refused the same way.
 - A single value where a list is expected (`tags: prod`,

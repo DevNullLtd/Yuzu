@@ -586,3 +586,13 @@ TEST_CASE("scope_yaml: the leading-space raw item names the list form to use (#2
     CHECK(err->find("write the list as '- item' lines or an inline [a, b] list") !=
           std::string::npos);
 }
+
+TEST_CASE("scope_yaml: an item with a space names the single-token rule (#2123 Gate 8)",
+          "[scope][dsl]") {
+    // Pins the round-5 hint text (round 5 quality-engineer Q5-1: reverting it
+    // survived every other test).
+    auto sb = parse_scope_block(doc("  scope:\n    selector:\n      tags:\n        - foo bar\n"));
+    auto err = validate_scope_block(sb, "", false);
+    REQUIRE(err.has_value());
+    CHECK(err->find("an item must be a single token") != std::string::npos);
+}
