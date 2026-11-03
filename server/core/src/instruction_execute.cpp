@@ -195,8 +195,8 @@ PrepareOutcome prepare_impl(Ctx& c) {
         c.audit("denied", "reason=invalid_definition_id definition=" +
                               ::yuzu::log_token(bounded_definition_id(rq.definition_id)));
         return refuse(c, make_refusal(RefusalKind::kBadRequest, "invalid_definition_id",
-                                      "definition id must be valid UTF-8 without control "
-                                      "characters",
+                                      "definition id must be valid UTF-8 and hold no control "
+                                      "byte (below 0x20 or 0x7F)",
                                       "re-call with the definition id exactly as the list "
                                       "endpoint returns it"));
     }

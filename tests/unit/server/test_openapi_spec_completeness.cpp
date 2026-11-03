@@ -535,7 +535,7 @@ TEST_CASE("openapi_spec_json(): POST /instructions/{id}/execute documents the au
     CHECK(rsp["400"].value("description", "").find("invalid UTF-8") != std::string::npos);
     const auto order_at = desc.find("Order: body depth and JSON parse, the definition id");
     REQUIRE(order_at != std::string::npos);
-    CHECK(desc.find("invalid_definition_id for a control character or invalid UTF-8", order_at) !=
+    CHECK(desc.find("invalid_definition_id for a control byte (below 0x20 or 0x7F) or invalid UTF-8", order_at) !=
           std::string::npos);
     // The gateway caveat on the lower-bound count.
     CHECK(desc.find("counts once queued for forwarding, which can still fail") != std::string::npos);

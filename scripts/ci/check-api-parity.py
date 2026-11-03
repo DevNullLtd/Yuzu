@@ -2363,7 +2363,9 @@ GATE_PARITY_KNOWN_MISMATCHES = {
         "branch 403s because kServiceScopeGlobalSafe is empty, so a service-scoped caller is "
         "refused on both; the MCP 'confined' label is the C8 ServiceScopeClass and is not a claim "
         "that the tool is usable by a service-scoped caller (mcp_server.cpp, C8 comment), which "
-        "this lexical comparison cannot see. ADR-1005 owner ruling 2026-10-31; programme #2146"),
+        "this lexical comparison cannot see. Recorded in ADR-1005 (the 2026-10-31 gate-parity "
+        "entry), programme #2146. Revisit by 2026-12-31: retire the entry if either side's gate "
+        "has changed."),
     ("POST", "/api/v1/result-sets", "create_result_set"): (
         "fleet:Infrastructure:Read",
         "denied:Infrastructure:Write; handler also gates on fleet:Infrastructure:Read",

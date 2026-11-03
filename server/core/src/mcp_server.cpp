@@ -2599,7 +2599,7 @@ static const ToolDef kTools[] = {
      "ORDER OF CHECKS, none of which dispatches, mints or consumes anything before it passes: "
      "the arguments are well formed and bounded, before the store is read (definition_id non-empty "
      "and at most 128 bytes, params, scope and agent_ids within their size bounds, agent_ids and "
-     "scope not empty and not both given); the definition_id holds no control character and is "
+     "scope not empty and not both given); the definition_id holds no control byte (below 0x20 or 0x7F) and is "
      "valid UTF-8 (else -32602 invalid_definition_id); the definition exists; the caller may run "
      "its plugin.action; params match "
      "the definition's stored parameter_schema (a violation is -32602 and nothing is queued for "
