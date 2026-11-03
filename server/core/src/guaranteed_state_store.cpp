@@ -1811,7 +1811,9 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
             if (matched->match) {
                 // A redelivery of an event stored with pending census evidence repairs it: the
                 // event is projected from its STORED ordering inputs (the redelivery's receipt is
-                // never used). Failed leaves the evidence for the next redelivery.
+                // never used). Failed leaves the evidence for the next redelivery, but the call still
+                // acks the event, so a redelivery happens only if the agent re-sends it; a stranded
+                // row is covered by the (unfiled) pending-evidence sweep follow-up.
                 if (matched->pending && bearing) {
                     const CensusOutcome repaired = project_rule_status(
                         conn, census_proj_failures_, census_lock_barrier_, row,
