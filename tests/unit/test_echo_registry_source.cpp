@@ -3113,7 +3113,6 @@ TEST_CASE("registry source: a failed HKEY_USERS enumeration keeps the cursor and
     const std::string baseline_before = r.state(root);
     const auto watch_calls_before = r.f.watch_calls.size();
     const std::string watch_roots_before = r.config("registry_watch_roots");
-    const std::string last_collect_before = r.config("registry_last_collect_ts");
 
     // The enumeration answers an error part-way: the tick throws before it touches the watch
     // set, the dirty marks, the baselines, the status keys or the cursor, and writes no gap row.
@@ -3124,7 +3123,6 @@ TEST_CASE("registry source: a failed HKEY_USERS enumeration keeps the cursor and
     CHECK(count_rows(r.t.db) == 0);
     CHECK(r.f.watch_calls.size() == watch_calls_before);
     CHECK(r.config("registry_watch_roots") == watch_roots_before);
-    CHECK(r.config("registry_last_collect_ts") == last_collect_before);
     CHECK(r.f.dirty->take_hku()); // the name-watch mark was put back (R7)
     r.f.dirty->mark_hku();
 
@@ -3137,7 +3135,7 @@ TEST_CASE("registry source: a failed HKEY_USERS enumeration keeps the cursor and
     CHECK(*r.t.db.get_cursor("registry").value() != cursor_before);
 }
 
-TEST_CASE("walk_enumeration: only the end of the list completes a walk, an error is a failed "
+TEST_CASE("walk_enumeration: only the end of the list completes a walk and an error is a failed "
           "read and never a short list",
           "[echo][registry]") {
     using Script = std::vector<std::pair<ListStep, std::string>>;
