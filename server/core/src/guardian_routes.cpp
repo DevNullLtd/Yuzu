@@ -85,7 +85,7 @@ std::string short_id() {
 // Worst-of severity ranking for a fleet/rollup badge (contract decision 5):
 // remediation_failed/errored (red) > drifted (amber) > compliant (green).
 // exempt is out of the denominator; stale is surfaced distinctly elsewhere.
-// `uncertain` (greatest ordered verdict cannot be proven, or a retained event is not yet
+// `uncertain` (the projected verdict cannot be proven to be the latest, or a retained event is not yet
 // reflected): a clean headline is never shown over an uncertain or pending pair (#5690).
 const char* worst_badge_class(int drifted, int remediation_failed, int errored, int uncertain = 0) {
     if (remediation_failed > 0 || errored > 0) return "worst-bad";
@@ -890,9 +890,9 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     html += "</div>";
 
     // ── Compliance census ── proportion bar + legend (NOT a donut), from the
-    // per-(agent,rule) status feed. Figures count each pair at the greatest ordered verdict that
+    // per-(agent,rule) status feed. Figures count each pair at the verdict its event order projected, that
     // reached the census, with uncertain or pending pairs flagged; they are not a live probe.
-    html += sech("Compliance &mdash; greatest ordered verdict projected (uncertain or pending pairs are flagged)");
+    html += sech("Compliance &mdash; verdict projected by event order (uncertain or pending pairs are flagged)");
     if (cc_total == 0) {
         html += "<div class=\"gs-hint\">No device "
                 "check-ins recorded yet &mdash; as deployed agents report each Guard's state (on change, "
@@ -929,7 +929,7 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
         html += "</div>";
         html += "<div class=\"gs-hint\">" +
                 std::to_string(cc_total) + " device-guard checks across " + std::to_string(agents) +
-                " online agent(s), at the greatest ordered verdict each pair reported." +
+                " online agent(s), at the verdict each pair's event order projected." +
                 (cc_uncertain > 0 ? " " + uncertain_phrase(cc_uncertain) + "." : "") +
                 (cc_notimpl > 0 ? " The compliant share is of all targeted device-guard pairs, "
                                   "including the unenforceable ones."
@@ -2129,7 +2129,7 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
              "<b>Re-deploy</b> to apply to agents.</div>";
 
     // Compliance hero.
-    h += "<div class=\"gp-sech\">Compliance &mdash; greatest ordered verdict projected (uncertain or pending pairs are flagged)</div>";
+    h += "<div class=\"gp-sech\">Compliance &mdash; verdict projected by event order (uncertain or pending pairs are flagged)</div>";
     if (obs_total == 0) {
         h += "<div class=\"gp-note\">No device check-ins recorded yet &mdash; as deployed agents report each "
              "Guard's state (on change, piggybacked on the heartbeat) the breakdown appears here.</div>";
@@ -2513,7 +2513,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
     }
 
     // Fleet compliance hero.
-    h += "<div class=\"gp-sech\">Fleet compliance &mdash; greatest ordered verdict projected (uncertain or pending pairs are flagged)</div>";
+    h += "<div class=\"gp-sech\">Fleet compliance &mdash; verdict projected by event order (uncertain or pending pairs are flagged)</div>";
     if (d_total == 0) {
         h += "<div class=\"gp-note\">No device has reported this Guard's state yet &mdash; states appear as "
              "deployed agents report (on change).</div>";

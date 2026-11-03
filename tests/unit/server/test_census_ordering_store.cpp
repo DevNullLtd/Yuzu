@@ -117,7 +117,8 @@ void downgrade_to_v3(const std::string& dsn) {
                       "DROP COLUMN proj_key_capped, DROP COLUMN projection_pending");
     exec_sql(dsn, std::string("ALTER TABLE ") + kSchema +
                       ".guardian_agent_rule_status DROP COLUMN key_ns, DROP COLUMN ingest_seq, "
-                      "DROP COLUMN ts_hwm, DROP COLUMN order_uncertain");
+                      "DROP COLUMN ts_hwm, DROP COLUMN seq_hwm, DROP COLUMN hwm_recv_ns, "
+                      "DROP COLUMN order_uncertain");
     exec_sql(dsn, "UPDATE public.schema_meta SET version = 3 "
                   "WHERE store = 'guaranteed_state_store'");
 }
@@ -139,8 +140,26 @@ TEST_CASE("census ordering: a fresh database migrates to v4 with every v4 object
                                  "('idx_gse_ingest_seq', 'idx_gse_pending')") == "2");
     CHECK(query_scalar(db.dsn(), "SELECT count(*) FROM pg_attribute WHERE attrelid = "
                                  "'guaranteed_state_store.guardian_agent_rule_status'::regclass "
-                                 "AND attname IN ('key_ns', 'ingest_seq', 'ts_hwm', "
-                                 "'order_uncertain') AND NOT attisdropped") == "4");
+                                 "AND attname IN ('key_ns', 'ingest_seq', 'ts_hwm', 'seq_hwm', "
+                                 "'hwm_recv_ns', 'order_uncertain') AND NOT attisdropped") == "6");
+}
+
+TEST_CASE("census ordering: a v4 database missing the two later census columns is repaired by a reset to version 3",
+          "[pg][guaranteed_state_store][db][census][ordering][schema]") {
+    // The remedy the upgrade guide gives for a development database stamped v4 by an earlier build of
+    // this change: the migration replays with IF NOT EXISTS and adds only what is missing.
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    REQUIRE(opens(db.dsn()));
+    const std::string st = std::string(kSchema) + ".guardian_agent_rule_status";
+    exec_sql(db.dsn(), "ALTER TABLE " + st + " DROP COLUMN seq_hwm, DROP COLUMN hwm_recv_ns");
+    CHECK_FALSE(opens(db.dsn())); // the boot probe refuses it
+    exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 3 "
+                       "WHERE store = 'guaranteed_state_store'");
+    CHECK(opens(db.dsn()));
+    CHECK(schema_version(db.dsn()) == "4");
+    CHECK(query_scalar(db.dsn(), "SELECT count(*) FROM pg_attribute WHERE attrelid = '" + st +
+                                     "'::regclass AND attname IN ('seq_hwm', 'hwm_recv_ns') AND "
+                                     "NOT attisdropped") == "2");
 }
 
 TEST_CASE("census ordering: v4 over a v3 database keeps the census and fills ingest_seq once",
@@ -251,6 +270,15 @@ TEST_CASE("census ordering: an adopted v4 object not as this version creates it 
     SECTION("the census order_uncertain is nullable") {
         exec_sql(db.dsn(), "ALTER TABLE " + st + " ALTER COLUMN order_uncertain DROP NOT NULL");
     }
+    SECTION("the census seq_hwm column is missing") {
+        exec_sql(db.dsn(), "ALTER TABLE " + st + " DROP COLUMN seq_hwm");
+    }
+    SECTION("the census hwm_recv_ns column is missing") {
+        exec_sql(db.dsn(), "ALTER TABLE " + st + " DROP COLUMN hwm_recv_ns");
+    }
+    SECTION("the census hwm_recv_ns column is of the wrong type") {
+        exec_sql(db.dsn(), "ALTER TABLE " + st + " ALTER COLUMN hwm_recv_ns TYPE integer USING 0");
+    }
     SECTION("a census key column of the wrong type") {
         exec_sql(db.dsn(), "ALTER TABLE " + st + " ALTER COLUMN key_ns TYPE integer");
     }
@@ -280,6 +308,15 @@ TEST_CASE("census ordering: an adopted v4 object not as this version creates it 
     }
     SECTION("the legacy-write trigger is disabled") {
         exec_sql(db.dsn(), "ALTER TABLE " + st + " DISABLE TRIGGER guardian_agent_rule_status_flag_legacy");
+    }
+    SECTION("the sequence was reseeded below the census seq_hwm (the events were reaped)") {
+        exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                               ".guaranteed_state_rules (rule_id, name, yaml_source, "
+                               "created_at, updated_at) VALUES ('r1', 'n1', 'y', 't', 't')");
+        exec_sql(db.dsn(), "INSERT INTO " + st + " (agent_id, rule_id, state, updated_at, key_ns, "
+                                                "ingest_seq, seq_hwm) VALUES ('a1', 'r1', "
+                                                "'compliant', 't', 1, 1, 500)");
+        exec_sql(db.dsn(), "SELECT setval('" + seq + "', 1, false)");
     }
     SECTION("the sequence was reseeded below the retained maximum") {
         exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
@@ -1221,14 +1258,14 @@ TEST_CASE("census ordering: a stale high-water mark stops freezing the verdict a
             EventInsertOutcome::Inserted);
 
     SECTION("inside the hour a lower key is refused and the verdict is held") {
-        age_mark("3599000000000"); // 59 min 59 s
+        age_mark("3500000000000"); // 58 min 20 s: well inside the hour
         REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 500)).outcome ==
                 EventInsertOutcome::Inserted);
         CHECK(census(db.dsn(), "a", "r1") ==
               "drifted|" + key_str(kBase + 1000) + "|" + key_str(kBase + 1000) + "|true");
     }
     SECTION("past the hour a lower key applies by arrival, stays flagged, and keeps the mark") {
-        age_mark("3601000000000"); // 60 min 1 s
+        age_mark("3700000000000"); // 61 min 40 s: well past the hour
         REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 500)).outcome ==
                 EventInsertOutcome::Inserted);
         CHECK(census(db.dsn(), "a", "r1") ==
@@ -1268,6 +1305,223 @@ TEST_CASE("census ordering: a stale high-water mark stops freezing the verdict a
                 EventInsertOutcome::Inserted); // refused: the mark does not rise
         CHECK(query_scalar(db.dsn(), std::string("SELECT hwm_recv_ns FROM ") + kSchema +
                                          ".guardian_agent_rule_status WHERE agent_id = 'a'") == before);
+    }
+}
+
+// "ingest_seq|seq_hwm|max event ingest_seq" of a pair, so a test can see the three move together.
+std::string census_internals(const std::string& dsn, const std::string& agent,
+                             const std::string& rule) {
+    return query_scalar(
+        dsn, std::string("SELECT c.ingest_seq || '|' || c.seq_hwm || '|' || (SELECT max(ingest_seq) "
+                         "FROM ") +
+                 kSchema + ".guaranteed_state_events e WHERE e.agent_id = c.agent_id AND "
+                           "e.rule_id = c.rule_id) FROM " +
+                 kSchema + ".guardian_agent_rule_status c WHERE c.agent_id = '" + agent +
+                 "' AND c.rule_id = '" + rule + "'");
+}
+
+// True when `hwm_recv_ns` is within a minute of the database clock (and so was not taken from an
+// agent stamp, which these tests set years in the past).
+std::string hwm_recv_is_db_now(const std::string& dsn, const std::string& agent) {
+    return query_scalar(
+        dsn, std::string("SELECT (hwm_recv_ns BETWEEN "
+                         "(floor(extract(epoch FROM clock_timestamp()) * 1000000000))::bigint - "
+                         "60000000000 AND "
+                         "(floor(extract(epoch FROM clock_timestamp()) * 1000000000))::bigint + "
+                         "1000000000)::text FROM ") +
+                 kSchema + ".guardian_agent_rule_status WHERE agent_id = '" + agent + "'");
+}
+
+TEST_CASE("census ordering: a pending event that shares a key with a different verdict is flagged (UP-3)",
+          "[pg][guaranteed_state_store][db][census][ordering][tie]") {
+    // Governance Gate 8 pass 2: nine reviewers found that a PENDING event with the same key as a
+    // later, different verdict was retired as dominated with the row left clean. A pending event's
+    // verdict is not stored beside its key, so any same-key pending peer flags (an over-flag for a
+    // peer with the same verdict is accepted: pending events are rare).
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+
+    SECTION("no census row yet: the insert arm flags the pair") {
+        install_census_fail(db.dsn(), "NEW.state = 'drifted'");
+        REQUIRE(store.insert_event_classified(ev("d1", "r1", "a", kDrifted, kBase + 300)).outcome ==
+                EventInsertOutcome::Inserted); // pending, no census row
+        remove_census_fail(db.dsn());
+        REQUIRE(pending_count(db.dsn()) == "1");
+        REQUIRE(store.insert_event_classified(ev("d2", "r1", "a", kCompliant, kBase + 300)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "compliant|" + key_str(kBase + 300) + "|" + key_str(kBase + 300) + "|true");
+        CHECK(pending_count(db.dsn()) == "0");
+    }
+    SECTION("no census row yet and the same verdict: flagged too (documented over-flag)") {
+        install_census_fail(db.dsn(), "NEW.state = 'drifted'");
+        REQUIRE(store.insert_event_classified(ev("d1", "r1", "a", kDrifted, kBase + 300)).outcome ==
+                EventInsertOutcome::Inserted);
+        remove_census_fail(db.dsn());
+        REQUIRE(store.insert_event_classified(ev("d2", "r1", "a", kDrifted, kBase + 300)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1").ends_with("|true"));
+    }
+    SECTION("a pending event with a different key does not flag the pair") {
+        install_census_fail(db.dsn(), "NEW.state = 'drifted'");
+        REQUIRE(store.insert_event_classified(ev("d1", "r1", "a", kDrifted, kBase + 200)).outcome ==
+                EventInsertOutcome::Inserted);
+        remove_census_fail(db.dsn());
+        REQUIRE(store.insert_event_classified(ev("d2", "r1", "a", kCompliant, kBase + 300)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "compliant|" + key_str(kBase + 300) + "|" + key_str(kBase + 300) + "|false");
+    }
+    SECTION("a row already at the key and an older pending peer at the same key: the apply flags") {
+        // The row holds (key, seq 1). A pending peer at the same key with a LOWER sequence than the
+        // row can only exist when it became pending after the row's own projection read the pair,
+        // so it is written directly. A later event then sees it.
+        REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kCompliant, kBase + 300)).outcome ==
+                EventInsertOutcome::Inserted);
+        REQUIRE(census(db.dsn(), "a", "r1").ends_with("|false"));
+        exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                               ".guaranteed_state_events (event_id, rule_id, "
+                               "agent_id, event_type, severity, timestamp, ingest_seq, proj_key, "
+                               "projection_pending) OVERRIDING SYSTEM VALUE VALUES ('p0', 'r1', 'a', 'drift.detected', "
+                               "'high', 't', 0, " + key_str(kBase + 300) + ", true)");
+        REQUIRE(pending_count(db.dsn()) == "1");
+        // The same verdict at the same key: nothing separates the new event from the row but the
+        // pending peer, which shares the winning key.
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 300)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "compliant|" + key_str(kBase + 300) + "|" + key_str(kBase + 300) + "|true");
+        CHECK(pending_count(db.dsn()) == "0");
+    }
+    SECTION("an older pending peer at a LOWER key than the winner is irrelevant") {
+        REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kCompliant, kBase + 300)).outcome ==
+                EventInsertOutcome::Inserted);
+        exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                               ".guaranteed_state_events (event_id, rule_id, agent_id, event_type, "
+                               "severity, timestamp, ingest_seq, proj_key, projection_pending) "
+                               "OVERRIDING SYSTEM VALUE VALUES ('p0', 'r1', 'a', 'drift.detected', "
+                               "'high', 't', 0, " + key_str(kBase + 200) + ", true)");
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kErrored, kBase + 400)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "errored|" + key_str(kBase + 400) + "|" + key_str(kBase + 400) + "|false");
+    }
+}
+
+TEST_CASE("census ordering: a lower-sequence arrival with the same key and a different verdict is flagged",
+          "[pg][guaranteed_state_store][db][census][ordering][tie][lockorder]") {
+    // The non-apply branch and the WHERE disjunct for a tie, reached deterministically: W1 (the
+    // lower sequence) parks after its pair lock, W2 (same key, other verdict) applies, W1 resumes.
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+
+    EventInsertResult w1_res;
+    BarrierHold hold;
+    store.set_census_lock_barrier_for_test([&] { hold.hit(); });
+    WriterThreads writers(store, &hold);
+    writers.start([&] { w1_res = store.insert_event_classified(ev("w1", "r1", "a", kDrifted, kBase + 500)); });
+    REQUIRE(hold.reached_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    REQUIRE(store.insert_event_classified(ev("w2", "r1", "a", kCompliant, kBase + 500)).outcome ==
+            EventInsertOutcome::Inserted);
+    CHECK(census(db.dsn(), "a", "r1") ==
+          "compliant|" + key_str(kBase + 500) + "|" + key_str(kBase + 500) + "|false");
+    writers.join_all();
+
+    CHECK(w1_res.outcome == EventInsertOutcome::Inserted);
+    // W1 arrived first, so the later arrival's verdict stays; the doubt is recorded.
+    CHECK(census(db.dsn(), "a", "r1") ==
+          "compliant|" + key_str(kBase + 500) + "|" + key_str(kBase + 500) + "|true");
+    CHECK(census_internals(db.dsn(), "a", "r1") ==
+          query_scalar(db.dsn(), std::string("SELECT max(ingest_seq) || '|' || max(ingest_seq) || '|' "
+                                             "|| max(ingest_seq) FROM ") +
+                                     kSchema + ".guaranteed_state_events"));
+}
+
+TEST_CASE("census ordering: recovery needs a later arrival than the applied verdict",
+          "[pg][guaranteed_state_store][db][census][ordering][stale][lockorder]") {
+    // R's `EXCLUDED.ingest_seq > c.ingest_seq`: after a quiet hour W2 (the later arrival) recovers
+    // the verdict; W1 (the earlier arrival, processed afterwards) must be refused, not applied.
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase + 1000)).outcome ==
+            EventInsertOutcome::Inserted);
+    exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
+                           ".guardian_agent_rule_status SET hwm_recv_ns = hwm_recv_ns - 7200000000000");
+
+    EventInsertResult w1_res;
+    BarrierHold hold;
+    store.set_census_lock_barrier_for_test([&] { hold.hit(); });
+    WriterThreads writers(store, &hold);
+    writers.start([&] { w1_res = store.insert_event_classified(ev("w1", "r1", "a", kCompliant, kBase + 500)); });
+    REQUIRE(hold.reached_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    REQUIRE(store.insert_event_classified(ev("w2", "r1", "a", kErrored, kBase + 600)).outcome ==
+            EventInsertOutcome::Inserted);
+    CHECK(census(db.dsn(), "a", "r1") ==
+          "errored|" + key_str(kBase + 600) + "|" + key_str(kBase + 1000) + "|true");
+    writers.join_all();
+
+    CHECK(w1_res.outcome == EventInsertOutcome::Inserted);
+    CHECK(census(db.dsn(), "a", "r1") ==
+          "errored|" + key_str(kBase + 600) + "|" + key_str(kBase + 1000) + "|true");
+}
+
+TEST_CASE("census ordering: the mark's time is the database clock, set when the mark rises",
+          "[pg][guaranteed_state_store][db][census][ordering][stale]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    const auto backdate = [&] {
+        exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
+                               ".guardian_agent_rule_status SET hwm_recv_ns = 1000");
+    };
+
+    SECTION("the insert arm stamps the database time, not the agent stamp or the event receipt") {
+        REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kCompliant, kBase + 100)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(hwm_recv_is_db_now(db.dsn(), "a") == "true");
+    }
+    SECTION("the update arm stamps it when the mark rises") {
+        REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kCompliant, kBase + 100)).outcome ==
+                EventInsertOutcome::Inserted);
+        backdate();
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kDrifted, kBase + 200)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(hwm_recv_is_db_now(db.dsn(), "a") == "true");
+    }
+    SECTION("the fold stamps it when a seen event raises the mark") {
+        REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kCompliant, kBase + 100)).outcome ==
+                EventInsertOutcome::Inserted);
+        install_census_fail(db.dsn(), "NEW.state = 'errored'");
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kErrored, kBase + 400)).outcome ==
+                EventInsertOutcome::Inserted); // pending, outranks the row
+        remove_census_fail(db.dsn());
+        backdate();
+        REQUIRE(store.insert_event_classified(ev("e3", "r1", "a", kDrifted, kBase + 200)).outcome ==
+                EventInsertOutcome::Inserted); // sees e2: the fold raises the mark to its key
+        CHECK(census(db.dsn(), "a", "r1").find("|" + key_str(kBase + 400) + "|") != std::string::npos);
+        CHECK(hwm_recv_is_db_now(db.dsn(), "a") == "true");
+    }
+    SECTION("a recorded time in the database's future counts as stale, never as an indefinite hold") {
+        REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase + 1000)).outcome ==
+                EventInsertOutcome::Inserted);
+        exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
+                               ".guardian_agent_rule_status SET hwm_recv_ns = hwm_recv_ns + "
+                               "10800000000000"); // three hours ahead
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 500)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "compliant|" + key_str(kBase + 500) + "|" + key_str(kBase + 1000) + "|true");
     }
 }
 

@@ -3505,7 +3505,7 @@ TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state 
         REQUIRE(store.insert_event(ev("d3b", "r1", "a1", "guard.errored", "2026-06-04T10:01:00Z")));
         CHECK(census()[{"a1", "r1"}] == "compliant");
     }
-    SECTION("D4: equal timestamps, distinct event ids: the later arrival wins (existing >=)") {
+    SECTION("D4: equal timestamps, distinct event ids: the later arrival wins (and the pair is flagged, #5690)") {
         REQUIRE(store.insert_event(ev("d4a", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
         REQUIRE(store.insert_event(ev("d4b", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
         CHECK(census()[{"a1", "r1"}] == "errored");

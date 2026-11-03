@@ -6718,7 +6718,7 @@ TEST_CASE("MCP Guardian: delete_guardian_rule removes a rule; a second delete "
     CHECK(ts.audit_log.back() == "guaranteed_state.rule.delete|denied");
 }
 
-TEST_CASE("MCP Guardian: a store fault on delete_guardian_rule is audited as failure, not denied (#5690)",
+TEST_CASE("MCP Guardian: a store fault on delete_guardian_rule is audited as failure; not denied (#5690)",
           "[pg][mcp][integration][guardian][ordering]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};

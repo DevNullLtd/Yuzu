@@ -3100,12 +3100,24 @@ void GuardianEngine::emit_guard_event(
     // doc comment in guardian_engine.hpp) rather than from `now_ms` above -
     // `event_id` keeps using `now_ms` regardless, so this touches ONLY the
     // event's timestamp, not its identity.
-    const auto timestamp_secs = timestamp_override.has_value()
-                                    ? std::chrono::duration_cast<std::chrono::seconds>(
-                                          timestamp_override->time_since_epoch())
-                                          .count()
-                                    : now_ms / 1000;
-    ev.mutable_timestamp()->set_seconds(timestamp_secs);
+    // Sub-second resolution matters to the server: it orders the Guardian census by this stamp
+    // (#5690), and two verdicts stamped with the same instant can only be ordered by arrival,
+    // which the server flags as `order_uncertain`. Whole-second stamps made every drift followed by
+    // its remediation within one second such a pair. `now_ms` is millisecond-resolution; a
+    // `timestamp_override` keeps the clock's own resolution.
+    std::int64_t stamp_ns = timestamp_override.has_value()
+                                ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      timestamp_override->time_since_epoch())
+                                      .count()
+                                : static_cast<std::int64_t>(now_ms) * 1'000'000;
+    std::int64_t stamp_secs = stamp_ns / 1'000'000'000;
+    std::int64_t stamp_nanos = stamp_ns % 1'000'000'000;
+    if (stamp_nanos < 0) { // floor, as protobuf Timestamp requires nanos in [0, 1e9)
+        stamp_nanos += 1'000'000'000;
+        --stamp_secs;
+    }
+    ev.mutable_timestamp()->set_seconds(stamp_secs);
+    ev.mutable_timestamp()->set_nanos(static_cast<std::int32_t>(stamp_nanos));
     // Stamp the agent's real platform (mirrors get_status) — not a hardcoded
     // "windows", which would mislabel every drift event once Linux/macOS guards land.
 #if defined(_WIN32)

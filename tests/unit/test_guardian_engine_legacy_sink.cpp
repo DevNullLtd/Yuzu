@@ -440,6 +440,45 @@ TEST_CASE("legacy_sink_dropped_unwired(): 0 until a sink is wired, then incremen
     f.engine->stop();
 }
 
+// ── #5690: the census orders by the event stamp, so the stamp keeps its sub-second part ────
+
+TEST_CASE("an emitted guard event carries a millisecond-resolution timestamp, not whole seconds "
+          "(#5690)",
+          "[guardian][engine][legacy_sink]") {
+    LegacySinkFixture f;
+    std::mutex cap_mu;
+    std::vector<gpb::GuaranteedStateEvent> captured;
+    f.engine->set_event_sink([&](const gpb::GuaranteedStateEvent& ev) {
+        std::lock_guard lk(cap_mu);
+        captured.push_back(ev);
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+    const auto before_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "file";
+    d.rule_id = "stamp-rule";
+    d.rule_name = "stamp-rule";
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    const auto after_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now().time_since_epoch())
+                              .count();
+    {
+        std::lock_guard lk(cap_mu);
+        REQUIRE(captured.size() == 1);
+        const auto& ts = captured[0].timestamp();
+        CHECK(ts.nanos() >= 0);
+        CHECK(ts.nanos() < 1'000'000'000);
+        CHECK(ts.nanos() % 1'000'000 == 0); // millisecond-resolution source
+        const std::int64_t stamp_ms = ts.seconds() * 1000 + ts.nanos() / 1'000'000;
+        CHECK(stamp_ms >= before_ms);
+        CHECK(stamp_ms <= after_ms);
+    }
+    REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
+}
+
 // ── CH-1 L1 (cross-platform): the detached send stalls, never the emitter ───
 
 TEST_CASE("CH-1 L1: a blocking legacy sink stalls the DETACHED SEND, never the emitting "
@@ -887,17 +926,16 @@ TEST_CASE("#4783 gap: legacy_sink_kick() stamps a still-open gap's repair with "
     // record entirely (nothing left to read afterward).
     auto gaps = f.engine->legacy_sink_executor_for_test().gapped_rules_needing_repair(10);
     REQUIRE(gaps.size() == 1);
-    const auto last_lost_secs = std::chrono::duration_cast<std::chrono::seconds>(
-                                    gaps[0].second.last_lost.time_since_epoch())
-                                    .count();
+    const auto last_lost_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  gaps[0].second.last_lost.time_since_epoch())
+                                  .count();
+    const auto last_lost_secs = last_lost_ns / 1'000'000'000;
 
     blocking.release();
     REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
     REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
 
-    // Timestamps here are second-granular (GuaranteedStateEvent.timestamp is a
-    // google.protobuf.Timestamp with only `seconds` ever set - see
-    // emit_guard_event()). Without letting real wall-clock time move into a
+    // Without letting real wall-clock time move into a
     // LATER second than last_lost, a kick() firing immediately after the loss
     // would stamp the same second whether it used `now` or `last_lost`, and the
     // assertion below would not actually discriminate between the fix and the
@@ -928,6 +966,8 @@ TEST_CASE("#4783 gap: legacy_sink_kick() stamps a still-open gap's repair with "
         // which by construction (the sleep above) is in a strictly LATER second.
         CHECK(captured[0].timestamp().seconds() == last_lost_secs);
         CHECK(captured[0].timestamp().seconds() < now_at_kick_secs);
+        // The sub-second part of last_lost travels too (the census orders by it, #5690).
+        CHECK(captured[0].timestamp().nanos() == last_lost_ns % 1'000'000'000);
     }
 
     REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));

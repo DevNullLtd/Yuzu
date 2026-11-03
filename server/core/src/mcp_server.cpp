@@ -1506,7 +1506,7 @@ static const ToolDef kTools[] = {
      "/api/v1/guaranteed-state/rules/{rule_id}/status exactly, same shared builder, same "
      "require_list_read (ADR-0017) confinement as get_guardian_status. Raw census — does NOT "
      "fold an offline agent's last-reported state to \"unknown\" the way the dashboard fragment "
-     "does. Each row carries order_uncertain (sticky: the greatest ordered verdict persisted for "
+     "does. Each row carries order_uncertain (sticky: the verdict persisted for "
      "the pair cannot be proven to be the latest; false does not prove freshness) and "
      "projection_pending (a retained event for the pair has not reached the row, so the state "
      "shown may lag it); a true flag means do not report the pair as settled, and "
@@ -16177,9 +16177,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         audit_fn, req, "guaranteed_state.rule.delete",
                         result.error().starts_with("not found") ? "denied" : "failure",
                         "GuaranteedState", rule_id, result.error());
-                    // retry-hint-exempt: mirrors REST's own posture — delete_rule
-                    // conflates not-found with a genuine failure into one error
-                    // string, so this is not distinguishably a transient store fault.
+                    // retry-hint-exempt: delete_rule returns one error string for a
+                    // missing rule and for a store fault (the audit row above tells them
+                    // apart by that string's prefix), so the fault half cannot yet carry an
+                    // honest retry_after_ms; mirrors REST, which answers 404 for both. The
+                    // error-class split that would close this is a tracked follow-up.
                     res.set_content(error_response(id, kInvalidParams, result.error()),
                                     "application/json");
                     return;

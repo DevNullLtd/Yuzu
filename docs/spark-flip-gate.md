@@ -2426,10 +2426,11 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   recovery after a spark re-arm is by code reading only, with no agent-level detach,
   re-arm, compliant-edge test (#5676); (c) the census orders by a key limited to server receipt plus 300 s (#5690 PR2a-1;
   the text timestamp in `guardian_ingest.cpp` (`ts_to_iso8601`) still feeds the TEXT column only) with ties broken by the
-  event INSERT's `ingest_seq`, and flags a refused or unprovable ordering (`order_uncertain`), so clock skew or a same-second tie across the
-  lifecycle and compliance lanes can leave a false compliant (#5690; live today
+  event INSERT's `ingest_seq`, and flags a refused, tied or unprovable ordering (`order_uncertain`), so clock skew or a same-instant tie across the
+  lifecycle and compliance lanes is shown as uncertain and no longer silently leaves a false compliant
+  (#5690; the agent now stamps milliseconds, and an agent that predates that stamps whole seconds; live today
   for guard.unhealthy; the agent-side hold, PR #5776, delays each overtake by up to
-  H = 1 s and then permits up to N = 64, but cannot close the same-second tie); (d) the census is absent from the decommission cascade, so
+  H = 1 s and then permits up to N = 64, which does not change the tie rule); (d) the census is absent from the decommission cascade, so
   REST/MCP errored_rules and the dashboard can disagree after a decommission (#5675).
 - **Journal-quarantine finding (enterprise-readiness Gate 6) - FOUND AND FIXED IN PR-2d
   ITSELF, not deferred.** `guardian_lifecycle_journal.cpp`'s replay-validation allowlist
@@ -2834,13 +2835,13 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   `GuardianSparkRuntime::drain_bounded()`. The earlier claim here that no consumer depends on
   strict cross-lane wire ordering is withdrawn: the server maps `guard.compliant` to
   `compliant` and `guard.errored`/`guard.unhealthy` to `errored`
-  (`event_state_from_type()` in `guaranteed_state_store.cpp`) and keeps a row on
-  `EXCLUDED.updated_at >= stored` (`project_rule_status()`) at one-second timestamp resolution (`guardian_ingest.cpp:293`), with the
-  equal-timestamp case pinned by the "equal timestamps, distinct event ids" section of the "guard.errored maps to the errored census state (C-1)" case in `test_guaranteed_state_store.cpp`, so an overtaking
-  `errored` can leave a false compliant. That is #5690 (C-1 residual (c), above); the
-  agent-side hold (PR #5776) delays each overtake by up to H = 1 s and then permits up to
-  N = 64 launches, with no time bound until the lane finds no blocker or empties, so it
-  cannot close the same-second tie.
+  (`event_state_from_type()` in `guaranteed_state_store.cpp`) and, before #5690, kept a row on
+  `EXCLUDED.updated_at >= stored` at one-second timestamp resolution, so an overtaking
+  `errored` could leave a false compliant. #5690 (C-1 residual (c), above) replaced that with the
+  `(key, ingest_seq)` ordering: a same-key pair of different verdicts is ordered by arrival and flagged
+  `order_uncertain`, and the agent now stamps milliseconds. The agent-side hold (PR #5776) delays each
+  overtake by up to H = 1 s and then permits up to N = 64 launches, with no time bound until the lane
+  finds no blocker or empties; it does not change the tie rule.
 - Known behaviour of the hold (verified against `wrapped_send()` and
   `GuardianSparkRuntime::try_page_batch`'s page-time stamp, not measured on a fleet):
   (i) a large lifecycle replay is stamped at page time, so it holds live compliance entries

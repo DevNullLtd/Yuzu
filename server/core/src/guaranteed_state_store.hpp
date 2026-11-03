@@ -155,8 +155,8 @@ struct GuardianAgentRuleStatus {
     std::string rule_id;
     std::string state;       // "compliant" | "drifted" | "errored"
     std::string updated_at;  // ISO-8601 of the event that set it
-    // Ordering evidence (schema v4). `order_uncertain` is sticky: the order of the greatest
-    // verdict persisted for this pair cannot be proven. `projection_pending`: a retained event
+    // Ordering evidence (schema v4). `order_uncertain` is sticky: the order of the verdict
+    // persisted for this pair cannot be proven. `projection_pending`: a retained event
     // for this pair has not reached the row. Both false does not establish freshness or
     // completeness: an event that never arrived leaves no trace.
     bool order_uncertain{false};

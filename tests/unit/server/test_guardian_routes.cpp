@@ -2411,7 +2411,7 @@ TEST_CASE("guardian overview: 'All compliant' is never shown over an uncertain p
         CHECK(res->body.find("ordering uncertain") == std::string::npos);
         // The census caption no longer claims "as of last check-in".
         CHECK(res->body.find("as of last check-in") == std::string::npos);
-        CHECK(res->body.find("greatest ordered verdict projected") != std::string::npos);
+        CHECK(res->body.find("verdict projected by event order") != std::string::npos);
     }
     // An older verdict arriving later is refused and flags the pair.
     h.seed_status("e2", "lin-1", "svc1", "drift.detected", "2026-09-01T09:00:00Z");
