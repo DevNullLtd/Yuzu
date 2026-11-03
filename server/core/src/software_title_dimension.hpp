@@ -157,10 +157,15 @@ public:
     /// One tick: passes until a short page / failure / cap / cancel, then the queue
     /// reconcile, then (unless cancelled) the gauges. `max_passes` is the pass cap
     /// (production: `kMaxPassesPerTick`; a parameter so a test can reach the cap with
-    /// a small fixture). Does not throw, because `run_pass`, `reconcile_queue` and
+    /// a small fixture). `tick_budget` is ONE wall deadline for the passes of the whole
+    /// tick (production: `kPassBudget`, the 60 s the backlog re-arm assumes): the first pass
+    /// always runs, a later pass starts only while the budget remains and is given what
+    /// is left of it, and a tick that stops on the budget reports `capped` (a full page
+    /// preceded it, so a backlog remains). Does not throw, because `run_pass`, `reconcile_queue` and
     /// `refresh_gauges` each catch internally; the `cancelled` predicate must not throw.
     [[nodiscard]] TickResult run_tick(const std::function<bool()>& cancelled = {},
-                                      int max_passes = kMaxPassesPerTick);
+                                      int max_passes = kMaxPassesPerTick,
+                                      std::chrono::seconds tick_budget = kPassBudget);
 
     /// Refresh the curation-queue device counts against the current `title_triples`,
     /// re-queue a present current-pack `unnormalized` title whose open row was pruned

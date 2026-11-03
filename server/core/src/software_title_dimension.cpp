@@ -634,15 +634,29 @@ void SoftwareTitleDimension::refresh_gauges() {
 }
 
 TickResult SoftwareTitleDimension::run_tick(const std::function<bool()>& cancelled,
-                                            int max_passes) {
+                                            int max_passes, std::chrono::seconds tick_budget) {
     TickResult tick;
     const auto stop = [&] { return cancelled && cancelled(); };
+    const auto tick_deadline = std::chrono::steady_clock::now() + tick_budget;
     for (int pass = 0; pass < max_passes; ++pass) {
         if (stop()) {
             tick.cancelled = true;
             break;
         }
-        const PassResult r = run_pass(cancelled);
+        // One deadline for the whole tick, not a fresh budget per pass: a later pass runs only
+        // while time remains, with what is left. Only a pass after a FULL page gets here, so
+        // stopping on the budget leaves a backlog (`capped`).
+        std::chrono::seconds budget = kPassBudget;
+        if (pass > 0) {
+            const auto left = std::chrono::duration_cast<std::chrono::seconds>(
+                tick_deadline - std::chrono::steady_clock::now());
+            if (left <= std::chrono::seconds{0}) {
+                tick.capped = true;
+                break;
+            }
+            budget = std::min(left, kPassBudget);
+        }
+        const PassResult r = run_pass(cancelled, budget);
         ++tick.passes;
         tick.processed += r.processed;
         if (r.outcome == PassOutcome::cancelled) {

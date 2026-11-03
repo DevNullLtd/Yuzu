@@ -761,8 +761,15 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         // taxonomy is sre's gate, out of scope for this round). The wait is
         // transaction-scoped + bounded by the pool's statement_timeout; a distinct
         // "contended" outcome label is the right pool-hygiene follow-up.
-        pg::PgResult lk = pg::exec_params(c, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                                          std::vector<std::string>{agent_id_s});
+        // CROSS-STORE NAMESPACE (do not remove the prefix): advisory-lock keys are ONE
+        // cluster-wide 64-bit space. A bare hashtextextended(agent_id, 0) is the same key as
+        // the fixed-string locks other jobs take (a valid agent id `software_normalization`
+        // IS the normalisation job's key), so a stream of full reports from such an agent
+        // could make that job's try-lock lose every tick. Every sibling store prefixes its
+        // key the same way (`vuln_finding_store:`, `device_ci:`, `app_usage:`, ...).
+        pg::PgResult lk = pg::exec_params(
+            c, "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || $1, 0))",
+            std::vector<std::string>{agent_id_s});
         if (lk.status() != PGRES_TUPLES_OK)
             return false;
         pg::PgResult del = pg::exec_params(
@@ -1840,6 +1847,26 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
                  "WHERE octet_length(name) + octet_length(publisher) + octet_length(ecosystem) <= " +
                  std::to_string(kTitleTripleMaxBytes) + " GROUP BY name, publisher, ecosystem"))
             return false;
+        // A triple over the cap is dropped (never truncated: a truncated key would resolve to
+        // the wrong title), so it is absent from the title, queue and ratio gauges while the
+        // rollup still reports success. Say so, with the count, once per refresh.
+        {
+            pg::PgResult dropped = pg::exec_params(
+                c,
+                "SELECT count(*) FROM (SELECT 1 FROM software_inventory_store.installed_software "
+                "WHERE octet_length(name) + octet_length(publisher) + octet_length(ecosystem) > " +
+                    std::to_string(kTitleTripleMaxBytes) +
+                    " GROUP BY name, publisher, ecosystem) over_wide",
+                std::vector<std::string>{});
+            if (dropped.status() != PGRES_TUPLES_OK)
+                return failed("over-wide title count", dropped);
+            if (PQntuples(dropped.get()) == 1 &&
+                std::string_view(PQgetvalue(dropped.get(), 0, 0)) != "0")
+                spdlog::warn("SoftwareInventoryStore: {} installed-software title(s) exceed {} "
+                             "bytes (name + publisher + ecosystem) and are left out of "
+                             "title_triples, so they are never normalised",
+                             PQgetvalue(dropped.get(), 0, 0), kTitleTripleMaxBytes);
+        }
 
         // Fleet-newest version of EVERY title, bounded memory: stream version_rollup in
         // (name, version) order (a total order, served by version_rollup_nv_key) through a
