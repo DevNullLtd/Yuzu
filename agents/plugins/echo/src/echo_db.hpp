@@ -427,15 +427,17 @@ struct RemovableEvent {
                                 // Appended after the frozen fields; not part of the identity digest.
 };
 
-/// One registry_live row (cursor-model seam, echo_cursor.hpp) -- a value or key
-/// change the key watch observed (echo_registry_parsers.hpp). The actor columns hold
+/// One registry event (cursor-model seam, echo_cursor.hpp) -- a value or key
+/// change the key watch observed (echo_registry_parsers.hpp). The actor fields hold
 /// the writer correlated to the change (a lead to verify, not proof): actor_pid is 0
 /// and actor_image '' when no writer is named, and `detail` says why (attr:*).
-/// `data` is the UNMASKED rendered new value; `prev_data` is empty for a row this build writes
-/// (the old value is not stored; `prev_data_type`/`prev_data_size` are).
-/// Warehouse columns are NOT NULL DEFAULT '' / 0, so "not applicable" (removals,
-/// key removals, gaps; the old value of an addition) is '' / 0, and `data_type`
-/// /`prev_data_type` == '' is what tells an absent value from an empty one.
+/// `data` is the UNMASKED rendered new value; `prev_data` is empty for an event this build
+/// makes (the old value is not carried; `prev_data_type`/`prev_data_size` are). The fold keeps
+/// only hive, key_path, value_name, action, a count, the newest data (512 bytes), its type,
+/// the actor image and ts; actor_pid, `detail`, `source` (notify | reconcile | offline),
+/// observed_at and the old-value fields are the collector's and are not stored.
+/// "Not applicable" (removals, key removals, gaps; the old value of an addition) is '' / 0,
+/// and `data_type`/`prev_data_type` == '' is what tells an absent value from an empty one.
 struct RegistryEvent {
     int64_t ts{0}; // unix seconds
     int64_t snapshot_id{0};
@@ -453,7 +455,7 @@ struct RegistryEvent {
     int prev_data_truncated{0};
     int64_t actor_pid{0}; // 0 = no writer named
     std::string actor_image;
-    std::string source;     // notify | reconcile
+    std::string source;     // notify | reconcile | offline
     int64_t observed_at{0}; // unix ms
     std::string detail;     // attr:* on a change row; the gap description on a gap
     std::string record_key; // replay idempotence through the 4096-key replay ring

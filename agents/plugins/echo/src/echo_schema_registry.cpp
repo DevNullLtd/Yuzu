@@ -585,18 +585,23 @@ const std::vector<CaptureSourceDef>& build_sources() {
         },
         // ── registry (cursor-model seam, echo_cursor.hpp) — registry value and key
         // changes under a curated persistence/policy watch list (HKLM and each
-        // loaded HKU hive): what changed, with its new value and the old value's type and
-        // size. Raw capture rows only, no rollups (P-008, same rationale as power above).
+        // profile hive, loaded or not). Roll-up tiers only, no raw capture table: a
+        // bucket keys on hive, key_path, value_name and action and keeps change_count,
+        // last_data (the newest value, 512 bytes, UNMASKED and readable through
+        // echo.sql), last_data_type, last_actor_image and last_ts. The old value, the
+        // writer's pid, `detail` and `source` are decided by the collector and not
+        // stored.
         // Mechanism: a RegNotifyChangeKeyValue subtree watch + a per-root baseline diff
         // (echo_state `registry:<root>`) say WHAT changed; a write-only
         // Kernel-Registry ETW session says WHO, by correlation on value name, type,
-        // size and time window. actor_pid / actor_image hold the correlated writer
-        // (a lead to verify, not proof) and are 0 / '' when none is named; `detail`
-        // says why (attr:corr | ambiguous | none | degraded | off | lost-restart).
-        // Values are stored UNMASKED: `data` (the new value) is readable through echo.sql;
-        // `prev_data` is empty, the old value's type and size are kept instead. Retention is
-        // a row count.
-        // Replay idempotence via the UNIQUE record_key index below.
+        // size and time window (a lead to verify, not proof; the pid is 0 and the
+        // image empty when none is named). `detail` says why the writer was settled
+        // (attr:corr | ambiguous | none | degraded | off | lost-restart | offline).
+        // A logged-off user's hive is mounted through the guarded offline-hive ladder and
+        // read on the hourly tick (every 12 slow ticks: hourly at the default 300 s; also on
+        // first sight, after a re-enable, and while a read is capped or owed a retry): its
+        // changes never name a writer and are folded like a loaded hive's, so the
+        // offline marker is not retained.
         {
             .name = "registry",
             .dollar_name = "Registry",
@@ -604,10 +609,15 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .os_support = {
                 {"windows", OsSupportStatus::kSupported, "regnotify+etw",
                  "RegNotifyChangeKeyValue subtree watch + baseline diff (what changed: the new "
-                 "value up to 512 bytes, and the old value's type and size) and a write-only "
+                 "value up to 512 bytes; the old value is not stored) and a write-only "
                  "Kernel-Registry ETW session that names the writing "
                  "process by correlation; cursor-model (echo_cursor.hpp). Without an elevated "
-                 "agent the session cannot open and rows carry attr:off."},
+                 "agent the session cannot open and no writer is named. The per-user roots of "
+                 "logged-off users' unloaded hives are read on the hourly tick (every 12 slow "
+                 "ticks: hourly at the default 300 s), and sooner on first sight, after a "
+                 "re-enable or while a read is capped or owed a retry, through the guarded "
+                 "offline-hive ladder (never a writer; the change is counted like a loaded "
+                 "hive's and the offline marker is not retained)."},
                 {"linux",   OsSupportStatus::kUnsupported, "",
                  "The Windows registry does not exist on this platform."},
                 {"macos",   OsSupportStatus::kUnsupported, "",
@@ -942,13 +952,15 @@ bool is_queryable_table(std::string_view real_table_name) {
         // deleting echo.db, which destroys every OTHER source's history too.
         // Reading it exposes a source name, a position and updated_at; the
         // cursor payload is the source's own bookkeeping, not captured content --
-        // with one exception: the registry cursor row holds, for about one tick, the
+        // with two exceptions: the registry cursor row holds, for about one tick, the
         // rendered new value of changes whose writer is not settled yet (and the old
-        // value only when the baseline came from an older build).
+        // value only when the baseline came from an older build), and its
+        // `offline` list holds [sid, ProfileImagePath] (the path names the user) for every
+        // logged-off profile.
         // echo_state carries the registry baselines (`registry:<root>`: type, size and
         // a hash per value; an older build also wrote a rendered prefix), readable here
-        // consistently with registry_live's own unmasked values;
-        // purge_source("registry") erases the table, the cursor row and
+        // consistently with the registry tiers' own unmasked last_data;
+        // purge_source("registry") erases the tiers, the cursor row and
         // every `registry:%` state row in one transaction.
         std::unordered_set<std::string> s{"echo_state", "echo_config", "echo_cursor"};
         for (const auto& [real, ref] : table_ref_map())

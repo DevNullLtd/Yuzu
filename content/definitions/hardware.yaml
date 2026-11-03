@@ -574,8 +574,10 @@ metadata:
     Reports the chassis type, serial number and asset tag. Not read yet on any OS:
     every dispatch answers one unsupported status row (windows:planned,
     linux:planned or macos:planned) until its leg lands.
-    macOS has no public source and will move to a typed unsupported. On-demand
-    only; it is not part of any daily sync.
+    macOS has no public source and will move to a typed unsupported. It is
+    dispatched by the daily device-record sync: its status, the planned one
+    included, is recorded as the chassis section, and the chassis columns of the
+    record fill once the leg reads them.
   tags: [hardware, inventory, chassis]
 
 spec:
@@ -649,8 +651,10 @@ metadata:
     Reports the baseboard (motherboard) vendor, product and serial number. Not
     read yet on any OS: every dispatch answers one unsupported status row
     (windows:planned, linux:planned or macos:planned) until its leg lands.
-    macOS has no public source and will move to a typed unsupported. On-demand
-    only; it is not part of any daily sync.
+    macOS has no public source and will move to a typed unsupported. It is
+    dispatched by the daily device-record sync: its status, the planned one
+    included, is recorded as the baseboard section, and the baseboard columns of
+    the record fill once the leg reads them.
   tags: [hardware, inventory, baseboard]
 
 spec:
@@ -724,7 +728,9 @@ metadata:
     Reports swap devices and page files with total and used size in MB. Not read
     yet on any OS: every dispatch answers one unsupported status row
     (windows:planned, linux:planned or macos:planned) until its leg lands.
-    On-demand only; it is not part of any daily sync.
+    It is dispatched by the daily device-record sync: its status, the planned one
+    included, is recorded as the swap section, and its rows land in that section
+    once the leg reads them (used size is not recorded).
   tags: [hardware, inventory, swap]
 
 spec:
@@ -800,8 +806,10 @@ metadata:
     answers one unsupported status row (windows:planned, linux:planned or
     macos:planned) until its leg lands; macOS has no
     source beyond the hardware UUID that device.hardware.system reports and
-    will move to a typed unsupported. On-demand only; it is not part of any
-    daily sync.
+    will move to a typed unsupported. It is dispatched by the daily device-record
+    sync: its status, the planned one included, is recorded as the machine id
+    section, and the hashed machine id column of the record fills once the leg
+    reads it.
   tags: [hardware, inventory, machine-id]
 
 spec:

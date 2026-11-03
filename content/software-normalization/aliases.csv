@@ -1,0 +1,113 @@
+# Software title alias pack - the seed shipped with the server.
+#
+# Maps raw installed-software titles onto canonical products for the server's title
+# normalisation job. Embedded in the server binary and loaded into Postgres at first
+# boot ONLY when no pack has been loaded yet; a newer binary never replaces a stored
+# pack. The rows below are a starting set rather than a measured one: a title they do
+# not resolve is labelled unnormalized and queued for curation, never guessed.
+#
+# Columns:
+#   ecosystem,raw_name,raw_publisher,vendor,product,edition,category,cpe_product
+#
+#   ecosystem      one of the software ecosystems (windows, msi, macos, brew, rpm, deb, ...)
+#                  or empty = any ecosystem.
+#   raw_name       a representative raw title. It is normalised on load (lowercased,
+#                  version and architecture tokens stripped), so "7-Zip 23.01 (x64)" and
+#                  "7-Zip" are the same key.
+#   raw_publisher  the raw publisher, normalised on load; empty = any publisher.
+#   vendor         canonical vendor of the product.
+#   product        canonical product title.
+#   edition        the product's edition; empty = none. EDITIONS ARE DISTINCT PRODUCTS:
+#                  an alias binds exactly one edition and there is no edition wildcard,
+#                  so a product sold in several editions needs one row per edition. When
+#                  both are present, this column must agree with the edition token in
+#                  raw_name.
+#   category       web_server | database | message_broker | runtime | other
+#   cpe_product    our own CPE product token for the product; empty = none.
+#
+# Precedence when several rows could match a title: curated before pack, then
+# (ecosystem, publisher) > (ecosystem, any) > (any, publisher) > (any, any).
+# Rows for the same product (same vendor, product and edition) must agree on category
+# and cpe_product, and every spelling of a product uses the SAME vendor value: the
+# vendor is part of the product's identity, so two vendor spellings are two products.
+# No quoting: a field may not contain a comma or a double quote.
+#
+#pack_version: 2026.11.1
+#
+# -- Linux distribution packages (ecosystem-agnostic names) -------------------------
+,openssl,,openssl,openssl,,runtime,openssl
+,openssh-server,,openbsd,openssh,,other,openssh
+,openssh-client,,openbsd,openssh,,other,openssh
+,curl,,curl,curl,,other,curl
+,libssl3,,openssl,openssl,,runtime,openssl
+,libssl1.1,,openssl,openssl,,runtime,openssl
+,libcurl4,,curl,curl,,other,curl
+,bash,,gnu,bash,,other,bash
+,glibc,,gnu,glibc,,runtime,glibc
+,libc6,,gnu,glibc,,runtime,glibc
+,sudo,,sudo_project,sudo,,other,sudo
+,nginx,,nginx,nginx,,web_server,nginx
+,wget,,gnu,wget,,other,wget
+,apache2,,apache,http server,,web_server,http_server
+,httpd,,apache,http server,,web_server,http_server
+,tomcat9,,apache,tomcat,,web_server,tomcat
+,tomcat10,,apache,tomcat,,web_server,tomcat
+,postgresql,,postgresql,postgresql,,database,postgresql
+,postgresql-server,,postgresql,postgresql,,database,postgresql
+,mariadb-server,,mariadb,mariadb,,database,mariadb
+,mysql-server,,oracle,mysql,,database,mysql
+,redis-server,,redis,redis,,database,redis
+,rabbitmq-server,,rabbitmq,rabbitmq,,message_broker,rabbitmq
+,mosquitto,,eclipse,mosquitto,,message_broker,mosquitto
+,python3,,python,python,,runtime,python
+,nodejs,,openjs,node.js,,runtime,node.js
+,git,,git-scm,git,,other,git
+# -- Windows applications -----------------------------------------------------------
+windows,7-Zip 23.01 (x64),,Igor Pavlov,7-Zip,,other,7-zip
+windows,Notepad++ (64-bit x64),,Notepad++ Team,Notepad++,,other,notepad++
+windows,Mozilla Firefox (x64 en-US),,Mozilla,Firefox,,other,firefox
+windows,Mozilla Thunderbird (x64 en-US),,Mozilla,Thunderbird,,other,thunderbird
+windows,Google Chrome,,Google,Chrome,,other,chrome
+windows,Microsoft Edge,,Microsoft,Edge,,other,edge_chromium
+windows,Adobe Acrobat Reader DC,,Adobe,Acrobat Reader DC,,other,acrobat_reader_dc
+windows,VLC media player,,VideoLAN,VLC media player,,other,vlc_media_player
+windows,Git,,git-scm,git,,other,git
+windows,Python 3.12.1 (64-bit),,Python Software Foundation,python,,runtime,python
+windows,Java(TM) SE Development Kit 17,,Oracle,JDK,,runtime,jdk
+windows,Java 8 Update 361 (64-bit),,Oracle,JRE,,runtime,jre
+windows,Microsoft .NET Runtime - 8.0.1 (x64),,Microsoft,.NET Runtime,,runtime,.net
+windows,Microsoft .NET SDK 8.0.100 (x64),,Microsoft,.NET SDK,,runtime,.net
+windows,Node.js,,OpenJS Foundation,node.js,,runtime,node.js
+windows,PostgreSQL 16,,postgresql,postgresql,,database,postgresql
+windows,MySQL Server 8.0,,Oracle,mysql,,database,mysql
+windows,MariaDB 10.11 (x64),,MariaDB,mariadb,,database,mariadb
+windows,MongoDB,,MongoDB,mongodb,,database,mongodb
+windows,Microsoft SQL Server 2019 Standard,,Microsoft,SQL Server,standard,database,sql_server
+windows,Microsoft SQL Server 2019 Enterprise,,Microsoft,SQL Server,enterprise,database,sql_server
+windows,Microsoft SQL Server 2019 Express,,Microsoft,SQL Server,express,database,sql_server
+windows,Visual Studio Community 2022,,Microsoft,Visual Studio,community,other,visual_studio
+windows,Visual Studio Professional 2022,,Microsoft,Visual Studio,professional,other,visual_studio
+windows,Visual Studio Enterprise 2022,,Microsoft,Visual Studio,enterprise,other,visual_studio
+windows,Microsoft Office Professional Plus 2019,,Microsoft,Office,,other,office
+windows,Zoom Workplace (64-bit),,Zoom,Zoom,,other,zoom
+windows,WinRAR 6.24 (64-bit),,win.rar,WinRAR,,other,winrar
+windows,Wireshark 4.2.0 x64,,Wireshark Foundation,Wireshark,,other,wireshark
+windows,PuTTY release 0.80 (64-bit),,Simon Tatham,PuTTY,,other,putty
+windows,FileZilla Client 3.66.1,,Tim Kosse,FileZilla,,other,filezilla
+windows,Docker Desktop,,Docker,Docker Desktop,,other,desktop
+windows,Oracle VM VirtualBox 7.0.12,,Oracle,VirtualBox,,other,vm_virtualbox
+windows,VMware Workstation,,VMware,Workstation,,other,workstation
+windows,LibreOffice 7.6.4.1,,libreoffice,LibreOffice,,other,libreoffice
+# -- macOS applications and Homebrew formulae ---------------------------------------
+macos,Firefox,,Mozilla,Firefox,,other,firefox
+macos,Google Chrome,,Google,Chrome,,other,chrome
+macos,Safari,,Apple,Safari,,other,safari
+macos,Visual Studio Code,,Microsoft,Visual Studio Code,,other,visual_studio_code
+macos,Docker,,Docker,Docker Desktop,,other,desktop
+brew,nginx,,nginx,nginx,,web_server,nginx
+brew,redis,,redis,redis,,database,redis
+brew,git,,git-scm,git,,other,git
+brew,wget,,gnu,wget,,other,wget
+brew,curl,,curl,curl,,other,curl
+brew,node,,openjs,node.js,,runtime,node.js
+brew,openssl@3,,openssl,openssl,,runtime,openssl
