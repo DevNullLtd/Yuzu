@@ -1173,10 +1173,17 @@ enrolments and recovery codes are untouched.
 **Shape 2: the whole random source is dead (not audited, not counted).** The same source also mints sign-in
 pending tokens and session tokens, and those draws are not covered by the counter or the audit trail. If the
 source is wholly dead, sign-in itself, including for already-enrolled accounts, fails with a bare `500`, and
-you will see **no audit row and flat counters**. A bare `500` at sign-in with the `RAND_bytes failed` log
-line is this shape. These draws are a tracked follow-up; until then the signals are the sign-in 5xx rate and
-that log line. If `site=api_token`, `device_token` or `engine_principal` is moving as well, the fault is
-host-wide and not specific to MFA.
+you will see **no audit row for the failure and flat counters**. A bare `500` at sign-in with the
+`RAND_bytes failed` log line is this shape. These draws are tracked follow-ups (#6996, #7018); until then
+the signals are the sign-in 5xx rate and that log line. If `site=api_token`, `device_token` or
+`engine_principal` is moving as well, the fault is host-wide and not specific to MFA.
+
+One ordering matters: at the sign-in enrolment confirm step the session-token draw runs *after* the
+enrolment has committed and its success audit rows (`mfa.enroll.verified`, `mfa.recovery_codes.generated`)
+have been written. If that draw fails the account is enrolled, the user never saw the recovery codes, and
+the response is a bare `500`; once the host recovers, the user signs in and regenerates the codes from
+Settings (#7018). PBKDF2 hashing of a recovery code can also throw (a provider failure, not a random draw;
+#7012).
 
 **Cause.** The host's random source failed: `getrandom` or `/dev/urandom` blocked or denied in a container
 (seccomp, a read-only `/dev`), a FIPS or OpenSSL provider that did not initialise, or an entropy shortage
