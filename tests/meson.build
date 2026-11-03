@@ -1711,6 +1711,7 @@ if build_server
       'unit/server/test_sle_routes.cpp',
       'unit/server/test_inventory_ci_join.cpp',
       'unit/server/test_software_catalog_rollup.cpp',
+      'unit/server/test_software_normalization_job.cpp',
       'unit/server/test_echo_process_tree.cpp',
       'unit/server/test_echo_timeline_render.cpp', # Echo timeline: pure renderer, goldens, CSS pin
       'unit/server/test_echo_timeline_page.cpp', # Echo timeline page: shell pins, flag default, escaping, script pins
@@ -1963,6 +1964,8 @@ if build_server
       'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_product_normalize.cpp',
       'unit/server/test_product_registry_store.cpp',
+      'unit/server/test_software_normalization_pack.cpp',
+      'unit/server/test_software_title_dimension.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
       'unit/server/test_app_usage_store.cpp',       # Wave 7b PR7b.2

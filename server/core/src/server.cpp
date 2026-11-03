@@ -237,6 +237,9 @@
 #include "inventory_ci_join.hpp"
 #include "network_routes.hpp"
 #include "software_catalog_rollup.hpp"
+#include "software_normalization_job.hpp"
+#include "software_normalization_pack.hpp"
+#include "software_title_dimension.hpp"
 #include "device_routes.hpp"
 #include "device_lens_routes.hpp"
 #include "device_api_local.hpp" // ADR-0031 WS-A4 wave 2: make_local_device_api
@@ -2454,6 +2457,37 @@ public:
                           "Epoch seconds of the last successful catalogue rollup refresh; alert when "
                           "now - this exceeds the rollup cadence (a stuck/failing thread leaves the "
                           "/inventory catalogue silently stale)",
+                          "gauge");
+        metrics_.describe("yuzu_software_normalization_pass_total",
+                          "Software-title normalisation ticks by outcome (success/error); hourly, "
+                          "or every 60 s while a backlog remains or the catalogue rollup has not "
+                          "yet filled the candidate source. A cancelled tick (shutdown) is "
+                          "neither. Keep-last-good on error.",
+                          "counter");
+        metrics_.describe("yuzu_software_normalization_duration_seconds",
+                          "Wall-clock of the last software-title normalisation tick",
+                          "gauge");
+        metrics_.describe("yuzu_software_normalization_last_success_timestamp",
+                          "Epoch seconds of the last successful software-title normalisation tick; "
+                          "0 until the first success. Alert when now - this exceeds two cadences",
+                          "gauge");
+        metrics_.describe("yuzu_software_titles",
+                          "Distinct installed-software titles by normalisation status "
+                          "(normalized/unnormalized/pending)",
+                          "gauge");
+        metrics_.describe("yuzu_software_unnormalized_ratio",
+                          "Fraction of installed-software installs (device-title pairs) whose "
+                          "title is not yet normalized (unnormalized or pending). Not exported "
+                          "until the first non-empty read of the title source; unchanged while "
+                          "that source is empty (a stalled catalogue rollup is not a perfect "
+                          "ratio)",
+                          "gauge");
+        metrics_.describe("yuzu_software_normalization_curation_queue_size",
+                          "Open titles in the software normalisation curation queue",
+                          "gauge");
+        metrics_.describe("yuzu_software_normalization_pack_info",
+                          "Loaded software normalisation alias pack (value 1 on the current "
+                          "pack_version label)",
                           "gauge");
         metrics_.describe("yuzu_app_perf_read_degrade_total",
                           "Authoritative B1 (per-device app-perf) reads that returned a degrade "
@@ -8112,6 +8146,34 @@ public:
                 startup_failed_ = true;
             } else {
                 product_registry_store_->set_metrics(&metrics_);
+                // Software-title normalisation. The seed is build-embedded, deterministic
+                // content, so a parse failure is a defective build; a load failure is that or
+                // a database fault (including a transient one): either way fail closed, the
+                // same posture as the CPE resolver. Loaded only when the PG row is absent; a
+                // later binary's newer seed is logged, not applied.
+                if (software_inventory_store_ && software_inventory_store_->is_open()) {
+                    auto seed = parse_normalization_pack(kSoftwareNormalizationSeed);
+                    if (!seed) {
+                        spdlog::error("[PG] Refusing to start: embedded software normalisation "
+                                      "seed is invalid: {}",
+                                      seed.error());
+                        startup_failed_ = true;
+                    } else if (auto loaded = product_registry_store_->load_pack_if_empty(*seed, "seed");
+                               !loaded) {
+                        spdlog::error("[PG] Refusing to start: software normalisation pack load "
+                                      "failed: {}",
+                                      loaded.error());
+                        startup_failed_ = true;
+                    } else {
+                        software_title_dimension_ = std::make_unique<SoftwareTitleDimension>(
+                            *pg_pool_, *product_registry_store_, *software_inventory_store_,
+                            &metrics_);
+                        software_normalization_job_ = std::make_unique<SoftwareNormalizationJob>(
+                            *software_title_dimension_,
+                            std::chrono::seconds{kCatalogueRefreshIntervalSeconds}, &metrics_);
+                        software_normalization_job_->start();
+                    }
+                }
             }
         }
 
@@ -10536,6 +10598,8 @@ public:
             // their stops are already bounded (e.g. NVD sync's 5s cancel-then-detach).
             if (software_catalog_rollup_)
                 software_catalog_rollup_->request_stop();
+            if (software_normalization_job_)
+                software_normalization_job_->request_stop();
             const seconds min_grace{std::clamp(cfg_.shutdown_drain_seconds, 0,
                                                shutdown_drain::kMaxShutdownDrainSeconds)};
             if (min_grace.count() > 0) {
@@ -11151,6 +11215,10 @@ public:
         // Stop the catalogue rollup thread (borrows software_inventory_store_ + the pool)
         // BEFORE the store/pool tear down — the dtor signals stop + joins. Idempotent.
         software_catalog_rollup_.reset();
+        // SAM.4 normalisation job + its owner borrow software_inventory_store_,
+        // product_registry_store_ and the pool - join/drop them before any of the three.
+        software_normalization_job_.reset();
+        software_title_dimension_.reset();
         agent_service_.set_software_inventory_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_software_inventory_store(nullptr);
@@ -23855,6 +23923,10 @@ private:
     // so it destructs before the pool; the /api/v1/sle/* routes read it (the UCE
     // module's evaluator writes it, out-of-server).
     std::unique_ptr<ProductRegistryStore> product_registry_store_;
+    // SAM.4: declared AFTER the stores they borrow so they destruct first; stop() also
+    // resets them explicitly before the stores and pool.
+    std::unique_ptr<SoftwareTitleDimension> software_title_dimension_;
+    std::unique_ptr<SoftwareNormalizationJob> software_normalization_job_;
     // Fleet-aggregate app-perf (B2) + its cross-store roll-up query owner (ADR-0012).
     // Declared after pg_pool_ so they destruct before the pool.
     std::unique_ptr<AppPerfFleetStore> app_perf_fleet_store_;
