@@ -404,6 +404,18 @@ private:
     std::function<void()> stamp_fault_hook_;   // test seam; empty in production
     RetentionEnforcedFn retention_enforced_fn_; // may be empty -> every window "Unknown"
     nlohmann::json retention_view() const;      // build_data_retention_settings + enforced
+    /// The engine-session belt of the Settings fragments (#6744, extending the Engine Principals
+    /// panel's G1 belt): an engine-classed session (`Session::is_engine()`) is refused with a 403
+    /// A4 body and an audited `denied` row (`engine_session_denied`) under `verb`, as the REST
+    /// twins' `deny_engine_session`. `also_mcp_tier` adds the Engine Principals panel's MCP-tier
+    /// refusal (`mcp_session_denied`, #520). Call AFTER the permission gate and the session
+    /// check, BEFORE any store read. ONE copy in this file: extend it, never inline another.
+    /// Returns true (the response is written) when the caller must stop.
+    [[nodiscard]] bool refuse_engine_session(const httplib::Request& req, httplib::Response& res,
+                                             const auth::Session& session, const char* verb,
+                                             const char* securable,
+                                             const std::string& target_id = "",
+                                             bool also_mcp_tier = false) const;
     /// Same-site gate for a page-called write (`browser_write_is_cross_site`): token callers are
     /// exempt, a cookie session must name this site in Origin/Referer. Defence in depth: the
     /// server-wide pre-routing gate answers a cookie-session write first. Call AFTER the

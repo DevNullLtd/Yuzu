@@ -2736,6 +2736,27 @@ std::string render_plugin_signing_panel(
     return html;
 }
 
+bool SettingsRoutes::refuse_engine_session(const httplib::Request& req, httplib::Response& res,
+                                           const auth::Session& session, const char* verb,
+                                           const char* securable, const std::string& target_id,
+                                           bool also_mcp_tier) const {
+    const bool engine = session.is_engine();
+    if (!engine && !(also_mcp_tier && !session.mcp_tier.empty()))
+        return false;
+    // As the REST twins' `deny_engine_session`: a dropped denial row is carried by
+    // Sec-Audit-Failed, the 403 stands (a denial commits no mutation).
+    (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, verb, "denied", securable,
+                                        target_id,
+                                        engine ? "engine_session_denied" : "mcp_session_denied");
+    res.status = 403;
+    // As the Access tokens panel's own belt 403 (access_tokens_routes.cpp).
+    res.set_header("Cache-Control", "no-store");
+    res.set_content(detail::a4_error(res, engine ? "engine principals cannot access this endpoint"
+                                                 : "this credential cannot access this endpoint"),
+                    "application/json");
+    return true;
+}
+
 bool SettingsRoutes::refuse_cross_site(const httplib::Request& req, httplib::Response& res,
                                        const auth::Session& session,
                                        const std::string& endpoint) const {
@@ -2992,23 +3013,9 @@ void SettingsRoutes::register_routes(
                      return;
                  // G1 (§9 deny belt), as the twin: an engine-classed session must not
                  // enumerate the engine principals. Plus the MCP-tier refusal above.
-                 const bool engine = session->is_engine();
-                 if (engine || !session->mcp_tier.empty()) {
-                     // As the twin: a dropped denial row is carried by Sec-Audit-Failed, the
-                     // 403 stands.
-                     (void)detail::emit_behavioral_audit(
-                         audit_read_fn_, req, res, "engine_principal.list", "denied",
-                         "EnginePrincipal", "",
-                         engine ? "engine_session_denied" : "mcp_session_denied");
-                     res.status = 403;
-                     // As the Access tokens panel's own belt 403 (access_tokens_routes.cpp).
-                     res.set_header("Cache-Control", "no-store");
-                     res.set_content(
-                         detail::a4_error(res, engine ? "engine principals cannot access this endpoint"
-                                                      : "this credential cannot access this endpoint"),
-                         "application/json");
+                 if (refuse_engine_session(req, res, *session, "engine_principal.list",
+                                           "EnginePrincipal", "", /*also_mcp_tier=*/true))
                      return;
-                 }
                  // The revoke Detail is the audit trail's text: the quiet AuditLog:Read probe
                  // against a scratch response, so a refusal is not an error and writes nothing
                  // for a cookie session. A degraded RBAC read answers "no", never "yes". It is
@@ -3040,10 +3047,21 @@ void SettingsRoutes::register_routes(
     // render_access_review_fragment()'s doc comment. The REST endpoints
     // under /api/v1/access-reviews* (rest_api_v1.cpp) and their MCP twins
     // are the ADR-1005 API-parity surface this fragment is a convenience
-    // layer over, not a replacement for.
+    // layer over, not a replacement for. Like every one of those routes, both
+    // fragments refuse an engine-class session (#6744, `refuse_engine_session`):
+    // only a human reads this evidence, whatever custom role the engine holds.
     sink.Get("/fragments/settings/access-reviews",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "AccessReview", "Read"))
+                     return;
+                 auto session = auth_fn_(req, res);
+                 if (!session)
+                     return;
+                 // #6744: as every /api/v1/access-reviews twin (`deny_engine_session`), only a
+                 // human reads this evidence. After the permission gate and the session check,
+                 // before any store read.
+                 if (refuse_engine_session(req, res, *session, "access_review.list",
+                                           "AccessReview"))
                      return;
                  res.set_content(render_access_review_fragment(req), "text/html; charset=utf-8");
              });
@@ -3056,7 +3074,16 @@ void SettingsRoutes::register_routes(
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "AccessReview", "Read"))
                      return;
+                 auto session = auth_fn_(req, res);
+                 if (!session)
+                     return;
                  std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+                 // #6744: the same belt as the main fragment, under the twin's `get` verb. The
+                 // denial row carries NO target, as the REST twin's and the Access page's do: `id`
+                 // is raw caller input and is never echoed into an audit column.
+                 if (refuse_engine_session(req, res, *session, "access_review.get",
+                                           "AccessReview"))
+                     return;
                  res.set_content(render_access_review_campaign_fragment(req, id),
                                  "text/html; charset=utf-8");
              });
