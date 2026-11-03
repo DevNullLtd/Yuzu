@@ -3132,6 +3132,31 @@ TEST_CASE("registry source: a failed HKEY_USERS enumeration keeps the cursor and
     CHECK(*r.t.db.get_cursor("registry").value() != cursor_before);
 }
 
+TEST_CASE("registry source: a failed HKEY_USERS enumeration at start-up arms no watch and the "
+          "first tick lists again",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.sids = {kSidA};
+    r.f.reads[root] = uread(root, 1);
+
+    // start() takes the same list: a failed enumeration must not escape it and must not arm a
+    // partial watch.
+    r.f.fail_loaded_sids = true;
+    REQUIRE_NOTHROW(r.src->start(r.t.db));
+    CHECK(r.f.watch_calls.empty());
+
+    // The first tick enumerates again: while that still fails it throws and keeps the (empty)
+    // cursor; once it works the loaded user is listed, baselined and watched.
+    r.f.clock += SEC;
+    CHECK_THROWS_AS(tick(r.t.db, *r.src), IncompleteCaptureError);
+    CHECK_FALSE(r.t.db.get_cursor("registry").value().has_value());
+    r.f.fail_loaded_sids = false;
+    CHECK(r.next().outcome == CursorOutcome::Baseline);
+    CHECK_FALSE(r.f.watch_calls.empty());
+    CHECK(nonempty_baseline(r.state(root)));
+}
+
 TEST_CASE("registry offline: first sight baselines silently; one mount per hive per hour, and discovery only when the loaded list is re-enumerated",
           "[echo][registry][lifecycle]") {
     OfflineRig r;
