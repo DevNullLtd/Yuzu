@@ -847,6 +847,30 @@ TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from ap
     CHECK(res.body.find("approval") != std::string::npos);
 }
 
+// Workflow:Execute joined the supervised-tier requires_approval() list (owner ruling 2026-10-30).
+// The legacy POST /api/workflows/{id}/execute route gates on require_permission, which mirrors
+// that rule on every non-MCP transport, so a supervised token is refused pending a ticket. No MCP
+// tool maps to Workflow:Execute in this change, so the refusal has no ticket path yet; the gap
+// this closes is a supervised token running a workflow with no human in the loop.
+TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from approval-gated "
+          "Workflow:Execute on the legacy REST route",
+          "[pg][auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-wfx-sup", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.path = "/api/workflows/wf-1/execute";
+    httplib::Response res;
+
+    bool ok = fix.ar->require_permission(req, res, "Workflow", "Execute");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("approval") != std::string::npos);
+}
+
 // Complement of the above: on the MCP JSON-RPC transport the C8 gate in
 // mcp_server.cpp is the authoritative approval gate for create_api_token
 // (ticket-then-recall, #289), so require_permission must NOT re-deny it here.

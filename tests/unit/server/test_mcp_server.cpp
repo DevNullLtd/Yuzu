@@ -499,6 +499,12 @@ TEST_CASE("MCP Policy: supervised requires approval for destructive ops", "[mcp]
     CHECK(requires_approval("supervised", "Security", "Execute"));
     CHECK(requires_approval("supervised", "UserManagement", "Write"));
     CHECK(requires_approval("supervised", "ManagementGroup", "Write"));
+    // A workflow fans several steps out in one call (owner ruling 2026-10-30). The operator tier
+    // never reaches the pair: tier_allows denies it.
+    CHECK(requires_approval("supervised", "Workflow", "Execute"));
+    CHECK_FALSE(requires_approval("supervised", "Workflow", "Read"));
+    CHECK_FALSE(requires_approval("supervised", "Workflow", "Write"));
+    CHECK_FALSE(tier_allows("operator", "Workflow", "Execute"));
 
     // Delete on any type
     CHECK(requires_approval("supervised", "Tag", "Delete"));
