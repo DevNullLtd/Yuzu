@@ -869,6 +869,43 @@ TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from ap
     CHECK_FALSE(ok);
     CHECK(res.status == 403);
     CHECK(res.body.find("approval") != std::string::npos);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["code"].get<int>() == 403);
+    CHECK(j["error"]["permission"].get<std::string>() == "Workflow:Execute");
+}
+
+// The "unaffected" side of the rule above: the approval gate is the supervised branch only. An
+// untiered token (and a session, which has no tier) passes the tier belt for Workflow:Execute, and
+// an operator-tier token is refused by the TIER check, not the approval gate (its body names the
+// tier, never an approval).
+TEST_CASE("AuthRoutes::require_permission - Workflow:Execute: untiered token passes the tier belt, "
+          "operator tier is refused by tier_allows not the approval gate",
+          "[pg][auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+
+    SECTION("untiered API token") {
+        auto raw = fix.api_tokens->create_token("wfx-untiered", "test_user", now + 3600, "", "");
+        REQUIRE(raw.has_value());
+        auto req = request_with_header("Authorization", "Bearer " + *raw);
+        req.path = "/api/workflows/wf-1/execute";
+        httplib::Response res;
+        CHECK(fix.ar->require_permission(req, res, "Workflow", "Execute"));
+        CHECK(res.body.find("approval") == std::string::npos);
+    }
+    SECTION("operator-tier token") {
+        auto raw = fix.api_tokens->create_token("wfx-operator", "test_user", now + 3600, "",
+                                                "operator");
+        REQUIRE(raw.has_value());
+        auto req = request_with_header("Authorization", "Bearer " + *raw);
+        req.path = "/api/workflows/wf-1/execute";
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_permission(req, res, "Workflow", "Execute"));
+        CHECK(res.status == 403);
+        CHECK(res.body.find("does not allow") != std::string::npos);
+        CHECK(res.body.find("requires approval") == std::string::npos);
+    }
 }
 
 // Complement of the above: on the MCP JSON-RPC transport the C8 gate in

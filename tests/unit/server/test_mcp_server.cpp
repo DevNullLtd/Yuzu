@@ -505,6 +505,11 @@ TEST_CASE("MCP Policy: supervised requires approval for destructive ops", "[mcp]
     CHECK_FALSE(requires_approval("supervised", "Workflow", "Read"));
     CHECK_FALSE(requires_approval("supervised", "Workflow", "Write"));
     CHECK_FALSE(tier_allows("operator", "Workflow", "Execute"));
+    // The rule lives inside the supervised branch: an empty tier (a session, an untiered token) and
+    // readonly are never gated by it, and hoisting it above that branch would lock every session out.
+    CHECK_FALSE(requires_approval("", "Workflow", "Execute"));
+    CHECK_FALSE(requires_approval("readonly", "Workflow", "Execute"));
+    CHECK_FALSE(requires_approval("operator", "Workflow", "Execute"));
 
     // Delete on any type
     CHECK(requires_approval("supervised", "Tag", "Delete"));
