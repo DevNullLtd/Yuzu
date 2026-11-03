@@ -3684,6 +3684,144 @@ only when a change cannot be expressed as an idempotent additive re-seed
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
 
+## Periodic access reviews (SOC 2 CC6.2)
+
+Fleet-wide grant export plus a durable attestation-campaign lifecycle (`open` freezes the complete grant
+population as `pending` rows, a reviewer records `attested` or `flagged_revoke` per grant, `close` ends the
+campaign) across all three RBAC principal types (user, group, engine). Routes: `/api/v1/access-reviews*` and
+the MCP twins `export_access_review`, `open_access_review`, `record_attestation`, `get_access_review`,
+`list_access_reviews`, `close_access_review`. The routed-concern row in
+`.claude/routed-concerns-access-control.md` carries the five catastrophic-if-violated clauses in short form;
+this section holds them in full, with the reasoning the row no longer carries. Per-surface reference:
+`docs/user-manual/rest-api.md` "Access Reviews", `docs/user-manual/mcp.md`; the original decision record is
+`docs/security-reviews/access-reviews-2026-07-21.md`.
+
+**#2225 round 2: the gate is the dedicated `AccessReview` securable, never `AuditLog:*`.** The gate is global
+and deliberately not `authorize_list_read` (clause 1 below). Its first implementation reused
+`AuditLog:Read`/`AuditLog:Attest`, assuming those were effectively `Reviewer`-only. They are not:
+`AuditLog:Read` is also seeded to `Operator` and `PlatformEngineer` for unrelated audit-log reads, and
+neither role holds `UserManagement:Read` (the permission gating `GET /api/v1/rbac/roles`) or
+`EnginePrincipal:Read` (gating the engine-principal grant reads, which moved off `Security:Read` in #2376).
+Under the first gate those two roles could still pull the whole grant population through the export, a wider
+disclosure than the routes they are deliberately refused. The fix cut a dedicated securable, `AccessReview`,
+with two operations: `Read` (export, get, list) and `Attest` (open, attest, close). It is seeded only to
+`Administrator` and the `Reviewer` role (`AccessReview:Read` plus `AccessReview:Attest`, nothing else), and
+`AuditLog:Read` alone no longer reaches any access-review route. Do not revert to `AuditLog:*`. Under RBAC
+off, `AccessReview:Read` is floored to the `admin` session role by the topology floor (see "The authorization
+topology floor" above); `AccessReview:Attest` is admin-only through the legacy rule, not through the floor.
+
+**The five clauses.**
+
+1. **Global gate, not `authorize_list_read` (#2225).** A grant has no per-agent or management-group boundary
+   to admit-then-filter against, and a confinement-filtered slice would be worthless as CC6.2 evidence: an
+   auditor needs the complete grant population every time. The dedicated-securable gate is the stronger
+   least-privilege posture, because a read-only reviewer can be appointed without `Administrator`.
+2. **Flag is not revoke.** `decision: "flagged_revoke"` records evidence only. It is never wired to an RBAC
+   or `EnginePrincipalStore` mutation; acting on a flag stays a separate, explicit, separately gated operator
+   action.
+3. **Grant-table-driven completeness (UP-1), never a roster walk.** `build_access_review` reads
+   `RbacStore::list_all_principal_roles_checked()`, so a grant belonging to a principal outside every roster
+   (a deleted user, a stale IdP row, an orphan SSO principal) is surfaced as `source="orphan"` and never
+   silently omitted.
+4. **Deliberate no-prune.** A closed campaign is the compliance evidence and persists indefinitely. No retention
+   pass is adopted; the disposition is recorded in `docs/clock-guarded-retention.md`, and any retention policy is
+   a separate, explicit, separately reviewed decision. The per-grant decision history
+   (`access_review_attestation_history`) is append-only against the application path by a database guard, with
+   the limits stated under "The decision history" below. It is not owner-proof.
+5. **The reviewer must differ from the subject of the grant (#4752).** The rules, the window and the residuals
+   are under "Separation of duties" below. Every decision is appended with the value it replaced, never
+   overwritten, and REST and MCP share one refusal helper, `server/core/src/access_review_attest_gate.hpp`.
+   Extend that header; do not write a second per-surface copy.
+
+**Separation of duties.** `evaluate_attestation_sod` runs as the last call before the store, after the
+permission, session, engine-session and (REST) browser-write checks, on both surfaces. By `principal_type`:
+
+- `user`: the reviewer is the subject when `session->username == principal_id`, compared byte-exact (the same
+  comparison `ApprovalManager::same_human_root` makes). This rule is decided in the write: the store refuses it
+  too (a `forbidden:` result) before any lease is taken, so it holds even for a caller that skips the gate, and
+  it is answered before `not_found`. A self-subject attempt against a closed campaign is therefore refused
+  with 403, not 404.
+- `engine`: refused when the reviewer owns the engine principal (`owner_username`), revoked engines included.
+  An engine id with no row (an orphan grant) is admitted, because there is no owner to compare against.
+- `group`: refused when the reviewer is a member of the group. A group with no row, or one the reviewer is not
+  in, is admitted. Membership is read with `RbacStore::user_rbac_group_names_checked`, which also covers
+  memberships reconciled from an identity provider at login (`reconcile_idp_memberships`).
+
+The engine and group rules are a pre-read through the owning stores. A lookup that cannot be answered fails
+CLOSED: REST answers 503 with `retry_after_ms`, MCP answers `kInternalError` with
+`mcp::kMcpStoreFaultRetryMs`, the audit row is `failure`, and nothing is written. It is never read as "not the
+owner" or "not a member". `get_group_members` is deliberately not used for this: it collapses a read failure
+into an empty list.
+
+The refusal is a 403 whose body names no `permission`: the caller already holds `AccessReview:Attest`, so
+naming it would claim a self-remediation grant that cannot help (clause 5 of the service-scope confinement
+row). The message is self-contained, because the browser renders only `error.message`. Both outcomes write one
+audit shape (see `docs/user-manual/audit-log.md`) and a refusal moves
+`yuzu_access_review_attestation_refused_total{surface,reason}`.
+
+Who reaches the gate: under RBAC on, `Administrator` and `Reviewer` both do, and the rule applies to both.
+Under RBAC off only administrators do, and the rule still applies: an administrator attesting their own
+`Administrator` grant is refused. Service-scoped tokens are refused earlier (the empty `kServiceScopeGlobalSafe`
+allow-list) and the MCP tier check precedes the gate. Engine principal sessions are refused before the gate.
+
+**The window (stated as a limit, not a guarantee).** The engine-owner and group-member rules are decided by a
+read BEFORE the store's write transaction, not inside it. ADR-0012 s2(c) forbids a store method from calling
+another store, or re-entering the pool, while it holds a lease, so the attest transaction cannot consult the
+engine or RBAC store. The window runs from that read to the commit: a pool acquire of up to the store's 4 s
+write budget, a row-lock wait of up to the pool's 10 s `lock_timeout`, and the statements themselves.
+It is normally milliseconds but is not a bound the code promises. An ownership transfer or a membership change
+that lands inside it is not seen, and there is no re-read after the commit. Membership can be changed by the
+reviewer's own SSO login (the Entra and SAML login paths call `reconcile_idp_memberships`). The user rule has
+no such window. Revisit under the four-eyes primitive work (epic #6060).
+
+**Two identities of one person.** `Session::username` is the stable principal (a local name, `oidc:<iss>#<sub>`
+or `saml:...`; a token session carries its owner's). A person who holds a local account and an SSO identity, or
+two SSO identities, counts as two reviewers. This is the maintainer-accepted exception recorded in
+`docs/enterprise-readiness-soc2-first-customer.md` (the addendum "approver assurance for approve and reject",
+residual risk (e)); it is not a guarantee across identities.
+
+**The decision history.** The current-state row in `access_review_attestation` keeps its four-part key and
+holds the latest decision plus `decision_seq` (0 while pending). The new table
+`access_review_attestation_history` holds one row per recorded decision, keyed by the same four parts and
+`seq`, with the decision it replaced (`previous_decision`; empty means "not recorded", for a decision
+backfilled by the schema v3 migration, and is never read as pending). Ordering is by `seq`, never by time.
+The store writes the history row in the same transaction as the state change; the database only guards:
+
+- a trigger on the state table refuses an insert that is not `pending` at seq 0, any delete, and any update
+  that is not exactly one appended, matching history row with `decision_seq` advanced by one;
+- a trigger on the history table refuses every update and delete;
+- a deferred constraint trigger refuses a commit in which a history row was written without the state
+  advancing to match;
+- both foreign keys are `ON DELETE RESTRICT`, and a `CHECK` on the history table refuses a `user` decision
+  whose reviewer is the subject.
+
+An older binary's bare UPDATE during a mixed-version window therefore fails (SQLSTATE class 23, answered as a
+write failure), it does not bypass the reviewer rule. That is the claim, and its limits are part of it:
+append-only against the application path and ordinary SQL. It is NOT held against the application credential:
+the migration runner creates the schema under that role, so the owner can disable a trigger, forge a matching
+history row or truncate. A role granted TRUNCATE can truncate, and a database administrator can do anything. A
+data-only restore into a migrated schema is refused by the guard; restore schema and data together. A future
+migration that touches attestation rows must disable the triggers inside its own transaction. The independent
+evidence is the audit store and its export, not this table.
+
+**Lost COMMIT.** One history event is one committed decision transaction. When the connection drops after
+COMMIT was sent, the server cannot tell whether the decision was recorded and answers a write failure (503 on
+REST). Before retrying, GET the campaign and compare `decision_seq`. A retry after an unacknowledged commit
+appends an identical decision at seq+1; it is kept and visible, never an error, and the first attempt's audit row
+may be missing while its history row exists. There is no idempotency key yet.
+
+**Close starvation.** A queued `close_campaign` does not block a new attestation's lock on the campaign row, so
+under a continuous stream of attestations a close can wait up to the pool's 10 s `lock_timeout` and answer 503.
+Retry the close.
+
+**Hard cutover.** A database that holds a decision recorded by the subject of the grant (an earlier build
+allowed it) makes the schema v3 migration fail, the store stay closed at version 2, and the server refuse to
+start (`server.cpp` treats a store that did not open as a startup failure) with a message that names the cause.
+It refuses again on every boot until the database is replaced. Deploy into a fresh database. This is the
+project's "Deployment contract (hard cutover)" posture, a decision of the project owner recorded in
+`docs/user-manual/upgrading.md`; the executable refuses a schema state, it does not verify where the database
+came from.
+
 ## Render-time permission probes (capability hints)
 
 Six `AuthRoutes` methods answer a permission question without writing a denial row for an
