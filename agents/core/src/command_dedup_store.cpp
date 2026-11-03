@@ -122,7 +122,10 @@ struct OpenFailure {
 
 } // namespace
 
-CommandDedupStore::CommandDedupStore(sqlite3* db) : db_{db} {}
+CommandDedupStore::CommandDedupStore(sqlite3* db) : db_{db} {
+    // Sole owner here (the store is not yet shared), so no lock is needed.
+    refresh_row_count_locked();
+}
 
 CommandDedupStore::~CommandDedupStore() {
     if (db_) {
@@ -132,8 +135,10 @@ CommandDedupStore::~CommandDedupStore() {
 }
 
 CommandDedupStore::CommandDedupStore(CommandDedupStore&& other) noexcept
-    : db_{other.db_}, quarantined_file_{std::move(other.quarantined_file_)} {
+    : db_{other.db_}, cached_rows_{other.cached_rows_.load(std::memory_order_relaxed)},
+      quarantined_file_{std::move(other.quarantined_file_)} {
     other.db_ = nullptr;
+    other.cached_rows_.store(kRowCountUnknown, std::memory_order_relaxed);
     other.quarantined_file_.reset();
 }
 
@@ -142,8 +147,11 @@ CommandDedupStore& CommandDedupStore::operator=(CommandDedupStore&& other) noexc
         if (db_)
             sqlite3_close(db_);
         db_ = other.db_;
+        cached_rows_.store(other.cached_rows_.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
         quarantined_file_ = std::move(other.quarantined_file_);
         other.db_ = nullptr;
+        other.cached_rows_.store(kRowCountUnknown, std::memory_order_relaxed);
         other.quarantined_file_.reset();
     }
     return *this;
@@ -344,7 +352,13 @@ ClaimResult CommandDedupStore::claim(std::string_view command_id) noexcept {
         }
         // NB: prune is NOT triggered here — it runs from record_terminal() (a
         // worker thread), off the latency-critical reader, since the ring evicts
-        // terminal rows.
+        // terminal rows. The cached row count (heartbeat capacity signal, #3663)
+        // is bumped here with no SQL: a relaxed load then store, NOT fetch_add,
+        // because mu_ (held for this whole function) already serialises every
+        // writer, and because fetch_add would turn the -1 "unknown" sentinel into
+        // 0 ("known empty"), so the bump happens only when a count is known.
+        if (auto rows = cached_rows_.load(std::memory_order_relaxed); rows >= 0)
+            cached_rows_.store(rows + 1, std::memory_order_relaxed);
         return ClaimResult{.status = ClaimStatus::Claimed};
     }
     if (rc != SQLITE_DONE) {
@@ -519,6 +533,35 @@ void CommandDedupStore::prune_locked() noexcept {
     rc = sqlite3_step(stmt.get());
     if (rc != SQLITE_DONE)
         spdlog::error("CommandDedupStore::prune step failed: {}", sqlite3_errmsg(db_));
+    // Re-anchor the heartbeat's cached count on the real table once the DELETE statement
+    // has run, whether or not its step succeeded (the count is read, not derived from the
+    // delete). A failed PREPARE returned above and skips this, so the cache then stays at
+    // its previous value until the next prune. This is the only place a COUNT(*) runs
+    // after open, on the worker thread that already pays for the prune, once per
+    // kPruneInterval terminal records (#3663).
+    refresh_row_count_locked();
+}
+
+void CommandDedupStore::refresh_row_count_locked() noexcept {
+    if (!db_)
+        return;
+    sqlite3_stmt* raw_stmt = nullptr;
+    const int prep =
+        sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM command_outcomes", -1, &raw_stmt, nullptr);
+    // Owned from here on EVERY path, including a failed prepare: SQLite leaves *ppStmt
+    // NULL on error and sqlite3_finalize(NULL) is a documented no-op, so there is no
+    // manual cleanup branch to forget.
+    StmtPtr stmt(raw_stmt);
+    if (prep != SQLITE_OK || sqlite3_step(stmt.get()) != SQLITE_ROW)
+        return; // KEEP the previous value: a transient SQLITE_BUSY must not blank a good count
+    cached_rows_.store(sqlite3_column_int64(stmt.get(), 0), std::memory_order_relaxed);
+}
+
+std::optional<std::int64_t> CommandDedupStore::cached_row_count() const noexcept {
+    const auto rows = cached_rows_.load(std::memory_order_relaxed);
+    if (rows < 0)
+        return std::nullopt;
+    return rows;
 }
 
 void CommandDedupStore::set_max_dedup_rows_for_test(std::int64_t n) {

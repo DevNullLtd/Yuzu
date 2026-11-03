@@ -2343,7 +2343,11 @@ Download the current certificate revocation list (DER). **Public** — no
 authentication. Returns `Content-Type: application/pkix-crl`,
 `Cache-Control: no-cache, must-revalidate`. `503` if no CRL has been published
 yet (transient — the server pre-publishes at startup and republishes on each
-revocation).
+revocation). Each CRL is valid for 48 hours from the moment it is built (`nextUpdate`),
+and the server rebuilds it when less than 24 hours remain, so a fleet with no
+revocations gets a new CRL about once a day. A consumer that fetches on a schedule
+should refresh well within 24 hours (hourly is typical; the response is small),
+and should alert when the `nextUpdate` of the CRL it holds has passed.
 
 ```bash
 curl https://yuzu.example.com/api/v1/ca/crl -o yuzu.crl
@@ -2419,7 +2423,7 @@ returns the same five fields at the top level of its result.
   ],
   "count": 1,
   "meta": { "api_version": "v1", "limit": 200, "offset": 0, "has_more": false,
-            "crl_version": 14, "crl_published_at": 1710849600, "crl_next_update": 1711454400,
+            "crl_version": 14, "crl_published_at": 1710849600, "crl_next_update": 1711022400,
             "crl_revoked_count": 2, "crl_stale": false }
 }
 ```
@@ -4399,6 +4403,9 @@ Audited as `access_review.closed`.
 Every `access_review.*` verb above additionally records `result=denied`
 (`detail="engine_session_denied"`) when the caller's own session is
 engine-classed — see the "Engine-session denial" note above.
+The Settings Access reviews fragments (`GET /fragments/settings/access-reviews` and its
+`/campaign` view) write the same denied rows, under `access_review.list` and
+`access_review.get`, with an empty `target_id`.
 `access_review.campaign_opened` and `access_review.attested` also record
 `result=denied`, `detail=content_type_not_json` (empty `target_id`) when a
 request is refused with `415`.
@@ -11239,7 +11246,7 @@ Render one role's permissions grouped by area.
 
 **`GET /fragments/access/roles/assignments`**
 
-Render the Role assignments panel: every fleet-wide grant (type, principal, role), with Assign and Remove controls on an administrator account.
+Render the Role assignments panel: every fleet-wide grant (type, principal, role). The Assign role button and the per-row Remove controls are drawn when the server's own administrator check (the durable-Administrator rule, then the enforcement-regime check) would admit the caller; if that check cannot be answered, Assign role is drawn disabled with the reason, **"Your administrator authority could not be confirmed. Reload to try again."**, and the Remove controls are left out. The controls are a hint: every click is checked again by its route.
 
 - **Permission:** `AccessReview:Read`, the same securable as `GET /api/v1/rbac/roles/assignments`. Not `UserManagement:Read`: the grant table is authorization topology.
 - **Audit:** a successful view writes `rbac.assignments.list` with `count=<grants on record>` (before the display cap). A row that cannot be saved sets `Sec-Audit-Failed: true` and the panel is still returned. A failed read writes no row.
@@ -11252,7 +11259,7 @@ Render the Role assignments panel: every fleet-wide grant (type, principal, role
 Render the RBAC enforcement panel.
 
 - **Permission:** any signed-in session, the same as its twin `GET /api/v1/me`. Neither the account-role gate nor a permission gate is applied. A service-scoped API token is refused first (**403**, audit action `access.fragment.access_denied`), because the panel reports fleet-wide RBAC state.
-- **Response (200):** HTML fragment: the setting (On or Off) with an **Enforce roles** switch when the session is an administrator account (a hint: the server decides on every PUT), a read-only switch for everyone else, **Unconfirmed** when the store's view could not be confirmed (the cached flag is not drawn at all in that case), or a red "could not be read" box when the RBAC store is not open. Never "Off" for a failed read.
+- **Response (200):** HTML fragment: the setting (On or Off) with an **Enforce roles** switch when that same administrator check admits the caller (a hint: the server decides on every PUT), a disabled switch ("Only a durable Administrator can change this.") for everyone else, a disabled switch with "Your administrator authority could not be confirmed. Reload to try again." when the check cannot be answered, **Unconfirmed** when the store's view could not be confirmed (the cached flag is not drawn at all in that case), or a red "could not be read" box when the RBAC store is not open. Never "Off" for a failed read.
 - **Headers:** `Cache-Control: no-store`. No audit row (the twin writes none).
 
 **`GET /fragments/access/users/detail?username=<name>`**

@@ -17,7 +17,7 @@
  * stub's condition variable for the agent's Subscribe, which Agent::run() opens
  * strictly after the removal block, so observing a Subscribe is observing the
  * post-removal state. The retry case does wait out the agent's own reconnect backoff
- * (2 s per retry, counted by the agent, not by the test).
+ * (1 to 3 s per retry, counted by the agent, not by the test).
  */
 
 #ifndef _WIN32

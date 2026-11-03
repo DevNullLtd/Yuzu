@@ -39,7 +39,7 @@ Every mutating operation on this surface requires:
   exist as a real Yuzu user — creation and transfer both fail closed
   (`400`) against an unknown username.
 
-**An engine-classed session is refused on the lifecycle and credential surface.** A caller whose *own* session is engine-classed is refused, even to read, on every engine-principal lifecycle and credential route on REST (create, list, get, revoke, mint, rotate, confirm, transfer and the no-admin audit) and on the engine lifecycle MCP tools; for the MCP tools, see the [MCP tool list](mcp.md#available-tools). `GET /api/v1/engine-principals/{id}/roles` (list) is the one REST exception: it carries no engine-session check and relies on its `EnginePrincipal:Read` gate alone. `POST` and `DELETE` on the roles routes (assign, unassign) are step-up gated like every other mutating route, so they refuse an engine-classed session before the handler runs.
+**An engine-classed session is refused on the lifecycle and credential surface.** A caller whose *own* session is engine-classed is refused, even to read, on every engine-principal lifecycle and credential route on REST (create, list, get, revoke, mint, rotate, confirm, transfer and the no-admin audit) and on the engine lifecycle MCP tools, and also on every access-review route, MCP tool and dashboard fragment (the grant population is evidence only a person reads); for the MCP tools, see the [MCP tool list](mcp.md#available-tools). `GET /api/v1/engine-principals/{id}/roles` (list) is the one REST exception: it carries no engine-session check and relies on its `EnginePrincipal:Read` gate alone. `POST` and `DELETE` on the roles routes (assign, unassign) are step-up gated like every other mutating route, so they refuse an engine-classed session before the handler runs.
 
 **What an engine principal can never be given.** Assignment refuses the roles named `admin` and `Administrator`, and refuses every built-in (system) role. Assignment does not inspect the permissions of a custom role, so a custom role that grants broad permissions can still be assigned. `GET /api/v1/engine-principals/audit/no-admin` reports an admin grant, a system role, or an effective grant that covers every securable and operation, so run it after assigning a custom role.
 
@@ -49,6 +49,51 @@ Every mutating operation on this surface requires:
 
 Dashboard: Settings → **Engine Principals** → fill in Slug, Display Name,
 Owner, Classification, Justification → Create.
+
+The panel needs `EnginePrincipal:Read`, the same permission as
+`GET /api/v1/engine-principals`. With RBAC disabled that means an effective
+administrator; with RBAC enabled it means the grant (the built-in `Administrator`
+and `Viewer` roles hold it), so an account administrator who has been given a
+role without it sees "You do not have permission to view this panel" instead of
+the list. The same note appears when the permission check itself could not be
+completed (a degraded RBAC read is answered `403`, not `503`): reload once (copy any
+credential secret shown first) before changing any grant, and if it persists check the
+role store's health and the `YuzuRbacReadDegraded` alert. The Settings page itself
+still opens for effective administrators only. The panel differs from the REST route in the ways
+listed once in [upgrading](upgrading.md) (the "Breaking: the Settings Engine
+Principals panel" section); none admits a caller the route refuses.
+
+A revoked row's **Detail (earliest retained record)** cell is the audit trail's text
+for that principal, shown to a caller who also holds `AuditLog:Read`. It is
+best-effort: the oldest committed revoke record the panel's read of the newest 200
+revoke events still holds, which is not the revocation's own record when audit
+retention has pruned it while a later retry survives, when the revoke committed but
+its audit row failed to persist (so a later retry of the same revoke is the first
+success row), or when an MCP revoke was given no reason (its committed row has an
+empty detail, so the cell shows no text and reads "(not recorded)"). Its states:
+
+- The recorded text, as above.
+- "(not recorded)": no committed revoke record is retained. There was no committed
+  revoke, or a committed MCP revoke was given no reason (an empty detail), or the
+  record is older than audit retention (365 days by default).
+- "(unavailable)": not looked up, or the lookup failed. The audit store could not
+  answer, or an earlier credential read in the same load failed (or no token store
+  is wired) and the lookup was skipped; the remaining revoked rows are then not
+  looked up. Retry when the panel shows a Retry control (a Retry cannot fix a server
+  with no token store wired), otherwise reload the page (copy any credential secret
+  shown first); if it persists, check the `YuzuAuditReadDegraded` alert and the audit
+  store ([Audit log](audit-log.md), Storage).
+- "(withheld: needs AuditLog:Read, or it could not be confirmed)": the caller does
+  not hold `AuditLog:Read`, or that check could not be completed. Grant it (the
+  built-in `Administrator` and `Viewer` roles hold it) or reload (copy any credential
+  secret shown first).
+
+Past 200 revoke events for one principal the cell adds "(more than 200 revoke events:
+this is the oldest success among the newest 200, not necessarily the original)" after
+the text, or "(more than 200 revoke events and none of the newest 200 succeeded)" after
+"(not recorded)"; the second can be wrong when the oldest success in the window has an
+empty detail (an MCP revoke given no reason). The full list of what the cell can
+and cannot say is in [upgrading](upgrading.md) ("The Detail cell").
 
 If the list or an engine principal's credentials cannot be read (for example
 while the database connection pool is exhausted), the panel says so: an
