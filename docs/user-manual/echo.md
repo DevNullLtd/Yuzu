@@ -485,7 +485,7 @@ The Yuzu dashboard includes a dedicated Echo page at `/echo`, reachable from the
 
 The first frame surfaces every device × source pair where the collector has been disabled (`<source>_enabled=false`). Rows are sorted paused-longest-first so devices accumulating non-aging data the longest float to the top of the list.
 
-**Columns:** device hostname, source pill, paused since (UTC), paused for (coarse age), live rows count, oldest data age.
+**Columns:** device hostname, source pill, paused since (UTC), paused for (coarse age), hourly rows count, oldest hourly bucket. A paused source is never pruned, so its hourly rows keep their place until it is re-enabled or purged.
 
 **Partial result banner (#4644).** The scan's response read is capped at 10,000 rows and 50 MiB of response payload. When either cap cuts it, the page shows a "Partial result" banner above the table, the header counts ("responded", "have all sources collecting normally") are marked as describing only the responses that were read, and, if no paused rows are in the part that was read, the empty state says the page cannot tell and that Refresh will not change it (the cut repeats), instead of "still in progress" or "running normally". Dropped responses read as agents that never answered, so the banner is NOT confirmation that every collector is running normally: narrow the scan to a smaller management group and scan again. A cut scan does not update the `yuzu_echo_retention_paused_devices` gauge (its partial row set would under-count), so the gauge keeps the last value from an uncut scan and can be stale. The same condition is `result_truncated_by_cap: true` in `GET /api/v1/echo/retention-paused` and the `list_echo_retention_paused` tool, which also set `store_degraded: true` for a cut scan so an older client sees an incomplete result.
 
@@ -517,23 +517,24 @@ The first frame surfaces every device × source pair where the collector has bee
 
 ### Process tree viewer
 
-The third frame on the `/echo` page reconstructs a **per-host process tree** entirely from that host's local Echo warehouse (`$Process_Live` + `$TCP_Live`) — no extra data is collected, and no other host is involved.
+The third frame on the `/echo` page shows a **per-host process tree for one hour**, built entirely from that host's own hourly roll-up (`$Process_Hourly` + `$TCP_Hourly`) -- no extra data is collected, and no other host is involved.
 
 **Workflow:**
 
-1. **Pick a live host** from the dropdown (only connected agents in your scope are listed). Selecting one reconstructs the default **Last 10m** window.
-2. **Choose a timescale** — the preset chips **On boot · On agent install · Last minute · Last 10m · Last hour · Last day**, or pick or type a **custom From/To (UTC)** range and click **Apply**. Setting From == To gives a true point-in-time tree. A custom From or To that is filled in must be a valid UTC date and time (`YYYY-MM-DDTHH:MM` or `YYYY-MM-DDTHH:MM:SS`) or, in a hand-built request, epoch seconds (up to 18 digits). Anything else, including a date that does not exist such as 31 February, is refused with a note ("The custom window is not a valid time") and nothing is dispatched to the device.
-3. **Read the tree.** Each row shows a running/exited dot, PID, name, owning user, and — when the process has connections — an inline network summary of remote `IP:port` endpoints (public/internet egress is highlighted). Dozens of identical-name siblings (e.g. `svchost.exe`) collapse into one `name ×N` row you can expand.
-4. **Click any process** to open the **detail panel on the right**: path, command line, user, start time, full connection list, and any anomaly evidence.
-5. **Filter** with the toolbar: **All / Running / Exited**, an **Anomalies only** toggle, and a text box that matches name, PID, or remote IP. Filters combine and apply instantly (no reload).
+1. **Pick a live host** from the dropdown (only connected agents in your scope are listed). Selecting one loads the default **Last 24 hours** window.
+2. **Choose a timescale** -- the preset chips **Last hour · Last 24 hours · Last 7 days**, or pick or type a **custom From/To (UTC)** range and click **Apply**. A window is made of whole hours (a custom range is floored to the hour) and is at most 168 hours. A custom From or To that is filled in must be a valid UTC date and time (`YYYY-MM-DDTHH:MM` or `YYYY-MM-DDTHH:MM:SS`) or, in a hand-built request, epoch seconds (up to 18 digits). Anything else, including a date that does not exist such as 31 February, is refused with a note ("The custom window is not a valid time") and nothing is dispatched to the device.
+3. **Pick the hour.** The **Hour** selector lists the hours in the window that have rows, newest first, and shows the newest by default. The tree shows that one hour.
+4. **Read the tree.** Each row is a process **name** (with its user) and shows how many instances started and stopped in the hour, and -- when the name has connections -- an inline network summary of remote `IP:port` endpoints (public/internet egress is highlighted). Children are linked to their parent by name.
+5. **Click any name** to open the **detail panel on the right**: parent name, user, started and stopped counts, abnormal exits, any anomaly evidence, and the full list of connections recorded under that name in the hour. Beside the tree, the **device network** panels list the hour's DNS and ARP activity for the host.
+6. **Filter** with the toolbar: an **Anomalies only** toggle and a text box that matches name, user, or remote IP. Filters combine and apply instantly (no reload).
 
-**What "anomalies" means here:** the viewer flags **suspicious parent→child spawns** — a common-document or browser application (Word, Excel, Outlook, Chrome, Edge, …) launching a shell or LOLBin (`powershell.exe`, `cmd.exe`, `mshta.exe`, `rundll32.exe`, …). This is computed on the server from the Echo data; it is heuristic, name-based, and deliberately conservative.
+**What "anomalies" means here:** a name is flagged when it has **abnormal exits** in the hour, or when it is a **suspicious parent→child spawn** -- a common-document or browser application (Word, Excel, Outlook, Chrome, Edge, …) launching a shell or LOLBin (`powershell.exe`, `cmd.exe`, `mshta.exe`, `rundll32.exe`, …). The spawn check is computed on the server from the Echo data; it is heuristic, name-based, and deliberately conservative. A name with more stops than starts is noted in the detail panel (some instances started before the hour) but is not flagged.
 
 **Honest limitations:**
 
-- **No seed.** The tree is replayed from the retained `$Process_Live` events only. A process whose `started` event has aged out of the live-tier cap (or that started before the oldest retained row) may not appear; the banner states the observation window.
-- **`On boot` / `On agent install` are proxies.** Echo stores no boot or install timestamp, so these anchors are derived from the retained events (install ≈ oldest retained row; boot ≈ the most recent root-process start).
-- **Windows is names-only.** On Windows the process feeder is ETW (Kernel-Process), which captures image **names only** — so per-process **path and command line are blank** on Windows (they are populated on Linux/macOS). Loaded libraries/DLLs are not captured by Echo on any platform.
+- **Names only.** The hourly roll-up keeps counts per name, not individual processes: **process ids, command lines and file paths are not kept**, on any platform, and processes that share a name share one position in the tree. Loaded libraries/DLLs are not captured by Echo on any platform.
+- **One hour at a time, whole hours.** A process that started before the chosen hour appears only through its stops; a window covers hourly buckets that exist. If the host has no rows for the hour the tree says so.
+- **No boot or agent-install anchors.** They need process ids and raw capture rows, which the roll-up does not keep.
 
 **Permissions:** viewing the frame requires `Infrastructure:Read`. Reconstructing a tree dispatches a read-only `echo.sql` to the device, so it additionally requires `Execution:Execute` and the device must be inside your management scope. The access is audited as `echo.process_tree.read` — once when the query is dispatched (recorded even if the device is offline) and again on a successful reconstruction (recording the time window, node/anomaly counts, the OS data-class, and whether connection data was shown). The device is the audit event's target.
 
@@ -565,8 +566,8 @@ Echo is designed for minimal performance overhead:
   **not** from the `retention_days` configure key -- that key is stored and
   reported by `status` but is not what the warehouse tiers prune against.
   The per-tier defaults are published by `GET /api/v1/settings/data-retention`
-  (`echo.tiers`) and shown on Settings > Data and retention (the `live` tier under
-  the Exact column) with a "Look again after" floor per source.
+  (`echo.tiers`) and shown on Settings > Data and retention (the hourly tier under
+  the Hourly column) with a "Look again after" floor per source.
 
 ### The retention clock guard
 

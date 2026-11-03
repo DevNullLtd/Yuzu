@@ -14,7 +14,7 @@ The Echo plugin is one of the **highest-leverage operator surfaces** in Yuzu —
 The page is also the home for several affordances that did not have anywhere to live:
 
 1. **Retention-paused source list** — the operator-facing view of `<source>_enabled=false` per device, born from issue #539. Without it, an operator who disabled `process_enabled` on a device for forensic preservation has no aggregate view of which boxes are accumulating non-aging data.
-2. **Process tree viewer** — reconstructed per-host from that host's local Echo warehouse (`$Process_Live` + `$TCP_Live`) only, with no seed (as-built; see §5). Forensic timeline of every process born under a parent over a chosen window, with an honest "no-seed" completeness caveat (Windows is names-only). **The pane also embeds device-level DNS-cache + ARP-table panels (ADR-0015)** — dispatched read-only `echo.sql` over `$DNS_Live`/`$ARP_Live` to the selected host, rendered beside the tree. These are **device views, not per-process** (the DNS cache carries no pid); they audit `echo.dns.read` / `echo.arp.read` (DNS is usage-class PII, separately countable).
+2. **Process tree viewer** — built per host and per hour from that host's own hourly roll-up (`$Process_Hourly` + `$TCP_Hourly`) only (as-built; see §5). A name-level tree of what started and stopped in one chosen hour, with start and stop counts, flagged anomalies and a plain statement of what the roll-up does not keep (process ids, command lines, paths). **The pane also embeds device-level DNS and ARP panels (ADR-0015)** — dispatched read-only `echo.sql` over `$DNS_Hourly`/`$ARP_Hourly` for the selected hour, rendered beside the tree. These are **device views, not per-process** (the DNS roll-up carries no process); they audit `echo.dns.read` / `echo.arp.read`.
 3. **Capture sources frame (ADR-0015)** — a per-device toggle table for the eleven core sources (`process`, `tcp`, `service`, `user`, `perf`, `procperf`, `netqual`, `module`, `arp`, `dns`, `registry`; the rest are toggled through `echo.configure`), with a category filter (six chips: Processes, Network, Services, User sessions, Performance and, for `registry`, System; the `registry` row also carries a NEW badge) and a **staged-then-push guardrail**: toggling a source only *stages* the change; nothing is dispatched until the operator clicks **Push** (guards against an accidental toggle of a usage-class source in either direction). Reads `echo status` + `echo compatibility`; Push dispatches `echo configure <source>_enabled` per change (audited `echo.sources.read` / `echo.sources.configure`). The same configure path is reachable via MCP/REST `crossplatform.echo.configure`.
 
 The page is also the surface where **scope walking** (per `docs/scope-walking-design.md`) becomes most visibly useful — the Echo SQL query is the canonical iterative-narrowing tool (it now starts from the Result sets page, **From Echo query**, rather than from a frame on `/echo`), and result-set chips are the operator's reasoning chain made visible.
@@ -36,9 +36,9 @@ The page is also the surface where **scope walking** (per `docs/scope-walking-de
  │  │  ─── lineage breadcrumb (per scope-walking §8.2) ────────────────  │    │
  │  └────────────────────────────────────────────────────────────────────┘    │
  │  ┌─ Retention-paused sources (PR-A) ──────────────────────────────────┐    │
- │  │   device              source     paused since   live rows  oldest  │    │
- │  │   prod-eu-1 (Linux)   process    2026-04-25      18,402   31d 4h   │    │
- │  │   prod-eu-1 (Linux)   tcp        2026-04-25       4,193   31d 4h   │    │
+ │  │   device         source   paused since  hourly rows  oldest bucket │    │
+ │  │   prod-eu-1      process  2026-04-25       18,402   03-25 04:00    │    │
+ │  │   prod-eu-1      tcp      2026-04-25        4,193   03-25 04:00    │    │
  │  │   ...                                                              │    │
  │  │   [Re-enable]  [Purge data]  [Export CSV]                          │    │
  │  └────────────────────────────────────────────────────────────────────┘    │
@@ -50,18 +50,19 @@ The page is also the surface where **scope walking** (per `docs/scope-walking-de
  │  │   [Save as result set ▼ "chrome-procs"]                            │    │
  │  └────────────────────────────────────────────────────────────────────┘    │
  │  ┌─ Process tree viewer (PR-H) ───────────────────────────────────────┐    │
- │  │   device: [pick from scope ▼]                                      │    │
+ │  │   device: [pick from scope ▼]  hour: [2026-04-25 09:00 UTC ▼]      │    │
  │  │                                                                    │    │
- │  │   1   systemd                                                      │    │
- │  │   ├── 234   sshd                                                   │    │
- │  │   │   └── 1402  bash (user=alice)                                  │    │
- │  │   │       └── 1419  python3 train.py  ← still running              │    │
- │  │   ├── 412   docker                                                 │    │
- │  │   │   ├── 998   containerd                                         │    │
+ │  │                                                     starts / stops │    │
+ │  │   systemd                                                   1 / 0  │    │
+ │  │   ├── sshd                                                 14 / 14 │    │
+ │  │   │   └── bash (user=alice)                                 9 / 9  │    │
+ │  │   │       └── python3                                       3 / 2  │    │
+ │  │   ├── docker                                                1 / 0  │    │
+ │  │   │   ├── containerd                                        1 / 0  │    │
  │  │   │   └── ...                                                      │    │
- │  │   ├── 814   yuzu-agent  (★ self)                                   │    │
+ │  │   ├── yuzu-agent  (★ self)                                  1 / 0  │    │
  │  │   ...                                                              │    │
- │  │   Tree as observed since 2026-04-12 09:14 UTC (agent install)      │    │
+ │  │   Names only: ids, command lines and paths are not kept.           │    │
  │  └────────────────────────────────────────────────────────────────────┘    │
  │                                                                            │
  ├─ Settings      (existing)                                                  │
@@ -163,75 +164,79 @@ No changes to the `echo.sql` agent action; the change is purely server-side scop
 ## 5. PR-H — Process tree viewer (**as-built**)
 
 > **Deviation from the original seed-based design below (kept for history).** What
-> shipped reconstructs the tree from **the agent's existing local Echo warehouse
-> only** (`$Process_Live` + `$TCP_Live`, queried via the read-only `echo.sql`
-> action) — there is **no agent-side seed action, no `action='seed'` rows, no
-> `__checkpoint__` rows, and (until #4027) no `/api/v1/echo/process-tree` REST
-> surface at all**. #4027 added `GET /api/v1/echo/process-tree` as the frame's
-> device-PICKER list twin only (§5.6) — the per-device reconstructed-tree JSON
-> surface this paragraph is about remains deferred. This was
-> a deliberate scope choice (local-Echo-data-only); the consequence is an honest
-> completeness limit (see "Honesty" below). Modules: server engine
+> shipped builds the tree from **the agent's own hourly roll-up only**
+> (`$Process_Hourly` + `$TCP_Hourly`, queried via the read-only `echo.sql`
+> action) for **one hour at a time** — there is **no agent-side seed action, no
+> `action='seed'` rows, no `__checkpoint__` rows, and (until #4027) no
+> `/api/v1/echo/process-tree` REST surface at all**. #4027 added `GET
+> /api/v1/echo/process-tree` as the frame's device-PICKER list twin only (§5.6) — the
+> per-device reconstructed-tree JSON surface this paragraph is about remains
+> deferred. This was a deliberate scope choice (local-Echo-data-only); the consequence
+> is an honest limit on detail (see "Honesty" below). Modules: server engine
 > `server/core/src/echo_process_tree.{hpp,cpp}` (pure, unit-tested), routes
 > `server/core/src/echo_tree_routes.{hpp,cpp}`, page `echo_page_ui.cpp` Frame 3.
 
 ### 5.1 Reconstruction model (as-built)
 
 - The viewer dispatches two canned, **read-only** `echo.sql` queries to ONE selected
-  live host — `SELECT … FROM $Process_Live` and `… FROM $TCP_Live` — through the
+  live host — `SELECT … FROM $Process_Hourly` and `… FROM $TCP_Hourly` — through the
   same dispatch-and-poll seam the device-page "Get live info" uses (untracked
   dispatch, `execution_id=""`, so it never enters the executions drawer). The agent
-  runs them on its read-only authorizer connection (#760/#631).
-- The agent forbids recursive CTEs, so the tree is reconstructed **server-side in
-  C++** from the flat event rows: per-pid alive-intervals are built from the
-  `started`/`stopped` stream, incarnations whose lifetime overlaps the chosen window
-  `[from, to]` are kept (PID-reuse-safe — each lifetime is its own node), and each is
-  linked to the parent incarnation that owned its `ppid` when it started. Orphans
-  (parent not present / `ppid` 0 / start event aged out) become roots. Cycle- and
-  50k-node-cap guarded.
-- **Timescale controls.** Preset chips — **On boot · On agent install · Last minute
-  · Last 10m · Last hour · Last day** — plus a **custom From/To (UTC)** box.
-  Point-in-time is the `from == to` case. `to` is the upper bound (running-vs-exited
-  is decided at `to`); the SQL fetch lower bound stays oldest-retained so a
-  long-running process started before the window still appears. **`On boot` and
-  `On agent install` are Echo-derived proxies** (Echo has no boot/install-time column):
-  install = `MIN(ts)` over retained rows; boot = the most-recent start of a root
-  process (`ppid==0`), falling back to install.
+  runs them on its read-only authorizer connection (#760/#631). Both queries are
+  bounded by whole-hour `int64` limits.
+- The hourly roll-up carries no process id, so the tree is **name-level**: one node per
+  process name (and user) in the chosen hour, linked to its parent **by name** from
+  the row's `parent_name`. A name whose parent is itself, or that has no parent row,
+  becomes a root; a name reached by more than one parent is placed once, under the
+  first, with its counts summed; cycles terminate and every node is shown once. The
+  render is capped at 50k names and a display depth limit, and says so when either applies.
+- **Timescale controls.** Preset chips — **Last hour · Last 24 hours · Last 7 days**
+  (whole hourly buckets ending at the last complete hour) — plus a **custom From/To
+  (UTC)** box that floors to the hour. The default is 24 hours. A window is at most 168
+  hourly buckets. The tree itself shows **one hour**: an **Hour** selector lists the
+  hours in the window that have rows, newest first, and the newest is shown by default.
+  There are no boot or agent-install anchors (they need process ids and raw capture
+  rows, which the roll-up does not keep).
 
-**Honesty in framing.** Banner reads e.g. `Window <from> → <to> · observed since
-<oldest-retained> · 411 nodes (281 running / 130 exited) · 0 flagged`, with a note
-that — because there is **no seed** — a process whose `started` event has aged out of
-the 100k `$Process_Live` cap (or that predates the oldest retained row) may not
-appear, and that the boot/install anchors are proxies. On **Windows the feeder is
-ETW (names-only)** so per-process path and command line are blank (stated inline);
-they are populated on Linux/macOS.
+**Honesty in framing.** The banner reads e.g. `Hour <hour> · 41 process names · 118
+starts · 2 abnormal exits · 1 flagged`, and a note says the tree is built from the
+host's hourly roll-up, names only, and that processes sharing a name share one
+position. Windows and Linux/macOS look the same: process ids, command lines and
+paths are not kept by the roll-up on any platform, and the detail panel says so.
 
-### 5.2 Filtering, grouping, network (client-side display)
+### 5.2 Filtering, network (client-side display)
 
-Reconstruction always returns the **full** tree; display filtering is client-side
-(instant, no re-dispatch — each row carries `data-state`/`data-anom`):
+The server renders the **full** tree for the hour; display filtering is client-side
+(instant, no re-dispatch — each row carries `data-anom`):
 
-- **State filter** — All / Running / Exited chips.
-- **Anomalies only** — toggle (the sole heuristic is a **suspicious parent→child**
-  name-pair denylist, e.g. an office app or browser spawning a shell/LOLBin; flagged
-  server-side, name-based so it works on Windows).
-- **Text filter** — matches name / PID / **remote IP**.
-- All three combine, reveal+expand the ancestor branches of matches, and are
-  re-applied after every tree swap (`htmx:afterSettle`).
-- **Same-name grouping** — 4+ identical-name siblings collapse into one
-  `name ×N (R running · E exited)` row (e.g. `svchost.exe ×106`), expandable to the
-  individual PIDs (each still drill-able). Filters auto-expand groups with matches.
-- **Inline network** — each row shows its `$TCP_Live` connections joined by pid:
-  a count + remote `IP:port` endpoints (public/routable egress highlighted amber;
-  listeners shown as `:port listen`). Full connection table is in the detail panel.
+- **Anomalies only** — toggle. The anomaly set is a row with **abnormal exits** in the
+  hour, or a **suspicious parent→child** name-pair denylist hit (e.g. an office app or
+  browser spawning a shell/LOLBin; flagged server-side, name-based). A name with more
+  stops than starts is shown as a soft note in the detail panel, not as an anomaly.
+  Elevated-process and spoofed-parent flags follow once the agent writes those columns.
+- **Text filter** — matches name, user or **remote IP**.
+- Both combine, reveal+expand the ancestor branches of matches, and are re-applied
+  after every tree swap (`htmx:afterSettle`).
+- **Counts, not state.** Each row shows `started N · stopped M` for the hour; there is
+  no running/exited state and no same-name grouping, because the roll-up has already
+  merged same-name processes into one node.
+- **Inline network** — each row shows the hour's `$TCP_Hourly` connections joined by
+  process **name**: a count + remote `IP:port` endpoints (public/routable egress
+  highlighted amber; listeners shown as `:port listen`). The full connection table is in
+  the detail panel.
+- **Device network.** Beside the tree, device-level **DNS** and **ARP** panels read
+  `$DNS_Hourly` and `$ARP_Hourly` for the same hour (`GET
+  /fragments/echo/process-tree/device-net`): per-hour appear / remove counts, a "no such
+  name" count for DNS, and the router role and rebind count for ARP.
 
 ### 5.3 Layout & detail panel
 
 Two-column: a scrollable tree on the left and a **sticky, always-visible detail
-panel on the right** (stacks below on narrow viewports). Clicking any process row
-hx-gets `/fragments/echo/process-tree/detail` into the right panel — name, PID, parent
-PID, user, running/exited + start time, path + command line (blank-with-note on
-Windows), the process's connections, and anomaly evidence. The detail renders from a
+panel on the right** (stacks below on narrow viewports). Clicking any name row
+hx-gets `/fragments/echo/process-tree/detail` into the right panel — name, parent
+name, user, started / stopped counts for the hour, abnormal exits, anomaly evidence,
+the name's connections for the hour, and a line stating what is not kept (process ids,
+command lines, file paths). The detail renders from a
 **server-side reconstruction cache** (bounded LRU, 180 s TTL, keyed by a CSPRNG token —
 `secure_random::random_hex`, never `mt19937`) so row clicks need no further agent
 round-trip. The cache entry is **bound to the operator who created it**: `detail`
@@ -245,8 +250,9 @@ in-panel error and caches nothing rather than minting a weak token.
 | Route | Purpose |
 |---|---|
 | `GET /fragments/echo/process-tree` | Frame body: host picker (operator-scoped) + timescale + filter bar + tree/detail targets |
-| `GET /fragments/echo/process-tree/run?device=&preset=&from=&to=` | Resolve window, dispatch the two `echo.sql`, return the polling fragment |
-| `GET /fragments/echo/process-tree/result?…&pcmd=&tcmd=&n=` | Poll both commands, reconstruct, cache, render the tree |
+| `GET /fragments/echo/process-tree/run?device=&preset=1h\|24h\|7d\|custom&from=&to=&hour=` | Resolve the whole-hour window, dispatch the two hourly `echo.sql`, return the polling fragment |
+| `GET /fragments/echo/process-tree/result?…&pcmd=&tcmd=&n=` | Poll both commands, build the name-level tree for the chosen hour (newest by default) with the Hour selector, cache, render |
+| `GET /fragments/echo/process-tree/device-net?device=&dcmd=&acmd=&hour=&n=` | Dispatch and poll the hourly DNS and ARP queries, render the device network panels for the hour |
 | `GET /fragments/echo/process-tree/detail?token=&node=` | Render one node's detail from the cache (re-checks scope **+ Execute + originating principal**) |
 
 ### 5.5 Permissions & audit
@@ -262,11 +268,11 @@ in-panel error and caches nothing rather than minting a weak token.
   binds to the originating principal. So a leaked/predicted token can neither cross
   management scope, downgrade the Execute tier (read behavioral detail an operator
   couldn't reconstruct themselves), nor be replayed under a different session.
-- `$Process_Live.cmdline` is already redaction-applied at capture by the agent, so no
-  server-side re-redaction is needed; all agent-controlled fields are HTML-escaped.
+- The hourly roll-up holds names, counts and remote endpoints only (no command lines or
+  paths); all agent-controlled fields are HTML-escaped.
 - Agent output is byte-capped before parse (16 MiB process / 4 MiB TCP, defense in
   depth over the gRPC message bound); the `echo.sql` query interpolates only an
-  `int64` upper-bound timestamp (no string concat — see the load-bearing comment at
+  whole-hour `int64` bounds (no string concat — see the load-bearing comment at
   the query site).
 - Audit `echo.process_tree.read` fires twice (parity with `device.live.*`): a
   **dispatch** row when the live query is sent (recorded even if the device is offline
@@ -298,7 +304,7 @@ in-panel error and caches nothing rather than minting a weak token.
   pair is an ordinary `echo sql` dispatch result (`Infrastructure:Read`, no
   execute gate) reachable in principle through the already-twinned generic
   dispatch surface (`execute_instruction` / `POST /api/command`) by reproducing
-  the two canned `$Process_Live`/`$TCP_Live` queries verbatim — not a dedicated
+  the two canned `$Process_Hourly`/`$TCP_Hourly` queries verbatim — not a dedicated
   API path, and a real twin would still need a new async polling contract (no
   htmx auto-reissue on REST/MCP). Both are otherwise minted only by the
   dashboard-only `/run` route, itself excluded as dispatch-shaped (batched with
@@ -317,9 +323,8 @@ the device bar, the "what is kept" chart, the lanes, the moment and selected pan
 and the "What this record cannot tell you" list. No page, route or API uses them yet,
 so nothing is operator-visible.
 
-- **What the model must say.** Each lane covers its window with typed regions (exact,
-  rolled-up, pruned, paused, not readable with a reason, capped with the point it
-  reaches back to). A stretch with no region renders as "Coverage not stated", never
+- **What the model must say.** Each lane covers its window with typed regions (rolled-up
+  at the hourly, daily or monthly tier, pruned, paused, not readable with a reason). A stretch with no region renders as "Coverage not stated", never
   as exact. Offline, failed and too-old-agent reads render as not readable, never as
   empty.
 - **Retention.** An expiry is stated only from the configured policy or a row limit.
@@ -371,7 +376,7 @@ operator-visible. A signed-out request is redirected to sign in; a missing `id` 
   arrow, Page, Home and End keys move the moment line (UTC). Every committed time
   change requests the moment panel and, while an item is selected, the selected panel at
   the same time; the newest request per panel wins and a superseded one is aborted. The
-  panels show whatever the server returns, including offline, not-readable and capped
+  panels show whatever the server returns, including offline and not-readable
   states; a non-2xx is "Could not load this panel (HTTP n)." and an unreachable server
   "Could not reach the server." (failures are announced as alerts, a landed panel is not).
   Every panel request sends `HX-Request: true`, so the server answers a signed-out one with

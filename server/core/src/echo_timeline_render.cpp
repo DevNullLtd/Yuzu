@@ -146,7 +146,9 @@ const EchoKeptBand* band_for(const EchoKeptRow& row, EchoTier tier) {
 /// from measured coverage. The hourly tier is the exception: it has no duration by design, its
 /// depth depends on the device's byte budget, and that is said.
 std::string kept_phrase_unknown() { return "How long this is kept is not stated"; }
-std::string kept_phrase_budget() { return "Budget-dependent: kept while the device byte budget allows"; }
+std::string kept_phrase_budget() {
+    return "Budget-dependent: kept while the device byte budget allows";
+}
 
 // ── time ruler labels ───────────────────────────────────────────────────────────────
 
@@ -389,6 +391,18 @@ double age_of(std::int64_t read_ts, std::int64_t ts) {
     return std::max(static_cast<double>(read_ts) - static_cast<double>(ts), 0.0);
 }
 
+/// The measured reach of a band as a floored whole-day (else whole-hour) figure. The
+/// agent-controlled age is clamped before the integer cast; the exact oldest time stays in the
+/// segment title.
+std::string reach_text(double age_s) {
+    const auto s = static_cast<std::int64_t>(std::min(age_s, 1e12));
+    if (s >= 86400)
+        return span_text(s / 86400 * 86400);
+    if (s >= 3600)
+        return span_text(s / 3600 * 3600);
+    return "under 1 hour";
+}
+
 std::string kept_qualifier(const EchoKeptBand* band, EchoTier tier) {
     if (band && band->policy_s > 0)
         return "pruned " + span_text(band->policy_s) + " after each " + tier_noun(tier) +
@@ -462,7 +476,9 @@ std::string kept_segments(const EchoTimelineModel& m, const EchoKeptRow& row) {
         if (end <= start)
             continue; // the newer tier already covers this far back
         seg(tier_seg_class(t), start, end, tier_label(t) + ", oldest observed " + iso(b->oldest_ts),
-            t == EchoTier::hourly ? tier_adverb(t) + ", budget-dependent" : tier_adverb(t));
+            t == EchoTier::hourly
+                ? tier_adverb(t) + ", budget-dependent, " + reach_text(end) + " here"
+                : tier_adverb(t));
         start = end;
     }
     return h;
@@ -863,8 +879,10 @@ std::string render_timeline_kept(const EchoTimelineModel& m) {
     h += "<div class=\"tl-kov\"><div class=\"tl-kmk\" style=\"left:" + fix3(mx) + "%\"><b" +
          (mx > 55.0 ? " class=\"r\"" : "") + ">" + esc(iso(moment)) + "</b></div></div>";
     h += "</div>";
-    h += "<div class=\"tl-kleg\" aria-label=\"Key\"><span><i class=\"h1\"></i>Hourly roll-up (budget-dependent)</span><span><i class=\"h2\"></i>Daily roll-up</span>"
-         "<span><i class=\"h3\"></i>Monthly roll-up</span><span>Nothing after the bar: pruned</span></div>";
+    h += "<div class=\"tl-kleg\" aria-label=\"Key\"><span><i class=\"h1\"></i>Hourly roll-up "
+         "(budget-dependent)</span><span><i class=\"h2\"></i>Daily roll-up</span>"
+         "<span><i class=\"h3\"></i>Monthly roll-up</span><span>Nothing after the bar: "
+         "pruned</span></div>";
     h += "<p class=\"tl-knote\">The limits are the agent's defaults. Coverage is measured on this "
          "device: each bar reaches back to the oldest record the device holds. The agent prunes on "
          "its own tick and can decline a prune when its clock looks wrong, so records may outlive "

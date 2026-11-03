@@ -270,6 +270,10 @@ R"HTM(
     #capCards .card dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; }
     #capCards .card dt { color: var(--mut); }
     #capCards .card dd { margin: 0; color: var(--ink); text-align: right; }
+    #capCards .card dd.tiers-mini { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+    #capCards .tiers-mini span { font-size: 11.5px; color: var(--mut); border: 1px solid var(--line);
+      border-radius: var(--rad-panel); padding: 0 6px; }
+    .echo-tree-hourbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 10px; }
     /* Notes and warning frame come from yuzu.css (.note.warn); only the flex row and margin are local */
     .apply-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 16px; }
     .apply-bar[hidden] { display: none; }

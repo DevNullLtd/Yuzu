@@ -171,7 +171,7 @@ TEST_CASE("echo parse: tcp hourly __schema__ output", "[echo][tree][parse]") {
     CHECK(parse_echo_tcp_hourly_output("error|nope\n").empty());
 }
 
-TEST_CASE("echo parse: dns hourly schema-located, skips torn/error rows", "[echo][dns][panel]") {
+TEST_CASE("echo parse: dns hourly schema-located; skips torn and error rows", "[echo][dns][panel]") {
     const std::string out =
         "__schema__|hour_ts|name|record_type|data|appear_count|remove_count|negative_count\n"
         "7200|example.com|A|93.184.216.34|3|2|0\n"
@@ -208,7 +208,7 @@ TEST_CASE("echo parse: arp hourly schema-located", "[echo][arp][panel]") {
 // Presets + window math
 // =============================================================================
 
-TEST_CASE("echo canonical_echo_preset: allowlist passes, garbage → 24h default",
+TEST_CASE("echo canonical_echo_preset: allowlist passes; garbage gives the 24h default",
           "[echo][tree][audit]") {
     for (const char* ok : {"1h", "24h", "7d", "custom"})
         CHECK(canonical_echo_preset(ok) == ok);
@@ -332,7 +332,7 @@ TEST_CASE("echo tree: three hours each build their own name-level tree", "[echo]
     CHECK(none.roots.empty());
 }
 
-TEST_CASE("echo tree: a row whose parent_name equals its own name is a root, rendered once",
+TEST_CASE("echo tree: a row whose parent_name equals its own name is a root and rendered once",
           "[echo][tree][cycle]") {
     const std::vector<EchoProcHourRow> rows{hr(3600, "bash", "bash", "alice", 4, 4),
                                             hr(3600, "ls", "bash", "alice", 2, 2)};
@@ -384,7 +384,7 @@ TEST_CASE("echo tree: a longer cycle with a tail renders every node exactly once
         CHECK(rendered_rows(html, n) == 1);
 }
 
-TEST_CASE("echo tree: a name with two parents is placed once under the first, counts summed",
+TEST_CASE("echo tree: a name with two parents is placed once under the first and counts are summed",
           "[echo][tree][fan-in]") {
     const std::vector<EchoProcHourRow> rows{
         hr(3600, "p1", "", "u", 1, 0),          hr(3600, "p2", "", "u", 1, 0),
@@ -452,7 +452,7 @@ TEST_CASE("echo tree: more distinct names than the node cap sets truncated", "[e
     CHECK(render_echo_tree_fragment(t, {}, kToken).find("exceeds the render limit") != std::string::npos);
 }
 
-TEST_CASE("echo anomaly: suspicious parent->child flagged, abnormal exits flagged, benign not",
+TEST_CASE("echo anomaly: suspicious parent->child and abnormal exits are flagged; benign is not",
           "[echo][tree][anomaly]") {
     std::string evidence;
     CHECK(echo_is_suspicious_spawn("winword.exe", "powershell.exe", &evidence));
@@ -483,7 +483,7 @@ TEST_CASE("echo anomaly: suspicious parent->child flagged, abnormal exits flagge
     CHECK(html.find("data-anom=\"0\"") != std::string::npos);
 }
 
-TEST_CASE("echo anomaly: a name with more stops than starts is a soft flag, not an anomaly",
+TEST_CASE("echo anomaly: a name with more stops than starts is a soft flag and not an anomaly",
           "[echo][tree][anomaly]") {
     const auto t = build_echo_process_tree({hr(3600, "daemon", "", "root", 1, 4)}, 3600);
     const auto* d = find_node(t, "daemon");
@@ -507,7 +507,7 @@ TEST_CASE("echo anomaly: denylist is basename-stripped and case-insensitive", "[
 // Render
 // =============================================================================
 
-TEST_CASE("echo render: rows carry data-anom and the hour's counts, no pid or run state",
+TEST_CASE("echo render: rows carry data-anom and the hour's counts with no pid or run state",
           "[echo][tree][render]") {
     const auto t = build_echo_process_tree({hr(7200, "bash", "", "alice", 3, 2, 1)}, 7200);
     const auto html = render_echo_tree_fragment(t, {}, kToken);
@@ -527,7 +527,7 @@ TEST_CASE("echo render: an empty hour says so", "[echo][tree][render]") {
     CHECK(html.find("echo-tree-row") == std::string::npos);
 }
 
-TEST_CASE("echo render: net summary joins by name, dedups, orders public first, labels listeners",
+TEST_CASE("echo render: net summary joins by name then dedups then orders public first and labels listeners",
           "[echo][tree][render][net]") {
     const auto t = build_echo_process_tree({hr(7200, "proc", ""), hr(7200, "other", "")}, 7200);
     const std::vector<EchoTcpHourRow> conns{
@@ -563,7 +563,7 @@ TEST_CASE("echo render: agent-controlled fields are HTML-escaped", "[echo][tree]
     CHECK(detail.find("&lt;script&gt;") != std::string::npos);
 }
 
-TEST_CASE("echo render: detail shows the counts, the parent name and the connections by name",
+TEST_CASE("echo render: detail shows the counts and the parent name and the connections by name",
           "[echo][tree][render]") {
     const auto t = build_echo_process_tree(
         {hr(7200, "systemd", "", "root"), hr(7200, "bash", "systemd", "alice", 3, 4, 2)}, 7200);
@@ -685,7 +685,7 @@ TEST_CASE("echo normalize_echo_os: maps to a closed audit-safe set", "[echo][tre
 // Device DNS / ARP panels (ADR-0015) — hourly activity + escape
 // =============================================================================
 
-TEST_CASE("render_echo_dns_panel: only the selected hour, counts shown, fields escaped",
+TEST_CASE("render_echo_dns_panel: only the selected hour; counts shown; fields escaped",
           "[echo][dns][panel]") {
     std::vector<EchoDnsHourRow> rows;
     EchoDnsHourRow a;
@@ -716,7 +716,7 @@ TEST_CASE("render_echo_dns_panel: only the selected hour, counts shown, fields e
     CHECK(none.find("devnet-empty") != std::string::npos);
 }
 
-TEST_CASE("render_echo_arp_panel: counts, router role and rebinds for the selected hour",
+TEST_CASE("render_echo_arp_panel: counts and router role and rebinds for the selected hour",
           "[echo][arp][panel]") {
     EchoArpHourRow router;
     router.hour_ts = 7200;
@@ -754,7 +754,7 @@ std::string card(const std::string& html, const std::string& name) {
 }
 } // namespace
 
-TEST_CASE("render_echo_capture_sources: cards, hourly names, staged toggles, device attr",
+TEST_CASE("render_echo_capture_sources: cards; hourly names; staged toggles; device attr",
           "[echo][capture-sources]") {
     const std::string status =
         "config|process_enabled|true\nconfig|process_rows|18204\nconfig|process_oldest_ts|1760000400\n"
@@ -781,7 +781,7 @@ TEST_CASE("render_echo_capture_sources: cards, hourly names, staged toggles, dev
     CHECK(card(html, "dns").find("Hourly</span></dd>") != std::string::npos); // hourly only
 }
 
-TEST_CASE("render_echo_capture_sources: row count reads <src>_rows, then <src>_live_rows",
+TEST_CASE("render_echo_capture_sources: row count reads <src>_rows then <src>_live_rows",
           "[echo][capture-sources]") {
     const auto rows_of = [](const std::string& status) {
         const std::string c = card(render_echo_capture_sources("d", status), "process");
@@ -877,7 +877,7 @@ TEST_CASE("Echo page: the capture-sources push bar stays hidden until a change i
     CHECK(page.find(".apply-bar[hidden] { display: none; }") != std::string::npos);
 }
 
-TEST_CASE("Echo renderers add no personal-data, privacy or usage-class wording to the UI",
+TEST_CASE("Echo renderers add no personal-data or privacy or usage-class wording to the UI",
           "[echo][render][copy]") {
     // Binding product rule: no such note, badge, pill, warning or caption is added to any
     // Echo UI string, and the old PII badge is not carried into the capture-source cards.

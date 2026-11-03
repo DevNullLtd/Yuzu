@@ -3400,8 +3400,14 @@ std::string DashboardRoutes::render_echo_retention_paused(
     // `EchoPausedSourceRow` fields) needs no further edits.
     std::vector<EchoPausedSourceRow>& rows = scan.rows;
 
+    // One sentence on every return path: paused rows are held in place, not pruned.
+    static constexpr const char* kPausedHint =
+        "<p class=\"hint\">A paused source is never pruned, so its hourly rows keep their "
+        "place until it is re-enabled or purged.</p>";
+
     if (scan_id.empty()) {
-        return "<div class=\"empty-state\">No scan data yet — click "
+        return std::string(kPausedHint) +
+               "<div class=\"empty-state\">No scan data yet — click "
                "<strong>Scan fleet</strong> above to query the agents "
                "in your scope for Echo retention state.</div>";
     }
@@ -3461,6 +3467,7 @@ std::string DashboardRoutes::render_echo_retention_paused(
                             agents_filtered_out_of_scope == 1 ? "" : "s");
     }
     html += "</div>";
+    html += kPausedHint;
     if (scan.result_truncated_by_cap) {
         // A cut read drops whole responses, which reads as agents that never answered, i.e. as
         // "collecting normally". Say the picture is partial (#4644, row 6a).

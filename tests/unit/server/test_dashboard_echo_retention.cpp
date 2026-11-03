@@ -248,6 +248,8 @@ TEST_CASE("render_echo_retention_paused: each visible agent appears; out-of-scop
     CHECK(contains(html, "<th class=\"r\">Hourly rows</th>"));
     CHECK(contains(html, "<th>Oldest hourly bucket</th>"));
     CHECK_FALSE(contains(html, "Live rows"));
+    CHECK(contains(html, "A paused source is never pruned, so its hourly rows keep their place "
+                   "until it is re-enabled or purged."));
     // NOTE: the >10,000-responses-from-one-agent global-window starvation the
     // reviewer flagged is the store-side per-(command_id, agent_id) cap tracked
     // in #561 — not reproducible at unit scale and out of scope for this render
@@ -423,6 +425,8 @@ TEST_CASE("render_echo_retention_paused: no scan yet renders the placeholder",
     // No stores wired, no scan recorded for this user.
     const std::string html = acc.render("nobody");
     CHECK(contains(html, "No scan data yet"));
+    CHECK(contains(html, "A paused source is never pruned, so its hourly rows keep their place "
+                   "until it is re-enabled or purged."));
 }
 
 // #2691 (Doomgoose finding #7): a degraded response-store read must not

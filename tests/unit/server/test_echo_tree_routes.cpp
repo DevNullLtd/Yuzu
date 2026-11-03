@@ -770,7 +770,7 @@ std::int64_t number_after(const std::string& sql, const std::string& key) {
 
 } // namespace
 
-TEST_CASE("echo routes: /run dispatches only the hourly tables, with whole-hour bounds",
+TEST_CASE("echo routes: /run dispatches only the hourly tables with whole-hour bounds",
           "[echo][routes][sql]") {
     EchoHarness h;
     auto r = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=24h");
@@ -955,7 +955,7 @@ TEST_CASE("echo routes: /device-net renders the chosen hour's DNS and ARP activi
     CHECK(newest->body.find("pill info\">router<") != std::string::npos);
 }
 
-TEST_CASE("echo routes: capture-source cards read <src>_rows, then <src>_live_rows",
+TEST_CASE("echo routes: capture-source cards read <src>_rows then <src>_live_rows",
           "[echo][routes][capture-sources]") {
     SECTION("<src>_rows alone") {
         EchoHarness h;

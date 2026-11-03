@@ -96,17 +96,19 @@ std::string render_hour_select(const std::vector<std::int64_t>& hours, std::int6
                                const std::string& to) {
     if (hours.empty())
         return {};
-    std::string h = "<div class=\"echo-tree-hourbar\"><label class=\"tt-filter-label\" "
-                    "for=\"echo-tree-hour\">Hour</label><select id=\"echo-tree-hour\" name=\"hour\" "
-                    "class=\"scope-chip-select\" hx-get=\"/fragments/echo/process-tree/run?preset=" +
-                    url_enc(canonical_echo_preset(preset)) + "&amp;from=" + url_enc(from) +
-                    "&amp;to=" + url_enc(to) +
-                    "\" hx-include=\"#echo-tree-host\" hx-trigger=\"change\" "
-                    "hx-target=\"#echo-tree\">";
-    for (std::size_t i = 0; i < hours.size() && i < static_cast<std::size_t>(kEchoMaxWindowHours); ++i)
+    std::string h =
+        "<div class=\"echo-tree-hourbar\"><label class=\"tt-filter-label\" "
+        "for=\"echo-tree-hour\">Hour</label><select id=\"echo-tree-hour\" name=\"hour\" "
+        "class=\"scope-chip-select\" hx-get=\"/fragments/echo/process-tree/run?preset=" +
+        url_enc(canonical_echo_preset(preset)) + "&amp;from=" + url_enc(from) +
+        "&amp;to=" + url_enc(to) +
+        "\" hx-include=\"#echo-tree-host\" hx-trigger=\"change\" "
+        "hx-target=\"#echo-tree\">";
+    for (std::size_t i = 0; i < hours.size() && i < static_cast<std::size_t>(kEchoMaxWindowHours);
+         ++i)
         h += "<option value=\"" + std::to_string(hours[i]) + "\"" +
-             (hours[i] == selected ? " selected" : "") + ">" + html_escape(format_iso_utc(hours[i])) +
-             "</option>";
+             (hours[i] == selected ? " selected" : "") + ">" +
+             html_escape(format_iso_utc(hours[i])) + "</option>";
     h += "</select></div>";
     return h;
 }
@@ -176,9 +178,11 @@ std::string render_frame(const std::vector<DeviceRow>& devices) {
     // Two-column layout: scrollable tree on the left, a sticky always-visible detail
     // panel on the right (stacks on narrow viewports).
     h += "<div class=\"echo-tree-layout\">";
-    h += "<div class=\"echo-tree-main\"><div id=\"echo-tree\"><div class=\"echo-tree-empty\">Pick a host "
+    h += "<div class=\"echo-tree-main\"><div id=\"echo-tree\"><div class=\"echo-tree-empty\">Pick "
+         "a host "
          "and a time range to see its process tree for one hour.</div></div></div>";
-    h += "<aside class=\"echo-tree-side\"><div id=\"echo-tree-detail\"><div class=\"echo-tree-mute\">"
+    h += "<aside class=\"echo-tree-side\"><div id=\"echo-tree-detail\"><div "
+         "class=\"echo-tree-mute\">"
          "Select a process name to see what the hourly record kept for it.</div></div></aside>";
     h += "</div>";
 
@@ -197,9 +201,9 @@ std::string tree_pending(const std::string& device, const std::string& preset,
     // never inherits an ancestor's hx-target — otherwise the outerHTML swap would
     // clobber the whole frame body, taking the toolbar with it.
     return "<div hx-get=\"/fragments/echo/process-tree/result?device=" + url_enc(device) +
-           "&amp;preset=" + url_enc(preset) + "&amp;from=" + url_enc(from) + "&amp;to=" +
-           url_enc(to) + "&amp;hour=" + url_enc(hour) + "&amp;pcmd=" + url_enc(pcmd) + "&amp;tcmd=" + url_enc(tcmd) +
-           "&amp;n=" + std::to_string(attempt) +
+           "&amp;preset=" + url_enc(preset) + "&amp;from=" + url_enc(from) +
+           "&amp;to=" + url_enc(to) + "&amp;hour=" + url_enc(hour) + "&amp;pcmd=" + url_enc(pcmd) +
+           "&amp;tcmd=" + url_enc(tcmd) + "&amp;n=" + std::to_string(attempt) +
            "\" hx-trigger=\"load delay:700ms\" hx-target=\"this\" hx-swap=\"outerHTML\" "
            "class=\"echo-tree-loading\">Reconstructing the process tree\xE2\x80\xA6</div>";
 }
@@ -210,8 +214,7 @@ std::string devnet_pending(const std::string& device, const std::string& dcmd,
                            const std::string& acmd, const std::string& hour, int attempt) {
     return "<div hx-get=\"/fragments/echo/process-tree/device-net?device=" + url_enc(device) +
            "&amp;dcmd=" + url_enc(dcmd) + "&amp;acmd=" + url_enc(acmd) +
-           "&amp;hour=" + url_enc(hour) +
-           "&amp;n=" + std::to_string(attempt) +
+           "&amp;hour=" + url_enc(hour) + "&amp;n=" + std::to_string(attempt) +
            "\" hx-trigger=\"load delay:700ms\" hx-target=\"this\" hx-swap=\"outerHTML\" "
            "class=\"echo-tree-loading\">Loading device DNS / ARP activity\xE2\x80\xA6</div>";
 }
@@ -736,11 +739,12 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         if (!parse_tree_window(req, res, now, win, hour_req))
             return;
         const auto rows = parse_echo_process_hourly_output(proc.output);
-        const auto all_conns = tcp_ok ? parse_echo_tcp_hourly_output(tcp.output)
-                                      : std::vector<EchoTcpHourRow>{};
+        const auto all_conns =
+            tcp_ok ? parse_echo_tcp_hourly_output(tcp.output) : std::vector<EchoTcpHourRow>{};
         // The tree shows ONE hour: the requested one, else the newest that has rows.
         const auto hours = echo_process_hours(rows);
-        const std::int64_t shown_hour = hour_req > 0 ? hour_req : (hours.empty() ? 0 : hours.front());
+        const std::int64_t shown_hour =
+            hour_req > 0 ? hour_req : (hours.empty() ? 0 : hours.front());
         auto tree = build_echo_process_tree(rows, shown_hour);
         std::vector<EchoTcpHourRow> conns;
         for (const auto& c : all_conns)
@@ -773,10 +777,11 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
                     "the process tree is shown without per-process network info.</div>";
         body += render_echo_tree_fragment(tree, conns, token);
         // Out-of-band: point the DNS / ARP panels at the hour this tree shows.
-        body += "<div id=\"echo-devnet\" hx-swap-oob=\"true\" "
-                "hx-get=\"/fragments/echo/process-tree/device-net" +
-                std::string(shown_hour > 0 ? "?hour=" + std::to_string(shown_hour) : "") +
-                "\" hx-include=\"#echo-tree-host\" hx-trigger=\"load\" hx-swap=\"innerHTML\"></div>";
+        body +=
+            "<div id=\"echo-devnet\" hx-swap-oob=\"true\" "
+            "hx-get=\"/fragments/echo/process-tree/device-net" +
+            std::string(shown_hour > 0 ? "?hour=" + std::to_string(shown_hour) : "") +
+            "\" hx-include=\"#echo-tree-host\" hx-trigger=\"load\" hx-swap=\"innerHTML\"></div>";
 
         ReconEntry entry;
         entry.device_id = device;
@@ -839,8 +844,9 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             // First call: dispatch the two queries for the hour the tree shows, or for the
             // default 24-hour window when none was picked (the render then takes the newest
             // hour that has rows). Both bounds are std::int64_t (see the /run SECURITY note).
-            const EchoWindow win = *hour_ts > 0 ? EchoWindow{*hour_ts, *hour_ts}
-                                                : resolve_echo_window("24h", 0, 0, now_epoch_seconds());
+            const EchoWindow win = *hour_ts > 0
+                                       ? EchoWindow{*hour_ts, *hour_ts}
+                                       : resolve_echo_window("24h", 0, 0, now_epoch_seconds());
             const std::string range =
                 std::format(" WHERE hour_ts >= {} AND hour_ts <= {}", win.from_ts, win.to_ts);
             const std::string dsql =
@@ -918,7 +924,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             for (const auto& r : arp_rows)
                 shown_hour = (std::max)(shown_hour, r.hour_ts);
         }
-        const std::string body = "<div class=\"devnet-row\">" + render_echo_dns_panel(dns_rows, shown_hour) +
+        const std::string body = "<div class=\"devnet-row\">" +
+                                 render_echo_dns_panel(dns_rows, shown_hour) +
                                  render_echo_arp_panel(arp_rows, shown_hour) + "</div>";
         res.set_content(body, "text/html; charset=utf-8");
     });
@@ -1067,8 +1074,7 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
                           : "The device failed the status query.");
             return;
         }
-        res.set_content(render_echo_capture_sources(device, st.output),
-                        "text/html; charset=utf-8");
+        res.set_content(render_echo_capture_sources(device, st.output), "text/html; charset=utf-8");
     });
 
     // Push: apply staged enable/disable changes. POST body: device + changes

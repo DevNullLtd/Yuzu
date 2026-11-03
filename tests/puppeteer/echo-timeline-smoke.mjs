@@ -3,7 +3,8 @@
 // The script is event-driven, the dashboard CSP has no 'unsafe-eval', and the repo has no JS
 // runner for the page, so string pins and the node driver cannot show that the real page runs
 // under the real CSP. This loads /echo/timeline?id=<device> as the UAT admin, presses Play,
-// scrubs the range, and clicks a drawn block, and fails on any uncaught page error or CSP
+// scrubs the range, and clicks a drawn block, then loads /echo, stages one capture-source toggle
+// (never Push) and clicks the Anomalies only filter, and fails on any uncaught page error or CSP
 // violation. Nothing is written, so the stack is left as found.
 //
 // Needs a flag-enabled local server (the timeline page is hidden by default) and a device that
@@ -86,6 +87,34 @@ async function main() {
     await new Promise(r => setTimeout(r, 1200));
     console.log('  OK  clicked a block');
   }
+
+  // The /echo page script: capture-source cards (stage a toggle) and the tree filter bar.
+  await page.goto(`${BASE}/echo`, { waitUntil: 'networkidle2', timeout: 15000 });
+  await page.waitForSelector('#cap-host', { timeout: 15000 });
+  await page.select('#cap-host', DEVICE); // fires change: the cards load by htmx
+  try {
+    await page.waitForSelector('#capCards .card', { timeout: 30000 });
+    const toggle = await page.$('#capCards .tgl:not(.locked)');
+    if (!toggle) {
+      problems.push('no capture card with an unlocked toggle to stage');
+    } else {
+      await toggle.click(); // stages only; Push is never clicked
+      const shown = await page.$eval('#capApplyBar', b => !b.hidden);
+      console.log(`  ${shown ? 'OK' : 'FAIL'}  staged a toggle: apply bar visible=${shown}`);
+      if (!shown) problems.push('staging a capture toggle did not show the apply bar');
+      await page.click('#capApplyBar .btn-secondary'); // Discard
+      const hidden = await page.$eval('#capApplyBar', b => b.hidden);
+      if (!hidden) problems.push('Discard did not hide the apply bar');
+    }
+  } catch (e) {
+    problems.push('capture cards did not load for the device: ' + e.message);
+  }
+  await page.waitForSelector('#echo-tree-anom-only', { timeout: 15000 });
+  await page.click('#echo-tree-anom-only');
+  const anomOn = await page.$eval('#echo-tree-anom-only', c => c.checked);
+  console.log(`  ${anomOn ? 'OK' : 'FAIL'}  Anomalies only filter engaged: checked=${anomOn}`);
+  if (!anomOn) problems.push('Anomalies only did not engage');
+  await new Promise(r => setTimeout(r, 500));
 
   await browser.close();
 

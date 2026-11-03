@@ -679,7 +679,7 @@ TEST_CASE("echo timeline banners: one per distinct lane and reason, offline not 
     contains(render_timeline_lanes(on), "TCP connections could not be read: device offline.");
 }
 
-TEST_CASE("echo timeline roll-up only: every stretch draws, none is exact or cut off",
+TEST_CASE("echo timeline roll-up only: every stretch draws and none is exact or cut off",
           "[echo][timeline]") {
     auto m = with_lane(lane("L-p", "process", "proc-a.exe", {},
                             {rolled(EchoTier::hourly, W0, W0 + 1200),
@@ -700,7 +700,7 @@ TEST_CASE("echo timeline roll-up only: every stretch draws, none is exact or cut
     }
 }
 
-TEST_CASE("echo timeline kept chart: no row limit, the hourly band is first and budget-dependent",
+TEST_CASE("echo timeline kept chart: no row limit; the hourly band is first and budget-dependent",
           "[echo][timeline]") {
     auto m = kept_model(3600);
     m.kept = {kept("process", "Processes",
@@ -712,6 +712,7 @@ TEST_CASE("echo timeline kept chart: no row limit, the hourly band is first and 
     contains(proc, "hourly is budget-dependent; reaches back to 2026-09-30T10:00:00Z on this device");
     contains(proc, "tl-ks h1\" style=\"left:0.000%;width:" + pct3(ax(20 * kDay)));
     contains(proc, "<small>budget-dependent</small>");
+    contains(proc, ">hourly, budget-dependent, 20 days here</div>"); // the measured reach
     CHECK(proc.find("tl-ks h1") < proc.find("tl-ks h2")); // hourly drawn first
     // no hourly band observed: the sub-label still says the depth is budget-dependent
     m.kept = {kept("process", "Processes", {})};

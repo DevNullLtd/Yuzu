@@ -601,7 +601,8 @@ TEST_CASE("Echo hint copy renders the supplied tick and each fixed clause",
     CHECK(has(t, "pruned every 123 s"));
     CHECK_FALSE(has(t, "every 900 s"));
     for (const char* n : {"agent's clock", "deepest guaranteed tier", "not a deeper tier", "never pruned",
-                          "not per-device"})
+                          "not per-device", "48 hours", "5 days for per-process performance",
+                          "180 days"})
         CHECK(has(t, n));
 }
 

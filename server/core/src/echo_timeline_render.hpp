@@ -7,8 +7,9 @@
 /// format_iso_utc (one past year 9999 is said in words); ruler labels are short forms.
 /// Inline `style` attributes carry only renderer-formatted percentages, never model text.
 ///
-/// Retention honesty: expiry statements come only from EchoKeptBand::policy_s. Measured coverage (oldest_ts) draws the chart and picks the tier
-/// at a moment; it never produces an expiry date or a remaining lifetime.
+/// Retention honesty: expiry statements come only from EchoKeptBand::policy_s. Measured coverage
+/// (oldest_ts) draws the chart and picks the tier at a moment; it never produces an expiry date or
+/// a remaining lifetime.
 
 #include "echo_timeline_view.hpp"
 
