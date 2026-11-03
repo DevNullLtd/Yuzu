@@ -44,22 +44,6 @@ std::string plural(std::size_t n, const char* one, const char* many) {
 
 std::string lane_label(const EchoTimelineLane& l) { return l.name.empty() ? l.id : l.name; }
 
-/// A lane's capped regions folded into one statement: the region with the earliest coverage
-/// start (first wins a tie), so the row limit and the date in the sentence come from one read.
-/// nullptr when the lane has none. Banner and limits bullet both route through this.
-const EchoTimelineRegion* lane_cap(const EchoTimelineLane& l) {
-    const EchoTimelineRegion* best = nullptr;
-    for (const auto& r : l.regions)
-        if (r.kind == EchoRegionKind::capped && (!best || r.coverage_from_ts < best->coverage_from_ts))
-            best = &r;
-    return best;
-}
-
-std::string capped_read_text(const EchoTimelineLane& l, const EchoTimelineRegion& cap) {
-    return "The read of " + lane_label(l) + " was cut off at " + num(cap.cap_rows) +
-           " rows; nothing before " + iso(cap.coverage_from_ts) + " is shown.";
-}
-
 std::string join(const std::vector<std::string>& v, const char* sep) {
     std::string out;
     for (std::size_t i = 0; i < v.size(); ++i) {
@@ -81,18 +65,16 @@ std::string span_text(std::int64_t s) {
     return plural(static_cast<std::size_t>(s), "second", "seconds");
 }
 
-constexpr std::array<EchoTier, 4> kTiers{EchoTier::exact, EchoTier::hourly, EchoTier::daily,
-                                        EchoTier::monthly};
+constexpr std::array<EchoTier, 3> kTiers{EchoTier::hourly, EchoTier::daily, EchoTier::monthly};
 
 /// Per-tier wording, indexed by the (contiguous, 0-based) EchoTier value.
 ///   noun: the unit a record covers ("after each <noun> starts", "whole <noun>")
-///   adverb: "exact", "hourly", "daily", "monthly"
+///   adverb: "hourly", "daily", "monthly"
 ///   seg: the kept-chart segment class
 struct TierText {
     const char *label, *noun, *adverb, *seg;
 };
-constexpr std::array<TierText, 4> kTierText{{
-    {"Exact records", "record", "exact", "l"},
+constexpr std::array<TierText, 3> kTierText{{
     {"Hourly roll-up", "hour", "hourly", "h1"},
     {"Daily roll-up", "day", "daily", "h2"},
     {"Monthly roll-up", "month", "monthly", "h3"},
@@ -160,9 +142,11 @@ const EchoKeptBand* band_for(const EchoKeptRow& row, EchoTier tier) {
     return nullptr;
 }
 
-/// Retention is stated only from a configured policy or a row limit (the latter for the exact
-/// tier only); anything else is not stated, never guessed from measured coverage.
+/// Retention is stated only from a configured policy; anything else is not stated, never guessed
+/// from measured coverage. The hourly tier is the exception: it has no duration by design, its
+/// depth depends on the device's byte budget, and that is said.
 std::string kept_phrase_unknown() { return "How long this is kept is not stated"; }
+std::string kept_phrase_budget() { return "Budget-dependent: kept while the device byte budget allows"; }
 
 // ── time ruler labels ───────────────────────────────────────────────────────────────
 
@@ -311,8 +295,6 @@ std::string region_class(const EchoTimelineRegion* r) {
     if (!r)
         return "unstated";
     switch (r->kind) {
-    case EchoRegionKind::exact:
-        return "exact";
     case EchoRegionKind::rolled_up:
         return "rolled";
     case EchoRegionKind::pruned:
@@ -321,17 +303,13 @@ std::string region_class(const EchoTimelineRegion* r) {
         return "paused";
     case EchoRegionKind::not_readable:
         return "unreadable";
-    case EchoRegionKind::capped:
-        return "capped";
     }
     return "unstated";
 }
 
-/// The one-line reason a region draws. Empty for exact (nothing is drawn).
+/// The one-line reason a region draws.
 std::string region_reason(const EchoTimelineRegion& r) {
     switch (r.kind) {
-    case EchoRegionKind::exact:
-        return {};
     case EchoRegionKind::rolled_up:
         return tier_label(r.tier);
     case EchoRegionKind::pruned:
@@ -340,9 +318,6 @@ std::string region_reason(const EchoTimelineRegion& r) {
         return "Paused " + paused_since(r.paused_since_ts);
     case EchoRegionKind::not_readable:
         return "Not readable: " + unreadable_text(r.reason);
-    case EchoRegionKind::capped:
-        return "Record cut off at " + num(r.cap_rows) + " rows; showing from " +
-               iso(r.coverage_from_ts);
     }
     return {};
 }
@@ -354,7 +329,7 @@ std::string region_div(const std::string& cls, double left, double width,
 }
 
 /// Regions as drawn: model regions clipped to the window, with a `.unstated` stretch for
-/// every part of the window no region covers. Exact regions draw nothing but are covered. At
+/// every part of the window no region covers. At
 /// most kEchoTimelineMaxBlocksPerLane regions draw (by start time); `omitted` is how many more
 /// there were, and the rest of the window is one `.unstated` stretch that says so.
 std::string render_regions(const EchoTimelineLane& lane, const EchoTimelineModel& m,
@@ -382,10 +357,8 @@ std::string render_regions(const EchoTimelineLane& lane, const EchoTimelineModel
         const std::int64_t b = std::min(r->to_ts, m.window_to_ts);
         if (a > cursor)
             gap(cursor, a);
-        if (r->kind != EchoRegionKind::exact) {
-            const double l = echo_timeline_pct(m, a);
-            h += region_div(region_class(r), l, echo_timeline_pct(m, b) - l, region_reason(*r));
-        }
+        const double l = echo_timeline_pct(m, a);
+        h += region_div(region_class(r), l, echo_timeline_pct(m, b) - l, region_reason(*r));
         cursor = std::max(cursor, b);
     }
     if (cursor < m.window_to_ts)
@@ -416,13 +389,11 @@ double age_of(std::int64_t read_ts, std::int64_t ts) {
     return std::max(static_cast<double>(read_ts) - static_cast<double>(ts), 0.0);
 }
 
-std::string kept_qualifier(const EchoKeptRow& row, const EchoKeptBand* band, EchoTier tier) {
-    if (tier == EchoTier::exact && row.row_limit > 0)
-        return "kept until newer rows push it out";
+std::string kept_qualifier(const EchoKeptBand* band, EchoTier tier) {
     if (band && band->policy_s > 0)
         return "pruned " + span_text(band->policy_s) + " after each " + tier_noun(tier) +
                " starts, at the earliest";
-    return kept_phrase_unknown();
+    return tier == EchoTier::hourly ? "budget-dependent" : kept_phrase_unknown();
 }
 
 struct AtMoment {
@@ -444,23 +415,20 @@ AtMoment kept_at_moment(const EchoTimelineModel& m, const EchoKeptRow& row, std:
     for (EchoTier t : kTiers) {
         const EchoKeptBand* b = band_for(row, t);
         if (b && b->oldest_ts > 0 && moment >= b->oldest_ts)
-            return {tier_label(t), kept_qualifier(row, b, t), false};
+            return {tier_label(t), kept_qualifier(b, t), false};
     }
     return {"Gone: nothing is kept this far back", {}, true};
 }
 
 std::string kept_row_sub(const EchoKeptRow& row) {
-    const EchoKeptBand* ex = band_for(row, EchoTier::exact);
+    const EchoKeptBand* hr = band_for(row, EchoTier::hourly);
     std::string s;
-    if (row.row_limit > 0) {
-        s = num(row.row_limit) + " rows kept";
-        if (ex && ex->oldest_ts > 0)
-            s += "; exact records reach back to " + iso(ex->oldest_ts) + " on this device";
-    } else if (ex && ex->policy_s > 0) {
-        s = "kept " + span_text(ex->policy_s) + " by default";
-    } else {
-        s = kept_phrase_unknown();
-    }
+    if (hr && hr->policy_s > 0)
+        s = "hourly kept " + span_text(hr->policy_s) + " by default";
+    else if (hr && hr->oldest_ts > 0)
+        s = "hourly is budget-dependent; reaches back to " + iso(hr->oldest_ts) + " on this device";
+    else
+        s = kept_phrase_budget();
     // A known pause time is drawn as the "not recorded" segment; an unknown one cannot be
     // placed on the axis, so it is said here instead.
     if (row.paused && row.paused_since_ts <= 0)
@@ -494,7 +462,7 @@ std::string kept_segments(const EchoTimelineModel& m, const EchoKeptRow& row) {
         if (end <= start)
             continue; // the newer tier already covers this far back
         seg(tier_seg_class(t), start, end, tier_label(t) + ", oldest observed " + iso(b->oldest_ts),
-            tier_adverb(t));
+            t == EchoTier::hourly ? tier_adverb(t) + ", budget-dependent" : tier_adverb(t));
         start = end;
     }
     return h;
@@ -512,14 +480,12 @@ std::string holdings_category(const std::string& source) {
     return source == "perf" || source == "process" ? source : "other";
 }
 
-/// The sentence for a lane whose region at t is not exact. `r` null = coverage not stated.
+/// The sentence for a lane's region at t. `r` null = coverage not stated.
 std::pair<std::string, std::string> state_for(const EchoTimelineLane& lane,
                                               const EchoTimelineRegion* r) {
     if (!r)
         return {"unstated", "Coverage not stated"};
     switch (r->kind) {
-    case EchoRegionKind::exact:
-        return {"exact-none", "Nothing at this time"};
     case EchoRegionKind::rolled_up:
         return {"rolled|" + num(static_cast<int>(r->tier)) + "|" + holdings_category(lane.source),
                 tier_label(r->tier) + ": " + holdings(lane.source, r->tier) + "."};
@@ -531,10 +497,6 @@ std::pair<std::string, std::string> state_for(const EchoTimelineLane& lane,
     case EchoRegionKind::not_readable:
         return {"unreadable|" + num(static_cast<int>(r->reason)),
                 "Not readable: " + unreadable_text(r->reason)};
-    case EchoRegionKind::capped:
-        return {"capped|" + num(r->cap_rows) + "|" + num(r->coverage_from_ts),
-                "The read was cut off at " + num(r->cap_rows) + " rows; nothing before " +
-                    iso(r->coverage_from_ts) + " is shown"};
     }
     return {"unstated", "Coverage not stated"};
 }
@@ -576,9 +538,6 @@ std::string retention_line(const EchoTimelineModel& m, const EchoTimelineLane& l
                            const EchoTimelineItem& it) {
     const EchoKeptRow* row = kept_row_for(m, lane.source);
     const EchoKeptBand* band = row ? band_for(*row, it.tier) : nullptr;
-    if (row && it.tier == EchoTier::exact && row->row_limit > 0)
-        return "Kept until newer rows push it past the " + num(row->row_limit) +
-               "-row limit; no date can be given";
     if (band && band->policy_s > 0) {
         // No date is stated rather than a wrapped or out-of-range one: from_ts is agent data, so
         // the sum is only formed when it provably stays inside 1970..9999 (and cannot overflow).
@@ -590,7 +549,7 @@ std::string retention_line(const EchoTimelineModel& m, const EchoTimelineLane& l
         return "Pruned after " + iso(it.from_ts + band->policy_s) + " at the earliest (a " + unit +
                " ages from its start; the agent prunes on its own tick and may hold it longer)";
     }
-    return kept_phrase_unknown();
+    return it.tier == EchoTier::hourly ? kept_phrase_budget() : kept_phrase_unknown();
 }
 
 } // namespace
@@ -904,8 +863,7 @@ std::string render_timeline_kept(const EchoTimelineModel& m) {
     h += "<div class=\"tl-kov\"><div class=\"tl-kmk\" style=\"left:" + fix3(mx) + "%\"><b" +
          (mx > 55.0 ? " class=\"r\"" : "") + ">" + esc(iso(moment)) + "</b></div></div>";
     h += "</div>";
-    h += "<div class=\"tl-kleg\" aria-label=\"Key\"><span><i class=\"l\"></i>Exact records</span>"
-         "<span><i class=\"h1\"></i>Hourly roll-up</span><span><i class=\"h2\"></i>Daily roll-up</span>"
+    h += "<div class=\"tl-kleg\" aria-label=\"Key\"><span><i class=\"h1\"></i>Hourly roll-up (budget-dependent)</span><span><i class=\"h2\"></i>Daily roll-up</span>"
          "<span><i class=\"h3\"></i>Monthly roll-up</span><span>Nothing after the bar: pruned</span></div>";
     h += "<p class=\"tl-knote\">The limits are the agent's defaults. Coverage is measured on this "
          "device: each bar reaches back to the oldest record the device holds. The agent prunes on "
@@ -938,8 +896,6 @@ std::string render_timeline_lanes(const EchoTimelineModel& m) {
     std::vector<std::string> unreadable_seen; // one banner per distinct (lane, reason)
     for (const auto& g : m.groups)
         for (const auto& l : g.lanes) {
-            if (const auto* cap = lane_cap(l)) // one banner per lane, however many capped stretches
-                h += "<div class=\"tl-warn\">" + esc(capped_read_text(l, *cap)) + "</div>";
             for (const auto& r : l.regions) {
                 // An offline device already said so above; repeating it per lane is noise.
                 if (r.kind != EchoRegionKind::not_readable ||
@@ -1080,7 +1036,7 @@ std::string render_timeline_limits(const EchoTimelineModel& m, const EchoTimelin
     auto li = [&](const std::string& text, const std::string& tail = {}) {
         h += "<li>" + esc(text) + tail + "</li>";
     };
-    // The list is built in the fixed order above; paused sources, capped reads and the
+    // The list is built in the fixed order above; paused sources and the
     // defaults note follow because they carry markup or come from other parts of the model.
     for (const auto& s : items)
         li(s);
@@ -1094,10 +1050,6 @@ std::string render_timeline_limits(const EchoTimelineModel& m, const EchoTimelin
                    paused_since(s.paused_since_ts) + "; its earlier records are kept as they were.",
                tail);
         }
-    for (const auto& g : m.groups)
-        for (const auto& l : g.lanes)
-            if (const auto* cap = lane_cap(l))
-                li(capped_read_text(l, *cap));
     li("The limits shown are the agent's defaults.");
     h += "</ul></div>";
     return h;
@@ -1110,7 +1062,7 @@ std::string render_timeline_moment(const EchoTimelineModel& m, std::int64_t t,
     if (t == 0) // the route owns passing the t it set as model.moment_ts; 0 means "resolve it"
         t = echo_timeline_resolve_moment(m);
     // An offline device has no readable record, whatever regions the model carries: every lane
-    // reads "Not readable", never "Nothing at this time".
+    // reads "Not readable", never "covered".
     static const EchoTimelineRegion kOffline = [] {
         EchoTimelineRegion r;
         r.kind = EchoRegionKind::not_readable;
@@ -1129,14 +1081,7 @@ std::string render_timeline_moment(const EchoTimelineModel& m, std::int64_t t,
         for (const auto& l : g.lanes) {
             const EchoTimelineRegion* r = m.online ? echo_timeline_region_at(l, t) : &kOffline;
             const auto items = echo_timeline_items_at(l, t);
-            const bool exact = r && r->kind == EchoRegionKind::exact;
             const bool rolled = r && r->kind == EchoRegionKind::rolled_up;
-            if (exact && !items.empty()) {
-                for (const auto* it : items)
-                    rows.push_back({it->label.empty() ? it->id : it->label, lane_label(l),
-                                    iso(it->from_ts), it->flagged});
-                continue;
-            }
             if (rolled)
                 for (const auto* it : items)
                     if (it->shape == EchoItemShape::count || it->shape == EchoItemShape::column)
@@ -1186,10 +1131,8 @@ std::string render_timeline_selected(const EchoTimelineModel& m, const std::stri
                "a connection or a marker.</div>";
     const EchoTimelineItem& it = *f.item;
     const std::string title = !it.title.empty() ? it.title : (!it.label.empty() ? it.label : it.id);
-    std::string h = "<div class=\"tl-det-h\"><b>" + esc(title) + "</b><span class=\"pill " +
-                    (it.tier == EchoTier::exact ? "ok" : "warn") + "\">" +
-                    esc(it.tier == EchoTier::exact ? std::string("Exact") : tier_label(it.tier)) +
-                    "</span>";
+    std::string h = "<div class=\"tl-det-h\"><b>" + esc(title) + "</b><span class=\"pill warn\">" +
+                    esc(tier_label(it.tier)) + "</span>";
     if (it.flagged)
         h += "<span class=\"pill bad\">Flagged</span>";
     h += "</div><div class=\"kvl\">";
