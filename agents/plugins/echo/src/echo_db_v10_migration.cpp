@@ -69,7 +69,8 @@
 #include "echo_db.hpp"
 #include "echo_fold.hpp"
 #include "echo_fold_schema.hpp"
-#include "echo_status_format.hpp" // kFreeSpaceRefusalPrefix
+#include "echo_schema_registry.hpp" // source_default_enabled: the usage feed decision
+#include "echo_status_format.hpp"   // kFreeSpaceRefusalPrefix
 #include "echo_usage.hpp"         // usage_fold_in: the lagged raw process rows reach usage too
 
 #include <sqlite3.h>
@@ -559,7 +560,7 @@ struct Report {
     int64_t ring_keys{0};
     int64_t untrusted_marks{0};   // marks ahead of the clock, replaced by the converted tier's edge
     int64_t usage_lag_rows{0};    // raw process rows past usage_hwm_id (the stored lag)
-    int64_t usage_lag_folded{0};  // of those, the ones at or above the floor, folded into usage
+    int64_t usage_lag_folded{0};  // of those, the ones at or above the floor and fed (usage Active)
     int64_t usage_lag_events{0};  // the counter the old fold kept, read before it is deleted
 };
 
@@ -803,8 +804,20 @@ private:
 
     // The ts at or above which `tier` of `def` was NOT yet filled: the stored mark when it is sane;
     // the beginning of time when there is none (the tier is empty, load_marks proved it); and, for
-    // a mark ahead of the clock, the end of the newest bucket the converted tier holds, which is
-    // what the old pass had provably summarised. Logged once per mark with the figures.
+    // a mark ahead of the clock, the end of the newest bucket AT OR BEFORE THE CLOCK that the
+    // converted tier holds (what the old pass had provably summarised), clamped to the clock. A
+    // bucket the old pass wrote during the excursion sits ahead of the clock too and must not be
+    // the floor: every raw row written since the clock healed is below it and would be dropped as
+    // summarised (g8-2). A converted tier with no such bucket cannot bound the fold: folding
+    // everything would add every raw row on top of the upper tiers that already hold them (g8-1),
+    // so the migration refuses with the figures named instead of guessing. The trust rule is the
+    // old budget pass's own bare `mark > now` (acd22e776 echo_aggregator.cpp, no tolerance), so a
+    // migration clock behind the stored marks makes them untrusted and lands here: a source whose
+    // converted tier holds a bucket is bounded by it, one with no bucket refuses until the clock
+    // or the mark is repaired. Logged once per mark with the figures.
+    // ponytail: a raw row the excursion itself stamped (ts ahead of the clock) folds again on top
+    // of the converted future bucket that already holds it; an upper bound on the raw read would
+    // close that, add it if a healed excursion with surviving raw rows is ever seen in the field.
     std::expected<int64_t, std::string> floor_for(const FoldSourceDef& def, std::string_view tier) {
         const auto it = marks_.find(std::format("{}/{}", def.name, tier));
         if (it == marks_.end() || !it->second.value)
@@ -814,17 +827,24 @@ private:
         const auto edge = newest_bucket_end(def, tier);
         if (!edge)
             return std::unexpected(edge.error());
-        const int64_t floor = edge->value_or(std::numeric_limits<int64_t>::min());
+        if (!edge->has_value())
+            return std::unexpected(std::format(
+                "echo_config 'rollup_{0}_{1}_at' = {2} is ahead of the clock ({3}) and the converted "
+                "{0} {1} tier holds no bucket at or before the clock to bound the fold, so what the "
+                "old roll-up summarised cannot be told; fix the clock or repair the mark before the "
+                "agent starts",
+                def.name, tier, *it->second.value, now_));
+        const int64_t floor = std::min(**edge, now_);
         spdlog::warn("EchoDatabase v10: rollup mark rollup_{}_{}_at = {} is ahead of the clock ({}); "
                      "it proves nothing about what was summarised, so the fold floor is the end of "
-                     "the converted {} tier's newest bucket instead ({}); rows below it are counted "
-                     "as older than the mark",
-                     def.name, tier, *it->second.value, now_, tier,
-                     edge->has_value() ? std::to_string(floor) : "none: every row folds");
+                     "the converted {} tier's newest bucket at or before the clock instead ({}); rows "
+                     "below it are counted as older than the mark",
+                     def.name, tier, *it->second.value, now_, tier, floor);
         return floor;
     }
 
-    // The end of the newest bucket of `def`'s converted `tier`, or nullopt when it holds no row.
+    // The end of the newest bucket at or before the clock of `def`'s converted `tier`, or nullopt
+    // when it holds no such row. A bucket starting after the clock is ignored, never the edge.
     std::expected<std::optional<int64_t>, std::string> newest_bucket_end(const FoldSourceDef& def,
                                                                         std::string_view tier) {
         const std::string table = physical_table_name(def.name, tier);
@@ -838,8 +858,11 @@ private:
             expr = std::format("CAST(strftime('%s', datetime(MAX({}), 'unixepoch', 'start of month', "
                                "'+1 month')) AS INTEGER)",
                                bucket);
-        auto st = prep(h_, std::format("SELECT {} FROM {}", expr, table));
-        if (!st || sqlite3_step(st.get()) != SQLITE_ROW)
+        auto st = prep(h_, std::format("SELECT {} FROM {} WHERE {} <= ?1", expr, table, bucket));
+        if (!st)
+            return std::unexpected(h_.error());
+        sqlite3_bind_int64(st.get(), 1, now_);
+        if (sqlite3_step(st.get()) != SQLITE_ROW)
             return std::unexpected(std::string("step failed: ") + sqlite3_errmsg(h_.raw()));
         if (sqlite3_column_type(st.get(), 0) == SQLITE_NULL)
             return std::optional<int64_t>{};
@@ -880,27 +903,48 @@ private:
 
         // The usage fold read the raw process rows through its own cursor (`usage_hwm_id`): rows
         // past it never reached usage, and the migration deletes the cursor (hp-2). They are fed to
-        // the usage fold here, in this transaction, exactly as the next fast tick would have; the
-        // stored lag counter is read before it goes so the figure is in the log line, not erased.
-        int64_t usage_hwm = std::numeric_limits<int64_t>::max();
+        // the usage fold here, in this transaction, exactly as the next fast tick would have, and
+        // only when that tick would have folded them: usage and process enabled and the lifecycle
+        // Active. Decided ONCE, before the chunk loop (g8-5): a PendingBaseline tick stamps a
+        // baseline and folds nothing, so nothing is fed and nothing is stamped here; decided per
+        // chunk, the first chunk's stamp would turn the next chunk into a retrospective fold of
+        // the rows the baseline excluded. An Active lifecycle with no cursor is the fault the
+        // pre-v10 fold refused on (its cursor and its active generation were written together), so
+        // it refuses here too (g8-4). The stored lag counter is informational: it is read for the
+        // log line, and an unreadable one is logged, never a refusal (g8-s3).
+        int64_t usage_hwm = std::numeric_limits<int64_t>::max(); // nothing past it: nothing fed
         if (def.name == "process") {
             const auto hwm = read_mark(h_, "usage_hwm_id");
             if (!hwm)
                 return std::unexpected(hwm.error());
-            const auto lag = read_mark(h_, "usage_lag_events");
-            if (!lag)
+            if (const auto lag = read_mark(h_, "usage_lag_events"); lag)
+                report_.usage_lag_events = lag->value_or(0);
+            else if (h_.poisoned())
                 return std::unexpected(lag.error());
-            report_.usage_lag_events = lag->value_or(0);
+            else
+                spdlog::warn("EchoDatabase v10: {}; the counter is informational and the migration "
+                             "deletes it",
+                             lag.error());
+            const auto feed = usage_fold_active();
+            if (!feed)
+                return std::unexpected(feed.error());
+            if (*feed && !hwm->has_value())
+                return std::unexpected(
+                    "usage is active (usage_active_generation equals usage_generation) but "
+                    "echo_config has no 'usage_hwm_id' cursor, so which raw process rows the usage "
+                    "fold had read cannot be told; restore the cursor, or delete the "
+                    "'usage_active_generation' row so usage re-baselines, before the agent starts");
             // No cursor: the usage fold never ran on this file, so nothing lagged behind it.
             if (hwm->has_value()) {
-                usage_hwm = **hwm;
                 auto st = prep(h_, "SELECT COUNT(*) FROM process_live WHERE id > ?1");
                 if (!st)
                     return std::unexpected(h_.error());
-                sqlite3_bind_int64(st.get(), 1, usage_hwm);
+                sqlite3_bind_int64(st.get(), 1, **hwm);
                 if (sqlite3_step(st.get()) != SQLITE_ROW)
                     return std::unexpected(std::string("step failed: ") + sqlite3_errmsg(h_.raw()));
                 report_.usage_lag_rows = sqlite3_column_int64(st.get(), 0);
+                if (*feed)
+                    usage_hwm = **hwm;
             }
         }
 
@@ -997,6 +1041,37 @@ private:
             return std::unexpected(h_.error());
         report_.raw_rows += *read;
         return {};
+    }
+
+    // Whether the next fast tick would feed process rows to usage: both sources enabled (the
+    // canonical tri-state, the registry default for a missing row, as usage_fold_in reads them)
+    // and the lifecycle Active (the stored active generation equals `usage_generation`, read
+    // strictly as the fold does; an absent generation is 0). A malformed active generation fails
+    // toward re-baselining, never toward Active, as usage_lifecycle_state does.
+    std::expected<bool, std::string> usage_fold_active() {
+        for (const auto source : {"usage", "process"}) {
+            auto st = prep(h_, "SELECT value FROM echo_config WHERE key = ?1");
+            if (!st)
+                return std::unexpected(h_.error());
+            const std::string key = std::format("{}_enabled", source);
+            sqlite3_bind_text(st.get(), 1, key.c_str(), static_cast<int>(key.size()), SQLITE_STATIC);
+            const int rc = sqlite3_step(st.get());
+            if (rc != SQLITE_ROW && rc != SQLITE_DONE)
+                return std::unexpected(std::string("step failed: ") + sqlite3_errmsg(h_.raw()));
+            const auto* t = rc == SQLITE_ROW
+                                ? reinterpret_cast<const char*>(sqlite3_column_text(st.get(), 0))
+                                : nullptr;
+            const std::string stored = t ? t : (source_default_enabled(source) ? "true" : "false");
+            if (canonical_source_enabled(stored) != "true")
+                return false;
+        }
+        const auto generation = read_mark(h_, "usage_generation");
+        if (!generation)
+            return std::unexpected(generation.error());
+        const auto active = read_mark(h_, "usage_active_generation");
+        if (!active && h_.poisoned())
+            return std::unexpected(active.error());
+        return active && active->has_value() && **active == generation->value_or(0);
     }
 
     template <class Event, class Decode>
@@ -1227,10 +1302,12 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
 
     const StorageBytes end = db.storage_bytes();
     spdlog::info("EchoDatabase: migrated to schema version 10 (roll-up tiers) in {} s: {} old summary "
-                 "rows converted, {} raw rows folded, {} raw rows older than the old roll-up mark were "
-                 "not folded (already summarised by the old roll-up, except rows written by a "
-                 "process-event backfill or skipped by the clock-gap clamp; the two cannot be told "
-                 "apart), {} rejected, {} replay keys seeded, {} marks ahead of the clock replaced by "
+                 "rows converted, {} raw rows folded, {} raw rows older than the old roll-up mark (or "
+                 "the converted tier's edge that replaced an untrusted one) were not folded (under a "
+                 "sane mark the old roll-up had summarised them, except rows written by a "
+                 "process-event backfill or skipped by the clock-gap clamp, and the two cannot be told "
+                 "apart; under a replaced floor they are the rows the converted tier's edge does not "
+                 "reach), {} rejected, {} replay keys seeded, {} marks ahead of the clock replaced by "
                  "the converted tier's edge, usage lag: {} raw process rows past usage_hwm_id "
                  "(usage_lag_events was {}), {} of them folded into usage, {} tables dropped; file {} "
                  "-> {} bytes, WAL {} bytes at commit; VACUUM {}",

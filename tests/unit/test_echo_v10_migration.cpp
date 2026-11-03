@@ -1130,13 +1130,140 @@ TEST_CASE("v10 migration: a mark ahead of the clock is replaced by the converted
     // the decision, with the figures, once
     CHECK(logs.text().find(std::format("rollup_process_hourly_at = {} is ahead of the clock", excursion)) !=
           std::string::npos);
-    CHECK(logs.text().find(std::format("newest bucket instead ({})", kNextHour)) != std::string::npos);
+    CHECK(logs.text().find(std::format("newest bucket at or before the clock instead ({})", kNextHour)) !=
+          std::string::npos);
     CHECK(logs.text().find("1 raw rows older than the old roll-up mark") != std::string::npos);
     CHECK(logs.text().find("1 marks ahead of the clock") != std::string::npos);
     // H0 keeps the old tier's figure (the raw row inside it is below the floor), the next hour folds
     CHECK(n(db, std::format("SELECT start_count FROM process_hourly WHERE hour_ts = {}", kH0)) == 1);
     CHECK(n(db, std::format("SELECT start_count FROM process_hourly WHERE hour_ts = {}", kNextHour)) == 2);
     CHECK(n(db, "SELECT SUM(start_count) FROM process_hourly") == 3);
+}
+
+TEST_CASE("v10 migration: a bucket the excursion itself wrote ahead of the clock is never the fold floor",
+          "[echo][v10][migration][marks]") {
+    Seeded seeded;
+    // A forward excursion with the collectors running: the old pass summarised hour H0 before it,
+    // then an hour a century ahead during it, and left the mark past that. The clock healed and
+    // the raw row of the next real hour was written since: never summarised, it must fold. The
+    // future bucket's end is above the clock; were it the floor, that row would be dropped as
+    // "already summarised".
+    const int64_t excursion = kH0 + int64_t{100} * 365 * 86400;
+    const int64_t excursion_hour = excursion - excursion % 3600;
+    seed(seeded, [&](sqlite3* db) {
+        for (const auto ts : {kH0 + 10, kNextHour + 7})
+            insert_raw(db, "process", {I(ts), I(1), T("started"), I(1), I(0), T("alpha.exe"), T(""), T("jsmith")});
+        for (const auto hour : {kH0, excursion_hour})
+            exec(db, std::format("INSERT INTO process_hourly (hour_ts, name, user, start_count, stop_count) "
+                                 "VALUES ({}, 'alpha.exe', 'jsmith', 1, 0)",
+                                 hour));
+        exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_process_hourly_at', '{}')",
+                             excursion_hour + 3600));
+    });
+    yuzu::test::LogCapture logs;
+    auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    CHECK(logs.text().find(std::format("newest bucket at or before the clock instead ({})", kNextHour)) !=
+          std::string::npos);
+    CHECK(logs.text().find("1 raw rows older than the old roll-up mark") != std::string::npos);
+    // H0 and the future bucket keep the old tier's figures; the post-heal row folds into its hour
+    CHECK(n(db, std::format("SELECT start_count FROM process_hourly WHERE hour_ts = {}", kH0)) == 1);
+    CHECK(n(db, std::format("SELECT start_count FROM process_hourly WHERE hour_ts = {}", kNextHour)) == 1);
+    CHECK(n(db, std::format("SELECT start_count FROM process_hourly WHERE hour_ts = {}", excursion_hour)) == 1);
+    CHECK(n(db, "SELECT SUM(start_count) FROM process_hourly") == 3);
+}
+
+TEST_CASE("v10 migration: a mark ahead of the clock over an empty converted tier refuses and names it",
+          "[echo][v10][migration][marks]") {
+    Seeded seeded;
+    // The old hourly tier is empty (retention emptied it) while the daily tier still holds what
+    // was summarised from it, and the hourly mark is ahead of the clock. Nothing bounds the fold:
+    // folding every raw row would count it a second time in the daily tier. The migration cannot
+    // tell a healed excursion from a migration clock behind a sane mark (a snapshot restore), so
+    // both land here and are refused with the figures, never guessed.
+    const int64_t excursion = kH0 + int64_t{100} * 365 * 86400;
+    seed(seeded, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(kT0), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
+        exec(db, std::format("INSERT INTO process_daily VALUES (NULL, {}, 'a.exe', 'u', 1, 0)", kH0 - kH0 % 86400));
+        exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_process_hourly_at', '{0}'), "
+                             "('rollup_process_daily_at', '{0}')",
+                             excursion));
+    });
+    const auto before = snapshot(seeded.tmp.path);
+    const auto failed = EchoDatabase::open(seeded.tmp.path);
+    REQUIRE(!failed.has_value());
+    INFO(failed.error());
+    CHECK(failed.error().find(std::format("'rollup_process_hourly_at' = {} is ahead of the clock", excursion)) !=
+          std::string::npos);
+    CHECK(failed.error().find("process hourly tier holds no bucket at or before the clock") != std::string::npos);
+    CHECK(snapshot(seeded.tmp.path) == before);
+}
+
+TEST_CASE("v10 migration: an active usage lifecycle with no cursor refuses and names it",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // usage_active_generation and usage_hwm_id were written in one transaction by the old fold, so
+    // Active with no cursor is damage: reading it as "never ran" would drop the lagged rows silently.
+    seed(seeded, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(kT0), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
+        exec(db, "INSERT INTO echo_config VALUES ('usage_active_generation', '0')");
+    });
+    const auto before = snapshot(seeded.tmp.path);
+    const auto failed = EchoDatabase::open(seeded.tmp.path);
+    REQUIRE(!failed.has_value());
+    INFO(failed.error());
+    CHECK(failed.error().find("echo_config has no 'usage_hwm_id' cursor") != std::string::npos);
+    CHECK(snapshot(seeded.tmp.path) == before);
+}
+
+TEST_CASE("v10 migration: lagged process rows are fed to usage only when its lifecycle is active",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    std::string want;
+    SECTION("usage awaits its baseline: more rows than one chunk and nothing is fed or stamped") {
+        // Decided once: were it decided per chunk, the first chunk would stamp the baseline and the
+        // second would be folded as if usage had been active for the rows the baseline excluded.
+        seed(seeded, [&](sqlite3* db) {
+            seed_process_rows(db, 10'001, kT0);
+            exec(db, "INSERT INTO echo_config VALUES ('usage_generation', '1'), "
+                     "('usage_active_generation', '0'), ('usage_hwm_id', '0')");
+        });
+        want = "usage lag: 10001 raw process rows past usage_hwm_id (usage_lag_events was 0), 0 of them "
+               "folded into usage";
+    }
+    SECTION("usage disabled: the rows past the cursor are counted and none is fed") {
+        seed(seeded, [&](sqlite3* db) {
+            seed_process_rows(db, 3, kT0);
+            exec(db, "INSERT INTO echo_config VALUES ('usage_enabled', 'false'), "
+                     "('usage_active_generation', '0'), ('usage_hwm_id', '0')");
+        });
+        want = "usage lag: 3 raw process rows past usage_hwm_id (usage_lag_events was 0), 0 of them "
+               "folded into usage";
+    }
+    yuzu::test::LogCapture logs;
+    auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    INFO(logs.text());
+    CHECK(logs.text().find(want) != std::string::npos);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live") == 0);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_daily") == 0);
+    CHECK(db.get_config("usage_active_generation", "absent") == "0"); // the migration stamps nothing
+}
+
+TEST_CASE("v10 migration: a malformed usage lag counter is logged and does not refuse the migration",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    seed(seeded, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(kT0), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
+        exec(db, "INSERT INTO echo_config VALUES ('usage_active_generation', '0'), ('usage_hwm_id', '0'), "
+                 "('usage_lag_events', 'abc')");
+    });
+    yuzu::test::LogCapture logs;
+    auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    CHECK(logs.text().find("'usage_lag_events' holds 'abc'") != std::string::npos);
+    CHECK(logs.text().find("(usage_lag_events was 0), 1 of them folded into usage") != std::string::npos);
+    CHECK(db.get_config("usage_lag_events", "absent") == "absent");
 }
 
 TEST_CASE("v10 migration: a legacy bucket or average that cannot convert is refused with the row named",

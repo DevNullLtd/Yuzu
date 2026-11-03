@@ -326,11 +326,19 @@ std::vector<std::string> referenced_legacy_live_shims(std::string_view sql) {
     const auto ident = [](char c) {
         return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
     };
+    // SQLite matches an identifier ASCII case-insensitively, so `PROCESS_LIVE`, `"Process_Live"`
+    // and `[process_live]` all reach the shim view and must all be found: the scan runs over an
+    // ASCII-lowered copy (the names are ASCII; a quote or bracket is not an identifier byte, so
+    // the whole-identifier test already admits the quoted forms).
+    std::string lower(sql);
+    for (auto& c : lower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const std::string_view text = lower;
     std::vector<std::string> out;
     for (const auto& name : legacy_live_shim_names()) {
-        for (auto pos = sql.find(name); pos != std::string_view::npos; pos = sql.find(name, pos + 1)) {
-            const bool starts = pos == 0 || !ident(sql[pos - 1]);
-            const bool ends = pos + name.size() == sql.size() || !ident(sql[pos + name.size()]);
+        for (auto pos = text.find(name); pos != std::string_view::npos; pos = text.find(name, pos + 1)) {
+            const bool starts = pos == 0 || !ident(text[pos - 1]);
+            const bool ends = pos + name.size() == text.size() || !ident(text[pos + name.size()]);
             if (starts && ends) {
                 out.push_back(name);
                 break;

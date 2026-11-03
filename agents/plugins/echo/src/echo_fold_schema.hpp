@@ -118,8 +118,10 @@ struct LegacyColumn {
 /// The shim names `sql` (translated operator SQL, real table names) mentions as whole
 /// identifiers, in shim order. A query over one succeeds with no rows, so the `sql` action
 /// reports it as a CONSTRAINED result (`retired_table:<name>`) rather than let an empty answer
-/// read as "nothing happened". A lexical scan: a name inside a string literal counts too, which
-/// is a spurious signal at worst, never a missed one.
+/// read as "nothing happened". A lexical scan, ASCII case-insensitive like SQLite's own
+/// identifier match, so every spelling SQLite accepts for the name (bare in any case,
+/// double-quoted, bracketed, backticked) is found; a name inside a string literal counts too,
+/// which is a spurious signal at worst, never a missed one.
 [[nodiscard]] std::vector<std::string> referenced_legacy_live_shims(std::string_view sql);
 
 /// Roll one source's rows up from tier `from` into tier `to` ("hourly" -> "daily" or "daily" ->

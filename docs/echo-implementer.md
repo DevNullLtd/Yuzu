@@ -289,10 +289,21 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    A mark ahead of the clock (`mark > now`, or above `kEchoMaxPlausibleNow`) was written during a
    forward clock excursion that later healed; the old pass returned early on `last_mark >= boundary`,
    so nothing after it was ever summarised, and the mark proves nothing. It is untrusted: the floor
-   becomes the end of the newest bucket the converted tier holds (what was provably summarised), the
-   decision is logged once per mark with the figures, and the rows below that floor are counted in
-   the "older than the mark" figure. A sane mark is used exactly as stored; the migration does not
-   otherwise decide per row whether a below-mark raw row was summarised.
+   becomes the end of the newest bucket at or before the clock that the converted tier holds (what
+   was provably summarised; a bucket the excursion itself wrote is ahead of the clock too and is
+   never the floor, or every raw row written since the clock healed would be dropped as
+   summarised), clamped to the clock, the decision is logged once per mark with the figures, and
+   the rows below that floor are counted in the "older than the mark" figure. A converted tier
+   with no bucket at or before the clock cannot bound the fold: folding everything would add every
+   raw row on top of the upper tiers that already hold them, so the migration refuses with the
+   source, tier, mark and clock named. The trust rule is the old budget pass's bare `mark > now`
+   (no tolerance, `acd22e776` `echo_aggregator.cpp` `raw_budget_candidates`), so a migration clock
+   behind every stored mark (a restored snapshot, a reset real-time clock) takes the same path:
+   bounded by the converted tier, or refused until the clock or the mark is repaired. Known limit:
+   a raw row the excursion itself stamped ahead of the clock folds again on top of the converted
+   future bucket that already holds it (an upper bound on the raw read would close it; not built).
+   A sane mark is used exactly as stored; the migration does not otherwise decide per row whether
+   a below-mark raw row was summarised.
    Sixteen decoders read the raw columns through `legacy_live_columns()`; a row the delta rules
    reject is counted and dropped. Raw rows older than that mark are dropped with the raw tables, by
    design: the old roll-up already summarised them, except rows a process-event backfill wrote with
@@ -303,7 +314,15 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    (the stored `usage_lag_events`, normally 0) are fed to `usage_fold_in` in this same transaction,
    so a lagging usage fold loses nothing when the cursor is deleted; the log line carries the rows
    past the cursor, the stored counter and how many of them were folded (a row past the cursor but
-   below the roll-up floor is not read and is in the "older than the mark" figure). A migrated tier
+   below the roll-up floor is not read and is in the "older than the mark" figure). They are fed
+   only when the next fast tick would have folded them: usage and process enabled and the usage
+   lifecycle Active (`usage_active_generation` equals `usage_generation`), decided ONCE before the
+   chunk loop; a PendingBaseline tick stamps a baseline and folds nothing, so the migration feeds
+   nothing and stamps nothing (decided per chunk, the first chunk's stamp would turn the next into
+   a retrospective fold of the rows the baseline excluded). An Active lifecycle with no cursor row
+   is the damage the pre-v10 fold refused on (both keys were written in one transaction) and
+   refuses the migration with the repair named; a malformed `usage_lag_events` (informational) is
+   logged and the migration continues. A migrated tier
    row carries the columns v9 did not have (`parent_name`, `abnormal_exit_count`, tcp `failed_count`
    and `listen_*`, user `disconnect_count`, removable `partition_count`) as blank or 0, so a bucket
    spanning the upgrade holds two process rows per (name, user): the migrated one with a blank

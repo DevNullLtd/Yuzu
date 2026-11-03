@@ -2380,6 +2380,13 @@ TEST_CASE("referenced_legacy_live_shims names the retired tables a translated qu
     CHECK(referenced_legacy_live_shims("SELECT * FROM process_hourly").empty());
     CHECK(referenced_legacy_live_shims("SELECT * FROM my_process_live").empty());   // not a whole identifier
     CHECK(referenced_legacy_live_shims("SELECT * FROM process_live_r").empty());    // nor this
+    CHECK(referenced_legacy_live_shims("SELECT * FROM process_livex").empty());     // nor this
+    // every spelling SQLite accepts for the same identifier reaches the shim view
+    CHECK(referenced_legacy_live_shims("SELECT * FROM PROCESS_LIVE") == V{"process_live"});
+    CHECK(referenced_legacy_live_shims("SELECT * FROM \"Process_Live\"") == V{"process_live"});
+    CHECK(referenced_legacy_live_shims("SELECT * FROM [process_live]") == V{"process_live"});
+    CHECK(referenced_legacy_live_shims("SELECT * FROM `Tcp_Live`") == V{"tcp_live"});
+    CHECK(referenced_legacy_live_shims("SELECT * FROM PROCESS_HOURLY").empty());   // an hourly query, any case
     CHECK(referenced_legacy_live_shims("SELECT * FROM usage_live").empty());        // usage keeps its table
     CHECK(referenced_legacy_live_shims("").empty());
 }

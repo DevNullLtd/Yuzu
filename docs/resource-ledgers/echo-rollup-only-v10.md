@@ -50,11 +50,15 @@ releases exactly the resource listed.
   clock-derived and `clock-guarded-retention.md` carries a row for it: every mark is read once and
   validated (not an integer, absent for a populated tier, or ahead of the finer tier's: the migration
   fails with the key named, never reads a damaged mark as "fold everything"), and a mark ahead of the
-  clock is untrusted and replaced by the end of the newest bucket the converted tier holds, logged with
-  the figures; a sane mark is used exactly as stored.
+  clock is untrusted and replaced by the end of the newest bucket at or before the clock that the
+  converted tier holds (never a bucket the excursion itself wrote), logged with the figures, and a
+  converted tier with no such bucket refuses the migration with the mark named rather than fold
+  every raw row on top of the upper tiers; a sane mark is used exactly as stored.
 - **Usage cursor:** the raw process rows past `usage_hwm_id` (the usage fold's own read cursor) are fed
   to `usage_fold_in` on the same handle before the cursor and `usage_lag_events` are deleted, so a
-  lagging usage fold loses nothing; the rows past the cursor, the stored counter and the rows folded
+  lagging usage fold loses nothing (fed only when usage and process are enabled and the lifecycle is
+  Active, decided once before the chunk loop; an Active lifecycle with no cursor refuses the
+  migration); the rows past the cursor, the stored counter and the rows folded
   are in the log line (a row past the cursor but below the roll-up floor is not read, and is in the
   "older than the mark" count).
 - **After COMMIT:** the connection must be in autocommit (`sqlite3_get_autocommit`); a wedged one is

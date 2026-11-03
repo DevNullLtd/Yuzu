@@ -3897,8 +3897,11 @@ private:
             return 1;
         }
         // The rows are gone either way; a dictionary sweep that did not finish leaves the purged
-        // strings on disk until the weekly sweep, which the reply and the typed status both say
-        // (the audit row records what the action reported, so "purged" alone would overstate it).
+        // strings on disk until the weekly sweep (or a rerun of this purge), which the reply and
+        // the typed status both say: the command's response record carries what the action
+        // reported, so "purged" alone would overstate it. (The server's `echo.source.purge` audit
+        // row is written at dispatch and carries no reply; only the status enum reaches the
+        // server, the detail text stays in the agent log.)
         if (res->dictionary_pending)
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   "echo:purge_dictionary_pending");
