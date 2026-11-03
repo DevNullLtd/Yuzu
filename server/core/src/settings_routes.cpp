@@ -995,7 +995,11 @@ std::string SettingsRoutes::render_engine_principals_fragment(
             // (1) audit retention pruned the revoking row but a later retry survives,
             // (2) the revoke committed but its success row failed to persist (the
             // route answers 503), so a later retry of the same revoke (text of the
-            // kind just described) is the first success row, or (3) an MCP revoke
+            // kind just described) is the first success row, (3) the credentials
+            // were revoked but the identity step then failed (the count is only in
+            // that call's failure row; the repeat writes `credentials_revoked=0`),
+            // (4) two revokes raced and the loser's success row (it carries
+            // `revoked_by_concurrent_request`) is the older, or (5) an MCP revoke
             // given no reason wrote an empty detail, which reads "(not recorded)".
             // Best-effort evidence; the facts beside it come from the principal
             // store. It is the audit trail's text, so it is shown only to a caller
