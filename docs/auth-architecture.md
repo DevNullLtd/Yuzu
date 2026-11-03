@@ -5129,6 +5129,13 @@ outage** — the latter also moves on a plain pool blip (it counts every
 store-unavailable `503` on the secret path, not only secret-decrypt failures).
 The approve and reject routes (`route="approval"`) increment only the coarser counter, never
 `yuzu_auth_read_degrade_total`, so that series does not cover them.
+One refusal in the initial `POST /login` handler is deliberately in NEITHER of those two
+counters: an MFA enrol-init that fails because the host's random-number generator failed
+(`AuthDBError::EntropyUnavailable`, #6995). No query failed, so it is counted in
+`yuzu_secure_random_failure_total{reason="prng_failure",site="mfa_enroll"}` instead; it is still
+the same fail-closed `503`. Test `is_entropy_failure()` before `is_store_unavailable()` at any site
+that attributes a refusal to a metric (`is_store_fault()` is the "count as a store outage"
+predicate).
 The other `is_store_unavailable`→`503` auth sites (`/login/mfa`, step-up,
 enrollment, elevate) are not yet reason-instrumented (finer cardinality and
 wider coverage tracked as #2401).

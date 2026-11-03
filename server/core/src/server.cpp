@@ -279,6 +279,7 @@
 #include "mcp_retry.hpp"  // kMcpPollTotalMetric (#3344) — direct, not transitive
 #include "mcp_server.hpp"
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
+#include "mfa_entropy_signal.hpp" // #6995 — the MFA CSPRNG-failure counter names (boot pre-seed)
 #include "stream_budget.hpp" // shared held-open-SSE admission budget (2f PR 2, Decision 15(h))
 #include "notification_routes.hpp"
 #include "integrations_sync_routes.hpp"
@@ -3073,15 +3074,28 @@ public:
                           "clock-anomaly detection across a restart",
                           "counter");
         // PR W1.1 sre-1 (gov Gate 6, sre): CSPRNG-failure paging signal.
-        // Increments in the token-create handlers (api_token, device_token)
+        // Increments in the token-create handlers (api_token, device_token,
+        // engine_principal)
         // when `secure_random::fill_random` returns prng_failure (entropy
-        // exhaustion). Operators wire a Prometheus rule like
+        // exhaustion), and (#6995) in the MFA enrolment / recovery-code
+        // handlers when AuthDB reports EntropyUnavailable. Operators wire a
+        // Prometheus rule like
         //   rate(yuzu_secure_random_failure_total[5m]) > 0
-        // to page on-call short of grepping audit logs.
+        // to page on-call short of grepping audit logs; it is label-agnostic,
+        // so it covers the MFA sites with no change.
         metrics_.describe("yuzu_secure_random_failure_total",
                           "CSPRNG (RAND_bytes / BCryptGenRandom) failures during token "
-                          "issuance, labelled by reason and call site",
+                          "issuance and MFA enrolment / recovery-code minting, labelled by "
+                          "reason and call site",
                           "counter");
+        // #6995: every site (the four token sites and the two MFA sites) exists from
+        // boot, so absent() alerts and a first scrape see 0, not a missing series, and
+        // a lone first fault still produces a rate. Names come from the one header.
+        for (auto site : mfa_entropy::kAllSites) {
+            metrics_.counter(std::string{mfa_entropy::kMetric},
+                             {{"reason", std::string{mfa_entropy::kReason}},
+                              {"site", std::string{site}}});
+        }
         // W1.3 (#826 + #1052 + #1053): device-token rejection counters.
         // Three high-signal variants each get their own counter so SRE
         // can alert directly without a labels selector. The remaining
@@ -3278,12 +3292,18 @@ public:
         // docs/observability-conventions.md, so absent() alerts stay
         // meaningful.
         metrics_.describe("yuzu_auth_secret_unavailable_total",
-                          "Total requests refused 503 by a fail-closed store-unavailable "
+                          "Total requests refused (503, or a retry fragment on Settings) by a "
+                          "fail-closed store-unavailable "
                           "guard on the auth/MFA surface, by route (route=approval also counts "
-                          "an unreadable durable session proof)",
+                          "an unreadable durable session proof; route=mfa_recovery counts a "
+                          "refused Settings recovery-code regeneration; a CSPRNG fault is "
+                          "never counted here, see yuzu_secure_random_failure_total)",
                           "counter");
+        // route=mfa_recovery (#6995): a refused Settings recovery-code
+        // regeneration on a store fault. A CSPRNG fault there is NOT counted
+        // here; it goes to yuzu_secure_random_failure_total{site=mfa_recovery}.
         for (auto route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate",
-                           "password_change", "approval"}) {
+                           "password_change", "approval", "mfa_recovery"}) {
             metrics_.counter("yuzu_auth_secret_unavailable_total", {{"route", route}});
         }
         // #2396 / #2401: reason-labelled sibling of the counter above. Same
@@ -3299,7 +3319,9 @@ public:
         // password change (route=password_change, which shares its lockout
         // helper, #5342) are instrumented; the other is_store_unavailable->503
         // auth sites (login/mfa, stepup, enroll, elevate) keep only
-        // yuzu_auth_secret_unavailable_total{route}. Reason
+        // yuzu_auth_secret_unavailable_total{route}. A CSPRNG fault at login
+        // enrol-init is NOT counted here (#6995: no query failed; it goes to
+        // yuzu_secure_random_failure_total{site=mfa_enroll}). Reason
         // token matches the yuzu_*_read_degrade_total family. Bounded, pre-seeded
         // closed label set per docs/observability-conventions.md so absent()
         // alerts stay meaningful.

@@ -60,14 +60,12 @@ inline constexpr std::string_view kProvisioningSourceLocal = "local";
 // Explicit underlying type — locks ABI/serialization width so adding new
 // values can never silently widen the enum across the plugin/wire boundary.
 enum class AuthDBError : std::uint8_t {
-    /// A write (or the transaction around it) failed. It ALSO covers a CSPRNG
-    /// failure while minting a TOTP secret or recovery code (#4763): in
-    /// `mfa_init_enrollment` the draw precedes every write; in the recovery-code
-    /// paths earlier statements of the same transaction have run and are rolled
-    /// back. The `spdlog::error` line is the only discriminator — at the login
-    /// enrol-init route the degrade metric labels it `reason=query_error`; the
-    /// other MFA sites carry only `yuzu_auth_secret_unavailable_total`, labelled by
-    /// route but with no `reason` (Settings regenerate carries no counter).
+    /// The catch-all fail-closed refusal of a write path: a write (or the transaction
+    /// around it) failed, its lease could not be acquired, or the path hit a
+    /// condition that no more specific value names (e.g. a secret-encrypt failure, a
+    /// provisional secret that vanished mid-call, an unexplained zero-row miss). A
+    /// CSPRNG failure while minting a TOTP secret or recovery code is NOT this: it is
+    /// `EntropyUnavailable` (#6995).
     WriteFailed,
     QueryFailed,
     UserNotFound,
@@ -147,10 +145,25 @@ enum class AuthDBError : std::uint8_t {
     /// a password reset also wipes the provisional secret, and that refusal must
     /// win.
     MfaEnrollmentCancelled,
+    /// #6995 (follow-up to #4763): the CSPRNG failed while minting a TOTP secret
+    /// (`mfa_init_enrollment`) or a recovery code (`mfa_verify_enrollment`,
+    /// `mfa_regenerate_recovery_codes`). Fail-closed: nothing was enrolled or
+    /// issued — in `mfa_init_enrollment` the draw precedes every write; in the
+    /// recovery-code paths earlier statements of the same transaction ran and are
+    /// rolled back, so the existing codes stand. NOT a store fault: no query
+    /// failed, so a caller MUST NOT count it in `yuzu_auth_secret_unavailable_total`
+    /// or `yuzu_auth_read_degrade_total` (that was the misattribution this value
+    /// exists to remove) and counts it in
+    /// `yuzu_secure_random_failure_total{reason="prng_failure",site="mfa_enroll"|"mfa_recovery"}`
+    /// instead. It IS still `is_store_unavailable()` so every existing fail-closed
+    /// 503 mapping is preserved; a caller that tests the helper first must test
+    /// this value BEFORE it. Appended last: the enum is a fixed-width `uint8_t`.
+    EntropyUnavailable,
 };
 
-/// True iff `e` reflects the AuthDB store itself being unavailable (PG
-/// unreachable, pool-lease timeout, secret-decrypt failure) rather than a
+/// True iff `e` maps to the fail-closed 503 class: the AuthDB store itself being
+/// unavailable (PG unreachable, pool-lease timeout, secret-decrypt failure) -- plus
+/// `EntropyUnavailable`, which is NOT a store outage (see below) -- rather than a
 /// genuine business-logic outcome (bad credentials, not found, etc.). Every
 /// MFA/auth call site that needs to distinguish "the store is down — 503,
 /// retry" from "the request was legitimately rejected" MUST route through
@@ -161,9 +174,32 @@ enum class AuthDBError : std::uint8_t {
 /// `SecretUnavailable`/`QueryFailed` would let that outage fall through to a
 /// wrong-code 401 (burning a lockout attempt) or an unhandled 500 instead of
 /// the intended fail-closed 503.
+///
+/// `EntropyUnavailable` (#6995) is included so its fail-closed 503 mapping is
+/// unchanged, but it is NOT a store outage. A site that COUNTS store outages must
+/// use `is_store_fault()` below (or test `is_entropy_failure()` first) and count the
+/// entropy case in `yuzu_secure_random_failure_total` instead; copying the old
+/// "is_store_unavailable -> count yuzu_auth_secret_unavailable_total" idiom onto a
+/// caller of `mfa_init_enrollment` / `mfa_verify_enrollment` /
+/// `mfa_regenerate_recovery_codes` silently re-creates the misattribution.
 [[nodiscard]] inline bool is_store_unavailable(AuthDBError e) noexcept {
     return e == AuthDBError::SecretUnavailable || e == AuthDBError::QueryFailed ||
-           e == AuthDBError::WriteFailed || e == AuthDBError::StoreBusy;
+           e == AuthDBError::WriteFailed || e == AuthDBError::StoreBusy ||
+           e == AuthDBError::EntropyUnavailable;
+}
+
+/// True iff `e` is the CSPRNG failing while minting an MFA secret or recovery code
+/// (#6995). Test this FIRST at any site that attributes a fail-closed refusal to a
+/// metric: entropy goes to `yuzu_secure_random_failure_total`, never to a
+/// store-outage counter.
+[[nodiscard]] inline bool is_entropy_failure(AuthDBError e) noexcept {
+    return e == AuthDBError::EntropyUnavailable;
+}
+
+/// True iff `e` is a genuine store fault: `is_store_unavailable()` minus the entropy
+/// case. This is the predicate for "count it as a store outage" (#6995).
+[[nodiscard]] inline bool is_store_fault(AuthDBError e) noexcept {
+    return is_store_unavailable(e) && !is_entropy_failure(e);
 }
 
 namespace detail {
@@ -767,6 +803,9 @@ public:
     /// credential change's row lock lands as `CredentialChanged`, never as a
     /// secret written over the change (and never over a secret a concurrent
     /// init or verify just wrote).
+    ///
+    /// Returns `EntropyUnavailable` (#6995) when the CSPRNG fails minting the
+    /// TOTP secret: the draw precedes every write, so nothing was stored.
     std::expected<MfaEnrollmentInit, AuthDBError>
     mfa_init_enrollment(const std::string& username, std::string_view issuer,
                         const std::optional<std::string>& expected_password_hash_hex);
@@ -781,6 +820,9 @@ public:
     /// longer the stored one — nothing is enrolled. The cause is NOT distinguished
     /// (a disable, a re-init, the stale-provisional sweep, `--mfa-reset` or a KEK
     /// rewrap all look the same); see `AuthDBError::MfaEnrollmentCancelled`.
+    /// Returns `EntropyUnavailable` (#6995) when the CSPRNG fails minting a
+    /// recovery code (the code or its salt): the enrolment UPDATE shares the
+    /// transaction, so it rolls back and the user stays provisional.
     ///
     /// `expected_password_hash_hex` (#5342 Gate 8, F2/F4 — REQUIRED, no
     /// default, so every caller decides) is the CREDENTIAL ANCHOR, always
@@ -828,9 +870,9 @@ public:
     /// matching storage (#3779). Returns `UserNotFound` when no ACTIVE user row
     /// matches (a deactivated account never receives fresh codes);
     /// `QueryFailed`/`WriteFailed` on a store outage (fail-closed 503) — and
-    /// `WriteFailed` also when the CSPRNG fails mid-mint (#4763): the transaction
-    /// rolls back, so no partial set is ever returned and the existing codes
-    /// stand. CAUTION: a lost COMMIT acknowledgement also reports `WriteFailed`
+    /// `EntropyUnavailable` when the CSPRNG fails mid-mint (#4763/#6995): the
+    /// transaction rolls back, so no partial set is ever returned and the existing
+    /// codes stand. CAUTION: a lost COMMIT acknowledgement also reports `WriteFailed`
     /// even if the server committed (`PgPool::with_txn_for`), so a caller must not
     /// assert to the user that the old codes definitely survive.
     std::expected<std::vector<std::string>, AuthDBError>
