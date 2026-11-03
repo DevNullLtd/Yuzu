@@ -2652,8 +2652,9 @@ public:
                                 spdlog::warn("Heartbeat plugin-tag bridge failed");
                             }
                             // HA WS-0 dedup safety-net signals, emitted every
-                            // heartbeat (the agent has no /metrics; the server-side
-                            // yuzu_fleet_* derivation + alert land with WS-11).
+                            // heartbeat (the agent has no /metrics; the server derives
+                            // the yuzu_fleet_agents_dedup_* gauges + the
+                            // YuzuDedupStoreDegraded alert from these tags, #3663).
                             // "degraded"=1 means the durable store never OPENED (a
                             // real 0/1 reading, never absent-reads-as-zero). It is
                             // the OPEN-failure signal ONLY; a store that opened then
@@ -2685,6 +2686,17 @@ public:
                                 metrics_.counter("yuzu_agent_dedup_record_errors_total").value()));
                             tags["yuzu.dedup_release_errors"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_dedup_release_errors_total").value()));
+                            // Capacity signal (#3663): the store's cached row count
+                            // (in-flight + terminal), read lock-free -- the heartbeat
+                            // never takes the store mutex the reader thread claims
+                            // under. ABSENT (not "0") when there is no store or the
+                            // count is unknown, so the server cannot read "unknown"
+                            // as "empty"; dedup_degraded already carries the no-store
+                            // case.
+                            if (command_dedup_) {
+                                if (const auto rows = command_dedup_->cached_row_count())
+                                    tags["yuzu.dedup_rows"] = std::to_string(*rows);
+                            }
                             // OTA signature refusals (#416/#3807). Carried on the
                             // heartbeat for the same reason as the dedup counters
                             // above: the agent has no /metrics endpoint, so this

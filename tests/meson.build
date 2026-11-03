@@ -1537,6 +1537,7 @@ if build_server
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
       'unit/server/test_agent_health_store.cpp',
+      'unit/server/test_dedup_fleet_tags.cpp', # #3663: pure parse/classify of the yuzu.dedup_* heartbeat tags (the 10-char wrap cap is only observable here)
       'unit/server/test_instruction_store.cpp',
       'unit/server/test_instruction_store_signing.cpp',
       'unit/server/test_instruction_yaml.cpp',
@@ -4031,6 +4032,18 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
 test('agent command-dedup wiring lexical gate (#3668)',
   _python3_test,
   args: [files('test_agent_command_dedup_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Command-dedup fleet telemetry (#3663): the agent's `yuzu.dedup_*` heartbeat tags and the
+# server's yuzu_fleet_agents_dedup_* table share no header (no upward server -> agent edge), so
+# nothing in the compiler binds them. This pins that every emitted tag has a server row and vice
+# versa, plus the HELP registration, metrics.md, and the YuzuDedupStoreDegraded alert + its
+# promtool case. Carries its own in-memory mutation self-test. No build required.
+test('agent command-dedup fleet telemetry drift gate (#3663)',
+  _python3_test,
+  args: [files('test_dedup_fleet_tags_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )

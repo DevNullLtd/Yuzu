@@ -253,6 +253,21 @@ This section applies to development and pre-release servers built with the #6535
 
 **Rollback.** Rolling back to a build without this change keeps leadership working (an older build opens against the newer schema and its election mints a different epoch, which is all the equality fence needs; the epoch it mints is smaller, not larger, than the stored one). It is NOT safe for the plugin enablement store, which orders epochs: `plugin_config_store.enablement_meta.issuer_epoch` keeps the packed value and the older build then rejects every enablement batch as fenced. After the last new-build server has stopped, connect to the Yuzu database as the application role (or the schema owner), for example `docker exec -it yuzu-postgres psql -U yuzu -d yuzu` (on the HA profile run it on the current primary: find it with `docker exec yuzu-ha-pg1 patronictl -c /run/patroni/patroni.yml list`, then `docker exec -it <primary node> psql -U yuzu -d yuzu`), and run `UPDATE plugin_config_store.enablement_meta SET issuer_epoch = 0 WHERE id = 1;`. The symptom without it is enablement batches rejected as fenced; nothing else reads that column, and nothing in the server issues enablement batches yet, so today the wedge is latent.
 
+## New: fleet gauges and a sample alert for agents whose command-dedup store failed to open (#3663)
+
+Additive; no behaviour change. **To get the alert, load `docs/prometheus/yuzu-alerts.yml` into your
+Prometheus and route `severity=warning` in Alertmanager; no compose or Helm file the project ships does
+either.** The server now exposes nine `yuzu_fleet_agents_dedup_*` / `yuzu_fleet_dedup_rows_max` series on
+`/metrics` (reference: `docs/user-manual/metrics.md`, "Agent command-dedup store telemetry"), agents add one
+heartbeat tag, `yuzu.dedup_rows`, and the rule file gains the sample alert `YuzuDedupStoreDegraded`. Upgrade
+agents and servers in either order: an old agent contributes nothing, and an old server ignores the new tag.
+Until `yuzu_fleet_agents_dedup_reporting` matches your fleet size, a 0 in the other series means nothing.
+
+**Preview:** the fleet count tells you how many agents are affected, not which; locating them is manual until
+#6931. The alert covers only a store that failed to open, counts agents seen in the last 90 s, and is per core
+replica; the full list of limits is in `docs/user-manual/security-hardening.md`, "Fleet monitoring of the dedup
+store".
+
 ## New: leader-election metrics and alerts (HA WS-11, #4014)
 
 Additive; no behaviour change and no action is needed to keep a deployment working. Every server with a
@@ -4218,7 +4233,7 @@ The agent's command deduplication moved from an in-memory set (cleared on every 
 
 **Breaking for automation/SIEM.** A redelivered/duplicate command no longer receives a `REJECTED` response with the fixed reason `"command replay rejected: duplicate command_id"`. That string **is retired.** A duplicate now either replays the command's **original terminal frame** (its real `SUCCESS`/`FAILURE`/`REJECTED` status, exit code, and structured error — the terminal frame carries the outcome, not the streamed stdout, which is not re-sent) or, while the first attempt is still running, returns a non-terminal `RUNNING` frame with output `"duplicate command still in flight"`. Any detection rule, dashboard, or evidence query that matched the old rejection string on a redelivered command will silently stop matching — re-point it before upgrading (there is no longer a single "this was a replay" signal on the wire; the server correlates by `command_id`).
 
-**What to do:** update or remove any rule keyed on `"command replay rejected: duplicate command_id"`. If you tracked replays for security evidence, note the agent now emits `yuzu.dedup_*` heartbeat tags (`dedup_degraded` for an unopenable store; `dedup_claim_errors`/`dedup_record_errors`/`dedup_release_errors` for post-open write failures; `dedup_replays`) instead; fleet-wide `yuzu_fleet_*` aggregation + an alert land with the HA observability workstream (WS-11).
+**What to do:** update or remove any rule keyed on `"command replay rejected: duplicate command_id"`. If you tracked replays for security evidence, note that the agent now emits `yuzu.dedup_*` heartbeat tags (`dedup_degraded` for an unopenable store; `dedup_claim_errors`/`dedup_record_errors`/`dedup_release_errors` for post-open write failures; `dedup_replays`) instead. The server turns them into fleet monitoring gauges (see "New: fleet gauges and a sample alert for agents whose command-dedup store failed to open" near the top of this page); those are operational signals about the agent's store, not an audit record of replays.
 
 **New on-disk artifact.** `command_dedup.db` (plus `-wal`/`-shm`) appears in the agent's `--data-dir`, bounded to the most recent commands. It is a regenerable safety net, **not** a backup target. **Upgrade is fresh-start** — no migration from the old in-memory scheme (there was no persistent state to carry); worst case on upgrade is that one already-delivered command could re-execute if redelivered during the restart, exactly as it could before this change. Downgrade is safe: an older agent simply ignores the file.
 
