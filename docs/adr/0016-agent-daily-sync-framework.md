@@ -611,13 +611,14 @@ re-measured when the storage legs land (`swap` has no capture either, its legs b
 its floor is its shortest possible row). `topology`'s cap is 96, not the 192 starting target,
 because 192 x 144 B would put the registry-derived total past the 80% line.
 
-**A host over the caps (sender contract).** No agent v2 writer exists in this change; this is
-the contract it is built to. The sender keeps the first N rows of each kind (N = the kind's row
+**A host over the caps (sender contract).** The agent v2 writer implements this contract (see
+the 2026-11-01 entry below). The sender keeps the first N rows of each kind (N = the kind's row
 cap) in a fixed sorted order, so the blob and its hash are stable day to day, and marks the
 section `constrained` with kept-of-total counts in its reason (a token distinct from the
 server's own `server_cap:<cap>`). If the blob would still exceed the ceiling it trims whole
 sections' tail rows, least valuable first: `topology`, `partition`, `volume`, `dimm`, `disk`,
-`cpu`, each trimmed section staying `constrained` with its kept-of-total. The scalar record and
+`cpu`, `swap` (swap last; see the 2026-11-01 entry), each trimmed section staying `constrained`
+with its kept-of-total. The scalar record and
 the per-section status records are never trimmed (together about 2-3 KiB, budgeted at 3 KiB), so
 a record always fits and the base fields always land. Trimmed rows are not stored: the daily
 record is a bounded summary, the live actions return the full data, and the daily record keeps
@@ -682,6 +683,108 @@ chassis, board and machine-id values and stale child rows to be served as curren
 agent's next full report on the upgraded server.
 
 **Personal data.** `chassis_serial`, `board_serial` and the DIMM `serial` column join the
-serial/UUID/MAC behavioural-PII tier. The sections read has no REST/MCP/UI route yet; the
-later REST read-surface change must serve it behind the same fail-closed audit as the
+serial/UUID/MAC behavioural-PII tier. The `volume` and `partition` mount-point column can name an
+account or a personal label as the OS reports it, so the agent redacts such entries before sending
+(2026-11-01 entry, "Mount points (personal data)"). The sections read has no REST/MCP/UI route yet;
+the later REST read-surface change must serve it behind the same fail-closed audit as the
 audited `inventory.device.ci` read.
+
+### 2026-11-01 — `device_ci` blob v2 (agent writer)
+
+The agent now emits the v2 record defined in the 2026-10-29 entry. This entry records
+what the writer does and the order in which a fresh deployment brings its components up.
+
+**v2 is emitted unconditionally.** There is no capability negotiation and no agent-side
+fallback flag; this supersedes the 2026-10-29 sentence that the agent change "may
+additionally gate emission on an ack-advertised capability". The class "a host that cannot
+produce v2" is empty by construction: an older hardware plugin (`unknown action`, rc 1), a
+missing `disk_actions` plugin and every planned leg each become a typed section status, so the
+22 base fields always land. The v1 writer is unchanged and stays byte-pinned; the v2 scalar
+record is the same clamp-join over 33 fields, and its first 22 fields equal the v1 blob.
+
+**Independent optional sections.** The 15 original actions keep abort-on-failure (a failed
+required action skips the cycle). The seven added with v2 (`chassis`, `baseboard`, `swap`,
+`machine_id`, and `disk_actions` `volumes`, `partitions`, `topology`) never abort it. All ten
+section-bearing actions, including the three that already existed (`processors`, `memory`,
+`disks`), map to a section status from the ABI4 typed result:
+
+| Source | Level | Reason |
+|---|---|---|
+| typed OK or undeclared | `ok` | typed provenance, else the plugin's own status-row token (`-` is empty), else empty |
+| typed CONSTRAINED | `constrained` | same |
+| typed UNAVAILABLE | `unavailable` | same (a planned leg reads `<os>:planned`) |
+| typed PERMISSION_DENIED | `permission_denied` | same |
+| rc != 0 | `unavailable` | `agent:action_absent` when the output starts `unknown action`, else `agent:rc=<n>` |
+| capture truncated | `unavailable` | `agent:truncated` |
+| `disk_actions` not loaded | `unavailable` | `agent:plugin_not_loaded` |
+| Windows `volumes` | `unavailable` | `agent:windows_volumes_unbounded` (the action is not run; see below) |
+| a mount point was redacted | `constrained` | `agent:mount_points_redacted`, placed before any plugin reason |
+
+**No rows from a failed section.** A section whose level is `unavailable` or
+`permission_denied` carries its status record and no rows, and its appended scalar positions
+stay blank. Nothing from a failed, truncated, absent or refused capture is projected, and the
+cap token below can never promote such a section to `constrained`.
+
+**Mount points (personal data).** The `volume` and `partition` mount-point column is forwarded as
+the OS reports it, so a volume folder-mounted under a user profile (`C:\Users\<name>\...`,
+`/Users/<name>/...`) or an APFS volume mounted at `/Volumes/<label>` would put an account name or
+a personal label into a record stored centrally on every cycle. The statement "machine-scope (no
+username/SID/user path)" in the data-classification paragraph above therefore holds for this column
+only because the writer minimises it: before the blob is built, every entry that lies under
+`/Users`, `/home`, `/Documents and Settings` or `/Volumes` is replaced with `[redacted]`. The match
+ignores case, reads `\` as `/`, ignores a leading drive letter and looks through a
+`/System/Volumes/Data` prefix, which macOS can use to spell the firmlinked user tree. The boot volume's label is user-chosen, so every
+`/Volumes` entry goes. A piece that is not a path (the tail of a label that held a comma) is
+replaced with it. A section in which any entry was replaced is `constrained` with
+`agent:mount_points_redacted`, placed before any plugin reason so the reason clamp cannot drop it.
+Drive letters, `/`, the `/System/Volumes/*` volumes themselves and any other folder mount pass
+through as the OS reported them, so the column can still name a folder an administrator chose; it is
+minimised, not proven free of names. Not covered by this paragraph: those other folder mounts; the
+user-chosen roots the Linux legs will report once they emit mount points (`/media/<user>`,
+`/run/media/<user>`), which the leg that adds them must add to the roots table and to this paragraph;
+free text in the other columns once a leg fills them with user-chosen labels; and the v1 `hostname`,
+`domain` and `ou` fields, which name a machine and are frozen. Redaction removes one route to a personal
+name. It does not change the stable-identifier capability (serial, UUID, MAC, chassis, board) that makes
+works-council review applicable, and it is not a consent mechanism: `--inventory-disable` remains the only
+control over the collection. The serial, board-serial and DIMM-serial columns of the 2026-10-29 "Personal data" paragraph
+are unchanged.
+
+**Windows `volumes` is not run.** The Windows `volumes` leg issues synchronous `DeviceIoControl`
+calls on handles opened without a deadline (`disk_actions_win.cpp`, "BOUNDING"). The daily sync runs
+on the thread the agent joins on reconnect and on shutdown, so one wedged drive would leave the
+endpoint unable to reconnect or to stop cleanly. Until those calls have a bound, the Windows writer
+does not run the action: the `volume` section is `unavailable` with `agent:windows_volumes_unbounded`
+and carries no rows. The operator-triggered `volumes` action is unchanged, and the Windows
+`partitions` and `topology` legs are status-only (`windows:planned`), so no other section is
+affected. The Windows volume rows return when the platform gap named in `disk_actions_win.cpp` (plugin OS
+calls have no deadline, #3925) is closed. The reason is expected on every Windows host and needs no
+operator action; the operator-triggered `volumes` action still works there.
+
+**Pipes inside a field.** The plugins write a literal `|` as `\|` and fold a literal `\` to `/`
+(`safe_output_field`). The writer splits the list rows and the three scalar groups on an unescaped
+pipe and unescapes before the clamp, so a pipe in a label or a firmware string stays in its field and
+moves no later column. The 22 v1 positions keep the raw split: their bytes are frozen.
+
+**Caps and the reserved reason slot.** Rows are projected to the wire columns, sorted
+lexicographically on the wire row (so the blob and its hash do not depend on the plugin's
+emission order), and the first N are kept (N = the kind's row cap, equal to the server's). A
+section over its cap is `constrained` with ONE token, `agent_cap:<kept>/<total>`, appended to the
+reason after `;` when a reason exists. The base reason is clamped to the field clamp minus the
+token's maximum width, so the composed reason always fits the 1,024-byte field contract and the
+server's clamp cannot cut the disclosure. A later ceiling trim replaces the token; a record never
+carries two. The token is distinct from the server's own `server_cap:<n>`. `swap` drops
+`used_mb` (volatile); the hardware disk sentinel row and the `disk_actions` volume
+placeholder (volume name `-`) are not rows.
+
+**Ceiling trim.** If the blob still exceeds the 96 KiB ceiling, tail rows are popped kind by
+kind in the order `topology`, `partition`, `volume`, `dimm`, `disk`, `cpu`, `swap`, each trimmed
+kind `constrained` with its final kept-of-total. This clarifies the six-kind order recorded
+above: `swap` is appended last so the sender's termination proof holds for every registered
+row-bearing kind (the scalar record and status records are never trimmed, and their clamp-bound
+worst case is `static_assert`ed under the ceiling on both sides). In practice the earlier kinds
+absorb any realistic overflow first, so `swap` is a defensive tail.
+
+**Component order in a fresh deployment.** The server of this build is brought up before agents of
+the same build enroll, and every replica is on that build. The deployment contract (a fresh
+database, every writer on this build; `docs/user-manual/upgrading.md`, "Deployment contract (hard
+cutover)") excludes an earlier server, so this entry states no behaviour of an agent against one.

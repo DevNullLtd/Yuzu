@@ -431,7 +431,12 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   predicate is a range and the planner's selectivity estimate for that range cannot be trusted —
   a wide window with real matches sparse and clustered at one end — `ORDER BY <indexed column>
   LIMIT 1 ... IS NOT NULL`, which is plan-independent: a Seq Scan would need a full sort before
-  applying the `LIMIT`, so the index-ordered path wins regardless of the estimate).
+  applying the `LIMIT`, so the index-ordered path wins regardless of the estimate). When a top-1
+  over a different index would otherwise be chosen (a backwards walk of a per-instruction index
+  filtering on a second key), writing the `ORDER BY` column as `<col> + 0` is the repo's one
+  sanctioned planner steer: it forces the access path onto the key-prefix index. `ResponseStore`'s
+  row-cap marker UPDATE (#561) is the worked example; measure any such steer with `EXPLAIN
+  (ANALYZE, BUFFERS)` before relying on it.
 - A **fixed re-arm interval** on a capped, paced background pass (a retention sweep, a rollup, a
   reconciliation loop) that never shortens when the cap keeps binding. If a pass hits its cap AND
   a genuine backlog remains, the NEXT pass should re-arm on a short floor (seconds, not the full
@@ -533,6 +538,20 @@ timeout, which rolls the migration back and makes the server refuse to start. It
 contract (a boot guard, tracked as a follow-up, would enforce it). An earlier plain index on
 `executions` was removed from this store as a policy-floor violation (the v6 comment block in
 `execution_tracker.cpp`); the difference is that this table is created empty by the same boot.
+
+A fifth plain build, `ResponseStore` `responses` v4 (#561, `idx_resp_instr_agent_status` on
+`(instruction_id, agent_id, status)`, which serves the per-pair row cap's count and terminal probe),
+rests on the same basis as the fourth: the 0.15.0 deployment contract is a fresh database only
+(`docs/user-manual/upgrading.md` "Deployment contract"), so `responses` is empty when v4 runs and
+the empty-table rule above already applies. What the entry records is that the contract is
+procedural (the executable does not verify it). On a carried-forward database the build would hold a
+`SHARE` lock on this high-write table (writes blocked, reads allowed) for its duration; the
+migration's own `SET LOCAL statement_timeout = 0` keeps the pool's statement timeout from rolling it
+back, and `IF NOT EXISTS` keeps a re-run after a rewound version stamp safe. The pool's 10 s
+`lock_timeout` still applies: if the `SHARE` lock cannot be taken (writers active), the migration
+rolls back and the server refuses to start; retry when writers are quiescent, or build the index by
+hand with `CREATE INDEX CONCURRENTLY` (`IF NOT EXISTS` makes the re-boot safe). It ends with the
+contract. ADR-0039's "Update (2026-11-02) — migration v4" section records the index.
 
 ## Substrate quick facts (pool / runner / helpers)
 

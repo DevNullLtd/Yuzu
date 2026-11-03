@@ -238,7 +238,8 @@ metadata:
     Reports the partitions of each physical disk with size, partition type and
     mount points. Not read yet on any OS: every dispatch answers one unsupported
     status row (windows:planned, linux:planned or macos:planned) until its leg
-    lands. On-demand only; it is not part of any daily sync.
+    lands. It is dispatched by the daily device-record sync, so its status (including
+    the planned one) is recorded as the partition section of the record.
   tags: [storage, disk, partitions]
 
 spec:
@@ -322,8 +323,9 @@ metadata:
     groups and logical volumes, md arrays, multipath maps and APFS containers.
     Not read yet on any OS: every dispatch answers one unsupported status row
     (windows:planned, linux:planned or macos:planned) until its leg lands;
-    Windows has no source ruled yet and stays planned. On-demand only; it is not
-    part of any daily sync.
+    Windows has no source ruled yet and stays planned. It is dispatched by the daily
+    device-record sync, so its status (including the planned one) is recorded as the
+    topology section of the record.
   tags: [storage, disk, topology]
 
 spec:

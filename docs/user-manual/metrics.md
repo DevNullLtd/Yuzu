@@ -784,9 +784,9 @@ same clock-guarded sweep the audit store uses.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `yuzu_server_response_ingest_dropped_total{reason}` | counter | Response result rows that did not persist, by `reason` (`store_not_open` / `pool_acquire_timeout` / `query_error` / `malformed_identity_field`). Fail-soft by design — the command is still tracked on the executions ladder — but a sustained non-zero rate means drawer/Echo result history is silently lossy. `malformed_identity_field` is a distinct case: `instruction_id`/`execution_id`/`plugin`/`agent_id` are bound unsanitized (see ADR-0039 "Ingest bounds") — a value containing an embedded NUL byte is rejected outright rather than silently truncated at the NUL, so a non-zero rate here means an agent sent a malformed identity field, not a store health problem. See `YuzuResponseMalformedIdentityDrops` (informational, not store-health) vs. `YuzuResponseIngestDrops` (excludes this reason). |
+| `yuzu_server_response_ingest_dropped_total{reason}` | counter | Response result rows that did not persist, by `reason` (`store_not_open` / `pool_acquire_timeout` / `query_error` / `malformed_identity_field` / `per_agent_cap`). Fail-soft by design — the command is still tracked on the executions ladder — but a sustained non-zero rate means drawer/Echo result history is silently lossy. `malformed_identity_field` is a distinct case: `instruction_id`/`execution_id`/`plugin`/`agent_id` are bound unsanitized (see ADR-0039 "Ingest bounds") — a value containing an embedded NUL byte is rejected outright rather than silently truncated at the NUL, so a non-zero rate here means an agent sent a malformed identity field, not a store health problem. See `YuzuResponseMalformedIdentityDrops` (informational, not store-health) vs. `YuzuResponseIngestDrops` (excludes this reason). `per_agent_cap` is likewise agent behaviour: an agent already had `--response-max-rows-per-agent` rows stored for that command on that device, so the frame was refused (see "Rows per agent are bounded" in [response-store.md](response-store.md)); `YuzuResponsePerAgentCapDrops` (informational) reports it and `YuzuResponseIngestDrops` excludes it too. |
 | `yuzu_server_response_facets_dropped_total{reason}` | counter | Facet rows (distinct (column, value) pairs) of a stored response that did not persist, by `reason`: `value_too_long` (a value over 2048 bytes is excluded from the response's facets, not truncated, because a prefix would be a different value than the one the agent reported; counts the distinct excluded (column, value) pairs), `cap` (distinct facets past the per-response limit of 5,000; the facets on the most lines are kept, ties broken by column index and then value, so the same output always keeps the same facets; a rare value, such as a single package on one host, sorts late and is the first to be cut, and nothing marks that response as capped) or `batch_failed` (the facet insert failed and was rolled back to its savepoint, so none of that response's facets persisted; counts the facets that were pending, and is also logged as a warning that names the `response_id`; a `cap` response likewise logs a warning, a `value_too_long` exclusion logs only at debug level). A facet counter moves only for a response that was stored and whose commit succeeded; in every such case the response row and its output persist, so `yuzu_server_response_ingest_dropped_total` does not move, and a failed commit publishes nothing. If the savepoint machinery itself fails (creating the savepoint, or rolling back to it after a failed insert), the transaction is aborted and the whole response is dropped; that is counted by `yuzu_server_response_ingest_dropped_total{reason="query_error"}` only, and no facet counter moves. A dropped facet is missing from the dashboard facet filter, group-from-results and the agent-count preview, and nothing marks the affected response (see "Facets are bounded" in [response-store.md](response-store.md)). The unit is facet rows, not responses, and one response can count in both `cap` and `batch_failed` (the facets kept after the cap are the ones that were pending when the insert failed). All three reasons are pre-seeded at 0 at startup. A non-zero `value_too_long` rate is expected wherever commands return very long fields; a non-zero `batch_failed` rate is not, and means a facet row the database refused (for example an unusually long `instruction_id`, which is the command id the agent echoed). No alert rule ships and none is owed yet: this is a data-completeness signal, not a store-health signal, and `YuzuResponseIngestDrops` covers only `yuzu_server_response_ingest_dropped_total`. A per-response marker and alert are tracked in #5630. |
-| `yuzu_server_response_read_degrade_total{reason,source}` | counter | Response reads that returned a **degrade** (nullopt, not empty), by `reason` (`store_not_open` / `pool_acquire_timeout` / `query_error` — the same three as the row above, excluding `malformed_identity_field`, which is write-path only) and `source` (`response_store`). The store seam distinguishes empty from degraded so a consumer renders a degrade banner rather than misreading a blip as "no responses". |
+| `yuzu_server_response_read_degrade_total{reason,source}` | counter | Response reads that returned a **degrade** (nullopt, not empty), by `reason` (`store_not_open` / `pool_acquire_timeout` / `query_error` — the three store-health reasons of the row above, excluding `malformed_identity_field` and `per_agent_cap`, which are write-path only) and `source` (`response_store`). The store seam distinguishes empty from degraded so a consumer renders a degrade banner rather than misreading a blip as "no responses". |
 | `yuzu_server_response_reap_passes_total{result}` | counter | TTL reap passes, by `result`: `swept` (deleted the full expired set), `capped` (hit the per-pass row cap of 10,000 OR the delete-time budget — a backlog likely remains either way; a sustained non-zero rate means expiry is outrunning the drain on this high-write store. Since the reap chunk-cascade fix (#2691 Gate 5), the delete-time budget can be hit before any row in a chunk is actually deleted, so `capped` no longer guarantees rows were removed this pass — it guarantees a backlog probe found one), `noop` (nothing expired), `declined` (the retention classifier vetoed a would-wipe or implausible-clock pass), `declined_no_anchor` (first pass ever against a store with expired rows present — declines once, the next pass drains), `skipped_lock` (another replica held the advisory lock), `failed` (the pass errored). As with the audit reaper, alert on the total NOT increasing — a reaper that never runs leaves every result flat at 0, identical to a quiet healthy store while the table grows — **and** alert on a sustained `capped` rate. |
 | `yuzu_server_forensics_tier_withheld_total{reason}` | counter | Stored-response reads whose Forensics-tier visibility could not be resolved (#4990), by `reason`: `rbac_unavailable` (the global `Forensics:Read` check was answered unavailable by the authorization store: not open, breaker open, pool timeout, or a failed role or permission query) or `unwired` (a dependency of the resolver was never wired; a running server should not show it). There is no scoped (management-group) read tier, so there is no reason for one. Each count is a read that was refused with a retryable error (a `503` on REST and the legacy routes, `kInternalError` with `retry_after_ms` on MCP) or that showed a notice instead of rows; no Forensics row was served and no partial result returned; this covers sessions, API tokens, MCP tokens and engine principals. A service-scoped token under a degraded store is default-denied (a definitive refusal) and is not counted, and when a whole-store outage fails the surface's earlier admission gate (`Response:Read`, or `Inventory:Read` and `Execution:Execute` on the Hardware poll) first, that gate's own answer is returned and this counter does not move. A definitive refusal (a caller who simply lacks `Forensics:Read`) is **not** counted, so the series stays flat on a healthy server whatever the callers' roles. Pre-seeded to 0 for each reason at start. Operational, not a security event. The `YuzuForensicsTierUnresolved` alert (`rate(...[5m]) > 0` for 10 minutes) does not fire on a single refusal or a burst shorter than about 5 minutes; a failure that keeps recurring fires after about 10 minutes. The edge is the 5-minute rate window: a refusal that recurs only every 5 minutes or longer leaves the rate false between events and does not fire, by design, while one recurring about every 285 seconds still fires. The cause is usually PostgreSQL pool saturation or a store outage, so correlate with `yuzu_server_rbac_read_degrade_total` and the server log line `Forensics-tier visibility could not be resolved`. |
 | `yuzu_exec_correlation_write_degrade_total` | counter | Dispatch-time writes of the per-dispatch record (`command_execution`: command id, plugin, execution id) that did not land (#4990): no pool lease within the budget (2 seconds for a single dispatch, 250 milliseconds in the operator Guardian rule push, which writes one record per target), a lock or statement timeout, or a query error. After the first failed write in that push, the remaining targets skip the write and each one counts here too, so one outage push adds one count per target from a single real write attempt. Dispatch itself is not refused or retried, but every response to a command whose record was not written is stored `~unverified` (Forensics-tier, withheld from callers without `Forensics:Read`) and the executions drawer misses that command's agent events. A failure is also logged. Alert: `YuzuDispatchRecordWriteFailing` (a non-zero rate for 10 minutes; it does not detect a store outage that leaves fewer than about one dispatch every 5 minutes, so read the counter itself too). Check PostgreSQL health and the `yuzu_pg_*` pool and lock metrics first. |
@@ -1148,7 +1148,7 @@ caller).
 ## Engine-credential confirm metric (#2404)
 
 ```
-# HELP yuzu_engine_principal_confirm_total Engine-credential rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient); store-reaching calls only, pre-store denials excluded (#2404)
+# HELP yuzu_engine_principal_confirm_total Engine-credential rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient|secret_mismatch); store-reaching calls only, pre-store denials excluded (#2404; secret_mismatch added #3015 proof-of-possession)
 # TYPE yuzu_engine_principal_confirm_total counter
 yuzu_engine_principal_confirm_total{surface="rest",result="success"} 0
 yuzu_engine_principal_confirm_total{surface="rest",result="conflict"} 0
@@ -1158,19 +1158,29 @@ yuzu_engine_principal_confirm_total{surface="mcp",result="success"} 0
 yuzu_engine_principal_confirm_total{surface="mcp",result="conflict"} 0
 yuzu_engine_principal_confirm_total{surface="mcp",result="client_error"} 0
 yuzu_engine_principal_confirm_total{surface="mcp",result="transient"} 0
+yuzu_engine_principal_confirm_total{surface="rest",result="secret_mismatch"} 0
+yuzu_engine_principal_confirm_total{surface="mcp",result="secret_mismatch"} 0
 ```
 
-All 8 series (the closed `surface` × `result` cross-product) are pre-seeded to
+All 10 series (the closed `surface` × `result` cross-product) are pre-seeded to
 `0` at startup so `absent()` alerts stay meaningful. The family makes a
 credential-**confirm** retry storm alertable, which `yuzu_http_requests_total`
 cannot show (it has no per-route label). `result` mirrors the shared
 store-error taxonomy (`engine_store_error_class.hpp`): `conflict` is a terminal
 409/kInvalidParams (a replay after the rotation already resolved, a moved-on
-pin, or unresolved rotation metadata — the client must not blindly retry),
+pin, unresolved rotation metadata, or a malformed two-credential pair, which
+is store corruption and not a replay — the client must not blindly retry),
 `client_error` is a 400 (more-than-two or non-engine active credentials),
 `transient` is a retryable 503 (store unavailable, lock contention, a persist
-failure, or the ambiguous empty/malformed-pair "no in-flight rotation"), and
-`success` is a completed confirm.
+failure, or the ambiguous empty read "no in-flight rotation to confirm"),
+`secret_mismatch` is a presented secret that does not verify (403), and
+`success` is a completed confirm. A malformed two-credential pair used to count
+as `transient`; it now counts as `conflict`, so a persistent malformed pair is
+visible on the `conflict` series, not on `transient`; the REST confirm route also
+writes a warning log line on the server, and on MCP the signals are the
+`conflict` series and the `engine_principal.credential.confirm` failure audit
+row. Alert authors who watch this family for store
+corruption should watch `conflict` as well.
 
 **Scope contract.** Counted only when a confirm reaches `ApiTokenStore::confirm_rotation`
 **or** trips the store-open guard (which increments `result="transient"`);
@@ -1189,7 +1199,11 @@ label (bounded cardinality only) — pair it with the
 (metric-is-the-signal / audit-row-is-the-evidence). A useful alert is
 `increase(yuzu_engine_principal_confirm_total{result="conflict"}[15m]) > <n>`
 to catch a client stuck replaying a resolved confirm, and
-`increase(...{result="transient"}[15m])` for a genuine store-health storm.
+`increase(...{result="transient"}[15m])` for a genuine store-health storm. A
+`conflict` count that keeps growing for one principal after its client has
+stopped replaying can also be a malformed two-credential pair that every retry
+meets again; the matching `engine_principal.credential.confirm` failure rows say
+`rotation pair is malformed`.
 
 **Semantics for alert authors:** this counts confirm **attempts** that reach
 the store, not logical rotations — a client retrying a `transient` blip 20 times
@@ -1243,25 +1257,27 @@ A server predating this metrics family, or a scrape config dropping the
 `yuzu_rotation_sweep_*` series, reads as a silently-healthy sweep — none of
 these are paired with their own "series is absent" companion alert today
 (unlike `YuzuAuditRetentionNotRunning`/`YuzuAuditRetentionMetricMissing`);
-that gap is tracked, not closed, by this round.
+that gap is tracked, not closed.
 
 ## Human API-token confirm metric (P2 #11)
 
 ```
-# HELP yuzu_api_token_confirm_total Human API-token rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient); store-reaching calls only, pre-store denials excluded - the human-owned twin of yuzu_engine_principal_confirm_total
+# HELP yuzu_api_token_confirm_total Human API-token rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient|secret_mismatch); store-reaching calls only, pre-store denials excluded - the human-owned twin of yuzu_engine_principal_confirm_total (secret_mismatch added #3015 proof-of-possession)
 # TYPE yuzu_api_token_confirm_total counter
 yuzu_api_token_confirm_total{surface="rest",result="success"} 0
 yuzu_api_token_confirm_total{surface="rest",result="conflict"} 0
 yuzu_api_token_confirm_total{surface="rest",result="client_error"} 0
 yuzu_api_token_confirm_total{surface="rest",result="transient"} 0
+yuzu_api_token_confirm_total{surface="rest",result="secret_mismatch"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="success"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="conflict"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="client_error"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="transient"} 0
+yuzu_api_token_confirm_total{surface="mcp",result="secret_mismatch"} 0
 ```
 
 The human-owned twin of [`yuzu_engine_principal_confirm_total`](#engine-credential-confirm-metric-2404)
-directly above — same closed `surface` x `result` cross-product (8 series),
+directly above — same closed `surface` x `result` cross-product (10 series),
 pre-seeded to `0` at startup for the same `absent()`-alert reason, and the
 same intended scope contract: counted only when a confirm reaches the
 credential store or trips the store-open guard (`result="transient"`),
