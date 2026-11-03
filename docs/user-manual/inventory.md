@@ -31,9 +31,10 @@ cadences.
   skips that day's report and keeps the last good state — nothing is deleted. A
   `constrained` `managers` answer that still names at least one present manager
   is accepted: the constraint concerns manager facts the presence row never
-  carried. A `constrained` `runtimes` `python` answer is the other exception: it
-  withholds only the Python rows and the cycle continues, so the stored Python rows
-  are removed until a later read succeeds (see Troubleshooting). A skipped cycle
+  carried. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
+  exception: it withholds only that source's rows and the cycle continues, so the
+  stored rows of that source are removed until a later read succeeds (see
+  Troubleshooting). A skipped cycle
   is retried sooner on a phase-aligned backoff: waits that double from 1 h after
   each consecutive skip (1 h, 2 h, 4 h, 8 h, …), each retry capped so it never
   lands after the next daily slot — up to four extra attempts — then one attempt
@@ -194,8 +195,8 @@ cadences.
   rows are REMOVED from the stored inventory until the source recovers, so they are absent
   from the Software page. The server sees no signal for this and cannot tell a withheld
   source from one with no IBM MQ installed; the state is visible only by running the
-  `ibm_mq` action on the device and reading its status row. This is the one exception to the
-  skip-the-cycle rule above. Windows and macOS answer `unsupported` (planned).
+  `ibm_mq` action on the device and reading its status row. This is the second such exception to the
+  skip-the-cycle rule above, with Python. Windows and macOS answer `unsupported` (planned).
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,

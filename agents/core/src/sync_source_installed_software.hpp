@@ -41,7 +41,7 @@ struct SwEntry {
     std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
     std::string kind;      // "package" | "app" | "pkg" | "feat"
-    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi|python
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi|python|ibm_mq
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
