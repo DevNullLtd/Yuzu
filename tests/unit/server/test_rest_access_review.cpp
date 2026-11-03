@@ -38,9 +38,11 @@
 
 #include "access_review_attest_gate.hpp"
 #include "access_review_store.hpp"
+#include "access_reviews_routes.hpp"
 #include "engine_principal_store.hpp"
 #include "mcp_jsonrpc.hpp"
 #include "mcp_server.hpp"
+#include "openapi_spec_access.hpp"
 #include "rbac_store.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
@@ -56,8 +58,11 @@
 
 #include <httplib.h>
 
+#include <cstdint>
+#include <expected>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -2633,4 +2638,147 @@ TEST_CASE("attestation SoD: a refusal stands and a recorded decision stands when
         CHECK(body["result"]["structuredContent"]["audit_persisted"] == false);
         CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 1);
     }
+}
+
+// ── Decision history on the read surfaces (#4752) ───────────────────────────
+//
+// GET /{id}, MCP get_access_review and the Access page show the same decisions: the latest, its
+// decision_seq and every earlier one. The page case drives the real fragment route over a callback
+// that reads the real store with include_history=true, which is what server.cpp wires; the Settings
+// fragment keeps reading without history and shows the latest decision only (an intended difference).
+
+namespace {
+
+std::set<std::string> keys_of(const nlohmann::json& o) {
+    std::set<std::string> out;
+    for (auto it = o.begin(); it != o.end(); ++it)
+        out.insert(it.key());
+    return out;
+}
+
+std::set<std::string> property_names(const nlohmann::json& schema) {
+    return keys_of(schema.at("properties"));
+}
+
+} // namespace
+
+TEST_CASE("decision history: REST, MCP and the Access page agree, and the OpenAPI schema names exactly "
+          "what is emitted",
+          "[pg][access_review][rest][mcp][access-reviews][4752]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    seed_user_grant(h, "alice");
+    const auto cid = h.open_campaign_rest("history reads");
+
+    h.session_user = "carol";
+    REQUIRE(h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator", "attested"))->status ==
+            200);
+    h.session_user = "dave";
+    REQUIRE(h.sink
+                .Post(attest_url(cid),
+                      nlohmann::json{{"principal_type", "user"},
+                                     {"principal_id", "bob"},
+                                     {"role_name", "Operator"},
+                                     {"decision", "flagged_revoke"},
+                                     {"justification", "left <the> team"}}
+                          .dump())
+                ->status == 200);
+
+    const auto find_att = [](const nlohmann::json& atts, const std::string& id) {
+        for (const auto& a : atts)
+            if (a["principal_id"] == id)
+                return a;
+        FAIL("attestation not found: " << id);
+        return nlohmann::json{};
+    };
+
+    auto rest = h.sink.Get("/api/v1/access-reviews/" + cid);
+    REQUIRE(rest);
+    REQUIRE(rest->status == 200);
+    const auto rest_atts = nlohmann::json::parse(rest->body)["data"]["attestations"];
+    const auto bob = find_att(rest_atts, "bob");
+    CHECK(bob["decision"] == "flagged_revoke");
+    CHECK(bob["reviewer"] == "dave");
+    CHECK(bob["decision_seq"] == 2);
+    REQUIRE(bob["history"].is_array());
+    REQUIRE(bob["history"].size() == 2);
+    CHECK(bob["history"][0]["seq"] == 1);
+    CHECK(bob["history"][0]["decision"] == "attested");
+    CHECK(bob["history"][0]["previous_decision"] == "pending");
+    CHECK(bob["history"][0]["reviewer"] == "carol");
+    CHECK(bob["history"][1]["seq"] == 2);
+    CHECK(bob["history"][1]["decision"] == "flagged_revoke");
+    CHECK(bob["history"][1]["previous_decision"] == "attested");
+    CHECK(bob["history"][1]["reviewer"] == "dave");
+    CHECK(bob["history"][1]["justification"] == "left <the> team");
+    CHECK(bob["history"][1]["decided_at_ms"].get<std::int64_t>() > 0);
+
+    // A grant nobody has decided: seq 0 and an empty array, never absent.
+    const auto alice = find_att(rest_atts, "alice");
+    CHECK(alice["decision"] == "pending");
+    CHECK(alice["decision_seq"] == 0);
+    REQUIRE(alice.contains("history"));
+    CHECK(alice["history"].is_array());
+    CHECK(alice["history"].empty());
+
+    // MCP returns the identical attestation objects.
+    auto mcp = h.mcp_call_tool("get_access_review", {{"campaign_id", cid}});
+    REQUIRE(mcp);
+    const auto mcp_body = nlohmann::json::parse(mcp->body);
+    REQUIRE(mcp_body.contains("result"));
+    const auto mcp_atts = mcp_body["result"]["structuredContent"]["attestations"];
+    CHECK(mcp_atts.dump() == rest_atts.dump());
+    CHECK(find_att(mcp_atts, "bob")["history"].size() == 2);
+
+    // OpenAPI names exactly the keys the route emits, on both the row and the history entry.
+    const auto spec = nlohmann::json::parse(yuzu::server::openapi_spec_json());
+    const auto& schemas = spec["components"]["schemas"];
+    const auto& att_schema = schemas["AccessReviewAttestation"];
+    CHECK(property_names(att_schema) == keys_of(bob));
+    CHECK(std::set<std::string>(att_schema["required"].begin(), att_schema["required"].end()) ==
+          keys_of(bob));
+    const auto& hist_schema = schemas["AccessReviewAttestationHistoryEntry"];
+    CHECK(property_names(hist_schema) == keys_of(bob["history"][0]));
+    CHECK(std::set<std::string>(hist_schema["required"].begin(), hist_schema["required"].end()) ==
+          keys_of(bob["history"][0]));
+    CHECK(att_schema["properties"]["history"]["items"]["$ref"] ==
+          "#/components/schemas/AccessReviewAttestationHistoryEntry");
+
+    // The Access page: the real fragment route over the real store, history opted in.
+    yuzu::server::test::TestRouteSink page;
+    yuzu::server::access_reviews::ReviewsDeps d;
+    d.auth_fn = [&h](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = h.session_user;
+        s.role = h.session_role;
+        return s;
+    };
+    d.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                   const std::string&) { return true; };
+    d.quiet_perm_fn = d.perm_fn;
+    d.probe_perm_fn = [](const httplib::Request&, const std::string&, const std::string&) {
+        return true;
+    };
+    d.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+    d.list_campaigns_fn = []() -> std::expected<std::vector<AccessReviewCampaignRow>, std::string> {
+        return std::vector<AccessReviewCampaignRow>{};
+    };
+    d.get_campaign_fn = [&h](const std::string& id) {
+        return h.access_review_store->get_campaign(id, /*include_history=*/true);
+    };
+    d.grants_fn = []() -> std::expected<yuzu::server::access_reviews::GrantsView, std::string> {
+        return yuzu::server::access_reviews::GrantsView{};
+    };
+    yuzu::server::access_reviews::register_access_reviews_routes(page, std::move(d));
+    const auto frag = page.Get("/fragments/access/reviews/campaign?id=" + cid);
+    REQUIRE(frag);
+    REQUIRE(frag->status == 200);
+    CHECK(frag->body.find("<span class=\"pill warn\">flagged_revoke</span>") != std::string::npos);
+    CHECK(frag->body.find("superseded 1 earlier decision") != std::string::npos);
+    CHECK(frag->body.find("#1 attested (previous: pending) by carol") != std::string::npos);
+    CHECK(frag->body.find("#2 flagged_revoke (previous: attested) by dave") != std::string::npos);
+    // The justification carries markup; it reaches the page escaped only.
+    CHECK(frag->body.find("left &lt;the&gt; team") != std::string::npos);
+    CHECK(frag->body.find("left <the> team") == std::string::npos);
 }

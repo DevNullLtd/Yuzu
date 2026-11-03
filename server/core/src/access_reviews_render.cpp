@@ -109,9 +109,63 @@ std::string side_card(const CampaignView& v, const CampaignDerived& d, bool can_
     return out;
 }
 
-std::string attestation_row(const AccessReviewAttestationRow& a, bool controls) {
+// A history entry that repeats its predecessor (same decision, reviewer and justification, and it
+// replaced a decision equal to its own) is a re-recorded decision, which is what a retry after an
+// unacknowledged commit appends. It is not a change of mind, so it is labelled apart.
+bool is_rerecord(const AttestationHistoryRow& prev, const AttestationHistoryRow& cur) {
+    return cur.decision == prev.decision && cur.reviewer == prev.reviewer &&
+           cur.justification == prev.justification && cur.previous_decision == cur.decision;
+}
+
+// "" is a decision backfilled from before the history table: not recorded, never pending.
+std::string previous_label(const std::string& p) {
+    return p.empty() ? std::string("not recorded") : esc(p);
+}
+
+std::string history_entry(const AccessReviewAttestationRow& a, std::size_t i) {
+    const auto& e = a.history[i];
+    std::string out = "<span class=\"sub\">#" + std::to_string(e.seq) + " " + esc(e.decision) +
+                      " (previous: " + previous_label(e.previous_decision) + ") by " +
+                      esc(e.reviewer) + " " + when(e.decided_at_ms);
+    if (!e.justification.empty())
+        out += ": " + esc(e.justification);
+    if (i > 0)
+        out += is_rerecord(a.history[i - 1], e)
+                   ? std::string(" (re-recorded)")
+                   : " (supersedes #" + std::to_string(a.history[i - 1].seq) + ")";
+    return out + "</span>";
+}
+
+// The earlier decisions behind a decided grant: a marker, and the history behind an escaped
+// <details> when it was loaded. Nothing for a grant decided once or never.
+std::string history_block(const AccessReviewAttestationRow& a) {
+    const auto recorded = static_cast<std::size_t>(std::max<std::int32_t>(a.decision_seq, 0));
+    const std::size_t total = std::max(recorded, a.history.size());
+    if (total < 2)
+        return {};
+    const std::size_t earlier = total - 1;
+    bool all_rerecorded = a.history.size() == total;
+    for (std::size_t i = 1; all_rerecorded && i < a.history.size(); ++i)
+        all_rerecorded = is_rerecord(a.history[i - 1], a.history[i]);
+    const std::string marker =
+        all_rerecorded ? "re-recorded " + std::to_string(earlier) + (earlier == 1 ? " time" : " times")
+                       : "superseded " + std::to_string(earlier) + " earlier decision" +
+                             (earlier == 1 ? "" : "s");
+    if (a.history.empty())
+        return "<span class=\"sub\">" + marker + "</span>";
+    std::string out = "<details class=\"ar-history\"><summary class=\"sub\">" + marker + "</summary>";
+    for (std::size_t i = 0; i < a.history.size(); ++i)
+        out += history_entry(a, i);
+    return out + "</details>";
+}
+
+// `viewer` is the signed-in reviewer. The server refuses a reviewer who is the subject of the
+// grant, so a user row naming the viewer shows no Attest or Flag; that is a courtesy, not the control.
+std::string attestation_row(const AccessReviewAttestationRow& a, bool controls,
+                            std::string_view viewer) {
     const bool pending = is_pending(a);
-    const bool edit = controls && pending;
+    const bool own = !viewer.empty() && a.principal_type == "user" && a.principal_id == viewer;
+    const bool edit = controls && pending && !own;
     std::string out = "<tr data-principal-type=\"" + esc(a.principal_type) +
                       "\" data-principal-id=\"" + esc(a.principal_id) + "\" data-role-name=\"" +
                       esc(a.role_name) + "\"><td class=\"long\"><span class=\"pill idle\">" +
@@ -121,7 +175,8 @@ std::string attestation_row(const AccessReviewAttestationRow& a, bool controls) 
     if (a.reviewer.empty())
         out += "<span class=\"hint\">None</span>";
     else
-        out += esc(a.reviewer) + "<span class=\"sub\">" + when(a.decided_at_ms) + "</span>";
+        out += esc(a.reviewer) + "<span class=\"sub\">" + when(a.decided_at_ms) + "</span>" +
+               history_block(a);
     out += "</td><td class=\"long\">";
     if (edit)
         out += "<input class=\"in\" data-ar-justification maxlength=\"1000\" "
@@ -136,10 +191,12 @@ std::string attestation_row(const AccessReviewAttestationRow& a, bool controls) 
                "data-decision=\"attested\">Attest</button><button type=\"button\" class=\"btn link "
                "sm danger\" data-act=\"ar-flag\" data-decision=\"flagged_revoke\" title=\"Flag for "
                "revocation. Records evidence; does not revoke the grant.\">Flag</button>";
+    else if (controls && pending && own)
+        out += "<span class=\"hint\">Another reviewer must decide</span>";
     return out + "</div></td></tr>";
 }
 
-std::string campaign_panel(const CampaignView& v, bool can_attest) {
+std::string campaign_panel(const CampaignView& v, bool can_attest, std::string_view viewer) {
     const auto& c = v.campaign;
     const bool open = c.status == "open";
     const auto d = derive_campaign_counts(v);
@@ -171,7 +228,7 @@ std::string campaign_panel(const CampaignView& v, bool can_attest) {
                "<tbody>";
         const std::size_t shown = std::min(ordered.size(), kGrantRenderCap);
         for (std::size_t i = 0; i < shown; ++i)
-            out += attestation_row(*ordered[i], open && can_attest);
+            out += attestation_row(*ordered[i], open && can_attest, viewer);
         out += "</tbody></table></div>";
     }
     return out + "</div>";
@@ -220,6 +277,9 @@ CampaignDerived derive_campaign_counts(const CampaignView& v) {
             ++d.flagged;
         if (!a.reviewer.empty())
             who.insert(a.reviewer);
+        for (const auto& h : a.history)
+            if (!h.reviewer.empty())
+                who.insert(h.reviewer);
     }
     d.reviewers = static_cast<int>(who.size());
     return d;
@@ -249,9 +309,9 @@ std::string render_campaigns(
 }
 
 std::string render_campaign(const std::variant<CampaignView, access::NotFound, access::Unavailable>& state,
-                            bool can_attest, std::string_view id) {
+                            bool can_attest, std::string_view id, std::string_view viewer) {
     if (const auto* v = std::get_if<CampaignView>(&state))
-        return campaign_panel(*v, can_attest) +
+        return campaign_panel(*v, can_attest, viewer) +
                side_card(*v, derive_campaign_counts(*v), can_attest);
     const std::string hd = "<div class=\"hd\"><h2>Review campaign</h2></div>";
     if (std::holds_alternative<access::NotFound>(state))

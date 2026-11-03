@@ -3423,12 +3423,20 @@ static const ToolDef kTools[] = {
      "'flagged_revoke' (the reviewer believes it should be revoked). flag != revoke: this "
      "tool ONLY records evidence — it never itself mutates any RBAC/EnginePrincipal grant. "
      "Acting on a flagged_revoke decision is a separate, explicit role-unassignment or "
-     "engine-principal-revoke call an operator makes after reading this evidence. This is "
-     "an UPSERT: calling it again for the same (campaign_id, principal_type, principal_id, "
-     "role_name) OVERWRITES the prior reviewer's decision, reviewer, and justification — "
-     "the earlier evidence is not retained, so destructiveHint:true. Mirrors "
-     "POST /api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested "
-     "or access_review.flagged (by decision). Requires AccessReview:Attest.",
+     "engine-principal-revoke call an operator makes after reading this evidence. Calling it "
+     "again for the same (campaign_id, principal_type, principal_id, role_name) makes the new "
+     "decision the CURRENT one and it can never return the grant to pending, so "
+     "destructiveHint:true; the earlier decision is NOT lost, every decision is kept in the "
+     "grant's history (get_access_review returns it, with a decision_seq). The reviewer must "
+     "differ from the subject of the grant: a user grant naming the caller, an engine "
+     "principal the caller owns, or a group the caller belongs to is refused with a "
+     "permission-denied result, 'the reviewer must differ from the subject of this grant; ask "
+     "another reviewer to record this decision', and records nothing. If the connection drops "
+     "before the answer arrives, call get_access_review and compare decision_seq before "
+     "retrying: a retry after an unacknowledged commit appends an identical decision, which is "
+     "kept and visible, not an error. Mirrors POST "
+     "/api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested or "
+     "access_review.flagged (by decision). Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$"},)j"
      R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
@@ -3441,7 +3449,12 @@ static const ToolDef kTools[] = {
 
     {"get_access_review",
      "Full evidentiary state of one review campaign: metadata plus every frozen "
-     "attestation row (pending/attested/flagged_revoke) plus pending_count. "
+     "attestation row (pending/attested/flagged_revoke) plus pending_count. Each attestation "
+     "carries its current decision, a decision_seq (0 while pending) and history, every "
+     "decision recorded for that grant oldest first as {seq, decision, previous_decision, "
+     "reviewer, justification, decided_at_ms}; previous_decision \"\" means not recorded (the "
+     "decision predates the history), never pending. The response grows with every "
+     "re-recorded decision. "
      "campaign.rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state frozen "
      "AT OPEN (empty string for a campaign opened before this field existed). Mirrors GET "
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
@@ -3449,7 +3462,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$"})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
+     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string","enum":["user","group","engine"]},"principal_id":{"type":"string"},"role_name":{"type":"string"},"decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"decided_at_ms":{"type":"integer"},"justification":{"type":"string"},"decision_seq":{"type":"integer"},"history":{"type":"array","items":{"type":"object","properties":{"seq":{"type":"integer"},"decision":{"type":"string","enum":["attested","flagged_revoke"]},"previous_decision":{"type":"string","enum":["","pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"justification":{"type":"string"},"decided_at_ms":{"type":"integer"}},"required":["seq","decision","previous_decision","reviewer","justification","decided_at_ms"]}}},"required":["principal_type","principal_id","role_name","decision","reviewer","decided_at_ms","justification","decision_seq","history"]}},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
     {"list_access_reviews",
      "List every review campaign's metadata (NOT its attestations — use get_access_review "
@@ -5491,7 +5504,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"raise_guardian_policy_generation",
      {ToolEffect::Destructive, true, "Raise Guardian policy generation"}},
     {"open_access_review", {ToolEffect::Additive, false, "Open access review campaign"}},
-    // record_attestation: UPSERT that overwrites a prior reviewer decision → Destructive.
+    // record_attestation: the current decision is replaced and a grant can never return to
+    // pending → Destructive. The earlier decision is retained in the grant's history, so this
+    // is not a loss of evidence; the hint stays true because the current state is replaced.
     {"record_attestation", {ToolEffect::Destructive, false, "Record access review attestation"}},
     // close_access_review: one-way open→closed lifecycle (no reopen path) → Destructive.
     {"close_access_review", {ToolEffect::Destructive, false, "Close access review campaign"}},
@@ -28463,7 +28478,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto view_res = access_review_store->get_campaign(campaign_id);
+                // Same read as GET /api/v1/access-reviews/{id}: every decision, not only the latest.
+                auto view_res = access_review_store->get_campaign(campaign_id, /*include_history=*/true);
                 if (!view_res) {
                     mcp_audit("failure", view_res.error());
                     const int code = mcp_error_for_access_review_msg(view_res.error());
@@ -28490,6 +28506,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     // grant_snapshot is raw-embedded, not escaped: this store's only
                     // writer (open_access_review/POST /api/v1/access-reviews) always
                     // freezes it as a JObj().str() JSON object.
+                    // Oldest first; previous_decision "" is "not recorded", never "pending".
+                    JArr history;
+                    for (const auto& h : a.history)
+                        history.add(JObj()
+                                        .add("seq", h.seq)
+                                        .add("decision", h.decision)
+                                        .add("previous_decision", h.previous_decision)
+                                        .add("reviewer", h.reviewer)
+                                        .add("justification", h.justification)
+                                        .add("decided_at_ms", h.decided_at_ms));
                     attestations.add(
                         JObj()
                             .add("principal_type", a.principal_type)
@@ -28500,7 +28526,9 @@ McpServer::HandlerFn McpServer::build_handler(
                             .add("decided_at_ms", a.decided_at_ms)
                             .add("justification", a.justification)
                             .raw("grant_snapshot",
-                                 a.grant_snapshot.empty() ? "null" : a.grant_snapshot));
+                                 a.grant_snapshot.empty() ? "null" : a.grant_snapshot)
+                            .add("decision_seq", a.decision_seq)
+                            .raw("history", history.str()));
                 }
                 (void)audit_fn(req, "access_review.get", "success", "AccessReview", campaign_id, "");
                 JObj payload;

@@ -45,9 +45,11 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <atomic>
 #include <set>
 #include <chrono>
 #include <cstdlib>
+#include <expected>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1266,6 +1268,57 @@ TEST_CASE("an attest issued while a close is in flight waits, then is not_found 
     CHECK(view->pending_count == 3);
     for (const auto& a : view->attestations)
         CHECK(a.history.empty());
+}
+
+// A queued close does NOT stop a NEW attest from taking its FOR SHARE on the campaign row, so
+// under a continuous attest stream a close can wait for the whole lock_timeout and answer a write
+// failure. Documented behaviour (access_review_store.hpp), pinned here so a change to it is seen.
+// The short lock_timeout keeps the test to about a second; nothing else sleeps.
+TEST_CASE("a close waiting behind an attest does not block a new attest of another grant, and "
+          "ends in a retryable write failure at lock_timeout, never not_found",
+          "[access_review][store][pg][concurrency]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6, .lock_timeout_ms = 1000}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign("Starvation", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    std::expected<void, std::string> closed;
+    std::atomic<bool> close_returned{false};
+    yuzu::test::HeldLocks held(pool);
+    held.run(grant_lock_sql(cid)); // attest A in flight: its row, and FOR SHARE on the campaign
+    yuzu::test::Workers workers([&] { held.rollback(); });
+    workers.add([&] {
+        closed = store.close_campaign(cid, "admin");
+        close_returned = true;
+    });
+    REQUIRE(yuzu::test::wait_for_lock_waiter(pool)); // the close is parked behind attest A
+
+    // Attest B, a different grant of the same campaign, is issued AFTER the close queued.
+    auto b = store.record_attestation(cid, "group", "eng", "Reader", "attested", "carol", "");
+    REQUIRE(b.has_value());
+    CHECK(b->seq == 1);
+    CHECK(b->previous_decision == "pending");
+    // It completed while the close was still waiting.
+    CHECK_FALSE(close_returned.load());
+
+    workers.join_all(); // attest A never releases: the close times out on its own
+    REQUIRE_FALSE(closed.has_value());
+    CHECK_FALSE(closed.error().starts_with("not_found:"));
+    CHECK(closed.error().starts_with("close_campaign write failed"));
+    held.rollback();
+
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    CHECK(view->campaign.status == "open");
+    const auto* eng = find_row(*view, "group", "eng", "Reader");
+    REQUIRE(eng != nullptr);
+    CHECK(eng->decision == "attested");
+    CHECK(eng->decision_seq == 1);
+    // A close issued once nothing holds the campaign succeeds: the failure left it open.
+    CHECK(store.close_campaign(cid, "admin").has_value());
 }
 
 // ── Migration v2 -> v3 (history table, guards, refusal) ─────────────────────

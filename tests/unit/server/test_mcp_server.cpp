@@ -2454,6 +2454,60 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
     }
 }
 
+// #4752: the access-review decision history is part of the served contract. record_attestation
+// stays destructive (the current decision is replaced and a grant cannot go back to pending) but
+// its prose must no longer claim the earlier decision is lost, and get_access_review types the
+// attestation items, decision_seq and history, not a bare array.
+TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the append contract; "
+          "get_access_review types decision_seq and history",
+          "[mcp][2g][4752]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    const nlohmann::json* record = nullptr;
+    const nlohmann::json* get = nullptr;
+    for (const auto& t : tools) {
+        if (t["name"] == "record_attestation")
+            record = &t;
+        if (t["name"] == "get_access_review")
+            get = &t;
+    }
+    REQUIRE(record != nullptr);
+    REQUIRE(get != nullptr);
+
+    CHECK((*record)["annotations"]["destructiveHint"] == true);
+    const auto rdesc = (*record)["description"].get<std::string>();
+    for (const char* needle : {"destructiveHint:true", "every decision is kept", "decision_seq",
+                               "must differ from the subject of the grant",
+                               "the reviewer must differ from the subject of this grant; ask another "
+                               "reviewer to record this decision",
+                               "get_access_review and compare decision_seq before retrying"})
+        CHECK(rdesc.find(needle) != std::string::npos);
+    for (const char* stale : {"UPSERT", "OVERWRITES", "not retained"})
+        CHECK(rdesc.find(stale) == std::string::npos);
+
+    const auto gdesc = (*get)["description"].get<std::string>();
+    CHECK(gdesc.find("decision_seq") != std::string::npos);
+    CHECK(gdesc.find("history") != std::string::npos);
+
+    const auto& items = (*get)["outputSchema"]["properties"]["attestations"]["items"];
+    REQUIRE(items.is_object());
+    CHECK(items["properties"]["decision_seq"]["type"] == "integer");
+    const auto& hist = items["properties"]["history"];
+    CHECK(hist["type"] == "array");
+    for (const char* k : {"seq", "decision", "previous_decision", "reviewer", "justification",
+                          "decided_at_ms"})
+        CHECK(hist["items"]["properties"].contains(k));
+    CHECK(hist["items"]["properties"]["seq"]["type"] == "integer");
+    CHECK(hist["items"]["properties"]["previous_decision"]["enum"] ==
+          nlohmann::json::array({"", "pending", "attested", "flagged_revoke"}));
+    const auto required = items["required"];
+    CHECK(std::find(required.begin(), required.end(), "decision_seq") != required.end());
+    CHECK(std::find(required.begin(), required.end(), "history") != required.end());
+}
+
 // #2383: C8 fail-closed. The boot validator and the three-way dispatch
 // classifier are exercised through the testonly seam over SYNTHETIC tables —
 // the seam wrappers forward to the REAL functions (no file-static mutation) —

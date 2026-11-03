@@ -16665,7 +16665,9 @@ private:
                     -> std::expected<CampaignView, std::string> {
                     if (!access_review_store_ || !access_review_store_->is_open())
                         return std::unexpected(std::string("access review store not open"));
-                    return access_review_store_->get_campaign(id);
+                    // The Access page shows the decision history, so it opts in; the
+                    // Settings fragment reads the latest decision only.
+                    return access_review_store_->get_campaign(id, /*include_history=*/true);
                 },
                 .grants_fn = [this]()
                     -> std::expected<yuzu::server::access_reviews::GrantsView, std::string> {

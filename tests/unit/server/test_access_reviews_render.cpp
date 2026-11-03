@@ -448,3 +448,163 @@ TEST_CASE("reviews render: current grants cap; empty and unavailable", "[access-
     CHECK_THAT(out, !ContainsSubstring("export?format=csv"));
     CHECK_THAT(out, !ContainsSubstring("No grants"));
 }
+
+// ---- decision history (#4752) ---------------------------------------------------------------
+
+namespace {
+
+AttestationHistoryRow hist(std::int32_t seq, std::string decision, std::string previous,
+                           std::string reviewer, std::string just = "") {
+    AttestationHistoryRow h;
+    h.seq = seq;
+    h.decision = std::move(decision);
+    h.previous_decision = std::move(previous);
+    h.reviewer = std::move(reviewer);
+    h.justification = std::move(just);
+    h.decided_at_ms = 1791884472000;
+    return h;
+}
+
+// One grant decided twice: carol attested it, dave flagged it. The current row is dave's.
+AccessReviewAttestationRow twice_decided() {
+    auto a = att("user", "bob", "Operator", "flagged_revoke", "dave", "left the team");
+    a.decision_seq = 2;
+    a.history = {hist(1, "attested", "pending", "carol", "looks fine"),
+                 hist(2, "flagged_revoke", "attested", "dave", "left the team")};
+    return a;
+}
+
+} // namespace
+
+TEST_CASE("reviews render: a grant decided twice shows the latest decision, a superseded marker and "
+          "the history",
+          "[access-reviews][render][4752]") {
+    const auto out = campaign_html(view(camp("c1", "T"), {twice_decided()}), true);
+    CHECK_THAT(out, ContainsSubstring("<span class=\"pill warn\">flagged_revoke</span>"));
+    CHECK_THAT(out, ContainsSubstring("superseded 1 earlier decision<"));
+    CHECK_THAT(out, !ContainsSubstring("superseded 1 earlier decisions"));
+    CHECK_THAT(out, ContainsSubstring("<details class=\"ar-history\"><summary class=\"sub\">"));
+    CHECK_THAT(out, ContainsSubstring("#1 attested (previous: pending) by carol"));
+    CHECK_THAT(out, ContainsSubstring("looks fine"));
+    CHECK_THAT(out, ContainsSubstring("#2 flagged_revoke (previous: attested) by dave"));
+    CHECK_THAT(out, ContainsSubstring("(supersedes #1)"));
+    CHECK_THAT(out, !ContainsSubstring("re-recorded"));
+    CHECK_THAT(out, !ContainsSubstring("not recorded"));
+}
+
+TEST_CASE("reviews render: three decisions say 'decisions'; no marker at decision_seq 0 or 1",
+          "[access-reviews][render][4752]") {
+    auto thrice = twice_decided();
+    thrice.decision_seq = 3;
+    thrice.history.push_back(hist(3, "attested", "flagged_revoke", "erin"));
+    thrice.decision = "attested";
+    thrice.reviewer = "erin";
+    CHECK_THAT(campaign_html(view(camp("c1", "T"), {thrice}), true),
+               ContainsSubstring("superseded 2 earlier decisions<"));
+
+    auto once = att("user", "bob", "Operator", "attested", "carol");
+    once.decision_seq = 1;
+    once.history = {hist(1, "attested", "pending", "carol")};
+    const auto never = att("user", "al", "Viewer", "pending");
+    const auto out = campaign_html(view(camp("c1", "T"), {once, never}), true);
+    CHECK_THAT(out, !ContainsSubstring("superseded"));
+    CHECK_THAT(out, !ContainsSubstring("re-recorded"));
+    CHECK_THAT(out, !ContainsSubstring("<details"));
+}
+
+TEST_CASE("reviews render: an identical consecutive decision is re-recorded, not superseded",
+          "[access-reviews][render][4752]") {
+    auto a = att("user", "bob", "Operator", "attested", "carol", "ok");
+    a.decision_seq = 2;
+    a.history = {hist(1, "attested", "pending", "carol", "ok"),
+                 hist(2, "attested", "attested", "carol", "ok")};
+    const auto out = campaign_html(view(camp("c1", "T"), {a}), true);
+    CHECK_THAT(out, ContainsSubstring("re-recorded 1 time<"));
+    CHECK_THAT(out, ContainsSubstring("(re-recorded)"));
+    CHECK_THAT(out, !ContainsSubstring("superseded"));
+
+    // The same decision by a DIFFERENT reviewer is a real supersede, not a re-record.
+    a.history[1].reviewer = "dave";
+    a.reviewer = "dave";
+    const auto other = campaign_html(view(camp("c1", "T"), {a}), true);
+    CHECK_THAT(other, ContainsSubstring("superseded 1 earlier decision<"));
+    CHECK_THAT(other, !ContainsSubstring("re-recorded"));
+}
+
+TEST_CASE("reviews render: a decision backfilled from before the history reads not recorded, never "
+          "pending",
+          "[access-reviews][render][4752]") {
+    auto a = att("user", "bob", "Operator", "flagged_revoke", "dave");
+    a.decision_seq = 2;
+    a.history = {hist(1, "attested", "", "carol"), hist(2, "flagged_revoke", "attested", "dave")};
+    const auto out = campaign_html(view(camp("c1", "T"), {a}), true);
+    CHECK_THAT(out, ContainsSubstring("#1 attested (previous: not recorded) by carol"));
+    CHECK_THAT(out, !ContainsSubstring("(previous: pending)"));
+}
+
+TEST_CASE("reviews render: a view read without history still shows the marker, and no details",
+          "[access-reviews][render][4752]") {
+    auto a = twice_decided();
+    a.history.clear();
+    const auto out = campaign_html(view(camp("c1", "T"), {a}), true);
+    CHECK_THAT(out, ContainsSubstring("<span class=\"sub\">superseded 1 earlier decision</span>"));
+    CHECK_THAT(out, !ContainsSubstring("<details"));
+}
+
+TEST_CASE("reviews render: hostile strings in the history are escaped", "[access-reviews][render][4752]") {
+    auto a = twice_decided();
+    a.history[0].reviewer = "<script>alert(1)</script>";
+    a.history[0].justification = "\"><img src=x onerror=alert(2)>";
+    a.history[1].previous_decision = "<b>x</b>";
+    const auto out = campaign_html(view(camp("c1", "T"), {a}), true);
+    CHECK_THAT(out, !ContainsSubstring("<script>"));
+    CHECK_THAT(out, !ContainsSubstring("<img"));
+    CHECK_THAT(out, !ContainsSubstring("<b>x</b>"));
+    CHECK_THAT(out, ContainsSubstring("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    CHECK_THAT(out, ContainsSubstring("&lt;img src=x onerror=alert(2)&gt;"));
+    CHECK_THAT(out, ContainsSubstring("(previous: &lt;b&gt;x&lt;/b&gt;)"));
+}
+
+TEST_CASE("reviews render: distinct reviewers count the current rows plus the history",
+          "[access-reviews][render][4752]") {
+    // carol's decision was replaced by dave's, so she is only in the history; erin decided another grant.
+    auto other = att("user", "al", "Viewer", "attested", "erin");
+    other.decision_seq = 1;
+    other.history = {hist(1, "attested", "pending", "erin")};
+    const auto with_history = view(camp("c1", "T"), {twice_decided(), other});
+    CHECK(derive_campaign_counts(with_history).reviewers == 3);
+    CHECK_THAT(campaign_html(with_history, true),
+               ContainsSubstring("<span>Reviewers who have acted</span><b>3</b>"));
+
+    // The same campaign read without history counts the current reviewers only.
+    auto bare = with_history;
+    for (auto& a : bare.attestations)
+        a.history.clear();
+    CHECK(derive_campaign_counts(bare).reviewers == 2);
+}
+
+TEST_CASE("reviews render: no Attest or Flag on a user grant that names the viewer",
+          "[access-reviews][render][4752]") {
+    const std::vector<AccessReviewAttestationRow> rows = {att("user", "carol", "Operator", "pending"),
+                                                          att("user", "bob", "Operator", "pending"),
+                                                          att("group", "carol", "Operator", "pending")};
+    const auto v = view(camp("c1", "T"), rows);
+    const auto out = render_campaign(v, true, {}, "carol");
+    // bob's user row and the group named "carol" keep their controls; carol's own user row does not.
+    CHECK(count_of(out, "data-act=\"ar-attest\"") == 2);
+    CHECK(count_of(out, "data-act=\"ar-flag\"") == 2);
+    CHECK(count_of(out, "data-ar-justification") == 2);
+    CHECK(count_of(out, "Another reviewer must decide") == 1);
+    // Pending rows keep store order, so the first body row is carol's own user grant.
+    const auto first_row = out.find("<tr data-principal-type=\"user\" data-principal-id=\"carol\"");
+    REQUIRE(first_row != std::string::npos);
+    const auto own_row = out.substr(first_row, out.find("</tr>", first_row) - first_row);
+    CHECK_THAT(own_row, ContainsSubstring("Another reviewer must decide"));
+    CHECK_THAT(own_row, !ContainsSubstring("data-act=\"ar-attest\""));
+    CHECK_THAT(own_row, !ContainsSubstring("data-ar-justification"));
+
+    // No viewer given: every pending row keeps its controls.
+    CHECK(count_of(render_campaign(v, true), "data-act=\"ar-attest\"") == 3);
+    // A viewer without Attest sees no hint at all.
+    CHECK_THAT(render_campaign(v, false, {}, "carol"), !ContainsSubstring("Another reviewer"));
+}

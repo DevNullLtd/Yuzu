@@ -43,7 +43,7 @@ def problems(src):
     if not pf or "httplib::Response scratch; return draw_perm_fn(req, scratch, type, op);" not in pf.group(1):
         out.append("reviews .probe_perm_fn is no longer the quiet draw_perm_fn on a scratch Response")
     for name, call in ((".list_campaigns_fn", "access_review_store_->list_campaigns()"),
-                       (".get_campaign_fn", "access_review_store_->get_campaign(id)")):
+                       (".get_campaign_fn", "access_review_store_->get_campaign(id, /*include_history=*/true)")):
         m = re.search(re.escape(name) + r" = (.*?)(?=, \.(?:get_campaign_fn|grants_fn)|$)", b)
         body = m.group(1) if m else ""
         if not m:

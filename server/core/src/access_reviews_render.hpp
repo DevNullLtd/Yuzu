@@ -53,9 +53,15 @@ using yuzu::server::valid_campaign_id;
 
 struct CampaignDerived {
     int total = 0;
-    int decided = 0;   ///< attested + flagged_revoke
+    int decided = 0; ///< attested + flagged_revoke
     int flagged = 0;
-    int reviewers = 0; ///< distinct non-empty reviewer names
+    /// Distinct non-empty reviewer names across the CURRENT decision of every grant plus every
+    /// history entry the view carries. A reviewer whose decision was later replaced still acted,
+    /// so the number is meant to count them, but it only can when the history was loaded
+    /// (`get_campaign(id, include_history=true)`, which the Access page uses): over a view read
+    /// without history it counts current reviewers alone. The Settings campaign fragment has its
+    /// own renderer, reads without history and never calls this function.
+    int reviewers = 0;
 };
 [[nodiscard]] CampaignDerived derive_campaign_counts(const CampaignView& v);
 
@@ -67,8 +73,12 @@ std::string render_campaigns(
 /// One campaign: the grants panel interior plus the summary card as an out-of-band swap of
 /// `#ar-campaign-side`, so one response fills both columns.
 /// `id` (already validated by the route) only builds the Retry button of the unavailable state.
+/// `viewer` is the signed-in reviewer: the Attest and Flag controls are left off a `user` grant
+/// that names them. The server refuses that decision anyway; this only spares a dead button.
+/// A grant that carries more than one decision shows a marker and, when the history was loaded,
+/// the history behind a `<details>`.
 std::string render_campaign(const std::variant<CampaignView, access::NotFound, access::Unavailable>& state,
-                            bool can_attest, std::string_view id = {});
+                            bool can_attest, std::string_view id = {}, std::string_view viewer = {});
 
 /// Nothing selected: both targets show their placeholder.
 std::string render_campaign_unselected();
