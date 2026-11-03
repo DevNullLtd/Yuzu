@@ -3524,8 +3524,15 @@ std::expected<std::int64_t, std::string> GuaranteedStateStore::pending_projectio
     }
     PGconn* conn = lease.get();
     pg::PgResult begin = pg::exec_params(conn, "BEGIN", std::vector<std::string>{});
-    if (begin.status() != PGRES_COMMAND_OK)
+    if (begin.status() != PGRES_COMMAND_OK) {
+        // Counted like every other failed read here: the gauge keeps its previous value on a
+        // failure, so this counter is how a stale reading is told from a quiet one.
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSource, sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::pending_projection_count_checked: BEGIN failed: {}",
+                         ::yuzu::log_key_token(PQerrorMessage(conn)));
         return std::unexpected(std::string("BEGIN failed: ") + PQerrorMessage(conn));
+    }
     pg::PgTxn txn(conn);
     pg::PgResult timeout = pg::exec_params(conn, "SET LOCAL statement_timeout = '5s'",
                                            std::vector<std::string>{});
