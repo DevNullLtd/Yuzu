@@ -3574,3 +3574,36 @@ TEST_CASE("middleware adapter and collector: a leg row built from NUL-bearing in
     REQUIRE(got.has_value());
     CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
 }
+
+TEST_CASE("collector: one drop_source source withheld does not touch the other",
+          "[sync][collector][runtimes][middleware]") {
+    // python and ibm_mq both withhold on a CONSTRAINED answer (each its own `continue` in the
+    // collector loop). Withholding one must leave the other's rows in the blob, in both directions.
+    const std::string python_row = "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python";
+    const std::string tok = "linux:middleware:mqinst_ini:permission_denied";
+    const auto constrain = [](std::size_t slot, const char* action, const std::string& token) {
+        g_fake[slot].result_status[action] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                              YUZU_RESULT_COMPLETENESS_PARTIAL, token};
+    };
+
+    SECTION("python withheld, ibm_mq kept") {
+        fake_mac();
+        g_fake[4].out["python"] = nl({st("python", "constrained", "linux:runtimes:permission_denied"), python_row});
+        constrain(4, "python", "linux:runtimes:permission_denied");
+        g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
+        const auto got = collect_with(with_middleware());
+        REQUIRE(got.has_value());
+        CHECK(count_source(got->first, "runtimes.python") == 0);
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
+    }
+    SECTION("ibm_mq withheld, python kept") {
+        fake_mac();
+        g_fake[4].out["python"] = nl({supported_status("python"), python_row});
+        g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "constrained", tok), kMqRow});
+        constrain(5, "ibm_mq", tok);
+        const auto got = collect_with(with_middleware());
+        REQUIRE(got.has_value());
+        CHECK(count_source(got->first, "runtimes.python") == 1);
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 0);
+    }
+}
