@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -221,6 +222,31 @@ void fill_product(const pg::PgResult& res, int row, ProductRow& out, int c0 = 0)
     out.category = PQgetvalue(res.get(), row, c0 + 11);
 }
 
+/// The dimension invalidation lock (see the header's "Dimension invalidation contract"): the
+/// BLOCKING twin of the try-lock every `SoftwareTitleDimension` pass takes, on the same key.
+/// A pass holds it for at most its 60 s budget, so the wait is bounded by a
+/// transaction-local statement timeout a little above that; a timeout fails the write
+/// (fail-soft, like every write here) and the caller retries.
+bool take_normalization_lock(PGconn* c) {
+    if (pg::exec_params(c, "SET LOCAL statement_timeout = '90s'", std::vector<std::string>{})
+            .status() != PGRES_COMMAND_OK)
+        return false;
+    return pg::exec_params(c,
+                           "SELECT pg_advisory_xact_lock(hashtextextended('software_normalization', "
+                           "0))",
+                           std::vector<std::string>{})
+               .status() == PGRES_TUPLES_OK;
+}
+
+/// The stale sentinel (`pack_version = ''`): the next normalisation pass re-selects the row.
+/// `where` is a trusted literal predicate over `title_dimension`, never caller text.
+bool mark_dimension_stale(PGconn* c, const char* where, const std::vector<std::string>& params) {
+    const std::string sql = std::string("UPDATE product_registry_store.title_dimension "
+                                        "SET pack_version = '' WHERE pack_version <> '' AND (") +
+                            where + ")";
+    return pg::exec_params(c, sql.c_str(), params).status() == PGRES_COMMAND_OK;
+}
+
 } // namespace
 
 ProductRegistryStore::ProductRegistryStore(pg::PgPool& pool) : pool_(pool) {
@@ -277,38 +303,61 @@ std::optional<std::int64_t>
 ProductRegistryStore::upsert_product(std::string_view norm_key, std::string_view vendor,
                                      std::string_view title, std::string_view edition,
                                      std::string_view platform) {
-    // Fail-soft write (evaluator matcher pass): any failure returns nullopt —
-    // the next cycle re-derives the same deterministic result (roadmap R7).
+    // Fail-soft write: any failure returns nullopt - the next cycle re-derives the same
+    // deterministic result (roadmap R7). It is also a registry mutation that can change how a
+    // title resolves, so it follows the dimension invalidation contract: the blocking
+    // normalisation lock, the upsert and the stale sentinel in ONE transaction.
     if (!open_ || norm_key.empty())
         return std::nullopt;
-    auto lease = pool_.try_acquire_for(kAcquireTimeout);
-    if (!lease) {
-        spdlog::warn("ProductRegistryStore: upsert_product skipped for norm_key={}, no "
-                     "connection ({})",
-                     norm_key, pool_.last_error());
+    std::optional<std::int64_t> id;
+    bool ok = false;
+    try {
+        ok = pool_.with_txn_for(kAcquireTimeout, [&](PGconn* c) -> bool {
+            if (!take_normalization_lock(c)) {
+                spdlog::warn("ProductRegistryStore: upsert_product could not take the "
+                             "normalisation lock for norm_key={}: {}",
+                             norm_key, PQerrorMessage(c));
+                return false;
+            }
+            // Single-statement upsert keyed on the UNIQUE norm_key. created_at is preserved on
+            // conflict; the RETURNING carries the id for both the insert and the update arm
+            // (#1033 idiom).
+            pg::PgResult res = pg::exec_params(
+                c,
+                "INSERT INTO product_registry_store.products "
+                "(norm_key, vendor, title, edition, platform, created_at, updated_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6::bigint, $6::bigint) "
+                "ON CONFLICT (norm_key) DO UPDATE SET "
+                "  vendor = EXCLUDED.vendor, title = EXCLUDED.title, edition = EXCLUDED.edition, "
+                "  platform = EXCLUDED.platform, updated_at = EXCLUDED.updated_at "
+                "RETURNING product_id",
+                std::vector<std::string>{std::string(norm_key), std::string(vendor),
+                                         std::string(title), std::string(edition),
+                                         std::string(platform), std::to_string(now_secs())});
+            if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+                spdlog::warn("ProductRegistryStore: upsert_product failed for norm_key={}: {}",
+                             norm_key, PQerrorMessage(c));
+                return false;
+            }
+            const std::int64_t pid = result_i64(res, 0, 0);
+            // Rows resolved to this product copy its vendor/title/edition; an unnormalized row
+            // may resolve to a product that did not exist (or changed) a moment ago.
+            if (!mark_dimension_stale(c, "product_id = $1::bigint OR norm_status = 'unnormalized'",
+                                      std::vector<std::string>{std::to_string(pid)})) {
+                spdlog::warn("ProductRegistryStore: upsert_product could not mark the title "
+                             "dimension stale for norm_key={}: {}",
+                             norm_key, PQerrorMessage(c));
+                return false;
+            }
+            id = pid;
+            return true;
+        });
+    } catch (const std::exception& e) {
+        spdlog::warn("ProductRegistryStore: upsert_product threw for norm_key={}: {}", norm_key,
+                     e.what());
         return std::nullopt;
     }
-    // Single-statement upsert keyed on the UNIQUE norm_key: atomic, no txn or
-    // advisory lock needed. created_at is preserved on conflict; the RETURNING
-    // carries the id for both the insert and the update arm (#1033 idiom).
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "INSERT INTO product_registry_store.products "
-        "(norm_key, vendor, title, edition, platform, created_at, updated_at) "
-        "VALUES ($1, $2, $3, $4, $5, $6::bigint, $6::bigint) "
-        "ON CONFLICT (norm_key) DO UPDATE SET "
-        "  vendor = EXCLUDED.vendor, title = EXCLUDED.title, edition = EXCLUDED.edition, "
-        "  platform = EXCLUDED.platform, updated_at = EXCLUDED.updated_at "
-        "RETURNING product_id",
-        std::vector<std::string>{std::string(norm_key), std::string(vendor), std::string(title),
-                                 std::string(edition), std::string(platform),
-                                 std::to_string(now_secs())});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
-        spdlog::warn("ProductRegistryStore: upsert_product failed for norm_key={}: {}", norm_key,
-                     PQerrorMessage(lease.get()));
-        return std::nullopt;
-    }
-    return result_i64(res, 0, 0);
+    return ok ? id : std::nullopt;
 }
 
 bool ProductRegistryStore::upsert_alias(std::string_view source, std::string_view raw_name,
@@ -316,36 +365,58 @@ bool ProductRegistryStore::upsert_alias(std::string_view source, std::string_vie
                                         std::string_view method, double confidence) {
     if (!open_ || source.empty() || raw_name.empty() || product_id <= 0)
         return false;
-    auto lease = pool_.try_acquire_for(kAcquireTimeout);
-    if (!lease) {
-        spdlog::warn("ProductRegistryStore: upsert_alias skipped for ({}, {}), no connection ({})",
-                     source, raw_name, pool_.last_error());
+    // A registry mutation that can change how a title resolves: the dimension invalidation
+    // contract applies (blocking normalisation lock, the upsert and the stale sentinel in ONE
+    // transaction). The alias key is a C++ derivation of the raw title that SQL cannot
+    // reproduce, so the affected rows cannot be named; every row is marked stale and the next
+    // passes re-resolve the dimension (idempotent, and a curated alias is a rare operator act).
+    bool ok = false;
+    try {
+        ok = pool_.with_txn_for(kAcquireTimeout, [&](PGconn* c) -> bool {
+            if (!take_normalization_lock(c)) {
+                spdlog::warn("ProductRegistryStore: upsert_alias could not take the "
+                             "normalisation lock for ({}, {}): {}",
+                             source, raw_name, PQerrorMessage(c));
+                return false;
+            }
+            // first_matched_at is preserved on conflict; the link's target/method/confidence +
+            // last_seen_at refresh each evaluator cycle (soft keys are re-derived, never frozen
+            // - roadmap R7). A dangling product_id fails the FK and lands in the error branch
+            // below (fail-soft, no throw).
+            pg::PgResult res = pg::exec_params(
+                c,
+                "INSERT INTO product_registry_store.product_aliases "
+                "(source, raw_name, raw_publisher, product_id, method, confidence, "
+                "first_matched_at, last_seen_at) "
+                "VALUES ($1, $2, $3, $4::bigint, $5, $6::double precision, $7::bigint, "
+                "$7::bigint) "
+                "ON CONFLICT (source, raw_name, raw_publisher) DO UPDATE SET "
+                "  product_id = EXCLUDED.product_id, method = EXCLUDED.method, "
+                "  confidence = EXCLUDED.confidence, last_seen_at = EXCLUDED.last_seen_at "
+                "RETURNING product_id",
+                std::vector<std::string>{std::string(source), std::string(raw_name),
+                                         std::string(raw_publisher), std::to_string(product_id),
+                                         std::string(method), std::to_string(confidence),
+                                         std::to_string(now_secs())});
+            if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+                spdlog::warn("ProductRegistryStore: upsert_alias failed for ({}, {}): {}", source,
+                             raw_name, PQerrorMessage(c));
+                return false;
+            }
+            if (!mark_dimension_stale(c, "TRUE", std::vector<std::string>{})) {
+                spdlog::warn("ProductRegistryStore: upsert_alias could not mark the title "
+                             "dimension stale for ({}, {}): {}",
+                             source, raw_name, PQerrorMessage(c));
+                return false;
+            }
+            return true;
+        });
+    } catch (const std::exception& e) {
+        spdlog::warn("ProductRegistryStore: upsert_alias threw for ({}, {}): {}", source, raw_name,
+                     e.what());
         return false;
     }
-    // first_matched_at is preserved on conflict; the link's target/method/
-    // confidence + last_seen_at refresh each evaluator cycle (soft keys are
-    // re-derived, never frozen — roadmap R7). A dangling product_id fails the
-    // FK and lands in the error branch below (fail-soft, no throw).
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "INSERT INTO product_registry_store.product_aliases "
-        "(source, raw_name, raw_publisher, product_id, method, confidence, "
-        "first_matched_at, last_seen_at) "
-        "VALUES ($1, $2, $3, $4::bigint, $5, $6::double precision, $7::bigint, $7::bigint) "
-        "ON CONFLICT (source, raw_name, raw_publisher) DO UPDATE SET "
-        "  product_id = EXCLUDED.product_id, method = EXCLUDED.method, "
-        "  confidence = EXCLUDED.confidence, last_seen_at = EXCLUDED.last_seen_at "
-        "RETURNING product_id",
-        std::vector<std::string>{std::string(source), std::string(raw_name),
-                                 std::string(raw_publisher), std::to_string(product_id),
-                                 std::string(method), std::to_string(confidence),
-                                 std::to_string(now_secs())});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
-        spdlog::warn("ProductRegistryStore: upsert_alias failed for ({}, {}): {}", source, raw_name,
-                     PQerrorMessage(lease.get()));
-        return false;
-    }
-    return true;
+    return ok;
 }
 
 std::expected<std::optional<std::int64_t>, RegistryReadError>

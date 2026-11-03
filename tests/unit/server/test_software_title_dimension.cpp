@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -425,12 +426,12 @@ TEST_CASE("owner pass queues unnormalized titles with device counts and removes 
     CHECK(scalar(pool, "SELECT device_count FROM product_registry_store.curation_queue "
                        "WHERE raw_name = 'Mystery Tool'") == "7");
 
-    // A curated alias lands (the contract: mark the affected dimension rows stale).
+    // A curated alias lands. The writers follow the invalidation contract themselves (lock,
+    // write and stale sentinel in one transaction), so no separate UPDATE is needed.
     const auto pid = reg.upsert_product("nobody:mystery tool", "nobody", "mystery tool", "", "");
     REQUIRE(pid.has_value());
     REQUIRE(reg.upsert_alias("curated:windows", "mystery tool", "nobody", *pid, "curated", 1.0));
-    sql(pool, "UPDATE product_registry_store.title_dimension SET pack_version = '' "
-              "WHERE raw_name = 'Mystery Tool'");
+    CHECK(dim(pool, "Mystery Tool", "pack_version").empty());
     const auto again = owner.run_pass();
     CHECK(again.normalized == 1);
     CHECK(dim(pool, "Mystery Tool", "method") == "curated");
@@ -553,6 +554,16 @@ TEST_CASE("owner tick pages through a backlog and reports a capped tick and a sp
         const auto rest = owner.run_tick({}, 1);
         CHECK(rest.processed == 1);
         CHECK_FALSE(rest.capped); // a short page is never capped, even at the cap
+    }
+    SECTION("an exhausted tick budget stops after the first full page and reports capped") {
+        const auto t = owner.run_tick({}, kMaxPassesPerTick, std::chrono::seconds{0});
+        CHECK_FALSE(t.errored);
+        CHECK(t.capped); // a full page ran, a backlog remains
+        CHECK(t.passes == 1);
+        CHECK(t.processed == kPassLimit);
+        const auto rest = owner.run_tick();
+        CHECK(rest.processed == 1);
+        CHECK_FALSE(rest.capped);
     }
     SECTION("a spent wall budget rolls the pass back and reports timed_out") {
         const auto r = owner.run_pass({}, std::chrono::seconds{0});
@@ -692,11 +703,11 @@ TEST_CASE("owner pass keeps a rejected queue row when its title later resolves",
     REQUIRE(owner.run_pass().unnormalized == 1);
     sql(pool, "UPDATE product_registry_store.curation_queue SET status = 'rejected'");
 
-    // A curated alias now resolves the title (contract: mark its dimension row stale).
+    // A curated alias now resolves the title (the writers mark its dimension row stale).
     const auto pid = reg.upsert_product("nobody:mystery tool", "nobody", "mystery tool", "", "");
     REQUIRE(pid.has_value());
     REQUIRE(reg.upsert_alias("curated:windows", "mystery tool", "nobody", *pid, "curated", 1.0));
-    sql(pool, "UPDATE product_registry_store.title_dimension SET pack_version = ''");
+    CHECK(dim(pool, "Mystery Tool", "pack_version").empty());
     const auto again = owner.run_pass();
     CHECK(again.normalized == 1);
     CHECK(dim(pool, "Mystery Tool", "method") == "curated");
@@ -988,4 +999,109 @@ TEST_CASE("owner pass resolves every shipped seed row from its stored alias key 
         CHECK(key == pack->rows[i].norm_key);
     }
     CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.curation_queue") == "0");
+}
+
+// ═══════════════ registry writers and the dimension invalidation contract ═══════════════
+
+namespace {
+/// Run one statement on a held connection (the "pass in flight" in the tests below).
+void held(PGconn* lease_conn, const char* stmt) {
+    pg::PgResult r = pg::exec_params(lease_conn, stmt, std::vector<std::string>{});
+    REQUIRE((r.status() == PGRES_COMMAND_OK || r.status() == PGRES_TUPLES_OK));
+}
+} // namespace
+
+TEST_CASE("registry writers follow the invalidation contract: a product edit stales the rows "
+          "resolved to it and an alias write stales every row",
+          "[pg][product_registry][normalization]") {
+    TD_ENV(db, pool, inv, reg, metrics, owner);
+    triple(pool, "Mystery Tool", "Nobody", "windows", 7);
+    triple(pool, "Other Gadget", "Elsewhere", "windows", 3);
+    const auto p1 = reg.upsert_product("nobody:mystery tool", "nobody", "mystery tool", "", "");
+    const auto p2 = reg.upsert_product("elsewhere:other gadget", "elsewhere", "other gadget", "", "");
+    REQUIRE(p1.has_value());
+    REQUIRE(p2.has_value());
+    REQUIRE(reg.upsert_alias("curated:windows", "mystery tool", "nobody", *p1, "curated", 1.0));
+    REQUIRE(reg.upsert_alias("curated:windows", "other gadget", "elsewhere", *p2, "curated", 1.0));
+    REQUIRE(owner.run_pass().normalized == 2);
+    REQUIRE_FALSE(dim(pool, "Mystery Tool", "pack_version").empty());
+    REQUIRE_FALSE(dim(pool, "Other Gadget", "pack_version").empty());
+
+    // A product attribute edit: only the rows resolved to THAT product go stale.
+    REQUIRE(reg.upsert_product("nobody:mystery tool", "nobody", "mystery tool", "pro", ""));
+    CHECK(dim(pool, "Mystery Tool", "pack_version").empty());
+    CHECK_FALSE(dim(pool, "Other Gadget", "pack_version").empty());
+    REQUIRE(owner.run_pass().normalized == 1);
+    REQUIRE_FALSE(dim(pool, "Mystery Tool", "pack_version").empty());
+
+    // An alias write: the alias key cannot be reproduced in SQL, so every row goes stale.
+    REQUIRE(reg.upsert_alias("curated:windows", "other gadget", "elsewhere", *p2, "curated", 0.9));
+    CHECK(dim(pool, "Mystery Tool", "pack_version").empty());
+    CHECK(dim(pool, "Other Gadget", "pack_version").empty());
+}
+
+TEST_CASE("a curated alias waits for a pass in flight and its invalidation survives the pass's "
+          "stamp",
+          "[pg][product_registry][normalization]") {
+    TD_ENV(db, pool, inv, reg, metrics, owner);
+    triple(pool, "Mystery Tool", "Nobody", "windows", 7);
+    REQUIRE(owner.run_pass().unnormalized == 1);
+    const std::string current = scalar(
+        pool, "SELECT pack_version FROM product_registry_store.normalization_pack WHERE id = 1");
+    REQUIRE_FALSE(current.empty());
+
+    // A pass in flight: this connection holds the normalisation lock inside an open transaction.
+    auto pass = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(pass);
+    held(pass.get(), "BEGIN");
+    held(pass.get(), "SELECT pg_advisory_xact_lock(hashtextextended('software_normalization', 0))");
+
+    auto landed = std::async(std::launch::async, [&] {
+        const auto pid = reg.upsert_product("nobody:mystery tool", "nobody", "mystery tool", "", "");
+        return pid.has_value() &&
+               reg.upsert_alias("curated:windows", "mystery tool", "nobody", *pid, "curated", 1.0);
+    });
+
+    // Wait until the writer is queued on the lock (observable in pg_locks), then let the pass
+    // finish the way the race does: it stamps the CURRENT version over the row it selected
+    // before the alias landed, and commits. COMMIT runs before any assertion so a failure
+    // cannot leave the writer parked.
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds{20};
+    bool queued = false;
+    while (!queued && std::chrono::steady_clock::now() < give_up)
+        queued = scalar(pool, "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND "
+                              "NOT granted") != "0";
+    held(pass.get(),
+         ("UPDATE product_registry_store.title_dimension SET pack_version = '" + current + "'")
+             .c_str());
+    held(pass.get(), "COMMIT");
+    REQUIRE(queued);
+
+    REQUIRE(landed.wait_for(std::chrono::seconds{20}) == std::future_status::ready);
+    CHECK(landed.get());
+    // The writer took the lock AFTER the pass: its sentinel is the last write, so it is not lost.
+    CHECK(dim(pool, "Mystery Tool", "pack_version").empty());
+    CHECK(owner.run_pass().normalized == 1);
+    CHECK(dim(pool, "Mystery Tool", "method") == "curated");
+}
+
+TEST_CASE("a full inventory report from an agent named like the normalisation lock is not "
+          "blocked by that lock",
+          "[pg][product_registry][normalization]") {
+    TD_ENV(db, pool, inv, reg, metrics, owner);
+    auto pass = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(pass);
+    held(pass.get(), "BEGIN");
+    held(pass.get(), "SELECT pg_advisory_xact_lock(hashtextextended('software_normalization', 0))");
+
+    // `software_normalization` is a valid agent id; its replace lock must be a different key.
+    const std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", "2026-01-01"}};
+    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+    auto stored = std::async(std::launch::async, [&] {
+        return inv.apply_installed_software("software_normalization", h, rows, 1000);
+    });
+    const auto st = stored.wait_for(std::chrono::seconds{20});
+    held(pass.get(), "COMMIT"); // before any assertion, so a failure cannot leave it parked
+    REQUIRE(st == std::future_status::ready);
+    CHECK(stored.get() == InventoryIngestOutcome::kStored);
 }

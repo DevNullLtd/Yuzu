@@ -55,8 +55,11 @@
 /// 'software_normalization', 0))` that every normalisation pass tries: a pass that
 /// selected a row before the mutation commits would otherwise upsert it afterwards,
 /// stamping the current `pack_version` over the sentinel and losing the invalidation.
-/// This store's own mutations (the seed load, which stamps the pack version, and the
-/// `ON DELETE SET NULL` foreign key) need no sentinel write. A `products.category`
+/// `upsert_product` and `upsert_alias` ARE such mutations and follow the contract themselves
+/// (the lock, the write and the sentinel in one transaction; `upsert_alias` marks every row
+/// stale because the alias key cannot be reproduced in SQL). The store's other own mutations
+/// (the seed load, which stamps the pack version, and the `ON DELETE SET NULL` foreign key)
+/// need no sentinel write. A `products.category`
 /// outside `kCategories` is written to the dimension as `other` (its `category` column is
 /// constrained to that set).
 ///
@@ -173,7 +176,10 @@ public:
     /// `updated_at` on an existing one (`created_at` is preserved). Returns
     /// the row's product_id via `RETURNING`; `std::nullopt` on a store/pool/
     /// query failure (fail-soft — the evaluator retries next cycle; never
-    /// throws). An empty `norm_key` is a precondition miss → `std::nullopt`.
+    /// throws). An empty `norm_key` is a precondition miss → `std::nullopt`. Follows the
+    /// dimension invalidation contract: blocks on the normalisation lock (bounded by a 90 s
+    /// transaction timeout, a failed wait is a `std::nullopt`), then upserts and marks the
+    /// title-dimension rows resolved to this product, and every unnormalized row, stale.
     [[nodiscard]] std::optional<std::int64_t>
     upsert_product(std::string_view norm_key, std::string_view vendor, std::string_view title,
                    std::string_view edition, std::string_view platform);
@@ -183,7 +189,9 @@ public:
     /// (product_id/method/confidence + `last_seen_at`; `first_matched_at` is
     /// preserved). `product_id` must reference an existing products row (FK) —
     /// a dangling id fails the statement and returns false. Fail-soft: false
-    /// on any failure, never throws.
+    /// on any failure, never throws. Follows the dimension invalidation contract: blocks on
+    /// the normalisation lock (bounded by a 90 s transaction timeout), then upserts and marks
+    /// EVERY title-dimension row stale in the same transaction.
     [[nodiscard]] bool upsert_alias(std::string_view source, std::string_view raw_name,
                                     std::string_view raw_publisher, std::int64_t product_id,
                                     std::string_view method, double confidence);
