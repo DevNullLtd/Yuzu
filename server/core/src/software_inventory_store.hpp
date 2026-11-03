@@ -499,6 +499,10 @@ public:
     /// INSERT batch, together with the `kRollupRefreshBudget` wall budget; true (or budget
     /// exhausted) rolls back and returns false, so stop() -> join is bounded by one statement
     /// plus one batch. An empty predicate means not cancellable (tests).
+    /// The same transaction also rebuilds `title_triples` (the distinct
+    /// (name, publisher, ecosystem) triples with exact device counts): the candidate
+    /// source of the SAM.4 title normalisation job, so that job never scans
+    /// `installed_software` itself.
     /// A second replica's serialization conflict also rolls back to last-good (benign; the
     /// mechanism is documented at the advisory-lock statement in the .cpp).
     bool refresh_catalog_rollup(const std::function<bool()>& cancelled = {});

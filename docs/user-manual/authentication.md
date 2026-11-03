@@ -91,6 +91,8 @@ Yuzu supports RFC 6238 TOTP (Time-based One-Time Passwords) as a second factor f
 3. Scan the QR code with your authenticator app, or type the base32 secret in manually if you can't scan.
 4. Enter the next 6-digit code shown by your authenticator app and click **Confirm**.
 5. The server confirms enrollment and reveals 10 single-use recovery codes in the format `XXXX-XXXX-XXXX-XXXX` (80 bits of entropy). **Save the codes somewhere safe** — they are shown exactly once.
+
+   If the server cannot draw random numbers at that moment, it refuses the enrolment, issues no codes and leaves you not enrolled; retry later. See [Random-number failure during MFA enrolment](security-hardening.md#random-number-failure-during-mfa-enrolment).
 6. From now on, every login by this account will prompt for a TOTP code after the password.
 
 The confirming code counts as a fresh step-up proof, so a just-enrolled administrator can regenerate recovery codes or disable two-factor straight away, but only inside `--mfa-step-up-window-secs` (default 300 s) and only from the session that confirmed. Any other session, and this one once the window has passed, needs a fresh proof (see the next two sections). The session is stamped only when it is a local cookie session of the same user; a bearer principal, an absent or mismatched cookie, or a store failure leaves it unstamped, which `mfa.enroll.verified` records in its detail (`step_up_proof=stamped` or `step_up_proof=not_stamped`).
@@ -132,6 +134,8 @@ This route is step-up-gated in the same way as regeneration, with the same limit
 #### Recovery when locked out
 
 If a user loses both their authenticator and all 10 recovery codes (or is locked out by MFA enforcement), an operator clears their MFA on the server host with the audited break-glass command `yuzu-server --mfa-reset <username>`, which also ends every session of the account (API tokens are untouched). See `docs/ops-runbooks/auth-db-recovery.md` "Emergency MFA disable" for the full procedure (it writes an `mfa.reset.breakglass` intent row before it clears anything, and an outcome row after; a direct-SQL fallback is documented for hosts without the binary).
+
+If nobody can sign in or enrol and the cause is the host's random-number generator rather than a lost authenticator, `--mfa-reset` does not help (it clears an enrolment, and the blocked account has none). See [MFA enrolment refused: random-number failure](../ops-runbooks/auth-db-recovery.md#mfa-enrolment-refused-random-number-failure-503).
 
 #### Configuration flags
 

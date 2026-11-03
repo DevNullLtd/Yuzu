@@ -741,9 +741,9 @@ public:
     /// member) could see an incomplete or empty list despite being admitted
     /// (INV-4/INV-7 violation, not a merely-conservative narrowing). Fixed:
     /// both tools now read this UNFILTERED registry snapshot — the SAME
-    /// zero-arg source `list_agents`' own `agents_fn` and REST's
+    /// zero-arg source `list_agents`' own `DeviceApi` and REST's
     /// `GET /api/v1/devices` (#4033) use (`registry_.to_json_obj()`) — with
-    /// `gate.scope` as the SOLE filter. `list_agents`' unscoped `agents_fn` was
+    /// `gate.scope` as the SOLE filter. `list_agents`' unscoped `DeviceApi` read was
     /// never the gap: `require_fleet_read`'s `gate.scope` is the actual
     /// authorization boundary in that pattern, applied after the unfiltered
     /// read, exactly as here.

@@ -501,7 +501,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # 212 -> 209 (twin batch B: commands, execution cancel/rerun): three rows flipped to `twinned`.
 # 209 -> 208 (instruction-definition execute twins): post.api-instructions-param-execute flipped from
 # planned to twinned (POST /api/v1/instructions/{id}/execute + the execute_instruction_definition MCP tool).
-BASELINE_UNTWINNED = 208
+# 212 -> 210 (#4041, ADR-1005 2026-11-02 entry): MCP list_agents moved onto require_fleet_read, so
+# get.api-agents and get.fragments-devices-list left their dated exception and are twinned to it.
+BASELINE_UNTWINNED = 206
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -560,9 +562,6 @@ STRICT_EXCEPTION_PINS = {
     "get.fragments-hardware-ci-stored-data": (2102, "2027-01-13"),
     # #5357: admin password reset has no MCP twin (ADR-1005 2026-10-04 passwords entry).
     "post.api-v1-users-param-password": (5357, "2027-01-04"),
-    # #4041: MCP list_agents is unconfined (a known gap) while GET /api/v1/devices is confined; ADR-1005 2026-10-23 entry.
-    "get.api-agents": (4041, "2027-01-31"),
-    "get.fragments-devices-list": (4041, "2027-01-31"),
     # #6061: approve/reject is a human-session act, MCP approve_request/reject_request permanently refuse (ADR-1005 exception entry).
     "post.api-approvals-param-approve": (6061, "2027-01-18"),
     "post.api-approvals-param-reject": (6061, "2027-01-18"),
