@@ -40,8 +40,10 @@
 
 #include <algorithm>
 #include <format>
+#include <fstream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -4736,6 +4738,130 @@ TEST_CASE("materialise: one agent that answers error|refused is counted and the 
         CHECK(read.agents_failed == 1);
         CHECK(read.partial);
     }
+}
+
+TEST_CASE("materialise: the members read pages past the store's default row limit",
+          "[pg][result_set][async][echo][agents_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    ResponseStore responses{pool};
+    REQUIRE(responses.is_open());
+
+    int status = 0;
+    auto created = h.post("/api/v1/result-sets/from-echo-query",
+                          R"({"sql":"SELECT pid FROM $Process_Hourly"})", status);
+    REQUIRE(status == 202);
+    const auto set_id = created["data"]["id"].get<std::string>();
+    const auto exec = get_ok(*h.store, set_id)->source_execution_id;
+
+    SECTION("a failed row at position 101 of a newest-first read is counted") {
+        // 100 newer matching rows, then one older failure: a read capped at the store's default
+        // 100 rows never sees the failure and reports partial=false.
+        for (int i = 0; i < 100; ++i)
+            put_exec_row(responses, exec, "agent-ok-" + std::to_string(i), 1, kOneRow, 200);
+        put_exec_row(responses, exec, "agent-refused", 1, "error|refused", 100);
+        const auto read = materialise_and_read(h, responses, set_id, exec);
+        CHECK(read.device_count == 100);
+        CHECK(read.agents_failed == 1);
+        CHECK(read.partial);
+    }
+    SECTION("a member at position 101 is a member") {
+        for (int i = 0; i < 100; ++i)
+            put_exec_row(responses, exec, "agent-ok-" + std::to_string(i), 1, kOneRow, 200);
+        put_exec_row(responses, exec, "agent-last", 1, kOneRow, 100);
+        const auto read = materialise_and_read(h, responses, set_id, exec);
+        CHECK(read.device_count == 101);
+        CHECK(read.agents_failed == 0);
+        CHECK_FALSE(read.partial);
+        CHECK(read.members.back() == "agent-last");
+    }
+    SECTION("an agent that never answered is neither a member nor counted") {
+        // The dispatch targeted more agents than answered; the read sees stored rows only, so
+        // partial stays false: the documented non-responder exclusion.
+        put_exec_row(responses, exec, "agent-ok", 1, kOneRow, 100);
+        const auto read = materialise_and_read(h, responses, set_id, exec);
+        CHECK(read.device_count == 1);
+        CHECK(read.agents_failed == 0);
+        CHECK_FALSE(read.partial);
+    }
+    SECTION("the read reports truncated only when rows lie past its bound") {
+        for (int i = 0; i < 6; ++i)
+            put_exec_row(responses, exec, "agent-" + std::to_string(i), 1, kOneRow, 100 + i);
+        PendingSet pending;
+        pending.id = set_id;
+        pending.source_execution_id = exec;
+        pending.matcher = R"({"kind":"echo_rows_ge","n":1})";
+        const auto* plugins = &yuzu::server::test::forensics_plugin_set();
+        // Two rows per page, four rows allowed, six stored: truncated, with the first four read.
+        auto bounded = result_set_members(responses, plugins, pending, 2, 4);
+        REQUIRE(bounded.has_value());
+        CHECK(bounded->truncated);
+        CHECK(bounded->size() == 4);
+        // Exactly as many rows as allowed: the page past the bound is empty, nothing is lost.
+        auto exact = result_set_members(responses, plugins, pending, 2, 6);
+        REQUIRE(exact.has_value());
+        CHECK_FALSE(exact->truncated);
+        CHECK(exact->size() == 6);
+        auto all = result_set_members(responses, plugins, pending, 2, 7);
+        REQUIRE(all.has_value());
+        CHECK_FALSE(all->truncated);
+        CHECK(all->size() == 6);
+        auto one_page = result_set_members(responses, plugins, pending, 500, 4);
+        REQUIRE(one_page.has_value());
+        CHECK_FALSE(one_page->truncated); // a short page ends the read before the bound is checked
+        CHECK(one_page->size() == 6);
+    }
+}
+
+TEST_CASE("materialise: a success answer whose schema lacks the matcher column is a failed agent",
+          "[pg][result_set][async][echo][agents_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResponseStore responses{pool};
+    REQUIRE(responses.is_open());
+    // A stored matcher over `pid`, which the roll-up tables do not keep.
+    put_exec_row(responses, "exec-col", "agent-no-column", 1, "__schema__|hour_ts|name\n1|a\n__total__|1", 100);
+    put_exec_row(responses, "exec-col", "agent-empty", 1, "__schema__|pid\n__total__|0", 100);
+    put_exec_row(responses, "exec-col", "agent-hit", 1, kOneRow, 100);
+
+    PendingSet pending;
+    pending.id = "rs-col";
+    pending.source_execution_id = "exec-col";
+    pending.matcher = R"({"column":"pid","op":"exists"})";
+    auto found = result_set_members(responses, &yuzu::server::test::forensics_plugin_set(), pending);
+    REQUIRE(found.has_value());
+    CHECK(std::vector<std::string>(found->begin(), found->end()) ==
+          std::vector<std::string>{"agent-hit"});
+    // agent-no-column answered from a table without `pid`: failed. agent-empty answered from a
+    // table with it and zero rows: a legitimate empty answer, not failed.
+    CHECK(found->agents_failed == 1);
+}
+
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+
+TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a truncated read closed",
+          "[result_set][async][agents_failed]") {
+    // The tick has no seam a test can drive (it is a lambda on the server's maintenance thread),
+    // so this pins the two lines lexically: the materialize call carries agents_failed, and a
+    // truncated read is marked failed instead of materialized.
+    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/server.cpp", std::ios::binary);
+    REQUIRE(in.good());
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    const auto src = ss.str();
+    CHECK(src.find("result_set_store_->materialize(p.id, members, agents_failed)") !=
+          std::string::npos);
+    CHECK(src.find("agents_failed = found->agents_failed;") != std::string::npos);
+    const auto truncated = src.find("if (found->truncated) {");
+    REQUIRE(truncated != std::string::npos);
+    const auto marked = src.find("result_set_store_->mark_failed(", truncated);
+    REQUIRE(marked != std::string::npos);
+    CHECK(marked - truncated < 1200);
 }
 
 TEST_CASE("materialise: a success-status error| answer under the default matcher is a member "

@@ -5,11 +5,13 @@
  */
 
 #include "echo_retention_tiers.hpp"
+#include "result_set_matcher.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <fstream>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string>
 
@@ -257,6 +259,46 @@ TEST_CASE("every canned default SQL reads a roll-up tier", "[echo][retention][de
         CHECK(tables >= 1);
     }
     CHECK(canned >= 12);
+}
+
+TEST_CASE("process tree canned query covers the last complete hour bucket",
+          "[echo][retention][definitions]") {
+    // A bucket is keyed by its start, so a bound of one hour back drops the last complete bucket
+    // for most of the hour (at 10:05 the 09:00 bucket sits before 09:05); two hours back keeps it.
+    const auto text = read_definition("echo_warehouse.yaml");
+    const auto at = text.find("id: crossplatform.echo.process_tree");
+    REQUIRE(at != std::string::npos);
+    const auto block = text.substr(at, text.find("\n---\n", at) - at);
+    const auto sql_at = block.find("default: \"SELECT");
+    REQUIRE(sql_at != std::string::npos);
+    const auto sql = block.substr(sql_at, block.find('\n', sql_at) - sql_at);
+    CHECK(sql.find("$Process_Hourly") != std::string::npos);
+    CHECK(sql.find("hour_ts > strftime('%s','now','-2 hours')") != std::string::npos);
+    CHECK(sql.find("'-1 hours'") == std::string::npos);
+}
+
+TEST_CASE("the raw capture table predicate names every source of the retention table",
+          "[echo][retention][definitions][result_set]") {
+    // Drift tripwire for the sixteen hard-coded `<source>_live` names: every source the embedded
+    // retention table declares, `usage` aside (its open-runs table is not a raw capture table),
+    // must be refused; nothing else is pinned to the agent's registry here. The source column is
+    // read from the table text itself: the parser skips `live` rows, and on this branch's base
+    // four sources still have no other tier.
+    std::set<std::string> sources;
+    std::istringstream in(yuzu::server::kEchoRetentionTiersTsv);
+    for (std::string line; std::getline(in, line);) {
+        const auto tab = line.find('\t');
+        if (tab != std::string::npos && line.substr(0, tab) != "source")
+            sources.insert(line.substr(0, tab));
+    }
+    REQUIRE(sources.erase("usage") == 1);
+    CHECK(sources.size() == 16);
+    for (const auto& s : sources) {
+        INFO(s);
+        CHECK(yuzu::server::rs_matcher::references_raw_capture_table("SELECT 1 FROM " + s + "_live"));
+        CHECK_FALSE(yuzu::server::rs_matcher::references_raw_capture_table("SELECT 1 FROM " + s +
+                                                                           "_hourly"));
+    }
 }
 
 TEST_CASE("listening ports canned query reads the listening-socket counters",

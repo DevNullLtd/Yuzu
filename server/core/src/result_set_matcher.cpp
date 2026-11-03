@@ -84,6 +84,22 @@ bool cell_satisfies(std::string_view cell, const std::string& op, const nlohmann
     return false;
 }
 
+// True when `output` carries an echo `__schema__` header line that does not name `column`
+// (the agent answered from a table without it). False with no header line at all (a JSON or
+// plain-row shape), and false when the header names the column, even over zero data rows.
+bool echo_schema_lacks_column(std::string_view output, const std::string& column) {
+    for (const auto& line : split_lines(output)) {
+        if (!line.starts_with("__schema__"))
+            continue;
+        auto cells = split_cells(line);
+        for (size_t i = 1; i < cells.size(); ++i)
+            if (cells[i] == column)
+                return false;
+        return true;
+    }
+    return false;
+}
+
 // Column matcher over the echo `__schema__` / row / `__total__` shape. Returns
 // true iff any data row's named column satisfies the op.
 bool echo_column_match(std::string_view output, const std::string& column, const std::string& op,
@@ -347,6 +363,16 @@ int echo_row_count(std::string_view output) {
     return n;
 }
 
+bool answer_lacks_matcher_column(std::string_view matcher_json, std::string_view output) {
+    if (matcher_json.empty())
+        return false;
+    auto m = nlohmann::json::parse(matcher_json, nullptr, false);
+    if (m.is_discarded() || !m.is_object() || m.contains("kind") || !m.contains("column") ||
+        !m["column"].is_string())
+        return false;
+    return echo_schema_lacks_column(output, m["column"].get<std::string>());
+}
+
 bool response_matches(std::string_view matcher_json, int status, std::string_view output) {
     // A non-success response is never a hit, whatever the matcher says.
     if (status != kStatusSuccess)
@@ -408,20 +434,46 @@ bool references_raw_capture_table(std::string_view sql) {
     const auto is_word = [](char c) {
         return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
     };
-    // Single pass: blank out '...' literals and -- / block comments, then read maximal
-    // [A-Za-z0-9_] runs. '$' is not a word character, so `$Process_Live` reads as the run
-    // `process_live`: every registry dollar name lowercases to its real table name.
+    // Single pass over SQLite's tokens: a '...' literal ('' escapes), a quoted identifier
+    // ("..." and `...` double their delimiter, [...] ends at the first ']'), a -- line comment
+    // and a /* block comment are each one token, so a `'`, `--` or `/*` INSIDE a quoted
+    // identifier never opens a literal or comment that would hide the code after it (the
+    // agent's scan_sql reads them the same way). Literals and comments are blanked; a quoted
+    // identifier's content is kept and read like code. Then read maximal [A-Za-z0-9_] runs:
+    // '$' is not a word character, so `$Process_Live` reads as the run `process_live`, and
+    // every registry dollar name lowercases to its real table name. An unterminated token runs
+    // to the end of the input, as SQLite reads it.
     // Two shapes are refused although SQLite would never read the shim: a name inside a
-    // double-quoted string literal (`SELECT "$Process_Live"`), and a CTE that shadows a shim
-    // name (`WITH process_live AS (...) SELECT ... FROM process_live`). Accepted: the
-    // predicate fails closed, and `"process_live"` must still be caught when it is a quoted
-    // identifier, which only a real SQL parse could tell from the literal.
+    // double-quoted string literal (`SELECT "$Process_Live"`, read here as an identifier), and
+    // a CTE that shadows a shim name (`WITH process_live AS (...) SELECT ... FROM process_live`).
+    // Accepted: the predicate fails closed, and `"process_live"` must still be caught when it
+    // is a quoted identifier, which only a real SQL parse could tell from the literal.
     std::string text(sql);
+    const auto quoted_end = [&](std::size_t i, char close, bool doubles) {
+        std::size_t j = i + 1;
+        while (j < text.size()) {
+            if (text[j] == close) {
+                if (doubles && j + 1 < text.size() && text[j + 1] == close) {
+                    j += 2;
+                    continue;
+                }
+                return j + 1;
+            }
+            ++j;
+        }
+        return text.size();
+    };
     for (std::size_t i = 0; i < text.size();) {
         std::size_t end = i;
+        bool blank = true;
         if (text[i] == '\'') {
-            end = text.find('\'', i + 1);
-            end = end == std::string::npos ? text.size() : end + 1;
+            end = quoted_end(i, '\'', true);
+        } else if (text[i] == '"' || text[i] == '`') {
+            end = quoted_end(i, text[i], true);
+            blank = false;
+        } else if (text[i] == '[') {
+            end = quoted_end(i, ']', false);
+            blank = false;
         } else if (text.compare(i, 2, "--") == 0) {
             end = text.find('\n', i);
             end = end == std::string::npos ? text.size() : end;
@@ -432,7 +484,8 @@ bool references_raw_capture_table(std::string_view sql) {
             ++i;
             continue;
         }
-        text.replace(i, end - i, end - i, ' ');
+        if (blank)
+            text.replace(i, end - i, end - i, ' ');
         i = end;
     }
     for (std::size_t i = 0; i < text.size();) {

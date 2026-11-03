@@ -563,9 +563,10 @@ metadata:
   displayName: "Echo: Process Tree"
   version: 1.0.0
   description: >
-    Show the processes started in the last hour with the name of their parent,
-    from the hourly roll-up. The roll-up keeps names and counts per hour, not
-    pids, so the tree is by parent name.
+    Show the processes started in the last complete hour and the current one
+    with the name of their parent, from the hourly roll-up (a bucket is keyed by
+    its start, so the window reaches back two hours). The roll-up keeps names
+    and counts per hour, not pids, so the tree is by parent name.
   tags: [echo, warehouse, processes, tree, forensics]
 
 spec:
@@ -582,7 +583,7 @@ spec:
     properties:
       sql:
         type: string
-        default: "SELECT hour_ts, parent_name, name, user, start_count FROM $Process_Hourly WHERE start_count > 0 AND hour_ts > strftime('%s','now','-1 hours') ORDER BY hour_ts, parent_name, name"
+        default: "SELECT hour_ts, parent_name, name, user, start_count FROM $Process_Hourly WHERE start_count > 0 AND hour_ts > strftime('%s','now','-2 hours') ORDER BY hour_ts, parent_name, name"
         description: >
           The preset SQL text this canned query runs. Hidden from the
           operator UI (not editable via the dashboard); see

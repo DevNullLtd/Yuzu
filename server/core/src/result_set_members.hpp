@@ -29,36 +29,61 @@ namespace yuzu::server {
 /// needs the members (the forensics tier tests) reads it exactly as before.
 struct ResultSetMembers : std::vector<std::string> {
     /// Distinct agents with NO row satisfying the matcher and at least one failed row (status not
-    /// success, or output starting `error|`). Matching decides first: an agent with any matching
-    /// row is a member and is never counted here, so under the default matcher a success-status
-    /// `error|` answer is a member, and the count only moves for an agent whose every row failed
-    /// or failed to match while at least one failed.
+    /// success, output starting `error|`, or a success answer whose `__schema__` header lacks the
+    /// column matcher's column). Matching decides first: an agent with any matching row is a
+    /// member and is never counted here, so under the default matcher a success-status `error|`
+    /// answer is a member, and the count only moves for an agent whose every row failed or failed
+    /// to match while at least one failed. Agents that never answered are not counted: the read
+    /// sees stored rows only.
     int64_t agents_failed{0};
+    /// True when the store holds more rows for the execution than `max_rows`: the membership is
+    /// incomplete in a way `agents_failed` cannot express, so the caller fails the set closed
+    /// instead of materializing it. A store holding exactly `max_rows` rows is not truncated.
+    bool truncated{false};
 };
+
+/// Rows the members read takes per store query. The read pages until a page comes back short.
+inline constexpr int kResultSetMembersPageRows = 500;
 
 /// The agent ids that satisfy `pending`'s matcher, in order of first appearance in the store's read
 /// (which is newest row first, `timestamp DESC`, not first-response order), plus `agents_failed`;
 /// `std::nullopt` when the store read degraded (the caller skips this pending set for this tick
-/// rather than materialize a false-empty membership, ADR-0039).
+/// rather than materialize a false-empty membership, ADR-0039). The read pages through every
+/// stored row of the execution, `page_rows` at a time, up to `max_rows` (default: the store's
+/// per-set member cap, one row per agent at least); a row past that bound sets `truncated`.
 [[nodiscard]] inline std::optional<ResultSetMembers>
 result_set_members(ResponseStore& responses, const ForensicsPluginSet* plugins,
-                   const PendingSet& pending) {
+                   const PendingSet& pending, int page_rows = kResultSetMembersPageRows,
+                   int max_rows = ResultSetStore::kMaxMembersPerSet) {
     const auto tier = plugins ? ResponseTierFilter::exclude(*plugins, authz::deny_all())
                               : ResponseTierFilter::refuse_unwired();
-    auto rows = responses.query_by_execution(pending.source_execution_id, tier);
-    if (!rows)
-        return std::nullopt;
     ResultSetMembers members;
     std::unordered_set<std::string> seen;
     std::unordered_set<std::string> failed;
-    for (const auto& r : *rows) {
-        if (!rs_matcher::response_matches(pending.matcher, r.status, r.output)) {
-            if (r.status != rs_matcher::kStatusSuccess || r.output.starts_with("error|"))
-                failed.insert(r.agent_id);
-            continue;
+    ResponseQuery page;
+    page.limit = page_rows;
+    for (int read = 0;; page.offset += page_rows) {
+        auto rows = responses.query_by_execution(pending.source_execution_id, tier, page);
+        if (!rows)
+            return std::nullopt;
+        if (read >= max_rows) {
+            // This page lies past the bound: any row in it means the read is incomplete.
+            members.truncated = !rows->empty();
+            break;
         }
-        if (seen.insert(r.agent_id).second)
-            members.push_back(r.agent_id);
+        for (const auto& r : *rows) {
+            if (!rs_matcher::response_matches(pending.matcher, r.status, r.output)) {
+                if (r.status != rs_matcher::kStatusSuccess || r.output.starts_with("error|") ||
+                    rs_matcher::answer_lacks_matcher_column(pending.matcher, r.output))
+                    failed.insert(r.agent_id);
+                continue;
+            }
+            if (seen.insert(r.agent_id).second)
+                members.push_back(r.agent_id);
+        }
+        read += static_cast<int>(rows->size());
+        if (static_cast<int>(rows->size()) < page_rows)
+            break;
     }
     for (const auto& id : failed)
         if (!seen.contains(id))

@@ -417,12 +417,14 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             s.dollar = m.dollar;
             s.category = m.category;
             s.enabled = (en->second == "true");
-            // Row count: `<src>_rows`, else the one-release alias `<src>_live_rows`.
+            // Row count: `<src>_rows` is the hourly count. An agent that sends only the
+            // one-release alias `<src>_live_rows` has not moved to the roll-up store, so its
+            // figure counts raw capture rows and is not shown under the hourly label.
             auto rows_it = cfg.find(std::string(m.name) + "_rows");
-            if (rows_it == cfg.end())
-                rows_it = cfg.find(std::string(m.name) + "_live_rows");
             if (rows_it != cfg.end()) {
                 try { s.live_rows = std::stoll(rows_it->second); } catch (...) {}
+            } else if (cfg.contains(std::string(m.name) + "_live_rows")) {
+                s.pre_rollup_agent = true;
             }
             if (s.enabled) ++on;
             rows.push_back(std::move(s));

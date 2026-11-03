@@ -636,6 +636,62 @@ TEST_CASE("raw capture table predicate: literals and comments are not table refe
     CHECK(references_raw_capture_table("SELECT 1 FROM process_live WHERE a = 'unterminated"));
 }
 
+TEST_CASE("raw capture table predicate: quoted identifiers are tokens and never hide the code "
+          "after them",
+          "[result_set][matcher]") {
+    // A quote, comment opener or bracket INSIDE a quoted identifier is part of the name.
+    CHECK(references_raw_capture_table("SELECT 1 AS \"a'\" FROM process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 AS \"--\" FROM process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 AS \"/*\" FROM process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 AS [--] FROM process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 AS [a'] FROM process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 AS `a'` FROM process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 AS `--` FROM $Process_Live"));
+    // A doubled delimiter is an escape inside "..." and `...`, not a close.
+    CHECK(references_raw_capture_table("SELECT 1 AS \"a\"\"'\" FROM process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 AS `a``'` FROM tcp_live"));
+    // The identifier's own content is read like code.
+    CHECK(references_raw_capture_table("SELECT 1 FROM \"Process_Live\""));
+    CHECK(references_raw_capture_table("SELECT 1 FROM [process_live]"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM `PROCESS_LIVE`"));
+    // A literal after a quoted identifier is still a literal.
+    CHECK_FALSE(references_raw_capture_table("SELECT \"x'\" , 'process_live' FROM $Process_Hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT [x'] , 'process_live' FROM $Process_Hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT `x'` , '$Process_Live' FROM $Process_Hourly"));
+    // An unterminated quoted identifier runs to the end, as SQLite reads it; its content is
+    // still read like code (fails closed), and it never hides a reference before it.
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a = \"process_live"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a = \"x"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM process_live WHERE a = \"unterminated"));
+    // Schema-qualified, tab and newline separated.
+    CHECK(references_raw_capture_table("SELECT 1\nFROM\tmain.process_live"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM main.\"process_live\""));
+    // The accepted false positive: a name inside a double-quoted string literal is read as an
+    // identifier and refused (the predicate fails closed).
+    CHECK(references_raw_capture_table("SELECT \"$Process_Live\" FROM $Process_Hourly"));
+}
+
+TEST_CASE("answer_lacks_matcher_column: a success answer from a table without the column",
+          "[result_set][matcher]") {
+    const std::string pid_exists = R"({"column":"pid","op":"exists"})";
+    // Schema present, column absent: the agent answered from a table without it.
+    CHECK(answer_lacks_matcher_column(pid_exists, "__schema__|hour_ts|name\n1|a\n__total__|1"));
+    CHECK(answer_lacks_matcher_column(pid_exists, "__schema__|hour_ts|name\n__total__|0"));
+    // Schema present and the column named, zero rows: a legitimate empty answer.
+    CHECK_FALSE(answer_lacks_matcher_column(pid_exists, "__schema__|pid\n__total__|0"));
+    CHECK_FALSE(answer_lacks_matcher_column(pid_exists, "__schema__|name|pid\n__total__|0"));
+    // No schema line at all (JSON or plain rows): nothing to decide.
+    CHECK_FALSE(answer_lacks_matcher_column(pid_exists, R"([{"name":"a"}])"));
+    CHECK_FALSE(answer_lacks_matcher_column(pid_exists, ""));
+    // Not a column matcher: never.
+    CHECK_FALSE(answer_lacks_matcher_column("", "__schema__|name\n__total__|0"));
+    CHECK_FALSE(answer_lacks_matcher_column(R"({"kind":"echo_rows_ge","n":1})",
+                                            "__schema__|name\n__total__|0"));
+    CHECK_FALSE(answer_lacks_matcher_column(R"({"column":5,"op":"exists"})",
+                                            "__schema__|name\n__total__|0"));
+    CHECK_FALSE(answer_lacks_matcher_column("not json", "__schema__|name\n__total__|0"));
+}
+
 TEST_CASE("instruction raw capture predicate: stored param first then schema default",
           "[result_set][matcher]") {
     const std::string schema =

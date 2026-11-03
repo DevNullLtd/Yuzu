@@ -557,7 +557,7 @@ Echo is designed for minimal performance overhead:
 
 - **Fast collection** (processes + network): typically completes in under 100ms
 - **Slow collection** (services + users): typically completes in under 200ms
-- **Performance sampling**: a handful of kernel-counter reads every 30s; one row written per sample. The `$Perf_Live` 7-day window holds ~20,000 rows (~1-2 MB) per endpoint at the default cadence.
+- **Performance sampling**: a handful of kernel-counter reads every 30s; each sample folds into the `$Perf_Hourly` bucket for its hour.
 - **Database size**: varies by system activity; a typical endpoint generates 1-5 MB per day (plus the ~1-2 MB perf window). It is capped by `db_budget_bytes` (default 250 MiB).
 - **CPU**: negligible between collection cycles; brief spike during snapshot + diff
 - **Automatic purge**: old events are removed on the rollup tick (every 900 s) and, when the database is over `db_budget_bytes`, the oldest eligible rows inside their window as well (see [The database byte budget](#the-database-byte-budget)).
@@ -756,7 +756,7 @@ condition clears.
 > sampling (`perf_enabled` defaults to `true`, 30-second cadence — unchanged
 > from the prior release). **Linux agents BEGIN device performance sampling on
 > upgrade to this release**: the Linux `perf` collector (procfs) is new, and
-> because `perf_enabled` is default-ON, `$Perf_Live` rows start accruing on
+> because `perf_enabled` is default-ON, `$Perf_Hourly` rows start accruing on
 > Linux hosts at the same 30-second cadence with no operator action — a real,
 > operator-visible data-collection change on Linux fleets (set
 > `perf_enabled=false` per host to opt out; the data is device-level with no
@@ -830,7 +830,7 @@ condition clears.
 >   posture) and not reversible by configuration — see the redaction section.
 > - **Live capture is active from the next agent start** — gap-free during the
 >   live session, so short-lived processes the poll missed now appear, and
->   `$Process_Live` holds more rows (cap raised to 100000). (One narrow seam: at
+>   more process starts and stops reach `$Process_Hourly`. (One narrow seam: at
 >   the boot→live handoff, events in the window between the agent sampling its
 >   boot/live boundary and the live provider becoming active can fall in neither
 >   the backfill nor the live stream — tracked as a follow-up.) If the ETW session
@@ -888,7 +888,7 @@ Echo keeps roll-up tiers only. This is settled, not a mode: there is no configur
 
 - **No raw tier.** Each batch a capture source records is folded into that source's tiers as it arrives. Hourly is the finest tier; daily and monthly sit above it for the sources that have them.
 - **Hourly depends on the byte budget.** A database over `db_budget_bytes` (default 250 MiB) removes hourly rows older than 48 hours (5 days for `procperf`), oldest first, until it is back under. Daily and monthly rows are never removed for size. The retention API marks the tier with `budget_dependent` (see [`GET /api/v1/settings/data-retention`](rest-api.md)).
-- **Default retention.** Hourly rows are kept 90 days, daily rows 180 days and monthly rows 365 days, each measured from the start of its bucket. The Settings data page and `GET /api/v1/settings/data-retention` list the figures per source.
+- **Default retention.** Hourly rows are kept 90 days, daily rows 180 days and monthly rows 365 days, each measured from the start of its bucket. These are the agent's roll-up-only defaults; the Settings data page and `GET /api/v1/settings/data-retention` list the figures of the retention table embedded in the server (a server built before the agent's roll-up-only release lists its earlier 24-hour hourly depth there).
 - **Query the roll-ups.** Read `$<Source>_Hourly`, `$<Source>_Daily` and `$<Source>_Monthly` through `echo.sql`. The canned queries in `content/definitions/echo_warehouse.yaml` all read the hourly tier. A roll-up row holds names, keys and counts per bucket, not individual events, so it carries no pid and no per-event timestamp.
 - **One-release alias for the old names.** For one release an agent answers a query over a `$<Source>_Live` name (or a `<source>_live` table) with an empty result set that keeps the old column header, instead of an error. Move such queries to the hourly tier. The status key that reports a source's row count is `<src>_rows`; the server also reads `<src>_live_rows`, which an agent from before this release still sends.
 - **Stored result sets over a raw table are refused.** Re-evaluating a result set whose query reads a raw capture table, and creating one from such a query, is refused with `RESULT_SET_REEVAL_STALE_SOURCE` and dispatches nothing (see [Result sets](rest-api.md#result-sets)). Without the refusal the set would be rebuilt as an empty membership with no error.
@@ -943,32 +943,32 @@ SELECT name, MAX(cpu_max) AS peak, AVG(cpu_avg) AS typical
 FROM $ProcPerf_Hourly GROUP BY name ORDER BY peak DESC LIMIT 10
 ```
 
-**Software tables:** `$Software_Live` carries `ts`, `snapshot_id`, `action` (installed/removed/upgraded), `name`, `version`, `prev_version` (populated only for `upgraded`), `publisher`, `install_date` — **machine scope only, no user identity / no PII**. The daily/monthly tiers carry `day_ts` (or `month_ts`), `name`, `install_count`, `remove_count`, `upgrade_count`. Example — everything installed or removed on a device in the last 30 days:
+**Software tables:** `$Software_Hourly` carries `hour_ts`, `name`, `version`, `publisher`, `arch`, `install_count`, `remove_count`, `upgrade_count`, `downgrade_count` — **machine scope only, no user identity**. The daily/monthly tiers carry the same keys and counts under `day_ts` (or `month_ts`). Example — everything installed or removed on a device in the last 30 days:
 
 ```sql
-SELECT ts, action, name, version, prev_version, publisher
-FROM $Software_Live
-WHERE action IN ('installed','removed','upgraded')
-ORDER BY ts DESC
+SELECT day_ts, name, version, publisher, install_count, remove_count, upgrade_count
+FROM $Software_Daily
+WHERE day_ts > strftime('%s','now','-30 days') AND install_count + remove_count + upgrade_count > 0
+ORDER BY day_ts DESC
 ```
 
-**NetQual tables** *(ADR-0020)*: `$NetQual_Live` carries `ts`, `snapshot_id`, `proto` (tcp/tcp6), `remote_bucket` (the **only** destination field — a coarse class: `loopback`/`private`/`public`/`unknown`; the raw address is never stored), `process_name` (image name only), `rtt_us`, `rtt_var_us` (jitter), `lost` (current-conditions loss gauge — the sort key), `retrans`, `segs_out`, `ca_state` (0=Open … 4=Loss). `$NetQual_Boot` is the per-boot retrospective baseline: `ts` (agent start), `snapshot_id`, `boot_ts`, `window_s` (the pre-Echo window length this boot), `retrans_segs`, `segs_out`, `estab_resets` (since-boot TCP totals), and `if_in_errors`/`if_in_discards`/`if_out_errors`/`if_out_discards`/`if_in_octets`/`if_out_octets` (non-loopback interface totals). Since-boot totals are coarse **context**, never a current-loss verdict.
+**NetQual tables** *(ADR-0020)*: `$NetQual_Hourly` carries `hour_ts`, `proto` (tcp/tcp6), `remote_bucket` (the **only** destination field — a coarse class: `loopback`/`private`/`public`/`unknown`; the raw address is never stored), `process_name` (image name only), `samples`, `rtt_us_sum`/`rtt_us_max`/`rtt_us_min`, `rtt_var_us_sum` (jitter), `lost_sum`/`lost_max` (current-conditions loss), `degraded_samples`, `bytes_in_sum`, `bytes_out_sum`; `$NetQual_Daily` carries the same per day. `$NetQual_Boot` is the per-boot retrospective baseline: `ts` (agent start), `snapshot_id`, `boot_ts`, `window_s` (the pre-Echo window length this boot), `retrans_segs`, `segs_out`, `estab_resets` (since-boot TCP totals), and `if_in_errors`/`if_in_discards`/`if_out_errors`/`if_out_discards`/`if_in_octets`/`if_out_octets` (non-loopback interface totals). Since-boot totals are coarse **context**, never a current-loss verdict.
 
-**NetConn table** *(ADR-0020)*: `$NetConn_Live` carries `ts` (the **event's** own timestamp — backfilled rows predate Echo), `snapshot_id`, `action` (`connected`/`disconnected`/`wifi_connected`/`wifi_connect_failed`/`wifi_disconnected`/`capability_changed`), `channel` (`networkprofile`/`ncsi`/`wlan`), `category` (`public`/`private`/`domain`, or empty), `capability` (`none`/`local`/`internet`, or empty), `iface_kind` (`wifi` or empty), `reason_code` (WLAN disconnect/fail reason or NCSI change reason). Every text column is a closed enum token — **no SSID, BSSID, profile name, GUID, or MAC is ever stored**. Example — connectivity/Wi-Fi drops on a device, including before Echo was enabled:
+**NetConn tables** *(ADR-0020)*: `$NetConn_Hourly` carries `hour_ts`, `action` (`connected`/`disconnected`/`wifi_connected`/`wifi_connect_failed`/`wifi_disconnected`/`capability_changed`), `channel` (`networkprofile`/`ncsi`/`wlan`), `category` (`public`/`private`/`domain`, or empty), `capability` (`none`/`local`/`internet`, or empty), `iface_kind` (`wifi` or empty), `reason_code` (WLAN disconnect/fail reason or NCSI change reason), `phy_type`, `auth_alg`, `cipher_alg`, `event_count` and `last_ts` (the newest event in the bucket; backfilled events predate Echo). Every text column is a closed enum token — **no SSID, BSSID, profile name, GUID, or MAC is ever stored**. Example — connectivity/Wi-Fi drops on a device by hour, including before Echo was enabled:
 
 ```sql
-SELECT ts, action, channel, capability, reason_code
-FROM $NetConn_Live
+SELECT hour_ts, action, channel, capability, reason_code, event_count
+FROM $NetConn_Hourly
 WHERE action IN ('disconnected','wifi_disconnected','wifi_connect_failed','capability_changed')
-ORDER BY ts DESC
+ORDER BY hour_ts DESC
 ```
 
-**MapDrive tables** *(capability-map §3.8):* `$MapDrive_Live` carries `ts`, `snapshot_id`, `action` (`appeared`/`removed` for live snapshot-diff, `historical` for the init backfill), `direction` (`outbound`/`inbound`), `local_mount`, `remote_path`, `remote_host`, `username`, `provider`, and `origin` (`live`/`historical`). The `origin` column separates historically-inferred mappings (seeded once from the registry / fstab / event logs, carrying the artifact's timestamp or `0`) from live-observed ones; a currently-mapped persistent drive legitimately appears as **both** a `historical` and a live `appeared` row. `$MapDrive_Hourly` carries `hour_ts`, `direction`, `local_mount`, `remote_path`, `remote_host`, `appear_count`, `remove_count`. Example — every previously and currently mapped drive, both directions:
+**MapDrive tables** *(capability-map §3.8):* `$MapDrive_Hourly` carries `hour_ts`, `direction` (`outbound`/`inbound`), `local_mount`, `remote_path`, `remote_host`, `appear_count`, `remove_count`, `historical_count` (mappings seeded once from the registry / fstab / event logs), `first_ts`, `last_ts`, `last_dialect` and `guest_count`; `$MapDrive_Daily` carries the same per day. A currently-mapped persistent drive legitimately counts as **both** historical and appeared. Example — every previously and currently mapped drive, both directions:
 
 ```sql
-SELECT ts, direction, local_mount, remote_path, remote_host, username, origin, action
-FROM $MapDrive_Live
-ORDER BY ts DESC
+SELECT hour_ts, direction, local_mount, remote_path, remote_host, appear_count, remove_count, historical_count
+FROM $MapDrive_Hourly
+ORDER BY hour_ts DESC
 ```
 
 **Registry table** *(Windows)*: `$Registry_Live` carries `ts` (unix seconds), `snapshot_id`, `hive` (`HKLM` or `HKU`), `key_path` (below the hive; HKU paths lead with the user SID), `value_name` (empty for `key_removed` and gaps), `action` (`added`, `changed`, `removed`, `key_removed`, `capture_gap`), the NEW value as `data_type`/`data`/`data_size`/`data_truncated`, the type and size of the OLD value as `prev_data_type`/`prev_data_size` (`prev_data` is empty for a change diffed against a baseline this build wrote; a change diffed against a baseline an older build wrote carries the old value's rendered prefix (at most 512 bytes) until that root's baseline is rewritten, and rows an older build wrote keep their old values until retention trims them or `echo.purge_source` runs on the paused source; `prev_data_truncated` = 1 on a row whose `prev_data` is empty means "there was a value, not stored"), `actor_pid`, `actor_image`, `source`, `observed_at` (unix ms of the read that saw the change), `detail` and `record_key`. `actor_pid` and `actor_image` name the process correlated to the change (see *The actor is correlated, not verified* below) and are `0` and empty when none is named. `detail` holds the attribution marker (`attr:...`) on a change row and the explanation on a `capture_gap` row. A column that does not apply is empty or `0`; an empty `data_type` is what tells an absent value (a removal) from a value that is present and empty. `data` follows `registry`-plugin rendering: strings as UTF-8, `REG_MULTI_SZ` joined with newlines, `REG_DWORD`/`REG_QWORD` in decimal, anything else as lowercase hex, capped at 512 bytes of UTF-8 text (`data_truncated` = 1 when cut). `ts` is the key's last-write time when the read saw a plausible one (not after the read that noticed the change), else the end of that read; `observed_at` is always the read. The `Services\bam\State` subtree (the Background Activity Moderator rewrites a per-user value for every program launch) is neither read nor recorded. `source` is `notify` when the key watch fired and `reconcile` when the full re-read (every 12 slow ticks, hourly at the default 300 s) found the change. A deletion is recorded as one `removed` row per value followed by one `key_removed` row for the key.

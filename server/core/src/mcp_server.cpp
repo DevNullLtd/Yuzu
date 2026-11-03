@@ -638,7 +638,7 @@ static_assert(kMaxFacetValueBytes == 2048,
 // nine result-set outputSchemas inside kTools[], so the nine copies cannot drift. They sit above the
 // array because scripts/ci/check-api-parity.py refuses a preprocessor line inside it; both are
 // #undef'd right after it.
-#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure and never matched; they are absent from the membership"},"partial":{"type":"boolean","description":"True when agents_failed is above zero"})j"
+#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are not counted. 0 without information for a set filled before this release or by an older server replica"},"partial":{"type":"boolean","description":"True when agents_failed is above zero: at least one answering agent failed. Says nothing about agents that never answered; false without information for a set filled before this release or by an older server replica"})j"
 #define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j"
 static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
@@ -14442,9 +14442,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto& def = **def_result;
-                // Same refusal as create_result_set_from_echo_query, on the SQL the definition
-                // will actually run (the caller's param, else its schema default): a set that
-                // reevaluate_result_set would refuse is not created either.
+                // Same refusal as create_result_set_from_echo_query, on the caller's params.sql,
+                // else the definition's declared default (the text the dashboard submits for a
+                // canned query; a default is never injected at dispatch, so a dispatch without
+                // sql is answered with an error by the agent and counted in agents_failed): a
+                // set that reevaluate_result_set would refuse is not created either.
                 if (def.plugin == "echo" && def.action == "sql" &&
                     yuzu::server::rs_matcher::instruction_reads_raw_capture_table(
                         args.value("params", nlohmann::json::object()), def.parameter_schema)) {
@@ -14760,8 +14762,9 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    // Same refusal as the echo_query branch, on the SQL the definition will
-                    // actually run (the stored param, else its schema default).
+                    // Same refusal as the echo_query branch, on the stored params.sql, else the
+                    // definition's declared default (never injected at dispatch; see the
+                    // create tool).
                     if (def->plugin == "echo" && def->action == "sql" &&
                         yuzu::server::rs_matcher::instruction_reads_raw_capture_table(
                             sp.value("params", nlohmann::json::object()),
