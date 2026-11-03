@@ -1851,13 +1851,12 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
         // the wrong title), so it is absent from the title, queue and ratio gauges while the
         // rollup still reports success. Say so, with the count, once per refresh.
         {
-            pg::PgResult dropped = pg::exec_params(
-                c,
+            const std::string count_sql =
                 "SELECT count(*) FROM (SELECT 1 FROM software_inventory_store.installed_software "
                 "WHERE octet_length(name) + octet_length(publisher) + octet_length(ecosystem) > " +
-                    std::to_string(kTitleTripleMaxBytes) +
-                    " GROUP BY name, publisher, ecosystem) over_wide",
-                std::vector<std::string>{});
+                std::to_string(kTitleTripleMaxBytes) +
+                " GROUP BY name, publisher, ecosystem) over_wide";
+            pg::PgResult dropped = pg::exec_params(c, count_sql.c_str(), std::vector<std::string>{});
             if (dropped.status() != PGRES_TUPLES_OK)
                 return failed("over-wide title count", dropped);
             if (PQntuples(dropped.get()) == 1 &&
