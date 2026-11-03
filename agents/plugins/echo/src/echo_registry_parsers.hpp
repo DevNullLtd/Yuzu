@@ -1496,7 +1496,7 @@ enum class ListStep { Item, End, Error };
 /// then empty, so a partial list cannot be mistaken for a complete one.
 struct ListWalk {
     std::vector<std::string> names;
-    std::string error; // "index <i> (<the OS's own words>)" when the walk failed
+    std::string error; // "index <i> (<the detail the step supplied>)" when the walk failed
 };
 
 /// Walk `step(i, name, err)` from index 0: it fills `name` and answers Item, answers End at
