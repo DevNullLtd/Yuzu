@@ -3109,27 +3109,72 @@ TEST_CASE("registry source: a failed HKEY_USERS enumeration keeps the cursor and
     CHECK(r.next().outcome == CursorOutcome::Baseline);
     r.f.dirty->mark_hku();
     r.f.clock += SEC;
-    r.f.reads[root] = uread(root, 2); // the loaded user's value changed between the ticks
     const std::string cursor_before = *r.t.db.get_cursor("registry").value();
     const std::string baseline_before = r.state(root);
+    const auto watch_calls_before = r.f.watch_calls.size();
+    const std::string watch_roots_before = r.config("registry_watch_roots");
+    const std::string last_collect_before = r.config("registry_last_collect_ts");
 
     // The enumeration answers an error part-way: the tick throws before it touches the watch
-    // set, the dirty marks, the baselines or the cursor, and writes no gap row.
+    // set, the dirty marks, the baselines, the status keys or the cursor, and writes no gap row.
     r.f.fail_loaded_sids = true;
     CHECK_THROWS_AS(tick(r.t.db, *r.src), IncompleteCaptureError);
     CHECK(*r.t.db.get_cursor("registry").value() == cursor_before);
     CHECK(r.state(root) == baseline_before);
     CHECK(count_rows(r.t.db) == 0);
+    CHECK(r.f.watch_calls.size() == watch_calls_before);
+    CHECK(r.config("registry_watch_roots") == watch_roots_before);
+    CHECK(r.config("registry_last_collect_ts") == last_collect_before);
     CHECK(r.f.dirty->take_hku()); // the name-watch mark was put back (R7)
     r.f.dirty->mark_hku();
 
-    // The enumeration works again: the tick re-lists, re-reads the changed value, and commits.
+    // The enumeration works again: the tick lists the loaded users once more and commits.
     r.f.fail_loaded_sids = false;
     const int enumerations = r.f.loaded_sids_calls;
     r.f.clock += SEC;
     tick(r.t.db, *r.src);
     CHECK(r.f.loaded_sids_calls == enumerations + 1);
     CHECK(*r.t.db.get_cursor("registry").value() != cursor_before);
+}
+
+TEST_CASE("walk_enumeration: only the end of the list completes a walk, an error is a failed "
+          "read and never a short list",
+          "[echo][registry]") {
+    using Script = std::vector<std::pair<ListStep, std::string>>;
+    const auto walk = [](const Script& script) {
+        return walk_enumeration([&](unsigned i, std::string& name, std::string& err) {
+            REQUIRE(i < script.size()); // the walk never asks past a terminal answer
+            const auto& [step, text] = script[i];
+            (step == ListStep::Item ? name : err) = text;
+            return step;
+        });
+    };
+
+    SECTION("a list that ends at its end returns every name") {
+        const auto w = walk({{ListStep::Item, "S-1-5-18"},
+                             {ListStep::Item, "S-1-5-21-1"},
+                             {ListStep::End, ""}});
+        CHECK(w.error.empty());
+        CHECK(w.names == std::vector<std::string>{"S-1-5-18", "S-1-5-21-1"});
+    }
+    SECTION("an empty list is complete") {
+        const auto w = walk({{ListStep::End, ""}});
+        CHECK(w.error.empty());
+        CHECK(w.names.empty());
+    }
+    SECTION("an error part-way fails the walk, names the index and returns no names") {
+        const auto w = walk({{ListStep::Item, "S-1-5-18"},
+                             {ListStep::Item, "S-1-5-21-1"},
+                             {ListStep::Error, "error 5"},
+                             {ListStep::Item, "never reached"}});
+        CHECK(w.error == "index 2 (error 5)");
+        CHECK(w.names.empty()); // the two names found so far are not handed out
+    }
+    SECTION("an error on the first index fails the walk too") {
+        const auto w = walk({{ListStep::Error, "error 6"}});
+        CHECK(w.error == "index 0 (error 6)");
+        CHECK(w.names.empty());
+    }
 }
 
 TEST_CASE("registry source: a failed HKEY_USERS enumeration at start-up arms no watch and the "

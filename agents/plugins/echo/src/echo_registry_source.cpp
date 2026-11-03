@@ -1474,27 +1474,31 @@ int read_current_control_set() {
     return static_cast<int>(v);
 }
 
-// The loaded-user list is the one HKU snapshot collect() classifies profiles against, so it
-// is complete or it is not returned: only ERROR_NO_MORE_ITEMS ends it. Any other error
-// throws IncompleteCaptureError (the cursor-source rule: a transient read failure keeps the
-// cursor), because a partial list would read a loaded user as logged off and drop that
-// user's watch and dirty state.
+// The loaded-user list is the one HKU snapshot collect() classifies profiles against, so a
+// walk that ends on anything but ERROR_NO_MORE_ITEMS is a failed read: it throws
+// IncompleteCaptureError (the cursor-source rule: a transient read failure keeps the cursor)
+// instead of returning the names found so far, because a partial list would read a loaded
+// user as logged off and drop that user's watch and dirty state. The end-of-list decision is
+// walk_enumeration (echo_registry_parsers.hpp), which the unit suite runs on every platform.
 std::vector<std::string> enumerate_hku() {
-    std::vector<std::string> out;
     wchar_t buf[256];
-    for (DWORD i = 0;; ++i) {
+    auto walk = walk_enumeration([&](unsigned i, std::string& name, std::string& err) {
         DWORD len = 256;
         const LONG rc =
             RegEnumKeyExW(HKEY_USERS, i, buf, &len, nullptr, nullptr, nullptr, nullptr);
+        if (rc == ERROR_SUCCESS) {
+            name = yuzu::win::from_wide(buf, static_cast<int>(len));
+            return ListStep::Item;
+        }
         if (rc == ERROR_NO_MORE_ITEMS)
-            break;
-        if (rc != ERROR_SUCCESS)
-            throw IncompleteCaptureError("Echo registry: HKEY_USERS enumeration failed at index " +
-                                         std::to_string(i) + " (error " + std::to_string(rc) +
-                                         ")");
-        out.push_back(yuzu::win::from_wide(buf, static_cast<int>(len)));
-    }
-    return out;
+            return ListStep::End;
+        err = "error " + std::to_string(rc);
+        return ListStep::Error;
+    });
+    if (!walk.error.empty())
+        throw IncompleteCaptureError("Echo registry: HKEY_USERS enumeration failed at " +
+                                     walk.error);
+    return std::move(walk.names);
 }
 
 // ── Offline (unloaded) per-user hives ───────────────────────────────────────

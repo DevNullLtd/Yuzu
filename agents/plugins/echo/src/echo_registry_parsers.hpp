@@ -1486,4 +1486,41 @@ struct DecodedBaseline {
     return out;
 }
 
+// ── Walking an index-driven OS list (RegEnumKeyExW and its kin) ─────────────────────
+
+/// What an index-driven enumerator answers for one index.
+enum class ListStep { Item, End, Error };
+
+/// The result of walking such a list. `error` is empty exactly when the walk ended at the
+/// list's end. A walk that ended on an error is a FAILED READ, never a short list: `names` is
+/// then empty, so a partial list cannot be mistaken for a complete one.
+struct ListWalk {
+    std::vector<std::string> names;
+    std::string error; // "index <i> (<the OS's own words>)" when the walk failed
+};
+
+/// Walk `step(i, name, err)` from index 0: it fills `name` and answers Item, answers End at
+/// the end of the list, or fills `err` and answers Error. Only End completes a walk. (An
+/// index-driven walk can still skip a hive that loads or unloads while it runs, with no
+/// error code; the next name-watch or hourly pass lists it.)
+template <class Step>
+[[nodiscard]] ListWalk walk_enumeration(Step&& step) {
+    ListWalk walk;
+    for (unsigned i = 0;; ++i) {
+        std::string name;
+        std::string err;
+        switch (step(i, name, err)) {
+        case ListStep::Item:
+            walk.names.push_back(std::move(name));
+            break;
+        case ListStep::End:
+            return walk;
+        case ListStep::Error:
+            walk.names.clear();
+            walk.error = "index " + std::to_string(i) + " (" + err + ")";
+            return walk;
+        }
+    }
+}
+
 } // namespace yuzu::echo
