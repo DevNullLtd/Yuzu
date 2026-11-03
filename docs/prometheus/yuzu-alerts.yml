@@ -541,8 +541,9 @@ groups:
       # Threshold: increase() >= 10 over 10m, i.e. about ten increases. One
       # request that fails to encode, or one oversized daily-sync batch, counts
       # once and must not warn; a systematic encoder fault (every Register failing)
-      # reaches 10 on a gateway fronting about 5 or more agents (one agent
-      # retries about 2.3 times per 10m at its steady 256 s backoff). A small
+      # reaches 10 on a gateway fronting about 3 or more agents (one agent
+      # retries about 4 times per 10m at its steady backoff, a mean wait of about
+      # 135 s under the agent's decorrelated jitter). A small
       # gateway, or a low-rate RPC (inventory, notify_stream, guardian: the
       # series is per rpc_name, there is no sum), can fault without reaching it:
       # for those use the log line "Upstream RPC ... raised" and
@@ -2233,6 +2234,42 @@ groups:
             possibly compromised or misbehaving IdP. Correlate via the
             scim provenance-denial audit row for the calling IdP/client.
           runbook_url: "https://docs.yuzu.io/runbooks/scim-provenance-denied"
+
+      # #6836: a SCIM deactivate/delete/reactivate/update (or a POST that
+      # revives a removed account) could not READ its provenance or role guard
+      # from the auth store and answered a retryable 503. Distinct from YuzuScimProvenanceDenied above: nothing was refused.
+      # Before #6836 this same fault was reported to the IdP as a 404 and
+      # counted as a provenance denial, so YuzuScimProvenanceDenied fired for
+      # an outage by accident; it no longer does, and this rule replaces that
+      # signal. `guard` is the closed pair provenance|role, pre-seeded to 0.
+      - alert: YuzuScimGuardStoreUnavailable
+        expr: |
+          increase(yuzu_scim_guard_store_unavailable_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "SCIM could not read the {{ $labels.guard }} guard from the auth store (retryable 503)"
+          description: >-
+            yuzu_scim_guard_store_unavailable_total{guard="{{ $labels.guard }}"}
+            moved: a SCIM deactivate, delete, reactivate or update, or a POST
+            that revives a removed account, could not read its
+            {{ $labels.guard }} check from the auth store and answered 503
+            with Retry-After instead of acting. Nothing was refused and the
+            failed guard changed nothing, but the IdP has to retry for the
+            deprovision to complete, so a sustained rate means leavers'
+            accounts are being deactivated late. This is not a provenance
+            denial (YuzuScimProvenanceDenied is the refusal signal). Check
+            /readyz, the yuzu_pg_* pool and connect alerts, and the server
+            ERROR log lines "ScimRoutes: provenance check", "ScimRoutes:
+            deprovision role check" and "ScimRoutes: revive role check"; then
+            confirm in the IdP's provisioning
+            log that the retries succeed. It does not cover a full database
+            outage, where the bearer-token check answers 401 first (#6835). If
+            the audit store is down as well, the request's audit row may be
+            missing and YuzuScimAuditWriteFailures
+            (yuzu_scim_audit_write_failures_total{action="scim.user.deactivated"})
+            can fire for a request that changed nothing.
+          runbook_url: "https://docs.yuzu.io/runbooks/scim-guard-store-unavailable"
 
       # Audit-write-failures: a committed SCIM mutation (create/update/patch/
       # delete/deprovision) lost its audit evidence write. This is an evidence
