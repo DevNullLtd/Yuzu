@@ -1046,7 +1046,7 @@ TEST_CASE("registry writers follow the invalidation contract: a change stales wh
     REQUIRE(reg.upsert_alias("curated:windows", "mystery tool", "nobody", *p1, "curated", 1.0));
     REQUIRE(reg.upsert_alias("curated:windows", "other gadget", "elsewhere", *p2, "curated", 1.0));
     const auto settle = [&] {
-        owner.run_pass();
+        static_cast<void>(owner.run_pass());
         REQUIRE_FALSE(dim(pool, "Mystery Tool", "pack_version").empty());
         REQUIRE_FALSE(dim(pool, "Other Gadget", "pack_version").empty());
         REQUIRE_FALSE(dim(pool, "Third Tool", "pack_version").empty());
