@@ -357,6 +357,7 @@ BEGIN
       (c, 'key_ns', 'bigint'::regtype, false, NULL),
       (c, 'ingest_seq', 'bigint'::regtype, false, NULL),
       (c, 'ts_hwm', 'bigint'::regtype, false, NULL),
+      (c, 'seq_hwm', 'bigint'::regtype, false, NULL),
       (c, 'order_uncertain', 'boolean'::regtype, true, 'false')) v(rel, col, typ, nn, dflt)
   LOOP
     IF NOT EXISTS (SELECT 1 FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
@@ -421,6 +422,7 @@ ALTER TABLE guardian_agent_rule_status
     ADD COLUMN IF NOT EXISTS key_ns BIGINT,
     ADD COLUMN IF NOT EXISTS ingest_seq BIGINT,
     ADD COLUMN IF NOT EXISTS ts_hwm BIGINT,
+    ADD COLUMN IF NOT EXISTS seq_hwm BIGINT,
     ADD COLUMN IF NOT EXISTS order_uncertain BOOLEAN NOT NULL DEFAULT FALSE;
 -- A census write that changes the verdict without changing its ordering tuple did not come from
 -- this version's upsert (which always moves key_ns or ingest_seq with the verdict): an earlier
@@ -1252,7 +1254,10 @@ std::expected<void, std::string> project_observation(PGconn* conn,
 // paths (single-event ingest, repair, `delete_rule`) every event-row lock is taken by one
 // `ORDER BY ingest_seq FOR UPDATE` statement, so event-row waits are acyclic; the census row
 // follows, and the rule row (a share lock on a census INSERT, an exclusive lock in `delete_rule`)
-// after the events, so those orders cannot meet on one row either. `insert_events` (the batch
+// after the events. The two orders around the census and rule rows (the FK check on a census
+// INSERT versus `delete_rule`'s delete and cascade) cannot close a cycle for a visibility reason,
+// not an ordering one: the cascade does not see an uncommitted census INSERT, so that writer meets
+// 23503 (Rejected) instead of waiting, and the UPDATE arm takes no rule-row lock at all. `insert_events` (the batch
 // path, no production caller) takes census rows in batch order across pairs and carries no such
 // guarantee: two concurrent batches can deadlock, which surfaces per statement as Failed.
 
@@ -1282,8 +1287,8 @@ std::int64_t wall_clock_ns() noexcept {
         .count();
 }
 
-// The ONE predicate for "this event takes part in the census": it decides both whether the event
-// is stored with pending evidence and whether any census statement runs for it.
+// The ONE predicate for "this event takes part in the census": it decides whether any census
+// statement runs for it (and so whether its pending evidence can ever be recorded).
 bool census_bearing(const GuaranteedStateEventRow& row) {
     return !row.agent_id.empty() && !row.rule_id.empty() && !is_reserved_rule_id(row.rule_id) &&
            event_state_from_type(row.event_type) != nullptr;
@@ -1310,7 +1315,8 @@ enum class CensusOutcome {
     RefusedNoop,    // zero rows: the event is dominated and nothing changed
     PendingRetired, // repair only: the event's pending evidence was retired concurrently
     Rejected,       // the rule is gone (the census foreign key, 23503); definitive, not a fault
-    Failed,         // any other statement error; savepoint rolled back and released, pending stays
+    Failed,         // any other statement error; savepoint rolled back and released; the event is
+                    // left with pending evidence (a first delivery records it now, a repair has it)
     Abandoned,      // a savepoint control or the pending-evidence write failed; abandon the txn
 };
 
@@ -1346,10 +1352,11 @@ void count_projection(yuzu::MetricsRegistry* metrics, ProjectionSource source,
 // of project_rule_status leaves it healthy; this makes that a checked fact instead of a habit.
 bool txn_healthy(PGconn* conn) noexcept { return PQtransactionStatus(conn) == PQTRANS_INTRANS; }
 
-// Lock EVERY pending event of the pair (self included) in ingest_seq order, in one statement.
-// First delivery: self is an uncommitted own row and always present. Repair: self absent means it
-// was retired concurrently (no repair); present means its stored (proj_key, proj_key_capped,
-// ingest_seq) are the projection inputs. The other rows are the `seen` list.
+// Lock EVERY committed pending event of the pair in ingest_seq order, in one statement. A first
+// delivery or batch row is stored not pending, so it is never in this result; a Repair's own row
+// is: absent means it was retired concurrently (no repair), present means its stored
+// (proj_key, proj_key_capped, ingest_seq) are the projection inputs. Every other row is the `seen`
+// list.
 constexpr const char* kCensusLockAll =
     "SELECT event_id, proj_key, proj_key_capped, ingest_seq "
     "FROM guaranteed_state_store.guaranteed_state_events "
@@ -1375,6 +1382,13 @@ constexpr const char* kCensusFold =
     "  AND EXISTS (SELECT 1 FROM guaranteed_state_store.guaranteed_state_events e "
     "               WHERE e.event_id = ANY($3::text[]) AND " YUZU_CENSUS_SEEN_DISAGREES_ ")";
 
+// The highest arrival sequence among the seen (pending) events. The clear below retires the seen
+// events the final row dominates, so their arrival order must be remembered on the row or a later
+// apply with a higher key would clear the doubt they raised (the row tracks `seq_hwm` for this).
+#define YUZU_CENSUS_SEEN_MAX_SEQ_                                                                 \
+    "(SELECT max(s.ingest_seq) FROM guaranteed_state_store.guaranteed_state_events s "             \
+    "WHERE s.event_id = ANY($8::text[]))"
+
 // The apply predicate P: the incoming (key, seq) is above the row's.
 #define YUZU_CENSUS_APPLY_                                                                        \
     "(EXCLUDED.key_ns > COALESCE(c.key_ns, 0) OR (EXCLUDED.key_ns = COALESCE(c.key_ns, 0) "        \
@@ -1383,9 +1397,10 @@ constexpr const char* kCensusFold =
 // K + sticky upsert. $5 key, $6 seq, $7 capped, $8 seen list, $4 the event's timestamp text.
 constexpr const char* kCensusUpsert =
     "INSERT INTO guaranteed_state_store.guardian_agent_rule_status AS c "
-    "(agent_id, rule_id, state, updated_at, key_ns, ingest_seq, ts_hwm, order_uncertain) "
+    "(agent_id, rule_id, state, updated_at, key_ns, ingest_seq, ts_hwm, seq_hwm, order_uncertain) "
     "SELECT $1::text, $2::text, $3::text, $4::text, $5::bigint, $6::bigint, "
     "       NULLIF(GREATEST($5::bigint, COALESCE(pm.mk, 0)), 0), "
+    "       GREATEST($6::bigint, COALESCE(" YUZU_CENSUS_SEEN_MAX_SEQ_ ", 0)), "
     "       ($5::bigint = 0 OR $7::boolean OR pm.mk IS NOT NULL) "
     "  FROM (SELECT max(p.proj_key) AS mk "
     "          FROM guaranteed_state_store.guaranteed_state_events p "
@@ -1398,19 +1413,22 @@ constexpr const char* kCensusUpsert =
     "  key_ns     = CASE WHEN " YUZU_CENSUS_APPLY_ " THEN EXCLUDED.key_ns     ELSE c.key_ns     END, "
     "  ingest_seq = CASE WHEN " YUZU_CENSUS_APPLY_ " THEN EXCLUDED.ingest_seq ELSE c.ingest_seq END, "
     "  ts_hwm     = NULLIF(GREATEST(COALESCE(c.ts_hwm, 0), EXCLUDED.key_ns), 0), "
+    "  seq_hwm    = GREATEST(COALESCE(c.seq_hwm, c.ingest_seq, 0), EXCLUDED.ingest_seq, "
+    "                        COALESCE(" YUZU_CENSUS_SEEN_MAX_SEQ_ ", 0)), "
     "  order_uncertain = CASE WHEN " YUZU_CENSUS_APPLY_ " THEN "
     "      (EXCLUDED.key_ns = 0 "
     "       OR $7::boolean "
     "       OR (c.key_ns IS NOT NULL AND c.key_ns = 0) "
     "       OR EXCLUDED.key_ns < COALESCE(c.ts_hwm, 0) "
     "       OR (c.order_uncertain AND EXCLUDED.key_ns <= COALESCE(c.ts_hwm, 0)) "
-    "       OR EXCLUDED.ingest_seq < COALESCE(c.ingest_seq, 0) "
+    "       OR EXCLUDED.ingest_seq < COALESCE(c.seq_hwm, c.ingest_seq, 0) "
     "       OR EXISTS (SELECT 1 FROM guaranteed_state_store.guaranteed_state_events p "
     "                   WHERE p.event_id = ANY($8::text[]) "
     "                     AND p.ingest_seq > EXCLUDED.ingest_seq)) "
     "    ELSE (c.order_uncertain OR EXCLUDED.ingest_seq > COALESCE(c.ingest_seq, 0)) END "
     "WHERE " YUZU_CENSUS_APPLY_ " OR EXCLUDED.ingest_seq > COALESCE(c.ingest_seq, 0) "
     "   OR EXCLUDED.key_ns > COALESCE(c.ts_hwm, 0) "
+    "   OR COALESCE(" YUZU_CENSUS_SEEN_MAX_SEQ_ ", 0) > COALESCE(c.seq_hwm, c.ingest_seq, 0) "
     "RETURNING (c.ingest_seq = $6::bigint) AS applied, c.order_uncertain";
 
 // Retire ONLY the event itself and the rows the pair-lock statement returned, and only what the
@@ -1423,8 +1441,9 @@ constexpr const char* kCensusClear =
     "  AND (p.event_id = $3 OR p.event_id = ANY($4::text[])) "
     "  AND (p.proj_key, p.ingest_seq) <= (COALESCE(c.key_ns, 0), COALESCE(c.ingest_seq, 0))";
 
-// After a rejected (rule gone) write the event has nothing to project onto: retire it in the OUTER
-// transaction, after the savepoint was rolled back and released.
+// After a rejected (rule gone) REPAIR the event has nothing to project onto: retire its pending
+// evidence in the OUTER transaction, after the savepoint was rolled back and released. (A first
+// delivery is stored not pending, so a rejected one needs no retire.)
 constexpr const char* kCensusOuterClear =
     "UPDATE guaranteed_state_store.guaranteed_state_events SET projection_pending = false "
     "WHERE event_id = $1";
@@ -1437,6 +1456,7 @@ constexpr const char* kCensusMarkPending =
     "WHERE event_id = $1";
 
 #undef YUZU_CENSUS_SEEN_DISAGREES_
+#undef YUZU_CENSUS_SEEN_MAX_SEQ_
 #undef YUZU_CENSUS_APPLY_
 
 constexpr const char* kCensusRuleFkName = "guardian_agent_rule_status_rule_fk";
@@ -1593,11 +1613,16 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
         out = !PQgetisnull(up.get(), 0, 0) && std::string_view(PQgetvalue(up.get(), 0, 0)) == "t"
                   ? CensusOutcome::Applied
                   : CensusOutcome::RefusedFlagged;
-    pg::PgResult clear = pg::exec_params(
-        conn, kCensusClear,
-        std::vector<std::string>{row.agent_id, row.rule_id, row.event_id, seen_arr});
-    if (clear.status() != PGRES_COMMAND_OK)
-        return fail(clear);
+    // The clear retires pending rows. A first delivery or batch row is stored not pending, so with
+    // nothing seen there is nothing for it to retire; only a repair (whose own row is pending) or
+    // a projection that saw other pending rows needs it.
+    if (source == ProjectionSource::Repair || !seen.empty()) {
+        pg::PgResult clear = pg::exec_params(
+            conn, kCensusClear,
+            std::vector<std::string>{row.agent_id, row.rule_id, row.event_id, seen_arr});
+        if (clear.status() != PGRES_COMMAND_OK)
+            return fail(clear);
+    }
     return control("RELEASE SAVEPOINT census_upsert") ? out : CensusOutcome::Abandoned;
 }
 
@@ -1874,8 +1899,6 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
             if (projected == CensusOutcome::Abandoned)
                 return std::unexpected(std::string("census savepoint failed: ") +
                                        PQerrorMessage(conn));
-            if (!txn_healthy(conn))
-                return std::unexpected("transaction aborted before commit");
         }
         // DEX projection — same degrade-don't-destroy contract as insert_event,
         // under its own SAVEPOINT (Postgres aborts on any failed statement).
@@ -1906,6 +1929,11 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
         }
     }
 
+    // After the whole loop, not after each projection: the DEX savepoint block inside it ignores
+    // the results of its own ROLLBACK TO / RELEASE, so only a check right before COMMIT can see an
+    // aborted transaction that COMMIT would otherwise report as success.
+    if (!txn_healthy(conn))
+        return std::unexpected("transaction aborted before commit");
     if (!txn.commit())
         return std::unexpected(std::string("COMMIT failed: ") + PQerrorMessage(conn));
     events_written_.fetch_add(rows.size(), std::memory_order_relaxed);

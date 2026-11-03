@@ -297,7 +297,7 @@ TEST_CASE("census ordering: an adopted v4 object not as this version creates it 
     cap.stop();
     CHECK_FALSE(store.is_open());
     CHECK(cap.text().find("unsupported schema, refusing to start") != std::string::npos);
-    CHECK(cap.text().find("v4") != std::string::npos);
+    CHECK(cap.text().find("v4: object not as this version creates it") != std::string::npos);
 }
 
 TEST_CASE("census ordering: a hand-broken object makes the v4 migration refuse and not stamp",
@@ -395,7 +395,8 @@ struct BarrierHold {
     }
 };
 
-// Owns the writer threads of a concurrency test. On scope exit (including a failed REQUIRE) it
+// Owns the writer threads of a concurrency test. RULE: every local a thread touches (result slots,
+// flags, strings) is declared BEFORE the owner so it outlives the join. On scope exit (including a failed REQUIRE) it
 // releases the barrier, joins every thread, and only then clears the store's barrier, so a failure
 // is a red test and never std::terminate on a joinable thread or a barrier pointing at dead locals.
 class WriterThreads {
@@ -697,11 +698,13 @@ TEST_CASE("census ordering: two repairs of one pair lock in one order and never 
     REQUIRE(pending_count(db.dsn()) == "2");
     const auto failures_before = store.census_proj_failures_total();
 
+    // Every local a writer thread touches is declared BEFORE `writers`, so on unwinding the owner
+    // joins the threads before those locals are destroyed.
+    EventInsertResult a_res;
+    EventInsertResult b_res;
     BarrierHold hold;
     store.set_census_lock_barrier_for_test([&] { hold.hit(); });
     WriterThreads writers(store, &hold);
-    EventInsertResult a_res;
-    EventInsertResult b_res;
     writers.start([&] { a_res = store.insert_event_classified(second); });
     REQUIRE(hold.reached_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
     writers.start([&] { b_res = store.insert_event_classified(first); });
@@ -830,11 +833,11 @@ TEST_CASE("census ordering: delete_rule waits on a repair that holds the pair's 
     remove_census_fail(db.dsn());
     const auto failures_before = store.census_proj_failures_total();
 
+    EventInsertResult repair_res;
+    std::expected<void, std::string> del_res;
     BarrierHold hold;
     store.set_census_lock_barrier_for_test([&] { hold.hit(); });
     WriterThreads writers(store, &hold);
-    EventInsertResult repair_res;
-    std::expected<void, std::string> del_res;
     writers.start([&] { repair_res = store.insert_event_classified(p); });
     REQUIRE(hold.reached_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
     writers.start([&] { del_res = store.delete_rule("r1"); });
@@ -887,8 +890,11 @@ TEST_CASE("census ordering: a pending event that disagrees with a verdict insert
                            ".guardian_agent_rule_status FOR EACH ROW EXECUTE FUNCTION " + kSchema +
                            ".yuzu_test_hold_w()");
 
-    // Declared BEFORE the lock holder so the holder (and its advisory locks) is destroyed first on
-    // a failure, which lets the parked writers finish before they are joined.
+    // Declaration order is the safety argument: the result slots first (the threads write them),
+    // then the owner, then the lock holder, so on a failure the holder (and its advisory locks) is
+    // destroyed first, the parked writers finish, and only then are they joined.
+    EventInsertResult x_res;
+    EventInsertResult w_res;
     WriterThreads writers(store, nullptr);
     pg::PgConn holder{PQconnectdb(db.dsn().c_str())};
     REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
@@ -901,8 +907,6 @@ TEST_CASE("census ordering: a pending event that disagrees with a verdict insert
         REQUIRE(r.ok());
     };
 
-    EventInsertResult x_res;
-    EventInsertResult w_res;
     writers.start([&] { x_res = store.insert_event_classified(ev("ux", "r1", "a", kCompliant, kBase + 100)); });
     REQUIRE(wait_for_lock_waiters(db.dsn(), 1, "advisory")); // X holds seq 1, parked in its INSERT
     writers.start([&] { w_res = store.insert_event_classified(ev("uw", "r1", "a", kDrifted, kBase + 200)); });
@@ -1168,4 +1172,123 @@ TEST_CASE("census ordering: the uncertain-rule count honours the caller's scope"
     GuaranteedStateStore closed(dead);
     CHECK(closed.uncertain_rule_count(Scope{std::vector<std::string>{}}).value() == 0);
     CHECK_FALSE(closed.uncertain_rule_count(Scope{}).has_value());
+}
+
+TEST_CASE("census ordering: a refused later arrival is remembered when an earlier one applies afterwards",
+          "[pg][guaranteed_state_store][db][census][ordering][lockorder]") {
+    // Three overlapping first deliveries to one new pair (governance Gate 8, UP-13).
+    //   W1 key 200 (seq 1), W0 key 300 (seq 2), W2 key 100 (seq 3).
+    // They are processed in the order W1, W2, W0: W2 (the latest arrival) is refused and flagged
+    // against W1's row, then W0 applies with a key above the high-water mark. Delivered in arrival
+    // order the same events leave the row flagged, because W2 arrived after the winner with a lower
+    // key; the key high-water mark alone forgets that, so the row also tracks the highest arrival
+    // sequence processed.
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+
+    REQUIRE(store.insert_event_classified(ev("w1", "r1", "a", kCompliant, kBase + 200)).outcome ==
+            EventInsertOutcome::Inserted); // seq 1, applied
+
+    EventInsertResult w0_res; // before the owner: the thread writes it
+    BarrierHold hold;
+    store.set_census_lock_barrier_for_test([&] { hold.hit(); });
+    WriterThreads writers(store, &hold);
+    writers.start([&] { w0_res = store.insert_event_classified(ev("w0", "r1", "a", kDrifted, kBase + 300)); });
+    REQUIRE(hold.reached_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    // W0 (seq 2) is parked right after its pair lock. W2 (seq 3) now runs to completion: refused.
+    REQUIRE(store.insert_event_classified(ev("w2", "r1", "a", kErrored, kBase + 100)).outcome ==
+            EventInsertOutcome::Inserted);
+    CHECK(census(db.dsn(), "a", "r1") ==
+          "compliant|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|true");
+    writers.join_all(); // W0 applies
+
+    CHECK(w0_res.outcome == EventInsertOutcome::Inserted);
+    CHECK(census(db.dsn(), "a", "r1") ==
+          "drifted|" + key_str(kBase + 300) + "|" + key_str(kBase + 300) + "|true");
+    CHECK(pending_count(db.dsn()) == "0");
+}
+
+TEST_CASE("census ordering: a repair of a rejected event retires its evidence in the outer transaction",
+          "[pg][guaranteed_state_store][db][census][ordering][k]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    install_census_fail(db.dsn(), "true");
+    const auto p = ev("p", "r1", "a", kDrifted, kBase);
+    REQUIRE(store.insert_event_classified(p).outcome == EventInsertOutcome::Inserted);
+    remove_census_fail(db.dsn());
+    REQUIRE(pending_count(db.dsn()) == "1");
+    // The rule disappears out from under the pending event (the F-13 class), so the repair's census
+    // write meets the foreign key (23503) and the event's evidence is retired, not left to repeat.
+    exec_sql(db.dsn(), std::string("DELETE FROM ") + kSchema +
+                           ".guaranteed_state_rules WHERE rule_id = 'r1'");
+    CHECK(store.insert_event_classified(p).outcome == EventInsertOutcome::Redelivered);
+    CHECK(pending_count(db.dsn()) == "0");
+    CHECK(metrics.counter("yuzu_server_guardian_census_projection_total",
+                          {{"source", "repair"}, {"outcome", "rejected"}}).value() == 1);
+    CHECK(store.event_count() == 1); // the audit row stays
+}
+
+TEST_CASE("census ordering: a seen event retired by a flagged apply is still remembered by a later apply",
+          "[pg][guaranteed_state_store][db][census][ordering][lockorder]") {
+    // Governance Gate 8 (randomised schedule): W1 (key 250, seq 1) is held inside its INSERT; W2
+    // (key 300, seq 2) takes its pair lock and parks; a pending event E (key 100, seq 3) is stored.
+    // W1 then sees E, applies flagged and retires E (E is dominated); W2 applies with a key above
+    // the high-water mark. Delivered in arrival order E arrives last with the lowest key, so the
+    // row must stay flagged: the retired event's arrival sequence is kept in `seq_hwm`.
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    exec_sql(db.dsn(),
+             std::string("CREATE FUNCTION ") + kSchema +
+                 ".yuzu_test_hold_x() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                 "IF NEW.event_id = 'w1' THEN PERFORM pg_advisory_lock(91011); "
+                 "PERFORM pg_advisory_unlock(91011); END IF; RETURN NEW; END $$");
+    exec_sql(db.dsn(), std::string("CREATE TRIGGER yuzu_test_hold_x BEFORE INSERT ON ") + kSchema +
+                           ".guaranteed_state_events FOR EACH ROW EXECUTE FUNCTION " + kSchema +
+                           ".yuzu_test_hold_x()");
+
+    EventInsertResult w1_res;
+    EventInsertResult w2_res;
+    BarrierHold hold;
+    store.set_census_lock_barrier_for_test([&] { hold.hit(); });
+    WriterThreads writers(store, &hold);
+    pg::PgConn holder{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    {
+        pg::PgResult r{PQexec(holder.get(), "SELECT pg_advisory_lock(91011)")};
+        REQUIRE(r.ok());
+    }
+    writers.start([&] { w1_res = store.insert_event_classified(ev("w1", "r1", "a", kCompliant, kBase + 250)); });
+    REQUIRE(wait_for_lock_waiters(db.dsn(), 1, "advisory")); // W1 holds seq 1, parked in its INSERT
+    writers.start([&] { w2_res = store.insert_event_classified(ev("w2", "r1", "a", kDrifted, kBase + 300)); });
+    REQUIRE(hold.reached_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready); // W2: seq 2, parked
+    exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                           ".guaranteed_state_events (event_id, rule_id, agent_id, event_type, "
+                           "severity, timestamp, proj_key, projection_pending) VALUES ('we', 'r1', "
+                           "'a', 'guard.unhealthy', 'high', 't', " + key_str(kBase + 100) + ", true)");
+    {
+        pg::PgResult r{PQexec(holder.get(), "SELECT pg_advisory_unlock(91011)")};
+        REQUIRE(r.ok());
+    }
+    // W1 now runs to completion against E; poll until its census row exists, then release W2.
+    for (int i = 0; i < 400 && census(db.dsn(), "a", "r1").empty(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    REQUIRE_FALSE(census(db.dsn(), "a", "r1").empty());
+    writers.join_all();
+
+    CHECK(w1_res.outcome == EventInsertOutcome::Inserted);
+    CHECK(w2_res.outcome == EventInsertOutcome::Inserted);
+    CHECK(census(db.dsn(), "a", "r1") ==
+          "drifted|" + key_str(kBase + 300) + "|" + key_str(kBase + 300) + "|true");
+    CHECK(pending_count(db.dsn()) == "0");
 }

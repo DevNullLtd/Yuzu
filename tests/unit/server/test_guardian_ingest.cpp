@@ -742,13 +742,15 @@ TEST_CASE("guardian ingest: an event with an empty rule_id is refused, not store
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
 
+    yuzu::MetricsRegistry metrics;
     yuzu::test::LogCapture cap(spdlog::level::warn);
     ingest_guardian_response(store, "agent-A", make_rule_event("evt-empty-rule", ""), nullptr,
-                             nullptr);
+                             nullptr, &metrics);
     cap.stop();
     CHECK(store.event_count() == 0);
     CHECK(store.events_written_total() == 0);
     CHECK(cap.text().find("empty rule_id") != std::string::npos);
+    CHECK(metrics.counter(yuzu::server::detail::kGuardianEventsRejectedMetric, {{"reason", "empty_rule_id"}}).value() == 1);
 
     // A well-formed rule id still goes in, so the refusal is the empty id, not the path.
     ingest_guardian_response(store, "agent-A", make_rule_event("evt-ok", "rule-1"), nullptr,

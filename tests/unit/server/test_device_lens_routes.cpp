@@ -566,4 +566,5 @@ TEST_CASE("DeviceLensRoutes guardian lens: an order-uncertain guard keeps the ti
     CHECK(r->body.find("100%") != std::string::npos);
     CHECK(r->body.find("class=\"n good\"") == std::string::npos);
     CHECK(r->body.find("1 with uncertain ordering or an unreflected verdict") != std::string::npos);
+    CHECK(r->body.find("&middot; ordering uncertain") != std::string::npos); // the row marker
 }

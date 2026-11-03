@@ -2425,3 +2425,53 @@ TEST_CASE("guardian overview: 'All compliant' is never shown over an uncertain p
               std::string::npos);
     }
 }
+
+TEST_CASE("every compliance figure shows an uncertain pair beside it (#5690)",
+          "[pg][guardian_routes][ordering]") {
+    Harness h;
+    auto rule = make_rule_with_spark("svc1", "ServiceGuard", "service-status-change");
+    h.seed_rule(rule);
+    deploy_via_baseline(h, "svc1");
+    h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"},)"
+                    R"({"agent_id":"lin-2","hostname":"otherbox","os":"linux"}])";
+    // lin-1: a newer verdict, then an older one arriving later (refused, flagged). lin-2: clean.
+    h.seed_status("a1", "lin-1", "svc1", "guard.compliant", "2026-09-01T10:00:00Z");
+    h.seed_status("a2", "lin-1", "svc1", "drift.detected", "2026-09-01T09:00:00Z");
+    h.seed_status("b1", "lin-2", "svc1", "guard.compliant", "2026-09-01T10:00:00Z");
+    const std::string phrase = "1 pair with uncertain ordering or an unreflected verdict";
+
+    auto count_of = [&](const std::string& body) {
+        std::size_t count = 0;
+        for (std::size_t pos = body.find(phrase); pos != std::string::npos;
+             pos = body.find(phrase, pos + 1))
+            ++count;
+        return count;
+    };
+    SECTION("the overview census hint") {
+        auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+        REQUIRE(res != nullptr);
+        CHECK(count_of(res->body) >= 1);
+    }
+    SECTION("the per-guard row on the guard view") {
+        auto res = h.sink.Get("/fragments/guardian/status?view=guard");
+        REQUIRE(res != nullptr);
+        CHECK(count_of(res->body) >= 1);
+    }
+    SECTION("the per-baseline row on the baseline view") {
+        auto res = h.sink.Get("/fragments/guardian/status?view=baseline");
+        REQUIRE(res != nullptr);
+        CHECK(count_of(res->body) >= 1);
+    }
+    SECTION("the guard page: a note under the hero and a marker on the device row") {
+        auto res = h.sink.Get("/fragments/guardian/guard/svc1/page");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find(phrase + ": each device is counted") != std::string::npos);
+        CHECK(res->body.find("&middot; ordering uncertain") != std::string::npos);
+    }
+    SECTION("the baseline page: a note under the hero and a count on the guard row") {
+        auto res = h.sink.Get("/fragments/guardian/baseline/bl1/page");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find(phrase + ": the figures above") != std::string::npos);
+        CHECK(res->body.find("1 uncertain") != std::string::npos);
+    }
+}

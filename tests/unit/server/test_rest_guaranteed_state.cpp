@@ -6115,3 +6115,29 @@ TEST_CASE("REST guaranteed-state: order_uncertain and projection_pending on the 
     h.seed_status("b4", "WS-2", "r2", "guard.compliant", "2026-06-20T10:05:00Z");
     CHECK(get("/api/v1/guaranteed-state/status", true)["data"]["uncertain_rules"].get<int>() == 1);
 }
+
+TEST_CASE("REST gs.rules: a store fault on delete answers 404 but is audited as failure (#5690)",
+          "[pg][rest][guaranteed_state][ordering]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    // A trigger that refuses the rule delete makes the store return "delete failed: ...", which is
+    // not the "not found" refusal the audit classifier maps to `denied`.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(),
+            "CREATE FUNCTION guaranteed_state_store.yuzu_test_refuse_delete() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced delete failure' USING ERRCODE = "
+            "'XX000'; END $$; "
+            "CREATE TRIGGER yuzu_test_refuse_delete BEFORE DELETE ON "
+            "guaranteed_state_store.guaranteed_state_rules FOR EACH ROW EXECUTE FUNCTION "
+            "guaranteed_state_store.yuzu_test_refuse_delete()")};
+        REQUIRE(r.ok());
+    }
+    auto del = h.sink.Delete("/api/v1/guaranteed-state/rules/r1");
+    REQUIRE(del);
+    CHECK(del->status == 404); // documented: any delete failure answers 404
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "failure");
+}

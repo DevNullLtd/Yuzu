@@ -6718,6 +6718,47 @@ TEST_CASE("MCP Guardian: delete_guardian_rule removes a rule; a second delete "
     CHECK(ts.audit_log.back() == "guaranteed_state.rule.delete|denied");
 }
 
+TEST_CASE("MCP Guardian: a store fault on delete_guardian_rule is audited as failure, not denied (#5690)",
+          "[pg][mcp][integration][guardian][ordering]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(),
+            "CREATE FUNCTION guaranteed_state_store.yuzu_test_refuse_delete() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced delete failure' USING ERRCODE = "
+            "'XX000'; END $$; "
+            "CREATE TRIGGER yuzu_test_refuse_delete BEFORE DELETE ON "
+            "guaranteed_state_store.guaranteed_state_rules FOR EACH ROW EXECUTE FUNCTION "
+            "guaranteed_state_store.yuzu_test_refuse_delete()")};
+        REQUIRE(r.ok());
+    }
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":208,"params":{"name":"delete_guardian_rule",)"
+        R"("arguments":{"rule_id":"r1"}}})");
+    REQUIRE(mint);
+    const std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":208,"params":{"name":"delete_guardian_rule",)"
+        R"("arguments":{"rule_id":"r1","approval_id":")" +
+        approval_id + R"("}}})");
+    REQUIRE(res);
+    REQUIRE(nlohmann::json::parse(res->body).contains("error"));
+    CHECK(ts.audit_log.back() == "guaranteed_state.rule.delete|failure");
+}
+
 TEST_CASE("MCP Guardian: delete_guardian_rule denies an MCP-tier-less caller - no "
           "MFA step-up and no approval gate would otherwise fire for it",
           "[mcp][integration][guardian][security]") {

@@ -792,13 +792,14 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     // two reads) is simply never looked up, so the fleet total stays consistent with the
     // By-Guard table; and because the rollup is the status table (not the prunable event
     // log), a quiet guard does not vanish from "needs attention" once its events age out.
-    int64_t cc_ok = 0, cc_drift = 0, cc_err = 0, cc_unk = 0, cc_notimpl = 0;
+    int64_t cc_ok = 0, cc_drift = 0, cc_err = 0, cc_unk = 0, cc_notimpl = 0, cc_uncertain = 0;
     int guards_drifting = 0, drift_instances = 0, guards_errored = 0;
     for (const auto& r : rules) {
         auto it = by_rule.find(r.rule_id);
         if (it == by_rule.end()) continue;
         const StateRollup& c = it->second;
         cc_ok += c.ok; cc_drift += c.drift; cc_err += c.err; cc_unk += c.unk; cc_notimpl += c.notimpl;
+        cc_uncertain += c.uncertain;
         if (c.drift > 0) { ++guards_drifting; drift_instances += static_cast<int>(c.drift); }
         if (c.err > 0) ++guards_errored;
     }
@@ -889,8 +890,8 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     html += "</div>";
 
     // ── Compliance census ── proportion bar + legend (NOT a donut), from the
-    // per-(agent,rule) status feed. Framing: figures count each pair at the greatest ordered verdict that reached the census, with uncertain or pending pairs shown beside them. Figures reflect
-    // each Guard's last reported state, not a live probe.
+    // per-(agent,rule) status feed. Figures count each pair at the greatest ordered verdict that
+    // reached the census, with uncertain or pending pairs flagged; they are not a live probe.
     html += sech("Compliance &mdash; greatest ordered verdict projected (uncertain or pending pairs are flagged)");
     if (cc_total == 0) {
         html += "<div class=\"gs-hint\">No device "
@@ -928,7 +929,8 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
         html += "</div>";
         html += "<div class=\"gs-hint\">" +
                 std::to_string(cc_total) + " device-guard checks across " + std::to_string(agents) +
-                " online agent(s), as of each Guard's last reported change." +
+                " online agent(s), at the greatest ordered verdict each pair reported." +
+                (cc_uncertain > 0 ? " " + uncertain_phrase(cc_uncertain) + "." : "") +
                 (cc_notimpl > 0 ? " The compliant share is of all targeted device-guard pairs, "
                                   "including the unenforceable ones."
                                 : "") +

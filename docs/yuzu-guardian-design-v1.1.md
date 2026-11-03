@@ -1198,8 +1198,8 @@ CREATE TABLE guardian_agent_rule_status (
     rule_id TEXT NOT NULL REFERENCES guaranteed_state_rules(rule_id) ON DELETE CASCADE,
     state TEXT NOT NULL, updated_at TEXT NOT NULL,
     -- schema v4 (#5690): the ordering tuple of the applied event, the high-water mark of
-    -- the keys seen, and the sticky flag. NULL key_ns / ingest_seq = a row written before v4.
-    key_ns BIGINT, ingest_seq BIGINT, ts_hwm BIGINT,
+    -- the keys seen, the highest arrival sequence processed (seq_hwm, including events retired as seen), and the sticky flag. NULL key_ns / ingest_seq = a row written before v4.
+    key_ns BIGINT, ingest_seq BIGINT, ts_hwm BIGINT, seq_hwm BIGINT,
     order_uncertain BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (agent_id, rule_id)
 );

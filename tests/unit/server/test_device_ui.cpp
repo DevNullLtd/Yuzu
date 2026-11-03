@@ -318,5 +318,7 @@ TEST_CASE("device Guardian lens: the tile is never 'good' over an uncertain or p
         CHECK(bad.find("class=\"n good\"") == std::string::npos); // but the tone is not clean
         CHECK(bad.find("class=\"n warn\"") != std::string::npos);
         CHECK(bad.find("1 with uncertain ordering or an unreflected verdict") != std::string::npos);
+        CHECK(bad.find("&middot; ordering uncertain") != std::string::npos); // the row marker
     }
+    CHECK(good.find("ordering uncertain") == std::string::npos);
 }
