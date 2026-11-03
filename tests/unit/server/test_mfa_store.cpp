@@ -454,6 +454,53 @@ TEST_CASE_METHOD(MfaFixture,
 }
 
 TEST_CASE_METHOD(MfaFixture,
+                 "factor-bound regenerate: a CSPRNG failure leaves the codes and the generation "
+                 "untouched, and a stale generation still wins over the mint (#6079, #4763)",
+                 "[pg][mfa][store][mfa_binding]") {
+    auto init = db->mfa_init_enrollment("alice", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto original = db->mfa_verify_enrollment("alice", code_for_now(init->secret_base32),
+                                              std::nullopt);
+    REQUIRE(original.has_value());
+    const std::int64_t gen = original->factor_gen;
+    REQUIRE(gen > 0);
+
+    // The route passes the generation its step-up check admitted. A CSPRNG fault with that
+    // real generation must roll back: same ten codes, same generation.
+    auto failed = [&] {
+        ForcedCsprngFailure forced;
+        auto r = db->mfa_regenerate_recovery_codes("alice", gen);
+        REQUIRE_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
+        return r;
+    }();
+    REQUIRE_FALSE(failed.has_value());
+    REQUIRE(failed.error() == AuthDBError::WriteFailed);
+    auto s = db->mfa_status("alice");
+    REQUIRE(s.has_value());
+    REQUIRE(s->recovery_codes_remaining == 10);
+    REQUIRE(s->factor_gen == gen);
+
+    // A stale generation is refused BEFORE any mint: the armed failure is not consumed, and
+    // the error is FactorChanged, not WriteFailed.
+    {
+        ForcedCsprngFailure forced;
+        auto stale = db->mfa_regenerate_recovery_codes("alice", gen - 1);
+        REQUIRE_FALSE(stale.has_value());
+        REQUIRE(stale.error() == AuthDBError::FactorChanged);
+        REQUIRE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
+    }
+
+    // Healthy CSPRNG, matching generation: the regenerate succeeds and does not move the
+    // generation (only a change of mfa_enrolled_at does).
+    auto ok = db->mfa_regenerate_recovery_codes("alice", gen);
+    REQUIRE(ok.has_value());
+    REQUIRE(ok->size() == 10);
+    auto after = db->mfa_status("alice");
+    REQUIRE(after.has_value());
+    REQUIRE(after->factor_gen == gen);
+}
+
+TEST_CASE_METHOD(MfaFixture,
                  "mfa_verify_enrollment rolls the enrol back on a recovery-code CSPRNG failure (#4763)",
                  "[pg][mfa][store]") {
     // The enrolling UPDATE and the recovery-code mint share ONE transaction. A CSPRNG
