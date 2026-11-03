@@ -1452,7 +1452,7 @@ account policy)"* — this ships **both** halves.
   (`startup_failed_`, non-zero exit, `[SSO] Refusing to start` in the log) when
   **no** provider is up. In practice this is the SAML leg: an IdP certificate
   that is unreadable, over 64 KiB, not a PEM certificate, or of a key type
-  xmlsec cannot verify with, a bad or non-RSA SP signing
+  xmlsec cannot verify with (for example Ed25519), a bad or non-RSA SP signing
   key, would otherwise leave a sole SAML provider that looks enabled while every
   assertion fails. The cause is the preceding `error` log line. The certificate
   is judged by the **verifier's own loader**: `SamlProvider` loads the pinned
@@ -1463,7 +1463,7 @@ account policy)"* — this ships **both** halves.
   placeholder certificate strings). An earlier draft parsed the file with a
   different loader and disagreed with the verifier in both directions
   (`BEGIN TRUSTED CERTIFICATE` rejected, Ed25519 accepted), so the single shared
-  helper is load-bearing: do not add a second certificate probe.
+  helper is load-bearing: do not add a second certificate probe. The helper also refuses a key type outside the verifier's algorithm allowlist (RSA and EC key data), so a key that xmlsec can adopt but the verifier would refuse (Ed25519 and Ed448 on xmlsec 1.3.12) is reported broken at start-up, not at the first sign-in.
 
   Deliberate limits of that second check:
   - **Local only — no network.** OIDC discovery and signing-key fetches stay
@@ -2278,7 +2278,7 @@ its in-process PKCE state and its browser-binding digest.
 Update `--saml-idp-cert` and **restart the server** — there is no hot-reload
 for the IdP cert in this release. **Validate the replacement file first** (a PEM
 certificate, at most 64 KiB, with a key type the SAML verifier can load; RSA
-works; the start-up check refuses a key type it cannot load): on an
+works, Ed25519 does not): on an
 `--auth-mode=sso-only` server whose only SSO provider is SAML, an unloadable
 certificate now stops the whole server at start-up (#4160, "Boot guard" above).
 

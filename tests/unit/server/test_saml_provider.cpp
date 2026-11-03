@@ -1141,23 +1141,25 @@ static std::string generate_rsa_pss_key_pem() {
     return std::string(bptr->data, bptr->length);
 }
 
-enum class CertKeyKind { Rsa, Ed25519, MlDsa65 };
+enum class CertKeyKind { Rsa, EcP256, Ed25519, Ed448 };
 
 /// A fresh self-signed certificate PEM over a new key of `kind`. `trusted`
 /// writes OpenSSL's "BEGIN TRUSTED CERTIFICATE" form (PEM_write_bio_X509_AUX),
 /// which xmlsec's loader (PEM_read_bio_X509_AUX) accepts but a plain
 /// PEM_read_bio_X509 rejects (#4160 false-reject regression input).
 static std::string make_self_signed_cert_pem(CertKeyKind kind, bool trusted) {
-    EVP_PKEY_CTX* ctx =
-        kind == CertKeyKind::MlDsa65
-            ? EVP_PKEY_CTX_new_from_name(nullptr, "ML-DSA-65", nullptr)
-            : EVP_PKEY_CTX_new_id(kind == CertKeyKind::Rsa ? EVP_PKEY_RSA : EVP_PKEY_ED25519,
-                                  nullptr);
+    const int nid = kind == CertKeyKind::Rsa       ? EVP_PKEY_RSA
+                    : kind == CertKeyKind::EcP256  ? EVP_PKEY_EC
+                    : kind == CertKeyKind::Ed25519 ? EVP_PKEY_ED25519
+                                                   : EVP_PKEY_ED448;
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(nid, nullptr);
     REQUIRE(ctx != nullptr);
     struct CtxGuard { EVP_PKEY_CTX* c; ~CtxGuard() { if (c) EVP_PKEY_CTX_free(c); } } cg{ctx};
     REQUIRE(EVP_PKEY_keygen_init(ctx) == 1);
     if (kind == CertKeyKind::Rsa)
         REQUIRE(EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) == 1);
+    if (kind == CertKeyKind::EcP256)
+        REQUIRE(EVP_PKEY_CTX_set_ec_paramgen_curve_nid(ctx, NID_X9_62_prime256v1) == 1);
     EVP_PKEY* pkey = nullptr;
     REQUIRE(EVP_PKEY_keygen(ctx, &pkey) == 1);
     REQUIRE(pkey != nullptr);
@@ -1176,7 +1178,8 @@ static std::string make_self_signed_cert_pem(CertKeyKind kind, bool trusted) {
                                reinterpret_cast<const unsigned char*>("Probe IdP"), -1, -1, 0);
     X509_set_issuer_name(cert, name);
     // The Edwards-curve kinds sign without a separate digest (md = nullptr).
-    REQUIRE(X509_sign(cert, pkey, kind == CertKeyKind::Rsa ? EVP_sha256() : nullptr) > 0);
+    const bool needs_md = kind == CertKeyKind::Rsa || kind == CertKeyKind::EcP256;
+    REQUIRE(X509_sign(cert, pkey, needs_md ? EVP_sha256() : nullptr) > 0);
 
     BIO* bio = BIO_new(BIO_s_mem());
     REQUIRE(bio != nullptr);
@@ -1225,21 +1228,33 @@ TEST_CASE("SAML: IdP cert probe — a TRUSTED CERTIFICATE PEM is accepted (as th
     CHECK_FALSE(p.idp_cert_configured_but_broken());
 }
 
-// NOTE: this asserts a NEGATIVE capability of the pinned xmlsec build: that it cannot adopt an
-// ML-DSA-65 key (measured on xmlsec 1.3.12 with OpenSSL 3.6.5). It was an Ed25519 certificate
-// while the baseline carried xmlsec 1.3.9; xmlsec 1.3.12 adopts Ed25519 and Ed448 keys, so the
-// case moved. If a future xmlsec bump gains ML-DSA, this case will fail loudly: pick another
-// certificate key type the loader still refuses, or delete the case. That is not a bug in the
-// probe, which always agrees with whatever the verifier can load.
-TEST_CASE("SAML: IdP cert probe — a certificate with a key type xmlsec cannot adopt is reported broken",
-          "[saml][4160]") {
+// NOTE: the probe refuses a key type the verifier's allowlist does not enable (RSA and EC key
+// data only, validate_response step 10.5), whatever the pinned xmlsec build can load. xmlsec
+// 1.3.9 could not adopt an Edwards-curve key at all; 1.3.12 adopts Ed25519 and Ed448 keys, and
+// before load_idp_key checked the key data type the probe reported such a certificate usable
+// while every assertion failed verification. These cases fail if that check is lost.
+TEST_CASE("SAML: IdP cert probe — an Ed25519 certificate is reported broken", "[saml][4160]") {
     // Regression: it parses as X.509 but xmlsec cannot adopt its key, so every
     // assertion would fail while the provider still looked enabled.
-    SamlProvider p{config_with_idp_cert(make_self_signed_cert_pem(CertKeyKind::MlDsa65, false))};
+    SamlProvider p{config_with_idp_cert(make_self_signed_cert_pem(CertKeyKind::Ed25519, false))};
     CHECK(p.idp_cert_configured_but_broken());
     CHECK_FALSE(p.idp_cert_init_error().empty());
     CHECK(p.idp_cert_init_error().find("BEGIN") == std::string::npos); // never echoes PEM bytes
     // Deliberately a SEPARATE flag: is_enabled() stays the config-presence test.
+    CHECK(p.is_enabled());
+}
+
+TEST_CASE("SAML: IdP cert probe — an Ed448 certificate is reported broken", "[saml][4160]") {
+    SamlProvider p{config_with_idp_cert(make_self_signed_cert_pem(CertKeyKind::Ed448, false))};
+    CHECK(p.idp_cert_configured_but_broken());
+    CHECK_FALSE(p.idp_cert_init_error().empty());
+    CHECK(p.is_enabled());
+}
+
+TEST_CASE("SAML: IdP cert probe — an EC P-256 certificate is usable", "[saml][4160]") {
+    SamlProvider p{config_with_idp_cert(make_self_signed_cert_pem(CertKeyKind::EcP256, false))};
+    CHECK_FALSE(p.idp_cert_configured_but_broken());
+    CHECK(p.idp_cert_init_error().empty());
     CHECK(p.is_enabled());
 }
 
