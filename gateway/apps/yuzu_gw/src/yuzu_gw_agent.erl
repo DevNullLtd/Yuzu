@@ -839,10 +839,14 @@ code_change(_OldVsn, State, Data0, Extra) when is_tuple(Data0), element(1, Data0
                                                 tuple_size(Data0) =:= tuple_size(#data{}) - 1 ->
     %% A record from before OWNER-RESTART: no owner_key (never restarted).
     code_change(_OldVsn, State, erlang:append_element(Data0, undefined), Extra);
-code_change(_OldVsn, State, #data{hostname = Info} = Data, Extra) when is_map(Info) ->
+code_change(_OldVsn, State, Data0, Extra) when is_tuple(Data0), element(1, Data0) =:= data,
+                                                tuple_size(Data0) =:= tuple_size(#data{}),
+                                                is_map(element(#data.hostname, Data0)) ->
     %% A record from before Phase 1c (2026-10-26): the field held the whole
-    %% AgentInfo; only its hostname is kept.
-    code_change(_OldVsn, State, Data#data{hostname = hostname_of(Info)}, Extra);
+    %% AgentInfo; only its hostname is kept. Matched as a tuple, not as
+    %% #data{}, whose field is now typed binary().
+    Info = element(#data.hostname, Data0),
+    code_change(_OldVsn, State, setelement(#data.hostname, Data0, hostname_of(Info)), Extra);
 code_change(_OldVsn, State, #data{pending = Pending} = Data, _Extra) ->
     %% A pending entry from a version that did not keep the dispatched plugin
     %% is a 3-tuple; it completes with the plugin unknown.
