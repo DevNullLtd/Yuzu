@@ -641,9 +641,22 @@ static_assert(kMaxFacetValueBytes == 2048,
 #define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are not counted. 0 without information for a set filled before this release or by an older server replica, and 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed is above zero: at least one answering agent failed. Says nothing about agents that never answered; false without information for a set filled before this release or by an older server replica, and false for a failed set"})j"
 #define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j"
 static const ToolDef kTools[] = {
-    {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
+    {"list_agents",
+     "List the connected agents the caller may read, with hostname, OS, architecture, and "
+     "version. Read-only. Requires Infrastructure:Read. A live snapshot of the agents connected "
+     "to this server: an enrolled device that is offline is not listed, so use list_hardware_ci "
+     "for enrolled devices. Use get_agent_details for one device's tags and detail; each row's "
+     "agent_id feeds the per-agent tools. Confined: when the read is scoped to the devices the "
+     "caller may read, the result carries scope_basis authority_scoped, and the text content is "
+     "the object {agents, scope_basis} instead of the bare array of an unscoped read. It is a "
+     "status, set whether or not anything was hidden; the number of hidden devices is never "
+     "disclosed. Every row and count then describes only the devices you may read and is never "
+     "a statement about the fleet: an empty list means no connected agent you may read, not "
+     "that none exists. Without that field the list is every agent connected to this server. A "
+     "permission denial is terminal; an authorization-store failure is a retryable 503 with "
+     "retry_after_ms, never an empty list; an unwired server is a non-retryable internal error.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
+     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the list holds only devices within that scope. A status, set whether or not any device was hidden; never a count."}},"required":["agents"]})j"},
 
     // ── #4027 API-parity read twins: Echo process-tree / capture-sources device
     // pickers + retention-paused source list. Requires Infrastructure:Read,
@@ -655,7 +668,7 @@ static const ToolDef kTools[] = {
     // all three now read from an UNFILTERED source (all_devices_fn_ /
     // DashboardRoutes::gather_echo_retention_paused with
     // extra_scope_is_authoritative=true) exactly like list_agents' own
-    // agents_fn, with fleet_read_fn_'s gate.scope as the SOLE filter — no
+    // DeviceApi read, with fleet_read_fn_'s gate.scope as the SOLE filter — no
     // longer intersected with a separate per-operator-scoped provider. See
     // set_all_devices_fn's doc comment (mcp_server.hpp) for the full
     // rationale.
@@ -2664,6 +2677,15 @@ static const ToolDef kTools[] = {
      "revoked identity with a still-valid credential). TERMINAL and irreversible — never "
      "un-revocable; a false-positive response mints a successor principal instead (pass "
      "superseded_by on the successor's own creation, then reference this principal here). "
+     "Order matters: the credentials die first, then the identity. A retryable error "
+     "(retry_after_ms 5000) after the credentials died means the principal may still be active "
+     "with zero credentials; repeating the call finishes the revoke. Repeating is safe (a "
+     "revoke by a concurrent request that wins is reported as success; the repeat reports "
+     "credentials_revoked 0), but the supervised tier consumes the approval ticket before the "
+     "handler runs, so a retry after a retryable error needs a NEW approval ticket. Cap your "
+     "retries at a few attempts, then read the principal "
+     "with get_engine_principal and report its state to an administrator. The failure audit "
+     "row carries the number of credentials the failed call revoked. "
      "Mirrors DELETE /api/v1/engine-principals/{id}. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
@@ -2696,16 +2718,19 @@ static const ToolDef kTools[] = {
 
     {"rotate_engine_credential",
      "Rotate an engine principal's credential via the overlap-pair workflow (design doc §7): "
-     "mints a successor (both credentials valid during the overlap window, default+minimum 7 "
-     "days, floor 24h), auto-revokes the predecessor at window end. BOUNDED-IDEMPOTENT, not "
+     "mints a successor (both credentials valid during the overlap window, default 7 days, "
+     "minimum 1 day = 24h), auto-revokes the predecessor at window end. BOUNDED-IDEMPOTENT, not "
      "generally idempotent: a re-call within a short grace window after the original mint "
      "re-serves the SAME successor secret (each reveal — original or replay — is independently "
-     "audited as engine_principal.credential.reveal); once the grace window lapses, a re-call "
-     "errors and the caller must recover over REST (find the stuck successor with GET "
-     "/api/v1/engine-principals/{id}, revoke it with DELETE /api/v1/tokens/{token_id} as an "
-     "administrator, then rotate again), never an indefinite retry, and never revoke the "
-     "principal, which is terminal. If the read-back answers but finds no linked successor, the "
-     "secret is withheld with NO retry hint: inspect the principal's credentials first. Mirrors POST "
+     "audited as engine_principal.credential.reveal; a re-call is a new tool call, so under the "
+     "supervised tier it needs a NEW approval ticket, the one before it having been consumed "
+     "before the handler ran); once the grace window lapses, a re-call "
+     "errors and the caller must recover (find the stuck successor with GET "
+     "/api/v1/engine-principals/{id}, revoke it with DELETE /api/v1/tokens/{token_id} or the "
+     "revoke_api_token tool as an administrator, then rotate again), never an indefinite retry, "
+     "and never revoke the principal, which is terminal. If the read-back answers but finds "
+     "no linked successor, the secret is withheld with NO retry hint: inspect the principal's "
+     "credentials first. Mirrors POST "
      "/api/v1/engine-principals/{id}/credentials/rotate. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
@@ -2725,13 +2750,16 @@ static const ToolDef kTools[] = {
      "successor secret (#3015 proof of possession, SOC 2 CC6.3) — this call revokes the "
      "predecessor on success, so it must not proceed on token_id alone; a wrong secret is refused "
      "with a distinct error, checked only after every other admission gate has already passed. "
-     "Replaying a confirm after this rotation already resolved (a network-dropped success, a double-submit) returns a "
+     "Replaying a confirm after this rotation already resolved (a network-dropped success, a "
+     "double-submit) returns a "
      "TERMINAL already-confirmed/already-resolved error (not a retryable one) - do not retry; "
      "re-rotate if a fresh rotation is needed. If confirm instead reports 'rotation confirmation "
      "unavailable' (the initiator binding is lost or in dispute), do NOT call "
      "revoke_engine_principal - that is TERMINAL and destroys BOTH credentials plus the "
-     "principal itself; there is no MCP twin for per-credential revoke, so resolve this case via "
-     "REST: DELETE /api/v1/tokens/{token_id} on the SPECIFIC credential you no longer trust. "
+     "principal itself. Revoke the SPECIFIC credential you no longer trust instead, with "
+     "DELETE /api/v1/tokens/{token_id} or the revoke_api_token tool (approval-gated at the "
+     "supervised tier, ApiToken:Delete; only an effective administrator or the token's owner "
+     "can revoke it, anyone else gets 'token not found'). "
      "Note: the approval gate applies two independent "
      "checks before this logic runs. (1) An exact replay carrying an already-consumed "
      "approval_id is denied ('approval already used'; submit a new request for a fresh ticket). "
@@ -2764,9 +2792,9 @@ static const ToolDef kTools[] = {
 
     {"rotate_api_token",
      "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3): mints "
-     "a successor token alongside the still-valid predecessor for the overlap window (default+"
-     "minimum 7 days, floor 24h). BOUNDED-IDEMPOTENT, not generally idempotent: a re-call within "
-     "a short grace window after the original mint re-serves the SAME successor secret (each "
+     "a successor token alongside the still-valid predecessor for the overlap window (default "
+     "7 days, minimum 1 day = 24h). BOUNDED-IDEMPOTENT, not generally idempotent: a re-call "
+     "within a short grace window after the original mint re-serves the SAME successor secret (each "
      "reveal — original or replay — is independently audited as api_token.reveal); once the "
      "grace window lapses, a re-call errors and the caller must fall back to an explicit new "
      "token or the compromise runbook — never an indefinite retry. Self-service ONLY: the "
@@ -6956,7 +6984,9 @@ McpServer::HandlerFn McpServer::build_handler(
             if (prompt_name == "fleet_overview") {
                 prompt_text = "Give me a summary of the fleet: how many agents are connected, "
                               "OS breakdown (Windows/Linux/macOS), and overall compliance status. "
-                              "Use the list_agents and get_fleet_compliance tools.";
+                              "Use the list_agents and get_fleet_compliance tools. If "
+                              "list_agents returns scope_basis, report its counts as the agents "
+                              "in your scope, not as the fleet.";
             } else if (prompt_name == "investigate_agent") {
                 auto agent_id = param_str(params, "agent_id", "UNKNOWN");
                 prompt_text =
@@ -9122,23 +9152,36 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── list_agents ───────────────────────────────────────────────
             if (tool_name == "list_agents") {
-                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                // #4041: a fan-out read of per-agent data — fleet_read_fn_
+                // (require_fleet_read, the ADR-0017 admit-then-filter chokepoint)
+                // is the SOLE gate in this handler, no separate tier_allows/perm_fn
+                // call: the C8 gate above has already tier-checked this tool's pair,
+                // for every principal class. Mirrors the Echo device pickers below.
+                // Unwired fails closed.
+                if (!fleet_read_fn_) {
+                    spdlog::error("list_agents: fleet_read_fn_ unwired — misconfigured "
+                                  "call site; failing closed");
+                    mcp_audit("failure");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                if (!device_api) {
+                    // Wiring fault: never an empty list, which reads as an empty fleet
+                    // (mirrors get_agent_details and REST's 503).
+                    mcp_audit("failure");
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        error_response(id, kInternalError, "device registry unavailable"),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
-                // ADR-0031 WS-A4 wave 2: sourced from the DeviceApi seam instead of
-                // the raw registry snapshot — BYTE-IDENTICAL gate/scope posture:
-                // still tier_allows + perm_fn ONLY, no scope filter at all (the
-                // known World-A confinement gap, #4041 — unconfined by design,
-                // tracked separately; do not "fix" it here).
-                std::vector<DeviceListRow> devices =
-                    device_api ? device_api->list_devices() : std::vector<DeviceListRow>{};
                 JArr arr;
-                for (const auto& d : devices) {
+                for (const auto& d : device_api->list_devices()) {
+                    if (!authz::in_scope(gate.scope, d.agent_id))
+                        continue;
                     arr.add(JObj()
                                 .add("agent_id", d.agent_id)
                                 .add("hostname", d.hostname)
@@ -9146,12 +9189,20 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("arch", d.arch)
                                 .add("agent_version", d.agent_version));
                 }
+                // Confinement is reported as a STATUS, never a count of hidden devices
+                // (mcp_tools_hardware.cpp), in both channels so a client reading only
+                // the text sees it. A scoped caller was refused before #4041, so no
+                // text consumer changes shape; gate.scope == nullopt keeps the bare
+                // array of a global read, where nothing was dropped.
+                JObj structured;
+                structured.raw("agents", arr.str());
+                if (gate.scope)
+                    structured.add("scope_basis", "authority_scoped");
+                const std::string body = structured.str();
                 mcp_audit("success");
                 res.set_content(
-                    success_response(id,
-                                      tool_result_split(arr.str(),
-                                                         JObj().raw("agents", arr.str()).str(),
-                                                         kObjectOutputSchema)),
+                    success_response(id, tool_result_split(gate.scope ? body : arr.str(), body,
+                                                           kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -9183,7 +9234,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // both confirmed by direct source inspection): the two device pickers
             // now read the SAME shared builder their REST twin calls
             // (api-twin-recipe.md Rule 1) from an UNFILTERED registry snapshot
-            // (all_devices_fn_ — same source list_agents' agents_fn and
+            // (all_devices_fn_ — same registry source list_agents and
             // GET /api/v1/devices (#4033) use), with gate.scope as the SOLE
             // filter — not an intersection with echo_devices_fn_'s direct-
             // membership-only pre-filter (see set_all_devices_fn's doc comment
@@ -26564,42 +26615,83 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::size_t credentials_revoked = *credentials_revoked_res;
+                // #6716: from here on the credentials ARE revoked. A failure row below
+                // carries that count, because the repeat call (which the retry hint
+                // invites) revokes 0 and records no count, so it would otherwise
+                // appear in no audit row at all. Same detail as the REST route.
+                const std::string revoked_count_detail =
+                    "credentials_revoked=" + std::to_string(credentials_revoked);
+                const auto fail_after_credentials = [&](const std::string& why) {
+                    // `why` may be a multi-line store error: one line, so the count stays
+                    // on the same physical line as the rest of the detail.
+                    const std::string detail =
+                        flatten_audit_text(why) + "; " + revoked_count_detail;
+                    mcp_audit("failure", detail);
+                    (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
+                                   principal_id, detail);
+                };
                 auto revoked_res = engine_principal_store_->revoke(principal_id, superseded_by);
                 if (!revoked_res) {
-                    mcp_audit("failure", revoked_res.error());
-                    (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
-                                   principal_id, revoked_res.error());
+                    fail_after_credentials(revoked_res.error());
                     res.set_content(a4_error(kInternalError, revoked_res.error(),
                                              "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
                 const bool revoked = *revoked_res;
-                if (!revoked && already_revoked) {
-                    // Idempotent no-op: the principal was already terminal before
-                    // this call, so `revoke()` returning false here is expected,
-                    // not an error — proceed to the success response below (same
-                    // as the REST route falling through this case).
-                } else if (!revoked) {
-                    // Genuine store failure (authoritative posture, EnginePrincipalStore
-                    // doc comment): a lease/query failure returns false, never a
-                    // silent success. Distinct from "already revoked" above — this is
-                    // retryable/partial-revoke state, not a permanent client-input
-                    // error, so map it to a 503-class retryable error rather than
-                    // kInvalidParams (which would misleadingly read as "bad request,
-                    // don't retry").
-                    mcp_audit("failure", "engine principal store failed to revoke");
-                    (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
-                                   principal_id, "store_unavailable");
-                    res.set_content(a4_error(kInternalError,
-                                             "failed to revoke engine principal — try again",
-                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
+                bool revoked_by_concurrent_request = false;
+                if (!revoked && !already_revoked) {
+                    // EnginePrincipalStore::revoke returns false ONLY when its UPDATE
+                    // matched no active row (a lease or query failure is the error arm
+                    // above). With `already_revoked` false at the read above, the
+                    // reachable cause is a concurrent revoke that landed between that
+                    // read and this write. Re-read to tell that apart from an identity
+                    // that is still active (mirrors the REST DELETE route).
+                    auto reread = engine_principal_store_->get(principal_id);
+                    if (reread && *reread && (*reread)->lifecycle_state != "active") {
+                        // The winner did the work and this call killed the credentials:
+                        // idempotent success, not a failure.
+                        revoked_by_concurrent_request = true;
+                    } else {
+                        // Still active (or gone, or unreadable): the identity is not
+                        // confirmed revoked and its credentials are already dead, the
+                        // same state as the revoke-error arm above, so the same hint.
+                        std::string why;
+                        if (!reread)
+                            why = "revoke matched no active row and the re-read failed: " +
+                                  reread.error();
+                        else if (!*reread)
+                            why = "revoke matched no active row and the principal is no longer "
+                                  "found";
+                        else
+                            why = "revoke matched no active row but the principal is still "
+                                  "active";
+                        fail_after_credentials(why);
+                        res.set_content(a4_error(kInternalError,
+                                                 "failed to revoke engine principal — try again",
+                                                 "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                        return;
+                    }
                 }
+                // `!revoked && already_revoked` is the idempotent no-op: the principal
+                // was already terminal before this call, so `false` is expected, not an
+                // error. The REST route falls through it the same way.
+                // The race row carries the same detail the REST route writes. A
+                // caller-supplied superseded_by was NOT persisted (the winner's value
+                // stands), so the row does not claim it was.
+                const std::string success_detail =
+                    revoked_by_concurrent_request
+                        ? revoked_count_detail + "; revoked_by_concurrent_request" +
+                              (superseded_by.empty() ? "" : "; superseded_by_not_persisted") +
+                              (reason.empty() ? "" : "; reason=" + audit_token(reason))
+                        // The caller's reason is sanitised here too: a raw one could carry
+                        // `credentials_revoked=0; revoked_by_concurrent_request` and read as
+                        // the race row of a revoke that did not race.
+                        : audit_token(reason);
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "engine_principal.revoke", "success", "EnginePrincipal",
-                    principal_id, reason);
+                    principal_id, success_detail);
                 if (!audit_ok) {
                     // #3937: fail closed (parity with REST #2466 + plugin-config MCP
                     // precedent). The principal + its credentials were revoked but the
@@ -27073,11 +27165,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     const bool denied_audit_ok =
                         audit_fn(req, "engine_principal.credential.confirm", "failure",
                                 "EnginePrincipal", principal_id, confirmed.error());
+                    // #6716: retry_after_ms only for the retryable (Transient ->
+                    // kInternalError) class, never for conflict / secret mismatch /
+                    // client validation. Mirrors rotate_engine_credential above and
+                    // the human-token confirm twin below.
+                    const int code = mcp_error_for_store_msg(confirmed.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_store_msg(confirmed.error()),
-                                       confirmed.error(),
-                                       denied_audit_ok ? std::string_view{}
-                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, confirmed.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     return;
                 }

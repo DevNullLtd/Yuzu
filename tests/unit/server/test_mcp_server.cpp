@@ -63,6 +63,7 @@
 #include "test_forensics_tier_fixture.hpp" // #4990: the Forensics tier fixture
 #include "test_route_sink.hpp"  // M.9 PR-2b: in-process sink for that REST half
 #include "test_principal_lock_gate.hpp" // SqlFault: a REAL table moved aside in the throwaway DB
+#include "test_identity_revoke_fault.hpp" // IdentityRevokeFault, shared with the REST twin test
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 #include "test_compliance_api_double.hpp" // ADR-0031 WS-A4: FnComplianceApi
@@ -1319,6 +1320,8 @@ struct McpTestServer {
     /// get_agent_details triggered ZERO backing read (mirrors the REST twin's
     /// FakeDeviceApi.lookup_calls). Populated in start(); null before then.
     std::shared_ptr<yuzu::server::test::JsonDeviceApi> device_api_for_test_;
+    /// Leaves build_handler's DeviceApi null, for the tools' wiring-fault branch.
+    bool device_api_unwired_for_test{false};
 
     /// ADR-0024 (SLE discovery): optionally wire a typed SoftwareLicensingStore so
     /// query_software_licenses (the MCP twin of the GET /sle/agents/{id} drill) is
@@ -1594,7 +1597,9 @@ private:
         // agents, byte-identical to the pre-rewire behaviour.
         device_api_for_test_ =
             std::make_shared<yuzu::server::test::JsonDeviceApi>(agents_fn);
-        auto device_api_for_test = device_api_for_test_;
+        std::shared_ptr<yuzu::server::test::JsonDeviceApi> device_api_for_test;
+        if (!device_api_unwired_for_test)
+            device_api_for_test = device_api_for_test_;
 
         // #2384: the engine-credential store rides a setter, not a
         // build_handler param — wire before the handlers are built.
@@ -4124,6 +4129,338 @@ TEST_CASE("MCP confirm_engine_rotation: replay after success is kInvalidParams +
     CHECK(confirm_metric("success") == 1.0); // unchanged by the replay
 }
 
+TEST_CASE("MCP confirm_engine_rotation: retry_after_ms only on a transient store fault, never "
+          "on a conflict or a malformed pair (#6716)",
+          "[mcp][pg][engine_principal][confirm][retry_hint]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-hint";
+    const std::string malformed = "engine:mcp-confirm-malformed";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+    // Two active credentials that no rotation linked together.
+    REQUIRE(store.create_token("svc-a", malformed, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.create_token("svc-b", malformed, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+
+    auto rot = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"rotate_engine_credential",)"
+        R"("arguments":{"principal_id":"engine:mcp-confirm-hint"}}})");
+    REQUIRE(rot->status == 200);
+    const auto rot_payload = nlohmann::json::parse(
+        nlohmann::json::parse(rot->body)["result"]["content"][0]["text"].get<std::string>());
+    const auto token_id = rot_payload["token_id"].get<std::string>();
+    const auto secret = rot_payload["raw_token"].get<std::string>();
+    const auto confirm_call = [&](const std::string& pid, const std::string& tid,
+                                  const std::string& sec) {
+        return ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                      {"method", "tools/call"},
+                                      {"id", 7},
+                                      {"params",
+                                       {{"name", "confirm_engine_rotation"},
+                                        {"arguments",
+                                         {{"principal_id", pid},
+                                          {"token_id", tid},
+                                          {"secret", sec}}}}}}
+                           .dump());
+    };
+
+    // Transient: every store lease is held, so the confirm cannot read. kInternalError with the
+    // retry hint, like rotate_engine_credential.
+    {
+        auto held = hold_all_leases(pool);
+        auto r = confirm_call(principal, token_id, secret);
+        REQUIRE(r);
+        const auto body = nlohmann::json::parse(r->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"].get<int>() == -32603);
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultRetryMs);
+    }
+
+    // Success, then the replay: a terminal conflict (kInvalidParams) with a null hint.
+    auto ok = confirm_call(principal, token_id, secret);
+    REQUIRE(ok);
+    CHECK(nlohmann::json::parse(ok->body).contains("result"));
+    auto replay = confirm_call(principal, token_id, "irrelevant-secret");
+    REQUIRE(replay);
+    const auto replay_body = nlohmann::json::parse(replay->body);
+    REQUIRE(replay_body.contains("error"));
+    CHECK(replay_body["error"]["code"].get<int>() == -32602);
+    CHECK(replay_body["error"]["data"]["retry_after_ms"].is_null());
+
+    // A malformed pair is a conflict now, never the retryable class.
+    const auto active = store.list_active_for_principal(malformed);
+    REQUIRE(active.size() == 2);
+    auto bad = confirm_call(malformed, active.at(0).token_id, "irrelevant-secret");
+    REQUIRE(bad);
+    const auto bad_body = nlohmann::json::parse(bad->body);
+    REQUIRE(bad_body.contains("error"));
+    CHECK(bad_body["error"]["code"].get<int>() == -32602);
+    CHECK(bad_body["error"]["message"].get<std::string>().find("rotation pair is malformed") !=
+          std::string::npos);
+    CHECK(bad_body["error"]["data"]["retry_after_ms"].is_null());
+}
+
+// #6716: revoke_engine_principal is the MCP twin of DELETE /api/v1/engine-principals/{id}. The
+// credentials are revoked FIRST and the identity SECOND, so the identity revoke can fail after the
+// credentials are already dead. The REST cases are in test_engine_principal_lifecycle.cpp; both
+// drive the SAME IdentityRevokeFault trigger on the real engine_principals table.
+TEST_CASE("MCP revoke_engine_principal: a fault after the credential revoke is retryable, "
+          "records the revoked count, and the repeat finishes the revoke (#6716)",
+          "[mcp][pg][engine_principal][revoke][retry_hint]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    yuzu::server::EnginePrincipalStore eps{pool}; // the SAME pool, as server.cpp builds it
+    REQUIRE(eps.is_open());
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const auto make = [&](const std::string& id) {
+        REQUIRE(eps.create(id, "alice", "j", "internal", "alice", id).has_value());
+        REQUIRE(store.create_token("svc", id, now + 90 * 24 * 3600, "", "readonly", "engine")
+                    .has_value());
+    };
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.engine_principal_store_for_test = &eps;
+    ts.start();
+    const auto revoke_call = [&](const std::string& pid, const std::string& superseded_by = "",
+                                 const std::string& reason = "") {
+        nlohmann::json args{{"principal_id", pid}};
+        if (!superseded_by.empty())
+            args["superseded_by"] = superseded_by;
+        if (!reason.empty())
+            args["reason"] = reason;
+        return ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                      {"method", "tools/call"},
+                                      {"id", 5},
+                                      {"params", {{"name", "revoke_engine_principal"},
+                                                  {"arguments", args}}}}
+                           .dump());
+    };
+    // (result, detail) of every engine_principal.revoke row, oldest first.
+    const auto revoke_rows = [&] {
+        std::vector<std::pair<std::string, std::string>> rows;
+        REQUIRE(ts.audit_log.size() == ts.audit_details.size());
+        for (std::size_t i = 0; i < ts.audit_log.size(); ++i)
+            if (ts.audit_log[i].starts_with("engine_principal.revoke|"))
+                rows.emplace_back(
+                    ts.audit_log[i].substr(std::string("engine_principal.revoke|").size()),
+                    ts.audit_details[i]);
+        return rows;
+    };
+    const auto payload_of = [](const std::unique_ptr<httplib::Response>& r) -> nlohmann::json {
+        const auto j = nlohmann::json::parse(r->body);
+        REQUIRE(j.contains("result"));
+        return nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+    };
+    const auto state_of = [&](const std::string& pid) {
+        auto got = eps.get(pid);
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        return (*got)->lifecycle_state;
+    };
+
+    SECTION("normal revoke is unchanged") {
+        make("engine:mcp-rv-normal");
+        auto r = revoke_call("engine:mcp-rv-normal");
+        REQUIRE(r);
+        const auto p = payload_of(r);
+        CHECK(p["revoked"].get<bool>() == true);
+        CHECK(p["credentials_revoked"].get<int>() == 1);
+        CHECK(state_of("engine:mcp-rv-normal") == "revoked");
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].first == "success");
+        CHECK(rows[0].second.find("revoked_by_concurrent_request") == std::string::npos);
+    }
+
+    SECTION("normal revoke: the success detail is the sanitised reason") {
+        make("engine:mcp-rv-reason");
+        auto r = revoke_call("engine:mcp-rv-reason", "", "rotate out, now");
+        REQUIRE(r);
+        CHECK(payload_of(r)["revoked"].get<bool>() == true);
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].first == "success");
+        CHECK(rows[0].second == "rotate_out__now"); // space and ',' become '_'
+    }
+
+    SECTION("normal revoke: a hostile reason cannot forge the count or race markers") {
+        make("engine:mcp-rv-hostile");
+        auto r = revoke_call("engine:mcp-rv-hostile", "",
+                             "credentials_revoked=0; revoked_by_concurrent_request");
+        REQUIRE(r);
+        CHECK(payload_of(r)["credentials_revoked"].get<int>() == 1);
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].first == "success");
+        // '=' and the spaces are neutralised, so no `key=value` marker and no "; " separator
+        // survives to be read as a real field of a row that is not a race row.
+        CHECK(rows[0].second == "credentials_revoked_0;_revoked_by_concurrent_request");
+        CHECK(rows[0].second.find('=') == std::string::npos);
+        CHECK(rows[0].second.find("; ") == std::string::npos);
+    }
+
+    SECTION("a second revoke of the same principal is a plain success, not a race row") {
+        const std::string pid = "engine:mcp-rv-twice";
+        make(pid);
+        REQUIRE(revoke_call(pid));
+        auto again = revoke_call(pid);
+        REQUIRE(again);
+        const auto p = payload_of(again);
+        CHECK(p["revoked"].get<bool>() == true);
+        CHECK(p["credentials_revoked"].get<int>() == 0);
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].first == "success");
+        // The principal was already terminal before the call: nothing raced, so the row must
+        // not claim a concurrent revoke.
+        CHECK(rows[1].second.find("revoked_by_concurrent_request") == std::string::npos);
+    }
+
+    SECTION("(d) the identity revoke errors: retry hint, failure row ends with the count") {
+        const std::string pid = "engine:mcp-rv-raise";
+        make(pid);
+        yuzu::server::test::IdentityRevokeFault fault{
+            pool, yuzu::server::test::IdentityRevokeFault::Mode::Raise};
+        auto r = revoke_call(pid);
+        REQUIRE(r);
+        const auto body = nlohmann::json::parse(r->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultRetryMs);
+        // Half done: the credential is gone, the identity is still active.
+        CHECK(state_of(pid) == "active");
+        CHECK(store.list_active_for_principal(pid).empty());
+        auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].first == "failure");
+        CHECK(rows[0].second.ends_with("; credentials_revoked=1"));
+        CHECK(rows[0].second.find("yuzu_test identity revoke fault") != std::string::npos);
+        // A libpq error text ends with a newline: the count must not land on its own line.
+        CHECK(rows[0].second.find('\n') == std::string::npos);
+        CHECK(rows[0].second.find('\r') == std::string::npos);
+
+        fault.remove();
+        auto again = revoke_call(pid);
+        REQUIRE(again);
+        CHECK(payload_of(again)["credentials_revoked"].get<int>() == 0);
+        CHECK(state_of(pid) == "revoked");
+        rows = revoke_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].first == "success");
+    }
+
+    SECTION("(e) race: a concurrent revoke wins, so the call is an idempotent success") {
+        const std::string pid = "engine:mcp-rv-race";
+        make(pid);
+        yuzu::server::test::IdentityRevokeFault fault{
+            pool, yuzu::server::test::IdentityRevokeFault::Mode::Race};
+        auto r = revoke_call(pid, "engine:mcp-rv-successor", "rotate-out");
+        REQUIRE(r);
+        const auto p = payload_of(r);
+        CHECK(p["revoked"].get<bool>() == true);
+        CHECK(p["credentials_revoked"].get<int>() == 1);
+        CHECK(state_of(pid) == "revoked");
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1); // a success row and no failure row for the same call
+        CHECK(rows[0].first == "success");
+        CHECK(rows[0].second == "credentials_revoked=1; revoked_by_concurrent_request; "
+                                "superseded_by_not_persisted; reason=rotate-out");
+        // The row must not claim the caller's value was persisted.
+        CHECK(rows[0].second.find("superseded_by=") == std::string::npos);
+    }
+
+    SECTION("(e) race row with only superseded_by") {
+        const std::string pid = "engine:mcp-rv-race-sup";
+        make(pid);
+        yuzu::server::test::IdentityRevokeFault fault{
+            pool, yuzu::server::test::IdentityRevokeFault::Mode::Race};
+        auto r = revoke_call(pid, "engine:mcp-rv-successor");
+        REQUIRE(r);
+        CHECK(payload_of(r)["revoked"].get<bool>() == true);
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].first == "success");
+        CHECK(rows[0].second ==
+              "credentials_revoked=1; revoked_by_concurrent_request; superseded_by_not_persisted");
+    }
+
+    SECTION("(e) race row with only reason") {
+        const std::string pid = "engine:mcp-rv-race-reason";
+        make(pid);
+        yuzu::server::test::IdentityRevokeFault fault{
+            pool, yuzu::server::test::IdentityRevokeFault::Mode::Race};
+        auto r = revoke_call(pid, "", "rotate-out");
+        REQUIRE(r);
+        CHECK(payload_of(r)["revoked"].get<bool>() == true);
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].first == "success");
+        CHECK(rows[0].second ==
+              "credentials_revoked=1; revoked_by_concurrent_request; reason=rotate-out");
+    }
+
+    SECTION("(e) race row: a hostile reason stays confined after reason=") {
+        const std::string pid = "engine:mcp-rv-race-hostile";
+        make(pid);
+        yuzu::server::test::IdentityRevokeFault fault{
+            pool, yuzu::server::test::IdentityRevokeFault::Mode::Race};
+        auto r = revoke_call(pid, "", "credentials_revoked=9; superseded_by=engine:evil");
+        REQUIRE(r);
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].second ==
+              "credentials_revoked=1; revoked_by_concurrent_request; "
+              "reason=credentials_revoked_9;_superseded_by_engine:evil");
+        // Exactly one real count marker and no real superseded_by marker.
+        CHECK(rows[0].second.find("credentials_revoked=", 1) == std::string::npos);
+        CHECK(rows[0].second.find("superseded_by=") == std::string::npos);
+    }
+
+    SECTION("(e) the identity revoke changed nothing and is still active: retryable") {
+        const std::string pid = "engine:mcp-rv-skip";
+        make(pid);
+        yuzu::server::test::IdentityRevokeFault fault{
+            pool, yuzu::server::test::IdentityRevokeFault::Mode::Skip};
+        auto r = revoke_call(pid);
+        REQUIRE(r);
+        const auto body = nlohmann::json::parse(r->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultRetryMs);
+        CHECK(state_of(pid) == "active");
+        const auto rows = revoke_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].first == "failure");
+        CHECK(rows[0].second ==
+              "revoke matched no active row but the principal is still active; "
+              "credentials_revoked=1");
+
+        fault.remove();
+        auto again = revoke_call(pid);
+        REQUIRE(again);
+        CHECK(payload_of(again)["credentials_revoked"].get<int>() == 0);
+        CHECK(state_of(pid) == "revoked");
+    }
+}
+
 // ── Human API-token rotation (P2 #11, SOC 2 CC6.3) ──────────────────────────
 //
 // rotate_api_token / confirm_api_token_rotation — MCP twins of POST
@@ -5755,6 +6092,196 @@ TEST_CASE("MCP Integration: tools/call list_agents", "[mcp][integration]") {
     // Verify audit was recorded
     REQUIRE(ts.audit_log.size() >= 1);
     CHECK(ts.audit_log.back() == "mcp.list_agents|success");
+}
+
+// ── #4041: list_agents is a fan-out read of per-agent data and must admit-then-filter
+// through fleet_read_fn_ (ADR-0017 World A), never a bare tier_allows + perm_fn. ──────
+
+namespace {
+// Agent ids a list_agents response names, from content[0].text (a bare array, or the
+// {agents, scope_basis} object when scoped).
+std::vector<std::string> list_agents_ids(const std::unique_ptr<httplib::Response>& res) {
+    std::vector<std::string> ids;
+    auto body = nlohmann::json::parse(res->body);
+    if (!body.contains("result"))
+        return ids;
+    auto text = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    for (const auto& a : text.is_object() ? text["agents"] : text)
+        ids.push_back(a["agent_id"].get<std::string>());
+    return ids;
+}
+// content[0].text as JSON: the bare array when unconfined, {agents, scope_basis} when scoped.
+nlohmann::json list_agents_text(const std::unique_ptr<httplib::Response>& res) {
+    auto body = nlohmann::json::parse(res->body);
+    return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+}
+constexpr const char* kListAgentsCall =
+    R"({"jsonrpc":"2.0","method":"tools/call","id":4041,"params":{"name":"list_agents"}})";
+} // namespace
+
+TEST_CASE("MCP list_agents (#4041): a confined caller sees only in-scope agents, in both "
+          "content and structuredContent",
+          "[mcp][integration][security][confinement]") {
+    McpTestServer ts;
+    std::vector<std::pair<std::string, std::string>> asked;
+    ts.fleet_read_fn_for_test = [&asked](const httplib::Request&, httplib::Response&,
+                                         const std::string& sec, const std::string& op)
+        -> yuzu::server::authz::FleetReadGate {
+        asked.emplace_back(sec, op);
+        return {true, std::unordered_set<std::string>{"agent-001"}};
+    };
+    ts.start();
+
+    auto res = ts.call(kListAgentsCall);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001"});
+    CHECK(res->body.find("agent-002") == std::string::npos);
+    CHECK(res->body.find("db-01") == std::string::npos);
+    REQUIRE(asked.size() == 1);
+    CHECK(asked[0] == std::make_pair(std::string{"Infrastructure"}, std::string{"Read"}));
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["result"].contains("structuredContent"));
+    const auto& sc = body["result"]["structuredContent"];
+    // Both channels carry the marker, so a client reading only the text sees it too.
+    CHECK(list_agents_text(res) == sc);
+    // Confinement is reported as a status, never as a count of hidden devices.
+    CHECK(sc.value("scope_basis", "") == "authority_scoped");
+    CHECK_FALSE(sc.contains("devices_omitted"));
+}
+
+TEST_CASE("MCP list_agents (#4041): an unconfined caller (nullopt scope) still sees every agent",
+          "[mcp][integration][security][confinement]") {
+    McpTestServer ts;
+    int calls = 0;
+    ts.fleet_read_fn_for_test = [&calls](const httplib::Request&, httplib::Response&,
+                                         const std::string&, const std::string&)
+        -> yuzu::server::authz::FleetReadGate {
+        ++calls;
+        return {true, std::nullopt};
+    };
+    ts.start();
+
+    auto res = ts.call(kListAgentsCall);
+    REQUIRE(res);
+    CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001", "agent-002"});
+    CHECK(calls == 1);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body["result"]["structuredContent"].contains("scope_basis"));
+    CHECK(list_agents_text(res).is_array()); // unconfined clients keep the bare array
+}
+
+TEST_CASE("MCP list_agents (#4041): a deny-all scope (present, empty) lists no agents",
+          "[mcp][integration][security][confinement]") {
+    McpTestServer ts;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&, const std::string&)
+        -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::deny_all()};
+    };
+    ts.start();
+
+    auto res = ts.call(kListAgentsCall);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(list_agents_ids(res).empty());
+    CHECK(res->body.find("agent-001") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result")); // an empty list, not a JSON-RPC error
+    REQUIRE(body["result"]["structuredContent"]["agents"].is_array());
+    CHECK(body["result"]["structuredContent"]["agents"].empty());
+    CHECK(body["result"]["structuredContent"].value("scope_basis", "") == "authority_scoped");
+    CHECK(list_agents_text(res).value("scope_basis", "") == "authority_scoped");
+}
+
+TEST_CASE("MCP list_agents (#4041): a gate that denies writes its own response and no agent "
+          "is served",
+          "[mcp][integration][security][confinement]") {
+    McpTestServer ts;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response& res,
+                                   const std::string&, const std::string&)
+        -> yuzu::server::authz::FleetReadGate {
+        res.status = 403;
+        res.set_content(R"({"error":{"message":"permission denied"}})", "application/json");
+        return {};
+    };
+    ts.start();
+
+    auto res = ts.call(kListAgentsCall);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("agent-001") == std::string::npos);
+    CHECK(res->body.find("agent-002") == std::string::npos);
+    // The handler stops at the gate: its own response stands and no success row is written.
+    CHECK(res->body.find("permission denied") != std::string::npos);
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.list_agents|success") ==
+          ts.audit_log.end());
+}
+
+TEST_CASE("MCP list_agents (#4041): fails closed when fleet_read_fn_ is genuinely unwired",
+          "[mcp][integration][security][confinement]") {
+    McpTestServer ts;
+    ts.fleet_read_fn_for_test = {};
+    ts.start();
+
+    auto res = ts.call(kListAgentsCall);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("service unavailable") !=
+          std::string::npos);
+    CHECK(res->body.find("agent-001") == std::string::npos);
+}
+
+TEST_CASE("MCP list_agents (#4041): an unwired DeviceApi is an error, never an empty list",
+          "[mcp][integration][security][confinement]") {
+    McpTestServer ts;
+    ts.device_api_unwired_for_test = true;
+    ts.start();
+
+    auto res = ts.call(kListAgentsCall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("device registry unavailable") !=
+          std::string::npos);
+    CHECK(ts.audit_log.back() == "mcp.list_agents|failure");
+}
+
+TEST_CASE("MCP list_agents (#4041): tools/list states the scope contract",
+          "[mcp][integration][a5]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":4042})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "list_agents")
+            tool = &t;
+    REQUIRE(tool != nullptr);
+    const auto description = (*tool)["description"].get<std::string>();
+    CHECK(description.find("List all") == std::string::npos);
+    CHECK(description.find("scope_basis") != std::string::npos);
+    CHECK(description.find("never disclosed") != std::string::npos);
+    CHECK((*tool)["outputSchema"]["properties"].contains("scope_basis"));
+}
+
+TEST_CASE("MCP fleet_overview (#4041): the prompt does not read a confined list as the fleet",
+          "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"prompts/get","id":4043,)"
+        R"("params":{"name":"fleet_overview"}})");
+    REQUIRE(res);
+    CHECK(res->body.find("scope_basis") != std::string::npos);
 }
 
 // ── #4027: Echo read-twin round-trip — proves registration (kTools/
@@ -14164,6 +14691,138 @@ void exec_tracker_ddl(const std::string& dsn, const std::string& sql) {
     REQUIRE(r.ok());
 }
 } // namespace
+
+// #4041: the real require_fleet_read and real stores. The stubbed list_agents tests above
+// cannot see the behaviour this issue changed: a caller whose only Infrastructure:Read comes
+// from a management group was 403 at the bare perm_fn and now gets its own devices.
+// perm_override_for_test denies every perm_fn call, so a perm_fn stacked in front of the gate
+// fails these cases (the #3216 defect).
+namespace {
+struct ListAgentsRealGate {
+    yuzu::test::ResponseExecutionAuthzPgRig authz;
+    McpTestServer ts;
+
+    explicit ListAgentsRealGate(const std::string& dsn) : authz{dsn} {
+        REQUIRE(authz.rbac.create_role({"InfraReader4041", "", false, 0}).has_value());
+        REQUIRE(authz.rbac.set_permission({"InfraReader4041", "Infrastructure", "Read", "allow"})
+                    .has_value());
+        REQUIRE(authz.mgmt.add_member(authz.bob_group, "agent-001").has_value());
+        REQUIRE(authz.mgmt.add_member(authz.alice_group, "agent-002").has_value());
+        ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+        ts.perm_override_for_test = [](const std::string&, const std::string&) { return false; };
+        ts.mock_username = "bob";
+    }
+
+    void grant_through_group() {
+        REQUIRE(authz.mgmt.assign_role({authz.bob_group, "user", "bob", "InfraReader4041"})
+                    .has_value());
+    }
+
+    std::unique_ptr<httplib::Response> call() {
+        ts.start("operator");
+        return ts.call_raw("POST", kListAgentsCall,
+                           {{"Authorization", "Bearer " + authz.mint_bob()}});
+    }
+};
+} // namespace
+
+TEST_CASE("MCP list_agents (#4041): a group-only caller gets its own devices through the real "
+          "gate",
+          "[pg][mcp][integration][security][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    ListAgentsRealGate rig{authz_db.dsn()};
+    rig.grant_through_group();
+
+    auto res = rig.call();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001"});
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["result"]["structuredContent"]["agents"].size() == 1);
+    CHECK(body["result"]["structuredContent"].value("scope_basis", "") == "authority_scoped");
+    CHECK(list_agents_text(res).value("scope_basis", "") == "authority_scoped");
+    REQUIRE_FALSE(rig.ts.audit_log.empty());
+    CHECK(rig.ts.audit_log.back() == "mcp.list_agents|success");
+}
+
+TEST_CASE("MCP list_agents (#4041): a global grant sees every device, unscoped",
+          "[pg][mcp][integration][security][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    ListAgentsRealGate rig{authz_db.dsn()};
+    REQUIRE(rig.authz.rbac.assign_role({"user", "bob", "InfraReader4041"}).has_value());
+
+    auto res = rig.call();
+    REQUIRE(res);
+    CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001", "agent-002"});
+    auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body["result"]["structuredContent"].contains("scope_basis"));
+    CHECK(list_agents_text(res).is_array()); // unscoped read keeps the bare-array text
+}
+
+TEST_CASE("MCP list_agents (#4041): RBAC off leaves every device visible, unscoped",
+          "[pg][mcp][integration][security][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    ListAgentsRealGate rig{authz_db.dsn()};
+    rig.authz.rbac.set_rbac_enabled(false);
+
+    auto res = rig.call();
+    REQUIRE(res);
+    CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001", "agent-002"});
+    auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body["result"]["structuredContent"].contains("scope_basis"));
+    CHECK(list_agents_text(res).is_array()); // unscoped read keeps the bare-array text
+}
+
+TEST_CASE("MCP list_agents (#4041): no grant of any kind is refused with no rows",
+          "[pg][mcp][integration][security][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    ListAgentsRealGate rig{authz_db.dsn()};
+
+    auto res = rig.call();
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("agent-001") == std::string::npos);
+    CHECK(res->body.find("agent-002") == std::string::npos);
+}
+
+// ADR-0017's 2026-07-24 Update (a): the group read is additive to a global deny.
+TEST_CASE("MCP list_agents (#4041): a global deny plus a group allow gets the group's devices",
+          "[pg][mcp][integration][security][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    ListAgentsRealGate rig{authz_db.dsn()};
+    REQUIRE(rig.authz.rbac.create_role({"InfraDeny4041", "", false, 0}).has_value());
+    REQUIRE(rig.authz.rbac.set_permission({"InfraDeny4041", "Infrastructure", "Read", "deny"})
+                .has_value());
+    REQUIRE(rig.authz.rbac.assign_role({"user", "bob", "InfraDeny4041"}).has_value());
+    rig.grant_through_group();
+
+    auto res = rig.call();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001"});
+    CHECK(list_agents_text(res).value("scope_basis", "") == "authority_scoped");
+}
+
+TEST_CASE("MCP list_agents (#4041): a service-scoped token stops at C8, before the gate",
+          "[mcp][integration][security][service_scope]") {
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    int gate_calls = 0;
+    ts.fleet_read_fn_for_test = [&gate_calls](const httplib::Request&, httplib::Response&,
+                                              const std::string&, const std::string&)
+        -> yuzu::server::authz::FleetReadGate {
+        ++gate_calls;
+        return {true, std::nullopt};
+    };
+    ts.start();
+
+    auto res = ts.call(kListAgentsCall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kPermissionDenied);
+    CHECK(gate_calls == 0);
+}
 
 TEST_CASE("MCP summarize_working_set execution: confined caller sees the exact projected counts (#3526)",
           "[pg][mcp][integration][agentic-demo][scope][4753]") {

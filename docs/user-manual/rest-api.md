@@ -1001,7 +1001,9 @@ twin of `/fragments/create-group-form`'s own live count. This route and its MCP 
 shared builder (`group_agent_count_preview.hpp`), so those two cannot drift from each other; the
 dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation
 (`DashboardRoutes::parse_filters`), except that for an over-bound filter it hides the count and
-shows a static sentence (#5623). For a filter within the bound, the number it shows and
+shows a static sentence (#5623), and that it also counts the results page's Search term, which this
+route cannot express (it takes `f_<col>` filters only; a Search-only set has no REST or MCP
+preview). For a filter within the bound and no Search term, the number it shows and
 this route's `agent_count` are expected to agree today, but are not structurally guaranteed to. MCP twin:
 `preview_management_group_agent_count`.
 
@@ -1256,7 +1258,7 @@ Explicit maker-checker confirmation that a rotation's successor secret has been 
 }
 ```
 
-**Errors:** the same state matrix as the engine-principal `credentials/confirm` route above (replay-after-success is a terminal `409`, an ambiguous empty/malformed-pair read is a retryable `503`, unresolved rotation metadata on the sole survivor is a terminal `409`), substituting `token is not a human-owned credential` / `principal has a non-human active credential` for the engine-kind equivalents. `401`/`403` follow the same step-up and permission rules as `rotate`. The same authority-inheritance `400` — `no such token to confirm` also applies here, as defence-in-depth only (see the `rotate` error matrix row above, including the #2963 empty-tier/scope exception). **This is not a same-session pin** — the caller confirming does not have to be the same session that called `rotate`; ownership and the raw successor secret (proof of possession) are the actual gates on who may confirm. The check re-verifies that the CALLER'S CURRENT `mcp_tier`/`scope_service` equals the successor's own (or the caller holds no standing tier/scope at all, #2963) — since the successor's tier/scope are fixed at mint time and cannot legitimately diverge from the predecessor's, this defense-in-depth check is not reachable as a live path today for a caller presenting the correct current authority, outside a future bypass of `rotate`'s own guard.
+**Errors:** the same state matrix as the engine-principal `credentials/confirm` route above (replay-after-success is a terminal `409`, an ambiguous empty read is a retryable `503`, a malformed two-credential pair is a terminal `409`, unresolved rotation metadata on the sole survivor is a terminal `409`), substituting `token is not a human-owned credential` / `principal has a non-human active credential` for the engine-kind equivalents. `401`/`403` follow the same step-up and permission rules as `rotate`. The same authority-inheritance `400` — `no such token to confirm` also applies here, as defence-in-depth only (see the `rotate` error matrix row above, including the #2963 empty-tier/scope exception). **This is not a same-session pin** — the caller confirming does not have to be the same session that called `rotate`; ownership and the raw successor secret (proof of possession) are the actual gates on who may confirm. The check re-verifies that the CALLER'S CURRENT `mcp_tier`/`scope_service` equals the successor's own (or the caller holds no standing tier/scope at all, #2963) — since the successor's tier/scope are fixed at mint time and cannot legitimately diverge from the predecessor's, this defense-in-depth check is not reachable as a live path today for a caller presenting the correct current authority, outside a future bypass of `rotate`'s own guard.
 
 `secret` missing, empty, or not a string is `400` — `secret required` (checked before the `404` ownership belt, see above). A wrong secret is `403` — `rotation secret mismatch — the presented secret does not verify against the pending successor` — distinct from every other outcome, reachable only after every other admission check has already passed. If the authoritative successor row cannot be re-read to verify the secret (should not happen under the lock already held), that's a fail-closed `503` — `failed to verify rotation secret`, folded into the general store-failure `503` row above.
 
@@ -1272,7 +1274,7 @@ Engine principals are the durable identities behind autonomous use-case-engine m
 
 **Audit-persist failure (fail closed on mutations):** these routes emit a privileged-action audit row, and a mutation that cannot record it must never look like a clean success. If the audit-store write itself fails, every **mutating** route (create, revoke, transfer-owner, `credentials`/`credentials/rotate`/`credentials/confirm`, and the role assign/unassign routes documented later) **fails closed** — it returns `503` with a `Sec-Audit-Failed: true` header instead of its normal `2xx` (ADR-1005 "mutations fail closed on audit failure"). The mutation may already have taken effect (the audit is emitted after the store write), so treat such a `503` as *unconfirmed* and reconcile via a read. This is a stricter posture than the software-package/deployment mutations elsewhere in this API, which set-and-proceed (stay `2xx` with `Sec-Audit-Failed`) on the same audit-drop: engine-principal management is a privileged-identity surface, so ADR-1005 holds it to fail-closed rather than proceed-and-signal.
 
-The credential **mint** and **rotate** routes additionally **withhold the one-time secret** on this path — nothing is placed in the `503` body. Recovery differs by route: a **mint** whose audit dropped leaves a credential that exists but is unusable (no one holds its secret) — `GET` the principal to see it, then **rotate** it (mints an audited successor you can then confirm) to obtain a usable secret; a **rotate** whose reveal-audit dropped can be **rotated again within the grace window** (about two minutes, by the same operator, against the same server replica; after a restart, on another replica or once the window ends the retry is `409`) to re-serve the *same* successor secret (an audited re-serve, not a new credential). If the window has passed, find the stuck successor with `GET /api/v1/engine-principals/{id}` (in `active_credentials`, the credential whose `overlap_expires_at` is `0` while another credential of the same `rotation_group` has a non-zero value; that read fails closed with `503`, so a `200` list is authoritative) and revoke it with `DELETE /api/v1/tokens/{token_id}` (REST only; it needs `ApiToken:Delete`, a fresh MFA step-up and an effective administrator, since the credential's owner is the engine principal and any other caller gets `404`), then rotate again from the remaining sole credential. Do **not** revoke only the predecessor, which leaves a credential nobody holds, and do **not** revoke the principal itself: that is terminal. Note the compounding case under a *sustained* audit outage: repeated mint/rotate failures can leave two unconfirmed credentials, at which point the store's ≤2-active guard blocks further rotation — recover once the audit store is healthy by revoking the stuck successor as described above and rotating again from the remaining credential (a second mint is refused while any active credential exists).
+The credential **mint** and **rotate** routes additionally **withhold the one-time secret** on this path — nothing is placed in the `503` body. Recovery differs by route: a **mint** whose audit dropped leaves a credential that exists but is unusable (no one holds its secret) — `GET` the principal to see it, then **rotate** it (mints an audited successor you can then confirm) to obtain a usable secret; a **rotate** whose reveal-audit dropped can be **rotated again within the grace window** (about two minutes, by the same operator, against the same server replica; after a restart, on another replica or once the window ends the retry is `409`) to re-serve the *same* successor secret (an audited re-serve, not a new credential). If the window has passed, find the stuck successor with `GET /api/v1/engine-principals/{id}` (in `active_credentials`, the credential whose `overlap_expires_at` is `0` while another credential of the same `rotation_group` has a non-zero value; that read fails closed with `503`, so a `200` list is authoritative) and revoke it with `DELETE /api/v1/tokens/{token_id}` (it needs `ApiToken:Delete`, a fresh MFA step-up and an effective administrator, since the credential's owner is the engine principal and any other caller gets `404`; over MCP an effective administrator can use `revoke_api_token`, supervised tier, approval-gated), then rotate again from the remaining sole credential. Do **not** revoke only the predecessor, which leaves a credential nobody holds, and do **not** revoke the principal itself: that is terminal. Note the compounding case under a *sustained* audit outage: repeated mint/rotate failures can leave two unconfirmed credentials, at which point the store's ≤2-active guard blocks further rotation — recover once the audit store is healthy by revoking the stuck successor as described above and rotating again from the remaining credential (a second mint is refused while any active credential exists).
 
 The **read** routes (`GET`/list, `GET /{id}`, `GET /audit/no-admin`, `GET /{id}/roles`) and the engine-session denial above instead set the same `Sec-Audit-Failed: true` header but still serve their response (except the `503` failure paths of the list and `GET /{id}` routes below, which serve nothing) — matching the MCP twins' `audit_persisted:false` body field. Reads proceed (rather than fail closed like the behavioural-PII device/network reads) because they commit no state and disclose only authorization **topology metadata** — principal ids, owners, role grants — not per-person behavioural PII; the fail-closed-on-read posture exists specifically to keep individual-identifying data off an unaudited response, which does not apply here. Alert on `Sec-Audit-Failed: true` from this surface as a SOC 2 CC7.2 evidence-gap signal (the same alert that covers the behavioural-PII routes fires on it), while noting the serve behaviour differs: these reads still return data, those withhold it.
 
@@ -1392,7 +1394,9 @@ Terminal, irreversible revoke. Every active credential is revoked **first**, the
 }
 ```
 
-**Errors:** `404` — engine principal not found. `503` — a genuine store failure at any step of the sequence (the principal lookup, the credential-store revoke, or the identity revoke itself) — never an idempotent no-op; credentials are revoked strictly before the identity, so a `503` here never leaves the identity flipped to `revoked` while a credential is still live. `503` + `Sec-Audit-Failed: true` — the revoke audit row could not persist (see *Audit-persist failure* above); the revoke may already have taken effect, so reconcile via `GET`.
+**Errors:** `404` — engine principal not found. `503` — a genuine store failure at any step of the sequence (the principal lookup, the credential-store revoke, or the identity revoke itself) — never an idempotent no-op; credentials are revoked strictly before the identity, so a `503` here never leaves the identity flipped to `revoked` while a credential is still live. `503` + `Sec-Audit-Failed: true` — the revoke audit row could not persist (see *Audit-persist failure* above); the revoke may already have taken effect, so reconcile via `GET`. The 503 has six causes: the stores are not open, the identity read failed, the credential revoke failed, the identity revoke returned an error (the credentials are already revoked), the identity revoke reported not done and the re-read found the principal still active, no longer found, or could not be read, and the audit row could not be saved. The first five carry `Retry-After: 2` and `retry_after_ms: 2000`; only the last, the audit-drop `503` after the revoke committed, carries no hint. When the identity revoke reports not done without an error, the route reads the principal again: if it is now revoked (a concurrent `DELETE` finished first) the answer is the idempotent `200`, and its success audit row's `detail` is `credentials_revoked=<N>; revoked_by_concurrent_request` (plus `; superseded_by_not_persisted` if you sent `superseded_by`, because the other request's value stands); if it is still active, no longer found, or could not be read, the answer is the `503` with the hint. Repeating the call is safe. The MCP tool `revoke_engine_principal` follows the same sequence and answers the same way (a retryable internal error with `retry_after_ms: 5000` in place of the `503`).
+
+**State after a partial failure.** If the credential revoke succeeded and the identity revoke then failed (the fourth cause), the credentials are already revoked and the principal may stay `active` with **zero credentials** until a repeat call completes (when the identity revoke returned an error, the store cannot tell whether its update landed). The repeat finds nothing left to revoke, so its `200` reports `credentials_revoked: 0`; the number revoked by the first call is recorded only in that call's failure audit row, whose `detail` ends with `; credentials_revoked=<N>` (also written for the fifth cause, where the rest of `detail` is text the route writes, such as `revoke matched no active row but the principal is still active`, not a store reason). Until the repeat completes, a principal with no credentials looks the same as one that was never minted, and a new credential can be minted for it. A client should cap its retries (a few attempts with growing delays) and, if the `503` persists, `GET` the principal and report the state to an administrator instead of retrying indefinitely.
 
 ---
 
@@ -1456,14 +1460,17 @@ Overlap-pair rotation (design doc §7): mints a successor credential while the e
 | More than two active credentials exist for this principal | `400` — resolve manually before rotating |
 | A rotation already in flight, initiated by a **different** operator | `409` — a second operator cannot touch an in-flight rotation they didn't start |
 | Grace window elapsed with no confirm | `409` — `grace window elapsed; confirm or revoke` |
-| No active credential found for this principal to rotate | `503` — **not** `400`/`404`. Deliberately conflated with a transient read failure: the internal read that finds "no active credential" cannot be told apart from a silently-failed read, so a genuine "nothing to rotate" is classified as retryable (503) rather than a definitive client error — treating it as 400 could otherwise mislead a caller into minting a redundant second credential during what was actually a transient outage. |
-| A non-engine-kind active credential is present for this principal (defensive check) | `503` |
+| Exactly one active credential that still carries **unresolved rotation metadata** (typically a rotation whose predecessor was revoked out of band, so the surviving successor still points at it) | `409`, terminal, no `Retry-After`; the message starts `one active credential with unresolved rotation metadata`. Rotating from here would strand a malformed pair, so the route refuses instead of minting. `GET /api/v1/engine-principals/{id}` and inspect the credential before acting: if a consumer is already using it, it is the good survivor and should be left alone. Only if it is confirmed stale, revoke it with `DELETE /api/v1/tokens/{token_id}` (it needs `ApiToken:Delete`, a fresh MFA step-up and an effective administrator; any other caller gets `404`). An MCP-only worker can use `revoke_api_token` instead (supervised tier, approval-gated, effective administrator only), and then mint a fresh credential if none remains. Never re-rotate. A sole credential whose predecessor expired on its own is refused here until the rotation sweep (it runs every 60 seconds) clears its linkage. `rotate` never accepts an overlap window that would outlive the predecessor's expiry, so the window has already ended and the next sweep tick that runs clears it (a tick can skip the work, and the pair is then picked up on a later tick). The sweep only does that for a successor that has been used at least once, so a never-used successor stays refused until it is used, revoked or expires. |
+| No active credential found for this principal to rotate | `503` with `Retry-After: 2` and `retry_after_ms: 2000` — **not** `400`/`404`. Deliberately conflated with a transient read failure: the internal read that finds "no active credential" cannot be told apart from a silently-failed read, so a genuine "nothing to rotate" is classified as retryable (503) rather than a definitive client error — treating it as 400 could otherwise mislead a caller into minting a redundant second credential during what was actually a transient outage. Because the hint is also given when nothing will ever succeed (a revoked principal, or one with no credentials, answers this `503` every time), a client must cap its retries and `GET` the principal on a persistent `503`. |
+| A non-engine-kind active credential is present for this principal (defensive check) | `400`, `principal has a non-engine active credential` (the same classification as the confirm route) |
 | The rotation itself succeeded (a successor now exists) but the follow-up read that locates it for the response could not answer | `503` with `Retry-After: 2`. The one-time secret is withheld, and the audit row is `engine_principal.credential.rotate` with `result=partial` (a successor exists, so it is never `failure`) and no `engine_principal.credential.reveal` row. The same operator's retry within the ~120-second grace window, against the same server replica, re-serves the same successor secret; after the window, after a restart or on another replica the retry is `409` and the pair is resolved by revoking the **successor** (not the predecessor) as described under *Audit-persist failure* above, then rotating from the sole credential |
-| Advisory-lock acquire failure, CSPRNG failure, the engine-referent check itself being unreachable, or a mint/stamp write that did not persist | `503` — retryable store failure |
+| The engine or credential store is not open, or an advisory-lock acquire failure, CSPRNG failure, the engine-referent check itself being unreachable, or a mint/stamp write that did not persist | `503` — retryable store failure, with `Retry-After: 2` and `retry_after_ms: 2000` |
 | The reveal audit row could not persist | `503` + `Sec-Audit-Failed: true` — the successor was minted but its **one-time secret is withheld**; rotate again within the grace window (about two minutes, same operator, same replica) to re-serve the *same* audited successor secret; after it the retry is `409` (see *Audit-persist failure* above) |
 | The rotation succeeded and the follow-up read answered, but no active credential links back to a predecessor (the successor was revoked or confirmed out of band in between) | `503` with the secret withheld and audit `engine_principal.credential.rotate` with `result=partial`, and **no** `Retry-After` or `retry_after_ms` (no pending pair remains, so a retry would perform a new rotation rather than re-serve). The message reads "A successor may exist; inspect the principal's credentials (`GET /api/v1/engine-principals/{id}`), then rotate again if needed" |
 | MFA step-up not satisfied | `401` |
 | Missing `Security:Write`, or the caller's own session is engine-classed (structural deny belt) | `403` |
+
+**Retrying.** Every `503` that carries `Retry-After: 2` is safe to repeat, but it is a hint to try again soon, not a promise that the call will succeed. A client should cap its retries (a few attempts with growing delays) and, if the `503` persists, `GET /api/v1/engine-principals/{id}` and look at the credentials before trying again.
 
 ---
 
@@ -1511,14 +1518,17 @@ Like `credentials/rotate` above, this route never looks up `{id}` via a `get()` 
 | One credential is active with its rotation state clear, but the supplied `token_id` is a **different** id (the pinned rotation has moved on) | `409`, terminal — `no rotation in flight for the supplied token_id - the rotation was resolved (confirmed, revoked, or cut over); rotate again if a new rotation is needed` |
 | One credential is active but still carries **unresolved rotation metadata** (a best-effort pair-resolve failed, or its partner expired before cleanup while the sweep was down) | `409` — `one active credential with unresolved rotation metadata - inspect the credential state and do not rotate; revoke only if it is confirmed stale`. Rotating from here would strand a malformed pair; **inspect before revoking** — in the sweep-outage case this sole credential is the good survivor. |
 | **More than two** active credentials for this principal (one minted outside the rotation path) | `400` — `more than two active credentials for this principal - resolve manually before confirming` |
-| No active credentials, or exactly two that aren't a recognized rotation pair | `503` — **not** `400`. Ambiguity-avoidance: an empty read can't be distinguished from a silently-failed read, and a malformed pair is kept conservative, so these stay retryable rather than a definitive client error. |
+| No active credentials | `503` with `Retry-After: 2` and `retry_after_ms: 2000` — **not** `400`. Ambiguity-avoidance: an empty read can't be distinguished from a silently-failed read, so this stays retryable rather than a definitive client error. The hint is also given when nothing will ever succeed (a revoked principal answers this `503` every time), so a client must cap its retries and `GET` the principal on a persistent `503`. |
+| Exactly two active credentials that are not a linked rotation pair | `409`, no `Retry-After`. Retrying cannot repair it. This is a positive read of the stored rows, not an ambiguous empty one, so it is store corruption and not a replay; it writes a `conflict`-labelled failure audit row and counts under `result="conflict"`. Recovery is by hand: `GET /api/v1/engine-principals/{id}` and inspect **both** credentials before revoking either: the surviving successor may be the one that holds the live secret, so do not apply the rule for a well-formed stuck pair (revoke the successor) without looking. Revoke the unwanted one with `DELETE /api/v1/tokens/{token_id}` (it needs `ApiToken:Delete`, a fresh MFA step-up and an effective administrator, as described under *Audit-persist failure* above). The MCP engine-principal tools have no per-credential revoke of their own, but an agentic worker holding a supervised-tier MCP token for an effective administrator can call `revoke_api_token` (approval-gated); any other MCP worker must hand this to an administrator. Never `DELETE /api/v1/engine-principals/{id}`, which is terminal. |
 | A non-engine-kind active credential is present for this principal (defensive check) | `400` — `principal has a non-engine active credential` |
 | **The presented `secret` does not hash-match the pending successor's stored secret (#3015 proof of possession)** — reached only after ownership/pair-state/the `token_id` pin/the initiator binding above have all passed | `403` — `rotation secret mismatch — the presented secret does not verify against the pending successor` |
-| The confirm audit row could not persist | `503` + `Sec-Audit-Failed: true` — the rotation was confirmed (predecessor retired) but its audit row did not persist (see *Audit-persist failure* above); a retried confirm returns the terminal `409` (the rotation is already resolved — the replay row above), which itself confirms the mutation took effect |
-| The authoritative successor row could not be re-read to verify the secret (should not happen under the lock already held; fails closed rather than assume a match) | `503` — `failed to verify rotation secret` |
-| Advisory-lock acquire failure, or the confirm/predecessor-revoke/successor-clear write did not persist | `503` — retryable store failure |
+| The confirm audit row could not persist | `503` + `Sec-Audit-Failed: true` — the rotation was confirmed (predecessor retired) but its audit row did not persist (see *Audit-persist failure* above); a retried confirm returns the terminal `409` (the rotation is already resolved — the replay row above), which itself confirms the mutation took effect. No retry hint on this `503` |
+| The authoritative successor row could not be re-read to verify the secret (should not happen under the lock already held; fails closed rather than assume a match) | `503` with `Retry-After: 2` and `retry_after_ms: 2000` — `failed to verify rotation secret` |
+| The engine or credential store is not open, an advisory-lock acquire failure, or the confirm/predecessor-revoke/successor-clear write did not persist | `503` — retryable store failure, with `Retry-After: 2` and `retry_after_ms: 2000` |
 | MFA step-up not satisfied | `401` |
 | Missing `Security:Write`, or the caller's own session is engine-classed | `403` |
+
+**Retrying.** As for `rotate`: cap retries on the hinted `503`s, and `GET /api/v1/engine-principals/{id}` if one persists. A `409` is terminal, so do not retry it. The MCP tool `confirm_engine_rotation` follows the same rules, with `retry_after_ms: 5000` on its retryable errors.
 
 ---
 
@@ -2076,9 +2086,12 @@ Quarantine a device.
 > grant. That remediation does not help a group-only holder, a JIT-elevated administrator
 > with no grant of their own, or a transient RBAC read failure: for the last, check
 > `yuzu_server_rbac_read_degrade_total` before treating the refusal as permanent. The
-> `403` bodies never carry a `permission` field: holding that permission would not admit
-> the caller, so naming it would be a false remediation hint. A refused request writes no
-> quarantine record and no `attempt` audit row. It writes a `quarantine.enable` row with
+> `403` bodies above never carry a `permission` field: holding that permission would not admit
+> the caller, so naming it would be a false remediation hint. The per-device scoped gate runs
+> before this check and has its own `403` (the caller lacks `Security:Execute` on the target
+> device, or the RBAC read failed): that body does carry a `permission` field and the refusal
+> is audited as `auth.scoped_permission_required`, not `quarantine.enable`. A request refused by the
+> dispatch approval check writes no quarantine record and no `attempt` audit row. It writes a `quarantine.enable` row with
 > `result=denied` and the reason in `detail`, and increments
 > `yuzu_server_dispatch_denied_total{reason}`. A session that expires between the first
 > authorisation check and the request's second look-up now ends at the `401` instead of
@@ -2124,7 +2137,8 @@ Quarantine a device.
 > and `error.retry_after_ms` is
 > `null`. A `503` means a genuine store/pool failure — retrying is
 > reasonable, and `error.retry_after_ms` carries a concrete `5000`
-> hint (REST's envelope has no nested `data` object — that's MCP's JSON-RPC
+> hint. That includes a `503` because the `attempt` audit row could not be saved
+> (nothing was changed; the hint is still `5000`). (REST's envelope has no nested `data` object — that's MCP's JSON-RPC
 > shape; REST matches the MCP `quarantine_device` twin's A5 behavior, not
 > its exact field path).
 
@@ -6870,6 +6884,12 @@ row cap and the export byte cap. `GET
 (`response_query_row_json`, `docs/api-twin-recipe.md` Rule 1); `GET /api/v1/responses/{id}/aggregate`
 and MCP `aggregate_responses` share another (`response_aggregate_row_json`).
 
+**Bounded rows (#561).** Rows per command and device are bounded (`--response-max-rows-per-agent`,
+default 256); past the cap the newest frames are dropped and the row just before them ends with a
+`...[rows past per-agent cap dropped]` marker (a terminal frame admitted afterwards lands after it
+and is marked itself only if frames are refused after it, so a capped pair can carry two marked
+rows). See [Response Store](response-store.md).
+
 **Forensics-tier rows (#4990).** Rows written by Forensics-tier plugins (`app_usage`,
 `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`; the set is
 derived from the capability catalogue) are served only to callers who hold `Forensics:Read` in
@@ -7907,7 +7927,7 @@ Family summary: devices per family, version buckets and the coverage denominator
 | Parameter | Type | Description |
 |---|---|---|
 | `family` | string | Restrict to one family id (`openssl`, `libressl`, `boringssl`, `gnutls`, `nss`, `mbedtls`, `wolfssl`, `libgcrypt`, `libsodium`, `nettle`, `botan`, `bouncycastle`); empty means every family |
-| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi` and `python`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python` and `ibm_mq`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
 
 A parameter repeated with differing values, an unknown `family`, a value that is not valid UTF-8 or contains a NUL byte, or an over-long value is a `400`. Unknown query keys are ignored.
 
@@ -8021,7 +8041,7 @@ A CycloneDX **1.7** inventory of the cryptographic *library* packages installed 
 | Parameter | Meaning |
 |---|---|
 | `family` | One family id from the curated table; omitted or empty means every family. An unknown id is a `400`. |
-| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
+| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
 
 ```json
 {
@@ -10971,7 +10991,7 @@ These endpoints drive the **Plugin Code Signing** card, which appears on **Setti
 
 **v1 deprecated.** `GET /api/v1/agent/plugin-policy` predates #4028, is now DEPRECATED, and stays on its original flat-body shape (no `data` envelope, `require_admin` gate instead of `PluginSigning:Read`, no audit row, the old bespoke error shape) — see `server-admin.md`'s vNEXT note for the announced removal window. #4028 originally hardened this route's shape in place; #4144 corrected that into the v1/v2 split below, since an in-place envelope reshape is a breaking change per `docs/api-versioning-policy.md`.
 
-- **Permission:** `PluginSigning:Read` (Administrator-only via the `rbac_store.cpp` seed; floored in `authz_topology_floor.hpp` so an RBAC-off deployment stays admin-gated — the same practical posture the prior admin-only gate had for interactive sessions and non-MCP API tokens). **No MCP token, at any tier, can satisfy this permission** — `PluginSigning` is one of four server-administration securables `mcp_policy.hpp`'s `tier_allows()` denies outright, regardless of Read/Write, so an admin-owned MCP token that would otherwise fall through the legacy role check is stopped before it gets there. The bundle holds X.509 certificates only (no private keys), but the SHA-256 fingerprint and the trust-anchor identity are operationally sensitive — non-admin token holders are not authorized to see when the trust anchor rotates. Future automatic agent-side fetch will introduce a dedicated agent identity for this endpoint.
+- **Permission:** `PluginSigning:Read` (granted to Administrator by default via the `rbac_store.cpp` seed, so with RBAC enforced a custom role granted it is admitted; floored in `authz_topology_floor.hpp` so an RBAC-off deployment requires the admin role — the same practical posture the prior admin-only gate had for interactive sessions and non-MCP API tokens). **No MCP token, at any tier, can satisfy this permission** — `PluginSigning` is one of four server-administration securables `mcp_policy.hpp`'s `tier_allows()` denies outright, regardless of Read/Write, so an admin-owned MCP token that would otherwise fall through the legacy role check is stopped before it gets there. The bundle holds X.509 certificates only (no private keys), but the SHA-256 fingerprint and the trust-anchor identity are operationally sensitive — non-admin token holders are not authorized to see when the trust anchor rotates. Future automatic agent-side fetch will introduce a dedicated agent identity for this endpoint.
 - **Audit:** fail-closed. `settings.plugin_signing.read` is persisted before the response is built; if the audit subsystem is unavailable the route returns 503 rather than serve settings data without durable evidence.
 - **Stability:** pilot-stable. The field set is unlikely to shrink (forward-compatible additions only). `cert_count`/`sha256`/`subjects`/`trust_bundle_pem` are derived from a single filesystem read (#4144) — they cannot describe two different bundle versions on a concurrent-upload race, unlike v1.
 - **Response (200, bundle uploaded):**
@@ -13205,6 +13225,8 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 }
 ```
 
+When the caller's read is confined to a scope (RBAC enforced and `Infrastructure:Read` held only through a management-group role), the text content is instead the object `{"agents": [...], "scope_basis": "authority_scoped"}` and lists only the devices within that scope. `scope_basis` is a status, set whether or not any device was hidden. Callers with a global grant, callers with an engine grant, and non-engine callers while RBAC is off keep the bare array above.
+
 **Response (error):**
 
 ```json
@@ -13234,7 +13256,7 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 
 | Tool | Description |
 |---|---|
-| `list_agents` | List connected agents with status |
+| `list_agents` | List the connected agents the caller may read |
 | `get_agent_details` | Detailed info for a specific agent |
 | `query_audit_log` | Search audit events with filters |
 | `list_definitions` | List instruction definitions |
@@ -13570,7 +13592,7 @@ Promote the **current cookie session** to admin for a bounded window. The sessio
 **Permission:** an authenticated **cookie** session only (a Bearer/MCP-token caller gets `401` — automation credentials can never elevate); the caller must be `elevation_eligible` (eligibility is keyed on a `users` table row — an OIDC identity with no such row is denied here, not later; provision it first via `POST /api/v1/users`). A second factor is mandatory, branched strictly on the session's identity source (never a local namesake's enrollment for an OIDC caller):
 
 - **Local session:** MFA must be enrolled (unconditionally, not gated on `--mfa-enforcement`) and a fresh MFA step-up (TOTP) is required.
-- **OIDC session:** ⚠️ **temporarily unavailable** — since the `oidc:<iss>#<sub>` identity re-key (#1837/#1857), an OIDC session has no local `users` row and is denied at the eligibility gate (`403`, `"eligibility read failed"`); restoration is tracked in #1852. *The `amr` behaviour described here is the intended path #1852 restores:* a seeded `amr`-asserted MFA proof from the *current* IdP login satisfies the second-factor requirement — no local TOTP enrollment is consulted (default `--jit-oidc-amr-elevation=true`). A single-factor (no-`amr`) OIDC session is denied (`"no MFA in SSO login"`), and a seeded-but-stale proof still triggers the step-up challenge rather than a silent grant. With `--no-jit-oidc-amr-elevation`, OIDC sessions cannot elevate at all (`"OIDC-amr elevation is disabled"`) — they cannot present a local TOTP step-up (their step-up challenge is re-SSO), so the operator must switch to a local-authenticated session with local TOTP.
+- **OIDC session:** ⚠️ **temporarily unavailable** — since the `oidc:<iss>#<sub>` identity re-key (#1837/#1857), an OIDC session has no local `users` row and is denied at the eligibility gate (`403`, `"eligibility read failed"`); restoration is tracked in #1852. *The `amr` behaviour described here is the intended path #1852 restores:* a seeded `amr`-asserted MFA proof from the *current* IdP login satisfies the second-factor requirement — no local TOTP enrollment is consulted (enabled by default; `--no-jit-oidc-amr-elevation` turns it off). A single-factor (no-`amr`) OIDC session is denied (`"no MFA in SSO login"`), and a seeded-but-stale proof still triggers the step-up challenge rather than a silent grant. With `--no-jit-oidc-amr-elevation`, OIDC sessions cannot elevate at all (`"OIDC-amr elevation is disabled"`) — they cannot present a local TOTP step-up (their step-up challenge is re-SSO), so the operator must switch to a local-authenticated session with local TOTP.
 
 **Body:** `{"justification": "<string, required>", "duration_secs": <int, optional>}`. `justification` must be non-empty (control bytes are sanitised to space; capped to 1 KiB). `duration_secs` defaults to `--jit-max-elevation-secs` when absent or `0`; a value above the cap is clamped; a negative value is a `400`.
 
@@ -13584,9 +13606,9 @@ curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
 
 **Response (200):** `{"status":"ok","expires_in":<seconds>,"expires_at":"<RFC3339 UTC>"}`. `expires_in` is the TRUE remaining time computed after the grant (not an echo of the requested `duration_secs`) — the window is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute expiry (an elevation can never outlive the cookie session that carries it), so `expires_in` is always `<=` the requested duration. `expires_at` is the wall-clock projection of that same window.
 
-**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"); `403` — not eligible, eligibility read failed (fail-closed), **no MFA enrolled** (local session), **no MFA in the SSO login** (OIDC session with no `amr` proof), or **OIDC-amr elevation is disabled** (`--jit-oidc-amr-elevation` off); the MFA step-up itself returns the standard step-up `401` challenge envelope (see `/login/mfa/stepup`); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — the auth store is unavailable.
+**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"), **or a fresh MFA step-up is required** (a stale or absent proof; the answer is the standard step-up `401` challenge envelope, see `meta.challenge_url` and `/login/mfa/stepup`; a failure to read the MFA status other than a store outage is also a `401`, with an `auth_db unavailable` remediation); `403` — not eligible, eligibility read failed (fail-closed), the account's identity source could not be read or does not match the session, **no MFA enrolled** (local session), **no MFA in the SSO login** (OIDC session with no `amr` proof), **OIDC-amr elevation is disabled** (`--no-jit-oidc-amr-elevation` set), or eligibility was revoked while the step-up was in progress. A SAML session cannot elevate in this release and is always refused: it has no account row to mark eligible, so it is turned away at the eligibility check (see `authentication.md`, "JIT Admin Elevation"); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — the persistent auth store is not available, or the second-factor store is unavailable (retry shortly).
 
-**Audit:** `role.elevation.granted` (`detail=duration_secs=<N> mfa=<oidc_amr|local_totp> expires_at=<RFC3339 UTC> justification=<sanitised>` — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the free-text `justification=` field so a crafted justification can't forge either) on success; `role.elevation.denied` on a `403`, with a distinct `detail` reason per cause (not eligible / no MFA enrolled / no MFA in SSO login / OIDC-amr elevation disabled / mfa_step_up_refused). A window that later lapses PASSIVELY (no manual revoke) is audited lazily as `role.elevation.expired` on the operator's next authenticated request — see `docs/user-manual/audit-log.md`.
+**Audit:** `role.elevation.granted` (`detail=duration_secs=<N> mfa=<oidc_amr|local_totp> expires_at=<RFC3339 UTC> justification=<sanitised>` — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the free-text `justification=` field so a crafted justification can't forge either) on success; `role.elevation.denied` on a `403`, with a distinct `detail` reason per cause (not eligible / eligibility read failed / identity-source lookup failed / identity-source mismatch / no MFA enrolled / no MFA in SSO login / OIDC-amr elevation disabled / eligibility revoked during step-up); the `detail` `mfa_step_up_refused` is also written when the shared step-up gate refuses the call: a stale or absent proof is a `401`; an unwired auth store, an MFA store or decrypt outage, or an internal fault in the gate itself is a `503`; any other failure to read the MFA status is a `401` whose remediation says `auth_db unavailable`. None of them is a `403`. When the second-factor store cannot be read, the `503` also writes `role.elevation.denied`, with `result=error` rather than `denied` and a detail that says the secret or store was unavailable (fail-closed). A window that later lapses PASSIVELY (no manual revoke) is audited lazily as `role.elevation.expired` on the operator's next authenticated request — see `docs/user-manual/audit-log.md`.
 
 #### `POST /api/v1/elevate/revoke`
 
@@ -13634,9 +13656,45 @@ to any local user via `ps`; the env var is not.
 **Permission:** every endpoint below, including the three discovery
 endpoints, requires `Authorization: Bearer <scim-token>` — validated
 constant-time against the configured token's hash. Missing/invalid → `401`
-+ `WWW-Authenticate: Bearer`. This is unrelated to session cookies, API
-tokens, or RBAC — there is no `role`/permission check on these routes, only
-the bearer credential.
++ `WWW-Authenticate: Bearer`, a `scim.auth.denied` audit row and a
+`yuzu_scim_auth_failures_total` increment. `401` means only that: the token was
+checked and rejected, or missing. If the store behind the check cannot answer
+(#6835: a connection that cannot be leased in time, or a failed query), the answer
+is `503` + `Retry-After: 2` with the detail "temporarily unable to authenticate the
+request (store unavailable); retry" on every route, discovery included; it writes no
+`scim.auth.denied` row and does not move `yuzu_scim_auth_failures_total` (an outage is
+not a credential guess), and counts
+`yuzu_scim_guard_store_unavailable_total{guard="bearer"}`. A SCIM store that is not
+configured or not open, and an empty token, stay `401`. This is unrelated to session
+cookies, API tokens, or RBAC — there is no `role`/permission check on these routes,
+only the bearer credential.
+
+**Store faults on lookups (#6835).** Where a route below answers `404`, `409` or an
+empty/"no duplicate" result on the strength of a SCIM-store read, a failed read (not an
+absent row) is instead `503` + `Retry-After: 2` with the detail "temporarily unable to read
+the SCIM store (store unavailable); retry". This covers `GET`, `PUT`, `PATCH` and `DELETE`
+on `/Users/{id}` and `/Groups/{id}`, the duplicate `userName` and `displayName` checks of
+`POST /Users` and `POST /Groups`, the rename duplicate checks of `PUT`/`PATCH` on a Group,
+and the `userName eq` / `displayName eq` filter queries. The request changes nothing; it
+counts `yuzu_scim_guard_store_unavailable_total{guard="resource"}` and logs an `ERROR`
+(which names the target id). A *mutating* request (`POST`, `PUT`, `PATCH`, `DELETE`) is also
+audited under its own verb (`scim.user.provisioned`, `scim.user.updated`, `scim.user.deleted`,
+`scim.group.created`, `scim.group.updated`, `scim.group.deleted`) as `failure` with detail
+`store_unavailable: lookup (<site>)`; the row is best effort, because the audit store is usually
+the same database that just failed. `GET /Users/{id}`, `GET /Groups/{id}`, the two list filters
+and the bearer-token `503` write no audit row (a `GET` has no audit verb, and a row per polled
+`GET` would trip `YuzuScimAuditWriteFailures` for requests that changed nothing). In a full
+outage the audit store is down too, so no row is written for any of these `503`s and the trail is
+the `ERROR` log plus the counter; when a mutating request's failure row cannot be written,
+`YuzuScimAuditWriteFailures` can fire for a request that changed nothing. A definitively
+missing resource is still `404` and a definitive duplicate still `409`. **Not covered:** the
+unfiltered `GET /Users` and `GET /Groups` (`list()` / `count()` fail open, #2481, so an
+unfiltered list can answer an empty `200` during a store fault while a filtered one answers
+`503`); the `POST /Users` reads other than the duplicate check, including the concurrent-create
+re-read (`get_by_username` after a failed create) and `find_by_external_id` (#6837, a fault there
+falls through to the later `500`); and the post-mutation re-fetches (`500`).
+Operator view of every case:
+[SCIM failure-mode matrix](scim-provisioning.md#scim-failure-mode-matrix).
 
 #### `GET /scim/v2/ServiceProviderConfig`
 
@@ -13670,9 +13728,10 @@ are tolerated and ignored).
 | Status | Condition | Body |
 |---|---|---|
 | `201` + `Location` + `ETag` | Created | SCIM User representation |
-| `409` (`scim_type=uniqueness`) | `userName` already provisioned on a **currently-active** account | SCIM error envelope |
+| `409` (`scim_type=uniqueness`) | `userName` already provisioned on a **currently-active** account (a definitive answer from the duplicate check; a store fault in that check is the `503` below) | SCIM error envelope |
 | `404` | The `userName` already holds an `Administrator` grant, or names a deactivated record whose role is not `user` (nothing is created or reactivated; the answer is a side-effect-free signal to the SCIM bearer holder, not an existence-free one) | SCIM error envelope |
 | `409` (`scim_type=mutability`) | `active:false` on create was refused by the last-Administrator guard (the new account stays active and mapped) | SCIM error envelope |
+| `503` + `Retry-After: 2` | (#6835) The SCIM store could not answer the duplicate-`userName` check; nothing was created, `yuzu_scim_guard_store_unavailable_total{guard="resource"}` counts it, `scim.user.provisioned` / `failure` with detail `store_unavailable: lookup (user lookup (create))` is audited (best effort), and a retry is safe | SCIM error envelope |
 | `500` | A deactivated record's role could not be read, a half-finished create could not be undone (`scim.user.compensation_failed`, state per outcome, see `rbac.md`), or the underlying account write failed | SCIM error envelope |
 | `503` + `Retry-After: 2` | The authorization store was unavailable (the Administrator-grant read failed, or the guarded deactivation for `active:false` timed out or lost its store). The body is the plain SCIM error (no `retry_after_ms` member); the detail says the account state may be indeterminate. After a grant-read failure nothing was created and a retry is safe; after a failed `active:false` deactivation the new account stays active and mapped and a retry of the `POST` answers the userName `409`, so it does not converge. Or (#6836) the role re-check after the reactivation of a revived account could not be read: the reactivation is undone (the account stays down), `Retry-After: 2`, audit `scim.user.provisioned` / `failure` with detail `store_unavailable: revive role check`, counted on `yuzu_scim_guard_store_unavailable_total{guard="role"}` and not on `yuzu_scim_provenance_denied_total`; the IdP's retry of the `POST` converges once the store answers. If the undo cannot complete (likely during a real outage, since the undo needs the same store) the answer is `500`, not `503`: audit detail `store_unavailable: revive role check; undo did not complete; see scim.user.compensation_failed`, a `scim.user.compensation_failed` row, `yuzu_scim_guard_store_unavailable_total{guard="role"}` still counted (it is bumped before the undo), and the account may be left active or indeterminate; an IdP retry revives it idempotently once the store answers | SCIM error envelope |
 
@@ -13693,7 +13752,8 @@ Read a single provisioned user by its SCIM `id`.
 | Status | Condition |
 |---|---|
 | `200` | Found — SCIM User representation |
-| `404` | Unknown `id` |
+| `404` | Unknown `id` (a definitive answer: the store was read and has no such resource) |
+| `503` + `Retry-After: 2` | (#6835) The SCIM store could not be read. Not a `404`; retry. No audit row (a `GET`); counted on `yuzu_scim_guard_store_unavailable_total{guard="resource"}` |
 
 #### `GET /scim/v2/Users?filter=userName eq "x"&startIndex=&count=`
 
@@ -13702,7 +13762,10 @@ call a connector makes before create. **Only `userName eq "value"` is
 supported** (case-insensitive attribute/operator, double-quoted value); any
 other filter expression is rejected `400` (`scim_type=invalidFilter`).
 Response is a SCIM `ListResponse` envelope; `startIndex` is 1-based per RFC
-7644 §3.4.2.
+7644 §3.4.2. (#6835) If the store cannot answer the `userName eq` lookup, the answer is
+`503` + `Retry-After: 2`, not an empty `ListResponse`: a connector that reads an empty list
+as "does not exist" would otherwise try to create a duplicate. The unfiltered list is not
+covered: it fails open and can read as empty or short during an outage (#2481).
 
 #### `PUT /scim/v2/Users/{id}`
 
@@ -13715,8 +13778,9 @@ connectors issue `PUT` rather than `PATCH` for lifecycle changes.
 |---|---|
 | `200` | Replaced — SCIM User representation |
 | `400` (`scim_type=mutability`) | Body includes a `userName` change — rename is out of scope this slice |
-| `404` | Unknown `id`, or the provenance/role guard rejects the target (see below) |
+| `404` | Unknown `id` (a definitive answer; a failed store read is the `503` below), or the provenance/role guard rejects the target (see below) |
 | `409` (`scim_type=mutability`) | `active:false` would remove the fleet's last protected administrator (see "Last-administrator refusal" below) |
+| `503` + `Retry-After: 2` | (#6835) The SCIM store could not be read for the resource lookup. Nothing is changed; audited as `scim.user.updated` / `failure`, detail `store_unavailable: lookup (user lookup (replace))` (best effort); counted on `yuzu_scim_guard_store_unavailable_total{guard="resource"}`; retry |
 | `500` | The account was deactivated but its durable session wipe failed (an IdP retry is not promised to repeat the wipe, #5214), or another account write failed |
 | `503` + `Retry-After: 2` | The guarded deactivation timed out or lost its store (the linked credentials were already revoked; the detail says the account state may be indeterminate), `active:true` could not read the Administrator grants, or (#4068) `active:false` on a resource whose Yuzu mirror already reads inactive could not verify the real account state because the user store did not answer: the request is refused instead of reported as an already-deprovisioned no-op, nothing is changed, and a retry once the store answers repairs a desynced account. Audit `scim.user.deactivated / failure` keyed by the resource's SCIM id with detail `store_unavailable: verifying account state`. A retry finishes the job only when the cause was a lock timeout in which nothing committed; it does not converge after a lost commit acknowledgement (the retry meets the `404` of the role guard on the now-deactivated account, #5214). Or (#6836) the provenance or role re-check could not be read because the user store did not answer: `Retry-After: 2`, audited as the request's own action (`failure`, detail `store_unavailable: provenance check` or `store_unavailable: role check`), counted on `yuzu_scim_guard_store_unavailable_total{guard}` and not on `yuzu_scim_provenance_denied_total`. The guard that fails makes no change. A `PUT`, or a `PATCH` that sets `externalId` together with a change to `active`, applies the `active` change first and then re-checks provenance (and, after a reactivation, the role); if that re-check meets the outage, the `503` follows an already-applied activation change (the audit shows a `success` row for the activation followed by a `scim.user.updated` `failure`) and the IdP's retry, which finds the account already in the requested state, completes. |
 
@@ -13733,19 +13797,19 @@ and explicit `{"path":"active","value":false}` PatchOp forms are accepted.
 | Status | Condition |
 |---|---|
 | `200` | Applied — SCIM User representation |
-| `404` | Unknown `id`, or the provenance/role guard rejects the target (see below) |
+| `404` | Unknown `id` (a definitive answer), or the provenance/role guard rejects the target (see below) |
 | `409` (`scim_type=mutability`) | `active:false` would remove the fleet's last protected administrator (see "Last-administrator refusal" below) |
-| `500` / `503` | As for `PUT` above, including the (#6836) `503` when the provenance or role re-check could not be read |
+| `500` / `503` | As for `PUT` above, including the (#6835) `503` when the resource lookup could not read the SCIM store and the (#6836) `503` when the provenance or role re-check could not be read |
 
 `active:true` applies the same pre-checks as `POST` on a revive (behaviour change: such a request used to reactivate the account): a deactivated record whose role is not `user`, or a username that now holds an `Administrator` grant, is `404` (nothing reactivated), audited as `scim.user.provenance_denied`. A tombstone whose role cannot be read answers `500` and an unreadable grant answer is the `503` above (audit `scim.user.reactivated` / `failure`: `tombstone role unreadable before reactivation` or `administrator grant check unavailable`). Every `404` bumps `yuzu_scim_provenance_denied_total`, which the shipped alert describes as a compromised-IdP signal: this benign case also fires it. An elevated tombstone cannot be re-enabled through SCIM or the dashboard until its role is cleared (see `rbac.md`, "SCIM specifics"); SCIM can deactivate the holder of an `Administrator` grant but cannot reactivate it until the grant is removed.
 
 #### `DELETE /scim/v2/Users/{id}`
 
 Deprovision (equivalent to `PATCH`/`PUT active:false` for IdPs that issue a
-hard delete). `204` on success; `404` if unknown or guard-rejected; `409`
+hard delete). `204` on success; `404` if unknown (a definitive answer) or guard-rejected; `409`
 (`scim_type=mutability`) under the last-administrator refusal below; `500`
 (account deactivated but its durable session wipe failed) or `503` +
-`Retry-After: 2` (the guarded write timed out or lost its store, or (#6836) the provenance or role re-check could not be read; a `DELETE` of an already-inactive mirror runs the provenance check only), as for `PUT`.
+`Retry-After: 2` (the guarded write timed out or lost its store, or (#6836) the provenance or role re-check could not be read; a `DELETE` of an already-inactive mirror runs the provenance check only; or (#6835) the resource lookup could not read the SCIM store, audited best effort as `scim.user.deleted` / `failure` with detail `store_unavailable: lookup (user lookup (delete))`), as for `PUT`.
 
 #### Last-administrator refusal
 
@@ -13829,7 +13893,8 @@ Create a group. Body: `displayName` (required), optional `members[]`
 | Status | Condition | Body |
 |---|---|---|
 | `201` + `Location` + `ETag` | Created | SCIM Group representation |
-| `409` (`scim_type=uniqueness`) | `displayName` already in use | SCIM error envelope |
+| `409` (`scim_type=uniqueness`) | `displayName` already in use (a definitive answer from the duplicate check) | SCIM error envelope |
+| `503` + `Retry-After: 2` | (#6835) The SCIM store could not answer the duplicate-`displayName` check (nothing created; audited best effort as `scim.group.created` / `failure`, detail `store_unavailable: lookup (group lookup (create))`; counted on `guard="resource"`), or a member could not be resolved ("membership unavailable", audited `scim.group.created` / `failure`). In the second case the members are resolved BEFORE the group row is created, so nothing is created, nothing is rolled back, and the retry creates the group normally (`201`, never a `409` against an empty group); the audit row has an empty target id. (A failure to persist the membership after the group was created is a different case: `500` `failed to persist group membership`, and the empty group remains.) | SCIM error envelope |
 
 The success audit row (`scim.group.created`) records `recompute=complete` when
 every affected member's role was recomputed as intended, otherwise
@@ -13838,8 +13903,10 @@ below.
 
 #### `GET /scim/v2/Groups/{id}`
 
-Read a single group by its SCIM `id`. `200` + Group representation, or
-`404` if unknown.
+Read a single group by its SCIM `id`. `200` + Group representation, `404` if unknown
+(a definitive answer), or `503` + `Retry-After: 2` if the SCIM store could not be read
+(#6835; a `GET`, so no audit row; counted on `guard="resource"`) or the Group's members could not be
+read ("membership unavailable", which now also carries `Retry-After: 2`).
 
 #### `GET /scim/v2/Groups?filter=displayName eq "x"&startIndex=&count=`
 
@@ -13847,13 +13914,19 @@ List groups. Same pagination contract as `GET /scim/v2/Users`
 (`startIndex`/`count`, SCIM `ListResponse` envelope, `startIndex` 1-based per
 RFC 7644 §3.4.2). Optional `filter=displayName eq "..."` (case-insensitive
 attribute/operator, double-quoted value); any other filter expression is
-rejected `400` (`scim_type=invalidFilter`).
+rejected `400` (`scim_type=invalidFilter`). (#6835) A failed store read for the
+`displayName eq` lookup is `503` + `Retry-After: 2`, not an empty `ListResponse`. The
+unfiltered list is not covered: it fails open (#2481).
 
 #### `PUT /scim/v2/Groups/{id}`
 
 Replace a group (`displayName`, `members[]`). `200` + Group representation;
 `404` if unknown; `409` (`scim_type=uniqueness`) if the replace would rename
-onto a `displayName` already used by a different group. The success audit row
+onto a `displayName` already used by a different group; `503` + `Retry-After: 2` if the
+SCIM store could not be read for the Group lookup, the re-read of the current Group, or the
+rename duplicate check (#6835; nothing changed, audited best effort as `scim.group.updated` / `failure` with detail `store_unavailable: lookup (<site>)`, counted on `guard="resource"`),
+or if membership could not be read or resolved ("membership unavailable", audited
+`scim.group.updated` / `failure`, now with `Retry-After: 2`). The success audit row
 (`scim.group.updated`) records `recompute=complete` or `recompute=incomplete`
 (the status stays `200`).
 
@@ -13861,12 +13934,19 @@ onto a `displayName` already used by a different group. The success audit row
 
 Add/remove members — RFC 7644 §3.5.2 PatchOp on the `members` path
 (`"op": "add"` / `"op": "remove"`, `"path": "members"`). `200` + Group
-representation, or `404` if unknown. The success audit row (`scim.group.updated`)
+representation, `404` if unknown, or `503` + `Retry-After: 2` if the SCIM store could not be
+read for the Group lookup, the re-read of the current Group or the rename duplicate check
+(#6835; nothing changed, audited best effort as `scim.group.updated` / `failure` with detail `store_unavailable: lookup (<site>)`, counted on `guard="resource"`) or membership could not
+be read or resolved (audited `scim.group.updated` / `failure`, now with `Retry-After: 2`). The
+success audit row (`scim.group.updated`)
 records `recompute=complete` or `recompute=incomplete` (the status stays `200`).
 
 #### `DELETE /scim/v2/Groups/{id}`
 
-Delete a group. `204` on success; `404` if unknown. The success audit row
+Delete a group. `204` on success; `404` if unknown; `503` + `Retry-After: 2` if the SCIM store
+could not be read for the Group lookup (#6835; audited best effort as `scim.group.deleted` / `failure` with detail `store_unavailable: lookup (group lookup (group_delete))`, counted on `guard="resource"`) or
+the membership snapshot could not be read (audited `scim.group.deleted` / `failure`, now with
+`Retry-After: 2`). The success audit row
 (`scim.group.deleted`) records `recompute=complete` or `recompute=incomplete`
 (the status stays `204`).
 
@@ -13881,19 +13961,19 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 
 | Action | Result | When |
 |---|---|---|
-| `scim.user.provisioned` | `success` / `denied` / `failure` | `POST` succeeds (incl. a revived reprovision) / rejected `409` against an active account / rolls back `500`. (#6836) A revive whose role re-check could not be read is `failure` / `503` with `detail` `store_unavailable: revive role check` (`target_id` is the userName; the reactivation was undone); if the undo did not complete it is `failure` / `500` with `detail` `store_unavailable: revive role check; undo did not complete; see scim.user.compensation_failed`. (#4068) A `500` after a failed account create whose concurrent-create re-read hit a user-store error carries `detail` `store_unavailable: concurrent-create re-read` (the answer stays `500`: the create may have committed, so a retry would meet the non-SCIM-account `409`; tracked in #6837) |
-| `scim.user.updated` | `success` / `failure` | `PUT /scim/v2/Users/{id}` succeeds / fails `500`; `failure` / `503` (#6836) with `detail` `store_unavailable: provenance check` or `store_unavailable: role check` when the provenance re-check, or the role re-check on an active resource (including straight after a reactivation), that a `PUT` (always) or a `PATCH` with `externalId` runs before its `externalId` write could not read the user store; when it follows an `active` change, that change was already applied and has its own `success` row |
+| `scim.user.provisioned` | `success` / `denied` / `failure` | `POST` succeeds (incl. a revived reprovision) / rejected `409` against an active account / rolls back `500`. (#6836) A revive whose role re-check could not be read is `failure` / `503` with `detail` `store_unavailable: revive role check` (`target_id` is the userName; the reactivation was undone); if the undo did not complete it is `failure` / `500` with `detail` `store_unavailable: revive role check; undo did not complete; see scim.user.compensation_failed`. (#4068) A `500` after a failed account create whose concurrent-create re-read hit a user-store error carries `detail` `store_unavailable: concurrent-create re-read` (the answer stays `500`: the create may have committed, so a retry would meet the non-SCIM-account `409`; tracked in #6837). (#6835) A SCIM-store fault in the duplicate-`userName` lookup is `failure` / `503` with `detail` `store_unavailable: lookup (user lookup (create))` (`target_id` is the userName; best effort) |
+| `scim.user.updated` | `success` / `failure` | `PUT /scim/v2/Users/{id}` succeeds / fails `500`; `failure` / `503` (#6836) with `detail` `store_unavailable: provenance check` or `store_unavailable: role check` when the provenance re-check, or the role re-check on an active resource (including straight after a reactivation), that a `PUT` (always) or a `PATCH` with `externalId` runs before its `externalId` write could not read the user store; when it follows an `active` change, that change was already applied and has its own `success` row. (#6835) A SCIM-store fault in the resource lookup is `failure` / `503` with `detail` `store_unavailable: lookup (user lookup (replace))` or `(user lookup (patch))` (best effort) |
 | `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write itself could not persist. (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#4068) A desync-repair read that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: verifying account state` (`target_id` is the SCIM id); nothing was changed. (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. |
 | `scim.user.reactivated` | `success` / `failure` | `PATCH`/`PUT` sets `active:true`. `failure` causes: the tombstone's role could not be read (`500`, detail `tombstone role unreadable before reactivation`), the Administrator-grant read was unavailable (`503`, detail `administrator grant check unavailable`), the account or mirror write failed (`500`). An elevated tombstone or a name holding an Administrator grant is NOT a `reactivated` row: it is `scim.user.provenance_denied` (`404`). (#6836) The provenance check inside the reactivation, when the user store could not answer it, is `failure` / `503` with `detail` `store_unavailable: provenance check`; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard="provenance"}`. The role re-check that a `PUT`/`PATCH` carrying `externalId` runs straight after a reactivation is audited as `scim.user.updated`, not `scim.user.reactivated`. |
-| `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed). (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. |
+| `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed). (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. (#6835) A SCIM-store fault in the resource lookup is `failure` / `503` with `detail` `store_unavailable: lookup (user lookup (delete))` (best effort). |
 | `scim.user.provenance_denied` | `denied` | A mutating call targets an account failing the provenance or role guard, or a `POST` or an `active:true` reactivation names a tombstone whose role is not `user` / a username that already holds an `Administrator` grant (the latter two also fire for a benign re-enable of an account an operator elevated or granted outside SCIM). For a deactivate, delete, reactivate, update or a `POST` that revives a removed account, a store fault is not a denial (#6836): when the user store cannot answer the provenance or role read (a `POST` revive re-reads only the role), no `scim.user.provenance_denied` row is written, `yuzu_scim_provenance_denied_total` does not move and the linked-identity escalation does not fire; the request answers `503` and is audited as its own action with `store_unavailable`. The `POST` create reads (the provisioning-source read and the duplicate/race reads) are tracked in #6837; the tombstone-role `500` in the revive pre-check (`POST` revive and `PATCH`/`PUT` `active:true`; the grant-read fault in the same pre-check already answers `503`) and the `500` when the reactivation's own post-commit re-read fails (`failed to revive the underlying account`, no undo) are not covered by this change either (same defect class as #6837, which does not list them). |
 | `scim.user.last_administrator_refused` | `denied` / `partial` | The last-Administrator guard refused a deactivation, delete, `POST` with `active:false` or group-derived demotion (`409` `mutability` on the Users routes; a refused group-derived demotion is not a `409`: the Group request keeps its `2xx` and the member keeps the role). On the Users routes `detail` carries `attempted_action=...`, `early_refusal=true\|false`, `credentials_revoked_before_refusal=true\|false`, `account_remains_active=true` and `live_api_tokens_slug=<n>` (the username's own live tokens; `unknown` if the store could not answer), plus `sessions_not_revoked=true` on an early refusal or `identity_links_unchanged=true` and the revoke summary on a late one; a LATE refusal is `partial` (credentials were revoked), an early one and a refused group-derived demotion are `denied`. `live_api_tokens_slug` is followed by `linked_principals_not_walked=true`: linked OIDC/SAML principals' tokens are not counted. The `revoked_principals=` list is lossy: `,`, space, `=`, control bytes and every byte >= 0x80 become `_`, so two distinct principals can collapse into one token (the exact identity stays in `identity_links`). For a refused group-derived demotion it carries `attempted_action=scim.user.role_changed` and `role_unchanged=true`. Every refusal, including a refused demotion, also raises a critical analytics event |
 | `scim.group.recompute_incomplete` | `partial` | (target type `Group`) A Group request's role recompute did not apply every member as intended (a refused or failed demotion, an undetermined member whose read failed, or promotions skipped after a failed guarded write): `detail` carries `members=<n>` and, per non-empty class, `refused`, `failed`, `undetermined` or `skipped_promotions` with the count and up to 20 usernames (the first 20 are named; the count is exact), then the trigger. Counted on `yuzu_scim_group_recompute_skipped_total{cause}`. The Group request's own status is unchanged, and its `scim.group.created`/`updated`/`deleted` success row says `recompute=incomplete`. A failed demotion is also a `scim.user.role_changed` `failure` row plus a critical analytics event |
 | `scim.user.compensation_failed` | `failure` | The guarded undo of a half-finished create/revive was refused or failed; the request answered `500`. `outcome=guard_refused_last_administrator` leaves the account active; `deactivated_but_session_wipe_failed` leaves it deactivated with a possibly live session; `store_failure` leaves its state indeterminate, so check the account. A critical analytics event and `yuzu_scim_compensation_failed_total{outcome}` accompany it |
-| `scim.auth.denied` | `denied` | Bearer-auth validation fails on any `/scim/v2/*` route, including discovery |
-| `scim.group.created` | `success` / `denied` / `failure` | `POST /scim/v2/Groups` succeeds / rejected `409` - `displayName` collision / rolls back `500`. On `success`, `detail` is `recompute=complete` or `recompute=incomplete` |
-| `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` - rename onto an existing `displayName` / fails `500`. On `success`, `detail` is `recompute=complete` or `recompute=incomplete` |
-| `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed). On `success`, `detail` is `recompute=complete` or `recompute=incomplete` |
+| `scim.auth.denied` | `denied` | Bearer-auth validation fails (missing, malformed or wrong token) on any `/scim/v2/*` route, including discovery. (#6835) Not written when the token check could not read the store: that is a `503`, with no audit row (the request has no verb or identity, and a row per polled `GET` would trip `YuzuScimAuditWriteFailures`), counted on `yuzu_scim_guard_store_unavailable_total{guard="bearer"}` and logged at `ERROR` |
+| `scim.group.created` | `success` / `denied` / `failure` | `POST /scim/v2/Groups` succeeds / rejected `409` - `displayName` collision / fails `500`. On `success`, `detail` is `recompute=complete` or `recompute=incomplete`. (#6835) A SCIM-store fault in the duplicate-`displayName` lookup is `failure` / `503` with `detail` `store_unavailable: lookup (group lookup (create))` (empty target; best effort). A member-resolution `503` is raised before the group row is created: it is `failure` with an empty target id and `detail` `member resolution unavailable; no group was created`, nothing is created (no rollback exists), and the retry creates the group normally (`201`). A `500` `failed to persist group membership` (after the group was created) leaves the empty group in place. |
+| `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` - rename onto an existing `displayName` / fails `500`. On `success`, `detail` is `recompute=complete` or `recompute=incomplete`. (#6835) A SCIM-store fault in the Group lookup, the re-read of the current Group or the rename duplicate check is `failure` / `503` with `detail` `store_unavailable: lookup (<site>)` where `<site>` is `group lookup (group_replace)`, `(group_replace, current)`, `(rename, replace)`, `(group_patch)`, `(group_patch, current)` or `(rename, patch)` (best effort) |
+| `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed). On `success`, `detail` is `recompute=complete` or `recompute=incomplete`. (#6835) A SCIM-store fault in the Group lookup is `failure` / `503` with `detail` `store_unavailable: lookup (group lookup (group_delete))` (best effort) |
 | `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value on user create or a Group create/replace/patch/delete (records `old_role`→`new_role`, `reason=group`) |
 | `scim.user.deprovision_role_refused_with_link` | `failure` | ADR-2001 D1: a role-refused deprovision (`deprovision_role_ok` 404 — the slug's role is not `user`) for a slug with ≥1 active linked OIDC identity, whose tokens are therefore NOT auto-revoked. Always written alongside `yuzu_scim_deprovision_role_refused_with_active_link_total` — see `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision". |
 | `auth.oidc.deprovisioned_denied` | `failure` | ADR-2001 §4/PR3: an OIDC login was refused because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the store could not answer — fail-closed). Emitted from `GET /auth/callback`, not a `/scim/v2/*` route — listed here because it is part of the same ADR-2001 linkage. `detail` carries `reason=linked_scim_resource_inactive;scim_id=<id>` when a resolved resource (deactivated, or orphaned by a hard-deleted `scim_resources` row) drove the denial, or `reason=scim_store_unavailable` when the store could not answer (fail-closed — no `scim_id` to name); and — only on the post-mint re-check path (a concurrent deprovision landed after the primary check) — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). The two `reason` values keep a genuine deprovision (CC6.8 evidence) distinguishable from a store outage. Pairs with `yuzu_auth_oidc_deprovisioned_denied_total`. |
@@ -13904,9 +13984,10 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 #### Metrics
 
 `yuzu_scim_requests_total{op,status}` (now including group ops),
-`yuzu_scim_auth_failures_total`, `yuzu_scim_audit_write_failures_total`,
-`yuzu_scim_provenance_denied_total`, `yuzu_scim_guard_store_unavailable_total` (#6836, label
-`guard`), `yuzu_scim_role_changes_total`,
+`yuzu_scim_auth_failures_total` (a rejected or missing token only; a store fault while
+checking the token does not move it), `yuzu_scim_audit_write_failures_total`,
+`yuzu_scim_provenance_denied_total`, `yuzu_scim_guard_store_unavailable_total` (#6836, #6835;
+label `guard` = `provenance`\|`role`\|`bearer`\|`resource`), `yuzu_scim_role_changes_total`,
 `yuzu_scim_role_change_failures_total` (a role change that was decided but
 failed to durably apply — pairs with `scim.user.role_changed` `failure`
 rows).

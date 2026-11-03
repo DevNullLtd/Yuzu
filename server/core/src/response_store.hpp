@@ -50,6 +50,7 @@
 #include <utility>
 #include <vector>
 
+#include "bounded_audit_budget.hpp"
 #include "response_tier_filter.hpp"
 
 namespace yuzu {
@@ -251,6 +252,15 @@ struct AggregationResult {
 /// Default retention (days) — matches the pre-migration SQLite default.
 inline constexpr int kDefaultResponseRetentionDays = 90;
 
+/// Default rows per (instruction_id, agent_id) pair (#561): about 16 MiB at the agent's
+/// ~64 KiB flush size; see response_cap_rules.hpp.
+inline constexpr int kDefaultResponseMaxRowsPerAgent = 256;
+
+/// The cap-refusal warning budget treats two keys that share this many leading bytes as ONE agent,
+/// so it covers a whole agent id (auth::kMaxAgentIdLength, 256; asserted in response_store.cpp
+/// where both are visible).
+inline constexpr std::size_t kCapLogBudgetKeyBytes = 256;
+
 class ResponseStore {
 public:
     /// Borrows the shared pool and runs the `response_store` schema
@@ -264,7 +274,8 @@ public:
     /// (`AuditStore::cleanup_once`'s `#2360/1d` shape), so `now_fn` can
     /// never move a reap verdict.
     explicit ResponseStore(pg::PgPool& pool, int retention_days = kDefaultResponseRetentionDays,
-                           std::function<int64_t()> now_fn = nullptr);
+                           std::function<int64_t()> now_fn = nullptr,
+                           int max_rows_per_agent = kDefaultResponseMaxRowsPerAgent);
 
     ResponseStore(const ResponseStore&) = delete;
     ResponseStore& operator=(const ResponseStore&) = delete;
@@ -300,6 +311,13 @@ public:
     /// transaction on any failed statement, unlike SQLite — the ADR-0038
     /// lesson); only the response INSERT itself failing aborts the whole
     /// call.
+    ///
+    /// Two independent bounds: per-row bytes (kMaxIngestBytes) and per-pair rows
+    /// (max_rows_per_agent, #561); refused frames count on
+    /// yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}, and a refusal marks
+    /// the pair's newest retained row (the one before the gap) so a reader can tell the tail
+    /// was dropped.
+    /// Exact semantics: response_cap_rules.hpp.
     void store(const StoredResponse& resp);
 
     /// Tri-state outcome of `finalize_terminal_status` so callers can
@@ -534,6 +552,14 @@ private:
     std::atomic<uint64_t> responses_reaped_{0};
     std::atomic<uint64_t> facets_predrained_{0};
     std::function<int64_t()> now_fn_; // test seam only; see ctor doc
+    // Rows per (instruction_id, agent_id) pair before store() refuses (#561). Callers pass >= 1
+    // (the flag's CLI::Range enforces it). No public accessor: the read tripwire freezes the
+    // public method list.
+    int max_rows_per_agent_;
+    // Bounds the cap-refusal WARN line per agent (the counter is unsampled). Keys are agent ids,
+    // so the key bound is kCapLogBudgetKeyBytes (the agent-id limit).
+    DenialAuditBudget cap_log_budget_{kDefaultAuditMaxRows, kDefaultAuditWindowMs, {},
+                                      kDefaultAuditMaxKeys, kCapLogBudgetKeyBytes};
 
     int64_t compute_ttl_epoch() const;
 };

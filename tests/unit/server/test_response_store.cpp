@@ -10,6 +10,8 @@
 
 #include "response_store.hpp"
 
+#include "response_cap_rules.hpp"
+
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -3855,4 +3857,265 @@ TEST_CASE("ResponseStore tier: a filter with no plugin set wired refuses every r
     auto lc = store.facet_line_count(kTierInstr, f, ctl);
     REQUIRE(lc.has_value());
     CHECK(*lc == 0);
+}
+
+// ── Per-(instruction, agent) row cap (#561) ──────────────────────────────────
+
+TEST_CASE("per_agent_cap_admits decision table", "[response_store][cap]") {
+    // Below the cap everything is admitted, terminal or not.
+    CHECK(per_agent_cap_admits(0, 4, false, false));
+    CHECK(per_agent_cap_admits(3, 4, true, true));
+    // At the cap a RUNNING frame is refused.
+    CHECK_FALSE(per_agent_cap_admits(4, 4, false, false));
+    // At the cap the first terminal frame is admitted; a second is refused.
+    CHECK(per_agent_cap_admits(4, 4, true, false));
+    CHECK_FALSE(per_agent_cap_admits(4, 4, true, true));
+}
+
+namespace {
+StoredResponse cap_frame(const std::string& instruction, const std::string& agent, int status,
+                         const std::string& execution_id = "") {
+    StoredResponse r;
+    r.instruction_id = instruction;
+    r.agent_id = agent;
+    r.status = status;
+    r.execution_id = execution_id;
+    r.output = "frame";
+    return r;
+}
+
+// The pair's retained rows, oldest first (by id).
+std::vector<StoredResponse> pair_rows(const ResponseStore& store, const std::string& instruction,
+                                      const std::string& agent) {
+    auto all = store.get_by_instruction(instruction, kAllRows);
+    REQUIRE(all.has_value());
+    std::vector<StoredResponse> rows;
+    for (const auto& r : *all)
+        if (r.agent_id == agent)
+            rows.push_back(r);
+    std::sort(rows.begin(), rows.end(),
+              [](const StoredResponse& a, const StoredResponse& b) { return a.id < b.id; });
+    return rows;
+}
+
+std::size_t cap_rows(const ResponseStore& store, const std::string& instruction,
+                     const std::string& agent) {
+    return pair_rows(store, instruction, agent).size();
+}
+
+double cap_dropped(yuzu::MetricsRegistry& metrics, const char* reason = "per_agent_cap") {
+    return metrics.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}})
+        .value();
+}
+
+// Member order is load-bearing: the store borrows the pool and keeps a pointer to the metrics, so
+// both outlive it.
+struct CapFixture {
+    PgPool pool;
+    yuzu::MetricsRegistry metrics;
+    ResponseStore store;
+    CapFixture(const std::string& dsn, int cap)
+        : pool{{.conninfo = dsn, .size = 4}}, store(pool, 0, nullptr, cap) {
+        REQUIRE(store.is_open());
+        store.set_metrics(&metrics);
+    }
+};
+} // namespace
+
+TEST_CASE("ResponseStore: rows per (instruction, agent) are capped and counted",
+          "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+
+    for (int i = 0; i < 5; ++i)
+        f.store.store(cap_frame("cmd-cap", "agent-1", 0));
+
+    CHECK(cap_rows(f.store, "cmd-cap", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 1.0);
+    CHECK(cap_dropped(f.metrics, "query_error") == 0.0); // a cap refusal is never a query_error
+}
+
+TEST_CASE("ResponseStore: a capped pair's row before the gap ends with the row-cap marker",
+          "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+    // The marker text is the operator-visible contract (response-store.md): pin the literal.
+    const std::string marker = "\n...[rows past per-agent cap dropped]";
+
+    for (int i = 0; i < 5; ++i)
+        f.store.store(cap_frame("cmd-mark", "agent-1", 0));
+    f.store.store(cap_frame("cmd-mark", "agent-2", 0)); // a different pair, below its cap
+
+    auto rows = pair_rows(f.store, "cmd-mark", "agent-1");
+    REQUIRE(rows.size() == 4);
+    for (std::size_t i = 0; i + 1 < rows.size(); ++i)
+        CHECK(rows[i].output == "frame"); // only the newest retained row carries the marker
+    CHECK(rows.back().output == "frame" + marker);
+    CHECK(pair_rows(f.store, "cmd-mark", "agent-2").front().output == "frame");
+
+    // A further refusal leaves exactly one marker (the UPDATE is idempotent).
+    f.store.store(cap_frame("cmd-mark", "agent-1", 0));
+    rows = pair_rows(f.store, "cmd-mark", "agent-1");
+    REQUIRE(rows.size() == 4);
+    CHECK(rows.back().output == "frame" + marker);
+    CHECK(cap_dropped(f.metrics) == 2.0);
+    CHECK(cap_dropped(f.metrics, "query_error") == 0.0);
+
+    // "Newest" is by row timestamp (what the executions drawer orders by), not insertion order:
+    // the marker lands on the ts=300 row even though two rows were inserted after it.
+    for (const int64_t ts : {200, 300, 100, 150, 250}) {
+        auto frame = cap_frame("cmd-mark", "agent-3", 0);
+        frame.timestamp = ts;
+        f.store.store(frame);
+    }
+    const auto agent3 = pair_rows(f.store, "cmd-mark", "agent-3");
+    REQUIRE(agent3.size() == 4);
+    for (const auto& r : agent3)
+        CHECK(r.output == (r.timestamp == 300 ? "frame" + marker : std::string("frame")));
+
+    // The overflow terminal row is NOT marked at insert: rows == cap is reachable with zero drops,
+    // so the marker stays on the row before the gap. Interleaved, with cap 4: 4 RUNNING, 1 refused
+    // (marks row 4), a terminal frame with output (admitted, lands newer and unmarked), 1 refused
+    // (marks the terminal too, since frames were refused after it).
+    for (int i = 0; i < 5; ++i)
+        f.store.store(cap_frame("cmd-mark", "agent-4", 0));
+    f.store.store(cap_frame("cmd-mark", "agent-4", 1));
+    rows = pair_rows(f.store, "cmd-mark", "agent-4");
+    REQUIRE(rows.size() == 5);
+    CHECK(rows[3].output == "frame" + marker); // the row before the gap
+    CHECK(rows[4].output == "frame");          // the admitted terminal row, not marked at insert
+
+    f.store.store(cap_frame("cmd-mark", "agent-4", 0));
+    rows = pair_rows(f.store, "cmd-mark", "agent-4");
+    REQUIRE(rows.size() == 5);
+    CHECK(rows[3].output == "frame" + marker);
+    CHECK(rows[4].output == "frame" + marker);
+}
+
+TEST_CASE("ResponseStore: a marker that cannot be written drops the frame as a query_error",
+          "[pg][response_store][cap]") {
+    // Fail-closed branch of the marker UPDATE (the only UPDATE store() issues on `responses`): a trigger that
+    // raises fails that statement alone, the INSERT path is untouched, so this discriminates the
+    // marker failure from every other store() failure.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+
+    for (int i = 0; i < 4; ++i)
+        f.store.store(cap_frame("cmd-mark-fail", "agent-1", 0));
+    exec_sql(db.dsn(),
+             "CREATE FUNCTION response_store.fail_marker_update() RETURNS trigger "
+             "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected'; END $$; "
+             "CREATE TRIGGER fail_marker_update BEFORE UPDATE ON response_store.responses "
+             "FOR EACH ROW EXECUTE FUNCTION response_store.fail_marker_update()");
+
+    f.store.store(cap_frame("cmd-mark-fail", "agent-1", 0));
+
+    CHECK(cap_rows(f.store, "cmd-mark-fail", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 0.0);
+    CHECK(cap_dropped(f.metrics, "query_error") == 1.0);
+}
+
+TEST_CASE("ResponseStore: the first terminal frame beyond the cap lands, a second is refused",
+          "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+
+    for (int i = 0; i < 4; ++i)
+        f.store.store(cap_frame("cmd-cap-term", "agent-1", 0));
+    f.store.store(cap_frame("cmd-cap-term", "agent-1", 1));
+    CHECK(cap_rows(f.store, "cmd-cap-term", "agent-1") == 5);
+    CHECK(cap_dropped(f.metrics) == 0.0);
+
+    f.store.store(cap_frame("cmd-cap-term", "agent-1", 1));
+    CHECK(cap_rows(f.store, "cmd-cap-term", "agent-1") == 5);
+    CHECK(cap_dropped(f.metrics) == 1.0);
+}
+
+TEST_CASE("ResponseStore: an out-of-range terminal status is capped like any terminal frame",
+          "[pg][response_store][cap]") {
+    // CommandResponse.Status is an open proto3 enum and the ingest callers cast it unchecked, so a
+    // negative value is "terminal" (status != 0). The admit predicate and the terminal-exists probe
+    // must agree on that, or every such frame past the cap is admitted forever.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+
+    for (int i = 0; i < 4; ++i)
+        f.store.store(cap_frame("cmd-cap-neg", "agent-1", 0));
+    for (int i = 0; i < 6; ++i)
+        f.store.store(cap_frame("cmd-cap-neg", "agent-1", -1));
+
+    CHECK(cap_rows(f.store, "cmd-cap-neg", "agent-1") == 5); // the cap + one overflow terminal
+    CHECK(cap_dropped(f.metrics) == 5.0);
+}
+
+TEST_CASE("ResponseStore: a capped stream finalizes in place and replay cannot grow the pair",
+          "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+
+    for (int i = 0; i < 5; ++i)
+        f.store.store(cap_frame("cmd-fin", "agent-1", 0, "exec-1"));
+    CHECK(cap_rows(f.store, "cmd-fin", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 1.0);
+
+    CHECK(f.store.finalize_terminal_status("cmd-fin", "agent-1", 1, "", "exec-1", 0) ==
+          ResponseStore::FinalizeResult::Updated);
+    auto rows = f.store.get_by_instruction("cmd-fin", kAllRows);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 4);
+    for (const auto& r : *rows)
+        CHECK(r.status == 1);
+
+    // A terminal frame with output now finds a terminal row: refused as a replay.
+    f.store.store(cap_frame("cmd-fin", "agent-1", 1, "exec-1"));
+    CHECK(cap_rows(f.store, "cmd-fin", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 2.0);
+    // And a late RUNNING frame is refused too.
+    f.store.store(cap_frame("cmd-fin", "agent-1", 0, "exec-1"));
+    CHECK(cap_rows(f.store, "cmd-fin", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 3.0);
+}
+
+TEST_CASE("ResponseStore: the row cap is per (instruction, agent) pair",
+          "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 2);
+
+    for (int i = 0; i < 2; ++i)
+        f.store.store(cap_frame("cmd-cap", "agent-1", 0));
+    const double before = cap_dropped(f.metrics);
+
+    f.store.store(cap_frame("cmd-cap", "agent-2", 0));  // other agent, same instruction
+    f.store.store(cap_frame("cmd-other", "agent-1", 0)); // same agent, other instruction
+
+    CHECK(cap_rows(f.store, "cmd-cap", "agent-2") == 1);
+    CHECK(cap_rows(f.store, "cmd-other", "agent-1") == 1);
+    CHECK(cap_dropped(f.metrics) == before);
+
+    // The filled pair itself is still refused (fails under a revert of the cap).
+    f.store.store(cap_frame("cmd-cap", "agent-1", 0));
+    CHECK(cap_rows(f.store, "cmd-cap", "agent-1") == 2);
+    CHECK(cap_dropped(f.metrics) == before + 1.0);
+}
+
+TEST_CASE("ResponseStore: migration v4 creates the per-pair index", "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CHECK(query_scalar(db.dsn(),
+                       "SELECT count(*) FROM pg_indexes WHERE schemaname='response_store' AND "
+                       "indexname='idx_resp_instr_agent_status'") == "1");
+
+    // The ordered key is what serves the terminal probe's `status` range, so a same-named index on
+    // other columns, in another order, partial or not valid must fail here. Column names (not
+    // attnums) so a future column reorder in CREATE TABLE cannot false-fail it.
+    CHECK(query_scalar(db.dsn(),
+                       "SELECT string_agg(a.attname::text, ',' ORDER BY k.ord) "
+                       "FROM pg_class c "
+                       "JOIN pg_index i ON i.indexrelid = c.oid "
+                       "CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) "
+                       "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum "
+                       "WHERE c.relname = 'idx_resp_instr_agent_status' "
+                       "AND c.relnamespace = 'response_store'::regnamespace "
+                       "AND i.indrelid = 'response_store.responses'::regclass "
+                       "AND i.indisvalid AND i.indpred IS NULL") ==
+          "instruction_id,agent_id,status");
 }
