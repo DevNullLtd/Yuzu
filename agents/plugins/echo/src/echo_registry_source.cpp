@@ -1727,8 +1727,6 @@ HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix) {
                      "profile's NTUSER.DAT stays locked until a holder releases it; retry "
                      "`reg unload HKU\\{}`",
                      n, n);
-    spdlog::info("Echo registry: swept {} leftover hive mount(s): {} unloaded, {} still mounted",
-                 stale.size(), r.released.size(), r.retained.size());
     return r;
 }
 
