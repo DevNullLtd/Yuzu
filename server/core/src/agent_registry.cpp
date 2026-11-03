@@ -959,7 +959,7 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"hardware.chassis", "Chassis type, serial and asset tag (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
         {"hardware.baseboard", "Baseboard vendor, product and serial (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
         {"hardware.swap", "Swap devices and page files with total and used size (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
-        {"hardware.machine_id", "Keyed hash of the OS machine identifier (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
+        {"hardware.machine_id", "Fixed-label HMAC-SHA256 of the OS machine identifier, a stable pseudonym that is not secret from a holder of the raw id (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
         // disk_actions
         {"disk_actions.smart", "Per-physical-drive health: model, transport, media type and, where the OS exposes it, wear indicators"},
         {"disk_actions.volumes", "Mapping between physical drives and the logical volumes they back, with mount points"},

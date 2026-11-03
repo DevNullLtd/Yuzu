@@ -1222,6 +1222,8 @@ sync, defeating the hash-skip protocol.
   independently: one section being unavailable never stops the others, or the base device
   fields, from being reported.
 
+On Windows the `chassis`, `baseboard`, `swap` and `machine_id` sections now report data (and the `cpu` and `dimm` rows carry the socket, stepping and DIMM identity columns); Linux and macOS still report `<os>:planned` for the four. A Windows section that could not be read reports `constrained`, `permission_denied` or `unavailable` with a reason token such as `smbios:win32_5`, `windows:machine_guid:absent` or `wmi:pagefile_usage:<cause>`; the full token list is in the Result status table of the hardware plugin README (`agents/plugins/hardware/README.md`). Those values are stored in the device record and are not yet shown on the Hardware pages or returned by the REST or MCP device-record endpoints.
+
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its
 columns, fields, and audit/degrade posture.
