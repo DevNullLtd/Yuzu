@@ -534,7 +534,9 @@ AdaptedRows parse_middleware_output(const std::string& out, std::string_view act
         if (tok[0] != action || tok.size() != 6)
             return false;
         // The title column is fixed vocabulary from the table: with no per-product title span a
-        // row can only carry p->title, anything else is seen but not mapped (siblings kept).
+        // row can only carry p->title, anything else is seen but not mapped (siblings kept). The
+        // token keeps its wire escapes, so this raw compare is only exact because
+        // products_well_formed() refuses a title holding `|` or `\` (middleware_products.hpp).
         if (tok[1] == p->title) {
             SwEntry e;
             e.name = p->title;
