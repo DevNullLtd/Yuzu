@@ -84,8 +84,9 @@ struct PageFlags {
 [[nodiscard]] bool valid_principal_id(std::string_view id);
 
 /// The detail of the OLDEST committed `engine_principal.revoke` the input holds (input is newest
-/// first). That is the original revoke's only when nothing older was lost, and not when a revoke
-/// that raced or was interrupted left an older success row (see the Settings panel's cell).
+/// first). That is the original revoke's only when nothing older was lost, and not when a raced
+/// revoke left an older success row or an interrupted one kept its count in a failure row (see
+/// the Settings panel's cell).
 /// A later failed or denied attempt writes the same action with a store error string as its
 /// detail; that text is never shown. "" = no committed revoke recorded. The success detail is
 /// `credentials_revoked=N[; superseded_by=ID]` from REST (the ID sanitised: space, `=`, `,` and

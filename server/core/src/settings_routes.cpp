@@ -997,7 +997,8 @@ std::string SettingsRoutes::render_engine_principals_fragment(
             // route answers 503), so a later retry of the same revoke (text of the
             // kind just described) is the first success row, (3) the credentials
             // were revoked but the identity step then failed (the count is only in
-            // that call's failure row; the repeat writes `credentials_revoked=0`),
+            // that call's failure row; the repeat writes `credentials_revoked=0`
+            // through the route, or its own typed reason through the MCP tool),
             // (4) two revokes raced and the loser's success row (it carries
             // `revoked_by_concurrent_request`) is the older, or (5) an MCP revoke
             // given no reason wrote an empty detail, which reads "(not recorded)".

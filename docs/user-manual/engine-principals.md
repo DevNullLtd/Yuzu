@@ -71,7 +71,8 @@ retention has pruned it while a later retry survives, when the revoke committed 
 its audit row failed to persist (so a later retry of the same revoke is the first
 success row), when the credentials were revoked but the identity step then failed (the
 credential count is only in that call's failure row, and the repeat that completes the
-revoke writes `credentials_revoked=0`, which is what the cell shows), when two revokes
+revoke writes `credentials_revoked=0` through the route, or its own typed reason through
+the MCP tool, which is what the cell shows), when two revokes
 raced (the row the loser wrote, which carries `revoked_by_concurrent_request`, can be the
 older of the two), or when an MCP revoke was given no reason (its committed row has an
 empty detail, so the cell shows no text and reads "(not recorded)"). Its states:
