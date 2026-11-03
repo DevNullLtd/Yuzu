@@ -68,6 +68,7 @@
 
 #include <yuzu/plugin.h>
 
+#include <atomic>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -209,8 +210,27 @@ public:
         return quarantined_file_;
     }
 
-    /** Row count (TEST/observability). nullopt on error/closed store. */
+    /** Row count (TEST/observability). nullopt on error/closed store. Takes the store
+     *  mutex and runs a COUNT(*) -- NOT for the heartbeat; use cached_row_count(). */
     [[nodiscard]] std::optional<std::int64_t> count() const;
+
+    /**
+     * Lock-free, approximate row count for the heartbeat capacity signal (#3663,
+     * `yuzu.dedup_rows`). Never takes mu_ and never queries SQLite, so the
+     * heartbeat thread cannot contend with claim() on the latency-critical reader.
+     *
+     * EXACT at construction and again after every prune that reaches its recount
+     * (record_terminal() recounts under mu_ each kPruneInterval terminal records; a
+     * prune whose DELETE failed to PREPARE returns before it). Between those points
+     * it is only incremented on a new claim: a release() of an in-flight row does not
+     * decrement it, so it can over-read by the number of releases since the last
+     * recount -- an over-read of a capacity gauge, never an under-read. A recount that
+     * fails KEEPS the previous value, so nullopt means only that the count at
+     * construction failed (unknown, NOT zero) and stays so until a prune recount
+     * succeeds, which on a low-volume agent can be a long time. Counts in-flight and
+     * terminal rows together, like count().
+     */
+    [[nodiscard]] std::optional<std::int64_t> cached_row_count() const noexcept;
 
     /**
      * TEST-ONLY: lower the terminal-ring bound so retention tests exercise the
@@ -243,7 +263,17 @@ private:
     /// Clock-free ring eviction over TERMINAL rows only. Caller holds mu_.
     void prune_locked() noexcept;
 
+    /// COUNT(*) into cached_rows_; on failure the previous value is kept. Caller holds
+    /// mu_ (or is the sole owner, as in the constructor).
+    void refresh_row_count_locked() noexcept;
+
+    /// Sentinel for "row count unknown" in cached_rows_.
+    static constexpr std::int64_t kRowCountUnknown = -1;
+
     sqlite3* db_{nullptr};
+    /// Heartbeat capacity signal; see cached_row_count(). Relaxed ordering: it is a
+    /// monitoring value, it synchronises nothing.
+    std::atomic<std::int64_t> cached_rows_{kRowCountUnknown};
     std::optional<std::string> quarantined_file_{}; ///< set by open() when it recovered (#3665)
     mutable std::mutex mu_;
     /// Prune is triggered from record_terminal() (a worker thread), NOT claim()
