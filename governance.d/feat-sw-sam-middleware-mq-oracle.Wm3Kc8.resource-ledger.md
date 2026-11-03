@@ -45,3 +45,22 @@ Adds `server/core/src/software_catalog_rules.hpp`, `tests/unit/server/test_softw
 - **Tests.** The catalogue-rules case builds a local `std::vector<std::string>` from the table and compares it with an initializer list; the page case calls `has(h, ...)` on the rendered `std::string`. Value types only; no file, thread, process or clock.
 
 No new fd, HANDLE, SOCKET, `FILE*`, sqlite3 object, OpenSSL or BCrypt object, thread, subprocess, callback context, mapped library or temp path. No manual cleanup in new C++.
+
+## Addendum: the remediation cycle after the dev merge (commits baa7cd696..HEAD)
+
+Supplements the list above; nothing above is changed. The findings of this cycle are in `governance.d/6832-middleware-remediation.EvfGir.jsonl`.
+
+- **`field_or_dash` (`middleware_parsers.hpp`).** One local by-value `std::string` copy of the field, scrubbed in place by `scrub_wire_bytes` (a length-preserving `?` replacement) and then read by `safe_output_field`: automatic storage, no owner, no acquisition or release, never returned or stored. A `bad_alloc` is caught by `execute_action`'s catch-all (a constrained `internal_error` row, rc 1), and the collector then skips the cycle and keeps the stored rows.
+- **`products_well_formed` (`middleware_products.hpp`).** `consteval`, over `const char*` literals in a `constexpr` table; a title with any byte other than printable ASCII, or holding `|` or a backslash, fails the build. No runtime resource. This supersedes the R5 wording that listed only the enumerator-path check.
+- **`#else #error` (`middleware_plugin.cpp`)** and the comment edits (`middleware_legs.hpp`, `scan_mounts`): no resource. `scan_mounts` is unchanged in behaviour (leaf `O_NOFOLLOW`, `/proc/self` followed, declared in the routed row and README); R2 stays accurate.
+- **Merge resolution.** Same-list appends only: `kEcosystemFamilies` 14, `kSoftwareSources` 8, `kUnitOs` 244, the gate row total 246, the collector test fakes (slot 4 runtimes, slot 5 middleware). Static-storage tables and value types; no new owner. The landing note above still holds for the shared collector hunks, which this merge resolved around dev's `runtimes.python` code without changing them.
+- **Tests.** Value types and the existing `yuzu_test_` temp-dir fixture only; no thread, process, clock or sleep.
+
+Out of this range, recorded here rather than as findings (neither is this PR's code or a regression it introduces); each is a follow-up issue candidate owed on the owner's word:
+
+- `runtimes.python`'s `field_or_dash` still uses `sanitize_utf8`, which passes NUL: the same row-cut chain this cycle closes for `middleware`. Whether a NUL can reach a python field (filesystem and registry key names cannot hold one; the PEP 514 value is read as a version) is to be established when it is filed.
+- A per-source missing-plugin policy (a registered but unloaded plugin silently removes its stored rows), the maintainer's own follow-up.
+- A count or token for scrubbed bytes, so a replaced byte is visible (finding g6832-9; `update_source_trust` is the precedent).
+
+No new fd, HANDLE, SOCKET, `FILE*`, sqlite3 object, OpenSSL or BCrypt object, thread, subprocess, callback context, mapped library or temp path. No manual cleanup in new C++.
+
