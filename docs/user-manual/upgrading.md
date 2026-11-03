@@ -2,6 +2,13 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: stored response rows are capped per command and device (256 by default) (#561)
+
+- **What changed:** the response store keeps at most 256 rows for one command on one device (`--response-max-rows-per-agent`, env `YUZU_RESPONSE_MAX_ROWS_PER_AGENT`, range 1-65536). Rows past the cap are dropped, newest first, and the row just before the dropped frames ends with a `...[rows past per-agent cap dropped]` marker. One terminal-status row is still recorded past the cap when none exists, so the command's outcome shows.
+- **Affected:** any caller that reads the full output of a command streaming more than about 16 MiB to one device (for example through `/api/v1/responses` or the executions drawer): it now gets the first part and the marker, not the tail.
+- **To keep the full output:** raise `--response-max-rows-per-agent` for such commands, and watch `yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}` and the informational alert `YuzuResponsePerAgentCapDrops`.
+- **Index:** a database index supporting the cap is created with the schema at first start (instant on a fresh database).
+
 ## Behaviour change: Echo holds `echo.db` to a byte budget (an existing database is trimmed on the first maintenance pass)
 
 **What changed.** The Echo agent plugin holds `echo.db` to a byte budget, `db_budget_bytes` (default 262144000, 250 MiB; minimum 33554432, 32 MiB; set with `echo.configure`). The figure compared with it is `db_size_bytes` in `echo.status`, which now counts the used database pages plus the write-ahead log and no longer counts free pages (it counted every page in the database file before). When that figure is over the budget, the maintenance pass (every 15 minutes, or `echo.rollup`) permanently deletes the oldest raw capture rows that their first summary tier has already passed, never the newest 24 hours, then hourly rows older than 48 hours (5 days for `procperf`), even inside their retention window. Daily and monthly rows, the `usage` tables, paused or errored sources and sources with no summary tier are never removed. `retention_days` is stored only: it neither protects nor loses history. The budget applies to an `echo.db` that already exists, not only to new ones.
@@ -2408,7 +2415,8 @@ than 2048 bytes:
 
 - **Results page.** A static hint in the results summary, "A filter value is longer than 2048 bytes.
   Newly stored responses do not index values that long, so this filter may match nothing. Clear the
-  filter (or switch the View to Default) and use the Search box." The hint never repeats the value, and
+  filter and use the Search box; if the filter comes from the View, tick 'View without saved
+  filters'." The hint never repeats the value, and
   the results, counts, Create Group button and the `422` are unchanged.
 - **REST agent-count preview and MCP preview tool.** `GET /api/v1/management-groups/agent-count-preview`
   and `preview_management_group_agent_count` add `unindexed_filter_keys` to the result: the filter keys
