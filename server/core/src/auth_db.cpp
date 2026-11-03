@@ -533,7 +533,17 @@ regenerate_recovery_codes_locked(PGconn* conn, const std::string& username) {
     std::vector<std::string> raw_codes;
     raw_codes.reserve(kRecoveryCodeCount);
     for (int i = 0; i < kRecoveryCodeCount; ++i) {
-        auto code = mfa::random_recovery_code();
+        auto minted = mfa::random_recovery_code();
+        if (!minted.has_value()) {
+            // #4763: CSPRNG failure — fail closed. Returning unexpected makes the
+            // caller roll back the txn, so the DELETE above is undone and the
+            // user keeps their existing codes; no partial set is ever issued.
+            spdlog::error("regenerate_recovery_codes: CSPRNG failure minting a recovery code "
+                          "for '{}' — refusing to issue recovery codes",
+                          username);
+            return std::unexpected(AuthDBError::WriteFailed);
+        }
+        auto code = std::move(*minted);
         std::string norm;
         norm.reserve(code.size());
         for (char c : code) {
@@ -1950,7 +1960,16 @@ AuthDB::mfa_init_enrollment(const std::string& username, std::string_view issuer
         }
 
         // Fresh secret, encrypted under this row's id (the SecretId AAD).
-        auto secret_bytes = mfa::random_secret();
+        auto minted_secret = mfa::random_secret();
+        if (!minted_secret.has_value()) {
+            // #4763: CSPRNG failure — never enroll a zero/partial secret. Nothing
+            // has been encrypted or written at this point.
+            spdlog::error("mfa_init_enrollment: CSPRNG failure minting TOTP secret for '{}' — "
+                          "refusing enrollment",
+                          username);
+            return std::unexpected(AuthDBError::WriteFailed);
+        }
+        auto secret_bytes = std::move(*minted_secret);
         auto secret_view = std::string_view(reinterpret_cast<const char*>(secret_bytes.data()),
                                             secret_bytes.size());
         auto secret_b32 = mfa::base32_encode(secret_view);

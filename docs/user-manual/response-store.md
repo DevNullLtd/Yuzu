@@ -61,7 +61,7 @@ filtering and pagination.
 `app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions` and
 `remote_access_audit` are absent, with no marker, for any other caller, and counts and truncation
 flags cover only the rows that caller may read, so an empty result does not prove that no data
-exists. A stored response is labelled with the plugin the server recorded when it dispatched the command; one whose command id has no server record is stored as `~unverified`, which is served under the same tier. See "Forensics-tier rows" in the REST API guide. The dashboard's create-group-from-results action reads facets through the same tier; when the server cannot determine the caller's authority it creates nothing, answers HTTP `200`, and shows an error toast ("The permission check for this action could not be completed. Nothing was created. Retry shortly.") through an `HX-Trigger` `showToast` header, because the create-group form swaps no response body into the page; its store-degraded case answers `503` with its own error toast on the same channel and also creates nothing. The action writes `group.create_from_results` but no `response.forensics.read` row, even when the matching agents come from Forensics-tier rows (a documented gap in audit coverage; see the audit log guide).
+exists. A stored response is labelled with the plugin the server recorded when it dispatched the command; one whose command id has no server record is stored as `~unverified`, which is served under the same tier. See "Forensics-tier rows" in the REST API guide. The dashboard's create-group-from-results action reads facets through the same tier; when the server cannot determine the caller's authority it creates nothing, answers HTTP `200`, and shows an error toast ("The permission check for this action could not be completed. Nothing was created. Retry shortly.") through an `HX-Trigger` `showToast` header, because the create-group form swaps no response body into the page; its store-degraded case answers `503` with its own error toast on the same channel and also creates nothing. Its other refusals travel on the same toast channel: the `422` for no matching agent or for a result set cut by the read cap, the `400` for a duplicate group name, and, for a request carrying a Search term, the `Response:Read` gate's refusal (`403`, or `503` when the permission cannot be checked), which creates nothing. The empty-name `400` and the `500` failures show no toast. The action writes `group.create_from_results` but no `response.forensics.read` row, even when the matching agents come from Forensics-tier rows (a documented gap in audit coverage; see the audit log guide).
 
 **Path parameters:**
 
@@ -336,6 +336,33 @@ operator-visible notes:
   are replaced with the Unicode replacement character (U+FFFD) at ingest. The
   response row is still stored and still renders (defanged) — it is not
   dropped or turned into a 500.
+- **Rows per agent are bounded.** The store keeps at most `--response-max-rows-per-agent` rows
+  (default 256, range 1-65536) for one command on one device. A row is one streamed output frame or
+  the final status frame; the agent sends a frame once its buffer reaches about 64 KiB (and a frame
+  can be larger), so 256 rows is roughly 16 MiB of streamed output, an illustration and not a byte
+  guarantee.
+  - **What is kept.** The first rows are kept and the **newest** frames past the cap are dropped, so
+    a command that streams more than about 16 MiB to one device loses the tail of its output. The
+    row just before the dropped frames ends with a `...[rows past per-agent cap dropped]` marker,
+    so a reader can tell a capped stream from a complete one. A terminal frame with output admitted
+    afterwards lands after it and is marked itself only if frames are refused after it, so a capped
+    pair can carry two marked rows. The marker is one extra line in the stored output, so a
+    line-counting reader (the `echo_rows_ge` matcher's fallback) counts it, as it already does the
+    byte-cap marker. Raise the flag for such commands.
+  - **Terminal frame.** The cap bounds total rows. At the cap, one extra terminal-status row is still
+    admitted, and only while no terminal row exists for that command and device, so a capped command
+    still shows its outcome. A terminal frame with no output instead finalizes the retained rows in
+    place (no new row), after which a further terminal frame at the cap is refused as a replay. A
+    redelivered terminal frame on a command and device already at the cap is refused the same way, so
+    it also counts as a cap drop and marks the row.
+  - **Counting.** Each refused frame counts on
+    `yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}` (see [metrics.md](metrics.md))
+    and logs a rate-limited warning. To find the command and device, grep the server log for
+    `per-agent row cap (` — one line carries the cap, the command and the device (the warning is
+    rate-limited, the counter is exact).
+  - **Concurrency.** There is no lock around the count and the insert, so two writers for the same
+    command and device at once (a direct stream and a gateway forward) can overshoot the cap by the
+    number of concurrent writers.
 - **Facets are bounded.** Each response keeps the distinct (column, value) pairs of its output as
   facets, which drive the facet filter, group-from-results and the agent-count preview.
   - **Long values.** A value over 2048 bytes (measured on the value as stored, after invalid UTF-8
@@ -351,8 +378,15 @@ operator-visible notes:
     dropdowns and the group-from-results count show nothing or "0 agents" for such a value; this
     includes values between 2049 bytes and about 2.6 KB that older servers indexed. The results
     page shows a hint when a filter value is over 2048 bytes, the REST and MCP agent-count previews
-    name such a filter in `unindexed_filter_keys`, and the create-group form and the group-from-results
-    `422` say the count may be wrong.
+    name such a filter in `unindexed_filter_keys`, and the create-group form's hint says the count may be
+    wrong (the group-from-results `422` body carries the same caveat, but the form swaps no body, so
+    its toast stays one fixed sentence).
+  - **Search term.** On the results page the Search term is part of the group-from-results definition
+    and of the "N agents" count (distinct agents with a matching line); the facet-index caveats on
+    this page apply to the column filters only. A set whose read was cut by the read cap is partial
+    and is refused rather than made into a smaller group. A Search term also needs `Response:Read`
+    on the create-group form and the group-from-results action (a substring match over stored
+    output is a content read), in addition to `ManagementGroup:Write`.
   - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column
     index ascending, then value ascending, so the same output always keeps the same facets. A rare
     value (one line, such as a single package on one host) sorts late and is the first to be cut.
