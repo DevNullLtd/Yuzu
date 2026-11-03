@@ -627,6 +627,15 @@ cursor.** What it adds to the pattern:
     mapped-drive walk: a stuck mount worker from EITHER source closes the gate for
     both, and the registry source logs the gate closing once per open -> closed
     transition.
+  - *Leftover mounts.* A kill mid-mount, or an unload that failed, leaves a `YUZU_HIVE_*` key
+    in HKU that keeps the profile's NTUSER.DAT locked. The reader's `start()` unloads them once
+    (`sweep_leftover_hive_mounts`: the process-wide offline-hive lock first, so no in-process
+    mount is in use while it lists HKU; names chosen by the pure `select_stale_hive_mounts`;
+    non-forced `RegUnLoadKeyW`, so a hive a holder has open is retained and logged), through
+    the same gate and bounded worker as a mount. A sweep that could not run at start
+    (`sweep_pending`) runs before the first offline mount that finds the gate open. It is
+    process-wide, so a sibling plugin's leftover goes too; a mount of a second agent process
+    in its handle-less window could also be unloaded, which is not a supported configuration.
   - *Cursor evolution.* `offline` and `deferred` are optional cursor fields and the
     cursor version is not gated on them (unlike `held`): an older build has no offline
     coverage to lose, so it ignores them and drops those roots through its own

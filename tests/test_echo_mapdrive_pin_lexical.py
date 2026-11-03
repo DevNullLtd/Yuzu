@@ -37,6 +37,16 @@ test_echo_mapdrive.cpp), so this pins the wiring lexically. Invariants:
      only moves in a fallback result built before the try (it must not allocate). Its profile
      discovery (discover_offline_profiles) routes through the unit-tested pure
      classify_offline_discovery.
+  8. The registry source's start-up sweep of leftover YUZU_HIVE_* mounts (UP-6) goes through the
+     same gate and worker: run_pending_hive_sweep asks decide_walk_gate(pin_plugin_module(), ...)
+     before its bounded_call_ex(kHiveMountBoundMs, ...), counts its worker in flight, clears
+     sweep_pending only when the worker completed and otherwise halts the tick through
+     decide_mount_call; it runs from the reader's start() before the ETW session and from
+     read_offline_hive_bounded before that function's own halted check. The shell
+     (sweep_leftover_hive_mounts) takes the process-wide offline-hive lock BEFORE it lists
+     HKEY_USERS (that lock is what keeps it off this process's own live mounts), lists through
+     the shared enumerate_hku_subkeys, offers only select_stale_hive_mounts' names to
+     RegUnLoadKeyW under SeRestorePrivilege, and never forces an unload.
 
 Robustness: `//` comments are stripped and whitespace is collapsed before matching, so a
 `//`-commented call cannot satisfy a check (`/* */` comments are deliberately NOT stripped). Lexical only: it cannot see a relocation that keeps
@@ -55,6 +65,7 @@ COLLECTOR = ROOT / "agents" / "plugins" / "echo" / "src" / "echo_mapdrive_collec
 PLUGIN = ROOT / "agents" / "plugins" / "echo" / "src" / "echo_plugin.cpp"
 GATE = ROOT / "agents" / "plugins" / "echo" / "src" / "echo_hive_mount_gate.hpp"
 REGISTRY = ROOT / "agents" / "plugins" / "echo" / "src" / "echo_registry_source.cpp"
+OFFLINE_READER = "OfflineHiveRead read_offline_hive_bounded("  # anchor: the mount reader, not the sweep
 HINT = (" (this gate pins the #5291 hive-mount wiring; if the collector was legitimately"
         " restructured, update tests/test_echo_mapdrive_pin_lexical.py)")
 
@@ -162,6 +173,68 @@ def problems(collector_src, plugin_src, gate_src, registry_src):
                        "KEY_READ | KEY_WOW64_64KEY")
     if not re.search(r"r\.read_offline_hive = .*?read_offline_hive_bounded\(", r):
         out.append("the Windows reader no longer wires read_offline_hive to read_offline_hive_bounded")
+    # The start-up sweep of leftover YUZU_HIVE_* mounts (UP-6): same gate, same bounded worker.
+    if "bool sweep_pending{true};" not in r:
+        out.append("OfflineMountTick no longer starts with the start-up sweep pending")
+    sweep = body_of(r, "void run_pending_hive_sweep(OfflineMountTick& tick)")
+    if sweep is None:
+        out.append("run_pending_hive_sweep() is missing")
+    else:
+        gate_at = sweep.find("decide_walk_gate(pin_plugin_module(), g_mount_workers_in_flight.load())")
+        call_at = sweep.find("bounded_call_ex(")
+        if gate_at < 0 or call_at < 0 or gate_at > call_at:
+            out.append("the sweep must pin the module and ask decide_walk_gate (pin + in-flight "
+                       "workers) before its bounded_call_ex")
+        if not re.search(r"decide_walk_gate\(pin_plugin_module\(\), g_mount_workers_in_flight\.load\(\)\) "
+                         r"!= yuzu::echo::WalkGate::open\) return;", sweep):
+            out.append("a closed gate must leave the sweep pending without running it")
+        if not re.search(r"bounded_call_ex\(\s*kHiveMountBoundMs\b", sweep):
+            out.append("the sweep is no longer bounded by kHiveMountBoundMs")
+        if not re.search(r"const MountWorkerGuard \w+;[^}]*?sweep_leftover_hive_mounts\(", sweep):
+            out.append("the sweep worker no longer counts itself in flight before it sweeps")
+        if not re.search(r"BoundedCallStatus::Completed\) \{ tick\.sweep_pending = false; return; \}", sweep):
+            out.append("the sweep must clear sweep_pending when, and only when, its worker completed")
+        if sweep.count("sweep_pending = false") != 1:
+            out.append("sweep_pending is cleared on a path other than a completed worker")
+        if "decide_mount_call(" not in sweep or "tick.halted = decision.halt_walk;" not in sweep:
+            out.append("a timed-out or rejected sweep no longer halts the tick through decide_mount_call")
+        if not sweep.lstrip("{ ").startswith("if (!tick.sweep_pending || tick.halted) return;"):
+            out.append("the sweep must return at once when nothing is pending or the tick is halted")
+    if offline is not None:
+        sweep_at = offline.find("run_pending_hive_sweep(tick);")
+        halted_at = offline.find("if (tick.halted)")
+        if not (0 <= sweep_at < halted_at):
+            out.append("the offline reader must run the pending sweep before it checks whether the "
+                       "tick is halted (a sweep that halts the tick answers not-attempted)")
+    start = body_of(r, "r.start = [etw, tick] {")
+    if start is None or "run_pending_hive_sweep(*tick);" not in start:
+        out.append("the Windows reader's start() no longer runs the pending sweep")
+    elif start.find("run_pending_hive_sweep(*tick);") > start.find("etw->start()"):
+        out.append("the sweep must run before the ETW session opens")
+    if not re.search(r"r\.read_offline_hive = \[tick\]", r):
+        out.append("the offline-read hook and start() no longer share one OfflineMountTick")
+    shell = body_of(r, "HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix)")
+    if shell is None:
+        out.append("sweep_leftover_hive_mounts() is missing")
+    else:
+        lock_at = shell.find('ScopedOfflineHiveLock offline_lock("echo_registry_sweep")')
+        list_at = shell.find("enumerate_hku_subkeys()")
+        if not (0 <= lock_at < list_at):
+            out.append("the sweep must take the process-wide offline-hive lock BEFORE it lists "
+                       "HKEY_USERS: the lock is what keeps it off this process's live mounts")
+        if "select_stale_hive_mounts(yuzu::win::enumerate_hku_subkeys(), prefix)" not in shell:
+            out.append("the sweep must list through the shared enumerate_hku_subkeys and select "
+                       "through the unit-tested select_stale_hive_mounts")
+        if "enumerate_hku()" in shell:
+            out.append("the sweep must not list through Echo's own enumerate_hku")
+        if 'PrivilegeScope restore_priv(L"SeRestorePrivilege")' not in shell:
+            out.append("the sweep no longer enables SeRestorePrivilege for the unload")
+        if not re.search(r"sweep_hive_mounts\( ?stale, \[\]\(const std::string& name\) \{ return "
+                         r"RegUnLoadKeyW\(HKEY_USERS, yuzu::win::to_wide\(name\)\.c_str\(\)\) "
+                         r"== ERROR_SUCCESS; \}\);", shell):
+            out.append("the sweep must unload only the selected names, through a plain RegUnLoadKeyW")
+        if "NtUnloadKey" in shell or "REG_FORCE_UNLOAD" in shell:
+            out.append("the sweep forces an unload: a holder with an open handle is a live user of the hive")
     # The profile-list classification is unit-tested (classify_offline_discovery); the Windows
     # shell must feed it, or an empty-but-complete discovery would leave every test green.
     discovery = body_of(
@@ -320,8 +393,8 @@ class EchoMapdrivePinLexical(unittest.TestCase):
                 "/*skip_known_historical=*/false")),
             "vanished-SID log dropped": dict(p=mutate(p, "dropped from the pending set", "dropped")),
             # the registry source's offline reader
-            "registry gate decision deleted": dict(r=mutate(
-                r, "decide_walk_gate(pin_plugin_module(), g_mount_workers_in_flight.load())",
+            "registry gate decision deleted": dict(r=mutate_after(
+                r, OFFLINE_READER, "decide_walk_gate(pin_plugin_module(), g_mount_workers_in_flight.load())",
                    "yuzu::echo::WalkGate::open")),
             "registry closed gate no longer refuses": dict(r=mutate(
                 r, "if (gate != yuzu::echo::WalkGate::open)", "if (false)")),
@@ -330,10 +403,10 @@ class EchoMapdrivePinLexical(unittest.TestCase):
             "registry mount unbounded": dict(r=mutate(
                 r, "kHiveMountBoundMs, [sid, path, roots, deadline]",
                    "std::chrono::milliseconds{0}, [sid, path, roots, deadline]")),
-            "registry worker not counted in flight": dict(r=mutate(
-                r, "const MountWorkerGuard in_flight;", "(void)0;")),
-            "registry timeout no longer halts the tick": dict(r=mutate(
-                r, "tick.halted = decision.halt_walk;", "(void)decision;")),
+            "registry worker not counted in flight": dict(r=mutate_after(
+                r, OFFLINE_READER, "const MountWorkerGuard in_flight;", "(void)0;")),
+            "registry timeout no longer halts the tick": dict(r=mutate_after(
+                r, OFFLINE_READER, "tick.halted = decision.halt_walk;", "(void)decision;")),
             "registry hook no longer wired": dict(r=mutate(
                 r, "return read_offline_hive_bounded(sid, path, roots, deadline, *tick);",
                    "return OfflineHiveRead{};")),
@@ -351,8 +424,8 @@ class EchoMapdrivePinLexical(unittest.TestCase):
                    "if (gate != yuzu::echo::WalkGate::open)\n        return unreadable_hive(roots, true,")),
             "registry halted check inverted": dict(r=mutate(
                 r, "if (tick.halted)\n", "if (!tick.halted)\n")),
-            "registry reader stops asking decide_mount_call": dict(r=mutate(
-                r, "decide_mount_call(", "decide_mount(")),
+            "registry reader stops asking decide_mount_call": dict(r=mutate_after(
+                r, OFFLINE_READER, "decide_mount_call(", "decide_mount(")),
             "registry gate asked after the mount": dict(r=mutate(
                 r, "const auto gate = yuzu::echo::decide_walk_gate(",
                    "(void)yuzu::shared::bounded_call_ex(kHiveMountBoundMs, [] { return 0; });\n"
@@ -371,6 +444,64 @@ class EchoMapdrivePinLexical(unittest.TestCase):
             "registry root open drops the link flag": dict(r=mutate(
                 r, "REG_OPTION_OPEN_LINK, KEY_READ | KEY_WOW64_64KEY, key.put()",
                    "0, KEY_READ | KEY_WOW64_64KEY, key.put()")),
+            # the start-up sweep of leftover YUZU_HIVE_* mounts (UP-6)
+            "sweep no longer starts pending": dict(r=mutate(
+                r, "bool sweep_pending{true};", "bool sweep_pending{false};")),
+            "sweep gate decision deleted": dict(r=mutate(
+                r, "if (yuzu::echo::decide_walk_gate(pin_plugin_module(), g_mount_workers_in_flight.load()) !=\n"
+                   "        yuzu::echo::WalkGate::open)\n        return;",
+                   "if (false)\n        return;")),
+            "sweep closed gate no longer leaves it pending": dict(r=mutate(
+                r, "yuzu::echo::WalkGate::open)\n        return;\n    const auto bounded",
+                   "yuzu::echo::WalkGate::open)\n        tick.sweep_pending = false;\n    const auto bounded")),
+            "sweep unbounded": dict(r=mutate(
+                r, "bounded_call_ex(kHiveMountBoundMs, [] {",
+                   "bounded_call_ex(std::chrono::milliseconds{0}, [] {")),
+            "sweep worker not counted in flight": dict(r=mutate(
+                r, "const MountWorkerGuard in_flight; // counted until this closure really returns\n"
+                   "        return yuzu::echo::sweep_leftover_hive_mounts();",
+                   "return yuzu::echo::sweep_leftover_hive_mounts();")),
+            "sweep cleared when it did not complete": dict(r=mutate(
+                r, "if (bounded.status == yuzu::shared::BoundedCallStatus::Completed) {\n"
+                   "        tick.sweep_pending = false;\n        return;\n    }",
+                   "tick.sweep_pending = false;\n    if (bounded.status == yuzu::shared::BoundedCallStatus::Completed) {\n"
+                   "        return;\n    }")),
+            "sweep timeout no longer halts the tick": dict(r=mutate(
+                r, "tick.halted = decision.halt_walk;\n    tick.halted_token = decision.attempted ? "
+                   "\"skipped_after_timeout\"", "(void)decision;\n    tick.halted_token = decision.attempted ? "
+                   "\"skipped_after_timeout\"")),
+            "sweep reruns on a halted tick": dict(r=mutate(
+                r, "if (!tick.sweep_pending || tick.halted)\n        return;",
+                   "if (!tick.sweep_pending)\n        return;")),
+            "offline reader runs the sweep after its halted check": dict(r=mutate(
+                mutate(r, "    run_pending_hive_sweep(tick);\n    if (tick.halted)",
+                          "    if (tick.halted)"),
+                "    const auto gate = yuzu::echo::decide_walk_gate(",
+                "    run_pending_hive_sweep(tick);\n    const auto gate = yuzu::echo::decide_walk_gate(")),
+            "start no longer runs the sweep": dict(r=mutate(
+                r, "run_pending_hive_sweep(*tick);", "(void)tick;")),
+            "start runs the sweep after the session opens": dict(r=mutate_after(
+                mutate(r, "        run_pending_hive_sweep(*tick);\n        if (const ULONG rc = etw->start();",
+                          "        if (const ULONG rc = etw->start();"),
+                "r.start = [etw, tick] {", "                         rc);\n    };",
+                "                         rc);\n        run_pending_hive_sweep(*tick);\n    };")),
+            "hook and start stop sharing one tick": dict(r=mutate(
+                r, "r.read_offline_hive = [tick](", "r.read_offline_hive = [tick = std::make_shared<OfflineMountTick>()](")),
+            "sweep lists HKU before it takes the lock": dict(r=mutate(
+                r, '        const yuzu::agent::ScopedOfflineHiveLock offline_lock("echo_registry_sweep");\n'
+                   "        stale = select_stale_hive_mounts(yuzu::win::enumerate_hku_subkeys(), prefix);\n",
+                   "        stale = select_stale_hive_mounts(yuzu::win::enumerate_hku_subkeys(), prefix);\n"
+                   '        const yuzu::agent::ScopedOfflineHiveLock offline_lock("echo_registry_sweep");\n')),
+            "sweep unloads names it did not select": dict(r=mutate(
+                r, "r = sweep_hive_mounts(stale, [](", "r = sweep_hive_mounts(yuzu::win::enumerate_hku_subkeys(), [](")),
+            "sweep lists through Echo's own enumeration": dict(r=mutate(
+                r, "select_stale_hive_mounts(yuzu::win::enumerate_hku_subkeys(), prefix)",
+                   "select_stale_hive_mounts(enumerate_hku(), prefix)")),
+            "sweep no longer enables SeRestorePrivilege": dict(r=mutate(
+                r, 'const yuzu::win::PrivilegeScope restore_priv(L"SeRestorePrivilege");', "(void)0;")),
+            "sweep forces the unload": dict(r=mutate(
+                r, "return RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(name).c_str()) == ERROR_SUCCESS;",
+                   "return NtUnloadKey2(name) == ERROR_SUCCESS;")),
         }
         for name, over in cases.items():
             with self.subTest(mutation=name):

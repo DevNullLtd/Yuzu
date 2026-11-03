@@ -1520,7 +1520,44 @@ struct OfflineMountTick {
     const char* halted_token{"skipped_after_timeout"};
     // The closed gate was warned of; the next mount attempt that finds it open clears this.
     bool gate_warned{false};
+    // The start-up sweep of leftover YUZU_HIVE_* mounts has not completed (see
+    // run_pending_hive_sweep). Cleared only when its worker returned.
+    bool sweep_pending{true};
 };
+
+// Runs the start-up sweep of leftover `YUZU_HIVE_*` mounts once, through the same gate and bounded
+// worker as a mount (the sweep needs the same process-wide offline-hive lock, and
+// ScopedOfflineHiveLock has no try-lock, so a bare call at start would wait forever behind a
+// worker a sibling source abandoned). `sweep_pending` is cleared only when the worker returned.
+// A closed gate, a rejected call or a timeout leaves it pending: the next read_offline_hive_bounded
+// runs it again before its mount, so a sweep that could not run at start is not lost. A rejected
+// or timed-out call halts the tick, as a mount's would.
+// ponytail: Echo-only. The effect is process-wide, so a sibling plugin's leftover mount is swept
+// too; move this to the shared ladder if a non-Echo consumer ever wants its own trigger.
+void run_pending_hive_sweep(OfflineMountTick& tick) {
+    if (!tick.sweep_pending || tick.halted)
+        return;
+    if (yuzu::echo::decide_walk_gate(pin_plugin_module(), g_mount_workers_in_flight.load()) !=
+        yuzu::echo::WalkGate::open)
+        return;
+    const auto bounded = yuzu::shared::bounded_call_ex(kHiveMountBoundMs, [] {
+        const MountWorkerGuard in_flight; // counted until this closure really returns
+        return yuzu::echo::sweep_leftover_hive_mounts();
+    });
+    if (bounded.status == yuzu::shared::BoundedCallStatus::Completed) {
+        tick.sweep_pending = false;
+        return;
+    }
+    const auto decision = yuzu::echo::decide_mount_call(
+       bounded.status == yuzu::shared::BoundedCallStatus::TimedOut
+          ? yuzu::echo::MountCallResult::timed_out
+          : yuzu::echo::MountCallResult::rejected);
+    tick.halted = decision.halt_walk;
+    tick.halted_token = decision.attempted ? "skipped_after_timeout" : "skipped_after_rejection";
+    spdlog::warn("Echo registry: sweep of leftover hive mounts did not complete ({}); retried "
+                 "before the next offline mount",
+                 decision.attempted ? "timeout" : "rejected");
+}
 
 // One warning per open -> closed transition of the shared mount gate (a failed module pin, or a
 // worker abandoned on a timeout that is still running): while it stays closed every hive is
@@ -1566,6 +1603,9 @@ OfflineHiveRead read_offline_hive_bounded(const std::string& sid, const std::str
         tick.deadline = deadline;
         tick.halted = false;
     }
+    // A sweep that could not run at start runs before the first mount that finds the gate open;
+    // if it halts the tick, the check below answers not-attempted.
+    run_pending_hive_sweep(tick);
     if (tick.halted)
         return unreadable_hive(roots, false, std::string("offline:") + tick.halted_token);
     const auto gate = yuzu::echo::decide_walk_gate(pin_plugin_module(), g_mount_workers_in_flight.load());
@@ -1653,6 +1693,45 @@ OfflineHiveRead read_offline_hive_bounded(const std::string& sid, const std::str
 
 } // namespace
 
+HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix) {
+    std::vector<std::string> stale;
+    HiveSweepResult r;
+    {
+        // Held for the whole sweep, and taken BEFORE the names are listed. Every mount this process
+        // makes holds this lock from RegLoadKeyW to the unload (with_user_hive), so while we hold it
+        // no `YUZU_HIVE_*` name is an in-process mount in use -- the name carries no process
+        // identity to tell a live mount from a stale one (unique_hive_mount_name salts it per
+        // process but never publishes the salt). A mount owned by ANOTHER process that has a handle
+        // open fails the non-forced unload below and is retained. Residual: a second Yuzu process's
+        // mount in its handle-less window (before it opens the root, or after it closes it and
+        // before it unloads) can be unloaded here; two agents on one host is not a supported
+        // configuration, and win_reg_handle.hpp already discloses that an out-of-process mount is
+        // unguarded.
+        const yuzu::agent::ScopedOfflineHiveLock offline_lock("echo_registry_sweep");
+        stale = select_stale_hive_mounts(yuzu::win::enumerate_hku_subkeys(), prefix);
+        if (stale.empty())
+            return r;
+        // RegUnLoadKeyW needs SeRestorePrivilege, which the agent account already holds
+        // (docs/agent-privilege-model.md); with_user_hive enables it the same way per mount.
+        const yuzu::win::PrivilegeScope restore_priv(L"SeRestorePrivilege");
+        r = sweep_hive_mounts(stale, [](const std::string& name) {
+            // Never RegUnLoadKey with force: a holder with an open handle is a live user of the hive.
+            return RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(name).c_str()) == ERROR_SUCCESS;
+        });
+    }
+    // Logged after the lock is released, so logging never extends another caller's wait.
+    for (const auto& n : r.released)
+        spdlog::info("Echo registry: unloaded leftover hive mount HKU\\{}", n);
+    for (const auto& n : r.retained)
+        spdlog::warn("Echo registry: leftover hive mount HKU\\{} could not be unloaded -- the "
+                     "profile's NTUSER.DAT stays locked until a holder releases it; retry "
+                     "`reg unload HKU\\{}`",
+                     n, n);
+    spdlog::info("Echo registry: swept {} leftover hive mount(s): {} unloaded, {} still mounted",
+                 stale.size(), r.released.size(), r.retained.size());
+    return r;
+}
+
 std::wstring registry_etw_session_name() {
     // Salted per process: the CI pools run several agents as one OS identity, and a
     // fixed session name is a cross-job shared resource. The name is per process, so it
@@ -1669,6 +1748,9 @@ RegistryReader make_windows_registry_reader() {
     etw->buffer = buffer;
     auto watcher = std::make_shared<WinWatcher>();
     watcher->dirty = dirty;
+    // Shared by the offline-read hook and start(): the mount halt, the gate-warning latch and the
+    // pending start-up sweep are one source's state.
+    auto tick = std::make_shared<OfflineMountTick>();
 
     RegistryReader r;
     r.dirty = dirty;
@@ -1680,9 +1762,8 @@ RegistryReader make_windows_registry_reader() {
     r.offline_profiles = [](const std::vector<std::string>& loaded) {
         return discover_offline_profiles(loaded);
     };
-    r.read_offline_hive = [tick = std::make_shared<OfflineMountTick>()](
-                             const std::string& sid, const std::string& path,
-                             const std::vector<std::string>& roots, std::int64_t deadline) {
+    r.read_offline_hive = [tick](const std::string& sid, const std::string& path,
+                                 const std::vector<std::string>& roots, std::int64_t deadline) {
         return read_offline_hive_bounded(sid, path, roots, deadline, *tick);
     };
     r.now_ts = [] { return filetime_now(); };
@@ -1694,7 +1775,11 @@ RegistryReader make_windows_registry_reader() {
     r.rearm = [watcher](const std::string& root) { return watcher->rearm(root); };
     // ponytail: a session that dies after start is not restarted -- capture_method flips to
     // notify and rows say attr:off; add a restart if that is ever seen in the field.
-    r.start = [etw] {
+    r.start = [etw, tick] {
+        // Before the session and before any offline mount: a mount a previous run leaked keeps its
+        // profile's NTUSER.DAT locked, so it must not outlive the restart that could release it.
+        // Bounded and gated like a mount; a sweep it cannot run here waits for the first offline read.
+        run_pending_hive_sweep(*tick);
         if (const ULONG rc = etw->start(); rc != ERROR_SUCCESS)
             spdlog::warn("Echo registry: Kernel-Registry ETW session unavailable (Win32 error {}; "
                          "5 = the agent is not elevated) -- the key watch still runs, rows will "

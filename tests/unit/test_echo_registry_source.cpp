@@ -1316,6 +1316,84 @@ TEST_CASE("registry schema constants agree with the registry", "[echo][registry]
     CHECK(generate_warehouse_ddl().find("registry_live_record_key_uq") != std::string::npos);
 }
 
+// The start-up sweep of leftover YUZU_HIVE_* mounts: the pure decision, with the unload injected.
+
+TEST_CASE("select_stale_hive_mounts: only YUZU_HIVE_ mounts, never a profile hive, .DEFAULT, a _Classes hive or an empty name",
+          "[echo][registry][pure]") {
+    const std::vector<std::string> hku{".DEFAULT",
+                                       "S-1-5-18",
+                                       "S-1-5-21-1-2-3-1001",
+                                       "S-1-5-21-1-2-3-1001_Classes",
+                                       "YUZU_HIVE_S-1-5-21-1-2-3-1002_0123456789abcdef_0",
+                                       "",
+                                       "yuzu_hive_lower",
+                                       "XYUZU_HIVE_S-1-5-21-1-2-3-1004_0123456789abcdef_2",
+                                       "YUZU_HIVE_S-1-5-21-1-2-3-1003_fedcba9876543210_7"};
+    // In HKEY_USERS order, nothing else.
+    CHECK(select_stale_hive_mounts(hku) == std::vector<std::string>{hku[4], hku[8]});
+    CHECK(select_stale_hive_mounts({}).empty());
+    CHECK(select_stale_hive_mounts({"S-1-5-21-1-2-3-1001", ".DEFAULT"}).empty());
+}
+
+TEST_CASE("select_stale_hive_mounts: a prefix only narrows the set; one that is not a mount prefix selects nothing",
+          "[echo][registry][pure]") {
+    const std::vector<std::string> hku{"S-1-5-21-1-2-3-1001",
+                                       "YUZU_HIVE_S-1-5-21-1-2-3-1002_0123456789abcdef_0",
+                                       "YUZU_HIVE_S-1-5-21-1-2-3-1003_fedcba9876543210_7"};
+    CHECK(select_stale_hive_mounts(hku, "YUZU_HIVE_S-1-5-21-1-2-3-1002_") ==
+          std::vector<std::string>{hku[1]});
+    CHECK(select_stale_hive_mounts(hku, "YUZU_HIVE_S-1-5-21-1-2-3-9999_").empty());
+    // No argument can reach a profile hive: a prefix outside the mount namespace selects nothing,
+    // an empty one included (it would otherwise match every name).
+    CHECK(select_stale_hive_mounts(hku, "S-1-").empty());
+    CHECK(select_stale_hive_mounts(hku, "").empty());
+    CHECK(select_stale_hive_mounts(hku, "YUZU_").empty());
+}
+
+TEST_CASE("sweep_hive_mounts: each name is offered once in order; a refusal is retained and the rest are still attempted",
+          "[echo][registry][pure]") {
+    const std::vector<std::string> names{"YUZU_HIVE_a_0000000000000000_0",
+                                         "YUZU_HIVE_b_0000000000000000_1",
+                                         "YUZU_HIVE_c_0000000000000000_2"};
+    std::vector<std::string> offered;
+    const auto r = sweep_hive_mounts(names, [&](const std::string& n) {
+        offered.push_back(n);
+        return n != names[1]; // the middle one is held open by something
+    });
+    CHECK(offered == names); // a refusal does not stop the sweep
+    CHECK(r.released == std::vector<std::string>{names[0], names[2]});
+    CHECK(r.retained == std::vector<std::string>{names[1]});
+
+    int calls = 0;
+    const auto none = sweep_hive_mounts({}, [&](const std::string&) {
+        ++calls;
+        return true;
+    });
+    CHECK(calls == 0);
+    CHECK(none.released.empty());
+    CHECK(none.retained.empty());
+
+    const auto all_held = sweep_hive_mounts(names, [](const std::string&) { return false; });
+    CHECK(all_held.released.empty());
+    CHECK(all_held.retained == names);
+}
+
+TEST_CASE("select then sweep: only a stale mount ever reaches the unload callback",
+          "[echo][registry][pure]") {
+    // The composition the Windows shell runs over an HKEY_USERS listing: a loaded profile, its
+    // classes hive and .DEFAULT are never offered to the unload, whatever it would answer.
+    const std::vector<std::string> hku{".DEFAULT", "S-1-5-21-1-2-3-1001", "S-1-5-21-1-2-3-1001_Classes",
+                                       "YUZU_HIVE_S-1-5-21-1-2-3-1002_0123456789abcdef_0"};
+    std::vector<std::string> offered;
+    const auto r = sweep_hive_mounts(select_stale_hive_mounts(hku), [&](const std::string& n) {
+        offered.push_back(n);
+        return true;
+    });
+    CHECK(offered == std::vector<std::string>{hku[3]});
+    CHECK(r.released == offered);
+    CHECK(r.retained.empty());
+}
+
 #ifndef _WIN32
 TEST_CASE("off Windows the production factory is null and the source list is unchanged",
           "[echo][registry]") {
@@ -5344,6 +5422,74 @@ TEST_CASE("registry live: a profile path with no NTUSER.DAT answers every root U
     }
     CHECK_FALSE(offline_fake_mount_present());
     CHECK(g_mount_workers_in_flight.load() == 0);
+}
+
+TEST_CASE("registry live: the start-up sweep unloads a leaked YUZU_HIVE_ mount and retains one a holder has open",
+          "[echo][registry][windows]") {
+    // A mount of the exact shape unique_hive_mount_name() mints, salted by this process's fake sid
+    // and swept through that sid's own prefix: the production sweep takes every YUZU_HIVE_* mount,
+    // and a concurrent job on a shared runner must never lose its own to this case.
+    OfflineMountSweep sweep;
+    ScratchHiveKey scratch;
+    yuzu::test::TempDir tmp("yuzu_test_regsweep_");
+    fs::create_directories(tmp.path);
+    const fs::path hive = tmp.path / "NTUSER.DAT";
+    {
+        const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+        if (!backup.ok())
+            SKIP("saving a mountable hive needs SeBackupPrivilege: not held here");
+        const LONG rc = RegSaveKeyExW(scratch.h, hive.c_str(), nullptr, REG_LATEST_FORMAT);
+        if (rc == ERROR_PRIVILEGE_NOT_HELD)
+            SKIP("RegSaveKeyExW: privilege not held");
+        REQUIRE(rc == ERROR_SUCCESS);
+    }
+    const std::string sid = offline_fake_sid();
+    const std::string prefix = "YUZU_HIVE_" + sid + "_";
+    const std::string mount = prefix + "deadbeefdeadbeef_0";
+    const std::wstring wmount = yuzu::win::to_wide(mount);
+    // Both privileges revert when this returns, so the sweep must enable its own.
+    const auto load = [&]() -> LONG {
+        const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+        const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
+        if (!backup.ok() || !restore.ok())
+            return ERROR_PRIVILEGE_NOT_HELD;
+        return RegLoadKeyW(HKEY_USERS, wmount.c_str(), hive.c_str());
+    };
+    REQUIRE_FALSE(offline_fake_mount_present());
+
+    SECTION("a leaked mount nothing holds is unloaded") {
+        const LONG rc = load();
+        if (rc == ERROR_PRIVILEGE_NOT_HELD)
+            SKIP("loading a hive needs SeBackupPrivilege and SeRestorePrivilege: not held here");
+        REQUIRE(rc == ERROR_SUCCESS);
+        REQUIRE(offline_fake_mount_present());
+        const auto r = sweep_leftover_hive_mounts(prefix);
+        CHECK(r.released == std::vector<std::string>{mount});
+        CHECK(r.retained.empty());
+        CHECK_FALSE(offline_fake_mount_present());
+        // Nothing left to sweep: a second run is a no-op.
+        const auto again = sweep_leftover_hive_mounts(prefix);
+        CHECK(again.released.empty());
+        CHECK(again.retained.empty());
+    }
+
+    SECTION("a mount a holder has open is retained, never forced, and released once the holder lets go") {
+        const LONG rc = load();
+        if (rc == ERROR_PRIVILEGE_NOT_HELD)
+            SKIP("loading a hive needs SeBackupPrivilege and SeRestorePrivilege: not held here");
+        REQUIRE(rc == ERROR_SUCCESS);
+        yuzu::win::RegKey holder; // closed before OfflineMountSweep's unconditional cleanup runs
+        REQUIRE(RegOpenKeyExW(HKEY_USERS, wmount.c_str(), 0, KEY_READ, holder.put()) == ERROR_SUCCESS);
+        const auto held = sweep_leftover_hive_mounts(prefix);
+        CHECK(held.released.empty());
+        CHECK(held.retained == std::vector<std::string>{mount});
+        CHECK(offline_fake_mount_present()); // still mounted: a holder's hive is not yanked
+        holder.reset();
+        const auto freed = sweep_leftover_hive_mounts(prefix);
+        CHECK(freed.released == std::vector<std::string>{mount});
+        CHECK(freed.retained.empty());
+        CHECK_FALSE(offline_fake_mount_present());
+    }
 }
 
 TEST_CASE("registry live: a root under an HKU hive that is not mounted reads Unreadable (hive_unloaded), never Absent",

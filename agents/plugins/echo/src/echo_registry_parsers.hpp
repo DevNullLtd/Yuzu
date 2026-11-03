@@ -83,6 +83,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
@@ -171,6 +172,47 @@ struct RegistryScope {
         return false;
     return std::all_of(n.begin() + kSidPrefix.size(), n.end(),
                        [](char c) { return (c >= '0' && c <= '9') || c == '-'; });
+}
+
+/// The start of every temporary hive mount agents/shared/win_reg_handle.hpp's
+/// unique_hive_mount_name() mints: `YUZU_HIVE_<sid>_<16 hex>_<n>`. It is the whole definition of a
+/// mount the start-up sweep may unload, and no profile hive (a SID), `.DEFAULT` or
+/// `<sid>_Classes` carries it.
+inline constexpr std::string_view kHiveMountPrefix = "YUZU_HIVE_";
+
+/// The HKEY_USERS subkeys the start-up sweep may unload: the names that start with `prefix`.
+/// `prefix` only NARROWS the set (the live test salts it with its own fake sid so that it never
+/// touches another process's mount on a shared runner); one that does not itself start with
+/// kHiveMountPrefix selects nothing, so no argument can reach a profile hive.
+[[nodiscard]] inline std::vector<std::string>
+select_stale_hive_mounts(const std::vector<std::string>& hku_subkeys,
+                         std::string_view prefix = kHiveMountPrefix) {
+    std::vector<std::string> out;
+    if (!prefix.starts_with(kHiveMountPrefix))
+        return out;
+    for (const auto& n : hku_subkeys)
+        if (n.starts_with(prefix))
+            out.push_back(n);
+    return out;
+}
+
+/// What a sweep did with each mount it was handed.
+struct HiveSweepResult {
+    std::vector<std::string> released; // unloaded
+    std::vector<std::string> retained; // the unload was refused: a holder has the hive open
+};
+
+/// Offers every name to `unload` (true = the mount is gone), in order. A refusal is recorded and
+/// the rest are still attempted, so one held hive never keeps another leaked mount loaded.
+/// `unload` must not force: a refusal is how a hive that is in use stays safe. The caller must
+/// have selected the names (select_stale_hive_mounts); this applies no name test of its own.
+[[nodiscard]] inline HiveSweepResult
+sweep_hive_mounts(const std::vector<std::string>& names,
+                  const std::function<bool(const std::string&)>& unload) {
+    HiveSweepResult r;
+    for (const auto& n : names)
+        (unload(n) ? r.released : r.retained).push_back(n);
+    return r;
 }
 
 inline std::vector<std::string>

@@ -352,6 +352,16 @@ RegistryReader make_windows_registry_reader();
 /// The name of the ETW session this process opens (the live tests look it up to prove
 /// stop() leaves none behind).
 std::wstring registry_etw_session_name();
+
+/// Unloads the `YUZU_HIVE_*` mounts a previous run left in HKEY_USERS (an agent killed mid-mount,
+/// or an unload that failed): until one is released it keeps its profile's NTUSER.DAT locked.
+/// Non-forced, so a mount something still holds open is retained, never yanked. Takes the
+/// process-wide offline-hive lock for the whole sweep, which is what makes it safe against this
+/// process's own mounts (each holds that lock from load to unload), and SeRestorePrivilege.
+/// `prefix` narrows the names (see select_stale_hive_mounts). Blocks on that lock: production
+/// reaches it only through the bounded worker in echo_registry_source.cpp; this is exposed for
+/// the live tests.
+HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix = kHiveMountPrefix);
 #endif
 
 /// Test factory: any scope over any reader.
