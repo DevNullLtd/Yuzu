@@ -1598,6 +1598,9 @@ TEST_CASE("gc_dictionary: a deadline that passes mid-statement rolls the batch b
     auto f = make_fold_db(true, [t0, calls] { return calls->fetch_add(1) == 0 ? t0 : t0 + kHour; });
     REQUIRE(f->db.execute_sql("WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000) "
                               "INSERT INTO echo_dict(text) SELECT 'orphan-' || n FROM s"));
+    // A VACUUM resets the schema, so the pass's first prepare re-loads it under the progress
+    // handler: the deadline can interrupt that prepare, and it must still read as a deadline hit.
+    REQUIRE(f->db.execute_sql("VACUUM"));
     const auto g = f->fold.gc_dictionary(f->db, t0 + std::chrono::seconds(1));
     REQUIRE(g.has_value());
     CHECK(g->deadline_hit);

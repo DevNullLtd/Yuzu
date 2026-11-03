@@ -99,7 +99,7 @@ public:
             return it->second;
         if (const auto it = staged_.find(text); it != staged_.end())
             return it->second;
-        if (!find_) {
+        if (!add_) {
             find_ = prep(h, std::format("SELECT id FROM {} WHERE text = ?", kDictTable));
             add_ = prep(h, std::format("INSERT INTO {} (text) VALUES (?) RETURNING id", kDictTable));
             if (!find_ || !add_)
@@ -518,10 +518,9 @@ std::expected<GcResult, std::string> EchoFold::gc_dictionary(EchoDatabase& db,
         const auto r = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
             GcProgress guard(h.raw(), [this, deadline] { return now() >= deadline; });
             for (const auto& sql : sqls) {
+                // A prepare can be interrupted too (it may re-load the schema after a VACUUM).
                 const StmtPtr st = prep(h, sql);
-                if (!st)
-                    return std::unexpected(h.error());
-                const auto n = run(h, st.get());
+                const auto n = st ? run(h, st.get()) : std::nullopt;
                 if (!n) {
                     hit = sqlite3_errcode(h.raw()) == SQLITE_INTERRUPT;
                     return std::unexpected(h.error());
