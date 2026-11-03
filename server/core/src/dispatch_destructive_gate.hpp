@@ -62,7 +62,7 @@
 /// already the elevation ceiling. For the other (13, at last count — see the
 /// catalogue-consistency test) Destructive rows, the caller's own
 /// `require_permission(cap.securable, cap.operation)` check IS real
-/// elevation (e.g. `tar.purge_source` -> `Infrastructure:Delete`) and stays
+/// elevation (e.g. `echo.purge_source` -> `Infrastructure:Delete`) and stays
 /// in the caller, deliberately — see D3 below.
 ///
 /// D3 — WHY THIS GATE DOES NOT CALL `require_permission`/`has_permission`
@@ -103,7 +103,7 @@
 /// legacy UI contract reads as the whole fleet). It reaches agents through
 /// `ServerImpl::dispatch_confined`, NOT through `/api/command`, so #3685's
 /// two call sites did not cover it and every non-`AdminOrApproval`
-/// Destructive row — `tar.purge_source`, `registry.delete_key`,
+/// Destructive row — `echo.purge_source`, `registry.delete_key`,
 /// `filesystem.delete_lines`, `tags.clear`, `storage.clear` and the rest —
 /// was fleet-targetable from it by any holder of the declared securable.
 /// It is wired to THIS header for the reason D3 gives below: the gate belongs

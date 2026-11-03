@@ -20,7 +20,7 @@
  * `CommandCapability::system_reserved` is deliberately NOT read here. It
  * records who the RBAC caller of a dispatch is, not whether work is
  * switchable: under D3 work the agent starts by itself obeys the same state,
- * so tar.fleet_snapshot and asset_tags.sync are ordinary units.
+ * so echo.fleet_snapshot and asset_tags.sync are ordinary units.
  *
  * PROTECTIVE SEAM (one line): the caller injects the predicate, and it is the
  * canonical protective set, `kProtectivePredicate`, which is
@@ -131,19 +131,20 @@ using ProtectivePredicate = bool (*)(std::string_view plugin, std::string_view a
 inline constexpr ProtectivePredicate kProtectivePredicate = &yuzu::protective::is_protective_action;
 
 // Requirement edges, per action. app_usage.summary and app_usage.last_used
-// open tar.db read-only (app_usage_plugin.cpp:112-160). app_usage.foreground
+// open echo.db read-only (app_usage_plugin.cpp:112-160). app_usage.foreground
 // has NO edge: do_foreground (app_usage_plugin.cpp:572) emits a constant
-// constrained line and never touches tar.db.
+// constrained line and never touches echo.db.
 inline constexpr std::array<RequirementEdge, 2> kRequirements{{
-    {"app_usage.summary", "tar"},
-    {"app_usage.last_used", "tar"},
+    {"app_usage.summary", "echo"},
+    {"app_usage.last_used", "echo"},
 }};
 
 // matrix: docs/os-capability-matrix.md generated block (2026-10-06; shares.list,
 // pkg_inventory.store_packages, msi_packages.list_inventory and remote_access_audit.list added
 // 2026-10-17/19; registry set_user_value, delete_user_value and apply added in registry 2.1.0;
-// hardware chassis/baseboard/swap/machine_id and disk_actions partitions/topology added as planned), 242 rows.
-inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
+// hardware chassis/baseboard/swap/machine_id and disk_actions partitions/topology added as planned;
+// runtimes python added 2026-10-28), 243 rows.
+inline constexpr std::array<UnitOsRow, 243> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -317,6 +318,7 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"registry", "apply", kWin | kLin | kMac},
     {"runtimes", "dotnet", kWin | kLin | kMac},
     {"runtimes", "jvm", kWin | kLin | kMac},
+    {"runtimes", "python", kWin | kLin | kMac},
     {"sccm", "client_version", kWin},
     {"sccm", "site", kWin},
     {"script_exec", "exec", kWin | kLin | kMac},
@@ -327,8 +329,7 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"services", "set_start_mode", kWin | kLin | kMac},
     // remote_access_audit: Linux is constrained, macOS supported, Windows `planned` (applicable).
     {"remote_access_audit", "list", kWin | kLin | kMac},
-    // shares: Linux and Windows are supported; the macOS leg is `planned`, which is applicable (not
-    // unsupported).
+    // shares: Linux, Windows and macOS are all supported.
     {"shares", "list", kWin | kLin | kMac},
     {"software_actions", "list_upgradable", kWin | kLin | kMac},
     {"software_actions", "installed_count", kWin | kLin | kMac},
@@ -353,20 +354,20 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"tags", "check", kWin | kLin | kMac},
     {"tags", "clear", kWin | kLin | kMac},
     {"tags", "count", kWin | kLin | kMac},
-    {"tar", "status", kWin | kLin | kMac},
-    {"tar", "query", kWin | kLin | kMac},
-    {"tar", "snapshot", kWin | kLin | kMac},
-    {"tar", "export", kWin | kLin | kMac},
-    {"tar", "configure", kWin | kLin | kMac},
-    {"tar", "collect_fast", kWin | kLin | kMac},
-    {"tar", "collect_slow", kWin | kLin | kMac},
-    {"tar", "collect_perf", kWin | kLin | kMac},
-    {"tar", "collect_software", kWin | kLin | kMac},
-    {"tar", "rollup", kWin | kLin | kMac},
-    {"tar", "sql", kWin | kLin | kMac},
-    {"tar", "compatibility", kWin | kLin | kMac},
-    {"tar", "fleet_snapshot", kWin | kLin | kMac},
-    {"tar", "purge_source", kWin | kLin | kMac},
+    {"echo", "status", kWin | kLin | kMac},
+    {"echo", "query", kWin | kLin | kMac},
+    {"echo", "snapshot", kWin | kLin | kMac},
+    {"echo", "export", kWin | kLin | kMac},
+    {"echo", "configure", kWin | kLin | kMac},
+    {"echo", "collect_fast", kWin | kLin | kMac},
+    {"echo", "collect_slow", kWin | kLin | kMac},
+    {"echo", "collect_perf", kWin | kLin | kMac},
+    {"echo", "collect_software", kWin | kLin | kMac},
+    {"echo", "rollup", kWin | kLin | kMac},
+    {"echo", "sql", kWin | kLin | kMac},
+    {"echo", "compatibility", kWin | kLin | kMac},
+    {"echo", "fleet_snapshot", kWin | kLin | kMac},
+    {"echo", "purge_source", kWin | kLin | kMac},
     {"update_source_trust", "sources", kWin | kLin | kMac},
     {"users", "logged_on", kWin | kLin | kMac},
     {"users", "sessions", kWin | kLin | kMac},

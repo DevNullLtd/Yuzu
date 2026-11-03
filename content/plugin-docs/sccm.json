@@ -385,7 +385,7 @@
   "version": "1.0.0",
   "where_the_data_goes": [
     "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (`response_retention_days`, default 90 days), rendered via `result_parsing.hpp`'s key-value schema (`Agent · Key · Value`) and queryable at `/api/responses/{id}`.",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule; each definition's `gather.ttlSeconds: 60` only caps how often a repeat dispatch is served from cache, it does not trigger one.",
+    "**Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics. Nothing runs on a schedule; each definition's `gather.ttlSeconds: 60` only caps how often a repeat dispatch is served from cache, it does not trigger one.",
     "**Sensitivity.** `client_version`'s `version` names the installed SCCM client software version; `site`'s `site_code`/`management_point` identify the device's organizational deployment grouping — no serial number, MAC, hostname, or username appears in any field.",
     "**Siblings:** `msi_packages` (general software inventory), `agent_actions.info` (agent build/identity), `windows_updates` (patch state) — none join with `sccm`'s output.",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"security.sccm.client_version\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."

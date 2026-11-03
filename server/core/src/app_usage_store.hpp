@@ -4,7 +4,7 @@
 /// Born-on-Postgres per-agent last-used app-usage store (wave 7 PR7.2, schema
 /// `app_usage_store`): the projection for the `app_usage` daily-sync source
 /// (ADR-0016 §5) — per-executable first/last-seen and a trailing-30-day
-/// run_count/total_seconds window, derived on the agent from TAR's
+/// run_count/total_seconds window, derived on the agent from Echo's
 /// `usage_daily` fold via the read-only `app_usage` plugin.
 ///
 /// RETAINED-WINDOW SEMANTICS (adjudication P3, binding — every doc, comment
@@ -12,7 +12,7 @@
 /// honestly): `first_seen`/`last_seen` on `agent_last_used` are NOT values
 /// spanning the executable's full run history. The agent computes them as
 /// MIN/MAX over the `usage_daily` rows
-/// still inside TAR's `usage` retention window (`tar_schema_registry.cpp`,
+/// still inside Echo's `usage` retention window (`echo_schema_registry.cpp`,
 /// `daily` suffix, `retention_default = 2678400` — 31 days by default,
 /// operator-tunable). An executable absent from a blob has not run inside
 /// that retained window; it does not mean the executable has never run. This
@@ -88,7 +88,7 @@ struct AgentLastUsedRow {
     std::string exe_key;
     std::int64_t first_seen{0};        ///< agent-observed retained-window first-seen epoch
                                         ///< seconds (MIN over usage_daily rows still inside
-                                        ///< TAR's 31-day, operator-tunable usage retention —
+                                        ///< Echo's 31-day, operator-tunable usage retention —
                                         ///< NOT a full-run-history value; see the file banner)
     std::int64_t last_seen{0};         ///< agent-observed retained-window last-seen epoch
                                         ///< seconds (MAX over the same retained window)
@@ -154,7 +154,7 @@ public:
     /// receipt time), delete the agent's old `agent_last_used` rows,
     /// batch-insert the new ones. An empty `rows` is a legitimate
     /// replace-to-empty — the retained-window projection can genuinely
-    /// shrink to nothing once every row ages out of TAR's usage retention —
+    /// shrink to nothing once every row ages out of Echo's usage retention —
     /// and `collected_at` is persisted on the parent row EVEN THEN, so a
     /// legitimate empty snapshot does not read back as "never collected"
     /// (see `collected_at()` below). Fail-soft: false on any failure (the

@@ -22,6 +22,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1343,4 +1344,45 @@ TEST_CASE("#5604 KvStore: two stores waited on in turn by one thread are each cu
         CHECK(ms_b >= 160.0);
         CHECK(ms_b < 1000.0);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// rename_plugin (Echo rename, upgrade window): re-key one plugin's namespace
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("KvStore::rename_plugin moves every row; an existing target key keeps its value",
+          "[kv_store][rename_plugin]") {
+    auto t = make_test_store();
+    REQUIRE(t.store.set("tar", "heartbeat.db_corruption_total", "2"));
+    REQUIRE(t.store.set("tar", "db_health.ledger", "old-ledger"));
+    REQUIRE(t.store.set("echo", "db_health.ledger", "new-ledger")); // already present under `to`
+
+    CHECK(t.store.rename_plugin("tar", "echo"));
+
+    CHECK(t.store.get("echo", "heartbeat.db_corruption_total") == std::optional<std::string>{"2"});
+    CHECK(t.store.get("echo", "db_health.ledger") == std::optional<std::string>{"new-ledger"});
+    CHECK_FALSE(t.store.get("tar", "heartbeat.db_corruption_total").has_value());
+    CHECK_FALSE(t.store.get("tar", "db_health.ledger").has_value());
+    CHECK(t.store.list("tar", "").empty());
+}
+
+TEST_CASE("KvStore::rename_plugin with nothing to move succeeds and changes nothing",
+          "[kv_store][rename_plugin]") {
+    auto t = make_test_store();
+    REQUIRE(t.store.set("echo", "k", "v"));
+    CHECK(t.store.rename_plugin("tar", "echo"));
+    CHECK(t.store.rename_plugin("tar", "echo")); // second call: still nothing to move
+    CHECK(t.store.get("echo", "k") == std::optional<std::string>{"v"});
+}
+
+TEST_CASE("KvStore::rename_plugin leaves other plugins' rows untouched",
+          "[kv_store][rename_plugin]") {
+    auto t = make_test_store();
+    REQUIRE(t.store.set("tar", "a", "1"));
+    REQUIRE(t.store.set("other", "a", "2"));
+    REQUIRE(t.store.set("tarsnap", "a", "3")); // a prefix match must not be taken for the plugin
+    CHECK(t.store.rename_plugin("tar", "echo"));
+    CHECK(t.store.get("other", "a") == std::optional<std::string>{"2"});
+    CHECK(t.store.get("tarsnap", "a") == std::optional<std::string>{"3"});
+    CHECK(t.store.get("echo", "a") == std::optional<std::string>{"1"});
 }

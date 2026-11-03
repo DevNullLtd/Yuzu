@@ -410,7 +410,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `/api/compliance*`) — marked **settings-plane exception** with a
        **2027-Q1** proposed re-home target (PO-adjustable; no committed
        date until an owning module is scoped). `/fragments/*` surfaces
-       (e.g. `/fragments/auto/*`, `/fragments/tar/*`,
+       (e.g. `/fragments/auto/*`, `/fragments/echo/*`,
        `/fragments/device/live/*`, `/fragments/executions`) remain under
        item 1 above; they carry no migration date — tracked separately.
 
@@ -443,7 +443,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      | POST | `/api/scope/validate` | `dashboard_api_routes.cpp` | settings-plane exception | 2027-Q1 |
      | POST | `/api/dashboard/execute` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
      | POST | `/api/dashboard/group-from-results` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
-     | POST | `/api/dashboard/tar-execute` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/dashboard/echo-execute` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
      | GET | `/api/deployment-jobs` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
      | POST | `/api/deployment-jobs` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
      | DELETE | `/api/deployment-jobs/([a-f0-9]+)` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
@@ -682,7 +682,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      has an open tracker that owns a date: the two NVD fragments
      (grandfathered surface #2, 2027-Q1 target, #4099 open); the
      self-service password change (a permanent exception, ADR 2026-10-04);
-     the two TAR process-tree fragments (waiting on a /run twin; #4027
+     the two Echo process-tree fragments (waiting on a /run twin; #4027
      closed, #3994 open design issue). The two dashboard api-tokens routes
      left this set when they were recorded as `twinned` (#6009). Plain growth
      of the set is machine-caught,
@@ -937,6 +937,37 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `STRICT_EXCEPTION_PINS`; like the 2026-10-22 API-parity ledger reconcile entry this is a session
      statement by the ADR owner, not a signed decision.
 
+   - **2026-11-02 - DEX score policy model parameters on the REST route (#6087).**
+     REST-only, still no MCP twin: the `GET`, `PUT` and `DELETE
+     /api/v1/dex/score-policy` contract widened (a version 2 document with a
+     `model` block: per-device event cap, regression start and full-weight
+     ratios, each also per application override, and the global interval
+     confidence level; typed as `DexScorePolicyDocument` in `openapi_spec()`),
+     while the #6087 twins have not landed, so the 2026-10-23 exception now
+     covers a larger surface.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
+       as **#6087**; **revisit by 2027-01-31**. When the twins land they take
+       the same document shape and the one write function
+       (`apply_dex_score_policy`), so there is no second validator; both this entry
+       and the 2026-10-23 one retire when the #6087 twins merge, and both are
+       then amended. No ledger row is added, as for the
+       2026-10-23 entry: the parity ledger admits an `exception:` row for a
+       `/api/v1` route but does not require one.
+     - **The exception relaxes no control.** Same gates, `If-Match`, audit-first
+       and fail-closed audit, A4 envelope, and discovery in `openapi_spec()` and
+       `/api/v1/discover/routes`; the new parameters are validated by the same
+       validator the reader uses. The MCP-token posture of these routes is
+       carried on #6087; this entry does not fence MCP tokens.
+     - **What an MCP-only caller can and cannot reach today.** `list_dex_apps`
+       returns the read-only Apps tiers projection, with no model parameters;
+       the OpenAPI document is readable as the `yuzu://openapi` resource; and
+       the generic runtime-config write refuses `dex_score_policy`.
+     - Wire reference: `docs/user-manual/rest-api.md`, "GET / PUT / DELETE
+       /api/v1/dex/score-policy"; the version 2 rolling-upgrade rule is in
+       `docs/user-manual/upgrading.md`; audit rows:
+       `docs/user-manual/audit-log.md` (unchanged by this entry).
+     - Recorded by the change author; ADR-owner acceptance pending.
+
    - **2026-10-23 - DEX customer score policy (`GET`, `PUT` and `DELETE
      /api/v1/dex/score-policy`, #6086).** REST-only, no MCP twin: a "no" on
      Decision 1's both-surfaces requirement, recorded rather than fixed in the
@@ -956,7 +987,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        are audit-first and fail closed on audit (`dex.score_policy.update`,
        `.reset`, `.validate`), and a service-scoped token is refused at the
        gate. The MCP-token posture of these routes is carried on #6087; this
-       entry does not fence MCP tokens.
+       entry does not fence MCP tokens. The contract was widened on
+       2026-11-02; see the entry above.
      - Wire reference: `docs/user-manual/rest-api.md`, "GET / PUT / DELETE
        /api/v1/dex/score-policy"; audit rows: `docs/user-manual/audit-log.md`.
 
@@ -988,11 +1020,12 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        deliberate.
      - **Acceptance.** Accepted by the ADR owner (Dave Rae) on 2026-10-23, as
        a session statement like the entries above and not a signed decision.
-       Revisit by 2026-12-19, eight weeks after acceptance, as the ADR owner
-       directed on 2026-10-24 (a session statement). Issue #6359 carries the
-       conditions for revisiting it: an agentic worker shown to need guide
-       text the default document lacks, or the first release that ships the
-       `/swagger` page. The date is not machine-checked.
+       Revisit by 2026-12-19, eight weeks from 2026-10-24, when the ADR owner
+       set the date (a session statement; acceptance was a day earlier).
+       Issue #6359 carries the conditions for revisiting it: an agentic
+       worker shown to need guide text the default document lacks, or the
+       first release that ships the `/swagger` page. The date is not
+       machine-checked.
    - **2026-10-24 - `get_me` as the MCP twin of `GET /api/v1/me`, and one
      `GATE_PARITY_NO_GATE_ALLOWED` entry. Confirmed 2026-10-24 by the ADR owner,
      as written.** Three parts.
@@ -1062,6 +1095,25 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - **Revisit** when a minimum-version admission check exists, or when
        multi-replica operation leaves the unsupported state in the safe-to-scale
        gate, whichever comes first. No calendar date is set.
+   - **2026-10-28 - the Echo rename retires every TAR-named surface with no
+     deprecation window.** `docs/api-versioning-policy.md` treats an endpoint or
+     tool rename as a Breaking change that keeps the old name for a window; this
+     rename retires the old names outside that cycle, by the owner's ruling at the
+     rename's planning (2026-10-28): a hard cut, no aliases. Scope: the REST
+     routes `/api/v1/tar/...` and `/api/dashboard/tar-*`, the MCP tools
+     `*_tar_*`, the metrics `yuzu_tar_*`, the audit actions `tar.*` (no longer
+     written; old rows keep their spelling and the `echo.*` filters match both),
+     the instruction ids `crossplatform.tar.*`, the result-set matcher kind
+     `tar_rows_ge` and the agent plugin name `tar`. Replacement names substitute
+     `echo` for `tar` (`/api/v1/echo/...`, `*_echo_*`, `yuzu_echo_*`, `echo.*`,
+     `crossplatform.echo.*`, `echo_rows_ge`, plugin `echo`). The only retained
+     compatibility is the upgrade-window plugin-name shim (the server accepts an
+     agent that still reports `tar` and writes that name on the wire to it),
+     removed with the other legacy-name shims. Rationale: the feature is renamed
+     outright, so a retained alias would keep the old name alive in every
+     surface; the migration guide (`docs/user-manual/upgrading.md`) lists the
+     old and new names. The ledger records the retirement because the policy
+     requires it.
 
 ## Interim rules (until the named follow-ups ship)
 

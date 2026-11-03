@@ -60,9 +60,9 @@ A Guard's response posture. **Observe** detects and alerts on drift without writ
 
 Applying Guardian policy to devices. Deploying a Baseline **converges every assigned device to its complete desired guard set** — the per-device union of the enabled member Guards of all deployed Baselines whose assignment includes that device, each gated by the device's Prerequisites. Convergence is to a device's *total* policy (as in Puppet/DSC/GPO), not to one Baseline's fragment; so removing a Guard from a Baseline and re-deploying actually removes it from any device no other deployed Baseline still delivers it to.
 
-## TAR
+## Echo
 
-Timeline Activity Record. TAR captures ordered endpoint activity and response history so operators and agentic workers can reconstruct what happened during investigation, remediation, and audit workflows.
+The agent-local record of ordered endpoint activity and response history, so operators and agentic workers can reconstruct what happened during investigation, remediation, and audit workflows. Echo was named TAR before 2026-10.
 
 ## Gateway
 
@@ -125,7 +125,7 @@ A service an attacker is assumed able to reach from outside a defended zone — 
 
 ## Attack path
 
-A directed chain through the reachability graph from an **entry point** to a **crown jewel**, where each hop is an observed reachability edge whose destination service carries an exploitable vulnerability. Each hop is weighted by the probability an attacker can exploit the destination service on arrival; the path's score is the product of its hop probabilities — found as a shortest *weighted* path so the **most probable** route surfaces, depth-bounded to the few hops that constitute a real threat. A finding's rank is driven by whether it sits on a short, probable attack path to value — **not** by raw CVSS. Distinct from **TAR** (observed temporal activity): an attack path is a structural statement about *possible* compromise routes, grounded in observed reachability but oriented toward what *could* happen. **AMAPC** formalizes this same shortest-weighted-path concept as a fleet-level board metric — the per-crown-jewel minimum, averaged (ADR-4003).
+A directed chain through the reachability graph from an **entry point** to a **crown jewel**, where each hop is an observed reachability edge whose destination service carries an exploitable vulnerability. Each hop is weighted by the probability an attacker can exploit the destination service on arrival; the path's score is the product of its hop probabilities — found as a shortest *weighted* path so the **most probable** route surfaces, depth-bounded to the few hops that constitute a real threat. A finding's rank is driven by whether it sits on a short, probable attack path to value — **not** by raw CVSS. Distinct from **Echo** (observed temporal activity): an attack path is a structural statement about *possible* compromise routes, grounded in observed reachability but oriented toward what *could* happen. **AMAPC** formalizes this same shortest-weighted-path concept as a fleet-level board metric — the per-crown-jewel minimum, averaged (ADR-4003).
 
 ## Chokepoint
 

@@ -21,6 +21,7 @@
 /// carries them as `data-denied` / `data-unavailable` attributes and `yuzu-access.js`
 /// builds its client-side boxes from those attributes.
 
+#include "fragment_states.hpp" // access::Unavailable and access::NotFound live there
 #include "rbac_store.hpp"
 
 #include <yuzu/server/auth.hpp>
@@ -32,11 +33,6 @@
 #include <vector>
 
 namespace yuzu::server::access {
-
-/// The account store did not answer. The route logs the cause; the renderer never sees it.
-struct Unavailable {};
-/// Detail: the store answered and no active account has that name.
-struct NotFound {};
 
 struct UsersList {
     std::vector<auth::UserEntry> users; ///< `AuthDB::list_users()` rows (active accounts only)
@@ -116,11 +112,21 @@ bool is_addressable_name(std::string_view name);
 struct AssignmentsView {
     std::vector<PrincipalRole> rows; ///< every grant the store returned (the render caps the table)
     std::string self;                ///< the caller's username; never empty (the route refuses)
-    bool can_assign = false;         ///< UI hint only: `may_attempt_rbac_admin(session)`; the server decides
+    bool can_assign = false;         ///< UI hint only: `RbacAdminHint::kMay`; the server decides
     /// Role names the Assign dialog offers (already filtered through `is_rbac_assignable_role`).
     /// Empty with `can_assign` means the catalogue could not be read: the button is drawn disabled.
     std::vector<std::string> assignable;
+    /// `RbacAdminHint::kUnconfirmed`: the authority check could not be answered. The Assign role
+    /// button is drawn disabled with `kAdminUnconfirmed` as the reason, never hidden (hiding reads
+    /// as "not allowed", which is not what is known). The per-row Remove controls are drawn only
+    /// with `can_assign`, so they are omitted while unconfirmed. Meaningful only with `can_assign`
+    /// false.
+    bool admin_unconfirmed = false;
 };
+
+/// The reason shown on a control whose authority check could not be answered.
+inline constexpr std::string_view kAdminUnconfirmed =
+    "Your administrator authority could not be confirmed. Reload to try again.";
 
 /// The table is drawn up to this many grants; a banner states the true count past it, and the
 /// derived cells on the page then say "Not shown" instead of a count that would be wrong.
@@ -134,15 +140,6 @@ inline constexpr std::string_view kAssignmentsUnavailable =
 /// The whole Role assignments panel interior. `cap` is a parameter so a test can use a small one.
 std::string render_assignments(const std::variant<AssignmentsView, Unavailable>& state,
                                std::size_t cap = kAssignmentsRenderCap);
-
-/// UI hint: may this session even try the RBAC administration routes (assign/unassign role,
-/// enforcement switch)? A local cookie session whose BASE role is admin (never the effective
-/// one: a JIT elevation does not satisfy the server's predicate). It is a hint in both
-/// directions: it may overstate (the server also needs a durable Administrator) and, with RBAC
-/// enforcement on, it may understate (a local account whose base role is user but which holds the
-/// Administrator grant is admitted by the server and gets no controls here; REST and MCP still
-/// work). The server re-checks on every call and its refusal is shown as it came.
-bool may_attempt_rbac_admin(const auth::Session& s);
 
 // ---- Your account -------------------------------------------------------------------------
 
@@ -160,7 +157,10 @@ std::string render_your_account(const std::string& username, const std::string& 
 struct EnforcementView {
     bool enabled = false;
     bool degraded = false;   ///< the view could not be confirmed: drawn as "Unconfirmed", never as On/Off
-    bool may_toggle = false; ///< `may_attempt_rbac_admin(session)`: a hint, the server decides
+    bool may_toggle = false; ///< `RbacAdminHint::kMay`: a hint, the server decides
+    /// `RbacAdminHint::kUnconfirmed`: the switch is drawn disabled with `kAdminUnconfirmed`.
+    /// Meaningful only with `may_toggle` false.
+    bool admin_unconfirmed = false;
 };
 
 inline constexpr std::string_view kEnforcementDenied = "The enforcement setting needs a signed-in session.";

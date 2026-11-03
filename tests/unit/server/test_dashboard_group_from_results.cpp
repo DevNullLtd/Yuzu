@@ -39,7 +39,7 @@
  *     — both matching agents materialise, no denied audit fires.
  *
  * Model + conventions borrowed from FragmentHarness
- * (test_dashboard_tar_fragments.cpp:106-180): member order is LOAD-BEARING
+ * (test_dashboard_echo_fragments.cpp:106-180): member order is LOAD-BEARING
  * — `sink` is declared LAST so it is destroyed FIRST, while the
  * DashboardRoutes whose `this` its handlers captured is still alive — and
  * the auth_fn/perm_fn/audit_fn capture lambdas follow the same shape. Unlike
@@ -52,7 +52,7 @@
  * plugin, f_* filter params) — the #1786 trap: routes are registered on the
  * sink BEFORE any request is issued, and TestRouteSink's own form parsing
  * (not `extract_form_value`'s raw-body fallback) is what's under test here,
- * exactly as test_dashboard_tar_fragments.cpp:563-582 documents.
+ * exactly as test_dashboard_echo_fragments.cpp:563-582 documents.
  */
 
 #include "dashboard_routes.hpp"
@@ -138,7 +138,7 @@ void seed_matching_responses(ResponseStore& rs, std::initializer_list<std::strin
 
 struct GroupFromResultsHarness {
     // MEMBER ORDER IS LOAD-BEARING (mirrors FragmentHarness,
-    // test_dashboard_tar_fragments.cpp:106-114): `sink` is declared AFTER
+    // test_dashboard_echo_fragments.cpp:106-114): `sink` is declared AFTER
     // `routes` so it is destroyed FIRST, while the `DashboardRoutes` whose
     // `this` its handlers captured is still alive. `rs_*`/`mg_bundle` precede
     // `routes` because `routes` borrows both via raw pointers. The members
@@ -687,8 +687,8 @@ TEST_CASE("group-from-results: a JIT-elevated session materialises every "
 // This route materialises management-group membership and, before this fix,
 // had no origin check at all (a pre-existing gap, unrelated to the scope
 // confinement above, closed in the same round it was found). Mirrors
-// test_dashboard_tar_fragments.cpp's coverage of the identical gate on the
-// TAR re-enable/purge fragments.
+// test_dashboard_echo_fragments.cpp's coverage of the identical gate on the
+// Echo re-enable/purge fragments.
 
 TEST_CASE("group-from-results: CSRF same-site gate rejects cross-origin and "
           "header-less POSTs, never creates a group, before any scope logic",

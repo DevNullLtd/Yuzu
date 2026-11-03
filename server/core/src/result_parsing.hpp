@@ -17,16 +17,16 @@ namespace yuzu::server {
 /// Default column schema for unknown plugins.
 inline const std::vector<std::string> kDefaultColumns{"Agent", "Output"};
 
-/// Sentinel: TAR SQL results use dynamic schemas (sent via __schema__ protocol line).
-inline const std::vector<std::string> kTarDynamic{"Agent", "Output"};
+/// Sentinel: Echo SQL results use dynamic schemas (sent via __schema__ protocol line).
+inline const std::vector<std::string> kEchoDynamic{"Agent", "Output"};
 
-/// Check if a line is a TAR protocol line (__schema__ or __total__).
-inline bool is_tar_protocol_line(const std::string& line) {
+/// Check if a line is an Echo protocol line (__schema__ or __total__).
+inline bool is_echo_protocol_line(const std::string& line) {
     return line.starts_with("__schema__|") || line.starts_with("__total__|");
 }
 
 /// Parse column names from a __schema__|col1|col2|... line.
-inline std::vector<std::string> parse_tar_schema_line(const std::string& line) {
+inline std::vector<std::string> parse_echo_schema_line(const std::string& line) {
     std::vector<std::string> cols;
     if (!line.starts_with("__schema__|")) return cols;
     size_t pos = 11; // skip "__schema__|"
@@ -56,7 +56,7 @@ inline const std::vector<std::string>& columns_for_plugin(const std::string& plu
         {"netstat",     {"Agent", "Proto", "Local Addr", "Local Port",
                          "Remote Addr", "Remote Port", "State", "PID"}},
         {"vuln_scan",   {"Agent", "Severity", "Category", "Title", "Detail"}},
-        {"tar",         {"Agent", "Output"}}, // Dynamic: overridden by __schema__ protocol
+        {"echo",         {"Agent", "Output"}}, // Dynamic: overridden by __schema__ protocol
     };
     static const std::vector<std::string> kKeyValue{"Agent", "Key", "Value"};
     static const std::unordered_set<std::string> kKeyValuePlugins{

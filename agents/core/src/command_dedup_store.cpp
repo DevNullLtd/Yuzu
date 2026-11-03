@@ -9,13 +9,21 @@
 
 #include <yuzu/agent/command_dedup_store.hpp>
 
+#include "command_dedup_quarantine.hpp"
+
 #include <sqlite3.h>
 
 #include <spdlog/spdlog.h>
 
 #include <cctype>
 #include <chrono>
+#include <cstddef>
 #include <format>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <system_error>
 
 namespace yuzu::agent {
 
@@ -48,13 +56,25 @@ using DbGuard = std::unique_ptr<sqlite3, DbCloser>;
 // pragma (e.g. journal_mode=WAL on a filesystem that cannot support it) is
 // reported by SQLite as SQLITE_OK with the *actual* mode in the result row, so
 // setting a pragma is not proof it took — invariant (6) requires reading it back.
-std::string query_pragma(sqlite3* db, const char* pragma_sql) {
+//
+// `rc_out` (optional) receives the first non-OK/ROW result code, so the caller can tell a
+// corruption-class failure (SQLITE_NOTADB / SQLITE_CORRUPT, #3665) from a plain unusable
+// read. Left SQLITE_OK when the read succeeded.
+std::string query_pragma(sqlite3* db, const char* pragma_sql, int* rc_out = nullptr) {
+    if (rc_out)
+        *rc_out = SQLITE_OK;
     sqlite3_stmt* raw = nullptr;
-    if (sqlite3_prepare_v2(db, pragma_sql, -1, &raw, nullptr) != SQLITE_OK)
+    if (int prc = sqlite3_prepare_v2(db, pragma_sql, -1, &raw, nullptr); prc != SQLITE_OK) {
+        if (rc_out)
+            *rc_out = prc;
         return {};
+    }
     StmtPtr stmt(raw);
-    if (sqlite3_step(stmt.get()) != SQLITE_ROW)
+    if (int src = sqlite3_step(stmt.get()); src != SQLITE_ROW) {
+        if (rc_out && src != SQLITE_DONE)
+            *rc_out = src;
         return {};
+    }
     const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
     std::string v = txt ? txt : "";
     for (auto& c : v)
@@ -66,9 +86,46 @@ std::string query_pragma(sqlite3* db, const char* pragma_sql) {
 constexpr int kStateInFlight = 0;
 constexpr int kStateTerminal = 1;
 
+// ---- Corruption recovery (#3665) -------------------------------------------------------
+//
+// command_dedup.db is a regenerable safety net: a file that cannot be opened protects nothing,
+// and staying degraded forever (fail-open on every boot) is strictly worse than starting a fresh
+// one. So a CORRUPTION-class OPEN failure moves the file aside and recreates it, as echo.db does
+// (#559; the filesystem half is command_dedup_quarantine.hpp).
+//
+// "Cannot be opened" means: SQLITE_CORRUPT / SQLITE_NOTADB from sqlite3_open_v2, the
+// journal_mode/synchronous pragmas, or creating the two tables. Damage confined to the unused
+// `meta` table is tolerated (see the schema_version seed below).
+//
+// Deliberately STRICTER than echo's integrity_ok(), in two ways:
+//  1. Only SQLITE_CORRUPT / SQLITE_NOTADB counts. BUSY / LOCKED / IOERR / FULL / CANTOPEN / PERM are
+//     transient or environmental; quarantining on them would discard good history, which lets an
+//     already-run command re-execute (the outcome invariants 4 and 5 forbid).
+//  2. There is NO whole-file integrity scan (no PRAGMA quick_check / integrity_check). A file that
+//     OPENS but has a few damaged pages is still mostly usable: in one experiment with a single
+//     damaged leaf page nearly every id still resolved (damage to an interior or root page costs
+//     many more), and only the claims that touch a bad page fail open (counted by
+//     yuzu_agent_dedup_claim_errors_total). Quarantining it on an integrity scan would discard ALL
+//     history, including in-flight claims, which is worse than the damage (owner ruling, #3665).
+//     Do not add such a scan without re-opening that ruling.
+
+// True for SQLITE_CORRUPT / SQLITE_NOTADB, including extended codes (SQLITE_CORRUPT_VTAB etc).
+bool is_corruption_rc(int rc) noexcept {
+    const int primary = rc & 0xFF;
+    return primary == SQLITE_CORRUPT || primary == SQLITE_NOTADB;
+}
+
+struct OpenFailure {
+    std::string message;
+    bool corrupt = false; ///< corruption-class: the caller may quarantine and retry ONCE
+};
+
 } // namespace
 
-CommandDedupStore::CommandDedupStore(sqlite3* db) : db_{db} {}
+CommandDedupStore::CommandDedupStore(sqlite3* db) : db_{db} {
+    // Sole owner here (the store is not yet shared), so no lock is needed.
+    refresh_row_count_locked();
+}
 
 CommandDedupStore::~CommandDedupStore() {
     if (db_) {
@@ -77,8 +134,12 @@ CommandDedupStore::~CommandDedupStore() {
     }
 }
 
-CommandDedupStore::CommandDedupStore(CommandDedupStore&& other) noexcept : db_{other.db_} {
+CommandDedupStore::CommandDedupStore(CommandDedupStore&& other) noexcept
+    : db_{other.db_}, cached_rows_{other.cached_rows_.load(std::memory_order_relaxed)},
+      quarantined_file_{std::move(other.quarantined_file_)} {
     other.db_ = nullptr;
+    other.cached_rows_.store(kRowCountUnknown, std::memory_order_relaxed);
+    other.quarantined_file_.reset();
 }
 
 CommandDedupStore& CommandDedupStore::operator=(CommandDedupStore&& other) noexcept {
@@ -86,52 +147,58 @@ CommandDedupStore& CommandDedupStore::operator=(CommandDedupStore&& other) noexc
         if (db_)
             sqlite3_close(db_);
         db_ = other.db_;
+        cached_rows_.store(other.cached_rows_.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+        quarantined_file_ = std::move(other.quarantined_file_);
         other.db_ = nullptr;
+        other.cached_rows_.store(kRowCountUnknown, std::memory_order_relaxed);
+        other.quarantined_file_.reset();
     }
     return *this;
 }
 
-std::expected<CommandDedupStore, CommandDedupError>
-CommandDedupStore::open(const std::filesystem::path& db_path) {
-    std::error_code ec;
-    auto parent = db_path.parent_path();
-    if (!parent.empty()) {
-        std::filesystem::create_directories(parent, ec);
-        if (ec) {
-            return std::unexpected(CommandDedupError{
-                std::format("failed to create directory {}: {}", parent.string(), ec.message())});
-        }
-    }
+namespace {
 
+// One open-and-initialise attempt. On failure `corrupt` says whether the cause was
+// corruption-class (the caller may quarantine and retry ONCE) or anything else (plain error,
+// the file is left exactly as found). Does not create the parent directory.
+std::expected<DbGuard, OpenFailure> open_and_init(const std::filesystem::path& db_path) {
     sqlite3* raw_db = nullptr;
     int rc = sqlite3_open_v2(db_path.string().c_str(), &raw_db,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
                              nullptr);
+    // open_v2 may hand back a handle even on failure, and DbCloser is null-safe, so the guard owns
+    // it from the first moment: no manual close on any path below.
+    DbGuard db_guard(raw_db);
     if (rc != SQLITE_OK) {
         std::string err = raw_db ? sqlite3_errmsg(raw_db) : "unknown error";
-        if (raw_db)
-            sqlite3_close(raw_db); // open_v2 may hand back a handle even on failure
-        return std::unexpected(
-            CommandDedupError{std::format("failed to open command_dedup.db: {}", err)});
+        return std::unexpected(OpenFailure{
+            std::format("failed to open command_dedup.db: {}", err), is_corruption_rc(rc)});
     }
-    DbGuard db_guard(raw_db); // owns the handle across every early return below
 
     // WAL + synchronous=FULL are load-bearing durability guarantees (invariant 6),
     // so SET then READ BACK: a *refused* pragma returns SQLITE_OK with the actual
     // mode in the result row, so a mismatch (WAL not "wal", synchronous not "2"=
     // FULL) means the guarantee is silently void — treat that as an open failure,
     // which takes the caller's observable fail-open path (degraded, not silent).
-    sqlite3_exec(raw_db, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
-    if (auto jm = query_pragma(raw_db, "PRAGMA journal_mode"); jm != "wal") {
-        return std::unexpected(CommandDedupError{
-            std::format("journal_mode=WAL not in effect (got '{}')", jm)});
+    // The rc of each step is kept (#3665) ONLY to classify corruption: a non-database
+    // file reports SQLITE_NOTADB here, not at open_v2.
+    int pragma_rc = sqlite3_exec(raw_db, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
+    int read_rc = SQLITE_OK;
+    auto jm = query_pragma(raw_db, "PRAGMA journal_mode", &read_rc);
+    if (jm != "wal") {
+        return std::unexpected(OpenFailure{
+            std::format("journal_mode=WAL not in effect (got '{}')", jm),
+            is_corruption_rc(pragma_rc) || is_corruption_rc(read_rc)});
     }
     // fsync every commit so a claim/terminal record survives a HOST power-loss,
     // not just a process crash. One write per command (not a hot path).
-    sqlite3_exec(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, nullptr);
-    if (auto sy = query_pragma(raw_db, "PRAGMA synchronous"); sy != "2") {
-        return std::unexpected(CommandDedupError{
-            std::format("synchronous=FULL not in effect (got '{}')", sy)});
+    pragma_rc = sqlite3_exec(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, nullptr);
+    auto sy = query_pragma(raw_db, "PRAGMA synchronous", &read_rc);
+    if (sy != "2") {
+        return std::unexpected(OpenFailure{
+            std::format("synchronous=FULL not in effect (got '{}')", sy),
+            is_corruption_rc(pragma_rc) || is_corruption_rc(read_rc)});
     }
     sqlite3_busy_timeout(raw_db, 5000);
 
@@ -142,7 +209,7 @@ CommandDedupStore::open(const std::filesystem::path& db_path) {
     // so this column must NEVER become a wall-clock retention cutoff (that would
     // reintroduce the clock-guarded-retention hazard on a user-controlled clock).
     // A `meta` table carries schema_version for a future migration ladder (the
-    // agent has no shared MigrationRunner; this mirrors tar_db's config-row
+    // agent has no shared MigrationRunner; this mirrors echo_db's config-row
     // precedent).
     const char* create_sql = R"(
         CREATE TABLE IF NOT EXISTS command_outcomes (
@@ -155,16 +222,26 @@ CommandDedupStore::open(const std::filesystem::path& db_path) {
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-        INSERT INTO meta(key, value) VALUES('schema_version', '1')
-            ON CONFLICT(key) DO NOTHING;
     )";
-    char* err_msg = nullptr;
-    rc = sqlite3_exec(raw_db, create_sql, nullptr, nullptr, &err_msg);
+    rc = sqlite3_exec(raw_db, create_sql, nullptr, nullptr, nullptr);
     if (rc != SQLITE_OK) {
-        std::string err = err_msg ? err_msg : "unknown error";
-        sqlite3_free(err_msg);
-        return std::unexpected(
-            CommandDedupError{std::format("failed to create command_dedup schema: {}", err)});
+        return std::unexpected(OpenFailure{
+            std::format("failed to create command_dedup schema: {}", sqlite3_errmsg(raw_db)),
+            is_corruption_rc(rc)});
+    }
+    // The schema_version seed is NOT part of "can this file be opened": nothing reads `meta` yet,
+    // and the INSERT probes the meta table's own b-tree pages, which command_outcomes never uses.
+    // Damage confined to them must not make a file whose command table is intact get quarantined
+    // (that would discard its in-flight claims, invariants 4 and 5; owner ruling, #3665). So a
+    // failure here is a warning, whatever its cause, and never `corrupt`.
+    rc = sqlite3_exec(raw_db,
+                      "INSERT INTO meta(key, value) VALUES('schema_version', '1') "
+                      "ON CONFLICT(key) DO NOTHING",
+                      nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::warn("CommandDedupStore: could not seed meta.schema_version ({}); continuing — "
+                     "nothing reads it yet",
+                     sqlite3_errmsg(raw_db));
     }
 
     // Owner-only (0600), matching the security-hardening.md "chmod 600 *.db" rule
@@ -178,8 +255,61 @@ CommandDedupStore::open(const std::filesystem::path& db_path) {
                                      std::filesystem::perm_options::replace, pec);
     }
 
+    return db_guard;
+}
+
+} // namespace
+
+std::expected<CommandDedupStore, CommandDedupError>
+CommandDedupStore::open(const std::filesystem::path& db_path) {
+    std::error_code ec;
+    auto parent = db_path.parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            return std::unexpected(CommandDedupError{
+                std::format("failed to create directory {}: {}", parent.string(), ec.message())});
+        }
+    }
+
+    auto attempt = open_and_init(db_path);
+    std::optional<std::string> quarantined_file;
+    if (!attempt && attempt.error().corrupt) {
+        // #3665: corruption-class failure. Exactly ONE quarantine + ONE retry — never a loop, so
+        // a disk that corrupts every fresh file degrades (observably) instead of spinning. The
+        // failed attempt's handle is already closed (DbGuard) before the rename.
+        const std::string reason = attempt.error().message;
+        auto moved =
+            dedup_quarantine::quarantine_corrupt_db(db_path, now_epoch_seconds());
+        if (!moved) {
+            // Fail-open, observable (invariant 7): the original file is untouched.
+            return std::unexpected(CommandDedupError{
+                std::format("command_dedup.db is corrupt ({}) and could not be quarantined: {}",
+                            reason, db_path.string())});
+        }
+        spdlog::error("CommandDedupStore: command_dedup.db is corrupt ({}) — quarantined to {} "
+                      "and re-initialising a fresh store",
+                      reason, moved->string());
+        quarantined_file = moved->filename().string();
+        attempt = open_and_init(db_path);
+        // Owner ruling: keep the newest few only. Runs whether or not the retry succeeded, so the
+        // bound also holds on a disk where every boot quarantines and the fresh create fails.
+        // Never throws (best effort).
+        dedup_quarantine::prune_old_quarantines(db_path, *moved);
+    }
+    if (!attempt) {
+        return std::unexpected(CommandDedupError{
+            quarantined_file
+                ? std::format("command_dedup.db re-initialised after quarantine (the corrupt file "
+                              "was kept as {}; its history is lost) still failed: {}",
+                              *quarantined_file, attempt.error().message)
+                : attempt.error().message});
+    }
+
     spdlog::info("CommandDedupStore opened: {}", db_path.string());
-    return CommandDedupStore{db_guard.release()};
+    CommandDedupStore store{attempt->release()};
+    store.quarantined_file_ = std::move(quarantined_file);
+    return store;
 }
 
 ClaimResult CommandDedupStore::claim(std::string_view command_id) noexcept {
@@ -222,7 +352,13 @@ ClaimResult CommandDedupStore::claim(std::string_view command_id) noexcept {
         }
         // NB: prune is NOT triggered here — it runs from record_terminal() (a
         // worker thread), off the latency-critical reader, since the ring evicts
-        // terminal rows.
+        // terminal rows. The cached row count (heartbeat capacity signal, #3663)
+        // is bumped here with no SQL: a relaxed load then store, NOT fetch_add,
+        // because mu_ (held for this whole function) already serialises every
+        // writer, and because fetch_add would turn the -1 "unknown" sentinel into
+        // 0 ("known empty"), so the bump happens only when a count is known.
+        if (auto rows = cached_rows_.load(std::memory_order_relaxed); rows >= 0)
+            cached_rows_.store(rows + 1, std::memory_order_relaxed);
         return ClaimResult{.status = ClaimStatus::Claimed};
     }
     if (rc != SQLITE_DONE) {
@@ -397,6 +533,35 @@ void CommandDedupStore::prune_locked() noexcept {
     rc = sqlite3_step(stmt.get());
     if (rc != SQLITE_DONE)
         spdlog::error("CommandDedupStore::prune step failed: {}", sqlite3_errmsg(db_));
+    // Re-anchor the heartbeat's cached count on the real table once the DELETE statement
+    // has run, whether or not its step succeeded (the count is read, not derived from the
+    // delete). A failed PREPARE returned above and skips this, so the cache then stays at
+    // its previous value until the next prune. This is the only place a COUNT(*) runs
+    // after open, on the worker thread that already pays for the prune, once per
+    // kPruneInterval terminal records (#3663).
+    refresh_row_count_locked();
+}
+
+void CommandDedupStore::refresh_row_count_locked() noexcept {
+    if (!db_)
+        return;
+    sqlite3_stmt* raw_stmt = nullptr;
+    const int prep =
+        sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM command_outcomes", -1, &raw_stmt, nullptr);
+    // Owned from here on EVERY path, including a failed prepare: SQLite leaves *ppStmt
+    // NULL on error and sqlite3_finalize(NULL) is a documented no-op, so there is no
+    // manual cleanup branch to forget.
+    StmtPtr stmt(raw_stmt);
+    if (prep != SQLITE_OK || sqlite3_step(stmt.get()) != SQLITE_ROW)
+        return; // KEEP the previous value: a transient SQLITE_BUSY must not blank a good count
+    cached_rows_.store(sqlite3_column_int64(stmt.get(), 0), std::memory_order_relaxed);
+}
+
+std::optional<std::int64_t> CommandDedupStore::cached_row_count() const noexcept {
+    const auto rows = cached_rows_.load(std::memory_order_relaxed);
+    if (rows < 0)
+        return std::nullopt;
+    return rows;
 }
 
 void CommandDedupStore::set_max_dedup_rows_for_test(std::int64_t n) {

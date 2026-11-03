@@ -35,7 +35,7 @@
 /// so the LLM-native flow does not require an out-of-band fetch"). REST and
 /// MCP therefore cannot drift from each other by construction.
 
-#include "discover_catalog_types.hpp" // DiscoveryDoc, build_routes_catalog (store-free)
+#include "discover_catalog_types.hpp" // DiscoveryDoc, build_routes_catalog (OpenAPI JSON only)
 #include "instruction_store.hpp"
 #include "rbac_store.hpp"
 #include "scope_engine.hpp"

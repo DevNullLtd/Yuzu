@@ -15,7 +15,7 @@
 #include <spdlog/spdlog.h>
 
 namespace yuzu::server {
-extern const std::string kTarRetentionTiersTsv; // docs/capability-registries/tar_retention_tiers.tsv
+extern const std::string kEchoRetentionTiersTsv; // docs/capability-registries/echo_retention_tiers.tsv
 }
 
 namespace yuzu::server::settings_model {
@@ -231,11 +231,11 @@ nlohmann::json build_mcp_settings(const Config& cfg) {
     return j;
 }
 
-const std::vector<tar_retention::TarRetentionTier>* embedded_tar_retention_tiers() {
+const std::vector<echo_retention::EchoRetentionTier>* embedded_echo_retention_tiers() {
     static const auto parsed = [] {
-        auto p = tar_retention::parse_tar_retention_tiers(kTarRetentionTiersTsv);
+        auto p = echo_retention::parse_echo_retention_tiers(kEchoRetentionTiersTsv);
         if (!p)
-            spdlog::error("embedded TAR retention tier table is unreadable: {}", p.error());
+            spdlog::error("embedded Echo retention tier table is unreadable: {}", p.error());
         return p;
     }();
     return parsed ? &*parsed : nullptr;
@@ -243,7 +243,7 @@ const std::vector<tar_retention::TarRetentionTier>* embedded_tar_retention_tiers
 
 nlohmann::json build_data_retention_settings(
     const Config& cfg, const RetentionEnforced& enforced,
-    const std::vector<tar_retention::TarRetentionTier>* tiers) {
+    const std::vector<echo_retention::EchoRetentionTier>* tiers) {
     const auto opt = [](const std::optional<int>& v) {
         return v ? nlohmann::json(*v) : nlohmann::json(nullptr);
     };
@@ -255,20 +255,20 @@ nlohmann::json build_data_retention_settings(
                      {"audit_retention_days", opt(enforced.audit_retention_days)},
                      {"guardian_event_retention_days", opt(enforced.guardian_event_retention_days)}};
     if (!tiers) {
-        j["tar"] = nullptr;
+        j["echo"] = nullptr;
     } else {
         auto rows = nlohmann::json::array();
         for (const auto& t : *tiers) {
-            const auto depth = tar_retention::guaranteed_depth_seconds(t);
+            const auto depth = echo_retention::guaranteed_depth_seconds(t);
             rows.push_back({{"source", t.source},
                             {"tier", t.tier},
                             {"limit_kind", t.row_count ? "rows" : "seconds"},
                             {"limit", t.limit},
-                            {"bucket_seconds", tar_retention::bucket_seconds(t.tier)},
+                            {"bucket_seconds", echo_retention::bucket_seconds(t.tier)},
                             {"guaranteed_depth_seconds",
                              depth ? nlohmann::json(*depth) : nlohmann::json(nullptr)}});
         }
-        j["tar"] = {{"tick_seconds", tar_retention::kTarRetentionTickSeconds}, {"tiers", rows}};
+        j["echo"] = {{"tick_seconds", echo_retention::kEchoRetentionTickSeconds}, {"tiers", rows}};
     }
     return j;
 }
@@ -298,7 +298,7 @@ std::string with_thousands(std::int64_t n) {
 
 } // namespace
 
-std::string tar_duration_text(std::int64_t seconds) {
+std::string echo_duration_text(std::int64_t seconds) {
     constexpr std::int64_t kDay = 86400;
     if (seconds < 3600)
         return "Under an hour";
@@ -316,14 +316,14 @@ namespace {
 
 constexpr std::array<std::string_view, 5> kTierCols{"live", "hourly", "daily", "monthly", "boot"};
 
-std::string render_tar_tiers(const nlohmann::json& tar) {
+std::string render_echo_tiers(const nlohmann::json& echo) {
     struct SourceRow {
         std::string source;
         std::array<std::string, 5> cell;
         std::optional<std::int64_t> depth;
     };
     std::vector<SourceRow> rows;
-    const auto tiers = tar.value("tiers", nlohmann::json::array());
+    const auto tiers = echo.value("tiers", nlohmann::json::array());
     if (tiers.is_array()) {
         for (const auto& t : tiers) {
             if (!t.is_object() || !t.contains("source") || !t.at("source").is_string() ||
@@ -345,7 +345,7 @@ std::string render_tar_tiers(const nlohmann::json& tar) {
                 if (kind == "rows")
                     cell = with_thousands(limit) + (limit == 1 ? " row" : " rows");
                 else if (kind == "seconds")
-                    cell = tar_duration_text(limit);
+                    cell = echo_duration_text(limit);
             }
             if (kind == "seconds" && t.contains("guaranteed_depth_seconds") &&
                 t.at("guaranteed_depth_seconds").is_number_integer()) {
@@ -355,7 +355,7 @@ std::string render_tar_tiers(const nlohmann::json& tar) {
         }
     }
     std::string html =
-        "<div class=\"tw tar-tiers\"><table><caption>TAR capture sources</caption><thead><tr>"
+        "<div class=\"tw echo-tiers\"><table><caption>Echo capture sources</caption><thead><tr>"
         "<th>Source</th><th>Exact</th><th>Hourly</th><th>Daily</th><th>Monthly</th><th>Boot</th>"
         "<th>Look again after</th></tr></thead><tbody>";
     for (const auto& r : rows) {
@@ -363,7 +363,7 @@ std::string render_tar_tiers(const nlohmann::json& tar) {
         for (const auto& c : r.cell)
             html += "<td>" + c + "</td>";
         html += "<td class=\"look\">";
-        html += r.depth ? tar_duration_text(*r.depth)
+        html += r.depth ? echo_duration_text(*r.depth)
                         : "<span class=\"hint\">Row count only</span>";
         html += "</td></tr>";
     }
@@ -372,7 +372,7 @@ std::string render_tar_tiers(const nlohmann::json& tar) {
             "record is guaranteed to stay in this source's history, measured on the agent's clock. "
             "Roll-up rows age from the start of their bucket, so the monthly figure is a 31-day "
             "worst-case floor. ";
-    const auto tick = tar.value("tick_seconds", 0);
+    const auto tick = echo.value("tick_seconds", 0);
     if (tick > 0)
         html += "Old rows are pruned every " + std::to_string(tick) +
                 " s, so a row can outlive its window by about one tick, more under a "
@@ -429,8 +429,8 @@ std::string render_retention_table(const nlohmann::json& v) {
             "written after the change; existing rows keep the window they were written with. Audit "
             "entries are removed at most 25,000 per cleanup pass, so the audit window is a minimum."
             "</p>";
-    if (v.contains("tar") && v.at("tar").is_object())
-        html += render_tar_tiers(v.at("tar"));
+    if (v.contains("echo") && v.at("echo").is_object())
+        html += render_echo_tiers(v.at("echo"));
     return html;
 }
 

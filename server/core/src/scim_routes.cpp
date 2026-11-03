@@ -2233,16 +2233,25 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 // duplicate POST that won the race between the uniqueness
                 // check above and this write — re-read: if the account now
                 // resolves, someone else just created it.
-                if (auth_mgr->get_user_role(input.user_name).has_value()) {
+                const auto reread = auth_mgr->get_user_role(input.user_name);
+                if (reread.has_value()) {
                     send_scim_error(res, 409, "userName already exists", "uniqueness");
                     audit(auth_mgr, audit_store, req, "scim.user.provisioned", "denied",
                          input.user_name, "userName already exists (concurrent create)");
                     record_request(auth_mgr, "create", 409);
                     return;
                 }
+                // #4068: a store error on the re-read is recorded distinctly from a genuine
+                // miss, but the answer stays 500 on purpose: when the re-read fails the insert
+                // may nonetheless have committed (a lost commit acknowledgement), and a retry
+                // would then meet the non-SCIM-account 409 and never converge, so a 503 +
+                // Retry-After would promise a convergence this path cannot give (#6837).
                 send_scim_error(res, 500, "failed to create the underlying account");
                 audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure",
-                     input.user_name);
+                      input.user_name,
+                      reread.error() == auth::AuthManager::GetUserRoleError::DbError
+                          ? "store_unavailable: concurrent-create re-read"
+                          : "");
                 record_request(auth_mgr, "create", 500);
                 return;
             }
@@ -2638,7 +2647,27 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     // believes it is already deprovisioned. Check the real
                     // auth state; only take the no-op when it is ALSO
                     // genuinely inactive.
-                    if (auth_mgr->get_user_role(resource->username).has_value()) {
+                    const auto live_role = auth_mgr->get_user_role(resource->username);
+                    if (!live_role &&
+                        live_role.error() == auth::AuthManager::GetUserRoleError::DbError) {
+                        // #4068 (CC6.8): a store ERROR is not "genuinely already inactive".
+                        // Taking the no-op here would skip the desync repair and report the
+                        // deprovision as complete while the account may still be live. Fail
+                        // closed with the retryable class; the IdP retries. Keyed by scim_id
+                        // like every other `scim.user.deactivated` row.
+                        spdlog::error("ScimRoutes: PUT active:false — auth store unavailable "
+                                      "verifying '{}' (scim_id={}); refusing the no-op",
+                                      ::yuzu::log_token(resource->username), resource->scim_id);
+                        send_scim_unavailable(res, "temporarily unable to verify the account "
+                                                   "state (authorization store unavailable; "
+                                                   "retry)");
+                        audit(auth_mgr, audit_store, req, "scim.user.deactivated", "failure",
+                              resource->scim_id,
+                              "store_unavailable: verifying account state");
+                        record_request(auth_mgr, "replace", 503);
+                        return;
+                    }
+                    if (live_role.has_value()) {
                         spdlog::warn(
                             "ScimRoutes: PUT active:false — scim_resource mirror for '{}' "
                             "(scim_id={}) says inactive but the auth account is still live; "
@@ -2796,7 +2825,27 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                           // — verify the real auth state before trusting
                           // the mirror's "already inactive" and short-
                           // circuiting to a no-op.
-                          if (auth_mgr->get_user_role(resource->username).has_value()) {
+                          const auto live_role = auth_mgr->get_user_role(resource->username);
+                          if (!live_role &&
+                              live_role.error() ==
+                                  auth::AuthManager::GetUserRoleError::DbError) {
+                              // #4068 (CC6.8): see the PUT branch - a store error must not
+                              // read as "genuinely already inactive".
+                              spdlog::error("ScimRoutes: PATCH active:false — auth store "
+                                            "unavailable verifying '{}' (scim_id={}); refusing "
+                                            "the no-op",
+                                            ::yuzu::log_token(resource->username),
+                                            resource->scim_id);
+                              send_scim_unavailable(res, "temporarily unable to verify the "
+                                                         "account state (authorization store "
+                                                         "unavailable; retry)");
+                              audit(auth_mgr, audit_store, req, "scim.user.deactivated",
+                                    "failure", resource->scim_id,
+                                    "store_unavailable: verifying account state");
+                              record_request(auth_mgr, "patch", 503);
+                              return;
+                          }
+                          if (live_role.has_value()) {
                               spdlog::warn(
                                   "ScimRoutes: PATCH active:false — scim_resource mirror for "
                                   "'{}' (scim_id={}) says inactive but the auth account is "

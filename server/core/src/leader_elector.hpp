@@ -14,11 +14,35 @@
 /// primary failover). So leadership is NOT proven by "I hold the lock" — it is
 /// proven by a **monotonically-increasing epoch**:
 ///
-///   * On each successful acquire, the elector mints a fresh epoch from a
-///     Postgres SEQUENCE (`leader_epoch_seq`) and records it as
+///   * On each successful acquire, the elector mints a fresh epoch,
+///     `GREATEST((GREATEST(timeline, prev >> 32) << 32) + nextval(leader_epoch_seq),
+///     prev + 1)` (the packed term, `(GREATEST(timeline, prev >> 32) << 32) + nextval`), and records it as
 ///     `leader_state.current_leader_epoch` — done ON the lock-owning
 ///     connection, so mutual exclusion guarantees only the true holder writes
 ///     it, and each new leader's epoch is strictly greater than any prior one.
+///     The TIMELINE (the Postgres WAL timeline of the primary written to, #6535)
+///     is in the epoch because a bare sequence is not monotonic across a LOSSY
+///     promotion: the promoted standby can lack the latest mint and re-mint a
+///     value a paused ex-leader holds. Every promotion starts a new timeline
+///     whatever WAL was lost, so the re-minted epoch differs. The surviving
+///     `leader_state` row is also a FLOOR (`GREATEST(packed, prev_epoch + 1)`,
+///     with the packed timeline itself `GREATEST(real, prev_epoch >> 32)`), so a
+///     restore / pg_upgrade / cutover onto a lower timeline, or an older
+///     sequence, can never mint below it (the enablement store orders epochs).
+///     A sequence BEHIND the row (a cutover or table-only restore) is advanced at the first
+///     floored mint, best-effort; that election and the next stay exposed.
+///     NOT covered (canonical list: ADR-2002 §3 "Update (2026-11-01, #6535)"):
+///     two live primaries (the fence is per database), a restore that loses the
+///     leader_state row, a lossy promotion while the row pins a higher timeline
+///     than the real one (only the sequence separates epochs there; the elector
+///     warns), same-timeline loss (crash recovery with an unflushed mint), a
+///     physical-snapshot restore without archive recovery, promotion tooling that
+///     skips the previous timeline's history or a PITR that reuses a timeline, and
+///     a rolling upgrade or downgrade across #6535.
+///     Epochs are therefore >= 2^32; the sequence is capped at 2^32-1
+///     (migration v2; `ALTER SEQUENCE ... RESTART` is a safe remedy because of
+///     the floor) and a timeline outside 1..2^31-1 is refused, both as the
+///     `epoch_record` acquire failure.
 ///   * Every LEADER-DRIVEN side-effecting claim (the slice-3.3 command outbox,
 ///     on an ORDINARY pooled connection) embeds the `epoch_fence_sql()` predicate
 ///     (`current_leader_epoch == expected_epoch`) INTO its claim's WRITE
@@ -159,6 +183,12 @@ public:
         /// The logical leadership key. Validated to `[a-z][a-z0-9_]{0,47}`;
         /// an invalid value leaves the elector permanently non-open (fail-closed).
         std::string lock_name = kServerBackgroundLeaderLock;
+        /// TEST SEAM (#6535) -- production never sets this (`server.cpp` leaves it
+        /// `nullopt`). Replaces the Postgres timeline the epoch mint reads, so a
+        /// test can simulate a promotion (timeline bump) without a second cluster.
+        /// A bound integer, never SQL text: nothing here can be spliced into the
+        /// mint statement.
+        std::optional<std::int64_t> timeline_override_for_test;
     };
 
     explicit LeaderElector(Config cfg);
@@ -267,8 +297,8 @@ public:
     [[nodiscard]] static std::string epoch_fence_sql(const std::string& lock_name,
                                                      std::int64_t epoch);
 
-    /// The schema migrations for this store (version 1: `leader_epoch_seq` +
-    /// `leader_state`). Exposed for tests and for the migration ladder.
+    /// The schema migrations for this store (v1: `leader_epoch_seq` + `leader_state`;
+    /// v2, #6535: the sequence's 32-bit MAXVALUE). Exposed for tests and the migration ladder.
     static const std::vector<pg::PgMigration>& migrations();
 
 private:
@@ -282,17 +312,22 @@ private:
     Config cfg_;
     bool name_valid_ = false;                 ///< cfg_.lock_name passed validation.
     pg::PgAdvisoryLockKey lock_key_;          ///< Derived from cfg_.lock_name.
+    /// The epoch-mint statement's bound parameters ($1 lock name, $2 holder, $3 test timeline
+    /// override as text or empty), built once in the constructor (exec_params still copies
+    /// them per call; see the constructor note on the residual bad_alloc window).
+    std::vector<std::string> mint_params_;
 
     mutable std::mutex mu_;
     pg::PgConn conn_;                          ///< Dedicated, never-recycled (declared BEFORE the guard).
     std::optional<pg::PgSessionAdvisoryLockGuard> lock_guard_; ///< Held only while leader.
     std::optional<std::int64_t> epoch_;        ///< Epoch of the current leadership, if any (writer state, under mu_).
     bool open_ = false;
+    std::int64_t last_logged_timeline_ = 0;    ///< Last timeline logged at info (under mu_).
 
     /// Lock-free publish channel for `is_leader()`/`epoch()` (slice 3.2, #4013):
-    /// `0` = not leader; `>= 1` = leader at that epoch (minted epochs start at 1,
-    /// so `0` is an unambiguous sentinel). The election loop stores this under
-    /// `mu_` whenever `epoch_` changes (acquire → the minted epoch; drop → 0),
+    /// `0` = not leader; `>= 1` = leader at that epoch (a minted epoch is >= 2^32 since
+    /// #6535 and always positive, so `0` is an unambiguous sentinel). The election loop
+    /// stores this under `mu_` whenever `epoch_` changes (acquire → the minted epoch; drop → 0),
     /// release-ordered; readers load it with acquire and never touch `mu_`, so a
     /// libpq probe stalled under `mu_` cannot block a worker tick's leadership
     /// read. `epoch_` above stays the writer's authoritative state under `mu_`.

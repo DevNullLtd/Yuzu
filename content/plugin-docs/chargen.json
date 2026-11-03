@@ -344,7 +344,7 @@
   "where_the_data_goes": [
     "**Instruction result only.** Both actions dispatch through `execute_instruction` (definitions `testing.chargen.start` / `testing.chargen.stop`); output lines travel as CommandResponse messages and land in the ResponseStore, queryable at `/api/responses/{id}`.",
     "**Also reachable via a legacy REST sink.** `POST /api/chargen/start` and `POST /api/chargen/stop` forward straight to the same `chargen`/`chargen_start`/`chargen_stop` plugin-action pair through `forward_legacy_command`, bypassing the definition id; both routes are confined through the same dispatch chokepoint and RBAC gate as the definition-based path. `GET /chargen` (the old dashboard page) just redirects to `/`.",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule (`gather.ttlSeconds: 0` on both definitions); the plugin only runs when explicitly dispatched.",
+    "**Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics. Nothing runs on a schedule (`gather.ttlSeconds: 0` on both definitions); the plugin only runs when explicitly dispatched.",
     "**Sensitivity.** `output` rows are a fixed, rotating ASCII pattern (RFC 864) with no reference to the host — nothing that could identify a device, a person, or installed software.",
     "**Siblings:** none — `chargen` is a standalone testing/benchmark plugin, not part of an inventory family.",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"testing.chargen.start\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."

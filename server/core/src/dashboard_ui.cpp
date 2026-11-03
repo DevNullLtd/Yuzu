@@ -401,7 +401,7 @@ constexpr char kDashBodyConsole[] = R"HTM(  </section>
           <input type="hidden" name="scope_expression" id="ox-scope-expression" value="" disabled>
           <button type="submit" id="btn-send">Send</button>
           <button type="button" class="btn-clear" onclick="clearResults()">Clear</button>
-          <button type="button" id="ox-tar-open" title="Run a read-only SQL query against the TAR warehouse on the selected target">Run on TAR history</button>
+          <button type="button" id="ox-echo-open" title="Run a read-only SQL query against the Echo warehouse on the selected target">Run on Echo history</button>
         </div>
       </div>
       <div class="stats">

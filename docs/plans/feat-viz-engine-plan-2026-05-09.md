@@ -6,7 +6,7 @@
 
 ## Context
 
-Yuzu operators today have no spatial view of their fleet. They can list devices, list processes per device, and list CVEs — but nothing answers *"which vulnerable processes on which machines are talking to which other machines?"*. The capability map calls this gap out as a flagship product differentiator (see `docs/scope-walking-design.md` and `docs/tar-dashboard.md`).
+Yuzu operators today have no spatial view of their fleet. They can list devices, list processes per device, and list CVEs — but nothing answers *"which vulnerable processes on which machines are talking to which other machines?"*. The capability map calls this gap out as a flagship product differentiator (see `docs/scope-walking-design.md` and `docs/echo-dashboard.md`).
 
 The new visualization will render each managed machine as a translucent cube, processes inside as positional nodes coloured by category, intra-machine localhost connections as interior lines, and external connections as edges that exit visible socket markers on one cube and enter sockets on another. WASD pans the camera, mouse drag rotates around scene centre, mouse wheel zooms.
 
@@ -14,7 +14,7 @@ The branch (`feat/viz-engine`, worktree `/Users/<user>/Yuzu-viz`) is at `origin/
 
 **Locked decisions (from clarifying questions):**
 1. Process categorization in v1 = hardcoded heuristics (system / browser / database / web / runtime / other)
-2. UI scope = single `/viz/fleet` page with click-to-drill-in (per-device exploration stays HTML on TAR page)
+2. UI scope = single `/viz/fleet` page with click-to-drill-in (per-device exploration stays HTML on Echo page)
 3. Cross-machine IP resolution = derive from connection snapshots (no `AgentRegistry` proto change)
 
 **Library choice — Three.js r168 + OrbitControls only.** Vanilla Three.js, no `3d-force-graph` (force-directed is wrong for positional cubes), no `three-stdlib` (1.4 MB of unneeded helpers; can be added in polish PR if `Line2`/`InstancedMesh` helpers prove necessary). Custom WASD listener plus OrbitControls with `enablePan=false`.
@@ -29,8 +29,8 @@ The branch (`feat/viz-engine`, worktree `/Users/<user>/Yuzu-viz`) is at `origin/
 
 These are *not* obvious from the code structure and shape several PR boundaries:
 
-1. **TAR connection rows are agent-local-only.** `tcp_live` / `process_live` tables (`agents/plugins/tar/src/tar_db.cpp:454,512`) hold the row data. The server's `response_store` only sees the summary line `tar|collect_fast|<N>|events_recorded` (`tar_plugin.cpp:384`) — counts, not rows. The server cannot reconstruct topology from existing stored data; it must dispatch a TAR action on demand.
-2. **`tar.query` exists** (`tar_plugin.cpp:533`) and emits JSON rows over the standard CommandRequest plumbing — no new wire protocol needed. We add one new TAR action that returns a single shaped JSON document.
+1. **Echo connection rows are agent-local-only.** `tcp_live` / `process_live` tables (`agents/plugins/echo/src/echo_db.cpp:454,512`) hold the row data. The server's `response_store` only sees the summary line `echo|collect_fast|<N>|events_recorded` (`echo_plugin.cpp:384`) — counts, not rows. The server cannot reconstruct topology from existing stored data; it must dispatch an Echo action on demand.
+2. **`echo.query` exists** (`echo_plugin.cpp:533`) and emits JSON rows over the standard CommandRequest plumbing — no new wire protocol needed. We add one new Echo action that returns a single shaped JSON document.
 3. **AgentSession lacks IP** (`agent_registry.hpp:47` — `agent_id, hostname, os, gateway_node`). IP set must come from somewhere else; we ship it inside the new snapshot payload (cheaper than extending the proto).
 4. **`embed_js.py`** chunks JS at 14 KB (`scripts/embed_js.py:30`) due to MSVC C2026 limit. Three.js r168 minified (~660 KB) → ~50 chunks. Pipeline already proven by ECharts (1 MB committed at `server/core/vendor/echarts.min.js`).
 5. **No long-lived `<canvas>` pattern.** HTMX swaps blow away DOM; a Three.js `WebGLRenderer` must own a node that survives swaps. PR 5 establishes this contract: persistent `<div id="viz-root">` with the canvas mounted once and left untouched on subsequent swaps; only an inner `#viz-overlay-panel` swaps.
@@ -41,17 +41,17 @@ These are *not* obvious from the code structure and shape several PR boundaries:
 
 11 PRs. Each is independently mergeable, independently demoable when possible, and small enough for a single `/governance` pass. The first three are pure data plane (no rendering); demo-able via `curl` and `jq`.
 
-### PR 1 — Agent: `tar.fleet_snapshot` action + `local_ips` collector
+### PR 1 — Agent: `echo.fleet_snapshot` action + `local_ips` collector
 
-**Demo:** `yuzu-cli run --plugin tar --action fleet_snapshot --target hostname=foo | jq '{procs: (.processes|length), conns: (.connections|length), ips: .local_ips}'` returns a snapshot.
+**Demo:** `yuzu-cli run --plugin echo --action fleet_snapshot --target hostname=foo | jq '{procs: (.processes|length), conns: (.connections|length), ips: .local_ips}'` returns a snapshot.
 
-- `agents/plugins/tar/src/tar_plugin.cpp` — add `"fleet_snapshot"` to `actions()` (line 226), dispatch in `run()` (line 301), implement `do_fleet_snapshot()` (after `do_snapshot` at line 682).
-- `agents/plugins/tar/src/tar_db.{hpp,cpp}` — add `select_active_processes(int64_t since_ts, int max=4096)` and `select_active_connections(int64_t since_ts, int max=4096)`. Read latest-snapshot rows from `process_live` / `tcp_live` where `action ∈ {'started','connected'}` minus subsequent `'stopped'/'disconnected'`.
+- `agents/plugins/echo/src/echo_plugin.cpp` — add `"fleet_snapshot"` to `actions()` (line 226), dispatch in `run()` (line 301), implement `do_fleet_snapshot()` (after `do_snapshot` at line 682).
+- `agents/plugins/echo/src/echo_db.{hpp,cpp}` — add `select_active_processes(int64_t since_ts, int max=4096)` and `select_active_connections(int64_t since_ts, int max=4096)`. Read latest-snapshot rows from `process_live` / `tcp_live` where `action ∈ {'started','connected'}` minus subsequent `'stopped'/'disconnected'`.
 - `agents/core/include/yuzu/agent/network_interfaces.hpp` (new) — `std::vector<std::string> enumerate_local_ips();` returning canonical-form, deduped, no-loopback.
 - `agents/core/src/network_interfaces_posix.cpp` (new) — `getifaddrs` impl (Linux + macOS).
 - `agents/core/src/network_interfaces_win.cpp` (new) — `GetAdaptersAddresses` impl.
-- `agents/core/meson.build`, `agents/plugins/tar/src/meson.build` — wire new sources.
-- `tests/unit/test_fleet_snapshot.cpp` (new, Catch2 `[tar][fleet]`) — synthesised rows roundtrip, stop/disconnect removes from snapshot, truncation at 4096, `cmdline` redaction (`should_redact` reused), `local_ips` injection, JSON byte size <512 KB on max-realistic load.
+- `agents/core/meson.build`, `agents/plugins/echo/src/meson.build` — wire new sources.
+- `tests/unit/test_fleet_snapshot.cpp` (new, Catch2 `[echo][fleet]`) — synthesised rows roundtrip, stop/disconnect removes from snapshot, truncation at 4096, `cmdline` redaction (`should_redact` reused), `local_ips` injection, JSON byte size <512 KB on max-realistic load.
 
 **Emitted schema (one JSON object per snapshot):**
 ```json
@@ -67,7 +67,7 @@ These are *not* obvious from the code structure and shape several PR boundaries:
 
 **Demo:** unit test prints serialised `TopologySnapshot` JSON; cache-hit timings shown.
 
-- `server/core/src/fleet_topology_store.{hpp,cpp}` (new) — class with `std::shared_ptr<const TopologySnapshot> get(bool include_vuln)`; LRU-of-2 (with-vuln, without-vuln) keyed on flag, 60 s TTL, single-flight refill via `std::shared_mutex` + `std::condition_variable_any` (mirrors `server/core/src/api_token_store.hpp` pattern). On cache miss, dispatches `tar.fleet_snapshot` to each session in `AgentRegistry` (5 s per-agent timeout, partial results allowed; missing agents flagged `stale=true`).
+- `server/core/src/fleet_topology_store.{hpp,cpp}` (new) — class with `std::shared_ptr<const TopologySnapshot> get(bool include_vuln)`; LRU-of-2 (with-vuln, without-vuln) keyed on flag, 60 s TTL, single-flight refill via `std::shared_mutex` + `std::condition_variable_any` (mirrors `server/core/src/api_token_store.hpp` pattern). On cache miss, dispatches `echo.fleet_snapshot` to each session in `AgentRegistry` (5 s per-agent timeout, partial results allowed; missing agents flagged `stale=true`).
 - `server/core/src/process_category.hpp` (new, header-only) — `enum class Category` + `Category classify(std::string_view exe_basename, std::string_view user)` mapping ~60 known executable names. Tested name table: `postgres,mysqld,mariadbd,redis-server,mongod,memcached → Database`; `chrome,chromium,firefox,msedge,safari → Browser`; `nginx,apache2,httpd,iisexpress → Web`; `java,python,python3,node,dotnet,ruby,php-fpm → Runtime`; `systemd,init,launchd,svchost,kthreadd,kernel_task → System`; default `Other`.
 - `server/core/src/fleet_topology_types.hpp` (new) — `MachineNode { agent_id, hostname, os, local_ips, processes[], connections[], stale }`, `ProcessNode { pid, ppid, name, user, category, rss_kb, worst_severity }`, `ConnectionEdge { src_pid, src_addr, src_port, dst_addr, dst_port, dst_agent_id (resolved or empty), proto, scope (LOCAL/INTERNAL_FLEET/EXTERNAL) }`.
 - **IP resolution**: server builds `unordered_map<string, string> ip_to_agent_id` from each agent's `local_ips`; falls back to unioning `connections[].local_addr` for legacy/missing-field agents; flags `0.0.0.0` and `::` as ambiguous (skipped from map).
@@ -108,14 +108,14 @@ These are *not* obvious from the code structure and shape several PR boundaries:
 
 **Demo:** navigate to `/viz/fleet`, see empty grey scene with faint ground grid + axes helper; WASD moves camera (W=up, S=down, A=left, D=right), drag rotates, wheel zooms; F12 console clean on Linux/macOS/Windows.
 
-- `server/core/src/viz_page_ui.cpp` (new — mirrors `tar_page_ui.cpp` shell + nav) — emits page with persistent outer `<div id="viz-root" data-yuzu-viz-url="/api/v1/viz/fleet/topology">` containing `<canvas id="viz-canvas">` and a swappable `<div id="viz-overlay-panel">` for future side-panels. `<script src="/static/three.min.js"></script><script src="/static/three-orbit-controls.js"></script><script src="/static/yuzu-viz.js"></script>`.
+- `server/core/src/viz_page_ui.cpp` (new — mirrors `echo_page_ui.cpp` shell + nav) — emits page with persistent outer `<div id="viz-root" data-yuzu-viz-url="/api/v1/viz/fleet/topology">` containing `<canvas id="viz-canvas">` and a swappable `<div id="viz-overlay-panel">` for future side-panels. `<script src="/static/three.min.js"></script><script src="/static/three-orbit-controls.js"></script><script src="/static/yuzu-viz.js"></script>`.
 - `server/core/src/yuzu_viz_js_bundle.cpp` (new, hand-written ~6 KB — under MSVC limit, no chunking) — `window.YuzuViz` IIFE that:
   - Mounts the renderer once on first `htmx:afterSettle` for `[data-yuzu-viz-url]`; bails idempotently if already mounted (canvas survival contract).
   - Builds scene + perspective camera + ambient + directional light + ground grid + axes helper.
   - OrbitControls with `enablePan=false` (WASD owns translation).
   - WASD `keydown` listener: pans camera position by camera-basis-aligned step (W=+Y, S=−Y, A=−X, D=+X in screen space; `requestAnimationFrame`-throttled).
   - Empty `render()` placeholder for PR 6 to fill in.
-- `server/core/src/server.cpp` — `extern const std::string kYuzuVizJs;` + `/static/yuzu-viz.js` route + `/viz/fleet` page route (gated behind same auth as `/tar`).
+- `server/core/src/server.cpp` — `extern const std::string kYuzuVizJs;` + `/static/yuzu-viz.js` route + `/viz/fleet` page route (gated behind same auth as `/echo`).
 - `server/core/src/dashboard_ui.cpp:373` — insert `<a href="/viz/fleet" class="nav-link">Fleet Viz</a>` before Settings.
 - `server/core/meson.build` — add `'src/viz_page_ui.cpp'`, `'src/yuzu_viz_js_bundle.cpp'`.
 
@@ -169,19 +169,19 @@ These are *not* obvious from the code structure and shape several PR boundaries:
 
 ## Critical files to read before implementation
 
-- `agents/plugins/tar/src/tar_plugin.cpp` — actions array (226), do_query (533), do_snapshot (682) — pattern to mirror for `do_fleet_snapshot`.
-- `agents/plugins/tar/src/tar_db.cpp` — `process_live` / `tcp_live` insert (454, 512) — read direction for new selectors.
-- `agents/plugins/tar/src/tar_collectors.hpp` — `NetConnection` struct + `redact_cmdline()`.
+- `agents/plugins/echo/src/echo_plugin.cpp` — actions array (226), do_query (533), do_snapshot (682) — pattern to mirror for `do_fleet_snapshot`.
+- `agents/plugins/echo/src/echo_db.cpp` — `process_live` / `tcp_live` insert (454, 512) — read direction for new selectors.
+- `agents/plugins/echo/src/echo_collectors.hpp` — `NetConnection` struct + `redact_cmdline()`.
 - `agents/core/include/yuzu/agent/process_enum.hpp` — `ProcessInfo` struct + `enumerate_processes()`.
 - `server/core/src/api_token_store.hpp` — LRU + TTL + single-flight pattern to mirror.
-- `server/core/src/agent_registry.hpp` — `AgentSession` (47), `send_to` (104) for dispatching `tar.fleet_snapshot`.
+- `server/core/src/agent_registry.hpp` — `AgentSession` (47), `send_to` (104) for dispatching `echo.fleet_snapshot`.
 - `server/core/src/nvd_db.hpp` — `match_inventory()` for vuln overlay.
 - `server/core/src/charts_js_bundle.cpp` — `[data-yuzu-chart-url]` HTMX hook + `htmx:afterSettle` listener pattern.
 - `server/core/src/server.cpp:165–168, 2523–2569` — extern declarations + static-asset routes — pattern to mirror.
 - `server/core/scripts/embed_js.py` — vendor embed pipeline (DELIM `ECHARTSEMBED`, CHUNK_SIZE 14_000).
 - `server/core/meson.build:55–99` — `custom_target` blocks for embeds + static_library composition.
 - `server/core/src/dashboard_ui.cpp:369–373` — nav-link block to extend.
-- `server/core/src/tar_page_ui.cpp` — page shell pattern for `/viz/fleet`.
+- `server/core/src/echo_page_ui.cpp` — page shell pattern for `/viz/fleet`.
 - `server/core/src/dashboard_routes.cpp:360–411` — fragment-route registration pattern (regex paths, RBAC, audit).
 - `tests/unit/test_helpers.hpp` — `unique_temp_path` / `TempDbFile` (mandatory per CLAUDE.md test-helpers section).
 - `docs/observability-conventions.md` — audit envelope + metric naming.
@@ -194,8 +194,8 @@ These are *not* obvious from the code structure and shape several PR boundaries:
 | Need | Reuse |
 |---|---|
 | Process enum | `yuzu::agent::enumerate_processes()` — `process_enum.hpp` |
-| Connection enum | `tar::enumerate_connections()` — `tar_network_collector.cpp` |
-| Cmdline redaction | `redact_cmdline()` — `tar_collectors.hpp` |
+| Connection enum | `echo::enumerate_connections()` — `echo_network_collector.cpp` |
+| Cmdline redaction | `redact_cmdline()` — `echo_collectors.hpp` |
 | Live-state read | new selectors on existing `process_live` / `tcp_live` — no DDL |
 | LRU + TTL + single-flight | `api_token_store.hpp` |
 | CVE matching | `NvdDatabase::match_inventory()` — `nvd_db.hpp` |
@@ -210,7 +210,7 @@ These are *not* obvious from the code structure and shape several PR boundaries:
 
 ## Verification
 
-- **PR 1**: `meson test -C build-linux --suite tar --print-errorlogs` passes; `yuzu-cli run --plugin tar --action fleet_snapshot --target hostname=$(hostname) | jq .schema` returns `"fleet_snapshot.v1"`.
+- **PR 1**: `meson test -C build-linux --suite echo --print-errorlogs` passes; `yuzu-cli run --plugin echo --action fleet_snapshot --target hostname=$(hostname) | jq .schema` returns `"fleet_snapshot.v1"`.
 - **PR 2**: `meson test -C build-linux --suite server --test fleet_topology_store` passes; cache-hit time < 5 % of cache-miss time at TTL boundary.
 - **PR 3**: `curl -H 'Authorization: Bearer …' http://localhost:8080/api/v1/viz/fleet/topology | jq '.machines | length'` returns ≥1 in UAT; metric `yuzu_viz_cache_hit_total` increments on second request within TTL.
 - **PR 4**: `curl -sI http://localhost:8080/static/three.min.js` returns 200 with byte count matching `wc -c server/core/vendor/three.min.js`. Build green on Linux GCC, macOS Apple Clang, Windows MSVC (validate on Shulgi per memory `reference_shulgi_windows_box.md`).

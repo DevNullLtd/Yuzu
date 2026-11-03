@@ -847,7 +847,7 @@ int main(int argc, char* argv[]) {
     // (which no-ops when g_agent is null) never silently swallows a Ctrl-C/
     // SIGTERM that arrives during make_agent()'s work (a SQLite open/write in
     // resolve_agent_id() plus a trivial in-memory Agent construction -- the
-    // actual heavy work, plugin load and KV/TAR store open, happens later
+    // actual heavy work, plugin load and KV/Echo store open, happens later
     // inside agent->run() below, which was already covered by this
     // registration point before make_agent() existed). Installing the
     // handlers any earlier -- e.g. before calling make_agent() -- would

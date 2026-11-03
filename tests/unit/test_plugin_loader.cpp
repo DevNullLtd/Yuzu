@@ -27,6 +27,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -446,6 +447,97 @@ TEST_CASE("PluginLoader rejects a plugin declaring an invalid name",
     REQUIRE(err.reason == yuzu::agent::kInvalidNameReason);
 
     fs::remove_all(tmp);
+}
+
+TEST_CASE("PluginLoader rejects a stale plugin declaring the retired pre-rename name",
+          "[plugin_loader][retired_name]") {
+    auto fixture = find_fixture_plugin("retired_name_fixture_plugin");
+    if (fixture.empty()) {
+        WARN("retired_name_fixture_plugin not found - skipping behavioral scan test");
+        SUCCEED();
+        return;
+    }
+
+    // Scan an isolated copy so the result reflects only this fixture. `tmp` is declared before
+    // `result`, so the dlopen handle is released before the directory is removed.
+    yuzu::test::TempDir tmp{"yuzu_test_retired_plugin_"};
+    fs::create_directories(tmp.path);
+    const auto staged = tmp.path / fixture.filename();
+    std::error_code ec;
+    fs::copy_file(fixture, staged, fs::copy_options::overwrite_existing, ec);
+    REQUIRE_FALSE(ec);
+
+    auto result = yuzu::agent::PluginLoader::scan(tmp.path);
+
+    // The stale plugin must not reach the dispatcher...
+    REQUIRE(result.loaded.empty());
+    // ...and must surface as one error under the stable reason prefix that the agent metric
+    // (reason="retired_name") and the OTA adoption deferral both key on.
+    REQUIRE(result.errors.size() == 1);
+    const auto& err = result.errors.front();
+    CHECK(err.path == staged.string());
+    REQUIRE(err.reason.starts_with(yuzu::agent::kRetiredNameReason));
+    CHECK(err.reason.find("tar") != std::string::npos);
+    // Rejected as retired, not as reserved: that list doubles as the KV-namespace contract.
+    CHECK_FALSE(yuzu::agent::is_reserved_plugin_name("tar"));
+}
+
+TEST_CASE("defer_legacy_echo_adoption holds adoption only while the retired plugin has no successor",
+          "[plugin_loader][retired_name]") {
+    using yuzu::agent::LoadError;
+    const std::vector<LoadError> retired{
+        {"/p/tar.so", std::string{yuzu::agent::kRetiredNameReason} + ": tar"}};
+    const std::vector<LoadError> reserved_only{
+        {"/p/x.so", std::string{yuzu::agent::kReservedNameReason} + ": __guard__"}};
+    const std::vector<std::string_view> none;
+    const std::vector<std::string_view> echo{"echo", "other"};
+
+    // Only the retired tar plugin is installed: the history must stay under tar.db.
+    CHECK(yuzu::agent::defer_legacy_echo_adoption(retired, none));
+    // The renamed plugin loaded beside the stale one: adopt.
+    CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption(retired, echo));
+    // No retired plugin (any other rejection, or none): adopt as before.
+    CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption(reserved_only, none));
+    CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption({}, none));
+
+    // A stale tar plugin refused BEFORE dlopen (allowlist or signature) never reaches the
+    // retired-name check, so its reason is the earlier one; its file stem still marks it.
+    const std::vector<LoadError> tar_allowlist{{"/p/tar.so", "not in plugin allowlist"}};
+    const std::vector<LoadError> tar_dll_signature{
+        {"/p/tar.dll", std::string{yuzu::agent::kSignatureMissingReason}}};
+    const std::vector<LoadError> other_allowlist{{"/p/other.so", "not in plugin allowlist"}};
+    CHECK(yuzu::agent::defer_legacy_echo_adoption(tar_allowlist, none));
+    CHECK(yuzu::agent::defer_legacy_echo_adoption(tar_dll_signature, none));
+    CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption(tar_allowlist, echo));
+    CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption(other_allowlist, none));
+    // A case-renamed stale file (TAR.dll, Tar.dylib) is the same retired plugin.
+    const std::vector<LoadError> upper_stem{{"/p/TAR.dll", "not in plugin allowlist"}};
+    const std::vector<LoadError> mixed_stem{
+        {"/p/Tar.dylib", std::string{yuzu::agent::kSignatureMissingReason}}};
+    CHECK(yuzu::agent::defer_legacy_echo_adoption(upper_stem, none));
+    CHECK(yuzu::agent::defer_legacy_echo_adoption(mixed_stem, none));
+    CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption(upper_stem, echo));
+}
+
+TEST_CASE("defer_legacy_echo_adoption sees a stale tar plugin the allowlist refused before dlopen",
+          "[plugin_loader][retired_name]") {
+    // The allowlist miss happens before the file is opened as a library, so plain bytes under the
+    // right filename are enough; no fixture plugin is needed.
+    yuzu::test::TempDir tmp{"yuzu_test_retired_allowlist_"};
+    fs::create_directories(tmp.path);
+    {
+        std::ofstream pf(tmp.path / (std::string{"tar"} + kPluginExt), std::ios::binary);
+        pf << "stale tar plugin bytes";
+    }
+    auto result = yuzu::agent::PluginLoader::scan(
+        tmp.path, {{std::string{"other"} + kPluginExt, std::string(64, '0')}});
+
+    REQUIRE(result.loaded.empty());
+    REQUIRE(result.errors.size() == 1);
+    CHECK(result.errors.front().reason == "not in plugin allowlist");
+    CHECK(fs::path{result.errors.front().path}.stem() == "tar");
+    const std::vector<std::string_view> none;
+    CHECK(yuzu::agent::defer_legacy_echo_adoption(result.errors, none));
 }
 
 // ─── Plugin config-sync (covers agent.cpp post-load sync invariant) ─────────

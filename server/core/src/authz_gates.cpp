@@ -137,7 +137,7 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
     // here). A successful admit stays TOP — "current engine grants are
     // fleet-wide only" (require_list_read), no per-tag scoping concept
     // applies to engine principals.
-    if (session->principal_kind == "engine") {
+    if (session->is_engine()) {
         if (!rbac_store_ || !rbac_store_->is_open()) {
             audit_log(req, "auth.fleet_read_required", "denied", "", "",
                       "engine principal denied: RBAC store unavailable");

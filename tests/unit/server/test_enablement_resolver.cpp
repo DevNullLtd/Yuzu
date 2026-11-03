@@ -708,7 +708,7 @@ TEST_CASE("enablement resolver: a loaded rule keeps stale units but is validated
 
     // A unit name is held to the shape build_unit_overlay freezes: a corrupt row must not
     // reach unresolved_units (audit and export strings). Legal-but-stale shapes still load.
-    for (const char* ok : {"gone", "gone.x", "tar.fleet_snapshot", "__guard__.push_rules"})
+    for (const char* ok : {"gone", "gone.x", "echo.fleet_snapshot", "__guard__.push_rules"})
         CHECK(make_persisted_rule("g", {ok}, "__all__", Provenance::Operator, kinds()));
     for (const std::string& bad :
          {std::string{}, std::string{"a\nb"}, std::string{"a\x01"}, std::string{"../../x"},
