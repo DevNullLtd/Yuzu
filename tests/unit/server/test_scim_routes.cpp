@@ -7601,19 +7601,22 @@ TEST_CASE("ScimRoutes: the Group checks that sit AFTER the first lookup (the in-
     CHECK(follow->status == 200);
 }
 
-// ── #6835: the POST /Groups rollback, the other membership 503 sites, healthy-store pins ─────────
+// ── #6835: the POST /Groups no-create-on-membership-503 case, the other membership 503 sites, healthy-store pins ─────────
 
-TEST_CASE("ScimRoutes: POST /Groups whose members cannot be resolved answers 503, rolls the empty "
-          "group back, and the IdP's retry then creates it (#6835)",
+TEST_CASE("ScimRoutes: POST /Groups whose members cannot be resolved answers 503, creates NO group, "
+          "and the IdP's retry then creates it with the member (#6835)",
           "[pg][scim][routes][store-error][outage]") {
     Fixture f;
-    auto user = json::parse(f.post("/scim/v2/Users", {{"userName", "gmember"}})->body);
-    const auto uid = user["id"].get<std::string>();
-    const json body{{"displayName", "g-rollback"}, {"members", json::array({json{{"value", uid}}})}};
+    auto created = f.post("/scim/v2/Users", {{"userName", "gmember"}});
+    REQUIRE(created);
+    const auto uid = json::parse(created->body)["id"].get<std::string>();
+    const json body{{"displayName", "g-nothing-created"},
+                    {"members", json::array({json{{"value", uid}}})}};
 
     std::unique_ptr<httplib::Response> res;
     {
-        // Member resolution reads scim_resources; the group row itself is created in scim_groups.
+        // Member resolution reads scim_resources; the duplicate-displayName check reads
+        // scim_groups, which stays healthy, so the request reaches the member read.
         ScimResourcesFault fault{f.auth_db.pool()};
         fault.arm();
         res = f.post("/scim/v2/Groups", body);
@@ -7624,35 +7627,48 @@ TEST_CASE("ScimRoutes: POST /Groups whose members cannot be resolved answers 503
     CHECK(res->get_header_value("Retry-After") == "2");
     CHECK(json::parse(res->body)["detail"] == "membership unavailable");
 
-    // The empty group created by the faulted call is gone, so the name is free again...
-    CHECK_FALSE(f.scim_store->get_group_by_display_name("g-rollback").has_value());
-    // ...and the failure row says it was rolled back.
+    // Members are resolved BEFORE the group row is written, so the refused request left nothing
+    // behind: no empty group for a retry to meet as a 409 and nothing a concurrent PUT/PATCH could
+    // have added a member (and a role) to.
+    const auto after = f.scim_store->get_group_by_display_name_checked("g-nothing-created");
+    REQUIRE(after.has_value());
+    CHECK_FALSE(after->has_value());
+
+    // The failure row says no group was created and carries no group id.
     AuditQuery q;
     q.action = "scim.group.created";
     auto rows = f.audit_store->query(q);
     REQUIRE(rows.has_value());
-    std::size_t rolled_back = 0;
+    std::size_t refused = 0;
     for (const auto& r : *rows)
-        if (r.result == "failure" && r.detail.find("rolled back") != std::string::npos &&
-            r.detail.find("NOT") == std::string::npos)
-            ++rolled_back;
-    CHECK(rolled_back == 1);
+        if (r.result == "failure" && r.target_id.empty() &&
+            r.detail.find("no group was created") != std::string::npos)
+            ++refused;
+    CHECK(refused == 1);
 
-    // The retry converges: no 409 against an empty group.
+    // The retry converges and carries the member.
     auto retry = f.post("/scim/v2/Groups", body);
     REQUIRE(retry);
     CHECK(retry->status == 201);
-    CHECK(json::parse(retry->body)["displayName"] == "g-rollback");
+    const auto retried = json::parse(retry->body);
+    CHECK(retried["displayName"] == "g-nothing-created");
+    REQUIRE(retried.contains("members"));
+    CHECK(retried["members"].size() == 1);
 }
 
+// hide_membership_table / restore_membership_table live in the block that is compiled out
+// under ThreadSanitizer (#438), so this test is too.
+#ifndef YUZU_SCIM_TSAN_BUILD
 TEST_CASE("ScimRoutes: PUT and PATCH /Groups whose members cannot be resolved, and the filtered "
           "GET whose membership cannot be read, answer 503 with Retry-After (#6835)",
           "[pg][scim][routes][store-error][outage]") {
     Fixture f;
-    auto user = json::parse(f.post("/scim/v2/Users", {{"userName", "gmember2"}})->body);
-    const auto uid = user["id"].get<std::string>();
-    auto group = json::parse(f.post("/scim/v2/Groups", {{"displayName", "g-members"}})->body);
-    const auto gid = group["id"].get<std::string>();
+    auto user_res = f.post("/scim/v2/Users", {{"userName", "gmember2"}});
+    REQUIRE(user_res);
+    const auto uid = json::parse(user_res->body)["id"].get<std::string>();
+    auto group_res = f.post("/scim/v2/Groups", {{"displayName", "g-members"}});
+    REQUIRE(group_res);
+    const auto gid = json::parse(group_res->body)["id"].get<std::string>();
 
     SECTION("PUT: member resolution reads the user table") {
         std::unique_ptr<httplib::Response> res;
@@ -7698,6 +7714,7 @@ TEST_CASE("ScimRoutes: PUT and PATCH /Groups whose members cannot be resolved, a
     CHECK(after->status == 200);
     CHECK(json::parse(after->body)["members"].size() == 0);
 }
+#endif // YUZU_SCIM_TSAN_BUILD
 
 TEST_CASE("ScimRoutes: on a healthy store the converted lookups still answer their definitive "
           "outcomes: an empty filter hit, a filter hit, a duplicate 409, an unknown id 404 "
@@ -7711,8 +7728,9 @@ TEST_CASE("ScimRoutes: on a healthy store the converted lookups still answer the
     CHECK(json::parse(miss->body)["totalResults"] == 0);
 
     // A Group filter HIT lists the group; a duplicate displayName is a 409.
-    auto group = json::parse(f.post("/scim/v2/Groups", {{"displayName", "g-healthy"}})->body);
-    const auto gid = group["id"].get<std::string>();
+    auto group_res = f.post("/scim/v2/Groups", {{"displayName", "g-healthy"}});
+    REQUIRE(group_res);
+    CHECK(group_res->status == 201);
     auto hit = f.get(R"(/scim/v2/Groups?filter=displayName%20eq%20%22g-healthy%22)");
     REQUIRE(hit);
     CHECK(hit->status == 200);
@@ -7733,5 +7751,4 @@ TEST_CASE("ScimRoutes: on a healthy store the converted lookups still answer the
                                                            {"value", "y"}}})}});
     REQUIRE(patch);
     CHECK(patch->status == 404);
-    (void)gid;
 }

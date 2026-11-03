@@ -3376,6 +3376,22 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             }
         }
 
+        // #6835: resolve the members BEFORE the group row exists. Could not resolve every
+        // member means persisting the partial set would silently drop real members from a
+        // brand-new group, so the request is refused with a retryable 503 - and because nothing
+        // has been created yet there is nothing to roll back: the IdP's retry meets no
+        // duplicate-displayName 409 against an empty group, and no concurrent PUT/PATCH can have
+        // added a member (and so conferred a role) to a group this request is about to remove.
+        // The audit row carries no target id for the same reason: no group was created.
+        auto members_resolved = resolve_member_values(scim_store, input.member_values);
+        if (!members_resolved.has_value()) {
+            send_scim_unavailable(res, "membership unavailable");
+            audit(auth_mgr, audit_store, req, "scim.group.created", "failure", "",
+                  "member resolution unavailable; no group was created", "Group");
+            record_request(auth_mgr, "group_create", 503);
+            return;
+        }
+
         auto group = scim_store->create_group(input.display_name, input.external_id);
         if (!group) {
             send_scim_error(res, 500, "failed to create the SCIM group");
@@ -3385,28 +3401,6 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             return;
         }
 
-        auto members_resolved = resolve_member_values(scim_store, input.member_values);
-        if (!members_resolved.has_value()) {
-            // Could not resolve every member — persisting the partial set
-            // would silently drop real members from a brand-new group.
-            //
-            // #6835: the group row was created by THIS call a few lines up and has no members
-            // yet. Leaving it would make the retry the 503's `Retry-After` invites meet the
-            // duplicate-displayName 409 against an empty group (a retry that can never
-            // converge), so it is rolled back, best effort. `delete_group` answers nullopt only
-            // on a store error (then the empty group stays and the audit detail says so); a
-            // present value, including "already gone", means the name is free again.
-            const auto rolled_back = scim_store->delete_group(group->scim_id);
-            send_scim_unavailable(res, "membership unavailable");
-            audit(auth_mgr, audit_store, req, "scim.group.created", "failure", group->scim_id,
-                  rolled_back.has_value()
-                      ? "member resolution unavailable; the empty group was rolled back"
-                      : "member resolution unavailable; the empty group could NOT be rolled "
-                        "back (a retry will meet 409 until it is removed)",
-                  "Group");
-            record_request(auth_mgr, "group_create", 503);
-            return;
-        }
         const std::vector<std::string>& members = *members_resolved;
         if (!members.empty() && !scim_store->set_group_members(group->scim_id, members)) {
             spdlog::error("ScimRoutes: set_group_members failed for group scim_id={}",

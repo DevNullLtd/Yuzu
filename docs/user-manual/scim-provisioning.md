@@ -277,7 +277,9 @@ Deploy these alert rules alongside SCIM Groups → role mapping:
 - **`yuzu_scim_audit_write_failures_total`** — the existing CC6.8
   evidence-integrity alert; it also covers a lost audit row for a group
   create/update/delete or role-change event (the SCIM call and the role
-  change themselves still succeeded — only the evidence row is missing).
+  change themselves still succeeded — only the evidence row is missing). It can
+  also fire for a failure row written for a `503` that changed nothing (see
+  "Evidence limits" under "During a database outage").
 
 **Remediation for a misconfigured `--scim-admin-group`:** fix the flag
 value and restart the server (see [Configuration](#configuration) above —
@@ -646,13 +648,15 @@ around:
    group or a slow store; the HTTP request and the per-process Group lock
    (taken by `PUT`, `PATCH` and `DELETE`, not by `POST`) are held meanwhile.
    There is no time bound on the loop.
-4. A Group `POST` whose member resolution fails after the group row is created
-   answers `503` and rolls the empty group back (#6835); the retry normally
-   creates the group (`201`). If the rollback itself cannot run because the
-   store is still failing, the empty group remains and a retry answers `409`
-   until it is removed; the audit row then says `could NOT be rolled back`. A
-   Group `POST` that fails after the membership is resolved (the `500` when the
-   members cannot be persisted) is not rolled back by this change.
+4. A Group `POST` resolves its members before it creates the group row (#6835). If
+   that resolution cannot be completed because the store failed, the request answers
+   `503` (`Retry-After: 2`) and creates nothing, so the retry never meets a `409` against
+   an empty group; the failure audit row has an empty target id. Nothing is rolled back
+   (there is no rollback), so a concurrent `PUT` or `PATCH` cannot have added a member to
+   a group that is then removed. A Group `POST` that fails after the group was created
+   (the `500` `failed to persist group membership`, when the members cannot be persisted)
+   leaves the empty group in place: it is not rolled back, and the retry meets `409` until
+   the group is removed.
 5. Deactivation of an account whose role is not `user` is refused with `404`
    until the role is corrected.
 6. `POST /Users` re-provisioning recomputes the one user but ignores an
@@ -776,7 +780,7 @@ and now also carry `Retry-After: 2`.
 | Store fault in the User or Group lookup, or the duplicate check, of a `POST`, `PUT`, `PATCH` or `DELETE` | `503` | `2` | `failure` on the request's own action (`scim.user.provisioned`, `scim.user.updated`, `scim.user.deleted`, `scim.group.created`, `scim.group.updated`, `scim.group.deleted`), detail `store_unavailable: lookup (<site>)`; best effort | `yuzu_scim_guard_store_unavailable_total{guard="resource"}` and `YuzuScimGuardStoreUnavailable` | Retry. Nothing was changed. |
 | Store fault in `GET /Users/{id}`, `GET /Groups/{id}` or a `userName eq` / `displayName eq` filter query | `503` | `2` | none | `yuzu_scim_guard_store_unavailable_total{guard="resource"}` and `YuzuScimGuardStoreUnavailable` | Retry. Nothing was changed. |
 | Store fault in the provenance or role guard of a deactivate, delete, reactivate, update or revive (#6836) | `503` | `2` | `failure` on the request's own action, detail `store_unavailable: provenance check`, `role check` or `revive role check` | `yuzu_scim_guard_store_unavailable_total{guard="provenance"\|"role"}` and `YuzuScimGuardStoreUnavailable` | Retry. A `PUT` or `PATCH` may already have applied its `active` change; the retry completes. A revive whose undo also fails is `500` (`scim.user.compensation_failed`): an operator checks the account. |
-| Group membership read fault | `503` ("membership unavailable") | `2` | `failure` on a Group `POST`, `PUT`, `PATCH` or `DELETE`; none on a `GET` | none | Retry. **`POST /Groups`:** the group row is created first and members are resolved afterwards, so on this `503` the empty group is rolled back (`ScimStore::delete_group`) before the answer and the retry normally creates the group (`201`). If the rollback cannot run because the store is still failing, the empty group remains, the audit row says `could NOT be rolled back`, and the retry meets `409` `displayName already exists` until it is removed (limit 4 under "Known limits of the Group role recompute"); the IdP should then reconcile by `GET`ting or `PATCH`ing the existing group. |
+| Group membership read fault | `503` ("membership unavailable") | `2` | `failure` on a Group `POST`, `PUT`, `PATCH` or `DELETE`; none on a `GET` | none | Retry. **`POST /Groups`:** the members are resolved before the group row is created, so on this `503` nothing is created, no rollback runs, and the retry creates the group normally (`201`, never a `409` against an empty group). The failure audit row `scim.group.created` has an empty target id and the detail `member resolution unavailable; no group was created`. A failure of the membership write after the group was created is a different case: the `500` `failed to persist group membership` leaves the empty group in place (limit 4 under "Known limits of the Group role recompute"). |
 | Resource does not exist | `404` | none | none | none | Treat as gone. |
 | Provenance or role refusal (account not created by SCIM, or role other than `user`) | `404` | none | `scim.user.provenance_denied` (`denied`) | `yuzu_scim_provenance_denied_total` | Stop. This is a refusal, not a fault. |
 | Duplicate `userName` or `displayName` | `409` (`scim_type=uniqueness`) | none | `denied` on the create or update action | none | Update the existing resource instead. |
@@ -799,7 +803,7 @@ cannot serve this right now" status, while `429` means the client is sending too
 
 **What to check.**
 
-1. `/readyz` on the server: it reports whether Postgres is reachable. A total outage may stop
+1. `/readyz` on the server: it answers `503` with `pg_reachable` in `failed_stores` when Postgres is unreachable. A total outage may stop
    the `/metrics` scrape too (a remote scrape resolves its token against Postgres), so
    `YuzuScimGuardStoreUnavailable` and the Postgres alerts may be silent until recovery. The
    honest backstops are `/readyz` and an operator-defined `up == 0` (scrape target down) alert.
@@ -814,15 +818,19 @@ cannot serve this right now" status, while `429` means the client is sending too
    [audit-log.md](audit-log.md) for the evidence limits.
 
 **What to do.** Restore PostgreSQL. The IdPs retry on their own schedule (configure each
-connector to retry `5xx`), and the retries complete the work: nothing needs re-provisioning.
+connector to retry `5xx`), and for the `503` cases the retries complete the work: nothing needs re-provisioning. Two
+exceptions: a `PUT` or `PATCH` whose `active` change had already committed before a later read
+faulted converges on the retry (the account state is already changed), and a Group create that
+failed AFTER the group row was created (the `500` `failed to persist group membership`) leaves
+an empty group that needs removing.
 Afterwards, look in the IdP's provisioning log for resources whose retries were exhausted and
 re-send them; Yuzu runs no reconciliation sweep (#6838).
 
 **Caveats.** An unfiltered `GET /Users` or `GET /Groups` still fails open: during a fault it
 can answer an empty or partial list with `200` (tracked as #2481), so do not treat an empty
 list as authoritative during an outage. A `POST /Groups` whose member resolution met the fault
-is rolled back before the `503`; if the rollback could not run either, the empty group remains
-until it is removed (see the matrix row above).
+creates nothing and answers `503` (see the matrix row above); only the `500` `failed to persist
+group membership` leaves an empty group, which must be removed.
 
 ### What the IdP vendors document
 
@@ -1255,7 +1263,7 @@ with a **currently-active** account.
 - **Every request returns 401.** The bearer token is checked on every
   `/scim/v2/*` call including the discovery endpoints — there's no
   unauthenticated preview. Re-verify the token value configured in the IdP.
-  A `401` always means the token was checked and rejected (or missing); it is never an outage.
+  A `401` always means the token was checked and rejected (or missing), or that SCIM is not configured / its store is not open (a boot or config state, not an outage); it is never an outage.
 - **Every request returns 503 with `Retry-After: 2`.** Yuzu could not read the SCIM store, so it
   could not check the token or look up the resource (#6835). Nothing was refused and nothing was
   changed. Check `/readyz`, the `yuzu_pg_*` metrics and the server `ERROR` lines starting
