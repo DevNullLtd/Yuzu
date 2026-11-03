@@ -27,8 +27,8 @@
 //     size and mtime: nothing has touched tar.db since the sidecars moved; resume as normal.
 //   - the same with the marker ABSENT or recording a different tar.db: the echo.db sidecar is not
 //     provably this adoption's own (the marker is written before every move it guards), so adoption
-//     fails closed, naming both files, and moves nothing; EchoDatabase::open() then refuses until the
-//     operator resolves the two files.
+//     fails closed, naming both files, and moves nothing; EchoDatabase::open() then refuses until
+//     the operator resolves the two files.
 // The marker is a plain file written with write_file_atomic (fsync'd on POSIX; on Windows the
 // shared writer documents no flush-by-handle, so a power loss right after the write can lose the
 // marker there, which fails closed rather than open). A marker left behind once tar.db is gone (the
@@ -60,7 +60,6 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
-#include <iterator>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -144,11 +143,19 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
     const auto fingerprint = detail::legacy_echo_fingerprint(legacy);
     if (!fingerprint)
         return std::unexpected(fingerprint.error());
-    // An absent or unreadable marker both read as "no marker".
-    std::ifstream in(marker, std::ios::binary);
+    // An absent or unreadable marker both read as "no marker". The read is capped: a fingerprint is
+    // under 64 bytes, so a longer file can only mismatch. The stream is closed before the marker is
+    // rewritten or removed below (on Windows an open handle blocks both).
     std::optional<std::string> recorded;
-    if (in)
-        recorded.emplace(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    {
+        std::ifstream in(marker, std::ios::binary);
+        if (in) {
+            std::string buf(256, '\0');
+            in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+            buf.resize(static_cast<std::size_t>(in.gcount()));
+            recorded = std::move(buf);
+        }
+    }
     const bool marker_matches = recorded && *recorded == *fingerprint;
     if (!marker_matches) {
         for (const char* suffix : kSidecars) {
@@ -223,7 +230,8 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
         return std::unexpected(std::format("cannot move {} to {}: {}", legacy.string(),
                                            echo_db.string(), ec.message()));
     // Adoption is complete; the marker is spent. A failed removal is retried at the next boot.
-    if (std::error_code mec; fs::remove(marker, mec), mec)
+    std::error_code mec;
+    if (fs::remove(marker, mec); mec)
         spdlog::warn("Cannot remove the spent adoption marker {}: {}", marker.string(),
                      mec.message());
     spdlog::info("Adopted legacy {} as {}", legacy.string(), echo_db.string());

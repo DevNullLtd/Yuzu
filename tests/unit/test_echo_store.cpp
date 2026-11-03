@@ -3516,7 +3516,7 @@ TEST_CASE("adopt_legacy_echo_db: an echo.db sidecar beside tar.db without the ma
 }
 
 TEST_CASE("adopt_legacy_echo_db: an older agent running between interruption and resume is "
-          "refused, not replayed over",
+          "refused and never replayed over",
           "[echo][store][adopt]") {
     ScratchDir d;
     make_legacy_tar_db_with_wal(d.path());
@@ -3549,6 +3549,33 @@ TEST_CASE("adopt_legacy_echo_db: an older agent running between interruption and
     auto refused = EchoDatabase::open(d.path() / "echo.db");
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().find("not adopted - refusing") != std::string::npos);
+}
+
+TEST_CASE("adopt_legacy_echo_db: an oversized marker reads as a mismatch and refuses",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db(d.path());
+    spit_file(d.path() / "echo.db-wal", "a log of unknown origin");
+    spit_file(d.path() / "echo.db.adopting", std::string(300, 'x'));
+
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error().find("records a different") != std::string::npos);
+    CHECK(fs::exists(d.path() / "tar.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db"));
+}
+
+TEST_CASE("adopt_legacy_echo_db: a spent marker left behind without a tar.db is deleted at boot",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    {
+        auto db = EchoDatabase::open(d.path() / "echo.db");
+        REQUIRE(db.has_value());
+    }
+    spit_file(d.path() / "echo.db.adopting", "12345 67890\n");
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+    CHECK_FALSE(fs::exists(d.path() / "echo.db.adopting"));
+    CHECK(fs::exists(d.path() / "echo.db"));
 }
 
 TEST_CASE("adopt_legacy_echo_db: a leftover legacy sidecar without a tar.db is warned about and left",

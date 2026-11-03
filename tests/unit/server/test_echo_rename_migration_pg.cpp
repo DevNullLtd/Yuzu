@@ -415,7 +415,7 @@ TEST_CASE("Echo rename: instruction_store v3 keeps the archive tool in an operat
 }
 
 TEST_CASE("Echo rename: instruction_store v3 refuses to open when a legacy definition id "
-          "collides with an existing Echo id, and rewrites nothing",
+          "collides with an existing Echo id and rewrites nothing",
           "[pg][echo][migration][instruction_store]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {

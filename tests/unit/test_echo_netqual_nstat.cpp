@@ -906,7 +906,7 @@ NstatFlowEvent closing_open(std::int64_t ts, const char* proc, const char* remot
 } // namespace
 
 TEST_CASE("nstat_dedupe_closing_opens: two TIME_WAIT opens for one process and remote in an hour "
-          "store one row, and the next hour stores another",
+          "store one row and the next hour stores another",
           "[echo][netqual][nstat]") {
     constexpr std::int64_t hour0 = 1'700'000'400; // inside one hour
     HourlySeenSet seen;
@@ -923,7 +923,7 @@ TEST_CASE("nstat_dedupe_closing_opens: two TIME_WAIT opens for one process and r
     CHECK(nstat_dedupe_closing_opens(std::move(later), seen).size() == 1);
 }
 
-TEST_CASE("nstat_dedupe_closing_opens: the key is (process, remote address, remote port) and "
+TEST_CASE("nstat_dedupe_closing_opens: the key is process plus remote address plus remote port and "
           "only closing-state opens are filtered",
           "[echo][netqual][nstat]") {
     constexpr std::int64_t ts = 1'700'000'400;

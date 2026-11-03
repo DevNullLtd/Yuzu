@@ -617,7 +617,8 @@ public:
     /// presented session id) instead of registering fresh, so a plugin list that changed under
     /// the same session cannot leave the directory row rewriting Echo commands to the old name.
     /// Session-guarded like `announce_connected`: a row now held by a DIFFERENT session is left
-    /// untouched, and `updated_at` (the tombstone purge clock) is not bumped. The returned bool is whether a row matched (`agent_id` + `session_id`).
+    /// untouched, and `updated_at` (the tombstone purge clock) is not bumped. The returned bool
+    /// is whether a row matched (`agent_id` + `session_id`).
     [[nodiscard]] std::expected<bool, GatewayRouteStoreError>
     set_legacy_echo_wire_name(std::string_view agent_id, std::string_view session_id,
                               bool legacy_echo_wire_name);

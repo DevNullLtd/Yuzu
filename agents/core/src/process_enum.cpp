@@ -196,7 +196,9 @@ void parse_proc_status(std::istream& in, ProcessInfo& pi) noexcept {
                     pi.user = uid_to_username(static_cast<uid_t>(*uid));
                 got_uid = true;
             }
-            // No early exit: the whole file is read so later fields stay reachable.
+            // No early exit (#6895, kept on purpose): the whole file is read so later fields stay
+            // reachable; /proc/<pid>/status is kernel-generated and about a kilobyte, so stopping
+            // after Uid: would save nothing measurable.
         }
     } catch (...) {
         // A failed read or an allocation failure keeps whatever parsed so far.

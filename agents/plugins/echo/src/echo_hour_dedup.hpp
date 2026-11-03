@@ -24,12 +24,22 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace yuzu::echo {
+
+/// The closing-socket rule's key, shared by the poll leg (compute_network_events) and the
+/// macOS nstat leg (nstat_dedupe_closing_opens) so the two cannot drift apart: a socket first
+/// seen already closing is one row per process, remote address and remote port per hour.
+[[nodiscard]] inline std::string tcp_closing_key(std::string_view process_name,
+                                                 std::string_view remote_addr, int remote_port) {
+    return std::format("{}\x1f{}\x1f{}", process_name, remote_addr, remote_port);
+}
 
 class HourlySeenSet {
 public:

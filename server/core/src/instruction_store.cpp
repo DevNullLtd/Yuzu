@@ -194,7 +194,8 @@ std::string normalize_to_array_helper(const nlohmann::json& v) {
 
 // ── Echo rename (upgrade window) ─────────────────────────────────────────────
 
-// The archive-tool guards of scripts/rename-tar-to-echo.py (PROTECT, lines 91-107), ported as
+// The archive-tool guards of scripts/rename-tar-to-echo.py (the PROTECT list's captured-data
+// and "archive tool: files, commands, package lists, prose" groups), ported as
 // zero-width constraints placed before the bare-word rule. The script masks a protected span and
 // rewrites the rest; the equivalent here is a `tar` that is protected when its left context L
 // AND its right context R both hold, so it is rewritten only when (NOT L) OR (NOT R):
@@ -230,7 +231,9 @@ std::string echo_rename_text_chain(const std::string& col) {
     };
     wrap("Timeline Activity Record \\(TAR\\)", "Echo");
     wrap("\\mTAR\\M", "Echo");
-    wrap("\\mtar_(?!events)", "echo_"); // legacy on-disk `tar_events` objects stay (script :91)
+    // Legacy on-disk `tar_events` objects stay (the script's "legacy on-disk SQLite objects"
+    // guard).
+    wrap("\\mtar_(?!events)", "echo_");
     wrap(std::string(kEchoRenameBareTarGuards) + "\\mtar\\M", "echo");
     return e;
 }
@@ -299,7 +302,8 @@ std::string echo_rename_definitions_sql() {
     //    is unreserved and may legitimately hold an operator-authored id once this has run.
     sql +=
         "DO $echo_collision$ BEGIN "
-        "IF EXISTS (SELECT 1 FROM instruction_definitions WHERE id LIKE 'crossplatform.tar.%') THEN "
+        "IF EXISTS (SELECT 1 FROM instruction_definitions WHERE id LIKE 'crossplatform.tar.%') "
+        "THEN "
         "RAISE EXCEPTION 'Echo rename: legacy definition ids remain (collision with an existing "
         "Echo definition): %', (SELECT string_agg(id, ', ' ORDER BY id) FROM ("
         "SELECT id FROM instruction_definitions WHERE id LIKE 'crossplatform.tar.%' "

@@ -455,7 +455,7 @@ TEST_CASE("GatewayRouteStore[pg]: set_legacy_echo_wire_name re-states the flag f
     CHECK_FALSE(*other);
     CHECK(fx.store().lookup_route("agent-up").value()->legacy_echo_wire_name);
 
-    // `updated_at` is the tombstone purge clock: back-date it, and a flag refresh must not reset it.
+    // `updated_at` is the tombstone purge clock: back-date it; a flag refresh must not reset it.
     fx.raw_set_updated_at_ago("agent-up", 400);
 
     // The matching session flips the flag; placement, epoch and session are untouched.

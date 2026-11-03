@@ -514,8 +514,7 @@ std::vector<NetworkEvent> compute_network_events(
                 emit("connected", c);
             } else if (closing_seen.first_this_hour(
                            timestamp,
-                           std::format("{}\x1f{}\x1f{}", c.process_name, c.remote_addr,
-                                       c.remote_port))) {
+                           tcp_closing_key(c.process_name, c.remote_addr, c.remote_port))) {
                 // First seen already closing: a poll catches most short-lived sockets only in
                 // TIME_WAIT, one per ephemeral port. One row per process and remote per hour
                 // keeps the fact (that process talked to that remote) without the churn.

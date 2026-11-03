@@ -340,9 +340,8 @@ std::vector<NstatFlowEvent> nstat_dedupe_closing_opens(std::vector<NstatFlowEven
     std::erase_if(events, [&seen](const NstatFlowEvent& e) {
         if (!e.is_open || !tcp_state_is_closing(e.state))
             return false;
-        // The same key compute_network_events (echo_diff.cpp) uses for the poll leg.
         return !seen.first_this_hour(
-            e.ts_unix, std::format("{}\x1f{}\x1f{}", e.process_name, e.remote_addr, e.remote_port));
+            e.ts_unix, tcp_closing_key(e.process_name, e.remote_addr, e.remote_port));
     });
     return events;
 }
