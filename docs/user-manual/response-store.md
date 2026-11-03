@@ -336,6 +336,33 @@ operator-visible notes:
   are replaced with the Unicode replacement character (U+FFFD) at ingest. The
   response row is still stored and still renders (defanged) — it is not
   dropped or turned into a 500.
+- **Rows per agent are bounded.** The store keeps at most `--response-max-rows-per-agent` rows
+  (default 256, range 1-65536) for one command on one device. A row is one streamed output frame or
+  the final status frame; the agent sends a frame once its buffer reaches about 64 KiB (and a frame
+  can be larger), so 256 rows is roughly 16 MiB of streamed output, an illustration and not a byte
+  guarantee.
+  - **What is kept.** The first rows are kept and the **newest** frames past the cap are dropped, so
+    a command that streams more than about 16 MiB to one device loses the tail of its output. The
+    row just before the dropped frames ends with a `...[rows past per-agent cap dropped]` marker,
+    so a reader can tell a capped stream from a complete one. A terminal frame with output admitted
+    afterwards lands after it and is marked itself only if frames are refused after it, so a capped
+    pair can carry two marked rows. The marker is one extra line in the stored output, so a
+    line-counting reader (the `echo_rows_ge` matcher's fallback) counts it, as it already does the
+    byte-cap marker. Raise the flag for such commands.
+  - **Terminal frame.** The cap bounds total rows. At the cap, one extra terminal-status row is still
+    admitted, and only while no terminal row exists for that command and device, so a capped command
+    still shows its outcome. A terminal frame with no output instead finalizes the retained rows in
+    place (no new row), after which a further terminal frame at the cap is refused as a replay. A
+    redelivered terminal frame on a command and device already at the cap is refused the same way, so
+    it also counts as a cap drop and marks the row.
+  - **Counting.** Each refused frame counts on
+    `yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}` (see [metrics.md](metrics.md))
+    and logs a rate-limited warning. To find the command and device, grep the server log for
+    `per-agent row cap (` — one line carries the cap, the command and the device (the warning is
+    rate-limited, the counter is exact).
+  - **Concurrency.** There is no lock around the count and the insert, so two writers for the same
+    command and device at once (a direct stream and a gateway forward) can overshoot the cap by the
+    number of concurrent writers.
 - **Facets are bounded.** Each response keeps the distinct (column, value) pairs of its output as
   facets, which drive the facet filter, group-from-results and the agent-count preview.
   - **Long values.** A value over 2048 bytes (measured on the value as stored, after invalid UTF-8
