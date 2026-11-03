@@ -380,6 +380,8 @@ constexpr std::array<Product, 1> kBadEcosystem{{mutated([](Product& p) { p.ecosy
 constexpr std::array<Product, 1> kBadId{{mutated([](Product& p) { p.id = "9mq"; })}};
 constexpr std::array<Product, 1> kBadTitle{{mutated([](Product& p) { p.title = ""; })}};
 constexpr std::array<Product, 1> kBadTitlePipe{{mutated([](Product& p) { p.title = "IBM|MQ"; })}};
+constexpr std::array<Product, 1> kBadTitleInvalidUtf8{{mutated([](Product& p) { p.title = "IBM\xff" "MQ"; })}};
+constexpr std::array<Product, 1> kBadTitleNonAscii{{mutated([](Product& p) { p.title = "IBM \xc3\xa9"; })}};
 constexpr std::array<Product, 1> kBadTitleNewline{{mutated([](Product& p) { p.title = "IBM\nMQ"; })}};
 constexpr std::array<Product, 1> kBadTitleCarriageReturn{{mutated([](Product& p) { p.title = "IBM\rMQ"; })}};
 constexpr std::array<Product, 1> kBadTitleBackslash{{mutated([](Product& p) { p.title = "IBM\\MQ"; })}};
@@ -479,6 +481,8 @@ TEST_CASE("middleware products: the same consteval check refuses a broken table"
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadTitle}));
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadTitlePipe}));
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadTitleBackslash}));
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadTitleInvalidUtf8}));
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadTitleNonAscii}));
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadTitleNewline}));
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadTitleCarriageReturn}));
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadVendor}));
