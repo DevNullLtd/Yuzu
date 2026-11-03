@@ -411,6 +411,11 @@ bool references_raw_capture_table(std::string_view sql) {
     // Single pass: blank out '...' literals and -- / block comments, then read maximal
     // [A-Za-z0-9_] runs. '$' is not a word character, so `$Process_Live` reads as the run
     // `process_live`: every registry dollar name lowercases to its real table name.
+    // Two shapes are refused although SQLite would never read the shim: a name inside a
+    // double-quoted string literal (`SELECT "$Process_Live"`), and a CTE that shadows a shim
+    // name (`WITH process_live AS (...) SELECT ... FROM process_live`). Accepted: the
+    // predicate fails closed, and `"process_live"` must still be caught when it is a quoted
+    // identifier, which only a real SQL parse could tell from the literal.
     std::string text(sql);
     for (std::size_t i = 0; i < text.size();) {
         std::size_t end = i;

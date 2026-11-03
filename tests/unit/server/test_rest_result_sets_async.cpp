@@ -4575,6 +4575,58 @@ TEST_CASE("from-echo-query: a query over a raw capture table is refused before d
     CHECK(h.calls.size() == 1);
 }
 
+TEST_CASE("from-instruction-result: a definition that reads a raw capture table is refused before dispatch",
+          "[pg][result_set][async][echo][stale_source]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    const auto create = [&](const std::string& iid, const nlohmann::json& params, int& status) {
+        nlohmann::json body{{"instruction_id", iid}};
+        if (!params.is_null())
+            body["params"] = params;
+        return h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    };
+
+    SECTION("the definition's own default reads a raw capture table") {
+        const auto iid = make_echo_sql_instruction(*h.instr, "SELECT 1 FROM $TCP_Live");
+        int status = 0;
+        auto j = create(iid, nullptr, status);
+        REQUIRE(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_REEVAL_STALE_SOURCE") !=
+              std::string::npos);
+        CHECK(h.calls.empty());
+    }
+    SECTION("a caller param overrides a clean default") {
+        const auto iid = make_echo_sql_instruction(*h.instr, "SELECT 1 FROM $TCP_Hourly");
+        int status = 0;
+        create(iid, nlohmann::json{{"sql", "SELECT 1 FROM tcp_live"}}, status);
+        CHECK(status == 400);
+        CHECK(h.calls.empty());
+    }
+    SECTION("a clean caller param overrides a stale default") {
+        const auto iid = make_echo_sql_instruction(*h.instr, "SELECT 1 FROM $TCP_Live");
+        int status = 0;
+        create(iid, nlohmann::json{{"sql", "SELECT 1 FROM $TCP_Hourly"}}, status);
+        CHECK(status == 202);
+        REQUIRE(h.calls.size() == 1);
+        CHECK(h.calls[0].params.at("sql") == "SELECT 1 FROM $TCP_Hourly");
+    }
+    SECTION("a clean default proceeds") {
+        const auto iid = make_echo_sql_instruction(*h.instr, "SELECT 1 FROM $TCP_Hourly");
+        int status = 0;
+        create(iid, nullptr, status);
+        CHECK(status == 202);
+        CHECK(h.calls.size() == 1);
+    }
+    SECTION("a definition of another plugin is not read for SQL") {
+        const auto iid = make_instruction(*h.instr); // filehash.check
+        int status = 0;
+        create(iid, nlohmann::json{{"sql", "$Process_Live"}}, status);
+        CHECK(status == 202);
+    }
+}
+
 // ── A query that failed on an agent is counted, not silently dropped from the set ──────────────
 
 namespace {

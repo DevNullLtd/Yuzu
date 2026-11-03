@@ -1335,7 +1335,11 @@ static const ToolDef kTools[] = {
      "accepts every responder. Dispatches to parent_id's CURRENT members when supplied, else "
      "broadcasts — same omit-to-broadcast / refuse-if-resolves-to-nothing contract as "
      "create_result_set_from_echo_query. Find valid instruction_id values via list_definitions "
-     "or discover_instructions — do not guess. If the definition runs a Forensics-tier "
+     "or discover_instructions — do not guess. An echo.sql definition whose SQL (params.sql, "
+     "else the definition's own default) reads a raw capture table ($<Source>_Live or a "
+     "<source>_live table, which Echo no longer keeps) is refused with "
+     "RESULT_SET_REEVAL_STALE_SOURCE and nothing is dispatched, the same as "
+     "create_result_set_from_echo_query. If the definition runs a Forensics-tier "
      "plugin (an action on the Forensics securable) the set materializes with no members "
      "for every creator, because the materializer never reads Forensics-tier output; an "
      "empty set from such a definition says nothing about the fleet. REST v1 twin: POST "
@@ -14438,6 +14442,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto& def = **def_result;
+                // Same refusal as create_result_set_from_echo_query, on the SQL the definition
+                // will actually run (the caller's param, else its schema default): a set that
+                // reevaluate_result_set would refuse is not created either.
+                if (def.plugin == "echo" && def.action == "sql" &&
+                    yuzu::server::rs_matcher::instruction_reads_raw_capture_table(
+                        args.value("params", nlohmann::json::object()), def.parameter_schema)) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                        "application/json");
+                    return;
+                }
                 std::unordered_map<std::string, std::string> params;
                 if (args.contains("params") && args["params"].is_object())
                     for (auto& [k, v] : args["params"].items())

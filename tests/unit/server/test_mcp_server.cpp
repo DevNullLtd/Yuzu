@@ -37389,6 +37389,50 @@ TEST_CASE("MCP result-sets: a query over a raw capture table is refused with the
         CHECK(is_stale(nlohmann::json::parse(res->body)));
         CHECK(dispatched == 0);
     }
+    SECTION("create_result_set_from_instruction_result on the SQL the definition will run") {
+        const auto define = [&](const std::string& sql_default) {
+            yuzu::server::InstructionDefinition def;
+            def.name = "Canned echo query";
+            def.version = "1.0";
+            def.plugin = "echo";
+            def.action = "sql";
+            def.type = "question";
+            def.description = "canned";
+            def.parameter_schema =
+                nlohmann::json{{"type", "object"},
+                               {"properties",
+                                {{"sql", {{"type", "string"}, {"default", sql_default}}}}}}
+                    .dump();
+            def.enabled = true;
+            auto created = instr.create_definition(def);
+            REQUIRE(created.has_value());
+            return *created;
+        };
+        const auto create = [&](const std::string& iid, const nlohmann::json& params) {
+            nlohmann::json args{{"instruction_id", iid}};
+            if (!params.is_null())
+                args["params"] = params;
+            auto res = ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                              {"method", "tools/call"},
+                                              {"id", 3},
+                                              {"params",
+                                               {{"name", "create_result_set_from_instruction_result"},
+                                                {"arguments", args}}}}
+                                   .dump());
+            REQUIRE(res);
+            return nlohmann::json::parse(res->body);
+        };
+        // The definition's own default is stale: refused, nothing dispatched.
+        CHECK(is_stale(create(define("SELECT 1 FROM $TCP_Live"), nullptr)));
+        CHECK(dispatched == 0);
+        // A caller param that reads a raw table overrides a clean default.
+        CHECK(is_stale(create(define("SELECT 1 FROM $TCP_Hourly"),
+                              nlohmann::json{{"sql", "SELECT 1 FROM tcp_live"}})));
+        CHECK(dispatched == 0);
+        // A clean default proceeds to dispatch.
+        CHECK_FALSE(is_stale(create(define("SELECT 1 FROM $TCP_Hourly"), nullptr)));
+        CHECK(dispatched == 1);
+    }
 }
 
 // Gate 4 unhappy-path finding (#4364 re-review): create_result_set has no
