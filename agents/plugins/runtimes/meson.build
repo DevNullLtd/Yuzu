@@ -1,8 +1,9 @@
-# runtimes -- installed .NET / JVM runtime inventory (read-only, zero subprocess).
+# runtimes -- installed .NET / JVM / Python runtime inventory (read-only, zero subprocess).
 # Multi-TU shape follows agents/plugins/peripherals/meson.build: one portable
 # plugin TU plus three per-OS leg TUs, each #if-gated internally for its own
-# target so all four are listed unconditionally. No platform frameworks or
-# libraries: the legs read directory names and metadata files only.
+# target so all four are listed unconditionally. No extra link dependencies: the
+# POSIX legs read directory names and metadata files; the Windows leg uses the
+# registry (Reg*W, advapi32).
 runtimes_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 
 # Assigned (not anonymous) so tests/meson.build's link_depends can name this

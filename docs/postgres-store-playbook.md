@@ -582,6 +582,23 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   such counter, so only the HTTP 5xx rate shows it. A NEW store adds its `/readyz` (and
   `/health`) row for boot-state parity AND a `*_read_degrade_total{reason}` counter, so this
   decision holds for it.
+- **Version-ahead warning (#3894):** when a store's recorded `schema_meta` version is HIGHER than
+  the highest version in the calling binary's own `migrations()` vector (an older build started
+  against a database a newer one already migrated), `run()` logs one `warn` per call naming the
+  store and both versions, applies nothing and still returns true
+  (`PgMigrationRunner::is_schema_ahead` is the pure decision). It is **warn-only on purpose**, not
+  a refusal: the situation is already outside the supported procedure (rolling upgrades and a
+  return to an earlier build are not supported at this stage; see the "Recorded exception" in the
+  migrations section above and ADR-0053 "Update (2026-10-20)"), and a refusal would add a second
+  failure to it. It fires per `run()` call, not per store per process: the auth and secrets stores
+  are opened twice at start-up (`main.cpp` bootstrap stack, then `ServerImpl`'s own) and
+  `LeaderElector` re-runs the migration on every reconnect. It is log-only (the `pg/` layer has no
+  metrics registry), protects only binaries that contain it (builds shipped earlier are silent),
+  and must not be cited as a compensating control. A store's own constructor can still refuse
+  afterwards (a projection smoke-check, `RbacStore`'s `load_enabled_flag`). A migration that drops
+  or reshapes a table is still a hazard for an older build: say so in that release's `upgrading.md`
+  section. Operator text: `upgrading.md` "When a server build finds its database ahead of it
+  (every Postgres store)".
 - **Runner guards**: schema-drift guard — a schema at version 0 that already contains tables is
   refused (never blindly re-run migration 1). Concurrent runners (multi-process boot) are
   serialized by a cluster-wide `pg_advisory_xact_lock`. Store/schema names must match
