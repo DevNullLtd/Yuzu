@@ -213,6 +213,9 @@ TEST_CASE("worked ages for the process source", "[echo][retention]") {
 // ── Canned definitions read the roll-up tiers ───────────────────────────────────────────────────
 // Source-tripwire: reads the committed definitions from the source tree (YUZU_SERVER_SRC_DIR is
 // server/core/src), so a canned query that names a raw capture table again fails here.
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
 
 namespace {
 

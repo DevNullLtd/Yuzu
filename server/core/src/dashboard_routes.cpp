@@ -3272,7 +3272,8 @@ DashboardRoutes::gather_echo_retention_paused(const std::string& username,
     // Each response is from one agent. Parse each line for
     //   config|<source>_enabled|<value>
     //   config|<source>_paused_at|<ts>
-    //   config|<source>_live_rows|<count>
+    //   config|<source>_rows|<count>        (an agent from before the roll-up-only release sends
+    //   config|<source>_live_rows|<count>   the same figure under this name; both are read)
     //   config|<source>_oldest_ts|<ts>
     // and emit one row for every (agent, source) pair where `<source>_enabled` ==
     // "false". Sources with `enabled=true` are dropped — callers want the *paused*
