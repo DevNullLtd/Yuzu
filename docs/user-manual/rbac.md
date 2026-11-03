@@ -112,18 +112,23 @@ Recommended order for a fresh install:
 > **):** `GET /fragments/results/filter-bar` (facet dropdown values + line
 > counts) and `GET /fragments/create-group-form` (matching-agent count) scope
 > their aggregate queries in SQL against the caller's `Response:Read`-visible
-> agent set. `POST /api/dashboard/group-from-results` fetches its matching id
+> agent set (for the form's count with a Search term, in the server after the read,
+> as the POST does). `POST /api/dashboard/group-from-results` fetches its matching id
 > list unscoped, then intersects it in C++ against that same visible set
 > before materialising group membership, audits any ids the intersection
 > drops, and — if every id is dropped — returns the same "no agents match"
 > response as a genuine no-match (the caller cannot tell a filtered result
 > from an empty one). All three resolve the visible set via
 > `RbacStore::visible_agents_for_permission` (deny-aware, management-group
-> hierarchy expanded, permission-specific to `Response:Read`).
+> hierarchy expanded, permission-specific to `Response:Read`). A request that
+> carries a Search term (the results page's free-text box, `q`) also needs
+> `Response:Read`, the same admission the results table uses, because it matches
+> stored output content; filters alone need only `ManagementGroup:Write`.
 >
 > A degraded **management-group** store fails **closed** here too: an
-> empty visible set makes the two GETs return success-empty without the
-> query ever reaching the response store, and makes `group-from-results`
+> empty visible set makes the two GETs return success-empty (for a
+> filters-only request without the query reaching the response store; a Search
+> term is matched first and the result then scoped to empty), and makes `group-from-results`
 > report "no agents match." A degraded **RBAC** store behaves differently —
 > it never reaches this scoping at all, because each route's own flat
 > admission gate (below) denies with `403` first, the same as any other

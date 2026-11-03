@@ -55,21 +55,28 @@
  * exactly as test_dashboard_echo_fragments.cpp:563-582 documents.
  */
 
+#include "agent_registry.hpp"
 #include "dashboard_routes.hpp"
+#include "event_bus.hpp"
 #include "management_group_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "response_store.hpp"
+#include "test_export_cap_guard.hpp"
 #include "test_forensics_tier_fixture.hpp"
 #include "test_mgmt_group_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
 #include <libpq-fe.h>
+
+#include "agent.pb.h"
 
 #include <initializer_list>
 #include <memory>
@@ -85,6 +92,7 @@ using namespace yuzu::server;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
+namespace agent_pb = ::yuzu::agent::v1;
 
 namespace {
 
@@ -136,6 +144,23 @@ void seed_matching_responses(ResponseStore& rs, std::initializer_list<std::strin
     }
 }
 
+/// One frame for `agent` with an explicit category and title (the Search term matches the title).
+/// @p plugin is the plugin the row is stored under (the Forensics tier keys on it).
+void seed_titled_response(ResponseStore& rs, const std::string& agent, const std::string& category,
+                          const std::string& title, const char* plugin = kPlugin) {
+    StoredResponse r;
+    r.instruction_id = kCommandId;
+    r.agent_id = agent;
+    r.status = 1;
+    r.plugin = plugin;
+    r.output = "high|" + category + "|" + title + "|detail\n";
+    rs.store(r);
+}
+
+std::string q_form_body(const std::string& group_name, const std::string& extra) {
+    return "group_name=" + group_name + "&command_id=" + kCommandId + "&plugin=" + kPlugin + extra;
+}
+
 struct GroupFromResultsHarness {
     // MEMBER ORDER IS LOAD-BEARING (mirrors FragmentHarness,
     // test_dashboard_echo_fragments.cpp:106-114): `sink` is declared AFTER
@@ -153,6 +178,11 @@ struct GroupFromResultsHarness {
     // #4990: the caller's Forensics visibility (admin by default so the cases that are not about
     // the tier keep their meaning). Declared before `routes`: the resolver borrows it.
     yuzu::server::test::ForensicsCaller forensics;
+    // The Search term also matches an agent's registry display name. Unwired (nullptr) unless the
+    // case asks for it; declared before `routes`, which borrows the registry by raw pointer.
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::EventBus bus;
+    std::unique_ptr<yuzu::server::detail::AgentRegistry> registry;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
 
@@ -177,6 +207,15 @@ struct GroupFromResultsHarness {
     /// unobservable in the response.
     int visible_set_fn_calls{0};
 
+    /// The Response:Read admission a Search term needs (#5700: it matches stored output content).
+    /// Admits by default (unconfined: scope nullopt); a case sets `fleet_read_admit = false` to
+    /// deny, or `fleet_read_wired = false` for the unwired fail-closed contract. Both are read live
+    /// per request; `fleet_read_calls` proves whether the gate ran at all.
+    bool fleet_read_admit{true};
+    int fleet_read_calls{0};
+    std::string fleet_read_securable;
+    std::string fleet_read_operation;
+
     /// @param degrade_response_store true → wire a ResponseStore pointed at
     ///        an unreachable pool (never open), so the 503-before-scope-logic
     ///        path is reachable. `mg` (the confinement substrate the group
@@ -187,8 +226,12 @@ struct GroupFromResultsHarness {
     ///        documented contract (dashboard_routes.hpp) -- CDX-FV-05 needs
     ///        this to actually prove the route reads a configured allowlist,
     ///        which a post-construction call would not exercise correctly.
+    /// @param with_registry true → wire an AgentRegistry (see @ref register_host).
     explicit GroupFromResultsHarness(bool degrade_response_store = false,
-                                     std::vector<std::string> csrf_trusted_origins = {}) {
+                                     std::vector<std::string> csrf_trusted_origins = {},
+                                     bool with_registry = false) {
+        if (with_registry)
+            registry = std::make_unique<yuzu::server::detail::AgentRegistry>(bus, metrics);
         // ManagementGroupStorePg's own constructor already SKIPs the whole
         // TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset (before this body
         // runs, per member-initialization order) — REQUIRE here is a
@@ -243,10 +286,23 @@ struct GroupFromResultsHarness {
         if (!csrf_trusted_origins.empty())
             routes.set_csrf_trusted_origins(std::move(csrf_trusted_origins));
         yuzu::server::test::wire_forensics(routes, forensics);
+        routes.set_fleet_read_fn([this](const httplib::Request&, httplib::Response& res,
+                                        const std::string& securable, const std::string& op)
+                                     -> authz::FleetReadGate {
+            ++fleet_read_calls;
+            fleet_read_securable = securable;
+            fleet_read_operation = op;
+            if (!fleet_read_admit) {
+                res.status = 403;
+                res.set_content(R"({"error":"permission denied"})", "application/json");
+                return {false, authz::deny_all()};
+            }
+            return {true, std::nullopt};
+        });
 
         routes.register_routes(
             sink, auth_fn, perm_fn, audit_fn, rs_.get(), &mg,
-            /*registry=*/nullptr, /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+            registry.get(), /*tag_store=*/nullptr, /*event_bus=*/nullptr,
             /*agents_json_fn=*/[] { return std::string{"[]"}; },
             /*dispatch_fn=*/DashboardRoutes::DispatchFn{},
             /*caller_fn=*/DashboardRoutes::CallerFn{},
@@ -260,6 +316,19 @@ struct GroupFromResultsHarness {
     }
 
     ResponseStore& rs() const { return *rs_; }
+
+    /// Registers @p agent_id under @p hostname (the registry's display name for it). Needs the
+    /// harness built with `with_registry`.
+    void register_host(const std::string& agent_id, const std::string& hostname) {
+        REQUIRE(registry != nullptr);
+        agent_pb::AgentInfo info;
+        info.set_agent_id(agent_id);
+        info.set_hostname(hostname);
+        info.mutable_platform()->set_os("linux");
+        info.mutable_platform()->set_arch("x86_64");
+        info.set_agent_version("0.13.0");
+        (void)registry->register_agent(info);
+    }
 
     static std::unordered_map<std::string, std::string> same_site_headers() {
         return {{"Host", kHost}, {"Origin", std::string{"https://"} + kHost}};
@@ -852,5 +921,476 @@ TEST_CASE("group-from-results: the success toast is valid single-line ASCII JSON
         const std::string msg = j["showToast"].value("message", "");
         CHECK(msg.find("...' created with 1 agents") != std::string::npos);
         CHECK(h.mg.find_group_by_name(name).has_value()); // the store keeps the full name
+    }
+}
+
+// ── #5700: the results page's Search term is part of the group ──────────────
+
+TEST_CASE("group-from-results: the Search term alone defines the group (ground-truthed against "
+          "the store), and with a column filter the two intersect",
+          "[pg][server][dashboard][group_from_results][search]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-B", "cat-a", "beta");
+    seed_titled_response(h.rs(), "agent-C", "cat-b", "alpha2");
+
+    SECTION("q alone: exactly the agents with a matching line, whatever their category") {
+        auto res = h.post(q_form_body("q-only", "&q=alp"));
+        CHECK(res->status == 200);
+        CHECK(contains(res->get_header_value("HX-Trigger"), "created with 2 agents"));
+        auto group = h.mg.find_group_by_name("q-only");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A", "agent-C"});
+        // The audit row records that a Search term shaped the set, never the term itself.
+        CHECK(contains(h.audit_detail("group.create_from_results", "success"), "text_query=1"));
+        CHECK_FALSE(contains(h.audit_detail("group.create_from_results", "success"), "alp"));
+    }
+    SECTION("q with a column filter: the intersection, not either alone") {
+        auto res = h.post(q_form_body("q-and-filter", "&f_category=cat-a&q=alp"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("q-and-filter");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
+    }
+    SECTION("no q: the filter-only path is unchanged and carries no marker") {
+        auto res = h.post(q_form_body("filter-only", "&f_category=cat-a"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("filter-only");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A", "agent-B"});
+        CHECK_FALSE(contains(h.audit_detail("group.create_from_results", "success"), "text_query"));
+    }
+    SECTION("a q that matches nothing: the existing 422, now with a toast, and no group row") {
+        auto res = h.post(q_form_body("q-none", "&q=zzznomatch"));
+        CHECK(res->status == 422);
+        CHECK(contains(res->body, "No agents match the current filters."));
+        CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
+        CHECK(contains(res->get_header_value("HX-Trigger"), "showToast"));
+        CHECK_FALSE(h.mg.find_group_by_name("q-none").has_value());
+    }
+}
+
+TEST_CASE("create-group-form: previews the Search-term count and carries q as a hidden field",
+          "[pg][server][dashboard][group_from_results][search]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-B", "cat-a", "beta");
+    seed_titled_response(h.rs(), "agent-C", "cat-b", "alpha2");
+    const std::string base = std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                             "&plugin=" + kPlugin;
+
+    auto res = h.sink.Get(base + "&q=alp");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    CHECK(contains(res->body, "2 agents will be added"));
+    CHECK(contains(res->body, "<input type=\"hidden\" name=\"q\" value=\"alp\">"));
+    CHECK_FALSE(contains(res->body, "disabled"));
+
+    // A quote in the term is HTML-escaped once, never raw and never double-escaped.
+    auto quoted = h.sink.Get(base + "&q=a%22b");
+    REQUIRE(quoted != nullptr);
+    CHECK(contains(quoted->body, "name=\"q\" value=\"a&quot;b\""));
+    CHECK_FALSE(contains(quoted->body, "a\"b"));
+    CHECK_FALSE(contains(quoted->body, "&amp;quot;"));
+
+    // No q: no hidden q field (the filter-only form is byte-compatible with before).
+    auto plain = h.sink.Get(base + "&f_category=cat-a");
+    REQUIRE(plain != nullptr);
+    CHECK_FALSE(contains(plain->body, "name=\"q\""));
+}
+
+// A Search set is still confined to the caller's visible scope: the preview and the persisted
+// membership both drop an agent the caller may not read, even though its lines match the term.
+TEST_CASE("group-from-results: a Search set is confined to the visible scope, in the preview and "
+          "in the persisted membership",
+          "[pg][server][dashboard][group_from_results][search][scope]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-B", "cat-a", "alpha2"); // matches q, out of scope
+    seed_titled_response(h.rs(), "agent-C", "cat-a", "beta");   // in scope, not a match
+    h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{"agent-A", "agent-C"};
+    };
+    const std::string base = std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                             "&plugin=" + kPlugin;
+
+    SECTION("the preview counts, and the group holds, only the visible match") {
+        auto form = h.sink.Get(base + "&q=alp");
+        REQUIRE(form != nullptr);
+        CHECK(contains(form->body, "1 agent will be added"));
+        CHECK_FALSE(contains(form->body, "2 agents will be added"));
+
+        auto res = h.post(q_form_body("q-confined", "&q=alp"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("q-confined");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
+        REQUIRE(h.audits_for("response.read", "denied") == 1);
+        CHECK(h.audit_detail("response.read", "denied") ==
+              "scope_dropped=1 surface=group_from_results");
+    }
+    SECTION("every match out of scope: the existing 422, and no group") {
+        auto res = h.post(q_form_body("q-all-dropped", "&q=alpha2"));
+        CHECK(res->status == 422);
+        CHECK(res->body ==
+              "<span class=\"feedback-error\">No agents match the current filters.</span>");
+        CHECK_FALSE(h.mg.find_group_by_name("q-all-dropped").has_value());
+        CHECK(h.audit_detail("response.read", "denied") ==
+              "scope_dropped=1 surface=group_from_results");
+    }
+}
+
+// The Search term also matches the agent's registry display name (the same predicate the results
+// table renders), so an agent whose stored lines do not contain the term still joins the group.
+TEST_CASE("group-from-results: a Search term matching only an agent's registry display name "
+          "includes that agent, in the preview and in the persisted membership",
+          "[pg][server][dashboard][group_from_results][search]") {
+    GroupFromResultsHarness h(/*degrade_response_store=*/false, /*csrf_trusted_origins=*/{},
+                              /*with_registry=*/true);
+    h.register_host("agent-D", "zeta-box");
+    h.register_host("agent-E", "plain-box");
+    seed_titled_response(h.rs(), "agent-D", "cat-a", "alpha"); // no "zeta" in any stored field
+    seed_titled_response(h.rs(), "agent-E", "cat-a", "alpha");
+    const std::string base = std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                             "&plugin=" + kPlugin;
+
+    auto form = h.sink.Get(base + "&q=zeta");
+    REQUIRE(form != nullptr);
+    CHECK(contains(form->body, "1 agent will be added"));
+
+    auto res = h.post(q_form_body("q-by-host", "&q=zeta"));
+    CHECK(res->status == 200);
+    auto group = h.mg.find_group_by_name("q-by-host");
+    REQUIRE(group.has_value());
+    CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-D"});
+}
+
+// #4990: the Forensics tier narrows a Search set exactly as it narrows a column-filter set. Every
+// tier case above posts without `q` (the facet branch), so the tier inside agents_matching_text is
+// pinned only here. agent-A and agent-B hold Forensics rows, agent-C and agent-D ordinary ones;
+// agent-D does not match the term, agent-B is outside the category the column filter picks.
+TEST_CASE("create-group-form: a Search preview counts only the rows the caller's Forensics tier "
+          "may read",
+          "[pg][server][dashboard][group_from_results][search][forensics]") {
+    GroupFromResultsHarness h;
+    const char* const forensics = yuzu::server::test::kForensicsPlugin;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha", forensics);
+    seed_titled_response(h.rs(), "agent-B", "cat-b", "alpha2", forensics);
+    seed_titled_response(h.rs(), "agent-C", "cat-a", "alpha3", yuzu::server::test::kOrdinaryPlugin);
+    seed_titled_response(h.rs(), "agent-D", "cat-a", "beta", yuzu::server::test::kOrdinaryPlugin);
+    const std::string base = std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                             "&plugin=" + kPlugin;
+
+    SECTION("without Forensics:Read, q alone previews exactly the ordinary match") {
+        h.forensics.viewer();
+        auto res = h.sink.Get(base + "&q=alp");
+        REQUIRE(res != nullptr);
+        CHECK(contains(res->body, "1 agent will be added"));
+        CHECK_FALSE(contains(res->body, "3 agents will be added"));
+    }
+    SECTION("without Forensics:Read, q plus a column filter previews exactly the ordinary match") {
+        h.forensics.viewer();
+        auto res = h.sink.Get(base + "&f_category=cat-a&q=alp");
+        REQUIRE(res != nullptr);
+        CHECK(contains(res->body, "1 agent will be added"));
+        CHECK_FALSE(contains(res->body, "2 agents will be added"));
+    }
+    SECTION("a global Forensics:Read previews every match") {
+        h.forensics.admin();
+        auto alone = h.sink.Get(base + "&q=alp");
+        REQUIRE(alone != nullptr);
+        CHECK(contains(alone->body, "3 agents will be added"));
+        auto both = h.sink.Get(base + "&f_category=cat-a&q=alp");
+        REQUIRE(both != nullptr);
+        CHECK(contains(both->body, "2 agents will be added"));
+    }
+    SECTION("an Unknown decision shows no count, never a number from a partial row set") {
+        h.forensics.unknown();
+        auto res = h.sink.Get(base + "&q=alp");
+        REQUIRE(res != nullptr);
+        CHECK(contains(res->body, "agent count unavailable"));
+        CHECK_FALSE(contains(res->body, "will be added"));
+    }
+}
+
+TEST_CASE("group-from-results: a Search set is narrowed by the caller's Forensics tier, and an "
+          "Unknown decision creates nothing",
+          "[pg][server][dashboard][group_from_results][search][forensics]") {
+    GroupFromResultsHarness h;
+    const char* const forensics = yuzu::server::test::kForensicsPlugin;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha", forensics);
+    seed_titled_response(h.rs(), "agent-B", "cat-b", "alpha2", forensics);
+    seed_titled_response(h.rs(), "agent-C", "cat-a", "alpha3", yuzu::server::test::kOrdinaryPlugin);
+    seed_titled_response(h.rs(), "agent-D", "cat-a", "beta", yuzu::server::test::kOrdinaryPlugin);
+
+    SECTION("without Forensics:Read, q alone materialises exactly the ordinary match") {
+        h.forensics.viewer();
+        auto res = h.post(q_form_body("tier-q-viewer", "&q=alp"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("tier-q-viewer");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-C"});
+    }
+    SECTION("without Forensics:Read, q plus a column filter materialises exactly the ordinary "
+            "match") {
+        h.forensics.viewer();
+        auto res = h.post(q_form_body("tier-qf-viewer", "&f_category=cat-a&q=alp"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("tier-qf-viewer");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-C"});
+    }
+    SECTION("a global Forensics:Read materialises every match") {
+        h.forensics.admin();
+        auto alone = h.post(q_form_body("tier-q-admin", "&q=alp"));
+        CHECK(alone->status == 200);
+        auto g1 = h.mg.find_group_by_name("tier-q-admin");
+        REQUIRE(g1.has_value());
+        CHECK(member_ids_of(h.mg, g1->id) ==
+              std::set<std::string>{"agent-A", "agent-B", "agent-C"});
+
+        auto both = h.post(q_form_body("tier-qf-admin", "&f_category=cat-a&q=alp"));
+        CHECK(both->status == 200);
+        auto g2 = h.mg.find_group_by_name("tier-qf-admin");
+        REQUIRE(g2.has_value());
+        CHECK(member_ids_of(h.mg, g2->id) == std::set<std::string>{"agent-A", "agent-C"});
+    }
+    SECTION("an Unknown decision answers the notice and creates no group") {
+        h.forensics.unknown();
+        auto res = h.post(q_form_body("tier-q-unknown", "&q=alp"));
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "could not be completed"));
+        CHECK(contains(res->body, "Nothing was created"));
+        CHECK(contains(res->get_header_value("HX-Trigger"), "showToast"));
+        CHECK(res->get_header_value("HX-Retarget").empty());
+        CHECK_FALSE(h.mg.find_group_by_name("tier-q-unknown").has_value());
+    }
+}
+
+// A set cut by a read cap is partial; a group is never materialised from it.
+TEST_CASE("group-from-results: a Search over a read cut by the byte cap is refused with a toast",
+          "[pg][server][dashboard][group_from_results][search][truncation]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-B", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-C", "cat-a", "alpha");
+    yuzu::test::ExportByteCapGuard cap{1}; // every row past the first is cut
+    const std::string base = std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                             "&plugin=" + kPlugin;
+
+    auto form = h.sink.Get(base + "&q=alp");
+    REQUIRE(form != nullptr);
+    CHECK(contains(form->body, "agent count is partial"));
+    CHECK(contains(form->body, "<button type=\"submit\" disabled>"));
+    CHECK_FALSE(contains(form->body, "agents will be added"));
+
+    auto res = h.post(q_form_body("cut-by-bytes", "&q=alp"));
+    CHECK(res->status == 422);
+    // The toast and the body say the same sentence, byte for byte (the 422 body is never swapped,
+    // so the toast is the operator's only signal).
+    CHECK(res->get_header_value("HX-Trigger") ==
+          R"({"showToast":{"message":"The result set was cut by the read cap, so the agent list is )"
+          R"(partial. Nothing was created. Narrow the filters or the Search term and try again.")"
+          R"(,"level":"error"}})");
+    CHECK(res->body == "<span class=\"feedback-error\">The result set was cut by the read cap, so "
+                       "the agent list is partial. Nothing was created. Narrow the filters or the "
+                       "Search term and try again.</span>");
+    CHECK_FALSE(h.mg.find_group_by_name("cut-by-bytes").has_value());
+}
+
+TEST_CASE("group-from-results: a Search plus a column filter over a read cut by the row cap is "
+          "refused, not materialised as a smaller group",
+          "[pg][server][dashboard][group_from_results][search][truncation]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-B", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-C", "cat-a", "alpha");
+    yuzu::test::ResultsRowCapGuard cap{2};
+    const std::string base = std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                             "&plugin=" + kPlugin + "&f_category=cat-a&q=alp";
+
+    auto form = h.sink.Get(base);
+    REQUIRE(form != nullptr);
+    CHECK(contains(form->body, "agent count is partial"));
+    CHECK(contains(form->body, "<button type=\"submit\" disabled>"));
+
+    auto res = h.post(q_form_body("cut-by-rows", "&f_category=cat-a&q=alp"));
+    CHECK(res->status == 422);
+    CHECK(contains(res->get_header_value("HX-Trigger"), "showToast"));
+    CHECK(contains(res->get_header_value("HX-Trigger"),
+                   "Narrow the filters or the Search term and try again."));
+    CHECK_FALSE(h.mg.find_group_by_name("cut-by-rows").has_value());
+
+    // Control: a cap that holds every match lets the same request through.
+    yuzu::test::ResultsRowCapGuard roomy{3};
+    auto ok = h.post(q_form_body("not-cut", "&f_category=cat-a&q=alp"));
+    CHECK(ok->status == 200);
+    auto group = h.mg.find_group_by_name("not-cut");
+    REQUIRE(group.has_value());
+    CHECK(member_ids_of(h.mg, group->id) ==
+          std::set<std::string>{"agent-A", "agent-B", "agent-C"});
+}
+
+TEST_CASE("group-from-results: a duplicate group name is refused with the same toast channel",
+          "[pg][server][dashboard][group_from_results]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    REQUIRE(h.post(GroupFromResultsHarness::form_body("dup-name"))->status == 200);
+
+    auto res = h.post(GroupFromResultsHarness::form_body("dup-name"));
+    CHECK(res->status == 400);
+    CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
+    CHECK(contains(res->body, "A group with that name already exists."));
+    CHECK(contains(res->get_header_value("HX-Trigger"), "showToast"));
+}
+
+// A degraded store never reads as "no agents match" on the Search path either: the POST refuses
+// before the visible scope is even resolved, and the preview says the count is unavailable.
+TEST_CASE("group-from-results: a Search-only request on a degraded store 503s before any scope "
+          "resolution, and the preview says the count is unavailable",
+          "[pg][server][dashboard][group_from_results][search][degrade]") {
+    GroupFromResultsHarness h{/*degrade_response_store=*/true};
+    h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{"agent-A"};
+    };
+
+    auto res = h.post(q_form_body("q-degrade", "&q=alp"));
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("HX-Trigger") ==
+          R"({"showToast":{"message":"Agent count unavailable. The response store could not be read. )"
+          R"(Nothing was created. Retry shortly.","level":"error"}})");
+    CHECK(h.visible_set_fn_calls == 0);
+    CHECK(h.audits_for("response.read", "denied") == 0);
+    CHECK_FALSE(h.mg.find_group_by_name("q-degrade").has_value());
+
+    const std::string preview_url = std::string{"/fragments/create-group-form?command_id="} +
+                                    kCommandId + "&plugin=" + kPlugin + "&q=alp";
+    auto form = h.sink.Get(preview_url);
+    REQUIRE(form != nullptr);
+    CHECK(form->status == 200);
+    CHECK(contains(form->body, "agent count unavailable"));
+    CHECK_FALSE(contains(form->body, "agents will be added"));
+    CHECK_FALSE(contains(form->body, "0 agents"));
+}
+
+// A urlencoded body is read by key, not by substring: a column named `seq` posts `f_seq=`, which
+// must never be taken for the Search term `q`. With no real `q` the request is a filters-only one
+// (no Response:Read admission, no marker); with a real `q` the real term wins.
+TEST_CASE("group-from-results: a form key that merely ends in q is never the Search term",
+          "[pg][server][dashboard][group_from_results][search]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-B", "cat-b", "beta");
+    h.fleet_read_admit = false; // a Search term would be refused; filters alone are not
+
+    SECTION("no real q: the filters-only path runs and records no Search marker") {
+        auto res = h.post(q_form_body("seq-key", "&f_category=cat-a&f_seq=5"));
+        CHECK(res->status == 200);
+        CHECK(h.fleet_read_calls == 0);
+        auto group = h.mg.find_group_by_name("seq-key");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
+        CHECK_FALSE(contains(h.audit_detail("group.create_from_results", "success"), "text_query"));
+    }
+    SECTION("a real q after it is the Search term") {
+        h.fleet_read_admit = true;
+        auto res = h.post(q_form_body("seq-and-q", "&f_seq=5&q=bet"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("seq-and-q");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-B"});
+    }
+}
+
+// R2: a Search term substring-matches stored output, so the preview and the POST that carry one
+// run the results table's own Response:Read admission after ManagementGroup:Write; a filters-only
+// request keeps ManagementGroup:Write alone, exactly as before.
+namespace {
+// The constant toast a refused Search admission answers (JSON as refusal_toast_header builds it).
+const std::string kSearchRefusalToast =
+    R"({"showToast":{"message":"The Search term could not be used: reading responses is not )"
+    R"(permitted or the permission check is unavailable.","level":"error"}})";
+} // namespace
+
+TEST_CASE("group-from-results: a Search term needs the results table's Response:Read admission, in "
+          "the preview and the POST; filters alone do not",
+          "[pg][server][dashboard][group_from_results][search][auth]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    seed_titled_response(h.rs(), "agent-B", "cat-a", "beta");
+    const std::string base = std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                             "&plugin=" + kPlugin;
+
+    SECTION("denied: the preview and the POST answer the gate's refusal and touch nothing") {
+        h.fleet_read_admit = false;
+
+        auto form = h.sink.Get(base + "&q=alp");
+        REQUIRE(form != nullptr);
+        CHECK(form->status == 403);
+        CHECK(contains(form->body, "permission denied"));
+        CHECK_FALSE(contains(form->body, "agents will be added"));
+        // The form never swaps a 4xx body: the toast is the operator's signal.
+        CHECK(form->get_header_value("HX-Trigger") == kSearchRefusalToast);
+        CHECK(h.fleet_read_securable == "Response");
+        CHECK(h.fleet_read_operation == "Read");
+
+        auto res = h.post(q_form_body("q-denied", "&q=alp"));
+        CHECK(res->status == 403);
+        CHECK(contains(res->body, "permission denied"));
+        CHECK(res->get_header_value("HX-Trigger") == kSearchRefusalToast);
+        CHECK(h.fleet_read_calls == 2);
+        CHECK_FALSE(h.mg.find_group_by_name("q-denied").has_value());
+        // The refusal precedes every store read and the visible-scope resolve.
+        CHECK(h.visible_set_fn_calls == 0);
+        CHECK(h.audits_for("group.create_from_results", "success") == 0);
+        CHECK(h.audits_for("response.read", "denied") == 0);
+    }
+    SECTION("filters alone never reach the gate, whatever it would answer") {
+        h.fleet_read_admit = false;
+
+        auto form = h.sink.Get(base + "&f_category=cat-a");
+        REQUIRE(form != nullptr);
+        CHECK(form->status == 200);
+        CHECK(contains(form->body, "2 agents will be added"));
+
+        auto res = h.post(GroupFromResultsHarness::form_body("filters-only"));
+        CHECK(res->status == 200);
+        CHECK(h.mg.find_group_by_name("filters-only").has_value());
+        CHECK(h.fleet_read_calls == 0);
+    }
+    SECTION("unwired: the Search path fails closed with a 503, never an open read") {
+        h.routes.set_fleet_read_fn(DashboardRoutes::FleetReadFn{});
+
+        auto form = h.sink.Get(base + "&q=alp");
+        REQUIRE(form != nullptr);
+        CHECK(form->status == 503);
+        CHECK_FALSE(contains(form->body, "agents will be added"));
+        CHECK(form->get_header_value("HX-Trigger") == kSearchRefusalToast);
+
+        auto res = h.post(q_form_body("q-unwired", "&q=alp"));
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("HX-Trigger") == kSearchRefusalToast);
+        CHECK_FALSE(h.mg.find_group_by_name("q-unwired").has_value());
+        CHECK(h.visible_set_fn_calls == 0);
+
+        // Filters alone are unaffected by the missing gate.
+        CHECK(h.post(GroupFromResultsHarness::form_body("unwired-filters"))->status == 200);
+    }
+    SECTION("admitted: the gate runs once per request on the Search path, and scoping still applies") {
+        h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+            return std::set<std::string>{"agent-A"};
+        };
+        auto form = h.sink.Get(base + "&q=a");
+        REQUIRE(form != nullptr);
+        CHECK(form->status == 200);
+        CHECK(contains(form->body, "1 agent will be added")); // agent-B's match is out of scope
+        CHECK(h.fleet_read_calls == 1);
+
+        auto res = h.post(q_form_body("q-admitted", "&q=a"));
+        CHECK(res->status == 200);
+        CHECK(h.fleet_read_calls == 2);
+        auto group = h.mg.find_group_by_name("q-admitted");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
     }
 }

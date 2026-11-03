@@ -203,6 +203,19 @@ TEST_CASE("hardware results region: sortable th / filter chip / pager always hx-
     const auto pagers = all_opening_tags(html, "<button class=\"gp-btn\" hx-get=\"");
     REQUIRE(pagers.size() == 2); // both Prev and Next are showing
     assert_controls(pagers, 2);
+
+    // Newest-wins: every sort header and pager button syncs on the search box with `replace`.
+    // `this:abort` DROPS a request issued while another is in flight, so the operator's latest
+    // click was lost. The search box keeps its own `this:replace`: same xhr slot, same policy.
+    CHECK(html.find("this:abort") == std::string::npos);
+    for (const auto& tag : all_opening_tags(html, "<th class=\"sortable\""))
+        CHECK(tag.find("hx-sync=\"#hw-q:replace\"") != std::string::npos);
+    for (const auto& tag : pagers)
+        CHECK(tag.find("hx-sync=\"#hw-q:replace\"") != std::string::npos);
+    const auto full = render_hardware_list_fragment(page, false, false, /*results_only=*/false);
+    const auto search = all_opening_tags(full, "<input id=\"hw-q\"");
+    REQUIRE(search.size() == 1);
+    CHECK(search[0].find("hx-sync=\"this:replace\"") != std::string::npos);
 }
 
 // ── Checkbox column + sticky bulk-tag bar ─────────────────────────────────────

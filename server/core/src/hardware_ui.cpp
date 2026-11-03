@@ -229,6 +229,11 @@ std::string kpis_html(const HardwareKpis& k, bool ci_degraded) {
     return h;
 }
 
+/// One newest-wins sync scope for the list's requests: the search box (`this:replace` on #hw-q)
+/// and every sort header / pager button (`#hw-q:replace`) share #hw-q's xhr slot. `this:abort`
+/// dropped a request issued while another was in flight, losing the operator's latest click.
+constexpr std::string_view kHwSyncScope = "#hw-q:replace";
+
 std::string sortable_th(const char* label, HwSortKey key, const HardwareListQuery& q) {
     const bool active = parse_hw_sort_key(q.sort) == key;
     const bool next_desc = active ? !q.desc : false;
@@ -239,7 +244,7 @@ std::string sortable_th(const char* label, HwSortKey key, const HardwareListQuer
     std::string indicator = active ? (q.desc ? " &#9660;" : " &#9650;") : "";
     return std::string("<th class=\"sortable\" hx-get=\"") + esc(list_url(nq, false, true)) +
            "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" hx-include=\"#hw-q\" "
-           "hx-sync=\"this:abort\">" + label + indicator + "</th>";
+           "hx-sync=\"" + std::string{kHwSyncScope} + "\">" + label + indicator + "</th>";
 }
 
 std::string chip(const char* label, const std::string& value, const HardwareListQuery& q,
@@ -318,13 +323,13 @@ std::string pagination(const HardwareListQuery& q, std::size_t total_matching) {
         pq.offset = q.offset >= q.limit ? q.offset - q.limit : 0;
         h += " <button class=\"gp-btn\" hx-get=\"" + esc(list_url(pq, false, true)) +
              "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" hx-include=\"#hw-q\" "
-             "hx-sync=\"this:abort\">Prev</button>";
+             "hx-sync=\"" + std::string{kHwSyncScope} + "\">Prev</button>";
     }
     if (q.offset + q.limit < total_matching) {
         HardwareListQuery nq = q; nq.offset = q.offset + q.limit;
         h += " <button class=\"gp-btn\" hx-get=\"" + esc(list_url(nq, false, true)) +
              "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" hx-include=\"#hw-q\" "
-             "hx-sync=\"this:abort\">Next</button>";
+             "hx-sync=\"" + std::string{kHwSyncScope} + "\">Next</button>";
     }
     h += "</div>";
     return h;
@@ -535,6 +540,7 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
     // keystroke. `changed`/`delay:` are plain token parsing (no eval), so they degrade
     // safely instead of silently. The input also lives OUTSIDE `#hw-results`, targeted
     // by every other control via `hx-include`, so its own swap can never destroy it.
+    // hx-sync="this:replace" is this element's side of kHwSyncScope: th/pager requests sync on #hw-q.
     h += "<input id=\"hw-q\" type=\"search\" class=\"hw-search\" name=\"q\" value=\"" + esc(q.q) +
          "\" placeholder=\"Search hostname, serial, model, CPU&hellip;\" hx-get=\"" +
          esc(list_url([&] { HardwareListQuery nq = q; nq.offset = 0; return nq; }(), false, true)) +
