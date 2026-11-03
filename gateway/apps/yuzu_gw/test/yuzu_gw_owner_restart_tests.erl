@@ -42,7 +42,7 @@ owner_restart_test_() ->
       {timeout, 60, {"stream still open: the session is re-established and a command reaches "
                      "the agent, with no reconnect", fun open_stream_is_recovered/0}},
       {timeout, 60, {"a restarted owner keeps the agent's hostname, in its info and in the "
-                     "registry row (Phase 1c G1)", fun restarted_owner_keeps_hostname/0}},
+                     "registry row", fun restarted_owner_keeps_hostname/0}},
       {timeout, 60, {"stream gone: DISCONNECTED only, no resurrection, no child left",
                      fun gone_stream_is_not_resurrected/0}},
       {timeout, 60, {"an owner that crashes on every start gives up after its budget with one "
@@ -165,7 +165,7 @@ open_stream_is_recovered() ->
     ?assertEqual(ok, wait_until(fun() -> frames_with(Conn, <<"or-cmd-1">>) > 0 end, ?PROMPT_MS)),
     ?assertEqual([recovered], outcomes()).
 
-%% Phase 1c G1: the owner keeps the hostname alone, so a restarted owner must
+%% The owner keeps the hostname alone, so a restarted owner must
 %% rebuild it from the owner table's copy of the start arguments. Both the
 %% successor's get_info/1 and the registry row (list_agents/2, which
 %% ListAgents and QueryInventory read) carry the original hostname.
@@ -553,7 +553,9 @@ start_with_stream(Id, Session, Fun) ->
 %% is started through the agent supervisor, as the Subscribe handler does.
 %% Opts: bind => true binds the session to the stand-in connection (its
 %% heartbeats are then admitted on that connection only); agent_info => Map
-%% replaces the default AgentInfo (#{agent_id => Id}).
+%% replaces the default AgentInfo (#{agent_id => Id}). The same
+%% AgentInfo term is both agent_info and register_req.info, as the Subscribe
+%% handler passes it, so the owner table stores it once (agent_info_from_req).
 start_with_stream(Id, Session, Fun, Opts) ->
     Parent = self(),
     Conn = spawn(fun conn_loop/0),
@@ -562,7 +564,7 @@ start_with_stream(Id, Session, Fun, Opts) ->
                            Args0 = #{agent_id => Id, agent_info => AgentInfo,
                                      stream_pid => self(), peer_addr => <<"127.0.0.1">>,
                                      session_id => Session,
-                                     register_req => #{info => #{agent_id => Id}}},
+                                     register_req => #{info => AgentInfo}},
                            Args = case maps:get(bind, Opts, false) of
                                       true  -> Args0#{conn_key => Conn};
                                       false -> Args0
