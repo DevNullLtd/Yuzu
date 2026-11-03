@@ -1770,9 +1770,10 @@ TEST_CASE("AuthDB MFA: regenerate refuses a deactivated account (no live codes)"
 // #4058 residual: a deactivated account's recovery code must not be consumable.
 // remove_user() DELETEs the codes, which would hide the gap, so this deactivates
 // by raw UPDATE and leaves the code rows in place — the out-of-band state the
-// `is_active` guard exists for. The SELECT and the UPDATE both carry the
-// guard; this end-to-end case cannot tell which one acted (the UPDATE-side window
-// between them is not deterministically reachable from a unit test).
+// `is_active` guard exists for. Both the candidate SELECT and the consuming statement carry the
+// guard; this case pins the SELECT side (an inactive account yields no candidate, so the consuming
+// statement never runs). The in-lock side is pinned by the "deactivated between the scan and the
+// lock" section of "AuthDB recovery consume takes the users row lock first ...".
 TEST_CASE("AuthDB MFA: recovery code is not consumable on an inactive account (#4058)",
           "[pg][auth_db][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
@@ -3529,6 +3530,28 @@ TEST_CASE("AuthDB recovery consume takes the users row lock first, bounded, and 
         REQUIRE(res.has_value());
         REQUIRE(res->has_value());
         CHECK_FALSE((*res)->ok);
+    }
+
+    SECTION("an account deactivated between the scan and the lock consumes nothing") {
+        PgConn locker = connect(db.dsn());
+        run_sql(locker.get(), "BEGIN");
+        run_sql(locker.get(), "SELECT 1 FROM auth.users WHERE username = 'r1' FOR UPDATE");
+        std::optional<std::expected<AuthDB::MfaVerification, AuthDBError>> res;
+        {
+            std::jthread t(
+                [&] { res = h.db.mfa_consume_recovery_code("r1", f.result.recovery_codes[0]); });
+            // The lock-free scan saw an active account and matched; the consume is queued on the
+            // users row, so only the consuming statement's own `is_active` test can refuse it.
+            CHECK(yuzu::test::wait_for_pg_lock_waiter(db.dsn(), "%WITH u AS MATERIALIZED%"));
+            run_sql(locker.get(), "UPDATE auth.users SET is_active = FALSE WHERE username = 'r1'");
+            run_sql(locker.get(), "COMMIT");
+        }
+        REQUIRE(res.has_value());
+        REQUIRE(res->has_value());
+        CHECK_FALSE((*res)->ok);
+        CHECK(scalar(h.conn.get(),
+                     "SELECT count(*) FROM auth.mfa_recovery_codes WHERE username = 'r1' "
+                     "AND consumed_at IS NOT NULL") == "0");
     }
 
     SECTION("two consumes of one code on two connections: exactly one wins") {

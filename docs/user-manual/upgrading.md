@@ -2,6 +2,11 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+**Cutting over to the MFA factor-binding build (#6079)?** It is a hard cutover with no rollback, and every
+enrolled operator needs a host-shell `yuzu-server --mfa-reset` before they can use the step-up routes, approvals or
+JIT elevation. Read [the cutover section](#breaking-mfa-proofs-are-bound-to-the-factor-they-were-earned-with-hard-cutover-with-no-upgrade-path-or-rollback-6079)
+and take the backup first.
+
 ## Behaviour change: Echo holds `echo.db` to a byte budget (an existing database is trimmed on the first maintenance pass)
 
 **What changed.** The Echo agent plugin holds `echo.db` to a byte budget, `db_budget_bytes` (default 262144000, 250 MiB; minimum 33554432, 32 MiB; set with `echo.configure`). The figure compared with it is `db_size_bytes` in `echo.status`, which now counts the used database pages plus the write-ahead log and no longer counts free pages (it counted every page in the database file before). When that figure is over the budget, the maintenance pass (every 15 minutes, or `echo.rollup`) permanently deletes the oldest raw capture rows that their first summary tier has already passed, never the newest 24 hours, then hourly rows older than 48 hours (5 days for `procperf`), even inside their retention window. Daily and monthly rows, the `usage` tables, paused or errored sources and sources with no summary tier are never removed. `retention_days` is stored only: it neither protects nor loses history. The budget applies to an `echo.db` that already exists, not only to new ones.
@@ -40,11 +45,6 @@ Lowering `db_budget_bytes` later deletes history the same way, within 15 minutes
 - **No setting restores the old default:** the caller passes `platform=windows`.
 - **MCP follows REST:** the MCP tool `list_dex_apps` takes the same `platform` argument (`all`, `windows`, `macos`, `linux`; default `all`), so an MCP caller that sends none now gets every platform too; pass `platform: "windows"` for the former figures. It also returns the additive `crash_source_coverage` field.
 > **Fresh deployment only.** 0.15.0 supports initial deployment into a freshly provisioned database; it provides no upgrade path from an earlier build's database or backups and no return to an earlier build. The server does not enforce this: migrations do not refuse a database written by another build, and an importer that runs at any boot where the database holds no import record for the file still reads leftover `enrollment-tokens.cfg` and `pending-agents.cfg` files without checking where they came from. Procedures below that describe upgrading, rolling back or restoring an earlier build's data are historical and not supported for 0.15.0 (see "Deployment contract (hard cutover)" in the Forensics section of this page).
-
-**Cutting over to the MFA factor-binding build (#6079)?** It is a hard cutover with no rollback, and every
-enrolled operator needs a host-shell `yuzu-server --mfa-reset` before they can use the step-up routes, approvals or
-JIT elevation. Read [the cutover section](#breaking-mfa-proofs-are-bound-to-the-factor-they-were-earned-with-hard-cutover-with-no-upgrade-path-or-rollback-6079)
-and take the backup first.
 
 ## ⚠️ Breaking: a user-store outage on Settings user create / role change and on SCIM `active:false` is now a retryable 503 with its own audit reason (#4068)
 

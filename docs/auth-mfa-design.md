@@ -231,20 +231,20 @@ password store: 100 000 iterations).
 Single-use enforcement: `mfa_consume_recovery_code` finds every unconsumed
 row for the user, constant-time-compares the salted hash against each
 candidate (bounded wall time regardless of which row matches — no early
-break, avoids leaking match position via timing), then on a Postgres schema
-`UPDATE auth.mfa_recovery_codes SET consumed_at = now() WHERE id = $1 AND
-consumed_at IS NULL RETURNING id` (abbreviated: the real statement also
-carries the `is_active` guard described below; originally, on SQLite, a
-`sqlite3_changes()` check served the same role — see the root `CLAUDE.md`
-`sqlite3_changes()` race note, #1033; Postgres's `RETURNING` was adopted
-directly rather than porting that idiom). The `WHERE consumed_at IS NULL`
-guard plus a zero-row `RETURNING` result means a concurrent consume that
-wins the race is treated as no-match by the loser — race-safe without an
-explicit transaction. Both the candidate `SELECT` and the consuming `UPDATE`
-also require the owning `auth.users` row to be `is_active = TRUE` (#4058), so
-a code on a deactivated account is refused as no-match and left unconsumed,
-matching the TOTP path. This is a statement-level guard, deliberately not a
-`FOR UPDATE` lock: the user row is not held across the PBKDF2 walk.
+break, avoids leaking match position via timing), then consumes the matched
+row in ONE statement inside a bounded transaction: a CTE locks the owning
+`auth.users` row `FOR UPDATE` (requiring `is_active = TRUE` and a non-NULL
+`mfa_enrolled_at`) and returns its factor generation, and the code row is
+set `consumed_at = now()` only if it is still unconsumed
+(`... WHERE c.id = $1 AND c.username = $2 AND c.consumed_at IS NULL RETURNING u.gen`).
+Lock order is the users row, then the code row, the order regeneration,
+enrolment and disable use. A concurrent consume that wins the race, a
+regeneration that deleted the candidate, or an account deactivated or cleared
+between the scan and the lock returns zero rows, which the loser treats as
+no-match. The candidate `SELECT` is the lock-free half: it also requires the
+owning row to be `is_active = TRUE` (#4058), so a code on a deactivated account
+is refused as no-match and left unconsumed, matching the TOTP path, and the
+user row is not held across the PBKDF2 walk.
 
 `mfa_regenerate_recovery_codes` deletes every row for the user (consumed
 or otherwise) and issues 10 fresh ones. The UI surfaces this when

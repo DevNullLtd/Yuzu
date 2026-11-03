@@ -878,9 +878,9 @@ public:
     std::expected<MfaVerification, AuthDBError> mfa_verify_login_code(const std::string& username,
                                                                       std::string_view code);
 
-    /// Consume a single recovery code for login or step-up. Returns true
+    /// Consume a single recovery code for login or step-up. `ok` is true
     /// if the code matched an unconsumed row (and that row is now
-    /// consumed). False on no-match (also false if the user has no
+    /// consumed). `ok` is false on no-match (also false if the user has no
     /// recovery codes / is not enrolled, or the account is inactive or
     /// removed — #4058). Recovery codes are PBKDF2-hashed,
     /// not envelope-encrypted (verify-only, ADR-0010 — no SecretCodec
