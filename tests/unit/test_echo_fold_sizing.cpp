@@ -92,7 +92,10 @@ std::string distinct_text(std::string_view src, std::string_view col, int n) {
 struct Built {
     TierAccumulator acc;
     std::vector<KeyedContribution> contributions; // cursor sources only
-    std::string distinct_col;
+    // A view into the source definition's static column name, never into this struct: a returned-by-value
+    // Built relocates a short std::string's buffer (MSVC debug does not elide the copy), and the keys of
+    // every contribution below hold string_views of this name.
+    std::string_view distinct_col;
 };
 
 // Realistic length of a TEXT measure: the registry value is the one large one (clipped to 512 B by
@@ -113,7 +116,7 @@ Built build(const FoldSourceDef& def) {
     Built b{TierAccumulator(def), {}, {}};
     for (const auto& c : def.columns)
         if (c.interned) {
-            b.distinct_col = std::string{c.name};
+            b.distinct_col = c.name;
             break;
         }
     NamedValues measures; // identical for every event
