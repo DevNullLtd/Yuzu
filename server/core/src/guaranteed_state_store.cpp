@@ -358,6 +358,7 @@ BEGIN
       (c, 'ingest_seq', 'bigint'::regtype, false, NULL),
       (c, 'ts_hwm', 'bigint'::regtype, false, NULL),
       (c, 'seq_hwm', 'bigint'::regtype, false, NULL),
+      (c, 'hwm_recv_ns', 'bigint'::regtype, false, NULL),
       (c, 'order_uncertain', 'boolean'::regtype, true, 'false')) v(rel, col, typ, nn, dflt)
   LOOP
     IF NOT EXISTS (SELECT 1 FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
@@ -423,6 +424,7 @@ ALTER TABLE guardian_agent_rule_status
     ADD COLUMN IF NOT EXISTS ingest_seq BIGINT,
     ADD COLUMN IF NOT EXISTS ts_hwm BIGINT,
     ADD COLUMN IF NOT EXISTS seq_hwm BIGINT,
+    ADD COLUMN IF NOT EXISTS hwm_recv_ns BIGINT,
     ADD COLUMN IF NOT EXISTS order_uncertain BOOLEAN NOT NULL DEFAULT FALSE;
 -- A census write that changes the verdict without changing its ordering tuple did not come from
 -- this version's upsert (which always moves key_ns or ingest_seq with the verdict): an earlier
@@ -1244,7 +1246,13 @@ std::expected<void, std::string> project_observation(PGconn* conn,
 // have unique values, duplicate deliveries reuse one, values are not contiguous). `order_uncertain`
 // says the row's verdict rests on a comparison that cannot be trusted (an unusable or capped key,
 // a key below the high-water mark `ts_hwm`, a pending event that outranks it, or a sequence that
-// disagrees with the key order) and clears only on a key strictly above the mark.
+// disagrees with the key order, or two different verdicts with the same key) and clears only on a
+// key strictly above the mark. A same-key pair of different verdicts is flagged because the agent
+// stamped both with the same instant (legacy agents stamp whole seconds), so arrival order is the
+// only order left and it is not emission order. `hwm_recv_ns` is the server receipt time at which
+// `ts_hwm` last rose: once an event arrives more than `kHwmStale` after it with a key below the
+// mark and a later arrival than the applied verdict, the mark is treated as stale (an agent clock
+// stepped back) and the verdict follows arrival order, still flagged until a key passes the mark.
 //
 // A first-delivery event whose census write fails stays stored with `projection_pending`; a
 // redelivery repairs it. No application-level pair lock, no heal clause and no repair skip:
@@ -1372,12 +1380,19 @@ constexpr const char* kCensusLockAll =
 
 // Fold the seen events into the existing row (UPDATE arm only; a no-op when the row is absent).
 // CORRELATED on c so Postgres re-evaluates it against the row's latest version after a lock wait.
+#define YUZU_CENSUS_FOLD_MAX_KEY_                                                                 \
+    "(SELECT max(e.proj_key) FROM guaranteed_state_store.guaranteed_state_events e "               \
+    "  WHERE e.event_id = ANY($3::text[]) AND " YUZU_CENSUS_SEEN_DISAGREES_ ")"
+
+// $4 is the server receipt time (ns) of the projection in progress; it becomes `hwm_recv_ns` when
+// the fold raises the mark.
 constexpr const char* kCensusFold =
     "UPDATE guaranteed_state_store.guardian_agent_rule_status c "
     "SET order_uncertain = true, "
+    "    hwm_recv_ns = CASE WHEN COALESCE(c.ts_hwm, 0) < COALESCE(" YUZU_CENSUS_FOLD_MAX_KEY_ ", 0) "
+    "                       THEN $4::bigint ELSE c.hwm_recv_ns END, "
     "    ts_hwm = NULLIF(GREATEST(COALESCE(c.ts_hwm, 0), "
-    "        (SELECT max(e.proj_key) FROM guaranteed_state_store.guaranteed_state_events e "
-    "          WHERE e.event_id = ANY($3::text[]) AND " YUZU_CENSUS_SEEN_DISAGREES_ ")), 0) "
+    "        COALESCE(" YUZU_CENSUS_FOLD_MAX_KEY_ ", 0)), 0) "
     "WHERE c.agent_id = $1 AND c.rule_id = $2 "
     "  AND EXISTS (SELECT 1 FROM guaranteed_state_store.guaranteed_state_events e "
     "               WHERE e.event_id = ANY($3::text[]) AND " YUZU_CENSUS_SEEN_DISAGREES_ ")";
@@ -1390,17 +1405,34 @@ constexpr const char* kCensusFold =
     "WHERE s.event_id = ANY($8::text[]))"
 
 // The apply predicate P: the incoming (key, seq) is above the row's.
-#define YUZU_CENSUS_APPLY_                                                                        \
+#define YUZU_CENSUS_APPLY_P_                                                                      \
     "(EXCLUDED.key_ns > COALESCE(c.key_ns, 0) OR (EXCLUDED.key_ns = COALESCE(c.key_ns, 0) "        \
     "AND EXCLUDED.ingest_seq > COALESCE(c.ingest_seq, 0)))"
+
+// Stale-mark recovery R: a usable key below the mark, a later arrival than the applied verdict, and
+// a mark that last rose more than kHwmStale (1 hour of server receipt time) ago. A row with no
+// recorded receipt (hwm_recv_ns NULL) never recovers. $9 is the receipt time of this projection.
+#define YUZU_CENSUS_STALE_NS_ "3600000000000"
+#define YUZU_CENSUS_RECOVER_                                                                      \
+    "(EXCLUDED.key_ns > 0 AND EXCLUDED.key_ns < COALESCE(c.ts_hwm, 0) "                            \
+    "AND EXCLUDED.ingest_seq > COALESCE(c.ingest_seq, 0) AND c.hwm_recv_ns IS NOT NULL "           \
+    "AND $9::bigint - c.hwm_recv_ns > " YUZU_CENSUS_STALE_NS_ ")"
+
+#define YUZU_CENSUS_APPLY_ "(" YUZU_CENSUS_APPLY_P_ " OR " YUZU_CENSUS_RECOVER_ ")"
+
+// Two different verdicts stamped with the same usable key: arrival order is all that separates them.
+#define YUZU_CENSUS_TIE_                                                                          \
+    "(EXCLUDED.key_ns <> 0 AND EXCLUDED.key_ns = COALESCE(c.key_ns, 0) AND EXCLUDED.state <> c.state)"
 
 // K + sticky upsert. $5 key, $6 seq, $7 capped, $8 seen list, $4 the event's timestamp text.
 constexpr const char* kCensusUpsert =
     "INSERT INTO guaranteed_state_store.guardian_agent_rule_status AS c "
-    "(agent_id, rule_id, state, updated_at, key_ns, ingest_seq, ts_hwm, seq_hwm, order_uncertain) "
+    "(agent_id, rule_id, state, updated_at, key_ns, ingest_seq, ts_hwm, seq_hwm, hwm_recv_ns, "
+    "order_uncertain) "
     "SELECT $1::text, $2::text, $3::text, $4::text, $5::bigint, $6::bigint, "
     "       NULLIF(GREATEST($5::bigint, COALESCE(pm.mk, 0)), 0), "
     "       GREATEST($6::bigint, COALESCE(" YUZU_CENSUS_SEEN_MAX_SEQ_ ", 0)), "
+    "       CASE WHEN $5::bigint > 0 OR pm.mk IS NOT NULL THEN $9::bigint END, "
     "       ($5::bigint = 0 OR $7::boolean OR pm.mk IS NOT NULL) "
     "  FROM (SELECT max(p.proj_key) AS mk "
     "          FROM guaranteed_state_store.guaranteed_state_events p "
@@ -1412,6 +1444,8 @@ constexpr const char* kCensusUpsert =
     "  updated_at = CASE WHEN " YUZU_CENSUS_APPLY_ " THEN EXCLUDED.updated_at ELSE c.updated_at END, "
     "  key_ns     = CASE WHEN " YUZU_CENSUS_APPLY_ " THEN EXCLUDED.key_ns     ELSE c.key_ns     END, "
     "  ingest_seq = CASE WHEN " YUZU_CENSUS_APPLY_ " THEN EXCLUDED.ingest_seq ELSE c.ingest_seq END, "
+    "  hwm_recv_ns = CASE WHEN EXCLUDED.key_ns > COALESCE(c.ts_hwm, 0) THEN $9::bigint "
+    "                     ELSE c.hwm_recv_ns END, "
     "  ts_hwm     = NULLIF(GREATEST(COALESCE(c.ts_hwm, 0), EXCLUDED.key_ns), 0), "
     "  seq_hwm    = GREATEST(COALESCE(c.seq_hwm, c.ingest_seq, 0), EXCLUDED.ingest_seq, "
     "                        COALESCE(" YUZU_CENSUS_SEEN_MAX_SEQ_ ", 0)), "
@@ -1422,11 +1456,14 @@ constexpr const char* kCensusUpsert =
     "       OR EXCLUDED.key_ns < COALESCE(c.ts_hwm, 0) "
     "       OR (c.order_uncertain AND EXCLUDED.key_ns <= COALESCE(c.ts_hwm, 0)) "
     "       OR EXCLUDED.ingest_seq < COALESCE(c.seq_hwm, c.ingest_seq, 0) "
+    "       OR " YUZU_CENSUS_TIE_ " "
     "       OR EXISTS (SELECT 1 FROM guaranteed_state_store.guaranteed_state_events p "
     "                   WHERE p.event_id = ANY($8::text[]) "
     "                     AND p.ingest_seq > EXCLUDED.ingest_seq)) "
-    "    ELSE (c.order_uncertain OR EXCLUDED.ingest_seq > COALESCE(c.ingest_seq, 0)) END "
+    "    ELSE (c.order_uncertain OR EXCLUDED.ingest_seq > COALESCE(c.ingest_seq, 0) "
+    "          OR " YUZU_CENSUS_TIE_ ") END "
     "WHERE " YUZU_CENSUS_APPLY_ " OR EXCLUDED.ingest_seq > COALESCE(c.ingest_seq, 0) "
+    "   OR " YUZU_CENSUS_TIE_ " "
     "   OR EXCLUDED.key_ns > COALESCE(c.ts_hwm, 0) "
     "   OR COALESCE(" YUZU_CENSUS_SEEN_MAX_SEQ_ ", 0) > COALESCE(c.seq_hwm, c.ingest_seq, 0) "
     "RETURNING (c.ingest_seq = $6::bigint) AS applied, c.order_uncertain";
@@ -1458,6 +1495,11 @@ constexpr const char* kCensusMarkPending =
 #undef YUZU_CENSUS_SEEN_DISAGREES_
 #undef YUZU_CENSUS_SEEN_MAX_SEQ_
 #undef YUZU_CENSUS_APPLY_
+#undef YUZU_CENSUS_APPLY_P_
+#undef YUZU_CENSUS_RECOVER_
+#undef YUZU_CENSUS_STALE_NS_
+#undef YUZU_CENSUS_TIE_
+#undef YUZU_CENSUS_FOLD_MAX_KEY_
 
 constexpr const char* kCensusRuleFkName = "guardian_agent_rule_status_rule_fk";
 // The two unique constraints an event INSERT can hit; the boot shape check requires both names.
@@ -1584,9 +1626,13 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
 
     std::vector<std::string_view> seen_views(seen.begin(), seen.end());
     const std::string seen_arr = pg::to_text_array(seen_views);
+    // The server receipt time of this projection: `hwm_recv_ns` when the mark rises, and the
+    // reference the stale-mark recovery measures against. Never taken from the agent.
+    const std::string recv_ns = std::to_string(wall_clock_ns());
     if (!seen.empty()) {
         pg::PgResult fold = pg::exec_params(
-            conn, kCensusFold, std::vector<std::string>{row.agent_id, row.rule_id, seen_arr});
+            conn, kCensusFold,
+            std::vector<std::string>{row.agent_id, row.rule_id, seen_arr, recv_ns});
         if (fold.status() != PGRES_COMMAND_OK)
             return fail(fold);
     }
@@ -1594,7 +1640,7 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
         conn, kCensusUpsert,
         std::vector<std::string>{row.agent_id, row.rule_id, std::string(state), row.timestamp,
                                  std::to_string(key), std::to_string(seq),
-                                 capped ? "true" : "false", seen_arr});
+                                 capped ? "true" : "false", seen_arr, recv_ns});
     if (up.status() != PGRES_TUPLES_OK)
         return fail(up);
     // Fold AGAIN, now that the row exists and is final for this statement: the first fold ran
@@ -1604,7 +1650,8 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
     // the first fold already applied; a no-op when `seen` is empty.
     if (!seen.empty()) {
         pg::PgResult refold = pg::exec_params(
-            conn, kCensusFold, std::vector<std::string>{row.agent_id, row.rule_id, seen_arr});
+            conn, kCensusFold,
+            std::vector<std::string>{row.agent_id, row.rule_id, seen_arr, recv_ns});
         if (refold.status() != PGRES_COMMAND_OK)
             return fail(refold);
     }

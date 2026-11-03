@@ -472,8 +472,35 @@ TEST_CASE("census ordering: the later key wins whatever the arrival order and sa
                 EventInsertOutcome::Inserted);
         REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 100)).outcome ==
                 EventInsertOutcome::Inserted);
+        // Arrival order is all that separates them, and it is not emission order: flagged.
         CHECK(census(db.dsn(), "a", "r1") ==
-              "compliant|" + key_str(kBase + 100) + "|" + key_str(kBase + 100) + "|false");
+              "compliant|" + key_str(kBase + 100) + "|" + key_str(kBase + 100) + "|true");
+    }
+    SECTION("the same key and the same verdict: nothing to doubt") {
+        REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase + 100)).outcome ==
+                EventInsertOutcome::Inserted);
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kDrifted, kBase + 100)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "drifted|" + key_str(kBase + 100) + "|" + key_str(kBase + 100) + "|false");
+    }
+    SECTION("a same-key flag clears on the next key strictly above the mark") {
+        REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase + 100)).outcome ==
+                EventInsertOutcome::Inserted);
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 100)).outcome ==
+                EventInsertOutcome::Inserted);
+        REQUIRE(census(db.dsn(), "a", "r1").ends_with("|true"));
+        REQUIRE(store.insert_event_classified(ev("e3", "r1", "a", kErrored, kBase + 200)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "errored|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|false");
+    }
+    SECTION("a same-key pair with an unusable key is already flagged by the key, not by the tie") {
+        REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, 0)).outcome ==
+                EventInsertOutcome::Inserted);
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, 0)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1").ends_with("|true"));
     }
     SECTION("an arrival that is newer in sequence but older in key leaves the verdict and flags it") {
         REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kCompliant, kBase + 100)).outcome ==
@@ -934,7 +961,7 @@ TEST_CASE("census ordering: two concurrent first deliveries to one pair match th
           "[pg][guaranteed_state_store][db][census][ordering][lockorder]") {
     // With no pending rows nothing but the census row serialises two first deliveries of one pair.
     // Whatever the interleaving, the winner is the greater (key, ingest_seq) and the row is flagged
-    // exactly when the later arrival (higher ingest_seq) has the lower key.
+    // exactly when the later arrival (higher ingest_seq) has the lower or the same key.
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
@@ -971,7 +998,8 @@ TEST_CASE("census ordering: two concurrent first deliveries to one pair match th
         const bool later_is_a = sa > sb;
         const std::int64_t later_key = later_is_a ? ka : kb;
         const std::int64_t earlier_key = later_is_a ? kb : ka;
-        const bool expect_flag = later_key < earlier_key;
+        // Different verdicts with the same key are flagged too (arrival order is not emission order).
+        const bool expect_flag = later_key <= earlier_key;
         INFO("pair " << i << " ka=" << ka << " kb=" << kb << " sa=" << sa << " sb=" << sb);
         CHECK(census(db.dsn(), agent, "r1") ==
               std::string(a_wins ? "drifted" : "compliant") + "|" + key_str(kBase + win_key) + "|" +
@@ -1172,6 +1200,75 @@ TEST_CASE("census ordering: the uncertain-rule count honours the caller's scope"
     GuaranteedStateStore closed(dead);
     CHECK(closed.uncertain_rule_count(Scope{std::vector<std::string>{}}).value() == 0);
     CHECK_FALSE(closed.uncertain_rule_count(Scope{}).has_value());
+}
+
+TEST_CASE("census ordering: a stale high-water mark stops freezing the verdict after an hour (UP-11)",
+          "[pg][guaranteed_state_store][db][census][ordering][stale]") {
+    // An agent clock that steps backwards stamps every later event below the mark. Within the hour
+    // after the mark last rose the verdict is held and flagged; after it, arrival order governs
+    // (still flagged) until a key passes the mark.
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    const auto age_mark = [&](const char* by) {
+        exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
+                               ".guardian_agent_rule_status SET hwm_recv_ns = hwm_recv_ns - " + by +
+                               " WHERE agent_id = 'a' AND rule_id = 'r1'");
+    };
+    REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase + 1000)).outcome ==
+            EventInsertOutcome::Inserted);
+
+    SECTION("inside the hour a lower key is refused and the verdict is held") {
+        age_mark("3599000000000"); // 59 min 59 s
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 500)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "drifted|" + key_str(kBase + 1000) + "|" + key_str(kBase + 1000) + "|true");
+    }
+    SECTION("past the hour a lower key applies by arrival, stays flagged, and keeps the mark") {
+        age_mark("3601000000000"); // 60 min 1 s
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 500)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "compliant|" + key_str(kBase + 500) + "|" + key_str(kBase + 1000) + "|true");
+        // The next event in the new clock frame also applies, still flagged.
+        REQUIRE(store.insert_event_classified(ev("e3", "r1", "a", kErrored, kBase + 600)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "errored|" + key_str(kBase + 600) + "|" + key_str(kBase + 1000) + "|true");
+        // A key strictly above the mark ends the doubt.
+        REQUIRE(store.insert_event_classified(ev("e4", "r1", "a", kCompliant, kBase + 2000)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "compliant|" + key_str(kBase + 2000) + "|" + key_str(kBase + 2000) + "|false");
+    }
+    SECTION("an unusable key never recovers, however old the mark") {
+        age_mark("7200000000000");
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, 0)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "drifted|" + key_str(kBase + 1000) + "|" + key_str(kBase + 1000) + "|true");
+    }
+    SECTION("a row with no recorded receipt never recovers") {
+        exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
+                               ".guardian_agent_rule_status SET hwm_recv_ns = NULL");
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 500)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "drifted|" + key_str(kBase + 1000) + "|" + key_str(kBase + 1000) + "|true");
+    }
+    SECTION("the receipt time moves only when the mark rises") {
+        const std::string before = query_scalar(
+            db.dsn(), std::string("SELECT hwm_recv_ns FROM ") + kSchema +
+                          ".guardian_agent_rule_status WHERE agent_id = 'a'");
+        REQUIRE_FALSE(before.empty());
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 500)).outcome ==
+                EventInsertOutcome::Inserted); // refused: the mark does not rise
+        CHECK(query_scalar(db.dsn(), std::string("SELECT hwm_recv_ns FROM ") + kSchema +
+                                         ".guardian_agent_rule_status WHERE agent_id = 'a'") == before);
+    }
 }
 
 TEST_CASE("census ordering: a refused later arrival is remembered when an earlier one applies afterwards",
