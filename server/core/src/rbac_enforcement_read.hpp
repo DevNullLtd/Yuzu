@@ -15,14 +15,17 @@
 ///     it does consult the cached enforcement label, but only to choose which durable source
 ///     answers (Administrator grant rows when enforcement is on or unconfirmed, the local
 ///     account role when it is off); the answer itself is read from those durable rows and then
-///     the regime check. So it is not independent of cache state: while the view is degraded an
-///     account with no Administrator grant row reads `unconfirmed`, and `enabled:false,
-///     unconfirmed:true` with `administrator:unconfirmed` is a real answer. Every combination of
-///     the two groups is legitimate. The HTML fragment skips the hint on a degraded view only
-///     because it cannot draw a usable switch then; that is a rendering decision, not an
-///     authority fact, and this builder deliberately does NOT copy it. An engine, a
-///     service-scoped or (on REST) an MCP-tier credential is `may_not` from structural checks
-///     before any store is read.
+///     the regime check. So it is not independent of cache state. While the cached value is a
+///     stale OFF (`enabled:false, unconfirmed:true`) an account with no Administrator grant row
+///     reads `unconfirmed`, because the predicate cannot tell a missing grant from a stale view.
+///     While it is a stale ON (`enabled:true, unconfirmed:true`) the label is `enabled`, so the
+///     same account reads `may_not`: a missing grant row is then a confirmed absence. Every
+///     combination of the two groups is legitimate. The HTML fragment skips the hint on a
+///     degraded view only because it cannot draw a usable switch then; that is a rendering
+///     decision, not an authority fact, and this builder deliberately does NOT copy it. An
+///     engine, or (on REST) an MCP-tier credential, is `may_not` from structural checks before
+///     any store is read. A service-scoped token never reaches this builder: both transports
+///     refuse it first.
 ///
 /// `administrator` is ADVISORY. `may` means the RBAC administration routes would admit this
 /// credential's durable authority now. It does NOT promise a mutation succeeds: REST MFA

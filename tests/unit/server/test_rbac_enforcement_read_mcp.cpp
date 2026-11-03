@@ -280,7 +280,9 @@ TEST_CASE("MCP get_rbac_enforcement: served metadata is typed, strict and read-o
     CHECK(desc.find("MFA step-up") != std::string::npos);
     CHECK(desc.find("rbac.enforcement.read") != std::string::npos);
     CHECK(desc.find("audit_persisted") != std::string::npos);
-    CHECK(desc.find("retry_after_ms") != std::string::npos);
+    // Retry guidance is part of the contract: a successful read carries no retry_after_ms (only the
+    // store-unavailable error does), and the description says so.
+    CHECK(desc.find("a successful read carries no retry_after_ms") != std::string::npos);
     // The stale pointer to the tracking issue is gone from the sibling get_me text.
     // Held in a local: a range-for over a member of a returned temporary would dangle.
     const auto all_tools = rig.raw(R"({"jsonrpc":"2.0","method":"tools/list","id":3})");
@@ -487,7 +489,7 @@ TEST_CASE("MCP get_rbac_enforcement: an engine principal reads may_not, a SAML p
     }
 }
 
-// ── unconfirmed and administrator are independent ──────────────────────────────────────────────
+// ── unconfirmed and administrator answer different questions ──────────────────────────────────────────────
 
 TEST_CASE("MCP get_rbac_enforcement: unconfirmed:false with administrator:unconfirmed (regime store "
           "unreadable) is legitimate and the body carries no store text",
@@ -535,7 +537,7 @@ TEST_CASE("MCP get_rbac_enforcement: a degraded enforcement view gives unconfirm
 
     McpRig rig{h, &replica_b};
 
-    SECTION("an engine principal is definitively may_not in every store state") {
+    SECTION("an engine principal reads may_not while the view is degraded") {
         h.session_principal_kind = "engine";
         const auto body = rig.call();
         const auto sc = success_body(rig, body);
@@ -571,6 +573,10 @@ TEST_CASE("MCP get_rbac_enforcement: a degraded view with RBAC off is enabled:fa
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(5200));
     REQUIRE(replica_b.rbac_enabled_view_degraded());
 
+    // What this proves: the replica's only connection is held, so the grant read cannot run, and an
+    // unreadable store reads administrator:unconfirmed alongside unconfirmed:true, with the domain
+    // audit row carrying both. It does NOT prove the label rule (a degraded label plus an absent
+    // grant row maps to unconfirmed): that is pinned by the REST twin in test_rbac_enforcement_read.cpp.
     McpRig rig{h, &replica_b};
     const auto body = rig.call();
     const auto sc = success_body(rig, body);

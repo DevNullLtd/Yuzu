@@ -3702,8 +3702,12 @@ an advisory `administrator` verdict (`may`, `may_not`, `unconfirmed`); the MCP t
   the result when the view is degraded. The predicate behind it does consult the cached enforcement
   label, but only to choose which durable source answers (Administrator grant rows when enforcement
   is on or unconfirmed, the local account role when it is off); the answer itself is read from those
-  rows and then the regime check. So it is not independent of cache state: while the view is
-  unconfirmed an account with no Administrator grant row reads `administrator: "unconfirmed"`.
+  rows and then the regime check. So it is not independent of cache state. While the cached value
+  is a stale off (`enabled:false` with `unconfirmed:true`), an account with no Administrator grant
+  row reads `administrator:"unconfirmed"`, because the predicate cannot tell a missing grant from
+  a stale view. While it is a stale on (`enabled:true` with `unconfirmed:true`), the same account
+  reads `administrator:"may_not"`, because enforcement is on and a missing grant row is a
+  confirmed absence.
   The two uses of "unconfirmed" (the boolean about the view, the value about the verdict) can
   appear in any combination. The hint now has two production callers, the `rbac_admin_hint_fn`
   wiring in `server.cpp` and `read_rbac_enforcement`; the read consumes the answer and changes no
@@ -3712,11 +3716,14 @@ an advisory `administrator` verdict (`may`, `may_not`, `unconfirmed`); the MCP t
 - **`administrator` defined.** `may` = the RBAC administration routes (role assignment and
   `PUT /rbac/enforcement`) would admit this credential's durable authority now; `may_not` = they
   would refuse it; `unconfirmed` = a required store could not answer, retry. A client treats any
-  value it does not recognise as `unconfirmed`. Engine, service-scoped and (on REST) MCP-tier
-  credentials are `may_not` from structural checks before any store is read; SSO-only principals,
-  SCIM-deactivated accounts, JIT-elevated administrators and group-held Administrators read
-  `may_not` because only durable user-type grants count (clause 3). A just-revoked Administrator
-  reads `may_not` on a fresh read, but a cached view on another replica can lag.
+  value it does not recognise as `unconfirmed`. Engine and (on REST) MCP-tier credentials are
+  `may_not` from structural checks before any store is read (a service-scoped token never receives
+  a verdict: it is refused 403 before any verdict, by the explicit REST deny and the C8 gate on
+  MCP); SSO-only principals, SCIM-deactivated accounts, JIT-elevated administrators and
+  group-held Administrators read `may_not` because only durable user-type grants count with
+  enforcement on, and the local account role with it off (clause 3). A just-revoked Administrator
+  reads `may_not` on a fresh read; what can lag on another replica is the cached `enabled` value,
+  which only selects which source applies.
 - **Advisory, not a promise.** `may` means the RBAC administration routes would admit this
   credential's durable authority now. It is not a go signal for a mutation. It excludes REST MFA step-up, the MCP tier and approval
   ladder (a readonly-tier administrator reads `may` on MCP and `set_rbac_enforcement` still

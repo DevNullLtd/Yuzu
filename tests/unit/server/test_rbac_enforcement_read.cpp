@@ -480,7 +480,7 @@ TEST_CASE("GET /api/v1/rbac/enforcement: verdict equals rbac_admin_hint on kRest
     REQUIRE(res->status == 200);
     const auto d = data_of(res->body);
     // The view is healthy (unconfirmed:false) while the hint could not be confirmed: the two
-    // groups are independent.
+    // groups answer different questions.
     CHECK(d["unconfirmed"] == false);
     CHECK(d["administrator"] == "unconfirmed");
     CHECK(d["administrator"].get<std::string>() == std::string(to_string(hint_of(h))));
@@ -595,6 +595,39 @@ TEST_CASE("GET /api/v1/rbac/enforcement: a degraded view is served on the wire a
     }
 }
 
+TEST_CASE("GET /api/v1/rbac/enforcement: a stale-on view with no grant row reads enabled:true, unconfirmed:true, administrator:may_not",
+          "[pg][rbac_enforcement_read]") {
+    RbacRoleHarness h;
+    pg::PgPool pool_b{{.conninfo = h.auth_db.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+
+    // A local human account with no Administrator grant row, RBAC durably ON, so the replica
+    // caches "on" at construction and then goes stale. Enforcement is on and a missing grant row
+    // is a confirmed absence, so the verdict is may_not even though the view is unconfirmed (a
+    // stale OFF, by contrast, cannot call the same missing row a denial: see the RBAC-off section
+    // of the degraded-view case above).
+    make_user(h, h.session_user, auth::Role::user);
+    h.rbac->set_rbac_enabled(true);
+    RbacStore replica{pool_b};
+    REQUIRE(replica.is_open());
+    degrade_view(replica, pool_b);
+
+    ReadRoute route{&replica, h.auth_db.get(), /*audit_wired=*/true};
+    route.username = h.session_user;
+    const auto res = route.sink.Get(kPath);
+    REQUIRE(res);
+    INFO("status=" << res->status << " body=" << res->body);
+    REQUIRE(res->status == 200);
+    const auto d = data_of(res->body);
+    CHECK(d["enabled"] == true);
+    CHECK(d["unconfirmed"] == true);
+    CHECK(d["administrator"] == "may_not");
+
+    REQUIRE(route.audit_log.size() == 1);
+    CHECK(route.audit_log.front().action == kAuditAction);
+    CHECK(route.audit_log.front().detail == "enabled=true; unconfirmed=true; administrator=may_not");
+}
+
 TEST_CASE("GET /api/v1/rbac/enforcement: a service-scoped token is 403 with a denied audit row and no permission named",
           "[pg][rbac_enforcement_read]") {
     RbacRoleHarness h;
@@ -666,6 +699,9 @@ TEST_CASE("GET /api/v1/rbac/enforcement: an audit row that cannot be persisted i
     const auto j = parse_json(res->body);
     REQUIRE(j.contains("error"));
     CHECK_FALSE(j.contains("data"));
+    // The refusal is retryable, and says when: the same shared hint as the store-unavailable 503.
+    REQUIRE(j["error"]["retry_after_ms"].is_number_integer());
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == mcp::kMcpStoreFaultRetryMs);
     CHECK(res->body.find("\"enabled\"") == std::string::npos);
     CHECK(res->body.find("\"unconfirmed\"") == std::string::npos);
     CHECK(res->body.find("\"administrator\"") == std::string::npos);

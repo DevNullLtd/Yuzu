@@ -67,7 +67,8 @@ The response reads (`response.read`, on `/api/responses/*` and `/api/v1/response
 and every served read there adds one audit INSERT, so a polling script on those routes raises audit
 volume; the audit reaper's retention cap is the only backpressure.
 The RBAC enforcement read (`GET /api/v1/rbac/enforcement`, audit action `rbac.enforcement.read`) is
-another such route: each served read adds one audit INSERT, and on REST it fails closed, so an audit
+another such route: each served REST read adds one audit INSERT (each MCP read adds two,
+`rbac.enforcement.read` and `mcp.get_rbac_enforcement`), and on REST it fails closed, so an audit
 outage answers it `503` with `Sec-Audit-Failed: true` and no state (the MCP twin returns the data with
 `audit_persisted: false`). Do not use that read to confirm enforcement state during an audit outage.
 

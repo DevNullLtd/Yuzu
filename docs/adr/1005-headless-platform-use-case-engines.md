@@ -1128,8 +1128,14 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `administrator` (`may`, `may_not`, `unconfirmed`) is the advisory
      administration hint on the caller's own surface, decided from durable
      grant rows or the local account role (the cached view only selects which
-     applies); it is neither forced nor hidden when the view is unconfirmed, but
-     an account with no Administrator grant row reads `unconfirmed` then. Second, the REST route is
+     applies); it is neither forced nor hidden when the view is unconfirmed.
+     While the cached value is a stale off (`enabled:false` with
+     `unconfirmed:true`), an account with no Administrator grant row reads
+     `administrator:"unconfirmed"`, because the predicate cannot tell a missing
+     grant from a stale view. While it is a stale on (`enabled:true` with
+     `unconfirmed:true`), the same account reads `administrator:"may_not"`,
+     because enforcement is on and a missing grant row is a confirmed absence.
+     Second, the REST route is
      session-only: it calls `auth_fn`, refuses a service-scoped token, and
      holds no `perm_fn` gate. The ground is parity with its HTML fragment and
      with `GET /api/v1/me`, both session-only; a
@@ -1153,10 +1159,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      can read `enabled:false, unconfirmed:false` while another replica
      enforces, bounded by the stale-serve window (#2703).
      (c) The REST route is not RBAC-gated, the same class as `GET /api/v1/me`
-     and `POST /api/v1/rbac/check`.
-     Retiring the two session-only `NO_GATE` entries (this route and
-     `GET /api/v1/me`) is tracked by #6432, the same follow-up the `get_me`
-     sibling entry names (`exception:#6432 revisit:2026-11-30`).
+     and `POST /api/v1/rbac/check`. #6432 tracks only the `get_me`
+     service-scope asymmetry over MCP (`exception:#6432 revisit:2026-11-30`);
+     it does not cover retiring the two session-only `NO_GATE` entries (this
+     route and `GET /api/v1/me`). A tracker for retiring both together is yet
+     to be filed.
      (d) "Audit every read" means every read on a deployment with a wired audit
      sink: REST fails closed on an audit-write failure (503 with
      `Sec-Audit-Failed`, body never sent), MCP reports `audit_persisted:false`,

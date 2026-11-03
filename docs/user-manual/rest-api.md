@@ -3371,23 +3371,29 @@ combination in the table below is legitimate.
 
 `may` is advisory and is NOT a go signal for a mutation. It excludes the REST MFA step-up, the MCP
 tier and approval ladder, and the PUT's destination-regime `409`, and the server decides again on
-every PUT. The check looks at durable user-type Administrator grants only, so these principals
-read `may_not` even when they can act as an administrator in some other way: an SSO-only (OIDC
-linked) principal, a SCIM-deactivated account, a just-in-time (JIT) elevated administrator, and an
-Administrator held only through a group. A just-revoked Administrator reads `may_not` on a fresh
-read, but a cached view on another replica can lag. On REST an engine session reads `may_not`
-(engines are not Administrators), and so does an MCP-tier token, because the REST predicate
-denies any MCP-tier credential structurally: this credential cannot administer RBAC through REST,
-which says nothing about its owner's roles. The MCP twin applies no tier rule, so an MCP
-administrator reads `may` whatever its tier, even where the mutation is then refused.
+every PUT. With enforcement on, the check looks at durable user-type Administrator grants only;
+with enforcement off, it looks at the caller's local account role (an inactive account is a
+confirmed absence). So these principals read `may_not` even when they can act as an administrator
+in some other way: an SSO-only (OIDC linked) principal, a SCIM-deactivated account, a
+just-in-time (JIT) elevated administrator, and an Administrator held only through a group. A
+just-revoked Administrator reads `may_not` on a fresh read; what can lag on another replica is the
+cached `enabled` value, which only selects which of the two sources applies. On REST an engine
+session reads `may_not` (engines are not Administrators), and so does an MCP-tier token, because
+the REST predicate denies any MCP-tier credential structurally: this credential cannot administer
+RBAC through REST, which says nothing about its owner's roles. The MCP twin applies no tier rule,
+so an MCP administrator reads `may` whatever its tier, even where the mutation is then refused. A
+service-scoped token never receives a verdict: it is refused (`403`) before any verdict.
 
 The verdict is decided from durable grant rows, or from the local account role when enforcement is
 off; the cached view only selects which of the two applies. It is neither forced nor hidden when the
-view is unconfirmed (the HTML fragment skips the hint in that case; this route does not), but an
-account with no Administrator grant row reads `administrator: "unconfirmed"` while the view is
-unconfirmed. So `enabled: false, unconfirmed: true, administrator: "unconfirmed"` is a real answer.
-An engine, a service-scoped token and (on REST) an MCP-tier token are `may_not` from structural
-checks before any store is read.
+view is unconfirmed (the HTML fragment skips the hint in that case; this route does not). While the
+cached value is a stale off (`enabled: false` with `unconfirmed: true`), an account with no
+Administrator grant row reads `administrator: "unconfirmed"`, because the predicate cannot tell a
+missing grant from a stale view. While it is a stale on (`enabled: true` with `unconfirmed: true`),
+the same account reads `administrator: "may_not"`, because enforcement is on and a missing grant row
+is a confirmed absence. So `enabled: false, unconfirmed: true, administrator: "unconfirmed"` is a
+real answer. An engine and (on REST) an MCP-tier token are `may_not` from structural checks before
+any store is read; a service-scoped token is refused (`403`) before any verdict.
 
 **What a client should do:**
 
