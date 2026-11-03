@@ -248,6 +248,15 @@ public:
     /// reachable without holding real concurrent queries.
     void set_apps_read_budget_for_test(int n) noexcept { apps_read_budget_ = n; }
 
+    /// Test seam for the census lock order: `fn` runs immediately after the pair-lock statement
+    /// (every pending event row of the (agent, rule) pair, locked in `ingest_seq` order) returns
+    /// and before the census row is touched, so a test can hold one writer at that point while a
+    /// second writer, or `delete_rule`, runs. Production leaves it empty (a no-op). Set it before
+    /// the store is used concurrently and clear it with an empty function.
+    void set_census_lock_barrier_for_test(std::function<void()> fn) {
+        census_lock_barrier_ = std::move(fn);
+    }
+
     // Rule CRUD. Mutating methods return `std::expected<void, std::string>`
     // (fail-hard — ADR-0038 posture). Duplicate-UNIQUE collisions (name or
     // rule_id) are reported as an error prefixed with `kConflictPrefix` so
@@ -539,6 +548,7 @@ private:
     std::atomic<uint64_t> events_dropped_{0};      // event_id conflict, MISMATCHED payload
     std::atomic<uint64_t> events_redelivered_{0};  // event_id conflict, MATCHING payload
     std::atomic<uint64_t> events_ingest_errors_{0}; // operational ingest fault
+    std::function<void()> census_lock_barrier_;     // test seam, empty in production
 
     // Compute ttl_expires_at = now + retention_days*86400 in epoch seconds;
     // retention_days <= 0 means "never expire" (returns 0, the sentinel the

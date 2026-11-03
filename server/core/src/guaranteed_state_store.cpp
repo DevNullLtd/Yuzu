@@ -202,10 +202,11 @@ std::string format_conflict(std::string_view detail) {
 // detection backend produces it, so it is dormant until the agent's prefer_spark
 // default flips. guard.armed, guard.disarmed and guard.healthy are deliberately NOT
 // mapped: they are lifecycle or recovery markers, not verdicts.
-// Ordering: project_rule_status keeps a row when the new updated_at is >= the stored
-// one. Event timestamps have one-second resolution, so two distinct events in the same
-// second tie and the later arrival wins; an exact redelivery of one event_id exits at
-// insert_event_classified (Redelivered/Conflict) before the census write is reached.
+// Ordering: project_rule_status replaces a census row when the event's ordering key K is
+// above the stored one, K being the agent stamp bounded by receipt plus 300 s (0 when the stamp
+// is absent or unusable), and breaks an exact tie by the event's INSERT-allocated ingest_seq. An
+// exact redelivery of one event_id exits at insert_event_classified (Redelivered/Conflict) before
+// a first-delivery census write is reached; it reaches the census only to repair pending evidence.
 const char* event_state_from_type(const std::string& t) {
     if (t == "guard.compliant" || t == "drift.remediated")
         return "compliant";
@@ -1065,16 +1066,23 @@ namespace {
 // embedded-NUL reject at the ingest boundary already rules out a truncated
 // exact-match false positive).
 //
-// Returns: true = idempotent redelivery, false = genuine field mismatch,
+// Returns: match = idempotent redelivery, !match = genuine field mismatch,
 // unexpected = the compare itself could NOT be performed (an OPERATIONAL
-// error) — mapped to Error by the caller, never a false collision.
-std::expected<bool, std::string> stored_event_matches(PGconn* conn,
-                                                       const GuaranteedStateEventRow& in) {
+// error) — mapped to Error by the caller, never a false collision. `pending` is the stored
+// row's projection_pending, a HINT only: it is not part of the equality, and the repair re-reads
+// it under a row lock.
+struct StoredEventMatch {
+    bool match{false};   // every compared field equals the incoming row
+    bool pending{false}; // the stored row still carries pending census evidence (a hint)
+};
+
+std::expected<StoredEventMatch, std::string> stored_event_matches(PGconn* conn,
+                                                                   const GuaranteedStateEventRow& in) {
     pg::PgResult res = pg::exec_params(
         conn,
         "SELECT rule_id, agent_id, event_type, guard_type, guard_category, detected_value, "
         "expected_value, remediation_action, remediation_success, detection_latency_us, "
-        "remediation_latency_us, timestamp, detail_json "
+        "remediation_latency_us, timestamp, detail_json, projection_pending "
         "FROM guaranteed_state_store.guaranteed_state_events WHERE event_id = $1",
         std::vector<std::string>{in.event_id});
     if (res.status() != PGRES_TUPLES_OK)
@@ -1093,7 +1101,7 @@ std::expected<bool, std::string> stored_event_matches(PGconn* conn,
         to_i64(PQgetvalue(res.get(), 0, 9)) == in.detection_latency_us &&
         to_i64(PQgetvalue(res.get(), 0, 10)) == in.remediation_latency_us &&
         text_col(res.get(), 0, 11) == in.timestamp && text_col(res.get(), 0, 12) == in.detail_json;
-    return match;
+    return StoredEventMatch{match, to_bool(PQgetvalue(res.get(), 0, 13))};
 }
 
 // Project one ruleless DEX observation into guardian_observations. Caller
@@ -1165,77 +1173,282 @@ std::expected<void, std::string> project_observation(PGconn* conn,
     return {};
 }
 
-enum class CensusOutcome {
-    Applied,   // upserted (or a stale event matched the ON CONFLICT guard: zero rows, not an error)
-    Rejected,  // SQLSTATE 23503: the rule is gone; definitive, not a fault
-    Failed,    // any other statement error; the savepoint was rolled back and released, the
-               // transaction is usable
-    Abandoned, // a savepoint control statement failed; the transaction must be abandoned
+// ── Census ordering (schema v4, #5690) ───────────────────────────────────────────────────────
+//
+// The contract: a census row says which verdict has the greatest ordering key among the events
+// that reached it, never "the latest event". `key_ns` is K = min(agent stamp, receipt + 300 s),
+// 0 when the stamp is absent or unusable; ties break by `ingest_seq`, the sequence value the event
+// INSERT allocated (later arrival = higher sequence, not emission or commit order; distinct events
+// have unique values, duplicate deliveries reuse one, values are not contiguous). `order_uncertain`
+// says the row's verdict rests on a comparison that cannot be trusted (an unusable or capped key,
+// a key below the high-water mark `ts_hwm`, a pending event that outranks it, or a sequence that
+// disagrees with the key order) and clears only on a key strictly above the mark.
+//
+// A first-delivery event whose census write fails stays stored with `projection_pending`; a
+// redelivery repairs it. No application-level pair lock, no heal clause and no repair skip:
+// Postgres row locks serialise a pair. Every pending event row of the pair is locked in
+// `ingest_seq` order in ONE statement, then the census row is touched, and `delete_rule` locks the
+// rule's pending rows the same way before it retires them and deletes the rule. The order is the
+// same everywhere, so no cycle can form.
+
+constexpr std::int64_t kReceiptSkewCapNs = 300'000'000'000LL; // receipt + 300 s bounds the key
+
+struct OrderingKey {
+    std::int64_t key{0};
+    bool capped{false};
 };
 
-// Write one (agent, rule) compliance state inside the caller's open transaction, under
-// SAVEPOINT census_upsert, so a failed upsert never aborts the transaction holding the
-// event. Rejected and Failed leave the transaction usable (the savepoint was rolled back and
-// released); neither failure discards the event, which is stored when the caller commits.
-// Abandoned means a SAVEPOINT, ROLLBACK TO or RELEASE statement itself failed, so the
-// transaction may be aborted and the caller must return an error without committing (a
+// K from the validated agent stamp and the receipt (both ns). A stamp at or below 0 is unusable.
+OrderingKey derive_ordering_key(std::int64_t agent_ns, std::int64_t received_ns) noexcept {
+    if (agent_ns <= 0)
+        return {};
+    const std::int64_t bound =
+        received_ns > std::numeric_limits<std::int64_t>::max() - kReceiptSkewCapNs
+            ? std::numeric_limits<std::int64_t>::max()
+            : received_ns + kReceiptSkewCapNs;
+    if (agent_ns > bound)
+        return {bound, true};
+    return {agent_ns, false};
+}
+
+std::int64_t wall_clock_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// The ONE predicate for "this event takes part in the census": it decides both whether the event
+// is stored with pending evidence and whether any census statement runs for it.
+bool census_bearing(const GuaranteedStateEventRow& row) {
+    return !row.agent_id.empty() && !row.rule_id.empty() && !is_reserved_rule_id(row.rule_id) &&
+           event_state_from_type(row.event_type) != nullptr;
+}
+
+enum class ProjectionSource {
+    FirstDelivery, // the event was just inserted in this transaction
+    Repair,        // a redelivery of an event stored with pending evidence
+};
+
+enum class CensusOutcome {
+    Applied,        // the event became the row's verdict
+    RefusedFlagged, // a row was touched but the event did not become the verdict (flag raised)
+    RefusedNoop,    // zero rows: the event is dominated and nothing changed
+    PendingRetired, // repair only: the event's pending evidence was retired concurrently
+    Rejected,       // the rule is gone (the census foreign key, 23503); definitive, not a fault
+    Failed,         // any other statement error; savepoint rolled back and released, pending stays
+    Abandoned,      // a savepoint control or the outer clear failed; abandon the transaction
+};
+
+// Lock EVERY pending event of the pair (self included) in ingest_seq order, in one statement.
+// First delivery: self is an uncommitted own row and always present. Repair: self absent means it
+// was retired concurrently (no repair); present means its stored (proj_key, proj_key_capped,
+// ingest_seq) are the projection inputs. The other rows are the `seen` list.
+constexpr const char* kCensusLockAll =
+    "SELECT event_id, proj_key, proj_key_capped, ingest_seq "
+    "FROM guaranteed_state_store.guaranteed_state_events "
+    "WHERE rule_id = $2 AND agent_id = $1 AND projection_pending "
+    "ORDER BY ingest_seq FOR UPDATE";
+
+// "Not dominated by the census row": a seen event that outranks it, or that arrived later than the
+// verdict (higher sequence) although its key is not higher. Retiring such an event without a flag
+// would lose the disagreement between arrival order and key order.
+#define YUZU_CENSUS_SEEN_DISAGREES_                                                               \
+    "((e.proj_key, e.ingest_seq) > (COALESCE(c.key_ns, 0), COALESCE(c.ingest_seq, 0)) "            \
+    "OR e.ingest_seq > COALESCE(c.ingest_seq, 0))"
+
+// Fold the seen events into the existing row (UPDATE arm only; a no-op when the row is absent).
+// CORRELATED on c so Postgres re-evaluates it against the row's latest version after a lock wait.
+constexpr const char* kCensusFold =
+    "UPDATE guaranteed_state_store.guardian_agent_rule_status c "
+    "SET order_uncertain = true, "
+    "    ts_hwm = NULLIF(GREATEST(COALESCE(c.ts_hwm, 0), "
+    "        (SELECT max(e.proj_key) FROM guaranteed_state_store.guaranteed_state_events e "
+    "          WHERE e.event_id = ANY($3::text[]) AND " YUZU_CENSUS_SEEN_DISAGREES_ ")), 0) "
+    "WHERE c.agent_id = $1 AND c.rule_id = $2 "
+    "  AND EXISTS (SELECT 1 FROM guaranteed_state_store.guaranteed_state_events e "
+    "               WHERE e.event_id = ANY($3::text[]) AND " YUZU_CENSUS_SEEN_DISAGREES_ ")";
+
+// The apply predicate P: the incoming (key, seq) is above the row's.
+#define YUZU_CENSUS_APPLY_                                                                        \
+    "(EXCLUDED.key_ns > COALESCE(c.key_ns, 0) OR (EXCLUDED.key_ns = COALESCE(c.key_ns, 0) "        \
+    "AND EXCLUDED.ingest_seq > COALESCE(c.ingest_seq, 0)))"
+
+// K + sticky upsert. $5 key, $6 seq, $7 capped, $8 seen list, $4 the event's timestamp text.
+constexpr const char* kCensusUpsert =
+    "INSERT INTO guaranteed_state_store.guardian_agent_rule_status AS c "
+    "(agent_id, rule_id, state, updated_at, key_ns, ingest_seq, ts_hwm, order_uncertain) "
+    "SELECT $1::text, $2::text, $3::text, $4::text, $5::bigint, $6::bigint, "
+    "       NULLIF(GREATEST($5::bigint, COALESCE(pm.mk, 0)), 0), "
+    "       ($5::bigint = 0 OR $7::boolean OR pm.mk IS NOT NULL) "
+    "  FROM (SELECT max(p.proj_key) AS mk "
+    "          FROM guaranteed_state_store.guaranteed_state_events p "
+    "         WHERE p.event_id = ANY($8::text[]) "
+    "           AND ((p.proj_key, p.ingest_seq) > ($5::bigint, $6::bigint) "
+    "                OR p.ingest_seq > $6::bigint)) pm "
+    "ON CONFLICT (agent_id, rule_id) DO UPDATE SET "
+    "  state      = CASE WHEN " YUZU_CENSUS_APPLY_ " THEN EXCLUDED.state      ELSE c.state      END, "
+    "  updated_at = CASE WHEN " YUZU_CENSUS_APPLY_ " THEN EXCLUDED.updated_at ELSE c.updated_at END, "
+    "  key_ns     = CASE WHEN " YUZU_CENSUS_APPLY_ " THEN EXCLUDED.key_ns     ELSE c.key_ns     END, "
+    "  ingest_seq = CASE WHEN " YUZU_CENSUS_APPLY_ " THEN EXCLUDED.ingest_seq ELSE c.ingest_seq END, "
+    "  ts_hwm     = NULLIF(GREATEST(COALESCE(c.ts_hwm, 0), EXCLUDED.key_ns), 0), "
+    "  order_uncertain = CASE WHEN " YUZU_CENSUS_APPLY_ " THEN "
+    "      (EXCLUDED.key_ns = 0 "
+    "       OR $7::boolean "
+    "       OR (c.key_ns IS NOT NULL AND c.key_ns = 0) "
+    "       OR EXCLUDED.key_ns < COALESCE(c.ts_hwm, 0) "
+    "       OR (c.order_uncertain AND EXCLUDED.key_ns <= COALESCE(c.ts_hwm, 0)) "
+    "       OR EXCLUDED.ingest_seq < COALESCE(c.ingest_seq, 0) "
+    "       OR EXISTS (SELECT 1 FROM guaranteed_state_store.guaranteed_state_events p "
+    "                   WHERE p.event_id = ANY($8::text[]) "
+    "                     AND p.ingest_seq > EXCLUDED.ingest_seq)) "
+    "    ELSE (c.order_uncertain OR EXCLUDED.ingest_seq > COALESCE(c.ingest_seq, 0)) END "
+    "WHERE " YUZU_CENSUS_APPLY_ " OR EXCLUDED.ingest_seq > COALESCE(c.ingest_seq, 0) "
+    "   OR EXCLUDED.key_ns > COALESCE(c.ts_hwm, 0) "
+    "RETURNING (c.ingest_seq = $6::bigint) AS applied, c.order_uncertain";
+
+// Retire ONLY the event itself and the rows the pair-lock statement returned, and only what the
+// final row dominates. A pending row that committed after the lock statement is never touched.
+constexpr const char* kCensusClear =
+    "UPDATE guaranteed_state_store.guaranteed_state_events p SET projection_pending = false "
+    "FROM guaranteed_state_store.guardian_agent_rule_status c "
+    "WHERE c.agent_id = $1 AND c.rule_id = $2 "
+    "  AND p.agent_id = c.agent_id AND p.rule_id = c.rule_id AND p.projection_pending "
+    "  AND (p.event_id = $3 OR p.event_id = ANY($4::text[])) "
+    "  AND (p.proj_key, p.ingest_seq) <= (COALESCE(c.key_ns, 0), COALESCE(c.ingest_seq, 0))";
+
+// After a rejected (rule gone) write the event has nothing to project onto: retire it in the OUTER
+// transaction, after the savepoint was rolled back and released.
+constexpr const char* kCensusOuterClear =
+    "UPDATE guaranteed_state_store.guaranteed_state_events SET projection_pending = false "
+    "WHERE event_id = $1";
+
+#undef YUZU_CENSUS_SEEN_DISAGREES_
+#undef YUZU_CENSUS_APPLY_
+
+constexpr const char* kCensusRuleFkName = "guardian_agent_rule_status_rule_fk";
+// The two unique constraints an event INSERT can hit; the boot shape check requires both names.
+constexpr const char* kEventPrimaryKeyName = "guaranteed_state_events_pkey";
+constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
+
+// Project one census-bearing event into the (agent, rule) row inside the caller's open
+// transaction, under SAVEPOINT census_upsert: pair lock, fold, K + sticky upsert, clear. A failed
+// statement is rolled back to the savepoint and released, so it never aborts the transaction
+// holding the event. Failed leaves the event stored with its pending evidence (counted on
+// `failures`, logged at error); Rejected (the census foreign key, and only that constraint) is a
+// definitive "the rule is gone", not counted, and the event's pending evidence is retired in the
+// outer transaction; Abandoned means a savepoint control statement or that outer retire failed,
+// so the transaction may be aborted and the caller must return an error without committing (a
 // COMMIT of an aborted transaction reports success to libpq).
-// An Abandoned outcome after a failed census statement is logged at error with that
-// statement's error (it is not counted on `failures`; the caller's error is counted as an
-// ingest error). A Failed outcome is counted on `failures` and logged at error. A Rejected outcome is not
-// counted and is logged at debug only; the database server still records the refused
-// statement in its own log. The count moves before the caller's COMMIT, so a COMMIT that
-// then fails leaves it one ahead of the events actually stored.
+// For a Repair the three inputs are overwritten from the locked row's stored values.
 [[nodiscard]] CensusOutcome project_rule_status(PGconn* conn, std::atomic<uint64_t>& failures,
+                                                const std::function<void()>& lock_barrier,
                                                 const GuaranteedStateEventRow& row,
-                                                const char* state) {
-    if (row.agent_id.empty() || row.rule_id.empty())
-        return CensusOutcome::Applied; // nothing to write
+                                                const char* state, ProjectionSource source,
+                                                std::int64_t key, std::int64_t seq, bool capped) {
     const auto control = [conn](const char* sql) {
         return pg::exec_params(conn, sql, std::vector<std::string>{}).status() ==
                PGRES_COMMAND_OK;
     };
     if (!control("SAVEPOINT census_upsert"))
         return CensusOutcome::Abandoned;
-    pg::PgResult res = pg::exec_params(
-        conn,
-        "INSERT INTO guaranteed_state_store.guardian_agent_rule_status "
-        "(agent_id, rule_id, state, updated_at) VALUES ($1,$2,$3,$4) "
-        "ON CONFLICT (agent_id, rule_id) DO UPDATE SET state = EXCLUDED.state, "
-        "updated_at = EXCLUDED.updated_at "
-        "WHERE EXCLUDED.updated_at >= guardian_agent_rule_status.updated_at",
-        std::vector<std::string>{row.agent_id, row.rule_id, std::string(state), row.timestamp});
-    if (res.status() == PGRES_COMMAND_OK)
-        return control("RELEASE SAVEPOINT census_upsert") ? CensusOutcome::Applied
-                                                          : CensusOutcome::Abandoned;
-    const char* sqlstate_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
-    const bool rejected = sqlstate_p && std::string_view(sqlstate_p) == "23503";
-    const std::string err = PQresultErrorMessage(res.get());
-    // ROLLBACK TO keeps the savepoint defined, so release it too: a batch otherwise stacks
-    // one live savepoint per failed row until the transaction ends.
-    if (!control("ROLLBACK TO SAVEPOINT census_upsert") ||
-        !control("RELEASE SAVEPOINT census_upsert")) {
-        // The caller reports only the control statement's own libpq text, so record the census
-        // error that started this here or it is lost.
-        spdlog::error("GuaranteedStateStore: census write abandoned, the census statement failed "
-                      "and its savepoint could not be rolled back and released, the event is "
-                      "not stored event_id={} agent_id={} rule_id={}: {}",
+
+    const auto fail = [&](pg::PgResult& res) -> CensusOutcome {
+        const char* state_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+        const char* name_p = PQresultErrorField(res.get(), PG_DIAG_CONSTRAINT_NAME);
+        const bool rejected = state_p != nullptr && std::string_view(state_p) == "23503" &&
+                              name_p != nullptr &&
+                              std::string_view(name_p) == kCensusRuleFkName;
+        const std::string err = PQresultErrorMessage(res.get());
+        // ROLLBACK TO keeps the savepoint defined, so release it too.
+        if (!control("ROLLBACK TO SAVEPOINT census_upsert") ||
+            !control("RELEASE SAVEPOINT census_upsert")) {
+            spdlog::error("GuaranteedStateStore: census write abandoned, the census statement "
+                          "failed and its savepoint could not be rolled back and released, the "
+                          "event is not stored event_id={} agent_id={} rule_id={}: {}",
+                          log_id_token(row.event_id), log_id_token(row.agent_id),
+                          log_id_token(row.rule_id), ::yuzu::log_key_token(err));
+            return CensusOutcome::Abandoned;
+        }
+        if (rejected) {
+            spdlog::debug("GuaranteedStateStore: census write refused, rule not defined on this "
+                          "server agent_id={} rule_id={}",
+                          log_id_token(row.agent_id), log_id_token(row.rule_id));
+            pg::PgResult outer = pg::exec_params(conn, kCensusOuterClear,
+                                                 std::vector<std::string>{row.event_id});
+            if (outer.status() != PGRES_COMMAND_OK) {
+                spdlog::error("GuaranteedStateStore: could not retire the pending evidence of an "
+                              "event whose rule is gone, the event is not stored event_id={} "
+                              "agent_id={} rule_id={}: {}",
+                              log_id_token(row.event_id), log_id_token(row.agent_id),
+                              log_id_token(row.rule_id),
+                              ::yuzu::log_key_token(PQresultErrorMessage(outer.get())));
+                return CensusOutcome::Abandoned;
+            }
+            return CensusOutcome::Rejected;
+        }
+        failures.fetch_add(1, std::memory_order_relaxed);
+        spdlog::error("GuaranteedStateStore: census upsert failed (status row not updated, event "
+                      "kept with pending evidence) event_id={} agent_id={} rule_id={}: {}",
                       log_id_token(row.event_id), log_id_token(row.agent_id),
                       log_id_token(row.rule_id), ::yuzu::log_key_token(err));
-        return CensusOutcome::Abandoned;
+        return CensusOutcome::Failed;
+    };
+
+    pg::PgResult lock = pg::exec_params(conn, kCensusLockAll,
+                                        std::vector<std::string>{row.agent_id, row.rule_id});
+    if (lock.status() != PGRES_TUPLES_OK)
+        return fail(lock);
+    if (lock_barrier)
+        lock_barrier();
+    std::vector<std::string> seen;
+    bool self_found = false;
+    for (int i = 0; i < PQntuples(lock.get()); ++i) {
+        const std::string id = PQgetvalue(lock.get(), i, 0);
+        if (id != row.event_id) {
+            seen.push_back(id);
+            continue;
+        }
+        self_found = true;
+        if (source == ProjectionSource::Repair) {
+            key = PQgetisnull(lock.get(), i, 1) ? 0 : to_i64(PQgetvalue(lock.get(), i, 1));
+            capped = to_bool(PQgetvalue(lock.get(), i, 2));
+            seq = to_i64(PQgetvalue(lock.get(), i, 3));
+        }
     }
-    if (rejected) {
-        spdlog::debug("GuaranteedStateStore: census write refused, rule not defined on this "
-                      "server (event not discarded) agent_id={} rule_id={}",
-                      log_id_token(row.agent_id), log_id_token(row.rule_id));
-        return CensusOutcome::Rejected;
+    if (source == ProjectionSource::Repair && !self_found) {
+        spdlog::debug("GuaranteedStateStore: pending evidence retired concurrently, no repair "
+                      "event_id={}",
+                      log_id_token(row.event_id));
+        return control("RELEASE SAVEPOINT census_upsert") ? CensusOutcome::PendingRetired
+                                                          : CensusOutcome::Abandoned;
     }
-    failures.fetch_add(1, std::memory_order_relaxed);
-    spdlog::error("GuaranteedStateStore: census upsert failed (status row not updated, event "
-                  "not discarded by this failure) event_id={} agent_id={} rule_id={}: {}",
-                  log_id_token(row.event_id), log_id_token(row.agent_id),
-                  log_id_token(row.rule_id), ::yuzu::log_key_token(err));
-    return CensusOutcome::Failed;
+
+    std::vector<std::string_view> seen_views(seen.begin(), seen.end());
+    const std::string seen_arr = pg::to_text_array(seen_views);
+    if (!seen.empty()) {
+        pg::PgResult fold = pg::exec_params(
+            conn, kCensusFold, std::vector<std::string>{row.agent_id, row.rule_id, seen_arr});
+        if (fold.status() != PGRES_COMMAND_OK)
+            return fail(fold);
+    }
+    pg::PgResult up = pg::exec_params(
+        conn, kCensusUpsert,
+        std::vector<std::string>{row.agent_id, row.rule_id, std::string(state), row.timestamp,
+                                 std::to_string(key), std::to_string(seq),
+                                 capped ? "true" : "false", seen_arr});
+    if (up.status() != PGRES_TUPLES_OK)
+        return fail(up);
+    CensusOutcome out = CensusOutcome::RefusedNoop;
+    if (PQntuples(up.get()) == 1)
+        out = !PQgetisnull(up.get(), 0, 0) && std::string_view(PQgetvalue(up.get(), 0, 0)) == "t"
+                  ? CensusOutcome::Applied
+                  : CensusOutcome::RefusedFlagged;
+    pg::PgResult clear = pg::exec_params(
+        conn, kCensusClear,
+        std::vector<std::string>{row.agent_id, row.rule_id, row.event_id, seen_arr});
+    if (clear.status() != PGRES_COMMAND_OK)
+        return fail(clear);
+    return control("RELEASE SAVEPOINT census_upsert") ? out : CensusOutcome::Abandoned;
 }
 
 } // namespace
@@ -1283,27 +1496,41 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
     if (sp.status() != PGRES_COMMAND_OK)
         return op_error(std::string("SAVEPOINT failed: ") + PQerrorMessage(conn), kReasonQueryError);
 
+    // The ordering inputs: K from the validated agent stamp and the receipt (the store's own clock
+    // when the caller supplied none), and whether this event takes part in the census at all.
+    const OrderingKey ordering = derive_ordering_key(
+        row.agent_ns, row.received_ns != 0 ? row.received_ns : wall_clock_ns());
+    const bool bearing = census_bearing(row);
+
+    // ingest_seq is never named: the identity allocates it, and RETURNING hands it back as the
+    // event's place in the arrival order.
     pg::PgResult ins = pg::exec_params(
         conn,
         "INSERT INTO guaranteed_state_store.guaranteed_state_events "
         "(event_id, rule_id, agent_id, event_type, severity, guard_type, guard_category, "
         " detected_value, expected_value, remediation_action, remediation_success, "
-        " detection_latency_us, remediation_latency_us, timestamp, ttl_expires_at, detail_json) "
+        " detection_latency_us, remediation_latency_us, timestamp, ttl_expires_at, detail_json, "
+        " proj_key, proj_key_capped, projection_pending) "
         "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::boolean,$12::bigint,$13::bigint,$14,"
-        "$15::bigint,$16)",
+        "$15::bigint,$16,$17::bigint,$18::boolean,$19::boolean) "
+        "RETURNING ingest_seq",
         std::vector<std::string>{row.event_id, row.rule_id, row.agent_id, row.event_type,
                                  row.severity, row.guard_type, row.guard_category,
                                  row.detected_value, row.expected_value, row.remediation_action,
                                  std::string(row.remediation_success ? "true" : "false"),
                                  std::to_string(row.detection_latency_us),
                                  std::to_string(row.remediation_latency_us), row.timestamp,
-                                 std::to_string(ttl), row.detail_json});
+                                 std::to_string(ttl), row.detail_json,
+                                 std::to_string(ordering.key), ordering.capped ? "true" : "false",
+                                 bearing ? "true" : "false"});
 
-    if (ins.status() != PGRES_COMMAND_OK) {
+    if (ins.status() != PGRES_TUPLES_OK) {
         const char* sqlstate_p = PQresultErrorField(ins.get(), PG_DIAG_SQLSTATE);
         const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
+        const char* constraint_p = PQresultErrorField(ins.get(), PG_DIAG_CONSTRAINT_NAME);
+        const std::string constraint = constraint_p ? constraint_p : "";
         const std::string err = PQresultErrorMessage(ins.get());
-        if (sqlstate == "23505") {
+        if (sqlstate == "23505" && constraint == kEventPrimaryKeyName) {
             // event_id already present. Un-abort the transaction (Postgres aborts the
             // WHOLE transaction on a failed statement, unlike SQLite) so the compare
             // SELECT below can run on the SAME connection/transaction — load-bearing
@@ -1316,7 +1543,23 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
             auto matched = stored_event_matches(conn, row);
             if (!matched)
                 return op_error("redelivery compare failed: " + matched.error(), kReasonQueryError);
-            if (*matched) {
+            if (matched->match) {
+                // A redelivery of an event stored with pending census evidence repairs it: the
+                // event is projected from its STORED ordering inputs (the redelivery's receipt is
+                // never used). Failed leaves the evidence for the next redelivery.
+                if (matched->pending && bearing) {
+                    const CensusOutcome repaired = project_rule_status(
+                        conn, census_proj_failures_, census_lock_barrier_, row,
+                        event_state_from_type(row.event_type), ProjectionSource::Repair, 0, 0,
+                        false);
+                    if (repaired == CensusOutcome::Abandoned)
+                        return op_error(std::string("census savepoint failed: ") +
+                                            PQerrorMessage(conn),
+                                        kReasonQueryError);
+                    if (!txn.commit())
+                        return op_error(std::string("commit failed: ") + PQerrorMessage(conn),
+                                        kReasonQueryError);
+                }
                 events_redelivered_.fetch_add(1, std::memory_order_relaxed);
                 return {EventInsertOutcome::Redelivered, {}};
             }
@@ -1325,8 +1568,18 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
                     format_conflict("event_id '" + row.event_id +
                                     "' already exists with different fields")};
         }
+        if (sqlstate == "23505") {
+            // The sequence index (or any other unique constraint) refused the insert: not a
+            // redelivery and not a collision of event ids, so it must never read as either.
+            return op_error(constraint == kEventSeqIndexName
+                                ? "ingest sequence collision (constraint " + constraint + "): " + err
+                                : "unique violation on unexpected constraint '" + constraint +
+                                      "': " + err,
+                            kReasonQueryError);
+        }
         return op_error("insert failed: " + err, kReasonQueryError);
     }
+    const std::int64_t ingest_seq = PQntuples(ins.get()) == 1 ? to_i64(PQgetvalue(ins.get(), 0, 0)) : 0;
 
     // DEX projection: ruleless observations only, under its own SAVEPOINT so a
     // projection failure degrades (event kept) instead of aborting the whole
@@ -1354,12 +1607,12 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
     // Census upsert in the SAME transaction as the event, so the two commit or roll back
     // together; a refused or failed census write is rolled back to its own savepoint and
     // never takes the event with it (see project_rule_status).
-    if (!is_reserved_rule_id(row.rule_id))
-        if (const char* state = event_state_from_type(row.event_type))
-            if (project_rule_status(conn, census_proj_failures_, row, state) ==
-                CensusOutcome::Abandoned)
-                return op_error(std::string("census savepoint failed: ") + PQerrorMessage(conn),
-                                kReasonQueryError);
+    if (bearing &&
+        project_rule_status(conn, census_proj_failures_, census_lock_barrier_, row,
+                            event_state_from_type(row.event_type), ProjectionSource::FirstDelivery,
+                            ordering.key, ingest_seq, ordering.capped) == CensusOutcome::Abandoned)
+        return op_error(std::string("census savepoint failed: ") + PQerrorMessage(conn),
+                        kReasonQueryError);
 
     if (!txn.commit())
         return op_error(std::string("commit failed: ") + PQerrorMessage(conn), kReasonQueryError);
@@ -1408,15 +1661,20 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
     const int64_t ttl = compute_ttl_epoch();
 
     for (const auto& row : rows) {
+        const OrderingKey ordering = derive_ordering_key(
+            row.agent_ns, row.received_ns != 0 ? row.received_ns : wall_clock_ns());
+        // projection_pending is explicitly false: this path does not abort on a failed census
+        // write, so it would otherwise strand evidence nothing repairs (no production caller).
         pg::PgResult ins = pg::exec_params(
             conn,
             "INSERT INTO guaranteed_state_store.guaranteed_state_events "
             "(event_id, rule_id, agent_id, event_type, severity, guard_type, guard_category, "
             " detected_value, expected_value, remediation_action, remediation_success, "
             " detection_latency_us, remediation_latency_us, timestamp, ttl_expires_at, "
-            " detail_json) "
+            " detail_json, proj_key, proj_key_capped, projection_pending) "
             "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::boolean,$12::bigint,$13::bigint,$14,"
-            "$15::bigint,$16)",
+            "$15::bigint,$16,$17::bigint,$18::boolean,false) "
+            "RETURNING ingest_seq",
             std::vector<std::string>{row.event_id, row.rule_id, row.agent_id, row.event_type,
                                      row.severity, row.guard_type, row.guard_category,
                                      row.detected_value, row.expected_value,
@@ -1424,24 +1682,34 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
                                      std::string(row.remediation_success ? "true" : "false"),
                                      std::to_string(row.detection_latency_us),
                                      std::to_string(row.remediation_latency_us), row.timestamp,
-                                     std::to_string(ttl), row.detail_json});
-        if (ins.status() != PGRES_COMMAND_OK) {
+                                     std::to_string(ttl), row.detail_json,
+                                     std::to_string(ordering.key),
+                                     ordering.capped ? "true" : "false"});
+        if (ins.status() != PGRES_TUPLES_OK) {
             const char* sqlstate_p = PQresultErrorField(ins.get(), PG_DIAG_SQLSTATE);
             const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
-            if (sqlstate == "23505")
+            const char* constraint_p = PQresultErrorField(ins.get(), PG_DIAG_CONSTRAINT_NAME);
+            const std::string constraint = constraint_p ? constraint_p : "";
+            if (sqlstate == "23505" && constraint == kEventPrimaryKeyName)
                 return std::unexpected(
                     format_conflict("event_id '" + row.event_id + "' already exists"));
+            if (sqlstate == "23505")
+                return std::unexpected("unexpected unique violation on constraint '" + constraint +
+                                       "': " + std::string(PQresultErrorMessage(ins.get())));
             return std::unexpected("insert failed: " + std::string(PQresultErrorMessage(ins.get())));
         }
+        const std::int64_t ingest_seq =
+            PQntuples(ins.get()) == 1 ? to_i64(PQgetvalue(ins.get(), 0, 0)) : 0;
         // Census upsert inside the batch transaction, rolled back with the batch on any later
         // failure; a refused or failed census write is isolated by its own savepoint, as in
         // insert_event_classified.
-        if (!is_reserved_rule_id(row.rule_id))
-            if (const char* state = event_state_from_type(row.event_type))
-                if (project_rule_status(conn, census_proj_failures_, row, state) ==
-                    CensusOutcome::Abandoned)
-                    return std::unexpected(std::string("census savepoint failed: ") +
-                                           PQerrorMessage(conn));
+        if (census_bearing(row) &&
+            project_rule_status(conn, census_proj_failures_, census_lock_barrier_, row,
+                                event_state_from_type(row.event_type),
+                                ProjectionSource::FirstDelivery, ordering.key, ingest_seq,
+                                ordering.capped) == CensusOutcome::Abandoned)
+            return std::unexpected(std::string("census savepoint failed: ") +
+                                   PQerrorMessage(conn));
         // DEX projection — same degrade-don't-destroy contract as insert_event,
         // under its own SAVEPOINT (Postgres aborts on any failed statement).
         if (is_reserved_rule_id(row.rule_id)) {
