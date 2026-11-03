@@ -432,11 +432,11 @@ TEST_CASE_METHOD(MfaFixture,
     auto original = db->mfa_verify_enrollment("alice", code_for_now(init->secret_base32),
                                               std::nullopt);
     REQUIRE(original.has_value());
-    REQUIRE(original->size() == 10);
+    REQUIRE(original->recovery_codes.size() == 10);
 
     auto regen = [&] {
         ForcedCsprngFailure forced;
-        auto r = db->mfa_regenerate_recovery_codes("alice");
+        auto r = db->mfa_regenerate_recovery_codes("alice", std::nullopt);
         REQUIRE_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
         return r;
     }();
@@ -448,9 +448,9 @@ TEST_CASE_METHOD(MfaFixture,
     auto s = db->mfa_status("alice");
     REQUIRE(s.has_value());
     REQUIRE(s->recovery_codes_remaining == 10);
-    auto consumed = db->mfa_consume_recovery_code("alice", (*original)[0]);
+    auto consumed = db->mfa_consume_recovery_code("alice", original->recovery_codes[0]);
     REQUIRE(consumed.has_value());
-    REQUIRE(*consumed);
+    REQUIRE(consumed->ok);
 }
 
 TEST_CASE_METHOD(MfaFixture,
@@ -482,7 +482,7 @@ TEST_CASE_METHOD(MfaFixture,
     // Same code, healthy CSPRNG: the enrolment now succeeds with ten codes.
     auto ok = db->mfa_verify_enrollment("alice", code, std::nullopt);
     REQUIRE(ok.has_value());
-    REQUIRE(ok->size() == 10);
+    REQUIRE(ok->recovery_codes.size() == 10);
     auto after = db->mfa_status("alice");
     REQUIRE(after.has_value());
     REQUIRE(after->enrolled);
