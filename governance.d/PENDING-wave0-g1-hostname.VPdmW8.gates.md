@@ -64,6 +64,7 @@ Routed-concern walk, row by row, against the `origin/dev` copies of all four tab
 | 8 | FINDINGS (pass 3) | security-guardian, docs-writer, gateway-erlang, quality-engineer, enterprise-readiness (fix diff a36406e00..de065b23f; no routed row matches) | 0/0/1 (g8p3-ge-1, I7)/0/1 NICE (g8-doc-1 residual); g3-qe-2 and g8-ge-1 confirmed closed; orchestrator eunit 2484/2484, dialyzer clean at de065b23f | 3 |
 | 7 | DONE (round 3) | gateway-erlang (producing agent) | g8p3-ge-1, g8-doc-1 residual (7941dcfc6) | 3 |
 | 8 | PASS (pass 4) | security-guardian, docs-writer, gateway-erlang, quality-engineer, enterprise-readiness (fix diff fc2d188d3..7941dcfc6; no routed row matches) | 0/0/0/0/1 NICE (g8p4-ge-1); orchestrator eunit 2484/2484, dialyzer clean at 7941dcfc6 | 4 |
+| 8 | PASS (pass 6) | docs-writer, gateway-erlang (independent Rule 4 re-review of e9fc76a8f; neither is the fixer) | 0/0/0/0/1 NICE (b6-doc-1, pre-existing, not owed); b5-g8-doc-1 confirmed closed, superseding the pass-5 self-review row | 6 |
 
 ## Verdict
 
