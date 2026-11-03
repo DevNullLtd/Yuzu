@@ -40,6 +40,7 @@ for bin in yuzu-server yuzu-agent; do
 done
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-server.service" "$TOPDIR/SOURCES/"
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-agent.service" "$TOPDIR/SOURCES/"
+cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-agent-dmi-snapshot.sh" "$TOPDIR/SOURCES/"
 # Postgres provisioning helper, shipped in the server RPM (ADR-0006, #1320)
 cp "$SCRIPT_DIR/../../../scripts/install-server-postgres.sh" "$TOPDIR/SOURCES/"
 

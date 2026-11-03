@@ -1130,7 +1130,7 @@ TEST_CASE("ScimRoutes: deprovision refused for a DB-elevated admin even with a C
     // treated that as "no elevation on file" — deactivating an admin an
     // operator had promoted out of SCIM's ownership. THIS test's fix
     // (contemporaneous with H2) reads the role authoritatively from AuthDB
-    // via a dedicated helper (db_authoritative_role) at the specific
+    // via a dedicated helper (db_authoritative_role_checked) at the specific
     // deprovision-role-check call site. (get_user_role() ITSELF stayed
     // cache-only until a much later, separate governance BLOCKING fix — see
     // the NOTE a few lines below — so as of THIS test's own authoring date
@@ -1165,7 +1165,7 @@ TEST_CASE("ScimRoutes: deprovision refused for a DB-elevated admin even with a C
     // lockout state, nothing else) that happens to be the ONLY mechanism
     // AuthManager exposes for loading an entry into a cold `users_` map.
     // This is NOT priming the thing H2 actually fixes (the role read below
-    // still goes through `db_authoritative_role`'s DB-authoritative path
+    // still goes through `db_authoritative_role_checked`'s DB-authoritative path
     // regardless of cache state) — it works around a SEPARATE, pre-existing
     // quirk this test surfaced: `AuthManager::remove_user()`'s bool return
     // is `users_.erase(username) > 0`, so on a truly virgin cache it
@@ -3706,7 +3706,7 @@ TEST_CASE("Groups integration: sec-L3/#7 member cap over HTTP — >5000 members 
 // to genuinely fail: an invalid username, a missing/inactive row, or a raw
 // write error from AuthDB. The first two are unreachable here — every read
 // this function performs first (`get_provisioning_source`, then
-// `db_authoritative_role`/`get_user`) shape-checks and `is_active=1`-filters
+// `db_authoritative_role_checked`/`get_user`) shape-checks and `is_active=1`-filters
 // identically to `update_role` itself, over the SAME username string, so
 // they fail together, never letting the reads succeed while only the write
 // fails (that would need concurrent mid-request mutation of the SAME
@@ -3739,7 +3739,7 @@ TEST_CASE("Groups integration: a genuine update_role failure during recompute au
     auto group_id = json::parse(group_post->body)["id"].get<std::string>();
 
     // Plant a trigger that aborts ONLY an UPDATE of 'carol's role column —
-    // reads (get_provisioning_source/db_authoritative_role, both plain
+    // reads (get_provisioning_source/db_authoritative_role_checked, both plain
     // SELECTs) are untouched, so they resolve exactly as they would on the
     // happy path; only the subsequent `AuthDB::update_role` UPDATE fails.
     // AuthDB is now Postgres-backed (ADR-0006), so this uses a PL/pgSQL
@@ -6613,12 +6613,13 @@ TEST_CASE("ScimRoutes: PUT active=false on a desynced mirror answers a retryable
     CHECK_FALSE(f.auth_mgr.get_user_role("ursula2").has_value());
 }
 
-// CHARACTERISATION of what the #4068 fix does NOT cover (governance Gate 5, CH-1): the same store
-// outage answers differently depending on WHERE it bites. Each cell is a measured fact, pinned so
-// the follow-ups that make these retryable 503s (#6835: tri-state ScimStore reads / bearer
-// validation; #6836: deactivate()'s provenance and role checks) are a deliberate, visible edit of
-// these values.
-TEST_CASE("ScimRoutes: characterisation - store-outage answers the #4068 fix does not cover",
+// CHARACTERISATION (governance Gate 5, CH-1): the same store outage answers differently depending
+// on WHERE it bites. Each cell is a measured fact, pinned so the follow-up that makes the
+// remaining one a retryable 503 (#6835: tri-state ScimStore reads / bearer validation) is a
+// deliberate, visible edit of these values. #6836 flipped the first cell (404 -> 503); the second
+// (401 at bearer validation) still awaits #6835.
+TEST_CASE("ScimRoutes: characterisation - a whole-pool outage still answers 401 at bearer "
+          "validation (#6835); the provenance cell was flipped to 503 by #6836",
           "[pg][scim][routes][patch][deprovision][store-error][characterisation]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "chara"}})->body);
@@ -6626,16 +6627,18 @@ TEST_CASE("ScimRoutes: characterisation - store-outage answers the #4068 fix doe
     json patch_body{{"Operations", json::array({{{"op", "replace"},
                                                  {"value", {{"active", false}}}}})}};
 
-    SECTION("mirror ACTIVE + auth.users unreadable: deactivate()'s provenance check -> 404") {
+    SECTION("mirror ACTIVE + auth.users unreadable: deactivate()'s provenance check -> 503 "
+            "(#6836)") {
         AuthUsersFault fault{f.auth_db.pool()};
         fault.arm();
         auto res = f.patch("/scim/v2/Users/" + id, patch_body);
         fault.repair();
         REQUIRE(res);
-        // KNOWN GAP (pre-existing): a store error read as "not ours" -> 404 provenance_denied,
-        // not a retryable 503. The IdP is told the resource is gone for a deprovision that did
-        // not happen.
-        CHECK(res->status == 404);
+        // #6836: a store error is no longer read as "not ours". It is the retryable 503, so the
+        // IdP retries a deprovision that did not happen instead of being told the resource is
+        // gone.
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "2");
         CHECK(f.auth_mgr.get_user_role("chara").has_value()); // still live
     }
 
@@ -6652,4 +6655,546 @@ TEST_CASE("ScimRoutes: characterisation - store-outage answers the #4068 fix doe
         CHECK(res->status == 401);
         CHECK(f.auth_mgr.get_user_role("chara").has_value());
     }
+}
+
+// ── #6836: provenance_ok / deprovision_role_ok tell a store fault from a refusal ─────────────────
+//
+// `AuthUsersFault` (the whole `auth.users` table unreadable) bites the FIRST guard read
+// (`provenance_ok`); `yuzu::test::RoleColumnFault` (only the `role` column unreadable) lets
+// `provenance_ok` pass and bites the SECOND (`deprovision_role_ok`), i.e. the mid-handler flap
+// of the issue. Both must answer the retryable 503, audit the CALLER's verb as a `failure` with a
+// `store_unavailable:` detail, leave the account untouched, and neither count a provenance denial
+// nor raise the ADR-2001 D1 "role-refused with a linked identity" escalation, because nothing was
+// refused.
+
+namespace {
+
+double provenance_denied_count(Fixture& f) {
+    return f.metrics.counter("yuzu_scim_provenance_denied_total").value();
+}
+
+double guard_unavailable(Fixture& f, const char* guard) {
+    return f.metrics.counter("yuzu_scim_guard_store_unavailable_total", {{"guard", guard}})
+        .value();
+}
+
+/// One raw statement on the Fixture's auth database (test setup only).
+void exec_sql(yuzu::server::pg::PgPool& pool, const char* sql,
+              const std::vector<std::string>& params) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(lease.get(), sql, params);
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
+/// The audit rows of one resource for `action` whose `result` is `result`.
+std::size_t rows_with_result(Fixture& f, const char* action, const std::string& id,
+                             const char* result) {
+    std::size_t n = 0;
+    for (const auto& r : audit_rows(f, action, id))
+        if (r.result == result)
+            ++n;
+    return n;
+}
+
+double d1_escalations(Fixture& f) {
+    return f.metrics.counter("yuzu_scim_deprovision_role_refused_with_active_link_total").value();
+}
+
+/// A store fault must leave NONE of the refusal signals behind.
+void check_no_refusal_signals(Fixture& f, const std::string& id, double denied_before,
+                              double d1_before) {
+    CHECK(provenance_denied_count(f) == denied_before);
+    CHECK(d1_escalations(f) == d1_before);
+    CHECK(audit_rows(f, "scim.user.provenance_denied", id).empty());
+    CHECK(audit_rows(f, "scim.user.deprovision_role_refused_with_link", id).empty());
+    CHECK(events_of(f, "scim.user.deprovision_role_refused_with_link").empty());
+}
+
+} // namespace
+
+TEST_CASE("ScimRoutes: a store fault in deactivate()'s provenance or role read answers a "
+          "retryable 503, not 404 provenance_denied, and raises no refusal signal (#6836)",
+          "[pg][scim][routes][deprovision][store-error]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "petra"}})->body);
+    const auto id = created["id"].get<std::string>();
+    // A linked identity makes the D1 escalation reachable, so its absence below is meaningful.
+    REQUIRE(f.scim_store->upsert_link("https://idp.example.com/", "sub-petra", id));
+    const auto denied_before = provenance_denied_count(f);
+    const auto d1_before = d1_escalations(f);
+
+    std::unique_ptr<httplib::Response> res;
+    std::string expected_detail;
+    std::string verb = "scim.user.deactivated";
+    std::string guard = "role";
+    SECTION("PATCH: auth.users unreadable - the provenance read faults") {
+        AuthUsersFault fault{f.auth_db.pool()};
+        fault.arm();
+        res = f.patch("/scim/v2/Users/" + id,
+                      json{{"Operations", json::array({{{"op", "replace"},
+                                                        {"value", {{"active", false}}}}})}});
+        fault.repair();
+        expected_detail = "store_unavailable: provenance check";
+        guard = "provenance";
+    }
+    SECTION("PATCH: only the role column unreadable - the provenance read passes, the role read "
+            "faults mid-handler (the flap)") {
+        yuzu::test::RoleColumnFault fault{f.auth_db.pool()};
+        fault.arm();
+        res = f.patch("/scim/v2/Users/" + id,
+                      json{{"Operations", json::array({{{"op", "replace"},
+                                                        {"value", {{"active", false}}}}})}});
+        fault.repair();
+        expected_detail = "store_unavailable: role check";
+    }
+    SECTION("PUT active:false: the role read faults") {
+        yuzu::test::RoleColumnFault fault{f.auth_db.pool()};
+        fault.arm();
+        res = f.put("/scim/v2/Users/" + id, {{"userName", "petra"}, {"active", false}});
+        fault.repair();
+        expected_detail = "store_unavailable: role check";
+    }
+    SECTION("DELETE of an ACTIVE resource: the role read faults (the D1 delete site)") {
+        yuzu::test::RoleColumnFault fault{f.auth_db.pool()};
+        fault.arm();
+        res = f.del("/scim/v2/Users/" + id);
+        fault.repair();
+        expected_detail = "store_unavailable: role check";
+        verb = "scim.user.deleted";
+    }
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->body.find("authorization store unavailable") != std::string::npos);
+
+    // The caller's own verb carries the failure, keyed by scim_id.
+    const auto rows = audit_rows(f, verb, id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].result == "failure");
+    CHECK(rows[0].detail.starts_with(expected_detail));
+
+    check_no_refusal_signals(f, id, denied_before, d1_before);
+    // The outage-proof signal: exactly the failing guard's counter moved, once.
+    CHECK(guard_unavailable(f, guard.c_str()) == 1.0);
+    CHECK(guard_unavailable(f, guard == "role" ? "provenance" : "role") == 0.0);
+
+    // Nothing mutated: the account is live and the mapping is still there and active.
+    CHECK(f.auth_mgr.get_user_role("petra").has_value());
+    auto resource = f.scim_store->get_by_scim_id(id);
+    REQUIRE(resource.has_value());
+    CHECK(resource->active);
+}
+
+TEST_CASE("ScimRoutes: a store fault in the provenance read of an externalId-only PUT or PATCH, "
+          "and of a reactivation, answers a retryable 503 (#6836)",
+          "[pg][scim][routes][store-error]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "quinn"}})->body);
+    const auto id = created["id"].get<std::string>();
+    const auto denied_before = provenance_denied_count(f);
+
+    std::unique_ptr<httplib::Response> res;
+    std::string verb = "scim.user.updated";
+    SECTION("PUT with active unchanged (the L3 provenance re-check)") {
+        AuthUsersFault fault{f.auth_db.pool()};
+        fault.arm();
+        res = f.put("/scim/v2/Users/" + id,
+                    {{"userName", "quinn"}, {"active", true}, {"externalId", "ext-1"}});
+        fault.repair();
+    }
+    SECTION("PATCH externalId only") {
+        AuthUsersFault fault{f.auth_db.pool()};
+        fault.arm();
+        res = f.patch("/scim/v2/Users/" + id,
+                      json{{"Operations", json::array({{{"op", "replace"},
+                                                        {"path", "externalId"},
+                                                        {"value", "ext-2"}}})}});
+        fault.repair();
+    }
+    SECTION("DELETE of an already-INACTIVE resource") {
+        REQUIRE(f.scim_store->set_active(id, false));
+        AuthUsersFault fault{f.auth_db.pool()};
+        fault.arm();
+        res = f.del("/scim/v2/Users/" + id);
+        fault.repair();
+        verb = "scim.user.deleted";
+    }
+    SECTION("PUT active:true on an inactive mirror (reactivation)") {
+        REQUIRE(f.scim_store->set_active(id, false));
+        AuthUsersFault fault{f.auth_db.pool()};
+        fault.arm();
+        res = f.put("/scim/v2/Users/" + id, {{"userName", "quinn"}, {"active", true}});
+        fault.repair();
+        verb = "scim.user.reactivated";
+    }
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(provenance_denied_count(f) == denied_before);
+    CHECK(audit_rows(f, "scim.user.provenance_denied", id).empty());
+    const auto rows = audit_rows(f, verb, id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].result == "failure");
+    CHECK(rows[0].detail.starts_with("store_unavailable: provenance check"));
+    CHECK(f.auth_mgr.get_user_role("quinn").has_value());
+}
+
+TEST_CASE("ScimRoutes: a genuine provenance or role refusal is still 404 and still raises its "
+          "signals (#6836 regression guard)",
+          "[pg][scim][routes][deprovision]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "rhea"}})->body);
+    const auto id = created["id"].get<std::string>();
+    REQUIRE(f.scim_store->upsert_link("https://idp.example.com/", "sub-rhea", id));
+    REQUIRE(f.auth_mgr.update_role("rhea", auth::Role::admin));
+    const auto denied_before = provenance_denied_count(f);
+    const auto d1_before = d1_escalations(f);
+
+    auto res = f.patch("/scim/v2/Users/" + id,
+                       json{{"Operations", json::array({{{"op", "replace"},
+                                                         {"value", {{"active", false}}}}})}});
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(res->get_header_value("Retry-After").empty());
+    CHECK(provenance_denied_count(f) == denied_before + 1.0);
+    CHECK(d1_escalations(f) == d1_before + 1.0);
+    CHECK(audit_rows(f, "scim.user.provenance_denied", id).size() == 1);
+    CHECK(f.auth_mgr.get_user_role("rhea").value() == auth::Role::admin);
+}
+
+// The role check of the externalId-only PUT/PATCH (the L3 guard) is a DIFFERENT call site from
+// deactivate()'s: flipping its `!= GuardVerdict::Ok` to `== Refused` would let the mutation run
+// with the role unverified, and no other test would notice.
+TEST_CASE("ScimRoutes: a store fault in the ROLE check of an externalId-only PUT or PATCH of an "
+          "ACTIVE resource answers 503 and leaves externalId unchanged (#6836)",
+          "[pg][scim][routes][store-error]") {
+    Fixture f;
+    auto created = json::parse(
+        f.post("/scim/v2/Users", {{"userName", "tamsin"}, {"externalId", "ext-before"}})->body);
+    const auto id = created["id"].get<std::string>();
+    const auto denied_before = provenance_denied_count(f);
+
+    std::unique_ptr<httplib::Response> res;
+    SECTION("PUT") {
+        yuzu::test::RoleColumnFault fault{f.auth_db.pool()};
+        fault.arm();
+        res = f.put("/scim/v2/Users/" + id,
+                    {{"userName", "tamsin"}, {"active", true}, {"externalId", "ext-after"}});
+        fault.repair();
+    }
+    SECTION("PATCH") {
+        yuzu::test::RoleColumnFault fault{f.auth_db.pool()};
+        fault.arm();
+        res = f.patch("/scim/v2/Users/" + id,
+                      json{{"Operations", json::array({{{"op", "replace"},
+                                                        {"path", "externalId"},
+                                                        {"value", "ext-after"}}})}});
+        fault.repair();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(provenance_denied_count(f) == denied_before);
+    CHECK(guard_unavailable(f, "role") == 1.0);
+
+    const auto rows = audit_rows(f, "scim.user.updated", id);
+    REQUIRE(rows.size() == 1); // the failure row only: no success row, the mutation never ran
+    CHECK(rows[0].result == "failure");
+    CHECK(rows[0].detail.starts_with("store_unavailable: role check"));
+
+    auto resource = f.scim_store->get_by_scim_id(id);
+    REQUIRE(resource.has_value());
+    CHECK(resource->external_id == "ext-before");
+}
+
+// The DEFINITIVE side of the three-way split. If `is_store_unavailable` were ever widened to
+// UserNotFound / InvalidUsername, these 404s would become a permanent 503 retry loop.
+TEST_CASE("ScimRoutes: a DEFINITIVE negative in the provenance or role read is still a 404 "
+          "refusal, never a retryable 503 (#6836)",
+          "[pg][scim][routes][deprovision]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "uma"}})->body);
+    const auto id = created["id"].get<std::string>();
+    const auto denied_before = provenance_denied_count(f);
+
+    SECTION("role read: the auth account is already inactive, the mirror still says active "
+            "(the #5214 convergence state)") {
+        REQUIRE(f.auth_mgr.remove_user_checked("uma") == auth::RemoveUserOutcome::Removed);
+    }
+    SECTION("provenance read: the auth row is gone entirely (UserNotFound)") {
+        exec_sql(f.auth_db.pool(), "DELETE FROM auth.users WHERE username = $1", {"uma"});
+    }
+    auto res = f.patch("/scim/v2/Users/" + id,
+                       json{{"Operations", json::array({{{"op", "replace"},
+                                                         {"value", {{"active", false}}}}})}});
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(res->get_header_value("Retry-After").empty());
+    CHECK(provenance_denied_count(f) == denied_before + 1.0);
+    CHECK(audit_rows(f, "scim.user.provenance_denied", id).size() == 1);
+    CHECK(guard_unavailable(f, "provenance") == 0.0);
+    CHECK(guard_unavailable(f, "role") == 0.0);
+}
+
+// "A retry repairs it" is the headline claim of the 503: pin it end to end.
+TEST_CASE("ScimRoutes: the IdP's retry after a guard store fault completes the deprovision "
+          "(#6836)",
+          "[pg][scim][routes][deprovision][store-error]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "vera"}})->body);
+    const auto id = created["id"].get<std::string>();
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+
+    std::unique_ptr<httplib::Response> faulted;
+    {
+        yuzu::test::RoleColumnFault fault{f.auth_db.pool()};
+        fault.arm();
+        faulted = f.patch("/scim/v2/Users/" + id, patch_body);
+        fault.repair();
+    }
+    REQUIRE(faulted);
+    CHECK(faulted->status == 503);
+    CHECK(f.auth_mgr.get_user_role("vera").has_value());
+
+    auto retry = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(retry);
+    CHECK(retry->status == 200);
+    CHECK_FALSE(f.auth_mgr.get_user_role("vera").has_value()); // deactivated
+    auto resource = f.scim_store->get_by_scim_id(id);
+    REQUIRE(resource.has_value());
+    CHECK_FALSE(resource->active);
+    // One failure row for the faulted attempt, exactly one success row for the completed one.
+    CHECK(rows_with_result(f, "scim.user.deactivated", id, "failure") == 1);
+    CHECK(rows_with_result(f, "scim.user.deactivated", id, "success") == 1);
+    CHECK(provenance_denied_count(f) == 0.0);
+}
+
+namespace {
+
+/// A ONE-SHOT flap: `auth.users.provisioning_source` is renamed away when the transaction that
+/// DEACTIVATES an account commits (a deferred constraint trigger, the
+/// `MembersReadFaultAfterGroupDelete` pattern). The provenance and role reads that precede the
+/// deactivation therefore pass, and only a LATER provenance read faults. A plain rename fault
+/// cannot do this: it breaks both reads. Inert for every other statement.
+class ProvenanceFaultAfterDeactivation : public yuzu::test::SqlFault {
+public:
+    explicit ProvenanceFaultAfterDeactivation(yuzu::server::pg::PgPool& pool)
+        : SqlFault(
+              pool,
+              "DO $do$ BEGIN "
+              "EXECUTE $f$CREATE OR REPLACE FUNCTION public.yuzu_test_after_deactivation() "
+              "RETURNS trigger LANGUAGE plpgsql AS $b$ BEGIN "
+              "EXECUTE 'ALTER TABLE auth.users RENAME COLUMN provisioning_source TO "
+              "prov_src_gone'; RETURN NULL; END $b$$f$; "
+              "EXECUTE $f$CREATE CONSTRAINT TRIGGER yuzu_test_after_deactivation AFTER UPDATE ON "
+              "auth.users DEFERRABLE INITIALLY DEFERRED FOR EACH ROW "
+              "WHEN (OLD.is_active AND NOT NEW.is_active) "
+              "EXECUTE FUNCTION public.yuzu_test_after_deactivation()$f$; "
+              "END $do$",
+              "DO $do$ BEGIN "
+              "DROP TRIGGER IF EXISTS yuzu_test_after_deactivation ON auth.users; "
+              "DROP FUNCTION IF EXISTS public.yuzu_test_after_deactivation(); "
+              "IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'auth' "
+              "AND table_name = 'users' AND column_name = 'prov_src_gone') THEN "
+              "ALTER TABLE auth.users RENAME COLUMN prov_src_gone TO provisioning_source; "
+              "END IF; END $do$") {}
+};
+
+} // namespace
+
+// The post-transition window: PUT ALWAYS re-checks provenance after deactivate(). The 503 is then
+// returned for a request whose deactivation already committed (so "the failing guard changed
+// nothing" is true, "the request changed nothing" is not). The retry must converge and must not
+// deactivate or audit a second time.
+TEST_CASE("ScimRoutes: a store fault at the provenance re-check AFTER a PUT's deactivation "
+          "committed answers 503, and the retry converges without a second deactivation "
+          "(#6836)",
+          "[pg][scim][routes][deprovision][store-error]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "wren"}})->body);
+    const auto id = created["id"].get<std::string>();
+    json put_body{{"userName", "wren"}, {"active", false}};
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        ProvenanceFaultAfterDeactivation fault{f.auth_db.pool()};
+        fault.arm();
+        res = f.put("/scim/v2/Users/" + id, put_body);
+        fault.repair();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(guard_unavailable(f, "provenance") == 1.0);
+    CHECK(provenance_denied_count(f) == 0.0);
+
+    // The deactivation DID commit before the 503: the account is down and the mirror says so.
+    CHECK_FALSE(f.auth_mgr.get_user_role("wren").has_value());
+    auto resource = f.scim_store->get_by_scim_id(id);
+    REQUIRE(resource.has_value());
+    CHECK_FALSE(resource->active);
+    // The audit trail tells the truth about both halves.
+    CHECK(rows_with_result(f, "scim.user.deactivated", id, "success") == 1);
+    const auto updated = audit_rows(f, "scim.user.updated", id);
+    REQUIRE(updated.size() == 1);
+    CHECK(updated[0].result == "failure");
+    CHECK(updated[0].detail.starts_with("store_unavailable: provenance check"));
+
+    // The IdP's retry finds the account already in the requested state and completes.
+    auto retry = f.put("/scim/v2/Users/" + id, put_body);
+    REQUIRE(retry);
+    CHECK(retry->status == 200);
+    CHECK(rows_with_result(f, "scim.user.deactivated", id, "success") == 1); // not repeated
+    CHECK(rows_with_result(f, "scim.user.updated", id, "success") == 1);
+}
+
+// #6836: the ONE role-read classification shared by deprovision_role_ok and the POST-revive role
+// re-check. A route-level fault test cannot isolate the revive step (AuthManager::reactivate_user
+// re-reads the same row with the same query immediately before it), so the mapping is locked here
+// directly, value by value. A new AuthDBError must fail CLOSED (Refused, 404) until
+// is_store_unavailable is deliberately widened.
+TEST_CASE("ScimRoutes: classify_role_read maps every AuthDB role-read outcome (#6836)",
+          "[scim][routes][store-error]") {
+    using yuzu::server::AuthDBError;
+    using yuzu::server::GuardVerdict;
+    using yuzu::server::classify_role_read;
+    using Read = std::expected<auth::Role, AuthDBError>;
+
+    CHECK(classify_role_read(Read{auth::Role::user}) == GuardVerdict::Ok);
+    CHECK(classify_role_read(Read{auth::Role::admin}) == GuardVerdict::Refused);
+
+    // The only store-fault values: Unavailable (retryable 503).
+    for (const auto e : {AuthDBError::QueryFailed, AuthDBError::WriteFailed,
+                         AuthDBError::SecretUnavailable, AuthDBError::StoreBusy})
+        CHECK(classify_role_read(Read{std::unexpected(e)}) == GuardVerdict::Unavailable);
+
+    // Definitive negatives: Refused (404), never a retry loop.
+    for (const auto e : {AuthDBError::UserNotFound, AuthDBError::InvalidUsername,
+                         AuthDBError::InvalidCredentials, AuthDBError::UserAlreadyExists})
+        CHECK(classify_role_read(Read{std::unexpected(e)}) == GuardVerdict::Refused);
+
+    // Every AuthDBError value is either a store fault (is_store_unavailable) or Refused:
+    // the classifier is exactly is_store_unavailable plus the role comparison.
+    static_assert(static_cast<unsigned>(AuthDBError::MfaEnrollmentCancelled) == 10,
+                  "AuthDBError grew: extend the classify_role_read coverage loop and revisit "
+                  "is_store_unavailable");
+    for (std::uint8_t v = 0; v <= static_cast<std::uint8_t>(AuthDBError::MfaEnrollmentCancelled);
+         ++v) {
+        const auto e = static_cast<AuthDBError>(v);
+        const auto verdict = classify_role_read(Read{std::unexpected(e)});
+        CHECK(verdict == (yuzu::server::is_store_unavailable(e) ? GuardVerdict::Unavailable
+                                                                : GuardVerdict::Refused));
+    }
+}
+
+namespace {
+
+/// A STATEFUL one-shot read fault for the POST-revive role re-check. `AuthManager::reactivate_user`
+/// re-reads the reactivated row with the SAME `get_user` query immediately before the revive role
+/// check, so no schema-level fault can fail only the second read. This one counts instead:
+/// `auth.users` is swapped for a view over the renamed table whose WHERE calls a gate function.
+/// A deferred constraint trigger on the real table ARMS the gate when the reactivation commits
+/// (`NOT is_active -> is_active`); from then on the gate counts reads of the target username on a
+/// SEQUENCE (non-transactional, so a raised read does not roll its own count back) and raises on
+/// exactly the 2nd (the revive role check; the 1st is reactivate_user's re-read). Every other
+/// read and write, including the guarded undo that follows, passes. Per-test throwaway database
+/// only; `repair()` restores the table name.
+class ReviveRoleReadFault : public yuzu::test::SqlFault {
+public:
+    explicit ReviveRoleReadFault(yuzu::server::pg::PgPool& pool, const std::string& target)
+        : SqlFault(
+              pool,
+              "DO $do$ BEGIN "
+              "CREATE TABLE public.yuzu_test_revive_ctl (target text NOT NULL, armed boolean NOT "
+              "NULL); "
+              "INSERT INTO public.yuzu_test_revive_ctl VALUES ('" +
+                  target +
+                  "', false); "
+                  "CREATE SEQUENCE public.yuzu_test_revive_hits; "
+                  "CREATE FUNCTION public.yuzu_test_revive_gate(p_user text) RETURNS boolean "
+                  "LANGUAGE plpgsql AS $b$ DECLARE v_target text; v_armed boolean; n bigint; "
+                  "BEGIN SELECT target, armed INTO v_target, v_armed FROM "
+                  "public.yuzu_test_revive_ctl; "
+                  "IF v_armed AND p_user = v_target THEN "
+                  "n := nextval('public.yuzu_test_revive_hits'); "
+                  "IF n = 2 THEN RAISE EXCEPTION 'yuzu_test: injected role-read fault'; END IF; "
+                  "END IF; RETURN true; END $b$; "
+                  "CREATE FUNCTION public.yuzu_test_revive_arm() RETURNS trigger LANGUAGE plpgsql "
+                  "AS $b$ BEGIN UPDATE public.yuzu_test_revive_ctl SET armed = true; RETURN NULL; "
+                  "END $b$; "
+                  "ALTER TABLE auth.users RENAME TO users_real; "
+                  "CREATE CONSTRAINT TRIGGER yuzu_test_revive_arm AFTER UPDATE ON "
+                  "auth.users_real DEFERRABLE INITIALLY DEFERRED FOR EACH ROW "
+                  "WHEN (NOT OLD.is_active AND NEW.is_active) "
+                  "EXECUTE FUNCTION public.yuzu_test_revive_arm(); "
+                  "CREATE VIEW auth.users AS SELECT * FROM auth.users_real "
+                  "WHERE public.yuzu_test_revive_gate(username); "
+                  "END $do$",
+              "DO $do$ BEGIN "
+              "IF EXISTS (SELECT 1 FROM pg_views WHERE schemaname = 'auth' AND viewname = "
+              "'users') THEN DROP VIEW auth.users; END IF; "
+              "IF to_regclass('auth.users_real') IS NOT NULL THEN "
+              "DROP TRIGGER IF EXISTS yuzu_test_revive_arm ON auth.users_real; "
+              "ALTER TABLE auth.users_real RENAME TO users; END IF; "
+              "DROP FUNCTION IF EXISTS public.yuzu_test_revive_gate(text); "
+              "DROP FUNCTION IF EXISTS public.yuzu_test_revive_arm(); "
+              "DROP TABLE IF EXISTS public.yuzu_test_revive_ctl; "
+              "DROP SEQUENCE IF EXISTS public.yuzu_test_revive_hits; "
+              "END $do$") {}
+};
+
+} // namespace
+
+// The route-level pin for the POST-revive role re-check (the step the final reviewer found folding
+// a store fault into 404). The undo is the SAME guarded remove_user_checked; the 503 is sent only
+// after it succeeded, so the account is known to be down.
+TEST_CASE("ScimRoutes: a store fault at the POST-revive role re-check undoes the reactivation "
+          "and answers 503, and the retry revives the account (#6836)",
+          "[pg][scim][routes][revive][store-error]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "rex"}})->body);
+    const auto old_id = created["id"].get<std::string>();
+    auto del_res = f.del("/scim/v2/Users/" + old_id);
+    REQUIRE(del_res);
+    REQUIRE(del_res->status == 204); // the tombstone a returning employee's account is in
+    const auto denied_before = provenance_denied_count(f);
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        ReviveRoleReadFault fault{f.auth_db.pool(), "rex"};
+        fault.arm();
+        res = f.post("/scim/v2/Users", {{"userName", "rex"}});
+        fault.repair();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->body.find("authorization store unavailable") != std::string::npos);
+
+    // Fail closed: the reactivation was undone, no mapping exists, nothing was counted as a denial.
+    CHECK_FALSE(f.auth_mgr.get_user_role("rex").has_value());
+    CHECK_FALSE(f.scim_store->get_by_username("rex").has_value());
+    CHECK(provenance_denied_count(f) == denied_before);
+    CHECK(audit_rows(f, "scim.user.provenance_denied", "rex").empty());
+    CHECK(guard_unavailable(f, "role") == 1.0);
+    CHECK(guard_unavailable(f, "provenance") == 0.0);
+    CHECK(compensation_failed(f, "store_failure") == 0.0);
+
+    const auto rows = audit_rows(f, "scim.user.provisioned", "rex");
+    std::size_t faults = 0;
+    for (const auto& r : rows)
+        if (r.result == "failure" && r.detail == "store_unavailable: revive role check")
+            ++faults;
+    CHECK(faults == 1);
+
+    // The IdP's retry (the fault is repaired) revives the account and creates the mapping.
+    auto retry = f.post("/scim/v2/Users", {{"userName", "rex"}});
+    REQUIRE(retry);
+    CHECK(retry->status == 201);
+    auto role = f.auth_mgr.get_user_role("rex");
+    REQUIRE(role.has_value());
+    CHECK(*role == auth::Role::user);
+    CHECK(f.scim_store->get_by_username("rex").has_value());
 }

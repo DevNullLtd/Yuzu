@@ -462,6 +462,7 @@ agent_test_exe = executable(
     'unit/test_quarantine_parsers.cpp',       # Wave 2 WP-F: pure netsh/iptables/pfctl output parsers
     'unit/test_quarantine_argv.cpp',          # Wave 2 WP-F remediation: pure mutating-argv construction (FN-03)
     'unit/test_quarantine_serialization.cpp', # Wave 2 P4: MutationGate bounded-wait serialization (#3286)
+    'unit/test_reconnect_backoff.cpp',        # HA WS-13 (#291): jittered reconnect delay, pure, random source injected
     'unit/test_server_address_parsers.cpp',   # #3429 round 4: pure host:port / IP-literal helpers for
                                                 # server_address_resolver.cpp's boot-time DNS resolution
     'unit/test_server_address_resolver.cpp',  # #3429 round 4 fix: resolve_bounded's deadline wrapper,

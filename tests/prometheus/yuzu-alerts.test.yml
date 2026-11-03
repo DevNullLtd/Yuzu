@@ -1617,6 +1617,29 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuResponseIngestDrops", alertstate="firing", reason="pool_acquire_timeout", severity="warning"}'
             value: 1
+      # Negative control for the per_agent_cap companion (#561): a store-health reason
+      # must not fire it.
+      - expr: 'ALERTS{alertname="YuzuResponsePerAgentCapDrops", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE 24b -- an agent hitting the per-command row cap (#561) must not page
+  # YuzuResponseIngestDrops (store health), but must page the informational
+  # companion.
+  - interval: 1m
+    name: response ingest drops - per_agent_cap alone does not page store health
+    input_series:
+      - series: 'yuzu_server_response_ingest_dropped_total{job="yuzu",instance="s1",reason="per_agent_cap"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuResponseIngestDrops", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuResponsePerAgentCapDrops", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuResponsePerAgentCapDrops", alertstate="firing", instance="s1", job="yuzu", reason="per_agent_cap", severity="info"}'
+            value: 1
 
   # ── YuzuRbacReadDegraded ────────────────────────────────────────────────
   #
@@ -2274,6 +2297,35 @@ tests:
         values: "0x60"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuScimProvenanceDenied"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # ── YuzuScimGuardStoreUnavailable (#6836) ────────────────────────────────
+
+  # CASE 54a -- a SCIM guard could not read the auth store (retryable 503); the
+  # bounded `guard` label survives onto the alert.
+  - interval: 1m
+    name: scim guard store unavailable - a guard read fault fires and keeps its guard label
+    input_series:
+      - series: 'yuzu_scim_guard_store_unavailable_total{job="yuzu",instance="s1",guard="role"}'
+        values: "0x30 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimGuardStoreUnavailable", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuScimGuardStoreUnavailable", alertstate="firing", guard="role", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 54b -- a flat (pre-seeded) counter stays quiet.
+  - interval: 1m
+    name: scim guard store unavailable - a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_scim_guard_store_unavailable_total{job="yuzu",instance="s1",guard="provenance"}'
+        values: "0x60"
+      - series: 'yuzu_scim_guard_store_unavailable_total{job="yuzu",instance="s1",guard="role"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimGuardStoreUnavailable"}'
         eval_time: 45m
         exp_samples: []
 
