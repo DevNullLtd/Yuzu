@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <format>
 
+#include "access_tokens_render.hpp" // revoke_detail_from / committed_revoke_detail (shared with the Access tokens panel)
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
 #include "enrolment_render.hpp" // enrolment token / pending / auto-approve fragment markup (pure)
@@ -892,7 +893,10 @@ constexpr const char* kEngineRetryControl =
     "credential secret shown above.</span>";
 } // namespace
 
-std::string SettingsRoutes::render_engine_principals_fragment() {
+std::string SettingsRoutes::render_engine_principals_fragment(
+    const std::function<bool()>& may_read_audit, std::optional<std::size_t>* roster_count) {
+    if (roster_count)
+        roster_count->reset();
     if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
         return "<span class=\"muted\">Engine Principals store unavailable "
                "(not configured — requires PostgreSQL, design doc §3.1).</span>";
@@ -919,6 +923,8 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                "read. " + std::string(kEngineRetryControl) + "</div>";
     }
     const auto& principals = *principals_res;
+    if (roster_count)
+        *roster_count = principals.size();
 
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>Principal ID</th><th>Display Name</th><th>Owner</th>"
@@ -930,6 +936,12 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
     // wired: either way no row can show a credential count, the row hint points at the Retry
     // control, and the revoke-detail lookups below are skipped.
     bool credentials_unreadable = (api_token_store_ == nullptr);
+    // The AuditLog:Read answer, asked once and only when a revoked row needs it. True from the
+    // first failed audit read: the remaining revoked rows are not queried (the same latch as
+    // `credentials_unreadable`, for the same reason: each failing read waits out its pool's
+    // timeout, so a per-row retry would hold this request for roughly N x that).
+    std::optional<bool> audit_readable;
+    bool audit_unreadable = false;
     if (principals.empty()) {
         html += "<tr><td colspan=\"8\" class=\"muted\">No engine principals</td></tr>";
     } else {
@@ -968,16 +980,37 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
             // a revocation occurred. `EnginePrincipalRow` carries no reason
             // column of its own (`revoke()` takes no reason parameter —
             // store schema is frozen for this PR); best-effort recover the
-            // audit trail's own detail string, which the REAL REST DELETE
-            // route (rest_api_v1.cpp) records as
-            // "credentials_revoked=N[; superseded_by=X]" — NOT an
-            // operator-supplied free-text reason (the route has no such
-            // field; an earlier draft of this fragment assumed one).
-            // Two DIFFERENT outcomes, distinguished: "(not recorded)" when the
-            // store answered and had no such row, "(unavailable)" when it could
-            // not answer at all. Collapsing them would state an absence the read
-            // never established — the revocation facts beside it come from the
-            // principal store and are unaffected either way.
+            // audit trail's own detail string for the EARLIEST RETAINED committed
+            // revoke record: "credentials_revoked=N[; superseded_by=X]" from the
+            // REST DELETE route, or the operator's typed reason from the MCP tool.
+            // The row is selected by `committed_revoke_detail`, the Access
+            // tokens panel's own rule (the OLDEST success in the bounded read): a
+            // later FAILED attempt writes the same action with a store error string
+            // as its detail, and a retried revoke writes a newer success row (through
+            // the REST route its detail is `credentials_revoked=0`, with
+            // `; superseded_by=X` appended when the retry names a successor; through
+            // the MCP tool it is the retry's own typed reason); neither is chosen
+            // while an older success survives. The cell is labelled "earliest retained record" because
+            // the read cannot say it is THE revocation's record, and it is not when
+            // (1) audit retention pruned the revoking row but a later retry survives,
+            // (2) the revoke committed but its success row failed to persist (the
+            // route answers 503), so a later retry of the same revoke (text of the
+            // kind just described) is the first success row, or (3) an MCP revoke
+            // given no reason wrote an empty detail, which reads "(not recorded)".
+            // Best-effort evidence; the facts beside it come from the principal
+            // store. It is the audit trail's text, so it is shown only to a caller
+            // who passes the AuditLog:Read probe (the handler's quiet one); everyone
+            // else gets the cell without it.
+            // Three DIFFERENT outcomes, distinguished: "(not recorded)" when the
+            // store answered and held no committed revoke text (no committed revoke
+            // at all, or a committed MCP revoke whose detail is empty),
+            // "(unavailable)" when it could not answer at all, "(withheld: ...)"
+            // when the caller may not read the audit trail or that could not be
+            // confirmed. Collapsing them
+            // would state a fact the read never established; the revocation facts
+            // beside it come from the principal store and are unaffected either way.
+            // A full window (more than kRevokeHistoryWindow events) adds the Access
+            // panel's caveat: the text may be a retry, not the revoke.
             std::string revocation_cell = "—";
             if (!active) {
                 std::string linkage =
@@ -985,8 +1018,14 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                         ? "<em class=\"muted\">no successor recorded</em>"
                         : ("superseded by <code>" + html_escape(p.superseded_by) + "</code>");
                 std::string audit_detail = "(not recorded)";
-                if (credentials_unreadable) {
-                    // The pool is already failing reads; do not queue another lease wait per
+                bool truncated = false;
+                bool have_detail = false;
+                if (!audit_readable)
+                    audit_readable = may_read_audit && may_read_audit();
+                if (!*audit_readable) {
+                    audit_detail = "(withheld: needs AuditLog:Read, or it could not be confirmed)";
+                } else if (credentials_unreadable || audit_unreadable) {
+                    // A pool is already failing reads; do not queue another lease wait per
                     // revoked row (revoked rows are never pruned, so they only accumulate).
                     // "(unavailable)" here means "not looked up", not "the audit store failed":
                     // rows rendered before the first failed read still show their real detail.
@@ -995,20 +1034,32 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                     AuditQuery q;
                     q.target_type = "EnginePrincipal";
                     q.target_id = p.principal_id;
-                    q.action_prefixes = {"engine_principal.revoke"};
-                    q.limit = 1;
+                    // Exact match: AuditQuery drops an `action_prefixes` entry carrying `_`
+                    // (a LIKE metacharacter), so the prefix form never matched this verb.
+                    q.action = "engine_principal.revoke";
+                    q.limit = access_tokens::kRevokeHistoryQueryLimit; // newest first
                     // Best-effort HTML cell (not an evidence endpoint): on a
                     // degrade (nullopt, ADR-0040) say so rather than 503-ing the
                     // whole settings page.
                     auto events = audit_store_->query(q);
-                    if (!events)
+                    if (!events) {
                         audit_detail = "(unavailable)";
-                    else if (!events->empty() && !events->front().detail.empty())
-                        audit_detail = events->front().detail;
+                        audit_unreadable = true;
+                    } else {
+                        auto rd = access_tokens::revoke_detail_from(std::move(*events));
+                        truncated = rd.truncated;
+                        if (!rd.text.empty()) {
+                            audit_detail = std::move(rd.text);
+                            have_detail = true;
+                        }
+                    }
                 }
+                std::string detail_html = html_escape(audit_detail);
+                if (truncated)
+                    detail_html += access_tokens::revoke_truncation_hint(have_detail);
                 revocation_cell = linkage +
-                                  "<br><span class=\"hint\">Detail: " +
-                                  html_escape(audit_detail) + "</span>";
+                                  "<br><span class=\"hint\">Detail (earliest retained record): " +
+                                  detail_html + "</span>";
                 if (p.revoked_at > 0) {
                     revocation_cell += "<br><span class=\"hint\">" +
                                         fmt_epoch(p.revoked_at) + "</span>";
@@ -1133,8 +1184,10 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
     }
 
     html += "  </tbody></table>";
-    // Only with rows: an empty roster has no row hint to point at it, and for a store that was
-    // never wired a retry cannot help.
+    // Only with rows: an empty roster has no row hint to point at it. With no token store wired
+    // `credentials_unreadable` is true from the start, so a roster with rows DOES draw the Retry
+    // (a Retry cannot fix an unwired server; that is a test or embedding seam), and an empty one
+    // does not.
     if (credentials_unreadable && !principals.empty())
         html += "<p>" + std::string(kEngineRetryControl) + "</p>";
 
@@ -2678,6 +2731,27 @@ std::string render_plugin_signing_panel(
     return html;
 }
 
+bool SettingsRoutes::refuse_engine_session(const httplib::Request& req, httplib::Response& res,
+                                           const auth::Session& session, const char* verb,
+                                           const char* securable, const std::string& target_id,
+                                           bool also_mcp_tier) const {
+    const bool engine = session.is_engine();
+    if (!engine && !(also_mcp_tier && !session.mcp_tier.empty()))
+        return false;
+    // As the REST twins' `deny_engine_session`: a dropped denial row is carried by
+    // Sec-Audit-Failed, the 403 stands (a denial commits no mutation).
+    (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, verb, "denied", securable,
+                                        target_id,
+                                        engine ? "engine_session_denied" : "mcp_session_denied");
+    res.status = 403;
+    // As the Access tokens panel's own belt 403 (access_tokens_routes.cpp).
+    res.set_header("Cache-Control", "no-store");
+    res.set_content(detail::a4_error(res, engine ? "engine principals cannot access this endpoint"
+                                                 : "this credential cannot access this endpoint"),
+                    "application/json");
+    return true;
+}
+
 bool SettingsRoutes::refuse_cross_site(const httplib::Request& req, httplib::Response& res,
                                        const auth::Session& session,
                                        const std::string& endpoint) const {
@@ -2883,12 +2957,82 @@ void SettingsRoutes::register_routes(
     // (built alongside this task); this fragment refreshes on the
     // `refreshEnginePrincipals` body event that REST mutation's `HX-Trigger`
     // response header fires, mirroring the API-tokens block's refresh
-    // pattern. Admin-only, same posture as /fragments/settings/tokens.
+    // pattern.
+    //
+    // Gated as its REST twin GET /api/v1/engine-principals (#5882): EnginePrincipal:Read,
+    // then the session, then the engine-session belt. The panel applies the same permission
+    // test as the route. Each difference is stricter, a different refusal, a different
+    // rendering of a store failure, or a different audit record; none admits a caller the
+    // route refuses. There are SEVEN, listed once with their rationale in
+    // docs/user-manual/upgrading.md (the count is pinned lexically by DifferenceListCount in
+    // tests/test_access_wiring_lexical.py; the render cases of 4 and 5 are in
+    // test_engine_principal_lifecycle.cpp, their audit halves in
+    // test_settings_engine_panel_authz.cpp):
+    //  1. an absent engine-principal store is an in-page note on a 200 (the route answers
+    //     503), because htmx would not swap the note otherwise;
+    //  2. an engine session with the store absent gets the belt's 403 where the route
+    //     answers 503;
+    //  3. an MCP-tier token is REFUSED (403, audited `mcp_session_denied`), as the Access
+    //     tokens panel and the pre-#5882 administrator gate did (#520): a cookie-session
+    //     dashboard panel is not an MCP surface. The route admits an administrator's MCP
+    //     token on its creator's authority;
+    //  4. credential counts, in two cases: (a) a count that cannot be read renders
+    //     "unavailable" on a 200 (no Mint or Rotate) and still writes the success row, where
+    //     the route answers 503 with a failure row; (b) with no token store wired (not a
+    //     production configuration) the panel renders as in (a), with a Retry (drawn when the
+    //     roster has rows) that cannot help, while the route answers 200 with every count 0
+    //     and its success row;
+    //  5. an unreadable roster renders a note with Retry on a 200 and writes no row; the
+    //     route answers 503 with a failure row;
+    //  6. the revoke Detail cell shows the audit trail's text, so it needs AuditLog:Read
+    //     as well (the route returns no audit text at all); a revoked row also shows
+    //     revoked_at and superseded_by, which the list route omits (GET /{id} returns both
+    //     under the same permission);
+    //  7. audit rows: the panel auto-loads, so a refused interactive cookie session writes no
+    //     auth.permission_required row (the route writes one), and an API token that lacks
+    //     AuditLog:Read writes one extra denied row on a view that lists a revoked principal
+    //     (the Detail check), although the view is served.
+    // The /settings page itself stays administrator-only, so with RBAC on this panel admits
+    // a non-administrator holding the grant (a Viewer) and refuses an account administrator
+    // without it; the page script says so rather than leave the panel on "Loading..."
+    // (htmx does not swap a 4xx body). Both gates are the quiet probe (difference 7); a
+    // token or engine caller keeps its denial row. A successful roster read writes one
+    // `engine_principal.list` success row (set-and-proceed, as the route and the Access
+    // tokens panel); an absent store or an unreadable roster writes none.
     sink.Get("/fragments/settings/engine-principals",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!admin_fn_(req, res))
+                 if (!read_perm(req, res, "EnginePrincipal", "Read"))
                      return;
-                 res.set_content(render_engine_principals_fragment(), "text/html; charset=utf-8");
+                 auto session = auth_fn_(req, res);
+                 if (!session)
+                     return;
+                 // G1 (§9 deny belt), as the twin: an engine-classed session must not
+                 // enumerate the engine principals. Plus the MCP-tier refusal above.
+                 if (refuse_engine_session(req, res, *session, "engine_principal.list",
+                                           "EnginePrincipal", "", /*also_mcp_tier=*/true))
+                     return;
+                 // The revoke Detail is the audit trail's text: the quiet AuditLog:Read probe
+                 // against a scratch response, so a refusal is not an error and writes nothing
+                 // for a cookie session. A degraded RBAC read answers "no", never "yes". It is
+                 // asked LAZILY, by the renderer and only when a revoked row exists: a token
+                 // that lacks the grant keeps the probe's denial row (the quiet treatment is for
+                 // interactive cookie sessions only), and a roster with nothing to withhold
+                 // must not write one.
+                 httplib::Response audit_probe;
+                 const auto may_read_audit = [this, &req, &audit_probe]() {
+                     return read_perm(req, audit_probe, "AuditLog", "Read");
+                 };
+                 std::optional<std::size_t> roster_count;
+                 // Principal and credential metadata: never cached, never shared, and a cache that
+                 // ignores `no-store` still keys on the cookie. As the Access tokens panel's 200
+                 // (access_tokens_routes.cpp respond_fragment).
+                 no_store_private(res);
+                 res.set_content(render_engine_principals_fragment(may_read_audit, &roster_count),
+                                 "text/html; charset=utf-8");
+                 if (roster_count)
+                     (void)detail::emit_behavioral_audit(
+                         audit_read_fn_, req, res, "engine_principal.list", "success",
+                         "EnginePrincipal", "", "count=" + std::to_string(*roster_count));
              });
 
     // Periodic Access Reviews (SOC 2 CC6.2) — Settings convenience surface.
@@ -2898,10 +3042,21 @@ void SettingsRoutes::register_routes(
     // render_access_review_fragment()'s doc comment. The REST endpoints
     // under /api/v1/access-reviews* (rest_api_v1.cpp) and their MCP twins
     // are the ADR-1005 API-parity surface this fragment is a convenience
-    // layer over, not a replacement for.
+    // layer over, not a replacement for. Like every one of those routes, both
+    // fragments refuse an engine-class session (#6744, `refuse_engine_session`):
+    // only a human reads this evidence, whatever custom role the engine holds.
     sink.Get("/fragments/settings/access-reviews",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "AccessReview", "Read"))
+                     return;
+                 auto session = auth_fn_(req, res);
+                 if (!session)
+                     return;
+                 // #6744: as every /api/v1/access-reviews twin (`deny_engine_session`), only a
+                 // human reads this evidence. After the permission gate and the session check,
+                 // before any store read.
+                 if (refuse_engine_session(req, res, *session, "access_review.list",
+                                           "AccessReview"))
                      return;
                  res.set_content(render_access_review_fragment(req), "text/html; charset=utf-8");
              });
@@ -2914,7 +3069,16 @@ void SettingsRoutes::register_routes(
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "AccessReview", "Read"))
                      return;
+                 auto session = auth_fn_(req, res);
+                 if (!session)
+                     return;
                  std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+                 // #6744: the same belt as the main fragment, under the twin's `get` verb. The
+                 // denial row carries NO target, as the REST twin's and the Access page's do: `id`
+                 // is raw caller input and is never echoed into an audit column.
+                 if (refuse_engine_session(req, res, *session, "access_review.get",
+                                           "AccessReview"))
+                     return;
                  res.set_content(render_access_review_campaign_fragment(req, id),
                                  "text/html; charset=utf-8");
              });

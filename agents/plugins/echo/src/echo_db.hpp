@@ -32,6 +32,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 struct sqlite3; // Forward declaration
@@ -415,7 +416,8 @@ struct RemovableEvent {
 /// change the key watch observed (echo_registry_parsers.hpp). The actor columns hold
 /// the writer correlated to the change (a lead to verify, not proof): actor_pid is 0
 /// and actor_image '' when no writer is named, and `detail` says why (attr:*).
-/// `data`/`prev_data` are UNMASKED rendered values.
+/// `data` is the UNMASKED rendered new value; `prev_data` is empty for a row this build writes
+/// (the old value is not stored; `prev_data_type`/`prev_data_size` are).
 /// Warehouse columns are NOT NULL DEFAULT '' / 0, so "not applicable" (removals,
 /// key removals, gaps; the old value of an addition) is '' / 0, and `data_type`
 /// /`prev_data_type` == '' is what tells an absent value from an empty one.
@@ -454,9 +456,42 @@ struct EchoStats {
     int64_t record_count{0};
     int64_t oldest_timestamp{0};
     int64_t newest_timestamp{0};
+    /// Bytes the database holds: used pages ((page_count - freelist_count) * page_size) plus
+    /// the WAL file. Free pages are excluded because they are reusable, so this is the figure
+    /// the byte budget is enforced against; it is NOT the on-disk file size.
     int64_t db_size_bytes{0};
     int retention_days{7};
 };
+
+/// Room the WAL file is allowed beyond the data pages: `PRAGMA journal_size_limit` at open, and
+/// the amount the byte budget keeps out of its data target (see run_budget).
+inline constexpr int64_t kEchoWalAllowanceBytes = 16 * 1024 * 1024;
+
+/// Raw storage figures behind `db_size_bytes`, read in one pass under the database lock.
+struct StorageBytes {
+    int64_t page_count{0};
+    int64_t freelist_count{0};
+    int64_t page_size{0};
+    int64_t wal_bytes{0};   ///< -wal file size; 0 when absent or unreadable
+    int64_t auto_vacuum{0}; ///< 0 = none, 1 = full, 2 = incremental
+    /// The page-count read succeeded. False for a closed store or a failed pragma read: the
+    /// figures above are then all zero, which must never be read as "an empty database"
+    /// (a failed measurement that reads as within-budget stops eviction and publishes a 0
+    /// overage). Callers branch on this before using the sizes.
+    bool ok{false};
+
+    /// Used pages in bytes (free pages are reusable and not counted).
+    [[nodiscard]] int64_t data_bytes() const noexcept {
+        return (page_count - freelist_count) * page_size;
+    }
+    [[nodiscard]] int64_t freelist_bytes() const noexcept { return freelist_count * page_size; }
+    /// Main database file size (used plus free pages), excluding the WAL.
+    [[nodiscard]] int64_t file_bytes() const noexcept { return page_count * page_size; }
+};
+
+enum class CheckpointMode { kPassive, kTruncate };
+/// kBusy: a reader pins the WAL (or another writer holds it); nothing was waited for.
+enum class CheckpointResult { kOk, kBusy, kError };
 
 /// Optional baseline write that commits atomically with a diff-source insert.
 struct StateWrite {
@@ -493,6 +528,43 @@ public:
      * Queries typed warehouse tables (process_live, tcp_live, etc.)
      */
     EchoStats stats();
+
+    // ── Storage budget primitives (echo_aggregator.cpp run_budget) ───────────
+
+    /// Page counts, page size, WAL file size and auto_vacuum mode, read under the lock.
+    /// All zero and `ok == false` when the store is closed or the pragma read failed.
+    [[nodiscard]] StorageBytes storage_bytes();
+
+    /**
+     * Run a DELETE ... RETURNING statement and a counter bump as ONE transaction.
+     * The row count comes from stepping the RETURNING rows, never sqlite3_changes() (that
+     * read races on the shared FULLMUTEX handle, #1033). The echo_config row `counter_key`
+     * is incremented by that count inside the same transaction, so a crash can never lose
+     * or double a count. Any failure rolls back both and returns the error.
+     * `sql` must be a complete statement ending in RETURNING; it is never built from
+     * operator input.
+     */
+    [[nodiscard]] std::expected<int64_t, std::string> delete_counted(const std::string& sql,
+                                                                     std::string_view counter_key);
+
+    /// Return up to `pages` free pages to the OS (no-op unless auto_vacuum is incremental).
+    /// False when the call did not run (closed handle, `pages <= 0`) or the PRAGMA failed.
+    bool incremental_vacuum(int pages);
+
+    /// WAL checkpoint with the busy timeout dropped to 0 for the call, so a reader that pins
+    /// the WAL yields kBusy at once instead of stalling the lock for the 5 s busy timeout.
+    CheckpointResult checkpoint(CheckpointMode mode);
+
+    /// Convert a database created before auto_vacuum was enabled to incremental mode with
+    /// one VACUUM. The rebuilt file passes through the WAL; the caller's post-pass checkpoint
+    /// reclaims it (TRUNCATE once the WAL outgrows its allowance). Holds the database lock for
+    /// the whole run. True on success. Caller gates it (free disk, size, the deferral marker) --
+    /// see vacuum_decision().
+    [[nodiscard]] bool vacuum_to_incremental();
+
+    /// If a raw BEGIN left the write connection inside a transaction (an exception unwound
+    /// past it), roll it back. No-op in autocommit.
+    void rollback_open_transaction() noexcept;
 
     // ── Snapshot state management ────────────────────────────────────────────
 
@@ -903,8 +975,14 @@ private:
     static bool upsert_state_locked(sqlite3* db, const std::string& collector,
                                     const std::string& json);
 
+    /// storage_bytes() on an already-locked handle (shared with stats()).
+    [[nodiscard]] StorageBytes storage_bytes_locked();
+
     /// Internal set_config that assumes caller already holds mu_.
     bool set_config_locked(const std::string& key, const std::string& value);
+    /// True (after a warn) when the write connection is inside a transaction. Only the two
+    /// standalone writers (set_config, set_state) ask: mu_ held, db_ non-null.
+    bool refuse_open_transaction_locked(const char* what) const;
 
     // ATOMIC because it is written at RUNTIME, not only at open/close: the
     // wedged-rollback path in execute_atomic_batch nulls it under mu_ while
