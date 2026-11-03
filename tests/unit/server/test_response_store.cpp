@@ -3737,11 +3737,12 @@ double cap_dropped(yuzu::MetricsRegistry& metrics, const char* reason = "per_age
         .value();
 }
 
-// Member order is load-bearing: the store borrows the pool.
+// Member order is load-bearing: the store borrows the pool and keeps a pointer to the metrics, so
+// both outlive it.
 struct CapFixture {
     PgPool pool;
-    ResponseStore store;
     yuzu::MetricsRegistry metrics;
+    ResponseStore store;
     CapFixture(const std::string& dsn, int cap)
         : pool{{.conninfo = dsn, .size = 4}}, store(pool, 0, nullptr, cap) {
         REQUIRE(store.is_open());
@@ -3761,6 +3762,55 @@ TEST_CASE("ResponseStore: rows per (instruction, agent) are capped and counted",
     CHECK(cap_rows(f.store, "cmd-cap", "agent-1") == 4);
     CHECK(cap_dropped(f.metrics) == 1.0);
     CHECK(cap_dropped(f.metrics, "query_error") == 0.0); // a cap refusal is never a query_error
+}
+
+TEST_CASE("ResponseStore: a capped pair's newest retained row ends with the row-cap marker",
+          "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+    // The marker text is the operator-visible contract (response-store.md): pin the literal.
+    const std::string marker = "\n...[rows past per-agent cap dropped]";
+
+    auto pair_rows = [&](const char* agent) {
+        auto all = f.store.get_by_instruction("cmd-mark", kAllRows);
+        REQUIRE(all.has_value());
+        std::vector<StoredResponse> rows;
+        for (const auto& r : *all)
+            if (r.agent_id == agent)
+                rows.push_back(r);
+        std::sort(rows.begin(), rows.end(),
+                  [](const StoredResponse& a, const StoredResponse& b) { return a.id < b.id; });
+        return rows;
+    };
+
+    for (int i = 0; i < 5; ++i)
+        f.store.store(cap_frame("cmd-mark", "agent-1", 0));
+    f.store.store(cap_frame("cmd-mark", "agent-2", 0)); // a different pair, below its cap
+
+    auto rows = pair_rows("agent-1");
+    REQUIRE(rows.size() == 4);
+    for (std::size_t i = 0; i + 1 < rows.size(); ++i)
+        CHECK(rows[i].output == "frame"); // only the newest retained row carries the marker
+    CHECK(rows.back().output == "frame" + marker);
+    CHECK(pair_rows("agent-2").front().output == "frame");
+
+    // A further refusal leaves exactly one marker (the UPDATE is idempotent).
+    f.store.store(cap_frame("cmd-mark", "agent-1", 0));
+    rows = pair_rows("agent-1");
+    REQUIRE(rows.size() == 4);
+    CHECK(rows.back().output == "frame" + marker);
+    CHECK(cap_dropped(f.metrics) == 2.0);
+    CHECK(cap_dropped(f.metrics, "query_error") == 0.0);
+
+    // "Newest" is by row timestamp (what the executions drawer orders by), not insertion order:
+    // the marker lands on the ts=300 row even though two rows were inserted after it.
+    for (const int64_t ts : {200, 300, 100, 150, 250}) {
+        auto frame = cap_frame("cmd-mark", "agent-3", 0);
+        frame.timestamp = ts;
+        f.store.store(frame);
+    }
+    for (const auto& r : pair_rows("agent-3"))
+        CHECK(r.output == (r.timestamp == 300 ? "frame" + marker : std::string("frame")));
 }
 
 TEST_CASE("ResponseStore: the first terminal frame beyond the cap lands, a second is refused",

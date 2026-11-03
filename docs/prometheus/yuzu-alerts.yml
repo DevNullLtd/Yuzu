@@ -3155,7 +3155,10 @@ groups:
             (--response-max-rows-per-agent, default 256). This is the cap
             working, not store unhealth. Investigate the reporting agent;
             raise the flag only if a command legitimately streams more than
-            about cap x 64 KiB of output per device.
+            about cap * 64 KiB (about 16 MiB at the default) of output per
+            device. A redelivered terminal frame on a command and device
+            already at the cap also counts here. Attribute with a server log
+            grep for "per-agent row cap (" ... "reached for instruction= agent=".
 
       - alert: YuzuResponseReadDegrade
         expr: |

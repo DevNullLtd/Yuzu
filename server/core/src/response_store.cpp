@@ -62,6 +62,10 @@ constexpr std::chrono::milliseconds kIngestTimeout{500};
 constexpr std::size_t kMaxIngestBytes = 2ull * 1024 * 1024;
 constexpr std::size_t kMaxFacetsPerResponse = 5'000;
 constexpr const char* kTruncationMarker = "\n...[truncated by server ingest cap]";
+// Appended to a capped pair's newest retained row (#561) so a reader can tell a stream whose
+// tail was dropped by the per-pair row cap from a complete one; the sibling of kTruncationMarker
+// (which marks the per-ROW byte cap).
+constexpr const char* kRowCapMarker = "\n...[rows past per-agent cap dropped]";
 
 // Ingest-drop / read-degrade reason labels (ADR-0037 label convention).
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
@@ -430,8 +434,10 @@ const std::vector<pg::PgMigration>& migrations() {
         // carried by the third column): both are bounded by the (instruction_id, agent_id)
         // prefix, so neither touches more than the pair's own rows. SET LOCAL for the same
         // reason v3 states: a multi-million row build past the 30 s pool statement_timeout would
-        // cancel, roll the version back and leave the store "persistence disabled" on every
-        // boot. IF NOT EXISTS: a re-run against a database whose version stamp was rewound (the
+        // cancel, roll the version back and refuse boot. (The pool's 10 s lock_timeout is not
+        // lifted: a build that cannot take its SHARE lock in that time rolls back and refuses
+        // boot too; docs/postgres-store-playbook.md has the recovery.) IF NOT EXISTS: a re-run
+        // against a database whose version stamp was rewound (the
         // Echo rename upgrade-window tests do exactly that) must not fail on the index it
         // already built.
         {4, R"(
@@ -514,7 +520,7 @@ void ResponseStore::store(const StoredResponse& resp) {
         has_embedded_nul(resp.plugin) || has_embedded_nul(resp.agent_id)) {
         spdlog::warn("ResponseStore: dropping response with an embedded NUL byte in "
                      "instruction_id/execution_id/plugin/agent_id (agent={})",
-                     resp.agent_id);
+                     ::yuzu::log_id_token(resp.agent_id));
         note_ingest_dropped(metrics_, kReasonMalformedIdentity);
         return;
     }
@@ -599,8 +605,33 @@ void ResponseStore::store(const StoredResponse& resp) {
         }
         if (!per_agent_cap_admits(to_i64(PQgetvalue(probe.get(), 0, 0)), max_rows_per_agent_,
                                   is_terminal, to_bool(PQgetvalue(probe.get(), 0, 1)))) {
+            // Mark the pair's newest retained row so a reader can tell a capped stream from a
+            // complete one (the sibling of kTruncationMarker). One idempotent UPDATE in this
+            // transaction: the suffix compare makes every refusal after the first a no-op.
+            // `timestamp + 0` is deliberate: a bare `ORDER BY timestamp DESC LIMIT 1` lets the
+            // planner walk idx_resp_instr_ts backwards filtering on agent_id, which reads every
+            // row of the instruction newer than this pair (measured: 10,000 entries filtered on a
+            // 2,000-agent command whose capped pair was its oldest). The expression forces the
+            // access path to be the pair's prefix on idx_resp_instr_agent_status (at most cap +
+            // overshoot entries) and a top-1 sort over them. Fail-closed like the probe: a marker
+            // that cannot be written rolls back (query_error).
+            pg::PgResult mark = pg::exec_params(
+                conn,
+                "UPDATE response_store.responses SET output = output || $3::text "
+                "WHERE id = (SELECT id FROM response_store.responses "
+                "WHERE instruction_id=$1 AND agent_id=$2 "
+                "ORDER BY timestamp + 0 DESC, id DESC LIMIT 1) "
+                "AND right(output, length($3::text)) <> $3::text",
+                std::vector<std::string>{resp.instruction_id, resp.agent_id, kRowCapMarker});
+            if (mark.status() != PGRES_COMMAND_OK) {
+                spdlog::warn("ResponseStore: per-agent cap marker failed for instruction={} "
+                             "agent={}: {}",
+                             ::yuzu::log_id_token(resp.instruction_id),
+                             ::yuzu::log_id_token(resp.agent_id), PQerrorMessage(conn));
+                return false;
+            }
             capped = true;
-            return true; // commits an empty transaction; not a query_error
+            return true; // commits the marker; not a query_error
         }
         pg::PgResult ins = pg::exec_params(
         conn,
@@ -616,7 +647,8 @@ void ResponseStore::store(const StoredResponse& resp) {
                                  std::to_string(resp.plugin_result_status)});
         if (ins.status() != PGRES_TUPLES_OK || PQntuples(ins.get()) != 1) {
             spdlog::warn("ResponseStore: insert failed for instruction={} agent={}: {}",
-                         resp.instruction_id, resp.agent_id, PQerrorMessage(conn));
+                         ::yuzu::log_id_token(resp.instruction_id),
+                         ::yuzu::log_id_token(resp.agent_id), PQerrorMessage(conn));
             return false; // with_txn_for rolls back
         }
         const int64_t response_id = to_i64(PQgetvalue(ins.get(), 0, 0));
@@ -772,7 +804,8 @@ void ResponseStore::store(const StoredResponse& resp) {
 
     if (!ok) {
         spdlog::warn("ResponseStore: store failed for instruction={} agent={}: {}",
-                     resp.instruction_id, resp.agent_id, pool_.last_error());
+                     ::yuzu::log_id_token(resp.instruction_id),
+                     ::yuzu::log_id_token(resp.agent_id), pool_.last_error());
         note_ingest_dropped(metrics_, reached_txn ? kReasonQueryError : kReasonPoolTimeout);
         return;
     }
@@ -782,7 +815,8 @@ void ResponseStore::store(const StoredResponse& resp) {
         note_ingest_dropped(metrics_, kReasonPerAgentCap);
         const auto admit = cap_log_budget_.try_admit(resp.agent_id);
         if (admit.closed_window_suppressed > 0)
-            spdlog::warn("ResponseStore: per-agent cap refusals suppressed in the last window: {}",
+            spdlog::warn("ResponseStore: per-agent cap-refusal warnings suppressed in the last "
+                         "window: {} (the counter is exact)",
                          admit.closed_window_suppressed);
         if (admit.admitted)
             spdlog::warn("ResponseStore: per-agent row cap ({}) reached for instruction={} "

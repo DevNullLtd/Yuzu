@@ -542,8 +542,11 @@ the empty-table rule above already applies. What the entry records is that the c
 procedural (the executable does not verify it). On a carried-forward database the build would hold a
 `SHARE` lock on this high-write table (writes blocked, reads allowed) for its duration; the
 migration's own `SET LOCAL statement_timeout = 0` keeps the pool's statement timeout from rolling it
-back, and `IF NOT EXISTS` keeps a re-run after a rewound version stamp safe. It ends with the
-contract. ADR-0039 "Update (2026-11-02) — migration v4" records the index.
+back, and `IF NOT EXISTS` keeps a re-run after a rewound version stamp safe. The pool's 10 s
+`lock_timeout` still applies: if the `SHARE` lock cannot be taken (writers active), the migration
+rolls back and the server refuses to start; retry when writers are quiescent, or build the index by
+hand with `CREATE INDEX CONCURRENTLY` (`IF NOT EXISTS` makes the re-boot safe). It ends with the
+contract. ADR-0039's "Update (2026-11-02) — migration v4" section records the index.
 
 ## Substrate quick facts (pool / runner / helpers)
 

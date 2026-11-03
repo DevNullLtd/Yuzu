@@ -6852,6 +6852,10 @@ row cap and the export byte cap. `GET
 (`response_query_row_json`, `docs/api-twin-recipe.md` Rule 1); `GET /api/v1/responses/{id}/aggregate`
 and MCP `aggregate_responses` share another (`response_aggregate_row_json`).
 
+**Bounded rows (#561).** Rows per command and device are bounded (`--response-max-rows-per-agent`,
+default 256); past the cap the newest frames are dropped and the last kept row ends with a
+`...[rows past per-agent cap dropped]` marker. See [Response Store](response-store.md).
+
 **Forensics-tier rows (#4990).** Rows written by Forensics-tier plugins (`app_usage`,
 `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`; the set is
 derived from the capability catalogue) are served only to callers who hold `Forensics:Read` in

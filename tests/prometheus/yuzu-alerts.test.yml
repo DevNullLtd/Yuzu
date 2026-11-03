@@ -1617,6 +1617,11 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuResponseIngestDrops", alertstate="firing", reason="pool_acquire_timeout", severity="warning"}'
             value: 1
+      # Negative control for the per_agent_cap companion (#561): a store-health reason
+      # must not fire it.
+      - expr: 'ALERTS{alertname="YuzuResponsePerAgentCapDrops", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
 
   # CASE 24b -- an agent hitting the per-command row cap (#561) must not page
   # YuzuResponseIngestDrops (store health), but must page the informational

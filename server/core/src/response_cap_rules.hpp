@@ -11,6 +11,8 @@
 ///     exists for the pair (so a capped command still shows its outcome; bound = cap + 1);
 ///   - `finalize_terminal_status` converts retained RUNNING rows in place (no new row), after
 ///     which a further terminal insert at the cap is refused as a replay;
+///   - a refusal also appends a marker to the pair's newest retained row (store(), once per row),
+///     so readers can tell a capped stream from a complete one;
 ///   - concurrent writers for one pair (direct stream + gateway forward) are not serialised
 ///     and can overshoot by the number of concurrent writers.
 ///

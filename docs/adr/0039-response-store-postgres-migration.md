@@ -320,9 +320,10 @@ should reach for one batch-under-one-savepoint, not a savepoint per row (subxid 
 `ResponseStore::store` bounds the rows kept per `(instruction_id, agent_id)` pair (default 256,
 `--response-max-rows-per-agent`). Before each insert it reads the pair's row count (bounded by a
 `LIMIT` at the cap) and, for a terminal frame at the cap, whether the pair already has a terminal
-row (`status <> 0`, the same definition of terminal the admit predicate uses). Migration v4 adds `idx_resp_instr_agent_status ON responses(instruction_id,
-agent_id, status)` so both reads touch only the pair's own index entries. It sits beside the
-`idx_resp_ttl` partial index (§Schema); no column or constraint changes, and v1 to v3 are untouched.
+row (`status <> 0`, the same definition of terminal the admit predicate uses). Migration v4 adds
+`idx_resp_instr_agent_status ON responses(instruction_id, agent_id, status)` so both reads touch
+only the pair's own index entries. It sits beside the `idx_resp_ttl` partial index (§Schema); no
+column or constraint changes, and v1 to v3 are untouched.
 
 **The transactional build.** v4 is a plain `CREATE INDEX IF NOT EXISTS` inside the migration
 transaction, on the high-write `responses` table. The non-transactional migration kind is not built
@@ -332,6 +333,6 @@ the 0.15.0 deployment contract is a fresh database only (`docs/user-manual/upgra
 table is empty when the build runs, and the entry records that the contract is procedural. On a
 carried-forward database the build would hold a `SHARE` lock for its duration; `SET LOCAL
 statement_timeout = 0` (the v3 precedent) stops the pool's statement timeout from cancelling it and
-leaving the store "persistence disabled" on every boot, and `IF NOT EXISTS` keeps a re-run safe.
+refusing boot, and `IF NOT EXISTS` keeps a re-run safe.
 The exception ends with the contract, or when #4432 delivers the non-transactional kind; after
 either, a new index on `responses` uses that kind.
