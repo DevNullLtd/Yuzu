@@ -2,6 +2,18 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: `echo.sql` refuses `WITH`, `NATURAL`, `USING` and bound-parameter markers
+
+**What changed.** The Echo agent plugin's `echo.sql` action refuses a query before it is prepared when it uses a common table expression, a `NATURAL` or `USING` join, or a parameter marker (`?`, `$x`, `:x`, `@x`, `#x`). A query that starts with `WITH` is answered `only SELECT queries are allowed`; `WITH` elsewhere, `NATURAL` and `USING` are answered `query contains forbidden keyword: <word>`; a marker is answered `query contains a bound-parameter marker`. Write a join with `ON` and a CTE as a subquery; `$`-prefixed table names such as `$Process_Hourly` still work.
+
+**Who is affected.** Anything that stores or replays an `echo.sql` query text: stored schedules, pinned or re-evaluated result sets, workflow steps, and REST and MCP callers.
+
+**Before you upgrade.** Search those stores for `WITH`, `NATURAL`, `USING` and for `?`, `$`, `:`, `@`, `#` outside string literals, and rewrite the queries.
+
+**Mixed fleet.** An agent that is not yet upgraded still answers these queries, so one stored query answers differently per agent version. Compare a result set's `device_count` with the source execution's `agents_failure` to see which agents refused it.
+
+**Rolling back.** Clean: nothing is stored differently, and an older agent accepts the queries again.
+
 ## Behaviour change: Echo holds `echo.db` to a byte budget (an existing database is trimmed on the first maintenance pass)
 
 **What changed.** The Echo agent plugin holds `echo.db` to a byte budget, `db_budget_bytes` (default 262144000, 250 MiB; minimum 33554432, 32 MiB; set with `echo.configure`). The figure compared with it is `db_size_bytes` in `echo.status`, which now counts the used database pages plus the write-ahead log and no longer counts free pages (it counted every page in the database file before). When that figure is over the budget, the maintenance pass (every 15 minutes, or `echo.rollup`) permanently deletes the oldest raw capture rows that their first summary tier has already passed, never the newest 24 hours, then hourly rows older than 48 hours (5 days for `procperf`), even inside their retention window. Daily and monthly rows, the `usage` tables, paused or errored sources and sources with no summary tier are never removed. `retention_days` is stored only: it neither protects nor loses history. The budget applies to an `echo.db` that already exists, not only to new ones.

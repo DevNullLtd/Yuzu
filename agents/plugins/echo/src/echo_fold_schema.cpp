@@ -43,8 +43,10 @@ constexpr ColumnDef g_avg(std::string_view n, std::string_view type, std::string
     return {n, type, R::kGenerated, M::kNone, false, expr};
 }
 
-// Average = sum / samples under the column's declared type; 0 for an empty bucket.
+// Average = sum / samples; 0 for an empty bucket. An INTEGER-declared average truncates, as
+// the legacy rollup's CAST(AVG(..) AS INTEGER) did; a REAL one is the exact mean.
 #define YUZU_FOLD_AVG(sum_col) "CASE WHEN samples>0 THEN " sum_col "*1.0/samples ELSE 0 END"
+#define YUZU_FOLD_IAVG(sum_col) "CASE WHEN samples>0 THEN " sum_col "/samples ELSE 0 END"
 
 constexpr std::string_view kH = "hourly";
 constexpr std::string_view kD = "daily";
@@ -84,13 +86,13 @@ std::vector<FoldSourceDef> build_fold_sources() {
                  {m_sum("samples"), g_avg("cpu_avg", "REAL", YUZU_FOLD_AVG("cpu_sum")),
                   m_rmax("cpu_max"), g_avg("mem_avg", "REAL", YUZU_FOLD_AVG("mem_sum")),
                   m_rmax("mem_max"), g_avg("commit_avg", "REAL", YUZU_FOLD_AVG("commit_sum")),
-                  g_avg("read_bps_avg", "INTEGER", YUZU_FOLD_AVG("read_bps_sum")),
-                  g_avg("write_bps_avg", "INTEGER", YUZU_FOLD_AVG("write_bps_sum")),
-                  g_avg("read_lat_us_avg", "INTEGER", YUZU_FOLD_AVG("read_lat_us_sum")),
-                  g_avg("write_lat_us_avg", "INTEGER", YUZU_FOLD_AVG("write_lat_us_sum")),
+                  g_avg("read_bps_avg", "INTEGER", YUZU_FOLD_IAVG("read_bps_sum")),
+                  g_avg("write_bps_avg", "INTEGER", YUZU_FOLD_IAVG("write_bps_sum")),
+                  g_avg("read_lat_us_avg", "INTEGER", YUZU_FOLD_IAVG("read_lat_us_sum")),
+                  g_avg("write_lat_us_avg", "INTEGER", YUZU_FOLD_IAVG("write_lat_us_sum")),
                   m_max("read_lat_us_max"), m_max("write_lat_us_max"),
-                  g_avg("rx_bps_avg", "INTEGER", YUZU_FOLD_AVG("rx_bps_sum")),
-                  g_avg("tx_bps_avg", "INTEGER", YUZU_FOLD_AVG("tx_bps_sum")),
+                  g_avg("rx_bps_avg", "INTEGER", YUZU_FOLD_IAVG("rx_bps_sum")),
+                  g_avg("tx_bps_avg", "INTEGER", YUZU_FOLD_IAVG("tx_bps_sum")),
                   m_rsum("cpu_sum"), m_rsum("mem_sum"), m_rsum("commit_sum"),
                   m_sum("read_bps_sum"), m_sum("write_bps_sum"), m_sum("read_lat_us_sum"),
                   m_sum("write_lat_us_sum"), m_sum("rx_bps_sum"), m_sum("tx_bps_sum"),
@@ -101,7 +103,7 @@ std::vector<FoldSourceDef> build_fold_sources() {
                  {k_txt("name"), k_txt("version"), k_int("is_kthread"), m_sum("samples"),
                   m_max("instances_max"), g_avg("cpu_avg", "REAL", YUZU_FOLD_AVG("cpu_sum")),
                   m_rmax("cpu_max"),
-                  g_avg("ws_avg_bytes", "INTEGER", YUZU_FOLD_AVG("ws_sum")),
+                  g_avg("ws_avg_bytes", "INTEGER", YUZU_FOLD_IAVG("ws_sum")),
                   m_max("ws_max_bytes"), m_rsum("cpu_sum"), m_sum("ws_sum"),
                   m_max("private_bytes_max"), m_max("handles_max"), m_max("threads_max"),
                   m_sum("io_read_bytes_sum"), m_sum("io_write_bytes_sum")}});
@@ -179,6 +181,7 @@ std::vector<FoldSourceDef> build_fold_sources() {
 }
 
 #undef YUZU_FOLD_AVG
+#undef YUZU_FOLD_IAVG
 
 const std::unordered_set<std::string>& view_set() {
     static const std::unordered_set<std::string> s = [] {
@@ -230,7 +233,7 @@ std::vector<std::string> fold_view_names() {
 std::string generate_fold_ddl() {
     std::ostringstream d;
     d << "CREATE TABLE IF NOT EXISTS " << kDictTable
-      << " (id INTEGER PRIMARY KEY, text TEXT NOT NULL UNIQUE);\n";
+      << " (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL UNIQUE);\n";
     // The replay ring of the cursor sources. `digest` is the identity check the raw
     // store did by payload comparison; `seq` orders the ring for pruning.
     d << "CREATE TABLE IF NOT EXISTS " << kSeenTable

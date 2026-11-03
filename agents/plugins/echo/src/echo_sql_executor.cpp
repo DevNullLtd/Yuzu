@@ -58,9 +58,11 @@ bool starts_with_ci(std::string_view s, std::string_view prefix) {
 /// region because SQLite tokenizes it as one token: a `--`, `/*` or `'` inside
 /// it is part of the name, and reading it as a comment or literal would hide the
 /// code after it from the keyword check. An unterminated quoting runs to the end
-/// of the input, as SQLite reads it. [begin, end) are byte offsets into `sql`.
+/// of the input, as SQLite reads it. With `idents_are_code` a quoted identifier stays
+/// in the surrounding code run (the $-name translator resolves names in it).
+/// [begin, end) are byte offsets into `sql`.
 template <class CodeFn, class SkipFn>
-void scan_sql(const std::string& sql, CodeFn on_code, SkipFn on_skip) {
+void scan_sql(const std::string& sql, CodeFn on_code, SkipFn on_skip, bool idents_are_code = false) {
     size_t i = 0;
     size_t code_start = 0;
     auto flush_code = [&](size_t end) {
@@ -71,7 +73,9 @@ void scan_sql(const std::string& sql, CodeFn on_code, SkipFn on_skip) {
         // String literal or quoted identifier. '...', "..." and `...` double their
         // delimiter to escape it; [...] ends at the first ']' and has no escape.
         if (sql[i] == '\'' || sql[i] == '"' || sql[i] == '`' || sql[i] == '[') {
-            flush_code(i);
+            const bool as_code = idents_are_code && sql[i] != '\'';
+            if (!as_code)
+                flush_code(i);
             size_t start = i;
             const char close = sql[i] == '[' ? ']' : sql[i];
             ++i;
@@ -84,8 +88,10 @@ void scan_sql(const std::string& sql, CodeFn on_code, SkipFn on_skip) {
                 } else
                     ++i;
             }
-            on_skip(start, i);
-            code_start = i;
+            if (!as_code) {
+                on_skip(start, i);
+                code_start = i;
+            }
         }
         // Block comment
         else if (sql[i] == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
@@ -125,8 +131,8 @@ std::string strip_literals_and_comments(const std::string& sql) {
     return out;
 }
 
-/// Translate $Word_Word table placeholders to their real table names, but ONLY
-/// in code regions — never inside a string literal or comment. A $name that is
+/// Translate $Word_Word table placeholders to their real table names in code and
+/// quoted identifiers, never inside a string literal or comment. A $name that is
 /// data (e.g. '$tar_events' as a string value) is left untouched, so the
 /// executed query is the same one the validator checked (#631). Returns an
 /// error if a placeholder is not in the registry whitelist.
@@ -159,15 +165,16 @@ std::expected<std::string, std::string> translate_dollar_names(const std::string
             }
             out.append(p, end);
         },
-        [&](size_t b, size_t e) { out.append(sql, b, e - b); });
+        [&](size_t b, size_t e) { out.append(sql, b, e - b); }, /*idents_are_code=*/true);
     if (error)
         return std::unexpected(*error);
     return out;
 }
 
-/// Check if the SQL contains a dangerous keyword (case-insensitive word match).
-/// Operates on stripped input (no string literals or comments).
-bool contains_dangerous_keyword(const std::string& stripped_sql) {
+/// The first dangerous keyword in the stripped SQL (case-insensitive word match), or
+/// empty. A byte >= 0x80 is an identifier character to SQLite but a separator here, so
+/// an alias such as `withé` is refused as WITH: over-refusal only (quote the identifier).
+std::string_view dangerous_keyword(const std::string& stripped_sql) {
     std::string upper;
     upper.reserve(stripped_sql.size());
     for (char c : stripped_sql)
@@ -182,9 +189,8 @@ bool contains_dangerous_keyword(const std::string& stripped_sql) {
         // roll-up view, and SQLite reports a CTE's inner reads under the CTE's name.
         "WITH",
         // NATURAL and USING joins are refused: SQLite resolves their shared columns
-        // before name resolution, so those reads never reach the authorizer (a
-        // dictionary self-join counts the dictionary; a view joined to a usage table
-        // is a per-user presence oracle). ON joins carry every read through it.
+        // before name resolution, so those reads never reach the authorizer. ON joins
+        // carry every read through it.
         "NATURAL", "USING",
     };
 
@@ -198,11 +204,11 @@ bool contains_dangerous_keyword(const std::string& stripped_sql) {
                             !std::isalnum(static_cast<unsigned char>(upper[pos + kw.size()])) &&
                                 upper[pos + kw.size()] != '_';
             if (left_ok && right_ok)
-                return true;
+                return kw;
             pos = upper.find(kw, pos + 1);
         }
     }
-    return false;
+    return {};
 }
 
 /// Check for multiple statements (semicolons followed by non-whitespace).
@@ -230,25 +236,33 @@ std::expected<std::string, std::string> validate_and_translate_sql(const std::st
     if (!starts_with_ci(trimmed, "SELECT"))
         return std::unexpected("only SELECT queries are allowed");
 
+    // Layer 2: translate $-prefixed table names first, so every check below reads the
+    // exact bytes SQLite will run (#631).
+    auto translated = translate_dollar_names(std::string(trimmed));
+    if (!translated)
+        return std::unexpected(translated.error());
+    std::string result = std::move(*translated);
+
     // Layer 1b: Must not contain dangerous keywords
-    // H7: Strip string literals and comments first to avoid false positives
-    std::string sql_str(trimmed);
-    auto stripped = strip_literals_and_comments(sql_str);
-    if (contains_dangerous_keyword(stripped))
-        return std::unexpected("query contains forbidden keyword");
+    // H7: Strip string literals, quoted identifiers and comments first to avoid false positives
+    const auto stripped = strip_literals_and_comments(result);
+    if (const auto kw = dangerous_keyword(stripped); !kw.empty()) {
+        const char* hint = kw == "WITH"                         ? " (use a subquery)"
+                           : (kw == "NATURAL" || kw == "USING") ? " (write the join with ON)"
+                                                                : "";
+        return std::unexpected(std::format("query contains forbidden keyword: {}{}", kw, hint));
+    }
+
+    // A variable token swallows text the checks above must see (`$x(--)` reads to the
+    // next ')' whatever it holds) and echo.sql binds nothing: refuse the whole class.
+    if (stripped.find_first_of("$@:#?") != std::string::npos)
+        return std::unexpected("query contains a bound-parameter marker");
 
     // Layer 3: single statement only. Checked on the stripped form so a ';'
     // inside a string literal or comment doesn't trip it; execute_user_query's
     // prepare-tail check is the engine-level backstop.
     if (has_multiple_statements(stripped))
         return std::unexpected("only single-statement queries are allowed");
-
-    // Layer 2: translate $-prefixed table names — only outside string literals
-    // and comments, so the executed query is the one that was validated (#631).
-    auto translated = translate_dollar_names(sql_str);
-    if (!translated)
-        return std::unexpected(translated.error());
-    std::string result = std::move(*translated);
 
     // Strip trailing semicolons
     while (!result.empty() &&

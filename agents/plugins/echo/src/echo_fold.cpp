@@ -83,11 +83,15 @@ void bind_value(sqlite3_stmt* s, int i, const Value& v) {
         v);
 }
 
-// Interns strings INSIDE a transaction. New ids go to a local staging map; the
-// caller publishes them to the shared cache only after COMMIT.
+// Interns strings INSIDE a transaction. New ids go to the caller's staging map; the
+// caller publishes them to the shared cache only after COMMIT. Constructed inside the
+// transaction callback, so both statements are finalised before COMMIT or ROLLBACK on
+// every exit path.
 class Interner {
 public:
-    explicit Interner(const std::unordered_map<std::string, int64_t>& cache) : cache_(cache) {}
+    Interner(const std::unordered_map<std::string, int64_t>& cache,
+             std::unordered_map<std::string, int64_t>& staged)
+        : cache_(cache), staged_(staged) {}
 
     // The id of `text`, or nullopt with the handle poisoned.
     std::optional<int64_t> intern(TransactionHandle& h, const std::string& text) {
@@ -95,36 +99,48 @@ public:
             return it->second;
         if (const auto it = staged_.find(text); it != staged_.end())
             return it->second;
-        if (!stmt_) {
-            // A no-op DO UPDATE so RETURNING yields the existing row's id on a hit.
-            stmt_ = prep(h, std::format("INSERT INTO {} (text) VALUES (?) ON CONFLICT(text) DO "
-                                        "UPDATE SET text = excluded.text RETURNING id",
-                                        kDictTable));
-            if (!stmt_)
+        if (!find_) {
+            find_ = prep(h, std::format("SELECT id FROM {} WHERE text = ?", kDictTable));
+            add_ = prep(h, std::format("INSERT INTO {} (text) VALUES (?) RETURNING id", kDictTable));
+            if (!find_ || !add_)
                 return std::nullopt;
         }
-        sqlite3_reset(stmt_.get());
-        sqlite3_clear_bindings(stmt_.get());
-        bind_text(stmt_.get(), 1, text);
-        if (sqlite3_step(stmt_.get()) != SQLITE_ROW) {
-            fail_sql(h, "dictionary intern failed");
-            return std::nullopt;
-        }
-        const int64_t id = sqlite3_column_int64(stmt_.get(), 0);
-        if (sqlite3_step(stmt_.get()) != SQLITE_DONE) {
-            fail_sql(h, "dictionary intern failed");
+        // SELECT first: an upsert on a hit still rewrites the index pages holding the string.
+        int64_t id = 0;
+        bind_one(find_.get(), text);
+        const int rc = sqlite3_step(find_.get());
+        if (rc == SQLITE_ROW) {
+            id = sqlite3_column_int64(find_.get(), 0);
+            sqlite3_reset(find_.get());
+        } else if (rc == SQLITE_DONE) {
+            bind_one(add_.get(), text);
+            if (sqlite3_step(add_.get()) != SQLITE_ROW) {
+                fail_sql(h, "dictionary intern failed");
+                return std::nullopt;
+            }
+            id = sqlite3_column_int64(add_.get(), 0);
+            if (sqlite3_step(add_.get()) != SQLITE_DONE) {
+                fail_sql(h, "dictionary intern failed");
+                return std::nullopt;
+            }
+        } else {
+            fail_sql(h, "dictionary lookup failed");
             return std::nullopt;
         }
         staged_.emplace(text, id);
         return id;
     }
 
-    std::unordered_map<std::string, int64_t>& staged() { return staged_; }
-
 private:
+    static void bind_one(sqlite3_stmt* s, const std::string& text) {
+        sqlite3_reset(s);
+        sqlite3_clear_bindings(s);
+        bind_text(s, 1, text);
+    }
+
     const std::unordered_map<std::string, int64_t>& cache_;
-    std::unordered_map<std::string, int64_t> staged_;
-    StmtPtr stmt_;
+    std::unordered_map<std::string, int64_t>& staged_;
+    StmtPtr find_, add_;
 };
 
 // Called after a successful COMMIT, still under op_mu_.
@@ -214,7 +230,7 @@ void warn_rejected(std::string_view source, std::size_t n, std::optional<int64_t
         return;
     // The first offending stamp only, never the payload.
     spdlog::warn("EchoFold: {} event(s) of source '{}' rejected for an unrepresentable time stamp "
-                 "(first: {}); the rest of the batch folded",
+                 "or a non-finite measure (first stamp: {}); the rest of the batch folded",
                  n, source, first.value_or(0));
 }
 
@@ -260,8 +276,8 @@ std::expected<void, std::string> EchoFold::install_fold_schema(EchoDatabase& db)
     std::lock_guard lock(op_mu_);
     const auto r = db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
         // A view cannot take the name of an existing table, and CREATE VIEW IF NOT
-        // EXISTS would then silently do nothing: drop the legacy table first.
-        // DESTRUCTIVE; this method has no production caller.
+        // EXISTS would then silently do nothing: drop the legacy table first. An empty
+        // one is dropped; one that holds rows refuses the install, so it destroys no data.
         for (const auto& name : fold_view_names()) {
             StmtPtr st = prep(h, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?");
             if (!st)
@@ -273,7 +289,22 @@ std::expected<void, std::string> EchoFold::install_fold_schema(EchoDatabase& db)
                 return std::unexpected(h.error());
             }
             st.reset(); // finalize the probe first: DROP TABLE needs the table unlocked
-            if (rc == SQLITE_ROW && !h.exec("DROP TABLE " + name))
+            if (rc != SQLITE_ROW)
+                continue;
+            st = prep(h, "SELECT count(*) FROM " + name);
+            if (!st || sqlite3_step(st.get()) != SQLITE_ROW) {
+                if (st)
+                    fail_sql(h, "legacy table count failed");
+                return std::unexpected(h.error());
+            }
+            const int64_t held = sqlite3_column_int64(st.get(), 0);
+            st.reset();
+            if (held > 0) {
+                h.fail(std::format("{} holds {} rows; move them aside before installing the roll-up schema",
+                                   name, held));
+                return std::unexpected(h.error());
+            }
+            if (!h.exec("DROP TABLE " + name))
                 return std::unexpected(h.error());
         }
         if (!h.exec(generate_fold_ddl()))
@@ -297,9 +328,10 @@ EchoFold::fold_rows(EchoDatabase& db, std::string_view source, const TierAccumul
     if (acc.def().name != def->name)
         return std::unexpected(std::format("accumulator is for '{}', not '{}'", acc.def().name, source));
 
-    Interner in(cache_);
+    std::unordered_map<std::string, int64_t> staged;
     std::size_t touched = 0;
     const auto r = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
+        Interner in(cache_, staged);
         const auto n = upsert_tiers(h, *def, acc, in);
         if (!n)
             return std::unexpected(h.error());
@@ -312,7 +344,7 @@ EchoFold::fold_rows(EchoDatabase& db, std::string_view source, const TierAccumul
     });
     if (!r)
         return std::unexpected(r.error());
-    publish(cache_, in.staged());
+    publish(cache_, staged);
     warn_rejected(source, acc.rejected(), acc.first_rejected_stamp());
     return FoldResult{touched, acc.rejected()};
 }
@@ -324,8 +356,9 @@ EchoFold::fold_cursor_rows(EchoDatabase& db, std::string_view source,
                            const std::vector<StateWrite>& baseline_writes) {
     using Kind = CursorFoldError::Kind;
     // A blank key is silently catastrophic (the ring's primary key would discard every
-    // event after the first and still report success); a NUL binds as zero-length and
-    // collapses distinct keys. Refuse the batch before any write.
+    // event after the first and still report success); a NUL is refused as the raw store
+    // refuses it (insert_power_events_and_cursor), and a C-string reader of the key would
+    // stop at it. Refuse the batch before any write.
     for (const auto& c : contributions) {
         if (c.record_key.empty() || c.record_key.find('\0') != std::string::npos) {
             spdlog::error("EchoFold::fold_cursor_rows: refusing a '{}' batch with an empty or "
@@ -359,11 +392,12 @@ EchoFold::fold_cursor_rows(EchoDatabase& db, std::string_view source,
         }
     }
 
-    Interner in(cache_);
+    std::unordered_map<std::string, int64_t> staged;
     CursorFoldResult res;
     res.rejected = rejected;
-    bool collided = false;
+    Kind kind = Kind::Transient;
     const auto r = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
+        Interner in(cache_, staged);
         res.folded = res.replayed = res.rows_touched = 0;
         // Once one prepare fails the handle is poisoned and the rest return null too.
         const StmtPtr max_seq =
@@ -396,11 +430,15 @@ EchoFold::fold_cursor_rows(EchoDatabase& db, std::string_view source,
                 sqlite3_reset(ins.get()); // the insert is done; drop the pending RETURNING row
                 ++seq;
                 // add()'s bool is deliberately ignored: `kept` holds only representable
-                // stamps, so it cannot refuse here; a misnamed key or measure makes
-                // resolve() throw, which unwinds the lambda and rolls back as Transient.
-                // The Interner (and its staged ids) lives OUTSIDE the lambda because
-                // checked_transaction runs it exactly once, never retrying.
-                acc.add(c->ts, c->keys, c->measures);
+                // stamps and a cursor source has no REAL measure, so it cannot refuse. A
+                // misnamed key or measure throws; that is a caller error, never a retry.
+                try {
+                    acc.add(c->ts, c->keys, c->measures);
+                } catch (const std::invalid_argument& e) {
+                    kind = Kind::Misuse;
+                    h.fail(e.what());
+                    return std::unexpected(h.error());
+                }
                 ++res.folded;
                 continue;
             }
@@ -429,8 +467,9 @@ EchoFold::fold_cursor_rows(EchoDatabase& db, std::string_view source,
                           "advance the cursor past one that was never folded; failing the "
                           "transaction instead",
                           yuzu::log_key_token(c->record_key), source);
-            collided = true;
-            h.fail("record_key collision");
+            kind = Kind::KeyCollision;
+            h.fail(std::format("record_key collision at contribution {} of source '{}' ({})",
+                               c - contributions.data(), source, yuzu::log_key_token(c->record_key)));
             return std::unexpected(h.error());
         }
 
@@ -460,8 +499,8 @@ EchoFold::fold_cursor_rows(EchoDatabase& db, std::string_view source,
         return {};
     });
     if (!r)
-        return std::unexpected(CursorFoldError{collided ? Kind::KeyCollision : Kind::Transient, r.error()});
-    publish(cache_, in.staged());
+        return std::unexpected(CursorFoldError{kind, r.error()});
+    publish(cache_, staged);
     warn_rejected(source, rejected, first_rejected);
     return res;
 }
@@ -469,49 +508,83 @@ EchoFold::fold_cursor_rows(EchoDatabase& db, std::string_view source,
 std::expected<GcResult, std::string> EchoFold::gc_dictionary(EchoDatabase& db,
                                                              Clock::time_point deadline) {
     std::lock_guard lock(op_mu_);
-    const std::string sql = dictionary_gc_sql(kGcBatch);
     GcResult out;
+    // Run `sqls` in ONE transaction under the pass deadline. The RETURNING rows they
+    // produced, or nullopt when the deadline fired (that transaction rolled back).
+    const auto timed = [&](std::initializer_list<std::string> sqls)
+        -> std::expected<std::optional<int64_t>, std::string> {
+        int64_t rows = 0;
+        bool hit = false;
+        const auto r = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
+            GcProgress guard(h.raw(), [this, deadline] { return now() >= deadline; });
+            for (const auto& sql : sqls) {
+                const StmtPtr st = prep(h, sql);
+                if (!st)
+                    return std::unexpected(h.error());
+                const auto n = run(h, st.get());
+                if (!n) {
+                    hit = sqlite3_errcode(h.raw()) == SQLITE_INTERRUPT;
+                    return std::unexpected(h.error());
+                }
+                rows += static_cast<int64_t>(*n);
+            }
+            return {};
+        });
+        if (r)
+            return rows;
+        if (hit)
+            return std::nullopt;
+        return std::unexpected(r.error());
+    };
+
+    // Cooperative: checked before each statement starts, and by the progress handler
+    // while one executes. Not mutex acquisition, BEGIN IMMEDIATE's busy wait or COMMIT I/O.
+    if (now() >= deadline) {
+        out.deadline_hit = true;
+        return out;
+    }
+    // The live set is derived ONCE per pass (op_mu_ is held, so no fold adds a reference
+    // meanwhile, and a retention delete only creates orphans), then orphans go by id. The
+    // temp table is dropped on every exit path and before each pass.
+    const std::string drop = std::format("DROP TABLE IF EXISTS temp.{}", kGcOrphanTable);
+    struct DropOrphans {
+        EchoDatabase& db;
+        const std::string& sql;
+        ~DropOrphans() { db.execute_sql(sql); }
+    } const cleanup{db, drop};
+    const auto built = timed(
+        {drop, std::format("CREATE TEMP TABLE {} (id INTEGER PRIMARY KEY)", kGcOrphanTable),
+         dictionary_orphans_sql()});
+    if (!built)
+        return std::unexpected(built.error());
+    if (!*built) { // the scan outran the deadline: nothing was deleted
+        out.deadline_hit = true;
+        return out;
+    }
+    out.live_set_built = true;
+    const std::string batch =
+        std::format("SELECT id FROM temp.{} ORDER BY id LIMIT {}", kGcOrphanTable, kGcBatch);
+    const std::string del_dict =
+        std::format("DELETE FROM {} WHERE id IN ({}) RETURNING id", kDictTable, batch);
+    const std::string del_orphan =
+        std::format("DELETE FROM temp.{} WHERE id IN ({})", kGcOrphanTable, batch);
     for (;;) {
-        // Cooperative: checked before each batch starts, and by the progress handler
-        // while a batch executes. Not mutex acquisition, BEGIN IMMEDIATE's busy wait
-        // or COMMIT I/O.
         if (now() >= deadline) {
             out.deadline_hit = true;
             break;
         }
-        int64_t deleted = 0;
-        bool interrupted = false;
-        const auto r = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
-            GcProgress guard(h.raw(), [this, deadline] { return now() >= deadline; });
-            const StmtPtr st = prep(h, sql);
-            if (!st)
-                return std::unexpected(h.error());
-            int rc = SQLITE_OK;
-            while ((rc = sqlite3_step(st.get())) == SQLITE_ROW)
-                ++deleted;
-            if (rc == SQLITE_INTERRUPT) { // the deadline: the batch rolls back, not an error
-                interrupted = true;
-                h.fail("dictionary GC interrupted by its deadline");
-                return std::unexpected(h.error());
-            }
-            if (rc != SQLITE_DONE) {
-                fail_sql(h, "dictionary GC step failed");
-                return std::unexpected(h.error());
-            }
-            return {};
-        });
-        if (!r) {
-            if (interrupted) {
-                out.deadline_hit = true;
-                break;
-            }
-            return std::unexpected(r.error());
+        const auto n = timed({del_dict, del_orphan});
+        if (!n)
+            return std::unexpected(n.error());
+        if (!*n) { // the deadline fired mid-statement: the batch rolled back
+            out.deadline_hit = true;
+            break;
         }
-        if (deleted > 0) {
-            out.deleted += deleted;
+        if (**n > 0) {
+            out.deleted += **n;
             cache_.clear(); // a deleted id must never be served from the cache
         }
-        if (deleted < kGcBatch)
+        if (**n < kGcBatch)
             break; // fewer than a full batch: nothing orphaned is left
     }
     return out;

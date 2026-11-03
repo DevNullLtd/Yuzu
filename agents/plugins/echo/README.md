@@ -32,8 +32,8 @@ Storage model: no setting, flag or mode selects between roll-ups and raw capture
 roll-up substrate (an interned string dictionary, one physical table per source and tier behind
 the existing tier view names, and a transactional fold writer in `echo_fold.cpp`) is in the plugin;
 no collector or action opens, writes or reads it, so the tables and reads described here are
-unchanged. `sql` refuses common table expressions (`WITH`) and `NATURAL` / `USING` joins (write
-joins with `ON`) and reads only through the tables and views the schema lists.
+unchanged. `sql` refuses common table expressions (`WITH`), `NATURAL` / `USING` joins (write
+joins with `ON`) and bound-parameter markers, and reads only through the tables and views the schema lists.
 
 Deliberately not: Echo does not stream events to the server in real time (everything lands in the
 local warehouse first and is pulled by a read action), it does not replay history from zero when a

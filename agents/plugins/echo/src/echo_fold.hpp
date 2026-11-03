@@ -8,8 +8,8 @@
  * no setting, flag, mode switch or environment variable that selects between the
  * two; none may be added. This header is staged, not wired: no collector,
  * aggregator, action or config surface opens, writes or reads these tables, and
- * EchoDatabase::open() changes only by forcing the two read-surface allowlists
- * (is_fold_view, is_fold_internal_table) to initialise.
+ * EchoDatabase::open() changes only by forcing the derived view allowlist
+ * (is_fold_view) to initialise.
  *
  * Two halves:
  *   - PURE CORE (this header, no I/O): bucket_start, Value, TierRow,
@@ -24,12 +24,13 @@
  * creates a bucket only age-based eviction removes.
  *
  * The ONE exception is an UNREPRESENTABLE stamp (outside kFoldMinStamp ..
- * kFoldMaxStamp, 0001-01-01..9999-12-31 UTC), which no calendar can bucket.
+ * kFoldMaxStamp, 0001-01-01..9999-12-31 UTC), which no calendar can bucket, or a
+ * NON-FINITE measure (SQLite binds NaN as NULL, which a NOT NULL column refuses).
  * Such an event is rejected INDIVIDUALLY: the rest of its batch folds normally.
  * The rejection is counted in the persisted echo_config counter
  * `fold_rejected_events_total` (kFoldRejectedCounterKey), added inside the same
  * transaction as the fold so a rollback leaves the counter unchanged, and
- * logged once per batch naming the first offending stamp only (never the
+ * logged once per batch naming the first rejected event's stamp only (never the
  * payload). echo.status does not report the counter.
  *
  * kLast merge: the incoming value replaces the stored one iff its guard column
@@ -47,12 +48,14 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <format>
 #include <functional>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -163,22 +166,28 @@ public:
     }
 
     /// Fold one event. Returns false -- folding nothing -- when `ts` is
-    /// unrepresentable (counted in rejected()); the caller keeps folding the rest.
+    /// unrepresentable or a measure is non-finite (counted in rejected()); the
+    /// caller keeps folding the rest.
     bool add(int64_t ts, const NamedValues& keys, const NamedValues& measures) {
+        const auto reject = [&] {
+            ++rejected_;
+            if (!first_rejected_)
+                first_rejected_ = ts;
+            return false;
+        };
         std::vector<int64_t> buckets;
         buckets.reserve(tiers_.size());
         for (const auto& t : tiers_) {
             const auto b = bucket_start(ts, t.name);
-            if (!b) {
-                ++rejected_;
-                if (!first_rejected_)
-                    first_rejected_ = ts;
-                return false;
-            }
+            if (!b)
+                return reject();
             buckets.push_back(*b);
         }
         std::vector<Value> kv = resolve(key_cols_, key_index_, keys, "key");
         std::vector<Value> mv = resolve(measure_cols_, measure_index_, measures, "measure");
+        for (const auto& v : mv)
+            if (const auto* d = std::get_if<double>(&v); d && !std::isfinite(*d))
+                return reject();
         for (std::size_t i = 0; i < tiers_.size(); ++i) {
             const auto [it, fresh] = tiers_[i].slots.try_emplace(SlotKey{buckets[i], kv}, mv);
             if (!fresh)
@@ -206,9 +215,9 @@ public:
     [[nodiscard]] const std::vector<ColumnDef>& measure_columns() const noexcept {
         return measure_cols_;
     }
-    /// Events refused for an unrepresentable stamp.
+    /// Events refused for an unrepresentable stamp or a non-finite measure.
     [[nodiscard]] std::size_t rejected() const noexcept { return rejected_; }
-    /// The first refused stamp -- the only thing the batch warning names.
+    /// The first refused event's stamp -- the only thing the batch warning names.
     [[nodiscard]] std::optional<int64_t> first_rejected_stamp() const noexcept {
         return first_rejected_;
     }
@@ -281,8 +290,19 @@ private:
             case MergeOp::kSum:
                 if (real)
                     std::get<double>(cur[j]) += std::get<double>(in[j]);
-                else
-                    std::get<int64_t>(cur[j]) += std::get<int64_t>(in[j]);
+                else {
+                    // Saturate: signed overflow is undefined, and a wrapped total would be
+                    // a plausible wrong number. (The SQL UPSERT promotes to REAL instead;
+                    // this sums within one batch only.)
+                    auto& a = std::get<int64_t>(cur[j]);
+                    const int64_t b = std::get<int64_t>(in[j]);
+                    if (b > 0 && a > std::numeric_limits<int64_t>::max() - b)
+                        a = std::numeric_limits<int64_t>::max();
+                    else if (b < 0 && a < std::numeric_limits<int64_t>::min() - b)
+                        a = std::numeric_limits<int64_t>::min();
+                    else
+                        a += b;
+                }
                 break;
             case MergeOp::kMax:
                 if (real)
@@ -455,9 +475,9 @@ inline void tcp_delta(const std::vector<NetworkEvent>& events, TierAccumulator& 
 
 inline void module_delta(const std::vector<ModuleRow>& events, TierAccumulator& acc) {
     for (const auto& e : events) {
-        // An unload is not stored; rebased_count: zero.
-        const char* measure =
-            pick(e.action, {{"loaded", "load_count"}, {"seed", "load_count"}, {"blocked", "blocked_count"}});
+        // load_count counts `loaded` only (a `seed` row contributes nothing); an unload is
+        // not stored; rebased_count: zero.
+        const char* measure = pick(e.action, {{"loaded", "load_count"}, {"blocked", "blocked_count"}});
         if (!measure)
             continue;
         acc.add(e.ts,
@@ -716,12 +736,14 @@ inline constexpr std::size_t kReplayRingDepth = 4096;
 inline constexpr std::size_t kDictCacheCap = 50'000;
 /// Orphan strings deleted per GC statement.
 inline constexpr int kGcBatch = 2000;
+/// The temp table holding one GC pass's orphan ids.
+inline constexpr std::string_view kGcOrphanTable = "echo_dict_orphan";
 
-/// The orphan-delete statement: one batch of dictionary strings no roll-up table
-/// references (an EXCEPT chain over every interned key column), RETURNING id.
-/// Pure text so the compound-select term count can be pinned by a test.
-[[nodiscard]] inline std::string dictionary_gc_sql(int batch) {
-    std::string sql = std::format("DELETE FROM {0} WHERE id IN (SELECT id FROM {0}", kDictTable);
+/// The live-set scan, run once per GC pass: every dictionary id that no roll-up table
+/// references (an EXCEPT chain over every interned key column) into the temp orphan
+/// table. Pure text so the compound-select term count can be pinned by a test.
+[[nodiscard]] inline std::string dictionary_orphans_sql() {
+    std::string sql = std::format("INSERT INTO temp.{1} SELECT id FROM {0}", kDictTable, kGcOrphanTable);
     for (const auto& def : fold_sources()) {
         if (def.own_tables)
             continue;
@@ -731,7 +753,6 @@ inline constexpr int kGcBatch = 2000;
                     sql += std::format(" EXCEPT SELECT {} FROM {}", physical_column_name(c),
                                        physical_table_name(def.name, tier));
     }
-    sql += std::format(" LIMIT {}) RETURNING id", batch);
     return sql;
 }
 
@@ -746,7 +767,8 @@ struct CursorFoldError {
         KeyCollision, ///< PERMANENT: an empty / NUL record_key, or a key already in the
                       ///< ring with a different digest. The same batch is re-derived and
                       ///< re-refused every tick; surface it, never retry indefinitely.
-        Misuse,       ///< PERMANENT: not a cursor source; a programming error, never retry.
+        Misuse,       ///< PERMANENT: not a cursor source, or a contribution naming a column the
+                      ///< source lacks / a value of the wrong type; a programming error, never retry.
     };
     Kind kind{Kind::Transient};
     std::string text;
@@ -762,6 +784,7 @@ struct CursorFoldResult {
 struct GcResult {
     int64_t deleted{0};
     bool deadline_hit{false};
+    bool live_set_built{false}; ///< the pass's one scan finished (false: it outran the deadline)
 };
 
 /**
@@ -776,15 +799,20 @@ struct GcResult {
  * checked_transaction); nothing may ever take op_mu_ while holding mu_. There is
  * no second cache lock. ONE EchoFold instance must front a database: a second
  * instance would have its own cache and its own mutex and could race a GC.
+ * `echo_dict.id` is AUTOINCREMENT, so an id is never reused: any deleter of
+ * `echo_dict` rows goes through EchoFold, which clears its cache; one that does not
+ * leaves dangling ids (the view reads NULL), never ids that name a different string.
  *
- * INTERNING. Strings are interned INSIDE the transaction into a local staging map
- * and published to the cache only after the transaction commits, still under
- * op_mu_. A rollback therefore never leaves the cache holding an id the database
- * does not have. Counts come from RETURNING row counts, never sqlite3_changes().
+ * INTERNING. Strings are interned INSIDE the transaction (the intern statements are
+ * finalised before COMMIT) into a staging map and published to the cache only after
+ * the transaction commits, still under op_mu_. A rollback therefore never leaves the
+ * cache holding an id the database does not have. Counts come from RETURNING row
+ * counts, never sqlite3_changes().
  *
- * GC DEADLINE IS COOPERATIVE. It bounds statement EXECUTION between batches
- * (sqlite3_progress_handler) and is checked before each batch starts. It does
- * NOT cover mutex acquisition, BEGIN IMMEDIATE's busy wait (5 s), or COMMIT I/O.
+ * GC DEADLINE IS COOPERATIVE. It is checked before each statement starts and by
+ * sqlite3_progress_handler inside a running one, which then rolls its transaction
+ * back. It does NOT cover mutex acquisition, BEGIN IMMEDIATE's busy wait (5 s), or
+ * COMMIT I/O.
  *
  * NOT called from EchoDatabase::open(), the collectors or the aggregator.
  */
@@ -802,14 +830,16 @@ public:
     /// Create the dictionary, the replay ring and every roll-up table, index and
     /// view in one transaction. A LEGACY TABLE whose name a view will take is
     /// dropped first (a view cannot be created over an existing table of the same
-    /// name, and CREATE VIEW IF NOT EXISTS would then silently do nothing). That
-    /// drop is destructive; this method has NO production caller. Clears the
-    /// dictionary cache.
+    /// name, and CREATE VIEW IF NOT EXISTS would then silently do nothing); one that
+    /// holds rows refuses the install, naming the table and its row count. This
+    /// method has NO production caller. Clears the dictionary cache.
     [[nodiscard]] std::expected<void, std::string> install_fold_schema(EchoDatabase& db);
 
     /// Fold a snapshot-diff source's accumulated batch (plus its optional baseline
     /// StateWrite) in ONE transaction. Rejected events (acc.rejected()) are added
-    /// to the persisted counter in the same transaction.
+    /// to the persisted counter in the same transaction. Additive, not idempotent: a
+    /// snapshot source is replay-safe only because its baseline StateWrite commits in
+    /// this same transaction.
     [[nodiscard]] std::expected<FoldResult, std::string>
     fold_rows(EchoDatabase& db, std::string_view source, const TierAccumulator& acc,
               const std::optional<StateWrite>& state = std::nullopt);
@@ -817,16 +847,20 @@ public:
     /// Fold a cursor source's contributions through the digest-checked replay ring,
     /// and commit the cursor and the baseline StateWrites in the SAME transaction.
     /// A replay (same key, same digest) is not folded; the cursor still advances.
-    /// A key collision rolls everything back and is PERMANENT.
+    /// The ring is first-sighting FIFO: a record re-offered after kReplayRingDepth
+    /// newer keys of its source folds again (kSum double counts; kMax, kMin and kLast
+    /// do not). A key collision rolls everything back and is PERMANENT.
     [[nodiscard]] std::expected<CursorFoldResult, CursorFoldError>
     fold_cursor_rows(EchoDatabase& db, std::string_view source,
                      const std::vector<KeyedContribution>& contributions,
                      const std::string& cursor_json,
                      const std::vector<StateWrite>& baseline_writes);
 
-    /// Delete orphaned dictionary strings in batches until none remain or the
-    /// deadline passes. A deadline hit is a result, not an error; any OTHER
-    /// failure is returned as an error, never as an empty success.
+    /// Delete orphaned dictionary strings until none remain or the deadline passes: one
+    /// live-set scan per pass into a temp table, then batches by id. A deadline hit is a
+    /// result, not an error (GcResult::live_set_built says whether the scan finished; a
+    /// pass whose scan outruns the deadline deletes nothing); any OTHER failure is
+    /// returned as an error, never as an empty success.
     [[nodiscard]] std::expected<GcResult, std::string> gc_dictionary(EchoDatabase& db,
                                                                       Clock::time_point deadline);
 

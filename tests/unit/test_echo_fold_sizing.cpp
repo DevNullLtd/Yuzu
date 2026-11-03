@@ -68,10 +68,10 @@ int64_t used_bytes(sqlite3* db) {
 }
 
 void exec(sqlite3* db, const std::string& sql) {
-    char* err = nullptr;
-    const int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err);
-    INFO("sqlite: " << (err ? err : ""));
-    sqlite3_free(err);
+    char* raw = nullptr;
+    const int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &raw);
+    const std::unique_ptr<char, decltype(&sqlite3_free)> err{raw, &sqlite3_free};
+    INFO("sqlite: " << (err ? err.get() : ""));
     REQUIRE(rc == SQLITE_OK);
 }
 

@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <latch>
 #include <limits>
 #include <map>
@@ -76,12 +77,10 @@ Stmt prepare(sqlite3* db, const std::string& sql) {
 }
 
 bool exec(sqlite3* db, const std::string& sql) {
-    char* err = nullptr;
-    const int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err);
-    if (err) {
-        INFO("sqlite: " << err);
-        sqlite3_free(err);
-    }
+    char* raw = nullptr;
+    const int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &raw);
+    const std::unique_ptr<char, decltype(&sqlite3_free)> err{raw, &sqlite3_free};
+    INFO("sqlite: " << (err ? err.get() : ""));
     return rc == SQLITE_OK;
 }
 
@@ -288,6 +287,28 @@ TEST_CASE("TierAccumulator: an unrepresentable stamp rejects that event only",
     CHECK(acc.rows("monthly").size() == 2);
 }
 
+TEST_CASE("TierAccumulator: a sum saturates, and a non-finite measure rejects that event only",
+          "[echo][fold][merge]") {
+    constexpr auto kMax = std::numeric_limits<int64_t>::max();
+    constexpr auto kMin = std::numeric_limits<int64_t>::min();
+    auto acc = make_acc("process");
+    using P = std::pair<const char*, int64_t>;
+    for (const auto& [name, n] : {P{"hi", kMax}, P{"hi", 1}, P{"lo", kMin}, P{"lo", -1}})
+        acc.add(kT0, {{"name", vt(name)}, {"user", vt("u")}}, {{"start_count", vi(n)}});
+    CHECK(mi(acc, row_for(acc, "hourly", {{"name", "hi"}}), "start_count") == kMax);
+    CHECK(mi(acc, row_for(acc, "hourly", {{"name", "lo"}}), "start_count") == kMin);
+
+    auto perf = make_acc("perf");
+    const auto cpu = [&](int64_t ts, double v) { return perf.add(ts, {}, {{"cpu_sum", vr(v)}}); };
+    CHECK(cpu(kT0, 0.5));
+    CHECK_FALSE(cpu(kT0 + 1, std::nan("")));
+    CHECK_FALSE(cpu(kT0 + 2, std::numeric_limits<double>::infinity()));
+    CHECK(cpu(kT0 + 3, 0.25));
+    CHECK(perf.rejected() == 2);
+    CHECK(perf.first_rejected_stamp() == kT0 + 1);
+    CHECK(md(perf, perf.rows("hourly")[0], "cpu_sum") == 0.75);
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Registry types and the per-source declarations
 // ═════════════════════════════════════════════════════════════════════════════
@@ -438,7 +459,9 @@ TEST_CASE("generate_fold_ddl: tables, indexes and views are exactly what the dec
         if (!d.own_tables)
             tiers += static_cast<int64_t>(d.tiers.size());
     CHECK(tiers == 34); // pinned: a tier added or dropped is a deliberate edit
-    CHECK(count(m.db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table'") == tiers + 2);
+    // + the dictionary, the replay ring and sqlite_sequence (the dictionary id never reuses a value).
+    CHECK(count(m.db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table'") == tiers + 3);
+    CHECK(count(m.db, "SELECT COUNT(*) FROM sqlite_master WHERE sql LIKE '%AUTOINCREMENT%'") == 1);
     CHECK(count(m.db, "SELECT COUNT(*) FROM sqlite_master WHERE type='view'") == tiers);
     CHECK(count(m.db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'usage%'") == 0);
 
@@ -624,10 +647,7 @@ TEST_CASE("tier_upsert_sql: pinned text, and it prepares against the generated s
             continue;
         for (auto tier : d.tiers) {
             INFO("upsert " << d.name << " " << tier);
-            sqlite3_stmt* st = nullptr;
-            const auto sql = tier_upsert_sql(d, tier);
-            CHECK(sqlite3_prepare_v2(m.db, sql.c_str(), -1, &st, nullptr) == SQLITE_OK);
-            sqlite3_finalize(st);
+            CHECK(prepare(m.db, tier_upsert_sql(d, tier)) != nullptr);
         }
     }
 }
@@ -684,7 +704,7 @@ TEST_CASE("tcp_delta: connect, disconnect, failed, listen, unknown", "[echo][fol
     CHECK(mi(acc, l, "connect_count") == 0);
 }
 
-TEST_CASE("module_delta: loaded and seed load, blocked is counted, unloaded is dropped",
+TEST_CASE("module_delta: loaded counts, seed and unloaded contribute nothing, blocked is counted",
           "[echo][fold][delta]") {
     const auto row = [](const char* action, const char* module) {
         ModuleRow r;
@@ -704,7 +724,7 @@ TEST_CASE("module_delta: loaded and seed load, blocked is counted, unloaded is d
                  acc);
     REQUIRE(acc.rows("hourly").size() == 1);
     const auto m = acc.rows("hourly")[0];
-    CHECK(mi(acc, m, "load_count") == 2);
+    CHECK(mi(acc, m, "load_count") == 1);
     CHECK(mi(acc, m, "blocked_count") == 1);
     CHECK(ks(acc, m, "is_kernel") == "1");
     CHECK(ks(acc, m, "module_dir") == "C:\\Windows");
@@ -1053,8 +1073,29 @@ TEST_CASE("identity_digest: deterministic, and covers exactly the fields the raw
     s.detail = "attr:late";
     s.snapshot_id = 5;
     CHECK(registry_delta({r})[0].identity_digest == registry_delta({s})[0].identity_digest);
-    s.data = "changed";
-    CHECK(registry_delta({r})[0].identity_digest != registry_delta({s})[0].identity_digest);
+    s.ts = kT0 + 1; // the stamp is not identity either
+    const auto reg = [](const RegistryEvent& e) { return registry_delta({e})[0].identity_digest; };
+    CHECK(reg(r) == reg(s));
+    // Every field the raw store compared is identity: a record differing in one is a collision.
+    const std::vector<std::function<void(RegistryEvent&)>> identity = {
+        [](RegistryEvent& e) { e.action = "added"; },     [](RegistryEvent& e) { e.hive = "HKU"; },
+        [](RegistryEvent& e) { e.key_path = "k2"; },      [](RegistryEvent& e) { e.value_name = "v"; },
+        [](RegistryEvent& e) { e.data_type = "REG_SZ"; }, [](RegistryEvent& e) { e.data = "changed"; },
+        [](RegistryEvent& e) { e.data_size = 9; },        [](RegistryEvent& e) { e.prev_data_type = "REG_DWORD"; },
+        [](RegistryEvent& e) { e.prev_data = "p"; },      [](RegistryEvent& e) { e.prev_data_size = 5; },
+        [](RegistryEvent& e) { e.observed_at = 3; },
+    };
+    for (std::size_t i = 0; i < identity.size(); ++i) {
+        INFO("registry edit " << i);
+        s = r;
+        identity[i](s);
+        CHECK(reg(r) != reg(s));
+    }
+    r.action = s.action = "capture_gap"; // a gap carries nothing but its action
+    s.hive = "HKU";
+    s.data = "other";
+    s.observed_at = 9;
+    CHECK(reg(r) == reg(s));
 
     // removable: every stored field is identity; `ts` is too, except for capture_gap and
     // present_at_baseline, where it is only when we noticed; snapshot_id never is.
@@ -1109,6 +1150,15 @@ TEST_CASE("install_fold_schema: replaces a legacy tier table with its view, idem
     CHECK(f->n("SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='process_hourly'") == 1);
     CHECK(f->n("SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='netqual_hourly'") == 1);
     REQUIRE(f->fold.install_fold_schema(f->db).has_value());
+
+    // A legacy table that holds rows refuses the install and keeps them.
+    auto g = make_fold_db(/*install=*/false);
+    REQUIRE(g->db.execute_sql("INSERT INTO process_hourly(hour_ts, name, user) VALUES (1, 'a', 'u')"));
+    const auto refused = g->fold.install_fold_schema(g->db);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("process_hourly holds 1 rows; move them aside") != std::string::npos);
+    CHECK(g->n("SELECT COUNT(*) FROM process_hourly") == 1);
+    CHECK(g->n("SELECT COUNT(*) FROM sqlite_master WHERE name = 'echo_dict'") == 0);
 }
 
 TEST_CASE("fold_rows: counts, text round-trip, and refusals", "[echo][fold][writer]") {
@@ -1139,14 +1189,36 @@ TEST_CASE("fold_rows: counts, text round-trip, and refusals", "[echo][fold][writ
     CHECK_FALSE(f->fold.fold_rows(f->db, "tcp", acc).has_value());                  // wrong accumulator
 }
 
-TEST_CASE("fold_rows: perf averages are exact weighted means across separate folds",
+TEST_CASE("fold_rows: a cold id cache re-folding known strings writes no more WAL frames than a warm one",
           "[echo][fold][writer]") {
     auto f = make_fold_db();
-    const auto sample = [](double cpu) {
+    auto acc = make_acc("process");
+    std::vector<ProcessEvent> evs;
+    for (int i = 0; i < 1500; ++i)
+        evs.push_back(pev(kT0, "started", ("proc_" + std::to_string(i) + std::string(40, 'x')).c_str()));
+    process_delta(evs, acc);
+    REQUIRE(f->fold.fold_rows(f->db, "process", acc).has_value()); // interns the strings
+    const auto frames = [&](EchoFold& fold) { // WAL frames one fold of `acc` writes
+        f->q("PRAGMA wal_checkpoint(TRUNCATE)");
+        REQUIRE(fold.fold_rows(f->db, "process", acc).has_value());
+        return std::stoll(f->q("PRAGMA wal_checkpoint(PASSIVE)")[0][1]);
+    };
+    const auto warm = frames(f->fold); // every id is cached
+    EchoFold cold;                     // an empty cache: every string is a dictionary hit
+    const auto cold_frames = frames(cold);
+    INFO("warm " << warm << " cold " << cold_frames);
+    CHECK(warm > 0);
+    CHECK(cold_frames <= warm);
+}
+
+TEST_CASE("fold_rows: perf averages are weighted means across separate folds; an INTEGER one truncates",
+          "[echo][fold][writer]") {
+    auto f = make_fold_db();
+    const auto sample = [](double cpu, int64_t bps = 1000) {
         PerfRow p;
         p.ts = kT0;
         p.cpu_pct = cpu;
-        p.disk_read_bps = 1000;
+        p.disk_read_bps = bps;
         return p;
     };
     auto a1 = make_acc("perf");
@@ -1155,14 +1227,14 @@ TEST_CASE("fold_rows: perf averages are exact weighted means across separate fol
     REQUIRE(first.has_value());
     CHECK(first->rows_touched == 2); // hourly + daily, one row each
     auto a2 = make_acc("perf");
-    perf_delta({sample(60)}, a2);
+    perf_delta({sample(60, 1001)}, a2);
     REQUIRE(f->fold.fold_rows(f->db, "perf", a2).has_value());
     const auto r = f->q("SELECT samples, cpu_avg, cpu_max, read_bps_avg FROM perf_hourly");
     REQUIRE(r.size() == 1);
     CHECK(r[0][0] == "3");
     CHECK(std::stod(r[0][1]) == 30.0); // (10 + 20 + 60) / 3
     CHECK(std::stod(r[0][2]) == 60.0);
-    CHECK(r[0][3] == "1000");
+    CHECK(r[0][3] == "1000"); // 3001 / 3 truncated, as CAST(AVG(..) AS INTEGER) was
     CHECK(f->n("SELECT COUNT(*) FROM perf_daily_r") == 1);
 }
 
@@ -1258,6 +1330,7 @@ TEST_CASE("fold_cursor_rows: events, ring, baseline and cursor commit together; 
                                              "{\"v\":1,\"n\":3}", {StateWrite{"power:late", "S2"}});
     REQUIRE_FALSE(r3.has_value());
     CHECK(r3.error().kind == CursorFoldError::Kind::KeyCollision);
+    CHECK(r3.error().text.find("contribution 1 of source 'power'") != std::string::npos);
     CHECK(f->n("SELECT SUM(event_count) FROM power_hourly") == 2);
     CHECK(f->n("SELECT COUNT(*) FROM echo_fold_seen WHERE source='power'") == 2); // k3 not entered
     CHECK_FALSE(f->db.try_get_state("power:late").value().has_value());
@@ -1455,6 +1528,11 @@ TEST_CASE("fold_cursor_rows: the replay ring prunes to its depth, per source", "
     CHECK(f->n("SELECT COUNT(*) FROM echo_fold_seen WHERE source='power' AND record_key='key-0'") == 0);
     CHECK(f->n("SELECT COUNT(*) FROM echo_fold_seen WHERE source='removable'") == 1);
     CHECK(f->n("SELECT SUM(event_count) FROM power_hourly") == 4200); // pruning never un-folds
+    // The ring is first-sighting FIFO: a record re-offered after 4096 newer keys folds again.
+    const auto again = f->fold.fold_cursor_rows(f->db, "power", batch, "c", {});
+    REQUIRE(again.has_value());
+    CHECK(again->replayed == 4096);
+    CHECK(f->n("SELECT SUM(event_count) FROM power_hourly") == 4304);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1524,16 +1602,27 @@ TEST_CASE("gc_dictionary: a deadline that passes mid-statement rolls the batch b
     const auto g = f->fold.gc_dictionary(f->db, t0 + std::chrono::seconds(1));
     REQUIRE(g.has_value());
     CHECK(g->deadline_hit);
+    CHECK_FALSE(g->live_set_built); // the scan did not fit: "nothing orphaned" would be a lie
     CHECK(g->deleted == 0);
-    CHECK(f->n("SELECT COUNT(*) FROM echo_dict") == 3000); // the interrupted batch rolled back
+    CHECK(f->n("SELECT COUNT(*) FROM echo_dict") == 3000); // the interrupted scan rolled back
+    // The progress handler is cleared on every exit: a long statement on the trusted
+    // connection must not call into the destroyed GcProgress.
+    const char* long_stmt = "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 200000) "
+                            "SELECT COUNT(*) FROM c";
+    CHECK(f->n(long_stmt) == 200000);
+    CHECK(f->n("SELECT COUNT(*) FROM sqlite_temp_master") == 0); // the orphan table is dropped on every exit
 
-    // The connection is healthy and a generous deadline now finishes the job (two batches).
+    // The connection is healthy and a generous deadline now finishes the job: one scan,
+    // then two batches by id.
     calls->store(1);
     const auto done = f->fold.gc_dictionary(f->db, t0 + 2 * kHour);
     REQUIRE(done.has_value());
     CHECK_FALSE(done->deadline_hit);
+    CHECK(done->live_set_built);
     CHECK(done->deleted == 3000);
     CHECK(f->n("SELECT COUNT(*) FROM echo_dict") == 0);
+    CHECK(f->n(long_stmt) == 200000);
+    CHECK(f->n("SELECT COUNT(*) FROM sqlite_temp_master") == 0);
 }
 
 TEST_CASE("gc_dictionary: a real failure is an error, never an empty success", "[echo][fold][gc]") {
@@ -1543,7 +1632,7 @@ TEST_CASE("gc_dictionary: a real failure is an error, never an empty success", "
     CHECK_FALSE(g.has_value());
 }
 
-TEST_CASE("dictionary_gc_sql: one EXCEPT term per interned key column, inside SQLite's compound limit",
+TEST_CASE("dictionary_orphans_sql: one EXCEPT term per interned key column, inside SQLite's compound limit",
           "[echo][fold][gc]") {
     std::size_t terms = 0;
     for (const auto& d : fold_sources())
@@ -1551,7 +1640,7 @@ TEST_CASE("dictionary_gc_sql: one EXCEPT term per interned key column, inside SQ
             for (std::size_t t = 0; t < d.tiers.size(); ++t)
                 for (const auto& c : d.columns)
                     terms += c.interned ? 1 : 0;
-    const auto sql = dictionary_gc_sql(kGcBatch);
+    const auto sql = dictionary_orphans_sql();
     std::size_t found = 0;
     for (auto pos = sql.find(" EXCEPT "); pos != std::string::npos; pos = sql.find(" EXCEPT ", pos + 1))
         ++found;
@@ -1560,9 +1649,41 @@ TEST_CASE("dictionary_gc_sql: one EXCEPT term per interned key column, inside SQ
     Mem m;
     open_mem(m);
     REQUIRE(exec(m.db, generate_fold_ddl()));
-    sqlite3_stmt* st = nullptr;
-    CHECK(sqlite3_prepare_v2(m.db, sql.c_str(), -1, &st, nullptr) == SQLITE_OK);
-    sqlite3_finalize(st);
+    REQUIRE(exec(m.db, "CREATE TEMP TABLE echo_dict_orphan (id INTEGER PRIMARY KEY)"));
+    CHECK(prepare(m.db, sql) != nullptr);
+}
+
+TEST_CASE("fold_rows waits while a GC pass holds op_mu_", "[echo][fold][gc][concurrency]") {
+    // The injected clock runs under op_mu_ (the first reading is the GC pass's own): park
+    // it there, then a fold started meanwhile must not complete until the pass is released.
+    std::promise<void> parked, release;
+    auto release_f = release.get_future().share();
+    std::atomic<bool> first{true};
+    auto f = make_fold_db(true, [&] {
+        if (first.exchange(false)) {
+            parked.set_value();
+            release_f.wait();
+        }
+        return std::chrono::steady_clock::now();
+    });
+    auto acc = make_acc("process"); // built here: no Catch2 assertions off the main thread
+    process_delta({pev(kT0, "started", "a.exe")}, acc);
+    std::atomic<bool> fold_ok{false};
+    std::promise<void> folded;
+    std::thread gc([&] { (void)f->fold.gc_dictionary(f->db, std::chrono::steady_clock::now() + kHour); });
+    parked.get_future().wait();
+    std::thread fold([&] {
+        fold_ok = f->fold.fold_rows(f->db, "process", acc).has_value();
+        folded.set_value();
+    });
+    auto folded_f = folded.get_future();
+    const auto blocked = folded_f.wait_for(std::chrono::milliseconds(150));
+    release.set_value();
+    gc.join();
+    fold.join();
+    CHECK(blocked == std::future_status::timeout);
+    CHECK(fold_ok);
+    CHECK(integrity_violations(*f) == 0);
 }
 
 TEST_CASE("fold and GC serialise: no dangling dictionary id after concurrent use",
@@ -1643,22 +1764,6 @@ std::expected<QueryResult, std::string> plugin_sql(EchoDatabase& db, const std::
     if (!v)
         return std::unexpected(v.error());
     return db.execute_user_query(*v);
-}
-
-// `body` placed behind each way a quoted identifier can look like a comment or literal opener to
-// a scanner that does not know identifiers: SQLite reads "--" / `--` / [--] / "/*" / "a""--" as
-// ONE identifier token, so the code after it is live and the validator must see it.
-void check_refused_behind_quoted_identifiers(const std::string& body) {
-    std::vector<std::string> sqls;
-    for (const char* marker : {"\"--\"", "`--`", "[--]", "\"/*\"", "\"a\"\"--\""})
-        sqls.push_back(std::string("SELECT 1 AS ") + marker + ", " + body);
-    sqls.push_back("SELECT 1 AS \"'\", " + body + ", 2 AS \"'\""); // the body between two quote characters
-    for (const auto& sql : sqls) {
-        INFO(sql);
-        const auto v = validate_and_translate_sql(sql);
-        REQUIRE_FALSE(v.has_value());
-        CHECK(v.error().find("forbidden keyword") != std::string::npos);
-    }
 }
 } // namespace
 
@@ -1742,7 +1847,7 @@ TEST_CASE("operator SQL: NATURAL and USING joins never reach the dictionary or t
         user_delta({li}, acc);
         REQUIRE(f->fold.fold_rows(f->db, "user", acc).has_value());
     }
-    // A usage row for the same user on the same day: the presence oracle's target (#4260).
+    // A usage row for the same user on the same day (the usage tables stay denied, #4260).
     REQUIRE(f->db.execute_sql("INSERT INTO usage_daily_user(day_ts, exe_key, user) VALUES (" +
                               std::to_string(kDay0) + ", 'x.exe', 'u')"));
 
@@ -1780,11 +1885,6 @@ TEST_CASE("operator SQL: NATURAL and USING joins never reach the dictionary or t
         REQUIRE_FALSE(v.has_value());
         CHECK(v.error().find("forbidden keyword") != std::string::npos);
     }
-    // The same joins behind a quoted identifier that holds a comment or quote marker.
-    check_refused_behind_quoted_identifiers("(SELECT count(*) FROM echo_dict a NATURAL JOIN echo_dict b)");
-    check_refused_behind_quoted_identifiers(
-        "(SELECT count(*) FROM user_daily NATURAL JOIN usage_daily_user WHERE user_daily.user = 'u')");
-    check_refused_behind_quoted_identifiers("(SELECT count(*) FROM echo_dict a JOIN echo_dict b USING (text))");
     // ON joins keep working, and identifiers or literals that merely contain the words
     // are not the keywords.
     CHECK(plugin_sql(f->db, "SELECT COUNT(*) FROM process_hourly p JOIN process_daily d ON d.name = p.name")
@@ -1820,9 +1920,6 @@ TEST_CASE("operator SQL: a CTE can never shadow a roll-up view name", "[echo][fo
         CHECK(v.error().find("forbidden keyword") != std::string::npos);
     }
     CHECK_FALSE(validate_and_translate_sql("WITH x AS (SELECT 1) SELECT * FROM x").has_value());
-    // The same CTE behind a quoted identifier that holds a comment or quote marker.
-    check_refused_behind_quoted_identifiers(
-        "(WITH process_hourly AS (SELECT group_concat(text) AS t FROM echo_dict) SELECT t FROM process_hourly)");
     // An unterminated quoting runs to the end of the input, as SQLite reads it, and SQLite then
     // refuses to tokenise it: nothing executes.
     CHECK_FALSE(plugin_sql(f->db, "SELECT 1 AS \"x, (WITH process_hourly AS (SELECT * FROM echo_dict) "
@@ -1838,7 +1935,7 @@ TEST_CASE("operator SQL: a CTE can never shadow a roll-up view name", "[echo][fo
     }
 }
 
-TEST_CASE("validate_and_translate_sql: a quoted identifier is one token, for keywords and for $ names",
+TEST_CASE("validate_and_translate_sql: a quoted identifier is one token, and $ names translate in it",
           "[echo][fold][authorizer][sql]") {
     // Quoted identifiers that merely contain a keyword or a comment or quote marker validate.
     for (const char* sql : {"SELECT 1 AS \"with\"", "SELECT 1 AS `natural`", "SELECT 1 AS [using]",
@@ -1847,14 +1944,76 @@ TEST_CASE("validate_and_translate_sql: a quoted identifier is one token, for key
         INFO(sql);
         CHECK(validate_and_translate_sql(sql).has_value());
     }
-    // A $name inside a quoted identifier is a name, translated only in code (as in a literal, #631).
+    // A $name in a quoted identifier is translated like one in code; in a literal it is data (#631).
     const auto q = validate_and_translate_sql(
-        "SELECT 1 AS \"$Process_Hourly\", 2 AS [$Process_Daily], 3 AS `$Process_Hourly` FROM $Process_Hourly");
+        "SELECT 1 AS \"$Process_Hourly\", 2 AS [$Process_Daily], 3 AS `$Process_Hourly`, '$Process_Hourly' "
+        "FROM \"$Process_Hourly\"");
     REQUIRE(q.has_value());
-    CHECK(q->find("\"$Process_Hourly\"") != std::string::npos);
-    CHECK(q->find("[$Process_Daily]") != std::string::npos);
-    CHECK(q->find("`$Process_Hourly`") != std::string::npos);
-    CHECK(q->ends_with(" FROM process_hourly"));
+    CHECK(*q == "SELECT 1 AS \"process_hourly\", 2 AS [process_daily], 3 AS `process_hourly`, '$Process_Hourly' "
+                "FROM \"process_hourly\"");
+    // Every bound-parameter marker is refused, named or not.
+    for (const char* sql : {"SELECT ?", "SELECT ?1", "SELECT $a", "SELECT :a", "SELECT @a", "SELECT #1"}) {
+        INFO(sql);
+        const auto r = validate_and_translate_sql(sql);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("bound-parameter marker") != std::string::npos);
+    }
+}
+
+TEST_CASE("operator SQL: no validator-accepted string runs a refused payload", "[echo][fold][authorizer][sql]") {
+    // A seeded differential corpus: runs of every token that swallows text in SQLite (the three
+    // identifier quotings, both comments, and the variable token with its "(...)" body) around a
+    // payload only the validator stands in front of. Whatever the validator accepts must not run it.
+    auto f = make_fold_db();
+    fold_names(*f, {"zz_sentinel"});
+    const std::string payloads[] = {
+        "(SELECT count(*)+7777777 FROM echo_dict a NATURAL JOIN echo_dict b)",
+        // The CTE shadows a view name, so the authorizer alone would admit it.
+        "(WITH process_hourly AS (SELECT text AS name FROM echo_dict) SELECT group_concat(name) FROM process_hourly)"};
+    const auto leaks = [](const std::expected<QueryResult, std::string>& r) {
+        if (!r)
+            return false;
+        for (const auto& row : r->rows)
+            for (const auto& cell : row)
+                if (cell.find("zz_sentinel") != std::string::npos ||
+                    (cell.size() >= 7 && cell.find_first_not_of("0123456789") == std::string::npos &&
+                     std::stoll(cell) >= 7777777))
+                    return true;
+        return false;
+    };
+    for (const auto& p : payloads) // positive control: the detector sees each payload when it runs
+        REQUIRE(leaks(f->db.execute_user_query("SELECT 1, " + p)));
+
+    const char* const tokens[] = {"'", "\"", "`", "[", "]", "--", "/*", "*/", "@x(", "$x(", ":x(", "#x(", ")", "\n", " "};
+    uint32_t rng = 20261103; // fixed seed: the corpus is the same on every run
+    const auto next = [&](uint32_t n) {
+        rng = rng * 1664525u + 1013904223u;
+        return (rng >> 16) % n;
+    };
+    const auto run_of = [&](uint32_t max_len) {
+        std::string out;
+        for (uint32_t k = next(max_len + 1); k > 0; --k)
+            out += tokens[next(std::size(tokens))];
+        return out;
+    };
+    int accepted = 0, parameter_refusals = 0;
+    for (int i = 0; i < 4000; ++i) {
+        std::string sql = next(2) ? "SELECT 1 AS " : "SELECT 1, "; // sequenced: same corpus on every compiler
+        sql += run_of(4);
+        sql += ", ";
+        sql += payloads[next(2)];
+        sql += run_of(2);
+        INFO(sql);
+        const auto v = validate_and_translate_sql(sql);
+        if (!v) {
+            parameter_refusals += v.error().find("bound-parameter marker") != std::string::npos;
+            continue;
+        }
+        ++accepted;
+        CHECK_FALSE(leaks(f->db.execute_user_query(*v)));
+    }
+    CHECK(accepted > 0);           // not vacuous: the validator does accept some of the corpus
+    CHECK(parameter_refusals > 0); // and the corpus does reach the variable-token shapes
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

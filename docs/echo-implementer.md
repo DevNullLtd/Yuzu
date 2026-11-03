@@ -159,7 +159,7 @@ patterns to `kDefaultRedactionPatterns` in `echo_collectors.hpp` rather
 than scrubbing per-callsite.
 
 **Schema versioning.** `echo_db.cpp` runs an idempotent migration at open
-time. Current schema version is **8** (legacy `tar_events` was retired at v3 in
+time. Current schema version is **9** (legacy `tar_events` was retired at v3 in
 PR M14, but `kCreateSchema` kept recreating it on every open — v5 stops that and
 drops it from already-migrated databases, #2093). Bumps go in the same
 function, never in `applies_*` collectors.
@@ -171,9 +171,8 @@ of operating for echo at all, I don't want this as a configurable thing, it's th
 operation." So there is no config key, flag, mode switch, environment variable or runtime toggle
 between raw capture rows and roll-ups, and none is to be added. The code in this section is
 staged: it is built and tested, but nothing opens, writes or reads it. `EchoDatabase::open()`
-changes only by forcing the two read-surface allowlists (`is_fold_view`,
-`is_fold_internal_table`) to initialise; the collectors, the aggregator and every setting do not
-reference it.
+changes only by forcing the derived view allowlist (`is_fold_view`) to initialise; the collectors,
+the aggregator and every setting do not reference it.
 
 **Where it lives.** `echo_fold_schema.{hpp,cpp}` declare the 17 sources' tier columns and
 generate the DDL; `echo_fold.{hpp,cpp}` hold the pure fold core (bucket math, `TierAccumulator`,
@@ -200,7 +199,8 @@ newer one (a tie takes the later arrival). A `kMin` column (`rtt_us_min`, `min_r
 on every event: the INSERT carries the value, so its `NOT NULL DEFAULT 0` never enters a `MIN()`;
 only a delta that writes a placeholder 0 holds the minimum at 0 (the `netqual` delta does for
 `rtt_us_min`). Averages are `*_sum` plus `samples`; the `*_avg` names are generated, so consumers
-keep their columns and every average is an exact weighted mean.
+keep their columns and every average is an exact weighted mean (an INTEGER-declared one truncates
+it, as the legacy rollup's `CAST(AVG(..) AS INTEGER)` did).
 
 **Cursor sources.** `power`, `removable` and `registry` fold through `fold_cursor_rows`, with a
 durable per-source ring (`echo_fold_seen`, newest 4096 keys). A key already in the ring is a replay
@@ -216,21 +216,31 @@ refuses the batch.
 **Event times are trusted as given.** A bucket comes from the event's own UTC stamp: no clamp, no
 counter. Accepted residual: a stamp inside the representable domain but far in the future makes a
 bucket only age-based eviction removes. The one refusal is a stamp outside 0001-01-01 ..
-9999-12-31 UTC, which no calendar can bucket: that single event is rejected and the rest of its
-batch folds. Rejections are counted in `echo_config` `fold_rejected_events_total`, in the same
+9999-12-31 UTC, which no calendar can bucket, and a non-finite measure (NaN or infinity): that
+single event is rejected and the rest of its batch folds. Rejections are counted in `echo_config` `fold_rejected_events_total`, in the same
 transaction as the fold (a rollback leaves it unchanged), and logged once per batch with the first
 offending stamp only. `echo.status` does not report the counter.
 
 **One lock, one order.** `EchoFold` holds a single `op_mu_` across every fold, GC, cache read and
 cache publication; lock order is `op_mu_` then `EchoDatabase::mu_`. New strings are interned
 inside the transaction and join the cache only after COMMIT. One `EchoFold` instance fronts a
-database. Counts come from `RETURNING`, never `sqlite3_changes()`.
+database. Counts come from `RETURNING`, never `sqlite3_changes()`. `echo_dict.id` is
+`AUTOINCREMENT`, so an id is never reused: any deleter of `echo_dict` rows goes through `EchoFold`
+(which clears its cache); one that does not leaves dangling ids (the view reads NULL), never ids
+naming another string. `fold_rows` is additive, not idempotent: a snapshot source is replay-safe
+only because its baseline `StateWrite` commits in the same transaction. The cursor ring is
+first-sighting FIFO: a record re-offered after 4096 newer keys of its source folds again (`kSum`
+double counts; `kMax`, `kMin` and `kLast` do not).
 
-**Dictionary GC.** `gc_dictionary` deletes strings no `_r` table references, 2000 per statement,
-until none remain or the deadline passes. The deadline is cooperative: a progress handler
-interrupts a running batch (it rolls back) and the loop checks before each batch. It does not
-cover mutex acquisition, `BEGIN IMMEDIATE`'s 5 s busy wait or COMMIT I/O. A real failure is
-returned as an error, never as an empty success.
+**Dictionary GC.** `gc_dictionary` scans the live set once per pass into a temp table
+(`echo_dict_orphan`, dropped at the pass end), then deletes the orphans by id, 2000 per statement,
+until none remain or the deadline passes. `op_mu_` is held for the pass, so no fold adds a
+reference meanwhile; a retention delete only creates orphans. The deadline is cooperative: a
+progress handler interrupts a running statement (it rolls back) and the loop checks before each
+one. A pass whose scan outruns the deadline deletes nothing and reports `live_set_built = false`.
+It does not cover mutex acquisition, `BEGIN IMMEDIATE`'s 5 s busy wait or COMMIT I/O. A real
+failure is returned as an error, never as an empty success. An interned string outlives its last
+row until the next pass.
 
 **`echo.sql` and the authorizer.** The views read the dictionary and the `_r` tables, so
 `echo_query_authorizer` lets those tables be read ONLY when SQLite reports the access under a
@@ -238,19 +248,40 @@ roll-up view (plus a column-less `COUNT(*)`-style read of a `_r` table, which ex
 count the view already shows, and only while every view is a WHERE-less single-table projection,
 which the DDL test pins). That rule is sound only because `validate_and_translate_sql` refuses
 `WITH`: SQLite reports a CTE's reads under the CTE's name, so a CTE named after a view would
-otherwise reach the dictionary. The validator's keyword check runs on the literal-, comment- and
-quoted-identifier-stripped query, using the same scan that translates `$` names, so a `--`, `/*`
-or `'` inside a `"..."`, `` `...` `` or `[...]` identifier cannot hide a keyword that follows it.
-The same validator refuses `NATURAL` and `USING` joins: SQLite resolves their shared columns
-before name resolution, so those reads never reach the authorizer at all (`echo_dict a NATURAL
-JOIN echo_dict b` counts the dictionary; a view joined `USING` to a usage table is a per-user
-presence oracle); both are observed by test on the shipped SQLite, and `ON` joins carry every read
-through the authorizer. The authorizer rule is defence in depth behind those refusals, not the
-closure. Direct reads of `echo_dict`, `echo_fold_seen` and any `_r` table, and the `usage_*`
+otherwise reach the dictionary. The validator translates `$` names first (in code and in quoted identifiers, never in a literal or
+comment), then runs its keyword check on the literal-, comment- and quoted-identifier-stripped
+translated query: the bytes SQLite runs. A bound-parameter marker (`$ @ : # ?`) is refused, because
+a variable token such as `$x(--)` swallows text the keyword check must see. The same validator
+refuses `NATURAL` and `USING` joins: SQLite resolves their shared columns before name resolution,
+so those reads never reach the authorizer; `ON` joins carry every read through it. A query that
+starts with `WITH` gets `only SELECT queries are allowed`; `WITH` elsewhere, `NATURAL` and `USING`
+get `query contains forbidden keyword: <word>` with the replacement (a subquery, or `ON`). The
+authorizer rule is defence in depth behind those refusals, not the closure. Direct reads of `echo_dict`, `echo_fold_seen` and any `_r` table, and the `usage_*`
 tables, stay denied.
 
-**`install_fold_schema` is destructive.** A view cannot take the name of an existing table, so it
-drops a legacy tier table first. It has no production caller.
+**Installing the roll-up schema on an existing database.** `install_fold_schema` drops an empty
+legacy tier table (a view cannot take its name) and refuses one that holds rows, naming it and its
+count. Once it has run:
+- `open()`'s registry DDL fails (`views may not be indexed`, rolled back, logged each boot) until
+  the registry tier DDL retires; the 16 tiers the registry does not declare have no retention row.
+- `purge_source`, the rollup `INSERT` and the retention and budget `DELETE`s address tier tables by
+  name and fail on views. `purge_source` must also delete the source's `_r` and `echo_fold_seen`
+  rows, run GC to completion and `TRUNCATE`-checkpoint; the ring is count-bounded and holds key
+  text (a hash of the key is the preferred shape).
+- `run_usage_fold` reads `process_live`; the schema version stays 9 and nothing marks the roll-up
+  shape; callers chunk backfills.
+- A `kLast` enrichment column is replaced by a later event that omits the field; a `historical`
+  mapdrive row with ts 0 folds into bucket 0; mapdrive `historical` (deduplicated by raw rows) and
+  netconn (a high-water mark in `echo_config`) have no transactional replay guard through
+  `fold_rows`.
+- Any deleter of `echo_dict` rows goes through `EchoFold`.
+
+**Adding a source or tier.** Five edits, each pinned by a test that fails until it matches: the
+registry row (`build_sources()`, section 8) where the tier has a `GranularityDef` (16 of the 34
+views have none, so no retention row and no `$` name); a `FoldSourceDef` at the same index in
+`fold_sources()`; a `*_delta` in `echo_fold.hpp`; the count pins in `test_echo_fold.cpp` (17
+sources, 34 tiers, 18 registry tiers, 16 shims); the capability TSV rows and the regenerated
+`docs/os-capability-matrix.md`.
 
 ---
 
@@ -442,7 +473,8 @@ header):
    data) → `appeared`/`removed`. Keep value-only fields (TTL, entry_type) **out**
    of the key so they don't churn the warehouse.
 5. **`echo_schema_registry.cpp`** `build_sources()` — add ONE `CaptureSourceDef`.
-   This is the single source of truth: it auto-drives the warehouse DDL, the
+   This is the single source of truth for the raw-capture tables (the roll-up tables and views are
+   declared apart, section 3.1): it auto-drives the warehouse DDL, the
    `$Name_Tier` → `name_tier` translation, the read-only-SQL authorizer allowlist
    (`is_queryable_table`, the #760/#631 chokepoint — **no hardcoded list to
    touch**), and the `status` / `compatibility` / `configure` / `snapshot` actions.
@@ -496,7 +528,8 @@ header):
 10. **Tests** — extend `test_echo_schema_registry.cpp` (every source has all three
     OS rows; every source in the `default_enabled=true` registry-wide invariant),
     `test_echo_diff.cpp` (appeared/removed + cap), `test_echo_warehouse.cpp` (DDL +
-    `$`-name translation + authorizer), and add a `test_echo_<source>.cpp`.
+    `$`-name translation + authorizer), and add a `test_echo_<source>.cpp`; the roll-up pins are
+    listed in section 3.1 ("Adding a source or tier").
 
 **`usage` is not an example of this pattern.** It is a DERIVED source (a fold over
 `process_live`, `echo_usage.cpp`/`echo_usage.hpp`) — no `enumerate_<source>()`, no
