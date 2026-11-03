@@ -428,15 +428,6 @@ enum class LifecycleState {
     Active,         ///< enabled and baselined under the current activation
 };
 
-/**
- * Outcome of one usage_sweep() pass (echo_usage.cpp). `ok == false` means the whole pass ROLLED
- * BACK and nothing changed.
- */
-struct UsageFoldResult {
-    bool ok{false};
-    std::string error;
-};
-
 /// Derive the current lifecycle state (see the file banner). Reads three
 /// echo_config facts; never writes anything.
 [[nodiscard]] LifecycleState usage_lifecycle_state(EchoDatabase& db);
@@ -491,8 +482,9 @@ usage_fold_in(TransactionHandle& h, int64_t now, const std::vector<ProcessEvent>
  * The per-tick sweep with no events: expire and cap the open runs, advance the last-fold
  * anchor and publish usage_feeder_enabled -- usage_fold_in on its own transaction. The fast
  * tick calls it after the process fold, so an open run ages out even on a tick with no
- * process event. A disabled or not-yet-baselined source is not a failure.
+ * process event. A disabled or not-yet-baselined source is not a failure; an error means the
+ * whole pass ROLLED BACK and nothing changed.
  */
-[[nodiscard]] UsageFoldResult usage_sweep(EchoDatabase& db, int64_t now);
+[[nodiscard]] std::expected<void, std::string> usage_sweep(EchoDatabase& db, int64_t now);
 
 } // namespace yuzu::echo::usage

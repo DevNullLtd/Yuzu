@@ -126,9 +126,28 @@ std::string_view col_text(sqlite3_stmt* stmt, int idx) {
     return txt ? std::string_view{txt} : std::string_view{};
 }
 
+// The text of an echo_config row, read through the transaction's own connection (calling
+// `db.get_config()` from inside a checked_transaction would try to reacquire `mu_` and deadlock):
+// nullopt = no row (a real, legitimate state), an error = the read failed. Never poisons the
+// handle -- each caller below owns that policy.
+std::expected<std::optional<std::string>, std::string> read_config_raw(TransactionHandle& h,
+                                                                       std::string_view key) {
+    sqlite3_stmt* raw = nullptr;
+    if (sqlite3_prepare_v2(h.raw(), "SELECT value FROM echo_config WHERE key = ?", -1, &raw,
+                           nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed"));
+    LocalStmtPtr stmt(raw);
+    sqlite3_bind_text(stmt.get(), 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_DONE)
+        return std::optional<std::string>{};
+    if (rc != SQLITE_ROW)
+        return std::unexpected(std::string("step failed"));
+    return std::optional<std::string>(std::string{col_text(stmt.get(), 0)});
+}
+
 // Best-effort read of a cumulative status counter FROM INSIDE an open
-// checked_transaction (via `h.raw()` -- calling `db.get_config()` here would
-// try to reacquire `mu_` and deadlock). A probe failure returns 0 rather
+// checked_transaction. A probe failure returns 0 rather
 // than poisoning the handle: these four counters (unmatched_stops,
 // clock_anomalies, gap_count, gap_lost_events) are cumulative,
 // informational-only status -- not one of the fold's three core
@@ -136,15 +155,8 @@ std::string_view col_text(sqlite3_stmt* stmt, int idx) {
 // read fault is the proportionate degrade, not failing the whole fold's
 // data commit over a status counter.
 int64_t read_config_i64_locked(TransactionHandle& h, std::string_view key) {
-    sqlite3_stmt* raw = nullptr;
-    if (sqlite3_prepare_v2(h.raw(), "SELECT value FROM echo_config WHERE key = ?", -1, &raw,
-                           nullptr) != SQLITE_OK)
-        return 0;
-    LocalStmtPtr stmt(raw);
-    sqlite3_bind_text(stmt.get(), 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt.get()) != SQLITE_ROW)
-        return 0;
-    return parse_i64(col_text(stmt.get(), 0));
+    const auto v = read_config_raw(h, key);
+    return (v && *v) ? parse_i64(**v) : 0;
 }
 
 // Distinguishes a genuinely-absent key (no row -- a real, legitimate state
@@ -161,21 +173,15 @@ int64_t read_config_i64_locked(TransactionHandle& h, std::string_view key) {
 // intact).
 std::expected<std::optional<int64_t>, std::string> read_config_i64_strict(TransactionHandle& h,
                                                                           std::string_view key) {
-    sqlite3_stmt* raw = nullptr;
-    if (sqlite3_prepare_v2(h.raw(), "SELECT value FROM echo_config WHERE key = ?", -1, &raw,
-                           nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed"));
-    LocalStmtPtr stmt(raw);
-    sqlite3_bind_text(stmt.get(), 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
-    const int rc = sqlite3_step(stmt.get());
-    if (rc == SQLITE_DONE)
+    const auto v = read_config_raw(h, key);
+    if (!v)
+        return std::unexpected(v.error());
+    if (!*v)
         return std::optional<int64_t>{}; // genuinely absent -- no row, not a fault
-    if (rc != SQLITE_ROW)
-        return std::unexpected(std::string("step failed"));
-    const std::string_view raw_val = col_text(stmt.get(), 0);
     int64_t parsed = 0;
-    auto [p, ec] = std::from_chars(raw_val.data(), raw_val.data() + raw_val.size(), parsed);
-    if (ec != std::errc{} || p != raw_val.data() + raw_val.size())
+    const char* const end = (*v)->data() + (*v)->size();
+    auto [p, ec] = std::from_chars((*v)->data(), end, parsed);
+    if (ec != std::errc{} || p != end)
         return std::unexpected(std::string("malformed value"));
     return std::optional<int64_t>(parsed);
 }
@@ -231,27 +237,17 @@ bool usage_set_enabled(EchoDatabase& db, bool enabled, int64_t now) {
 
 namespace {
 
-// A text config value read through the transaction's own connection: nullopt = no row (a
-// legitimate state), an error = the read failed (the handle is poisoned, so the caller's whole
-// transaction rolls back rather than act on a guess).
+// A text config value through the transaction's own connection: nullopt = no row (a legitimate
+// state), an error = the read failed (the handle is poisoned, so the caller's whole transaction
+// rolls back rather than act on a guess).
 std::expected<std::optional<std::string>, std::string> read_config_text(TransactionHandle& h,
                                                                         std::string_view key) {
-    sqlite3_stmt* raw = nullptr;
-    if (sqlite3_prepare_v2(h.raw(), "SELECT value FROM echo_config WHERE key = ?", -1, &raw,
-                           nullptr) != SQLITE_OK) {
-        h.fail("prepare echo_config read failed");
+    auto v = read_config_raw(h, key);
+    if (!v) {
+        h.fail("echo_config read failed: " + v.error());
         return std::unexpected(h.error());
     }
-    LocalStmtPtr stmt(raw);
-    sqlite3_bind_text(stmt.get(), 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
-    const int rc = sqlite3_step(stmt.get());
-    if (rc == SQLITE_DONE)
-        return std::optional<std::string>{};
-    if (rc != SQLITE_ROW) {
-        h.fail("step echo_config read failed");
-        return std::unexpected(h.error());
-    }
-    return std::optional<std::string>(std::string{col_text(stmt.get(), 0)});
+    return v;
 }
 
 // `<source>_enabled` through the handle: the canonical tri-state of #560, the registry default
@@ -270,6 +266,19 @@ bool upsert_config(TransactionHandle& h, std::string_view key, std::string_view 
                               sql_str(key), sql_str(value)));
 }
 
+// Stamp a fresh baseline on the transaction's handle: forget the open runs, record the coverage
+// start, and mark `generation` active. It stays on the handle (no db.set_config inside a
+// checked_transaction), shared by usage_ensure_baselined and the PendingBaseline branch of
+// usage_fold_in.
+std::expected<void, std::string> stamp_baseline(TransactionHandle& h, int64_t now,
+                                                int64_t generation) {
+    if (!h.exec("DELETE FROM usage_live") ||
+        !upsert_config(h, "usage_coverage_since", std::to_string(now)) ||
+        !upsert_config(h, "usage_active_generation", std::to_string(generation)))
+        return std::unexpected(h.error());
+    return {};
+}
+
 } // namespace
 
 std::expected<void, std::string> usage_ensure_baselined(EchoDatabase& db, int64_t now) {
@@ -279,15 +288,7 @@ std::expected<void, std::string> usage_ensure_baselined(EchoDatabase& db, int64_
     const int64_t generation = parse_i64(db.get_config("usage_generation", "0"));
 
     auto result = db.checked_transaction(
-        [&](TransactionHandle& h) -> std::expected<void, std::string> {
-            if (!h.exec("DELETE FROM usage_live"))
-                return std::unexpected(h.error());
-            if (!upsert_config(h, "usage_coverage_since", std::to_string(now)))
-                return std::unexpected(h.error());
-            if (!upsert_config(h, "usage_active_generation", std::to_string(generation)))
-                return std::unexpected(h.error());
-            return {};
-        });
+        [&](TransactionHandle& h) { return stamp_baseline(h, now, generation); });
     if (!result.has_value())
         spdlog::warn("Echo usage: baseline attempt failed ({}); will retry", result.error());
     return result;
@@ -322,13 +323,7 @@ std::expected<void, std::string> usage_fold_in(TransactionHandle& h, int64_t now
     if (!active) {
         // PendingBaseline: stamp the baseline now. A freshly-established baseline has nothing yet
         // to fold forward from, so this tick's events fold into the process tiers only.
-        if (!h.exec("DELETE FROM usage_live"))
-            return std::unexpected(h.error());
-        if (!upsert_config(h, "usage_coverage_since", std::to_string(now)))
-            return std::unexpected(h.error());
-        if (!upsert_config(h, "usage_active_generation", std::to_string(generation)))
-            return std::unexpected(h.error());
-        return {};
+        return stamp_baseline(h, now, generation);
     }
 
     // ── Load the open-run table (usage_live) ──
@@ -498,17 +493,9 @@ std::expected<void, std::string> usage_fold_in(TransactionHandle& h, int64_t now
     return {};
 }
 
-UsageFoldResult usage_sweep(EchoDatabase& db, int64_t now) {
-    UsageFoldResult result;
-    auto r = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
-        return usage_fold_in(h, now, {});
-    });
-    if (!r.has_value()) {
-        result.error = std::move(r.error());
-        return result;
-    }
-    result.ok = true;
-    return result;
+std::expected<void, std::string> usage_sweep(EchoDatabase& db, int64_t now) {
+    return db.checked_transaction(
+        [&](TransactionHandle& h) { return usage_fold_in(h, now, {}); });
 }
 
 } // namespace yuzu::echo::usage

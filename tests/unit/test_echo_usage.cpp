@@ -386,7 +386,7 @@ TEST_CASE("usage: the sweep does nothing (ok=true) while usage or process is dis
     auto t = make_test_db();
     REQUIRE(t.db.set_config("usage_enabled", "false"));
     auto result = usage_sweep(t.db, 1000);
-    CHECK(result.ok);
+    CHECK(result.has_value());
     CHECK(cfg(t.db, "usage_feeder_enabled") == "false");
     CHECK(count_rows(t.db, "usage_live") == 0);
 }
@@ -571,7 +571,7 @@ TEST_CASE("usage: expire sweep declines on a genuinely-absent anchor (first fold
     seed_open_run(t.db, 1, "old.exe", 1000); // stays open
 
     auto result = usage_sweep(t.db, /*now=*/1000 + yuzu::echo::usage::kDefaultMaxAgeSeconds + 1);
-    REQUIRE(result.ok);
+    REQUIRE(result.has_value());
     CHECK(count_rows(t.db, "usage_live") == 1); // the run is still open: the sweep declined
 }
 
@@ -584,7 +584,7 @@ TEST_CASE("usage: expire sweep declines when the anchor read fails, and still ad
     REQUIRE(t.db.set_config("usage_last_fold_ts", "not_a_number")); // malformed -- read fails
 
     auto result = usage_sweep(t.db, /*now=*/1000 + yuzu::echo::usage::kDefaultMaxAgeSeconds + 1);
-    REQUIRE(result.ok); // the read/parse failure declines the SWEEP only, not the whole fold
+    REQUIRE(result.has_value()); // the read/parse failure declines the SWEEP only, not the whole fold
     CHECK(count_rows(t.db, "usage_live") == 1);
     CHECK(cfg(t.db, "usage_last_fold_ts") ==
           std::to_string(1000 + yuzu::echo::usage::kDefaultMaxAgeSeconds + 1)); // re-anchored
@@ -606,7 +606,7 @@ TEST_CASE("usage: a declined tick DOES advance the anchor, so an ordinary sleep/
     seed_open_run(t.db, 1, "old.exe", 1500); // stays open across every tick below
 
     // Tick 1: establishes a real anchor at now=2000 (small gap, plausible).
-    REQUIRE(usage_sweep(t.db, /*now=*/2000).ok);
+    REQUIRE(usage_sweep(t.db, /*now=*/2000).has_value());
     CHECK(cfg(t.db, "usage_last_fold_ts") == "2000");
     CHECK(cfg(t.db, "usage_expiry_declined_count") == ""); // never written -- no decline yet
 
@@ -614,7 +614,7 @@ TEST_CASE("usage: a declined tick DOES advance the anchor, so an ordinary sleep/
     // must decline THIS tick's sweep (the run must not be wrongly force-closed against an
     // untrustworthy `now`) but the anchor MUST still advance, and the decline must be counted.
     const int64_t wake_now = 2000 + 700000; // > 8 days "asleep"
-    REQUIRE(usage_sweep(t.db, wake_now).ok);
+    REQUIRE(usage_sweep(t.db, wake_now).has_value());
     CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(wake_now)); // advanced -- the fix
     CHECK(count_rows(t.db, "usage_live") == 1); // the run is still open, not wrongly expired
     CHECK(cfg(t.db, "usage_expiry_declined_count") == "1");
@@ -625,7 +625,7 @@ TEST_CASE("usage: a declined tick DOES advance the anchor, so an ordinary sleep/
     // correctly-healed guard expires it; a still-frozen guard (the round-1 bug) would keep
     // declining forever and this run would never expire.
     const int64_t healed_now = wake_now + 500;
-    REQUIRE(usage_sweep(t.db, healed_now).ok);
+    REQUIRE(usage_sweep(t.db, healed_now).has_value());
     REQUIRE(healed_now - 1500 > yuzu::echo::usage::kDefaultMaxAgeSeconds); // sanity: old enough
     CHECK(count_rows(t.db, "usage_live") == 0); // expired -- the guard self-healed
     CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(healed_now));
@@ -646,10 +646,10 @@ TEST_CASE("usage: a sustained bad clock still declines on its OWN first implausi
     REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
     seed_open_run(t.db, 1, "old.exe", 1500);
 
-    REQUIRE(usage_sweep(t.db, /*now=*/2000).ok);
+    REQUIRE(usage_sweep(t.db, /*now=*/2000).has_value());
 
     // A backward clock step is exactly as implausible as a huge forward one.
-    REQUIRE(usage_sweep(t.db, /*now=*/1500).ok);
+    REQUIRE(usage_sweep(t.db, /*now=*/1500).has_value());
     CHECK(count_rows(t.db, "usage_live") == 1); // declined -- not wrongly force-closed
     CHECK(cfg(t.db, "usage_expiry_declined_count") == "1");
 }

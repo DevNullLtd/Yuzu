@@ -2047,23 +2047,21 @@ bool EchoDatabase::fold_mapdrive_events(const std::vector<MapDriveEvent>& events
     std::vector<std::string> new_keys;
     {
         std::unordered_set<std::string> known;
-        std::vector<std::string> candidates;
-        std::vector<std::string> keyed(events.size());
+        std::vector<std::string> keyed(events.size()); // empty for a non-historical event
+        std::string in_list;
+        int n_keys = 0;
         for (std::size_t i = 0; i < events.size(); ++i) {
             if (events[i].origin != "historical")
                 continue;
             const auto& e = events[i];
             keyed[i] = identity_hex({e.direction, e.local_mount, e.remote_path, e.remote_host, e.username});
-            candidates.push_back(keyed[i]);
+            in_list += (n_keys++ ? ",'" : "'") + keyed[i] + "'"; // hex digits only: safe to interpolate
         }
-        if (skip_known_historical && !candidates.empty()) {
-            std::string in_list;
-            for (const auto& k : candidates) // hex digits only: safe to interpolate
-                in_list += (in_list.empty() ? "'" : ",'") + k + "'";
+        if (skip_known_historical && n_keys > 0) {
             const auto rows = execute_query(
                 std::format("SELECT record_key FROM {} WHERE source = '{}' AND record_key IN ({})",
                             kSeenTable, kMapdriveHistoricalSource, in_list),
-                static_cast<int>(candidates.size()) + 1);
+                n_keys + 1);
             if (!rows) {
                 spdlog::error("EchoDatabase: fold_mapdrive_events: the known-mapping lookup failed: {}",
                               rows.error());
@@ -2090,19 +2088,21 @@ bool EchoDatabase::fold_mapdrive_events(const std::vector<MapDriveEvent>& events
     EchoFold::ExtraFn remember;
     if (!new_keys.empty()) {
         remember = [&new_keys, skip_known_historical](TransactionHandle& h) -> std::expected<void, std::string> {
+            sqlite3_stmt* raw = nullptr;
+            if (sqlite3_prepare_v2(h.raw(),
+                                   std::format("INSERT INTO {} (source, record_key, digest, seq) "
+                                               "VALUES ('{}', ?, 0, 0) ON CONFLICT DO NOTHING "
+                                               "RETURNING record_key",
+                                               kSeenTable, kMapdriveHistoricalSource)
+                                       .c_str(),
+                                   -1, &raw, nullptr) != SQLITE_OK) {
+                h.fail(std::string("prepare failed: ") + sqlite3_errmsg(h.raw()));
+                return std::unexpected(h.error());
+            }
+            StmtPtr stmt(raw); // finalised on every exit, before the caller commits
             for (const auto& key : new_keys) {
-                sqlite3_stmt* raw = nullptr;
-                if (sqlite3_prepare_v2(h.raw(),
-                                       std::format("INSERT INTO {} (source, record_key, digest, seq) "
-                                                   "VALUES ('{}', ?, 0, 0) ON CONFLICT DO NOTHING "
-                                                   "RETURNING record_key",
-                                                   kSeenTable, kMapdriveHistoricalSource)
-                                           .c_str(),
-                                       -1, &raw, nullptr) != SQLITE_OK) {
-                    h.fail(std::string("prepare failed: ") + sqlite3_errmsg(h.raw()));
-                    return std::unexpected(h.error());
-                }
-                StmtPtr stmt(raw);
+                // Back to ready (drops the previous pass's RETURNING row); the one parameter is rebound.
+                sqlite3_reset(stmt.get());
                 sqlite3_bind_text(stmt.get(), 1, key.data(), static_cast<int>(key.size()), SQLITE_STATIC);
                 const int rc = sqlite3_step(stmt.get());
                 if (rc == SQLITE_DONE) { // already remembered
@@ -2116,7 +2116,6 @@ bool EchoDatabase::fold_mapdrive_events(const std::vector<MapDriveEvent>& events
                     h.fail(std::string("step failed: ") + sqlite3_errmsg(h.raw()));
                     return std::unexpected(h.error());
                 }
-                sqlite3_reset(stmt.get()); // the insert is done; drop the pending RETURNING row
             }
             return {};
         };

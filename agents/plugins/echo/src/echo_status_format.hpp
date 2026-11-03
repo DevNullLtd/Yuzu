@@ -63,17 +63,16 @@ inline constexpr std::string_view kFreeSpaceRefusalPrefix = "not enough free dis
 
 /// The complete `echo status` reply when the database was never opened because the migration was
 /// refused for lack of free disk space, in the order it must be written (`error|` FIRST, for the
-/// reason format_storage_offline_lines documents). `token` is the reason (`free_space`); `detail` is
+/// reason format_storage_offline_lines documents). The reason is always `free_space`; `detail` is
 /// the open error, which names the two figures. The plugin has loaded but nothing collects and no
 /// trigger is registered: restart the agent once the space is freed.
-[[nodiscard]] inline std::vector<std::string> format_storage_refused_lines(std::string_view token,
-                                                                           std::string_view detail) {
+[[nodiscard]] inline std::vector<std::string> format_storage_refused_lines(std::string_view detail) {
     return {
         std::string{"error|Echo storage is offline on this endpoint: "}
             .append(detail)
             .append(". Collection and retention are stopped and the database was not changed. "
                     "Restart the agent after freeing the space."),
-        std::string{"storage_state|offline|"}.append(token),
+        "storage_state|offline|free_space",
     };
 }
 

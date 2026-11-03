@@ -57,7 +57,7 @@ releases exactly the resource listed.
   it held).
 - **Baseline:** `PendingBaseline` stamps its lifecycle state and folds nothing.
 
-### Offline plugin state (`EchoPlugin::offline_reason_`, `offline_detail_`)
+### Offline plugin state (`EchoPlugin::offline_detail_`)
 - **Site:** set by `init()` when `EchoDatabase::open` returns a free-space refusal; read by
   `execute_dispatch` and the status path.
 - **Owner type:** the plugin instance. Written once in `init()` before any trigger or dispatch exists,

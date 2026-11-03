@@ -55,6 +55,7 @@
  * Roll-up is the only storage model: nothing here selects between it and raw rows.
  */
 
+#include "echo_aggregator.hpp" // kAutoVacuumDeferredKey
 #include "echo_db.hpp"
 #include "echo_fold.hpp"
 #include "echo_fold_schema.hpp"
@@ -64,9 +65,9 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -92,7 +93,6 @@ using StmtPtr = std::unique_ptr<sqlite3_stmt, StmtDeleter>;
 
 constexpr int64_t kChunkRows = 10'000;
 constexpr std::string_view kTiers[] = {"hourly", "daily", "monthly"};
-constexpr std::string_view kAutoVacuumDeferredAt = "auto_vacuum_deferred_at";
 
 int64_t now_epoch_seconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -144,6 +144,14 @@ std::optional<std::vector<std::string>> read_texts(TransactionHandle& h, const s
     return out;
 }
 
+// The column names of `table`.
+std::optional<std::set<std::string>> column_names(TransactionHandle& h, std::string_view table) {
+    const auto names = read_texts(h, std::format("SELECT name FROM pragma_table_info('{}')", table));
+    if (!names)
+        return std::nullopt;
+    return std::set<std::string>(names->begin(), names->end());
+}
+
 // The mark `key` holds, or nullopt when it is absent or unparseable (an unparseable mark is
 // treated as absent: the safe reading is "nothing was rolled up", and it is logged).
 std::optional<int64_t> read_mark(TransactionHandle& h, const std::string& key) {
@@ -159,15 +167,15 @@ std::optional<int64_t> read_mark(TransactionHandle& h, const std::string& key) {
         return std::nullopt;
     }
     const auto* t = reinterpret_cast<const char*>(sqlite3_column_text(st.get(), 0));
-    const std::string text = t ? t : "";
-    char* end = nullptr;
-    const long long v = std::strtoll(text.c_str(), &end, 10);
-    if (text.empty() || end == nullptr || *end != '\0') {
+    const std::string_view text = t ? t : "";
+    int64_t v = 0;
+    const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), v);
+    if (ec != std::errc{} || end != text.data() + text.size()) {
         spdlog::warn("EchoDatabase v10: rollup mark '{}' is not a number; treated as never rolled up",
                      key);
         return std::nullopt;
     }
-    return static_cast<int64_t>(v);
+    return v;
 }
 
 // ── Raw row decoding ──────────────────────────────────────────────────────
@@ -200,12 +208,11 @@ private:
 std::optional<Columns> raw_columns(TransactionHandle& h, std::string_view source) {
     Columns c;
     c.cols = legacy_live_columns(source);
-    const auto have = read_texts(h, std::format("SELECT name FROM pragma_table_info('{}_live')", source));
-    if (!have)
+    const auto names = column_names(h, std::format("{}_live", source));
+    if (!names)
         return std::nullopt;
-    const std::set<std::string> names(have->begin(), have->end());
     for (std::size_t i = 0; i < c.cols.size(); ++i) {
-        c.present.push_back(names.contains(std::string{c.cols[i].name}));
+        c.present.push_back(names->contains(std::string{c.cols[i].name}));
         c.index.emplace(c.cols[i].name, i);
     }
     return c;
@@ -563,12 +570,6 @@ public:
             if (auto r = fold_raw(def); !r)
                 return r;
         }
-        if (report_.rejected > 0 &&
-            !h_.exec(std::format(
-                "INSERT INTO echo_config (key, value) VALUES ('{0}', '{1}') ON CONFLICT(key) DO "
-                "UPDATE SET value = CAST(CAST(value AS INTEGER) + {1} AS TEXT)",
-                kFoldRejectedCounterKey, report_.rejected)))
-            return std::unexpected(h_.error());
         return {};
     }
 
@@ -585,18 +586,10 @@ public:
     [[nodiscard]] const Report& report() const noexcept { return report_; }
 
 private:
-    // The columns of an old summary table, by name.
-    std::optional<std::set<std::string>> columns_of(const std::string& table) {
-        const auto names = read_texts(h_, std::format("SELECT name FROM pragma_table_info('{}')", table));
-        if (!names)
-            return std::nullopt;
-        return std::set<std::string>(names->begin(), names->end());
-    }
-
     std::expected<void, std::string> convert_tier(const FoldSourceDef& def, std::string_view tier) {
         const std::string legacy = fold_view_name(def.name, tier) + "_legacy";
         const std::string bucket{ts_column_for_suffix(tier)};
-        const auto have = columns_of(legacy);
+        const auto have = column_names(h_, legacy);
         if (!have)
             return std::unexpected(h_.error());
         if (!have->contains(bucket))
@@ -891,7 +884,7 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
 
     // 1. ONE transaction.
     Report report;
-    std::vector<std::string> dropped;
+    std::size_t dropped = 0;
     const auto result = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
         if (has_retired) {
             Migration m(h, *db.fold_, legacy_tiers, raw_tables);
@@ -900,7 +893,7 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
             for (const auto& table : m.retired_tables()) {
                 if (!h.exec("DROP TABLE " + table))
                     return std::unexpected(h.error());
-                dropped.push_back(table);
+                ++dropped;
             }
             report = m.report();
             if (seams.v10_after_drop) {
@@ -947,14 +940,14 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
         const std::uintmax_t need = 2 * static_cast<std::uintmax_t>(now_sb.file_bytes());
         if (!free_now || *free_now < need) {
             if (const int64_t t = now_epoch_seconds(); t > 0)
-                (void)db.set_config(std::string{kAutoVacuumDeferredAt}, std::to_string(t));
+                (void)db.set_config(std::string{kAutoVacuumDeferredKey}, std::to_string(t));
             vacuum_note = "deferred (not enough free disk space for the copy)";
             spdlog::warn("EchoDatabase v10: the VACUUM that returns the freed pages is deferred: the "
                          "volume has less than twice the database free. The daily maintenance pass "
                          "retries it.");
         } else if (!db.vacuum_to_incremental()) {
             if (const int64_t t = now_epoch_seconds(); t > 0)
-                (void)db.set_config(std::string{kAutoVacuumDeferredAt}, std::to_string(t));
+                (void)db.set_config(std::string{kAutoVacuumDeferredKey}, std::to_string(t));
             vacuum_note = "failed (retried by the daily maintenance pass)";
         } else {
             vacuum_note = "done";
@@ -971,7 +964,7 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
                  "dropped; file {} -> {} bytes, WAL {} bytes at commit; VACUUM {}",
                  std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - started).count(),
                  report.legacy_tier_rows, report.raw_rows, report.rejected, report.ring_keys,
-                 dropped.size(), before.file_bytes(), end.ok ? end.file_bytes() : 0,
+                 dropped, before.file_bytes(), end.ok ? end.file_bytes() : 0,
                  after_commit.wal_bytes, vacuum_note);
     return {};
 }

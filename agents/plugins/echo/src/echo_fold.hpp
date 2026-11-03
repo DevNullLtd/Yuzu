@@ -856,7 +856,8 @@ public:
     /// transaction. Takes NEITHER op_mu_ nor the database mutex (the caller holds the latter
     /// inside checked_transaction), so it is valid only while no other thread can reach this
     /// instance, i.e. inside EchoDatabase::open() before the object is returned. Rejected events
-    /// are not counted (the caller owns that policy); returns the RETURNING row count.
+    /// (acc.rejected()) are added to the persisted counter in the caller's transaction, as
+    /// fold_rows does; returns the RETURNING row count.
     [[nodiscard]] std::expected<std::size_t, std::string>
     fold_in(TransactionHandle& h, std::string_view source, const TierAccumulator& acc,
             const std::optional<StateWrite>& state = std::nullopt);

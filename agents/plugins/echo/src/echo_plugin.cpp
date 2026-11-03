@@ -625,7 +625,6 @@ public:
                 // less. Nothing was changed. The plugin LOADS, offline, so `echo.status` can say why
                 // (`storage_state|offline|free_space`); no trigger is registered and nothing
                 // collects until the agent restarts with the space freed.
-                offline_reason_ = "free_space";
                 offline_detail_ = result.error();
                 return {};
             }
@@ -1206,12 +1205,11 @@ public:
 
     int execute_dispatch(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) {
         if (!db_) {
-            if (!offline_reason_.empty()) {
+            if (!offline_detail_.empty()) {
                 // Loaded but offline (the migration was refused): `status` explains, every other
                 // action refuses with the same error. `error|` leads, as format_storage_*_lines
                 // pins.
-                const auto lines =
-                    yuzu::echo::format_storage_refused_lines(offline_reason_, offline_detail_);
+                const auto lines = yuzu::echo::format_storage_refused_lines(offline_detail_);
                 for (std::size_t i = 0; i < lines.size(); ++i)
                     if (i == 0 || action == "status")
                         ctx.write_output(lines[i]);
@@ -1394,9 +1392,9 @@ private:
     bool proc_poll_seed_pending_{false};
     std::unique_ptr<yuzu::echo::EchoDatabase> db_;
     // Set when the database could not be opened because the v10 migration needs more free disk
-    // space than the volume has (the plugin loads, offline): the token `status` reports and the
-    // open error's text. Empty on every other path. Written once in init(), before any action runs.
-    std::string offline_reason_;
+    // space than the volume has (the plugin loads, offline): the open error's text, which `status`
+    // reports as `storage_state|offline|free_space`. Empty on every other path. Written once in
+    // init(), before any action runs.
     std::string offline_detail_;
     std::mutex collect_mu_; // Protects the state read-diff-write sequence in collect methods
     // Separate mutex for the software source: its state read-diff-write touches
@@ -1787,11 +1785,11 @@ private:
         // advance the anchor, so a run ages out even on a tick with no process event. Still under
         // collect_mu_. Gates itself on usage_enabled AND process_enabled, and on the lifecycle
         // state internally -- a disabled or not-yet-baselined source is not a failure.
-        if (auto fold = yuzu::echo::usage::usage_sweep(*db_, ts); !fold.ok) {
+        if (auto fold = yuzu::echo::usage::usage_sweep(*db_, ts); !fold) {
             note_health("usage", "insert_failed");
             if (ts - usage_last_fold_warn_ts_ >= 60) {
                 spdlog::warn("ECHO: usage sweep failed this tick ({}) -- retrying next tick",
-                            fold.error);
+                            fold.error());
                 usage_last_fold_warn_ts_ = ts;
             }
         } else {

@@ -636,6 +636,19 @@ TEST_CASE("v10 migration: raw rows below the rollup mark are not counted twice",
     CHECK(n(db, "SELECT SUM(start_count) FROM process_daily") == 4);
 }
 
+TEST_CASE("v10 migration: a raw row with an unrepresentable stamp is counted as rejected, the rest fold",
+          "[echo][v10][migration]") {
+    Seeded seeded;
+    seed(seeded, [&](sqlite3* db) {
+        for (const auto ts : {kT0, kFoldMaxStamp + 1})
+            insert_raw(db, "process",
+                       {I(ts), I(1), T("started"), I(1), I(0), T("alpha.exe"), T(""), T("jsmith")});
+    });
+    auto db = open_ok(seeded.tmp.path);
+    CHECK(db.get_config(std::string{kFoldRejectedCounterKey}) == "1");
+    CHECK(n(db, "SELECT SUM(start_count) FROM process_hourly") == 1);
+}
+
 TEST_CASE("v10 migration: the roll-ups the aggregator had not performed are finished once",
           "[echo][v10][migration]") {
     Seeded seeded;
@@ -904,7 +917,7 @@ TEST_CASE("v10 migration: the free-space refusal is told apart from every other 
         "v10 roll-up migration failed (the schema stays at v9; the retired tables are intact): "
         "not enough free disk space to migrate the Echo database to its roll-up tables: 10 bytes are free"));
     CHECK(!is_free_space_refusal("failed to open echo.db: unable to open database file"));
-    const auto lines = format_storage_refused_lines("free_space", "not enough free disk space to migrate x");
+    const auto lines = format_storage_refused_lines("not enough free disk space to migrate x");
     REQUIRE(lines.size() == 2);
     CHECK(lines[0].starts_with("error|")); // the server gates on a leading error|
     CHECK(lines[1] == "storage_state|offline|free_space");

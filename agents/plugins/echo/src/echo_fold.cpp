@@ -376,7 +376,10 @@ EchoFold::fold_in(TransactionHandle& h, std::string_view source, const TierAccum
     // published, so a rollback cannot leave an id the database does not have.
     static const std::unordered_map<std::string, int64_t> kNoCache;
     std::unordered_map<std::string, int64_t> staged;
-    return fold_body(h, *def, acc, state, kNoCache, staged);
+    auto n = fold_body(h, *def, acc, state, kNoCache, staged);
+    if (n && acc.rejected() > 0 && !bump_rejected(h, acc.rejected()))
+        return std::unexpected(h.error());
+    return n;
 }
 
 std::expected<CursorFoldResult, CursorFoldError>
