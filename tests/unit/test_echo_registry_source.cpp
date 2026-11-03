@@ -5426,9 +5426,9 @@ TEST_CASE("registry live: a profile path with no NTUSER.DAT answers every root U
 
 TEST_CASE("registry live: the start-up sweep unloads a leaked YUZU_HIVE_ mount and retains one a holder has open",
           "[echo][registry][windows]") {
-    // A mount of the exact shape unique_hive_mount_name() mints, salted by this process's fake sid
-    // and swept through that sid's own prefix: the production sweep takes every YUZU_HIVE_* mount,
-    // and a concurrent job on a shared runner must never lose its own to this case.
+    // A mount named by unique_hive_mount_name() itself, salted by this process's fake sid and swept
+    // through that sid's own prefix: the production sweep takes every YUZU_HIVE_* mount, and a
+    // concurrent job on a shared runner must never lose its own to this case.
     OfflineMountSweep sweep;
     ScratchHiveKey scratch;
     yuzu::test::TempDir tmp("yuzu_test_regsweep_");
@@ -5444,8 +5444,11 @@ TEST_CASE("registry live: the start-up sweep unloads a leaked YUZU_HIVE_ mount a
         REQUIRE(rc == ERROR_SUCCESS);
     }
     const std::string sid = offline_fake_sid();
-    const std::string prefix = "YUZU_HIVE_" + sid + "_";
-    const std::string mount = prefix + "deadbeefdeadbeef_0";
+    const std::string prefix = std::string(kHiveMountPrefix) + sid + "_";
+    const std::string mount =
+        yuzu::win::from_wide(yuzu::win::unique_hive_mount_name(yuzu::win::to_wide(sid)).c_str());
+    // The sweep's prefix catches a name the shared minter really emits, not a look-alike.
+    REQUIRE(mount.starts_with(prefix));
     const std::wstring wmount = yuzu::win::to_wide(mount);
     // Both privileges revert when this returns, so the sweep must enable its own.
     const auto load = [&]() -> LONG {

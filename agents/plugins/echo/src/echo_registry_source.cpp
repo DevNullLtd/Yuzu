@@ -1696,6 +1696,7 @@ OfflineHiveRead read_offline_hive_bounded(const std::string& sid, const std::str
 HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix) {
     std::vector<std::string> stale;
     HiveSweepResult r;
+    bool privilege_missing = false;
     {
         // Held for the whole sweep, and taken BEFORE the names are listed. Every mount this process
         // makes holds this lock from RegLoadKeyW to the unload (with_user_hive), so while we hold it
@@ -1714,12 +1715,31 @@ HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix) {
         // RegUnLoadKeyW needs SeRestorePrivilege, which the agent account already holds
         // (docs/agent-privilege-model.md); with_user_hive enables it the same way per mount.
         const yuzu::win::PrivilegeScope restore_priv(L"SeRestorePrivilege");
-        r = sweep_hive_mounts(stale, [](const std::string& name) {
-            // Never RegUnLoadKey with force: a holder with an open handle is a live user of the hive.
-            return RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(name).c_str()) == ERROR_SUCCESS;
-        });
+        if (restore_priv.ok()) {
+            r = sweep_hive_mounts(stale, [](const std::string& name) {
+                // Never RegUnLoadKey with force: a holder with an open handle is a live user of the hive.
+                return RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(name).c_str()) == ERROR_SUCCESS;
+            });
+        } else {
+            // A hardened install may strip it (a documented degraded mode, as in with_user_hive).
+            // Every unload would fail ERROR_PRIVILEGE_NOT_HELD and read as a holder keeping the hive
+            // open, so none is attempted. The sweep still completes: the privilege will not appear on
+            // a retry, and one warning per start is all this needs.
+            r.retained = std::move(stale);
+            privilege_missing = true;
+        }
     }
     // Logged after the lock is released, so logging never extends another caller's wait.
+    if (privilege_missing) {
+        std::string names;
+        for (const auto& n : r.retained)
+            names += (names.empty() ? "HKU\\" : ", HKU\\") + n;
+        spdlog::warn("Echo registry: privilege_missing -- SeRestorePrivilege is not held, so the "
+                     "leftover hive mount(s) {} cannot be unloaded and the profile's NTUSER.DAT "
+                     "stays locked; unload each with `reg unload` from an elevated prompt",
+                     names);
+        return r;
+    }
     for (const auto& n : r.released)
         spdlog::info("Echo registry: unloaded leftover hive mount HKU\\{}", n);
     for (const auto& n : r.retained)
