@@ -54,3 +54,4 @@ Routed-concern walk, row by row, against the `origin/dev` copies of all four tab
 |---|---|---|---|---|
 | 1 | PASS | orchestrator | — | 1 |
 | 2 | PASS (no blocking) | security-guardian (PASS, 0 findings), docs-writer (2 wording) | 0/0/0/0/2 | 1 |
+| 3 | FINDINGS | gateway-erlang (PASS), quality-engineer, architect (PASS), performance (PASS) | 0/2 derived HIGH (qe-1, qe-2) + 1 speculative floor candidate (ge-3)/0/0/7 NICE | 1 |
