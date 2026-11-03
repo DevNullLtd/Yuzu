@@ -2367,13 +2367,15 @@ public:
         metrics_.describe("yuzu_server_response_ingest_dropped_total",
                           "Response result rows that did not persist (fail-soft ingest, ADR-0039), "
                           "by reason (store_not_open/pool_acquire_timeout/query_error/"
-                          "malformed_identity_field) - the executions ladder still tracks the "
+                          "malformed_identity_field/per_agent_cap) - the executions ladder still tracks the "
                           "command; a sustained non-zero rate means drawer/Echo result history is "
                           "silently lossy. malformed_identity_field is distinct: an "
                           "instruction_id/execution_id/plugin containing an embedded NUL byte was "
                           "rejected rather than silently truncated (#2691 UP-5) - a non-zero rate "
                           "here means an agent sent a malformed identity field, not store "
-                          "unhealth",
+                          "unhealth. per_agent_cap is likewise agent behaviour: an agent exceeded "
+                          "the per-(command, agent) row cap (--response-max-rows-per-agent), "
+                          "not store unhealth",
                           "counter");
         metrics_.describe("yuzu_server_response_read_degrade_total",
                           "Response reads that returned a degrade (nullopt, not empty) rather than "
@@ -2398,7 +2400,8 @@ public:
         // degrade) — seeded separately so read_degrade_total doesn't carry a
         // spurious always-zero series for a reason it can never emit.
         for (const auto reason :
-             {"store_not_open", "pool_acquire_timeout", "query_error", "malformed_identity_field"})
+             {"store_not_open", "pool_acquire_timeout", "query_error", "malformed_identity_field",
+              "per_agent_cap"})
             metrics_.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}});
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_response_read_degrade_total",
@@ -5618,7 +5621,9 @@ public:
         // the deliberate reset.
         if (pg_pool_ && !startup_failed_) {
             response_store_ =
-                std::make_unique<ResponseStore>(*pg_pool_, cfg_.response_retention_days);
+                std::make_unique<ResponseStore>(*pg_pool_, cfg_.response_retention_days,
+                                                /*now_fn=*/nullptr,
+                                                cfg_.response_max_rows_per_agent);
             if (!response_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: response store migration/open failed "
                               "(database reachable but the response_store schema could not be "
