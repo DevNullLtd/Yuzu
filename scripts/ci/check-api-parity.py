@@ -503,6 +503,8 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # planned to twinned (POST /api/v1/instructions/{id}/execute + the execute_instruction_definition MCP tool).
 # 212 -> 210 (#4041, ADR-1005 2026-11-02 entry): MCP list_agents moved onto require_fleet_read, so
 # get.api-agents and get.fragments-devices-list left their dated exception and are twinned to it.
+# The two 212-origin steps above ran on separate branches. Merged: 4 rows flipped by twin batch B and
+# 2 by #4041, the sets are disjoint, so 212 - 4 - 2 = 206.
 BASELINE_UNTWINNED = 206
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
