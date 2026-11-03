@@ -122,6 +122,10 @@ inline constexpr std::size_t kMaxIdentityBytes = 256;
         raw.remove_prefix(1);
     if (yuzu::shared::smbios::is_placeholder(raw))
         return "-";
+    // A string that was ONLY bytes the scrub had to replace (a 0xFF-filled serial) is now "????": the
+    // same pseudo-value on every such device. It is garbage, not data.
+    if (!raw.empty() && std::ranges::all_of(raw, [](char c) { return c == '?'; }))
+        return "-";
     return yuzu::util::safe_output_field(yuzu::shared::smbios::rtrim(raw));
 }
 
@@ -255,6 +259,11 @@ struct MachineIdRead {
             return Report::failure(Outcome::denied, tok + "win32_" + std::to_string(e));
         return Report::failure(Outcome::constrained, tok + "win32_" + std::to_string(e));
     }
+    const std::string norm = yuzu::shared::normalise_machine_id(*read.value);
+    // The nil GUID (WinPE, a broken sysprep) is the same string on every such device: hashing it would
+    // give them all one "identity". It is not an identifier, so report it as such.
+    if (!norm.empty() && std::ranges::all_of(norm, [](char c) { return c == '0' || c == '-'; }))
+        return Report::failure(Outcome::unavailable, "windows:machine_guid:nil");
     const auto h = yuzu::shared::hash_machine_id(*read.value);
     if (!h)
         return Report::failure(Outcome::unavailable, "windows:machine_guid:empty");

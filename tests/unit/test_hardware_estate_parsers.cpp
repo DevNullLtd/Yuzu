@@ -83,8 +83,11 @@ TEST_CASE("estate: firmware bytes that are not UTF-8 are scrubbed before they re
     CHECK(est::clean_identity(std::string_view{"AB\xC0\x80" "CD"}) == "AB??CD"); // overlong NUL
     CHECK(est::clean_identity(std::string("A\0B", 3)) == "A?B");                    // embedded NUL
     CHECK(est::clean_identity(std::string_view{"caf\xC3\xA9"}) == "caf\xC3\xA9");  // valid UTF-8 kept
-    // scrubbing happens BEFORE the filler test, so a string that is only bad bytes is data, not filler
-    CHECK(est::clean_identity(std::string_view{"\xFF"}) == "?");
+    // a string that is ONLY unreadable bytes is garbage, not data: it must not ship as the shared
+    // pseudo-serial "????" on every device with that firmware
+    CHECK(est::clean_identity(std::string_view{"\xFF"}) == "-");
+    CHECK(est::clean_identity(std::string_view{"\xFF\xFF\xFF\xFF"}) == "-");
+    CHECK(est::clean_identity(std::string_view{"AB\xFF"}) == "AB?"); // partly readable stays
     CHECK(est::clean_identity_opt(std::optional<std::string>{"X\x80Y"}) == "X?Y");
 }
 
@@ -285,6 +288,16 @@ TEST_CASE("estate: machine_id failures are typed and carry no row", "[hardware_e
     other.win32_error = 13;
     r = est::machine_id_report(other);
     CHECK(r.outcome == est::Outcome::constrained);
+
+    for (const char* nil : {"00000000-0000-0000-0000-000000000000", "{00000000-0000-0000-0000-000000000000}", "0"}) {
+        est::MachineIdRead n;
+        n.value = nil;
+        const auto rn = est::machine_id_report(n);
+        INFO("nil-like id: " << nil);
+        CHECK(rn.outcome == est::Outcome::unavailable);
+        CHECK(rn.token == "windows:machine_guid:nil");
+        CHECK(rn.rows.empty());
+    }
 
     est::MachineIdRead empty;
     empty.value = "  {}  ";

@@ -21,6 +21,7 @@
 
 #include <yuzu/plugin.hpp>
 
+#include "hardware_estate_emit.hpp"     // result_code_for (typed status for a failed WMI query)
 #include "hardware_estate_legs.hpp"    // chassis/baseboard/swap/machine_id Kind
 #include "hardware_estate_parsers.hpp"  // pure field hygiene shared by every OS leg
 #include "hardware_estate_win.hpp"      // run_windows (Windows builds only)
@@ -196,9 +197,11 @@ using yuzu::hardware::wmi_rows::wmi_row_uint64;
 // do_disks/do_system) still discards it exactly as before; only do_drivers
 // below reads it, because it is the one action whose result set can
 // realistically exceed the row cap on a host with many installed drivers.
-template <typename Fn> bool wmi_query(const wchar_t* wql, Fn&& fn) {
+template <typename Fn> bool wmi_query(const wchar_t* wql, Fn&& fn, std::string* error_out = nullptr) {
     auto result = wmi::run_bounded_wmi_query(L"ROOT\\CIMV2", wql);
     if (result.error) {
+        if (error_out)
+            *error_out = *result.error; // lets a caller tell a FAILED query from a genuinely empty one
         // gate-6 sre remediation: a connect/query/deadline failure was
         // previously indistinguishable from a genuinely-absent WMI class --
         // every caller emits the same "unknown" sentinel either way, with no
@@ -215,6 +218,21 @@ template <typename Fn> bool wmi_query(const wchar_t* wql, Fn&& fn) {
     for (const auto& row : result.rows)
         fn(row);
     return result.truncated;
+}
+
+// A sentinel row (`cpu|0|unknown|...`, `dimm|unknown|0|...`) is written both when the WMI query FAILED
+// and when it genuinely returned nothing. Without a typed status the failed case is
+// indistinguishable downstream and the device record would read it as an `ok` section. So when the
+// query itself failed, declare it (unavailable / permission_denied / constrained, with the cause),
+// through the same host-tested mapping the estate actions use. A genuinely empty result stays
+// undeclared, exactly as before.
+void report_wmi_failure(yuzu::CommandContext& ctx, std::string_view wmi_class, const std::string& error) {
+    if (error.empty())
+        return;
+    const auto rep = yuzu::hardware::estate::wmi_failure_report(wmi_class, error, 0);
+    const auto rc = yuzu::hardware::estate::result_code_for(rep.outcome);
+    ctx.set_result_status(rc.status, rc.completeness,
+                          rc.carries_token ? std::string_view{rep.token} : std::string_view{});
 }
 #endif
 
@@ -460,6 +478,7 @@ int do_processors(yuzu::CommandContext& ctx) {
 
 #elif defined(_WIN32)
     int idx = 0;
+    std::string wmi_error;
     wmi_query(L"SELECT Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed, "
               L"SocketDesignation, ProcessorId, Architecture, Stepping FROM Win32_Processor",
               [&](const wmi::WmiRow& row) {
@@ -485,11 +504,14 @@ int do_processors(yuzu::CommandContext& ctx) {
                       wmi_row_string(row, "ProcessorId"), arch, wmi_row_string(row, "Stepping"));
                   ctx.write_output(yuzu::hardware::estate::format_cpu_row(
                       idx++, name, cores, threads, mhz, socket, stepping));
-              });
+              },
+              &wmi_error);
     // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
     // doc comment above.
-    if (idx == 0)
+    if (idx == 0) {
         ctx.write_output("cpu|0|unknown|0|0|0|-|-");
+        report_wmi_failure(ctx, "processors", wmi_error);
+    }
 
 #else
     ctx.write_output("cpu|0|unknown|0|0|0|-|-");
@@ -557,6 +579,7 @@ int do_memory(yuzu::CommandContext& ctx) {
 
 #elif defined(_WIN32)
     bool found = false;
+    std::string wmi_error;
     wmi_query(L"SELECT DeviceLocator, Capacity, MemoryType, SMBIOSMemoryType, Speed, "
               L"Manufacturer, PartNumber, SerialNumber FROM Win32_PhysicalMemory",
               [&](const wmi::WmiRow& row) {
@@ -590,11 +613,14 @@ int do_memory(yuzu::CommandContext& ctx) {
                       yuzu::hardware::estate::dimm_identity_field(wmi_row_string(row, "Manufacturer")),
                       yuzu::hardware::estate::dimm_identity_field(wmi_row_string(row, "PartNumber")),
                       yuzu::hardware::estate::dimm_identity_field(wmi_row_string(row, "SerialNumber"))));
-              });
+              },
+              &wmi_error);
     // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
     // doc comment above.
-    if (!found)
+    if (!found) {
         ctx.write_output("dimm|unknown|0|unknown|0|-|-|-");
+        report_wmi_failure(ctx, "memory", wmi_error);
+    }
 
 #else
     ctx.write_output("dimm|unknown|0|unknown|0|-|-|-");
