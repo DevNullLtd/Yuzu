@@ -126,8 +126,8 @@
     stream_pid  :: pid() | undefined,     %% subscribe handler process
     stream_mon  :: reference() | undefined, %% monitor ref for stream_pid
     %% The agent's hostname. It replaces the whole AgentInfo the field used to
-    %% hold (about 26 KB for an agent with 69 plugins, the Phase 1c measurement
-    %% of 2026-10-26): this process reads only the hostname of it (registry
+    %% hold (about 26 KB for an agent with 69 plugins, measured
+    %% 2026-10-26): this process reads only the hostname of it (registry
     %% row, re-register, get_info), and the owner table keeps the start
     %% arguments for a restart. A supervised owner holds no AgentInfo at all
     %% once it has registered, because drop_request/1 empties register_req; an
@@ -846,7 +846,7 @@ code_change(_OldVsn, State, Data0, Extra) when is_tuple(Data0), element(1, Data0
 code_change(_OldVsn, State, Data0, Extra) when is_tuple(Data0), element(1, Data0) =:= data,
                                                 tuple_size(Data0) =:= tuple_size(#data{}),
                                                 is_map(element(#data.hostname, Data0)) ->
-    %% A record from before Phase 1c (2026-10-26): the field held the whole
+    %% A record from before the owner kept the hostname alone (2026-10-26): the field held the whole
     %% AgentInfo; only its hostname is kept. Matched as a tuple, not as
     %% #data{}, whose field is now typed binary().
     Info = element(#data.hostname, Data0),

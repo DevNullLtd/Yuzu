@@ -33,7 +33,7 @@ registration_test_() ->
                      fun start_child_does_not_wait_for_the_registry/0}},
       {"start_agent answers once the agent is in the routing table",
        fun start_agent_waits_for_registration/0},
-      {"the registry row carries the agent's hostname (Phase 1c G1)",
+      {"the registry row carries the agent's hostname",
        fun registry_row_carries_hostname/0},
       {"the agent joins its own {agent, Id} group and no other",
        fun agent_joins_only_its_own_group/0},
@@ -116,7 +116,7 @@ start_agent_waits_for_registration() ->
     ?assertEqual({ok, Pid}, yuzu_gw_registry:lookup(Id)),
     ?assertEqual([Pid], pg:get_local_members(yuzu_gw, {agent, Id})).
 
-%% Phase 1c G1: the owner keeps the hostname alone; the row it writes on
+%% The owner keeps the hostname alone; the row it writes on
 %% registering must still carry it, as read by list_agents/2 (the accessor
 %% behind ListAgents and QueryInventory).
 registry_row_carries_hostname() ->

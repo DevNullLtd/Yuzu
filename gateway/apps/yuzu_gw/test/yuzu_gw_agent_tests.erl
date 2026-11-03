@@ -75,7 +75,7 @@ agent_test_() ->
       {"agent stops on stream_error", fun stops_on_error/0},
       {"disconnect notifies pending waiters", fun disconnect_notifies_pending/0},
       {"get_info returns state", fun get_info_works/0},
-      {"the owner keeps the hostname, not the whole AgentInfo (Phase 1c G1)",
+      {"the owner keeps the hostname, not the whole AgentInfo",
        fun owner_keeps_hostname_not_agent_info/0},
       {"code_change reduces a pre-G1 AgentInfo field to its hostname",
        fun code_change_reduces_agent_info_to_hostname/0},
@@ -418,11 +418,12 @@ get_info_works() ->
     ?assert(is_integer(maps:get(connected_at, Info))),
     stop_agent(Pid).
 
-%% Phase 1c G1 (2026-10-26): the hostname field replaces the whole AgentInfo.
+%% The owner keeps the hostname alone (measured 2026-10-26): the hostname
+%% field replaces the whole AgentInfo.
 %% An owner started directly (no owner_key) keeps its RegisterRequest in
 %% register_req, and so one copy of the AgentInfo there; the hostname field
 %% must not add a second. A marker in another AgentInfo field therefore occurs
-%% exactly once in the process's state (twice before G1), and get_info/1
+%% exactly once in the process's state (twice in earlier builds), and get_info/1
 %% still answers hostname and plugins.
 owner_keeps_hostname_not_agent_info() ->
     Marker = <<"MARKER-g1-description">>,
@@ -445,8 +446,8 @@ owner_keeps_hostname_not_agent_info() ->
     ?assertEqual(1, length(binary:matches(term_to_binary(Data), Marker))),
     stop_agent(Pid).
 
-%% Phase 1c G1: the hostname is read from a binary key or an atom key of the
-%% AgentInfo, and is <<>> when the AgentInfo has none.
+%% The hostname is read from a binary key or an atom key of the AgentInfo,
+%% and is <<>> when the AgentInfo has none.
 hostname_key_shapes() ->
     Cases = [{<<"g1-key-bin">>, #{<<"hostname">> => <<"h">>}, <<"h">>},
              {<<"g1-key-atom">>, #{hostname => <<"h">>}, <<"h">>},
@@ -464,9 +465,9 @@ hostname_key_shapes() ->
               stop_agent(Pid)
       end, Cases).
 
-%% Phase 1c G1 (chaos CH-3): code_change/4 called directly on a record from
-%% before both OWNER-RESTART and G1 (one element short, the AgentInfo map in
-%% the hostname slot). The tuple is built from a live owner's state, so the
+%% Chaos CH-3: code_change/4 called directly on a record from before both
+%% OWNER-RESTART and the hostname-only owner (one element short, the AgentInfo
+%% map in the hostname slot). The tuple is built from a live owner's state, so the
 %% test does not hard-code the record: the hostname slot is the one element
 %% holding the owner's unique hostname, and the last element is dropped.
 code_change_pure_pre_g1_tuple() ->
@@ -496,8 +497,8 @@ code_change_pure_pre_g1_tuple() ->
               ?assertEqual(undefined, element(Size, New))
       end, Cases).
 
-%% Phase 1c G1: a #data record from before G1 holds the whole AgentInfo map in
-%% the hostname position. code_change/4 reduces it to the hostname, and the
+%% The owner keeps the hostname alone: a #data record from an earlier build
+%% holds the whole AgentInfo map in the hostname position. code_change/4 reduces it to the hostname, and the
 %% upgraded owner still answers get_info/1 and dispatches.
 code_change_reduces_agent_info_to_hostname() ->
     Args = #{agent_id   => <<"g1-cc">>,
