@@ -2370,3 +2370,16 @@ TEST_CASE("synthetic three-day run: every source, every tier equals the independ
     CHECK(integrity_violations(*f) == 0);
     CHECK(f->db.try_get_config(std::string{kFoldRejectedCounterKey}).value() == std::nullopt);
 }
+
+TEST_CASE("referenced_legacy_live_shims names the retired tables a translated query mentions",
+          "[echo][fold][schema][shim]") {
+    using V = std::vector<std::string>;
+    CHECK(referenced_legacy_live_shims("SELECT * FROM process_live WHERE ts > 1") == V{"process_live"});
+    CHECK(referenced_legacy_live_shims("select count(*) from tcp_live t join process_live p on 1") ==
+          V{"process_live", "tcp_live"}); // shim order, each once
+    CHECK(referenced_legacy_live_shims("SELECT * FROM process_hourly").empty());
+    CHECK(referenced_legacy_live_shims("SELECT * FROM my_process_live").empty());   // not a whole identifier
+    CHECK(referenced_legacy_live_shims("SELECT * FROM process_live_r").empty());    // nor this
+    CHECK(referenced_legacy_live_shims("SELECT * FROM usage_live").empty());        // usage keeps its table
+    CHECK(referenced_legacy_live_shims("").empty());
+}

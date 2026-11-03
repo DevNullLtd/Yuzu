@@ -62,28 +62,60 @@
 
 #include <charconv>
 #include <format>
+#include <initializer_list>
 #include <memory>
 #include <set>
+#include <string_view>
 #include <utility>
+#include <variant>
 
 namespace yuzu::echo::usage {
 
 namespace {
 
-// Doubles embedded single quotes -- the only escape SQLite string literals
-// need. Every dynamic string value (exe_key, user) that reaches a hand-built
-// SQL statement in this file goes through this.
-std::string sql_str(std::string_view s) {
-    std::string out;
-    out.reserve(s.size() + 2);
-    out.push_back('\'');
-    for (char c : s) {
-        if (c == '\'')
-            out.push_back('\'');
-        out.push_back(c);
+// RAII for a raw sqlite3_stmt* obtained via TransactionHandle::raw() --
+// distinct from (and not shared with) echo_db.cpp's own file-local StmtPtr,
+// which is not exposed through echo_db.hpp.
+struct LocalStmtDeleter {
+    void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
+};
+using LocalStmtPtr = std::unique_ptr<sqlite3_stmt, LocalStmtDeleter>;
+
+// One bind value of a statement below: an integer or text. Text is bound by length, so an
+// exe or user name reaches the row byte for byte (a NUL or a quote included) and never
+// becomes part of the statement text.
+using Bind = std::variant<int64_t, std::string_view>;
+
+// Prepare `sql` on the transaction's connection, bind `binds` in order, step it to completion.
+// A failure poisons the handle (the whole fold rolls back), as h.exec does.
+bool exec_bound(TransactionHandle& h, std::string_view sql, std::initializer_list<Bind> binds) {
+    if (h.poisoned())
+        return false;
+    sqlite3_stmt* raw = nullptr;
+    if (sqlite3_prepare_v2(h.raw(), sql.data(), static_cast<int>(sql.size()), &raw, nullptr) !=
+        SQLITE_OK) {
+        h.fail(std::string("prepare failed: ") + sqlite3_errmsg(h.raw()));
+        return false;
     }
-    out.push_back('\'');
-    return out;
+    LocalStmtPtr st(raw);
+    int idx = 0;
+    for (const auto& b : binds) {
+        ++idx;
+        if (const auto* i = std::get_if<int64_t>(&b))
+            sqlite3_bind_int64(st.get(), idx, *i);
+        else {
+            const auto t = std::get<std::string_view>(b);
+            sqlite3_bind_text(st.get(), idx, t.data(), static_cast<int>(t.size()), SQLITE_TRANSIENT);
+        }
+    }
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(st.get())) == SQLITE_ROW) {
+    }
+    if (rc != SQLITE_DONE) {
+        h.fail(std::string("step failed: ") + sqlite3_errmsg(h.raw()));
+        return false;
+    }
+    return true;
 }
 
 int64_t parse_i64(std::string_view s, int64_t def = 0) {
@@ -96,30 +128,23 @@ int64_t parse_i64(std::string_view s, int64_t def = 0) {
     return v;
 }
 
-// One usage_daily upsert statement for `d` -- plain additive, no replay
-// guard needed (see file banner: checked_transaction makes one unnecessary).
-std::string build_daily_upsert(const DailyDelta& d) {
-    return std::format(
+// One usage_daily upsert for `d` -- plain additive, no replay guard needed (see file banner:
+// checked_transaction makes one unnecessary).
+bool upsert_daily(TransactionHandle& h, const DailyDelta& d) {
+    return exec_bound(
+        h,
         "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
-        "last_seen, distinct_users, superseded_runs, expired_runs) VALUES ({}, {}, {}, {}, {}, "
-        "{}, 0, {}, {}) ON CONFLICT(day_ts, exe_key) DO UPDATE SET "
+        "last_seen, distinct_users, superseded_runs, expired_runs) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?) "
+        "ON CONFLICT(day_ts, exe_key) DO UPDATE SET "
         "run_count = run_count + excluded.run_count, "
         "total_seconds = total_seconds + excluded.total_seconds, "
         "first_seen = MIN(first_seen, excluded.first_seen), "
         "last_seen = MAX(last_seen, excluded.last_seen), "
         "superseded_runs = superseded_runs + excluded.superseded_runs, "
         "expired_runs = expired_runs + excluded.expired_runs",
-        d.day_ts, sql_str(d.exe_key), d.run_count, d.total_seconds, d.first_seen, d.last_seen,
-        d.superseded_runs, d.expired_runs);
+        {d.day_ts, std::string_view{d.exe_key}, d.run_count, d.total_seconds, d.first_seen,
+         d.last_seen, d.superseded_runs, d.expired_runs});
 }
-
-// RAII for a raw sqlite3_stmt* obtained via TransactionHandle::raw() --
-// distinct from (and not shared with) echo_db.cpp's own file-local StmtPtr,
-// which is not exposed through echo_db.hpp.
-struct LocalStmtDeleter {
-    void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
-};
-using LocalStmtPtr = std::unique_ptr<sqlite3_stmt, LocalStmtDeleter>;
 
 std::string_view col_text(sqlite3_stmt* stmt, int idx) {
     const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, idx));
@@ -261,9 +286,10 @@ std::expected<bool, std::string> source_on(TransactionHandle& h, std::string_vie
 }
 
 bool upsert_config(TransactionHandle& h, std::string_view key, std::string_view value) {
-    return h.exec(std::format("INSERT INTO echo_config (key, value) VALUES ({}, {}) ON CONFLICT(key) "
-                              "DO UPDATE SET value = excluded.value",
-                              sql_str(key), sql_str(value)));
+    return exec_bound(h,
+                      "INSERT INTO echo_config (key, value) VALUES (?, ?) ON CONFLICT(key) "
+                      "DO UPDATE SET value = excluded.value",
+                      {key, value});
 }
 
 // Stamp a fresh baseline on the transaction's handle: forget the open runs, record the coverage
@@ -314,8 +340,17 @@ std::expected<void, std::string> usage_fold_in(TransactionHandle& h, int64_t now
         return {}; // nothing to do this tick -- not a failure
 
     // ── Lifecycle, read through the handle: Active iff the two generations match. A missing or
-    // unreadable active generation fails TOWARD re-baselining, never toward Active.
-    const int64_t generation = read_config_i64_locked(h, "usage_generation");
+    // unreadable active generation fails TOWARD re-baselining, never toward Active. The
+    // generation itself is read STRICTLY: a failed or malformed read poisons the transaction
+    // (safe-1). The lenient 0-on-fault helper would read a stored active generation as a mismatch
+    // and stamp_baseline would delete the open runs over a transient read fault; an absent row is
+    // the legitimate first-ever state and reads as 0, as get_config's default does.
+    const auto generation_read = read_config_i64_strict(h, "usage_generation");
+    if (!generation_read) {
+        h.fail("usage_generation read failed: " + generation_read.error());
+        return std::unexpected(h.error());
+    }
+    const int64_t generation = generation_read->value_or(0);
     const auto active_text = read_config_text(h, "usage_active_generation");
     if (!active_text)
         return std::unexpected(active_text.error());
@@ -421,25 +456,26 @@ std::expected<void, std::string> usage_fold_in(TransactionHandle& h, int64_t now
     // needed: the whole fold is inside the caller's transaction, so a retried tick finds nothing
     // of a failed predecessor ──
     for (const auto& d : fold_daily(closed)) {
-        if (!h.exec(build_daily_upsert(d)))
+        if (!upsert_daily(h, d))
             return std::unexpected(h.error());
     }
 
     std::set<std::pair<int64_t, std::string>> touched_days;
     for (const auto& c : closed) {
         const int64_t day_ts = day_ts_for(c.start_ts);
-        if (!h.exec(std::format("INSERT OR IGNORE INTO usage_daily_user (day_ts, exe_key, user) "
-                                "VALUES ({}, {}, {})",
-                                day_ts, sql_str(c.exe_key), sql_str(c.user))))
+        if (!exec_bound(h,
+                        "INSERT OR IGNORE INTO usage_daily_user (day_ts, exe_key, user) "
+                        "VALUES (?, ?, ?)",
+                        {day_ts, std::string_view{c.exe_key}, std::string_view{c.user}}))
             return std::unexpected(h.error());
         touched_days.insert({day_ts, c.exe_key});
     }
     for (const auto& [day_ts, exe_key] : touched_days) {
-        if (!h.exec(std::format(
-                "UPDATE usage_daily SET distinct_users = (SELECT COUNT(DISTINCT user) FROM "
-                "usage_daily_user WHERE day_ts = {0} AND exe_key = {1}) WHERE day_ts = {0} AND "
-                "exe_key = {1}",
-                day_ts, sql_str(exe_key))))
+        if (!exec_bound(h,
+                        "UPDATE usage_daily SET distinct_users = (SELECT COUNT(DISTINCT user) FROM "
+                        "usage_daily_user WHERE day_ts = ?1 AND exe_key = ?2) WHERE day_ts = ?1 AND "
+                        "exe_key = ?2",
+                        {day_ts, std::string_view{exe_key}}))
             return std::unexpected(h.error());
     }
 
@@ -448,26 +484,20 @@ std::expected<void, std::string> usage_fold_in(TransactionHandle& h, int64_t now
     std::set<std::pair<uint32_t, std::string>> touched_keys = opened_this_tick;
     for (const auto& c : closed)
         touched_keys.insert({c.pid, c.exe_key});
-    if (!touched_keys.empty()) {
-        std::string in_list;
-        for (const auto& [pid, exe_key] : touched_keys) {
-            if (!in_list.empty())
-                in_list += ",";
-            in_list += std::format("({},{})", pid, sql_str(exe_key));
-        }
-        if (!h.exec(std::format("DELETE FROM usage_live WHERE (pid, exe_key) IN (VALUES {})", in_list)))
+    for (const auto& key : touched_keys) {
+        if (!exec_bound(h, "DELETE FROM usage_live WHERE pid = ? AND exe_key = ?",
+                        {static_cast<int64_t>(key.first), std::string_view{key.second}}))
             return std::unexpected(h.error());
-        for (const auto& key : touched_keys) {
-            auto it = state.open.find(key);
-            if (it == state.open.end())
-                continue; // touched but not open at the end -- delete only
-            const auto& run = it->second;
-            if (!h.exec(std::format(
-                    "INSERT INTO usage_live (ts, snapshot_id, action, pid, exe_key, user, start_ts) "
-                    "VALUES ({}, 0, 'open', {}, {}, {}, {})",
-                    run.start_ts, run.pid, sql_str(run.exe_key), sql_str(run.user), run.start_ts)))
-                return std::unexpected(h.error());
-        }
+        auto it = state.open.find(key);
+        if (it == state.open.end())
+            continue; // touched but not open at the end -- delete only
+        const auto& run = it->second;
+        if (!exec_bound(h,
+                        "INSERT INTO usage_live (ts, snapshot_id, action, pid, exe_key, user, "
+                        "start_ts) VALUES (?1, 0, 'open', ?2, ?3, ?4, ?1)",
+                        {run.start_ts, static_cast<int64_t>(run.pid), std::string_view{run.exe_key},
+                         std::string_view{run.user}}))
+            return std::unexpected(h.error());
     }
 
     // ── echo_config counters, in the SAME transaction ──

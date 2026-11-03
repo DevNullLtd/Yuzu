@@ -28,6 +28,7 @@
  * Uses WAL mode, busy_timeout=5000, secure_delete=ON.
  */
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -387,15 +388,15 @@ struct NetConnRow {
 /// One power_live row (cursor-model seam, echo_cursor.hpp) -- a sleep/wake/
 /// AC-power transition. FROZEN by the cursor seam: wave-2 collectors and the
 /// schema registry consume this shape exactly; changing a field is a
-/// contract change, not a refactor. `record_key` is the UNIQUE replay-
-/// idempotence key (echo_cursor.hpp rule 3) -- a value-only field for every
-/// OTHER purpose, never re-derived by a query.
+/// contract change, not a refactor. `record_key` is the replay-idempotence key
+/// the fold's bounded replay ring checks (echo_cursor.hpp rule 3) -- a
+/// value-only field for every OTHER purpose, never re-derived by a query.
 struct PowerEvent {
     int64_t ts{0};
     int64_t snapshot_id{0};
     std::string action; // sleep, wake, ac_attached, ac_detached, capture_gap
     std::string detail;
-    std::string record_key; // UNIQUE — replay idempotence (INSERT OR IGNORE)
+    std::string record_key; // replay idempotence through the 4096-key replay ring
 };
 
 /// One removable_live row (cursor-model seam, echo_cursor.hpp) -- an
@@ -421,7 +422,7 @@ struct RemovableEvent {
     std::string image_path; // typed identity column (P-004); "" when n/a
     int64_t pid{0};         // typed identity column (P-004); 0 when n/a
     std::string evidence;   // forensic/value field only — NOT identity
-    std::string record_key; // UNIQUE — replay idempotence (INSERT OR IGNORE)
+    std::string record_key; // replay idempotence through the 4096-key replay ring
     int64_t partition_count{0}; // partitions the OS reported (Windows attach record); 0 when n/a.
                                 // Appended after the frozen fields; not part of the identity digest.
 };
@@ -455,7 +456,7 @@ struct RegistryEvent {
     std::string source;     // notify | reconcile
     int64_t observed_at{0}; // unix ms
     std::string detail;     // attr:* on a change row; the gap description on a gap
-    std::string record_key; // UNIQUE -- replay idempotence (INSERT OR IGNORE)
+    std::string record_key; // replay idempotence through the 4096-key replay ring
 };
 
 /// Row from an arbitrary SQL query (used by echo.sql action).
@@ -994,10 +995,22 @@ public:
      * referenced. Backs the `echo.purge_source` action (retention-paused frame, Phase 15.A): it
      * drops a deliberately paused source's accumulated forensic data WITHOUT re-enabling
      * collection. The rows go in one transaction (all or none); the dictionary sweep follows
-     * it and, if it outruns its deadline, leaves the strings to the weekly GC (logged).
-     * @return total rows deleted, or an error string (unknown source / SQL error).
+     * it under `dictionary_deadline` (60 s: operator-initiated and rare) and, if it outruns the
+     * deadline or fails, the strings stay until the weekly GC: that is REPORTED
+     * (`dictionary_pending`, counted in `dict_gc_starved_total`), never a silent success, since
+     * the purge is promised as forensic erasure and the strings of the purged rows are forensic
+     * data too. The deadline is a parameter so a test can drive that path (gc_dictionary's
+     * deadline is the seam).
+     * @return the rows deleted and whether the dictionary sweep is pending, or an error string
+     *         (unknown source / SQL error).
      */
-    std::expected<int, std::string> purge_source(const std::string& source);
+    struct PurgeResult {
+        int rows_deleted{0};
+        bool dictionary_pending{false}; ///< strings of the purged rows remain until the weekly GC
+    };
+    std::expected<PurgeResult, std::string> purge_source(
+        const std::string& source,
+        std::chrono::steady_clock::duration dictionary_deadline = std::chrono::seconds(60));
 
 private:
     explicit EchoDatabase(sqlite3* db);

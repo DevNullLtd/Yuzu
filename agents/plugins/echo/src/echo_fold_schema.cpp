@@ -322,6 +322,24 @@ bool is_legacy_live_shim(std::string_view name) {
     return names.contains(std::string(name));
 }
 
+std::vector<std::string> referenced_legacy_live_shims(std::string_view sql) {
+    const auto ident = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+    };
+    std::vector<std::string> out;
+    for (const auto& name : legacy_live_shim_names()) {
+        for (auto pos = sql.find(name); pos != std::string_view::npos; pos = sql.find(name, pos + 1)) {
+            const bool starts = pos == 0 || !ident(sql[pos - 1]);
+            const bool ends = pos + name.size() == sql.size() || !ident(sql[pos + name.size()]);
+            if (starts && ends) {
+                out.push_back(name);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
 // ── The retired raw tables' columns ─────────────────────────────────────────
 
 namespace {

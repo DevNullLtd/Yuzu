@@ -5618,13 +5618,13 @@ guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depend
 fast a device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not
 where it sits: a record is still in its finer tier until the coarser roll-up closes. It holds while
 the device is within its `db_budget_bytes` (default 250 MiB): a device over its byte budget removes
-raw capture rows older than 24 h that their first summary tier has passed and hourly rows older
-than 48 h (5 days for `procperf`) inside these depths, oldest first, until it is back under;
-`echo.status` reports it as `budget_evicted_raw_rows_total` and `budget_evicted_hourly_rows_total`
-(see the Echo manual, The database byte budget). It is a
-floor on rows that exist, not on coverage: after an agent is offline longer than a tier's
-roll-up catch-up window (2 h hourly, 2 d daily, about 62 d monthly) the missed span is a gap in
-that tier, not a deeper tier. The
+hourly rows older than 48 h (5 days for `procperf`) inside these depths, oldest first, until it is
+back under (daily and monthly rows, the `usage` tables and paused sources are never taken);
+`echo.status` reports it as `budget_evicted_hourly_rows_total` (`budget_evicted_raw_rows_total` is
+retired: there is no raw tier) (see the Echo manual, The database byte budget). It is a floor on
+rows that exist, not on coverage: every event folds into every tier as it arrives, so an agent that
+is offline records nothing for that span in any tier, and there is no later aggregation pass or
+catch-up window that could fill it. The
 `usage`/`live` row is a backstop, not an operative bound: the usage fold bounds its own open
 set (20,000 runs) before this limit can apply.
 
@@ -5657,10 +5657,10 @@ server-enforced reading, if one ever ships, lands under a new key, never by rede
     "echo": {
       "tick_seconds": 900,
       "tiers": [
-        { "source": "process", "tier": "live", "limit_kind": "rows", "limit": 100000,
+        { "source": "usage", "tier": "live", "limit_kind": "rows", "limit": 200000,
           "bucket_seconds": 0, "guaranteed_depth_seconds": null },
-        { "source": "process", "tier": "daily", "limit_kind": "seconds", "limit": 2678400,
-          "bucket_seconds": 86400, "guaranteed_depth_seconds": 2592000 }
+        { "source": "process", "tier": "daily", "limit_kind": "seconds", "limit": 15552000,
+          "bucket_seconds": 86400, "guaranteed_depth_seconds": 15465600 }
       ]
     }
   },

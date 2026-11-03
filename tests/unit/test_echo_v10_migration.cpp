@@ -26,11 +26,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <format>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -114,6 +116,9 @@ CREATE TABLE echo_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
 CREATE TABLE echo_cursor (source TEXT PRIMARY KEY, cursor_json TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE usage_live (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL DEFAULT 0, snapshot_id INTEGER NOT NULL DEFAULT 0, action TEXT NOT NULL DEFAULT '', pid INTEGER NOT NULL DEFAULT 0, exe_key TEXT NOT NULL DEFAULT '', user TEXT NOT NULL DEFAULT '', start_ts INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE usage_daily (id INTEGER PRIMARY KEY AUTOINCREMENT, day_ts INTEGER NOT NULL DEFAULT 0, exe_key TEXT NOT NULL DEFAULT '', run_count INTEGER NOT NULL DEFAULT 0, total_seconds INTEGER NOT NULL DEFAULT 0, first_seen INTEGER NOT NULL DEFAULT 0, last_seen INTEGER NOT NULL DEFAULT 0, distinct_users INTEGER NOT NULL DEFAULT 0, superseded_runs INTEGER NOT NULL DEFAULT 0, expired_runs INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE usage_daily_user (day_ts INTEGER NOT NULL, exe_key TEXT NOT NULL, user TEXT NOT NULL, PRIMARY KEY(day_ts, exe_key, user));
+CREATE UNIQUE INDEX usage_daily_day_exe_uq ON usage_daily(day_ts, exe_key);
+CREATE UNIQUE INDEX usage_live_pid_exe_uq ON usage_live(pid, exe_key);
 CREATE TABLE netqual_boot (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL DEFAULT 0, snapshot_id INTEGER NOT NULL DEFAULT 0, boot_ts INTEGER NOT NULL DEFAULT 0, window_s INTEGER NOT NULL DEFAULT 0, retrans_segs INTEGER NOT NULL DEFAULT 0, segs_out INTEGER NOT NULL DEFAULT 0, estab_resets INTEGER NOT NULL DEFAULT 0, if_in_errors INTEGER NOT NULL DEFAULT 0, if_in_discards INTEGER NOT NULL DEFAULT 0, if_out_errors INTEGER NOT NULL DEFAULT 0, if_out_discards INTEGER NOT NULL DEFAULT 0, if_in_octets INTEGER NOT NULL DEFAULT 0, if_out_octets INTEGER NOT NULL DEFAULT 0);
 )";
 
@@ -541,6 +546,67 @@ bool has_table(sqlite3* db, const std::string& name, const char* type = "table")
                                     type, name)) == 1;
 }
 
+// Every table and view of sqlite_master and every row of every table, in rowid order: two
+// databases hold the same data iff their snapshots are equal (the rollback and refusal oracle).
+// Indexes are left out: open() creates the warehouse indexes of the tables the roll-up keeps
+// (netqual_boot, usage_*) idempotently before the v10 step, outside its transaction.
+using Snapshot = std::map<std::string, std::vector<std::vector<std::string>>>;
+
+Snapshot snapshot(const fs::path& p) {
+    Db d;
+    open_raw(d, p);
+    Snapshot out;
+    out["sqlite_master"] = rows_of(d.db, "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type <> 'index' "
+                                         "ORDER BY type, name");
+    for (const auto& r : rows_of(d.db, "SELECT name FROM sqlite_master WHERE type = 'table' AND "
+                                       "name NOT LIKE 'sqlite_%' ORDER BY name"))
+        out[r[0]] = rows_of(d.db, std::format("SELECT * FROM \"{}\" ORDER BY rowid", r[0]));
+    return out;
+}
+
+// The tables whose rows (or whose presence) differ between two snapshots, for a failure message.
+std::string snapshot_diff(const Snapshot& a, const Snapshot& b) {
+    std::string out;
+    for (const auto& [k, rows] : a)
+        if (!b.contains(k) || b.at(k) != rows) {
+            out += k + ": ";
+            for (const auto& r : rows)
+                if (!b.contains(k) || std::find(b.at(k).begin(), b.at(k).end(), r) == b.at(k).end())
+                    for (const auto& c : r) out += "[-" + c + "]";
+            if (b.contains(k))
+                for (const auto& r : b.at(k))
+                    if (std::find(rows.begin(), rows.end(), r) == rows.end())
+                        for (const auto& c : r) out += "[+" + c + "]";
+            out += " ";
+        }
+    for (const auto& [k, rows] : b)
+        if (!a.contains(k))
+            out += k + " ";
+    return out;
+}
+
+// Copy a database and whatever sidecars it has (-wal, -shm) to `to` and its sidecars: a crash
+// image taken while a transaction is open. A sidecar that cannot be copied is simply absent.
+void copy_sidecars(const fs::path& from, const fs::path& to) {
+    std::error_code ec;
+    fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
+    REQUIRE(!ec);
+    for (const char* suffix : {"-wal", "-shm"}) {
+        const fs::path src{from.string() + suffix};
+        if (fs::exists(src, ec))
+            fs::copy_file(src, fs::path{to.string() + suffix}, fs::copy_options::overwrite_existing, ec);
+    }
+}
+
+// `n` raw process rows (started, one pid each, one second apart from `ts0`) through one recursive
+// CTE: cheap, machine independent, and more than one 10,000-row chunk when n is.
+void seed_process_rows(sqlite3* db, int64_t n, int64_t ts0) {
+    exec(db, std::format("WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < {}) "
+                         "INSERT INTO process_live (ts, snapshot_id, action, pid, ppid, name, cmdline, user) "
+                         "SELECT {} + i, 1, 'started', i, 0, 'a.exe', '', 'u' FROM c",
+                         n, ts0));
+}
+
 } // namespace
 
 TEST_CASE("v10 migration: every source converts exactly (differential against a fresh fold)",
@@ -667,18 +733,22 @@ TEST_CASE("v10 migration: the roll-ups the aggregator had not performed are fini
                              d0 + 3600, d0 + 7200));
         exec(db, std::format("INSERT INTO process_daily VALUES (NULL, {}, 'a', 'u', 10, 5)", d0 - 86400));
         exec(db, std::format("INSERT INTO process_monthly VALUES (NULL, {}, 'a', 'u', 10, 5)", m0));
+        // monthly mark = d0: the day before d0 is already in monthly, day d0 is not yet
         exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_process_hourly_at', '{0}'), "
-                             "('rollup_process_daily_at', '{1}'), ('rollup_process_monthly_at', '{2}')",
-                             d0 + 86400, d0, m0 + 86400 * 31));
+                             "('rollup_process_daily_at', '{1}'), ('rollup_process_monthly_at', '{1}')",
+                             d0 + 86400, d0));
     });
     auto db = open_ok(seeded.tmp.path);
     // daily: the old row (10, 5) plus the two hours folded in (7, 3) on day d0
     CHECK(n(db, std::format("SELECT start_count FROM process_daily WHERE day_ts = {}", d0)) == 7);
     CHECK(n(db, std::format("SELECT stop_count FROM process_daily WHERE day_ts = {}", d0)) == 3);
     CHECK(n(db, std::format("SELECT start_count FROM process_daily WHERE day_ts = {}", d0 - 86400)) == 10);
-    // monthly: the old row (already containing d0 - 1 day's 10) plus the new day d0 (7): the
-    // daily rows at or above the monthly mark... the mark is past both, so monthly is unchanged
-    CHECK(n(db, std::format("SELECT start_count FROM process_monthly WHERE month_ts = {}", m0)) == 10);
+    // monthly: the old row (10, 5: it already holds the day before d0, which is below the mark and
+    // is NOT added again) plus day d0 (7, 3), which the hourly -> daily finish built and the
+    // daily -> monthly finish then folded, because it is at the mark
+    CHECK(n(db, std::format("SELECT start_count FROM process_monthly WHERE month_ts = {}", m0)) == 17);
+    CHECK(n(db, std::format("SELECT stop_count FROM process_monthly WHERE month_ts = {}", m0)) == 8);
+    CHECK(n(db, "SELECT COUNT(*) FROM process_monthly") == 1);
 }
 
 TEST_CASE("v10 migration: a retired average comes back as a sum",
@@ -692,6 +762,9 @@ TEST_CASE("v10 migration: a retired average comes back as a sum",
                              "instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes) "
                              "VALUES ({}, 'chrome', '1.0', 0, 2, 3, 20.0, 30.0, 1000, 1500)",
                              kH0));
+        exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_perf_hourly_at', '{0}'), "
+                             "('rollup_procperf_hourly_at', '{0}')",
+                             kNextHour));
     });
     auto db = open_ok(seeded.tmp.path);
     CHECK(n(db, "SELECT cpu_sum FROM perf_hourly_r") == 50);          // 12.5 * 4
@@ -767,13 +840,20 @@ TEST_CASE("v10 migration: a fault after the drops rolls everything back and the 
         for (const auto& c : cases)
             c.seed_raw(db);
         exec(db, std::format("INSERT INTO process_hourly VALUES (NULL, {}, 'a', 'u', 3, 1)", kH0));
+        // the mark at the start of H0: every raw row is at or after it, so all of them fold
+        exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_process_hourly_at', '{}')", kH0));
     });
+    const auto before = snapshot(seeded.tmp.path);
 
+    // The crash image: the database, its write-ahead log and shm copied at the fault point, inside
+    // the transaction, exactly what a power cut there would leave on disk.
+    yuzu::test::TempDbFile crash_copy{"yuzu_test_echo_v10_crash_"};
     {
         OpenSeams seams;
         bool faulted = false;
         seams.v10_after_drop = [&]() -> std::expected<void, std::string> {
             faulted = true;
+            copy_sidecars(seeded.tmp.path, crash_copy.path);
             return std::unexpected("injected fault after the DROP TABLE statements");
         };
         const auto failed = EchoDatabase::open(seeded.tmp.path, seams);
@@ -782,20 +862,15 @@ TEST_CASE("v10 migration: a fault after the drops rolls everything back and the 
         CHECK(failed.error().find("injected fault") != std::string::npos);
     }
 
-    // The file is exactly the v9 database: version, every retired table and its rows, no roll-up.
+    // The file is exactly the v9 database: the same objects (sqlite_master) and the same rows in
+    // every table, and the crash image recovers to the same through SQLite's WAL recovery.
+    CHECK(snapshot(seeded.tmp.path) == before);
+    CHECK(snapshot(crash_copy.path) == before);
     {
         Db check;
         open_raw(check, seeded.tmp.path);
         CHECK(count_of(check.db, "SELECT value FROM echo_config WHERE key = 'schema_version'") == 9);
-        for (const auto& def : fold_sources()) {
-            if (def.own_tables)
-                continue;
-            INFO(def.name);
-            CHECK(has_table(check.db, std::format("{}_live", def.name)));
-            CHECK(count_of(check.db, std::format("SELECT COUNT(*) FROM {}_live", def.name)) >= 2);
-        }
         CHECK(has_table(check.db, "process_hourly"));
-        CHECK(count_of(check.db, "SELECT COUNT(*) FROM process_hourly") == 1);
         CHECK(!has_table(check.db, "echo_dict"));
         CHECK(!has_table(check.db, "process_hourly_r"));
         CHECK(!has_table(check.db, "process_live", "view"));
@@ -813,22 +888,21 @@ TEST_CASE("v10 migration: a volume with less than twice the file free refuses an
     seed(seeded, [&](sqlite3* db) {
         insert_raw(db, "process", {I(kT0), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
     });
-    const auto size_before = fs::file_size(seeded.tmp.path);
-
     OpenSeams tight;
     tight.free_bytes = [](const fs::path&) -> std::optional<std::uintmax_t> { return 1000; };
+    const auto before = snapshot(seeded.tmp.path);
     const auto refused = EchoDatabase::open(seeded.tmp.path, tight);
     REQUIRE(!refused.has_value());
     CHECK(is_free_space_refusal(refused.error()));
     CHECK(refused.error().find("1000 bytes are free") != std::string::npos); // both figures named
     CHECK(refused.error().find("are needed") != std::string::npos);
-    // untouched: the same size, version 9, the raw table with its row
+    // untouched: the same objects and rows, version 9, the raw table with its row
+    CHECK(snapshot(seeded.tmp.path) == before);
     Db check;
     open_raw(check, seeded.tmp.path);
     CHECK(count_of(check.db, "SELECT value FROM echo_config WHERE key = 'schema_version'") == 9);
     CHECK(count_of(check.db, "SELECT COUNT(*) FROM process_live") == 1);
     CHECK(!has_table(check.db, "echo_dict"));
-    CHECK(fs::file_size(seeded.tmp.path) >= size_before); // WAL mode may append to nothing, never shrink
 
     // and it succeeds once the space is there
     OpenSeams roomy;
@@ -987,4 +1061,229 @@ TEST_CASE("v10 migration: the free-space refusal is told apart from every other 
     REQUIRE(lines.size() == 2);
     CHECK(lines[0].starts_with("error|")); // the server gates on a leading error|
     CHECK(lines[1] == "storage_state|offline|free_space");
+}
+
+TEST_CASE("v10 migration: a damaged roll-up mark fails the migration and names it",
+          "[echo][v10][migration][marks]") {
+    Seeded seeded;
+    std::string want; // a fragment of the error that names the defect
+    SECTION("a mark that is not an integer is never read as absent") {
+        seed(seeded, [&](sqlite3* db) {
+            insert_raw(db, "process", {I(kT0), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
+            exec(db, std::format("INSERT INTO process_hourly VALUES (NULL, {}, 'a', 'u', 3, 1)", kH0));
+            exec(db, "INSERT INTO echo_config VALUES ('rollup_process_hourly_at', 'abc')");
+        });
+        want = "'rollup_process_hourly_at' holds 'abc'";
+    }
+    SECTION("an empty mark is not an integer either") {
+        seed(seeded, [&](sqlite3* db) {
+            exec(db, std::format("INSERT INTO process_hourly VALUES (NULL, {}, 'a', 'u', 3, 1)", kH0));
+            exec(db, "INSERT INTO echo_config VALUES ('rollup_process_hourly_at', '')");
+        });
+        want = "'rollup_process_hourly_at' holds ''";
+    }
+    SECTION("a populated old tier with no mark cannot say what it already holds") {
+        seed(seeded, [&](sqlite3* db) {
+            exec(db, std::format("INSERT INTO process_hourly VALUES (NULL, {}, 'a', 'u', 3, 1)", kH0));
+            exec(db, std::format("INSERT INTO process_daily VALUES (NULL, {}, 'a', 'u', 3, 1)", kH0 - kH0 % 86400));
+            exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_process_hourly_at', '{}')", kNextHour));
+        });
+        want = "process_daily holds 1 rows but echo_config has no 'rollup_process_daily_at' mark";
+    }
+    SECTION("a coarser tier's mark ahead of its finer tier's is inconsistent") {
+        seed(seeded, [&](sqlite3* db) {
+            exec(db, std::format("INSERT INTO process_hourly VALUES (NULL, {}, 'a', 'u', 3, 1)", kH0));
+            exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_process_hourly_at', '{}'), "
+                                 "('rollup_process_daily_at', '{}')",
+                                 kNextHour, kNextDay));
+        });
+        want = "'rollup_process_daily_at' = " + std::to_string(kNextDay) + " is ahead of the finer tier's mark";
+    }
+    const auto before = snapshot(seeded.tmp.path);
+    const auto failed = EchoDatabase::open(seeded.tmp.path);
+    REQUIRE(!failed.has_value());
+    INFO(failed.error());
+    CHECK(failed.error().find(want) != std::string::npos);
+    const auto after = snapshot(seeded.tmp.path);
+    INFO("differs: " << snapshot_diff(before, after));
+    CHECK(after == before); // nothing changed: the retired tables are intact
+}
+
+TEST_CASE("v10 migration: a mark ahead of the clock is replaced by the converted tier's newest bucket",
+          "[echo][v10][migration][marks]") {
+    Seeded seeded;
+    // A forward clock excursion wrote the mark a century ahead and then healed: the old pass never
+    // summarised anything after it. Hour H0 is in the old hourly tier; the raw rows of the next
+    // hour were never summarised and must fold; the raw row inside H0 is below the floor.
+    const int64_t excursion = kH0 + int64_t{100} * 365 * 86400;
+    seed(seeded, [&](sqlite3* db) {
+        for (const auto ts : {kH0 + 10, kNextHour, kNextHour + 7})
+            insert_raw(db, "process", {I(ts), I(1), T("started"), I(1), I(0), T("alpha.exe"), T(""), T("jsmith")});
+        exec(db, std::format("INSERT INTO process_hourly (hour_ts, name, user, start_count, stop_count) "
+                             "VALUES ({}, 'alpha.exe', 'jsmith', 1, 0)",
+                             kH0));
+        exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_process_hourly_at', '{}')", excursion));
+    });
+    yuzu::test::LogCapture logs;
+    auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    // the decision, with the figures, once
+    CHECK(logs.text().find(std::format("rollup_process_hourly_at = {} is ahead of the clock", excursion)) !=
+          std::string::npos);
+    CHECK(logs.text().find(std::format("newest bucket instead ({})", kNextHour)) != std::string::npos);
+    CHECK(logs.text().find("1 raw rows older than the old roll-up mark") != std::string::npos);
+    CHECK(logs.text().find("1 marks ahead of the clock") != std::string::npos);
+    // H0 keeps the old tier's figure (the raw row inside it is below the floor), the next hour folds
+    CHECK(n(db, std::format("SELECT start_count FROM process_hourly WHERE hour_ts = {}", kH0)) == 1);
+    CHECK(n(db, std::format("SELECT start_count FROM process_hourly WHERE hour_ts = {}", kNextHour)) == 2);
+    CHECK(n(db, "SELECT SUM(start_count) FROM process_hourly") == 3);
+}
+
+TEST_CASE("v10 migration: a legacy bucket or average that cannot convert is refused with the row named",
+          "[echo][v10][migration][validate]") {
+    Seeded seeded;
+    std::string want;
+    SECTION("a daily bucket stamped in milliseconds is outside years 0001-9999") {
+        seed(seeded, [&](sqlite3* db) {
+            exec(db, std::format("INSERT INTO process_daily VALUES (NULL, {}, 'a', 'u', 3, 1)", kH0 * 1000));
+            exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_process_daily_at', '{}')", kNextDay));
+        });
+        want = std::format("process_daily_legacy.day_ts = {} (row id 1) is outside years 0001-9999", kH0 * 1000);
+    }
+    SECTION("an average whose product with samples is not finite") {
+        seed(seeded, [&](sqlite3* db) {
+            exec(db, std::format("INSERT INTO perf_hourly (hour_ts, samples, cpu_avg) VALUES ({}, 2, 1e308)", kH0));
+            exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_perf_hourly_at', '{}')", kNextHour));
+        });
+        want = "perf_hourly_legacy.cpu_avg = 1.0e+308 with samples = 2 (row id 1) does not convert";
+    }
+    SECTION("a NULL samples count has no product") {
+        seed(seeded, [&](sqlite3* db) {
+            // v9's DDL made every column NOT NULL; a table from an older build need not have. The
+            // fixture table is empty here, so it is replaced by one whose samples column can be NULL.
+            exec(db, "DROP TABLE perf_hourly; CREATE TABLE perf_hourly (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                     "hour_ts INTEGER NOT NULL DEFAULT 0, samples INTEGER, cpu_avg REAL)");
+            exec(db, std::format("INSERT INTO perf_hourly (hour_ts, samples, cpu_avg) VALUES ({}, NULL, 1.5)", kH0));
+            exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_perf_hourly_at', '{}')", kNextHour));
+        });
+        want = "perf_hourly_legacy.cpu_avg = 1.5 with samples = NULL (row id 1) does not convert";
+    }
+    const auto before = snapshot(seeded.tmp.path);
+    const auto failed = EchoDatabase::open(seeded.tmp.path);
+    REQUIRE(!failed.has_value());
+    INFO(failed.error());
+    CHECK(failed.error().find(want) != std::string::npos);
+    CHECK(snapshot(seeded.tmp.path) == before);
+}
+
+TEST_CASE("v10 migration: raw process rows the usage fold had not read reach usage in the same transaction",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // The old usage fold had read row 1 (the start: an open run in usage_live) and lagged behind
+    // row 2 (the stop): usage_hwm_id = 1, usage_lag_events = 1. The migration deletes the cursor,
+    // so the stop must be fed to usage here or the run stays open until the 7-day expiry.
+    seed(seeded, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(kT0), I(1), T("started"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+        insert_raw(db, "process", {I(kT0 + 60), I(1), T("stopped"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+        exec(db, std::format("INSERT INTO usage_live (ts, snapshot_id, action, pid, exe_key, user, start_ts) "
+                             "VALUES ({0}, 0, 'open', 100, 'alpha.exe', 'jsmith', {0})",
+                             kT0));
+        exec(db, "INSERT INTO echo_config VALUES ('usage_active_generation', '0'), ('usage_hwm_id', '1'), "
+                 "('usage_lag_events', '1')");
+    });
+    yuzu::test::LogCapture logs;
+    auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    CHECK(logs.text().find("usage lag: 1 raw process rows past usage_hwm_id (usage_lag_events was 1), 1 of "
+                           "them folded into usage") != std::string::npos);
+    // the run closed: 60 s credited, nothing left open, the cursor gone
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live") == 0);
+    CHECK(n(db, "SELECT run_count FROM usage_daily WHERE exe_key = 'alpha.exe'") == 1);
+    CHECK(n(db, "SELECT total_seconds FROM usage_daily WHERE exe_key = 'alpha.exe'") == 60);
+    CHECK(db.get_config("usage_hwm_id", "absent") == "absent");
+    // and the process tier saw both rows once
+    CHECK(n(db, "SELECT SUM(start_count) FROM process_hourly") == 1);
+    CHECK(n(db, "SELECT SUM(stop_count) FROM process_hourly") == 1);
+}
+
+TEST_CASE("v10 migration: every old summary tier converts on data and a duplicate bucket-and-keys pair merges",
+          "[echo][v10][migration][tiers]") {
+    Seeded seeded;
+    // Two identical rows in EVERY old tier (nothing in the old schema stopped that), with sane marks.
+    seed(seeded, [&](sqlite3* db) {
+        for (const auto& t : kOldTiers) {
+            std::string cols, vals;
+            std::string spec = t.columns;
+            size_t pos = 0;
+            while (pos < spec.size()) {
+                auto comma = spec.find(',', pos);
+                if (comma == std::string::npos)
+                    comma = spec.size();
+                std::string col = spec.substr(pos, comma - pos);
+                col = col.substr(col.find_first_not_of(' '));
+                const auto sp = col.find(' ');
+                const std::string name = col.substr(0, sp), type = col.substr(sp + 1);
+                cols += (cols.empty() ? "" : ", ") + name;
+                std::string v = type == "TEXT" ? "'k'" : type == "REAL" ? "1.5" : "1";
+                if (name.ends_with("_ts"))
+                    v = std::to_string(kH0);
+                vals += (vals.empty() ? "" : ", ") + v;
+                pos = comma + 1;
+            }
+            for (int i = 0; i < 2; ++i)
+                exec(db, std::format("INSERT INTO {} ({}) VALUES ({})", t.table, cols, vals));
+            const std::string table{t.table};
+            const auto us = table.rfind('_');
+            exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_{}_{}_at', '{}')",
+                                 table.substr(0, us), table.substr(us + 1), kNextDay));
+        }
+    });
+    auto db = open_ok(seeded.tmp.path);
+    int checked = 0;
+    for (const auto& t : kOldTiers) {
+        const std::string table{t.table};
+        const auto us = table.rfind('_');
+        const std::string source = table.substr(0, us), tier = table.substr(us + 1);
+        const FoldSourceDef* def = fold_source(source);
+        REQUIRE(def != nullptr);
+        INFO(table);
+        // one merged row, and its first summed measure holds both rows' contribution
+        CHECK(n(db, std::format("SELECT COUNT(*) FROM {}", physical_table_name(source, tier))) == 1);
+        const std::string spec = t.columns;
+        for (const auto& c : def->columns) {
+            if (c.role != ColumnRole::kMeasure || c.merge != MergeOp::kSum)
+                continue;
+            if (spec.find(std::string{c.name} + " ") == std::string::npos)
+                continue; // a measure the old tier did not have reads 0
+            CHECK(n(db, std::format("SELECT {} FROM {}", physical_column_name(c), physical_table_name(source, tier))) == 2);
+            ++checked;
+            break;
+        }
+    }
+    CHECK(checked == static_cast<int>(std::size(kOldTiers)));
+}
+
+TEST_CASE("v10 migration: more rows than one chunk fold continuously and the ring keeps the newest depth",
+          "[echo][v10][migration][chunks]") {
+    Seeded seeded;
+    constexpr int64_t kRows = 10'001;                // one row past the 10,000-row chunk
+    constexpr int64_t kKeys = kReplayRingDepth + 1;  // one key past the ring
+    seed(seeded, [&](sqlite3* db) {
+        seed_process_rows(db, kRows, kT0);
+        exec(db, std::format("WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < {}) "
+                             "INSERT INTO power_live (ts, snapshot_id, action, detail, record_key) "
+                             "SELECT {} + i, 1, 'wake', 'd', 'p:' || i FROM c",
+                             kKeys, kT0));
+    });
+    auto db = open_ok(seeded.tmp.path);
+    CHECK(n(db, "SELECT SUM(start_count) FROM process_hourly") == kRows);
+    CHECK(n(db, "SELECT SUM(start_count) FROM process_daily") == kRows);
+    CHECK(n(db, "SELECT SUM(event_count) FROM power_hourly") == kKeys);
+    // the newest kReplayRingDepth keys seed the ring, with contiguous sequence numbers
+    CHECK(n(db, "SELECT COUNT(*) FROM echo_fold_seen WHERE source = 'power'") == static_cast<int64_t>(kReplayRingDepth));
+    CHECK(n(db, "SELECT COUNT(*) FROM echo_fold_seen WHERE source = 'power' AND record_key = 'p:1'") == 0);
+    CHECK(n(db, "SELECT COUNT(*) FROM echo_fold_seen WHERE source = 'power' AND record_key = 'p:2'") == 1);
+    CHECK(n(db, std::format("SELECT COUNT(*) FROM echo_fold_seen WHERE source = 'power' AND record_key = 'p:{}'", kKeys)) == 1);
+    CHECK(n(db, "SELECT MAX(seq) - MIN(seq) + 1 FROM echo_fold_seen WHERE source = 'power'") ==
+          static_cast<int64_t>(kReplayRingDepth));
 }

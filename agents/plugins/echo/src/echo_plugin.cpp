@@ -3896,8 +3896,15 @@ private:
                 "list; retry the purge (the deletion itself is idempotent and will not repeat)");
             return 1;
         }
-        ctx.write_output(
-            std::format(R"({{"source":"{}","rows_deleted":{},"status":"purged"}})", source, *res));
+        // The rows are gone either way; a dictionary sweep that did not finish leaves the purged
+        // strings on disk until the weekly sweep, which the reply and the typed status both say
+        // (the audit row records what the action reported, so "purged" alone would overstate it).
+        if (res->dictionary_pending)
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "echo:purge_dictionary_pending");
+        ctx.write_output(std::format(
+            R"({{"source":"{}","rows_deleted":{},"status":"purged","dictionary_pending":{}}})", source,
+            res->rows_deleted, res->dictionary_pending ? "true" : "false"));
         return 0;
     }
 
@@ -4835,6 +4842,18 @@ private:
             return 1;
         }
         auto& result = *query_result;
+
+        // A retired `$X_Live` name answers with no rows (an empty shim view, never an error), so
+        // a stored query, schedule or result-set producer would read the empty answer as "nothing
+        // happened". The typed status says what it is: CONSTRAINED, `retired_table:<name>`. The
+        // rows and the __total__ line are unchanged; refusing the name is a separate decision.
+        if (const auto retired = yuzu::echo::referenced_legacy_live_shims(*validated); !retired.empty()) {
+            std::string detail = "retired_table:";
+            for (std::size_t i = 0; i < retired.size(); ++i)
+                detail += (i ? "," : "") + retired[i];
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  detail);
+        }
 
         // Output schema line
         std::string schema_line = "__schema__";

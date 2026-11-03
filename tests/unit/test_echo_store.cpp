@@ -154,7 +154,8 @@ TEST_CASE("EchoDatabase: purge_source drops ALL tiers for one source, leaves oth
 
     auto res = t.db.purge_source("process");
     REQUIRE(res.has_value());
-    CHECK(*res == 9); // 3 + 3 + 3 across all three tiers -- the cross-tier sum
+    CHECK(res->rows_deleted == 9); // 3 + 3 + 3 across all three tiers -- the cross-tier sum
+    CHECK(!res->dictionary_pending); // the sweep finished inside its deadline
     CHECK(count("process_hourly") == 0);
     CHECK(count("process_daily") == 0);
     CHECK(count("process_monthly") == 0);
@@ -225,7 +226,7 @@ TEST_CASE("EchoDatabase: purge_source(usage) also erases usage_daily_user",
 
     auto res = t.db.purge_source("usage");
     REQUIRE(res.has_value());
-    CHECK(*res == 3); // usage_daily + usage_live (registered tiers) + usage_daily_user
+    CHECK(res->rows_deleted == 3); // usage_daily + usage_live (registered tiers) + usage_daily_user
     CHECK(count("usage_daily") == 0);
     CHECK(count("usage_daily_user") == 0); // the regression this test pins
     CHECK(count("usage_live") == 0);
@@ -1672,6 +1673,7 @@ TEST_CASE("EchoDatabase: a v3 database with pre-version procperf tables upgrades
             INSERT INTO procperf_hourly (hour_ts, name, samples, instances_max, cpu_avg, cpu_max,
                                          ws_avg_bytes, ws_max_bytes)
                 VALUES (3600, 'old.exe', 2, 1, 1.5, 2.0, 50, 60);
+            INSERT INTO echo_config (key, value) VALUES ('rollup_procperf_hourly_at', '7200');
         )";
         REQUIRE(sqlite3_exec(raw, seed, nullptr, nullptr, nullptr) == SQLITE_OK);
         sqlite3_close(raw);
@@ -4146,4 +4148,34 @@ TEST_CASE("EchoDatabase: a pre-auto_vacuum database converts with one VACUUM",
         CHECK(db.checkpoint(CheckpointMode::kTruncate) == CheckpointResult::kOk);
         CHECK(db.storage_bytes().wal_bytes == 0); // TRUNCATE reclaimed the WAL file
     }
+}
+
+TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not finish and counts it",
+          "[echo][store][purge][dictionary]") {
+    // The rows go either way; the strings of the purged rows are forensic data too, so a sweep
+    // that outran its deadline is reported (dictionary_pending) and counted, never a silent
+    // "purged". A deadline already past is gc_dictionary's own seam for that path.
+    auto t = make_test_db();
+    ProcessEvent e;
+    e.ts = 1000;
+    e.snapshot_id = 1;
+    e.action = "started";
+    e.pid = 1;
+    e.name = "purged.exe";
+    e.user = "u";
+    REQUIRE(t.db.fold_process_events({e}));
+
+    const auto starved = t.db.purge_source("process", std::chrono::seconds(0));
+    REQUIRE(starved.has_value());
+    CHECK(starved->rows_deleted == 3); // hourly, daily, monthly
+    CHECK(starved->dictionary_pending);
+    CHECK(t.db.get_config("dict_gc_starved_total", "0") == "1");
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'") == "1"); // still there
+
+    const auto swept = t.db.purge_source("process");
+    REQUIRE(swept.has_value());
+    CHECK(swept->rows_deleted == 0);
+    CHECK(!swept->dictionary_pending);
+    CHECK(t.db.get_config("dict_gc_starved_total", "0") == "1");
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'") == "0");
 }

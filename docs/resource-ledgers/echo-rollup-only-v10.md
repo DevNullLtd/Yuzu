@@ -45,8 +45,18 @@ releases exactly the resource listed.
 - **Rows not folded:** raw rows older than the first old tier's mark (`ts < mark`) are dropped with the
   raw tables, not folded: the old roll-up already summarised them except rows a process-event backfill
   wrote and rows its clock-gap clamp skipped, and its `GROUP BY` kept no identity to tell the two apart,
-  so folding them would double-count the first group. The count is in the migration's log line. The DROP
-  has no clock-derived cutoff, so `clock-guarded-retention.md` has no row for it.
+  so folding them would double-count the first group. The count is in the migration's log line. The mark
+  IS a clock-derived value (a persisted reading of the old pass's clock), so the DROP's cutoff is
+  clock-derived and `clock-guarded-retention.md` carries a row for it: every mark is read once and
+  validated (not an integer, absent for a populated tier, or ahead of the finer tier's: the migration
+  fails with the key named, never reads a damaged mark as "fold everything"), and a mark ahead of the
+  clock is untrusted and replaced by the end of the newest bucket the converted tier holds, logged with
+  the figures; a sane mark is used exactly as stored.
+- **Usage cursor:** the raw process rows past `usage_hwm_id` (the usage fold's own read cursor) are fed
+  to `usage_fold_in` on the same handle before the cursor and `usage_lag_events` are deleted, so a
+  lagging usage fold loses nothing; the rows past the cursor, the stored counter and the rows folded
+  are in the log line (a row past the cursor but below the roll-up floor is not read, and is in the
+  "older than the mark" count).
 - **After COMMIT:** the connection must be in autocommit (`sqlite3_get_autocommit`); a wedged one is
   returned as an error and `open()` closes it, never publishes it.
 

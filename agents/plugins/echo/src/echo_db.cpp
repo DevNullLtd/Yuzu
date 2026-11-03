@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <expected>
 #include <filesystem>
@@ -1831,7 +1832,9 @@ bool EchoDatabase::create_warehouse_tables() {
     return true;
 }
 
-std::expected<int, std::string> EchoDatabase::purge_source(const std::string& source) {
+std::expected<EchoDatabase::PurgeResult, std::string>
+EchoDatabase::purge_source(const std::string& source,
+                           std::chrono::steady_clock::duration dictionary_deadline) {
     // Resolve the source's tables from the schema registry -- never hardcode. A roll-up tier
     // name (`process_hourly`) is a VIEW; the rows live in its `_r` table. The tables the roll-up
     // does not own (netqual_boot, usage_live, usage_daily) are named as they are.
@@ -1911,19 +1914,32 @@ std::expected<int, std::string> EchoDatabase::purge_source(const std::string& so
 
     // The strings only this source's rows referenced (process names, users, DNS names, key paths)
     // are forensic data too: sweep the dictionary now rather than leave them to the weekly pass.
-    // Operator-initiated and rare, so it gets a long deadline. If it still runs out, say so: the
-    // weekly sweep finishes the job.
+    // Operator-initiated and rare, so it gets a long deadline. If it still runs out or fails,
+    // the result SAYS so and the starved counter moves (cmp-3): the action's audit row must not
+    // record a complete erasure while the purged strings are still on disk. The weekly sweep
+    // finishes the job.
+    PurgeResult out{static_cast<int>(total), false};
     if (fold_) {
-        const auto swept =
-            fold_->gc_dictionary(*this, EchoFold::Clock::now() + std::chrono::seconds(60));
-        if (!swept)
+        const auto swept = fold_->gc_dictionary(*this, EchoFold::Clock::now() + dictionary_deadline);
+        if (!swept) {
+            out.dictionary_pending = true;
             spdlog::warn("purge_source({}): the dictionary sweep failed ({}); the purged strings "
                          "stay until the weekly sweep",
                          source, swept.error());
-        else if (swept->deadline_hit)
+        } else if (swept->deadline_hit) {
+            out.dictionary_pending = true;
             spdlog::warn("purge_source({}): the dictionary sweep ran out of time; the purged strings "
                          "stay until the weekly sweep",
                          source);
+        }
+        if (out.dictionary_pending) {
+            int64_t starved = 0;
+            const auto text = get_config("dict_gc_starved_total", "0");
+            const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), starved);
+            if (ec != std::errc{} || p != text.data() + text.size())
+                starved = 0;
+            (void)set_config("dict_gc_starved_total", std::to_string(starved + 1));
+        }
     }
 
     // Forensic-erasure completion: secure_delete=ON (open path) zeroes the deleted rows in the
@@ -1939,7 +1955,7 @@ std::expected<int, std::string> EchoDatabase::purge_source(const std::string& so
                      "persist in the WAL until the next checkpoint",
                      source);
     }
-    return static_cast<int>(total);
+    return out;
 }
 
 // ── Roll-up folds ───────────────────────────────────────────────────────────

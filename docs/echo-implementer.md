@@ -282,12 +282,34 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
 3. Finish the tier-to-tier roll-ups the old aggregator had not yet performed, using each source's
    `rollup_<src>_<to>_at` mark (absent means "fold all"), then fold the raw rows at or after the
    first old tier's mark (`ts >= mark`: a mark is the half-open end of the last rolled bucket).
+   The marks are read once and validated before any of this: a mark that is not an integer, a
+   populated old tier whose own mark is absent, or a coarser tier's mark ahead of its finer tier's
+   fails the migration with the key, value and table named (an absent mark means "fold everything
+   into that tier", so a damaged one read as absent would double count what the tier already holds).
+   A mark ahead of the clock (`mark > now`, or above `kEchoMaxPlausibleNow`) was written during a
+   forward clock excursion that later healed; the old pass returned early on `last_mark >= boundary`,
+   so nothing after it was ever summarised, and the mark proves nothing. It is untrusted: the floor
+   becomes the end of the newest bucket the converted tier holds (what was provably summarised), the
+   decision is logged once per mark with the figures, and the rows below that floor are counted in
+   the "older than the mark" figure. A sane mark is used exactly as stored; the migration does not
+   otherwise decide per row whether a below-mark raw row was summarised.
    Sixteen decoders read the raw columns through `legacy_live_columns()`; a row the delta rules
    reject is counted and dropped. Raw rows older than that mark are dropped with the raw tables, by
    design: the old roll-up already summarised them, except rows a process-event backfill wrote with
    historical timestamps and rows the old aggregator's clock-gap clamp skipped while the mark still
    advanced. The old `GROUP BY` destroyed the row identity that would tell the two apart, so folding
-   them would double-count the first group; the migration logs how many it left unfolded.
+   them would double-count the first group; the migration logs how many it left unfolded. The usage
+   fold read the raw process rows through its own cursor, `usage_hwm_id`: the process rows past it
+   (the stored `usage_lag_events`, normally 0) are fed to `usage_fold_in` in this same transaction,
+   so a lagging usage fold loses nothing when the cursor is deleted; the log line carries the rows
+   past the cursor, the stored counter and how many of them were folded (a row past the cursor but
+   below the roll-up floor is not read and is in the "older than the mark" figure). A migrated tier
+   row carries the columns v9 did not have (`parent_name`, `abnormal_exit_count`, tcp `failed_count`
+   and `listen_*`, user `disconnect_count`, removable `partition_count`) as blank or 0, so a bucket
+   spanning the upgrade holds two process rows per (name, user): the migrated one with a blank
+   `parent_name` and the live one with the real parent. A legacy bucket outside years 0001-9999 or
+   an average that is not a finite sum is refused before any write to that tier, with the table,
+   column and row id named.
 4. Seed the replay ring with the newest 4096 `record_key`s of each cursor source, drop the retired
    tables, delete the rollup marks, `usage_hwm_id` and `usage_lag_events`, create the empty `$X_Live`
    shim views (`legacy_live_shim_ddl()`), and write `schema_version` 10.
@@ -350,7 +372,7 @@ sources, 34 tiers, 18 registry tiers, 16 shims); the capability TSV rows and the
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | echo.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe Echo data, delete `<data_dir>/echo.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing echo.db, runs migration if the schema version differs, and resumes collection. State in `echo_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/echo.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no echo.db — the next collect_fast creates it from scratch. The old echo.db at the previous path is orphaned but not deleted. Operator concern, not Echo's. |
-| **Roll back to an older agent** | An older agent refuses a v10 `echo.db`: `schema_version` 10 is unknown to it, so it cannot open the file (`docs/user-manual/upgrading.md`). Restore a copy of `echo.db` taken before the upgrade, or move the v10 file aside and let the older agent create a fresh one. It cannot read the roll-up tiers. |
+| **Roll back to an older agent** | An older agent does NOT refuse a v10 `echo.db`: no earlier build checks `schema_version` against a ceiling, so it opens the file, its warehouse DDL fails on the `<source>_live` shim views (`views may not be indexed`) and every collector write errors, so it records nothing and reads only the empty views; nothing is dropped or rewritten, but the install is useless until the file is replaced. The supported path is to restore the copy of `echo.db` (with its `-wal` and `-shm`) taken before the upgrade, or to move the v10 file aside and let the older agent create a fresh one; never run an older agent on a migrated file. An automatic OTA rollback (the updater rolling back a build that failed to verify) lands on the same file and needs the same restore (`docs/user-manual/upgrading.md` "Rolling back"). |
 | **Corruption detected at open** (#559) | `EchoDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `echo.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `echo_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `echo.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — Echo refuses to load rather than trust the corrupt DB. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.echo.*` heartbeat tags; the server exposes `yuzu_fleet_echo_db_corruption_agents` and writes an `echo.db.corruption_quarantined` audit row — see docs/user-manual/echo.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent

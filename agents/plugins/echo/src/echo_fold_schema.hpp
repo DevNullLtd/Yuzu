@@ -115,6 +115,13 @@ struct LegacyColumn {
 /// True for a name `legacy_live_shim_ddl` creates.
 [[nodiscard]] bool is_legacy_live_shim(std::string_view name);
 
+/// The shim names `sql` (translated operator SQL, real table names) mentions as whole
+/// identifiers, in shim order. A query over one succeeds with no rows, so the `sql` action
+/// reports it as a CONSTRAINED result (`retired_table:<name>`) rather than let an empty answer
+/// read as "nothing happened". A lexical scan: a name inside a string literal counts too, which
+/// is a spurious signal at worst, never a missed one.
+[[nodiscard]] std::vector<std::string> referenced_legacy_live_shims(std::string_view sql);
+
 /// Roll one source's rows up from tier `from` into tier `to` ("hourly" -> "daily" or "daily" ->
 /// "monthly"): every row of `<src>_<from>_r` whose bucket is at or above `?1` is UPSERTed into
 /// `<src>_<to>_r` at its coarser bucket, one row at a time in (bucket, id) order, under exactly the

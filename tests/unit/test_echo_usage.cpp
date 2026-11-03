@@ -653,3 +653,49 @@ TEST_CASE("usage: a sustained bad clock still declines on its OWN first implausi
     CHECK(count_rows(t.db, "usage_live") == 1); // declined -- not wrongly force-closed
     CHECK(cfg(t.db, "usage_expiry_declined_count") == "1");
 }
+
+TEST_CASE("usage: a malformed usage_generation fails the whole fold instead of re-baselining",
+          "[echo][usage][fold]") {
+    // The lenient 0-on-fault read let a damaged generation read as a mismatch, and the fold then
+    // stamped a fresh baseline: DELETE FROM usage_live over a read fault. Now the read is strict
+    // and the transaction (process tiers included) rolls back.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    seed_open_run(t.db, 1, "old.exe", 1000);
+    REQUIRE(t.db.set_config("usage_generation", "not_a_number"));
+
+    CHECK_FALSE(fold_tick(t.db, process_pair(2, "new.exe", 2000, 2100), 2100));
+    CHECK(count_rows(t.db, "usage_live") == 1);    // the open run survived
+    CHECK(count_rows(t.db, "usage_daily") == 0);
+    CHECK(count_rows(t.db, "process_hourly") == 0); // and the process half rolled back with it
+    CHECK(t.db.is_open());
+}
+
+TEST_CASE("usage: an exe or user name reaches the rows byte for byte (bound and never spliced into SQL)",
+          "[echo][usage][fold]") {
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    std::string odd = "it's";
+    odd.push_back('\0');
+    odd += "x.exe";
+    std::string user = "o'brien";
+    user.push_back('\0');
+    user += "z";
+    REQUIRE(fold_tick(t.db, process_pair(7, odd, 2000, 2060, user), 2060));
+    const auto key = yuzu::echo::usage::normalise_exe_key(odd);
+    std::string hex;
+    for (const unsigned char c : key)
+        hex += std::format("{:02X}", c);
+    auto r = t.db.execute_query("SELECT hex(exe_key), total_seconds FROM usage_daily");
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 1);
+    CHECK(r->rows[0][0] == hex);
+    CHECK(r->rows[0][1] == "60");
+    std::string user_hex;
+    for (const unsigned char c : user)
+        user_hex += std::format("{:02X}", c);
+    auto u = t.db.execute_query("SELECT hex(user) FROM usage_daily_user");
+    REQUIRE(u.has_value());
+    REQUIRE(u->rows.size() == 1);
+    CHECK(u->rows[0][0] == user_hex);
+}

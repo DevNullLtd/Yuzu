@@ -17,11 +17,16 @@ metadata:
     network_capture_method and the network_capture_method_effective (the
     mechanism actually collecting — always polling today), so status never
     misrepresents the active capture mechanism. On the healthy path the FIRST
-    line is storage_state|ok. Offline means a wedged rollback closed the Echo
-    database, so collection and retention are both stopped until the agent
-    restarts and every other field is withheld -- the reply is then just an
-    error| line followed by storage_state|offline, and the action exits
-    non-zero. The order is REVERSED on that path: error| comes FIRST, because
+    line is storage_state|ok. Offline means collection and retention are both
+    stopped until the agent restarts and every other field is withheld -- the
+    reply is then just an error| line followed by storage_state|offline (a
+    wedged rollback closed the Echo database) or
+    storage_state|offline|free_space (the roll-up migration was refused at
+    start because the volume held less than twice the database file free, or
+    its free space could not be read; the file is untouched and Echo loads
+    without its database until a restart with the space freed), and the
+    action exits non-zero. The order is REVERSED on that path: error| comes
+    FIRST, because
     server and dashboard consumers key off the output starting with error|, so
     do not assume storage_state is always the first line. Historical data
     NORMALLY stays queryable via echo sql, but only when the read-only query
@@ -45,8 +50,9 @@ metadata:
     cannot be read; above 0 while an echo.sql read pins the log, after an
     eviction pass that failed or was skipped, while a catch-up is still
     draining, or when only exempt rows remain),
-    budget_evicted_raw_rows_total and budget_evicted_hourly_rows_total
-    (cumulative rows the budget removed), and db_auto_vacuum (incremental;
+    budget_evicted_hourly_rows_total (cumulative hourly rows the budget
+    removed; budget_evicted_raw_rows_total is retired, no longer written, and
+    prints its last value for one release), and db_auto_vacuum (incremental;
     none; or deferred once a one-off conversion was wanted and could not run,
     for too little free disk space or a failed VACUUM, which stays until a
     conversion succeeds).
@@ -777,7 +783,11 @@ spec:
           recorded. A key is baselined silently at its first read, so for a user
           hive that loads at logon (or a user who logs off and back on) anything
           written to its watched keys before that first read is not a row.
-          Retention is a row count (500000 rows). Setting "false" pauses capture
+          Rows live in $Registry_Hourly and $Registry_Daily ($Registry_Live
+          is an empty view): the newest value of each changed value is
+          readable there as last_data, unmasked, for the tier's retention
+          (90 days hourly, 180 days daily by default; time-based, not a row
+          count). Setting "false" pauses capture
           and a later "true" re-baselines every watched key (no row is invented
           for what changed while paused). Requires an agent newer than v0.14.1;
           older agents silently ignore. Valid: "true" | "false".

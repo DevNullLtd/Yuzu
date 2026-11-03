@@ -1225,3 +1225,46 @@ TEST_CASE("echo plugin: a closing tcp socket whose insert failed is recorded on 
     REQUIRE(rows.size() == 1);
     CHECK(rows[0][0] == "1");
 }
+
+TEST_CASE("echo plugin: a query over a retired $X_Live name answers no rows and a CONSTRAINED status",
+          "[echo][local_dispatcher][sql][shim]") {
+    // The empty shim view makes a stored query succeed with `__total__|0`; the typed result status
+    // is what tells a schedule, a result-set producer or an operator that the table is retired,
+    // not that nothing happened. A query over a tier view carries no such status.
+    const auto plugin_path = find_echo_plugin();
+    if (plugin_path.empty()) {
+        if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+            FAIL("echo plugin library not found under meson test");
+        WARN("echo plugin library not found -- skipping (run from the build root or via meson test)");
+        return;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    REQUIRE(handle.has_value());
+    const auto* desc = handle->descriptor();
+    REQUIRE(desc != nullptr);
+    REQUIRE(desc->init != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_echo_shim_sql_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    yuzu::agent::StandalonePluginContext ctx("echo", {{"agent.data_dir", dir_guard.path.string()}},
+                                             &*kv);
+    REQUIRE(desc->init(ctx.get()) == 0);
+    yuzu::agent::LocalDispatcher d;
+    const yuzu::test::ScopeExit shutdown_on_exit{[&] { desc->shutdown(ctx.get()); }};
+
+    const YuzuParam retired[] = {{"sql", "SELECT * FROM $Process_Live"}};
+    const auto r = d.run(desc, "sql", retired);
+    CHECK(r.rc == 0);
+    const auto rows = rows_of(r.captured);
+    CHECK(row_with_prefix(rows, "__schema__|id|ts|").has_value()); // the old column shape
+    CHECK(row_with_prefix(rows, "__total__|0") == std::optional<std::string>{"__total__|0"});
+    CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+
+    const YuzuParam live[] = {{"sql", "SELECT * FROM $Process_Hourly"}};
+    const auto ok = d.run(desc, "sql", live);
+    CHECK(ok.rc == 0);
+    CHECK(ok.result_status != YUZU_RESULT_STATUS_CONSTRAINED);
+}
