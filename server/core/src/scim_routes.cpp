@@ -3356,6 +3356,29 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             return;
         }
 
+        // #6835: resolve the members BEFORE the group row exists, and BEFORE the duplicate check.
+        // Could not resolve every member means persisting the partial set would silently drop
+        // real members from a brand-new group, so the request is refused with a retryable 503 -
+        // and because nothing has been created yet there is nothing to roll back: the IdP's
+        // retry meets no duplicate-displayName 409 against an empty group, and no concurrent
+        // PUT/PATCH can have added a member (and so conferred a role) to a group this request
+        // is about to remove. The audit row carries no target id for the same reason.
+        //
+        // The duplicate check comes AFTER the resolution so that its window to `create_group`
+        // stays the single round trip it always was: there is no DB UNIQUE on displayName, and
+        // with the check first, up to kMaxGroupMembers sequential reads would sit between the
+        // check and the insert, widening the two-concurrent-POST duplicate race (and a
+        // duplicate named like the admin group keeps conferring admin). The cost is that a
+        // duplicate-named request resolves its members before it is refused with 409.
+        auto members_resolved = resolve_member_values(scim_store, input.member_values);
+        if (!members_resolved.has_value()) {
+            send_scim_unavailable(res, "membership unavailable");
+            audit(auth_mgr, audit_store, req, "scim.group.created", "failure", "",
+                  "member resolution unavailable; no group was created", "Group");
+            record_request(auth_mgr, "group_create", 503);
+            return;
+        }
+
         // Idempotent-create on displayName — no DB-level UNIQUE (ScimStore's
         // doc comment on get_group_by_display_name); the routes layer owns
         // the 409.
@@ -3374,22 +3397,6 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 record_request(auth_mgr, "group_create", 409);
                 return;
             }
-        }
-
-        // #6835: resolve the members BEFORE the group row exists. Could not resolve every
-        // member means persisting the partial set would silently drop real members from a
-        // brand-new group, so the request is refused with a retryable 503 - and because nothing
-        // has been created yet there is nothing to roll back: the IdP's retry meets no
-        // duplicate-displayName 409 against an empty group, and no concurrent PUT/PATCH can have
-        // added a member (and so conferred a role) to a group this request is about to remove.
-        // The audit row carries no target id for the same reason: no group was created.
-        auto members_resolved = resolve_member_values(scim_store, input.member_values);
-        if (!members_resolved.has_value()) {
-            send_scim_unavailable(res, "membership unavailable");
-            audit(auth_mgr, audit_store, req, "scim.group.created", "failure", "",
-                  "member resolution unavailable; no group was created", "Group");
-            record_request(auth_mgr, "group_create", 503);
-            return;
         }
 
         auto group = scim_store->create_group(input.display_name, input.external_id);

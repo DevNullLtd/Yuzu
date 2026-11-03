@@ -783,7 +783,7 @@ and now also carry `Retry-After: 2`.
 | Group membership read fault | `503` ("membership unavailable") | `2` | `failure` on a Group `POST`, `PUT`, `PATCH` or `DELETE`; none on a `GET` | none | Retry. **`POST /Groups`:** the members are resolved before the group row is created, so on this `503` nothing is created, no rollback runs, and the retry creates the group normally (`201`, never a `409` against an empty group). The failure audit row `scim.group.created` has an empty target id and the detail `member resolution unavailable; no group was created`. A failure of the membership write after the group was created is a different case: the `500` `failed to persist group membership` leaves the empty group in place (limit 4 under "Known limits of the Group role recompute"). |
 | Resource does not exist | `404` | none | none | none | Treat as gone. |
 | Provenance or role refusal (account not created by SCIM, or role other than `user`) | `404` | none | `scim.user.provenance_denied` (`denied`) | `yuzu_scim_provenance_denied_total` | Stop. This is a refusal, not a fault. |
-| Duplicate `userName` or `displayName` | `409` (`scim_type=uniqueness`) | none | `denied` on the create or update action | none | Update the existing resource instead. |
+| Duplicate `userName` or `displayName` | `409` (`scim_type=uniqueness`) | none | `denied` on the create or update action | none | Update the existing resource instead. On `POST /Groups` the members are resolved before the duplicate check, so while the store is faulting a duplicate whose members cannot be resolved answers `503` rather than `409`; the retry then meets the `409`. |
 | Unfiltered `GET /Users` and `GET /Groups` (`list()` / `count()` fail open, #2481). Not covered. | `200`: a store fault can read as an empty or short list, while a filtered list answers `503` | none | none | none | Do not treat an empty list as authoritative during an outage. |
 | `POST /Users` create reads other than the duplicate check, including the concurrent-create re-read (`get_by_username` after a failed create) and `find_by_external_id`. Not covered (#6837). | Whatever the unconverted path answered before: a fault there falls through to the later `500` | none | none (500) | none | A `5xx` is not promised to converge; retry once the store answers. |
 | Tombstone-role `500` in the revive pre-check; the `500` when a reactivation's own post-commit re-read fails. Not covered. | `500` | none | the site's own row, unchanged by this change | none | A `5xx` is not promised to converge. An operator checks the account. |
@@ -795,8 +795,10 @@ Also not covered: Yuzu runs no reconciliation sweep (#6838), and a concurrent re
 
 ### During a database outage
 
-**What the IdP sees.** `503` with `Retry-After: 2` on every SCIM verb that needs the store:
-the token check, the User and Group lookups, the duplicate checks and the `eq` filters. Nothing
+**What the IdP sees.** `503` with `Retry-After: 2` on the SCIM checks this change converts:
+the token check, the User and Group lookups, the duplicate checks and the `eq` filters (the reads
+listed under "Not covered" in the matrix still answer as before: the unfiltered lists `200`, the
+`POST /Users` create reads `500`). Nothing
 is refused and nothing is changed by the failed read, so there is nothing to re-provision. `429`
 was considered as the status for this condition and rejected: `503` is the correct "the server
 cannot serve this right now" status, while `429` means the client is sending too fast.
@@ -807,6 +809,10 @@ cannot serve this right now" status, while `429` means the client is sending too
    the `/metrics` scrape too (a remote scrape resolves its token against Postgres), so
    `YuzuScimGuardStoreUnavailable` and the Postgres alerts may be silent until recovery. The
    honest backstops are `/readyz` and an operator-defined `up == 0` (scrape target down) alert.
+   **Pool saturation with Postgres still reachable keeps `/readyz` green:** its `pg_reachable` and
+   `pg_pool` rows go red on a connect failure, not on a saturated pool. For saturation read
+   `yuzu_pg_pool_in_use` against the pool size, `yuzu_pg_acquire_wait_seconds`, and the guard counter
+   below.
 2. `yuzu_scim_guard_store_unavailable_total` by `guard` (`bearer`, `resource`, `provenance`,
    `role`) on a scrape that works, to see which check is failing.
 3. The server `ERROR` log: `ScimRoutes: bearer validation - SCIM token store unavailable`

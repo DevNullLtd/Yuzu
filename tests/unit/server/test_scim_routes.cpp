@@ -7714,6 +7714,35 @@ TEST_CASE("ScimRoutes: PUT and PATCH /Groups whose members cannot be resolved, a
     CHECK(after->status == 200);
     CHECK(json::parse(after->body)["members"].size() == 0);
 }
+
+TEST_CASE("ScimRoutes: POST /Groups whose membership WRITE fails after the group was created answers "
+          "500, leaves the empty group, and the retry meets 409 (documented known limit, #6835)",
+          "[pg][scim][routes][store-error][outage]") {
+    Fixture f;
+    auto created = f.post("/scim/v2/Users", {{"userName", "gmember3"}});
+    REQUIRE(created);
+    const auto uid = json::parse(created->body)["id"].get<std::string>();
+    const json body{{"displayName", "g-write-fails"},
+                    {"members", json::array({json{{"value", uid}}})}};
+
+    // Member RESOLUTION reads scim_resources (healthy) and the group row is created in
+    // scim_groups (healthy); only the member WRITE touches scim_group_members.
+    hide_membership_table(f.auth_db.dsn());
+    auto res = f.post("/scim/v2/Groups", body);
+    restore_membership_table(f.auth_db.dsn());
+    REQUIRE(res);
+    CHECK(res->status == 500);
+
+    // The group row was created before the membership write failed and is NOT rolled back.
+    const auto after = f.scim_store->get_group_by_display_name_checked("g-write-fails");
+    REQUIRE(after.has_value());
+    CHECK(after->has_value());
+
+    // So the retry meets the duplicate-displayName 409 until the empty group is removed.
+    auto retry = f.post("/scim/v2/Groups", body);
+    REQUIRE(retry);
+    CHECK(retry->status == 409);
+}
 #endif // YUZU_SCIM_TSAN_BUILD
 
 TEST_CASE("ScimRoutes: on a healthy store the converted lookups still answer their definitive "
