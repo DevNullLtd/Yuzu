@@ -42,7 +42,7 @@ Not applicable: no C++ in the diff. Erlang processes: no new process, monitor, l
 
 ### Prior validation performed
 
-Build agent: eunit 2480/2480, dialyzer clean (OTP 28.4, 2026-11-03). Re-run by the orchestrator at `192ee0864`: see Gate 1 status below.
+Build agent: eunit 2480/2480, dialyzer clean (OTP 28.4, 2026-11-03). Re-run by the orchestrator at `192ee0864` (OTP 28.4, bash `source scripts/ensure-erlang.sh`): `rebar3 eunit --dir apps/yuzu_gw/test` exit 0, All 2480 tests passed; `rebar3 dialyzer` exit 0, no warnings.
 
 ### Governance domains triggered
 
@@ -53,3 +53,4 @@ Routed-concern walk, row by row, against the `origin/dev` copies of all four tab
 | gate | status | agents | findings (C/H/M/L/I) | pass |
 |---|---|---|---|---|
 | 1 | PASS | orchestrator | — | 1 |
+| 2 | PASS (no blocking) | security-guardian (PASS, 0 findings), docs-writer (2 wording) | 0/0/0/0/2 | 1 |
