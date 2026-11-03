@@ -251,16 +251,12 @@ R"HTM(
 
     /* Capture-sources frame (ADR-0015) — toggles, category filter, push guardrail */
     .cat-filter { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    #capTable .src-name { font-family: var(--mds-font-family-mono); font-size: 12.5px; font-weight: 500; color: var(--ink); }
-    #capTable .src-dollar { font-family: var(--mds-font-family-mono); font-size: 12px; color: var(--mut); }
-    #capTable .cat { color: var(--ink2); }
+    #capCards .src-name { font-family: var(--mds-font-family-mono); font-size: 12.5px; font-weight: 500; color: var(--ink); }
+    #capCards .src-dollar { font-family: var(--mds-font-family-mono); font-size: 12px; color: var(--mut); }
+    #capCards .cat { color: var(--ink2); }
     .badge-new { background: var(--mds-color-bg-info-tinted); color: var(--info); }
-    .badge-pii { background: var(--mds-color-bg-warning-tinted); color: var(--warn); }
     .badge-rows { background: var(--surface2); color: var(--mut); font-family: var(--mds-font-family-mono); }
     .os-cell { font-size: 12.5px; white-space: nowrap; }
-    #capTable .os-ok { color: var(--ok); }
-    #capTable .os-con { color: var(--warn); }
-    #capTable .os-planned { color: var(--mut); }
     /* Switch (design .sw): 36x20 track, 16px square knob */
     .tgl { position: relative; display: inline-block; flex: 0 0 36px; width: 36px; height: 20px; }
     .tgl input { opacity: 0; width: 0; height: 0; }
@@ -276,8 +272,15 @@ R"HTM(
     .state-txt { font-size: 12.5px; color: var(--mut); }
     .state-on { color: var(--ok); font-weight: 500; }
     .pending-txt { color: var(--warn); font-weight: 500; }
-    #capTable tr.pending td { background: color-mix(in srgb, var(--warn) 10%, transparent); }
-    #capTable tr.pending td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+    #capCards.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(285px, 1fr)); gap: 14px; padding: 14px 16px; }
+    #capCards .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--rad-panel);
+      padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+    #capCards .card.pending { border-color: var(--warn); box-shadow: inset 3px 0 0 var(--warn); }
+    #capCards .card .top { display: flex; align-items: center; gap: 8px; }
+    #capCards .card .top .tgl { margin-left: auto; }
+    #capCards .card dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; }
+    #capCards .card dt { color: var(--mut); }
+    #capCards .card dd { margin: 0; color: var(--ink); text-align: right; }
     /* Notes and warning frame come from yuzu.css (.note.warn); only the flex row and margin are local */
     .apply-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 16px; }
     .apply-bar[hidden] { display: none; }
@@ -338,6 +341,7 @@ R"HTM(    <!-- ── Capture sources (ADR-0015) ──────────�
       <div class="echo-frame-body tw" id="capture-sources"
            hx-get="/fragments/echo/capture-sources" hx-trigger="load" hx-swap="innerHTML">
         <div class="placeholder">Loading capture sources&hellip;</div>
+        <!-- Capture-source cards are rendered into this container by the fragment. -->
       </div>
     </div>
     <script>
@@ -356,13 +360,13 @@ R"HTM(    <!-- ── Capture sources (ADR-0015) ──────────�
     // Capture-sources staged-then-push guardrail + category filter (ADR-0015). Plain
     // onclick/onchange handlers (CSP-safe — no hx-on/eval). A toggle only STAGES a
     // change; nothing is dispatched until Push.
-    function capDirtyRows(){return Array.prototype.slice.call(document.querySelectorAll('#capTable tbody tr.pending'));}
+    function capDirtyRows(){return Array.prototype.slice.call(document.querySelectorAll('#capCards .card.pending'));}
     function refreshCapBar(){var n=capDirtyRows().length,bar=document.getElementById('capApplyBar');if(!bar)return;bar.hidden=(n===0);var m=document.getElementById('capApplyMsg');if(m)m.textContent=n+' pending change'+(n===1?'':'s')+' — not yet sent';}
     function setCapState(tr,on){var st=tr.querySelector('.state-txt');if(!st)return;st.textContent=on?'enabled':'disabled';st.classList.remove('pending-txt');st.classList.toggle('state-on',on);}
-    function stageCapToggle(cb){var tr=cb.closest('tr');var committed=cb.dataset.committed==='true';var dirty=cb.checked!==committed;tr.classList.toggle('pending',dirty);if(dirty){var st=tr.querySelector('.state-txt');st.textContent=(cb.checked?'→ enable':'→ disable')+' (pending)';st.classList.add('pending-txt');st.classList.remove('state-on');}else{setCapState(tr,committed);}refreshCapBar();}
+    function stageCapToggle(cb){var tr=cb.closest('.card');var committed=cb.dataset.committed==='true';var dirty=cb.checked!==committed;tr.classList.toggle('pending',dirty);if(dirty){var st=tr.querySelector('.state-txt');st.textContent=(cb.checked?'→ enable':'→ disable')+' (pending)';st.classList.add('pending-txt');st.classList.remove('state-on');}else{setCapState(tr,committed);}refreshCapBar();}
     function discardCapChanges(){capDirtyRows().forEach(function(tr){var cb=tr.querySelector('input[type=checkbox]');cb.checked=(cb.dataset.committed==='true');setCapState(tr,cb.checked);tr.classList.remove('pending');});refreshCapBar();}
-    function pushCapChanges(){var rows=capDirtyRows();if(!rows.length)return;var t=document.getElementById('capTable');var device=t?t.getAttribute('data-device'):'';var parts=rows.map(function(tr){var cb=tr.querySelector('input[type=checkbox]');return cb.dataset.source+'='+(cb.checked?'on':'off');});htmx.ajax('POST','/fragments/echo/capture-sources/push',{values:{device:device,changes:parts.join(',')},swap:'none'}).then(function(){if(typeof showToast==='function')showToast('Pushed '+parts.length+' change(s) to '+device,'success');htmx.ajax('GET','/fragments/echo/capture-sources/load',{values:{device:device},target:'#cap-sources-body',swap:'innerHTML'});});}
-    function filterCap(chip,cat){document.querySelectorAll('#capFilter .echo-chip').forEach(function(c){c.classList.toggle('on',c===chip);});document.querySelectorAll('#capTable tbody tr').forEach(function(tr){tr.style.display=(cat==='all'||tr.getAttribute('data-cat')===cat)?'':'none';});}
+    function pushCapChanges(){var rows=capDirtyRows();if(!rows.length)return;var t=document.getElementById('capCards');var device=t?t.getAttribute('data-device'):'';var parts=rows.map(function(tr){var cb=tr.querySelector('input[type=checkbox]');return cb.dataset.source+'='+(cb.checked?'on':'off');});htmx.ajax('POST','/fragments/echo/capture-sources/push',{values:{device:device,changes:parts.join(',')},swap:'none'}).then(function(){if(typeof showToast==='function')showToast('Pushed '+parts.length+' change(s) to '+device,'success');htmx.ajax('GET','/fragments/echo/capture-sources/load',{values:{device:device},target:'#cap-sources-body',swap:'innerHTML'});});}
+    function filterCap(chip,cat){document.querySelectorAll('#capFilter .echo-chip').forEach(function(c){c.classList.toggle('on',c===chip);});document.querySelectorAll('#capCards .card').forEach(function(tr){tr.style.display=(cat==='all'||tr.getAttribute('data-cat')===cat)?'':'none';});}
     </script>
 )HTM"
 // Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate.
@@ -385,6 +389,7 @@ R"HTM(
         <h2 class="echo-frame-title">Process tree viewer</h2>
       </div>
       <div class="echo-frame-body tw echo-pad">
+        <p class="echo-meta">Built from the hourly process record: start and stop counts per hour.</p>
         <!-- No hx-target here: the default target is this element itself. An
              explicit hx-target="this" would be INHERITED by descendants (the poll
              div), making their swaps clobber this whole frame body. -->
@@ -426,37 +431,23 @@ document.body.addEventListener('showToast', function(e) {
 });
 
 // ── Process tree viewer: client-side filters (no round-trip) ─────────────
-// Combines a state filter (all/running/exited), an anomalies-only toggle, and a
-// text query over each row. A row is shown if it matches ALL active filters; its
+// Combines an anomalies-only toggle and a text query over each row. A row is shown if it matches ALL active filters; its
 // ancestor branches are revealed + expanded so the tree stays navigable. Re-applied
 // after every tree swap (htmx:afterSettle) since the toolbar lives outside #echo-tree.
-window.__ttState = 'all';
-function echoTreeState(s, el) {
-  window.__ttState = s;
-  if (el && el.parentElement) {
-    el.parentElement.querySelectorAll('[data-statechip]').forEach(function(c){
-      c.classList.toggle('on', c === el);
-    });
-  }
-  applyEchoTreeFilters();
-}
 function applyEchoTreeFilters() {
   var tree = document.querySelector('#echo-tree .echo-tree');
   if (!tree) return;
-  var state = window.__ttState || 'all';
   var anomEl = document.getElementById('echo-tree-anom-only');
   var anomOnly = anomEl && anomEl.checked;
   var qEl = document.getElementById('echo-tree-filter');
   var q = (qEl && qEl.value ? qEl.value : '').trim().toLowerCase();
-  var active = state !== 'all' || anomOnly || q;
+  var active = anomOnly || q;
   var nomatch = document.querySelector('#echo-tree .echo-tree-nomatch');
   var nodes = tree.querySelectorAll('.echo-tree-node, .echo-tree-leaf');
   if (!active) { nodes.forEach(function(el){ el.style.display = ''; }); if (nomatch) nomatch.style.display = 'none'; return; }
   nodes.forEach(function(el){ el.style.display = 'none'; });
   var shown = 0;
   tree.querySelectorAll('.echo-tree-row').forEach(function(row){
-    if (state === 'running' && row.getAttribute('data-state') !== 'running') return;
-    if (state === 'exited' && row.getAttribute('data-state') !== 'exited') return;
     if (anomOnly && row.getAttribute('data-anom') !== '1') return;
     if (q && row.textContent.toLowerCase().indexOf(q) === -1) return;
     shown++;

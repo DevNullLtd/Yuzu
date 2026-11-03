@@ -18,6 +18,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
+#include <limits>
 #include <string>
 
 #include <yuzu/server/server.hpp>
@@ -502,11 +503,11 @@ TEST_CASE("render_retention_table appends the Echo tier table after the three wi
     const auto wo = sm::render_retention_table(without);
     CHECK(w.compare(0, wo.size(), wo) == 0);
     CHECK_FALSE(has(wo, "Echo capture sources"));
-    for (const char* n : {"<caption>Echo capture sources</caption>", "<th>Exact</th>", "<th>Boot</th>",
-                          "<th>Look again after</th>", ">process<", "100,000 rows", ">1 day<",
-                          ">31 days<", ">12 months<", ">11 months<", "400 rows", "Row count only",
-                          ">7 days<", ">30 days<", "every 900 s", "never pruned", "not per-device"})
+    for (const char* n : {"<caption>Echo capture sources</caption>", "<th>Hourly</th>", "<th>Boot</th>",
+                          "<th>Look again after</th>", ">process<", "every 900 s", "never pruned",
+                          "not per-device"})
         CHECK(has(w, n));
+    CHECK_FALSE(has(w, "<th>Exact</th>"));
     const auto cap = w.find("<caption");
     REQUIRE(cap != std::string::npos);
     CHECK_FALSE(has(w.substr(cap), "class=\"pill"));
@@ -747,4 +748,46 @@ TEST_CASE("build_plugin_signing_settings emits trust_bundle_pem only when explic
     auto j_with = sm::build_plugin_signing_settings(false, std::nullopt, "-----BEGIN...-----");
     REQUIRE(j_with.contains("trust_bundle_pem"));
     CHECK(j_with.at("trust_bundle_pem").get<std::string>() == "-----BEGIN...-----");
+}
+
+namespace {
+nlohmann::json echo_tier_fixture(bool with_budget, std::int64_t budget = 262144000) {
+    nlohmann::json echo = {
+        {"tick_seconds", 900},
+        {"tiers",
+         nlohmann::json::array(
+             {{{"source", "process"}, {"tier", "hourly"}, {"limit_kind", "seconds"},
+               {"limit", 172800}, {"budget_dependent", true}},
+              {{"source", "process"}, {"tier", "daily"}, {"limit_kind", "seconds"},
+               {"limit", 15552000}, {"guaranteed_depth_seconds", 15552000}},
+              {{"source", "arp"}, {"tier", "hourly"}, {"limit_kind", "seconds"},
+               {"limit", 172800}, {"budget_dependent", false}}})}};
+    if (with_budget)
+        echo["db_budget_bytes"] = budget;
+    return nlohmann::json{{"echo", echo}};
+}
+} // namespace
+
+TEST_CASE("render_retention_table Echo tiers: budget line and budget class only with db_budget_bytes",
+          "[settings][settings_model][retention][echo]") {
+    const auto with = sm::render_retention_table(echo_tier_fixture(true));
+    CHECK(has(with, "Byte budget per device: 262,144,000 bytes (250 MiB default); hourly history "
+                    "is kept while the device is within it"));
+    CHECK(has(with, "<td class=\"budget\">2 days</td>"));
+    // arp is not budget-dependent in the fixture: plain hourly cell
+    CHECK(has(with, "<td>2 days</td>"));
+    CHECK(has(with, "<span class=\"hint\">No guarantee: budget-dependent</span>"));
+    CHECK_FALSE(has(with, "Exact"));
+
+    const auto without = sm::render_retention_table(echo_tier_fixture(false));
+    CHECK_FALSE(has(without, "Byte budget per device"));
+    CHECK_FALSE(has(without, "Exact"));
+    CHECK(has(without, "<th>Source</th><th>Hourly</th><th>Daily</th><th>Monthly</th><th>Boot</th>"));
+}
+
+TEST_CASE("render_retention_table Echo tiers: INT64_MIN budget does not overflow",
+          "[settings][settings_model][retention][echo]") {
+    const auto html = sm::render_retention_table(
+        echo_tier_fixture(true, std::numeric_limits<std::int64_t>::min()));
+    CHECK(has(html, "-9,223,372,036,854,775,808 bytes"));
 }

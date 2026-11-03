@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdint>
 #include <optional>
 #include <string_view>
 
@@ -286,7 +287,9 @@ std::string plural(std::int64_t n, const char* unit) {
 }
 
 std::string with_thousands(std::int64_t n) {
-    std::string d = std::to_string(n < 0 ? -n : n);
+    // Magnitude as unsigned: negating INT64_MIN is undefined behaviour.
+    const std::uint64_t mag = n < 0 ? 0 - static_cast<std::uint64_t>(n) : static_cast<std::uint64_t>(n);
+    std::string d = std::to_string(mag);
     std::string out;
     for (std::size_t i = 0; i < d.size(); ++i) {
         if (i != 0 && (d.size() - i) % 3 == 0)
@@ -314,13 +317,14 @@ std::string echo_duration_text(std::int64_t seconds) {
 
 namespace {
 
-constexpr std::array<std::string_view, 5> kTierCols{"live", "hourly", "daily", "monthly", "boot"};
+constexpr std::array<std::string_view, 4> kTierCols{"hourly", "daily", "monthly", "boot"};
 
 std::string render_echo_tiers(const nlohmann::json& echo) {
     struct SourceRow {
         std::string source;
-        std::array<std::string, 5> cell;
+        std::array<std::string, 4> cell;
         std::optional<std::int64_t> depth;
+        bool budget_dependent = false;
     };
     std::vector<SourceRow> rows;
     const auto tiers = echo.value("tiers", nlohmann::json::array());
@@ -347,6 +351,8 @@ std::string render_echo_tiers(const nlohmann::json& echo) {
                 else if (kind == "seconds")
                     cell = echo_duration_text(limit);
             }
+            if (tier == "hourly" && t.value("budget_dependent", false))
+                it->budget_dependent = true;
             if (kind == "seconds" && t.contains("guaranteed_depth_seconds") &&
                 t.at("guaranteed_depth_seconds").is_number_integer()) {
                 const auto d = t.at("guaranteed_depth_seconds").get<std::int64_t>();
@@ -354,24 +360,33 @@ std::string render_echo_tiers(const nlohmann::json& echo) {
             }
         }
     }
-    std::string html =
-        "<div class=\"tw echo-tiers\"><table><caption>Echo capture sources</caption><thead><tr>"
-        "<th>Source</th><th>Exact</th><th>Hourly</th><th>Daily</th><th>Monthly</th><th>Boot</th>"
+    std::string html = "<div class=\"tw echo-tiers\">";
+    if (echo.contains("db_budget_bytes") && echo.at("db_budget_bytes").is_number_integer())
+        html += "<p class=\"hint echo-budget\" style=\"padding:12px 16px 0\">Byte budget per "
+                "device: " +
+                with_thousands(echo.at("db_budget_bytes").get<std::int64_t>()) +
+                " bytes (250 MiB default); hourly history is kept while the device is within "
+                "it.</p>";
+    html +=
+        "<table><caption>Echo capture sources</caption><thead><tr>"
+        "<th>Source</th><th>Hourly</th><th>Daily</th><th>Monthly</th><th>Boot</th>"
         "<th>Look again after</th></tr></thead><tbody>";
     for (const auto& r : rows) {
         html += "<tr><td class=\"mono\">" + html_escape(r.source) + "</td>";
-        for (const auto& c : r.cell)
-            html += "<td>" + c + "</td>";
+        for (std::size_t i = 0; i < r.cell.size(); ++i)
+            html += std::string(i == 0 && r.budget_dependent ? "<td class=\"budget\">" : "<td>") +
+                    r.cell[i] + "</td>";
         html += "<td class=\"look\">";
         html += r.depth ? echo_duration_text(*r.depth)
-                        : "<span class=\"hint\">Row count only</span>";
+                        : "<span class=\"hint\">No guarantee: budget-dependent</span>";
         html += "</td></tr>";
     }
     html += "</tbody></table></div>"
-            "<p class=\"hint\" style=\"padding:12px 16px 14px\">Look again after is how long a "
-            "record is guaranteed to stay in this source's history, measured on the agent's clock. "
-            "Roll-up rows age from the start of their bucket, so the monthly figure is a 31-day "
-            "worst-case floor. ";
+            "<p class=\"hint\" style=\"padding:12px 16px 14px\">Look again after is the depth "
+            "held while the device is within its byte budget, counted from the start of the "
+            "bucket on the agent's clock; it is the deepest guaranteed tier. A device over budget "
+            "removes hourly rows older than 48 hours (5 days for per-process performance). Daily "
+            "rows are kept 180 days. ";
     const auto tick = echo.value("tick_seconds", 0);
     if (tick > 0)
         html += "Old rows are pruned every " + std::to_string(tick) +

@@ -245,6 +245,9 @@ TEST_CASE("render_echo_retention_paused: each visible agent appears; out-of-scop
     CHECK(contains(html, "agent-B"));
     CHECK_FALSE(contains(html, "agent-C"));
     CHECK(contains(html, "out-of-scope"));
+    CHECK(contains(html, "<th class=\"r\">Hourly rows</th>"));
+    CHECK(contains(html, "<th>Oldest hourly bucket</th>"));
+    CHECK_FALSE(contains(html, "Live rows"));
     // NOTE: the >10,000-responses-from-one-agent global-window starvation the
     // reviewer flagged is the store-side per-(command_id, agent_id) cap tracked
     // in #561 — not reproducible at unit scale and out of scope for this render

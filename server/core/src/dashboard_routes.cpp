@@ -3535,8 +3535,8 @@ std::string DashboardRoutes::render_echo_retention_paused(
             "<th>Source</th>"
             "<th>Paused since</th>"
             "<th>Paused for</th>"
-            "<th class=\"r\">Live rows</th>"
-            "<th>Oldest data</th>"
+            "<th class=\"r\">Hourly rows</th>"
+            "<th>Oldest hourly bucket</th>"
             "<th></th>"
             "</tr></thead><tbody>";
 
