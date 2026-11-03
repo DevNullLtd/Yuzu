@@ -125,12 +125,16 @@
     session_id  :: binary() | undefined,
     stream_pid  :: pid() | undefined,     %% subscribe handler process
     stream_mon  :: reference() | undefined, %% monitor ref for stream_pid
-    %% The agent's hostname, the only part of the RegisterRequest's AgentInfo
-    %% this process reads (registry row, re-register, get_info). The whole
-    %% AgentInfo (26 KB for an agent with 69 plugins, measured 2026-10-26) is
-    %% NOT kept: nothing here reads the rest, and the owner table keeps the
-    %% request for a restart. Same tuple position as the old `agent_info'
-    %% field, so #data.stream_pid stays element 4 (yuzu_gw_scale_probe reads it).
+    %% The agent's hostname. It replaces the whole AgentInfo the field used to
+    %% hold (about 26 KB for an agent with 69 plugins, the Phase 1c measurement
+    %% of 2026-10-26): this process reads only the hostname of it (registry
+    %% row, re-register, get_info), and the owner table keeps the start
+    %% arguments for a restart. A supervised owner holds no AgentInfo at all
+    %% once it has registered, because drop_request/1 empties register_req; an
+    %% owner started directly (no owner_key) keeps the request, and so its
+    %% AgentInfo, in register_req. The tuple position is unchanged, so the
+    %% pre-G1 code_change/4 clause finds the old AgentInfo map here.
+    %% (stream_pid's position does not depend on this: it precedes the field.)
     hostname    :: binary(),
     register_req :: map(),                %% verbatim RegisterRequest (for upstream-reconnect replay)
     plugins     :: [binary()],
