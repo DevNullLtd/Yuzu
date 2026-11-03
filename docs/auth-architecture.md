@@ -3719,9 +3719,13 @@ an advisory `administrator` verdict (`may`, `may_not`, `unconfirmed`); the MCP t
   value it does not recognise as `unconfirmed`. Engine and (on REST) MCP-tier credentials are
   `may_not` from structural checks before any store is read (a service-scoped token never receives
   a verdict: it is refused 403 before any verdict, by the explicit REST deny and the C8 gate on
-  MCP); SSO-only principals, SCIM-deactivated accounts, JIT-elevated administrators and
-  group-held Administrators read `may_not` because only durable user-type grants count with
-  enforcement on, and the local account role with it off (clause 3). A just-revoked Administrator
+  MCP). An account whose Administrator authority is not a durable grant on an active local
+  account (for example a SAML sign-in, a SCIM-deactivated account, a temporarily elevated
+  session, or an Administrator held only through a group) reads `may_not`, because only durable
+  user-type grants count with enforcement on, and the local account role with it off (clause 3).
+  With enforcement on, an OIDC administrator who holds the grant reads `may`: an OIDC sign-in
+  provisions an active local account row (`provision_sso_identity`); with enforcement off the local
+  account role counts instead, and that row's role is `user`. A just-revoked Administrator
   reads `may_not` on a fresh read; what can lag on another replica is the cached `enabled` value,
   which only selects which source applies.
 - **Advisory, not a promise.** `may` means the RBAC administration routes would admit this

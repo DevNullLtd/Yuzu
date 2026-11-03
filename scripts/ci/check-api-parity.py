@@ -2394,7 +2394,9 @@ GATE_PARITY_NO_GATE_ALLOWED = {
         "perm_fn(Infrastructure, Read) gate would make the machine twin stricter than its fragment "
         "and invent an authority the route does not have. The RBAC store is the data the route "
         "reads, not its gate; the tool is gated at Infrastructure:Read for the MCP tier ladder and "
-        "the default-denied service-scope class only (ADR-1005 2026-11-03 entry)"),
+        "the default-denied service-scope class only; retiring or making permanent this and the "
+        "get_me session-only entry together is tracked as exception:#6984 revisit:2026-11-30 "
+        "(ADR-1005 2026-11-03 entry)"),
     ("GET", "/api/v1/result-sets", "list_result_sets"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
         "call (result-set precedent)"),

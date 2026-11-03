@@ -71,7 +71,8 @@ struct McpRig {
     McpRig(const McpRig&) = delete;
     McpRig& operator=(const McpRig&) = delete;
 
-    McpRig(RbacRoleHarness& harness, RbacStore* store) : h(harness) {
+    /// `audit_wired` false hands the handler an EMPTY audit callback, the audit-off deployment shape.
+    McpRig(RbacRoleHarness& harness, RbacStore* store, bool audit_wired = true) : h(harness) {
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<yuzu::server::auth::Session> {
             return h.session_with_tier(h.session_mcp_tier);
@@ -86,12 +87,15 @@ struct McpRig {
             }
             return true;
         };
-        auto audit_fn = [this](const httplib::Request&, const std::string& action,
-                               const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) -> bool {
-            audit_log.push_back({action, result, target_id, detail, target_type});
-            return drop_actions.count(action) == 0;
-        };
+        yuzu::server::mcp::McpServer::AuditFn audit_fn;
+        if (audit_wired) {
+            audit_fn = [this](const httplib::Request&, const std::string& action,
+                              const std::string& result, const std::string& target_type,
+                              const std::string& target_id, const std::string& detail) -> bool {
+                audit_log.push_back({action, result, target_id, detail, target_type});
+                return drop_actions.count(action) == 0;
+            };
+        }
         auto agents_fn = []() -> nlohmann::json { return nlohmann::json::array(); };
         handler = server.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
@@ -631,6 +635,8 @@ TEST_CASE("MCP get_rbac_enforcement: an unwired RBAC store is a retryable error 
     REQUIRE(body.contains("error"));
     CHECK_FALSE(body.contains("result"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    REQUIRE(body["error"].contains("data"));
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
     CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
     CHECK(rig.no_tool_rows());
     check_no_store_text(body);
@@ -652,6 +658,8 @@ TEST_CASE("MCP get_rbac_enforcement: a closed RBAC store is a retryable error wi
     REQUIRE(body.contains("error"));
     CHECK_FALSE(body.contains("result"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    REQUIRE(body["error"].contains("data"));
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
     CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
     CHECK(rig.no_tool_rows());
     check_no_store_text(body);
@@ -692,6 +700,25 @@ TEST_CASE("MCP get_rbac_enforcement: either audit row dropping reports audit_per
         CHECK(rig.rows("rbac.enforcement.read", "success") == 1);
         CHECK(rig.rows("mcp.get_rbac_enforcement", "success") == 1);
     }
+}
+
+TEST_CASE("MCP get_rbac_enforcement: an unwired audit callback serves the data with audit_persisted:true "
+          "and writes no row",
+          "[pg][rbac_enforcement_read][mcp]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    // The audit-off deployment: the handler is built with an EMPTY audit callback. That is not a
+    // persist failure, so the tool answers normally and reports the audit as persisted (the served
+    // output schema says: true when both persisted, or when no audit sink is wired).
+    McpRig rig{h, h.rbac.get(), /*audit_wired=*/false};
+
+    const auto sc = success_body(rig, rig.call());
+    CHECK(sc["enabled"] == false);
+    CHECK(sc["unconfirmed"] == false);
+    CHECK(sc["administrator"] == "may");
+    CHECK(sc["audit_persisted"] == true);
+    CHECK(rig.audit_log.empty()); // nothing was wired to record into
+    CHECK(rig.no_tool_rows());
 }
 
 TEST_CASE("MCP get_rbac_enforcement: audit rows carry nothing the session supplied",

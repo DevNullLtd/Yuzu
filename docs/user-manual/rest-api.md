@@ -3373,9 +3373,12 @@ combination in the table below is legitimate.
 tier and approval ladder, and the PUT's destination-regime `409`, and the server decides again on
 every PUT. With enforcement on, the check looks at durable user-type Administrator grants only;
 with enforcement off, it looks at the caller's local account role (an inactive account is a
-confirmed absence). So these principals read `may_not` even when they can act as an administrator
-in some other way: an SSO-only (OIDC linked) principal, a SCIM-deactivated account, a
-just-in-time (JIT) elevated administrator, and an Administrator held only through a group. A
+confirmed absence). So an account whose Administrator authority is not a durable grant on an
+active local account (for example a SAML sign-in, a SCIM-deactivated account, a temporarily
+elevated session, or an Administrator held only through a group) reads `may_not` even when it can
+act as an administrator in some other way. With enforcement on, an OIDC administrator who holds the
+grant reads `may`: an OIDC sign-in provisions an active local account row (with enforcement off the
+local account role counts instead, and that row's role is `user`). A
 just-revoked Administrator reads `may_not` on a fresh read; what can lag on another replica is the
 cached `enabled` value, which only selects which of the two sources applies. On REST an engine
 session reads `may_not` (engines are not Administrators), and so does an MCP-tier token, because
@@ -3407,12 +3410,23 @@ any store is read; a service-scoped token is refused (`403`) before any verdict.
 Any `administrator` value a client does not recognise must be treated as `unconfirmed`: the set
 is closed today, but a client should not assume it stays closed. "Re-read in a few seconds" has no
 server-supplied interval on a `200`; the `503` answers carry `retry_after_ms` of 5000 and a similar
-interval is a reasonable default.
+interval is a reasonable default. **Cadence:** each call writes one audit row (two on the MCP
+twin), so poll no faster than that 5000 ms interval.
 
 ```bash
 curl -s -b cookies.txt http://localhost:8080/api/v1/rbac/enforcement
 # {"data":{"enabled":true,"unconfirmed":false,"administrator":"may"},"meta":{"api_version":"v1"}}
 ```
+
+With an API token instead of a session cookie:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/rbac/enforcement"
+```
+
+A plain API token gets a real verdict (`may`, `may_not` or `unconfirmed`), while an MCP-tier token
+gets `may_not` on REST, because the REST predicate denies any MCP-tier credential structurally.
 
 **Errors:** `401`: no valid session (a bare refusal, no audit row); `403`: a service-scoped
 token (audited as a `denied` row, see below; the body names no permission that would admit the
@@ -3431,12 +3445,16 @@ wired (audit off) the read succeeds without a row, so read "every successful rea
 row. `GET /fragments/access/enforcement` and `GET /api/v1/me` read the same state without
 writing a row. See `docs/user-manual/audit-log.md`.
 
-**Headers:** `Cache-Control: no-store, private`.
+**Headers:** the `200` response carries `Cache-Control: no-store, private` (the error responses
+do not set it).
 
 **Rolling upgrade.** The route is new in this release. A replica that has not been upgraded is
 expected to answer `404` for it (and an unknown tool for `get_rbac_enforcement` on MCP); retry
-or pin the client to an upgraded replica. This is the expected behaviour of an older build, not
-something that has been observed on a live rolling upgrade.
+or pin the client to an upgraded replica. On MCP the older replica is also expected to audit the
+attempt as `mcp.get_rbac_enforcement` with `result=denied` and `detail=unknown tool`, so a SIEM
+rule on denied MCP rows can fire for a tool that exists on the upgraded replicas until every
+replica is upgraded. This is the expected behaviour of an older build, not something that has
+been observed on a live rolling upgrade.
 
 MCP twin: `get_rbac_enforcement`, see `docs/user-manual/mcp.md`.
 
@@ -11397,9 +11415,9 @@ Render the Role assignments panel: every fleet-wide grant (type, principal, role
 
 Render the RBAC enforcement panel.
 
-- **Permission:** any signed-in session, the same as its twin `GET /api/v1/me`. Neither the account-role gate nor a permission gate is applied. A service-scoped API token is refused first (**403**, audit action `access.fragment.access_denied`), because the panel reports fleet-wide RBAC state.
+- **Permission:** any signed-in session, the same gate as `GET /api/v1/me` and as its machine twin `GET /api/v1/rbac/enforcement` (all three are session-only). Neither the account-role gate nor a permission gate is applied. A service-scoped API token is refused first (**403**, audit action `access.fragment.access_denied`), because the panel reports fleet-wide RBAC state.
 - **Response (200):** HTML fragment: the setting (On or Off) with an **Enforce roles** switch when that same administrator check admits the caller (a hint: the server decides on every PUT), a disabled switch ("Only a durable Administrator can change this.") for everyone else, a disabled switch with "Your administrator authority could not be confirmed. Reload to try again." when the check cannot be answered, **Unconfirmed** when the store's view could not be confirmed (the cached flag is not drawn at all in that case), or a red "could not be read" box when the RBAC store is not open. Never "Off" for a failed read.
-- **Headers:** `Cache-Control: no-store`. No audit row (the twin writes none).
+- **Headers:** `Cache-Control: no-store`. No audit row: the fragment writes none, unlike its machine twin `GET /api/v1/rbac/enforcement` (which writes `rbac.enforcement.read`); `GET /api/v1/me` also writes none.
 
 **`GET /fragments/access/users/detail?username=<name>`**
 

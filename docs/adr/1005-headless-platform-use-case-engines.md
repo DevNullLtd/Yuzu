@@ -1162,8 +1162,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      and `POST /api/v1/rbac/check`. #6432 tracks only the `get_me`
      service-scope asymmetry over MCP (`exception:#6432 revisit:2026-11-30`);
      it does not cover retiring the two session-only `NO_GATE` entries (this
-     route and `GET /api/v1/me`). A tracker for retiring both together is yet
-     to be filed.
+     route and `GET /api/v1/me`). That retire-or-make-permanent decision is
+     tracked by #6984 (revisit 2026-11-30), which relates to #6432.
      (d) "Audit every read" means every read on a deployment with a wired audit
      sink: REST fails closed on an audit-write failure (503 with
      `Sec-Audit-Failed`, body never sent), MCP reports `audit_persisted:false`,

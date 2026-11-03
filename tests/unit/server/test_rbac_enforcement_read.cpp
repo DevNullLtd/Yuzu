@@ -118,6 +118,18 @@ void make_regime_store_unreadable(RbacRoleHarness& h) {
     REQUIRE(r.status() == PGRES_COMMAND_OK);
 }
 
+/// Removes the durable `rbac_enabled` row from the disposable clone. The schema's CHECK constraint
+/// (`rbac_meta_enabled_canonical`) rejects a non-canonical value at write time, so an absent row is
+/// the one way to leave the flag unconfirmable on a refresh that still reads `write_generation`.
+void delete_rbac_enabled_row(RbacRoleHarness& h) {
+    auto lease = h.auth_db.pool().acquire();
+    REQUIRE(lease);
+    auto r = pg::exec_params(lease.get(),
+                             "DELETE FROM rbac_store.rbac_meta WHERE key = 'rbac_enabled'",
+                             std::vector<std::string>{});
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
 RbacAdminHint hint_of(RbacRoleHarness& h) {
     return rbac_admin_hint(h.rest_session(), h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kRest);
 }
@@ -247,6 +259,7 @@ void check_store_unavailable_503(ReadRoute& route) {
     const auto j = parse_json(res->body);
     REQUIRE(j.contains("error"));
     CHECK(j["error"]["message"] == "service unavailable");
+    REQUIRE(j["error"].contains("retry_after_ms"));
     REQUIRE(j["error"]["retry_after_ms"].is_number_integer());
     CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == mcp::kMcpStoreFaultRetryMs);
     CHECK_FALSE(j.contains("data"));
@@ -520,6 +533,35 @@ TEST_CASE("GET /api/v1/rbac/enforcement: a SAML principal is 200 with administra
     CHECK(d["administrator"] == "may_not");
 }
 
+TEST_CASE("GET /api/v1/rbac/enforcement: an OIDC-provisioned principal with a durable Administrator grant reads may",
+          "[pg][rbac_enforcement_read]") {
+    RbacRoleHarness h;
+    h.session_user = "oidc:https://idp.example#sub-1";
+    h.session_auth_source = "oidc";
+    h.rbac->set_rbac_enabled(true);
+    REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
+
+    SECTION("provisioned by the real login path: an active auth.users row, so the regime check admits") {
+        // AuthDB::upsert_sso_identity is what an OIDC login provisions through (role user,
+        // is_active TRUE), so an OIDC administrator who holds the grant is NOT a may_not case.
+        REQUIRE(h.auth_db
+                    ->upsert_sso_identity(h.session_user, "https://idp.example", "sub-1", "Alice",
+                                          "oidc")
+                    .has_value());
+        const auto d = check_read_equals_hint(h, RbacAdminHint::kMay);
+        CHECK(d["enabled"] == true);
+        CHECK(d["unconfirmed"] == false);
+        CHECK(d["administrator"] == "may");
+
+        REQUIRE(count_rows(h, kAuditAction) == 1);
+        CHECK(h.audit_log.front().detail == "enabled=true; unconfirmed=false; administrator=may");
+    }
+    SECTION("contrast: the same grant with no provisioned row reads may_not (P7 at the route)") {
+        const auto d = check_read_equals_hint(h, RbacAdminHint::kMayNot);
+        CHECK(d["administrator"] == "may_not");
+    }
+}
+
 TEST_CASE("GET /api/v1/rbac/enforcement: session-only gate: with every permission denied the read still answers 200 and no permission is asked",
           "[pg][rbac_enforcement_read]") {
     RbacRoleHarness h;
@@ -630,6 +672,50 @@ TEST_CASE("GET /api/v1/rbac/enforcement: a stale-on view with no grant row reads
     CHECK(route.audit_log.front().detail == "enabled=true; unconfirmed=true; administrator=may_not");
 }
 
+TEST_CASE("GET /api/v1/rbac/enforcement: a missing rbac_enabled row is a 200 with unconfirmed:true after the stale-serve bound, never a 5xx",
+          "[pg][rbac_enforcement_read]") {
+    RbacRoleHarness h;
+    // With the durable row absent, a refresh still reads write_generation but cannot confirm
+    // rbac_enabled: it leaves the cached value alone (never coerced to false) and does NOT advance
+    // the freshness clock (maybe_refresh_generation, row_absent). Once the last confirmed refresh is
+    // past the stale-serve bound the view therefore reads degraded. All this case asserts about
+    // `administrator` is that it is never `may` and equals the hint computed from the same stores:
+    // the regime check re-reads the durable flag (read_rbac_enabled_lockfree), which fails on an
+    // absent row and so answers unavailable, and a stale-off view with no grant row is unconfirmed.
+    const auto verify = [&h](bool cached_on) {
+        delete_rbac_enabled_row(h);
+        h.rbac->age_refresh_state_for_test(std::chrono::milliseconds(5200));
+
+        const auto res = h.sink.Get(kPath);
+        REQUIRE(res);
+        INFO("status=" << res->status << " body=" << res->body);
+        REQUIRE(res->status == 200); // an unconfirmable flag is a degraded view, not an error
+        const auto d = data_of(res->body);
+        CHECK(d["unconfirmed"] == true);
+        CHECK(d["enabled"] == cached_on); // the cached value is served unchanged
+        CHECK(d["administrator"] != "may");
+        CHECK(d["administrator"].get<std::string>() == std::string(to_string(hint_of(h))));
+        // No driver or relation text reaches the caller.
+        CHECK(res->body.find("rbac_meta") == std::string::npos);
+        CHECK(res->body.find("relation \"") == std::string::npos);
+        CHECK(res->body.find("does not exist") == std::string::npos);
+
+        REQUIRE(count_rows(h, kAuditAction) == 1);
+        CHECK(h.audit_log.front().detail.starts_with(std::string("enabled=") +
+                                                     (cached_on ? "true" : "false") +
+                                                     "; unconfirmed=true; administrator="));
+    };
+
+    SECTION("cached off") {
+        h.make_caller_admin(/*rbac_on=*/false);
+        verify(false);
+    }
+    SECTION("cached on") {
+        h.make_caller_admin(/*rbac_on=*/true);
+        verify(true);
+    }
+}
+
 TEST_CASE("GET /api/v1/rbac/enforcement: a service-scoped token is 403 with a denied audit row and no permission named",
           "[pg][rbac_enforcement_read]") {
     RbacRoleHarness h;
@@ -702,6 +788,7 @@ TEST_CASE("GET /api/v1/rbac/enforcement: an audit row that cannot be persisted i
     REQUIRE(j.contains("error"));
     CHECK_FALSE(j.contains("data"));
     // The refusal is retryable, and says when: the same shared hint as the store-unavailable 503.
+    REQUIRE(j["error"].contains("retry_after_ms"));
     REQUIRE(j["error"]["retry_after_ms"].is_number_integer());
     CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == mcp::kMcpStoreFaultRetryMs);
     CHECK(res->body.find("\"enabled\"") == std::string::npos);
