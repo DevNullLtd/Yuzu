@@ -5904,6 +5904,7 @@ static void mcp_seed_status(GuaranteedStateStore& store, const std::string& even
     e.event_type = event_type;
     e.severity = "info";
     e.timestamp = ts;
+    e.agent_ns = yuzu::test::iso8601_to_ns(ts); // the census orders by the agent stamp (schema v4)
     REQUIRE(store.insert_event(e).has_value());
 }
 
@@ -43907,4 +43908,87 @@ TEST_CASE("MCP runtime config: the set_runtime_config description names exactly 
     }
     CHECK(writable.find("oidc_") == std::string::npos);
     CHECK(refused.find("oidc_") != std::string::npos);
+}
+
+TEST_CASE("MCP Guardian: the twins carry order_uncertain, projection_pending and uncertain_rules "
+          "(#5690)",
+          "[pg][mcp][integration][guardian][ordering]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_rule(store, "r2", "rule-two");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(),
+            "CREATE FUNCTION guaranteed_state_store.yuzu_test_fail_marked() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN IF NEW.updated_at = '2026-06-20T10:02:00Z' THEN "
+            "RAISE EXCEPTION 'forced census failure' USING ERRCODE = 'XX000'; END IF; "
+            "RETURN NEW; END $$; "
+            "CREATE TRIGGER yuzu_test_fail_marked BEFORE INSERT OR UPDATE ON "
+            "guaranteed_state_store.guardian_agent_rule_status FOR EACH ROW EXECUTE FUNCTION "
+            "guaranteed_state_store.yuzu_test_fail_marked()")};
+        REQUIRE(r.ok());
+    }
+    mcp_seed_status(store, "a1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    mcp_seed_status(store, "a2", "WS-1", "r1", "drift.detected", "2026-06-20T10:00:00Z"); // flagged
+    mcp_seed_status(store, "b1", "WS-1", "r2", "guard.compliant", "2026-06-20T10:01:00Z");
+    mcp_seed_status(store, "b2", "WS-2", "r2", "guard.compliant", "2026-06-20T10:01:00Z");
+    mcp_seed_status(store, "b3", "WS-2", "r2", "drift.detected", "2026-06-20T10:02:00Z"); // pending
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response&,
+                                     const std::string&, const std::string&,
+                                     const std::string&) -> bool { return true; };
+    ts.start("readonly");
+    const auto call = [&](const std::string& json) {
+        auto res = ts.call(json);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    };
+
+    const auto fleet = call(R"({"jsonrpc":"2.0","method":"tools/call","id":70,"params":{"name":"get_guardian_status"}})");
+    CHECK(fleet["total_rules"].get<int>() == 2);
+    CHECK(fleet["uncertain_rules"].get<int>() == 2);
+
+    const auto rule = call(R"({"jsonrpc":"2.0","method":"tools/call","id":71,"params":{"name":"get_guardian_rule_status","arguments":{"rule_id":"r2"}}})");
+    int pending = 0;
+    int uncertain = 0;
+    for (const auto& a : rule["agents"]) {
+        pending += a["projection_pending"].get<bool>() ? 1 : 0;
+        uncertain += a["order_uncertain"].get<bool>() ? 1 : 0;
+    }
+    CHECK(pending == 1);
+    CHECK(uncertain == 0);
+
+    const auto dev = call(R"({"jsonrpc":"2.0","method":"tools/call","id":72,"params":{"name":"get_guardian_device_guards","arguments":{"agent_id":"WS-1"}}})");
+    int dev_uncertain = 0;
+    for (const auto& g : dev["guards"])
+        dev_uncertain += g["order_uncertain"].get<bool>() ? 1 : 0;
+    CHECK(dev_uncertain == 1);
+
+    const auto agent = call(R"({"jsonrpc":"2.0","method":"tools/call","id":73,"params":{"name":"get_guardian_agent_status","arguments":{"agent_id":"WS-2"}}})");
+    CHECK(agent["uncertain_rules"].get<int>() == 1);
+
+    // The advertised output schemas list the new keys as required.
+    auto list = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":74})");
+    REQUIRE(list);
+    const auto tools = nlohmann::json::parse(list->body)["result"]["tools"];
+    const auto required = [&](const char* name) {
+        for (const auto& t : tools)
+            if (t["name"] == name)
+                return t["outputSchema"].dump();
+        FAIL("no tool " << name);
+        return std::string{};
+    };
+    CHECK(required("get_guardian_status").find("uncertain_rules") != std::string::npos);
+    CHECK(required("get_guardian_agent_status").find("uncertain_rules") != std::string::npos);
+    CHECK(required("get_guardian_rule_status").find("projection_pending") != std::string::npos);
+    CHECK(required("get_guardian_device_guards").find("order_uncertain") != std::string::npos);
 }

@@ -15,13 +15,15 @@ guardian_status_rollup(GuaranteedStateStore& store,
     // pre-existing inline logic this replaces in rest_api_v1.cpp verbatim).
     auto rule_names_result = store.rule_names();
     auto errored_result = store.errored_rule_count(agent_scope);
-    if (!rule_names_result || !errored_result)
+    auto uncertain_result = store.uncertain_rule_count(agent_scope);
+    if (!rule_names_result || !errored_result || !uncertain_result)
         return std::nullopt;
     GuardianStatusRollup out;
     out.total_rules = static_cast<std::int64_t>(rule_names_result->size());
     out.compliant_rules = 0;
     out.drifted_rules = 0;
     out.errored_rules = static_cast<std::int64_t>(*errored_result);
+    out.uncertain_rules = static_cast<std::int64_t>(*uncertain_result);
     return out;
 }
 
@@ -49,6 +51,8 @@ guardian_agent_status_rollup(GuaranteedStateStore& store, const std::string& age
         ++out.total_rules;
         if (st.state == "errored")
             ++out.errored_rules;
+        if (st.order_uncertain || st.projection_pending)
+            ++out.uncertain_rules;
     }
     return out;
 }
@@ -65,6 +69,8 @@ guardian_rule_agent_status_rows(GuaranteedStateStore& store, const std::string& 
         row.agent_id = s.agent_id;
         row.state = s.state;
         row.updated_at = s.updated_at;
+        row.order_uncertain = s.order_uncertain;
+        row.projection_pending = s.projection_pending;
         out.push_back(std::move(row));
     }
     return out;
@@ -91,6 +97,8 @@ guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent
         row.name = (it != names->end() && !it->second.empty()) ? it->second : s.rule_id;
         row.state = s.state;
         row.updated_at = s.updated_at;
+        row.order_uncertain = s.order_uncertain;
+        row.projection_pending = s.projection_pending;
         out.push_back(std::move(row));
     }
     return out;

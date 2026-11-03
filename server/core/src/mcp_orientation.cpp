@@ -179,6 +179,8 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
 // views; list_guardian_events is the __observation__/enforcement event feed
 // (confined, not denied — see its kToolSecurityRows comment);
 // get_guardian_device_guards is the per-device all-guards census.
+// #5690: the census-reading tools report order_uncertain / projection_pending per row and
+// uncertain_rules per rollup; a clean value never proves freshness or completeness.
 // #2146 Batch B1 extends this family with the rule CRUD/push mutations
 // (create/get/update/delete_guardian_rule, push_guardian_rules) and the two
 // per-agent reads #4037 deliberately deferred (get_guardian_agent_status,

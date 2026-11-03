@@ -2906,12 +2906,28 @@ GuaranteedStateStore::agent_rule_statuses(const std::string& rule_id) const {
             spdlog::warn("GuaranteedStateStore::agent_rule_statuses: pool acquire timed out");
         return std::unexpected("no database connection: " + pool_.last_error());
     }
-    std::string sql =
-        "SELECT agent_id, rule_id, state, updated_at FROM "
-        "guaranteed_state_store.guardian_agent_rule_status";
+    // The unfiltered read is whole-census (the status fragment folds it), so the pending flag
+    // comes from one hashed semi-join over the pending pairs; a correlated EXISTS per census row
+    // measured about ten times slower at 100k rows. The drill-down is one rule, where EXISTS rides
+    // idx_gse_pending (rule_id leading) per returned row. The flag covers REPRESENTED pairs only: a
+    // pending event whose pair has no census row is invisible here.
+    std::string sql;
     std::vector<std::string> params;
-    if (!rule_id.empty()) {
-        sql += " WHERE rule_id = $1"; // idx_gars_rule covers this for the drill-down
+    if (rule_id.empty()) {
+        sql = "SELECT c.agent_id, c.rule_id, c.state, c.updated_at, c.order_uncertain, "
+              "(p.rule_id IS NOT NULL) AS projection_pending "
+              "FROM guaranteed_state_store.guardian_agent_rule_status c "
+              "LEFT JOIN (SELECT DISTINCT rule_id, agent_id "
+              "           FROM guaranteed_state_store.guaranteed_state_events "
+              "          WHERE projection_pending) p "
+              "ON p.rule_id = c.rule_id AND p.agent_id = c.agent_id";
+    } else {
+        sql = "SELECT c.agent_id, c.rule_id, c.state, c.updated_at, c.order_uncertain, "
+              "EXISTS (SELECT 1 FROM guaranteed_state_store.guaranteed_state_events e "
+              "         WHERE e.rule_id = c.rule_id AND e.agent_id = c.agent_id "
+              "           AND e.projection_pending) AS projection_pending "
+              "FROM guaranteed_state_store.guardian_agent_rule_status c "
+              "WHERE c.rule_id = $1"; // idx_gars_rule covers this for the drill-down
         params.push_back(rule_id);
     }
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
@@ -2932,6 +2948,8 @@ GuaranteedStateStore::agent_rule_statuses(const std::string& rule_id) const {
         r.rule_id = text_col(res.get(), i, 1);
         r.state = text_col(res.get(), i, 2);
         r.updated_at = text_col(res.get(), i, 3);
+        r.order_uncertain = to_bool(PQgetvalue(res.get(), i, 4));
+        r.projection_pending = to_bool(PQgetvalue(res.get(), i, 5));
         out.push_back(std::move(r));
     }
     return out;
@@ -2958,8 +2976,11 @@ GuaranteedStateStore::agent_rule_statuses_for_agent(const std::string& agent_id)
     // Rides the (agent_id, rule_id) PK auto-index (agent_id leading).
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT agent_id, rule_id, state, updated_at FROM "
-        "guaranteed_state_store.guardian_agent_rule_status WHERE agent_id = $1",
+        "SELECT c.agent_id, c.rule_id, c.state, c.updated_at, c.order_uncertain, "
+        "EXISTS (SELECT 1 FROM guaranteed_state_store.guaranteed_state_events e "
+        "         WHERE e.rule_id = c.rule_id AND e.agent_id = c.agent_id "
+        "           AND e.projection_pending) AS projection_pending "
+        "FROM guaranteed_state_store.guardian_agent_rule_status c WHERE c.agent_id = $1",
         std::vector<std::string>{agent_id});
     if (res.status() != PGRES_TUPLES_OK) {
         if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceRules,
@@ -2978,6 +2999,8 @@ GuaranteedStateStore::agent_rule_statuses_for_agent(const std::string& agent_id)
         r.rule_id = text_col(res.get(), i, 1);
         r.state = text_col(res.get(), i, 2);
         r.updated_at = text_col(res.get(), i, 3);
+        r.order_uncertain = to_bool(PQgetvalue(res.get(), i, 4));
+        r.projection_pending = to_bool(PQgetvalue(res.get(), i, 5));
         out.push_back(std::move(r));
     }
     return out;
@@ -3117,6 +3140,61 @@ std::expected<std::size_t, std::string> GuaranteedStateStore::errored_rule_count
                                               sampler);
             d.should_log)
             spdlog::warn("GuaranteedStateStore::errored_rule_count: query failed: {}",
+                         PQresultErrorMessage(res.get()));
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
+    return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
+}
+
+std::expected<std::size_t, std::string> GuaranteedStateStore::uncertain_rule_count(
+    const std::optional<std::vector<std::string>>& agent_scope) const {
+    static DegradeSampler sampler;
+    // Same scope contract as errored_rule_count: an engaged-empty scope is zero rows without a
+    // query (ADR-0017 INV-2), a non-empty one is applied in SQL before the aggregate (INV-3).
+    if (agent_scope && agent_scope->empty())
+        return static_cast<std::size_t>(0);
+    if (!open_) {
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::uncertain_rule_count: store not open");
+        return std::unexpected("database not open");
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::uncertain_rule_count: pool acquire timed out");
+        return std::unexpected("no database connection: " + pool_.last_error());
+    }
+    // Rules (live, joined to the rule table) with at least one represented pair whose row is
+    // order-uncertain or whose retained event is pending. The parentheses around the OR matter:
+    // the scope predicate is ANDed after it and must confine both branches.
+    std::string sql =
+        "SELECT COUNT(DISTINCT s.rule_id) FROM "
+        "guaranteed_state_store.guardian_agent_rule_status s JOIN "
+        "guaranteed_state_store.guaranteed_state_rules r ON r.rule_id = s.rule_id "
+        "LEFT JOIN (SELECT DISTINCT rule_id, agent_id "
+        "           FROM guaranteed_state_store.guaranteed_state_events "
+        "          WHERE projection_pending) p "
+        "ON p.rule_id = s.rule_id AND p.agent_id = s.agent_id "
+        "WHERE (s.order_uncertain OR p.rule_id IS NOT NULL)";
+    std::vector<std::string> params;
+    if (agent_scope) {
+        std::vector<std::string_view> views;
+        views.reserve(agent_scope->size());
+        for (const std::string& a : *agent_scope)
+            views.emplace_back(a);
+        sql += " AND s.agent_id = ANY($1::text[])";
+        params.push_back(pg::to_text_array(views));
+    }
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::uncertain_rule_count: query failed: {}",
                          PQresultErrorMessage(res.get()));
         return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
     }

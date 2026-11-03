@@ -301,3 +301,22 @@ TEST_CASE("device live disk: usage-bar tones, low-free floor, clamp, unmeasured,
         CHECK(render_device_live_disk({}).find("No volume reported") != std::string::npos);
     }
 }
+
+TEST_CASE("device Guardian lens: the tile is never 'good' over an uncertain or pending guard (#5690)",
+          "[device][ui][ordering]") {
+    DeviceGuardRow clean{"Defender RTP", "compliant", "2026-06-16T10:00:00Z"};
+    DeviceGuardRow unc{"BitLocker", "compliant", "2026-06-16T10:00:00Z"};
+    unc.order_uncertain = true;
+    DeviceGuardRow pend{"Firewall", "compliant", "2026-06-16T10:00:00Z"};
+    pend.projection_pending = true;
+    const auto good = render_device_guardian_lens("a-1", {clean, clean});
+    CHECK(good.find("class=\"n good\"") != std::string::npos);
+    CHECK(good.find("uncertain ordering") == std::string::npos);
+    for (const auto& bad : {render_device_guardian_lens("a-1", {clean, unc}),
+                            render_device_guardian_lens("a-1", {clean, pend})}) {
+        CHECK(bad.find("100%") != std::string::npos);             // every guard reports compliant
+        CHECK(bad.find("class=\"n good\"") == std::string::npos); // but the tone is not clean
+        CHECK(bad.find("class=\"n warn\"") != std::string::npos);
+        CHECK(bad.find("1 with uncertain ordering or an unreflected verdict") != std::string::npos);
+    }
+}

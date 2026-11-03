@@ -155,6 +155,12 @@ struct GuardianAgentRuleStatus {
     std::string rule_id;
     std::string state;       // "compliant" | "drifted" | "errored"
     std::string updated_at;  // ISO-8601 of the event that set it
+    // Ordering evidence (schema v4). `order_uncertain` is sticky: the order of the greatest
+    // verdict persisted for this pair cannot be proven. `projection_pending`: a retained event
+    // for this pair has not reached the row. Both false does not establish freshness or
+    // completeness: an event that never arrived leaves no trace.
+    bool order_uncertain{false};
+    bool projection_pending{false};
 };
 
 // The DEX read-model value types (GuardianObservationRow + the Dex* observation
@@ -442,6 +448,10 @@ public:
     /// 0, on any store/query failure.
     std::expected<std::size_t, std::string>
     errored_rule_count(const std::optional<std::vector<std::string>>& agent_scope) const;
+    /// COUNT(DISTINCT rule_id) of live rules with an order-uncertain census row or a pending event
+    /// on at least one in-scope represented pair; same scope contract as errored_rule_count.
+    std::expected<std::size_t, std::string>
+    uncertain_rule_count(const std::optional<std::vector<std::string>>& agent_scope) const;
 
     std::size_t rule_count() const;
     /// Type-distinguishable twin of `rule_count()`: an error string on a store that is not open,

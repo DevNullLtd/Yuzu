@@ -1401,4 +1401,22 @@ static_assert(kSqliteOwnerIsSealed<struct SqliteOwnerSealCheck>);
 #endif
 }
 
+/// An ISO-8601 UTC instant ("2026-04-19T12:00:00Z", whole seconds) as nanoseconds since the epoch;
+/// 0 when the text does not parse. The Guardian census orders by a key the ingest boundary derives
+/// from the agent's wire stamp, so a test that builds an event row directly and wants its
+/// timestamp to decide the order supplies the same instant as `agent_ns`.
+inline std::int64_t iso8601_to_ns(const std::string& ts) {
+    int year_v = 0, month_v = 0, day_v = 0, hour_v = 0, minute_v = 0, second_v = 0;
+    if (std::sscanf(ts.c_str(), "%d-%d-%dT%d:%d:%dZ", &year_v, &month_v, &day_v, &hour_v,
+                    &minute_v, &second_v) != 6)
+        return 0;
+    using namespace std::chrono;
+    const sys_days date{year{year_v} / month{static_cast<unsigned>(month_v)} /
+                        day{static_cast<unsigned>(day_v)}};
+    const seconds secs =
+        date.time_since_epoch() + hours{hour_v} + minutes{minute_v} + seconds{second_v};
+    return static_cast<std::int64_t>(secs.count()) * 1'000'000'000LL;
+}
+
+
 } // namespace yuzu::test

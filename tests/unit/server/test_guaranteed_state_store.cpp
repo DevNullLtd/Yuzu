@@ -45,7 +45,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
 #include <limits>
@@ -119,19 +118,6 @@ GuaranteedStateEventRow make_event(std::string event_id, std::string rule_id,
     e.remediation_latency_us = 1200;
     e.timestamp = std::move(timestamp);
     return e;
-}
-
-// The census orders by the ordering key K, which the ingest boundary derives from the agent's
-// wire stamp. A test that builds a row directly and wants its ISO timestamp to decide the order
-// supplies the same instant as the stamp (whole seconds, nanoseconds since the epoch).
-std::int64_t iso_to_ns(const std::string& ts) {
-    int Y = 0, M = 0, D = 0, h = 0, m = 0, sec = 0;
-    if (std::sscanf(ts.c_str(), "%d-%d-%dT%d:%d:%dZ", &Y, &M, &D, &h, &m, &sec) != 6)
-        return 0;
-    using namespace std::chrono;
-    const sys_days date{year{Y} / month{static_cast<unsigned>(M)} / day{static_cast<unsigned>(D)}};
-    const seconds secs = date.time_since_epoch() + hours{h} + minutes{m} + seconds{sec};
-    return static_cast<std::int64_t>(secs.count()) * 1'000'000'000LL;
 }
 
 // RAII guard for a per-test temp database file. Constructed FIRST so the
@@ -3348,7 +3334,7 @@ TEST_CASE("GuaranteedStateStore: overview aggregations", "[pg][guaranteed_state_
                   std::string ts) {
         auto e = make_event(std::move(id), std::move(rule), std::move(agent), "high", std::move(ts));
         e.event_type = std::move(type);
-        e.agent_ns = iso_to_ns(e.timestamp);
+        e.agent_ns = yuzu::test::iso8601_to_ns(e.timestamp);
         return e;
     };
     // Insertion order == rowid order, so the LAST event per (agent,rule) is "latest".
@@ -3395,7 +3381,7 @@ TEST_CASE("GuaranteedStateStore: per-(agent,rule) compliance census (Slice B)",
                   std::string ts) {
         auto e = make_event(std::move(id), std::move(rule), std::move(agent), "high", std::move(ts));
         e.event_type = std::move(type);
-        e.agent_ns = iso_to_ns(e.timestamp);
+        e.agent_ns = yuzu::test::iso8601_to_ns(e.timestamp);
         return e;
     };
     // agent_rule_statuses is now type-distinguishable (ADR-0038 catastrophic-
@@ -3490,7 +3476,7 @@ TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state 
                   std::string ts) {
         auto e = make_event(std::move(id), std::move(rule), std::move(agent), "high", std::move(ts));
         e.event_type = std::move(type);
-        e.agent_ns = iso_to_ns(e.timestamp);
+        e.agent_ns = yuzu::test::iso8601_to_ns(e.timestamp);
         return e;
     };
     auto census = [&] {

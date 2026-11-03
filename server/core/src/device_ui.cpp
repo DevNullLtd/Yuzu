@@ -1015,15 +1015,24 @@ std::string render_device_guardian_lens(const std::string& agent_id,
              "evaluated on this device yet.</div>";
         return h;
     }
-    int compliant = 0;
-    for (const auto& g : guards)
+    int compliant = 0, uncertain = 0;
+    for (const auto& g : guards) {
         if (g.state == "compliant")
             ++compliant;
+        if (g.order_uncertain || g.projection_pending)
+            ++uncertain;
+    }
     const int pct = static_cast<int>(100.0 * compliant / static_cast<double>(guards.size()) + 0.5);
+    // A clean tone is never shown over a guard whose ordering is uncertain or whose retained
+    // event is not yet reflected (#5690).
     h += "<div class=\"gp-tiles\"><div class=\"gp-tile\"><div class=\"n " +
-         std::string(pct >= 100 ? "good" : "warn") + "\">" + std::to_string(pct) +
+         std::string(pct >= 100 && uncertain == 0 ? "good" : "warn") + "\">" + std::to_string(pct) +
          "%</div><div class=\"l\">Compliant</div><div class=\"sx\">" + std::to_string(compliant) +
-         " of " + std::to_string(guards.size()) + " guards</div></div></div>";
+         " of " + std::to_string(guards.size()) + " guards" +
+         (uncertain > 0 ? ", " + std::to_string(uncertain) +
+                              " with uncertain ordering or an unreflected verdict"
+                        : std::string()) +
+         "</div></div></div>";
     h += "<div class=\"gp-sech\">Guards on this device</div>";
     h += "<table class=\"gp-table\"><thead><tr><th>Guard</th><th>State</th><th>Last evaluated</th>"
          "</tr></thead><tbody>";

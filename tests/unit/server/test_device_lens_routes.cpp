@@ -92,6 +92,7 @@ GuaranteedStateEventRow make_drift_event(std::string event_id, std::string rule_
     e.detected_value = "0";
     e.expected_value = "1";
     e.timestamp = std::move(ts);
+    e.agent_ns = yuzu::test::iso8601_to_ns(e.timestamp); // a usable ordering key (schema v4)
     return e;
 }
 
@@ -535,4 +536,34 @@ TEST_CASE("device lenses: Guardian lens — zero statuses renders the honest-emp
     CHECK(r->status == 200);
     CHECK(r->body == "<div class=\"gp-placeholder\"><b>No guards evaluated</b>No Guardian guards "
                      "have been evaluated on this device yet.</div>");
+}
+
+TEST_CASE("DeviceLensRoutes guardian lens: an order-uncertain guard keeps the tile off 'good' (#5690)",
+          "[pg][device][lens][ordering]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    const std::string agent = "guardian-dev-2";
+    REQUIRE(store.create_rule(make_lens_rule("r-alpha", "Alpha Guard")));
+    // A compliant verdict, then an OLDER drift verdict that arrives later: the row keeps the
+    // compliant verdict and is flagged, so every guard reads compliant but is not trustworthy.
+    REQUIRE(store.insert_event(make_drift_event("evt-1", "r-alpha", agent, "drift.remediated",
+                                                "2026-04-19T13:00:00Z")));
+    REQUIRE(store.insert_event(make_drift_event("evt-2", "r-alpha", agent, "drift.detected",
+                                                "2026-04-19T12:00:00Z")));
+
+    auto dex_api = make_local_dex_api(&store, {});
+    auto guardian_api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
+    auto okScoped = [](const httplib::Request&, httplib::Response&, const std::string&,
+                       const std::string&, const std::string&) { return true; };
+    yuzu::server::test::TestRouteSink sink;
+    DeviceLensRoutes routes;
+    routes.register_routes(sink, okScoped, dex_api, guardian_api);
+
+    auto r = sink.Get("/fragments/device/guardian?id=" + agent + "&bare=1");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->body.find("100%") != std::string::npos);
+    CHECK(r->body.find("class=\"n good\"") == std::string::npos);
+    CHECK(r->body.find("1 with uncertain ordering or an unreflected verdict") != std::string::npos);
 }

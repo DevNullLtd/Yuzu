@@ -140,6 +140,7 @@ struct GuardianStatusRollup {
     std::int64_t compliant_rules{0};
     std::int64_t drifted_rules{0};
     std::int64_t errored_rules{0};
+    std::int64_t uncertain_rules{0}; // rules with an order-uncertain or pending represented pair
 };
 
 /// Per-agent Guaranteed State status rollup — shared by
@@ -153,6 +154,7 @@ struct GuardianAgentStatusRollup {
     std::int64_t compliant_rules{0};
     std::int64_t drifted_rules{0};
     std::int64_t errored_rules{0};
+    std::int64_t uncertain_rules{0}; // rules with an order-uncertain or pending represented pair
 };
 
 /// Per-guard fleet-wide agent-status drilldown row — one row per agent that
@@ -163,6 +165,8 @@ struct GuardianRuleAgentStatusRow {
     std::string agent_id;
     std::string state;      // "compliant" | "drifted" | "errored"
     std::string updated_at; // ISO-8601 of the event that set it
+    bool order_uncertain{false};
+    bool projection_pending{false};
 };
 
 /// Per-device all-guards view row — one row per guard this device has
@@ -175,6 +179,8 @@ struct GuardianDeviceGuardRow {
                              // rule has since been deleted from the catalogue
     std::string state;      // "compliant" | "drifted" | "errored"
     std::string updated_at; // ISO-8601 of the event that set it
+    bool order_uncertain{false};
+    bool projection_pending{false};
 };
 
 /// Per-baseline device-compliance rollup — shared by

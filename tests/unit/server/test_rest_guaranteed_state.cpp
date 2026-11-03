@@ -818,10 +818,11 @@ struct RestGsHarness {
     // (insert_event → project_rule_status). event_type maps to state per
     // event_state_from_type: guard.compliant/drift.remediated→compliant,
     // drift.detected→drifted, remediation.failed/guard.unhealthy/guard.errored→errored.
-    // NOTE: the upsert keeps the row only when excluded.updated_at >= the existing
-    // updated_at, so re-seeding the same (agent, rule_id) with an EARLIER timestamp is
-    // silently dropped, while an EQUAL timestamp overwrites (the later arrival wins);
-    // use strictly increasing ts when overwriting a verdict to keep the result obvious.
+    // NOTE: the census keeps the verdict with the greatest ordering key, and the key is the
+    // agent stamp this helper derives from `ts` (whole seconds). Re-seeding the same (agent,
+    // rule_id) with an EARLIER ts leaves the verdict and flags the row order_uncertain; an EQUAL
+    // ts is a tie that the later arrival wins; use strictly increasing ts to overwrite a verdict
+    // and keep the row unflagged.
     void seed_status(const std::string& event_id, const std::string& agent,
                      const std::string& rule_id, const std::string& event_type,
                      const std::string& ts) {
@@ -832,6 +833,7 @@ struct RestGsHarness {
         e.event_type = event_type;
         e.severity = "info";
         e.timestamp = ts;
+        e.agent_ns = yuzu::test::iso8601_to_ns(ts);
         REQUIRE(store->insert_event(e).has_value());
     }
 
@@ -6038,4 +6040,78 @@ TEST_CASE("REST dex/signals, dex/scope and dex/signals/{obs_type}: a window outs
             CHECK(res->status == 200);
         }
     }
+}
+
+TEST_CASE("REST guaranteed-state: order_uncertain and projection_pending on the row routes, "
+          "uncertain_rules on the rollups (#5690)",
+          "[pg][rest][guaranteed_state][ordering]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    h.seed_rule("r2", "rule-2");
+    h.seed_rule("r3", "rule-3");
+    // A census trigger that refuses the projection of one verdict (identified by its timestamp)
+    // leaves that event stored with pending evidence and the row at its previous state.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(),
+            "CREATE FUNCTION guaranteed_state_store.yuzu_test_fail_marked() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN IF NEW.updated_at = '2026-06-20T10:02:00Z' THEN "
+            "RAISE EXCEPTION 'forced census failure' USING ERRCODE = 'XX000'; END IF; "
+            "RETURN NEW; END $$; "
+            "CREATE TRIGGER yuzu_test_fail_marked BEFORE INSERT OR UPDATE ON "
+            "guaranteed_state_store.guardian_agent_rule_status FOR EACH ROW EXECUTE FUNCTION "
+            "guaranteed_state_store.yuzu_test_fail_marked()")};
+        REQUIRE(r.ok());
+    }
+    h.seed_status("a1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    h.seed_status("a2", "WS-1", "r1", "drift.detected", "2026-06-20T10:00:00Z"); // older key, later arrival
+    h.seed_status("b1", "WS-1", "r2", "guard.compliant", "2026-06-20T10:01:00Z");
+    h.seed_status("b2", "WS-2", "r2", "guard.compliant", "2026-06-20T10:01:00Z");
+    h.seed_status("b3", "WS-2", "r2", "drift.detected", "2026-06-20T10:02:00Z"); // projection fails: pending
+    h.seed_status("c1", "WS-1", "r3", "guard.compliant", "2026-06-20T10:01:00Z");
+
+    const auto get = [&](const std::string& path, bool with_headers) {
+        auto res = with_headers ? h.sink.Get(path, h.status_route_headers()) : h.sink.Get(path);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body);
+    };
+    const auto row_for = [](const nlohmann::json& rows, const char* agent) {
+        for (const auto& x : rows)
+            if (x["agent_id"].get<std::string>() == agent)
+                return x;
+        FAIL("no row for " << agent);
+        return nlohmann::json{};
+    };
+
+    const auto r1 = get("/api/v1/guaranteed-state/rules/r1/status", true);
+    const auto r1_ws1 = row_for(r1["data"], "WS-1");
+    CHECK(r1_ws1["order_uncertain"].get<bool>());
+    CHECK_FALSE(r1_ws1["projection_pending"].get<bool>());
+    CHECK(r1_ws1["state"].get<std::string>() == "compliant"); // the older verdict did not win
+
+    const auto r2 = get("/api/v1/guaranteed-state/rules/r2/status", true);
+    CHECK_FALSE(row_for(r2["data"], "WS-1")["projection_pending"].get<bool>());
+    CHECK(row_for(r2["data"], "WS-2")["projection_pending"].get<bool>());
+    CHECK_FALSE(row_for(r2["data"], "WS-2")["order_uncertain"].get<bool>());
+
+    const auto fleet = get("/api/v1/guaranteed-state/status", true);
+    CHECK(fleet["data"]["total_rules"].get<int>() == 3);
+    CHECK(fleet["data"]["uncertain_rules"].get<int>() == 2); // r1 (flag) and r2 (pending); r3 clean
+    CHECK(get("/api/v1/guaranteed-state/status/WS-1", false)["data"]["uncertain_rules"].get<int>() == 1);
+    CHECK(get("/api/v1/guaranteed-state/status/WS-2", false)["data"]["uncertain_rules"].get<int>() == 1);
+
+    CHECK(get("/api/v1/guaranteed-state/agents/WS-2/rules", false)["data"]["guards"][0]
+              ["projection_pending"].get<bool>());
+    int uncertain_guards = 0;
+    for (const auto& g : get("/api/v1/guaranteed-state/agents/WS-1/rules", false)["data"]["guards"])
+        if (g["order_uncertain"].get<bool>())
+            ++uncertain_guards;
+    CHECK(uncertain_guards == 1);
+
+    // A later verdict that dominates the pending event retires it: only r1 stays uncertain.
+    h.seed_status("b4", "WS-2", "r2", "guard.compliant", "2026-06-20T10:05:00Z");
+    CHECK(get("/api/v1/guaranteed-state/status", true)["data"]["uncertain_rules"].get<int>() == 1);
 }

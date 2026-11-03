@@ -305,10 +305,10 @@ struct Harness {
     // drives the derived state per event_state_from_type (guaranteed_state_
     // store.cpp): "guard.compliant"/"drift.remediated" -> compliant,
     // "drift.detected" -> drifted, "remediation.failed"/"guard.unhealthy"/
-    // "guard.errored" -> errored. The upsert keeps a row only when the new
-    // updated_at >= the existing one: an EQUAL timestamp overwrites (the later
-    // arrival wins) and an earlier one is silently dropped, so use a strictly
-    // increasing ts per (agent, rule) across multiple seeds.
+    // "guard.errored" -> errored. The census keeps the verdict with the greatest ordering key,
+    // which this helper derives from `ts` (whole seconds): an EQUAL ts is a tie that the later
+    // arrival wins, and an EARLIER ts leaves the verdict and flags the row order_uncertain, so
+    // use a strictly increasing ts per (agent, rule) to overwrite a verdict without a flag.
     void seed_status(const std::string& event_id, const std::string& agent_id,
                      const std::string& rule_id, const std::string& event_type,
                      const std::string& ts = "2026-09-01T00:00:00Z") {
@@ -319,6 +319,7 @@ struct Harness {
         e.event_type = event_type;
         e.severity = "info";
         e.timestamp = ts;
+        e.agent_ns = yuzu::test::iso8601_to_ns(ts);
         REQUIRE(store->insert_event(e).has_value());
     }
 
@@ -2392,4 +2393,35 @@ TEST_CASE("guard detail census: an agent-supplied id is encoded in the /viz/host
     // The dot-only device is still listed by name, just not linked.
     CHECK(res->body.find("host3") != std::string::npos);
     CHECK_FALSE(yuzu::test::has_url(urls, "/viz/host/.."));
+}
+
+TEST_CASE("guardian overview: 'All compliant' is never shown over an uncertain pair (#5690)",
+          "[pg][guardian_routes][ordering]") {
+    Harness h;
+    auto rule = make_rule_with_spark("svc1", "ServiceGuard", "service-status-change");
+    h.seed_rule(rule);
+    deploy_via_baseline(h, "svc1");
+    h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"}])";
+
+    h.seed_status("e1", "lin-1", "svc1", "guard.compliant", "2026-09-01T10:00:00Z");
+    {
+        auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find("All compliant") != std::string::npos);
+        CHECK(res->body.find("ordering uncertain") == std::string::npos);
+        // The census caption no longer claims "as of last check-in".
+        CHECK(res->body.find("as of last check-in") == std::string::npos);
+        CHECK(res->body.find("greatest ordered verdict projected") != std::string::npos);
+    }
+    // An older verdict arriving later is refused and flags the pair.
+    h.seed_status("e2", "lin-1", "svc1", "drift.detected", "2026-09-01T09:00:00Z");
+    {
+        auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find("All compliant") == std::string::npos);
+        CHECK(res->body.find("Compliant, ordering uncertain") != std::string::npos);
+        CHECK(res->body.find("worst-badge worst-warn") != std::string::npos);
+        CHECK(res->body.find("1 guard(s) with uncertain ordering or an unreflected verdict") !=
+              std::string::npos);
+    }
 }
