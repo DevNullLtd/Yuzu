@@ -597,6 +597,10 @@ fix; released agents may need a restart, see [Heartbeat admission](#heartbeat-ad
 Multi-node behaviour
 is not tested.
 
+**Hot code loading is unsupported.** Never run `l(yuzu_gw_agent)` or `code:load_file` on a live
+gateway node: a raw load or a downgrade can crash agent owners or leave a malformed registry row.
+Upgrade and roll back by restarting the node.
+
 **Upgrading.** A rejected agent re-registers on its own only in a build that includes
 the #2182 fix, or with `--no-auto-update` on v0.13.0 and v0.14.0-rc6 (see Heartbeat
 admission): upgrade the agents first, then the gateway, with 0.15.0 or later, which includes the fix.
