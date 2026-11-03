@@ -1,0 +1,2 @@
+- **A Linux agent no longer aborts when a process exits while its `/proc` entry is being read.** The Echo process enumeration threw out of the snapshot pump and terminated the agent; a failed cycle now costs one snapshot and is logged.
+- **Catalog-signed Windows system files no longer read `unsigned` in Echo's module table.** An image with no embedded signature is looked up in the system catalogs (SHA-256, then SHA-1) and reads `signed` with the catalog's signer when a catalog lists it and verifies.

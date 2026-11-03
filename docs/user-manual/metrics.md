@@ -68,7 +68,7 @@ All Yuzu metrics follow a consistent naming scheme.
 
 | Metric | Type | Description |
 |---|---|---|
-| `yuzu_server_identity_uri_present` | gauge | `1` when the built-in `default-server.pem` carries the server identity URI SAN (`yuzu://<ca-fingerprint>/server`, #6016), `0` when it does not — a skipped or failed in-place upgrade (the server log says why and re-attempts on every boot). **Absent** (not `0`) when the server is not using built-in default certificates. It describes the file `default-server.pem`, not what each listener serves: it is a readiness signal only when the agent and management listeners use the default certificates. The gateway management plane can admit the server by this URI (`mgmt_peer_auth_mode` `identity_or_pin` or `identity`, an opt-in, #6016); this gauge is one of two conditions before moving a gateway to `identity`, and neither is sufficient alone: it is set once at server boot and describes the file, not the certificate the server presents to the gateway (a server given its own `--cert`/`--key` presents that one, even while default certificates stay active for another listener), and a replica on the previous binary does not export it; the other condition is real command traffic admitted by identity (`yuzu_gw_mgmt_auth_admitted_total{method="identity"}` moves, `{method="pin"}` does not). Alert: `YuzuServerIdentityUriAbsent` (warning, `== 0` for 15 m). |
+| `yuzu_server_identity_uri_present` | gauge | `1` when the built-in `default-server.pem` carries the server identity URI SAN (`yuzu://<ca-fingerprint>/server`, #6016), `0` when it does not — a skipped or failed in-place upgrade (the server log says why and re-attempts on every boot). Set whenever ANY surface (for example the HTTPS listener) uses the built-in default certificates, so it can read `1` while the certificate presented to the gateway (`--cert`/`--key`) carries no identity; **absent** (not `0`) only when no surface uses them. It describes the file `default-server.pem`, not what each listener serves: it is a readiness signal only when the agent and management listeners use the default certificates. The gateway management plane can admit the server by this URI (`mgmt_peer_auth_mode` `identity_or_pin` or `identity`; the shipped reference configs from release N+1 set `identity`, #6016); this gauge is one of two conditions before moving a gateway to `identity`, and neither is sufficient alone: it is set once at server boot and describes the file, not the certificate the server presents to the gateway (a server given its own `--cert`/`--key` presents that one, even while default certificates stay active for another listener), and a replica on the previous binary does not export it; the other condition is real command traffic admitted by identity (`yuzu_gw_mgmt_auth_admitted_total{method="identity"}` moves, `{method="pin"}` does not). Alert: `YuzuServerIdentityUriAbsent` (warning, `== 0` for 15 m). |
 | `yuzu_server_default_certs_active` | gauge | `1` when the server is running with built-in per-install **default** certificates, `0` otherwise. Alert on `== 1` for any production deployment — defaults are convenience certs and should be replaced (see `security-hardening.md`). |
 | `yuzu_server_ca_crl_publish_failures_total` | counter | Failed CRL (re)publish attempts, whatever the cause — e.g. the CA root read or CA key load failed, CRL build/sign failed, no database connection within 2.5 s, a wait of more than 5 s for the `ca_store.ca_crl_versions` table lock, a statement or idle-in-transaction timeout, a degraded revoked-set or number read, an insert or COMMIT failure, the CA root changing twice mid-publish, or another publish in the same process still running after 7.5 s. Every failed publish counts; the one exception is the background freshness pass finding another publish already running in the same process, which it skips (a skip is not a failure) instead of waiting. A failure of the freshness pass's unpublished-revocation *check* (not a publish) is logged at warn and not counted here — see `yuzu_server_ca_unpublished_revocation_check_failures_total` below (#4830). Server-side revocation enforcement is unaffected; the public CRL is stale until the next successful publish, which the leader's freshness pass retries automatically. Fires `YuzuCaCrlPublishFailing` (`docs/prometheus/yuzu-alerts.yml`). |
 | `yuzu_server_ca_crl_publish_failure_reason_total{reason}` | counter | (#4830) The same failures as `yuzu_server_ca_crl_publish_failures_total` above, additionally broken down by cause — a bounded, closed set pre-seeded to 0 at boot: `key_load`, `root_read_failed`, `no_connection`, `lock_timeout`, `number_read_failed`, `degraded_revoked_read`, `build_failed`, `insert_or_commit_failed`, `root_changed_twice`, `busy`, `exception`. Additive triage breakdown — `yuzu_server_ca_crl_publish_failures_total` stays the unlabelled alert source; this series answers "which cause" once that alert has fired. |
@@ -247,8 +247,8 @@ peer node) or because it is a histogram; every other family exists from start.
 | `yuzu_gw_heartbeat_buffer_dropped_total` | counter | `reason` | Heartbeat data the buffer gave up to stay bounded |
 | `yuzu_gw_heartbeat_coalesced_total` | counter | | Heartbeats merged into the buffered one of the same session |
 | `yuzu_gw_session_limit_rejected_total` | counter | | Registrations refused by the per-connection session cap |
-| `yuzu_gw_mgmt_auth_rejected_total` | counter | `reason` | Management-listener streams refused by the peer authorization (the SPKI pin and, since #6016, the server identity and the serial deny-list). `reason` is a closed set of eleven: `pin_mismatch`, `missing_server_auth_eku`, `no_pins_resolved`, `no_pins_configured`, `bad_peer_cert`, `bad_pin_config`, `no_uri_san`, `identity_mismatch`, `identity_unresolved`, `revoked`, `internal_error`; all created at 0 at start. In `identity_or_pin` with pins configured, a peer that fails both paths because it has no identity is counted with the pin's reason (`pin_mismatch` or `no_pins_resolved`), so `no_uri_san` and `identity_mismatch` appear only when no pin is configured (or in `identity` mode). `identity_unresolved` (the gateway could not resolve its identity and the pin does not admit the peer) and `revoked` are counted as themselves in every mode. Alerts: `YuzuGatewayMgmtAuthRejected` (every reason but `pin_mismatch`), `YuzuGatewayMgmtPinMismatch` |
-| `yuzu_gw_mgmt_auth_admitted_total` | counter | `method` | Management-listener streams let in, by the method that admitted them (`identity` or `pin`; both created at 0 at start). Shows which path carries the traffic before `mgmt_peer_auth_mode` is narrowed from `identity_or_pin` to `identity`: move only after real command traffic has moved `method="identity"` while `method="pin"` stood still (`pin` standing still on an idle gateway proves nothing). The shipped configs ship `pin`; `identity_or_pin` is an opt-in, so until an operator sets it the `identity` series stays at 0 |
+| `yuzu_gw_mgmt_auth_rejected_total` | counter | `reason` | Management-listener streams refused by the peer authorization (the SPKI pin and, since #6016, the server identity and the serial deny-list). `reason` is a closed set of eleven: `pin_mismatch`, `missing_server_auth_eku`, `no_pins_resolved`, `no_pins_configured`, `bad_peer_cert`, `bad_pin_config`, `no_uri_san`, `identity_mismatch`, `identity_unresolved`, `revoked`, `internal_error`; all created at 0 at start. In `identity_or_pin` with pins configured, a peer that fails both paths because it has no identity is counted with the pin's reason (`pin_mismatch` or `no_pins_resolved`), so `no_uri_san` and `identity_mismatch` appear only when no pin is configured (or in `identity` mode). `identity_unresolved` (the gateway could not resolve its identity and the pin does not admit the peer) and `revoked` are counted as themselves in every mode. Alerts: `YuzuGatewayMgmtAuthRejected` (every reason but `pin_mismatch`), `YuzuGatewayMgmtPinMismatch` Alerts: `YuzuGatewayMgmtAuthRejected` (warning, every reason but `pin_mismatch`), `YuzuGatewayMgmtPinMismatch` (critical) and `YuzuGatewayMgmtIdentityOutage` (critical: `no_uri_san` or `identity_mismatch` with no admission in the same five minutes). |
+| `yuzu_gw_mgmt_auth_admitted_total` | counter | `method` | Management-listener streams let in, by the method that admitted them (`identity` or `pin`; both created at 0 at start). Shows which path carries the traffic before `mgmt_peer_auth_mode` is narrowed from `identity_or_pin` to `identity`: move only after real command traffic has moved `method="identity"` while `method="pin"` stood still (`pin` standing still on an idle gateway proves nothing). The shipped configs ship `identity` (release N+1), so on them the `pin` series stays at 0; it moves only in `pin` and `identity_or_pin` `YuzuGatewayMgmtIdentityOutage` reads it: identity refusals page only when no stream was admitted on that gateway in the same five minutes. |
 | `yuzu_gw_mgmt_auth_pin_unresolved_total` | counter | | Management auth attempts with a configured pin that did not resolve, including `identity_or_pin` attempts the identity admits |
 | `yuzu_gw_grpc_origin_ignored_total` | counter | `mode`, `reason` | Calls behind a proxy whose claimed client address was not used |
 | `yuzu_gw_grpc_dropped_data_bytes_total` | counter | `reason` | Request bytes discarded because the call could not use them |
@@ -325,6 +325,60 @@ entry for the full seven-part design), recovers an execution row left permanentl
 No dedicated alert rule ships for either family in this change — same posture as the Gateway
 routing directory reap counter below, which also has none; revisit once real fleet data exists
 to size a threshold.
+
+## Execution-tracker read-degrade metric (#3834)
+
+Until now a degraded read of the execution tracker (the store behind execution history, the
+executions drawer and result polls) was visible only as a server log line. This counter makes it
+visible on a dashboard.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_execution_tracker_read_degrade_total{method,reason}` | counter | An execution-tracker read returned a degraded answer instead of data. `method` ∈ `query_executions`\|`get_execution`\|`get_agent_statuses`\|`get_agent_statuses_for_executions`\|`get_children` names the reader (it is not an HTTP method). `reason` ∈ `store_not_open`\|`pool_acquire_timeout`\|`query_error` says where the read failed, not why (see below). Pre-seeded to 0 for all 15 combinations. **Diagnostic only — not an availability or user-impact measure:** it also counts the server's own periodic reads (about 4 per minute per replica of `method="query_executions"` with no users at all, more while `/health`, `/api/health`, the health summary or the dashboard health fragment is polled by an authenticated caller), so any database trouble makes it non-zero within one 15 s tick plus the read wait. |
+
+**How to read it:**
+
+- A counted degrade is answered `503` (or a retryable error) by the REST, MCP and dashboard
+  execution routes. Some server-internal readers fail open instead: the command-queue-depth gauge
+  reads 0, the health summary shows 0 in flight, and the shutdown drain can see 0 running and end
+  early. Those were already true; the counter makes them visible.
+- `reason="pool_acquire_timeout"` means no database connection was obtained. That is pool
+  saturation **or** a database that is unreachable or in connect backoff (or shutdown), so it is
+  not by itself a reason to raise `--postgres-pool-size`. Check `yuzu_server_pg_reachable` first:
+  when it is 0 the database is unreachable or refusing connections (a database whose
+  connection slots are used up, for example by other clients on a Postgres without the reserved slots
+  the shipped images set, refuses the probe's reconnect too: see "Sizing `max_connections`" in
+  [server-admin.md](server-admin.md)), not a pool that is too small. Treat it as saturation only
+  when `yuzu_pg_pool_in_use` is at the pool size. `yuzu_pg_acquire_wait_seconds` records only
+  successful checkouts, so it stays flat when the pool is completely exhausted. Before raising
+  the pool, look for long or blocked statements holding the connections (`pg_stat_activity`): then
+  the pool is the symptom, and more connections only add load to a struggling database.
+- `reason="query_error"` means a connection was obtained and the statement failed or timed out
+  (a slow or locked table, a stale connection after a restart or failover, a schema mismatch).
+- `reason="store_not_open"` stays 0 on a running server, which refuses to start without the
+  tracker; it exists so the three reasons match the other stores' read-degrade counters.
+- The reasons can change during one incident (a failover typically shows `query_error` first and
+  `pool_acquire_timeout` after), so read them together.
+- Counters are per replica. One connection pool serves every store, so a tracker
+  `pool_acquire_timeout` can be the symptom of another store holding connections.
+- **No alert rule ships for this counter** (tracked in #6883). A per-reason alert would flap during a failover, and
+  the rate includes the server's own polling. If you alert on it, alert on the sum across reasons
+  with a sustained `for:` of several minutes (the server's own polling makes it non-zero on any
+  single blip), alongside `yuzu_server_pg_reachable`.
+
+**Useful PromQL queries:**
+
+```promql
+# Tracker reads degrading, by reader and reason (includes the server's own polling).
+sum by (method, reason) (increase(yuzu_server_execution_tracker_read_degrade_total[5m])) > 0
+
+# No label filter separates user impact from the server's own polling (query_executions is
+# also the executions-list reader behind the REST, MCP and dashboard pages): read this next to
+# yuzu_server_pg_reachable, not instead of it.
+
+# Fleet-wide vs one replica.
+sum by (instance, reason) (increase(yuzu_server_execution_tracker_read_degrade_total[5m]))
+```
 
 ## Command outbox delivery metrics (HA WS-3 3.3)
 
@@ -1638,12 +1692,97 @@ disconnect, plugin load) over a bidirectional stream. This is used internally
 by the gateway and can be consumed by custom integrations that prefer gRPC over
 SSE.
 
+### Agent command-dedup store telemetry (#3663)
+
+Every agent keeps a small durable store (`command_dedup.db`) so a redelivered command is
+replayed or answered `RUNNING` instead of executing twice (see [Command Replay
+Protection](security-hardening.md#command-replay-protection)). If that store cannot be opened or
+written, the agent **fails open**: it keeps running commands, undeduplicated, so a single disk
+fault does not drop the endpoint out of remote-control reach. That is a deliberate availability
+choice, which is why it has to be visible.
+
+**How it reaches you.** The agent has no `/metrics` endpoint, so its dedup signals travel on the
+heartbeat as the status tags `yuzu.dedup_degraded` (0 or 1), `yuzu.dedup_replays`,
+`yuzu.dedup_claim_errors`, `yuzu.dedup_record_terminal_misses`, `yuzu.dedup_record_errors`,
+`yuzu.dedup_release_errors` and `yuzu.dedup_rows`, and the server derives the
+`yuzu_fleet_agents_dedup_*` gauges and `yuzu_fleet_dedup_rows_max` from them on each ~15 s sweep.
+
+**Population and scope: read this before trusting a number.**
+
+- Every gauge counts the agents with a **heartbeat in the last 90 seconds**. An agent that is
+  offline, or that heartbeats slower than 90 s (keep `--heartbeat` below 90 s, preferably 60 s or
+  less), drops out of every count, including `reporting`. A degraded agent that goes offline
+  therefore leaves the count **without having been fixed**.
+- The health store is **per core replica**: each replica exports only the agents attached to it.
+  Scrape every replica and sum the counts (`sum by (job) (...)`) but take the **max** of
+  `yuzu_fleet_dedup_rows_max` (`max by (job) (...)`); during a failover one agent can be counted on
+  two replicas for a few minutes.
+- Agents that predate these tags contribute nothing, and `yuzu.dedup_rows` only exists on agents
+  that include #3663. `yuzu_fleet_agents_dedup_reporting` is the denominator: a 0 in the counts is
+  only reassuring when `reporting` is close to the number of agents you expect (compare it with
+  `yuzu_fleet_agents_healthy`; this is a monitor-only ratio, there is no alert on it).
+- The counts can exceed `reporting`. `reporting` counts agents with a valid `yuzu.dedup_degraded`
+  flag; an agent whose flag was rejected (and is counted in `tag_rejected`) can still be counted by
+  a counter gauge whose own tag was valid.
+
+**Reading the gauges.**
+
+- The counter-derived gauges count **agents**, not events. The agent's counters are per-process
+  and restart from 0, so a fleet sum would fall whenever an agent restarted and could not back an
+  `increase()` alert. Counting agents with a value above 0 is restart-robust, but it means
+  "has happened since that agent last started", not "is happening now".
+- `yuzu_fleet_agents_dedup_store_degraded` is the only live reading, so it is the only gauge with
+  an alert, `YuzuDedupStoreDegraded`. **It covers a store that failed to OPEN, and only that.** A
+  store that opened and later fails writes (a disk filling after boot) leaves `degraded` at 0 and
+  shows only on `yuzu_fleet_agents_dedup_claim_erroring` (and `..._record_erroring`,
+  `..._release_erroring`), which have no alert (a windowed signal that clears on recovery is
+  tracked in #6932).
+- `YuzuDedupStoreDegraded` is a **sample rule** in `docs/prometheus/yuzu-alerts.yml`. It is a control
+  only once you load that file into your Prometheus and route `severity=warning` in Alertmanager;
+  neither is done by any compose or Helm file the project ships. It is agent-self-reported, so one
+  forged or buggy agent can keep it firing.
+
+**When `YuzuDedupStoreDegraded` fires.** There is no page or API yet that lists which endpoints are
+affected (tracked in #6931), so the count tells you how many to find. Check the agent log on
+suspect endpoints for `Failed to open command dedup store` (the usual causes are a full or
+read-only data directory or a permissions fault on `command_dedup.db`), fix the cause, and restart
+the agent. The count drops within about 45 seconds of the restart (the agent sends its first
+heartbeat one interval, 30 s by default, after it starts, then the server sweeps every 15 s), and
+the alert resolves about 5 minutes after that, so it can still fire for an agent that was just fixed.
+A restart does **not** re-send an in-flight operator command to the agent: an offline agent gets no
+queued commands (by code reading; a chaos run to measure it is tracked in #6935). But while an
+endpoint has no durable dedup record, a command redelivered to it by **any** path is not absorbed:
+the server tries a gateway forward up to three times with the same command id, and a scheduled
+command can be re-driven after a fault (the undelivered backlog is visible as
+`yuzu_server_command_outbox_pending`, but it counts every undelivered occurrence and does not
+identify re-drives). You cannot see from the product whether a redelivery is in
+flight, so do not delay the fix for it; restarting after the fix restores protection for later
+commands. "Resolved" means the agent is back, counted in `reporting`, with `store_degraded` at 0; a
+count that fell only because the agent went offline is not resolved.
+
+**The capacity gauge.** `yuzu_fleet_dedup_rows_max` is the largest store, in rows, that any agent
+reports. The store keeps the newest 20,000 terminal rows, so a healthy value tops out near
+20,500. It is an **approximate cached count that can over-read**, for example after a burst of
+queue-full releases, so treat it as a hint: investigate sustained values above about 25,000 (in-flight
+rows left by crashed commands are never evicted and are one way to get there). It is a MAX of
+agent-reported values, so one forged value up to 1,000,000,000 owns it and it names no agent. It is
+also per core replica: take the max across replicas, not the sum. There is no alert on it.
+
+**Not covered:** an agent that recovered from a **corrupt** dedup store (#3665) loses its replay history but is not
+degraded. It reports the per-process `yuzu.dedup_quarantined` tag, which the server does not read
+and which returns to 0 on the next agent restart, so no gauge counts it (a restart-surviving
+marker with its consumer is tracked in #6933). An agent whose heartbeat carries more than 512
+status tags (or an oversized tag) has **all** its tags dropped by the gateway and vanishes from
+every dedup count; the gateway counts this as
+`yuzu_gw_heartbeat_buffer_dropped_total{reason="heartbeat_oversize"}`, which no shipped alert
+watches yet (#6934).
+
 ## Fleet performance gauges (DEX)
 
 Published on every fleet-health sweep (~15 s). A metric nobody reported is
 **absent**, never zero (exception: server-owned agent counts such as
-`yuzu_fleet_echo_db_corruption_agents` and `yuzu_fleet_inventory_sync_skipping{source}`
-are published every sweep, 0 included); values are validated server-side (forged
+`yuzu_fleet_echo_db_corruption_agents`, `yuzu_fleet_inventory_sync_skipping{source}` and
+the `yuzu_fleet_agents_dedup_*` counts are published every sweep, 0 included); values are validated server-side (forged
 non-finite / out-of-range readings are rejected).
 
 | Metric | Type | Description |
@@ -1652,6 +1791,15 @@ non-finite / out-of-range readings are rejected).
 | `yuzu_fleet_echo_db_corruption_agents` | gauge | Agents whose Echo database has **ever** been quarantined as corrupt (#1567) — cumulative per agent since install, so read a **rising** value as the signal, not the absolute number; an agent that recovered still counts. Derived from the heartbeat tag `yuzu.plugin.echo.db_corruption_total`, published by the echo plugin (the agent has no `/metrics` endpoint, so a per-agent counter is not scrapable). Counts only agents currently reporting heartbeats. Example alert: `delta(yuzu_fleet_echo_db_corruption_agents[1h]) > 0` (a gauge, so use `delta`; an agent returning from offline after a quarantine re-raises it once). |
 | `yuzu_fleet_plugin_init_failed{plugin}` | gauge | Agents reporting a plugin that failed init, per plugin name (heartbeat tag `yuzu.plugins_failed`); distinguishes "failed to load" from "not installed". Absent-not-zero: the family is empty when no agent reports a failure. At most 64 named labels per sweep (lexicographically first); the rest are summed under `plugin="other"`. |
 | `yuzu_fleet_inventory_sync_skipping{source}` | gauge | Agents currently reporting heartbeats whose daily-sync `source` skipped its most recent collection cycle(s) (#5332), from the heartbeat tag `yuzu.sync.<source>.skip_streak` (> 0; today only `source="installed_software"`, written by agents that include the skip-visibility change, #5327); the cause is in the agent's own log, and the agent also publishes it as the `yuzu.sync.<source>.last_skip` heartbeat tag (no server page or API returns that tag yet). Published every sweep, 0 included. Counts only agents currently reporting heartbeats. The gauge only counts agents that emit the skip-streak heartbeat tag: an agent that does not emit it (older agents, during a rollout, or in a mixed-version fleet) contributes zero even when its collector is skipping, so a zero gauge does not establish that all collectors are healthy. Correlate with `yuzu_inventory_stale_agents{source="installed_software"}` (see the inventory manual) to tell an online host whose collector is skipping from an offline one, but do not subtract one from the other: they count different populations (live heartbeats vs stored-receipt age). |
+| `yuzu_fleet_agents_dedup_store_degraded` | gauge | Agents whose durable command-dedup store **could not be opened** (#3663), from the heartbeat tag `yuzu.dedup_degraded` = 1. These agents still run commands but **without replay protection**, so a redelivered command may execute twice (at-least-once, fail-open by design). Covers a store that failed to OPEN only: a store that opened and later failed writes shows on `yuzu_fleet_agents_dedup_claim_erroring`, which has no alert. A **live** 0/1 reading recomputed every sweep, over agents with a heartbeat in the last 90 s, exported per core replica (sum across replicas): it clears within about 45 s of the restart (with the default 30 s heartbeat), and an agent offline for more than 90 s leaves it without having been fixed. Published every sweep, 0 included. Sample alert: `YuzuDedupStoreDegraded`. See [Agent command-dedup store telemetry](#agent-command-dedup-store-telemetry-3663). |
+| `yuzu_fleet_agents_dedup_replaying` | gauge | Agents that have served at least one durable terminal-outcome replay **since their last restart** (`yuzu.dedup_replays` > 0). Informational: a replay is the store doing its job, so non-zero is normal. Latches until the agent restarts. Published every sweep, 0 included. No alert. |
+| `yuzu_fleet_agents_dedup_claim_erroring` | gauge | Agents whose dedup store has failed at least one claim since their last restart (`yuzu.dedup_claim_errors` > 0): each is a command that ran undeduplicated because a store write failed **after** boot (full disk, I/O error). Unlike `dedup_store_degraded`, the store did open. Latches until restart. Published every sweep, 0 included. No alert. |
+| `yuzu_fleet_agents_dedup_record_terminal_missing` | gauge | Agents that have recorded at least one terminal outcome matching no in-flight row since their last restart (`yuzu.dedup_record_terminal_misses` > 0): the command ran undeduplicated, or a duplicate terminal arrived. Not a measure of the ring-eviction double-execute, which is not separately detectable. Latches until restart. Published every sweep, 0 included. No alert. |
+| `yuzu_fleet_agents_dedup_record_erroring` | gauge | Agents whose store failed to record at least one terminal outcome since their last restart (`yuzu.dedup_record_errors` > 0): a redelivery of that command answers `RUNNING` rather than replaying its result. Latches until restart. Published every sweep, 0 included. No alert. |
+| `yuzu_fleet_agents_dedup_release_erroring` | gauge | Agents whose store failed at least one claim release since their last restart (`yuzu.dedup_release_errors` > 0): a possibly-leaked claim, which answers `RUNNING` to every redelivery of that command and never re-runs it. Latches until restart. Published every sweep, 0 included. No alert. |
+| `yuzu_fleet_agents_dedup_reporting` | gauge | Agents with a heartbeat in the last 90 s whose latest heartbeat carried a valid `yuzu.dedup_degraded` flag, i.e. the agents the `yuzu_fleet_agents_dedup_*` counts are measuring. Per core replica (sum across replicas). An agent that predates the tag, or whose flag was rejected, is not counted, so a 0 in the counts is only reassuring when this is non-zero and close to the number of agents you expect; the counts can exceed it when an agent's flag was rejected but another of its dedup tags was valid. Published every sweep, 0 included. |
+| `yuzu_fleet_agents_dedup_tag_rejected` | gauge | Agents whose latest heartbeat carried at least one `yuzu.dedup_*` value the server rejected: non-numeric, empty, longer than 10 characters, above 1,000,000,000, or a degraded flag other than 0 or 1. A rejected value is dropped from the counts, never clamped; an agent is counted once however many of its tags are bad. >0 means an agent is sending malformed or forged dedup tags. Published every sweep, 0 included. |
+| `yuzu_fleet_dedup_rows_max` | gauge | The largest durable command-dedup store, in rows (in-flight + terminal), reported by any agent (heartbeat tag `yuzu.dedup_rows`, an **approximate cached count** that can over-read after a burst of released claims). The store is a ring that keeps the newest 20,000 terminal rows, so a healthy value tops out near 20,500; in-flight rows left by crashed commands are never evicted and are one way it grows beyond that. A MAX of agent-reported values, per core replica (take the max across replicas, not the sum): one forged value up to 1,000,000,000 owns it and it names no agent, so treat it as a hint and investigate sustained values above about 25,000. **Absent** (not 0) when no agent reports a valid value; an old agent without the tag contributes nothing. No alert. |
 | `yuzu_fleet_perf_reporting` | gauge | Devices contributing at least one perf metric this sweep (the same any-of-three definition the `/dex` Performance tab's Reporting card uses) |
 | `yuzu_fleet_perf_cpu_pct{stat}` | gauge | Fleet CPU busy %, `stat` = `avg` / `p50` / `p90` / `max` |
 | `yuzu_fleet_perf_commit_pct{stat}` | gauge | Fleet memory commit % of limit, same `stat` labels |

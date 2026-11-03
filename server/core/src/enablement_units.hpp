@@ -143,8 +143,8 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 // pkg_inventory.store_packages, msi_packages.list_inventory and remote_access_audit.list added
 // 2026-10-17/19; registry set_user_value, delete_user_value and apply added in registry 2.1.0;
 // hardware chassis/baseboard/swap/machine_id and disk_actions partitions/topology added as planned;
-// middleware ibm_mq added by SAM.2), 243 rows.
-inline constexpr std::array<UnitOsRow, 243> kUnitOs{{
+// middleware ibm_mq added by SAM.2; runtimes python added 2026-10-28), 244 rows.
+inline constexpr std::array<UnitOsRow, 244> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -319,6 +319,7 @@ inline constexpr std::array<UnitOsRow, 243> kUnitOs{{
     {"registry", "apply", kWin | kLin | kMac},
     {"runtimes", "dotnet", kWin | kLin | kMac},
     {"runtimes", "jvm", kWin | kLin | kMac},
+    {"runtimes", "python", kWin | kLin | kMac},
     {"sccm", "client_version", kWin},
     {"sccm", "site", kWin},
     {"script_exec", "exec", kWin | kLin | kMac},

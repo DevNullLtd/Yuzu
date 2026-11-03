@@ -58,6 +58,7 @@
  * `#if defined(__APPLE__)`) needs Apple headers.
  */
 
+#include "echo_db.hpp"         // NetworkEvent
 #include "echo_netqual.hpp"     // TcpQualitySample
 #include "echo_proc_stream.hpp" // EventRing<T>
 
@@ -236,6 +237,7 @@ struct TcpDescriptor {
     std::uint8_t reserved[3]{};
 };
 static_assert(sizeof(TcpDescriptor) == 336);
+static_assert(offsetof(TcpDescriptor, state) == 76); // read by nstat_decode_tcp_src_desc
 static_assert(offsetof(TcpDescriptor, pid) == 116);
 static_assert(offsetof(TcpDescriptor, epid) == 120);
 static_assert(offsetof(TcpDescriptor, local) == 124);
@@ -400,6 +402,7 @@ struct DecodedTcpDesc {
     int remote_port{0};
     std::uint32_t pid{0};
     std::string process_name; ///< pname; "" if empty (the macOS 13.3 tcp descriptor has no epname/uid)
+    std::string state;        ///< TCP state name from the descriptor (ESTABLISHED, TIME_WAIT, ...)
 };
 /// PURE. Decodes a SRC_DESC message whose embedded provider is
 /// kNstatProviderTcp/kNstatProviderTcpKernel into a DecodedTcpDesc. Returns
@@ -437,6 +440,7 @@ struct NstatFlowEvent {
     int remote_port{0};
     std::uint32_t pid{0};
     std::string process_name;
+    std::string state; ///< open events: the descriptor's TCP state; "" on a close event
 };
 
 /// The lifecycle-event ring — EventRing<T> reused verbatim (echo_proc_stream.hpp),
@@ -500,6 +504,12 @@ NstatFlowEvent nstat_build_open_event(std::int64_t ts_unix, const DecodedTcpDesc
 /// removed before its identity was ever resolved — there is nothing
 /// meaningful to report).
 NstatFlowEvent nstat_build_close_event(std::int64_t ts_unix, const FlowState& last_known);
+
+/// PURE. The tcp row a lifecycle event is stored as. An open event carries the descriptor's
+/// TCP state when SRC_DESC resolved it and ESTABLISHED when it did not; a close event is
+/// "CLOSED" (the flow just vanished). nstat is a lifecycle stream, not the DNS-resolving poll,
+/// so remote_host stays empty.
+NetworkEvent network_event_from_nstat_flow(const NstatFlowEvent& e, std::int64_t snapshot_id);
 
 /// PURE. Derives one TcpQualitySample from a live flow. `lost` is
 /// nq_delta_clamped(txretransmit_cum, txretransmit_prev_snapshot) — the

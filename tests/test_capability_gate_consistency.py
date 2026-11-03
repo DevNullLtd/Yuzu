@@ -234,11 +234,12 @@ FRAGMENT_FILES = [
 # 235, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
 # registry 2.1.0: +3 (set_user_value Mutating, delete_user_value Destructive, apply Destructive; all
 # Infrastructure, gate AdminOrApproval) on top of that 235 = 238, re-derived the same way.
-# middleware (ibm_mq, +1, ReadOnly, Inventory:Read, gate None) on top of H.2's 244 = 245, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
+# runtimes python: +1 (runtimes.python ReadOnly, Inventory, gate None) on top of H.2's 244 = 245, re-derived the same way.
+# middleware (ibm_mq, +1, ReadOnly, Inventory:Read, gate None) on top of runtimes python's 245 = 246, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
 # H.2 hardware scaffold: +4 hardware (chassis/baseboard/swap/machine_id) +2 disk_actions
 # (partitions/topology), all ReadOnly, Inventory:Read, gate None, on top of 238 = 244, re-derived by
 # running this test (parse_fragment_gate_rows over FRAGMENT_FILES), not by adding to a baseline.
-EXPECTED_TOTAL_ROWS = 245
+EXPECTED_TOTAL_ROWS = 246
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

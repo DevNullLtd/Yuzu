@@ -81,7 +81,7 @@ inline bool is_os_native(const SoftwareEntry& e) {
     const std::string eco = yuzu::server::detail::to_lower_ascii(cpe_trim_view(e.ecosystem));
     return kind == "app" || kind == "feat" || eco == "windows" || eco == "macos" ||
            eco == "macos_pkgutil" || eco == "brew" || eco == "optional_feature" ||
-           eco == "snap" || eco == "flatpak" || eco == "msi" || eco == "ibm_mq";
+           eco == "snap" || eco == "flatpak" || eco == "msi" || eco == "python" || eco == "ibm_mq";
 }
 
 // ---------------------------------------------------------------------------

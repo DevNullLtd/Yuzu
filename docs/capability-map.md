@@ -1658,7 +1658,7 @@ Partial (library components only). `GET /api/v1/crypto/cbom` and MCP `export_cry
 | discovery | Y | Y | Y | Network |
 | netprobe | Y | Y | Y | Network |
 | installed_apps | Y | Y | Y | Software |
-| runtimes | - | Y | - | Software |
+| runtimes | Y | Y | Y | Software |
 | msi_packages | Y | - | Y | Software |
 | pkg_inventory | - | Y | Y | Software |
 | middleware | - | Y | - | Software |

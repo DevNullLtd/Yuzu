@@ -26,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <expected>
 #include <filesystem>
 #include <limits>
 #include <mutex>
@@ -1614,6 +1615,64 @@ TEST_CASE("Echo #2361: the status lines always carry both totals",
     CHECK(lines[3] == "retention_guard_failures_total|2");
 }
 
+TEST_CASE("Echo budget: the __budget__ skip line is in neither retention guard total",
+          "[echo][retention][clock-guard][budget]") {
+    // A skipped byte-budget pass is the consequence of a decline or failure that is already
+    // counted, so it must surface as its own line and stay out of both totals. Folding it into
+    // declines would double a clock decline and turn a failures-only event (an anchor write
+    // failure) into a non-zero declines total, the misread the status text warns against.
+    yuzu::echo::RetentionGuardState g;
+    {
+        std::lock_guard lock(g.mu);
+        g.budget_skips = 2;
+        g.declines["process_hourly"] = 1;
+    }
+    auto lines = yuzu::echo::format_retention_guard_lines(g);
+    REQUIRE(lines.size() == 4);
+    CHECK(lines[0] == "retention_guard|process_hourly|1");
+    CHECK(lines[1] == "retention_guard|__budget__|2");
+    CHECK(lines[2] == "retention_guard_declines_total|1");
+    CHECK(lines[3] == "retention_guard_failures_total|0");
+
+    // Failures only (no decline): the skip line appears and the declines total stays 0.
+    yuzu::echo::RetentionGuardState f;
+    {
+        std::lock_guard lock(f.mu);
+        f.budget_skips = 1;
+        f.failures["__clock_state__"] = 1;
+    }
+    lines = yuzu::echo::format_retention_guard_lines(f);
+    REQUIRE(lines.size() == 4);
+    CHECK(lines[0] == "retention_guard_failed|__clock_state__|1");
+    CHECK(lines[1] == "retention_guard|__budget__|1");
+    CHECK(lines[2] == "retention_guard_declines_total|0");
+    CHECK(lines[3] == "retention_guard_failures_total|1");
+}
+
+TEST_CASE("Echo budget: retention_clock_events counts clock refusals and not delete failures",
+          "[echo][retention][clock-guard][budget]") {
+    // The budget pass skips when this total rises across run_retention. A table whose DELETE
+    // fails every pass is a delete problem, not a clock problem (the guard admitted the clock),
+    // so it must not switch the byte cap off.
+    yuzu::echo::RetentionGuardState g;
+    CHECK(yuzu::echo::retention_clock_events(g) == 0);
+    {
+        std::lock_guard lock(g.mu);
+        g.delete_failures["x"] = 5;
+    }
+    CHECK(yuzu::echo::retention_clock_events(g) == 0);
+    {
+        std::lock_guard lock(g.mu);
+        g.declines["x"] = 1;
+    }
+    CHECK(yuzu::echo::retention_clock_events(g) == 1);
+    {
+        std::lock_guard lock(g.mu);
+        g.failures["__clock_state__"] = 1;
+    }
+    CHECK(yuzu::echo::retention_clock_events(g) == 2);
+}
+
 TEST_CASE("Echo #2361: every registered granularity declares the ts column its suffix maps to",
           "[echo][retention][clock-guard][registry]") {
     // `ts_column_for_suffix` is public API with three consumers now (the DDL's
@@ -2562,4 +2621,786 @@ TEST_CASE("Echo #1567: db_health line format", "[echo][status][issue1567]") {
     CHECK(format_db_health_line(true, 1700000000) == "db_health|quarantined|1700000000");
     CHECK(format_db_health_line(false, 0) == "db_health|ok|0");
     CHECK(format_db_health_line(false, 1700000000) == "db_health|ok|1700000000");
+}
+
+// =============================================================================
+// Byte budget: run_budget eviction, vacuum_decision, parse_budget_bytes
+// =============================================================================
+
+namespace {
+
+constexpr int64_t kBudgetNow = 1'700'000'000; // a fixed "now": no test here reads the real clock
+constexpr int64_t kRawFloor = kBudgetNow - kBudgetRawFloorSec;
+
+EchoDatabase open_budget_db(const yuzu::test::TempDbFile& tmp) {
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    return std::move(*opened);
+}
+
+// n rows spread evenly over [oldest, newest], ascending in id and ts; each carries a
+// 2 * payload_bytes hex remote_host, ~330 bytes a row at the default.
+void seed_tcp_live(EchoDatabase& db, int n, int64_t oldest, int64_t newest,
+                   int payload_bytes = 100) {
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < {0}) "
+        "INSERT INTO tcp_live (ts,snapshot_id,action,proto,local_addr,local_port,remote_addr,"
+        "remote_host,remote_port,state,pid,process_name) "
+        "SELECT {1} + (i * ({2} - {1})) / {0}, 1, 'connected', 'tcp', '10.0.0.1', i % 60000, "
+        "'203.0.113.1', hex(zeroblob({3})), 443, 'ESTABLISHED', 1, 'curl' FROM n",
+        n - 1, oldest, newest, payload_bytes)));
+}
+
+void seed_module_live(EchoDatabase& db, int n, int64_t oldest, int64_t newest) {
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < {0}) "
+        "INSERT INTO module_live (ts,snapshot_id,action,pid,process_name,module_name,module_dir,"
+        "signed_state,signer,is_kernel) "
+        "SELECT {1} + (i * ({2} - {1})) / {0}, 1, 'loaded', 100, 'app.exe', 'a' || i || '.dll', "
+        "hex(zeroblob(60)), 'signed', 'MS', 0 FROM n",
+        n - 1, oldest, newest)));
+}
+
+void seed_process_live(EchoDatabase& db, int n, int64_t oldest, int64_t newest) {
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < {0}) "
+        "INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+        "SELECT {1} + (i * ({2} - {1})) / {0}, 1, 'started', i, 1, 'p' || i, "
+        "hex(zeroblob(80)), 'root' FROM n",
+        n - 1, oldest, newest)));
+}
+
+void seed_process_hourly_span(EchoDatabase& db, int n, int64_t oldest, int64_t newest) {
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < {0}) "
+        "INSERT INTO process_hourly (hour_ts,name,user,start_count,stop_count) "
+        "SELECT {1} + (i * ({2} - {1})) / {0}, 'p' || i, 'root', 1, 1 FROM n",
+        n - 1, oldest, newest)));
+}
+
+void set_mark(EchoDatabase& db, std::string_view source, int64_t mark) {
+    REQUIRE(db.set_config(std::format("rollup_{}_hourly_at", source), std::to_string(mark)));
+}
+
+int64_t scalar(EchoDatabase& db, const std::string& sql) {
+    auto q = db.execute_query(sql, 1);
+    REQUIRE(q.has_value());
+    REQUIRE(q->rows.size() == 1);
+    return std::stoll(q->rows[0][0]);
+}
+
+const auto kAlwaysTime = [] { return true; };
+
+// The ruled literals, pinned independently of the constants the engine derives them from: a
+// changed floor or batch is a changed product promise, and must show up as a failing test here
+// rather than silently moving every expectation with it (raw capture rows are never evicted
+// inside 24 h, hourly rows never inside 48 h, 1,000 rows per batch, 2 s per pass).
+static_assert(kBudgetRawFloorSec == 86400);
+static_assert(kBudgetHourlyFloorSec == 172800);
+static_assert(kBudgetBatchRows == 1000);
+static_assert(kBudgetPassDeadlineMs == 2000);
+// procperf_hourly is re-read by the daily app-perf sync for two completed UTC days plus today
+// (agents/core/src/sync_source_app_perf.cpp), and the server overwrites those days from what it
+// receives: evicting an hour inside that window shrinks an already-correct aggregate. 5 d covers
+// the 3 UTC days at any time of day with slack.
+static_assert(kBudgetProcPerfHourlyFloorSec == 432000);
+static_assert(kBudgetProcPerfHourlyFloorSec >= 4 * 86400);
+
+} // namespace
+
+TEST_CASE("run_budget: evicts the largest raw table first, oldest first, inside the preservation floors",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_main_"};
+    auto db = open_budget_db(tmp);
+    seed_tcp_live(db, 4000, kBudgetNow - 72 * 3600, kBudgetNow);
+    seed_module_live(db, 1000, kBudgetNow - 72 * 3600, kBudgetNow);
+    seed_process_live(db, 1000, kBudgetNow - 72 * 3600, kBudgetNow);
+    for (const char* src : {"tcp", "module", "process"})
+        set_mark(db, src, kBudgetNow - 2 * 3600);
+    REQUIRE(db.set_config("usage_hwm_id", "500"));
+
+    const int64_t tcp_recent_before = scalar(db, std::format("SELECT COUNT(*) FROM tcp_live WHERE ts >= {}", kRawFloor));
+    const int64_t data_before = db.storage_bytes().data_bytes();
+    const int64_t target = data_before - 256 * 1024;
+
+    const auto res = run_budget(db, kBudgetNow, target, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK_FALSE(res.deadline_hit);
+    CHECK_FALSE(res.exhausted);
+    CHECK(res.evicted_raw > 0);
+    CHECK(res.evicted_hourly == 0);
+    CHECK(res.data_bytes_after <= target);
+    CHECK(res.data_bytes_after == db.storage_bytes().data_bytes());
+
+    // tcp_live was the largest, so it is the only table touched ...
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == 4000 - res.evicted_raw);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM module_live") == 1000);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM process_live") == 1000);
+    // ... oldest first (ids ascend with ts), never anything newer than 24 h ...
+    CHECK(scalar(db, "SELECT MIN(id) FROM tcp_live") == 1 + res.evicted_raw);
+    CHECK(scalar(db, std::format("SELECT COUNT(*) FROM tcp_live WHERE ts >= {}", kRawFloor)) ==
+          tcp_recent_before);
+    // ... and the persisted counter equals what the batches returned.
+    CHECK(db.get_config("budget_evicted_raw_rows_total", "") == std::to_string(res.evicted_raw));
+    CHECK(db.get_config("budget_evicted_hourly_rows_total", "0") == "0");
+}
+
+TEST_CASE("run_budget: with nothing else to take it empties exactly the eligible raw rows",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_exhaust_"};
+    auto db = open_budget_db(tmp);
+    seed_tcp_live(db, 3000, kBudgetNow - 72 * 3600, kBudgetNow);
+    seed_process_live(db, 1000, kBudgetNow - 72 * 3600, kBudgetNow);
+    set_mark(db, "tcp", kBudgetNow - 2 * 3600);
+    set_mark(db, "process", kBudgetNow - 2 * 3600);
+    REQUIRE(db.set_config("usage_hwm_id", "500"));
+    const int64_t tcp_recent = scalar(db, std::format("SELECT COUNT(*) FROM tcp_live WHERE ts >= {}", kRawFloor));
+
+    const auto res = run_budget(db, kBudgetNow, /*target=*/0, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(res.exhausted);
+    CHECK_FALSE(res.deadline_hit);
+    CHECK(res.data_bytes_after > 0);
+    CHECK(budget_over_bytes(res.data_bytes_after, 0, 0) > 0);
+
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == tcp_recent); // only the newest 24 h left
+    // process_live: rows the usage fold has not read (id > hwm) survive even when old.
+    CHECK(scalar(db, "SELECT COUNT(*) FROM process_live WHERE id > 500") == 500);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM process_live WHERE id <= 500") == 0);
+}
+
+TEST_CASE("run_budget: the rollup mark is a floor when it is older than 24 h, and 0 means never rolled up",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_mark_"};
+    auto db = open_budget_db(tmp);
+    seed_tcp_live(db, 3000, kBudgetNow - 72 * 3600, kBudgetNow);
+    seed_module_live(db, 1000, kBudgetNow - 72 * 3600, kBudgetNow);
+    const int64_t mark = kBudgetNow - 30 * 3600; // the rollup is 30 h behind: older than the floor
+    set_mark(db, "tcp", mark);
+    // module has no mark at all: nothing is provably summarised.
+
+    const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(scalar(db, std::format("SELECT COUNT(*) FROM tcp_live WHERE ts < {}", mark)) == 0);
+    CHECK(scalar(db, std::format("SELECT COUNT(*) FROM tcp_live WHERE ts >= {}", mark)) > 1000);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM module_live") == 1000); // never touched
+}
+
+TEST_CASE("run_budget: already within target does nothing", "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_noop_"};
+    auto db = open_budget_db(tmp);
+    seed_tcp_live(db, 1000, kBudgetNow - 72 * 3600, kBudgetNow);
+    set_mark(db, "tcp", kBudgetNow - 2 * 3600);
+    const auto res = run_budget(db, kBudgetNow, db.storage_bytes().data_bytes() + 1, kAlwaysTime);
+    CHECK(res.evicted_raw == 0);
+    CHECK(res.evicted_hourly == 0);
+    CHECK_FALSE(res.exhausted);
+    CHECK_FALSE(res.failed);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == 1000);
+}
+
+TEST_CASE("run_budget with REAL aggregation never takes a row the rollup can still reach",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_real_"};
+    auto db = open_budget_db(tmp);
+    seed_tcp_live(db, 4000, kBudgetNow - 72 * 3600, kBudgetNow);
+    // No hand-seeded mark: run_aggregation writes it.
+    REQUIRE(run_aggregation(db, kBudgetNow) > 0);
+    const int64_t mark = std::stoll(db.get_config("rollup_tcp_hourly_at", "0"));
+    REQUIRE(mark > 0);
+    const int64_t reachable = scalar(db, std::format("SELECT COUNT(*) FROM tcp_live WHERE ts >= {}", mark));
+    const int64_t recent = scalar(db, std::format("SELECT COUNT(*) FROM tcp_live WHERE ts >= {}", kRawFloor));
+    REQUIRE(reachable > 0); // not vacuous: the open hour holds rows
+
+    const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(res.evicted_raw > 0);
+    CHECK(scalar(db, std::format("SELECT COUNT(*) FROM tcp_live WHERE ts >= {}", mark)) == reachable);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == recent);
+    // The summaries the rows were folded into are untouched.
+    CHECK(scalar(db, "SELECT COALESCE(SUM(connect_count),0) FROM tcp_hourly") > 0);
+}
+
+TEST_CASE("run_budget: rows the H11 rollup clamp skipped are evictable like retention prunes them",
+          "[echo][aggregator][budget]") {
+    // Documents the preservation contract's edge: after a long gap the rollup clamps its
+    // window to the last 2 h, so rows older than that were never summarised. Their timestamps
+    // are below the mark, so eviction treats them as the existing age-based retention already
+    // does, oldest first and only under size pressure. Fixing the clamp is a separate change.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_clamp_"};
+    auto db = open_budget_db(tmp);
+    seed_tcp_live(db, 4000, kBudgetNow - 4 * 86400, kBudgetNow);
+    (void)run_aggregation(db, kBudgetNow - 3 * 86400); // an old pass, then a 3-day gap
+    (void)run_aggregation(db, kBudgetNow);              // clamped to the last 2 h
+    const int64_t mark = std::stoll(db.get_config("rollup_tcp_hourly_at", "0"));
+    REQUIRE(mark > kRawFloor);
+    const int64_t recent = scalar(db, std::format("SELECT COUNT(*) FROM tcp_live WHERE ts >= {}", kRawFloor));
+
+    const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == recent);
+}
+
+TEST_CASE("run_budget: paused, errored and summary-less sources are never touched",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_exempt_"};
+    auto db = open_budget_db(tmp);
+    seed_tcp_live(db, 3000, kBudgetNow - 72 * 3600, kBudgetNow);
+    seed_module_live(db, 2000, kBudgetNow - 72 * 3600, kBudgetNow);
+    seed_process_live(db, 1000, kBudgetNow - 72 * 3600, kBudgetNow);
+    for (const char* src : {"tcp", "module", "process"})
+        set_mark(db, src, kBudgetNow - 2 * 3600);
+    REQUIRE(db.set_config("usage_hwm_id", "1000"));
+    // The registry source (raw capture rows only, no summary tier) and the usage tables, old and numerous.
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 1999) "
+        "INSERT INTO registry_live (ts,snapshot_id,action,record_key) "
+        "SELECT {} + i, 1, 'changed', 'k' || i FROM n",
+        kBudgetNow - 72 * 3600)));
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 1999) "
+        "INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) "
+        "SELECT {} + i, 1, 'open', i, 'exe' || i, 'u', {} FROM n",
+        kBudgetNow - 72 * 3600, kBudgetNow - 72 * 3600)));
+
+    // tcp paused, module errored (a value written outside the plugin), process enabled.
+    REQUIRE(db.set_config("tcp_enabled", "false"));
+    REQUIRE(db.set_config("module_enabled", "maybe"));
+
+    const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == 3000);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM module_live") == 2000);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM registry_live") == 2000);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM usage_live") == 2000);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM process_live") <
+          1000); // the one enabled source with a summary tier gave rows up
+    CHECK(res.exhausted);
+}
+
+TEST_CASE("run_budget: hourly rows only after the raw tier, never newer than 48 h, daily and monthly never",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_hourly_"};
+    auto db = open_budget_db(tmp);
+    const int64_t hourly_floor = kBudgetNow - kBudgetHourlyFloorSec;
+    seed_process_hourly_span(db, 3000, kBudgetNow - 120 * 3600, kBudgetNow);
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 999) "
+        "INSERT INTO module_hourly (hour_ts,module_name,signer,signed_state,is_kernel,load_count) "
+        "SELECT {} + i * 100, 'm' || i, 'MS', 'signed', 0, 1 FROM n",
+        kBudgetNow - 120 * 3600)));
+    REQUIRE(db.execute_sql(std::format(
+        "INSERT INTO process_daily (day_ts,name,user,start_count,stop_count) VALUES ({0},'old','root',1,1);"
+        "INSERT INTO process_monthly (month_ts,name,user,start_count,stop_count) VALUES ({0},'old','root',1,1)",
+        kBudgetNow - 200 * 86400)));
+    const int64_t proc_new = scalar(db, std::format("SELECT COUNT(*) FROM process_hourly WHERE hour_ts >= {}", hourly_floor));
+    // A raw row too, to show the raw tier is taken before any hourly row: rolled up and old.
+    seed_tcp_live(db, 1500, kBudgetNow - 72 * 3600, kBudgetNow);
+    set_mark(db, "tcp", kBudgetNow - 2 * 3600);
+    const int64_t tcp_recent = scalar(db, std::format("SELECT COUNT(*) FROM tcp_live WHERE ts >= {}", kRawFloor));
+
+    SECTION("a target the raw tier can meet leaves every hourly row alone") {
+        const auto res = run_budget(db, kBudgetNow, db.storage_bytes().data_bytes() - 64 * 1024, kAlwaysTime);
+        REQUIRE_FALSE(res.failed);
+        CHECK(res.evicted_raw > 0);
+        CHECK(res.evicted_hourly == 0);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM process_hourly") == 3000);
+    }
+    SECTION("once the raw tier is spent, the largest hourly table goes first and stops at 48 h") {
+        const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+        REQUIRE_FALSE(res.failed);
+        CHECK(res.exhausted);
+        CHECK(budget_over_bytes(res.data_bytes_after, 0, 0) > 0); // still over: reported, not hidden
+        CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == tcp_recent);
+        CHECK(res.evicted_hourly > 0);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM process_hourly") == proc_new);
+        CHECK(scalar(db, std::format("SELECT COUNT(*) FROM process_hourly WHERE hour_ts < {}", hourly_floor)) == 0);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM process_daily") == 1);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM process_monthly") == 1);
+        CHECK(db.get_config("budget_evicted_hourly_rows_total", "") == std::to_string(res.evicted_hourly));
+    }
+}
+
+TEST_CASE("run_budget: the largest hourly table is taken first", "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_hourly_order_"};
+    auto db = open_budget_db(tmp);
+    seed_process_hourly_span(db, 3000, kBudgetNow - 120 * 3600, kBudgetNow - 60 * 3600);
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 999) "
+        "INSERT INTO module_hourly (hour_ts,module_name,signer,signed_state,is_kernel,load_count) "
+        "SELECT {} + i * 100, 'm' || i, 'MS', 'signed', 0, 1 FROM n",
+        kBudgetNow - 120 * 3600)));
+    const auto res = run_budget(db, kBudgetNow, db.storage_bytes().data_bytes() - 32 * 1024, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(res.evicted_hourly > 0);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM module_hourly") == 1000); // the smaller table is spared
+    CHECK(scalar(db, "SELECT COUNT(*) FROM process_hourly") < 3000);
+}
+
+TEST_CASE("run_budget: the deadline is checked between batches", "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_deadline_"};
+    auto db = open_budget_db(tmp);
+    seed_tcp_live(db, 5000, kBudgetNow - 72 * 3600, kBudgetNow);
+    set_mark(db, "tcp", kBudgetNow - 2 * 3600);
+    int calls = 0;
+    const auto res = run_budget(db, kBudgetNow, 0, [&] { return ++calls <= 2; });
+    REQUIRE_FALSE(res.failed);
+    CHECK(res.deadline_hit);
+    CHECK_FALSE(res.exhausted);
+    CHECK(res.evicted_raw == 2 * kBudgetBatchRows);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == 5000 - 2 * kBudgetBatchRows);
+}
+
+TEST_CASE("budget_catch_up_after: only a deadline-limited pass over target arms, and it carries "
+          "the clock it was admitted with",
+          "[echo][aggregator][budget][chaos]") {
+    // The plugin cannot arm a catch-up deterministically through the C ABI (arming needs a real
+    // 2 s deadline hit and a free-function clock), so the decision is this pure function.
+    constexpr int64_t kTarget = 1000;
+    // A reading <= 0 is the legitimate dead-CMOS case: it must travel like any other, which is
+    // why `armed` is a separate field and not "admitted_now != 0".
+    for (const int64_t admitted : {int64_t{-5}, int64_t{0}, kBudgetNow, kEchoMaxPlausibleNow}) {
+        // bit 0 deadline_hit, bit 1 exhausted, bit 2 failed, bit 3 data above target.
+        // Exactly one row arms: deadline hit, not exhausted, not failed, over target.
+        for (int bits = 0; bits < 16; ++bits) {
+            INFO("admitted = " << admitted << ", bits = " << bits);
+            BudgetPassResult res;
+            res.deadline_hit = (bits & 1) != 0;
+            res.exhausted = (bits & 2) != 0;
+            res.failed = (bits & 4) != 0;
+            res.data_bytes_after = (bits & 8) != 0 ? kTarget + 1 : kTarget;
+            const auto next = budget_catch_up_after(res, kTarget, admitted);
+            if (bits == 0b1001) {
+                CHECK(next.armed);
+                CHECK(next.admitted_now == admitted); // the arming reading, unchanged
+            } else {
+                CHECK_FALSE(next.armed);
+                CHECK(next.admitted_now == 0);
+            }
+        }
+    }
+}
+
+TEST_CASE("run_budget: a catch-up slice keeps the arming clock, so a later forward step widens no floor",
+          "[echo][aggregator][budget][chaos]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_carry_"};
+    auto db = open_budget_db(tmp);
+    constexpr int64_t kStep = kEchoMinBigStepSec + 86400; // a forward step the guard would refuse
+    // 2,500 raw capture rows 25-58 h old (past the 24 h floor), two 23 h old (inside it), the
+    // rollup mark one hour behind the arming clock.
+    seed_tcp_live(db, 2500, kBudgetNow - 58 * 3600, kBudgetNow - 25 * 3600);
+    seed_tcp_live(db, 2, kBudgetNow - 23 * 3600, kBudgetNow - 23 * 3600);
+    set_mark(db, "tcp", kBudgetNow - 3600);
+
+    // The arming pass ran out of time with rows left, admitted at kBudgetNow.
+    int calls = 0;
+    const auto first = run_budget(db, kBudgetNow, 0, [&] { return ++calls <= 1; });
+    REQUIRE_FALSE(first.failed);
+    const auto latch = budget_catch_up_after(first, 0, kBudgetNow);
+    REQUIRE(latch.armed);
+    REQUIRE(latch.admitted_now == kBudgetNow);
+
+    // The wall clock then steps forward; the slice runs with the carried reading, not that one.
+    const int64_t fresh = kBudgetNow + kStep;
+    REQUIRE(latch.admitted_now != fresh);
+    const auto slice = run_budget(db, latch.admitted_now, 0, kAlwaysTime);
+    REQUIRE_FALSE(slice.failed);
+    CHECK(slice.exhausted); // everything past the arming clock's 24 h floor is gone ...
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == 2); // ... and the 23 h rows are kept
+    CHECK_FALSE(budget_catch_up_after(slice, 0, latch.admitted_now).armed); // the drain ended
+
+    // Positive control: the same rows go under the stepped clock, because its floor is the mark.
+    const auto stepped = run_budget(db, fresh, 0, kAlwaysTime);
+    REQUIRE_FALSE(stepped.failed);
+    CHECK(stepped.evicted_raw == 2);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == 0);
+}
+
+TEST_CASE("run_budget: a failing table is skipped and reported, the others still evict",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_fail_"};
+    auto db = open_budget_db(tmp);
+    seed_tcp_live(db, 3000, kBudgetNow - 72 * 3600, kBudgetNow);
+    seed_module_live(db, 1000, kBudgetNow - 72 * 3600, kBudgetNow);
+    set_mark(db, "tcp", kBudgetNow - 2 * 3600);
+    set_mark(db, "module", kBudgetNow - 2 * 3600);
+    const int64_t tcp_recent = scalar(db, std::format("SELECT COUNT(*) FROM tcp_live WHERE ts >= {}", kRawFloor));
+    const int64_t module_recent = scalar(db, std::format("SELECT COUNT(*) FROM module_live WHERE ts >= {}", kRawFloor));
+
+    SECTION("a candidate table that is gone") {
+        REQUIRE(db.execute_sql("DROP TABLE module_live"));
+        const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+        CHECK(res.failed);
+        CHECK_FALSE(res.exhausted); // the dropped table may still have held eligible rows
+        CHECK_FALSE(res.deadline_hit);
+        // One broken table must not stop eviction from the healthy one.
+        CHECK(res.evicted_raw > 0);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == tcp_recent);
+    }
+    SECTION("a delete that errors part-way") {
+        REQUIRE(db.execute_sql(
+            "CREATE TRIGGER yuzu_test_block BEFORE DELETE ON tcp_live WHEN OLD.local_port = 7 "
+            "BEGIN SELECT RAISE(ABORT, 'blocked'); END"));
+        const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+        CHECK(res.failed);
+        CHECK_FALSE(res.exhausted);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == 3000); // the failed batch rolled back
+        // module_live carried on; the persisted counter is exactly what its batches returned.
+        CHECK(res.evicted_raw > 0);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM module_live") == module_recent);
+        CHECK(db.get_config("budget_evicted_raw_rows_total", "none") == std::to_string(res.evicted_raw));
+    }
+    SECTION("nothing wrong") { // the positive control for the two sections above
+        const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+        CHECK_FALSE(res.failed);
+        CHECK(res.exhausted);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == tcp_recent);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM module_live") == module_recent);
+    }
+}
+
+TEST_CASE("run_budget: a clock excursion leaves no state that weakens a floor",
+          "[echo][aggregator][budget][chaos]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_clock_"};
+    auto db = open_budget_db(tmp);
+    seed_tcp_live(db, 3000, kBudgetNow - 72 * 3600, kBudgetNow);
+    const int64_t rows = scalar(db, "SELECT COUNT(*) FROM tcp_live");
+
+    SECTION("a rollup mark ahead of the clock proves nothing and its raw rows stay") {
+        // Written during a forward excursion: min(mark, now - 24 h) would otherwise be the whole
+        // 24 h floor, evicting rows that were never summarised.
+        set_mark(db, "tcp", kBudgetNow + 365 * 86400);
+        const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+        CHECK_FALSE(res.failed);
+        CHECK(res.exhausted); // nothing was eligible
+        CHECK(res.evicted_raw == 0);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == rows);
+        // Positive control: the same rows go once the mark is sane.
+        set_mark(db, "tcp", kBudgetNow - 2 * 3600);
+        CHECK(run_budget(db, kBudgetNow, 0, kAlwaysTime).evicted_raw > 0);
+    }
+    SECTION("an implausible clock fails the pass and evicts nothing") {
+        set_mark(db, "tcp", kBudgetNow - 2 * 3600);
+        const int64_t crazy = std::numeric_limits<int64_t>::max() / 4 + 1;
+        REQUIRE(crazy > kEchoMaxPlausibleNow);
+        const auto res = run_budget(db, crazy, 0, kAlwaysTime);
+        CHECK(res.failed);
+        CHECK_FALSE(res.exhausted);
+        CHECK(res.evicted_raw == 0);
+        CHECK(res.evicted_hourly == 0);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == rows);
+        // Positive control: the same data under a sane clock evicts.
+        CHECK(run_budget(db, kBudgetNow, 0, kAlwaysTime).evicted_raw > 0);
+    }
+    SECTION("the largest plausible clock is still honoured") {
+        set_mark(db, "tcp", kBudgetNow - 2 * 3600);
+        CHECK_FALSE(run_budget(db, kEchoMaxPlausibleNow, 0, kAlwaysTime).failed);
+    }
+}
+
+TEST_CASE("run_budget: procperf_hourly keeps the hours the app-perf sync still re-sends",
+          "[echo][aggregator][budget][chaos]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_procperf_"};
+    auto db = open_budget_db(tmp);
+    // Hourly rows 3-4 d old (outside the 48 h floor every other source gets) for tcp and
+    // procperf, plus procperf rows 6 d old, which are past its own 5 d floor.
+    const int64_t three_days = kBudgetNow - 3 * 86400;
+    const int64_t six_days = kBudgetNow - 6 * 86400;
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 23) "
+        "INSERT INTO tcp_hourly (hour_ts,remote_addr,remote_port,proto,process_name,connect_count,"
+        "disconnect_count) SELECT {} - i * 3600, '203.0.113.1', 443, 'tcp', 'curl', 1, 0 FROM n",
+        three_days)));
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 23) "
+        "INSERT INTO procperf_hourly (hour_ts,name,version,is_kthread,samples) "
+        "SELECT {} - i * 3600, 'app' || (i % 3), '', 0, 10 FROM n",
+        three_days)));
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 19) "
+        "INSERT INTO procperf_hourly (hour_ts,name,version,is_kthread,samples) "
+        "SELECT {} - i * 3600, 'old' || (i % 3), '', 0, 10 FROM n",
+        six_days)));
+
+    const auto res = run_budget(db, kBudgetNow, /*target=*/0, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(res.exhausted);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == 0); // 3 d old: past the 48 h floor
+    CHECK(scalar(db, "SELECT COUNT(*) FROM procperf_hourly WHERE name LIKE 'app%'") == 24);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM procperf_hourly WHERE name LIKE 'old%'") == 0);
+}
+
+TEST_CASE("run_budget: an enabled source's hourly rows go while a paused source's stay",
+          "[echo][aggregator][budget]") {
+    // The paused/errored exemption on the HOURLY tier, not only the raw one.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_hourly_exempt_"};
+    auto db = open_budget_db(tmp);
+    const int64_t old_hour = kBudgetNow - 120 * 3600;
+    seed_process_hourly_span(db, 1000, old_hour, old_hour + 50 * 3600);
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 999) "
+        "INSERT INTO tcp_hourly (hour_ts,remote_addr,remote_port,proto,process_name,connect_count,"
+        "disconnect_count) SELECT {} + i, '203.0.113.1', 443, 'tcp', 'curl', 1, 0 FROM n",
+        old_hour)));
+    REQUIRE(db.set_config("tcp_enabled", "false")); // paused
+
+    const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(res.exhausted);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == 1000);   // paused: untouched
+    CHECK(scalar(db, "SELECT COUNT(*) FROM process_hourly") == 0);  // enabled: taken
+}
+
+TEST_CASE("run_budget: eviction counters accumulate across passes batch by batch",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_counters_"};
+    auto db = open_budget_db(tmp);
+    seed_tcp_live(db, 4000, kBudgetNow - 72 * 3600, kBudgetNow);
+    set_mark(db, "tcp", kBudgetNow - 2 * 3600);
+    const int64_t d0 = db.storage_bytes().data_bytes();
+    const auto a = run_budget(db, kBudgetNow, d0 - 64 * 1024, kAlwaysTime);
+    REQUIRE_FALSE(a.failed);
+    const auto b = run_budget(db, kBudgetNow, db.storage_bytes().data_bytes() - 64 * 1024, kAlwaysTime);
+    REQUIRE_FALSE(b.failed);
+    REQUIRE(a.evicted_raw > 0);
+    REQUIRE(b.evicted_raw > 0);
+    CHECK(db.get_config("budget_evicted_raw_rows_total", "") == std::to_string(a.evicted_raw + b.evicted_raw));
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == 4000 - a.evicted_raw - b.evicted_raw);
+}
+
+TEST_CASE("budget_rank_probe_sql ranks by two index searches, never a scan", "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_plan_"};
+    auto db = open_budget_db(tmp);
+    for (const char* table : {"tcp_live", "process_hourly"}) {
+        auto plan = db.execute_query("EXPLAIN QUERY PLAN " + budget_rank_probe_sql(table), 50);
+        REQUIRE(plan.has_value());
+        REQUIRE_FALSE(plan->rows.empty());
+        bool searched = false;
+        for (const auto& row : plan->rows) {
+            const std::string& detail = row.back();
+            INFO(table << ": " << detail);
+            // The outer SELECT has no FROM and plans as "SCAN CONSTANT ROW"; a scan of the
+            // table itself would plan as "SCAN <table>".
+            CHECK(detail.find(std::string{"SCAN "} + table) == std::string::npos);
+            CHECK((detail.find("SCAN") == std::string::npos || detail == "SCAN CONSTANT ROW"));
+            searched = searched || detail.find(std::string{"SEARCH "} + table) != std::string::npos;
+        }
+        CHECK(searched);
+    }
+    // An empty table ranks 0, not NULL.
+    CHECK(scalar(db, budget_rank_probe_sql("tcp_live")) == 0);
+    seed_tcp_live(db, 10, 1000, 2000);
+    CHECK(scalar(db, budget_rank_probe_sql("tcp_live")) == 10);
+}
+
+TEST_CASE("budget: a reader that pins the WAL makes the checkpoint report busy, and the overage clears after it",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_pinned_"};
+    auto db = open_budget_db(tmp);
+    seed_tcp_live(db, 100, 1000, 2000);
+    (void)db.checkpoint(CheckpointMode::kTruncate);
+
+    yuzu::test::SqliteHandleOwner<sqlite3> reader;
+    REQUIRE(sqlite3_open(tmp.path.string().c_str(), &reader.db) == SQLITE_OK);
+    // An explicit read transaction: it holds its WAL snapshot until it ends.
+    REQUIRE(sqlite3_exec(reader.db, "BEGIN; SELECT COUNT(*) FROM tcp_live;", nullptr, nullptr, nullptr) ==
+            SQLITE_OK);
+
+    // A write burst larger than the WAL allowance lands while the reader is pinned. The disk
+    // cost is the point of the case: the WAL has to outgrow the production 16 MiB allowance for
+    // "busy, not reclaimed" to mean anything. Twenty ~1 MiB rows get there with the fewest rows.
+    seed_tcp_live(db, 20, 3000, 4000, 524288);
+    const auto pinned = db.storage_bytes();
+    REQUIRE(pinned.wal_bytes > kEchoWalAllowanceBytes);
+
+    // Busy comes back instead of a wait: the pass must not sleep out the 5 s busy timeout with
+    // the database lock held. The deterministic proof is the result plus the timeout being put
+    // back after the call (it is dropped to 0 inside), not a clock reading.
+    CHECK(db.checkpoint(CheckpointMode::kTruncate) == CheckpointResult::kBusy);
+    CHECK(scalar(db, "PRAGMA busy_timeout") == 5000);
+    CHECK(db.storage_bytes().wal_bytes >= pinned.wal_bytes); // nothing was reclaimed
+
+    // The budget is hard for data pages and soft for the WAL: with the WAL pinned, data + WAL is
+    // over a budget between the two, and the overage is reported, not hidden.
+    const int64_t budget = pinned.data_bytes() + kEchoWalAllowanceBytes;
+    CHECK(budget_over_bytes(pinned.data_bytes(), pinned.wal_bytes, budget) > 0);
+
+    // An eviction pass must not keep committing batches the pinned log cannot recycle: it stops
+    // after the batch that observed the WAL over its allowance -- not exhausted, no deadline, so
+    // no catch-up is armed -- and the next maintenance pass retries once the reader is gone.
+    seed_tcp_live(db, 3000, 1000, 2000);
+    set_mark(db, "tcp", kBudgetNow - 2 * 3600);
+    const auto paused = run_budget(db, kBudgetNow, /*target=*/0, kAlwaysTime);
+    CHECK_FALSE(paused.failed);
+    CHECK_FALSE(paused.exhausted);
+    CHECK_FALSE(paused.deadline_hit);
+    CHECK(paused.evicted_raw == kBudgetBatchRows);
+
+    // After the reader ends, the next pass truncates the WAL and the overage returns to 0.
+    REQUIRE(sqlite3_exec(reader.db, "ROLLBACK", nullptr, nullptr, nullptr) == SQLITE_OK);
+    CHECK(db.checkpoint(CheckpointMode::kTruncate) == CheckpointResult::kOk);
+    CHECK(scalar(db, "PRAGMA busy_timeout") == 5000);
+    const auto after = db.storage_bytes();
+    CHECK(after.wal_bytes == 0);
+    CHECK(budget_over_bytes(after.data_bytes(), after.wal_bytes, budget) == 0);
+}
+
+TEST_CASE("vacuum_decision: run only when every condition holds", "[echo][aggregator][budget]") {
+    constexpr int64_t kMiB = 1024 * 1024;
+    constexpr int64_t kNow = 1'700'000'000;
+    const int64_t data = 200 * kMiB, target = 234 * kMiB, file = 1000 * kMiB, freelist = 500 * kMiB;
+    const int64_t disk = 2 * data;
+    auto decide = [&](int64_t av, int64_t d, int64_t fl, int64_t free_disk, int64_t deferred_at) {
+        return vacuum_decision(av, d, target, fl, file, free_disk, deferred_at, kNow,
+                               /*eviction_exhausted=*/false);
+    };
+    CHECK(decide(0, data, freelist, disk, 0) == VacuumAction::kRun);
+    CHECK(decide(2, data, freelist, disk, 0) == VacuumAction::kSkip);            // already incremental
+    CHECK(decide(0, target + 1, freelist, disk, 0) == VacuumAction::kSkip);      // not yet under target
+    CHECK(decide(0, data, 10 * kMiB, disk, 0) == VacuumAction::kSkip);           // small freelist
+    CHECK(decide(0, data, 200 * kMiB, disk, 0) == VacuumAction::kSkip);          // < a quarter of the file
+    CHECK(decide(0, data, 250 * kMiB, disk, 0) == VacuumAction::kRun);           // exactly a quarter
+    CHECK(decide(0, data, freelist, disk - 1, 0) == VacuumAction::kDefer);       // free disk < 2x data
+    CHECK(decide(0, data, freelist, disk, kNow - 3600) == VacuumAction::kSkip);  // deferred < 24 h ago
+    CHECK(decide(0, data, freelist, disk - 1, kNow - 3600) == VacuumAction::kSkip); // still short: retry daily
+    CHECK(decide(0, data, freelist, disk, kNow - 86400) == VacuumAction::kRun);  // a day later
+    CHECK(decide(0, data, freelist, disk - 1, kNow - 86400) == VacuumAction::kDefer);
+    CHECK(decide(0, data, freelist, disk, kNow - 86399) == VacuumAction::kSkip); // one second short
+    // A small file needs the 32 MiB freelist floor, not a quarter.
+    CHECK(vacuum_decision(0, 10 * kMiB, 100 * kMiB, 20 * kMiB, 40 * kMiB, 1000 * kMiB, 0, kNow,
+                          false) == VacuumAction::kSkip);
+    CHECK(vacuum_decision(0, 10 * kMiB, 100 * kMiB, 32 * kMiB, 100 * kMiB, 1000 * kMiB, 0, kNow,
+                          false) == VacuumAction::kRun);
+}
+
+TEST_CASE("vacuum_decision: a deferral marker ahead of the clock is stale, not recent",
+          "[echo][aggregator][budget][chaos]") {
+    // A marker written during a forward clock excursion has a NEGATIVE age once the clock
+    // corrects; read as "deferred recently" it would hold the conversion off until the clock
+    // catches up to it (up to a year, or for ever at INT64_MAX).
+    constexpr int64_t kMiB = 1024 * 1024;
+    constexpr int64_t kNow = 1'700'000'000;
+    const auto decide = [&](int64_t deferred_at, int64_t free_disk) {
+        return vacuum_decision(0, 200 * kMiB, 234 * kMiB, 500 * kMiB, 1000 * kMiB, free_disk,
+                               deferred_at, kNow, /*eviction_exhausted=*/false);
+    };
+    constexpr int64_t kDisk = 400 * kMiB;
+    for (const int64_t at : {int64_t{0}, kNow - 86401, kNow + 1, kNow + 365 * 86400,
+                             std::numeric_limits<int64_t>::max()}) {
+        INFO("deferred_at = " << at);
+        CHECK(decide(at, kDisk) == VacuumAction::kRun);
+        CHECK(decide(at, kDisk - 1) == VacuumAction::kDefer); // still gated by the disk check
+    }
+    CHECK(decide(kNow - 86399, kDisk) == VacuumAction::kSkip); // a genuinely recent marker holds
+    CHECK(decide(kNow, kDisk) == VacuumAction::kSkip);         // recorded this very second
+}
+
+TEST_CASE("deferred_marker_reading: a failed-write copy outranks an older stored marker",
+          "[echo][aggregator][budget][chaos]") {
+    // After a failed marker write the persisted value can only be older than the in-memory
+    // attempt time. A stale positive stored marker must not hide it, or a database that cannot
+    // store the marker repeats a failed conversion every maintenance pass instead of daily.
+    constexpr int64_t kMiB = 1024 * 1024;
+    constexpr int64_t kT = 1'700'000'000;
+    const auto decide = [&](int64_t stored, int64_t copy, int64_t now) {
+        return vacuum_decision(0, 200 * kMiB, 234 * kMiB, 500 * kMiB, 1000 * kMiB, 400 * kMiB,
+                               deferred_marker_reading(stored, copy), now,
+                               /*eviction_exhausted=*/false);
+    };
+    // The attempt at kT failed to persist over an expired stored marker; the next pass is 900 s on.
+    CHECK(decide(kT - 86401, kT, kT + 900) == VacuumAction::kSkip);
+    // Controls: the expired stored marker alone re-admits; a stored marker of kT holds.
+    CHECK(decide(kT - 86401, 0, kT + 900) == VacuumAction::kRun);
+    CHECK(decide(kT, 0, kT + 900) == VacuumAction::kSkip);
+    // A stored marker AHEAD of the clock (a forward excursion) must not outrank a sane copy:
+    // max() would pick it, vacuum_decision would discard it as stale, and every pass would run.
+    CHECK(decide(kT + 365 * 86400, kT, kT + 900) == VacuumAction::kSkip);
+    CHECK(decide(kT + 365 * 86400, 0, kT + 900) == VacuumAction::kRun);
+    // The copy is held for a day, then the conversion is retried.
+    CHECK(decide(kT - 86401, kT, kT + 86400) == VacuumAction::kRun);
+    // The precedence itself.
+    CHECK(deferred_marker_reading(0, 0) == 0);
+    CHECK(deferred_marker_reading(5, 0) == 5);
+    CHECK(deferred_marker_reading(0, 7) == 7);
+    CHECK(deferred_marker_reading(5, 7) == 7);
+    CHECK(deferred_marker_reading(9, 7) == 7);
+}
+
+TEST_CASE("vacuum_decision: exhausted eviction above target no longer blocks the conversion",
+          "[echo][aggregator][budget][chaos]") {
+    // 300 MiB of used data against a 234 MiB target, none of it evictable (exempt tables, the
+    // newest 24 h): waiting for the data to drop under target waits for ever, so the file keeps
+    // its 2 GiB freelist. Once eviction reports it has nothing left, the conversion may run.
+    constexpr int64_t kMiB = 1024 * 1024;
+    constexpr int64_t kNow = 1'700'000'000;
+    const int64_t data = 300 * kMiB, target = 234 * kMiB, freelist = 2048 * kMiB,
+                  file = 2355 * kMiB, disk = 10240 * kMiB;
+    const auto decide = [&](int64_t av, int64_t free_disk, bool exhausted) {
+        return vacuum_decision(av, data, target, freelist, file, free_disk, 0, kNow, exhausted);
+    };
+    CHECK(decide(0, disk, false) == VacuumAction::kSkip); // eviction may still shrink it
+    CHECK(decide(0, disk, true) == VacuumAction::kRun);   // nothing left to evict
+    CHECK(decide(0, 500 * kMiB, true) == VacuumAction::kDefer); // the 2x free-disk gate stands
+    CHECK(decide(2, disk, true) == VacuumAction::kSkip);        // already incremental
+    // Under target the flag is irrelevant.
+    CHECK(vacuum_decision(0, 200 * kMiB, target, freelist, file, disk, 0, kNow, false) ==
+          VacuumAction::kRun);
+}
+
+TEST_CASE("parse_budget_bytes accepts whole bytes at or above the minimum only",
+          "[echo][aggregator][budget]") {
+    CHECK_FALSE(parse_budget_bytes("33554431").has_value());
+    CHECK_FALSE(parse_budget_bytes("-1").has_value());
+    CHECK_FALSE(parse_budget_bytes("1e9").has_value());
+    CHECK_FALSE(parse_budget_bytes("32MiB").has_value());
+    CHECK_FALSE(parse_budget_bytes("").has_value());
+    CHECK_FALSE(parse_budget_bytes("+33554432").has_value());
+    CHECK_FALSE(parse_budget_bytes(" 33554432").has_value());
+    CHECK_FALSE(parse_budget_bytes("33554432.0").has_value());
+    CHECK_FALSE(parse_budget_bytes("99999999999999999999").has_value()); // overflows int64
+    CHECK_FALSE(parse_budget_bytes("9223372036854775808").has_value());
+    REQUIRE(parse_budget_bytes("33554432").has_value());
+    CHECK(*parse_budget_bytes("33554432") == 33554432);
+    REQUIRE(parse_budget_bytes("262144000").has_value());
+    CHECK(*parse_budget_bytes("262144000") == kEchoDbBudgetBytesDefault);
+    CHECK(*parse_budget_bytes("9223372036854775807") == INT64_MAX);
+    CHECK(kEchoDbBudgetBytesMin == 33554432);
+}
+
+TEST_CASE("budget_from_config: an unreadable setting is unknown, never the default",
+          "[echo][aggregator][budget][chaos]") {
+    using Stored = std::expected<std::optional<std::string>, std::string>;
+    // The read FAILED: the caller must skip the pass, because substituting 250 MiB for a raised
+    // budget would delete down to the smaller target.
+    CHECK_FALSE(budget_from_config(Stored{std::unexpected(std::string{"disk I/O error"})}).has_value());
+    // Read fine, nothing stored (never configured): the default.
+    REQUIRE(budget_from_config(Stored{std::optional<std::string>{}}).has_value());
+    CHECK(*budget_from_config(Stored{std::optional<std::string>{}}) == kEchoDbBudgetBytesDefault);
+    // Stored, but edited outside the plugin into something unusable: the default, not "no budget".
+    CHECK(*budget_from_config(Stored{std::optional<std::string>{"abc"}}) == kEchoDbBudgetBytesDefault);
+    CHECK(*budget_from_config(Stored{std::optional<std::string>{"33554431"}}) == kEchoDbBudgetBytesDefault);
+    CHECK(*budget_from_config(Stored{std::optional<std::string>{""}}) == kEchoDbBudgetBytesDefault);
+    // A valid stored value is itself.
+    REQUIRE(budget_from_config(Stored{std::optional<std::string>{"1073741824"}}).has_value());
+    CHECK(*budget_from_config(Stored{std::optional<std::string>{"1073741824"}}) == 1073741824);
+    CHECK(*budget_from_config(Stored{std::optional<std::string>{"33554432"}}) == kEchoDbBudgetBytesMin);
+}
+
+TEST_CASE("budget eligibility: the evictable source sets are pinned so a new source is a decision",
+          "[echo][aggregator][budget]") {
+    // Drift guard, like the #538 diff_state_key guard: eligibility is derived from the schema
+    // registry, so a new capture source with a live tier and a rollup would become evictable the
+    // day it is registered. Pin both sets to literals so adding one fails here and forces the
+    // choice: raw rows that ARE the record (netconn, power, removable, registry, netqual) must
+    // stay out, summarised ones may join.
+    const auto sorted = [](std::vector<std::string> v) {
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    CHECK(sorted(budget_raw_eligible_sources()) ==
+          sorted({"process", "tcp", "service", "user", "perf", "procperf", "module", "software",
+                  "arp", "dns", "mapdrive"}));
+    CHECK(sorted(budget_hourly_eligible_sources()) ==
+          sorted({"process", "tcp", "service", "perf", "procperf", "module", "arp", "dns",
+                  "mapdrive"}));
 }

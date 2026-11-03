@@ -590,12 +590,12 @@ TEST_CASE("capability catalogue: firmware_posture classifies `firmware` and refu
 /// class, so without this pin a silent change to `Mutating` or `Security`
 /// ships green (an orchestrator probe confirmed it). Appended at the end of
 /// the file so sibling plugins' pins do not collide textually.
-TEST_CASE("capability catalogue: runtimes.dotnet and runtimes.jvm pin their exact "
+TEST_CASE("capability catalogue: runtimes.dotnet, runtimes.jvm and runtimes.python pin their exact "
           "classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_runtimes();
-    REQUIRE(rows.size() == 2);
-    for (const auto action : {"dotnet", "jvm"}) {
+    REQUIRE(rows.size() == 3);
+    for (const auto action : {"dotnet", "jvm", "python"}) {
         const auto it =
             std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
         REQUIRE(it != rows.end());

@@ -13,7 +13,8 @@
 ///   pkg_inventory.store_packages            active snaps/flatpaks (ecosystems `snap`, `flatpak`)
 ///   windows_optional_features.list          every DISM feature, state in `version`
 ///   msi_packages.list_inventory             machine-context MSI products (ecosystem `msi`)
-///   middleware.ibm_mq   installed IBM MQ (ecosystem ibm_mq; title->name, vendor->publisher from the product table)
+///   runtimes.python                         installed Python interpreters (ecosystem `python`)
+///   middleware.ibm_mq                       installed IBM MQ (ecosystem `ibm_mq`; name and publisher from the product table)
 /// Every row carries `source` = "<plugin>.<action>". NO per-user data (machine
 /// scope only — no PII).
 
@@ -40,7 +41,7 @@ struct SwEntry {
     std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
     std::string kind;      // "package" | "app" | "pkg" | "feat"
-    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi|python
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
@@ -146,6 +147,14 @@ YUZU_EXPORT AdaptedRows parse_pkg_inventory_store_packages_output(const std::str
 /// is skipped.
 YUZU_EXPORT AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out,
                                                                  ConstrainedPolicy policy);
+
+/// Adapt `runtimes` `python` output (`status|python|<level>|...` plus five-token
+/// `python|<flavour>|<version or ->|<install_path or ->|<vendor or ->`). Each row becomes
+/// {name=Python, kind=app, ecosystem=python}; `-` version -> empty, flavour/path/vendor dropped.
+/// On Linux the version is major.minor only (the patch level needs the interpreter). The
+/// collector's table row uses ConstrainedPolicy::drop_source: a `constrained` answer withholds
+/// these rows (Status::withheld) and the cycle continues; `unsupported` is skipped.
+YUZU_EXPORT AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPolicy policy);
 
 /// Adapt `windows_optional_features` `list` output (`feature|<name>|<state>|<0/1>`):
 /// EVERY feature becomes {kind=feat, ecosystem=optional_feature} with the DISM

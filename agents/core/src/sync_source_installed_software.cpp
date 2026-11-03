@@ -313,6 +313,12 @@ const InventoryAction kInventoryActions[] = {
     {.plugin = "msi_packages",
      .action = "list_inventory",
      .adapt = parse_msi_packages_list_inventory_output},
+    // Metadata-only source whose constraint is a host fact (an NFS /usr/local, a cap, an access-
+    // denied registry key): a constrained answer withholds just the python rows, not the cycle.
+    {.plugin = "runtimes",
+     .action = "python",
+     .adapt = parse_runtimes_python_output,
+     .constrained = ConstrainedPolicy::drop_source},
     // Metadata-only source whose steady-state constraint is a permission fact: a constrained
     // answer drops just that source (rows withheld) instead of failing the whole cycle.
     {.plugin = "middleware",
@@ -484,6 +490,33 @@ AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out,
         entries.push_back(std::move(e));
         return true;
     }, policy);
+}
+
+AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPolicy policy) {
+    // python|<flavour>|<version or ->|<install_path or ->|<vendor or ->, one row per interpreter the
+    // runtimes plugin found at the standard machine roots (agents/plugins/runtimes/src/
+    // runtimes_python_parsers.hpp). The status row is the shared inventory grammar. Every row
+    // becomes one {name Python, kind app, ecosystem python} entry whose version is the row's
+    // (`-` = unknown -> empty; on Linux it is major.minor, the patch level is not available there).
+    // The flavour, path and vendor have no installed_software slot and are dropped. A constrained
+    // status withholds these rows only: see the table row's ConstrainedPolicy::drop_source.
+    // The producer escapes a literal pipe in the free-text fields (runtimes_parsers.hpp
+    // field_or_dash -> safe_output_field gives `\|`), so the split is escape-aware: width stays
+    // strict (five logical fields) and only the version, which is dotted digits by construction
+    // on every leg, is stored, so no unescape is needed.
+    return adapt_pkg_inventory(out, "python",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
+        if (tok[0] != "python" || tok.size() != 5)
+            return false;
+        SwEntry e;
+        e.name = "Python";
+        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
+        e.kind = "app";
+        e.ecosystem = "python";
+        entries.push_back(std::move(e));
+        return true;
+    }, policy, /*escaped=*/true);
 }
 
 AdaptedRows parse_middleware_output(const std::string& out, std::string_view action,
