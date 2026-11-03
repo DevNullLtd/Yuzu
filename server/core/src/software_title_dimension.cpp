@@ -633,8 +633,8 @@ void SoftwareTitleDimension::refresh_gauges() {
     last_pack_version_label_ = pack_version;
 }
 
-TickResult SoftwareTitleDimension::run_tick(const std::function<bool()>& cancelled,
-                                            int max_passes, std::chrono::seconds tick_budget) {
+TickResult SoftwareTitleDimension::run_tick(const std::function<bool()>& cancelled, int max_passes,
+                                            std::chrono::seconds tick_budget) {
     TickResult tick;
     const auto stop = [&] { return cancelled && cancelled(); };
     const auto tick_deadline = std::chrono::steady_clock::now() + tick_budget;

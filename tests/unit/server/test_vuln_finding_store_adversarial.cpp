@@ -733,11 +733,12 @@ TEST_CASE("ADVERSARIAL: VulnFindingStore's advisory lock key is namespaced away 
     // A holds the software-inventory-style key (blocking lock; unheld → returns at
     // once). pg_advisory_xact_lock returns void, so we don't route it through the
     // try-lock witness helper.
-    REQUIRE(yuzu::server::pg::exec_params(
-                leaseA.get(),
-                "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || $1, 0))",
-                std::vector<std::string>{agent})
-                .status() == PGRES_TUPLES_OK);
+    REQUIRE(
+        yuzu::server::pg::exec_params(
+            leaseA.get(),
+            "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || $1, 0))",
+            std::vector<std::string>{agent})
+            .status() == PGRES_TUPLES_OK);
     // B try-locks the namespaced vuln key — disjoint → TRUE.
     CHECK(try_xact_lock(
         leaseB.get(),

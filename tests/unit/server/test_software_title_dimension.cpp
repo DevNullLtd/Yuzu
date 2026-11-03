@@ -558,7 +558,8 @@ TEST_CASE("owner tick pages through a backlog and reports a capped tick and a sp
         CHECK_FALSE(rest.capped); // a short page is never capped, even at the cap
     }
     SECTION("an exhausted tick budget stops after the first full page and reports capped") {
-        for (const auto budget : {std::chrono::seconds{0}, kMinLaterPassBudget - std::chrono::seconds{1}}) {
+        for (const auto budget :
+             {std::chrono::seconds{0}, kMinLaterPassBudget - std::chrono::seconds{1}}) {
             INFO("tick budget " << budget.count() << " s");
             const auto t = owner.run_tick({}, kMaxPassesPerTick, budget);
             CHECK_FALSE(t.errored);
@@ -577,7 +578,8 @@ TEST_CASE("owner tick pages through a backlog and reports a capped tick and a sp
     }
     SECTION("a tick budget with the minimum left starts the later pass") {
         // Generous headroom over the minimum: the first page only has to finish well inside it.
-        const auto t = owner.run_tick({}, kMaxPassesPerTick, kMinLaterPassBudget + std::chrono::seconds{30});
+        const auto t =
+            owner.run_tick({}, kMaxPassesPerTick, kMinLaterPassBudget + std::chrono::seconds{30});
         CHECK_FALSE(t.errored);
         CHECK(t.passes == 2); // the second page is short: the backlog is gone
         CHECK(t.processed == kPassLimit + 1);
@@ -1037,7 +1039,8 @@ TEST_CASE("registry writers follow the invalidation contract: a change stales wh
     triple(pool, "Other Gadget", "Elsewhere", "windows", 3);
     triple(pool, "Third Tool", "Nobody Three", "windows", 1); // no alias: unnormalized
     const auto p1 = reg.upsert_product("nobody:mystery tool", "nobody", "mystery tool", "", "");
-    const auto p2 = reg.upsert_product("elsewhere:other gadget", "elsewhere", "other gadget", "", "");
+    const auto p2 =
+        reg.upsert_product("elsewhere:other gadget", "elsewhere", "other gadget", "", "");
     REQUIRE(p1.has_value());
     REQUIRE(p2.has_value());
     REQUIRE(reg.upsert_alias("curated:windows", "mystery tool", "nobody", *p1, "curated", 1.0));
@@ -1092,7 +1095,8 @@ TEST_CASE("each registry writer waits for a pass in flight and its invalidation 
     REQUIRE_FALSE(current.empty());
     // The product the alias will point at exists before the pass is parked, so the alias writer
     // is the only registry write in flight in its section.
-    const auto existing = reg.upsert_product("nobody:mystery tool", "nobody", "mystery tool", "", "");
+    const auto existing =
+        reg.upsert_product("nobody:mystery tool", "nobody", "mystery tool", "", "");
     REQUIRE(existing.has_value());
     sql(pool, "UPDATE product_registry_store.title_dimension SET pack_version = '" + current + "'");
 
@@ -1104,8 +1108,9 @@ TEST_CASE("each registry writer waits for a pass in flight and its invalidation 
         auto pass = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(pass);
         held(pass.get(), "BEGIN");
-        held(pass.get(),
-             "SELECT pg_advisory_xact_lock(hashtextextended('software_normalization', 0))");
+        held(pass.get(), ("SELECT pg_advisory_xact_lock(hashtextextended('" +
+                          std::string(kNormalizationLockKey) + "', 0))")
+                             .c_str());
         auto landed = std::async(std::launch::async, writer);
         // Wait until the writer is queued on the lock (the shared helper polls pg_stat_activity
         // for this database's advisory-lock waiters), then let the pass finish the way the race
@@ -1113,9 +1118,9 @@ TEST_CASE("each registry writer waits for a pass in flight and its invalidation 
         // and commits. COMMIT runs before any assertion so a failure cannot leave the writer
         // parked.
         const bool queued = yuzu::test::wait_for_lock_waiter(pool);
-        held(pass.get(), ("UPDATE product_registry_store.title_dimension SET pack_version = '" +
-                          current + "'")
-                             .c_str());
+        held(pass.get(),
+             ("UPDATE product_registry_store.title_dimension SET pack_version = '" + current + "'")
+                 .c_str());
         held(pass.get(), "COMMIT");
         REQUIRE(queued);
         REQUIRE(landed.wait_for(std::chrono::seconds{20}) == std::future_status::ready);
@@ -1129,9 +1134,11 @@ TEST_CASE("each registry writer waits for a pass in flight and its invalidation 
     SECTION("upsert_product") {
         // A changed attribute: the row resolved to the product goes stale. (Resolve the title
         // to the product first so a row exists to be marked.)
-        REQUIRE(reg.upsert_alias("curated:windows", "mystery tool", "nobody", *existing, "curated", 1.0));
+        REQUIRE(reg.upsert_alias("curated:windows", "mystery tool", "nobody", *existing, "curated",
+                                 1.0));
         REQUIRE(owner.run_pass().processed == 1);
-        sql(pool, "UPDATE product_registry_store.title_dimension SET pack_version = '" + current + "'");
+        sql(pool,
+            "UPDATE product_registry_store.title_dimension SET pack_version = '" + current + "'");
         section_writer([&] {
             return reg.upsert_product("nobody:mystery tool", "nobody", "mystery tool", "pro", "")
                 .has_value();
@@ -1153,7 +1160,9 @@ TEST_CASE("a full inventory report from an agent named like the normalisation lo
     auto pass = pool.try_acquire_for(std::chrono::seconds{5});
     REQUIRE(pass);
     held(pass.get(), "BEGIN");
-    held(pass.get(), "SELECT pg_advisory_xact_lock(hashtextextended('software_normalization', 0))");
+    held(pass.get(), ("SELECT pg_advisory_xact_lock(hashtextextended('" +
+                      std::string(kNormalizationLockKey) + "', 0))")
+                         .c_str());
 
     // `software_normalization` is a valid agent id; its replace lock must be a different key.
     const std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", "2026-01-01"}};

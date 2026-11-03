@@ -73,8 +73,8 @@
 #include <libpq-fe.h> // PGconn: the static reads below take a caller-pinned connection (see
                       // pg_migration_runner.hpp - include libpq, never re-declare pg_conn)
 
-#include <cstdint>
 #include <chrono>
+#include <cstdint>
 #include <expected>
 #include <optional>
 #include <string>

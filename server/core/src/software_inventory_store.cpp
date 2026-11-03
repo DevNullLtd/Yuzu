@@ -768,7 +768,8 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         // could make that job's try-lock lose every tick. Every sibling store prefixes its
         // key the same way (`vuln_finding_store:`, `device_ci:`, `app_usage:`, ...).
         pg::PgResult lk = pg::exec_params(
-            c, "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || $1, 0))",
+            c,
+            "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || $1, 0))",
             std::vector<std::string>{agent_id_s});
         if (lk.status() != PGRES_TUPLES_OK)
             return false;
@@ -1856,7 +1857,8 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
                 "WHERE octet_length(name) + octet_length(publisher) + octet_length(ecosystem) > " +
                 std::to_string(kTitleTripleMaxBytes) +
                 " GROUP BY name, publisher, ecosystem) over_wide";
-            pg::PgResult dropped = pg::exec_params(c, count_sql.c_str(), std::vector<std::string>{});
+            pg::PgResult dropped =
+                pg::exec_params(c, count_sql.c_str(), std::vector<std::string>{});
             if (dropped.status() != PGRES_TUPLES_OK)
                 return failed("over-wide title count", dropped);
             if (PQntuples(dropped.get()) == 1 &&

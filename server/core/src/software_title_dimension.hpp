@@ -167,8 +167,9 @@ public:
     /// tick (production: `kPassBudget`, the 60 s the backlog re-arm assumes): the first pass
     /// always runs, a later pass starts only while `kMinLaterPassBudget` or more of the budget
     /// is left and is given what is left of it, and a tick that stops on the budget reports
-    /// `capped` (a full page preceded it, so a backlog remains). Does not throw, because `run_pass`, `reconcile_queue` and
-    /// `refresh_gauges` each catch internally; the `cancelled` predicate must not throw.
+    /// `capped` (a full page preceded it, so a backlog remains). Does not throw, because
+    /// `run_pass`, `reconcile_queue` and `refresh_gauges` each catch internally; the `cancelled`
+    /// predicate must not throw.
     [[nodiscard]] TickResult run_tick(const std::function<bool()>& cancelled = {},
                                       int max_passes = kMaxPassesPerTick,
                                       std::chrono::seconds tick_budget = kPassBudget);

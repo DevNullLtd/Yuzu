@@ -11,10 +11,10 @@
 ///
 /// Two cadences (`rearm_interval`): QUIET - the configured interval (hourly) - and
 /// SHORT - `kBacklogRearm` (60 s) after a tick that either hit its pass cap or spent its 60 s
-/// tick budget on a full page (up to 200,000 titles per tick) or found the candidate source (`title_triples`) still
-/// empty while installed software exists (the catalogue rollup has not completed yet). A
-/// backlog therefore moves at up to 200,000 titles per minute-spaced tick rather than per
-/// hour, and a fresh boot picks up its first titles as soon as the rollup has run (the
+/// tick budget on a full page (up to 200,000 titles per tick) or found the candidate source
+/// (`title_triples`) still empty while installed software exists (the catalogue rollup has not
+/// completed yet). A backlog therefore moves at up to 200,000 titles per minute-spaced tick rather
+/// than per hour, and a fresh boot picks up its first titles as soon as the rollup has run (the
 /// rollup's own duration still applies). A failed, timed-out or cancelled tick KEEPS the
 /// quiet interval: retrying at once would re-select the same batch and repeat the failure.
 ///

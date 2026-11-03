@@ -229,13 +229,18 @@ void fill_product(const pg::PgResult& res, int row, ProductRow& out, int c0 = 0)
 /// statement timeout above that (`kNormalizationLockWait`); a timeout fails the write
 /// (fail-soft, like every write here) and the caller retries.
 bool take_normalization_lock(PGconn* c) {
-    static const std::string timeout_sql =
-        "SET LOCAL statement_timeout = '" + std::to_string(kNormalizationLockWait.count()) + "s'";
+    // Both timeouts: Postgres applies `lock_timeout` to an advisory-lock wait, and the pool
+    // sets a 10 s one on every connection, so without the second SET LOCAL the writer would
+    // give up after 10 s whatever its statement_timeout says.
+    for (const char* setting : {"statement_timeout", "lock_timeout"}) {
+        const std::string sql = std::string("SET LOCAL ") + setting + " = '" +
+                                std::to_string(kNormalizationLockWait.count()) + "s'";
+        if (pg::exec_params(c, sql.c_str(), std::vector<std::string>{}).status() !=
+            PGRES_COMMAND_OK)
+            return false;
+    }
     static const std::string lock_sql = "SELECT pg_advisory_xact_lock(hashtextextended('" +
                                         std::string(kNormalizationLockKey) + "', 0))";
-    if (pg::exec_params(c, timeout_sql.c_str(), std::vector<std::string>{}).status() !=
-        PGRES_COMMAND_OK)
-        return false;
     return pg::exec_params(c, lock_sql.c_str(), std::vector<std::string>{}).status() ==
            PGRES_TUPLES_OK;
 }
