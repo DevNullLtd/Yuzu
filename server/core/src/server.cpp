@@ -237,6 +237,9 @@
 #include "inventory_ci_join.hpp"
 #include "network_routes.hpp"
 #include "software_catalog_rollup.hpp"
+#include "software_normalization_job.hpp"
+#include "software_normalization_pack.hpp"
+#include "software_title_dimension.hpp"
 #include "device_routes.hpp"
 #include "device_lens_routes.hpp"
 #include "device_api_local.hpp" // ADR-0031 WS-A4 wave 2: make_local_device_api
@@ -279,6 +282,7 @@
 #include "mcp_retry.hpp"  // kMcpPollTotalMetric (#3344) — direct, not transitive
 #include "mcp_server.hpp"
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
+#include "mfa_entropy_signal.hpp" // #6995 — the MFA CSPRNG-failure counter names (boot pre-seed)
 #include "stream_budget.hpp" // shared held-open-SSE admission budget (2f PR 2, Decision 15(h))
 #include "notification_routes.hpp"
 #include "integrations_sync_routes.hpp"
@@ -2454,6 +2458,37 @@ public:
                           "now - this exceeds the rollup cadence (a stuck/failing thread leaves the "
                           "/inventory catalogue silently stale)",
                           "gauge");
+        metrics_.describe("yuzu_software_normalization_pass_total",
+                          "Software-title normalisation ticks by outcome (success/error); hourly, "
+                          "or every 60 s while a backlog remains or the catalogue rollup has not "
+                          "yet filled the candidate source. A cancelled tick (shutdown) is "
+                          "neither. Keep-last-good on error.",
+                          "counter");
+        metrics_.describe("yuzu_software_normalization_duration_seconds",
+                          "Wall-clock of the last software-title normalisation tick",
+                          "gauge");
+        metrics_.describe("yuzu_software_normalization_last_success_timestamp",
+                          "Epoch seconds of the last successful software-title normalisation tick; "
+                          "0 until the first success. Alert when now - this exceeds two cadences",
+                          "gauge");
+        metrics_.describe("yuzu_software_titles",
+                          "Distinct installed-software titles by normalisation status "
+                          "(normalized/unnormalized/pending)",
+                          "gauge");
+        metrics_.describe("yuzu_software_unnormalized_ratio",
+                          "Fraction of installed-software installs (device-title pairs) whose "
+                          "title is not yet normalized (unnormalized or pending). Not exported "
+                          "until the first non-empty read of the title source; unchanged while "
+                          "that source is empty (a stalled catalogue rollup is not a perfect "
+                          "ratio)",
+                          "gauge");
+        metrics_.describe("yuzu_software_normalization_curation_queue_size",
+                          "Open titles in the software normalisation curation queue",
+                          "gauge");
+        metrics_.describe("yuzu_software_normalization_pack_info",
+                          "Loaded software normalisation alias pack (value 1 on the current "
+                          "pack_version label)",
+                          "gauge");
         metrics_.describe("yuzu_app_perf_read_degrade_total",
                           "Authoritative B1 (per-device app-perf) reads that returned a degrade "
                           "rather than a result, by reason "
@@ -3073,15 +3108,28 @@ public:
                           "clock-anomaly detection across a restart",
                           "counter");
         // PR W1.1 sre-1 (gov Gate 6, sre): CSPRNG-failure paging signal.
-        // Increments in the token-create handlers (api_token, device_token)
+        // Increments in the token-create handlers (api_token, device_token,
+        // engine_principal)
         // when `secure_random::fill_random` returns prng_failure (entropy
-        // exhaustion). Operators wire a Prometheus rule like
+        // exhaustion), and (#6995) in the MFA enrolment / recovery-code
+        // handlers when AuthDB reports EntropyUnavailable. Operators wire a
+        // Prometheus rule like
         //   rate(yuzu_secure_random_failure_total[5m]) > 0
-        // to page on-call short of grepping audit logs.
+        // to page on-call short of grepping audit logs; it is label-agnostic,
+        // so it covers the MFA sites with no change.
         metrics_.describe("yuzu_secure_random_failure_total",
                           "CSPRNG (RAND_bytes / BCryptGenRandom) failures during token "
-                          "issuance, labelled by reason and call site",
+                          "issuance and MFA enrolment / recovery-code minting, labelled by "
+                          "reason and call site",
                           "counter");
+        // #6995: every site (the four token sites and the two MFA sites) exists from
+        // boot, so absent() alerts and a first scrape see 0, not a missing series, and
+        // a lone first fault still produces a rate. Names come from the one header.
+        for (auto site : mfa_entropy::kAllSites) {
+            metrics_.counter(std::string{mfa_entropy::kMetric},
+                             {{"reason", std::string{mfa_entropy::kReason}},
+                              {"site", std::string{site}}});
+        }
         // W1.3 (#826 + #1052 + #1053): device-token rejection counters.
         // Three high-signal variants each get their own counter so SRE
         // can alert directly without a labels selector. The remaining
@@ -3278,12 +3326,18 @@ public:
         // docs/observability-conventions.md, so absent() alerts stay
         // meaningful.
         metrics_.describe("yuzu_auth_secret_unavailable_total",
-                          "Total requests refused 503 by a fail-closed store-unavailable "
+                          "Total requests refused (503, or a retry fragment on Settings) by a "
+                          "fail-closed store-unavailable "
                           "guard on the auth/MFA surface, by route (route=approval also counts "
-                          "an unreadable durable session proof)",
+                          "an unreadable durable session proof; route=mfa_recovery counts a "
+                          "refused Settings recovery-code regeneration; a CSPRNG fault is "
+                          "never counted here, see yuzu_secure_random_failure_total)",
                           "counter");
+        // route=mfa_recovery (#6995): a refused Settings recovery-code
+        // regeneration on a store fault. A CSPRNG fault there is NOT counted
+        // here; it goes to yuzu_secure_random_failure_total{site=mfa_recovery}.
         for (auto route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate",
-                           "password_change", "approval"}) {
+                           "password_change", "approval", "mfa_recovery"}) {
             metrics_.counter("yuzu_auth_secret_unavailable_total", {{"route", route}});
         }
         // #2396 / #2401: reason-labelled sibling of the counter above. Same
@@ -3299,7 +3353,9 @@ public:
         // password change (route=password_change, which shares its lockout
         // helper, #5342) are instrumented; the other is_store_unavailable->503
         // auth sites (login/mfa, stepup, enroll, elevate) keep only
-        // yuzu_auth_secret_unavailable_total{route}. Reason
+        // yuzu_auth_secret_unavailable_total{route}. A CSPRNG fault at login
+        // enrol-init is NOT counted here (#6995: no query failed; it goes to
+        // yuzu_secure_random_failure_total{site=mfa_enroll}). Reason
         // token matches the yuzu_*_read_degrade_total family. Bounded, pre-seeded
         // closed label set per docs/observability-conventions.md so absent()
         // alerts stay meaningful.
@@ -8090,6 +8146,34 @@ public:
                 startup_failed_ = true;
             } else {
                 product_registry_store_->set_metrics(&metrics_);
+                // Software-title normalisation. The seed is build-embedded, deterministic
+                // content, so a parse failure is a defective build; a load failure is that or
+                // a database fault (including a transient one): either way fail closed, the
+                // same posture as the CPE resolver. Loaded only when the PG row is absent; a
+                // later binary's newer seed is logged, not applied.
+                if (software_inventory_store_ && software_inventory_store_->is_open()) {
+                    auto seed = parse_normalization_pack(kSoftwareNormalizationSeed);
+                    if (!seed) {
+                        spdlog::error("[PG] Refusing to start: embedded software normalisation "
+                                      "seed is invalid: {}",
+                                      seed.error());
+                        startup_failed_ = true;
+                    } else if (auto loaded = product_registry_store_->load_pack_if_empty(*seed, "seed");
+                               !loaded) {
+                        spdlog::error("[PG] Refusing to start: software normalisation pack load "
+                                      "failed: {}",
+                                      loaded.error());
+                        startup_failed_ = true;
+                    } else {
+                        software_title_dimension_ = std::make_unique<SoftwareTitleDimension>(
+                            *pg_pool_, *product_registry_store_, *software_inventory_store_,
+                            &metrics_);
+                        software_normalization_job_ = std::make_unique<SoftwareNormalizationJob>(
+                            *software_title_dimension_,
+                            std::chrono::seconds{kCatalogueRefreshIntervalSeconds}, &metrics_);
+                        software_normalization_job_->start();
+                    }
+                }
             }
         }
 
@@ -10514,6 +10598,8 @@ public:
             // their stops are already bounded (e.g. NVD sync's 5s cancel-then-detach).
             if (software_catalog_rollup_)
                 software_catalog_rollup_->request_stop();
+            if (software_normalization_job_)
+                software_normalization_job_->request_stop();
             const seconds min_grace{std::clamp(cfg_.shutdown_drain_seconds, 0,
                                                shutdown_drain::kMaxShutdownDrainSeconds)};
             if (min_grace.count() > 0) {
@@ -11129,6 +11215,10 @@ public:
         // Stop the catalogue rollup thread (borrows software_inventory_store_ + the pool)
         // BEFORE the store/pool tear down — the dtor signals stop + joins. Idempotent.
         software_catalog_rollup_.reset();
+        // SAM.4 normalisation job + its owner borrow software_inventory_store_,
+        // product_registry_store_ and the pool - join/drop them before any of the three.
+        software_normalization_job_.reset();
+        software_title_dimension_.reset();
         agent_service_.set_software_inventory_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_software_inventory_store(nullptr);
@@ -20350,7 +20440,7 @@ private:
         // pre-existing `/fragments/echo/...` HTML routes stay on perm_fn_ this
         // round — see the recorded-exception comment at their registration.
         echo_tree_routes_->set_fleet_read_fn(fleet_read_fn);
-        // #4143 review fix — same unfiltered source list_agents' agents_fn and
+        // #4143 review fix — same unfiltered source list_agents' DeviceApi and
         // GET /api/v1/devices (#4033) read from; gate.scope (fleet_read_fn_
         // above) is the SOLE filter now, not an intersection with devices_fn's
         // direct-membership pre-filter. See set_all_devices_fn's doc comment.
@@ -23833,6 +23923,10 @@ private:
     // so it destructs before the pool; the /api/v1/sle/* routes read it (the UCE
     // module's evaluator writes it, out-of-server).
     std::unique_ptr<ProductRegistryStore> product_registry_store_;
+    // SAM.4: declared AFTER the stores they borrow so they destruct first; stop() also
+    // resets them explicitly before the stores and pool.
+    std::unique_ptr<SoftwareTitleDimension> software_title_dimension_;
+    std::unique_ptr<SoftwareNormalizationJob> software_normalization_job_;
     // Fleet-aggregate app-perf (B2) + its cross-store roll-up query owner (ADR-0012).
     // Declared after pg_pool_ so they destruct before the pool.
     std::unique_ptr<AppPerfFleetStore> app_perf_fleet_store_;
