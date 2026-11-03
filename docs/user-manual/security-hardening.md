@@ -258,6 +258,12 @@ export YUZU_OIDC_CLIENT_SECRET=$(vault kv get -field=secret secret/yuzu/oidc)
 exec /usr/local/bin/yuzu-server "$@"
 ```
 
+## Random-number failure during MFA enrolment
+
+If the host's random source fails while the server is generating an MFA TOTP secret, a recovery code or a recovery code's salt, the server refuses the request and issues nothing: no TOTP secret, no recovery codes and no partial enrolment. An enrolment being confirmed at that moment is rolled back and the existing recovery codes stay valid. The operator sees a retryable "Authentication store is temporarily unavailable" message (HTTP `503` at sign-in) and can retry once the host recovers. Stored enrolments and recovery codes are untouched.
+
+These attempts are audited with a `detail` starting `csprng_unavailable: ` and counted in `yuzu_secure_random_failure_total{site="mfa_enroll"|"mfa_recovery"}`, separately from a database outage. The same random source also mints sign-in and session tokens, and those draws are **not** counted or audited: if the source is wholly dead, new sign-ins fail with a bare `500` (already-established sessions keep working), and the only signals are the sign-in error rate and the server log. See [Secret-minting failure metric](metrics.md#secret-minting-csprng-failure-metric) and the [response runbook](../ops-runbooks/auth-db-recovery.md#mfa-enrolment-refused-random-number-failure-503).
+
 ## Rate Limiting
 
 Configure API and login rate limits:
