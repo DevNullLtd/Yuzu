@@ -407,6 +407,7 @@ require admin approval before taking effect. This includes:
   bypass the approval gate by switching transports
 - User management writes
 - Management group writes
+- API token creation (`ApiToken:Write`)
 - Workflow execution (`Workflow:Execute`), enforced on the REST
   `POST /api/workflows/{id}/execute` route, which refuses a supervised token (`403`, approval
   required on this transport). No MCP tool maps to it yet, so a supervised token has no ticket path

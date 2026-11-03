@@ -163,7 +163,7 @@ place.
 
 The ticket for `execute_instruction_definition`, `create_result_set_from_instruction_result` and `reevaluate_result_set` now binds the `plugin.action` the stored definition resolves to, not only the call's arguments, so a definition repointed between approval and re-call is refused (`-32003` "the definition changed since this approval was requested", ticket unspent) instead of running the new action under the old approval. Approval tickets for these tools that are pending, or approved but not yet redeemed, when you upgrade must be re-requested (a ticket minted before the binding is an ordinary mismatch). An unreadable definition store while a ticket is requested or redeemed for the two result-set tools is now a `-32603` (retryable when the store cannot answer) that mints and spends nothing, and a supervised token without `Execution:Execute` is refused before the ticket for them rather than after it is approved. Rolling back to an older build drops the protection: that build does not bind the effect, so a ticket again covers only the call's arguments, and a ticket minted by the new build is refused by the older one.
 
-## Behaviour change: a supervised-tier MCP token needs an approval ticket for Workflow:Execute (#2146)
+## ⚠️ Breaking: a supervised-tier MCP token needs an approval ticket for Workflow:Execute (#2146)
 
 **What changed.** `Workflow:Execute` joined the operations a `supervised`-tier MCP token can only perform through an approval ticket. `POST /api/workflows/{id}/execute` now refuses such a token with `403` (audit action `auth.approval_required`, "approval required on this transport"). Before this change the token ran the workflow with no ticket and no human in the loop.
 

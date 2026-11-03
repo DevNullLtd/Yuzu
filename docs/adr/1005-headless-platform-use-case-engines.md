@@ -1126,14 +1126,16 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `governance.d/2146-batch-b-dispatch-core.DbkUcG.jsonl`, adjudicated by the
      repository owner.
    - **2026-10-30 - `Workflow:Execute` is approval-gated at the supervised MCP
-     tier.** Owner ruling. A workflow fans several steps out to the fleet in one
+     tier.** Owner ruling 2026-10-30; the rule was cut out of this change with the
+     workflow twin on 2026-10-31, then ruled back into it on 2026-11-03 so the gap
+     closes without waiting for the twin. A workflow fans several steps out to the fleet in one
      call with no per-step human look, so a supervised token needs an approval
      ticket for it, like every other fleet execution at that tier. The rule is one
      line in `requires_approval()` (`server/core/src/mcp_policy.hpp`), mirrored by
      `AuthRoutes::require_permission` on every non-MCP transport, so
      `POST /api/workflows/{id}/execute` refuses a supervised token with `403`.
      Before it, a supervised token ran a workflow with no ticket. Residual: no MCP
-     tool maps to the pair yet (the `execute_workflow` twin is a separate change),
+     tool maps to the pair yet (the `execute_workflow` tool is a separate change),
      so until it ships a supervised token has no ticket path to run a workflow;
      that availability loss is accepted in exchange for closing the gap. The owner
      ruling is recorded in the governance ledger fragment

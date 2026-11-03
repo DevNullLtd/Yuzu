@@ -14279,7 +14279,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 //     tier (see the #4353 comment just below: it is absent
                 //     from requires_approval()'s Delete/Execution:Execute/
                 //     Policy:Write/Security:Write|Execute/UserManagement:
-                //     Write/ManagementGroup:Write/ApiToken:Write list), and
+                //     Write/ManagementGroup:Write/Workflow:Execute/ApiToken:Write list), and
                 //     tier_allows() already confines operator tier out of
                 //     Infrastructure:Write entirely -- so a supervised-tier
                 //     caller of THIS tool never needed a ticket in the first
