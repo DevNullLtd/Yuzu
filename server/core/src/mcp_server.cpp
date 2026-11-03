@@ -92,6 +92,7 @@
 #include "viz_routes.hpp" // #2146 Batch B3: VizRoutes::kDefaultMachinesMax/kMachinesMaxCeiling/kOfflineStaleWindowSecs
 #include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
+#include "access_review_attest_gate.hpp" // reviewer != subject of the grant, shared with REST
 #include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"           // access-review read-model optional email enrichment
 #include "enrollment_directory_model.hpp" // #4031: shared row builders — REST/MCP parity (Rule 1)
@@ -28347,18 +28348,56 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // decision selects the audit verb so the two outcomes are
+                // separately countable evidence, matching the REST twin exactly. Every
+                // row of this verb has one shape: target_id = the campaign alone, the
+                // grant tuple in the detail (access_review_attest_gate.hpp).
+                const std::string audit_action =
+                    access_review_sod::attest_audit_action(decision);
+                const std::string tuple_detail =
+                    access_review_sod::attest_tuple_detail(principal_type, principal_id,
+                                                           role_name);
+                // One refusal path for the gate's verdict and for the store's in-write
+                // `forbidden:` backstop. The domain row is written first, then the
+                // `mcp.<tool>` wrapper row; either failing to persist is surfaced as
+                // audit_persisted:false (MCP has no response-header channel) and the
+                // refusal stands.
+                auto refuse = [&](const access_review_sod::SodVerdict& verdict) {
+                    const auto refusal = access_review_sod::sod_refusal_for(verdict.outcome);
+                    const bool domain_ok = access_review_sod::audit_and_count_refusal(
+                        audit_fn, req, metrics, access_review_sod::AttestSurface::kMcp, verdict,
+                        audit_action, campaign_id, tuple_detail);
+                    const bool wrapper_ok = mcp_audit(
+                        std::string(refusal.audit_result),
+                        access_review_sod::sod_refusal_detail(verdict, refusal, {}));
+                    res.set_content(
+                        a4_error(refusal.jsonrpc_code, refusal.message, refusal.remediation,
+                                 refusal.retry_after_ms.value_or(-1), {},
+                                 domain_ok && wrapper_ok),
+                        "application/json");
+                };
+                // The LAST call before the store (see the REST twin): the reviewer must
+                // differ from the subject of the grant; engine-owner and group-member are a
+                // pre-read outside the store's transaction (documented window).
+                const auto verdict = access_review_sod::evaluate_attestation_sod(
+                    session->username, principal_type, principal_id, engine_principal_store_,
+                    rbac_store);
+                if (verdict.outcome != access_review_sod::SodOutcome::kPass) {
+                    refuse(verdict);
+                    return;
+                }
                 auto rec_res = access_review_store->record_attestation(
                     campaign_id, principal_type, principal_id, role_name, decision,
                     session->username, justification);
-                // decision selects the audit verb so the two outcomes are
-                // separately countable evidence, matching the REST twin exactly.
-                const std::string audit_action = decision == "flagged_revoke"
-                                                     ? "access_review.flagged"
-                                                     : "access_review.attested";
                 if (!rec_res) {
-                    const bool denied_audit_ok =
-                        audit_fn(req, audit_action, "failure", "AccessReview", campaign_id,
-                                rec_res.error());
+                    if (const auto sod =
+                            access_review_sod::sod_from_store_error(rec_res.error())) {
+                        refuse({*sod, {}});
+                        return;
+                    }
+                    const bool denied_audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, audit_action, "failure", "AccessReview", campaign_id,
+                        flatten_audit_text(rec_res.error()) + tuple_detail);
                     mcp_audit("failure", rec_res.error());
                     res.set_content(
                         error_response(id, mcp_error_for_access_review_msg(rec_res.error()),
@@ -28375,10 +28414,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // on this path (flag != revoke). Acting on the flag is a separate,
                 // explicit RBAC/EnginePrincipal write an operator performs after
                 // reading this evidence.
-                const bool audit_ok = audit_fn(
-                    req, audit_action, "success", "AccessReview",
-                    campaign_id + ":" + principal_type + ":" + principal_id + ":" + role_name,
-                    "decision=" + decision);
+                //
+                // Set-and-proceed: the decision and its history row are already
+                // committed, so the audit row is secondary evidence and never a gate. A
+                // throwing audit callback is caught inside try_persist_audit.
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, audit_action, "success", "AccessReview", campaign_id,
+                    access_review_sod::attest_success_detail(decision, rec_res->previous_decision,
+                                                             rec_res->seq, tuple_detail));
                 JObj payload;
                 payload.add("recorded", true);
                 if (!audit_ok)

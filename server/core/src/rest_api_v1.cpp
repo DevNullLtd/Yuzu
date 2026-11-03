@@ -5,6 +5,7 @@
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
+#include "access_review_attest_gate.hpp" // reviewer != subject of the grant, shared with MCP
 #include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
 #include "pg_error_class.hpp" // is_permanent_pg_error — approval store error classification (PR #4656)
 #include "directory_sync.hpp"      // access-review read-model optional email enrichment
@@ -10659,7 +10660,7 @@ void RestApiV1::register_routes(
     // reviewer decision against a frozen grant.
     sink.Post(
         R"(/api/v1/access-reviews/([^/]+)/attestations)",
-        [perm_fn, auth_fn, audit_fn, access_review_store, metrics_registry,
+        [perm_fn, auth_fn, audit_fn, access_review_store, metrics_registry, rbac_store, eps,
          ar_refuse_browser_write](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
@@ -10713,21 +10714,42 @@ void RestApiV1::register_routes(
                 return;
             }
 
+            // decision selects the audit verb (access_review.attested vs
+            // access_review.flagged) so the two outcomes are separately
+            // countable/alertable evidence, not one verb with a buried field. Every row
+            // of this verb has one shape: target_id = the campaign alone, the grant tuple
+            // in the detail (access_review_attest_gate.hpp).
+            const std::string audit_action = access_review_sod::attest_audit_action(decision);
+            const std::string tuple_detail =
+                access_review_sod::attest_tuple_detail(principal_type, principal_id, role_name);
+            auto refuse = [&](const access_review_sod::SodVerdict& verdict) {
+                const bool persisted = access_review_sod::audit_and_count_refusal(
+                    audit_fn, req, metrics_registry, access_review_sod::AttestSurface::kRest,
+                    verdict, audit_action, campaign_id, tuple_detail);
+                access_review_sod::write_rest_refusal(res, verdict.outcome, persisted);
+            };
+            // The LAST call before the store: the reviewer must differ from the subject of the
+            // grant. The engine-owner and group-member rules are a pre-read outside the
+            // store's transaction (documented window, access_review_attest_gate.hpp); the
+            // user rule is decided again inside the write.
+            const auto verdict = access_review_sod::evaluate_attestation_sod(
+                session->username, principal_type, principal_id, eps, rbac_store);
+            if (verdict.outcome != access_review_sod::SodOutcome::kPass) {
+                refuse(verdict);
+                return;
+            }
+
             auto rec_res = access_review_store->record_attestation(
                 campaign_id, principal_type, principal_id, role_name, decision, session->username,
                 justification);
-            // decision selects the audit verb (access_review.attested vs
-            // access_review.flagged) so the two outcomes are separately
-            // countable/alertable evidence, not one verb with a buried field.
-            const std::string audit_action =
-                decision == "flagged_revoke" ? "access_review.flagged" : "access_review.attested";
             if (!rec_res) {
-                try {
-                    (void)audit_fn(req, audit_action, "failure", "AccessReview", campaign_id,
-                                   rec_res.error());
-                } catch (const std::exception& ex) {
-                    spdlog::warn("{} audit emission threw: {}", audit_action, ex.what());
+                if (const auto sod = access_review_sod::sod_from_store_error(rec_res.error())) {
+                    refuse({*sod, {}});
+                    return;
                 }
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, audit_action, "failure", "AccessReview", campaign_id,
+                    flatten_audit_text(rec_res.error()) + tuple_detail);
                 res.status = access_review_error_status(rec_res.error());
                 res.set_content(detail::a4_error(res, rec_res.error()), "application/json");
                 return;
@@ -10739,24 +10761,14 @@ void RestApiV1::register_routes(
             // EnginePrincipal write an operator performs after reading this
             // evidence (flag != revoke).
             //
-            // The attestation was already recorded — the audit row is evidence of
-            // that, never a gate on it. A failed audit surfaces via
-            // Sec-Audit-Failed and the response proceeds (mirrors export above).
-            bool attest_audit_emitted = false;
-            try {
-                attest_audit_emitted = audit_fn(
-                    req, audit_action, "success", "AccessReview",
-                    campaign_id + ":" + principal_type + ":" + principal_id + ":" + role_name,
-                    "decision=" + decision);
-            } catch (const std::exception& ex) {
-                spdlog::warn("{} audit emission threw: {}", audit_action, ex.what());
-            }
-            if (!attest_audit_emitted) {
-                spdlog::warn("{} did not persist — evidence-chain gap for an access-review "
-                             "attestation",
-                             audit_action);
-                res.set_header("Sec-Audit-Failed", "true");
-            }
+            // The decision (and its history row) is already committed; the audit row is
+            // secondary evidence, never a gate on it. A failed audit surfaces via
+            // Sec-Audit-Failed and the response proceeds (set-and-proceed, mirrors export
+            // above); a throwing audit callback is caught inside try_persist_audit.
+            (void)detail::emit_behavioral_audit(
+                audit_fn, req, res, audit_action, "success", "AccessReview", campaign_id,
+                access_review_sod::attest_success_detail(decision, rec_res->previous_decision,
+                                                         rec_res->seq, tuple_detail));
             if (metrics_registry)
                 metrics_registry->counter("yuzu_access_review_attestations_total",
                                           {{"decision", decision}})

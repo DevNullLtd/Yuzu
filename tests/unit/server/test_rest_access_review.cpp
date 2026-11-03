@@ -36,6 +36,7 @@
  * unset, fails when set but broken (test_helpers.hpp skip-vs-fail contract).
  */
 
+#include "access_review_attest_gate.hpp"
 #include "access_review_store.hpp"
 #include "engine_principal_store.hpp"
 #include "mcp_jsonrpc.hpp"
@@ -57,7 +58,9 @@
 
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -203,6 +206,14 @@ struct AccessReviewHarness {
     /// audit_should_fail in test_inventory_routes.cpp.
     std::string audit_fail_action;
 
+    /// What the MCP audit callback does. `fail` returns false (a persist failure), `throws` throws
+    /// std::runtime_error (a bad_alloc-class fault), both only for `mcp_audit_mode_action` (empty =
+    /// every action, the domain row AND the `mcp.<tool>` wrapper row). The REST callback has its own
+    /// knob above; the MCP one defaulted to always-true before the attestation refusal tests.
+    enum class McpAuditMode { ok, fail, throws };
+    McpAuditMode mcp_audit_mode{McpAuditMode::ok};
+    std::string mcp_audit_mode_action;
+
     /// Real (not nullptr) registry — item G (governance hardening round)
     /// exercises the metric names/labels rest_api_v1.cpp actually touches.
     yuzu::MetricsRegistry metrics;
@@ -217,7 +228,12 @@ struct AccessReviewHarness {
     /// kInternalError path on BOTH transports (list/open/get/attest/close)
     /// without needing a third harness type — mirrors `auth_db_available`
     /// above.
-    explicit AccessReviewHarness(bool auth_db_available = true, bool store_available = true) {
+    ///
+    /// `own_pool` puts the three stores on a caller-owned pool (a per-test migrated clone) instead
+    /// of the file-wide shared one, and skips the shared reset. Needed where a test DROPs a table:
+    /// the shared clone's TRUNCATE reset cannot repair a dropped table.
+    explicit AccessReviewHarness(bool auth_db_available = true, bool store_available = true,
+                                 yuzu::server::pg::PgPool* own_pool = nullptr) {
         // Redundant with AuthDbPgShared's own SKIP above (both gate on the
         // same env var) — kept as a defence-in-depth guard directly on this
         // fixture's own PG dependencies (RbacStore + EnginePrincipalStore +
@@ -225,7 +241,11 @@ struct AccessReviewHarness {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
-        acc_rev_reset();
+        yuzu::server::pg::PgPool* pool = own_pool;
+        if (!pool) {
+            acc_rev_reset();
+            pool = &*acc_rev_shared().pool;
+        }
         // The cookie session below is a browser session, and a browser write must name this site
         // (the access-review mutations refuse a cross-site or header-less cookie write). Every
         // call carries the same-origin headers a browser sends; the csrf cases override them.
@@ -234,11 +254,11 @@ struct AccessReviewHarness {
         // /AccessReviewStore (own `rbac_store` schema) — acc_rev_reset() above
         // TRUNCATEs its user-data tables too, so each harness still gets fully
         // fresh RBAC state (the old per-harness SQLite file's guarantee).
-        rbac = std::make_unique<RbacStore>(*acc_rev_shared().pool);
+        rbac = std::make_unique<RbacStore>(*pool);
         REQUIRE(rbac->is_open());
-        eps = std::make_unique<EnginePrincipalStore>(*acc_rev_shared().pool);
+        eps = std::make_unique<EnginePrincipalStore>(*pool);
         REQUIRE(eps->is_open());
-        access_review_store = std::make_unique<AccessReviewStore>(*acc_rev_shared().pool);
+        access_review_store = std::make_unique<AccessReviewStore>(*pool);
         REQUIRE(access_review_store->is_open());
         AccessReviewStore* ars_ptr = store_available ? access_review_store.get() : nullptr;
 
@@ -343,6 +363,12 @@ struct AccessReviewHarness {
                                    const std::string& result, const std::string&,
                                    const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_id, detail});
+            if (mcp_audit_mode != McpAuditMode::ok &&
+                (mcp_audit_mode_action.empty() || action == mcp_audit_mode_action)) {
+                if (mcp_audit_mode == McpAuditMode::throws)
+                    throw std::runtime_error("injected audit fault");
+                return false;
+            }
             return true;
         };
         auto agents_fn = []() -> nlohmann::json { return nlohmann::json::array(); };
@@ -1954,4 +1980,657 @@ TEST_CASE("the store's bad_request prefix maps to 400 and invalid-params, not 50
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(pending_in(h, cid) == pending0);
+}
+
+// ── Attestation separation of duties (#4752) ────────────────────────────────
+//
+// The reviewer must differ from the subject of the grant, on REST and MCP, through ONE gate
+// (access_review_attest_gate.hpp). The harness session defaults to an ADMIN with RBAC off, which is
+// the "RBAC off, administrator attesting their own grant" case. RBAC on/off, service scope and the
+// MCP tier are NOT driven here: the harness stubs `rest_perm_fn`/`mcp_perm_fn`, so those paths are
+// unreachable from these cases (the gate itself is pure of them).
+
+namespace {
+
+namespace sod = yuzu::server::access_review_sod;
+
+constexpr const char* kRefusedMetric = "yuzu_access_review_attestation_refused_total";
+
+double refused_count(AccessReviewHarness& h, const char* surface, const char* reason) {
+    return h.metrics.counter(kRefusedMetric, {{"surface", surface}, {"reason", reason}}).value();
+}
+
+std::string sod_body(const std::string& type, const std::string& id, const std::string& role,
+                     const std::string& decision = "attested") {
+    return nlohmann::json{
+        {"principal_type", type}, {"principal_id", id}, {"role_name", role}, {"decision", decision}}
+        .dump();
+}
+
+nlohmann::json sod_args(const std::string& cid, const std::string& type, const std::string& id,
+                        const std::string& role, const std::string& decision = "attested") {
+    return {{"campaign_id", cid},
+            {"principal_type", type},
+            {"principal_id", id},
+            {"role_name", role},
+            {"decision", decision}};
+}
+
+std::string attest_url(const std::string& cid) {
+    return "/api/v1/access-reviews/" + cid + "/attestations";
+}
+
+std::vector<AuditRecord> audit_rows(const AccessReviewHarness& h, const std::string& action) {
+    std::vector<AuditRecord> out;
+    for (const auto& r : h.audit_log)
+        if (r.action == action)
+            out.push_back(r);
+    return out;
+}
+
+AccessReviewAttestationRow grant_row(const AccessReviewHarness& h, const std::string& cid,
+                                     const std::string& type, const std::string& id,
+                                     const std::string& role) {
+    auto v = h.access_review_store->get_campaign(cid, /*include_history=*/true);
+    REQUIRE(v.has_value());
+    for (const auto& a : v->attestations)
+        if (a.principal_type == type && a.principal_id == id && a.role_name == role)
+            return a;
+    FAIL("grant not frozen in the campaign: " << type << ":" << id << ":" << role);
+    return {};
+}
+
+void seed_user_grant(AccessReviewHarness& h, const std::string& user,
+                     const std::string& role = "Operator") {
+    REQUIRE(h.auth_db->upsert_user(user, "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", user, role}).has_value());
+}
+
+// An engine principal owned by `owner` holding `role`. The id is the full "engine:<slug>".
+void seed_engine_grant(AccessReviewHarness& h, const std::string& engine_id,
+                       const std::string& owner, const std::string& role = "Writer") {
+    if (!h.rbac->get_role(role))
+        REQUIRE(h.rbac->create_role({.name = role, .description = "d"}).has_value());
+    REQUIRE(h.eps->create("Svc", owner, "sod test", "internal", "admin", engine_id).has_value());
+    REQUIRE(h.rbac->assign_role({"engine", engine_id, role}).has_value());
+}
+
+void seed_group_grant(AccessReviewHarness& h, const std::string& group, const std::string& member,
+                      const std::string& role = "Reader") {
+    if (!h.rbac->get_role(role))
+        REQUIRE(h.rbac->create_role({.name = role, .description = "d"}).has_value());
+    REQUIRE(
+        h.rbac->create_group({.name = group, .description = "d", .source = "local"}).has_value());
+    if (!member.empty())
+        REQUIRE(h.rbac->add_group_member(group, member).has_value());
+    REQUIRE(h.rbac->assign_role({"group", group, role}).has_value());
+}
+
+void drop_table_cascade(const std::string& dsn, const char* table) {
+    yuzu::server::pg::PgConn c{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult dr{
+        PQexec(c.get(), (std::string("DROP TABLE ") + table + " CASCADE").c_str())};
+    REQUIRE(dr.ok());
+}
+
+// The refusal's wire answer must be identical in message on both transports and must name no
+// permission (the caller holds AccessReview:Attest, so a named permission would be a false hint).
+void check_rest_sod_refusal(const std::unique_ptr<httplib::Response>& res) {
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["message"] == std::string(sod::kSodMessage));
+    CHECK(body["error"]["remediation"] == std::string(sod::kSodRemediation));
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK(res->body.find("\"permission\"") == std::string::npos);
+}
+
+nlohmann::json mcp_error_of(const std::unique_ptr<httplib::Response>& res) {
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    return body["error"];
+}
+
+} // namespace
+
+TEST_CASE("attestation SoD gate: pure decisions with no store, and the store-error mapping",
+          "[access_review][sod][4752]") {
+    using sod::SodOutcome;
+    // user: byte-exact comparison, no store needed.
+    CHECK(sod::evaluate_attestation_sod("bob", "user", "bob", nullptr, nullptr).outcome ==
+          SodOutcome::kSelfSubject);
+    CHECK(sod::evaluate_attestation_sod("bob", "user", "Bob", nullptr, nullptr).outcome ==
+          SodOutcome::kPass);
+    CHECK(sod::evaluate_attestation_sod("bob", "user", "bob ", nullptr, nullptr).outcome ==
+          SodOutcome::kPass);
+    CHECK(sod::evaluate_attestation_sod("bob", "user", "carol", nullptr, nullptr).outcome ==
+          SodOutcome::kPass);
+    // An unknown type is the store's not_found, never a separation-of-duties answer.
+    CHECK(sod::evaluate_attestation_sod("bob", "robot", "bob", nullptr, nullptr).outcome ==
+          SodOutcome::kPass);
+    // engine / group with no store wired fail CLOSED and name the store.
+    const auto e = sod::evaluate_attestation_sod("bob", "engine", "engine:x", nullptr, nullptr);
+    CHECK(e.outcome == SodOutcome::kUnavailable);
+    CHECK(e.store == "engine");
+    const auto g = sod::evaluate_attestation_sod("bob", "group", "eng", nullptr, nullptr);
+    CHECK(g.outcome == SodOutcome::kUnavailable);
+    CHECK(g.store == "rbac");
+
+    // The store's in-write refusal maps onto the same outcome; nothing else does.
+    CHECK(sod::sod_from_store_error("forbidden: reviewer is the subject").value() ==
+          SodOutcome::kSelfSubject);
+    CHECK_FALSE(sod::sod_from_store_error("not_found: no such campaign").has_value());
+    CHECK_FALSE(sod::sod_from_store_error("bad_request: campaign_id invalid").has_value());
+    CHECK_FALSE(sod::sod_from_store_error("pool acquire timeout").has_value());
+    CHECK_FALSE(sod::sod_from_store_error("").has_value());
+
+    // The three refusals share one self-contained message; only the audit token differs.
+    for (const auto& [outcome, token, reason] :
+         {std::tuple{SodOutcome::kSelfSubject, "sod_self_subject", "self_subject"},
+          std::tuple{SodOutcome::kEngineOwner, "sod_engine_owner", "engine_owner"},
+          std::tuple{SodOutcome::kGroupMember, "sod_group_member", "group_member"}}) {
+        const auto r = sod::sod_refusal_for(outcome);
+        CHECK(r.http_status == 403);
+        CHECK(r.jsonrpc_code == yuzu::server::mcp::kPermissionDenied);
+        CHECK(r.message == sod::kSodMessage);
+        CHECK(r.audit_result == "denied");
+        CHECK(r.audit_detail == token);
+        CHECK(r.reason == reason);
+        CHECK_FALSE(r.retry_after_ms.has_value());
+    }
+    const auto u = sod::sod_refusal_for(SodOutcome::kUnavailable);
+    CHECK(u.http_status == 503);
+    CHECK(u.jsonrpc_code == yuzu::server::mcp::kInternalError);
+    CHECK(u.audit_result == "failure");
+    CHECK(u.audit_detail == "sod_check_unavailable");
+    CHECK(u.reason == "check_unavailable");
+    REQUIRE(u.retry_after_ms.has_value());
+    CHECK(*u.retry_after_ms == 5000);
+    CHECK(std::string(sod::kSodMessage) ==
+          "the reviewer must differ from the subject of this grant; ask another reviewer to "
+          "record this decision");
+}
+
+TEST_CASE("attestation SoD: the subject of a user grant is refused on REST and MCP, once, with "
+          "the same message, an audit row and the counter",
+          "[pg][access_review][rest][mcp][sod][4752]") {
+    AccessReviewHarness h;
+    CHECK_FALSE(h.rbac->is_rbac_enabled()); // RBAC off: an ADMIN self-attesting is still refused
+    seed_user_grant(h, "bob");
+    const auto cid = h.open_campaign_rest("sod self");
+    h.session_user = "bob";
+    h.audit_log.clear();
+    const std::string tuple = " principal_type=user principal_id=bob role=Operator";
+
+    SECTION("REST") {
+        auto res = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
+        check_rest_sod_refusal(res);
+
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "denied");
+        CHECK(rows[0].target_id == cid);
+        CHECK(rows[0].detail == "sod_self_subject" + tuple);
+        CHECK(audit_rows(h, "access_review.flagged").empty());
+        // A persisted refusal row sets no failure header.
+        CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+
+        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        CHECK(row.decision == "pending");
+        CHECK(row.decision_seq == 0);
+        CHECK(row.history.empty());
+        CHECK(refused_count(h, "rest", "self_subject") == 1.0);
+        CHECK(refused_count(h, "mcp", "self_subject") == 0.0);
+    }
+
+    SECTION("REST: flag uses the flagged verb") {
+        auto res =
+            h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator", "flagged_revoke"));
+        check_rest_sod_refusal(res);
+        const auto rows = audit_rows(h, "access_review.flagged");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "denied");
+        CHECK(rows[0].detail == "sod_self_subject" + tuple);
+        CHECK(audit_rows(h, "access_review.attested").empty());
+    }
+
+    SECTION("MCP") {
+        auto res = h.mcp_call_tool("record_attestation", sod_args(cid, "user", "bob", "Operator"));
+        const auto err = mcp_error_of(res);
+        CHECK(err["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(err["message"] == std::string(sod::kSodMessage));
+        CHECK(err["data"]["remediation"] == std::string(sod::kSodRemediation));
+        CHECK_FALSE(err["data"].contains("audit_persisted")); // both rows persisted
+
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "denied");
+        CHECK(rows[0].target_id == cid);
+        CHECK(rows[0].detail == "sod_self_subject" + tuple);
+        const auto wrapper = audit_rows(h, "mcp.record_attestation");
+        REQUIRE(wrapper.size() == 1);
+        CHECK(wrapper[0].result == "denied");
+
+        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        CHECK(row.decision == "pending");
+        CHECK(row.history.empty());
+        CHECK(refused_count(h, "mcp", "self_subject") == 1.0);
+        CHECK(refused_count(h, "rest", "self_subject") == 0.0);
+    }
+}
+
+TEST_CASE("attestation SoD: a different reviewer records, and every decision is appended",
+          "[pg][access_review][rest][mcp][sod][4752]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    const auto cid = h.open_campaign_rest("sod other");
+    h.session_user = "carol";
+    h.audit_log.clear();
+    const std::string tuple = " principal_type=user principal_id=bob role=Operator";
+
+    SECTION("REST: attest, attest again, then flag") {
+        auto r1 = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
+        REQUIRE(r1);
+        CHECK(r1->status == 200);
+        CHECK(nlohmann::json::parse(r1->body)["data"]["recorded"] == true);
+        CHECK(r1->get_header_value("Sec-Audit-Failed").empty());
+        auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "success");
+        CHECK(rows[0].target_id == cid);
+        CHECK(rows[0].detail == "decision=attested previous=pending seq=1 sod=pass" + tuple);
+
+        auto r2 = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
+        REQUIRE(r2);
+        CHECK(r2->status == 200);
+        rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].target_id == cid);
+        CHECK(rows[1].detail == "decision=attested previous=attested seq=2 sod=pass" + tuple);
+
+        auto r3 =
+            h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator", "flagged_revoke"));
+        REQUIRE(r3);
+        CHECK(r3->status == 200);
+        const auto flagged = audit_rows(h, "access_review.flagged");
+        REQUIRE(flagged.size() == 1);
+        CHECK(flagged[0].detail ==
+              "decision=flagged_revoke previous=attested seq=3 sod=pass" + tuple);
+
+        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        CHECK(row.decision == "flagged_revoke");
+        CHECK(row.reviewer == "carol");
+        CHECK(row.decision_seq == 3);
+        REQUIRE(row.history.size() == 3);
+        CHECK(row.history[2].previous_decision == "attested");
+        // No refusal was counted.
+        CHECK(refused_count(h, "rest", "self_subject") == 0.0);
+    }
+
+    SECTION("MCP") {
+        auto res = h.mcp_call_tool("record_attestation", sod_args(cid, "user", "bob", "Operator"));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        CHECK(body["result"]["structuredContent"]["recorded"] == true);
+        CHECK_FALSE(body["result"]["structuredContent"].contains("audit_persisted"));
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "success");
+        CHECK(rows[0].target_id == cid);
+        CHECK(rows[0].detail == "decision=attested previous=pending seq=1 sod=pass" + tuple);
+        CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 1);
+    }
+}
+
+TEST_CASE("attestation SoD: a subject cannot un-flag a grant that a reviewer flagged",
+          "[pg][access_review][rest][sod][4752]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    const auto cid = h.open_campaign_rest("sod unflag");
+
+    h.session_user = "carol";
+    auto flag = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator", "flagged_revoke"));
+    REQUIRE(flag);
+    REQUIRE(flag->status == 200);
+
+    h.session_user = "bob";
+    check_rest_sod_refusal(h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator")));
+
+    const auto row = grant_row(h, cid, "user", "bob", "Operator");
+    CHECK(row.decision == "flagged_revoke");
+    CHECK(row.reviewer == "carol");
+    CHECK(row.decision_seq == 1);
+    CHECK(row.history.size() == 1);
+}
+
+TEST_CASE("attestation SoD: the owner of an engine principal is refused, revoked or not; an "
+          "orphan engine id is admitted",
+          "[pg][access_review][rest][mcp][sod][4752]") {
+    AccessReviewHarness h;
+    seed_engine_grant(h, "engine:svc", "bob");
+    // An orphan grant: the grant table names an engine that has no principal row.
+    REQUIRE(h.rbac->assign_role({"engine", "engine:ghost", "Writer"}).has_value());
+    const auto cid = h.open_campaign_rest("sod engine");
+    h.audit_log.clear();
+    const std::string tuple = " principal_type=engine principal_id=engine:svc role=Writer";
+
+    SECTION("REST: the owner is refused, another reviewer records") {
+        h.session_user = "bob";
+        check_rest_sod_refusal(
+            h.sink.Post(attest_url(cid), sod_body("engine", "engine:svc", "Writer")));
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "denied");
+        CHECK(rows[0].target_id == cid);
+        CHECK(rows[0].detail == "sod_engine_owner" + tuple);
+        CHECK(refused_count(h, "rest", "engine_owner") == 1.0);
+        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer").history.empty());
+
+        h.session_user = "carol";
+        auto ok = h.sink.Post(attest_url(cid), sod_body("engine", "engine:svc", "Writer"));
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer").decision_seq == 1);
+    }
+
+    SECTION("REST: a REVOKED engine owned by the reviewer is still refused") {
+        REQUIRE(h.eps->revoke("engine:svc").has_value());
+        h.session_user = "bob";
+        check_rest_sod_refusal(
+            h.sink.Post(attest_url(cid), sod_body("engine", "engine:svc", "Writer")));
+        CHECK(refused_count(h, "rest", "engine_owner") == 1.0);
+    }
+
+    SECTION("REST: an orphan engine id (no principal row) is admitted") {
+        h.session_user = "bob";
+        auto ok = h.sink.Post(attest_url(cid), sod_body("engine", "engine:ghost", "Writer"));
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        CHECK(refused_count(h, "rest", "engine_owner") == 0.0);
+    }
+
+    SECTION("MCP: the owner is refused, another reviewer records") {
+        h.session_user = "bob";
+        const auto err = mcp_error_of(
+            h.mcp_call_tool("record_attestation", sod_args(cid, "engine", "engine:svc", "Writer")));
+        CHECK(err["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(err["message"] == std::string(sod::kSodMessage));
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].detail == "sod_engine_owner" + tuple);
+        CHECK(refused_count(h, "mcp", "engine_owner") == 1.0);
+
+        h.session_user = "carol";
+        auto ok =
+            h.mcp_call_tool("record_attestation", sod_args(cid, "engine", "engine:svc", "Writer"));
+        REQUIRE(ok);
+        CHECK(nlohmann::json::parse(ok->body).contains("result"));
+    }
+}
+
+TEST_CASE("attestation SoD: a member of a group is refused; a non-member and a group with no "
+          "row are admitted",
+          "[pg][access_review][rest][mcp][sod][4752]") {
+    AccessReviewHarness h;
+    seed_group_grant(h, "eng", "bob");
+    // A grant naming a group that has no row at all.
+    REQUIRE(h.rbac->assign_role({"group", "ghosts", "Reader"}).has_value());
+    const auto cid = h.open_campaign_rest("sod group");
+    h.audit_log.clear();
+    const std::string tuple = " principal_type=group principal_id=eng role=Reader";
+
+    SECTION("REST") {
+        h.session_user = "bob";
+        check_rest_sod_refusal(h.sink.Post(attest_url(cid), sod_body("group", "eng", "Reader")));
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "denied");
+        CHECK(rows[0].target_id == cid);
+        CHECK(rows[0].detail == "sod_group_member" + tuple);
+        CHECK(refused_count(h, "rest", "group_member") == 1.0);
+        CHECK(grant_row(h, cid, "group", "eng", "Reader").history.empty());
+
+        h.session_user = "carol";
+        auto ok = h.sink.Post(attest_url(cid), sod_body("group", "eng", "Reader"));
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+
+        // bob is not in "ghosts" (no such group row): admitted.
+        h.session_user = "bob";
+        auto orphan = h.sink.Post(attest_url(cid), sod_body("group", "ghosts", "Reader"));
+        REQUIRE(orphan);
+        CHECK(orphan->status == 200);
+        CHECK(refused_count(h, "rest", "group_member") == 1.0);
+    }
+
+    SECTION("MCP") {
+        h.session_user = "bob";
+        const auto err = mcp_error_of(
+            h.mcp_call_tool("record_attestation", sod_args(cid, "group", "eng", "Reader")));
+        CHECK(err["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(err["message"] == std::string(sod::kSodMessage));
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].detail == "sod_group_member" + tuple);
+        CHECK(refused_count(h, "mcp", "group_member") == 1.0);
+    }
+}
+
+TEST_CASE("attestation SoD: the permission gate answers before the refusal",
+          "[pg][access_review][rest][sod][4752]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    const auto cid = h.open_campaign_rest("sod perm order");
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return !(t == "AccessReview" && op == "Attest");
+    };
+    h.session_user = "bob";
+    h.audit_log.clear();
+    auto res = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body == R"({"error":"forbidden"})");
+    CHECK(h.audit_log.empty());
+    CHECK(refused_count(h, "rest", "self_subject") == 0.0);
+}
+
+TEST_CASE("attestation SoD: a closed campaign is 404 for another reviewer, but the subject is "
+          "refused (403) on both transports",
+          "[pg][access_review][rest][mcp][sod][4752]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    const auto cid = h.open_campaign_rest("sod closed");
+
+    auto closed = h.sink.Post("/api/v1/access-reviews/" + cid + "/close", "");
+    REQUIRE(closed);
+    REQUIRE(closed->status == 200);
+
+    SECTION("another reviewer: 404 REST, invalid-params MCP, no history") {
+        h.session_user = "carol";
+        auto rest = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
+        REQUIRE(rest);
+        CHECK(rest->status == 404);
+        const auto err = mcp_error_of(
+            h.mcp_call_tool("record_attestation", sod_args(cid, "user", "bob", "Operator")));
+        CHECK(err["code"] == yuzu::server::mcp::kInvalidParams);
+        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        CHECK(row.decision == "pending");
+        CHECK(row.history.empty());
+    }
+
+    SECTION("the subject: 403 on both transports (the refusal precedes not_found)") {
+        h.session_user = "bob";
+        check_rest_sod_refusal(h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator")));
+        const auto err = mcp_error_of(
+            h.mcp_call_tool("record_attestation", sod_args(cid, "user", "bob", "Operator")));
+        CHECK(err["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(grant_row(h, cid, "user", "bob", "Operator").history.empty());
+    }
+}
+
+TEST_CASE("attestation SoD: an engine or group lookup that cannot be answered fails closed (503 "
+          "REST / internal-error MCP), writes nothing, and is counted",
+          "[pg][access_review][rest][mcp][sod][degrade][4752]") {
+    // A per-test migrated clone, NOT the file-wide shared one: the shared reset TRUNCATEs and
+    // cannot repair a table this case DROPs.
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_rest_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    REQUIRE(pool.valid());
+    AccessReviewHarness h{true, true, &pool};
+
+    SECTION("engine store unavailable") {
+        seed_engine_grant(h, "engine:svc", "bob");
+        const auto cid = h.open_campaign_rest("sod degrade engine");
+        drop_table_cascade(db.dsn(), "engine_principal_store.engine_principals");
+        h.session_user = "carol";
+        h.audit_log.clear();
+        const std::string tuple = " principal_type=engine principal_id=engine:svc role=Writer";
+
+        auto rest = h.sink.Post(attest_url(cid), sod_body("engine", "engine:svc", "Writer"));
+        REQUIRE(rest);
+        CHECK(rest->status == 503);
+        auto body = nlohmann::json::parse(rest->body);
+        CHECK(body["error"]["retry_after_ms"] == 5000);
+        CHECK(body["error"]["message"] == std::string(sod::kSodUnavailableMessage));
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "failure");
+        CHECK(rows[0].target_id == cid);
+        CHECK(rows[0].detail == "sod_check_unavailable store=engine" + tuple);
+        CHECK(refused_count(h, "rest", "check_unavailable") == 1.0);
+        const auto row = grant_row(h, cid, "engine", "engine:svc", "Writer");
+        CHECK(row.decision == "pending");
+        CHECK(row.history.empty());
+
+        const auto err = mcp_error_of(
+            h.mcp_call_tool("record_attestation", sod_args(cid, "engine", "engine:svc", "Writer")));
+        CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(err["data"]["retry_after_ms"] == 5000);
+        CHECK(refused_count(h, "mcp", "check_unavailable") == 1.0);
+        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer").history.empty());
+    }
+
+    SECTION("rbac group store unavailable (RBAC off, administrator session)") {
+        seed_group_grant(h, "eng", "bob");
+        const auto cid = h.open_campaign_rest("sod degrade group");
+        drop_table_cascade(db.dsn(), "rbac_store.group_members");
+        h.session_user = "carol";
+        h.audit_log.clear();
+        const std::string tuple = " principal_type=group principal_id=eng role=Reader";
+
+        auto rest = h.sink.Post(attest_url(cid), sod_body("group", "eng", "Reader"));
+        REQUIRE(rest);
+        CHECK(rest->status == 503);
+        CHECK(nlohmann::json::parse(rest->body)["error"]["retry_after_ms"] == 5000);
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "failure");
+        CHECK(rows[0].detail == "sod_check_unavailable store=rbac" + tuple);
+        CHECK(refused_count(h, "rest", "check_unavailable") == 1.0);
+        CHECK(grant_row(h, cid, "group", "eng", "Reader").history.empty());
+
+        const auto err = mcp_error_of(
+            h.mcp_call_tool("record_attestation", sod_args(cid, "group", "eng", "Reader")));
+        CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(err["data"]["retry_after_ms"] == 5000);
+        CHECK(refused_count(h, "mcp", "check_unavailable") == 1.0);
+    }
+}
+
+TEST_CASE("attestation SoD: a refusal stands and a recorded decision stands when its audit row "
+          "cannot be persisted, and nothing escapes a throwing audit callback",
+          "[pg][access_review][rest][mcp][sod][audit][4752]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    const auto cid = h.open_campaign_rest("sod audit faults");
+
+    SECTION("REST refusal: 403 stands, Sec-Audit-Failed set") {
+        h.session_user = "bob";
+        h.audit_fail_action = "access_review.attested";
+        auto res = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
+        check_rest_sod_refusal(res);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(grant_row(h, cid, "user", "bob", "Operator").history.empty());
+        CHECK(refused_count(h, "rest", "self_subject") == 1.0); // counted though the row failed
+    }
+
+    SECTION("REST success: decision recorded, Sec-Audit-Failed set") {
+        h.session_user = "carol";
+        h.audit_fail_action = "access_review.attested";
+        auto res = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        CHECK(row.decision == "attested");
+        CHECK(row.decision_seq == 1);
+        CHECK(row.history.size() == 1);
+    }
+
+    SECTION("MCP refusal, audit row returns false") {
+        h.session_user = "bob";
+        h.mcp_audit_mode = AccessReviewHarness::McpAuditMode::fail;
+        h.mcp_audit_mode_action = "access_review.attested";
+        const auto err = mcp_error_of(
+            h.mcp_call_tool("record_attestation", sod_args(cid, "user", "bob", "Operator")));
+        CHECK(err["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(err["message"] == std::string(sod::kSodMessage));
+        CHECK(err["data"]["audit_persisted"] == false);
+        CHECK(grant_row(h, cid, "user", "bob", "Operator").history.empty());
+    }
+
+    SECTION("MCP refusal, only the mcp.<tool> wrapper row fails") {
+        h.session_user = "bob";
+        h.mcp_audit_mode = AccessReviewHarness::McpAuditMode::fail;
+        h.mcp_audit_mode_action = "mcp.record_attestation";
+        const auto err = mcp_error_of(
+            h.mcp_call_tool("record_attestation", sod_args(cid, "user", "bob", "Operator")));
+        CHECK(err["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(err["data"]["audit_persisted"] == false);
+    }
+
+    SECTION("MCP refusal, audit callback throws") {
+        h.session_user = "bob";
+        h.mcp_audit_mode = AccessReviewHarness::McpAuditMode::throws;
+        h.mcp_audit_mode_action = "access_review.attested";
+        std::unique_ptr<httplib::Response> res;
+        REQUIRE_NOTHROW(
+            res = h.mcp_call_tool("record_attestation", sod_args(cid, "user", "bob", "Operator")));
+        const auto err = mcp_error_of(res);
+        CHECK(err["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(err["data"]["audit_persisted"] == false);
+    }
+
+    SECTION("MCP success, audit row returns false") {
+        h.session_user = "carol";
+        h.mcp_audit_mode = AccessReviewHarness::McpAuditMode::fail;
+        h.mcp_audit_mode_action = "access_review.attested";
+        auto res = h.mcp_call_tool("record_attestation", sod_args(cid, "user", "bob", "Operator"));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        CHECK(body["result"]["structuredContent"]["recorded"] == true);
+        CHECK(body["result"]["structuredContent"]["audit_persisted"] == false);
+        CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 1);
+    }
+
+    SECTION("MCP success, audit callback throws after the mutation") {
+        h.session_user = "carol";
+        h.mcp_audit_mode = AccessReviewHarness::McpAuditMode::throws;
+        h.mcp_audit_mode_action = "access_review.attested";
+        std::unique_ptr<httplib::Response> res;
+        REQUIRE_NOTHROW(
+            res = h.mcp_call_tool("record_attestation", sod_args(cid, "user", "bob", "Operator")));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        CHECK(body["result"]["structuredContent"]["recorded"] == true);
+        CHECK(body["result"]["structuredContent"]["audit_persisted"] == false);
+        CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 1);
+    }
 }

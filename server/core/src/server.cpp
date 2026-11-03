@@ -939,6 +939,23 @@ public:
         for (auto decision : {"attested", "flagged_revoke"}) {
             metrics_.counter("yuzu_access_review_attestations_total", {{"decision", decision}});
         }
+        // Attestations refused by the reviewer-differs-from-the-subject rule, on BOTH surfaces
+        // (counted inside the shared gate in access_review_attest_gate.hpp, so the MCP twin is
+        // counted here, unlike the four counters above). `surface` and `reason` are closed sets,
+        // never derived from caller input. Operational, not a security event: the refusal's
+        // audit row is the evidence.
+        metrics_.describe("yuzu_access_review_attestation_refused_total",
+                          "Access review attestations refused because the reviewer is the subject "
+                          "of the grant, by surface (rest|mcp) and reason (self_subject|"
+                          "engine_owner|group_member|check_unavailable)",
+                          "counter");
+        for (auto surface : {"rest", "mcp"}) {
+            for (auto reason :
+                 {"self_subject", "engine_owner", "group_member", "check_unavailable"}) {
+                metrics_.counter("yuzu_access_review_attestation_refused_total",
+                                 {{"surface", surface}, {"reason", reason}});
+            }
+        }
         // MCP Streamable HTTP transport (ADR-1005 Decision 15(k) — the family was
         // NAMED in the decision, not left to implementer discretion, so alerts can
         // be authored against it before every rung has landed). Pre-seeded to 0 per
