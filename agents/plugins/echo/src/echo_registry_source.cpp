@@ -92,7 +92,16 @@ void RegistryCursorSource::start(EchoDatabase& db) {
     // ones, and the force_all_ reconcile reads) finalises as lost-restart.
     events_since_ = reader_.now_ts();
     last_query_ts_ = events_since_;
-    ensure_watch(scope_.roots_for(reader_.loaded_sids()));
+    try {
+        ensure_watch(scope_.roots_for(reader_.loaded_sids()));
+    } catch (const IncompleteCaptureError& e) {
+        // A partial list would arm a partial watch: arm nothing here. The first collect()
+        // enumerates again (force_all_) and, if that also fails, keeps the cursor and retries.
+        spdlog::warn("Echo registry: the loaded user hives could not be listed at start-up ({}); "
+                     "their watches arm on the first tick that can list them",
+                     e.what());
+        force_all_ = true;
+    }
 }
 
 void RegistryCursorSource::stop() noexcept {
@@ -1465,14 +1474,26 @@ int read_current_control_set() {
     return static_cast<int>(v);
 }
 
+// The loaded-user list is the one HKU snapshot collect() classifies profiles against, so it
+// is complete or it is not returned: only ERROR_NO_MORE_ITEMS ends it. Any other error
+// throws IncompleteCaptureError (the cursor-source rule: a transient read failure keeps the
+// cursor), because a partial list would read a loaded user as logged off and drop that
+// user's watch and dirty state.
 std::vector<std::string> enumerate_hku() {
     std::vector<std::string> out;
     wchar_t buf[256];
     for (DWORD i = 0;; ++i) {
         DWORD len = 256;
-        if (RegEnumKeyExW(HKEY_USERS, i, buf, &len, nullptr, nullptr, nullptr, nullptr) !=
-            ERROR_SUCCESS)
+        const LONG rc =
+            RegEnumKeyExW(HKEY_USERS, i, buf, &len, nullptr, nullptr, nullptr, nullptr);
+        if (rc == ERROR_NO_MORE_ITEMS)
             break;
+        if (rc == ERROR_MORE_DATA)
+            continue; // a name longer than any SID or its _Classes twin is not a user hive
+        if (rc != ERROR_SUCCESS)
+            throw IncompleteCaptureError("Echo registry: HKEY_USERS enumeration failed at index " +
+                                         std::to_string(i) + " (error " + std::to_string(rc) +
+                                         ")");
         out.push_back(yuzu::win::from_wide(buf, static_cast<int>(len)));
     }
     return out;

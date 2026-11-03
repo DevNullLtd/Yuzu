@@ -1440,6 +1440,7 @@ struct Fake {
     bool etw{true}; // the write-event session is delivering
     std::vector<std::string> sids;
     int loaded_sids_calls{0}; // the HKU enumerations collect() made
+    bool fail_loaded_sids{false}; // the HKU enumeration fails part-way (throws, like the real one)
     OfflineDiscovery offline_discovery; // complete, no logged-off profile
     std::deque<OfflineDiscovery> offline_discovery_queue; // answers consumed one per walk, before the line above
     std::int64_t offline_mount_cost{0}; // clock a read_offline_hive call advances
@@ -1475,6 +1476,8 @@ struct Fake {
         };
         r.loaded_sids = [this] {
             ++loaded_sids_calls;
+            if (fail_loaded_sids)
+                throw IncompleteCaptureError("Echo registry: HKEY_USERS enumeration failed");
             return sids;
         };
         r.offline_profiles = [this](const std::vector<std::string>& loaded) {
@@ -3095,6 +3098,39 @@ struct OfflineRig {
 };
 
 } // namespace
+
+TEST_CASE("registry source: a failed HKEY_USERS enumeration keeps the cursor, the baselines and "
+          "the HKU mark, and the next tick re-enumerates",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.sids = {kSidA};
+    r.f.reads[root] = uread(root, 1);
+    CHECK(r.next().outcome == CursorOutcome::Baseline);
+    r.f.dirty->mark_hku();
+    r.f.clock += SEC;
+    r.f.reads[root] = uread(root, 2); // the loaded user's value changed between the ticks
+    const std::string cursor_before = *r.t.db.get_cursor("registry").value();
+    const std::string baseline_before = r.state(root);
+
+    // The enumeration answers an error part-way: the tick throws before it touches the watch
+    // set, the dirty marks, the baselines or the cursor, and writes no gap row.
+    r.f.fail_loaded_sids = true;
+    CHECK_THROWS_AS(tick(r.t.db, *r.src), IncompleteCaptureError);
+    CHECK(*r.t.db.get_cursor("registry").value() == cursor_before);
+    CHECK(r.state(root) == baseline_before);
+    CHECK(count_rows(r.t.db) == 0);
+    CHECK(r.f.dirty->take_hku()); // the name-watch mark was put back (R7)
+    r.f.dirty->mark_hku();
+
+    // The enumeration works again: the tick re-lists, re-reads the changed value, and commits.
+    r.f.fail_loaded_sids = false;
+    const int enumerations = r.f.loaded_sids_calls;
+    r.f.clock += SEC;
+    tick(r.t.db, *r.src);
+    CHECK(r.f.loaded_sids_calls == enumerations + 1);
+    CHECK(*r.t.db.get_cursor("registry").value() != cursor_before);
+}
 
 TEST_CASE("registry offline: first sight baselines silently; one mount per hive per hour, and discovery only when the loaded list is re-enumerated",
           "[echo][registry][lifecycle]") {

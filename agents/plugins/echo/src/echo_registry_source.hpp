@@ -261,7 +261,11 @@ struct SessionLoss {
 struct RegistryReader {
     /// One bounded read of `root`. Must not throw. `deadline` is an absolute now_ts() value.
     std::function<SubtreeRead(const std::string& root, std::int64_t deadline)> read_subtree;
-    std::function<std::vector<std::string>()> loaded_sids; // subkey names under HKEY_USERS
+    /// Subkey names under HKEY_USERS: the COMPLETE list or a throw. A failed or part-way
+    /// enumeration throws `IncompleteCaptureError` (collect() lets it propagate and keeps the
+    /// cursor, the watches and the dirty marks; start() arms nothing and the first collect()
+    /// asks again), because a partial list reads a loaded user as logged off.
+    std::function<std::vector<std::string>()> loaded_sids;
     /// The profiles whose hive is NOT loaded, from the profile list, classified against collect's
     /// own `loaded_sids` for this tick (never a second HKU enumeration). Asked on an HKU
     /// name-watch mark, on the full re-read and on a re-baseline, while the known list is empty,
