@@ -25,7 +25,17 @@
 %%%                     URI and stay here.
 %%%   identity_or_pin   the identity OR a pin admits. The transition mode.
 %%%   identity          the identity admits; a pin, if any is configured, must
-%%%                     ALSO match.
+%%%                     ALSO match. What the shipped configurations set since
+%%%                     release N+1 (with no pin).
+%%%
+%%% The shipped configurations choose `identity' EXPLICITLY; an UNSET mode stays
+%%% `pin', so a configuration written before #6016 changes nothing until its
+%%% operator sets the key (release N promised exactly that). Making an unset mode
+%%% `identity' would refuse every command of an installation whose server
+%%% certificate carries no identity, and `identity_or_pin' would make the derived
+%%% identity (public: a hash of the CA certificate) a second way in under a CA that
+%%% lets a requester choose a URI SAN. The boot logs a WARN when the mode is unset
+%%% so that a later release can change the default after notice.
 %%%
 %%% The identity is only as strong as the issuing CA's refusal to mint it for
 %%% anyone else. That holds for the Yuzu install CA (default_certs.cpp mints it
@@ -118,13 +128,21 @@ resolve(Mode0, Identity0, Denied0, Listeners, Pins) ->
                Other -> {error, {bad_mgmt_peer_auth_mode, Other}}
            end,
     Denied = validate_denied(Denied0),
+    %% A pin setting that is not a PROPER list (a bare `{cert_file, Path}' typed over the
+    %% shipped `[]') is a boot defect in EVERY mode: left alone it passes the boot
+    %% guard under `identity' (the identity is resolved) and then refuses every peer
+    %% at runtime as `bad_pin_config'.
+    PinsOk = case yuzu_grpc_listener:proper_list(Pins) of
+                 true  -> {ok, Pins};
+                 false -> {error, {bad_mgmt_peer_pins, redact(Pins)}}
+             end,
     Identity = case Mode of
                    {ok, pin} -> {ok, undefined};
                    {ok, M0} -> bundle_guard(M0, resolve_identity(Identity0, Listeners),
                                             Listeners, Pins);
                    {error, _} -> {ok, undefined}
                end,
-    case [E || {error, E} <- [Mode, Denied, Identity]] of
+    case [E || {error, E} <- [Mode, Denied, Identity, PinsOk]] of
         [] ->
             {ok, M1} = Mode,
             {ok, D1} = Denied,

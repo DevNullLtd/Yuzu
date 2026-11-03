@@ -9,7 +9,7 @@ app with external plugins, and disables executable-replacement OTA.
 
 1. Use an SDK that ships the Endpoint Security header and library stub (both the
    Command Line Tools and full Xcode SDKs do). Configure must not print
-   "EndpointSecurity library or header not found"; otherwise TAR deliberately
+   "EndpointSecurity library or header not found"; otherwise Echo deliberately
    compiles the polling fallback.
 2. Follow [the build guide](build-guide.md) for Meson, the C++23 toolchain and
    vcpkg prerequisites. Use the pinned manifest and repository `arm64-osx` triplet.
@@ -19,7 +19,7 @@ app with external plugins, and disables executable-replacement OTA.
    "$VCPKG_ROOT/vcpkg" install --triplet arm64-osx --x-manifest-root=. --binarysource=clear
    ./scripts/setup.sh --tests --native-file meson/native/macos-appleclang.ini
    meson compile -C build-macos
-   meson test -C build-macos --suite agent --suite tar --print-errorlogs
+   meson test -C build-macos --suite agent --suite echo --print-errorlogs
    ```
 
    `--binarysource=clear` disables binary caches; it does not force replacement of
@@ -96,11 +96,11 @@ The check leaves the service running and its configuration untouched. It verifie
 - Root launchd PID points to the installed executable and remains stable.
 - App and external plugin signatures pass; executable, profile and plugin hashes
   remain unchanged, with no executable-adjacent OTA markers.
-- Explicit single-target `os_info.os_name`, `tar.status` and `tar.sql` commands
+- Explicit single-target `os_info.os_name`, `echo.status` and `echo.sql` commands
   return terminal SUCCESS; failures, wrong-target replies and timeouts fail closed.
-- TAR reports `endpoint_security`, process capture enabled, and unchanged drop
+- Echo reports `endpoint_security`, process capture enabled, and unchanged drop
   counters. A private native `/usr/bin/true` copy generates a unique EXEC/EXIT pair
-  retrieved through normal command dispatch, not by reading the TAR database.
+  retrieved through normal command dispatch, not by reading the Echo database.
 - Repeated targeted commands succeed during the observation window (default 120
   seconds). This tests responsiveness, **not** a per-agent heartbeat metric.
 
@@ -110,7 +110,7 @@ retention. Keep evidence private under `.agent-runs/`, excluded from git **and**
 Docker contexts. Python parser/mock regressions run on every host via Meson's
 `agent` suite; the live smoke is opt-in and never invoked automatically by CI.
 
-If marker rows are initially absent, allow TAR's configured drain interval (normally
+If marker rows are initially absent, allow Echo's configured drain interval (normally
 60 seconds). A new SQL command is a fresh snapshot; repeatedly polling the same
 receipt cannot discover later rows. If launchd bootstrap returns 5 after bootout,
 first check whether the previous PID is still exiting and inspect retained logs;
@@ -125,7 +125,7 @@ should stop a successfully retained service.
 | Guardian | `guardian_engine.cpp`, `guardian_spark_runtime.*`, `guardian_state_reader.*`. Preserve the single reconciliation chokepoint and §24 invariants; this PR does not flip production `prefer_spark`. |
 | DEX | `dex_macos_collector.cpp`, `dex_macos_signals.*`, `dex_macos_oslog.*`, `dex_macos_iokit.*` already implement Mac collection. Extend/converge these, not a second competing collector stack. |
 | Reflex | [ADR-0021](adr/0021-spark-reflex-architecture.md) defines the future consumer. Existing TriggerEngine is not a shipped Reflex implementation. A root daemon cannot substitute for an interactive-session consent helper. |
-| Endpoint Security | `agents/plugins/tar/src/tar_proc_es.cpp` currently feeds TAR, **not Spark**. Its NOTIFY EXEC/EXIT stream proves observation, not synchronous AUTH prevention. |
+| Endpoint Security | `agents/plugins/echo/src/echo_proc_es.cpp` currently feeds Echo, **not Spark**. Its NOTIFY EXEC/EXIT stream proves observation, not synchronous AUTH prevention. |
 
 Read ADR-0021, [the Spark consumer design](spark-stage2-guardian-consumer-design.md),
 [the delta registry](spark-legacy-delta-registry.md), and

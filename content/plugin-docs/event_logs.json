@@ -560,9 +560,9 @@
   "version": "1.1.0",
   "where_the_data_goes": [
     "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention; the definitions carry no override), queryable at `/api/responses/{id}` and aggregatable (`errors` groups by `source`, `query` by `level` and `source`, both meaningful on Windows only).",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX or metrics. `event_logs` is among the plugins whose results the legacy dashboard row renderer shows as generic `Agent|Key|Value` pairs rather than a fixed column set, which fits the per-OS row shapes above.",
+    "**Not consumed by** daily-sync inventory, the Echo warehouse, DEX or metrics. `event_logs` is among the plugins whose results the legacy dashboard row renderer shows as generic `Agent|Key|Value` pairs rather than a fixed column set, which fits the per-OS row shapes above.",
     "**Sensitivity.** `message` is raw log text and can carry user names, host names or other identifying content depending on what the OS logged; the Windows `source` and the Linux `unit` can name installed software or services. These rows are the least predictable in the catalogue for what they may disclose.",
-    "**Siblings:** none expose a general event-log query. The `users` and `tar` plugins read specific Windows event channels internally (`users_plugin.cpp`, `tar_netconn_win.cpp`), and the agent daemon reads the Linux journal for its own use (`agents/core/src/dex_linux_journal.cpp`); none of those return event-log rows to an operator.",
+    "**Siblings:** none expose a general event-log query. The `users` and `echo` plugins read specific Windows event channels internally (`users_plugin.cpp`, `echo_netconn_win.cpp`), and the agent daemon reads the Linux journal for its own use (`agents/core/src/dex_linux_journal.cpp`); none of those return event-log rows to an operator.",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.event_logs.errors\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
   ]
 }

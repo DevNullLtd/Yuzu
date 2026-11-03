@@ -329,7 +329,7 @@ operator-visible notes:
   backfill, ADR-0009), so on the upgrade to the Postgres substrate the
   response history starts empty and refills as new commands run. The server
   logs a one-time `response history reset on Postgres cutover` warning at
-  first boot. Executions-drawer and TAR views for commands issued before the
+  first boot. Executions-drawer and Echo views for commands issued before the
   cutover will be empty; commands issued after are unaffected.
 - **Non-UTF-8 plugin output is sanitised.** A plugin can emit non-UTF-8 bytes
   in its output/error; PostgreSQL `TEXT` requires valid UTF-8, so such bytes

@@ -41,7 +41,7 @@ Follow these five principles throughout:
    VI=<main-checkout>/vcpkg_installed/x64-linux   # e.g. /home/<user>/Yuzu/vcpkg_installed/x64-linux
    meson setup build-linux --buildtype=debug -Dbuild_tests=true \
      -Dcmake_prefix_path=$VI -Dpkg_config_path=$VI/lib/pkgconfig,/usr/lib/x86_64-linux-gnu/pkgconfig
-   meson compile -C build-linux tests/yuzu_server_tests   # or tests/yuzu_agent_tests, tests/yuzu_tar_tests
+   meson compile -C build-linux tests/yuzu_server_tests   # or tests/yuzu_agent_tests, tests/yuzu_echo_tests
    ./build-linux/tests/yuzu_server_tests '[tag]'
    ```
    Both flags are required. `$VCPKG_ROOT/installed/<triplet>` is the WRONG prefix — this repo

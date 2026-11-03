@@ -144,7 +144,7 @@ Yuzu/
 
 Prebuilt artifacts are published with every tagged release. If you just want to run Yuzu, start here — you do not need to build from source.
 
-- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.14.1.
+- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.15.0, a fresh-deployment release: it supports initial deployment into a new database only, with no in-place upgrade from, and no return to, 0.14.x or earlier (see [Upgrading](docs/user-manual/upgrading.md#behaviour-change-stored-responses-of-forensics-tier-plugins-need-forensicsread-4990-fresh-deployment-only), Deployment contract).
 - **Container images** (published to GHCR on every tag):
   - `ghcr.io/devnullltd/yuzu-server:<version>`
   - `ghcr.io/devnullltd/yuzu-postgres:<version>`
@@ -157,8 +157,8 @@ Step 1 creates a `yuzu` directory, downloads the compose file into it and writes
 ```bash
 [ -z "$(docker volume inspect -f '{{.Name}}' yuzu_server-data yuzu_certs yuzu_postgres-data 2>/dev/null)" ] &&
 mkdir yuzu && cd yuzu &&
-curl -fsSL https://raw.githubusercontent.com/DevNullLtd/Yuzu/v0.14.1/deploy/docker/docker-compose.reference.yml -o docker-compose.yml &&
-(umask 077; set -C; p1=$(openssl rand -hex 24) && p2=$(openssl rand -hex 24) && [ ${#p1} -eq 48 ] && [ ${#p2} -eq 48 ] && printf 'YUZU_VERSION=0.14.1\nYUZU_POSTGRES_PASSWORD=%s\nYUZU_DB_PASSWORD=%s\n' "$p1" "$p2" > .env)
+curl -fsSL https://raw.githubusercontent.com/DevNullLtd/Yuzu/v0.15.0/deploy/docker/docker-compose.reference.yml -o docker-compose.yml &&
+(umask 077; set -C; p1=$(openssl rand -hex 24) && p2=$(openssl rand -hex 24) && [ ${#p1} -eq 48 ] && [ ${#p2} -eq 48 ] && printf 'YUZU_VERSION=0.15.0\nYUZU_POSTGRES_PASSWORD=%s\nYUZU_DB_PASSWORD=%s\n' "$p1" "$p2" > .env)
 ```
 
 Step 2 creates the first admin account. The server's first-run setup asks for it on a terminal, which a detached container does not have, so this writes the file that setup would write, `yuzu-server.cfg` (PBKDF2-HMAC-SHA256, 100,000 iterations), and copies it into the server's data volume. It asks for the password twice and refuses to overwrite either copy.
@@ -190,7 +190,7 @@ Open `https://localhost:8443` and sign in as `admin`. The browser warns about th
 
 The admin password is kept in the database. `yuzu-server.cfg` only seeds the first admin on the first start: editing it afterwards does not change the password, and the server logs a warning at start while the file still holds a different, stale password ([#5274](https://github.com/DevNullLtd/Yuzu/issues/5274)). Change the password in the dashboard (Settings → User Management → **Change password**) or with `POST /api/v1/users/me/password` ([#5342](https://github.com/DevNullLtd/Yuzu/issues/5342)); the change is recorded in the audit log. Protect both copies of `yuzu-server.cfg` like a password, or delete the host copy once you have signed in.
 
-The stack publishes ports 8443 (dashboard and REST API), 8080 (plain HTTP: redirects to HTTPS and answers the four health probes in cleartext), 50051 (agent gRPC) and 50052 (management gRPC) on every interface. On a machine other people can reach, publish the ones you need only locally on `127.0.0.1`, for example `"127.0.0.1:8443:8443"` in the `ports:` list of `docker-compose.yml`; change the host side there too if a port is already in use. Upgrading (`docker compose -f docker-compose.yml pull && docker compose -f docker-compose.yml up -d` after you change `YUZU_VERSION` in `.env`) and recreating the server keep the certificate authority and the secrets key. `docker compose -f docker-compose.yml down -v` deletes them, together with the database, and every other install on this host whose directory is also named `yuzu`: never run it unless you mean to destroy this install. Back up before upgrading, with the recipe under **Back up before upgrading** in [Upgrading](docs/user-manual/upgrading.md#docker) and `P=yuzu` (the 0.14.0 compose file's header recipe names the volumes without the project prefix and backs up nothing). The stack runs the server only: the dashboard stays empty until agents enroll; [Agent enrollment](docs/user-manual/device-management.md#agent-enrollment) covers connecting agents, and [Agent bundle](docs/agent-bundle.md) the agent install image.
+The stack publishes ports 8443 (dashboard and REST API), 8080 (plain HTTP: redirects to HTTPS and answers the four health probes in cleartext), 50051 (agent gRPC) and 50052 (management gRPC) on every interface. On a machine other people can reach, publish the ones you need only locally on `127.0.0.1`, for example `"127.0.0.1:8443:8443"` in the `ports:` list of `docker-compose.yml`; change the host side there too if a port is already in use. Recreating the server keeps the certificate authority and the secrets key; changing `YUZU_VERSION` on an existing install is not a supported upgrade for 0.15.0, which supports fresh deployment only (see [Upgrading](docs/user-manual/upgrading.md#behaviour-change-stored-responses-of-forensics-tier-plugins-need-forensicsread-4990-fresh-deployment-only), Deployment contract). `docker compose -f docker-compose.yml down -v` deletes the certificate authority and the secrets key, together with the database, and every other install on this host whose directory is also named `yuzu`: never run it unless you mean to destroy this install. To back up this install for restoring onto this same deployment, use the recipe under **Back up before upgrading** in [Upgrading](docs/user-manual/upgrading.md#docker) and `P=yuzu` (the 0.14.0 compose file's header recipe names the volumes without the project prefix and backs up nothing). The stack runs the server only: the dashboard stays empty until agents enroll; [Agent enrollment](docs/user-manual/device-management.md#agent-enrollment) covers connecting agents, and [Agent bundle](docs/agent-bundle.md) the agent install image.
 
 [`deploy/docker/docker-compose.yml`](deploy/docker/docker-compose.yml) is a development stack, not a download-only install. It builds the server and Postgres images from a checkout of this repository (`build: context: ../..`), ignores `YUZU_VERSION`, and publishes port 8080 but not 8443. Run it from `deploy/docker/` in a clone ([#5419](https://github.com/DevNullLtd/Yuzu/issues/5419)).
 
@@ -219,7 +219,7 @@ The stack publishes ports 8443 (dashboard and REST API), 8080 (plain HTTP: redir
 - **RHEL / Rocky / AlmaLinux 9:** the system GCC (11) cannot build C++23 — see
   [`docs/rhel9-build-setup.md`](docs/rhel9-build-setup.md) for the verified
   recipe, or run `bash scripts/setup-rhel9.sh`.
-  The 0.14.0 release packages do not run there either; see the native-package
+  The 0.14.0 release packages do not run there either, and building to an older baseline is not part of 0.15.0; see the native-package
   floor under *Supported Platforms* in [`docs/user-manual/README.md`](docs/user-manual/README.md).
 
 ### Quick Start

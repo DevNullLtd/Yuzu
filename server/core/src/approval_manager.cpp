@@ -602,6 +602,13 @@ const std::vector<pg::PgMigration>& migrations() {
          "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS request_json   TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS request_digest TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS excluded_roots TEXT NOT NULL DEFAULT '';"},
+        // v4 (Echo rename, upgrade window): approvals follow the renamed definition ids and the
+        // renamed plugin. request_json / request_digest are deliberately NOT rewritten: the digest
+        // binds the frozen request text, so editing the text would orphan its digest.
+        {4,
+         "UPDATE approvals SET definition_id = replace(definition_id, "
+         "'crossplatform.tar.', 'crossplatform.echo.') WHERE definition_id LIKE 'crossplatform.tar.%';"
+         "UPDATE approvals SET target_plugin = 'echo' WHERE target_plugin = 'tar';"},
     };
     return kMigrations;
 }

@@ -1775,6 +1775,9 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
     // #5342 Gate 8 (F4): the credential anchor, always bound in the guarded
     // UPDATE below — the caller's proven hash, else the hash read above.
     const std::string anchor = expected_password_hash_hex.value_or(row->password_hash_hex);
+    // The ENCRYPTED envelope blob (never the plaintext secret), hex-encoded once: the guarded UPDATE
+    // and, on a 0-row miss, the classify SELECT both bind it.
+    const std::string secret_hex = auth::AuthManager::bytes_to_hex(row->secret_blob);
 
     auto secret_view = std::string_view(reinterpret_cast<const char*>(dec->data()), dec->size());
     auto current = mfa::current_counter(std::chrono::system_clock::now());
@@ -1813,8 +1816,9 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
         //       that rotates to a DIFFERENT provisional secret B likewise fails (B ≠ the
         //       loaded A → 0 rows) — a bare `IS NOT NULL` would have MATCHED B and enrolled
         //       the account against a secret whose code was never verified (#3781 review).
-        //       Any 0-row outcome here → classify below keeps WriteFailed/503 (fail-closed,
-        //       no half-enrolled state).
+        //       Either way nothing is enrolled (fail-closed, no half-enrolled state); the
+        //       0-row classify below grades it `MfaEnrollmentCancelled` (#3808), a benign
+        //       cancel, rather than a store outage.
         // LOAD-BEARING: dropping (a) reopens the double-regen; weakening (b) from the exact
         // blob to `IS NOT NULL` reopens the enrol-over-a-rotated-secret race. Neither wedges
         // a legitimate enroll: an uninterrupted verify's loaded secret is still the stored
@@ -1838,33 +1842,38 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
             "AND mfa_totp_secret = decode($3, 'hex') "
             "AND password_hash = $4 RETURNING id",
             std::vector<std::string>{std::to_string(*matched), username,
-                                     auth::AuthManager::bytes_to_hex(row->secret_blob), anchor});
+                                     secret_hex, anchor});
         if (r.status() != PGRES_TUPLES_OK)
             return false; // write outage → fail closed (WriteFailed → 503)
         if (PQntuples(r.get()) == 0) {
             // 0 rows = the user was deactivated/deleted mid-request, OR a concurrent
-            // verify already enrolled them (the guard above). Classify so the
-            // concurrent-enroll loser is graded MfaAlreadyEnrolled — NOT WriteFailed,
+            // verify already enrolled them, OR the provisional secret this verify
+            // loaded is no longer the stored one (#3808: a disable, a re-init, the
+            // stale-provisional sweep, `--mfa-reset` or a KEK rewrap — not
+            // distinguishable here, so no caller may name a cause). Classify so
+            // each benign race is graded by its own business outcome — NOT WriteFailed,
             // which `is_store_unavailable()` routes to a false 503 + a
-            // secret-unavailable degrade metric + a kCritical "store unavailable" audit
-            // for a benign race. A genuinely deactivated user keeps the fail-closed
-            // WriteFailed/503 (unchanged).
+            // secret-unavailable degrade metric + a kCritical "store unavailable" audit.
+            // A genuinely deactivated/deleted user, or a miss nothing explains, keeps
+            // the fail-closed WriteFailed/503 (unchanged).
             // #5342 Gate 8 (F2/F4): an active, still un-enrolled row whose hash
             // is no longer the anchor → CredentialChanged (a refusal, not a
-            // store fault). Evaluated in the SAME statement as the enrolled
-            // test so the two cannot disagree.
+            // store fault); it outranks the cancel because a password reset also wipes
+            // the provisional secret. All four facts come from the SAME statement so
+            // they cannot disagree; the precedence is the pure
+            // `detail::classify_enroll_verify_miss`.
             pg::PgResult cls = pg::exec_params(
                 conn,
                 "SELECT is_active, (mfa_enrolled_at IS NOT NULL), "
-                "(password_hash IS DISTINCT FROM $2) "
+                "(password_hash IS DISTINCT FROM $2), "
+                "(mfa_totp_secret IS DISTINCT FROM decode($3, 'hex')) "
                 "FROM auth.users WHERE username = $1",
-                std::vector<std::string>{username, anchor});
-            if (cls.status() == PGRES_TUPLES_OK && PQntuples(cls.get()) == 1 &&
-                to_bool(col(cls.get(), 0, 0))) {
-                if (to_bool(col(cls.get(), 0, 1)))
-                    txn_error = AuthDBError::MfaAlreadyEnrolled;
-                else if (to_bool(col(cls.get(), 0, 2)))
-                    txn_error = AuthDBError::CredentialChanged;
+                std::vector<std::string>{username, anchor,
+                                         secret_hex});
+            if (cls.status() == PGRES_TUPLES_OK && PQntuples(cls.get()) == 1) {
+                txn_error = detail::classify_enroll_verify_miss(
+                    to_bool(col(cls.get(), 0, 0)), to_bool(col(cls.get(), 0, 1)),
+                    to_bool(col(cls.get(), 0, 2)), to_bool(col(cls.get(), 0, 3)));
             }
             return false;
         }
@@ -2022,8 +2031,16 @@ AuthDB::mfa_consume_recovery_code(const std::string& username, std::string_view 
             return std::unexpected(AuthDBError::WriteFailed);
         pg::PgResult res = pg::exec_params(
             lease.get(),
-            "SELECT id, code_hash, code_salt FROM auth.mfa_recovery_codes "
-            "WHERE username = $1 AND consumed_at IS NULL",
+            // #4058, defence in depth: an inactive account has no usable recovery
+            // codes, mirroring mfa_verify_login_code's `is_active = TRUE` filter.
+            // remove_user already deletes the codes with the soft-delete; this
+            // covers an account deactivated outside that path (a direct database
+            // edit). Lock-free by design — holding the user-row lock
+            // across the PBKDF2 walk below is the hazard
+            // mfa_regenerate_recovery_codes documents.
+            "SELECT c.id, c.code_hash, c.code_salt FROM auth.mfa_recovery_codes c "
+            "WHERE c.username = $1 AND c.consumed_at IS NULL "
+            "AND EXISTS (SELECT 1 FROM auth.users u WHERE u.username = c.username AND u.is_active = TRUE)",
             std::vector<std::string>{username});
         if (res.status() != PGRES_TUPLES_OK)
             return std::unexpected(AuthDBError::WriteFailed);
@@ -2065,13 +2082,22 @@ AuthDB::mfa_consume_recovery_code(const std::string& username, std::string_view 
         return std::unexpected(AuthDBError::WriteFailed);
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "UPDATE auth.mfa_recovery_codes SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL "
-        "RETURNING id",
+        // Same is_active guard as the candidate SELECT: an account whose
+        // deactivation committed before this statement started must not have a
+        // code consumed. The EXISTS reads this statement's snapshot (READ
+        // COMMITTED re-reads only the target code row), so a deactivation
+        // committing mid-statement is indistinguishable from the consume
+        // landing first. The login caller is covered by its post-mint recheck;
+        // the step-up caller has no recheck, but a product-path deactivation
+        // sweeps the session that step-up would stamp.
+        "UPDATE auth.mfa_recovery_codes c SET consumed_at = now() WHERE c.id = $1 AND c.consumed_at IS NULL "
+        "AND EXISTS (SELECT 1 FROM auth.users u WHERE u.username = c.username AND u.is_active = TRUE) "
+        "RETURNING c.id",
         std::vector<std::string>{std::to_string(matched_id)});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(AuthDBError::WriteFailed);
     if (PQntuples(res.get()) == 0)
-        return false; // a concurrent consume won the race
+        return false; // a concurrent consume won the race, or the account was deactivated before the UPDATE ran
     return true;
 }
 

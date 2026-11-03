@@ -31,17 +31,17 @@ Two existing constraints shape the design:
 - **Thin central (ADR-0004).** Most device data stays on the per-agent edge
   warehouse; central Postgres holds only what fleet-wide queries need.
 
-### Why not "TAR first"
+### Why not "Echo first"
 
-The initial instinct was to land this in the agent's local **TAR** edge
-warehouse and pull it centrally. Rejected: TAR is **pull-only by design** and
+The initial instinct was to land this in the agent's local **Echo** edge
+warehouse and pull it centrally. Rejected: Echo is **pull-only by design** and
 **event-shaped** (it records *change events*, e.g. PR #1620's `$Software`
-source records install/uninstall/upgrade deltas). TAR answers *"what changed,
+source records install/uninstall/upgrade deltas). Echo answers *"what changed,
 when"* on the edge. Our goal is *"what is installed now, daily, in central
-Postgres."* Routing a full daily snapshot through TAR would require building a
-new push/export transport that contradicts TAR's no-push philosophy, and TAR's
+Postgres."* Routing a full daily snapshot through Echo would require building a
+new push/export transport that contradicts Echo's no-push philosophy, and Echo's
 delta shape does not match a full-snapshot need. The two are **complementary,
-not substitutes**: this framework owns *current state, central*; TAR owns
+not substitutes**: this framework owns *current state, central*; Echo owns
 *change history, edge*. PR #1620 is out of scope here and lives or dies on its
 own merits.
 
@@ -56,7 +56,7 @@ is **source #1**; the seam is built right so further sources (and a future
 ### 1. Vehicle — direct push over `ReportInventory`
 Reuse the dormant `AgentService.ReportInventory(InventoryReport) → InventoryAck`
 RPC. `InventoryReport.plugin_data` is already a generic `map<string,bytes>`
-envelope (key = data-type, value = opaque blob). No TAR involvement.
+envelope (key = data-type, value = opaque blob). No Echo involvement.
 
 ### 2. Generic per-source framework (agent)
 A small, source-agnostic seam:
@@ -74,7 +74,7 @@ A small, source-agnostic seam:
 - Persist `last_sync_ts` + `last_hash` per source in the agent **`KvStore`**
   (`agents/core/src/kv_store.cpp`, `kv_store.db`), namespace `__sync__` — the
   same agent-core state store Guardian uses (namespace `__guardian__`).
-  Explicitly **not** TAR: TAR is a *plugin-owned, append-only* capture
+  Explicitly **not** Echo: Echo is a *plugin-owned, append-only* capture
   warehouse; this is *mutable agent-core* KV state, and core must not depend on
   a plugin's DB being loaded/healthy.
 - **Startup policy:** first-run or overdue (gone past one interval while
@@ -161,7 +161,7 @@ Therefore we **coexist, not replace**:
   future high-query sources get their own typed table in this store. Built per
   the `OfflineEndpointStore` template + ADR-0012 + the postgres-store-playbook:
   - **Current-state only** (replace on change). No history in central PG —
-    change-history stays an edge/TAR concern (ADR-0004 boundary).
+    change-history stays an edge/Echo concern (ADR-0004 boundary).
   - **Normalized relational rows**, **no JSONB/GIN** — honors the
     "migrate off Postgres easily" constraint. Generic parent
     `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` +
@@ -253,14 +253,14 @@ Therefore we **coexist, not replace**:
 
 ## Alternatives considered
 
-- **TAR-first + central pull** — rejected (pull-only, event-shaped; see Context).
+- **Echo-first + central pull** — rejected (pull-only, event-shaped; see Context).
 - **JSONB blob + GIN index** — rejected (Postgres lock-in; clunky range
   filters; conflicts with the migrate-off-PG constraint).
 - **Always send the full list** — rejected (abandons network-kindness).
 - **Server-dispatched daily schedule** — rejected (daily fleet fan-out; the
   agent-push model matches the RPC's purpose and self-staggers).
 - **Full version history in central PG** — rejected for v1 (fattest; contradicts
-  thin-central; history is TAR's edge concern).
+  thin-central; history is Echo's edge concern).
 
 ## Relationship to other ADRs
 - **ADR-0004** (edge warehouses / thin central) — this framework's
@@ -268,7 +268,7 @@ Therefore we **coexist, not replace**:
 - **ADR-0006/0008** (Postgres substrate) — `InventoryStore` is born-on-PG.
 - **ADR-0012** (server Postgres store contract) — `InventoryStore` follows it;
   recorded as a prioritized net-new store in `docs/postgres-migration-ladder.md`.
-- **PR #1620 / `$Software` TAR source** — complementary edge change-history,
+- **PR #1620 / `$Software` Echo source** — complementary edge change-history,
   not a substitute for this framework.
 
 ## Updates
@@ -523,8 +523,8 @@ header banner in `agents/plugins/app_usage/src/app_usage_parsers.hpp` are the
 per-file contracts; this entry is the routed-concerns.md pointer's full text
 (kept here, not duplicated inline in that file, to stay under its per-file
 character budget — see `docs/instruction-file-standard.md`'s placement
-ladder). The plugin reads TAR's `usage` fold read-only (`PRAGMA query_only`,
-`SQLITE_OPEN_READONLY`) — it never writes `tar.db`. Four clauses, all
+ladder). The plugin reads Echo's `usage` fold read-only (`PRAGMA query_only`,
+`SQLITE_OPEN_READONLY`) — it never writes `echo.db`. Four clauses, all
 CATASTROPHIC-IF-VIOLATED:
 
 1. **No pid, command line or user name is ever emitted.** `usage_daily_user`
@@ -537,12 +537,137 @@ CATASTROPHIC-IF-VIOLATED:
    the producer's backslash-pipe escape sequence — changing one side without
    the other silently corrupts or drops rows whose executable name contains a
    delimiter character.
-3. **A `tar_config` read failure must map to `Errored`, never `Enabled`.**
+3. **An `echo_config` read failure must map to `Errored`, never `Enabled`.**
    `source_state_from_config`'s tri-state (Enabled/Disabled/Errored) mirrors
-   TAR's own `canonical_source_enabled` #560 fix; defaulting a read failure to
+   Echo's own `canonical_source_enabled` #560 fix; defaulting a read failure to
    `Enabled` is the opposite of fail-closed.
 4. **Never send an empty blob for a constrained capture.** Skip the sync cycle
    instead — an empty blob reads server-side as "genuinely zero usage" on a
    host that is actually constrained or disabled, which is a false negative a
    downstream consumer cannot distinguish from real data.
   exposure (already derivable from the existing `os_info` source).
+
+### 2026-10-29 — `device_ci` blob v2 (store and ingest)
+
+The server now accepts and stores a versioned `device_ci` blob. This entry is the
+binding wire contract for the agent-side writer change and records the store-side
+rules. **Server-first rollout:** a v1 server cannot read a v2 blob (it would
+store `\x02` + the manufacturer and nack every cycle), so every serving replica upgrades
+before any agent emits v2; the agent-side change may additionally gate emission on an
+ack-advertised capability. No proto change.
+
+**Layout.** `blob := 0x02 scalar_record list_record*`; every record is 0x1F-separated
+and 0x1E-terminated. A blob whose first byte is not `0x02` parses exactly as before (v1).
+
+| Part | Contents |
+|---|---|
+| `scalar_record` | positions 0-21 = the frozen v1 fields (unchanged order); positions 22-32 appended: `chassis_type`, `chassis_serial`, `chassis_asset_tag`, `chassis_source`, `board_vendor`, `board_product`, `board_serial`, `board_source`, `machine_id_hash`, `machine_id_algorithm`, `machine_id_source`. Missing trailing positions stay blank; extras are ignored. |
+| status record | `status` 1F `<section>` 1F `<level>` 1F `<reason>` — one per registered section, including the three status-only ones (`chassis`, `baseboard`, `machine_id`, whose values are the appended scalars). Last wins. An unregistered section is ignored. |
+| list row | `<kind>` 1F `<c1>` ... `<cn>` — columns per kind below. A short row is padded blank, extra fields are ignored, an unknown kind is ignored. Each blob's ignored tokens (unknown kinds and sections, the scalar record, status records or kinds that carried extra fields) are named in one debug log line, so version skew is diagnosable. |
+| blob ceiling | 96 KiB (98,304 bytes) total, on the server and, equal by contract, on the agent (`kDeviceCiMaxBlobBytes` in `device_ci_kinds.hpp` and in `sync_source_device_ci.hpp`; the two binaries share no header, so each side's test pins its own constant to the literal 98304). The v1 agent's cap moves from 64 KiB to 96 KiB with it; that is behaviour-neutral, as its record is about 1 KiB. Derived from the section registry below, not from a transport limit: a p99 large host is about 25 KiB, and every kind at its row cap with a p99.9-wide row sums to about 75 KiB (table below). A conforming sender never reaches the ceiling (see "A host over the caps"). Every field is clamped to 1,024 bytes. |
+
+Section registry (one declaration, `server/core/src/device_ci_kinds.hpp`, shared by the
+parser and the store; the agent-side v2 writer MUST apply the same caps). The row budget is the
+declared p99.9 row width in wire bytes (kind token, separators and the record terminator
+included): a budget, not a bound. The 1,024-byte field clamp bounds each field and the
+ceiling bounds the blob.
+
+| Section / row kind | Columns | Row cap | Row budget (B) | Cap x budget (B) |
+|---|---|---|---|---|
+| `chassis`, `baseboard`, `machine_id` | status only | n/a | n/a | n/a |
+| `cpu` | idx, model, cores, threads, clock_mhz, socket_designation, stepping | 32 | 96 | 3,072 |
+| `dimm` | slot, size_mb, type, speed_mhz, manufacturer, part_number, serial | 64 | 96 | 6,144 |
+| `disk` | idx, model, size_gb, media_type, interface | 128 | 64 | 8,192 |
+| `swap` | device, total_mb, source | 16 | 56 | 896 |
+| `volume` | volume, mount_points, device, fstype, total_bytes, detail | 128 | 144 | 18,432 |
+| `partition` | disk, partition, size_bytes, type, mount_points, detail | 192 | 120 | 23,040 |
+| `topology` | topo_kind, name, uuid, members, detail | 96 | 144 | 13,824 |
+| rows subtotal | | | | 73,600 |
+| scalar record + status records | declared budget | | | 3,072 |
+| registry-derived total | 74.9 KiB, 78.0% of the 98,304-byte ceiling | | | 76,672 |
+
+A `static_assert` in `device_ci_kinds.hpp` holds that total to at most 80% of the ceiling, so
+changing a cap or a budget fails the build until the ceiling is reconsidered on both the server
+and the agent. A second `static_assert` keeps every row budget between the shortest possible row
+and the clamp-bound row, and at or above the measured width recorded beside it (`row_floor`), so
+a budget cannot be cut below a width actually observed to dodge the 80% line.
+
+The `partition` and `topology` budgets are assumed widths: no captures exist yet, so they are
+re-measured when the storage legs land (`swap` has no capture either, its legs being planned, and
+its floor is its shortest possible row). `topology`'s cap is 96, not the 192 starting target,
+because 192 x 144 B would put the registry-derived total past the 80% line.
+
+**A host over the caps (sender contract).** No agent v2 writer exists in this change; this is
+the contract it is built to. The sender keeps the first N rows of each kind (N = the kind's row
+cap) in a fixed sorted order, so the blob and its hash are stable day to day, and marks the
+section `constrained` with kept-of-total counts in its reason (a token distinct from the
+server's own `server_cap:<cap>`). If the blob would still exceed the ceiling it trims whole
+sections' tail rows, least valuable first: `topology`, `partition`, `volume`, `dimm`, `disk`,
+`cpu`, each trimmed section staying `constrained` with its kept-of-total. The scalar record and
+the per-section status records are never trimmed (together about 2-3 KiB, budgeted at 3 KiB), so
+a record always fits and the base fields always land. Trimmed rows are not stored: the daily
+record is a bounded summary, the live actions return the full data, and the daily record keeps
+no history. Any later report or search over these tables must present a `constrained` host as
+incomplete, not as one with fewer rows. The server drops and nacks `need_full` a blob over the
+ceiling as a backstop for a non-conforming sender only (its base fields then never land); each
+such drop writes one warn log line (`device_ci: oversized blob from agent=...`) and counts
+`yuzu_inventory_ingest_total{source="device_ci",outcome="dropped"}`.
+
+**Plugin-action to section mapping (agent-side writer obligation).** The section identifier on
+the wire is always the row-kind token, never the plugin action name: `chassis`->`chassis`,
+`baseboard`->`baseboard`, `machine_id`->`machine_id`, `swap`->`swap`, `volumes`->`volume`,
+`partitions`->`partition`, `topology`->`topology`. `partitions`->`partition` is the one
+rename. Fibre Channel and iSCSI tables are deferred: no column contract exists yet, so
+they land as an additive store migration with their own PR.
+
+**`swap.used_mb` is excluded** from the daily row — it is volatile telemetry that changes
+every cycle, the same hash-stability rule as the 2026-06-30 entry. The on-demand action
+still reports it.
+
+**Truncation is disclosed, not silent.** Rows past a kind's cap are dropped and the
+section is persisted with level `constrained` and reason `server_cap:<cap>` (appended with
+`;` after a non-empty incoming reason), so a hash-only acknowledgement of an unchanged blob
+never presents a bounded projection as complete.
+
+**The machine ID ships only as a hash.** `machine_id_hash` must be lower-case hex (any
+length — the algorithm is open) or `-` when absent. Any other value, such as a raw
+GUID or `IOPlatformUUID`, is blanked and the `machine_id` section is persisted `constrained`
+with reason `server:machine_id_shape` (appended with `;` after a non-empty incoming reason),
+through the same disclosure path as the row caps. The limit is stated plainly: this rejects
+UUID/GUID shapes but cannot detect a raw hex id such as `/etc/machine-id`.
+
+**Hash, per version.** v1 keeps the positional 22-field join byte-for-byte (the v1
+cross-pin constants are untouched), so an old agent never loops on `need_full`. v2's
+canonical hash is the sha256 of the received blob bytes, set by the parser: the agent's
+canonical bytes are the blob, so the server carries no re-serialisation to drift (a
+cap or clamp mismatch would otherwise store the server's bounded view and storm
+`need_full`). The "raw-byte hashing must be done for all sources together" note above
+concerns changing v1 semantics and does not apply to a new format. A digest failure yields
+a v2 record with an empty hash; the store refuses it (`kError`, nack `need_full`) rather
+than store under a placeholder. A v1 agent whose manufacturer begins with byte `0x02` is
+read as v2. Its blob is its canonical bytes, so the server's sha256 of the received bytes
+equals the hash the agent claims and there is no `need_full` loop. The record is stored as v2
+with no sections and blank appended scalars, and the manufacturer loses that leading byte (it
+was taken for the version byte). The next cycle's hash-only report matches and is touched, so
+the record does not self-heal until the value changes or the agent emits v2. This is not a
+real DMI/WMI value.
+
+**Store.** Migration 2 is additive: `blob_version` plus the 11 scalars on `device_ci`, a
+`device_ci_section` status table and one typed table per list kind, each referencing
+`device_ci` with `ON DELETE CASCADE` (so decommission stays one `DELETE`). A full payload
+of either version replaces the parent row and every child row in ONE transaction under a
+per-agent advisory lock (key prefixed `device_ci:` so it never collides with the software
+store's per-agent lock); any failure rolls back with the previous set intact and nacks
+`need_full`. A v1 full replaces the child set with the empty set. The sections read runs in
+one REPEATABLE READ transaction so a replacement committing mid-read cannot mix generations.
+
+**Rollback.** Do not run an older server after migration 2. An older server keeps working
+on the migrated database (the new columns default blank and the child tables cascade), but its
+v1 full neither rewrites the v2 columns nor deletes the child rows. If you must, expect stale
+chassis, board and machine-id values and stale child rows to be served as current until each
+agent's next full report on the upgraded server.
+
+**Personal data.** `chassis_serial`, `board_serial` and the DIMM `serial` column join the
+serial/UUID/MAC behavioural-PII tier. The sections read has no REST/MCP/UI route yet; the
+later REST read-surface change must serve it behind the same fail-closed audit as the
+audited `inventory.device.ci` read.

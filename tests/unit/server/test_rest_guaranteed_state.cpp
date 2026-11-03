@@ -815,7 +815,7 @@ struct RestGsHarness {
     }
 
     // Seed one device's reported verdict for a Guard via the status feed
-    // (insert_event → upsert_rule_status). event_type maps to state per
+    // (insert_event → project_rule_status). event_type maps to state per
     // event_state_from_type: guard.compliant/drift.remediated→compliant,
     // drift.detected→drifted, remediation.failed/guard.unhealthy/guard.errored→errored.
     // NOTE: the upsert keeps the row only when excluded.updated_at >= the existing
@@ -843,7 +843,7 @@ struct RestGsHarness {
     // Ported from a raw sqlite3 connection (ADR-0038): unconditional
     // INSERT ... ON CONFLICT DO UPDATE (no updated_at guard) — this helper
     // wants to FORCE the state regardless, unlike the store's own
-    // upsert_rule_status, which only advances on a newer timestamp.
+    // project_rule_status, which only advances on a newer timestamp.
     void seed_raw_status(const std::string& agent, const std::string& rule_id,
                          const std::string& state, const std::string& ts) {
         yuzu::server::pg::PgConn conn{PQconnectdb(gs_db_pg->dsn().c_str())};
@@ -1989,19 +1989,19 @@ TEST_CASE("REST gs.status: errored_rules is real, census-derived and DISTINCT-ru
     CHECK(j["data"]["total_rules"].get<int>() == 3);
 }
 
-TEST_CASE("REST gs.status: an errored census row for a DELETED rule is excluded (not counted)",
+TEST_CASE("REST gs.status: an event for a rule that does not exist adds no census row (not counted)",
           "[pg][rest][guaranteed_state][status]") {
-    // Adversarial-review finding: delete_rule's own status-table cleanup is
-    // explicitly best-effort (no changes-count check, warn-only on failure) with no
-    // FK — so a census row can outlive its rule. errored_rules must intersect
-    // against the live catalogue, or a deleted rule inflates the count forever.
+    // Schema v3: guardian_agent_rule_status has a foreign key to
+    // guaranteed_state_rules, so a census row for a missing rule is refused and
+    // cannot be arranged. This pins the observable result (errored_rules counts the
+    // live rule only); the live-catalogue intersection in the route remains as
+    // defense in depth.
     RestGsHarness h;
     REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r-live", "live"))
                 ->status == 201);
     h.seed_status("e1", "WS-1", "r-live", "guard.unhealthy", "2026-06-20T10:00:00Z");
-    // r-orphan has a census row but was NEVER created as a rule (models the
-    // best-effort-cleanup-failed / late-event-after-delete case without needing to
-    // race the actual delete path).
+    // r-orphan was NEVER created as a rule: the event is stored, its census write
+    // is refused by the foreign key.
     h.seed_status("e2", "WS-1", "r-orphan", "guard.unhealthy", "2026-06-20T10:00:00Z");
 
     auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
@@ -2009,6 +2009,37 @@ TEST_CASE("REST gs.status: an errored census row for a DELETED rule is excluded 
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
     CHECK(j["data"]["errored_rules"].get<int>() == 1); // r-live only
+    CHECK(j["data"]["total_rules"].get<int>() == 1);
+}
+
+TEST_CASE("REST gs.status: with the foreign key removed, an errored census row for a deleted rule "
+          "is still excluded",
+          "[pg][rest][guaranteed_state][status]") {
+    // The route intersects the census with the live rule catalogue as defense in depth in
+    // case the schema v3 foreign key is ever missing. The key is dropped here so an orphan
+    // census row can be arranged and that intersection observed; with the key in place the
+    // test above cannot reach it.
+    RestGsHarness h;
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r-live", "live"))
+                ->status == 201);
+    h.seed_status("e1", "WS-1", "r-live", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult res = yuzu::server::pg::exec_params(
+            conn.get(),
+            "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+            "DROP CONSTRAINT guardian_agent_rule_status_rule_fk",
+            std::vector<std::string>{});
+        REQUIRE(PQresultStatus(res.get()) == PGRES_COMMAND_OK);
+    }
+    h.seed_raw_status("WS-1", "r-orphan", "errored", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["errored_rules"].get<int>() == 1); // r-live only; r-orphan intersected out
     CHECK(j["data"]["total_rules"].get<int>() == 1);
 }
 
@@ -2250,8 +2281,9 @@ TEST_CASE("REST gs.status: a guard.errored lifecycle event counts as an errored 
     CHECK(j["data"]["compliant_rules"].get<int>() == 0);
 }
 
-TEST_CASE("REST gs.status/{agent_id}: an errored census row for a DELETED rule is excluded",
+TEST_CASE("REST gs.status/{agent_id}: an event for a rule that does not exist adds no census row",
           "[pg][rest][guaranteed_state][status]") {
+    // Schema v3: the foreign key refuses the census row for the missing rule.
     RestGsHarness h;
     REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r-live", "live"))
                 ->status == 201);
@@ -2981,7 +3013,7 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
 
     // Additive per-application and per-version figures.
     CHECK(j["data"]["population"].is_number_integer());
-    CHECK(j["data"]["population_basis"] == "windows_online");
+    CHECK(j["data"]["population_basis"] == "all_online"); // the default scope
     CHECK(j["data"]["apps_total"] == 2);
     CHECK(j["data"]["apps_truncated"] == false);
     CHECK_FALSE(j["data"].contains("stat_failures"));
@@ -2991,6 +3023,9 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
         CHECK(first.contains(k));
     CHECK(first["profile"] == "default");
     CHECK(first["versions"].is_array());
+    CHECK(j["data"]["crash_source_coverage"].size() == 3);
+    for (const char* k : {"windows", "linux", "macos"})
+        CHECK(j["data"]["crash_source_coverage"].contains(k));
     CHECK(res->body.find("below_floor") == std::string::npos);
 
     // The policy every figure was scored under is named on the payload.
@@ -3013,7 +3048,7 @@ TEST_CASE("REST dex/apps: an intact empty store is a 200 with an empty list, not
     auto j = nlohmann::json::parse(res->body);
     REQUIRE(j["data"]["apps"].is_array());
     CHECK(j["data"]["apps"].empty());
-    CHECK(j["data"]["population_basis"] == "windows_online");
+    CHECK(j["data"]["population_basis"] == "all_online"); // the default scope
     CHECK(res->body.find("retry_after_ms") == std::string::npos);
 }
 
@@ -3078,6 +3113,73 @@ TEST_CASE("REST dex/apps: an off-enum window is a 400, never a silent default",
     auto res = h.sink.Get("/api/v1/dex/apps?window=bogus");
     REQUIRE(res);
     CHECK(res->status == 400);
+}
+
+TEST_CASE("REST dex/apps: an unknown platform is a 400 with no retry hint",
+          "[pg][rest][dex][apps]") {
+    RestGsHarness h;
+    // The token match is exact: an unshipped spelling, empty and any non-lowercase form all refuse.
+    for (const char* bad : {"darwin", "", "Windows", "ALL"}) {
+        CAPTURE(bad);
+        auto res = h.sink.Get(std::string{"/api/v1/dex/apps?platform="} + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["message"] == "invalid platform (expected all|windows|macos|linux)");
+        CHECK(j["error"]["retry_after_ms"].is_null());
+        CHECK(res->get_header_value("Retry-After").empty());
+    }
+}
+
+TEST_CASE("REST dex/apps: the platform scope selects the population and the coverage",
+          "[pg][rest][dex][apps]") {
+    RestGsHarness h;
+    h.dex_fleet_override_.connected_agents = {{"w1", "windows"}, {"w2", "windows"}, {"l1", "linux"},
+                                              {"m1", "macos"}};
+    h.dex_fleet_override_.total_online = 4;
+    // The same subject on two operating systems: one merged row under `all`, one row per scope otherwise.
+    h.seed_obs("b1", "w1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("b2", "l1", "process.crashed", "chrome.exe", "linux", "2026-06-10T10:00:00Z");
+    const auto get = [&](const char* q) {
+        auto res = h.sink.Get(q);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body)["data"];
+    };
+    const auto none = get("/api/v1/dex/apps?window=all");
+    CHECK(none["population_basis"] == "all_online");
+    CHECK(none["population"] == 4);
+    REQUIRE(none["apps"].size() == 1);
+    CHECK(none["apps"][0]["subject"] == "chrome.exe");
+    CHECK(none["apps"][0]["crashes"] == 2);
+    CHECK(none["apps"][0]["distinct_devices"] == 2);
+    // The per-version rows merge across operating systems the same way (one unversioned bucket).
+    REQUIRE(none["apps"][0]["versions"].size() == 1);
+    CHECK(none["apps"][0]["versions"][0]["version"] == "");
+    CHECK(none["apps"][0]["versions"][0]["crashes"] == 2);
+    CHECK(none["apps"][0]["versions"][0]["distinct_devices"] == 2);
+    const auto win = get("/api/v1/dex/apps?window=all&platform=windows");
+    CHECK(win["population_basis"] == "windows_online");
+    CHECK(win["population"] == 2);
+    REQUIRE(win["apps"].size() == 1);
+    CHECK(win["apps"][0]["crashes"] == 1);
+    CHECK(win["apps"][0]["distinct_devices"] == 1);
+    CHECK(win["crash_source_coverage"] == nlohmann::json{{"windows", "complete"}});
+    const auto lin = get("/api/v1/dex/apps?window=all&platform=linux");
+    CHECK(lin["population_basis"] == "linux_online");
+    CHECK(lin["population"] == 1);
+    REQUIRE(lin["apps"].size() == 1);
+    CHECK(lin["apps"][0]["crashes"] == 1);
+    CHECK(lin["apps"][0]["distinct_devices"] == 1);
+    CHECK(lin["crash_source_coverage"] == nlohmann::json{{"linux", "partial"}});
+    // The two published values the cases above do not send: an explicit `all` is the default, and
+    // `macos` selects the macOS population (one online device, no observation seeded for it).
+    CHECK(get("/api/v1/dex/apps?window=all&platform=all") == none);
+    const auto mac = get("/api/v1/dex/apps?window=all&platform=macos");
+    CHECK(mac["population_basis"] == "macos_online");
+    CHECK(mac["population"] == 1);
+    CHECK(mac["apps"].empty());
+    CHECK(mac["crash_source_coverage"] == nlohmann::json{{"macos", "partial"}});
 }
 
 TEST_CASE("REST dex/catalogue/group: family drill, unknown family -> 404, no audit",
@@ -5404,31 +5506,28 @@ TEST_CASE("REST gs.device-compliance: unrecognized stored state folds into pendi
     CHECK(d["guards"][0]["updated_at"].get<std::string>() == "2026-06-20T10:00:00Z");
 }
 
-TEST_CASE("REST gs.device-compliance: snapshot guard with no rule row falls back to rule_id name",
+TEST_CASE("REST gs.device-compliance: a snapshot guard whose rule was deleted drops out with its census row",
           "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     h.seed_rule("r1", "Real Guard");
-    // r-gone is in the deployed snapshot but its rule row was never created (e.g. the
-    // Guard was deleted after deploy) -> name falls back to the rule_id. The device
-    // reported BOTH guards, so both are applicable.
+    h.seed_rule("r-gone", "Doomed Guard");
+    // r-gone is in the deployed snapshot and the device reported it, then the Guard was
+    // deleted after deploy. The census row has a foreign key to the rule (schema v3,
+    // #5674), so deleting the rule removes it and the device no longer reports r-gone; a
+    // census row with no rule row, which this test used to arrange to exercise the
+    // rule_id name fallback, can no longer exist.
     h.seed_deployed_baseline("B", {"r1", "r-gone"});
     h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
     h.seed_status("e2", "WS-1", "r-gone", "drift.detected", "2026-06-20T10:00:00Z");
+    REQUIRE(h.store->delete_rule("r-gone"));
 
     auto res = h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS-1");
     REQUIRE(res);
     auto j = nlohmann::json::parse(res->body);
     auto& d = j["data"];
-    CHECK(d["total_guards"].get<int>() == 2);
-    bool saw_fallback = false;
-    for (auto& g : d["guards"]) {
-        if (g["rule_id"].get<std::string>() == "r-gone") {
-            CHECK(g["name"].get<std::string>() == "r-gone"); // fallback to rule_id
-            CHECK(g["status"].get<std::string>() == "drifted");
-            saw_fallback = true;
-        }
-    }
-    CHECK(saw_fallback);
+    CHECK(d["total_guards"].get<int>() == 1);
+    for (auto& g : d["guards"])
+        CHECK(g["rule_id"].get<std::string>() != "r-gone");
 }
 
 TEST_CASE("REST gs.device-compliance: rule_names_for chunks the IN-list past 500 (perf-2/UP-6)",

@@ -150,6 +150,11 @@ const std::vector<pg::PgMigration>& migrations() {
          ");"
          "CREATE INDEX idx_schedules_due ON schedules(next_execution_at) "
          "  WHERE enabled AND next_execution_at > 0;"},
+        // v2 (Echo rename, upgrade window): a schedule's definition id follows the renamed
+        // definitions. Guarded by LIKE, so a re-run and a fresh database are no-ops.
+        {2,
+         "UPDATE schedules SET definition_id = replace(definition_id, "
+         "'crossplatform.tar.', 'crossplatform.echo.') WHERE definition_id LIKE 'crossplatform.tar.%';"},
     };
     return kMigrations;
 }

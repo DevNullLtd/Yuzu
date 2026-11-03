@@ -11,13 +11,14 @@ cadences.
 
 - **Machine-wide installed software** (blob contract v2): name, version,
   publisher, install date, plus the package-manager fields below. The daily
-  sync calls six inventory actions in-process and merges their rows:
+  sync calls seven inventory actions in-process and merges their rows:
   `installed_apps` `list_inventory` (Windows: `HKLM` + the agent service
   account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
   `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
   `store_packages` (Linux snaps and flatpaks), and
   `windows_optional_features` `list` and `msi_packages` `list_inventory`
-  (Windows machine-context MSI products). An action whose plugin is not loaded, or
+  (Windows machine-context MSI products), and `runtimes` `python` (installed
+  Python interpreters). An action whose plugin is not loaded, or
   that answers "unsupported on this OS", is skipped. A plugin that is not
   loaded is logged at warn (the rows its action produced are removed on the next
   report); without `installed_apps` the source stays idle and sends nothing,
@@ -29,10 +30,13 @@ cadences.
   skips that day's report and keeps the last good state — nothing is deleted. A
   `constrained` `managers` answer that still names at least one present manager
   is accepted: the constraint concerns manager facts the presence row never
-  carried. A skipped cycle is retried sooner on a phase-aligned backoff:
-  waits that double from 1 h after each consecutive skip (1 h, 2 h, 4 h, 8 h, …),
-  each retry capped so it never lands after the next daily slot — up to four
-  extra attempts — then one attempt per daily slot until a collection succeeds.
+  carried. A `constrained` `runtimes` `python` answer is the other exception: it
+  withholds only the Python rows and the cycle continues, so the stored Python rows
+  are removed until a later read succeeds (see Troubleshooting). A skipped cycle
+  is retried sooner on a phase-aligned backoff: waits that double from 1 h after
+  each consecutive skip (1 h, 2 h, 4 h, 8 h, …), each retry capped so it never
+  lands after the next daily slot — up to four extra attempts — then one attempt
+  per daily slot until a collection succeeds.
   While it is skipping, the agent publishes the heartbeat tags
   `yuzu.sync.installed_software.skip_streak` (consecutive skips since the last
   success, uncapped) and `yuzu.sync.installed_software.last_skip` (the reason
@@ -41,7 +45,8 @@ cadences.
   `source` names the
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `pkg_inventory.store_packages`,
-  `windows_optional_features.list`, `msi_packages.list_inventory`); `package_id`
+  `windows_optional_features.list`, `msi_packages.list_inventory`,
+  `runtimes.python`); `package_id`
   is empty for these producers except `msi_packages.list_inventory`, where it is
   the MSI product code. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
@@ -80,19 +85,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -149,6 +154,28 @@ cadences.
   and the machine-context guarantee. Install location and uninstall string are
   not collected (wire slots 13-14 stay reserved and empty, #5186). If the
   enumeration itself fails the cycle is skipped (see Troubleshooting).
+
+  **Python interpreters** are collected through `runtimes` `python` (all three OSes;
+  `source` `runtimes.python`) as one `app` row per interpreter, `name` `Python`,
+  `ecosystem` `python`, `version` the interpreter version; publisher and the other
+  package fields are empty. No process is started: each OS answers from install
+  metadata. Windows reads the PEP 514 `HKLM\SOFTWARE\Python\PythonCore` keys in both
+  registry views (python.org installs; per-user installs and other PEP 514
+  publishers are not listed) and reports the full `x.y.z`. macOS reads the
+  python.org framework under `/Library/Frameworks/Python.framework/Versions` and
+  reports the full `x.y.z` from each version's `Info.plist`. Linux lists
+  `python3.<minor>` files in `/usr/bin`, `/usr/local/bin` and `/var/usrlocal/bin` (the
+  last exists only on rpm-ostree hosts such as Fedora CoreOS and RHEL Edge, where
+  `/usr/local` links to `../var/usrlocal`) and reports **major.minor only** (for
+  example `3.11`): the patch level is not stored anywhere without running the
+  interpreter, so it is not guessed.
+  Homebrew, pyenv, conda, virtual environments and Xcode's Python are not walked. A
+  read that cannot be completed (an unreadable or network-mounted root, a cap, an
+  access-denied registry key) withholds only the `python` rows from that day's report
+  and every other source is still sent; the report replaces the device's stored
+  software rows, so the stored `python` rows are removed until a read succeeds again
+  (see Troubleshooting). A missing or unreadable version file never does this, the
+  row reports the version it could determine.
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,
@@ -510,7 +537,7 @@ place, **Hardware** and **Software**, each its own page:
 
 - **`/hardware`** — a ServiceNow-style Configuration-Item list and record; the successor
   to the old **Devices** tab, extended with a generic action runner. The list shows
-  hostname, **IP** (new — read live from the TAR fleet-snapshot cache, so it is honestly
+  hostname, **IP** (new — read live from the Echo fleet-snapshot cache, so it is honestly
   blank once a device goes offline rather than a stale last-known address), OS,
   online/offline/**stale** status, per-page **DEX score**, agent version, last-seen,
   **Tags** (new — click a chip to filter by that exact `key` or `key=value`, or type
@@ -635,7 +662,10 @@ place, **Hardware** and **Software**, each its own page:
     as pills with a Clear all, the URL hash carries them (so a view can be bookmarked or shared), and the
     exact REST call the view corresponds to is shown with a copy button. The filter box on an
     expanded devices table filters only the rows already loaded; the catalogue search
-    and chips are server-side.
+    and chips are server-side. Rows and the **versions** and **devices** controls work from the
+    keyboard (Tab, then Enter or Space), and pressing an open control again closes its drill.
+    The chip rows are built from the server's vocabulary tables, so **Found by** lists every
+    collector source and each **Kind** and **Found by** chip's tooltip says what it covers.
   - **The table** lists titles most-installed first, 100 at a time with a keyset
     **Load more**. **Installs** is the exact number of distinct devices carrying the
     title under the active filters (a device carrying one title through two sources
@@ -697,10 +727,13 @@ place, **Hardware** and **Software**, each its own page:
   - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
     a management group, so the fleet view, the strip and the version counts need an
     unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused
-    (audited as denied); the notice points to Hardware and carries a
+    (audited as denied); the notice points to Hardware (open the device from
+    Hardware, **Installed software**, **Open in Software**) and carries a
     **Clear all filters and reload** link. A scoped account can still use the host view
-    and the devices tables for devices in its scope, but only through a hand-typed
-    `/software#host=<agent_id>` address, which has no host-name type-ahead; there the "newest in fleet" mark is
+    and the devices tables for devices in its scope, through that **Open in Software**
+    link on a device's Hardware **Installed software** lens (it opens
+    `/software#host=<agent_id>`) or a hand-typed address of the same form; the page has no
+    host-name type-ahead for them; there the "newest in fleet" mark is
     blanked, no fleet
     figures are read, and device counts omit "of M". A scope wider than 10,000 devices is
     applied after the read in at most four bounded reads, so a devices page can come back short or
@@ -820,6 +853,23 @@ read more than 20000 rows` (or a merged-entry or 3 MiB blob cap) is not an
 action failure: that host reports more software rows than one report can carry,
 so its report is skipped rather than sent truncated; review the host's
 inventory rather than removing a plugin.
+
+**A device's Python rows vanished, but the rest of its software is still reported; its
+log shows `sync: runtimes.python constrained (<tokens>) — rows withheld this cycle`.**
+The `runtimes` `python` read was constrained, so the agent withheld only the Python rows
+rather than send a partial list. The report replaces the device's stored software rows,
+so its stored `python` rows are removed until a read succeeds again; no other source is
+affected and the cycle is not skipped. The tokens name the cause:
+`linux:runtimes:network_fs_skipped` (`/usr/bin`, `/usr/local/bin`, `/var/usrlocal/bin` or
+a directory above one of them, such as `/usr/local`, is on a network mount, so it is
+never opened), `linux:runtimes:permission_denied`,
+`linux:runtimes:symlink_refused` (a symlink at a root that is not a same-action alias;
+the rpm-ostree `/usr/local -> ../var/usrlocal` link is covered and is not a cause),
+`linux:runtimes:mountinfo_unreadable` and `macos:runtimes:mountinfo_unreadable` (the
+mount table could not be read), `macos:runtimes:permission_denied`,
+`windows:runtimes:python_reg:access_denied` and any `<os>:runtimes:row_cap` or
+`windows:runtimes:python_reg:row_cap` (a walk cap was hit). Fix the named cause; the next
+daily sync restores the rows.
 
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`
@@ -1110,6 +1160,19 @@ sync, defeating the hash-skip protocol.
 - **VMs / serial-less hosts.** A device with no SMBIOS serial (many VMs) reports
   `serial`/`system_uuid` as the literal `"unknown"` — use `manufacturer`/`model`
   (e.g. "VMware, Inc."/"VMware7,1") to recognise it.
+- **Versioned record (v2).** The server also stores a versioned record that adds
+  chassis (type, serial, asset tag), baseboard (vendor, product, serial) and a hashed
+  machine-id, each with its source, plus typed per-device rows for CPUs, DIMMs, disks,
+  swap, volumes, partitions and storage topology, each section with its own status.
+  `blob_version` says which format an agent last sent. A device whose agent is still on
+  the original format has **no** section rows stored — read that as "not stored", not
+  "the device has none". A section reported `constrained` with reason `server_cap:<n>`
+  means the server kept only the first `n` rows; `server:machine_id_shape` on the
+  `machine_id` section means the reported machine ID was not a hash and was discarded.
+  Chassis, board and DIMM serial numbers are personal data on the same footing as the
+  device serial and system UUID. Agents keep working unchanged; upgrade the server
+  before the agents. No page or API reads the per-device rows yet: these values are stored
+  now and become visible when the device-CI read surface ships.
 
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its
@@ -1118,8 +1181,8 @@ columns, fields, and audit/degrade posture.
 ## App usage inventory (`app_usage`)
 
 A further daily-sync source, **`app_usage`**, is live on the agent and server. It
-derives machine-scope executable usage evidence read-only from TAR's `usage` fold
-(`usage_daily`/`usage_daily_user`/`usage_live` inside `tar.db`) and persists it in
+derives machine-scope executable usage evidence read-only from Echo's `usage` fold
+(`usage_daily`/`usage_daily_user`/`usage_live` inside `echo.db`) and persists it in
 the typed Postgres schema **`app_usage_store`**: per-executable run counts, total
 seconds, first/last-seen, and a distinct-user count over a 30-day sliding window.
 

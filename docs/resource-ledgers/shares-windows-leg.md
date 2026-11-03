@@ -10,7 +10,7 @@ New owned resources introduced by `agents/plugins/shares/src/shares_win.cpp`. Ev
 - **Allocated by:** the `bufptr` out-parameter of `NetShareEnum` (level 1 or 2), allocated by the
   system; success, `ERROR_MORE_DATA` and failure all go through the same guard.
 - **Owner type:** `NetApiBuf`, a local non-copyable, non-movable RAII guard whose destructor calls
-  `NetApiBufferFree`. It is a deliberate small duplicate of the TAR guard (owner decision; TAR's
+  `NetApiBufferFree`. It is a deliberate small duplicate of the Echo guard (owner decision; Echo's
   header is untouched).
 - **Release point:** `~NetApiBuf` when `one_page` returns, on every exit including the
   `std::bad_alloc` unwind to `execute_list`'s catch.

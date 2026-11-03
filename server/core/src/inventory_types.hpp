@@ -61,7 +61,7 @@ struct InventoryDeviceRow {
     /// when both are present — it is the agent's own self-report, not a device-CI
     /// sync cycle that may be up to 24h stale.
     std::string arch;
-    /// Claimed IPs from the live TAR fleet-snapshot cache (FleetTopologyStore,
+    /// Claimed IPs from the live Echo fleet-snapshot cache (FleetTopologyStore,
     /// 60s TTL) — ONLINE-ONLY, evicted on deregistration. Empty is honest for an
     /// offline row, not a degrade: there is no durable IP source today (round-3
     /// item 10; a device-CI blob field is the tracked follow-up).

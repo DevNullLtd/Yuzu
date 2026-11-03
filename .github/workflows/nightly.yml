@@ -473,7 +473,7 @@ jobs:
           # Which binaries to gdb, with which Catch2 seed, is derived from the run
           # itself — see scripts/ci/tsan-gdb-capture.py. It replaces a hardcoded
           # `./tests/yuzu_server_tests`, which captured nothing at all when the
-          # crash was in agent/tar/transport (#1038, R-06). Best-effort by
+          # crash was in agent/echo/transport (#1038, R-06). Best-effort by
           # contract: the script always exits 0, so a diagnostic that cannot run
           # never masks — or adds to — the real failure.
           # Explicit if/else, not `[[ ]] && mode=…`: the default runner shell is

@@ -2,15 +2,15 @@
 <html lang="en">
 <!--
   MOCKUP — Device "Get live info" snapshot (feat/device-live-snapshot).
-  Standalone/self-contained: theme tokens + .gp-* + .tar-tree-* component CSS +
+  Standalone/self-contained: theme tokens + .gp-* + .echo-tree-* component CSS +
   the tree filter / pop-out helpers inlined, opens in a browser with no server.
   Mirrors what device_ui.cpp will render (HTMX, dark-theme-only, CSP-safe —
   inline onclick/oninput only, never hx-on).
 
   Layout: a compact KPI strip + a uniform responsive grid of category cards.
   Every card is collapsed by default, same size, scrollable, with a pop-out
-  (⤢) for a larger view. The single Processes card uses the /tar tree format
-  (PR1551 — tar-tree-* / tt-* classes) and carries the SHA-256 + a name/PID/hash
+  (⤢) for a larger view. The single Processes card uses the /echo tree format
+  (PR1551 — echo-tree-* / tt-* classes) and carries the SHA-256 + a name/PID/hash
   search bar (no separate flat list). Not product code.
 -->
 <head>
@@ -91,24 +91,24 @@
     .sw.on::after{left:.98rem;background:var(--green)}
     .src-on{color:var(--green);font-weight:600}.src-off{color:var(--muted)}
 
-    /* process tree — VERBATIM from tar_page_ui.cpp (PR1551), + .tt-hash */
-    .tar-tree-node{margin:0}
-    .tar-tree-node>summary{display:flex;align-items:center;list-style:none;cursor:pointer;padding:.05rem 0}
-    .tar-tree-node>summary::-webkit-details-marker{display:none}
-    .tar-tree-node>summary::before{content:"\25B8";flex:0 0 1rem;text-align:center;color:var(--muted);font-size:.7rem}
-    .tar-tree-node[open]>summary::before{content:"\25BE"}
-    .tar-tree-children{margin-left:.5rem;padding-left:.7rem;border-left:1px solid var(--border)}
-    .tar-tree-leaf{display:flex;align-items:center;padding:.05rem 0 .05rem 1rem}
-    .tar-tree-row{display:inline-flex;align-items:center;gap:.45rem;flex:1 1 auto;min-width:0;color:var(--fg);text-decoration:none;cursor:pointer;padding:.05rem .3rem;border-radius:.2rem;font-size:.74rem}
-    .tar-tree-row:hover{background:var(--hover)}
-    .tar-tree-row[data-anom="1"]{box-shadow:inset 2px 0 0 var(--red)}
+    /* process tree — VERBATIM from echo_page_ui.cpp (PR1551), + .tt-hash */
+    .echo-tree-node{margin:0}
+    .echo-tree-node>summary{display:flex;align-items:center;list-style:none;cursor:pointer;padding:.05rem 0}
+    .echo-tree-node>summary::-webkit-details-marker{display:none}
+    .echo-tree-node>summary::before{content:"\25B8";flex:0 0 1rem;text-align:center;color:var(--muted);font-size:.7rem}
+    .echo-tree-node[open]>summary::before{content:"\25BE"}
+    .echo-tree-children{margin-left:.5rem;padding-left:.7rem;border-left:1px solid var(--border)}
+    .echo-tree-leaf{display:flex;align-items:center;padding:.05rem 0 .05rem 1rem}
+    .echo-tree-row{display:inline-flex;align-items:center;gap:.45rem;flex:1 1 auto;min-width:0;color:var(--fg);text-decoration:none;cursor:pointer;padding:.05rem .3rem;border-radius:.2rem;font-size:.74rem}
+    .echo-tree-row:hover{background:var(--hover)}
+    .echo-tree-row[data-anom="1"]{box-shadow:inset 2px 0 0 var(--red)}
     .tt-dot{width:.5rem;height:.5rem;border-radius:50%;flex:0 0 auto}
     .tt-dot-run{background:var(--green);box-shadow:0 0 4px rgba(60,200,120,.5)}
     .tt-pid{color:var(--muted);flex:0 0 auto;min-width:3.4rem;text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono)}
     .tt-name{flex:1 1 auto;min-width:0;color:var(--fg);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .tt-hash{flex:0 0 auto;color:var(--muted);font-family:var(--mono);font-size:.64rem;white-space:nowrap;padding-left:.6rem}
     .tt-anom{color:var(--red);flex:0 0 auto}
-    /* inline per-process network summary (VERBATIM from tar_page_ui.cpp) */
+    /* inline per-process network summary (VERBATIM from echo_page_ui.cpp) */
     .tt-net{display:inline-flex;align-items:center;gap:.25rem;font-size:.66rem;color:var(--muted);flex:0 0 auto;min-width:0}
     .tt-net-ico{color:var(--accent)}
     .tt-net-pub .tt-net-ico{color:var(--yellow)}
@@ -141,7 +141,7 @@
     <a href="#" class="nav-brand">Yuzu</a>
     <a href="#" class="nav-link">Dashboard</a><a href="#" class="nav-link">Compliance</a>
     <a href="#" class="nav-link">Guardian</a><a href="#" class="nav-link">DEX</a>
-    <a href="#" class="nav-link">TAR</a><a href="#" class="nav-link active">Devices</a>
+    <a href="#" class="nav-link">Echo</a><a href="#" class="nav-link active">Devices</a>
     <span class="nav-spacer"></span><span class="nav-user">jsmith@example.com</span>
   </nav>
   <div class="context-bar"><span class="context-role-badge">Administrator</span><span class="context-user">jsmith</span></div>
@@ -186,39 +186,39 @@
           <input class="ls-search" type="text" placeholder="Search name, PID, or hash&hellip;" oninput="filterTree(this)">
           <div class="note">Windows names-only (no command line / path); suspicious parent&rarr;child spawns flagged.</div>
           <div class="proctree">
-            <details class="tar-tree-node" open>
-              <summary><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">4</span><span class="tt-name">System</span><span class="tt-hash">&mdash;</span></span></summary>
-              <div class="tar-tree-children">
-                <details class="tar-tree-node" open>
-                  <summary><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">388</span><span class="tt-name">smss.exe</span><span class="tt-hash" title="b1e4c0…full sha256">b1e4c0…8f2a</span></span></summary>
-                  <div class="tar-tree-children">
-                    <div class="tar-tree-leaf"><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">712</span><span class="tt-name">winlogon.exe</span><span class="tt-hash" title="3c9d…full">3c9d11…11ef</span></span></div>
+            <details class="echo-tree-node" open>
+              <summary><span class="echo-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">4</span><span class="tt-name">System</span><span class="tt-hash">&mdash;</span></span></summary>
+              <div class="echo-tree-children">
+                <details class="echo-tree-node" open>
+                  <summary><span class="echo-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">388</span><span class="tt-name">smss.exe</span><span class="tt-hash" title="b1e4c0…full sha256">b1e4c0…8f2a</span></span></summary>
+                  <div class="echo-tree-children">
+                    <div class="echo-tree-leaf"><span class="echo-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">712</span><span class="tt-name">winlogon.exe</span><span class="tt-hash" title="3c9d…full">3c9d11…11ef</span></span></div>
                   </div>
                 </details>
               </div>
             </details>
-            <details class="tar-tree-node" open>
-              <summary><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">980</span><span class="tt-name">services.exe</span><span class="tt-hash" title="7a22…full">7a22f0…90bc</span></span></summary>
-              <div class="tar-tree-children">
-                <details class="tar-tree-node tar-tree-group">
-                  <summary><span class="tar-tree-row tt-group"><span class="tt-group-ico">&#9646;</span><span class="tt-name">svchost.exe</span><span class="tt-group-count">&times;12</span><span class="tt-meta">12 running</span></span></summary>
-                  <div class="tar-tree-children">
-                    <div class="tar-tree-leaf"><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">1124</span><span class="tt-name">svchost.exe</span><span class="tt-net" title=":445 listen tcp  :3389 listen tcp"><span class="tt-net-ico">&#8599;</span>2<span class="tt-ep">:445 listen</span><span class="tt-ep">:3389 listen</span></span><span class="tt-hash" title="de01…full">de0144…4456</span></span></div>
-                    <div class="tar-tree-leaf"><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">1180</span><span class="tt-name">svchost.exe</span><span class="tt-hash" title="de01…full">de0144…4456</span></span></div>
-                    <div class="tar-tree-leaf"><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">1244</span><span class="tt-name">svchost.exe</span><span class="tt-hash" title="de01…full">de0144…4456</span></span></div>
+            <details class="echo-tree-node" open>
+              <summary><span class="echo-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">980</span><span class="tt-name">services.exe</span><span class="tt-hash" title="7a22…full">7a22f0…90bc</span></span></summary>
+              <div class="echo-tree-children">
+                <details class="echo-tree-node echo-tree-group">
+                  <summary><span class="echo-tree-row tt-group"><span class="tt-group-ico">&#9646;</span><span class="tt-name">svchost.exe</span><span class="tt-group-count">&times;12</span><span class="tt-meta">12 running</span></span></summary>
+                  <div class="echo-tree-children">
+                    <div class="echo-tree-leaf"><span class="echo-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">1124</span><span class="tt-name">svchost.exe</span><span class="tt-net" title=":445 listen tcp  :3389 listen tcp"><span class="tt-net-ico">&#8599;</span>2<span class="tt-ep">:445 listen</span><span class="tt-ep">:3389 listen</span></span><span class="tt-hash" title="de01…full">de0144…4456</span></span></div>
+                    <div class="echo-tree-leaf"><span class="echo-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">1180</span><span class="tt-name">svchost.exe</span><span class="tt-hash" title="de01…full">de0144…4456</span></span></div>
+                    <div class="echo-tree-leaf"><span class="echo-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">1244</span><span class="tt-name">svchost.exe</span><span class="tt-hash" title="de01…full">de0144…4456</span></span></div>
                   </div>
                 </details>
-                <details class="tar-tree-node" open>
-                  <summary><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">4188</span><span class="tt-name">explorer.exe</span><span class="tt-hash" title="9f7c…full">9f7c2a…a2d1</span></span></summary>
-                  <div class="tar-tree-children">
-                    <details class="tar-tree-node" open>
-                      <summary><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">5678</span><span class="tt-name">chrome.exe</span><span class="tt-net tt-net-pub" title="140.82.112.4:443 tcp  20.190.160.3:443 tcp  10.0.4.10:8080 tcp"><span class="tt-net-ico">&#8599;</span>3<span class="tt-ep tt-ep-pub">140.82.112.4:443</span><span class="tt-ep tt-ep-pub">20.190.160.3:443</span><span class="tt-ep tt-ep-more">+1</span></span><span class="tt-hash" title="1122…full">1122cc…ccdd</span></span></summary>
-                      <div class="tar-tree-children">
-                        <div class="tar-tree-leaf"><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">5680</span><span class="tt-name">chrome.exe</span><span class="tt-net tt-net-pub" title="140.82.113.21:443 tcp"><span class="tt-net-ico">&#8599;</span>1<span class="tt-ep tt-ep-pub">140.82.113.21:443</span></span><span class="tt-hash" title="1122…full">1122cc…ccdd</span></span></div>
-                        <div class="tar-tree-leaf"><span class="tar-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">5712</span><span class="tt-name">chrome.exe</span><span class="tt-hash" title="1122…full">1122cc…ccdd</span></span></div>
+                <details class="echo-tree-node" open>
+                  <summary><span class="echo-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">4188</span><span class="tt-name">explorer.exe</span><span class="tt-hash" title="9f7c…full">9f7c2a…a2d1</span></span></summary>
+                  <div class="echo-tree-children">
+                    <details class="echo-tree-node" open>
+                      <summary><span class="echo-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">5678</span><span class="tt-name">chrome.exe</span><span class="tt-net tt-net-pub" title="140.82.112.4:443 tcp  20.190.160.3:443 tcp  10.0.4.10:8080 tcp"><span class="tt-net-ico">&#8599;</span>3<span class="tt-ep tt-ep-pub">140.82.112.4:443</span><span class="tt-ep tt-ep-pub">20.190.160.3:443</span><span class="tt-ep tt-ep-more">+1</span></span><span class="tt-hash" title="1122…full">1122cc…ccdd</span></span></summary>
+                      <div class="echo-tree-children">
+                        <div class="echo-tree-leaf"><span class="echo-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">5680</span><span class="tt-name">chrome.exe</span><span class="tt-net tt-net-pub" title="140.82.113.21:443 tcp"><span class="tt-net-ico">&#8599;</span>1<span class="tt-ep tt-ep-pub">140.82.113.21:443</span></span><span class="tt-hash" title="1122…full">1122cc…ccdd</span></span></div>
+                        <div class="echo-tree-leaf"><span class="echo-tree-row"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">5712</span><span class="tt-name">chrome.exe</span><span class="tt-hash" title="1122…full">1122cc…ccdd</span></span></div>
                       </div>
                     </details>
-                    <div class="tar-tree-leaf"><span class="tar-tree-row" data-anom="1"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">9001</span><span class="tt-name">powershell.exe</span><span class="tt-anom" title="excel.exe spawned a shell">&#9888;</span><span class="tt-net tt-net-pub" title="185.220.101.5:8443 tcp"><span class="tt-net-ico">&#8599;</span>1<span class="tt-ep tt-ep-pub">185.220.101.5:8443</span></span><span class="tt-hash" title="5e5e…full">5e5e0f…0f0f</span></span></div>
+                    <div class="echo-tree-leaf"><span class="echo-tree-row" data-anom="1"><span class="tt-dot tt-dot-run"></span><span class="tt-pid">9001</span><span class="tt-name">powershell.exe</span><span class="tt-anom" title="excel.exe spawned a shell">&#9888;</span><span class="tt-net tt-net-pub" title="185.220.101.5:8443 tcp"><span class="tt-net-ico">&#8599;</span>1<span class="tt-ep tt-ep-pub">185.220.101.5:8443</span></span><span class="tt-hash" title="5e5e…full">5e5e0f…0f0f</span></span></div>
                   </div>
                 </details>
               </div>
@@ -309,14 +309,14 @@
         </tbody></table></div>
       </details>
 
-      <!-- ── Capture sources (bottom-right): what TAR is capturing locally on this device ── -->
+      <!-- ── Capture sources (bottom-right): what Echo is capturing locally on this device ── -->
       <details class="ls-card">
         <summary><span class="ls-ttl">Capture sources</span><span class="ls-cnt">7 of 10 on</span>
           <span class="ls-prev"><span class="px">Process, TCP, Service, ARP, DNS&hellip;</span></span>
           <button class="ls-pop" title="Pop out" onclick="popOut(event,this)">&#10530;</button></summary>
         <div class="ls-body">
-          <div class="note">TAR warehouse capture running on this device (background &middot; distinct from the
-            live snapshot above). Read-only here &mdash; <a href="#" style="color:var(--accent)">configure on TAR &rarr;</a></div>
+          <div class="note">Echo warehouse capture running on this device (background &middot; distinct from the
+            live snapshot above). Read-only here &mdash; <a href="#" style="color:var(--accent)">configure on Echo &rarr;</a></div>
           <table class="ls-tbl"><thead><tr><th></th><th>Source</th><th>Table</th><th class="ls-num">Live rows</th><th>Category</th></tr></thead><tbody>
             <tr><td><span class="sw on"></span></td><td class="src-on">process</td><td><code>$Process_Live</code></td><td class="ls-num">100,000</td><td><span class="pill cat">Activity</span></td></tr>
             <tr><td><span class="sw on"></span></td><td class="src-on">tcp</td><td><code>$TCP_Live</code></td><td class="ls-num">8,412</td><td><span class="pill cat">Network</span></td></tr>
@@ -368,23 +368,23 @@
       document.getElementById('po-body').innerHTML = card.querySelector('.ls-body').innerHTML;
       document.getElementById('popout').showModal();
     }
-    /* Tree filter — matches the /tar page: hide all, reveal each matching row's
+    /* Tree filter — matches the /echo page: hide all, reveal each matching row's
        ancestor chain (matches PID/name/hash via row.textContent). Scoped to the
        nearest body so it works in the card AND the pop-out clone. */
     function filterTree(input){
       var scope = input.closest('.ls-body,.po-body'); if(!scope) return;
       var tree = scope.querySelector('.proctree'); if(!tree) return;
       var q = (input.value||'').trim().toLowerCase();
-      var nodes = tree.querySelectorAll('.tar-tree-node,.tar-tree-leaf');
+      var nodes = tree.querySelectorAll('.echo-tree-node,.echo-tree-leaf');
       if(!q){ nodes.forEach(function(el){el.style.display='';}); return; }
       nodes.forEach(function(el){el.style.display='none';});
-      tree.querySelectorAll('.tar-tree-row').forEach(function(row){
+      tree.querySelectorAll('.echo-tree-row').forEach(function(row){
         if(row.textContent.toLowerCase().indexOf(q)===-1) return;
-        var el = row.closest('.tar-tree-leaf,.tar-tree-node');
+        var el = row.closest('.echo-tree-leaf,.echo-tree-node');
         while(el && tree.contains(el)){
           el.style.display='';
           if(el.tagName==='DETAILS') el.open=true;
-          el = el.parentElement ? el.parentElement.closest('.tar-tree-node') : null;
+          el = el.parentElement ? el.parentElement.closest('.echo-tree-node') : null;
         }
       });
     }

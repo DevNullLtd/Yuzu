@@ -144,7 +144,7 @@ curl -s -X DELETE http://localhost:8080/api/settings/enrollment-tokens/tok_a1b2c
   -b "$COOKIE"
 ```
 
-Tokens are persisted in the PostgreSQL `auth.enrollment_tokens` table (WS-6 6.2) — shared by every server replica, not a per-replica file. They survive server restarts and image swaps. A pre-6.2 install's `enrollment-tokens.cfg` is imported once, automatically, at the first 6.2 boot (see `docs/adr/2002-high-availability-architecture.md` §8).
+Tokens are persisted in the PostgreSQL `auth.enrollment_tokens` table (WS-6 6.2) — shared by every server replica, not a per-replica file. They survive server restarts and image swaps. A leftover `enrollment-tokens.cfg` in the directory holding `yuzu-server.cfg` or in `--data-dir` is imported once, at any boot where the database holds no import record for it, as live tokens, without any check of where it came from, so a fresh deployment must not start with one (see `docs/adr/2002-high-availability-architecture.md` §8).
 
 ### Tier 3: Platform Trust (Planned)
 
@@ -265,14 +265,14 @@ A device with zero reported guards renders "No guards evaluated" even if the fle
 
 #### Get live info
 
-The **Get live info** button (shown when the device is online) dispatches read-only instructions to the agent **now** — not from cached heartbeat data — and renders a **TAR-styled live snapshot**: a KPI strip (uptime, process/service/connection/user counts) over a grid of **collapsible, uniformly-sized cards**. Cards are collapsed by default; an **Expand all / Collapse all** control toggles them together, and each card has a **pop-out (⤢)** for a larger view. Each card is one live query against the OS, dispatched through the same proven chokepoint as before.
+The **Get live info** button (shown when the device is online) dispatches read-only instructions to the agent **now** — not from cached heartbeat data — and renders an **Echo-styled live snapshot**: a KPI strip (uptime, process/service/connection/user counts) over a grid of **collapsible, uniformly-sized cards**. Cards are collapsed by default; an **Expand all / Collapse all** control toggles them together, and each card has a **pop-out (⤢)** for a larger view. Each card is one live query against the OS, dispatched through the same proven chokepoint as before.
 
 Each card has its own audit verb so a usage-class read (what a person is running) stays separately countable from a machine-health read — the works-council posture (see [Audit log](audit-log.md)):
 
 | Card | Source | Audit verb | OS |
 |---|---|---|---|
 | **Uptime** (KPI) | `os_info/uptime` | `device.live.uptime` | all |
-| **Processes** — a parent→child **tree** (TAR `/tar` viewer style), each node showing the **SHA-256** of its on-disk image and its **live network connections** (joined by PID, public endpoints highlighted); suspicious `parent→child` spawns are flagged. Searchable by name / PID / hash / endpoint. | `processes/list_tree` + `network_diag/connections` | `device.live.process_tree` | tree all; hash all; connection join Windows |
+| **Processes** — a parent→child **tree** (Echo `/echo` viewer style), each node showing the **SHA-256** of its on-disk image and its **live network connections** (joined by PID, public endpoints highlighted); suspicious `parent→child` spawns are flagged. Searchable by name / PID / hash / endpoint. | `processes/list_tree` + `network_diag/connections` | `device.live.process_tree` | tree all; hash all; connection join Windows |
 | **Services** — run state | `services/list` | `device.live.services` | all |
 | **Adapters & IP** | `network_config/ip_addresses` | `device.live.netconfig` | all |
 | **ARP / neighbours** | `network_config/arp` | `device.live.arp` | all (constrained on Linux/macOS) |
@@ -280,7 +280,7 @@ Each card has its own audit verb so a usage-class read (what a person is running
 | **Listening ports** | `network_diag/listening` | `device.live.listening` | all |
 | **Active connections** | `network_diag/connections` | `device.live.connections` | all |
 | **Logged-in users** | `users/logged_on` | `device.live.users` | all |
-| **Capture sources** — read-only view of which TAR warehouse sources are capturing locally (toggle state + `$`-table + live row count); configure on the TAR page | `tar/status` | `device.live.capture_sources` | all |
+| **Capture sources** — read-only view of which Echo warehouse sources are capturing locally (toggle state + `$`-table + live row count); configure on the Echo page | `echo/status` | `device.live.capture_sources` | all |
 | **Disk space** — free/used for the root volume with a colour-coded usage bar (>=90% used or <5 GiB free = red) | `disk_space/free` | `device.live.disk` | all |
 
 Every card requires **`Execution:Execute`** in addition to `GuaranteedState:Read`, each scoped to the device's management group; without Execute the card shows an explanatory note rather than failing silently, and a device outside your scope cannot be live-queried at all. The process tree, connections, logged-in-user, and **DNS-cache** reads are **usage-class behavioral telemetry** (a person's running software, active connections, sessions, and resolved names) and are individually audit-logged; the remaining kinds (uptime, services, adapters/IP, listening ports, ARP, capture sources, disk space) are machine-health reads.

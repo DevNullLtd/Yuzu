@@ -486,7 +486,7 @@
   "version": "1.0.0",
   "where_the_data_goes": [
     "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`.",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — grepping the server tree for `wol` finds only the capability-declaration rows in `plugin_action_catalogue_c.hpp`; nothing else reads this plugin's output.",
+    "**Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics — grepping the server tree for `wol` finds only the capability-declaration rows in `plugin_action_catalogue_c.hpp`; nothing else reads this plugin's output.",
     "**Sensitivity.** `check`'s `host` row echoes back the caller-supplied hostname or IP address being probed — a device identifier. `wake` has no declared identifying column, though its uncaptured success-path `message` text likely names the target MAC address as confirmation text (see Caveat 3 — never observed in a sample). Neither action's rows carry a person's identity or installed-software information.",
     "**Siblings:** `network.probe.icmp` / `network.probe.tcp` (`netprobe.yaml`) share `check`'s underlying `icmp_probe.hpp` mechanism for their own reachability probes.",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.wol.wake\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."

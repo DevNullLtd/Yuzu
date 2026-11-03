@@ -44,8 +44,8 @@ static_assert(kNerrServerNotStarted == static_cast<std::uint32_t>(NERR_ServerNot
 static_assert(kRpcServerUnavailable == static_cast<std::uint32_t>(RPC_S_SERVER_UNAVAILABLE));
 static_assert(kRpcUnknownIf == static_cast<std::uint32_t>(RPC_S_UNKNOWN_IF));
 
-/// Owns one NetShareEnum out-buffer. Duplicated from TAR's guard on purpose (tar_win_raii_guards.hpp
-/// is a TAR-internal header); one buffer at a time, freed on every exit, never transferred.
+/// Owns one NetShareEnum out-buffer. Duplicated from Echo's guard on purpose (echo_win_raii_guards.hpp
+/// is an Echo-internal header); one buffer at a time, freed on every exit, never transferred.
 struct NetApiBuf {
     LPBYTE p = nullptr;
     NetApiBuf() = default;
@@ -66,7 +66,7 @@ constexpr DWORD kWinPageBytes = 64 * 1024;
 // KNOWN OPERATIONAL HAZARD -- NO DEADLINE ON NetShareEnum.
 // The call is synchronous local RPC to the Server service, run on a dispatch-pool worker with
 // no timeout. A wedged (not stopped) service parks that worker and each repeated fire parks
-// another. Same class as NetUserEnum (users), NetSessionEnum (tar mapdrive) and the VSS calls
+// another. Same class as NetUserEnum (users), NetSessionEnum (echo mapdrive) and the VSS calls
 // (filesystem_posture); tracked in #3925. Do not bound it locally with bounded_wait.hpp: that
 // abandons a DETACHED thread, and this plugin can be unloaded out from under it.
 

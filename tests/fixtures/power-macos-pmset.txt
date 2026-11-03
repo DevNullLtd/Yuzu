@@ -7,7 +7,7 @@
 #
 # WHAT THIS HOST CANNOT PROVE: it is a desktop and never sleeps, so the log
 # contains 10,399 Assertions lines and ZERO Sleep/Wake/DarkWake domain lines.
-# The sleep/wake parsing in test_tar_power.cpp is therefore driven by
+# The sleep/wake parsing in test_echo_power.cpp is therefore driven by
 # RECONSTRUCTED lines built to this same format — not a real capture — and
 # is unverified against a Mac that actually sleeps. A reviewer on a laptop
 # can close that gap; see the PR description.

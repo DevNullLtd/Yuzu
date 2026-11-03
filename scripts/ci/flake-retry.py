@@ -789,7 +789,7 @@ def _selftest():
                     '<testcase name="agent - yuzu:agent unit tests" time="200.5"/>'
                     '<testcase name="agent - yuzu:agent unit tests" time="0.5"/>'   # dup: summed
                     '<testcase name="docs - yuzu:changelog order"/>'                # no time: skipped
-                    '<testcase name="tar - yuzu:tar unit tests" time="garbled"/>'   # bad time: skipped
+                    '<testcase name="echo - yuzu:echo unit tests" time="garbled"/>'   # bad time: skipped
                     '</testsuite></testsuites>')
         durations = _entry_durations(d)
         check(durations == {"agent - yuzu:agent unit tests": 201.0},
@@ -825,10 +825,10 @@ def _selftest():
         with open(os.path.join(logs, "testlog.junit.xml"), "w") as f:
             f.write('<testsuites><testsuite>'
                     '<testcase name="server - yuzu:server unit tests" time="510.0"/>'
-                    '<testcase name="tar - yuzu:tar unit tests" time="12.0"/>'
+                    '<testcase name="echo - yuzu:echo unit tests" time="12.0"/>'
                     '</testsuite></testsuites>')
         entries = [{"name": "server unit tests", "timeout": 600},
-                   {"name": "tar unit tests", "timeout": 90}]
+                   {"name": "echo unit tests", "timeout": 90}]
         summary_path = os.path.join(d, "summary.md")
         old_summary = os.environ.get("GITHUB_STEP_SUMMARY")
         os.environ["GITHUB_STEP_SUMMARY"] = summary_path
@@ -844,14 +844,14 @@ def _selftest():
         stdout = out.getvalue()
         check("::warning::" in stdout and "server unit tests at 510/600s (85%)" in stdout,
               "watchdog warning emits for the over-budget suite")
-        check("tar unit tests" not in stdout, "no warning for the under-budget suite")
+        check("echo unit tests" not in stdout, "no warning for the under-budget suite")
         with open(summary_path, encoding="utf-8") as f:
             table = f.read()
         check("### Suite durations vs meson budgets" in table
               and "| test entry | wall (s) | budget (s) | used |" in table,
               "summary table heading and header row written")
         check("| server unit tests | 510 | 600 | 85% |" in table
-              and "| tar unit tests | 12 | 90 | 13% |" in table,
+              and "| echo unit tests | 12 | 90 | 13% |" in table,
               "summary table rows written on green")
 
     # catch2 exe detection.
@@ -860,7 +860,7 @@ def _selftest():
     check(CATCH2_EXE.search("python3") is None, "python is not a catch2 exe")
 
     # suite matching.
-    tests = [{"name": "agent unit tests", "cmd": ["x"]}, {"name": "tar unit tests", "cmd": ["y"]}]
+    tests = [{"name": "agent unit tests", "cmd": ["x"]}, {"name": "echo unit tests", "cmd": ["y"]}]
     check(match_suite("agent - yuzu:agent unit tests", tests)["cmd"] == ["x"], "suite match")
 
     # sharded server suite (#2092): the two shard names must map uniquely

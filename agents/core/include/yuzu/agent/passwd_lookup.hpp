@@ -29,7 +29,7 @@
  * `getpwnam_r` is not a local-file read on a directory-joined Mac -- it can do
  * a blocking network Directory Services / NSS lookup with no caller-supplied
  * timeout, a hazard this repo already records at
- * agents/plugins/tar/src/tar_proc_es.cpp ("getpwuid_r -- which can do a
+ * agents/plugins/echo/src/echo_proc_es.cpp ("getpwuid_r -- which can do a
  * blocking network NSS lookup on a directory-joined Mac"). Before #3406 the
  * certificates plugin obtained this same information through CHILD PROCESSES
  * (`/bin/sh -c` performing `~user` tilde expansion, and `/usr/bin/id -u`), both

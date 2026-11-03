@@ -405,7 +405,7 @@
   "version": "0.1.0",
   "where_the_data_goes": [
     "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The dashboard renders `network_actions` as a generic key-value table (Agent/Key/Value), and a legacy static action-description registry names both actions for that rendering.",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its two definitions.",
+    "**Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its two definitions.",
     "**Sensitivity.** `ping`'s `output` rows echo the operator-supplied `host` back verbatim in the tool's own text (an IP or hostname the operator chose, not one discovered from the device); `flush_dns`'s `output`/`detail` rows carry only command exit codes and generic tool diagnostics. Neither action's rows name a person, an account, or installed software.",
     "**Siblings:** `network.probe.icmp` (netprobe's read-only ICMP probe, an alternative mechanism to `ping`), `device.wol.check` (also performs ICMP as part of wake verification), `device.network_config.dns_cache` (the macOS DNS-honesty sibling that reports the resolver cache contents `flush_dns` clears).",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.network_actions.ping\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."

@@ -5,7 +5,7 @@
  * test_app_usage_parsers.cpp and test_app_usage_local_dispatcher.cpp.
  *
  * Test-only: creates the four tables app_usage_parsers.hpp reads
- * (usage_daily, usage_daily_user, usage_live, tar_config) with the exact
+ * (usage_daily, usage_daily_user, usage_live, echo_config) with the exact
  * columns that header's SQL selects, and inserts rows through bound
  * parameters (never string-built SQL) so a fixture row containing a quote,
  * pipe, backslash, or newline seeds cleanly regardless of the plugin's own
@@ -61,7 +61,7 @@ inline void exec_or_fail(sqlite3* db, const char* sql) {
 
 /// Creates the four tables app_usage_parsers.hpp's SQL reads from, with the
 /// exact columns its queries select (usage_daily has no distinct_users
-/// column here — the real tar.db table does, but no app_usage query ever
+/// column here — the real echo.db table does, but no app_usage query ever
 /// selects it; distinct_users is derived entirely from usage_daily_user).
 inline void create_schema(sqlite3* db) {
     exec_or_fail(db, "CREATE TABLE usage_daily (day_ts INTEGER, exe_key TEXT, "
@@ -70,7 +70,7 @@ inline void create_schema(sqlite3* db) {
     exec_or_fail(db, "CREATE TABLE usage_daily_user (day_ts INTEGER, exe_key TEXT, user TEXT)");
     exec_or_fail(db, "CREATE TABLE usage_live (pid INTEGER, exe_key TEXT, user TEXT, "
                      "start_ts INTEGER)");
-    exec_or_fail(db, "CREATE TABLE tar_config (key TEXT PRIMARY KEY, value TEXT)");
+    exec_or_fail(db, "CREATE TABLE echo_config (key TEXT PRIMARY KEY, value TEXT)");
 }
 
 namespace detail {
@@ -125,9 +125,9 @@ inline void insert_usage_live(sqlite3* db, int64_t pid, std::string_view exe_key
     sqlite3_finalize(stmt);
 }
 
-inline void insert_tar_config(sqlite3* db, std::string_view key, std::string_view value) {
+inline void insert_echo_config(sqlite3* db, std::string_view key, std::string_view value) {
     sqlite3_stmt* stmt = nullptr;
-    REQUIRE(sqlite3_prepare_v2(db, "INSERT INTO tar_config VALUES (?,?)", -1, &stmt, nullptr) ==
+    REQUIRE(sqlite3_prepare_v2(db, "INSERT INTO echo_config VALUES (?,?)", -1, &stmt, nullptr) ==
            SQLITE_OK);
     detail::bind_text(stmt, 1, key);
     detail::bind_text(stmt, 2, value);
@@ -210,9 +210,9 @@ inline void seed_from_fixture_dir(sqlite3* db, const std::string& fixture_dir) {
         for (int64_t i = 1; i <= open_run_count; ++i)
             insert_usage_live(db, i, "(placeholder)", "", 0);
     }
-    for (const auto& row : read_fixture_rows(fixture_dir + "/tar_config_macos.txt")) {
+    for (const auto& row : read_fixture_rows(fixture_dir + "/echo_config_macos.txt")) {
         REQUIRE(row.size() == 2);
-        insert_tar_config(db, row[0], row[1]);
+        insert_echo_config(db, row[0], row[1]);
     }
 }
 

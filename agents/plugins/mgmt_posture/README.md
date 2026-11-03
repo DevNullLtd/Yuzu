@@ -145,7 +145,7 @@ Every row is pipe-delimited; field 0 is the row kind and the first row is always
 ### Where the data goes
 
 - **Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `posture` is also a gathered definition (`crossplatform.security.mgmt_posture`, 3600s TTL).
-- **Not consumed by** daily-sync, TAR, DEX, or metrics.
+- **Not consumed by** daily-sync, Echo, DEX, or metrics.
 - **Sensitivity.** The MDM server host and the management plane are organisation-level facts; no person is named. The SSSD domain name that decides the plane is used internally and is never emitted. Only the host of the MDM server URL is kept (no path or query, which can carry a token). Key material is never read: the keytab is a presence check only.
 - **Siblings:** `device_identity` (owns the domain, OU and joined rows) and `local_security_policy` (local policy, not management plane).
 
@@ -194,5 +194,4 @@ krb5_keytab|absent
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_mgmt_posture.hpp`
 - Tests: `tests/test_mgmt_posture_definition.py` · `tests/unit/test_mgmt_posture_legs.cpp` · `tests/unit/test_mgmt_posture_local_dispatcher.cpp` · `tests/unit/test_mgmt_posture_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-04-mgmt_posture.added.md`
 <!-- END GENERATED -->

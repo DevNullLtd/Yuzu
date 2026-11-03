@@ -115,7 +115,7 @@ namespace detail {
 // The extractor primitives below intentionally mirror
 // users_win_events.hpp::detail (Wave-2 WP-A) -- same bounded, total-over-
 // malformed-input scans, kept file-local per the plugin-isolation precedent
-// (tar and users each carry their own EvtGuard/extractor copies; a shared
+// (echo and users each carry their own EvtGuard/extractor copies; a shared
 // consolidation is a follow-up decision, not this PR's).
 
 // Finds `open` at-or-after `from` (strictly before `limit`), then `close`

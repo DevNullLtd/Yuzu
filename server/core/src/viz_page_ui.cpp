@@ -1,7 +1,7 @@
 // Fleet Visualization page (PR 5 of feat/viz-engine ladder).
 //
 // Compiled in its own TU to keep the long raw string literal away from
-// server.cpp brace matching, mirroring tar_page_ui.cpp.
+// server.cpp brace matching, mirroring echo_page_ui.cpp.
 //
 // The page hosts a persistent <div id="viz-root"> + <canvas id="viz-canvas">
 // + <div id="viz-overlay-panel"> structure. The renderer JS (yuzu-viz.js,

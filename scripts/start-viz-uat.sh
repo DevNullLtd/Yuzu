@@ -11,7 +11,7 @@
 #   bash scripts/start-viz-uat.sh                # full bring-up (build if needed)
 #   bash scripts/start-viz-uat.sh stop           # docker compose down -v + clean state
 #   bash scripts/start-viz-uat.sh status         # ps + recent logs
-#   bash scripts/start-viz-uat.sh fleet-snapshot # dispatch tar.fleet_snapshot to the agent
+#   bash scripts/start-viz-uat.sh fleet-snapshot # dispatch echo.fleet_snapshot to the agent
 #
 # Environment overrides:
 #   VIZ_UAT_DIR           default: /tmp/yuzu-viz-uat
@@ -168,17 +168,17 @@ cmd_fleet_snapshot() {
   fi
   ok "Found $count registered agent(s)"
 
-  info "Dispatching crossplatform.tar.fleet_snapshot..."
+  info "Dispatching crossplatform.echo.fleet_snapshot..."
   local resp
   resp=$(curl -fsS -b "$VIZ_UAT_DIR/cookies.txt" \
       -H "Content-Type: application/json" -H "Origin: http://localhost:8080" \
-      -X POST "http://localhost:8080/api/instructions/crossplatform.tar.fleet_snapshot/execute" \
+      -X POST "http://localhost:8080/api/instructions/crossplatform.echo.fleet_snapshot/execute" \
       -d "{\"agent_ids\":$agent_ids_json}" || true)
   local cmd_id
   cmd_id=$(echo "$resp" | python3 -c \
     'import json,sys;j=json.load(sys.stdin);print(j.get("command_id",""))' 2>/dev/null || true)
   if [ -z "$cmd_id" ]; then
-    fail "Could not dispatch tar.fleet_snapshot:"
+    fail "Could not dispatch echo.fleet_snapshot:"
     fail "  $resp"
     exit 1
   fi
@@ -661,7 +661,7 @@ cmd_start() {
   echo "  Gateway:     http://localhost:8081/healthz | http://localhost:9568/metrics"
   echo "  State dir:   $VIZ_UAT_DIR"
   echo ""
-  echo "  Exercise tar.fleet_snapshot:"
+  echo "  Exercise echo.fleet_snapshot:"
   echo "    bash scripts/start-viz-uat.sh fleet-snapshot"
   echo ""
   echo "  Tail logs:"
@@ -688,7 +688,7 @@ Usage: $(basename "$0") [start|stop|restart|status|fleet-snapshot]
   stop             docker compose down -v + clean \$VIZ_UAT_DIR
   restart          stop + start
   status           docker compose ps + last log lines
-  fleet-snapshot   dispatch crossplatform.tar.fleet_snapshot to all agents
+  fleet-snapshot   dispatch crossplatform.echo.fleet_snapshot to all agents
 
 Env overrides:
   VIZ_UAT_DIR=/tmp/yuzu-viz-uat
