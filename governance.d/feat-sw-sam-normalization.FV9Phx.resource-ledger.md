@@ -59,3 +59,17 @@ Each test below was run against a build with one deliberate defect and went red,
 | alert window put back to 2h | the promtool case at a 61 minute period (evaluations at 182, 243 and 304 minutes) |
 
 The unexpected-shape arm of `try_norm_lock` (zero rows or a value other than `t` or `f`) cannot be produced from a real Postgres, so it is pinned by inspection; the peer-held (`f`) and held (`t`) arms are exercised by the cases above.
+
+## Addendum - registry writers take the normalisation lock (review of b4013c418)
+
+Range: `8bb3d4c4b..HEAD`. C++ files touched and what the change does to them:
+
+| File | Change | Resources |
+|---|---|---|
+| `server/core/src/product_registry_store.cpp` | `upsert_product` and `upsert_alias` run in one `with_txn_for` transaction; new anonymous-namespace helpers `take_normalization_lock` (two `SET LOCAL` timeouts, then a blocking `pg_advisory_xact_lock`) and `mark_dimension_stale`. | One pooled connection per call, held for the transaction and returned by the lease's RAII (`with_txn_for` rolls back on a false return or an exception). The advisory lock is transaction-scoped: released at COMMIT/ROLLBACK, never manually. Function-local `static const std::string` SQL texts (constant after first use). No file, socket, thread or timer. |
+| `server/core/src/product_registry_store.hpp` | `kNormalizationLockKey`, `kNormalizationLockWait` and the contract text. | Constants only. |
+| `server/core/src/software_title_dimension.{cpp,hpp}` | The pass's try-lock SQL built from the shared key; `run_tick` takes a `tick_budget`, `kMinLaterPassBudget`, a `static_assert`. | A local `steady_clock` time point; no new resource. |
+| `server/core/src/software_inventory_store.cpp` | Prefixed replace-lock key; one extra count query and one log line in the catalogue refresh. | The count runs on the refresh's existing transaction and connection (REPEATABLE READ snapshot); no new connection. |
+| `tests/unit/server/test_software_title_dimension.cpp`, `test_vuln_finding_store_adversarial.cpp` | New and updated cases. | Pooled leases held across a lock hold in the parked-pass cases (released before any assertion); `std::async` futures waited inside the scope; no temp files. |
+
+A writer blocked on the lock holds one pooled connection for at most `kNormalizationLockWait` (90 s, enforced by `statement_timeout` and `lock_timeout`); it has no production caller today.
