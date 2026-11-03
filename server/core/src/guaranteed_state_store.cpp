@@ -319,6 +319,106 @@ Result dex_read(bool open, pg::PgPool& pool, yuzu::MetricsRegistry* metrics, con
         .value_or(Result{});
 }
 
+// Schema v4 (#5690): the census ordering key, the durable pending evidence and the INSERT-allocated
+// event sequence. The shape check below is the ONE text run by the migration (before it stamps
+// the version) and by the boot probe `ordering_schema_defect`, because the runner skips a
+// database already stamped 4 and so cannot tell this schema's v4 from objects adopted by hand.
+// Every name is schema-qualified because the probe runs on a pooled connection without the
+// runner's search_path. `pg_index.indkey` is an int2vector whose `::int2[]` form has lower bound
+// 0 and never equals an ARRAY[...], so the keys are compared as text. The retained maxima are
+// read BEFORE the sequence: a concurrent allocation only raises the sequence, so the other order
+// could refuse a healthy database. The two constraint names are checked because the 23503 and
+// 23505 classifiers in the census projection and the event insert key on them.
+constexpr const char* kV4ShapeCheck = R"SQL(
+DO $do$
+DECLARE
+  bad text := '';
+  nxt bigint;
+  max_e bigint;
+  max_c bigint;
+  seqrel regclass;
+  r record;
+  e regclass := 'guaranteed_state_store.guaranteed_state_events'::regclass;
+  c regclass := 'guaranteed_state_store.guardian_agent_rule_status'::regclass;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = e AND attname = 'ingest_seq' AND NOT attisdropped
+                   AND atttypid = 'bigint'::regtype AND attnotnull AND attidentity = 'a')
+    THEN bad := bad || ' events.ingest_seq(bigint,not null,identity ALWAYS)'; END IF;
+  seqrel := pg_get_serial_sequence('guaranteed_state_store.guaranteed_state_events', 'ingest_seq')::regclass;
+  IF seqrel IS NULL OR NOT EXISTS (SELECT 1 FROM pg_sequence WHERE seqrelid = seqrel AND seqtypid = 'bigint'::regtype
+                   AND seqincrement = 1 AND seqmin = 1 AND seqmax = 9223372036854775807 AND seqcache = 1
+                   AND NOT seqcycle)
+    THEN bad := bad || ' events.ingest_seq sequence(bigint,inc 1,min 1,max bigint,cache 1,no cycle,owned)'; END IF;
+  FOR r IN SELECT * FROM (VALUES
+      (e, 'proj_key', 'bigint'::regtype, false, NULL::text),
+      (e, 'proj_key_capped', 'boolean'::regtype, true, 'false'),
+      (e, 'projection_pending', 'boolean'::regtype, true, 'false'),
+      (c, 'key_ns', 'bigint'::regtype, false, NULL),
+      (c, 'ingest_seq', 'bigint'::regtype, false, NULL),
+      (c, 'ts_hwm', 'bigint'::regtype, false, NULL),
+      (c, 'order_uncertain', 'boolean'::regtype, true, 'false')) v(rel, col, typ, nn, dflt)
+  LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+                    WHERE a.attrelid = r.rel AND a.attname = r.col AND NOT a.attisdropped AND a.atttypid = r.typ
+                      AND a.attnotnull = r.nn AND a.attidentity = '' AND a.attgenerated = ''
+                      AND (CASE WHEN r.dflt IS NULL THEN d.oid IS NULL ELSE pg_get_expr(d.adbin, d.adrelid) = r.dflt END))
+      THEN bad := bad || ' ' || r.rel::text || '.' || r.col; END IF;
+  END LOOP;
+  IF NOT EXISTS (SELECT 1 FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
+                  WHERE i.indrelid = e AND ic.relname = 'idx_gse_ingest_seq' AND i.indisunique AND i.indisvalid
+                    AND i.indisready AND i.indimmediate AND i.indpred IS NULL
+                    AND i.indkey::text = (SELECT attnum::text FROM pg_attribute WHERE attrelid = e AND attname = 'ingest_seq'))
+    THEN bad := bad || ' idx_gse_ingest_seq(unique,immediate,valid,on ingest_seq only)'; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
+                  WHERE i.indrelid = e AND ic.relname = 'idx_gse_pending' AND NOT i.indisunique AND i.indisvalid
+                    AND i.indisready AND pg_get_expr(i.indpred, i.indrelid) = 'projection_pending'
+                    AND i.indkey::text = (SELECT attnum::text FROM pg_attribute WHERE attrelid = e AND attname = 'rule_id') || ' ' ||
+                                         (SELECT attnum::text FROM pg_attribute WHERE attrelid = e AND attname = 'agent_id'))
+    THEN bad := bad || ' idx_gse_pending((rule_id,agent_id) WHERE projection_pending)'; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = e AND conname = 'guaranteed_state_events_pkey' AND contype = 'p')
+    THEN bad := bad || ' events primary key name guaranteed_state_events_pkey'; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = c AND conname = 'guardian_agent_rule_status_rule_fk' AND contype = 'f')
+    THEN bad := bad || ' census foreign key name guardian_agent_rule_status_rule_fk'; END IF;
+  IF seqrel IS NOT NULL THEN
+    SELECT COALESCE(max(ingest_seq), 0) INTO max_e FROM guaranteed_state_store.guaranteed_state_events;
+    SELECT COALESCE(max(ingest_seq), 0) INTO max_c FROM guaranteed_state_store.guardian_agent_rule_status;
+    EXECUTE format('SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END FROM %s', seqrel) INTO nxt;
+    IF nxt <= GREATEST(max_e, max_c)
+      THEN bad := bad || format(' ingest_seq sequence next=%s is not above the retained maxima', nxt); END IF;
+  END IF;
+  IF bad <> '' THEN
+    RAISE EXCEPTION 'guaranteed_state_store v4: object not as this version creates it:%', bad USING ERRCODE = 'P0001';
+  END IF;
+END
+$do$;
+)SQL";
+
+// The identity fill REWRITES guaranteed_state_events: a new filenode under ACCESS EXCLUSIVE for
+// the whole statement (every other replica's ingest, readers and reaper block, so stop them
+// first), needing disk headroom of one full copy of the table and its indexes. The ACCESS
+// EXCLUSIVE lock is held until this transaction ends, which includes the index builds and the
+// shape check. The pool's 30 s statement_timeout would refuse boot at about four million
+// retained events, so this transaction widens it; the bound still exists, as a per-statement
+// limit, not a migration deadline (docs/user-manual/upgrading.md).
+constexpr const char* kV4Ddl = R"SQL(
+SET LOCAL lock_timeout = '3s';
+SET LOCAL statement_timeout = '900s';
+ALTER TABLE guaranteed_state_events
+    ADD COLUMN IF NOT EXISTS ingest_seq BIGINT GENERATED ALWAYS AS IDENTITY (CACHE 1 NO CYCLE),
+    ADD COLUMN IF NOT EXISTS proj_key BIGINT,
+    ADD COLUMN IF NOT EXISTS proj_key_capped BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS projection_pending BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gse_ingest_seq ON guaranteed_state_events (ingest_seq);
+CREATE INDEX IF NOT EXISTS idx_gse_pending ON guaranteed_state_events (rule_id, agent_id)
+    WHERE projection_pending;
+ALTER TABLE guardian_agent_rule_status
+    ADD COLUMN IF NOT EXISTS key_ns BIGINT,
+    ADD COLUMN IF NOT EXISTS ingest_seq BIGINT,
+    ADD COLUMN IF NOT EXISTS ts_hwm BIGINT,
+    ADD COLUMN IF NOT EXISTS order_uncertain BOOLEAN NOT NULL DEFAULT FALSE;
+)SQL";
+
+
 // ── Postgres schema (ADR-0038): the FINAL column set of all 8 SQLite
 // migrations, collapsed into one v1. Unqualified DDL — the migration runner
 // sets search_path to `guaranteed_state_store` for the migration transaction.
@@ -454,6 +554,9 @@ const std::vector<pg::PgMigration>& migrations() {
             END
             $do$;
         )SQL"},
+        // v4 (#5690): the migration text is the DDL followed by the shape check, so a database
+        // carrying an adopted object of the wrong shape rolls back unstamped.
+        {4, std::string(kV4Ddl) + kV4ShapeCheck},
     };
     return kMigrations;
 }
@@ -497,6 +600,32 @@ std::string census_schema_defect(PGconn* conn) {
     return {};
 }
 
+// Boot probe for schema v4: the same shape check the migration ran, again on every start,
+// because a database stamped 4 is skipped by the runner. Returns an empty string when every v4
+// object is as this version creates it, else the cause for the boot error. A refusal our own
+// check raised (SQLSTATE P0001) carries the objects it found wrong and the remedy; any other
+// failure is reported as a probe failure with the libpq message sanitised.
+std::string ordering_schema_defect(PGconn* conn) {
+    pg::PgResult res = pg::exec_params(conn, kV4ShapeCheck, std::vector<std::string>{});
+    if (res.status() == PGRES_COMMAND_OK)
+        return {};
+    const char* state = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+    if (state == nullptr || std::string_view(state) != "P0001")
+        return std::string("ordering schema probe failed: ") +
+               ::yuzu::log_key_token(PQerrorMessage(conn));
+    const char* primary = PQresultErrorField(res.get(), PG_DIAG_MESSAGE_PRIMARY);
+    return std::string(primary != nullptr ? primary : "guaranteed_state_store v4: object not as "
+                                                       "this version creates it") +
+           ". Back up the database first and stop every replica. If v4 was never used (no "
+           "census row has key_ns and no event has proj_key or projection_pending), drop the "
+           "named objects and run \"UPDATE public.schema_meta SET version = 3 WHERE store = "
+           "'guaranteed_state_store'\", then restart, which re-runs the v4 migration. If v4 was "
+           "used, dropping an object discards ordering evidence, so reconcile by hand. A "
+           "sequence refusal is repaired, with every replica stopped, by setval of the "
+           "ingest_seq sequence to the larger of the event and census maxima with is_called "
+           "true; the store never reseeds it";
+}
+
 } // namespace
 
 // ── Construction ─────────────────────────────────────────────────────────────
@@ -519,6 +648,10 @@ GuaranteedStateStore::GuaranteedStateStore(pg::PgPool& pool, int retention_days,
     if (const std::string defect = census_schema_defect(lease.get()); !defect.empty()) {
         // `defect` is fixed text, or the probe failure with its libpq message already
         // sanitised; log_key_token here would cut the remedy off at its 256-byte cap.
+        spdlog::error("GuaranteedStateStore: unsupported schema, refusing to start: {}", defect);
+        return;
+    }
+    if (const std::string defect = ordering_schema_defect(lease.get()); !defect.empty()) {
         spdlog::error("GuaranteedStateStore: unsupported schema, refusing to start: {}", defect);
         return;
     }
