@@ -281,6 +281,6 @@ TEST_CASE("kSoftwareKinds and kSoftwareSources: UI vocabulary tables",
                             "installed_apps.list_inventory", "pkg_inventory.managers",
                             "pkg_inventory.packages", "pkg_inventory.store_packages",
                             "windows_optional_features.list", "msi_packages.list_inventory",
-                            "runtimes.python"});
+                            "runtimes.python", "middleware.ibm_mq"});
     }
 }

@@ -60,6 +60,14 @@ inline constexpr std::string_view kProvisioningSourceLocal = "local";
 // Explicit underlying type — locks ABI/serialization width so adding new
 // values can never silently widen the enum across the plugin/wire boundary.
 enum class AuthDBError : std::uint8_t {
+    /// A write (or the transaction around it) failed. It ALSO covers a CSPRNG
+    /// failure while minting a TOTP secret or recovery code (#4763): in
+    /// `mfa_init_enrollment` the draw precedes every write; in the recovery-code
+    /// paths earlier statements of the same transaction have run and are rolled
+    /// back. The `spdlog::error` line is the only discriminator — at the login
+    /// enrol-init route the degrade metric labels it `reason=query_error`; the
+    /// other MFA sites carry only `yuzu_auth_secret_unavailable_total`, labelled by
+    /// route but with no `reason` (Settings regenerate carries no counter).
     WriteFailed,
     QueryFailed,
     UserNotFound,
@@ -819,7 +827,12 @@ public:
     /// than interleaving into a torn 20-row set with the returned codes not
     /// matching storage (#3779). Returns `UserNotFound` when no ACTIVE user row
     /// matches (a deactivated account never receives fresh codes);
-    /// `QueryFailed`/`WriteFailed` on a store outage (fail-closed 503).
+    /// `QueryFailed`/`WriteFailed` on a store outage (fail-closed 503) — and
+    /// `WriteFailed` also when the CSPRNG fails mid-mint (#4763): the transaction
+    /// rolls back, so no partial set is ever returned and the existing codes
+    /// stand. CAUTION: a lost COMMIT acknowledgement also reports `WriteFailed`
+    /// even if the server committed (`PgPool::with_txn_for`), so a caller must not
+    /// assert to the user that the old codes definitely survive.
     std::expected<std::vector<std::string>, AuthDBError>
     mfa_regenerate_recovery_codes(const std::string& username);
 
