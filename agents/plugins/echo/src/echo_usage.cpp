@@ -320,6 +320,25 @@ std::expected<void, std::string> usage_ensure_baselined(EchoDatabase& db, int64_
     return result;
 }
 
+// Active iff the two generations match. A missing or unreadable active generation fails TOWARD
+// re-baselining, never toward Active. The generation itself is read STRICTLY: a failed or
+// malformed read poisons the transaction (safe-1). The lenient 0-on-fault helper would read a
+// stored active generation as a mismatch and stamp_baseline would delete the open runs over a
+// transient read fault; an absent row is the legitimate first-ever state and reads as 0, as
+// get_config's default does. The active generation keeps the lenient parse usage_lifecycle_state
+// uses (an empty or malformed value is 0), so the two readers agree on every stored value.
+std::expected<bool, std::string> usage_active_in(TransactionHandle& h) {
+    const auto generation_read = read_config_i64_strict(h, "usage_generation");
+    if (!generation_read) {
+        h.fail("usage_generation read failed: " + generation_read.error());
+        return std::unexpected(h.error());
+    }
+    const auto active_text = read_config_text(h, "usage_active_generation");
+    if (!active_text)
+        return std::unexpected(active_text.error());
+    return active_text->has_value() && parse_i64(**active_text) == generation_read->value_or(0);
+}
+
 std::expected<void, std::string> usage_fold_in(TransactionHandle& h, int64_t now,
                                                const std::vector<ProcessEvent>& events) {
     const auto usage_on = source_on(h, "usage");
@@ -336,26 +355,19 @@ std::expected<void, std::string> usage_fold_in(TransactionHandle& h, int64_t now
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value IS NOT excluded.value",
             (*usage_on && *process_on) ? "true" : "false")))
         return std::unexpected(h.error());
-    if (!*usage_on || !*process_on)
+    if (!*usage_on || (!*process_on && events.empty()))
         return {}; // nothing to do this tick -- not a failure
 
-    // ── Lifecycle, read through the handle: Active iff the two generations match. A missing or
-    // unreadable active generation fails TOWARD re-baselining, never toward Active. The
-    // generation itself is read STRICTLY: a failed or malformed read poisons the transaction
-    // (safe-1). The lenient 0-on-fault helper would read a stored active generation as a mismatch
-    // and stamp_baseline would delete the open runs over a transient read fault; an absent row is
-    // the legitimate first-ever state and reads as 0, as get_config's default does.
-    const auto generation_read = read_config_i64_strict(h, "usage_generation");
-    if (!generation_read) {
-        h.fail("usage_generation read failed: " + generation_read.error());
-        return std::unexpected(h.error());
-    }
-    const int64_t generation = generation_read->value_or(0);
-    const auto active_text = read_config_text(h, "usage_active_generation");
-    if (!active_text)
-        return std::unexpected(active_text.error());
-    const bool active = active_text->has_value() && parse_i64(**active_text) == generation;
-    if (!active) {
+    const auto active = usage_active_in(h);
+    if (!active)
+        return std::unexpected(active.error());
+    if (!*active) {
+        const auto generation_read = read_config_i64_strict(h, "usage_generation");
+        if (!generation_read) {
+            h.fail("usage_generation read failed: " + generation_read.error());
+            return std::unexpected(h.error());
+        }
+        const int64_t generation = generation_read->value_or(0);
         // PendingBaseline: stamp the baseline now. A freshly-established baseline has nothing yet
         // to fold forward from, so this tick's events fold into the process tiers only.
         return stamp_baseline(h, now, generation);

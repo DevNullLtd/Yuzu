@@ -670,8 +670,8 @@ spec:
         displayName: Power Transition Capture Enabled
         description: >
           Enable or disable the sleep/wake/AC-power transition source (power →
-          $Power_Live, cursor-model seam). **ON by default ("true")**, like every
-          other capture source. The SOC 2 data inventory classifies $Power_Live as
+          $Power_Hourly, cursor-model seam). **ON by default ("true")**, like every
+          other capture source. The SOC 2 data inventory classifies $Power_Hourly as
           usage-class / behavioral-adjacent, because the TIMING of sleep/wake
           and AC events is a presence and working-hours proxy. Treat it as
           co-determination-relevant and use power_lookback_seconds=0 where a
@@ -706,11 +706,11 @@ spec:
         displayName: Removable Media Capture Enabled
         description: >
           Enable or disable the removable-media attach/detach source
-          (removable → $Removable_Live, cursor-model seam), including
+          (removable → $Removable_Hourly, cursor-model seam), including
           exec_from_removable correlation (a process observed running from a
           removable volume). **ON by default ("true")**, like every other
           capture source. This is the MORE sensitive of power and removable. The SOC 2
-          data inventory classifies $Removable_Live as usage/identity-class:
+          data inventory classifies $Removable_Hourly as usage/identity-class:
           it records device vendor, product and SERIAL, plus the executed
           binary path and pid of any process running from a removable volume.
           Treat it as co-determination-relevant and set
@@ -719,7 +719,7 @@ spec:
           The source WILL use the same durable log-position cursor model as
           power (see power_enabled) — a lost/invalid cursor will re-baseline
           forward and record a capture_gap rather than replaying history.
-          Queried via echo.sql only ($Removable_Live); the legacy echo.query /
+          Queried via echo.sql only ($Removable_Hourly); the legacy echo.query /
           echo.export actions do not surface removable. Set to "false"
           to opt out. Requires agent v0.12.0+; older agents silently ignore.
           Valid: "true" | "false".
@@ -751,9 +751,10 @@ spec:
           Image File Execution Options, AppInit_DLLs, Winlogon, LSA, Policies and
           Defender under HKLM, plus Run, RunOnce, Policies and Winlogon under every
           loaded user hive) is watched for changes; each added or changed value
-          is recorded with its new value (up to 512 bytes of text), a removed
-          value by its name, and a changed or removed value also carries the
-          type and size of its old value, never the old value itself.
+          is recorded with its new value (up to 512 bytes of text) and its
+          type, a removed value by its name, and each row carries the image
+          of the process that wrote it when attribution succeeded; the old
+          value is not kept, neither its text nor its type or size.
           VALUES ARE STORED UNMASKED: the newest value of every value added or
           changed under a watched key is readable through echo.sql as last_data
           in $Registry_Hourly and $Registry_Daily, for the tier's retention (for

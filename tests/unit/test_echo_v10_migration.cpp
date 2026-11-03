@@ -27,6 +27,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -1173,15 +1174,16 @@ TEST_CASE("v10 migration: a bucket the excursion itself wrote ahead of the clock
     CHECK(n(db, "SELECT SUM(start_count) FROM process_hourly") == 3);
 }
 
-TEST_CASE("v10 migration: a mark ahead of the clock over an empty converted tier refuses and names it",
+TEST_CASE("v10 migration: a mark ahead of the clock over a converted tier with no bucket at or before the clock refuses",
           "[echo][v10][migration][marks]") {
     Seeded seeded;
-    // The old hourly tier is empty (retention emptied it) while the daily tier still holds what
-    // was summarised from it, and the hourly mark is ahead of the clock. Nothing bounds the fold:
-    // folding every raw row would count it a second time in the daily tier. The migration cannot
-    // tell a healed excursion from a migration clock behind a sane mark (a snapshot restore), so
-    // both land here and are refused with the figures, never guessed.
+    // The daily tier still holds what was summarised from the hourly one, a raw row exists, and
+    // the hourly mark is ahead of the clock. Nothing bounds the fold: folding every raw row would
+    // count it a second time in the daily tier. The migration cannot tell a healed excursion from
+    // a migration clock behind a sane mark (a snapshot restore), so both land here and are
+    // refused with the figures, never guessed.
     const int64_t excursion = kH0 + int64_t{100} * 365 * 86400;
+    const int64_t excursion_hour = excursion - excursion % 3600;
     seed(seeded, [&](sqlite3* db) {
         insert_raw(db, "process", {I(kT0), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
         exec(db, std::format("INSERT INTO process_daily VALUES (NULL, {}, 'a.exe', 'u', 1, 0)", kH0 - kH0 % 86400));
@@ -1189,6 +1191,13 @@ TEST_CASE("v10 migration: a mark ahead of the clock over an empty converted tier
                              "('rollup_process_daily_at', '{0}')",
                              excursion));
     });
+    SECTION("the old hourly tier is empty (retention emptied it)") {
+    }
+    SECTION("the old hourly tier holds only a bucket the excursion itself wrote") {
+        Db raw;
+        open_raw(raw, seeded.tmp.path);
+        exec(raw.db, std::format("INSERT INTO process_hourly VALUES (NULL, {}, 'a.exe', 'u', 1, 0)", excursion_hour));
+    }
     const auto before = snapshot(seeded.tmp.path);
     const auto failed = EchoDatabase::open(seeded.tmp.path);
     REQUIRE(!failed.has_value());
@@ -1264,6 +1273,192 @@ TEST_CASE("v10 migration: a malformed usage lag counter is logged and does not r
     CHECK(logs.text().find("'usage_lag_events' holds 'abc'") != std::string::npos);
     CHECK(logs.text().find("(usage_lag_events was 0), 1 of them folded into usage") != std::string::npos);
     CHECK(db.get_config("usage_lag_events", "absent") == "absent");
+}
+
+namespace {
+// A started and a stopped event of one run, both past a cursor at 0: fed, the run closes with
+// 60 s credited and nothing is left open.
+void seed_one_lagged_run(sqlite3* db) {
+    insert_raw(db, "process", {I(kT0), I(1), T("started"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+    insert_raw(db, "process", {I(kT0 + 60), I(1), T("stopped"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+    exec(db, "INSERT INTO echo_config VALUES ('usage_hwm_id', '0')");
+}
+} // namespace
+
+TEST_CASE("v10 migration: the usage feed reads the active generation exactly as the fold reads it",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // usage_lifecycle_state and usage_fold_in parse the active generation leniently (an empty or
+    // malformed value is 0), so against an absent generation (0) they read Active and would have
+    // credited the lagged rows on the next tick. The migration must read the row the same way: a
+    // stricter parse would feed nothing and then delete the cursor.
+    std::string active;
+    SECTION("an empty active generation with no generation row") {
+        active = "";
+    }
+    SECTION("a malformed active generation with no generation row") {
+        active = "abc";
+    }
+    seed(seeded, [&](sqlite3* db) {
+        seed_one_lagged_run(db);
+        exec(db, std::format("INSERT INTO echo_config VALUES ('usage_active_generation', '{}')", active));
+    });
+    yuzu::test::LogCapture logs;
+    auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    INFO(logs.text());
+    CHECK(logs.text().find("usage lag: 2 raw process rows past usage_hwm_id (usage_lag_events was 0), 2 of "
+                           "them folded into usage") != std::string::npos);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live") == 0);
+    CHECK(n(db, "SELECT run_count FROM usage_daily WHERE exe_key = 'alpha.exe'") == 1);
+    CHECK(n(db, "SELECT total_seconds FROM usage_daily WHERE exe_key = 'alpha.exe'") == 60);
+    CHECK(db.get_config("usage_active_generation", "absent") == active); // nothing re-stamped
+}
+
+TEST_CASE("v10 migration: lagged process rows reach usage while the process source is disabled",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // The pre-v10 fold left its cursor where it was while process was disabled and credited the
+    // rows once process was re-enabled. The migration folds the raw rows into the process tiers
+    // regardless and deletes the cursor, so they must reach usage now or never.
+    seed(seeded, [&](sqlite3* db) {
+        seed_one_lagged_run(db);
+        exec(db, "INSERT INTO echo_config VALUES ('process_enabled', 'false'), ('usage_active_generation', '0')");
+    });
+    yuzu::test::LogCapture logs;
+    auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    INFO(logs.text());
+    CHECK(logs.text().find("usage lag: 2 raw process rows past usage_hwm_id (usage_lag_events was 0), 2 of "
+                           "them folded into usage") != std::string::npos);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live") == 0);
+    CHECK(n(db, "SELECT run_count FROM usage_daily WHERE exe_key = 'alpha.exe'") == 1);
+    CHECK(n(db, "SELECT total_seconds FROM usage_daily WHERE exe_key = 'alpha.exe'") == 60);
+    CHECK(n(db, "SELECT SUM(start_count) FROM process_hourly") == 1); // the process tiers too
+    CHECK(db.get_config("usage_feeder_enabled", "absent") == "false"); // the flag still says process is off
+}
+
+TEST_CASE("v10 migration: a mark over a source with nothing to fold migrates whether or not it is trusted",
+          "[echo][v10][migration][marks]") {
+    Seeded seeded;
+    // The pre-v10 pass wrote a mark for every source and tier whether or not it had rows, so
+    // after a forward excursion every never-used source carries a mark ahead of the clock over
+    // empty tiers. Such a mark bounds nothing and must not stop Echo from loading.
+    const int64_t excursion = kH0 + int64_t{100} * 365 * 86400;
+    int64_t mark = 0;
+    int64_t want_starts = 0;
+    std::string want_log;
+    SECTION("a sane mark over empty tiers and no raw row") {
+        mark = kNextHour;
+    }
+    SECTION("a sane mark over an empty converted tier with a raw row at or after it") {
+        mark = kNextHour;
+        want_starts = 1;
+    }
+    SECTION("a mark ahead of the clock over empty tiers and no raw row") {
+        mark = excursion;
+        want_log = "the process source holds no raw row and no converted bucket";
+    }
+    seed(seeded, [&](sqlite3* db) {
+        if (want_starts)
+            insert_raw(db, "process", {I(kNextHour + 7), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
+        exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_process_hourly_at', '{0}'), "
+                             "('rollup_process_daily_at', '{0}'), ('rollup_process_monthly_at', '{0}')",
+                             mark));
+    });
+    yuzu::test::LogCapture logs;
+    auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    INFO(logs.text());
+    CHECK(logs.text().find(want_log) != std::string::npos);
+    CHECK(logs.text().find("holds no bucket at or before the clock") == std::string::npos);
+    CHECK(n(db, "SELECT COALESCE(SUM(start_count), 0) FROM process_hourly") == want_starts);
+    CHECK(db.get_config("rollup_process_hourly_at", "absent") == "absent");
+}
+
+TEST_CASE("v10 migration: a daily or monthly mark ahead of the clock is replaced by that tier's own bucket end",
+          "[echo][v10][migration][marks]") {
+    Seeded seeded;
+    // The hourly edge is MAX(hour_ts) + 3600; a day's edge is its start + 86400 and a month's
+    // the start of the next month. Each coarser tier's replacement floor comes from its own
+    // converted buckets, never the hourly one's.
+    const int64_t excursion = kH0 + int64_t{100} * 365 * 86400;
+    const int64_t day0 = kH0 - kH0 % 86400;
+    constexpr int64_t kOct0 = 1790812800; // 2026-10-01T00:00:00Z: a month that has ended
+    constexpr int64_t kNov0 = 1793491200; // 2026-11-01T00:00:00Z: its end
+    std::string key;
+    int64_t want_edge = 0;
+    SECTION("daily: the end of the newest day at or before the clock") {
+        seed(seeded, [&](sqlite3* db) {
+            exec(db, std::format("INSERT INTO process_daily VALUES (NULL, {}, 'a.exe', 'u', 1, 0)", day0));
+            exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_process_hourly_at', '{}'), "
+                                 "('rollup_process_daily_at', '{}')",
+                                 kNextHour, excursion));
+        });
+        key = "rollup_process_daily_at";
+        want_edge = day0 + 86400;
+    }
+    SECTION("monthly: the start of the month after the newest at or before the clock") {
+        seed(seeded, [&](sqlite3* db) {
+            exec(db, std::format("INSERT INTO process_daily VALUES (NULL, {}, 'a.exe', 'u', 1, 0)", day0));
+            exec(db, std::format("INSERT INTO process_monthly VALUES (NULL, {}, 'a.exe', 'u', 1, 0)", kOct0));
+            exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_process_hourly_at', '{0}'), "
+                                 "('rollup_process_daily_at', '{0}'), ('rollup_process_monthly_at', '{1}')",
+                                 kNextHour, excursion));
+        });
+        key = "rollup_process_monthly_at";
+        want_edge = kNov0;
+    }
+    {
+        Db raw;
+        open_raw(raw, seeded.tmp.path);
+        exec(raw.db, std::format("INSERT INTO process_hourly VALUES (NULL, {}, 'a.exe', 'u', 1, 0)", kH0));
+    }
+    yuzu::test::LogCapture logs;
+    auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    INFO(logs.text());
+    CHECK(logs.text().find(std::format("{} = {} is ahead of the clock", key, excursion)) != std::string::npos);
+    CHECK(logs.text().find(std::format("newest bucket at or before the clock instead ({})", want_edge)) !=
+          std::string::npos);
+    CHECK(n(db, "SELECT SUM(start_count) FROM process_daily") == 1); // nothing rolled up twice
+}
+
+TEST_CASE("v10 migration: the replacement floor is clamped to the clock when the newest bucket is the current hour",
+          "[echo][v10][migration][marks]") {
+    Seeded seeded;
+    // A bucket of the current hour ends after the clock; its end must not be the floor, or a raw
+    // row written since the clock healed and inside this hour would be dropped as summarised.
+    // The migration reads the real clock (no seam), so the floor is bracketed between two
+    // readings taken around the open rather than compared with a figure. Two buckets, this hour
+    // and the next, so an hour rolling over between the readings still leaves the newest bucket
+    // at or before the clock ending after it.
+    const auto epoch_now = [] {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    };
+    const int64_t before = epoch_now();
+    const int64_t hour = before - before % 3600;
+    seed(seeded, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(hour - 10), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
+        for (const auto h : {hour, hour + 3600})
+            exec(db, std::format("INSERT INTO process_hourly VALUES (NULL, {}, 'a.exe', 'u', 1, 0)", h));
+        exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_process_hourly_at', '{}')",
+                             hour + int64_t{100} * 365 * 86400));
+    });
+    yuzu::test::LogCapture logs;
+    auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    const int64_t after = epoch_now();
+    const auto text = logs.text();
+    INFO(text);
+    const auto at = text.find("newest bucket at or before the clock instead (");
+    REQUIRE(at != std::string::npos);
+    const int64_t floor = std::stoll(text.substr(at + std::string_view{"newest bucket at or before the clock instead ("}.size()));
+    CHECK(floor >= before);
+    CHECK(floor <= after); // the bucket's end is later: the clamp held
+    CHECK(text.find("1 raw rows older than the old roll-up mark") != std::string::npos);
 }
 
 TEST_CASE("v10 migration: a legacy bucket or average that cannot convert is refused with the row named",

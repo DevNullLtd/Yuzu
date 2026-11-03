@@ -296,14 +296,20 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    the rows below that floor are counted in the "older than the mark" figure. A converted tier
    with no bucket at or before the clock cannot bound the fold: folding everything would add every
    raw row on top of the upper tiers that already hold them, so the migration refuses with the
-   source, tier, mark and clock named. The trust rule is the old budget pass's bare `mark > now`
-   (no tolerance, `acd22e776` `echo_aggregator.cpp` `raw_budget_candidates`), so a migration clock
-   behind every stored mark (a restored snapshot, a reset real-time clock) takes the same path:
-   bounded by the converted tier, or refused until the clock or the mark is repaired. Known limit:
-   a raw row the excursion itself stamped ahead of the clock folds again on top of the converted
-   future bucket that already holds it (an upper bound on the raw read would close it; not built).
-   A sane mark is used exactly as stored; the migration does not otherwise decide per row whether
-   a below-mark raw row was summarised.
+   source, tier, mark and clock named, unless the source holds no raw row and no converted bucket
+   at all (the pre-v10 pass wrote a mark for every source and tier whether or not it had rows, so
+   after a forward excursion every never-used source carries one; it bounds nothing, is ignored
+   and logged, and the migration proceeds). The trust rule is the old budget pass's bare
+   `mark > now` (no tolerance, `acd22e776` `echo_aggregator.cpp` `raw_budget_candidates`), so a
+   migration clock behind every stored mark (a restored snapshot, a reset real-time clock) takes
+   the same path: bounded by the converted tier, or refused until the clock or the mark is
+   repaired. Known limit, two triggers of one mechanism: a raw row the excursion itself stamped
+   ahead of the clock folds again on top of the converted future bucket that already holds it;
+   and a migration clock set back from a SANE mark (a restored snapshot, an NTP step) makes the
+   mark untrusted by the same rule, and the clamp to the clock folds the raw rows between the
+   clock and the mark again on top of the buckets that hold them (an upper bound on the raw read
+   would close both; not built). A sane mark is used exactly as stored; the migration does not
+   otherwise decide per row whether a below-mark raw row was summarised.
    Sixteen decoders read the raw columns through `legacy_live_columns()`; a row the delta rules
    reject is counted and dropped. Raw rows older than that mark are dropped with the raw tables, by
    design: the old roll-up already summarised them, except rows a process-event backfill wrote with
@@ -312,17 +318,27 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    them would double-count the first group; the migration logs how many it left unfolded. The usage
    fold read the raw process rows through its own cursor, `usage_hwm_id`: the process rows past it
    (the stored `usage_lag_events`, normally 0) are fed to `usage_fold_in` in this same transaction,
-   so a lagging usage fold loses nothing when the cursor is deleted; the log line carries the rows
-   past the cursor, the stored counter and how many of them were folded (a row past the cursor but
-   below the roll-up floor is not read and is in the "older than the mark" figure). They are fed
-   only when the next fast tick would have folded them: usage and process enabled and the usage
-   lifecycle Active (`usage_active_generation` equals `usage_generation`), decided ONCE before the
-   chunk loop; a PendingBaseline tick stamps a baseline and folds nothing, so the migration feeds
-   nothing and stamps nothing (decided per chunk, the first chunk's stamp would turn the next into
-   a retrospective fold of the rows the baseline excluded). An Active lifecycle with no cursor row
-   is the damage the pre-v10 fold refused on (both keys were written in one transaction) and
-   refuses the migration with the repair named; a malformed `usage_lag_events` (informational) is
-   logged and the migration continues. A migrated tier
+   so a lagging usage fold loses nothing it would have credited when the cursor is deleted; the
+   log line carries the rows past the cursor, the stored counter and how many of them were folded
+   (a row past the cursor but below the roll-up floor is not read and is in the "older than the
+   mark" figure). They are fed only when the usage fold would have credited them, through the
+   fold's own predicate (`usage_active_in`): usage enabled and the lifecycle Active, with the
+   active generation parsed as `usage_lifecycle_state` parses it (an empty or malformed
+   `usage_active_generation` is 0 and reads Active against an absent or 0 `usage_generation`,
+   exactly as the next tick would read it; a stricter parse here would feed nothing and then
+   delete the cursor). `process_enabled` is deliberately not consulted: the pre-v10 fold left its
+   cursor in place while process was disabled and credited the rows once process was re-enabled,
+   and the migration folds the raw rows into the process tiers regardless, so the rows reach usage
+   now or never (`usage_fold_in` credits the events it is handed while process is disabled; only
+   its event-less sweep stays idle). Decided ONCE before the chunk loop; a PendingBaseline tick
+   stamps a baseline and folds nothing, so the migration feeds nothing and stamps nothing (decided
+   per chunk, the first chunk's stamp would turn the next into a retrospective fold of the rows
+   the baseline excluded). An Active lifecycle with no cursor row is the damage the pre-v10 fold
+   refused on (both keys were written in one transaction) and refuses the migration with the
+   repair named (`DELETE FROM echo_config WHERE key = 'usage_active_generation';`: usage then
+   re-baselines on the first tick, which deletes `usage_live`, so the open usage runs are
+   forgotten and the lagged rows are not credited); a malformed `usage_lag_events`
+   (informational) is logged and the migration continues. A migrated tier
    row carries the columns v9 did not have (`parent_name`, `abnormal_exit_count`, tcp `failed_count`
    and `listen_*`, user `disconnect_count`, removable `partition_count`) as blank or 0, so a bucket
    spanning the upgrade holds two process rows per (name, user): the migrated one with a blank

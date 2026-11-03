@@ -463,12 +463,27 @@ enum class LifecycleState {
 [[nodiscard]] std::expected<void, std::string> usage_ensure_baselined(EchoDatabase& db, int64_t now);
 
 /**
+ * Whether the usage lifecycle is Active, read through the transaction's handle exactly as
+ * `usage_fold_in` reads it: `usage_generation` strictly (a malformed or failed read poisons `h`
+ * and is an error; an absent row is 0), `usage_active_generation` leniently (an absent row is
+ * not Active; a present row is parsed as `usage_lifecycle_state` parses it, so an empty or
+ * malformed value reads as 0). The ONE predicate for "would the next tick fold": the v10
+ * migration takes its feed decision from it so an existing file is read the way the fold would
+ * have read it, never through a stricter parallel parse. Does not read `usage_enabled`.
+ */
+[[nodiscard]] std::expected<bool, std::string> usage_active_in(TransactionHandle& h);
+
+/**
  * Fold `events` (one tick's process events) into the usage tables ON THE CALLER'S TRANSACTION
  * `h`: pair started/stopped against the open-run table (usage_live), expire and cap it,
  * upsert usage_daily / usage_daily_user, and write the cumulative echo_config counters. The
  * lifecycle is read through `h` too, so the decision and the writes are one snapshot: a
- * disabled source (usage or process) folds nothing; a source awaiting its baseline stamps it
- * (clearing usage_live) and folds nothing this tick; an Active source folds.
+ * disabled usage source folds nothing; a disabled process source folds nothing on a sweep (no
+ * events: the open runs stay as they are, as the pre-v10 fold left them) but still credits the
+ * events it is handed (the v10 migration's lagged raw process rows, which the pre-v10 fold
+ * would have credited once process was re-enabled; the live path hands it no events while
+ * process is disabled); a source awaiting its baseline stamps it (clearing usage_live) and
+ * folds nothing this tick; an Active source folds.
  *
  * Passed as EchoFold::fold_rows' `extra` by the process fold, so a tick's process tiers and
  * its usage rows commit or roll back together. Must not call any EchoDatabase method that

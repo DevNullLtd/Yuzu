@@ -53,14 +53,25 @@ releases exactly the resource listed.
   clock is untrusted and replaced by the end of the newest bucket at or before the clock that the
   converted tier holds (never a bucket the excursion itself wrote), logged with the figures, and a
   converted tier with no such bucket refuses the migration with the mark named rather than fold
-  every raw row on top of the upper tiers; a sane mark is used exactly as stored.
+  every raw row on top of the upper tiers, unless the source holds no raw row and no converted
+  bucket at all (a never-used source's mark bounds nothing and is ignored, logged); a sane mark is
+  used exactly as stored. Second trigger of the same residual, disclosed and not closed: a
+  migration clock set back from a SANE mark (a restored snapshot, an NTP step) makes the mark
+  untrusted by the same rule, and the clamp to the clock then folds the raw rows between the clock
+  and the mark a second time on top of the buckets that hold them.
 - **Usage cursor:** the raw process rows past `usage_hwm_id` (the usage fold's own read cursor) are fed
   to `usage_fold_in` on the same handle before the cursor and `usage_lag_events` are deleted, so a
-  lagging usage fold loses nothing (fed only when usage and process are enabled and the lifecycle is
-  Active, decided once before the chunk loop; an Active lifecycle with no cursor refuses the
-  migration); the rows past the cursor, the stored counter and the rows folded
-  are in the log line (a row past the cursor but below the roll-up floor is not read, and is in the
-  "older than the mark" count).
+  lagging usage fold loses nothing it would have credited. The feed decision is the fold's own
+  predicate (`usage_active_in`: usage enabled and the lifecycle Active, with the active generation
+  parsed as `usage_lifecycle_state` parses it, so an empty or malformed value reads as it would at
+  the next tick), decided once before the chunk loop, and it does NOT consult `process_enabled`:
+  the pre-v10 fold left its cursor in place while process was disabled and credited the rows once
+  process was re-enabled, and the migration folds the raw rows into the process tiers regardless,
+  so they reach usage now or never. A usage source that is disabled or awaiting its baseline
+  would not have credited them and gets nothing (the rows are counted, not fed). An Active
+  lifecycle with no cursor refuses the migration; the rows past the cursor, the stored counter
+  and the rows folded are in the log line (a row past the cursor but below the roll-up floor is
+  not read, and is in the "older than the mark" count).
 - **After COMMIT:** the connection must be in autocommit (`sqlite3_get_autocommit`); a wedged one is
   returned as an error and `open()` closes it, never publishes it.
 
