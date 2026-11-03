@@ -3724,12 +3724,23 @@ StoredResponse cap_frame(const std::string& instruction, const std::string& agen
     return r;
 }
 
-std::size_t cap_rows(const ResponseStore& store, const std::string& instruction,
-                     const std::string& agent) {
+// The pair's retained rows, oldest first (by id).
+std::vector<StoredResponse> pair_rows(const ResponseStore& store, const std::string& instruction,
+                                      const std::string& agent) {
     auto all = store.get_by_instruction(instruction, kAllRows);
     REQUIRE(all.has_value());
-    return static_cast<std::size_t>(std::count_if(
-        all->begin(), all->end(), [&](const StoredResponse& r) { return r.agent_id == agent; }));
+    std::vector<StoredResponse> rows;
+    for (const auto& r : *all)
+        if (r.agent_id == agent)
+            rows.push_back(r);
+    std::sort(rows.begin(), rows.end(),
+              [](const StoredResponse& a, const StoredResponse& b) { return a.id < b.id; });
+    return rows;
+}
+
+std::size_t cap_rows(const ResponseStore& store, const std::string& instruction,
+                     const std::string& agent) {
+    return pair_rows(store, instruction, agent).size();
 }
 
 double cap_dropped(yuzu::MetricsRegistry& metrics, const char* reason = "per_agent_cap") {
@@ -3764,39 +3775,27 @@ TEST_CASE("ResponseStore: rows per (instruction, agent) are capped and counted",
     CHECK(cap_dropped(f.metrics, "query_error") == 0.0); // a cap refusal is never a query_error
 }
 
-TEST_CASE("ResponseStore: a capped pair's newest retained row ends with the row-cap marker",
+TEST_CASE("ResponseStore: a capped pair's row before the gap ends with the row-cap marker",
           "[pg][response_store][cap]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     CapFixture f(db.dsn(), 4);
     // The marker text is the operator-visible contract (response-store.md): pin the literal.
     const std::string marker = "\n...[rows past per-agent cap dropped]";
 
-    auto pair_rows = [&](const char* agent) {
-        auto all = f.store.get_by_instruction("cmd-mark", kAllRows);
-        REQUIRE(all.has_value());
-        std::vector<StoredResponse> rows;
-        for (const auto& r : *all)
-            if (r.agent_id == agent)
-                rows.push_back(r);
-        std::sort(rows.begin(), rows.end(),
-                  [](const StoredResponse& a, const StoredResponse& b) { return a.id < b.id; });
-        return rows;
-    };
-
     for (int i = 0; i < 5; ++i)
         f.store.store(cap_frame("cmd-mark", "agent-1", 0));
     f.store.store(cap_frame("cmd-mark", "agent-2", 0)); // a different pair, below its cap
 
-    auto rows = pair_rows("agent-1");
+    auto rows = pair_rows(f.store, "cmd-mark", "agent-1");
     REQUIRE(rows.size() == 4);
     for (std::size_t i = 0; i + 1 < rows.size(); ++i)
         CHECK(rows[i].output == "frame"); // only the newest retained row carries the marker
     CHECK(rows.back().output == "frame" + marker);
-    CHECK(pair_rows("agent-2").front().output == "frame");
+    CHECK(pair_rows(f.store, "cmd-mark", "agent-2").front().output == "frame");
 
     // A further refusal leaves exactly one marker (the UPDATE is idempotent).
     f.store.store(cap_frame("cmd-mark", "agent-1", 0));
-    rows = pair_rows("agent-1");
+    rows = pair_rows(f.store, "cmd-mark", "agent-1");
     REQUIRE(rows.size() == 4);
     CHECK(rows.back().output == "frame" + marker);
     CHECK(cap_dropped(f.metrics) == 2.0);
@@ -3809,8 +3808,49 @@ TEST_CASE("ResponseStore: a capped pair's newest retained row ends with the row-
         frame.timestamp = ts;
         f.store.store(frame);
     }
-    for (const auto& r : pair_rows("agent-3"))
+    for (const auto& r : pair_rows(f.store, "cmd-mark", "agent-3"))
         CHECK(r.output == (r.timestamp == 300 ? "frame" + marker : std::string("frame")));
+
+    // The overflow terminal row is NOT marked at insert: rows == cap is reachable with zero drops,
+    // so the marker stays on the row before the gap. Interleaved, with cap 4: 4 RUNNING, 1 refused
+    // (marks row 4), a terminal frame with output (admitted, lands newer and unmarked), 1 refused
+    // (marks the terminal too, since frames were refused after it).
+    for (int i = 0; i < 5; ++i)
+        f.store.store(cap_frame("cmd-mark", "agent-4", 0));
+    f.store.store(cap_frame("cmd-mark", "agent-4", 1));
+    rows = pair_rows(f.store, "cmd-mark", "agent-4");
+    REQUIRE(rows.size() == 5);
+    CHECK(rows[3].output == "frame" + marker); // the row before the gap
+    CHECK(rows[4].output == "frame");          // the admitted terminal row, not marked at insert
+
+    f.store.store(cap_frame("cmd-mark", "agent-4", 0));
+    rows = pair_rows(f.store, "cmd-mark", "agent-4");
+    REQUIRE(rows.size() == 5);
+    CHECK(rows[3].output == "frame" + marker);
+    CHECK(rows[4].output == "frame" + marker);
+}
+
+TEST_CASE("ResponseStore: a marker that cannot be written drops the frame as a query_error",
+          "[pg][response_store][cap]") {
+    // Fail-closed branch of the marker UPDATE (the only UPDATE store() issues): a trigger that
+    // raises fails that statement alone, the INSERT path is untouched, so this discriminates the
+    // marker failure from every other store() failure.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+
+    for (int i = 0; i < 4; ++i)
+        f.store.store(cap_frame("cmd-mark-fail", "agent-1", 0));
+    exec_sql(db.dsn(),
+             "CREATE FUNCTION response_store.fail_marker_update() RETURNS trigger "
+             "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected'; END $$; "
+             "CREATE TRIGGER fail_marker_update BEFORE UPDATE ON response_store.responses "
+             "FOR EACH ROW EXECUTE FUNCTION response_store.fail_marker_update()");
+
+    f.store.store(cap_frame("cmd-mark-fail", "agent-1", 0));
+
+    CHECK(cap_rows(f.store, "cmd-mark-fail", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 0.0);
+    CHECK(cap_dropped(f.metrics, "query_error") == 1.0);
 }
 
 TEST_CASE("ResponseStore: the first terminal frame beyond the cap lands, a second is refused",

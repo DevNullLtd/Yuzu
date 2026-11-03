@@ -633,6 +633,11 @@ void ResponseStore::store(const StoredResponse& resp) {
             capped = true;
             return true; // commits the marker; not a query_error
         }
+        // The overflow terminal row admitted at rows == cap is deliberately NOT marked here: that
+        // state is reachable with zero drops (the probe is LIMIT-bounded and reads no output), so
+        // a marker would label a complete stream as capped. The marker stays on the row before the
+        // gap; a terminal row admitted after a refusal is marked itself only if frames are
+        // refused after it.
         pg::PgResult ins = pg::exec_params(
         conn,
         "INSERT INTO response_store.responses (instruction_id, agent_id, timestamp, status, "
@@ -852,7 +857,10 @@ ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
     //
     // Bound it BEFORE sanitizing, exactly as store() does for error_detail
     // (#2691): a terminal frame's message must not exceed the documented
-    // per-row worst case (kMaxIngestBytes plus the marker).
+    // per-row worst case: kMaxIngestBytes bounds the agent-supplied bytes of
+    // each field; output may additionally carry the two server-authored
+    // markers (kTruncationMarker, kRowCapMarker), error_detail at most
+    // kTruncationMarker.
     const std::string sanitized_error =
         sanitize_pg_text(truncate_ingest(error_detail, kMaxIngestBytes));
     pg::PgResult res = pg::exec_params(

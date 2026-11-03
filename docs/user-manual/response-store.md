@@ -343,8 +343,12 @@ operator-visible notes:
   guarantee.
   - **What is kept.** The first rows are kept and the **newest** frames past the cap are dropped, so
     a command that streams more than about 16 MiB to one device loses the tail of its output. The
-    last row kept ends with a `...[rows past per-agent cap dropped]` marker, so a reader can tell a
-    capped stream from a complete one. Raise the flag for such commands.
+    row just before the dropped frames ends with a `...[rows past per-agent cap dropped]` marker,
+    so a reader can tell a capped stream from a complete one. A terminal frame with output admitted
+    afterwards lands after it and is marked itself only if frames are refused after it, so a capped
+    pair can carry two marked rows. The marker is one extra line in the stored output, so a
+    line-counting reader (the `echo_rows_ge` matcher's fallback) counts it, as it already does the
+    byte-cap marker. Raise the flag for such commands.
   - **Terminal frame.** The cap bounds total rows. At the cap, one extra terminal-status row is still
     admitted, and only while no terminal row exists for that command and device, so a capped command
     still shows its outcome. A terminal frame with no output instead finalizes the retained rows in

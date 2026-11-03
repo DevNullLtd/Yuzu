@@ -307,8 +307,9 @@ public:
     ///
     /// Two independent bounds: per-row bytes (kMaxIngestBytes) and per-pair rows
     /// (max_rows_per_agent, #561); refused frames count on
-    /// yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}, and the pair's
-    /// newest retained row ends with a marker so a reader can tell the tail was dropped.
+    /// yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}, and a refusal marks
+    /// the pair's newest retained row (the one before the gap) so a reader can tell the tail
+    /// was dropped.
     /// Exact semantics: response_cap_rules.hpp.
     void store(const StoredResponse& resp);
 

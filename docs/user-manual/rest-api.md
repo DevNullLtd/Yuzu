@@ -6853,8 +6853,10 @@ row cap and the export byte cap. `GET
 and MCP `aggregate_responses` share another (`response_aggregate_row_json`).
 
 **Bounded rows (#561).** Rows per command and device are bounded (`--response-max-rows-per-agent`,
-default 256); past the cap the newest frames are dropped and the last kept row ends with a
-`...[rows past per-agent cap dropped]` marker. See [Response Store](response-store.md).
+default 256); past the cap the newest frames are dropped and the row just before them ends with a
+`...[rows past per-agent cap dropped]` marker (a terminal frame admitted afterwards lands after it
+and is marked itself only if frames are refused after it, so a capped pair can carry two marked
+rows). See [Response Store](response-store.md).
 
 **Forensics-tier rows (#4990).** Rows written by Forensics-tier plugins (`app_usage`,
 `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`; the set is

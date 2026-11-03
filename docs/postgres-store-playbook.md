@@ -431,7 +431,12 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   predicate is a range and the planner's selectivity estimate for that range cannot be trusted —
   a wide window with real matches sparse and clustered at one end — `ORDER BY <indexed column>
   LIMIT 1 ... IS NOT NULL`, which is plan-independent: a Seq Scan would need a full sort before
-  applying the `LIMIT`, so the index-ordered path wins regardless of the estimate).
+  applying the `LIMIT`, so the index-ordered path wins regardless of the estimate). When a top-1
+  over a different index would otherwise be chosen (a backwards walk of a per-instruction index
+  filtering on a second key), writing the `ORDER BY` column as `<col> + 0` is the repo's one
+  sanctioned planner steer: it forces the access path onto the key-prefix index. `ResponseStore`'s
+  row-cap marker UPDATE (#561) is the worked example; measure any such steer with `EXPLAIN
+  (ANALYZE, BUFFERS)` before relying on it.
 - A **fixed re-arm interval** on a capped, paced background pass (a retention sweep, a rollup, a
   reconciliation loop) that never shortens when the cap keeps binding. If a pass hits its cap AND
   a genuine backlog remains, the NEXT pass should re-arm on a short floor (seconds, not the full
