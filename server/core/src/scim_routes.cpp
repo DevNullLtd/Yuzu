@@ -185,6 +185,23 @@ void bump_provenance_denied(auth::AuthManager* auth_mgr) {
         m->counter("yuzu_scim_provenance_denied_total").increment();
 }
 
+/// #6836: bumped on the three arms where an AuthDB read FAILED (a store fault, not a refusal) and
+/// the request is answered with a retryable 503 or, for the revive arm, would have been: the
+/// provenance read of `provenance_ok`, the role read of `deprovision_role_ok`, and the role
+/// re-check of a POST revive. `guard` is one of `kScimGuardStoreUnavailableGuards`
+/// (scim_routes.hpp; server.cpp pre-seeds exactly that set to 0 at boot); it carries no username or scim_id. This is the
+/// signal `YuzuScimGuardStoreUnavailable` keys on: unlike the audit row (written to the same store
+/// that is failing) it survives an outage, and it is deliberately NOT
+/// `yuzu_scim_provenance_denied_total`, which means "SCIM tried to touch an account it does not
+/// own".
+void bump_guard_store_unavailable(auth::AuthManager* auth_mgr, std::string_view guard) {
+    if (!auth_mgr)
+        return;
+    if (auto* m = auth_mgr->metrics_registry())
+        m->counter("yuzu_scim_guard_store_unavailable_total", {{"guard", std::string(guard)}})
+            .increment();
+}
+
 /// #2021 slice 2: bumped every time `recompute_scim_user_role` actually
 /// changes a SCIM-provisioned user's role (promotion OR demotion).
 void bump_role_changed(auth::AuthManager* auth_mgr) {
@@ -828,9 +845,24 @@ bool require_bearer(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditSto
 /// Returns true iff the mutation may proceed. On refusal, sends 404 (NEVER
 /// 403 — a 403 would confirm to the IdP that a local account by this name
 /// exists) and audits `scim.user.provenance_denied`.
-bool provenance_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
-                   const httplib::Request& req, const std::string& username,
-                   const std::string& scim_id, httplib::Response& res) {
+///
+/// #6836: a STORE ERROR reading the provenance is not a refusal. `get_provisioning_source` is
+/// tri-state (`std::expected`), so a lease timeout or query error (`is_store_unavailable`) is told
+/// apart from a definitive `UserNotFound` / non-`scim` answer. The error arm answers the retryable
+/// 503 (`send_scim_unavailable`), audits `audit_action` (the CALLER's own verb, the #4068
+/// precedent) with result `failure` and a `store_unavailable:` detail, counts
+/// `yuzu_scim_guard_store_unavailable_total{guard="provenance"}` and does NOT count
+/// `yuzu_scim_provenance_denied_total` (a denial signal). It still returns false: the response is
+/// already sent, so every caller bails exactly as it does for a refusal. THIS GUARD mutates
+/// nothing, but it does not promise the REQUEST did: PUT (always) and PATCH-with-externalId run
+/// it again AFTER `deactivate()`/`reactivate()` has committed an `active` change, so a 503 there
+/// is returned for a request whose activation change was already applied. The audit then shows
+/// that change's success row followed by this `failure` row; the IdP's retry finds the account in
+/// the requested state and completes.
+[[nodiscard]] bool provenance_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
+                                const httplib::Request& req, const std::string& username,
+                                const std::string& scim_id, std::string_view audit_action,
+                                httplib::Response& res) {
     AuthDB* db = auth_mgr ? auth_mgr->auth_db_ptr() : nullptr;
     if (!db) {
         // No persistent AuthDB configured — SCIM cannot durably record/verify
@@ -846,6 +878,17 @@ bool provenance_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
         return false;
     }
     auto source = db->get_provisioning_source(username);
+    if (!source && is_store_unavailable(source.error())) {
+        spdlog::error("ScimRoutes: provenance check — auth store unavailable reading '{}' "
+                      "(scim_id={}); answering 503, not a provenance refusal",
+                      ::yuzu::log_token(username), scim_id);
+        send_scim_unavailable(res, "temporarily unable to verify the account's provenance "
+                                   "(authorization store unavailable); retry");
+        audit(auth_mgr, audit_store, req, std::string(audit_action), "failure", scim_id,
+              "store_unavailable: provenance check");
+        bump_guard_store_unavailable(auth_mgr, kScimGuardProvenance);
+        return false;
+    }
     if (!source || *source != kProvisioningSourceScim) {
         spdlog::warn("SCIM: refusing to mutate account '{}' (scim_id={}) — "
                     "provisioning_source is not 'scim' (this account was not created by SCIM)",
@@ -868,19 +911,26 @@ bool provenance_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
 /// durable row is `admin`. The SCIM deprovision/revive guards previously
 /// treated that `nullopt` as "no elevation on file, allowed", which is
 /// fail-OPEN: a cold-cache process would deactivate a DB-elevated admin an
-/// IdP pushes `active:false` for. Returns `nullopt` only when the role
+/// IdP pushes `active:false` for. Returns an error only when the role
 /// genuinely cannot be determined (no `AuthDB` configured, or
 /// `AuthDB::get_user` errors / finds no active row for `username`) —
-/// every caller MUST treat `nullopt` as "refuse", never as "allowed"
-/// (S-ROLE-FAILCLOSED).
-std::optional<auth::Role> db_authoritative_role(auth::AuthManager* auth_mgr,
-                                                const std::string& username) {
+/// every caller MUST treat an error as "refuse" (or, for a store fault,
+/// "retry"), never as "allowed" (S-ROLE-FAILCLOSED; `classify_role_read`).
+///
+/// #6836: this form keeps WHY there is no role. `QueryFailed` and the other `is_store_unavailable`
+/// errors are a store fault (retry, 503); `UserNotFound` (no ACTIVE row) and `InvalidUsername` are
+/// definitive. A missing `AuthDB` is reported as `UserNotFound`, not as a fault: it is a permanent
+/// misconfiguration, not a transient outage, so it stays the fail-closed 404 (`provenance_ok`
+/// treats it the same way). The earlier form that folded every error into `nullopt` ("no role")
+/// is gone: its only remaining caller, the POST-revive role re-check, now uses this one.
+std::expected<auth::Role, AuthDBError>
+db_authoritative_role_checked(auth::AuthManager* auth_mgr, const std::string& username) {
     AuthDB* db = auth_mgr ? auth_mgr->auth_db_ptr() : nullptr;
     if (!db)
-        return std::nullopt;
+        return std::unexpected(AuthDBError::UserNotFound);
     auto entry = db->get_user(username);
     if (!entry)
-        return std::nullopt;
+        return std::unexpected(entry.error());
     return entry->role;
 }
 
@@ -893,17 +943,30 @@ std::optional<auth::Role> db_authoritative_role(auth::AuthManager* auth_mgr,
 /// the admin group — before SCIM may tear it down; this is a sequencing
 /// requirement, not a permanent carve-out for operator-owned accounts.
 /// Checked only while the account is still ACTIVE. Role is read via
-/// `db_authoritative_role` (H2) — the DB row, never the AuthManager
+/// `db_authoritative_role_checked` (H2, #6836) — the DB row, never the AuthManager
 /// in-memory cache, which can be cold on a freshly-started process. Returns
-/// true iff the deprovision may proceed; FAILS CLOSED (refuses) if the role
-/// cannot be determined at all, not just when it resolves to something
-/// other than `user`. On refusal sends 404 (never 403 — matches the
+/// `Ok` iff the deprovision may proceed; FAILS CLOSED (`Refused`) if the role
+/// cannot be determined for a DEFINITIVE reason (no active row, invalid name,
+/// no `AuthDB`), not just when it resolves to something other than `user`. On
+/// refusal sends 404 (never 403 — matches the
 /// provenance guard's no-existence-oracle posture) and reuses
 /// `scim.user.provenance_denied` (same "SCIM does not own this account's
 /// lifecycle right now" refusal class).
-bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
-                        const httplib::Request& req, const std::string& username,
-                        const std::string& scim_id, httplib::Response& res) {
+///
+/// #6836: `Unavailable` is a store fault reading the role
+/// (`is_store_unavailable`): the retryable 503 is sent, `audit_action` is audited with result
+/// `failure` and a `store_unavailable:` detail, `yuzu_scim_guard_store_unavailable_total{guard=
+/// "role"}` is counted, this guard mutates nothing and NEITHER the denial counter
+/// NOR the ADR-2001 D1 "role-refused with a linked identity" escalation fires, because nothing
+/// was refused. `Refused` is the unchanged 404 (a non-`user` role, no ACTIVE row, or an invalid
+/// name) and is the only value the D1 callers escalate on.
+[[nodiscard]] GuardVerdict deprovision_role_ok(auth::AuthManager* auth_mgr,
+                                               AuditStore* audit_store,
+                                               const httplib::Request& req,
+                                               const std::string& username,
+                                               const std::string& scim_id,
+                                               std::string_view audit_action,
+                                               httplib::Response& res) {
     // #2021 (Groups->role): deliberately NOT weakened for a group-elevated
     // admin. A SCIM user promoted to admin via Group membership still fails
     // this guard exactly like an operator-elevated one — the IdP must
@@ -914,20 +977,32 @@ bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
     // group-promoting an account to admin and deprovisioning it in the same
     // breath in a way that could race an operator's own admin actions on
     // that account. Do not add a bypass for the group-elevated case.
-    auto role = db_authoritative_role(auth_mgr, username);
-    if (!role.has_value() || *role != auth::Role::user) {
+    const auto role = db_authoritative_role_checked(auth_mgr, username);
+    const auto verdict = classify_role_read(role);
+    if (verdict == GuardVerdict::Unavailable) {
+        spdlog::error("ScimRoutes: deprovision role check — auth store unavailable reading '{}' "
+                      "(scim_id={}); answering 503, not a role refusal",
+                      ::yuzu::log_token(username), scim_id);
+        send_scim_unavailable(res, "temporarily unable to verify the account's role "
+                                   "(authorization store unavailable); retry");
+        audit(auth_mgr, audit_store, req, std::string(audit_action), "failure", scim_id,
+              "store_unavailable: role check");
+        bump_guard_store_unavailable(auth_mgr, kScimGuardRole);
+        return GuardVerdict::Unavailable;
+    }
+    if (verdict == GuardVerdict::Refused) {
         spdlog::warn("SCIM: refusing to deprovision '{}' (scim_id={}) — role is not 'user' or "
                     "could not be authoritatively determined (an operator may have elevated "
-                    "this account outside SCIM's ownership, or the DB-authoritative role read "
-                    "failed closed)",
+                    "this account outside SCIM's ownership, or the account has no active "
+                    "row)",
                     username, scim_id);
         send_scim_error(res, 404, "resource not found");
         audit(auth_mgr, audit_store, req, "scim.user.provenance_denied", "denied", scim_id,
              "role is not 'user' (or undetermined) for username=" + username);
         bump_provenance_denied(auth_mgr);
-        return false;
+        return GuardVerdict::Refused;
     }
-    return true;
+    return GuardVerdict::Ok;
 }
 
 /// What `recompute_scim_user_role` tells a per-member loop (#4966). Six values in four classes
@@ -1030,7 +1105,7 @@ struct RecomputeOutcome {
 /// now-stale role gets corrected by whichever recompute runs last.
 ///
 /// LOCK ORDER (do not invert): `kRecomputeMu` → `AuthManager::mu_` (taken
-/// and released inside `db_authoritative_role`/`update_role`). The
+/// and released inside `db_authoritative_role_checked`/`update_role`). The
 /// `ScimStore` calls (`get_by_scim_id`/`list_group_display_names_for_user`)
 /// no longer hold any process-wide lock across their PgPool round-trip — a
 /// per-connection Postgres lease is not a mutex this function's callers can
@@ -1124,7 +1199,7 @@ RecomputeOutcome recompute_scim_user_role(ScimStore* scim_store, auth::AuthManag
     auth::Role resolved = auth::resolve_role_from_groups(*groups, scim_admin_group);
 
     // Step 4: fail-closed on an undetermined current role (S-ROLE-FAILCLOSED
-    // posture, matching db_authoritative_role's every other caller).
+    // posture, matching db_authoritative_role_checked's every other caller).
     // `get_user` returns the ACTIVE row only; `UserNotFound` is therefore "no active row", which
     // is either no row at all or a soft-deleted one (see `get_role_including_inactive`). Neither
     // can hold a session, so there is nothing to retain. Any other error is a failed read.
@@ -1705,10 +1780,16 @@ bool deactivate(ScimStore* scim_store, ApiTokenStore* token_store, auth::AuthMan
                 AnalyticsEventStore* analytics_store = nullptr,
                 const DeprovisionedFn& on_deprovisioned = DeprovisionedFn{}) {
     const DeprovisionCtx ctx{scim_store, token_store, analytics_store};
-    if (!provenance_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id, res))
+    if (!provenance_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id,
+                       audit_action, res))
         return false;
-    if (!deprovision_role_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id,
-                             res)) {
+    const auto role_verdict = deprovision_role_ok(auth_mgr, audit_store, req, resource.username,
+                                                  resource.scim_id, audit_action, res);
+    // #6836: a store fault (503, already sent and audited) is not a refusal: skip the D1
+    // escalation below, which says a human must terminate linked identities by hand.
+    if (role_verdict == GuardVerdict::Unavailable)
+        return false;
+    if (role_verdict == GuardVerdict::Refused) {
         // ADR-2001 D1: deprovision_role_ok already sent 404 + audited
         // scim.user.provenance_denied — #2021's protection for a manually-
         // elevated account stands, and this deprovision is NOT auto-
@@ -1880,7 +1961,8 @@ ProvisionPrecheck provisioning_prechecks(auth::AuthManager* auth_mgr, const std:
 /// enforced via the failure-counter alert).
 bool reactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* audit_store,
                 const httplib::Request& req, httplib::Response& res, const ScimResource& resource) {
-    if (!provenance_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id, res))
+    if (!provenance_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id,
+                       "scim.user.reactivated", res))
         return false;
     // #4966: the SAME pre-checks `POST /Users` applies to a revive, before anything is
     // reactivated: an elevated tombstone or a name holding an Administrator grant is never
@@ -2167,7 +2249,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             // path. Checked AFTER reactivate_user() (not before): the
             // tombstoned row is soft-deleted, so a plain cache read has no
             // entry for it until reactivate_user() loads it. Role is read
-            // via `db_authoritative_role` (H2, consistency with
+            // via `db_authoritative_role_checked` (H2, consistency with
             // deprovision_role_ok) — the DB row, never the AuthManager
             // in-memory cache — and FAILS CLOSED (refuses) if the role
             // cannot be determined at all, not just when it resolves to
@@ -2176,27 +2258,64 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             // account stays down, not just that this response says 404.
             // Same posture as the deprovision role guard: 404 (never 403 —
             // no existence oracle), scim.user.provenance_denied.
-            if (auto role = db_authoritative_role(auth_mgr, input.user_name);
-                !role.has_value() || *role != auth::Role::user) {
-                spdlog::warn("ScimRoutes: refusing to revive '{}' via POST — role is not "
-                            "'user' (an operator elevated this account before it was "
-                            "tombstoned)",
-                            input.user_name);
+            //
+            // #6836 (the same defect class as the deprovision guards): a STORE FAULT reading
+            // the role is not a refusal. It takes the SAME guarded undo (the account stays down:
+            // fail closed) but answers the retryable 503 with a `store_unavailable:` audit row
+            // and the guard counter, and does NOT count a provenance denial: the IdP retries the
+            // POST and the revive converges once the store answers.
+            const auto role_verdict =
+                classify_role_read(db_authoritative_role_checked(auth_mgr, input.user_name));
+            const bool role_read_failed = role_verdict == GuardVerdict::Unavailable;
+            if (role_verdict != GuardVerdict::Ok) {
+                if (role_read_failed) {
+                    spdlog::error("ScimRoutes: revive role check — auth store unavailable "
+                                  "reading '{}'; undoing the reactivation and answering 503, "
+                                  "not a role refusal",
+                                  ::yuzu::log_token(input.user_name));
+                    // Counted BEFORE the undo: the undo needs the same store, so in a real
+                    // outage it is likely to fail too, and that 500 path must still move the
+                    // signal YuzuScimGuardStoreUnavailable keys on. (Cost note: each retried
+                    // revive does a pre-check read, a reactivation write, a role read and a
+                    // guarded undo: heavier than a deprovision 503, bounded by the IdP's
+                    // retry rate and the fixed Retry-After: 2.)
+                    bump_guard_store_unavailable(auth_mgr, kScimGuardRole);
+                } else {
+                    spdlog::warn("ScimRoutes: refusing to revive '{}' via POST — role is not "
+                                "'user' (an operator elevated this account before it was "
+                                "tombstoned)",
+                                input.user_name);
+                }
                 // The pre-check above already refused an elevated tombstone, so reaching here
                 // means the role changed in the window between that read and the reactivation (a
-                // concurrent operator promotion): a rare race, handled by a GUARDED undo. If the
-                // undo cannot complete (the guard refuses it: this account is by definition the
-                // last counted administrator, or a store fault) the account may stay ACTIVE at an
-                // elevated role (the outcome is in scim.user.compensation_failed); fail closed
-                // (500) so the IdP retries, escalate it
-                // (compensate_created_account), and do not claim a 404 that a retry cannot fix.
+                // concurrent operator promotion), or the role read faulted: handled by a GUARDED
+                // undo. If the undo cannot complete (the guard refuses it: this account is by
+                // definition the last counted administrator, or a store fault) the account may
+                // stay ACTIVE at an elevated role (the outcome is in
+                // scim.user.compensation_failed); fail closed (500) so the IdP retries, escalate
+                // it (compensate_created_account), and do not claim a 404/503 that a retry
+                // cannot fix.
                 if (!compensate_created_account(auth_mgr, audit_store, analytics_store, req,
-                                                input.user_name, "revive_role_refusal_undo")) {
+                                                input.user_name,
+                                                role_read_failed ? "revive_role_read_fault_undo"
+                                                                 : "revive_role_refusal_undo")) {
                     send_scim_error(res, 500, "failed to revive the underlying account");
                     audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure",
                          input.user_name,
-                         "role-refusal undo did not complete; see scim.user.compensation_failed");
+                         role_read_failed
+                             ? "store_unavailable: revive role check; undo did not complete; see "
+                               "scim.user.compensation_failed"
+                             : "role-refusal undo did not complete; see "
+                               "scim.user.compensation_failed");
                     record_request(auth_mgr, "create", 500);
+                    return;
+                }
+                if (role_read_failed) {
+                    send_scim_unavailable(res, "temporarily unable to verify the account's role "
+                                               "(authorization store unavailable); retry");
+                    audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure",
+                          input.user_name, "store_unavailable: revive role check");
+                    record_request(auth_mgr, "create", 503);
                     return;
                 }
                 send_scim_error(res, 404, "resource not found");
@@ -2707,13 +2826,14 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 // every inactive-but-legitimately-SCIM-owned account (its
                 // DB-authoritative read only resolves an ACTIVE row).
                 if (!provenance_ok(auth_mgr, audit_store, req, resource->username,
-                                   resource->scim_id, res)) {
+                                   resource->scim_id, "scim.user.updated", res)) {
                     record_request(auth_mgr, "replace", res.status);
                     return;
                 }
                 if (resource->active &&
-                    !deprovision_role_ok(auth_mgr, audit_store, req, resource->username,
-                                         resource->scim_id, res)) {
+                    deprovision_role_ok(auth_mgr, audit_store, req, resource->username,
+                                        resource->scim_id, "scim.user.updated", res) !=
+                        GuardVerdict::Ok) {
                     record_request(auth_mgr, "replace", res.status);
                     return;
                 }
@@ -2880,13 +3000,14 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       // further being torn down once inactive, and
                       // `deprovision_role_ok` only resolves an ACTIVE row).
                       if (!provenance_ok(auth_mgr, audit_store, req, resource->username,
-                                        resource->scim_id, res)) {
+                                        resource->scim_id, "scim.user.updated", res)) {
                           record_request(auth_mgr, "patch", res.status);
                           return;
                       }
                       if (resource->active &&
-                          !deprovision_role_ok(auth_mgr, audit_store, req, resource->username,
-                                              resource->scim_id, res)) {
+                          deprovision_role_ok(auth_mgr, audit_store, req, resource->username,
+                                             resource->scim_id, "scim.user.updated", res) !=
+                              GuardVerdict::Ok) {
                           record_request(auth_mgr, "patch", res.status);
                           return;
                       }
@@ -2944,12 +3065,20 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                    bool erasure_link_read_failed = false;      // R2-1: reported after the hook
                    if (resource->active) {
                        if (!provenance_ok(auth_mgr, audit_store, req, resource->username, id,
-                                         res)) {
+                                         "scim.user.deleted", res)) {
                            record_request(auth_mgr, "delete", res.status);
                            return;
                        }
-                       if (!deprovision_role_ok(auth_mgr, audit_store, req, resource->username,
-                                               id, res)) {
+                       const auto role_verdict =
+                           deprovision_role_ok(auth_mgr, audit_store, req, resource->username, id,
+                                              "scim.user.deleted", res);
+                       if (role_verdict == GuardVerdict::Unavailable) {
+                           // #6836: 503 already sent and audited; a store fault is not a
+                           // refusal, so no D1 escalation.
+                           record_request(auth_mgr, "delete", res.status);
+                           return;
+                       }
+                       if (role_verdict == GuardVerdict::Refused) {
                            // ADR-2001 D1 — same loud-refusal signal as
                            // deactivate()'s doc comment: deprovision_role_ok
                            // already sent 404 + audited
@@ -3016,7 +3145,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                        // down (see deprovision_role_ok's doc comment — the
                        // in-memory role cache has no entry to check anyway).
                        if (!provenance_ok(auth_mgr, audit_store, req, resource->username, id,
-                                         res)) {
+                                         "scim.user.deleted", res)) {
                            record_request(auth_mgr, "delete", res.status);
                            return;
                        }

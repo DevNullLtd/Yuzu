@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstddef>
+#include <regex>
 #include <string>
 #include <string_view>
 
@@ -127,4 +128,42 @@ TEST_CASE("Settings page shows the refreshed list a stale enrolment action retur
     CHECK(count_of(html, "indexOf('text/html') !== -1") == 1);
     CHECK(count_of(html, "d.shouldSwap = true;") == 1);
     CHECK(count_of(html, "d.isError = false;") == 1);
+}
+
+TEST_CASE("Settings page tells a caller the Engine Principals panel refused why, not 'Loading...' "
+          "forever",
+          "[settings][settings_page][engine_principal]") {
+    // The panel gates on EnginePrincipal:Read (#5882), which the page's own administrator gate
+    // does not imply, and htmx does not swap a 4xx body. A body listener scoped to the panel
+    // says so. CSP-safe: no hx-on, no eval, text only.
+    const std::string html = kSettingsHtml;
+    CHECK(count_of(html, "'htmx:responseError'") == 1);
+    CHECK(count_of(html, "el.id !== 'engine-principals-section'") == 1);
+    CHECK(count_of(html, "It needs the EnginePrincipal:Read permission.") == 1);
+    CHECK(count_of(html, "Sign in again to view this panel.") == 1);
+    CHECK(count_of(html, "(HTTP ' + x.status + ')") == 1);
+    // The 5xx/429 note offers the in-page Retry (kEngineRetryControl's wording) and never tells
+    // the caller to reload: a reload discards a credential secret shown outside the section.
+    CHECK(count_of(html, "Retry here instead of reloading the page, which would discard a "
+                         "credential secret shown above.") == 1);
+    CHECK(count_of(html, "htmx.trigger(document.body, 'refreshEnginePrincipals')") >= 1);
+    CHECK(count_of(html, "Reload the page to try again.") == 0);
+    // The note is written as text, never parsed as markup.
+    const auto at = html.find("'htmx:responseError'");
+    REQUIRE(at != std::string::npos);
+    const auto end = html.find("\n    });", at); // the listener's own close, not a nested one
+    REQUIRE(end != std::string::npos);
+    const auto body = html.substr(at, end - at);
+    CHECK(count_of(body, "el.textContent = ") == 3);
+    CHECK(count_of(body, "innerHTML") == 0);
+    // The listener writes only to the panel's own section, never to the secret-reveal element
+    // that sits outside it (a mint or rotate response is shown there and must survive).
+    CHECK(count_of(body, "engine-principal-reveal") == 0);
+    CHECK(count_of(body, "getElementById") == 0);
+    CHECK(count_of(body, "hx-on") == 0);
+    CHECK(count_of(body, "new Function") == 0);
+    CHECK(count_of(body, "eval(") == 0);
+    // No element on the page carries an hx-on attribute (CSP has no 'unsafe-eval'; htmx compiles
+    // hx-on:* with new Function() and the handler silently does nothing). Comments may name it.
+    CHECK_FALSE(std::regex_search(html, std::regex{R"(<[a-zA-Z][^<>]*\shx-on[:\-])"}));
 }

@@ -487,26 +487,77 @@ Yuzu now refuses with `503` and `Retry-After: 2` (audit `scim.user.deactivated`,
 deprovision complete. Nothing is changed, and a retry once the store answers repairs the account.
 Configure your IdP to retry `5xx` responses.
 
-*What this does not cover.* It narrows one gap and does not make deprovisioning
+**When the user store cannot answer the provenance or role check (#6836).** Before Yuzu
+deactivates, deletes, reactivates or updates a SCIM resource, it re-reads the account's
+provisioning source. It also re-reads the account's role while the account is still active: before a deactivation, before a `DELETE` of an active resource, and before the `externalId` write of a `PUT` or `PATCH` whose resource is active at that point (including straight after a reactivation), and straight after a `POST` revive's reactivation. A `PUT` always reaches that write; a `PATCH` only when its body carries `externalId`.
+A `DELETE` of an already-inactive mirror and a `PUT`/`PATCH` reactivation itself run the provenance check
+only. If the user store cannot answer either read (a connection that cannot
+be leased, or a failed query), Yuzu answers `503` with `Retry-After: 2` and the detail
+"temporarily unable to verify the account's provenance|role (authorization store unavailable);
+retry", instead of `404`. The audit row is the request's own action (`scim.user.deactivated`
+for a `PATCH`/`PUT` with `active:false`, `scim.user.deleted` for a `DELETE`,
+`scim.user.reactivated` for `active:true`, or `scim.user.updated` for the check before the
+`externalId` write of a `PUT` or `PATCH`, including after an `active` change) with result `failure` and detail
+`store_unavailable: provenance check` or `store_unavailable: role check`. A `POST` that
+revives a removed account re-reads only the role, after the reactivation; if that read meets the
+outage, Yuzu undoes the reactivation (the account stays down, the same guarded undo as a role
+refusal), answers `503` with `Retry-After: 2`, and audits `scim.user.provisioned` /
+`failure` with detail `store_unavailable: revive role check`. The IdP's retry of the `POST`
+converges once the store answers. Because the undo needs the same store as the failed role read, during a real outage the undo is likely to fail too: the answer is then `500`, not `503`, with a `scim.user.compensation_failed` audit row, a `yuzu_scim_compensation_failed_total` increment and a critical analytics event, and the account may be left active at the role the pre-check read (or in an indeterminate state) with no SCIM mapping created. An IdP retry revives it idempotently once the store answers; an operator should check the account (see [`rbac.md`](rbac.md) and the `scim.user.compensation_failed` audit row). The `500` audit detail is `store_unavailable: revive role check; undo did not complete; see scim.user.compensation_failed`.
+
+The guard that fails makes no change. A `PUT`, or a `PATCH` that sets `externalId` together with
+a change to `active`, applies the `active` change first and then re-checks provenance (and, after a reactivation, the role). If that
+re-check meets the outage, the `503` is returned for a request whose activation change was
+already applied. The audit shows a `success` row for the activation followed by a
+`scim.user.updated` `failure`. The IdP's retry finds the account already in the requested state
+and completes.
+
+For a deactivate, delete, reactivate, update or a `POST` that revives a removed account, a store fault is not a denial.
+`yuzu_scim_provenance_denied_total` does not move and the
+`scim.user.deprovision_role_refused_with_link` escalation does not fire, because nothing was
+refused. The `POST` create reads (the provisioning-source read and the duplicate/race reads) are tracked in #6837; the tombstone-role `500` in the revive pre-check (`POST` revive and `PATCH`/`PUT` `active:true`; the grant-read fault in the same pre-check already answers `503`) and the `500` when the reactivation's own post-commit re-read fails (`failed to revive the underlying account`, no undo) are not covered by this change either (same defect class as #6837, which does not list them). Each fault instead counts on
+`yuzu_scim_guard_store_unavailable_total{guard="provenance"|"role"}`, and the
+`YuzuScimGuardStoreUnavailable` alert (warning) fires on any increase over an hour. This alert
+is distinct from `YuzuScimProvenanceDenied`, which no longer fires for outages. A real refusal
+(the account was not created by SCIM, or its role is not `user`) is unchanged: `404`
+`provenance_denied`. `yuzu_auth_get_user_role_store_error_total` does not move for these
+faults; it counts only the mirror-inactive (#4068) check above.
+
+If the `503` persists, check `/readyz` and the `yuzu_pg_*` metrics, look in the server log for
+the `ERROR` lines `ScimRoutes: provenance check`, `ScimRoutes: deprovision role check` and `ScimRoutes: revive role check`, and
+confirm in your IdP's provisioning log that it retried. Whether your IdP retries a `503`, and
+how many failures it tolerates before it pauses or quarantines provisioning, is that vendor's
+documented behaviour; check it for your connector (that verification is tracked in #6835).
+Configure your IdP to retry `5xx` responses.
+
+*What this does not cover.* These changes narrow two gaps and do not make deprovisioning
 outage-proof:
 
 - During a full database outage the SCIM endpoint rejects the request at bearer-token
   validation with `401`, before any of this runs. Your IdP may pause or quarantine provisioning
   after repeated `401` responses; check its provisioning log and resume it after the outage.
-- For a resource whose mirror reads *active*, the provenance and role checks inside the
-  deactivation can still turn the same outage into a `404` rather than a `503`.
 - Yuzu runs no reconciliation sweep. If your IdP stops retrying, an account that was never
   deactivated stays active until an operator acts. To find such accounts, list SCIM resources
   that read inactive and whose account is still active
   (`scim_store.scim_resources` with `active = false`, joined on `username` to `auth.users`
   with `is_active = TRUE`), then re-send `active:false` from the IdP or deactivate the user in
-  Settings → Users. The `yuzu_auth_get_user_role_store_error_total` counter and the
-  `store_unavailable` audit rows are the evidence trail; the audit row is itself written to the
-  database that is down, so it can be missing for the outage window (the server log still
-  carries an `ERROR` line).
-- `DELETE` of a resource whose mirror is already inactive does not run this check.
+  Settings → Users. The `store_unavailable` audit rows are the evidence trail, with two
+  counters: `yuzu_auth_get_user_role_store_error_total` for the mirror-inactive (#4068) check
+  and `yuzu_scim_guard_store_unavailable_total` for the provenance and role checks (#6836).
+  The audit row is itself written to the database that is down, so it can be missing for the
+  outage window (the server log still carries an `ERROR` line).
+- The `POST` create reads (the provisioning-source read and the duplicate/race reads) still
+  behave as before (#6837). So do the tombstone-role `500` in the revive pre-check (`POST` revive
+  and `PATCH`/`PUT` `active:true`; the grant-read fault in the same pre-check already answers
+  `503`) and the `500` when the reactivation's own post-commit re-read fails (no undo): the same
+  defect class as #6837, which does not list them.
+- The #5214 state (the account is already deactivated but the SCIM mirror still reads active,
+  after a failed mirror write) still answers `404` plus the ADR-2001 D1 escalation on every IdP
+  retry once the store is healthy; the new `503` does not change that (#5214, #5673).
+- `DELETE` of a resource whose mirror is already inactive does not run the account-state check
+  described under #4068 above (it does run the provenance check).
 
-These gaps are tracked in #6835, #6836 and #6838.
+These gaps are tracked in #6835, #6837 and #6838.
 
 **Known limits of the Group role recompute.** These are real gaps, tracked in
 #5673. Until then they are documented rather than engineered

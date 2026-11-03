@@ -84,6 +84,7 @@
 #include "compliance_eval.hpp"
 #include "custom_properties_store.hpp"
 #include "data_export.hpp"
+#include "dedup_fleet_tags.hpp" // agent command-dedup store fleet gauge names + HELP (#3663)
 #include "deployment_store.hpp"
 #include "developer_routes.hpp" // System > Developer and API page + fragments (read-only)
 #include "dispatch_record_policy.hpp" // #4990: per-loop latch + short lease budget for the dispatch-record write
@@ -160,6 +161,7 @@
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
 #include "scope_yaml.hpp"
+#include "rbac_admin_predicate.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_confined
@@ -2365,13 +2367,15 @@ public:
         metrics_.describe("yuzu_server_response_ingest_dropped_total",
                           "Response result rows that did not persist (fail-soft ingest, ADR-0039), "
                           "by reason (store_not_open/pool_acquire_timeout/query_error/"
-                          "malformed_identity_field) - the executions ladder still tracks the "
+                          "malformed_identity_field/per_agent_cap) - the executions ladder still tracks the "
                           "command; a sustained non-zero rate means drawer/Echo result history is "
                           "silently lossy. malformed_identity_field is distinct: an "
                           "instruction_id/execution_id/plugin containing an embedded NUL byte was "
                           "rejected rather than silently truncated (#2691 UP-5) - a non-zero rate "
                           "here means an agent sent a malformed identity field, not store "
-                          "unhealth",
+                          "unhealth. per_agent_cap is likewise agent behaviour: an agent exceeded "
+                          "the per-(command, agent) row cap (--response-max-rows-per-agent), "
+                          "not store unhealth",
                           "counter");
         metrics_.describe("yuzu_server_response_read_degrade_total",
                           "Response reads that returned a degrade (nullopt, not empty) rather than "
@@ -2396,7 +2400,8 @@ public:
         // degrade) — seeded separately so read_degrade_total doesn't carry a
         // spurious always-zero series for a reason it can never emit.
         for (const auto reason :
-             {"store_not_open", "pool_acquire_timeout", "query_error", "malformed_identity_field"})
+             {"store_not_open", "pool_acquire_timeout", "query_error", "malformed_identity_field",
+              "per_agent_cap"})
             metrics_.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}});
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_response_read_degrade_total",
@@ -2489,6 +2494,17 @@ public:
                           "yuzu_inventory_stale_agents, never subtract (different populations, "
                           "see metrics.md)",
                           "gauge");
+        // #3663: agent command-dedup store fleet telemetry. Table-driven off
+        // detail::kDedupAgentCountMetrics (dedup_fleet_tags.hpp), the single source of truth
+        // for these names and their HELP text, so the registration cannot drift from the
+        // gauges AgentHealthStore::recompute_metrics publishes. Fully qualified: yuzu::detail
+        // also exists in this file.
+        namespace dedup = yuzu::server::detail;
+        for (const auto& m : dedup::kDedupAgentCountMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        metrics_.describe(dedup::kDedupReportingGauge, dedup::kDedupReportingHelp, "gauge");
+        metrics_.describe(dedup::kDedupTagRejectedGauge, dedup::kDedupTagRejectedHelp, "gauge");
+        metrics_.describe(dedup::kDedupRowsMaxGauge, dedup::kDedupRowsMaxHelp, "gauge");
         metrics_.describe("yuzu_fleet_agents_dex_observer_disarmed",
                           "Windows agents (DEX enabled) reporting their DEX signal observer is not "
                           "fully healthy (no channel armed, or a channel subscription dropped at "
@@ -3349,7 +3365,10 @@ public:
                           "get_user_role() AuthDB lookups (any caller) that failed on a genuine "
                           "store error (not a plain not-found/invalid-username miss); the "
                           "legacy-API-token path floors that request to Role::user, the "
-                          "Settings and SCIM active:false callers refuse with 503",
+                          "Settings routes and SCIM active:false on an already-inactive "
+                          "mirror (#4068) refuse with 503; the SCIM provenance and role "
+                          "guards (#6836) read AuthDB directly and are counted by "
+                          "yuzu_scim_guard_store_unavailable_total instead",
                           "counter");
         metrics_.counter("yuzu_auth_get_user_role_store_error_total");
         // HA WS-1/1a: durable SessionStore degradation on the auth hot path
@@ -3730,6 +3749,16 @@ public:
                           "an account it does not own is a misconfigured-IdP or compromised-IdP "
                           "signal",
                           "counter");
+        metrics_.describe("yuzu_scim_guard_store_unavailable_total",
+                          "Total SCIM mutations answered 503 (retryable) because the AuthDB "
+                          "read inside the provenance or role guard FAILED (a lease timeout or "
+                          "query error), by guard (provenance|role); the role guard includes "
+                          "the POST-revive role re-check. Distinct from "
+                          "yuzu_scim_provenance_denied_total: nothing was refused and nothing "
+                          "was mutated by the failed guard, the IdP is expected to retry. A "
+                          "sustained rate means SCIM deprovisioning is being delayed by an "
+                          "auth-store fault",
+                          "counter");
         // SCIM v2 Groups->role application core (#2021). Bumped only when
         // recompute_scim_user_role ACTUALLY changes a role (promotion or
         // demotion via group membership) — never on a no-op recompute, and
@@ -3940,6 +3969,11 @@ public:
         metrics_.counter("yuzu_scim_deprovision_role_refused_with_active_link_total");
         metrics_.counter("yuzu_scim_deprovision_unlinked_total");
         metrics_.counter("yuzu_scim_provenance_denied_total");
+        // #6836: closed label set (kept in step with bump_guard_store_unavailable in
+        // scim_routes.cpp), seeded so increase() sees the first fault per guard.
+        for (const std::string_view guard : kScimGuardStoreUnavailableGuards)
+            metrics_.counter("yuzu_scim_guard_store_unavailable_total",
+                             {{"guard", std::string(guard)}});
         metrics_.counter("yuzu_scim_role_changes_total");
         metrics_.counter("yuzu_scim_role_change_failures_total");
         metrics_.counter("yuzu_scim_oidc_link_write_failures_total");
@@ -5581,7 +5615,9 @@ public:
         // the deliberate reset.
         if (pg_pool_ && !startup_failed_) {
             response_store_ =
-                std::make_unique<ResponseStore>(*pg_pool_, cfg_.response_retention_days);
+                std::make_unique<ResponseStore>(*pg_pool_, cfg_.response_retention_days,
+                                                /*now_fn=*/nullptr,
+                                                cfg_.response_max_rows_per_agent);
             if (!response_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: response store migration/open failed "
                               "(database reachable but the response_store schema could not be "
@@ -9548,7 +9584,8 @@ public:
                 // reject an expired CRL), and a failed startup pre-publish would
                 // leave /ca/crl 503 with no self-heal. Re-publish when the latest
                 // CRL is missing or within 24h of nextUpdate; once it runs,
-                // nextUpdate jumps 7 days out so this fires ~once/6 days.
+                // nextUpdate jumps 48h out (kCrlValidity, #6016 PR 4d) so this fires
+                // ~once a day.
                 //
                 // HA WS-6 6.1 (UP-1): ALSO re-publish when the latest CRL was not
                 // built from the current revoked set — a revoke whose own publish
@@ -16406,8 +16443,8 @@ private:
                     return rbac_store_->list_all_principal_roles_checked();
                 },
                 // Display accessors only: the cached view FIRST (reading it refreshes it), then the
-                // staleness flag. The enforcement-label and administrator predicates are
-                // deliberately not used here (routed A2/A1 row, clauses 3 and 4).
+                // staleness flag. Whether the switch is live is NOT decided here: that is
+                // `rbac_admin_hint_fn` below.
                 .enforcement_state_fn =
                     [this]() -> std::expected<yuzu::server::access::EnforcementView, std::string> {
                     if (!rbac_store_ || !rbac_store_->is_open())
@@ -16424,6 +16461,17 @@ private:
                         return auth_routes_->deny_service_scoped_session(req, res, action, message,
                                                                           target_type, target_id);
                     },
+                // The ONE call site of `rbac_admin_hint` (routed A2/A1 row): the page draws the
+                // Assign button and the enforcement switch from the authority the A2/A1 routes
+                // apply (the durable-Administrator predicate, then the regime check; A1 applies
+                // the regime rule inside set_enforcement), not from the session's base role.
+                // kRest because the controls call the REST routes. HINT ONLY: every action
+                // keeps its own gate. Null stores fold to kUnconfirmed inside the hint.
+                .rbac_admin_hint_fn = [this](const auth::Session& s) {
+                    return yuzu::server::rbac_admin_hint(
+                        s, auth_db_.get(), rbac_store_.get(),
+                        yuzu::server::RbacAdminSurface::kRest);
+                },
             });
 
         // Tokens and principals page (Phase 2 UI): /access/tokens, its three
@@ -17343,6 +17391,14 @@ private:
         settings_routes_->set_read_admin_fn(
             [this](const httplib::Request& req, httplib::Response& res) {
                 return auth_routes_->probe_admin(req, res);
+            });
+        // The auto-loading Engine Principals panel applies the same EnginePrincipal:Read test as
+        // its REST twin (#5882); the quiet probe withholds the denial row for a refused cookie
+        // session only. Wired before the listener starts.
+        settings_routes_->set_read_perm_fn(
+            [this](const httplib::Request& req, httplib::Response& res, const std::string& type,
+                   const std::string& op) {
+                return auth_routes_->probe_permission(req, res, type, op);
             });
         // F1: live-apply hook for the DEX alerts settings (wired before the
         // listener starts, so no request races the set).

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "custom_properties_store.hpp"
+#include "dedup_fleet_tags.hpp" // agent command-dedup store fleet telemetry (#3663)
 #include "dex_perf_rules.hpp"
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet telemetry table (#2298 gate 3, item 6d)
 #include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet telemetry table (rung 9c PR-3)
@@ -2488,6 +2489,10 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         metrics.clear_gauge_family(m.gauge);
     for (const auto& m : kGuardianIoCeilingMetrics)
         metrics.clear_gauge_family(m.gauge);
+    // #3663: the dedup-store capacity MAX is the one dedup gauge that is ABSENT-not-zero (a
+    // per-agent reading that nobody may report). The dedup agent COUNTS are server-owned counts
+    // published every sweep, 0 included, so they need no clear (same as the OTA gauge).
+    metrics.clear_gauge_family(kDedupRowsMaxGauge);
 
     // Aggregate
     std::unordered_map<std::string, int> os_counts;
@@ -2701,6 +2706,28 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::map<std::string, int64_t> plugin_init_failed; // #1567: plugin -> agents
     int sync_skipping = 0; // #5332: agents whose installed_software daily sync is skipping
 
+    // #3663: agent command-dedup store telemetry. Counts of AGENTS (not sums of per-process
+    // counters), published every sweep including 0, so a flat 0 is a measurement;
+    // `dedup_reporting` is the denominator that says whether anyone is being measured and
+    // `dedup_tag_rejected` makes a dropped forged value visible (see dedup_fleet_tags.hpp).
+    std::array<int, kNDedupAgentCountMetrics> dedup_agent_counts{};
+    int dedup_reporting = 0;
+    int dedup_tag_rejected = 0;
+    unsigned long long dedup_rows_max = 0;
+    bool dedup_rows_reported = false;
+    // std::string twins of the table's C-string tag keys: unordered_map::find takes the key
+    // type, so passing the char* would heap-construct a temporary key per lookup, per agent,
+    // per sweep. Built once; same pattern, and the same static-destruction reasoning, as
+    // gj_keys below (the sole production reader, health_recompute_thread_, is joined in
+    // ServerImpl::stop() before exit).
+    static const std::array<std::string, kNDedupAgentCountMetrics> dedup_keys = [] {
+        std::array<std::string, kNDedupAgentCountMetrics> keys;
+        for (std::size_t i = 0; i < kNDedupAgentCountMetrics; ++i)
+            keys[i] = kDedupAgentCountMetrics[i].tag;
+        return keys;
+    }();
+    static const std::string dedup_rows_key{kDedupRowsTag};
+
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
 
@@ -2795,6 +2822,44 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         static const std::string kKeySyncSkip{"yuzu.sync.installed_software.skip_streak"};
         if (parse_echo_corruption_total(get_view(kKeySyncSkip)))
             ++sync_skipping;
+
+        // #3663: agent command-dedup store. Absent tag = this agent does not report it (an
+        // older agent): skipped, neither counted nor rejected. A PRESENT tag is classified once
+        // and the verdict is mutually exclusive: rejected (forged / malformed), or a valid
+        // reading that either counts the agent or does not. In-place reads, no copies.
+        {
+            bool dedup_agent_rejected = false;
+            for (std::size_t i = 0; i < kNDedupAgentCountMetrics; ++i) {
+                const auto it = snap.status_tags.find(dedup_keys[i]);
+                if (it == snap.status_tags.end())
+                    continue;
+                switch (classify_dedup_value(kDedupAgentCountMetrics[i].kind, it->second)) {
+                case DedupVerdict::kRejected:
+                    dedup_agent_rejected = true;
+                    break;
+                case DedupVerdict::kCounted:
+                    ++dedup_agent_counts[i];
+                    if (i == kDedupPresenceIndex)
+                        ++dedup_reporting;
+                    break;
+                case DedupVerdict::kNotCounted:
+                    if (i == kDedupPresenceIndex)
+                        ++dedup_reporting;
+                    break;
+                }
+            }
+            if (const auto it = snap.status_tags.find(dedup_rows_key);
+                it != snap.status_tags.end()) {
+                if (const auto rows = parse_dedup_value(it->second)) {
+                    dedup_rows_max = std::max(dedup_rows_max, *rows);
+                    dedup_rows_reported = true;
+                } else {
+                    dedup_agent_rejected = true;
+                }
+            }
+            if (dedup_agent_rejected)
+                ++dedup_tag_rejected;
+        }
 
         auto os_val = get("yuzu.os");
         if (!os_val.empty())
@@ -3134,6 +3199,17 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // needs no clear_gauge_family.
     metrics.gauge("yuzu_fleet_inventory_sync_skipping", {{"source", "installed_software"}})
         .set(static_cast<double>(sync_skipping));
+    // #3663: agent command-dedup store. The agent COUNTS and the two meta-gauges are
+    // server-owned counts over the reporting population, published every sweep, 0 included
+    // (no clear needed). Only the capacity MAX is absent-not-zero: cleared at the top, set
+    // only when at least one agent reported a value that passed the parse.
+    for (std::size_t i = 0; i < kNDedupAgentCountMetrics; ++i)
+        metrics.gauge(kDedupAgentCountMetrics[i].gauge)
+            .set(static_cast<double>(dedup_agent_counts[i]));
+    metrics.gauge(kDedupReportingGauge).set(static_cast<double>(dedup_reporting));
+    metrics.gauge(kDedupTagRejectedGauge).set(static_cast<double>(dedup_tag_rejected));
+    if (dedup_rows_reported)
+        metrics.gauge(kDedupRowsMaxGauge).set(static_cast<double>(dedup_rows_max));
     {
         constexpr std::size_t kMaxPluginLabels = 64;
         std::size_t n = 0;
