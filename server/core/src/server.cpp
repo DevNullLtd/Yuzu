@@ -9579,7 +9579,8 @@ public:
                 // reject an expired CRL), and a failed startup pre-publish would
                 // leave /ca/crl 503 with no self-heal. Re-publish when the latest
                 // CRL is missing or within 24h of nextUpdate; once it runs,
-                // nextUpdate jumps 7 days out so this fires ~once/6 days.
+                // nextUpdate jumps 48h out (kCrlValidity, #6016 PR 4d) so this fires
+                // ~once a day.
                 //
                 // HA WS-6 6.1 (UP-1): ALSO re-publish when the latest CRL was not
                 // built from the current revoked set — a revoke whose own publish
