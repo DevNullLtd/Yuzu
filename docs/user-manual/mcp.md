@@ -407,6 +407,10 @@ require admin approval before taking effect. This includes:
   bypass the approval gate by switching transports
 - User management writes
 - Management group writes
+- Workflow execution (`Workflow:Execute`), enforced on the REST
+  `POST /api/workflows/{id}/execute` route, which refuses a supervised token (`403`, approval
+  required on this transport). No MCP tool maps to it yet, so a supervised token has no ticket path
+  to run a workflow until the `execute_workflow` tool ships
 
 The one exception is the closed exempt list (`cancel_execution`): it only marks a tracker record
 cancelled and sends nothing to any device, so a supervised token calls it with no ticket (the REST

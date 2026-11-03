@@ -439,11 +439,12 @@ function, `requires_approval(mcp_tier, securable_type, operation)` (`mcp_policy.
 own doc comment, "AFTER `tier_allows()` returns true." **It is not derived from anything else — it
 is its own hard-coded, exact-match `(securable_type, operation)` list** (supervised tier:
 `Execution:Execute`, any `Delete`, `Policy:Write`, `Security:Write`, `Security:Execute`,
-`UserManagement:Write`, `ManagementGroup:Write`; operator tier: `Tag:Delete` only —
-`mcp_policy.hpp:105-158`). A pair that is destructive in the everyday sense but **absent** from this
-list runs un-approved at supervised tier, full stop — there is no fallback heuristic ("Write implies
-approval" is not the rule; `ApiToken:Write` itself is not in the list, deliberately, per the comment
-at `mcp_policy.hpp:124-151`).
+`UserManagement:Write`, `ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`; operator
+tier: `Tag:Delete` only; read the supervised branch of `requires_approval()` in `mcp_policy.hpp`
+for the current list, which this paragraph can fall behind). A pair that is destructive in the
+everyday sense but **absent** from this list runs un-approved at supervised tier, full stop: there
+is no fallback heuristic ("Write implies approval" is not the rule; `ApiToken:Rotate` is
+deliberately absent from the list, with its rationale in the comment above that branch).
 
 **This means a twin PR for a destructive action-twin must explicitly decide, and state in the tool
 description, whether its `(securable_type, operation)` pair belongs in `requires_approval()`** — not
@@ -952,9 +953,10 @@ before any of the table edits below.
 
 Next, the decision §3's "fifth registration point"
 calls out explicitly: `SoftwareDeployment:Execute` is **not** in `requires_approval()`'s hard-coded
-supervised-tier list today (verified — the full list is `Execution:Execute`, any `Delete`,
-`Policy:Write`, `Security:Write`, `Security:Execute`, `UserManagement:Write`,
-`ManagementGroup:Write`; `mcp_policy.hpp:105-121`). Starting a deployment pushes a package to live
+supervised-tier list today (verified; the list at the time of writing is `Execution:Execute`,
+any `Delete`, `Policy:Write`, `Security:Write`, `Security:Execute`, `UserManagement:Write`,
+`ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`; read the supervised branch of
+`requires_approval()` in `mcp_policy.hpp` for the current one). Starting a deployment pushes a package to live
 endpoints — REST gates the equivalent action behind an MFA step-up (`step_up_fn`,
 `rest_api_v1.cpp:9053`) precisely because it is consequential. The twin PR's job is to make that
 call explicitly rather than silently ship an unapproved supervised-tier action: add

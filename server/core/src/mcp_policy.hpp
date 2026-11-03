@@ -179,7 +179,7 @@ inline bool requires_approval(std::string_view mcp_tier,
         // this tier. Before this line a supervised token passed Workflow:Execute with NO
         // ticket. AuthRoutes::require_permission mirrors this rule on every non-MCP transport,
         // so a supervised-tier token is refused (403) on the REST execute route. No MCP tool
-        // maps to Workflow:Execute yet (the execute_workflow twin lands in a later change), so
+        // maps to Workflow:Execute yet (the execute_workflow tool is not implemented), so
         // until it does a supervised token has no ticket path to run a workflow. The operator
         // tier stays DENIED by tier_allows() above, which admits only Execution:Execute among
         // execute operations.
