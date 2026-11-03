@@ -3040,24 +3040,6 @@ TEST_CASE("manager-ecosystem table: each row maps through its own action only",
     }
 }
 
-TEST_CASE("middleware adapter and collector: a leg row built from NUL-bearing installer text still maps",
-          "[sync][parse][adapter][collector][middleware]") {
-    // mw::format_row scrubs a NUL to '?' (scrub_wire_bytes), so the row reaches the collector whole.
-    // Unscrubbed, the plugin ABI's C string would end the row at the NUL while the status row stays
-    // `supported`; the adapter then rejects the short row and the source's stored rows are erased.
-    const std::string row = mwr::format_row("ibm_mq", "IBM MQ", std::string{"In\0st", 5}, "9.4.5",
-                                            std::string{"/opt/m\0qm", 9}, "");
-    REQUIRE(row.find('\0') == std::string::npos);
-    const std::string out = nl({st("ibm_mq", "supported", "-"), row});
-    CHECK(show(bind_mq(out)) == res("ok", "", {entry_of("IBM MQ", "9.4.5", "IBM", "app", "ibm_mq")}));
-
-    fake_windows();
-    g_fake[5].out["ibm_mq"] = out;
-    const auto got = collect_with(with_middleware());
-    REQUIRE(got.has_value());
-    CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
-}
-
 // runtimes.python through the COLLECTOR (the adapter cases below call the parser directly): the
 // table row is what wires the plugin in, so removing it, or flipping its ConstrainedPolicy away
 // from drop_source, turns a section here red.
@@ -3573,4 +3555,22 @@ TEST_CASE("middleware adapter: the leg's own escaped rows round-trip through the
         const AdaptedRows got = bind_mq(nl({st("ibm_mq", "supported", "-"), *row}));
         CHECK(show(got) == show(want));
     }
+}
+
+TEST_CASE("middleware adapter and collector: a leg row built from NUL-bearing installer text still maps",
+          "[sync][parse][adapter][collector][middleware]") {
+    // mw::format_row scrubs a NUL to '?' (scrub_wire_bytes), so the row reaches the collector whole.
+    // Unscrubbed, the plugin ABI's C string would end the row at the NUL while the status row stays
+    // `supported`; the adapter then rejects the short row and the source's stored rows are erased.
+    const std::string row = mwr::format_row("ibm_mq", "IBM MQ", std::string{"In\0st", 5}, "9.4.5",
+                                            std::string{"/opt/m\0qm", 9}, "");
+    REQUIRE(row.find('\0') == std::string::npos);
+    const std::string out = nl({st("ibm_mq", "supported", "-"), row});
+    CHECK(show(bind_mq(out)) == res("ok", "", {entry_of("IBM MQ", "9.4.5", "IBM", "app", "ibm_mq")}));
+
+    fake_windows();
+    g_fake[5].out["ibm_mq"] = out;
+    const auto got = collect_with(with_middleware());
+    REQUIRE(got.has_value());
+    CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
 }
