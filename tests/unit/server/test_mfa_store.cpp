@@ -17,6 +17,7 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 
+#include "../../../server/core/src/secure_random.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "pg/pg_exec.hpp"
 #include "test_auth_db_pg_helper.hpp"
@@ -24,9 +25,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <span>
 
 using namespace yuzu::server;
 using yuzu::server::auth::AuthManager;
@@ -360,4 +364,127 @@ TEST_CASE("mfa_init_enrollment aborts with no plaintext/partial write when encry
     auto retry = db->mfa_init_enrollment("alice", "Yuzu", std::nullopt);
     REQUIRE(retry.has_value());
     CHECK_FALSE(retry->secret_base32.empty());
+}
+
+// ── #4763: a CSPRNG failure fails enrollment / regeneration CLOSED ───────────
+// `force_next_failure_for_this_thread` is one-shot and thread-local; it is
+// consumed by the first `fill_random` on this thread, which in these paths is
+// the mfa::random_secret / mfa::random_recovery_code call under test.
+//
+// KNOWN LIMIT: the hook always fails the FIRST draw, so the regeneration case
+// below fails on recovery code #0 (the DELETE has run, no INSERT has). A failure
+// at code #1..#9 (DELETE plus k INSERTs already issued) takes the same
+// `unexpected(WriteFailed)` -> `with_txn_for` rollback path, so it is covered by
+// reading `run_in_txn`, not by this test.
+
+namespace {
+
+/// Arms the one-shot CSPRNG failure hook and GUARANTEES it is disarmed on scope
+/// exit. Without this, a REQUIRE that throws before the hooked draw runs would
+/// leave the flag armed on this thread and poison the next test case's first
+/// `fill_random` (#4763). Test-only; never used from production code.
+struct ForcedCsprngFailure {
+    ForcedCsprngFailure() { yuzu::server::test_hooks::force_next_failure_for_this_thread(); }
+    ~ForcedCsprngFailure() {
+        if (yuzu::server::test_hooks::is_failure_forced_for_this_thread()) {
+            std::array<std::uint8_t, 1> drain{};
+            (void)yuzu::server::fill_random(std::span<std::uint8_t>{drain}); // consumes the flag
+        }
+    }
+    ForcedCsprngFailure(const ForcedCsprngFailure&) = delete;
+    ForcedCsprngFailure& operator=(const ForcedCsprngFailure&) = delete;
+};
+
+} // namespace
+
+TEST_CASE_METHOD(MfaFixture, "mfa_init_enrollment fails closed on a CSPRNG failure (#4763)",
+                 "[pg][mfa][store]") {
+    auto init = [&] {
+        ForcedCsprngFailure forced;
+        auto r = db->mfa_init_enrollment("alice", "Yuzu", std::nullopt);
+        // Checked BEFORE the guard drains it: proves the mint draw was reached and
+        // consumed the hook, i.e. the WriteFailed below is the CSPRNG path and not
+        // an unrelated earlier failure.
+        REQUIRE_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
+        return r;
+    }();
+    REQUIRE_FALSE(init.has_value());
+    REQUIRE(init.error() == AuthDBError::WriteFailed);
+
+    // Nothing was written: not enrolled, and a retry mints a real, non-zero secret.
+    auto s = db->mfa_status("alice");
+    REQUIRE(s.has_value());
+    REQUIRE_FALSE(s->enrolled);
+
+    auto retry = db->mfa_init_enrollment("alice", "Yuzu", std::nullopt);
+    REQUIRE(retry.has_value());
+    auto bytes = mfa::base32_decode(retry->secret_base32);
+    REQUIRE(bytes.has_value());
+    REQUIRE(bytes->size() == static_cast<std::size_t>(mfa::kTotpSecretBytes));
+    REQUIRE(std::any_of(bytes->begin(), bytes->end(), [](uint8_t b) { return b != 0; }));
+}
+
+TEST_CASE_METHOD(MfaFixture,
+                 "mfa_regenerate_recovery_codes fails closed on a CSPRNG failure (#4763)",
+                 "[pg][mfa][store]") {
+    auto init = db->mfa_init_enrollment("alice", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto original = db->mfa_verify_enrollment("alice", code_for_now(init->secret_base32),
+                                              std::nullopt);
+    REQUIRE(original.has_value());
+    REQUIRE(original->size() == 10);
+
+    auto regen = [&] {
+        ForcedCsprngFailure forced;
+        auto r = db->mfa_regenerate_recovery_codes("alice");
+        REQUIRE_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
+        return r;
+    }();
+    REQUIRE_FALSE(regen.has_value());
+    REQUIRE(regen.error() == AuthDBError::WriteFailed);
+
+    // The txn rolled back: the user keeps all ten ORIGINAL codes (not wiped,
+    // not a partial new set), and one of them still redeems.
+    auto s = db->mfa_status("alice");
+    REQUIRE(s.has_value());
+    REQUIRE(s->recovery_codes_remaining == 10);
+    auto consumed = db->mfa_consume_recovery_code("alice", (*original)[0]);
+    REQUIRE(consumed.has_value());
+    REQUIRE(*consumed);
+}
+
+TEST_CASE_METHOD(MfaFixture,
+                 "mfa_verify_enrollment rolls the enrol back on a recovery-code CSPRNG failure (#4763)",
+                 "[pg][mfa][store]") {
+    // The enrolling UPDATE and the recovery-code mint share ONE transaction. A CSPRNG
+    // failure in the mint must roll the whole thing back: the user stays provisional
+    // (never "enrolled with zero recovery codes"), so the same code can enrol again.
+    // (This does not exercise the TOTP replay counter: mfa_verify_enrollment verifies
+    // with no minimum counter, so the proof here is the mfa_enrolled_at rollback.)
+    auto init = db->mfa_init_enrollment("alice", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    const auto code = code_for_now(init->secret_base32);
+
+    auto failed = [&] {
+        ForcedCsprngFailure forced;
+        auto r = db->mfa_verify_enrollment("alice", code, std::nullopt);
+        REQUIRE_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
+        return r;
+    }();
+    REQUIRE_FALSE(failed.has_value());
+    REQUIRE(failed.error() == AuthDBError::WriteFailed);
+
+    auto s = db->mfa_status("alice");
+    REQUIRE(s.has_value());
+    REQUIRE_FALSE(s->enrolled);
+    REQUIRE(s->recovery_codes_remaining == 0);
+
+    // Same code, healthy CSPRNG: the enrolment now succeeds with ten codes.
+    auto ok = db->mfa_verify_enrollment("alice", code, std::nullopt);
+    REQUIRE(ok.has_value());
+    REQUIRE(ok->size() == 10);
+    auto after = db->mfa_status("alice");
+    REQUIRE(after.has_value());
+    REQUIRE(after->enrolled);
+    REQUIRE(after->recovery_codes_remaining == 10);
 }

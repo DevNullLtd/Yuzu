@@ -17,8 +17,9 @@ cadences.
   `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
   `store_packages` (Linux snaps and flatpaks), and
   `windows_optional_features` `list` and `msi_packages` `list_inventory`
-  (Windows machine-context MSI products), and `runtimes` `python` (installed
-  Python interpreters). An action whose plugin is not loaded, or
+  (Windows machine-context MSI products), `runtimes` `python` (installed
+  Python interpreters), and `middleware` `ibm_mq` (IBM MQ
+  installations; Linux). An action whose plugin is not loaded, or
   that answers "unsupported on this OS", is skipped. A plugin that is not
   loaded is logged at warn (the rows its action produced are removed on the next
   report); without `installed_apps` the source stays idle and sends nothing,
@@ -30,9 +31,10 @@ cadences.
   skips that day's report and keeps the last good state — nothing is deleted. A
   `constrained` `managers` answer that still names at least one present manager
   is accepted: the constraint concerns manager facts the presence row never
-  carried. A `constrained` `runtimes` `python` answer is the other exception: it
-  withholds only the Python rows and the cycle continues, so the stored Python rows
-  are removed until a later read succeeds (see Troubleshooting). A skipped cycle
+  carried. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
+  exception: it withholds only that source's rows and the cycle continues, so the
+  stored rows of that source are removed until a later read succeeds (see
+  Troubleshooting). A skipped cycle
   is retried sooner on a phase-aligned backoff: waits that double from 1 h after
   each consecutive skip (1 h, 2 h, 4 h, 8 h, …), each retry capped so it never
   lands after the next daily slot — up to four extra attempts — then one attempt
@@ -46,7 +48,7 @@ cadences.
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `pkg_inventory.store_packages`,
   `windows_optional_features.list`, `msi_packages.list_inventory`,
-  `runtimes.python`); `package_id`
+  `runtimes.python`, `middleware.ibm_mq`); `package_id`
   is empty for these producers except `msi_packages.list_inventory`, where it is
   the MSI product code. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
@@ -85,19 +87,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -176,6 +178,25 @@ cadences.
   software rows, so the stored `python` rows are removed until a read succeeds again
   (see Troubleshooting). A missing or unreadable version file never does this, the
   row reports the version it could determine.
+
+  **IBM MQ** is collected through the `middleware` plugin's `ibm_mq` action (Linux; `source`
+  `middleware.ibm_mq`) with `kind` `app`, `ecosystem` `ibm_mq`, `name` `IBM MQ` and `publisher`
+  `IBM`, taken from the plugin's product table. `version` is VRM (version.release.modification,
+  for example `9.4.5`); the fix-pack level is not carried. The install path and edition
+  are shown by the `middleware` definition, not carried into installed software. This is a
+  metadata-only read with no subprocess: `mqinst.ini` and the
+  swidtag file names, readable by an unprivileged account (measured as a throwaway
+  unprivileged uid on one IBM MQ 9.4.5.0 Ubuntu-debs install; not measured as the packaged
+  `yuzu-agent` account or on another version or distribution). If the answer is `constrained`
+  (an access or walk fault such as a refused read or a cap; an unusable `mqinst.ini` stanza
+  beside a usable one is only logged) the collector withholds this source's rows for the
+  cycle, logs a warning, and carries on with every other source, rather than failing the
+  whole report. Because each cycle replaces the agent's stored inventory, the withheld IBM MQ
+  rows are REMOVED from the stored inventory until the source recovers, so they are absent
+  from the Software page. The server sees no signal for this and cannot tell a withheld
+  source from one with no IBM MQ installed; the state is visible only by running the
+  `ibm_mq` action on the device and reading its status row. This is the second such exception to the
+  skip-the-cycle rule above, with Python. Windows and macOS answer `unsupported` (planned).
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,
@@ -1151,7 +1172,11 @@ sync, defeating the hash-skip protocol.
 - **Scope / privacy.** Machine-scope only (no per-user data), but serial/UUID/MAC
   are device-persistent identifiers — treat as potentially personal data where a
   device is person-assigned. The same **`--inventory-disable`** flag suppresses
-  `device_ci` along with the other sources (it gates the whole daily-sync thread).
+  `device_ci` along with the other sources (it gates the whole daily-sync thread). A volume
+  or partition mount point under a user profile or under `/Volumes` is replaced with
+  `[redacted]` before it is sent. That removes one route to a personal name and is not a
+  consent mechanism; other folder mounts, free text in the other columns, and the device
+  name, domain and OU are sent as the machine reports them.
 - **Observability.** Ingest shares
   `yuzu_inventory_ingest_total{source="device_ci"}` +
   `yuzu_inventory_ingest_duration_seconds{source="device_ci"}`; read degrades use
@@ -1173,6 +1198,29 @@ sync, defeating the hash-skip protocol.
   device serial and system UUID. Agents keep working unchanged; upgrade the server
   before the agents. No page or API reads the per-device rows yet: these values are stored
   now and become visible when the device-CI read surface ships.
+- **What the agent sends.** An agent that carries this change always sends the versioned
+  record; there is no flag to fall back to the earlier format, and `--inventory-disable`
+  still stops the collection. Each section reports one of four levels:
+  `ok`, `constrained` (partial: read the reason), `unavailable` (the data could not be
+  read on this host) and `permission_denied` (the agent was refused). A section that is
+  `unavailable` or `permission_denied` carries **no rows**, so an empty list under those
+  levels means "not collected", not "the device has none". A reason of the form
+  `<os>:planned` means the collector for that OS is not shipped yet; `agent:action_absent`
+  means the installed plugin predates the section; `agent:plugin_not_loaded` means the
+  disk plugin is not loaded on that host; `agent:windows_volumes_unbounded` means the
+  Windows volume probe was not run, because it has no deadline and the daily sync must not
+  block on a wedged drive, so the Windows `volume` section is `unavailable` with no rows;
+  `agent:mount_points_redacted` means at least one mount point under a user profile or under
+  `/Volumes` was replaced with `[redacted]` and the rest of the row is unchanged. The Windows reason
+  is expected on every Windows host and needs no action; the operator-triggered `volumes` action
+  still works there. To see how many devices report each state, query
+  `SELECT kind, level, reason, count(*) FROM device_inventory_store.device_ci_section GROUP BY kind, level, reason ORDER BY kind, count(*) DESC;`.
+  A reason ending `agent_cap:<kept>/<total>`
+  means the agent kept only the first `kept` of `total` rows (it caps each list to
+  the same limits the server applies, and trims the least valuable lists first if the whole
+  record would be too large); `server_cap:<n>` is the server's own cap. Sections fail
+  independently: one section being unavailable never stops the others, or the base device
+  fields, from being reported.
 
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its

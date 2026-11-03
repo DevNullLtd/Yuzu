@@ -434,10 +434,11 @@ public:
     /// state-discriminated (classifier: `rotation_confirm_state.hpp`) so a
     /// replay after the rotation already resolved gets a TERMINAL conflict the
     /// caller maps to 409/kInvalidParams, NOT the old blanket retryable error:
-    ///   - 0 active, or 2 active that aren't a linked pair -> "no in-flight
-    ///     rotation to confirm" (RETRYABLE/Transient: 0-active is ambiguous
-    ///     with a swallowed read failure, and a malformed pair is kept
-    ///     conservative);
+    ///   - 0 active -> "no in-flight rotation to confirm" (RETRYABLE/Transient:
+    ///     the empty read is ambiguous with a swallowed read failure);
+    ///   - 2 active that aren't a linked pair -> "rotation pair is malformed
+    ///     ..." (terminal Conflict -> 409/kInvalidParams: a positive read of
+    ///     the stored rows, so no retry can repair it);
     ///   - >2 active -> "more than two active credentials ..." (terminal,
     ///     manual resolution) — mirrors `rotate_engine_credential`;
     ///   - 1 active with UNCLEARED rotation linkage -> "... unresolved
