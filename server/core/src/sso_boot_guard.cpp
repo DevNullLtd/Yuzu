@@ -93,8 +93,8 @@ sso_only_runtime_providers_ok(const Config& cfg, bool oidc_up, bool saml_up) {
         "--auth-mode=sso-only disables local-password login, but " + disabled +
         (named > 1 ? " were" : " was") + " disabled at startup, so every operator would be locked out. The cause is the "
         "error logged just before this line (for example a SAML IdP certificate that is "
-        "missing, over 64 KiB, not a PEM certificate, a certificate type this server "
-        "cannot use such as Ed25519, or an unusable SAML signing key). Fix the "
+        "missing, over 64 KiB, not a PEM certificate, a certificate key type this server "
+        "cannot load, or an unusable SAML signing key). Fix the "
         "configuration and restart. As a last resort --auth-mode=standard starts the server "
         "with local-password login enabled again for every account, including accounts of "
         "people who have left. The break-glass account "

@@ -1141,15 +1141,18 @@ static std::string generate_rsa_pss_key_pem() {
     return std::string(bptr->data, bptr->length);
 }
 
-enum class CertKeyKind { Rsa, Ed25519 };
+enum class CertKeyKind { Rsa, Ed25519, MlDsa65 };
 
 /// A fresh self-signed certificate PEM over a new key of `kind`. `trusted`
 /// writes OpenSSL's "BEGIN TRUSTED CERTIFICATE" form (PEM_write_bio_X509_AUX),
 /// which xmlsec's loader (PEM_read_bio_X509_AUX) accepts but a plain
 /// PEM_read_bio_X509 rejects (#4160 false-reject regression input).
 static std::string make_self_signed_cert_pem(CertKeyKind kind, bool trusted) {
-    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(
-        kind == CertKeyKind::Rsa ? EVP_PKEY_RSA : EVP_PKEY_ED25519, nullptr);
+    EVP_PKEY_CTX* ctx =
+        kind == CertKeyKind::MlDsa65
+            ? EVP_PKEY_CTX_new_from_name(nullptr, "ML-DSA-65", nullptr)
+            : EVP_PKEY_CTX_new_id(kind == CertKeyKind::Rsa ? EVP_PKEY_RSA : EVP_PKEY_ED25519,
+                                  nullptr);
     REQUIRE(ctx != nullptr);
     struct CtxGuard { EVP_PKEY_CTX* c; ~CtxGuard() { if (c) EVP_PKEY_CTX_free(c); } } cg{ctx};
     REQUIRE(EVP_PKEY_keygen_init(ctx) == 1);
@@ -1172,7 +1175,7 @@ static std::string make_self_signed_cert_pem(CertKeyKind kind, bool trusted) {
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
                                reinterpret_cast<const unsigned char*>("Probe IdP"), -1, -1, 0);
     X509_set_issuer_name(cert, name);
-    // Ed25519 signs without a separate digest (md = nullptr).
+    // The Edwards-curve kinds sign without a separate digest (md = nullptr).
     REQUIRE(X509_sign(cert, pkey, kind == CertKeyKind::Rsa ? EVP_sha256() : nullptr) > 0);
 
     BIO* bio = BIO_new(BIO_s_mem());
@@ -1222,14 +1225,17 @@ TEST_CASE("SAML: IdP cert probe — a TRUSTED CERTIFICATE PEM is accepted (as th
     CHECK_FALSE(p.idp_cert_configured_but_broken());
 }
 
-// NOTE: this asserts a NEGATIVE capability of the pinned xmlsec (1.3.9 has no EdDSA key
-// support). If a future xmlsec bump gains Ed25519, this case will fail loudly: that is a
-// cue to delete or invert it (and the "for example Ed25519" wording in the error text),
-// not a bug in the probe, which always agrees with whatever the verifier can load.
-TEST_CASE("SAML: IdP cert probe — an Ed25519 certificate is reported broken", "[saml][4160]") {
+// NOTE: this asserts a NEGATIVE capability of the pinned xmlsec build: that it cannot adopt an
+// ML-DSA-65 key (measured on xmlsec 1.3.12 with OpenSSL 3.6.5). It was an Ed25519 certificate
+// while the baseline carried xmlsec 1.3.9; xmlsec 1.3.12 adopts Ed25519 and Ed448 keys, so the
+// case moved. If a future xmlsec bump gains ML-DSA, this case will fail loudly: pick another
+// certificate key type the loader still refuses, or delete the case. That is not a bug in the
+// probe, which always agrees with whatever the verifier can load.
+TEST_CASE("SAML: IdP cert probe — a certificate with a key type xmlsec cannot adopt is reported broken",
+          "[saml][4160]") {
     // Regression: it parses as X.509 but xmlsec cannot adopt its key, so every
     // assertion would fail while the provider still looked enabled.
-    SamlProvider p{config_with_idp_cert(make_self_signed_cert_pem(CertKeyKind::Ed25519, false))};
+    SamlProvider p{config_with_idp_cert(make_self_signed_cert_pem(CertKeyKind::MlDsa65, false))};
     CHECK(p.idp_cert_configured_but_broken());
     CHECK_FALSE(p.idp_cert_init_error().empty());
     CHECK(p.idp_cert_init_error().find("BEGIN") == std::string::npos); // never echoes PEM bytes

@@ -695,8 +695,7 @@ SamlProvider::SamlProvider(SamlConfig config) : config_(std::move(config)) {
             idp_cert_init_failed_ = true;
             idp_cert_init_error_  = "SAML IdP certificate could not be loaded as a "
                                     "signature-verification key (not a PEM certificate, "
-                                    "or a key type that cannot verify signatures here, "
-                                    "for example Ed25519)";
+                                    "or a key type that cannot verify signatures here)";
             spdlog::error("SamlProvider: {}", idp_cert_init_error_);
         }
     }

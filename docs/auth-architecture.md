@@ -1452,7 +1452,7 @@ account policy)"* — this ships **both** halves.
   (`startup_failed_`, non-zero exit, `[SSO] Refusing to start` in the log) when
   **no** provider is up. In practice this is the SAML leg: an IdP certificate
   that is unreadable, over 64 KiB, not a PEM certificate, or of a key type
-  xmlsec cannot verify with (for example Ed25519), a bad or non-RSA SP signing
+  xmlsec cannot verify with, a bad or non-RSA SP signing
   key, would otherwise leave a sole SAML provider that looks enabled while every
   assertion fails. The cause is the preceding `error` log line. The certificate
   is judged by the **verifier's own loader**: `SamlProvider` loads the pinned
@@ -2278,7 +2278,7 @@ its in-process PKCE state and its browser-binding digest.
 Update `--saml-idp-cert` and **restart the server** — there is no hot-reload
 for the IdP cert in this release. **Validate the replacement file first** (a PEM
 certificate, at most 64 KiB, with a key type the SAML verifier can load; RSA
-works, Ed25519 does not): on an
+works; the start-up check refuses a key type it cannot load): on an
 `--auth-mode=sso-only` server whose only SSO provider is SAML, an unloadable
 certificate now stops the whole server at start-up (#4160, "Boot guard" above).
 
