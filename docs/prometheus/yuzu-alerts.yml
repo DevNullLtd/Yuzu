@@ -2243,40 +2243,60 @@ groups:
             scim provenance-denial audit row for the calling IdP/client.
           runbook_url: "https://docs.yuzu.io/runbooks/scim-provenance-denied"
 
-      # #6836: a SCIM deactivate/delete/reactivate/update (or a POST that
-      # revives a removed account) could not READ its provenance or role guard
-      # from the auth store and answered a retryable 503. Distinct from YuzuScimProvenanceDenied above: nothing was refused.
-      # Before #6836 this same fault was reported to the IdP as a 404 and
-      # counted as a provenance denial, so YuzuScimProvenanceDenied fired for
-      # an outage by accident; it no longer does, and this rule replaces that
-      # signal. `guard` is the closed pair provenance|role, pre-seeded to 0.
+      # #6836 / #6835: a SCIM request could not READ the store it needed and
+      # answered a retryable 503 instead of acting. Distinct from
+      # YuzuScimProvenanceDenied above: nothing was refused. `guard` is the
+      # closed set provenance|role (the deprovision / revive guards, #6836) and
+      # bearer|resource (the SCIM token check and the User / Group lookups,
+      # #6835), pre-seeded to 0. Before these changes the same faults were
+      # reported to the IdP as a 404 (and counted as a provenance denial, so
+      # YuzuScimProvenanceDenied fired for an outage by accident) or as a 401
+      # (a credential failure); this rule replaces that signal.
       - alert: YuzuScimGuardStoreUnavailable
         expr: |
           increase(yuzu_scim_guard_store_unavailable_total[1h]) > 0
         labels:
           severity: warning
         annotations:
-          summary: "SCIM could not read the {{ $labels.guard }} guard from the auth store (retryable 503)"
+          summary: "SCIM could not read the store for a {{ $labels.guard }} check (retryable 503)"
           description: >-
             yuzu_scim_guard_store_unavailable_total{guard="{{ $labels.guard }}"}
-            moved: a SCIM deactivate, delete, reactivate or update, or a POST
-            that revives a removed account, could not read its
-            {{ $labels.guard }} check from the auth store and answered 503
-            with Retry-After instead of acting. Nothing was refused and the
-            failed guard changed nothing, but the IdP has to retry for the
-            deprovision to complete, so a sustained rate means leavers'
-            accounts are being deactivated late. This is not a provenance
+            moved: a SCIM request could not read the store behind its
+            {{ $labels.guard }} check and answered 503 with Retry-After
+            instead of acting. guard=bearer is the SCIM token check (the
+            request could not be authenticated, so no SCIM verb was served),
+            guard=resource is a User or Group lookup, guard=provenance and
+            guard=role are the deprovision and revive guards (the role guard
+            includes the role re-check of a POST that revives a removed
+            account). Nothing was refused and the failed read changed nothing,
+            but the IdP has to retry for the work to complete, so a sustained
+            rate means provisioning, and above all leavers' deactivations, are
+            running late. This is not a credential failure or a provenance
             denial (YuzuScimProvenanceDenied is the refusal signal). Check
             /readyz, the yuzu_pg_* pool and connect alerts, and the server
-            ERROR log lines "ScimRoutes: provenance check", "ScimRoutes:
-            deprovision role check" and "ScimRoutes: revive role check"; then
-            confirm in the IdP's provisioning
-            log that the retries succeed. It does not cover a full database
-            outage, where the bearer-token check answers 401 first (#6835). If
-            the audit store is down as well, the request's audit row may be
-            missing and YuzuScimAuditWriteFailures
-            (yuzu_scim_audit_write_failures_total{action="scim.user.deactivated"})
-            can fire for a request that changed nothing.
+            ERROR log lines "ScimRoutes: bearer validation", "ScimRoutes: user
+            lookup", "ScimRoutes: group lookup", "ScimRoutes: provenance check",
+            "ScimRoutes: deprovision role check" and "ScimRoutes: revive role
+            check"; then confirm in the IdP's provisioning log that the retries
+            succeed. The counter is in memory, so it moves while the database
+            is down, but this rule only fires once Prometheus manages to scrape
+            /metrics. Do not rely on it to page DURING a full database outage:
+            a remote scrape of the authenticated /metrics resolves its session
+            or API token against Postgres (it can fail, except for a localhost
+            scrape, --metrics-no-auth, or a still-cached token) and the
+            handler itself reads Postgres. YuzuServerPostgresUnreachable and
+            YuzuPgConnectFailing need a working scrape too, so they are not an
+            honest backstop for a TOTAL outage either; the backstops for that
+            case are the /readyz readiness probe and an operator-defined
+            `up == 0` (scrape target down) alert on the server job (none
+            ships in this file). This rule then fires after recovery from the
+            increase over the gap, or at once when the fault is partial. If
+            the audit store is down as well, the audit row of a mutating
+            request's 503 (scim.user.provisioned, scim.user.updated,
+            scim.user.deleted, scim.group.created, scim.group.updated or
+            scim.group.deleted with result failure) may be missing and
+            YuzuScimAuditWriteFailures can fire for a request that changed
+            nothing.
           runbook_url: "https://docs.yuzu.io/runbooks/scim-guard-store-unavailable"
 
       # Audit-write-failures: a committed SCIM mutation (create/update/patch/
@@ -2307,7 +2327,17 @@ groups:
             advance) — a truly isolated first failure of a given `action`
             may lag up to one evaluation cycle before this rule fires;
             treat a single fresh occurrence with that in mind, and rely on
-            recurrence/sustained failures for confident detection.
+            recurrence/sustained failures for confident detection. This
+            rule may also fire for a request that changed nothing: a SCIM
+            request whose User or Group lookup could not read the store
+            answers 503 and is audited, best effort, under its own verb
+            (scim.user.provisioned, scim.user.updated, scim.user.deleted,
+            scim.group.created, scim.group.updated or scim.group.deleted)
+            with result failure and a detail beginning "store_unavailable:";
+            when the audit store is down too, that failure row is lost and
+            this counter moves for a 503 that mutated nothing. Read
+            yuzu_scim_guard_store_unavailable_total alongside it before
+            treating the gap as lost evidence of a committed change.
           runbook_url: "https://docs.yuzu.io/runbooks/scim-audit-write-failures"
 
   - name: yuzu-mcp
@@ -3230,7 +3260,7 @@ groups:
       # drop rather than being summed together.
       - alert: YuzuResponseIngestDrops
         expr: |
-          sum(rate(yuzu_server_response_ingest_dropped_total{reason!="malformed_identity_field"}[5m])) by (reason) > 0
+          sum(rate(yuzu_server_response_ingest_dropped_total{reason!~"malformed_identity_field|per_agent_cap"}[5m])) by (reason) > 0
         for: 10m
         labels:
           severity: warning
@@ -3239,9 +3269,10 @@ groups:
           description: >-
             The response store fail-soft-dropped command results for 10m
             (reason label = store_not_open / pool_acquire_timeout / query_error
-            — malformed_identity_field excluded, that's an agent sending a
-            malformed identity field, not store unhealth; see
-            YuzuResponseMalformedIdentityDrops for that case).
+            — malformed_identity_field and per_agent_cap excluded, those are
+            agent behaviour, not store unhealth; see
+            YuzuResponseMalformedIdentityDrops and
+            YuzuResponsePerAgentCapDrops for those cases).
             The executions ladder still tracks the commands, but drawer/Echo
             result history is lossy — check PostgreSQL pool saturation / health.
 
@@ -3267,6 +3298,30 @@ groups:
             is the guard working correctly, not store unhealth; investigate
             the reporting agent if this recurs (a well-behaved agent never
             triggers it).
+
+      # Companion, informational (#561): per_agent_cap is the per-(command,
+      # agent) row cap working as intended -- a flooding or legitimately very
+      # chatty agent, not store unhealth -- so it is excluded from
+      # YuzuResponseIngestDrops above for the same reason as the malformed
+      # identity case.
+      - alert: YuzuResponsePerAgentCapDrops
+        expr: |
+          increase(yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}[1h]) > 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "An agent exceeded the per-command response row cap"
+          description: >-
+            ResponseStore refused at least one response frame because an
+            agent already had the maximum rows stored for that command
+            (--response-max-rows-per-agent, default 256). This is the cap
+            working, not store unhealth. Investigate the reporting agent;
+            raise the flag only if a command legitimately streams more than
+            about cap * 64 KiB (about 16 MiB at the default) of output per
+            device. A redelivered terminal frame on a command and device
+            already at the cap also counts here. Attribute with a server log
+            grep for "per-agent row cap (" (one line carries the cap, the instruction and the agent).
 
       - alert: YuzuResponseReadDegrade
         expr: |
