@@ -36,30 +36,33 @@ bool fail_sql(TransactionHandle& h, const char* what) {
     return false;
 }
 
-bool prep(TransactionHandle& h, StmtPtr& out, const std::string& sql) {
+// The prepared statement, or null with the handle poisoned (the handle carries the text).
+StmtPtr prep(TransactionHandle& h, const std::string& sql) {
     if (h.poisoned())
-        return false;
+        return nullptr;
     sqlite3_stmt* raw = nullptr;
     if (sqlite3_prepare_v2(h.raw(), sql.c_str(), static_cast<int>(sql.size()), &raw, nullptr) !=
-        SQLITE_OK)
-        return fail_sql(h, "prepare failed");
-    out.reset(raw);
-    return true;
+        SQLITE_OK) {
+        fail_sql(h, "prepare failed");
+        return nullptr;
+    }
+    return StmtPtr{raw};
 }
 
-// Step to completion, counting RETURNING rows (never sqlite3_changes(), #1033).
-bool run(TransactionHandle& h, sqlite3_stmt* s, std::size_t* rows = nullptr) {
+// Step to completion; the RETURNING row count (never sqlite3_changes(), #1033), or
+// nullopt with the handle poisoned.
+std::optional<std::size_t> run(TransactionHandle& h, sqlite3_stmt* s) {
     if (h.poisoned())
-        return false;
+        return std::nullopt;
     int rc = SQLITE_OK;
     std::size_t n = 0;
     while ((rc = sqlite3_step(s)) == SQLITE_ROW)
         ++n;
-    if (rc != SQLITE_DONE)
-        return fail_sql(h, "step failed");
-    if (rows)
-        *rows += n;
-    return true;
+    if (rc != SQLITE_DONE) {
+        fail_sql(h, "step failed");
+        return std::nullopt;
+    }
+    return n;
 }
 
 void bind_text(sqlite3_stmt* s, int i, std::string_view v) {
@@ -86,33 +89,34 @@ class Interner {
 public:
     explicit Interner(const std::unordered_map<std::string, int64_t>& cache) : cache_(cache) {}
 
-    bool intern(TransactionHandle& h, const std::string& text, int64_t& id) {
-        if (const auto it = cache_.find(text); it != cache_.end()) {
-            id = it->second;
-            return true;
-        }
-        if (const auto it = staged_.find(text); it != staged_.end()) {
-            id = it->second;
-            return true;
-        }
+    // The id of `text`, or nullopt with the handle poisoned.
+    std::optional<int64_t> intern(TransactionHandle& h, const std::string& text) {
+        if (const auto it = cache_.find(text); it != cache_.end())
+            return it->second;
+        if (const auto it = staged_.find(text); it != staged_.end())
+            return it->second;
         if (!stmt_) {
             // A no-op DO UPDATE so RETURNING yields the existing row's id on a hit.
-            if (!prep(h, stmt_,
-                      std::format("INSERT INTO {} (text) VALUES (?) ON CONFLICT(text) DO UPDATE "
-                                  "SET text = excluded.text RETURNING id",
-                                  kDictTable)))
-                return false;
+            stmt_ = prep(h, std::format("INSERT INTO {} (text) VALUES (?) ON CONFLICT(text) DO "
+                                        "UPDATE SET text = excluded.text RETURNING id",
+                                        kDictTable));
+            if (!stmt_)
+                return std::nullopt;
         }
         sqlite3_reset(stmt_.get());
         sqlite3_clear_bindings(stmt_.get());
         bind_text(stmt_.get(), 1, text);
-        if (sqlite3_step(stmt_.get()) != SQLITE_ROW)
-            return fail_sql(h, "dictionary intern failed");
-        id = sqlite3_column_int64(stmt_.get(), 0);
-        if (sqlite3_step(stmt_.get()) != SQLITE_DONE)
-            return fail_sql(h, "dictionary intern failed");
+        if (sqlite3_step(stmt_.get()) != SQLITE_ROW) {
+            fail_sql(h, "dictionary intern failed");
+            return std::nullopt;
+        }
+        const int64_t id = sqlite3_column_int64(stmt_.get(), 0);
+        if (sqlite3_step(stmt_.get()) != SQLITE_DONE) {
+            fail_sql(h, "dictionary intern failed");
+            return std::nullopt;
+        }
         staged_.emplace(text, id);
-        return true;
+        return id;
     }
 
     std::unordered_map<std::string, int64_t>& staged() { return staged_; }
@@ -137,17 +141,19 @@ void publish(std::unordered_map<std::string, int64_t>& cache,
         cache.emplace(text, id);
 }
 
-// Upsert every tier of the accumulator. Counts RETURNING rows into `touched`.
-bool upsert_tiers(TransactionHandle& h, const FoldSourceDef& def, const TierAccumulator& acc,
-                  Interner& in, std::size_t& touched) {
+// Upsert every tier of the accumulator. The RETURNING row count summed over the
+// tiers, or nullopt with the handle poisoned.
+std::optional<std::size_t> upsert_tiers(TransactionHandle& h, const FoldSourceDef& def,
+                                        const TierAccumulator& acc, Interner& in) {
     const auto& key_cols = acc.key_columns();
+    std::size_t touched = 0;
     for (auto tier : def.tiers) {
         const auto rows = acc.rows(tier);
         if (rows.empty())
             continue;
-        StmtPtr st;
-        if (!prep(h, st, tier_upsert_sql(def, tier)))
-            return false;
+        const StmtPtr st = prep(h, tier_upsert_sql(def, tier));
+        if (!st)
+            return std::nullopt;
         for (const auto& row : rows) {
             sqlite3_reset(st.get());
             sqlite3_clear_bindings(st.get());
@@ -155,32 +161,34 @@ bool upsert_tiers(TransactionHandle& h, const FoldSourceDef& def, const TierAccu
             sqlite3_bind_int64(st.get(), idx++, row.bucket);
             for (std::size_t k = 0; k < key_cols.size(); ++k) {
                 if (key_cols[k].interned) {
-                    int64_t id = 0;
-                    if (!in.intern(h, std::get<std::string>(row.keys[k]), id))
-                        return false;
-                    sqlite3_bind_int64(st.get(), idx++, id);
+                    const auto id = in.intern(h, std::get<std::string>(row.keys[k]));
+                    if (!id)
+                        return std::nullopt;
+                    sqlite3_bind_int64(st.get(), idx++, *id);
                 } else {
                     bind_value(st.get(), idx++, row.keys[k]);
                 }
             }
             for (const auto& m : row.measures)
                 bind_value(st.get(), idx++, m);
-            if (!run(h, st.get(), &touched))
-                return false;
+            const auto n = run(h, st.get());
+            if (!n)
+                return std::nullopt;
+            touched += *n;
         }
     }
-    return true;
+    return touched;
 }
 
 // Prepare `sql`, bind `args` in order, step to completion. Statements with no result rows.
 bool exec_bound(TransactionHandle& h, const std::string& sql, std::initializer_list<Value> args) {
-    StmtPtr st;
-    if (!prep(h, st, sql))
+    const StmtPtr st = prep(h, sql);
+    if (!st)
         return false;
     int i = 1;
     for (const auto& a : args)
         bind_value(st.get(), i++, a);
-    return run(h, st.get());
+    return run(h, st.get()).has_value();
 }
 
 // echo_cursor UPSERT (same SQL as the raw-store cursor commit).
@@ -253,10 +261,10 @@ std::expected<void, std::string> EchoFold::install_fold_schema(EchoDatabase& db)
     const auto r = db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
         // A view cannot take the name of an existing table, and CREATE VIEW IF NOT
         // EXISTS would then silently do nothing: drop the legacy table first.
-        // DESTRUCTIVE; no production caller exists in this change.
+        // DESTRUCTIVE; this method has no production caller.
         for (const auto& name : fold_view_names()) {
-            StmtPtr st;
-            if (!prep(h, st, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?"))
+            StmtPtr st = prep(h, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?");
+            if (!st)
                 return std::unexpected(h.error());
             bind_text(st.get(), 1, name);
             const int rc = sqlite3_step(st.get());
@@ -292,8 +300,10 @@ EchoFold::fold_rows(EchoDatabase& db, std::string_view source, const TierAccumul
     Interner in(cache_);
     std::size_t touched = 0;
     const auto r = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
-        if (!upsert_tiers(h, *def, acc, in, touched))
+        const auto n = upsert_tiers(h, *def, acc, in);
+        if (!n)
             return std::unexpected(h.error());
+        touched = *n;
         if (state && !write_state(h, *state))
             return std::unexpected(h.error());
         if (acc.rejected() > 0 && !bump_rejected(h, acc.rejected()))
@@ -330,7 +340,7 @@ EchoFold::fold_cursor_rows(EchoDatabase& db, std::string_view source,
     const FoldSourceDef* def = fold_source(source);
     if (!def || def->own_tables || !def->cursor_source)
         return std::unexpected(
-            CursorFoldError{Kind::Transient, std::format("'{}' is not a cursor source", source)});
+            CursorFoldError{Kind::Misuse, std::format("'{}' is not a cursor source", source)});
 
     // An unrepresentable stamp drops only that contribution: it is not folded and not
     // entered in the ring (its batch commit advances the cursor, so it is never
@@ -355,12 +365,14 @@ EchoFold::fold_cursor_rows(EchoDatabase& db, std::string_view source,
     bool collided = false;
     const auto r = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
         res.folded = res.replayed = res.rows_touched = 0;
-        StmtPtr max_seq, ins, dup;
-        if (!prep(h, max_seq, "SELECT COALESCE(MAX(seq), 0) FROM echo_fold_seen WHERE source = ?") ||
-            !prep(h, ins,
-                  "INSERT OR IGNORE INTO echo_fold_seen (source, record_key, digest, seq) "
-                  "VALUES (?, ?, ?, ?) RETURNING record_key") ||
-            !prep(h, dup, "SELECT digest FROM echo_fold_seen WHERE source = ? AND record_key = ?"))
+        // Once one prepare fails the handle is poisoned and the rest return null too.
+        const StmtPtr max_seq =
+            prep(h, "SELECT COALESCE(MAX(seq), 0) FROM echo_fold_seen WHERE source = ?");
+        const StmtPtr ins = prep(h, "INSERT OR IGNORE INTO echo_fold_seen (source, record_key, "
+                                    "digest, seq) VALUES (?, ?, ?, ?) RETURNING record_key");
+        const StmtPtr dup =
+            prep(h, "SELECT digest FROM echo_fold_seen WHERE source = ? AND record_key = ?");
+        if (!max_seq || !ins || !dup)
             return std::unexpected(h.error());
 
         bind_text(max_seq.get(), 1, source);
@@ -422,13 +434,16 @@ EchoFold::fold_cursor_rows(EchoDatabase& db, std::string_view source,
             return std::unexpected(h.error());
         }
 
-        if (!upsert_tiers(h, *def, acc, in, res.rows_touched))
+        const auto touched = upsert_tiers(h, *def, acc, in);
+        if (!touched)
             return std::unexpected(h.error());
+        res.rows_touched = *touched;
 
         // Keep the newest kReplayRingDepth keys of this source.
         if (seq > static_cast<int64_t>(kReplayRingDepth)) {
-            StmtPtr prune;
-            if (!prep(h, prune, "DELETE FROM echo_fold_seen WHERE source = ? AND seq <= ?"))
+            const StmtPtr prune =
+                prep(h, "DELETE FROM echo_fold_seen WHERE source = ? AND seq <= ?");
+            if (!prune)
                 return std::unexpected(h.error());
             bind_text(prune.get(), 1, source);
             sqlite3_bind_int64(prune.get(), 2, seq - static_cast<int64_t>(kReplayRingDepth));
@@ -468,8 +483,8 @@ std::expected<GcResult, std::string> EchoFold::gc_dictionary(EchoDatabase& db,
         bool interrupted = false;
         const auto r = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
             GcProgress guard(h.raw(), [this, deadline] { return now() >= deadline; });
-            StmtPtr st;
-            if (!prep(h, st, sql))
+            const StmtPtr st = prep(h, sql);
+            if (!st)
                 return std::unexpected(h.error());
             int rc = SQLITE_OK;
             while ((rc = sqlite3_step(st.get())) == SQLITE_ROW)

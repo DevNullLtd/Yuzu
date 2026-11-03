@@ -84,8 +84,10 @@ The schema registry (`echo_schema_registry.cpp`) is the single source of
 truth for table shape, retention behavior, rollup SQL, and per-OS
 support metadata. Adding a new capture source means: append to
 `build_sources()`, populate `os_support`, write the collector, write
-the diff, wire the typed insert, write tests. No DDL, no rollup
-plumbing edits.
+the diff, wire the typed insert, write tests, and declare the source's
+roll-up columns (a `FoldSourceDef` in `echo_fold_schema.cpp`, a `*_delta` in
+`echo_fold.hpp` and their test pins, section 3.1). The roll-up DDL is generated
+from that declaration.
 
 ---
 
@@ -123,15 +125,16 @@ PR M14, but `kCreateSchema` kept recreating it on every open — v5 stops that a
 drops it from already-migrated databases, #2093). Bumps go in the same
 function, never in `applies_*` collectors.
 
-### 3.1 Roll-up-only storage model (substrate staged, switch-over in the next change)
+### 3.1 Roll-up-only storage model (substrate staged, not wired)
 
 **Roll-up is the only model.** The recorded design ruling is: "roll-up mode should be the only way
 of operating for echo at all, I don't want this as a configurable thing, it's the only method of
 operation." So there is no config key, flag, mode switch, environment variable or runtime toggle
 between raw capture rows and roll-ups, and none is to be added. The code in this section is
-staged: it is built and tested, but `EchoDatabase::open()`, the collectors, the aggregator and
-every setting are untouched, so nothing opens, writes or reads it yet. The next change flips the
-registry onto it for good.
+staged: it is built and tested, but nothing opens, writes or reads it. `EchoDatabase::open()`
+changes only by forcing the two read-surface allowlists (`is_fold_view`,
+`is_fold_internal_table`) to initialise; the collectors, the aggregator and every setting do not
+reference it.
 
 **Where it lives.** `echo_fold_schema.{hpp,cpp}` declare the 17 sources' tier columns and
 generate the DDL; `echo_fold.{hpp,cpp}` hold the pure fold core (bucket math, `TierAccumulator`,
@@ -143,26 +146,33 @@ the 17 `*_delta` functions) and the `EchoFold` writer. Per-column `role`, `merge
 - `<src>_<tier>_r` is the physical table: bucket column (`hour_ts` / `day_ts` / `month_ts`), keys,
   merged measures and `VIRTUAL` generated `*_avg` columns. ONE unique index
   `<src>_<tier>_r_uq (bucket, keys...)` is both the UPSERT target and the bucket index retention
-  and the byte budget use.
-- `<src>_<tier>` is a view with today's column names, today's order first and new columns after.
-  A text key resolves through a correlated dictionary lookup, not a `JOIN`: SQLite reports an
-  unselected join table as a column-less top-level read, which the operator-SQL authorizer cannot
-  tell from a direct dictionary read. `usage` keeps its own tables and has no roll-up DDL.
-- The starred enrichment columns are declared now and written as 0 / empty until a producer fills
-  them, so the switch-over needs no second schema change.
+  uses.
+- `<src>_<tier>` is a view carrying the registry tier's existing column names in their existing
+  order first, then the new columns. A text key resolves through a correlated dictionary lookup,
+  not a `JOIN`: SQLite reports an unselected join table as a column-less top-level read, which the
+  operator-SQL authorizer cannot tell from a direct dictionary read. `usage` keeps its own tables
+  and has no roll-up DDL.
+- The enrichment columns are those a source's `*_delta` leaves unnamed: they are written as 0 /
+  empty and are carried by the tier, so a tier is declared once.
 
 **Merge.** `kSum` adds, `kMax` / `kMin` keep the extreme, `kLast` takes the incoming value only if
 its guard column (`last_ts`, ...) is >= the stored one, so a late older event never overwrites a
-newer one (a tie takes the later arrival). Averages are `*_sum` plus `samples`; the `*_avg` names
-are generated, so consumers keep their columns and every average is an exact weighted mean.
+newer one (a tie takes the later arrival). A `kMin` column (`rtt_us_min`, `min_run_s`) is written
+on every event: the INSERT carries the value, so its `NOT NULL DEFAULT 0` never enters a `MIN()`;
+only a delta that writes a placeholder 0 holds the minimum at 0 (the `netqual` delta does for
+`rtt_us_min`). Averages are `*_sum` plus `samples`; the `*_avg` names are generated, so consumers
+keep their columns and every average is an exact weighted mean.
 
 **Cursor sources.** `power`, `removable` and `registry` fold through `fold_cursor_rows`, with a
 durable per-source ring (`echo_fold_seen`, newest 4096 keys). A key already in the ring is a replay
 when its 64-bit digest matches (not folded, cursor still advances) and a permanent key collision
-when it does not (everything rolls back). The digest covers exactly what the raw store compared:
-the record minus `snapshot_id`, minus `ts` for a `capture_gap` (and `present_at_baseline` for
-removable), and for `registry` minus `actor_pid`, `actor_image` and `detail`. An empty or
-NUL-bearing `record_key` refuses the batch.
+when it does not (everything rolls back). The digest covers exactly what the raw store compares to
+recognise a replay, never `snapshot_id`: `power` is the action, detail and `ts` (no `ts` for a
+`capture_gap`); `removable` is its stored payload plus `ts` (no `ts` for `capture_gap` or
+`present_at_baseline`); `registry` is the action plus, unless it is a `capture_gap`, hive, key
+path, value name, data type, data, data size, the previous type, data and size, and `observed_at`
+-- never `ts`, `actor_pid`, `actor_image` or `detail`. An empty or NUL-bearing `record_key`
+refuses the batch.
 
 **Event times are trusted as given.** A bucket comes from the event's own UTC stamp: no clamp, no
 counter. Accepted residual: a stamp inside the representable domain but far in the future makes a
@@ -170,7 +180,7 @@ bucket only age-based eviction removes. The one refusal is a stamp outside 0001-
 9999-12-31 UTC, which no calendar can bucket: that single event is rejected and the rest of its
 batch folds. Rejections are counted in `echo_config` `fold_rejected_events_total`, in the same
 transaction as the fold (a rollback leaves it unchanged), and logged once per batch with the first
-offending stamp only. The counter is not yet in `echo.status`.
+offending stamp only. `echo.status` does not report the counter.
 
 **One lock, one order.** `EchoFold` holds a single `op_mu_` across every fold, GC, cache read and
 cache publication; lock order is `op_mu_` then `EchoDatabase::mu_`. New strings are interned
@@ -189,17 +199,19 @@ roll-up view (plus a column-less `COUNT(*)`-style read of a `_r` table, which ex
 count the view already shows, and only while every view is a WHERE-less single-table projection,
 which the DDL test pins). That rule is sound only because `validate_and_translate_sql` refuses
 `WITH`: SQLite reports a CTE's reads under the CTE's name, so a CTE named after a view would
-otherwise reach the dictionary. The same validator refuses `NATURAL` and `USING` joins: SQLite
-resolves their shared columns before name resolution, so those reads never reach the authorizer
-at all (`echo_dict a NATURAL JOIN echo_dict b` counts the dictionary; a view joined `USING` to a
-usage table is a per-user presence oracle); both are observed by test on the shipped SQLite, and
-`ON` joins carry every read through the authorizer. The authorizer rule is defence in depth
-behind those refusals, not the closure. Direct reads of `echo_dict`, `echo_fold_seen` and any
-`_r` table, and the `usage_*` tables, stay denied.
+otherwise reach the dictionary. The validator's keyword check runs on the literal-, comment- and
+quoted-identifier-stripped query, using the same scan that translates `$` names, so a `--`, `/*`
+or `'` inside a `"..."`, `` `...` `` or `[...]` identifier cannot hide a keyword that follows it.
+The same validator refuses `NATURAL` and `USING` joins: SQLite resolves their shared columns
+before name resolution, so those reads never reach the authorizer at all (`echo_dict a NATURAL
+JOIN echo_dict b` counts the dictionary; a view joined `USING` to a usage table is a per-user
+presence oracle); both are observed by test on the shipped SQLite, and `ON` joins carry every read
+through the authorizer. The authorizer rule is defence in depth behind those refusals, not the
+closure. Direct reads of `echo_dict`, `echo_fold_seen` and any `_r` table, and the `usage_*`
+tables, stay denied.
 
 **`install_fold_schema` is destructive.** A view cannot take the name of an existing table, so it
-drops a legacy tier table first. It exists as the migration precursor and has no production caller
-in this change.
+drops a legacy tier table first. It has no production caller.
 
 ---
 
@@ -354,8 +366,9 @@ Routine debugging entry points:
 
 For new-source bring-up, the smallest viable change is: add a
 `CaptureSourceDef` to `build_sources()`, write the platform collectors
-+ enumeration function, write the diff, write tests. No DDL, no
-rollup, no plumbing changes — the registry is the contract.
++ enumeration function, write the diff, write tests, and add the source's
+`FoldSourceDef`, `*_delta` and test pins (section 3.1). The roll-up DDL is
+generated from the declaration.
 
 ## 8. Adding a capture source
 

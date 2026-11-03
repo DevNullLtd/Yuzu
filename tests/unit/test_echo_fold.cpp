@@ -28,6 +28,8 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <latch>
 #include <limits>
 #include <map>
 #include <memory>
@@ -51,13 +53,27 @@ constexpr int64_t kHi = 253402300799LL;
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
-struct Mem {
-    sqlite3* db{nullptr};
-    Mem() { REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK); }
-    ~Mem() { sqlite3_close(db); }
-    Mem(const Mem&) = delete;
-    Mem& operator=(const Mem&) = delete;
+// A raw :memory: handle for DDL-only cases. The owner closes it on scope exit, so a fatal
+// REQUIRE after the open cannot leak it.
+using Mem = yuzu::test::SqliteHandleOwner<sqlite3>;
+
+void open_mem(Mem& m) {
+    REQUIRE(sqlite3_open(":memory:", &m.db) == SQLITE_OK);
+}
+
+// A prepared statement that is finalised on every exit, including a fatal REQUIRE.
+struct StmtFinalizer {
+    void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
 };
+using Stmt = std::unique_ptr<sqlite3_stmt, StmtFinalizer>;
+
+Stmt prepare(sqlite3* db, const std::string& sql) {
+    sqlite3_stmt* raw = nullptr;
+    const int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &raw, nullptr);
+    Stmt st{raw};
+    REQUIRE(rc == SQLITE_OK);
+    return st;
+}
 
 bool exec(sqlite3* db, const std::string& sql) {
     char* err = nullptr;
@@ -72,18 +88,16 @@ bool exec(sqlite3* db, const std::string& sql) {
 // All rows of `sql`, each cell as text ("NULL" for NULL).
 std::vector<std::vector<std::string>> rows(sqlite3* db, const std::string& sql) {
     std::vector<std::vector<std::string>> out;
-    sqlite3_stmt* st = nullptr;
-    REQUIRE(sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) == SQLITE_OK);
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    const Stmt st = prepare(db, sql);
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
         std::vector<std::string> r;
-        for (int i = 0; i < sqlite3_column_count(st); ++i) {
-            const auto* t = reinterpret_cast<const char*>(sqlite3_column_text(st, i));
-            r.emplace_back(t ? std::string(t, static_cast<size_t>(sqlite3_column_bytes(st, i)))
+        for (int i = 0; i < sqlite3_column_count(st.get()); ++i) {
+            const auto* t = reinterpret_cast<const char*>(sqlite3_column_text(st.get(), i));
+            r.emplace_back(t ? std::string(t, static_cast<size_t>(sqlite3_column_bytes(st.get(), i)))
                              : "NULL");
         }
         out.push_back(std::move(r));
     }
-    sqlite3_finalize(st);
     return out;
 }
 
@@ -206,7 +220,7 @@ std::string ks(const TierAccumulator& a, const TierRow& r, std::string_view n) {
     return to_str(*v);
 }
 
-// Every named measure of `r` is zero / empty (the starred enrichment columns).
+// Every named measure of `r` is zero / empty (the enrichment columns).
 void check_zero(const TierAccumulator& a, const TierRow& r, std::initializer_list<std::string_view> names) {
     for (auto n : names) {
         INFO("column " << n);
@@ -344,9 +358,9 @@ TEST_CASE("fold_sources: key and measure lists are the pinned contract", "[echo]
         std::string_view name;
         std::vector<std::string_view> keys, measures;
     };
-    // Transcribed from the design table. Keys keep TODAY's registry order where a tier
-    // exists today (so process keys read name, user, parent_name); measures list the
-    // generated *_avg columns where today's view order interleaves them.
+    // The contract. Keys keep the registry's existing order where the registry already
+    // declares the tier (so process keys read name, user, parent_name); measures list the
+    // generated *_avg columns where the existing view order interleaves them.
     const std::vector<Pin> pins = {
         {"process", {"name", "user", "parent_name"},
          {"start_count", "stop_count", "abnormal_exit_count", "elevated_count", "spoofed_parent_count"}},
@@ -415,6 +429,7 @@ TEST_CASE("fold_sources: key and measure lists are the pinned contract", "[echo]
 TEST_CASE("generate_fold_ddl: tables, indexes and views are exactly what the declarations say",
           "[echo][fold][schema]") {
     Mem m;
+    open_mem(m);
     REQUIRE(exec(m.db, generate_fold_ddl()));
     REQUIRE(exec(m.db, generate_fold_ddl())); // idempotent
 
@@ -472,9 +487,10 @@ TEST_CASE("generate_fold_ddl: tables, indexes and views are exactly what the dec
     }
 }
 
-TEST_CASE("generate_fold_ddl: every view keeps today's columns first, in order, with the same types",
+TEST_CASE("generate_fold_ddl: every view keeps the registry's columns first, in order, with the same types",
           "[echo][fold][schema]") {
     Mem m;
+    open_mem(m);
     REQUIRE(exec(m.db, generate_fold_ddl()));
     int checked = 0;
     for (const auto& src : capture_sources()) {
@@ -499,7 +515,7 @@ TEST_CASE("generate_fold_ddl: every view keeps today's columns first, in order, 
             ++checked;
         }
     }
-    CHECK(checked == 18); // every tier the registry has today
+    CHECK(checked == 18); // every tier the registry declares
 }
 
 TEST_CASE("is_fold_view, is_fold_internal_table and legacy_live_shim_names", "[echo][fold][schema]") {
@@ -570,6 +586,9 @@ TEST_CASE("TierAccumulator: merge ops, and kLast never lets an older event win",
 
     CHECK_THROWS_AS(a.add(kT0, {{"nope", vt("x")}}, {}), std::invalid_argument);
     CHECK_THROWS_AS(a.add(kT0, {{"k", vi(1)}}, {}), std::invalid_argument);
+    // Numeric typing is strict in both directions: no int <-> real conversion.
+    CHECK_THROWS_AS(a.add(kT0, {{"k", vt("x")}}, {{"n", vr(1.5)}}), std::invalid_argument); // INTEGER given a real
+    CHECK_THROWS_AS(a.add(kT0, {{"k", vt("x")}}, {{"r", vi(1)}}), std::invalid_argument);   // REAL given an int
 }
 
 TEST_CASE("tier_upsert_sql: pinned text, and it prepares against the generated schema",
@@ -598,6 +617,7 @@ TEST_CASE("tier_upsert_sql: pinned text, and it prepares against the generated s
           std::string::npos);
 
     Mem m;
+    open_mem(m);
     REQUIRE(exec(m.db, generate_fold_ddl()));
     for (const auto& d : fold_sources()) {
         if (d.own_tables)
@@ -613,7 +633,7 @@ TEST_CASE("tier_upsert_sql: pinned text, and it prepares against the generated s
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// The 17 deltas (starred enrichment columns stay zero)
+// The 17 deltas (enrichment columns stay zero)
 // ═════════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("process_delta", "[echo][fold][delta]") {
@@ -861,6 +881,14 @@ TEST_CASE("netconn, mapdrive, perf, procperf and netqual deltas", "[echo][fold][
         CHECK(mi(acc, r, "read_lat_us_sum") == 18);
         CHECK(mi(acc, r, "read_lat_us_max") == 11);
         CHECK(mi(acc, r, "rx_bps_sum") == 2000);
+        CHECK(md(acc, r, "mem_sum") == 100);
+        CHECK(md(acc, r, "mem_max") == 50);
+        CHECK(md(acc, r, "commit_sum") == 60);
+        CHECK(mi(acc, r, "read_bps_sum") == 200);
+        CHECK(mi(acc, r, "write_bps_sum") == 400);
+        CHECK(mi(acc, r, "write_lat_us_sum") == 18);
+        CHECK(mi(acc, r, "write_lat_us_max") == 9);
+        CHECK(mi(acc, r, "tx_bps_sum") == 4000);
         check_zero(acc, r, {"cpu_kernel_sum", "rx_bps_max", "tx_bps_max", "procs_sum", "threads_sum", "handles_sum"});
     }
     {
@@ -881,6 +909,7 @@ TEST_CASE("netconn, mapdrive, perf, procperf and netqual deltas", "[echo][fold][
         CHECK(mi(acc, r, "samples") == 2);
         CHECK(mi(acc, r, "instances_max") == 5);
         CHECK(md(acc, r, "cpu_sum") == 25);
+        CHECK(md(acc, r, "cpu_max") == 12.5);
         CHECK(mi(acc, r, "ws_sum") == 12288);
         CHECK(mi(acc, r, "ws_max_bytes") == 8192);
         check_zero(acc, r, {"private_bytes_max", "handles_max", "threads_max", "io_read_bytes_sum", "io_write_bytes_sum"});
@@ -903,6 +932,7 @@ TEST_CASE("netconn, mapdrive, perf, procperf and netqual deltas", "[echo][fold][
         CHECK(mi(acc, r, "samples") == 2);
         CHECK(mi(acc, r, "rtt_us_sum") == 4000);
         CHECK(mi(acc, r, "rtt_us_max") == 3000);
+        CHECK(mi(acc, r, "rtt_var_us_sum") == 100);
         CHECK(mi(acc, r, "lost_sum") == 4);
         CHECK(mi(acc, r, "lost_max") == 4);
         CHECK(mi(acc, r, "degraded_samples") == 1);
@@ -1025,6 +1055,45 @@ TEST_CASE("identity_digest: deterministic, and covers exactly the fields the raw
     CHECK(registry_delta({r})[0].identity_digest == registry_delta({s})[0].identity_digest);
     s.data = "changed";
     CHECK(registry_delta({r})[0].identity_digest != registry_delta({s})[0].identity_digest);
+
+    // removable: every stored field is identity; `ts` is too, except for capture_gap and
+    // present_at_baseline, where it is only when we noticed; snapshot_id never is.
+    RemovableEvent m;
+    m.ts = kT0;
+    m.snapshot_id = 1;
+    m.action = "attached";
+    m.device_key = "usb1";
+    m.vendor = "V";
+    m.serial = "S";
+    m.record_key = "mk";
+    const auto digest_of = [](const RemovableEvent& e) { return removable_delta({e})[0].identity_digest; };
+    RemovableEvent n = m;
+    n.snapshot_id = 99;
+    CHECK(digest_of(m) == digest_of(n));
+    n = m;
+    n.ts = kT0 + 1;
+    CHECK(digest_of(m) != digest_of(n)); // a real attach: ts is identity
+    for (const char* special : {"capture_gap", "present_at_baseline"}) {
+        INFO("action " << special);
+        m.action = n.action = special;
+        n.ts = kT0 + 1;
+        CHECK(digest_of(m) == digest_of(n));
+    }
+    m.action = "attached";
+    const std::vector<std::function<void(RemovableEvent&)>> edits = {
+        [](RemovableEvent& e) { e.action = "detached"; },  [](RemovableEvent& e) { e.device_key = "usb2"; },
+        [](RemovableEvent& e) { e.vendor = "W"; },         [](RemovableEvent& e) { e.product = "P"; },
+        [](RemovableEvent& e) { e.serial = "T"; },         [](RemovableEvent& e) { e.bus = "usb"; },
+        [](RemovableEvent& e) { e.volume = "E:"; },        [](RemovableEvent& e) { e.size_bytes = 5; },
+        [](RemovableEvent& e) { e.image_path = "x.exe"; }, [](RemovableEvent& e) { e.pid = 4; },
+        [](RemovableEvent& e) { e.evidence = "ev"; },
+    };
+    for (std::size_t i = 0; i < edits.size(); ++i) {
+        INFO("edit " << i);
+        n = m;
+        edits[i](n);
+        CHECK(digest_of(m) != digest_of(n));
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1100,7 +1169,9 @@ TEST_CASE("fold_rows: perf averages are exact weighted means across separate fol
 TEST_CASE("fold_rows: a failing statement rolls rows, dictionary, state and counter back together",
           "[echo][fold][writer]") {
     auto f = make_fold_db();
-    REQUIRE(f->db.execute_sql("DROP TABLE process_daily_r"));
+    // The daily upsert fails after the hourly one succeeded and its strings were interned.
+    REQUIRE(f->db.execute_sql("CREATE TRIGGER fold_fail BEFORE INSERT ON process_daily_r "
+                              "BEGIN SELECT RAISE(ABORT, 'forced'); END"));
     auto acc = make_acc("process");
     process_delta({pev(kT0, "started", "a.exe"), pev(std::numeric_limits<int64_t>::max(), "started", "x.exe")}, acc);
     REQUIRE(acc.rejected() == 1);
@@ -1111,12 +1182,16 @@ TEST_CASE("fold_rows: a failing statement rolls rows, dictionary, state and coun
     CHECK_FALSE(f->db.try_get_state("process").value().has_value());
     CHECK_FALSE(f->db.try_get_config(std::string{kFoldRejectedCounterKey}).value().has_value()); // unchanged
 
-    // Re-install, fold again: ids are interned afresh, nothing stale in the cache.
-    REQUIRE(f->fold.install_fold_schema(f->db).has_value());
+    // Clear the cause and fold again through the SAME EchoFold: no reinstall, so nothing but the
+    // rollback itself keeps the id cache clean. A cache that learned the rolled-back ids would
+    // bind them here and leave dangling references.
+    REQUIRE(f->db.execute_sql("DROP TRIGGER fold_fail"));
     const auto ok = f->fold.fold_rows(f->db, "process", acc, StateWrite{"process", "{\"v\":1}"});
     REQUIRE(ok.has_value());
     CHECK(integrity_violations(*f) == 0);
+    CHECK(f->n("SELECT COUNT(*) FROM process_hourly WHERE name = 'a.exe' AND user = 'u' AND start_count = 1") == 1);
     CHECK(f->db.try_get_state("process").value() == "{\"v\":1}");
+    CHECK(f->db.try_get_config(std::string{kFoldRejectedCounterKey}).value() == std::optional<std::string>{"1"});
 }
 
 TEST_CASE("fold_rows: an unrepresentable stamp rejects that event, counts it, keeps the batch",
@@ -1233,7 +1308,13 @@ TEST_CASE("fold_cursor_rows: an empty or NUL record_key refuses the batch with n
     CHECK_FALSE(f->db.get_cursor("power").value().has_value());
     CHECK_FALSE(f->db.try_get_state("s").value().has_value());
     CHECK(f->n("SELECT COUNT(*) FROM power_hourly_r") == 0);
-    CHECK_FALSE(f->fold.fold_cursor_rows(f->db, "process", {}, "c", {}).has_value()); // not a cursor source
+    // Not a cursor source, or not a source at all: a programming error, never a retryable failure.
+    for (const char* source : {"process", "usage", "nope"}) {
+        INFO("source " << source);
+        const auto misuse = f->fold.fold_cursor_rows(f->db, source, {}, "c", {});
+        REQUIRE_FALSE(misuse.has_value());
+        CHECK(misuse.error().kind == CursorFoldError::Kind::Misuse);
+    }
 }
 
 TEST_CASE("fold_cursor_rows: a bad stamp drops only that contribution, the cursor still advances",
@@ -1261,6 +1342,58 @@ TEST_CASE("fold_cursor_rows: a bad stamp drops only that contribution, the curso
     CHECK(f->db.try_get_config(std::string{kFoldRejectedCounterKey}).value() == std::optional<std::string>{"1"});
 }
 
+TEST_CASE("fold_cursor_rows: a batch whose every stamp is unrepresentable still advances the cursor",
+          "[echo][fold][cursor]") {
+    auto f = make_fold_db();
+    PowerEvent a;
+    a.ts = std::numeric_limits<int64_t>::min();
+    a.action = "sleep";
+    a.record_key = "x1";
+    PowerEvent b = a;
+    b.record_key = "x2";
+    const auto r = f->fold.fold_cursor_rows(f->db, "power", power_delta({a, b}), "cur", {StateWrite{"s", "B"}});
+    REQUIRE(r.has_value());
+    CHECK(r->rejected == 2);
+    CHECK(r->folded == 0);
+    CHECK(f->db.get_cursor("power").value() == std::optional<std::string>{"cur"});
+    CHECK(f->n("SELECT COUNT(*) FROM echo_fold_seen") == 0); // a dropped contribution is never in the ring
+    CHECK(f->db.try_get_config(std::string{kFoldRejectedCounterKey}).value() == std::optional<std::string>{"2"});
+    CHECK(f->db.try_get_state("s").value() == std::optional<std::string>{"B"});
+}
+
+TEST_CASE("fold_cursor_rows: a removable replay follows the digest's field set",
+          "[echo][fold][cursor]") {
+    auto f = make_fold_db();
+    // A capture_gap re-noticed later has a different ts, which is not identity for a gap: a replay.
+    RemovableEvent gap;
+    gap.ts = kT0;
+    gap.action = "capture_gap";
+    gap.record_key = "gap-1";
+    auto later = gap;
+    later.ts = kT0 + 60;
+    REQUIRE(f->fold.fold_cursor_rows(f->db, "removable", removable_delta({gap}), "c1", {}).has_value());
+    const auto replay = f->fold.fold_cursor_rows(f->db, "removable", removable_delta({later}), "c2", {});
+    REQUIRE(replay.has_value());
+    CHECK(replay->replayed == 1);
+    CHECK(replay->folded == 0);
+
+    // The same key with a different stored field is a different record: a collision.
+    RemovableEvent att;
+    att.ts = kT0;
+    att.action = "attached";
+    att.device_key = "usb1";
+    att.vendor = "V";
+    att.record_key = "att-1";
+    REQUIRE(f->fold.fold_cursor_rows(f->db, "removable", removable_delta({att}), "c3", {}).has_value());
+    auto other = att;
+    other.vendor = "W";
+    const auto collision = f->fold.fold_cursor_rows(f->db, "removable", removable_delta({other}), "c4", {});
+    REQUIRE_FALSE(collision.has_value());
+    CHECK(collision.error().kind == CursorFoldError::Kind::KeyCollision);
+    CHECK(f->n("SELECT SUM(event_count) FROM removable_hourly") == 2); // the gap and the attach only
+    CHECK(f->db.get_cursor("removable").value() == std::optional<std::string>{"c3"});
+}
+
 TEST_CASE("fold_cursor_rows: a failing statement rolls the cursor and the ring back together",
           "[echo][fold][cursor]") {
     auto f = make_fold_db();
@@ -1276,6 +1409,29 @@ TEST_CASE("fold_cursor_rows: a failing statement rolls the cursor and the ring b
     CHECK(f->n("SELECT COUNT(*) FROM power_hourly_r") == 0);
     CHECK_FALSE(f->db.get_cursor("power").value().has_value());
     CHECK_FALSE(f->db.try_get_state("s").value().has_value());
+}
+
+TEST_CASE("fold_cursor_rows: a rolled-back fold publishes nothing to the id cache", "[echo][fold][cursor]") {
+    auto f = make_fold_db();
+    REQUIRE(f->db.execute_sql("CREATE TRIGGER fold_fail BEFORE INSERT ON power_daily_r "
+                              "BEGIN SELECT RAISE(ABORT, 'forced'); END"));
+    PowerEvent e;
+    e.ts = kT0;
+    e.action = "sleep";
+    e.record_key = "k1";
+    const auto contrib = power_delta({e});
+    const auto failed = f->fold.fold_cursor_rows(f->db, "power", contrib, "cur", {StateWrite{"s", "x"}});
+    CHECK_FALSE(failed.has_value());
+    CHECK(f->n("SELECT COUNT(*) FROM echo_dict") == 0);
+    CHECK(f->n("SELECT COUNT(*) FROM echo_fold_seen") == 0);
+
+    // Same EchoFold, same cache, no reinstall and no GC in between: the retry must intern afresh.
+    REQUIRE(f->db.execute_sql("DROP TRIGGER fold_fail"));
+    const auto ok = f->fold.fold_cursor_rows(f->db, "power", contrib, "cur", {StateWrite{"s", "x"}});
+    REQUIRE(ok.has_value());
+    CHECK(ok->folded == 1);
+    CHECK(integrity_violations(*f) == 0);
+    CHECK(f->n("SELECT COUNT(*) FROM power_hourly WHERE action = 'sleep' AND event_count = 1") == 1);
 }
 
 TEST_CASE("fold_cursor_rows: the replay ring prunes to its depth, per source", "[echo][fold][cursor]") {
@@ -1402,6 +1558,7 @@ TEST_CASE("dictionary_gc_sql: one EXCEPT term per interned key column, inside SQ
     CHECK(found == terms);
     CHECK(terms < 500); // SQLITE_MAX_COMPOUND_SELECT
     Mem m;
+    open_mem(m);
     REQUIRE(exec(m.db, generate_fold_ddl()));
     sqlite3_stmt* st = nullptr;
     CHECK(sqlite3_prepare_v2(m.db, sql.c_str(), -1, &st, nullptr) == SQLITE_OK);
@@ -1412,10 +1569,22 @@ TEST_CASE("fold and GC serialise: no dangling dictionary id after concurrent use
           "[echo][fold][gc][concurrency]") {
     auto f = make_fold_db();
     REQUIRE(f->db.execute_sql("PRAGMA synchronous=OFF"));
+    // One batch folds BEFORE the threads start, so the dictionary already holds strings
+    // (seed_proc, seed_user) that nothing re-references: the maintainer's first pass orphans
+    // them and GC deletes them on every schedule.
+    {
+        auto seed = make_acc("process");
+        process_delta({pev(kT0, "started", "seed_proc", "seed_user")}, seed);
+        REQUIRE(f->fold.fold_rows(f->db, "process", seed).has_value());
+    }
+    constexpr int kMinPasses = 20;
+    std::latch start{2}; // both threads begin together
     std::atomic<bool> folding{true};
     std::atomic<int> fold_errors{0}, gc_errors{0};
+    std::atomic<int64_t> gc_deleted{0};
 
     std::thread folder([&] {
+        start.arrive_and_wait();
         for (int i = 0; i < 200; ++i) {
             TierAccumulator acc(*fold_source("process")); // no Catch2 assertions off the main thread
             process_delta({pev(kT0 + i, "started", ("proc_" + std::to_string(i % 16)).c_str(),
@@ -1427,12 +1596,19 @@ TEST_CASE("fold and GC serialise: no dangling dictionary id after concurrent use
         folding = false;
     });
     std::thread maintainer([&] {
-        while (folding) {
+        start.arrive_and_wait();
+        // A work loop, not a poll: every pass is a real retention-style DELETE then a real GC.
+        // At least kMinPasses passes run whatever the schedule, then it continues until the
+        // folder is done.
+        for (int pass = 0; pass < kMinPasses || folding; ++pass) {
             // Simulated retention (drops references), then GC (drops the orphans).
             for (const char* t : {"process_hourly_r", "process_daily_r", "process_monthly_r"})
                 if (!f->db.execute_sql(std::string("DELETE FROM ") + t))
                     ++gc_errors;
-            if (!f->fold.gc_dictionary(f->db, std::chrono::steady_clock::now() + kHour).has_value())
+            const auto g = f->fold.gc_dictionary(f->db, std::chrono::steady_clock::now() + kHour);
+            if (g.has_value())
+                gc_deleted += g->deleted;
+            else
                 ++gc_errors;
         }
     });
@@ -1441,6 +1617,7 @@ TEST_CASE("fold and GC serialise: no dangling dictionary id after concurrent use
 
     CHECK(fold_errors == 0);
     CHECK(gc_errors == 0);
+    CHECK(gc_deleted > 0); // GC really ran against live data: at least the seed strings went
     CHECK(integrity_violations(*f) == 0);
 
     // Positive control: the same check does see a dangling id.
@@ -1467,6 +1644,22 @@ std::expected<QueryResult, std::string> plugin_sql(EchoDatabase& db, const std::
         return std::unexpected(v.error());
     return db.execute_user_query(*v);
 }
+
+// `body` placed behind each way a quoted identifier can look like a comment or literal opener to
+// a scanner that does not know identifiers: SQLite reads "--" / `--` / [--] / "/*" / "a""--" as
+// ONE identifier token, so the code after it is live and the validator must see it.
+void check_refused_behind_quoted_identifiers(const std::string& body) {
+    std::vector<std::string> sqls;
+    for (const char* marker : {"\"--\"", "`--`", "[--]", "\"/*\"", "\"a\"\"--\""})
+        sqls.push_back(std::string("SELECT 1 AS ") + marker + ", " + body);
+    sqls.push_back("SELECT 1 AS \"'\", " + body + ", 2 AS \"'\""); // the body between two quote characters
+    for (const auto& sql : sqls) {
+        INFO(sql);
+        const auto v = validate_and_translate_sql(sql);
+        REQUIRE_FALSE(v.has_value());
+        CHECK(v.error().find("forbidden keyword") != std::string::npos);
+    }
+}
 } // namespace
 
 TEST_CASE("operator SQL reads the roll-up views, never the tables behind them", "[echo][fold][authorizer]") {
@@ -1479,7 +1672,7 @@ TEST_CASE("operator SQL reads the roll-up views, never the tables behind them", 
     REQUIRE(ok->rows.size() == 1);
     CHECK(ok->rows[0] == QueryRow{"a.exe", "u", "1"});
     CHECK(plugin_sql(f->db, "SELECT * FROM $Process_Daily").has_value()); // the $-name path
-    // A tier the registry does not have today is still allowed (a view, by name).
+    // A tier the registry does not declare is still allowed (a view, by name).
     CHECK(plugin_sql(f->db, "SELECT * FROM netqual_hourly").has_value());
     CHECK(plugin_sql(f->db, "SELECT 'with' AS w FROM process_hourly").has_value());
     // A partial projection and a COUNT(*) must work: they are the common queries.
@@ -1587,11 +1780,23 @@ TEST_CASE("operator SQL: NATURAL and USING joins never reach the dictionary or t
         REQUIRE_FALSE(v.has_value());
         CHECK(v.error().find("forbidden keyword") != std::string::npos);
     }
+    // The same joins behind a quoted identifier that holds a comment or quote marker.
+    check_refused_behind_quoted_identifiers("(SELECT count(*) FROM echo_dict a NATURAL JOIN echo_dict b)");
+    check_refused_behind_quoted_identifiers(
+        "(SELECT count(*) FROM user_daily NATURAL JOIN usage_daily_user WHERE user_daily.user = 'u')");
+    check_refused_behind_quoted_identifiers("(SELECT count(*) FROM echo_dict a JOIN echo_dict b USING (text))");
     // ON joins keep working, and identifiers or literals that merely contain the words
     // are not the keywords.
     CHECK(plugin_sql(f->db, "SELECT COUNT(*) FROM process_hourly p JOIN process_daily d ON d.name = p.name")
               .has_value());
     CHECK(plugin_sql(f->db, "SELECT name AS using_it, 'natural' AS n FROM process_hourly").has_value());
+    // Positive control: a quoted identifier that is exactly a keyword is a name, not the keyword.
+    for (const char* sql : {"SELECT name AS \"natural\" FROM process_hourly",
+                            "SELECT name AS [natural] FROM process_hourly",
+                            "SELECT name AS `using` FROM process_hourly"}) {
+        INFO(sql);
+        CHECK(plugin_sql(f->db, sql).has_value());
+    }
 }
 
 TEST_CASE("operator SQL: a CTE can never shadow a roll-up view name", "[echo][fold][authorizer]") {
@@ -1615,8 +1820,41 @@ TEST_CASE("operator SQL: a CTE can never shadow a roll-up view name", "[echo][fo
         CHECK(v.error().find("forbidden keyword") != std::string::npos);
     }
     CHECK_FALSE(validate_and_translate_sql("WITH x AS (SELECT 1) SELECT * FROM x").has_value());
+    // The same CTE behind a quoted identifier that holds a comment or quote marker.
+    check_refused_behind_quoted_identifiers(
+        "(WITH process_hourly AS (SELECT group_concat(text) AS t FROM echo_dict) SELECT t FROM process_hourly)");
+    // An unterminated quoting runs to the end of the input, as SQLite reads it, and SQLite then
+    // refuses to tokenise it: nothing executes.
+    CHECK_FALSE(plugin_sql(f->db, "SELECT 1 AS \"x, (WITH process_hourly AS (SELECT * FROM echo_dict) "
+                                  "SELECT * FROM process_hourly)")
+                    .has_value());
     // Identifiers that merely contain the word are not the keyword.
     CHECK(validate_and_translate_sql("SELECT name AS without_it FROM process_hourly").has_value());
+    // Positive control: a quoted identifier that is exactly the keyword is a name.
+    for (const char* sql : {"SELECT name AS \"with\" FROM process_hourly", "SELECT name AS [with] FROM process_hourly",
+                            "SELECT name AS `with` FROM process_hourly"}) {
+        INFO(sql);
+        CHECK(plugin_sql(f->db, sql).has_value());
+    }
+}
+
+TEST_CASE("validate_and_translate_sql: a quoted identifier is one token, for keywords and for $ names",
+          "[echo][fold][authorizer][sql]") {
+    // Quoted identifiers that merely contain a keyword or a comment or quote marker validate.
+    for (const char* sql : {"SELECT 1 AS \"with\"", "SELECT 1 AS `natural`", "SELECT 1 AS [using]",
+                            "SELECT 1 AS \"a--b\"", "SELECT 1 AS [a/*b]", "SELECT 1 AS \"it's\"",
+                            "SELECT 1 AS \"a\"\"--\""}) {
+        INFO(sql);
+        CHECK(validate_and_translate_sql(sql).has_value());
+    }
+    // A $name inside a quoted identifier is a name, translated only in code (as in a literal, #631).
+    const auto q = validate_and_translate_sql(
+        "SELECT 1 AS \"$Process_Hourly\", 2 AS [$Process_Daily], 3 AS `$Process_Hourly` FROM $Process_Hourly");
+    REQUIRE(q.has_value());
+    CHECK(q->find("\"$Process_Hourly\"") != std::string::npos);
+    CHECK(q->find("[$Process_Daily]") != std::string::npos);
+    CHECK(q->find("`$Process_Hourly`") != std::string::npos);
+    CHECK(q->ends_with(" FROM process_hourly"));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1628,7 +1866,10 @@ namespace {
 constexpr int64_t kStart = 1793361600; // 2026-10-30T12:00:00Z
 constexpr int64_t kOct1 = 1790812800;  // 2026-10-01T00:00:00Z
 constexpr int64_t kNov1 = 1793491200;  // 2026-11-01T00:00:00Z
-constexpr int64_t kStep = 300;         // the shared tick, seconds
+// The shared tick, seconds. 300 s (864 ticks over 72 h) rather than 60 s (4,320): five times
+// fewer transactions on a suite that already runs long, with the same hour, day and month
+// boundaries and the same late event exercised.
+constexpr int64_t kStep = 300;
 constexpr int64_t kTicks = 72 * 3600 / kStep;
 
 // The independent reducer's calendar: no bucket_start. The window starts after the epoch and

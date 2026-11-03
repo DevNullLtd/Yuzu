@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <format>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -35,26 +36,36 @@ namespace {
 constexpr int kEvents = 20'000;
 constexpr int64_t kBase = 1793615400; // 2026-11-02T10:30:00Z: every event shares one hour/day/month
 
+// A raw handle, closed on scope exit even when a REQUIRE fails after the open.
+using Conn = yuzu::test::SqliteHandleOwner<sqlite3>;
+
+void open_conn(Conn& c, const char* path, int flags) {
+    REQUIRE(sqlite3_open_v2(path, &c.db, flags, nullptr) == SQLITE_OK);
+}
+
+// A prepared statement that is finalised on every exit, including a fatal REQUIRE.
+struct StmtFinalizer {
+    void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
+};
+using Stmt = std::unique_ptr<sqlite3_stmt, StmtFinalizer>;
+
+Stmt prepare(sqlite3* db, const std::string& sql) {
+    sqlite3_stmt* raw = nullptr;
+    const int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &raw, nullptr);
+    Stmt st{raw};
+    REQUIRE(rc == SQLITE_OK);
+    return st;
+}
+
 int64_t pragma(sqlite3* db, const char* name) {
-    sqlite3_stmt* st = nullptr;
-    REQUIRE(sqlite3_prepare_v2(db, (std::string("PRAGMA ") + name).c_str(), -1, &st, nullptr) == SQLITE_OK);
-    REQUIRE(sqlite3_step(st) == SQLITE_ROW);
-    const int64_t v = sqlite3_column_int64(st, 0);
-    sqlite3_finalize(st);
-    return v;
+    const Stmt st = prepare(db, std::string("PRAGMA ") + name);
+    REQUIRE(sqlite3_step(st.get()) == SQLITE_ROW);
+    return sqlite3_column_int64(st.get(), 0);
 }
 
 int64_t used_bytes(sqlite3* db) {
     return (pragma(db, "page_count") - pragma(db, "freelist_count")) * pragma(db, "page_size");
 }
-
-struct Conn {
-    sqlite3* db{nullptr};
-    explicit Conn(const char* path, int flags) { REQUIRE(sqlite3_open_v2(path, &db, flags, nullptr) == SQLITE_OK); }
-    ~Conn() { sqlite3_close(db); }
-    Conn(const Conn&) = delete;
-    Conn& operator=(const Conn&) = delete;
-};
 
 void exec(sqlite3* db, const std::string& sql) {
     char* err = nullptr;
@@ -147,7 +158,8 @@ Sizes measure(const FoldSourceDef& def) {
     REQUIRE(fold.install_fold_schema(db).has_value());
     REQUIRE(db.execute_sql("PRAGMA synchronous=OFF"));
 
-    Conn reader(path.string().c_str(), SQLITE_OPEN_READONLY);
+    Conn reader;
+    open_conn(reader, path.string().c_str(), SQLITE_OPEN_READONLY);
     const int64_t before = used_bytes(reader.db);
 
     Built b = build(def);
@@ -169,20 +181,19 @@ Sizes measure(const FoldSourceDef& def) {
     const auto strings = db.execute_query("SELECT text FROM echo_dict ORDER BY id", kEvents * 8);
     REQUIRE(strings.has_value());
     if (!strings->rows.empty()) {
-        Conn mem(":memory:", SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+        Conn mem;
+        open_conn(mem, ":memory:", SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
         exec(mem.db, generate_fold_ddl());
         const int64_t base = used_bytes(mem.db);
         exec(mem.db, "BEGIN");
-        sqlite3_stmt* ins = nullptr;
-        REQUIRE(sqlite3_prepare_v2(mem.db, "INSERT INTO echo_dict(text) VALUES(?)", -1, &ins, nullptr) == SQLITE_OK);
+        const Stmt ins = prepare(mem.db, "INSERT INTO echo_dict(text) VALUES(?)");
         double text_len = 0;
         for (const auto& row : strings->rows) {
-            sqlite3_reset(ins);
-            sqlite3_bind_text(ins, 1, row[0].data(), static_cast<int>(row[0].size()), SQLITE_STATIC);
-            REQUIRE(sqlite3_step(ins) == SQLITE_DONE);
+            sqlite3_reset(ins.get());
+            sqlite3_bind_text(ins.get(), 1, row[0].data(), static_cast<int>(row[0].size()), SQLITE_STATIC);
+            REQUIRE(sqlite3_step(ins.get()) == SQLITE_DONE);
             text_len += static_cast<double>(row[0].size());
         }
-        sqlite3_finalize(ins);
         exec(mem.db, "COMMIT");
         dict_total = used_bytes(mem.db) - base;
         s.dict_bytes = static_cast<double>(dict_total) / static_cast<double>(strings->rows.size());
@@ -191,7 +202,8 @@ Sizes measure(const FoldSourceDef& def) {
     if (def.cursor_source) {
         const auto ring = db.execute_query("SELECT source, record_key, digest, seq FROM echo_fold_seen ORDER BY source, record_key", kEvents);
         REQUIRE(ring.has_value());
-        Conn mem(":memory:", SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+        Conn mem;
+        open_conn(mem, ":memory:", SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
         exec(mem.db, generate_fold_ddl());
         const int64_t base = used_bytes(mem.db);
         exec(mem.db, "BEGIN");
@@ -209,7 +221,7 @@ Sizes measure(const FoldSourceDef& def) {
 TEST_CASE("roll-up size: bytes per row stay under the pinned ceilings, for every fold source",
           "[echo][fold][fold_sizing]") {
     // Ceilings, bytes per row (table + unique index, all tiers). process, tcp, module, registry and
-    // perf are the design figures. The rest are the figure measured at 100,000 keys x 1.25 rounded
+    // perf have round ceilings fixed up front. The rest are the figure measured at 100,000 keys x 1.25 rounded
     // up to a multiple of 8. Both measurements sit beside each ceiling (at 100,000 keys, then at
     // the 20,000 this test folds; the per-row cost barely moves with the key count). All of them
     // depend on this fixture's small non-zero measures and its TEXT measure lengths
@@ -255,24 +267,22 @@ TEST_CASE("roll-up size: bytes per row stay under the pinned ceilings, for every
 
 TEST_CASE("roll-up size: a replay-ring row costs its key plus a small fixed overhead",
           "[echo][fold][fold_sizing]") {
-    Conn mem(":memory:", SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+    Conn mem;
+    open_conn(mem, ":memory:", SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
     exec(mem.db, generate_fold_ddl());
     const int64_t base = used_bytes(mem.db);
     exec(mem.db, "BEGIN");
-    sqlite3_stmt* ins = nullptr;
-    REQUIRE(sqlite3_prepare_v2(mem.db, "INSERT INTO echo_fold_seen(source, record_key, digest, seq) VALUES ('registry', ?, ?, ?)",
-                               -1, &ins, nullptr) == SQLITE_OK);
+    const Stmt ins = prepare(mem.db, "INSERT INTO echo_fold_seen(source, record_key, digest, seq) VALUES ('registry', ?, ?, ?)");
     double key_len = 0;
     for (int i = 0; i < static_cast<int>(kReplayRingDepth); ++i) {
         const std::string key = "HKLM|SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run|value" + padded(i, 6) + "|changed";
-        sqlite3_reset(ins);
-        sqlite3_bind_text(ins, 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
-        sqlite3_bind_int64(ins, 2, 0x5a5a5a5a5a5a5a5aLL + i);
-        sqlite3_bind_int64(ins, 3, i + 1);
-        REQUIRE(sqlite3_step(ins) == SQLITE_DONE);
+        sqlite3_reset(ins.get());
+        sqlite3_bind_text(ins.get(), 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_int64(ins.get(), 2, 0x5a5a5a5a5a5a5a5aLL + i);
+        sqlite3_bind_int64(ins.get(), 3, i + 1);
+        REQUIRE(sqlite3_step(ins.get()) == SQLITE_DONE);
         key_len += static_cast<double>(key.size());
     }
-    sqlite3_finalize(ins);
     exec(mem.db, "COMMIT");
     const double per_row = static_cast<double>(used_bytes(mem.db) - base) / static_cast<double>(kReplayRingDepth);
     WARN("ring: " << per_row << " B/row, mean key " << key_len / static_cast<double>(kReplayRingDepth));

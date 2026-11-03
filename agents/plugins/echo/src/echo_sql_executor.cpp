@@ -50,11 +50,15 @@ bool starts_with_ci(std::string_view s, std::string_view prefix) {
 }
 
 /// Scan `sql` left to right, invoking `on_code(begin, end)` for each maximal
-/// run of ordinary SQL and `on_skip(begin, end)` for each single-quoted string
-/// literal or comment (block or line). Both the keyword stripper and the $-name
-/// translator are built on this one scanner so they always agree on what is
-/// code vs. data — the root-cause fix for the validate-vs-execute divergence
-/// (#631). [begin, end) are byte offsets into `sql`.
+/// run of ordinary SQL and `on_skip(begin, end)` for each string literal
+/// ('...'), quoted identifier ("...", `...`, [...]) or comment (block or line).
+/// Both the keyword stripper and the $-name translator are built on this one
+/// scanner so they always agree on what is code vs. data -- the root-cause fix
+/// for the validate-vs-execute divergence (#631). A quoted identifier is a skip
+/// region because SQLite tokenizes it as one token: a `--`, `/*` or `'` inside
+/// it is part of the name, and reading it as a comment or literal would hide the
+/// code after it from the keyword check. An unterminated quoting runs to the end
+/// of the input, as SQLite reads it. [begin, end) are byte offsets into `sql`.
 template <class CodeFn, class SkipFn>
 void scan_sql(const std::string& sql, CodeFn on_code, SkipFn on_skip) {
     size_t i = 0;
@@ -64,15 +68,17 @@ void scan_sql(const std::string& sql, CodeFn on_code, SkipFn on_skip) {
             on_code(code_start, end);
     };
     while (i < sql.size()) {
-        // Single-quoted string literal
-        if (sql[i] == '\'') {
+        // String literal or quoted identifier. '...', "..." and `...` double their
+        // delimiter to escape it; [...] ends at the first ']' and has no escape.
+        if (sql[i] == '\'' || sql[i] == '"' || sql[i] == '`' || sql[i] == '[') {
             flush_code(i);
             size_t start = i;
+            const char close = sql[i] == '[' ? ']' : sql[i];
             ++i;
             while (i < sql.size()) {
-                if (sql[i] == '\'' && i + 1 < sql.size() && sql[i + 1] == '\'')
-                    i += 2; // escaped ''
-                else if (sql[i] == '\'') {
+                if (sql[i] == close && close != ']' && i + 1 < sql.size() && sql[i + 1] == close)
+                    i += 2; // escaped delimiter
+                else if (sql[i] == close) {
                     ++i;
                     break;
                 } else
@@ -108,8 +114,8 @@ void scan_sql(const std::string& sql, CodeFn on_code, SkipFn on_skip) {
     flush_code(sql.size());
 }
 
-/// Replace string literals and comments with a single space so keyword matching
-/// doesn't produce false positives on data values. (H7)
+/// Replace string literals, quoted identifiers and comments with a single space so
+/// keyword matching doesn't produce false positives on data values or names. (H7)
 std::string strip_literals_and_comments(const std::string& sql) {
     std::string out;
     out.reserve(sql.size());

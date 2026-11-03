@@ -3,13 +3,11 @@
  * generator and the read-surface allowlists. See echo_fold_schema.hpp.
  *
  * Roll-up is the ONLY storage model: raw capture rows are not kept, and no
- * setting, flag or mode selects between the two. This translation unit is
- * staged ahead of the switch-over; nothing opens, writes or reads these tables
- * yet.
+ * setting, flag or mode selects between the two. Nothing outside the fold writer
+ * and its tests opens, writes or reads these tables.
  *
- * Star marks below ("*") are enrichment columns declared now and written as
- * zero / empty until a producer fills them: the schema ships once, so the
- * switch-over needs no second migration to widen a tier.
+ * Enrichment columns are the ones a source's *_delta leaves unnamed: they are
+ * written as 0 / '' and are declared with the tier so a tier is declared once.
  */
 
 #include "echo_fold_schema.hpp"
@@ -45,7 +43,7 @@ constexpr ColumnDef g_avg(std::string_view n, std::string_view type, std::string
     return {n, type, R::kGenerated, M::kNone, false, expr};
 }
 
-// Average = sum / samples under today's declared type; 0 for an empty bucket.
+// Average = sum / samples under the column's declared type; 0 for an empty bucket.
 #define YUZU_FOLD_AVG(sum_col) "CASE WHEN samples>0 THEN " sum_col "*1.0/samples ELSE 0 END"
 
 constexpr std::string_view kH = "hourly";
@@ -54,8 +52,8 @@ constexpr std::string_view kM = "monthly";
 
 // ── The 17 declarations ─────────────────────────────────────────────────────
 //
-// Order inside `columns` is the VIEW order: today's columns first (where the
-// source has a tier in the registry today), new columns after.
+// Order inside `columns` is the VIEW order: the registry's existing columns first
+// (where the registry already declares the tier), new columns after.
 
 std::vector<FoldSourceDef> build_fold_sources() {
     std::vector<FoldSourceDef> s;
@@ -262,7 +260,7 @@ std::string generate_fold_ddl() {
             }
             d << "\n);\n";
 
-            // ONE unique index: the UPSERT target and the retention/budget bucket
+            // ONE unique index: the UPSERT target and the retention bucket
             // index (bucket first, so a bucket-ordered scan needs no second index).
             d << "CREATE UNIQUE INDEX IF NOT EXISTS " << table << "_uq ON " << table << "(" << bucket;
             for (const auto& c : def.columns)

@@ -6,8 +6,8 @@
  *
  * Roll-up is the ONLY storage model. There is no setting, flag, mode switch or
  * environment variable that selects between raw capture rows and roll-ups, and
- * none is to be added. This header is the substrate the switch-over builds on:
- * nothing opens, writes or reads these tables yet.
+ * none may be added. This header declares that storage; no collector, aggregator
+ * or action opens, writes or reads these tables.
  *
  * Shape (every fold source except `usage`, which keeps its own tables):
  *   echo_dict(id, text)              interned strings, one row per distinct text
@@ -15,18 +15,18 @@
  *                                    interned keys as <key>_id, merged measures,
  *                                    VIRTUAL generated *_avg columns, ONE unique
  *                                    index (bucket, keys...) that is the UPSERT
- *                                    target and the retention/budget bucket index
- *   <src>_<tier>                     a VIEW over the table: today's column names,
- *                                    today's order first, new columns after; text
- *                                    keys resolve through a correlated dictionary
+ *                                    target and the retention bucket index
+ *   <src>_<tier>                     a VIEW over the table: the registry tier's
+ *                                    existing column names in their existing order
+ *                                    first, then the new columns; text keys resolve
+ *                                    through a correlated dictionary
  *                                    lookup (see generate_fold_ddl for why not a JOIN)
  *   echo_fold_seen                   the replay ring of the cursor sources
  *
- * Column order in FoldSourceDef::columns is the view order. Where the source has
- * a tier in today's registry, today's columns come first and in today's order so
- * every consumer of the existing names keeps working; new columns follow. That
- * is why a key list can differ in order from the design table (for example
- * process keys read name, user, parent_name).
+ * Column order in FoldSourceDef::columns is the view order. Where the registry
+ * already declares the tier, its columns come first and in their registry order,
+ * so every consumer of the existing names keeps working; new columns follow. That
+ * is why process keys read name, user, parent_name.
  */
 
 #include "echo_schema_registry.hpp"
@@ -87,9 +87,9 @@ struct FoldSourceDef {
 /// column content.
 [[nodiscard]] bool is_fold_row_table(std::string_view name);
 
-/// The 16 `<src>_live` names the switch-over keeps as empty views so existing
-/// `$X_Live` reads return no rows instead of an error. `usage_live` is excluded:
-/// usage keeps its own tables.
+/// The 16 `<src>_live` names: the raw-row tables that roll-up does not keep,
+/// listed so a `$X_Live` read can be answered by an empty view instead of an
+/// error. `usage_live` is excluded: usage keeps its own tables.
 [[nodiscard]] std::vector<std::string> legacy_live_shim_names();
 
 } // namespace yuzu::echo

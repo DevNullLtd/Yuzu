@@ -6,9 +6,10 @@
  *
  * ROLL-UP IS THE ONLY STORAGE MODEL. Raw capture rows are not kept, and there is
  * no setting, flag, mode switch or environment variable that selects between the
- * two; none is to be added. This header is staged ahead of the switch-over:
- * nothing opens, writes or reads these tables yet (open(), the collectors, the
- * aggregator and every config surface are untouched).
+ * two; none may be added. This header is staged, not wired: no collector,
+ * aggregator, action or config surface opens, writes or reads these tables, and
+ * EchoDatabase::open() changes only by forcing the two read-surface allowlists
+ * (is_fold_view, is_fold_internal_table) to initialise.
  *
  * Two halves:
  *   - PURE CORE (this header, no I/O): bucket_start, Value, TierRow,
@@ -29,7 +30,7 @@
  * `fold_rejected_events_total` (kFoldRejectedCounterKey), added inside the same
  * transaction as the fold so a rollback leaves the counter unchanged, and
  * logged once per batch naming the first offending stamp only (never the
- * payload). Surfacing the counter in echo.status is a later change.
+ * payload). echo.status does not report the counter.
  *
  * kLast merge: the incoming value replaces the stored one iff its guard column
  * is >= the stored guard, so an older event never overwrites a newer one and two
@@ -129,7 +130,7 @@ struct TierRow {
 /// each measure's MergeOp. Pure: no I/O, no clock.
 ///
 /// A key or measure the caller does not name defaults to 0 / 0.0 / "" -- which is
-/// how enrichment columns that no producer fills yet stay at zero. A name that is
+/// how the enrichment columns (those a delta leaves unnamed) stay at zero. A name that is
 /// not a column of the source, or a value whose type is not its column's declared
 /// type, throws std::invalid_argument (a declaration typo, caught by the per-delta
 /// tests), never a silently dropped or converted value.
@@ -405,9 +406,8 @@ struct KeyedContribution {
 // ── The 13 snapshot-diff deltas ─────────────────────────────────────────────
 //
 // Each folds one batch of already-derived events into `acc`. Enrichment columns
-// (the starred ones in echo_fold_schema.cpp) that the event structs cannot yet
-// supply are left unnamed and so stay 0 / ''. An unrecognised action token is
-// ignored, never guessed at.
+// (the ones the event structs do not carry) are left unnamed and so stay 0 / ''.
+// An unrecognised action token is ignored, never guessed at.
 
 /// The measure `action` maps to in `table`, or nullptr for a token the delta does
 /// not know (the caller skips the event).
@@ -468,8 +468,9 @@ inline void module_delta(const std::vector<ModuleRow>& events, TierAccumulator& 
     }
 }
 
-// compute_service_events() emits exactly three tokens. Install/remove are new
-// columns; status_changes keeps today's meaning (state_changed only).
+// compute_service_events() emits exactly three tokens. status_changes counts
+// state_changed only, as the registry's existing service tier does; started and
+// stopped feed install_count and remove_count.
 inline void service_delta(const std::vector<ServiceEvent>& events, TierAccumulator& acc) {
     for (const auto& e : events) {
         const char* measure = pick(e.action, {{"started", "install_count"},
@@ -615,10 +616,13 @@ inline void netqual_delta(const std::vector<NetQualRow>& events, TierAccumulator
 // ── The 3 cursor-source deltas ──────────────────────────────────────────────
 //
 // Each returns one contribution per event. The digest covers exactly the fields
-// the raw store compared when it recognised a replay: the payload minus
-// snapshot_id, minus `ts` where `ts` is not identity, and (registry) minus the
-// attribution fields, because the registry key does not depend on attribution
-// and a replay may derive a different writer.
+// the raw store compares to recognise a replay: the payload minus snapshot_id,
+// minus `ts` where `ts` is not identity (power and removable capture_gap,
+// removable present_at_baseline), and for the registry source the action plus,
+// unless it is capture_gap, hive, key path, value name, data type / data / size,
+// the previous data type / data / size and observed_at -- never `ts` and never
+// the attribution fields (actor_pid, actor_image, detail), because the registry
+// key does not depend on attribution and a replay may derive a different writer.
 
 inline std::vector<KeyedContribution> power_delta(const std::vector<PowerEvent>& events) {
     std::vector<KeyedContribution> out;
@@ -688,8 +692,8 @@ inline std::vector<KeyedContribution> registry_delta(const std::vector<RegistryE
 
 /// A pure adapter over usage::fold_daily (echo_usage.hpp): the day-bucketed run
 /// totals map onto the usage daily tier's columns; distinct_users and the
-/// enrichment columns are 0 / ''. No second fold is implemented here -- usage's
-/// own writer is untouched, and the switch-over decides whether it consumes this.
+/// enrichment columns are 0 / ''. No second fold is implemented here: usage's own
+/// writer (echo_usage.cpp) is unchanged and does not call this.
 inline void usage_delta(const std::vector<usage::ClosedRun>& runs, TierAccumulator& acc) {
     for (const auto& d : usage::fold_daily(runs)) {
         acc.add(d.day_ts, {{"exe_key", vt(d.exe_key)}},
@@ -742,6 +746,7 @@ struct CursorFoldError {
         KeyCollision, ///< PERMANENT: an empty / NUL record_key, or a key already in the
                       ///< ring with a different digest. The same batch is re-derived and
                       ///< re-refused every tick; surface it, never retry indefinitely.
+        Misuse,       ///< PERMANENT: not a cursor source; a programming error, never retry.
     };
     Kind kind{Kind::Transient};
     std::string text;
@@ -763,9 +768,11 @@ struct GcResult {
  * The only code that touches SQLite on behalf of the fold. Owns the dictionary
  * cache and ONE operation mutex.
  *
- * LOCKING. `op_mu_` is held for the ENTIRE duration of every public method:
- * cache reads, the transaction, the post-commit cache publication and cache
- * invalidation. Lock order is op_mu_ THEN EchoDatabase::mu_ (taken inside
+ * LOCKING. `op_mu_` is held from before the first cache or database access to
+ * the method's return: cache reads, the transaction, the post-commit cache
+ * publication and cache invalidation. (fold_cursor_rows refuses a blank or NUL
+ * record_key before taking it, touching neither.) Lock order is op_mu_ THEN
+ * EchoDatabase::mu_ (taken inside
  * checked_transaction); nothing may ever take op_mu_ while holding mu_. There is
  * no second cache lock. ONE EchoFold instance must front a database: a second
  * instance would have its own cache and its own mutex and could race a GC.
@@ -779,7 +786,7 @@ struct GcResult {
  * (sqlite3_progress_handler) and is checked before each batch starts. It does
  * NOT cover mutex acquisition, BEGIN IMMEDIATE's busy wait (5 s), or COMMIT I/O.
  *
- * NOT wired into EchoDatabase::open(), the collectors or the aggregator.
+ * NOT called from EchoDatabase::open(), the collectors or the aggregator.
  */
 class EchoFold {
 public:
@@ -796,8 +803,8 @@ public:
     /// view in one transaction. A LEGACY TABLE whose name a view will take is
     /// dropped first (a view cannot be created over an existing table of the same
     /// name, and CREATE VIEW IF NOT EXISTS would then silently do nothing). That
-    /// drop is destructive: it exists as the migration precursor and has NO
-    /// production caller in this change. Clears the dictionary cache.
+    /// drop is destructive; this method has NO production caller. Clears the
+    /// dictionary cache.
     [[nodiscard]] std::expected<void, std::string> install_fold_schema(EchoDatabase& db);
 
     /// Fold a snapshot-diff source's accumulated batch (plus its optional baseline

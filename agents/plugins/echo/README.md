@@ -28,13 +28,12 @@ demand and local: `status`, `query`, `export` and `sql` read `echo.db`, `snapsho
 out-of-cycle collection, and `fleet_snapshot` re-enumerates processes and connections without
 touching `echo.db`.
 
-Storage model: roll-up is the only model Echo is built toward, and no setting, flag or mode selects
-between roll-ups and raw capture rows. The roll-up substrate (an interned string dictionary, one
-physical table per source and tier behind the existing tier view names, and a transactional fold
-writer in `echo_fold.cpp`) is in the plugin but is not yet opened, written or read by any
-collector or action, so the tables and reads described here are unchanged. `sql` refuses common
-table expressions (`WITH`) and `NATURAL` / `USING` joins (write joins with `ON`) and reads only
-through the tables and views the schema lists.
+Storage model: no setting, flag or mode selects between roll-ups and raw capture rows. The
+roll-up substrate (an interned string dictionary, one physical table per source and tier behind
+the existing tier view names, and a transactional fold writer in `echo_fold.cpp`) is in the plugin;
+no collector or action opens, writes or reads it, so the tables and reads described here are
+unchanged. `sql` refuses common table expressions (`WITH`) and `NATURAL` / `USING` joins (write
+joins with `ON`) and reads only through the tables and views the schema lists.
 
 Deliberately not: Echo does not stream events to the server in real time (everything lands in the
 local warehouse first and is pulled by a read action), it does not replay history from zero when a
@@ -831,5 +830,5 @@ three broken legs; it is one chokepoint. See Caveats item 1.
 - Capability rows: `server/core/src/capability_decls/core_dispatch_capabilities.hpp` · `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
 - Tests: `tests/test_echo_adoption_wiring_lexical.py` · `tests/test_echo_mapdrive_pin_lexical.py` · `tests/test_echo_timeline_script_behaviour.py` · `tests/unit/server/test_echo_process_tree.cpp` · `tests/unit/server/test_echo_rename_migration_pg.cpp` · `tests/unit/server/test_echo_retention_tiers.cpp` · `tests/unit/server/test_echo_timeline_page.cpp` · `tests/unit/server/test_echo_timeline_render.cpp` · `tests/unit/server/test_echo_tree_routes.cpp` · `tests/unit/test_echo_aggregator.cpp` · `tests/unit/test_echo_arp.cpp` · `tests/unit/test_echo_capability_table.cpp` · `tests/unit/test_echo_capture_status.cpp` · `tests/unit/test_echo_cursor.cpp` · `tests/unit/test_echo_diff.cpp` · `tests/unit/test_echo_fold.cpp` · `tests/unit/test_echo_fold_sizing.cpp` · `tests/unit/test_echo_local_dispatcher.cpp` · `tests/unit/test_echo_mapdrive.cpp` · `tests/unit/test_echo_module_etw.cpp` · `tests/unit/test_echo_module_stream.cpp` · `tests/unit/test_echo_netconn.cpp` · `tests/unit/test_echo_netqual_nstat.cpp` · `tests/unit/test_echo_perf.cpp` · `tests/unit/test_echo_power.cpp` · `tests/unit/test_echo_proc_es.cpp` · `tests/unit/test_echo_proc_etw.cpp` · `tests/unit/test_echo_proc_perf.cpp` · `tests/unit/test_echo_registry_source.cpp` · `tests/unit/test_echo_removable.cpp` · `tests/unit/test_echo_retention_tiers_table.cpp` · `tests/unit/test_echo_schema_registry.cpp` · `tests/unit/test_echo_service.cpp` · `tests/unit/test_echo_software.cpp` · `tests/unit/test_echo_source_health.cpp` · `tests/unit/test_echo_store.cpp` · `tests/unit/test_echo_usage.cpp` · `tests/unit/test_echo_warehouse.cpp` · `tests/unit/test_echo_win_raii_guards.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-11-02-echo-fold-substrate.added.md`
+- Changelog: `changelog.d/2026-11-02-echo-fold-substrate.added.md` · `changelog.d/2026-11-02-echo-fold-substrate.changed.md`
 <!-- END GENERATED -->
