@@ -457,6 +457,35 @@ TEST_CASE("instruction_yaml: line-ending and EOF edges", "[instruction_yaml]") {
         CHECK(f.plugin == "agent_actions");
         CHECK(f.action == "set_log_level");
     }
+    SECTION("two documents are refused whatever the line breaks (#2123 G2-SEC-F2)") {
+        // The multi-document guard must split lines the same way yaml_scan does:
+        // with lone-CR breaks the `---` separator used to go unseen, so doc 1
+        // saved and doc 2 was silently dropped.
+        const std::string lf = "apiVersion: yuzu.io/v1alpha1\n"
+                               "kind: InstructionDefinition\n"
+                               "metadata:\n"
+                               "  id: a.b\n"
+                               "spec:\n"
+                               "  plugin: p\n"
+                               "  action: a\n"
+                               "---\n"
+                               "apiVersion: yuzu.io/v1alpha1\n"
+                               "kind: InstructionDefinition\n"
+                               "metadata:\n"
+                               "  id: c.d\n"
+                               "spec:\n"
+                               "  plugin: q\n"
+                               "  action: b\n";
+        for (const std::string eol : {"\r\n", "\r"}) {
+            std::string doc;
+            for (char c : lf)
+                doc += (c == '\n') ? eol : std::string(1, c);
+            INFO("eol = " << (eol == "\r" ? "CR" : "CRLF"));
+            auto errors = validate_definition_yaml(doc);
+            REQUIRE_FALSE(errors.empty());
+            CHECK(errors.front().find("multiple documents") != std::string::npos);
+        }
+    }
     SECTION("comment line at column 0 inside spec, LF (#2123)") {
         auto f = parse_definition_yaml("metadata:\n"
                                        "  id: cmt.id\n"

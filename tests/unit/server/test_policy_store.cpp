@@ -530,29 +530,42 @@ TEST_CASE("PolicyStore: list extent never widens groups or drops tags (#2123)",
                              "fragment: " +
                              frag.value() + "\n";
 
-    SECTION("an outer list's item is not absorbed as a management group") {
+    SECTION("an outer list's item is refused, never absorbed as a management group") {
         auto result = store.create_policy(head + "spec:\n"
                                                  "  things:\n"
                                                  "    - name: a\n"
                                                  "      managementGroups:\n"
                                                  "        - g1\n"
                                                  "    - g2\n");
-        REQUIRE(result.has_value());
-        auto pol = store.get_policy(result.value());
-        REQUIRE(pol.has_value());
-        REQUIRE(pol->has_value());
-        for (const auto& g : (*pol)->management_groups)
-            CHECK(g != "g2");
+        // The outer item is kept raw by the scanner and refused as a group id:
+        // never stored as group `g2` (governance G3-QE-3: assert the outcome,
+        // not a loop that passes on an empty list).
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("is not a management group id") != std::string::npos);
     }
-    SECTION("comment text in a multi-line flow list never becomes a group") {
+    // An inline list that does not close on its key's line becomes one raw item.
+    // A management group id outside the scope-token charset is now refused, so a
+    // broken groups list is a 400, never a policy silently targeting nobody or
+    // overriding its selector (governance G4-UP-1, G4-UP-2, G3-ARCH-F1).
+    SECTION("comment text in a multi-line flow groups list is refused, never a group") {
         auto result =
             store.create_policy(head + "managementGroups: [g1,  # canary, prod-all,\n  g2]\n");
-        REQUIRE(result.has_value());
-        auto pol = store.get_policy(result.value());
-        REQUIRE(pol.has_value());
-        REQUIRE(pol->has_value());
-        for (const auto& g : (*pol)->management_groups)
-            CHECK(g != "prod-all");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("is not a management group id") != std::string::npos);
+    }
+    SECTION("a valid multi-line flow groups list is refused, not silently zero targets") {
+        auto result = store.create_policy(head + "managementGroups: [g1,\n  g2]\n");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("is not a management group id") != std::string::npos);
+    }
+    SECTION("an unterminated groups list never overrides a valid selector") {
+        auto result = store.create_policy(head + "scope:\n"
+                                                 "  selector:\n"
+                                                 "    platform: windows\n"
+                                                 "    tags: [prod]\n"
+                                                 "managementGroups: [g1");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("is not a management group id") != std::string::npos);
     }
     SECTION("an unterminated tags list is rejected, never stored without the tag") {
         auto result = store.create_policy(head + "scope:\n"
@@ -560,7 +573,63 @@ TEST_CASE("PolicyStore: list extent never widens groups or drops tags (#2123)",
                                                  "    platform: windows\n"
                                                  "    tags: [prod\n"
                                                  "other: [x]\n");
-        CHECK_FALSE(result.has_value());
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("selector.tags entry '[prod'") != std::string::npos);
+        CHECK(result.error().find("same line") != std::string::npos);
+    }
+    SECTION("a misindented tag item is rejected, never stored without the tag") {
+        auto result = store.create_policy(head + "scope:\n"
+                                                 "  selector:\n"
+                                                 "    platform: windows\n"
+                                                 "    tags:\n"
+                                                 "   - prod\n");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("indentation") != std::string::npos);
+    }
+    SECTION("managementGroups: null is no groups, and a scalar group id is refused") {
+        // Governance Gate 8 A1 / UP-A / UP-B: a YAML null is an empty list (the
+        // selector applies); any other scalar is refused, never read as a group
+        // that replaces the selector.
+        auto none = store.create_policy(head + "scope:\n  selector:\n    platform: windows\n"
+                                               "managementGroups: null\n");
+        REQUIRE(none.has_value());
+        auto pol = store.get_policy(none.value());
+        REQUIRE(pol.has_value());
+        REQUIRE(pol->has_value());
+        CHECK((*pol)->management_groups.empty());
+        CHECK((*pol)->scope_expression == "ostype == \"windows\"");
+        auto scalar = store.create_policy(head + "managementGroups: abc123def456\n");
+        REQUIRE_FALSE(scalar.has_value());
+        CHECK(scalar.error().find("is not a management group id") != std::string::npos);
+    }
+    SECTION("a scalar managementGroups inside a description block is refused") {
+        // Round 4 quality-engineer: pins UP-B's placement end to end.
+        auto r = store.create_policy(head + "description: |\n  managementGroups: abc123def456\n"
+                                            "scope:\n  selector:\n    platform: windows\n");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("is not a management group id") != std::string::npos);
+    }
+    SECTION("managementGroups null followed by a list line is refused") {
+        // Round 4 R4-1 / UP-F: the null must not hide the line after it.
+        auto r = store.create_policy(head + "scope:\n  selector:\n    platform: windows\n"
+                                            "managementGroups: null\n  - abc123def456\n");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("is not a management group id") != std::string::npos);
+    }
+    SECTION("a hyphen inside a comment does not drop the triggers") {
+        // Governance G4-TRIG-1: the trigger splitter used the first '-' in the
+        // section, comments included, so dash_indent was wrong and no trigger
+        // was stored (the interval fell back to the default).
+        auto result = store.create_policy(head + "triggers:\n"
+                                                 "  # re-check every 5-min\n"
+                                                 "  - type: interval\n"
+                                                 "    interval_seconds: 300\n");
+        REQUIRE(result.has_value());
+        auto pol = store.get_policy(result.value());
+        REQUIRE(pol.has_value());
+        REQUIRE(pol->has_value());
+        REQUIRE((*pol)->triggers.size() == 1);
+        CHECK((*pol)->triggers[0].config_json.find("300") != std::string::npos);
     }
 }
 

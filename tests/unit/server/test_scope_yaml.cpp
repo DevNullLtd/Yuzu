@@ -9,13 +9,16 @@
  * test_scope_walking_authz.cpp where a live ResultSetStore is available.
  */
 
+#include "instruction_store.hpp"
 #include "scope_engine.hpp"
 #include "scope_yaml.hpp"
 #include "yaml_scan.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <string>
+#include <vector>
 
 using namespace yuzu::server;
 
@@ -317,4 +320,269 @@ TEST_CASE("scope_yaml: CRLF blank line inside spec.assignment keeps rule 1 enfor
         sb, yuzu::server::yaml_scan::extract_yaml_value(asn, "mode"),
         !yuzu::server::yaml_scan::extract_yaml_list(asn, "managementGroups").empty());
     CHECK(err.has_value());
+}
+
+TEST_CASE("scope_yaml: a misindented tag item is rejected and never lowered without it (#2123)",
+          "[scope][dsl]") {
+    // Governance G2-SEC-F1 / G3-DSL-F1: the scanner keeps a misplaced `- prod`
+    // as a raw item; validation must reject it rather than lower the scope to
+    // the platform alone.
+    for (const std::string items : {
+             "     - prod\n",                  // shallower than tags:
+             "        - a\n       - prod\n",   // between columns
+             "        - a\n          - prod\n" // deeper - line
+         }) {
+        INFO("items:\n" << items);
+        auto sb = parse_scope_block(doc("  scope:\n"
+                                        "    selector:\n"
+                                        "      platform: windows\n"
+                                        "      tags:\n" +
+                                        items));
+        auto err = validate_scope_block(sb, "", false);
+        REQUIRE(err.has_value());
+        CHECK(err->find("tags") != std::string::npos);
+        CHECK(err->find("indentation") != std::string::npos);
+    }
+}
+
+TEST_CASE("scope_yaml: an unclosed inline tag list names the opening bracket (#2123)",
+          "[scope][dsl]") {
+    auto sb = parse_scope_block(doc("  scope:\n"
+                                    "    selector:\n"
+                                    "      platform: windows\n"
+                                    "      tags: [prod,\n"
+                                    "        staging]\n"));
+    auto err = validate_scope_block(sb, "", false);
+    REQUIRE(err.has_value());
+    CHECK(err->find("same line") != std::string::npos);
+}
+
+// ── #2123 governance Gate 5 CH-1: metamorphic differential over the scope block ──
+//
+// For every seed selector, two families of mutation:
+//   - meaning-PRESERVING (YAML reads the same thing): CRLF / lone-CR / mixed line
+//     endings, a blank line or a comment line inserted at every line boundary
+//     and every indent. The lowered scope must equal the seed's exactly.
+//   - meaning-BREAKING (invalid or different YAML): a `-` item moved one column
+//     either way, a flow list wrapped across lines. The scope must then be
+//     REJECTED, or still carry every seed tag — never lowered without one,
+//     because a dropped tag widens the policy to more devices.
+// No YAML library is needed: the oracle is the seed's own lowering.
+
+namespace {
+
+std::vector<std::string> lines_of(const std::string& lf) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : lf) {
+        if (c == '\n') {
+            out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    if (!cur.empty())
+        out.push_back(cur);
+    return out;
+}
+
+std::string join_lines(const std::vector<std::string>& ls, const std::string& eol) {
+    std::string out;
+    for (const auto& l : ls)
+        out += l + eol;
+    return out;
+}
+
+struct Seed {
+    std::string scope; // the `  scope:` block, LF
+    std::vector<std::string> tags;
+};
+
+const Seed kSeeds[] = {
+    {"  scope:\n    selector:\n      platform: windows\n      tags:\n        - prod\n"
+     "        - pci\n",
+     {"prod", "pci"}},
+    {"  scope:\n    selector:\n      tags:\n        - a\n        - b\n        - c\n"
+     "      platform: linux\n",
+     {"a", "b", "c"}},
+    {"  scope:\n    selector:\n      platform: darwin\n      tags: [edge, lab]\n", {"edge", "lab"}},
+    {"  scope:\n    selector:\n      tags:\n      - compact\n      - form\n", {"compact", "form"}},
+};
+
+} // namespace
+
+TEST_CASE("scope_yaml: meaning-preserving mutations lower exactly like the seed (#2123 CH-1)",
+          "[scope][dsl]") {
+    int checked = 0;
+    for (const auto& seed : kSeeds) {
+        const auto want = lower_scope_block(parse_scope_block(doc(seed.scope)));
+        REQUIRE(want.find("tag:" + seed.tags.front()) != std::string::npos);
+        const auto ls = lines_of(seed.scope);
+        std::vector<std::string> variants;
+        for (const std::string eol : {"\n", "\r\n", "\r"})
+            variants.push_back(join_lines(ls, eol));
+        {
+            std::string mixed;
+            for (std::size_t i = 0; i < ls.size(); ++i)
+                mixed += ls[i] + (i % 3 == 0 ? "\r\n" : i % 3 == 1 ? "\r" : "\n");
+            variants.push_back(mixed);
+        }
+        // A blank or comment line after line i (i >= 1, so it never precedes
+        // `scope:` itself), at every indent from 0 to 10.
+        for (std::size_t i = 1; i < ls.size(); ++i) {
+            for (std::size_t indent = 0; indent <= 10; indent += 1) {
+                for (const std::string body : {"", "# note - with a hyphen, and: a colon"}) {
+                    auto m = ls;
+                    m.insert(m.begin() + static_cast<std::ptrdiff_t>(i) + 1,
+                             std::string(indent, ' ') + body);
+                    for (const std::string eol : {"\n", "\r\n", "\r"})
+                        variants.push_back(join_lines(m, eol));
+                }
+            }
+        }
+        for (const auto& v : variants) {
+            INFO("variant:\n" << v);
+            auto sb = parse_scope_block(doc(v));
+            CHECK_FALSE(validate_scope_block(sb, "", false).has_value());
+            CHECK(lower_scope_block(sb) == want);
+            ++checked;
+        }
+    }
+    CHECK(checked > 500);
+}
+
+TEST_CASE("scope_yaml: meaning-breaking mutations are rejected or keep every tag (#2123 CH-1)",
+          "[scope][dsl]") {
+    int checked = 0;
+    for (const auto& seed : kSeeds) {
+        const auto ls = lines_of(seed.scope);
+        std::vector<std::string> variants;
+        for (std::size_t i = 0; i < ls.size(); ++i) {
+            const auto fc = ls[i].find_first_not_of(' ');
+            if (fc == std::string::npos || ls[i][fc] != '-')
+                continue;
+            for (int shift : {-1, +1}) {
+                if (shift < 0 && fc == 0)
+                    continue;
+                auto m = ls;
+                m[i] = shift > 0 ? " " + ls[i] : ls[i].substr(1);
+                for (const std::string eol : {"\n", "\r\n", "\r"})
+                    variants.push_back(join_lines(m, eol));
+            }
+        }
+        // Wrap an inline list across two lines.
+        for (std::size_t i = 0; i < ls.size(); ++i) {
+            const auto comma = ls[i].find(", ");
+            if (ls[i].find('[') == std::string::npos || comma == std::string::npos)
+                continue;
+            auto m = ls;
+            m[i] = ls[i].substr(0, comma + 1);
+            m.insert(m.begin() + static_cast<std::ptrdiff_t>(i) + 1,
+                     std::string(8, ' ') + ls[i].substr(comma + 2));
+            for (const std::string eol : {"\n", "\r\n", "\r"})
+                variants.push_back(join_lines(m, eol));
+        }
+        for (const auto& v : variants) {
+            INFO("variant:\n" << v);
+            auto sb = parse_scope_block(doc(v));
+            if (validate_scope_block(sb, "", false).has_value()) {
+                ++checked;
+                continue; // rejected: the safe outcome
+            }
+            // A wrapped inline list is never valid input: it must not be accepted.
+            CHECK(v.find("[") == std::string::npos);
+            const auto got = lower_scope_block(sb);
+            for (const auto& t : seed.tags)
+                CHECK(got.find("tag:" + t) != std::string::npos);
+            ++checked;
+        }
+    }
+    CHECK(checked > 20);
+}
+
+TEST_CASE("validate_definition_scope: CRLF blank and comment lines keep rule 1 enforced (#2123)",
+          "[scope][dsl]") {
+    // Governance G3-ARCH-F3: the instruction-store validation path had no
+    // line-ending test. A blank line used to hide managementGroups from rule 1
+    // (fromResultSet + managementGroups is forbidden) on a CRLF definition.
+    std::string lf = doc("  scope:\n"
+                         "    fromResultSet: rs_abc\n"
+                         "  assignment:\n"
+                         "    mode: static\n"
+                         "\n"
+                         "# groups follow\n"
+                         "    managementGroups:\n"
+                         "      - g1\n");
+    for (const std::string eol : {"\n", "\r\n", "\r"}) {
+        std::string d;
+        for (char c : lf)
+            d += (c == '\n') ? eol : std::string(1, c);
+        INFO("eol size " << eol.size() << (eol == "\r" ? " (CR)" : ""));
+        auto err = validate_definition_scope(d);
+        REQUIRE(err.has_value());
+        CHECK(err->find("managementGroups") != std::string::npos);
+    }
+}
+
+TEST_CASE("scope_yaml: a list item outside selector.tags is refused (#2123 Gate 8)",
+          "[scope][dsl]") {
+    // A `- prod` misindented to selector's own column falls outside the selector
+    // block, so tags never saw it and the scope lowered to the platform alone
+    // (governance Gate 8 security-guardian F7).
+    for (const std::string tail : {"    - prod\n", "   - prod\n"}) {
+        INFO("tail: " << tail);
+        auto sb = parse_scope_block(doc("  scope:\n"
+                                        "    selector:\n"
+                                        "      platform: windows\n"
+                                        "      tags:\n" +
+                                        tail));
+        auto err = validate_scope_block(sb, "", false);
+        REQUIRE(err.has_value());
+        CHECK(err->find("spec.scope") != std::string::npos);
+    }
+    // The ordinary block list is untouched.
+    auto ok = parse_scope_block(doc("  scope:\n    selector:\n      tags:\n        - prod\n"));
+    CHECK_FALSE(validate_scope_block(ok, "", false).has_value());
+}
+
+TEST_CASE(
+    "scope_yaml: a scalar tags value is refused, never lowered without the tag (#2123 Gate 8)",
+    "[scope][dsl]") {
+    for (const std::string v :
+         {"prod", "\"prod\"", "&t [prod]", "!!seq [prod]", "prod, pci", "\"\""}) {
+        INFO("value: " << v);
+        auto sb = parse_scope_block(doc("  scope:\n    selector:\n      tags: " + v + "\n"));
+        auto err = validate_scope_block(sb, "", false);
+        REQUIRE(err.has_value());
+        CHECK(err->find("selector.tags") != std::string::npos);
+    }
+    // A YAML null is no tags at all, as YAML means.
+    auto none = parse_scope_block(
+        doc("  scope:\n    selector:\n      platform: windows\n      tags: null\n"));
+    CHECK_FALSE(validate_scope_block(none, "", false).has_value());
+    CHECK(lower_scope_block(none) == "ostype == \"windows\"");
+}
+
+TEST_CASE("scope_yaml: tags null followed by list lines is refused (#2123 Gate 8)",
+          "[scope][dsl]") {
+    for (const std::string tail :
+         {"      tags: null\n        - prod\n", "      tags: [a]\n        - prod\n"}) {
+        INFO("tail: " << tail);
+        auto sb =
+            parse_scope_block(doc("  scope:\n    selector:\n      platform: windows\n" + tail));
+        auto err = validate_scope_block(sb, "", false);
+        REQUIRE(err.has_value());
+        CHECK(err->find("selector.tags") != std::string::npos);
+    }
+}
+
+TEST_CASE("scope_yaml: the leading-space raw item names the list form to use (#2123 Gate 8)",
+          "[scope][dsl]") {
+    // Pins the hint text (round 4 consistency-auditor CON-R4-3).
+    auto sb = parse_scope_block(doc("  scope:\n    selector:\n      tags: prod\n"));
+    auto err = validate_scope_block(sb, "", false);
+    REQUIRE(err.has_value());
+    CHECK(err->find("write the list as '- item' lines or an inline [a, b] list") !=
+          std::string::npos);
 }
