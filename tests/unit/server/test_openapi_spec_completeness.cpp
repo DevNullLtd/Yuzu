@@ -2263,7 +2263,7 @@ TEST_CASE("openapi_spec_json(): the data-retention operation documents the Echo 
     CHECK(ok.find("echo: {tick_seconds, tiers") != std::string::npos);
 }
 
-TEST_CASE("openapi documents: the response status set of the ten hand-checked operations matches "
+TEST_CASE("openapi documents: the response status set of the hand-checked operations matches "
           "what their handlers return",
           "[openapi][structure][responses]") {
     // Pins WHICH statuses the document declares per route, not their wording. Each expected set
@@ -2311,6 +2311,17 @@ TEST_CASE("openapi documents: the response status set of the ten hand-checked op
         // and 403 (perm_fn_ PluginSigning:Read); 500 (bundle on disk unreadable); 503 (audit
         // unavailable, runtime config store unavailable, bundle changed while serving).
         {"/v2/agent/plugin-policy", "get", {"200", "401", "403", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Delete(.../([^/]+)/([^/]+)/secret): 200; 400
+        // (parse_plugin_key); 404 (delete_secret NotFound, after the attempted audit row); 500
+        // (WriteFailed) and 403 (perm_fn), which the document does not declare (not part of #6167);
+        // 503 (store not open, Unavailable, attempt audit unavailable).
+        {"/plugin-config/{plugin}/{key}/secret", "delete", {"200", "400", "404", "503"}},
+        // file_retrieval_routes.cpp register_chunk(): 200; 400 (Content-Range, body length, and
+        // the TLS gate, which the document does not declare); 401 (session_unknown); 409
+        // (offset_mismatch, session_terminal); 410 (expired); 413 (chunk_too_large,
+        // size_exceeded); 500 (open or write failed); 503 (store null or unavailable,
+        // advance_offset error).
+        {"/uploads/{upload_id}/chunk", "put", {"200", "400", "401", "409", "410", "413", "500", "503"}},
     };
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
