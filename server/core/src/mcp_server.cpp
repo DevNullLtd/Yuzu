@@ -634,6 +634,12 @@ std::string lower_copy(std::string v) {
 // constant).
 static_assert(kMaxFacetValueBytes == 2048,
               "update the preview tool text, the OpenAPI text and the docs");
+// The ResultSet row's `properties` / `required` fragments are spelled once here and spliced into the
+// nine result-set outputSchemas inside kTools[], so the nine copies cannot drift. They sit above the
+// array because scripts/ci/check-api-parity.py refuses a preprocessor line inside it; both are
+// #undef'd right after it.
+#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure and never matched; they are absent from the membership"},"partial":{"type":"boolean","description":"True when agents_failed is above zero"})j"
+#define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j"
 static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
      R"({"type":"object","properties":{}})",
@@ -1256,8 +1262,8 @@ static const ToolDef kTools[] = {
      "share.",
      R"j({"type":"object","properties":{"cursor":{"type":"string","maxLength":2048,"description":"Opaque pagination cursor from a prior response's next_cursor"},"limit":{"type":"integer","minimum":1,"maximum":500,"default":50}}})j",
      R"j({"type":"object","properties":{"result_sets":{"type":"array","items":{"type":"object","properties":{)j"
-     R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure and never matched; they are absent from the membership"},"partial":{"type":"boolean","description":"True when agents_failed is above zero"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j" R"j(]}},"next_cursor":{"type":"string"}},"required":["result_sets","next_cursor"]})j"},
+     YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]}},"next_cursor":{"type":"string"}},"required":["result_sets","next_cursor"]})j"},
 
     {"create_result_set",
      "Create a result set directly from pre-computed device ids. Synchronous — lands "
@@ -1268,8 +1274,8 @@ static const ToolDef kTools[] = {
      "request (RESULT_SET_UNKNOWN_DEVICE_ID). REST v1 twin: POST /api/v1/result-sets. "
      "Service-scoped API tokens are denied outright.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure and never matched; they are absent from the membership"},"partial":{"type":"boolean","description":"True when agents_failed is above zero"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"create_result_set_from_inventory_query",
      "Create an owner-scoped result set from a SYNCHRONOUS inventory query — evaluates "
@@ -1287,8 +1293,8 @@ static const ToolDef kTools[] = {
      "reason - query_truncated/poison_excluded/parse_error_excluded). REST v1 twin: "
      "POST /api/v1/result-sets/from-inventory-query.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512,"description":"Declared as a string because the in-house schema compiler (mcp_input_schema.cpp) supports a single type per node. The handler also accepts a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically) and a boolean for == and != only. Under > >= < <= a string that is a plain decimal number (e.g. \"4\", \"2e-7\") is compared exactly against a stored number or fully numeric string; a stored string that merely starts with a number (a dotted version, \"5 GB\") keeps the legacy leading-number read (use version_gte or version_lte for dotted versions) and any other stored value never matches, whereas a JSON number operand never matches a non-numeric stored string; == and != with a string stay an exact text compare. JSON integers are exact; every JSON float (a decimal point or exponent: 5.0, 1e3, 5.5) is -32602: send an integer, or send the decimal as a string under > >= < <= (at most 15 significant digits, a magnitude below 2^53, not subnormal, within the range of a double), where == and != stay a text compare; write a whole number as an integer up to 18446744073709551615, or as digits or an exponent form such as 1e16 (read exactly). Null, an array, an object, or a number/boolean under another op is -32602. maxLength bounds the string form."}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure and never matched; they are absent from the membership"},"partial":{"type":"boolean","description":"True when agents_failed is above zero"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"create_result_set_from_echo_query",
      "Create a result set by DISPATCHING a read-only Echo SQL query to the fleet. ASYNC: "
@@ -1316,8 +1322,8 @@ static const ToolDef kTools[] = {
      "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
      "poll executions for the outcome instead.",
      R"j({"type":"object","properties":{"sql":{"type":"string","minLength":1,"maxLength":100000},"include_empty":{"type":"boolean","default":false,"description":"Include responders with zero matching rows in membership"},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members are the dispatch scope; omit to broadcast to every connected agent"},"name":{"type":"string","maxLength":256}},"required":["sql"]})j",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure and never matched; they are absent from the membership"},"partial":{"type":"boolean","description":"True when agents_failed is above zero"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"create_result_set_from_instruction_result",
      "Create a result set by DISPATCHING an existing InstructionDefinition to the fleet. "
@@ -1342,8 +1348,8 @@ static const ToolDef kTools[] = {
      "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
      "poll executions for the outcome instead.",
      R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:echo_rows_ge,n} needs n to be an integer from 1 to 2147483647"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure and never matched; they are absent from the membership"},"partial":{"type":"boolean","description":"True when agents_failed is above zero"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"reevaluate_result_set",
      "Re-run an existing result set's OWN source query, creating a NEW SIBLING set (same "
@@ -1373,16 +1379,16 @@ static const ToolDef kTools[] = {
      "faulted after a real command already reached the fleet) carries no retry_after_ms "
      "and must NEVER be retried - poll executions for the outcome instead.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64,"description":"The result set to re-evaluate"}},"required":["id"]})",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure and never matched; they are absent from the membership"},"partial":{"type":"boolean","description":"True when agents_failed is above zero"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"get_result_set",
      "Get one result set's metadata by id. Owner-scoped — a non-owner gets the same "
      "not-found error as a nonexistent id (existence-oracle-safe). REST v1 twin: GET "
      "/api/v1/result-sets/{id}.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure and never matched; they are absent from the membership"},"partial":{"type":"boolean","description":"True when agents_failed is above zero"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"get_result_set_members",
      "List a result set's member device ids. Owner-scoped. REST v1 twin: GET "
@@ -1403,15 +1409,15 @@ static const ToolDef kTools[] = {
      "set is a no-op success, same end state. Owner-scoped; capped at 50 pinned sets per "
      "owner. REST v1 twin: POST /api/v1/result-sets/{id}/pin.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure and never matched; they are absent from the membership"},"partial":{"type":"boolean","description":"True when agents_failed is above zero"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"unpin_result_set",
      "Unpin a result set, restoring its normal TTL. Idempotent — unpinning an already-unpinned "
      "set is a no-op success. Owner-scoped. REST v1 twin: POST /api/v1/result-sets/{id}/unpin.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure and never matched; they are absent from the membership"},"partial":{"type":"boolean","description":"True when agents_failed is above zero"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"delete_result_set",
      "Delete a result set. Owner-scoped. A pinned set must be unpinned first. REST v1 twin: "
@@ -4212,6 +4218,8 @@ static const ToolDef kTools[] = {
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
      R"j(},"required":["username","display_name","role","principal_kind","auth_source","mcp_tier","scope_service","rbac_enabled","rbac_roles_resolved","effective_role","elevated","can_access_settings"],"additionalProperties":false})j"},
 };
+#undef YUZU_MCP_RESULT_SET_ROW_PROPS
+#undef YUZU_MCP_RESULT_SET_ROW_REQUIRED
 
 static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
               "the catalogue cursor bound must equal the MCP cursor input bound");
@@ -14740,7 +14748,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // actually run (the stored param, else its schema default).
                     if (def->plugin == "echo" && def->action == "sql" &&
                         yuzu::server::rs_matcher::instruction_reads_raw_capture_table(
-                            sp.contains("params") ? sp["params"] : nlohmann::json::object(),
+                            sp.value("params", nlohmann::json::object()),
                             def->parameter_schema)) {
                         res.set_content(
                             error_response(

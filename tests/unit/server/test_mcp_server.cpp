@@ -37284,44 +37284,26 @@ TEST_CASE("MCP create_result_set: a malformed or empty parent_id is refused with
     }
 }
 
-// Roll-up only: every tool that returns a result set reports the failure signal, and a set stored
-// over a raw capture table is refused rather than re-run to an empty membership.
-TEST_CASE("MCP result-sets: every result-set output schema lists agents_failed and partial as required",
+// Roll-up only: a result set reports the failure signal, and a set stored over a raw capture table
+// is refused rather than re-run to an empty membership. The nine row schemas share one macro, so one
+// tool pins the fields.
+TEST_CASE("MCP result-sets: the get_result_set output schema lists agents_failed and partial as required",
           "[mcp][integration][result-sets][agents_failed]") {
     McpTestServer ts;
     ts.start();
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
+    const nlohmann::json* schema = nullptr;
     const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
-
-    // An object schema is a result-set row when it declares source_execution_id.
-    int row_schemas = 0;
-    const std::function<void(const nlohmann::json&, const std::string&)> visit =
-        [&](const nlohmann::json& node, const std::string& tool) {
-            if (node.is_object()) {
-                if (node.contains("properties") && node["properties"].is_object() &&
-                    node["properties"].contains("source_execution_id")) {
-                    ++row_schemas;
-                    INFO(tool);
-                    CHECK(node["properties"].contains("agents_failed"));
-                    CHECK(node["properties"].contains("partial"));
-                    CHECK(node["properties"]["agents_failed"]["type"] == "integer");
-                    CHECK(node["properties"]["partial"]["type"] == "boolean");
-                    const auto& req = node["required"];
-                    CHECK(std::find(req.begin(), req.end(), "agents_failed") != req.end());
-                    CHECK(std::find(req.begin(), req.end(), "partial") != req.end());
-                }
-                for (const auto& kv : node.items())
-                    visit(kv.value(), tool);
-            } else if (node.is_array()) {
-                for (const auto& v : node)
-                    visit(v, tool);
-            }
-        };
     for (const auto& t : tools)
-        if (t.contains("outputSchema"))
-            visit(t["outputSchema"], t["name"].get<std::string>());
-    CHECK(row_schemas == 9);
+        if (t["name"] == "get_result_set")
+            schema = &t["outputSchema"];
+    REQUIRE(schema != nullptr);
+    CHECK((*schema)["properties"]["agents_failed"]["type"] == "integer");
+    CHECK((*schema)["properties"]["partial"]["type"] == "boolean");
+    const auto& req = (*schema)["required"];
+    CHECK(std::find(req.begin(), req.end(), "agents_failed") != req.end());
+    CHECK(std::find(req.begin(), req.end(), "partial") != req.end());
 }
 
 TEST_CASE("MCP result-sets: a query over a raw capture table is refused with the stale-source token",
@@ -37373,12 +37355,6 @@ TEST_CASE("MCP result-sets: a query over a raw capture table is refused with the
     SECTION("reevaluate_result_set over $Process_Live") {
         const auto id = seed(std::string(source_kind::kEchoQuery),
                              nlohmann::json{{"sql", "SELECT pid FROM $Process_Live"}});
-        CHECK(is_stale(reeval(id)));
-        CHECK(dispatched == 0);
-    }
-    SECTION("reevaluate_result_set over the real table name") {
-        const auto id = seed(std::string(source_kind::kEchoQuery),
-                             nlohmann::json{{"sql", "SELECT pid FROM process_live WHERE name='chrome.exe'"}});
         CHECK(is_stale(reeval(id)));
         CHECK(dispatched == 0);
     }

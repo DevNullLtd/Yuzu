@@ -15379,7 +15379,7 @@ void RestApiV1::register_routes(
                           // will actually run (the stored param, else its schema default).
                           if (def->plugin == "echo" && def->action == "sql" &&
                               yuzu::server::rs_matcher::instruction_reads_raw_capture_table(
-                                  sp.contains("params") ? sp["params"] : nlohmann::json::object(),
+                                  sp.value("params", nlohmann::json::object()),
                                   def->parameter_schema)) {
                               rs_err(res, 400, std::string(yuzu::server::rs_matcher::kStaleSourceMessage));
                               return;

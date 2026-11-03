@@ -90,12 +90,14 @@ std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher
 void bind_declared_columns(nlohmann::json& matcher, const std::string& result_schema_json,
                            const std::string& plugin);
 
-/// True when the stored echo SQL still reads a raw capture table: a `$<Word>_Live` token, or one of
-/// the sixteen real `<source>_live` table names, as a whole identifier outside string literals and
-/// comments (case-insensitive). Roll-up is the only mode, so such a query answers with no rows
+/// True when the stored echo SQL still reads a raw capture table: one of the sixteen real
+/// `<source>_live` table names, or its `$<Source>_Live` spelling (the `$` is not a word character,
+/// so both tokenise to the same lower-cased name), as a whole identifier outside string literals
+/// and comments (case-insensitive). Roll-up is the only mode, so such a query answers with no rows
 /// (the shims) rather than an error, and re-evaluating it would silently build an empty set.
-/// `usage_live` is not a raw capture table and is not matched. Pure; used by the REST and MCP
-/// re-evaluation and create paths (RESULT_SET_REEVAL_STALE_SOURCE).
+/// `usage_live` and an unknown `$Foo_Live` are not matched: the agent answers those with an
+/// error, which the failure signal counts. Pure; used by the REST and MCP re-evaluation and
+/// create paths (RESULT_SET_REEVAL_STALE_SOURCE).
 bool references_raw_capture_table(std::string_view sql);
 
 /// The same predicate for an instruction_result set, applied to the SQL it will actually run:

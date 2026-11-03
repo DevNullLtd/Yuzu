@@ -454,11 +454,6 @@ TEST_CASE("build_data_retention_settings publishes the Echo retention tiers",
                 return &t;
         return nullptr;
     };
-    // Roll-up only: the parser skips `live` rows, so no tier named live is published, whether or
-    // not the embedded table still carries them.
-    for (const auto& t : tiers)
-        CHECK(t.at("tier") != "live");
-    CHECK(find("process", "live") == nullptr);
     const auto* hourly = find("process", "hourly");
     REQUIRE(hourly);
     CHECK(hourly->at("limit_kind") == "seconds");

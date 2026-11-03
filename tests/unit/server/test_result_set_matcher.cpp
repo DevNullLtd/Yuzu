@@ -618,6 +618,9 @@ TEST_CASE("raw capture table predicate: roll-up tiers and look-alikes pass", "[r
     CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM my_process_live"));
     // usage_live is the open-runs table, not a raw capture table.
     CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM usage_live"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Usage_Live"));
+    // An unknown shim is the agent's error path (counted by agents_failed), not a server refusal.
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Foo_Live"));
     CHECK_FALSE(references_raw_capture_table(""));
 }
 

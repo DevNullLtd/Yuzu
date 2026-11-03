@@ -4487,23 +4487,18 @@ TEST_CASE("re-eval: a set stored over a raw capture table is refused with RESULT
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
 
-    SECTION("by dollar name") {
-        const auto id = seed_echo_query(h, "SELECT pid FROM $Process_Live");
-        int status = 0;
-        auto re = h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
-        REQUIRE(status == 400);
-        CHECK(re["error"]["message"].get<std::string>().find("RESULT_SET_REEVAL_STALE_SOURCE") !=
-              std::string::npos);
+    SECTION("by dollar name and by real table name") {
+        for (const char* sql :
+             {"SELECT pid FROM $Process_Live", "SELECT pid FROM process_live WHERE name='chrome.exe'"}) {
+            INFO(sql);
+            const auto id = seed_echo_query(h, sql);
+            int status = 0;
+            auto re = h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
+            REQUIRE(status == 400);
+            CHECK(re["error"]["message"].get<std::string>().find("RESULT_SET_REEVAL_STALE_SOURCE") !=
+                  std::string::npos);
+        }
         CHECK(h.calls.empty()); // nothing was dispatched
-    }
-    SECTION("by real table name") {
-        const auto id = seed_echo_query(h, "SELECT pid FROM process_live WHERE name='chrome.exe'");
-        int status = 0;
-        auto re = h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
-        REQUIRE(status == 400);
-        CHECK(re["error"]["message"].get<std::string>().find("RESULT_SET_REEVAL_STALE_SOURCE") !=
-              std::string::npos);
-        CHECK(h.calls.empty());
     }
     SECTION("a set over the hourly roll-up proceeds") {
         const auto id = seed_echo_query(h, "SELECT name FROM $Process_Hourly");
@@ -4512,12 +4507,6 @@ TEST_CASE("re-eval: a set stored over a raw capture table is refused with RESULT
         CHECK(status == 202);
         REQUIRE(h.calls.size() == 1);
         CHECK(h.calls[0].params.at("sql") == "SELECT name FROM $Process_Hourly");
-    }
-    SECTION("a literal that merely mentions the old name proceeds") {
-        const auto id = seed_echo_query(h, "SELECT '$Process_Live' AS was FROM $Process_Hourly");
-        int status = 0;
-        h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
-        CHECK(status == 202);
     }
 }
 

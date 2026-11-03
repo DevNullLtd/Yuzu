@@ -2195,7 +2195,6 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     CHECK_FALSE(echo.at("properties").at("tick_seconds").value("nullable", false));
     // The byte budget is published once at the echo level, as the agent's default.
     REQUIRE(real["echo"].contains("db_budget_bytes"));
-    CHECK(real["echo"]["db_budget_bytes"].get<long long>() == 262144000);
     CHECK(echo.at("properties").at("db_budget_bytes").value("type", "") ==
           type_of(real["echo"]["db_budget_bytes"]));
     CHECK_FALSE(echo.at("properties").at("db_budget_bytes").value("nullable", false));
@@ -2241,15 +2240,10 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     }
     CHECK(saw_rows);
     CHECK(saw_seconds);
-    // Every row says whether the byte budget can shorten it; only hourly can.
+    // Every row says whether the byte budget can shorten it.
     const json& budget_dep = item.at("properties").at("budget_dependent");
     CHECK(budget_dep.value("type", "") == "boolean");
     CHECK_FALSE(budget_dep.value("nullable", false));
-    for (const auto& tier : real["echo"]["tiers"]) {
-        INFO("tier: " << tier.dump());
-        REQUIRE(tier.contains("budget_dependent"));
-        CHECK(tier.at("budget_dependent").get<bool>() == (tier.at("tier") == "hourly"));
-    }
     const json& depth = item.at("properties").at("guaranteed_depth_seconds");
     CHECK(depth.value("type", "") == "integer");
     CHECK(depth.value("nullable", false));

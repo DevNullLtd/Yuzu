@@ -409,7 +409,8 @@ bool references_raw_capture_table(std::string_view sql) {
         return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
     };
     // Single pass: blank out '...' literals and -- / block comments, then read maximal
-    // [A-Za-z0-9_] runs and ask of each whether it was introduced by '$'.
+    // [A-Za-z0-9_] runs. '$' is not a word character, so `$Process_Live` reads as the run
+    // `process_live`: every registry dollar name lowercases to its real table name.
     std::string text(sql);
     for (std::size_t i = 0; i < text.size();) {
         std::size_t end = i;
@@ -440,15 +441,8 @@ bool references_raw_capture_table(std::string_view sql) {
         std::string word = text.substr(i, j - i);
         for (auto& c : word)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        const bool dollar = i > 0 && text[i - 1] == '$';
-        constexpr std::string_view kSuffix = "_live";
-        if (dollar) {
-            if (word.size() > kSuffix.size() &&
-                word.compare(word.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0)
-                return true;
-        } else if (std::find(kRealNames.begin(), kRealNames.end(), word) != kRealNames.end()) {
+        if (std::find(kRealNames.begin(), kRealNames.end(), word) != kRealNames.end())
             return true;
-        }
         i = j;
     }
     return false;
