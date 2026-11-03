@@ -1237,7 +1237,7 @@ fi
 #   [info] crash: class=exit exception={noproc,{gen_server,call,[yuzu_gw_upstream,...]}}
 # which the gateway emits via its own diagnostic logger when an agent's
 # first registration attempt races the upstream gen_server startup (the
-# agent's retry backoff resolves it cleanly within ~6s). Real Erlang
+# agent's retry backoff resolves it cleanly within seconds: 1-3 s per retry). Real Erlang
 # crashes always emit a `CRASH REPORT` or `=ERROR REPORT` header, or a
 # `Supervisor: ... terminating` line; we match only those, plus any
 # explicit SIGTERM at [error] level.
