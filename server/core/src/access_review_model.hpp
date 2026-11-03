@@ -90,9 +90,11 @@
 /// DOES propagate — the pointer being present makes it part of the read set
 /// this call promised to read completely.
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
@@ -189,5 +191,32 @@ build_access_review(AuthDB* users, RbacStore* rbac, EnginePrincipalStore* engine
 /// to `rbac_enforcement_in_effect()`. `rbac` may be null (degrades to
 /// `"degraded"`, matching `rbac_enforcement_label(nullptr)`).
 [[nodiscard]] std::string access_review_rbac_enforcement(const RbacStore* rbac);
+
+/// Longest campaign id any surface accepts (the store mints 16 hex digits; this is wider).
+inline constexpr std::size_t kCampaignIdMaxLen = 64;
+
+/// The refusal text every surface (REST 400, MCP invalid-params) returns for an id that fails
+/// `valid_campaign_id`, so the two transports cannot drift.
+inline constexpr std::string_view kCampaignIdInvalidMessage =
+    "campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -";
+
+/// The single shared campaign id validator: 1..kCampaignIdMaxLen bytes, each in `[A-Za-z0-9_-]`.
+/// REST, MCP and the Access page all call this (the Settings fragment does from its own change);
+/// never fork a second copy. It tests every byte of the view, so an embedded NUL is rejected:
+/// `pg/pg_exec.hpp` binds `c_str()`, so a NUL (httplib decodes `%00` in a route capture to a real
+/// one) would truncate the bound id and read or write a different row than the one named. The
+/// accepted alphabet excludes every URL-significant byte, so an id that passes can be placed in a
+/// query value or a path segment unchanged.
+[[nodiscard]] inline bool valid_campaign_id(std::string_view id) noexcept {
+    if (id.empty() || id.size() > kCampaignIdMaxLen)
+        return false;
+    for (const unsigned char c : id) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                        c == '_' || c == '-';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
 
 } // namespace yuzu::server

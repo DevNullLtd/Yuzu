@@ -50,6 +50,7 @@
 ///     population (an unknown/foreign key never matches — see
 ///     `record_attestation`).
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <string>
@@ -60,6 +61,10 @@ class PgPool;
 }
 
 namespace yuzu::server {
+
+/// Longest `justification` `record_attestation` accepts, in bytes; a longer one is refused with
+/// `bad_request:` so no stored decision row is unbounded.
+inline constexpr std::size_t kMaxJustificationBytes = 4096;
 
 /// One grant to freeze into a campaign at `open_campaign` time — the shape
 /// `access_review_model::AccessReviewRow` is expanded into (one `GrantRef`
@@ -147,7 +152,10 @@ public:
     /// field existed (schema migration 2), never as a value a live caller
     /// may supply. Returns the minted `campaign_id` on success;
     /// `unexpected(msg)` if the transaction did not commit (nothing is
-    /// left half-open — the whole freeze is atomic).
+    /// left half-open — the whole freeze is atomic). An embedded NUL in
+    /// `title` or `created_by` (libpq binds `c_str()`, so it would truncate
+    /// the stored value) returns `unexpected("bad_request: ...")` before the
+    /// pool is touched and no campaign is created.
     [[nodiscard]] std::expected<std::string, std::string>
     open_campaign(std::string title, std::string created_by,
                  const std::vector<GrantRef>& frozen_population,
@@ -161,20 +169,27 @@ public:
     /// terminal-shaped write to un-terminal itself). Stamps
     /// `decided_at_ms = now` (caller-independent — this store reads the wall
     /// clock, matching `EnginePrincipalStore`'s `now_epoch` idiom) and the
-    /// given `reviewer`/`justification`. `unexpected("not_found: ...")` —
-    /// note the machine-checkable `not_found:` prefix, so a REST caller can
-    /// map it to 404 rather than 503 — when the (campaign_id, principal_type,
-    /// principal_id, role_name) tuple is not in the frozen population, OR
-    /// the campaign is not open (closed campaigns are immutable evidence —
-    /// see `close_campaign`). Any other `unexpected(msg)` is a genuine
-    /// write failure (503/retry).
+    /// given `reviewer`/`justification`. Errors carry a machine-checkable
+    /// prefix so a REST caller can map them without parsing prose:
+    /// `unexpected("bad_request: ...")` (400) when `campaign_id` fails
+    /// `valid_campaign_id` (`access_review_model.hpp`; an empty id included),
+    /// when `principal_type`/`principal_id`/`role_name`/`justification`/
+    /// `reviewer` holds an embedded NUL (libpq binds `c_str()`, so a NUL would
+    /// silently truncate the value), or when `justification` exceeds
+    /// `kMaxJustificationBytes`, all checked before the pool is touched; `unexpected("not_found: ...")`
+    /// (404) when the (campaign_id, principal_type, principal_id, role_name)
+    /// tuple is not in the frozen population, OR the campaign is not open
+    /// (closed campaigns are immutable evidence, see `close_campaign`). Any
+    /// other `unexpected(msg)` is a genuine write failure (503/retry).
     [[nodiscard]] std::expected<void, std::string>
     record_attestation(const std::string& campaign_id, const std::string& principal_type,
                        const std::string& principal_id, const std::string& role_name,
                        std::string decision, std::string reviewer, std::string justification);
 
     /// Full evidentiary state for one campaign: metadata + every frozen
-    /// attestation row + `pending_count`. `unexpected("not_found: ...")`
+    /// attestation row + `pending_count`. `unexpected("bad_request: ...")`
+    /// when `campaign_id` fails `valid_campaign_id` (empty included), checked
+    /// before the pool is touched. `unexpected("not_found: ...")`
     /// (machine-checkable prefix, as `record_attestation` above) when no
     /// campaign with this id exists; any other `unexpected(msg)` is a
     /// genuine read failure (503/retry).
@@ -188,7 +203,10 @@ public:
     /// this store silently launders by forcing completion). Idempotent-
     /// rejecting: closing an already-closed or unknown campaign returns
     /// `unexpected("not_found: ...")` (machine-checkable prefix, as above);
-    /// any other `unexpected(msg)` is a genuine write failure.
+    /// a `campaign_id` that fails `valid_campaign_id` (empty included)
+    /// returns `unexpected("bad_request: ...")` before the pool is touched, as
+    /// does a `closed_by` holding an embedded NUL; any other `unexpected(msg)`
+    /// is a genuine write failure.
     [[nodiscard]] std::expected<void, std::string>
     close_campaign(const std::string& campaign_id, const std::string& closed_by);
 

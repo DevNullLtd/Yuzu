@@ -3413,6 +3413,9 @@ static const ToolDef kTools[] = {
      R"j(},"required":["title"]})j",
      R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"}},"required":["campaign_id","grant_count"]})j"},
 
+    // campaign_id on the three id tools below carries maxLength/pattern as DISCOVERY METADATA
+    // only: the schema validator runs just for approval-gated calls, so each handler's own
+    // valid_campaign_id check is the enforcement.
     {"record_attestation",
      "Record one reviewer decision against a grant frozen into an open campaign — "
      "'attested' (the reviewer confirms this grant is still appropriate) or "
@@ -3426,7 +3429,7 @@ static const ToolDef kTools[] = {
      "POST /api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested "
      "or access_review.flagged (by decision). Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1},)j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$"},)j"
      R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
      R"j("principal_id":{"type":"string","minLength":1},)j"
      R"j("role_name":{"type":"string","minLength":1},)j"
@@ -3443,7 +3446,7 @@ static const ToolDef kTools[] = {
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
      "AccessReview:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1})j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$"})j"
      R"j(},"required":["campaign_id"]})j",
      R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
@@ -3467,7 +3470,7 @@ static const ToolDef kTools[] = {
      "untouched), but the campaign's own open->closed state is irreversibly transitioned. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1})j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$"})j"
      R"j(},"required":["campaign_id"]})j",
      R"j({"type":"object","properties":{"closed":{"type":"boolean"}},"required":["closed"]})j"},
 
@@ -6047,25 +6050,27 @@ int mcp_error_for_store_msg(const std::string& msg) {
 
 // AccessReviewStore error → JSON-RPC code (mirrors rest_api_v1.cpp's
 // access_review_error_status(), translated into the JSON-RPC vocabulary).
-// The store's documented "not_found: " prefix (access_review_store.hpp —
+// The store's documented "not_found: " prefix (access_review_store.hpp,
 // machine-checkable) means a bad campaign_id, a grant never in the frozen
 // population, or an already-closed campaign: client input, not a server
-// fault, so it maps to kInvalidParams like the REST twin's 404. Any other
-// message is a genuine read/write failure → kInternalError (retryable).
+// fault, so it maps to kInvalidParams like the REST twin's 404. The
+// "bad_request: " prefix (campaign_id shape, an embedded NUL, an oversized
+// justification) is client input the store refused before touching the pool,
+// so it is kInvalidParams too, like the REST twin's 400. Any other message is
+// a genuine read/write failure -> kInternalError (retryable).
 //
-// Contract pin: same binary posture as rest_api_v1.cpp's
-// access_review_error_status — every tool handler above pre-validates its
-// own required fields (title/decision/campaign_id/principal_type/
-// principal_id/role_name) BEFORE calling into AccessReviewStore, so the
-// store's own input-validation error strings never actually reach this
-// function today; they would otherwise land in the `else -> kInternalError`
-// arm, which is wrong (client error, not retryable). Callers MUST keep
-// pre-validating. If a future path reaches the store unvalidated, add a
-// `bad_request:` prefix to that store error and a kInvalidParams arm here
-// (and the matching 400 arm in rest_api_v1.cpp's access_review_error_status)
-// rather than letting it fall through to kInternalError.
+// Contract pin: every tool handler above pre-validates its own required
+// fields (title/decision/campaign_id/principal_type/principal_id/role_name)
+// BEFORE calling into AccessReviewStore, so the store's other
+// input-validation strings never actually reach this function today; an
+// unprefixed one would land in the `else -> kInternalError` arm, which is
+// wrong (client error, not retryable). Callers MUST keep pre-validating, and
+// any new store-side validation error gets the `bad_request:` prefix (the
+// arm below and the matching 400 arm in rest_api_v1.cpp's
+// access_review_error_status already map it).
 int mcp_error_for_access_review_msg(const std::string& msg) {
-    return msg.starts_with("not_found:") ? kInvalidParams : kInternalError;
+    return (msg.starts_with("not_found:") || msg.starts_with("bad_request:")) ? kInvalidParams
+                                                                              : kInternalError;
 }
 
 // B4 (#2146 API-parity) — ManagementGroupStore error → JSON-RPC code + retry
@@ -28325,6 +28330,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // The id is checked here, not by the input schema: the schema's pattern is
+                // discovery metadata (the schema validator only runs for approval-gated tools).
+                if (!valid_campaign_id(campaign_id)) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignIdInvalidMessage),
+                                    "application/json");
+                    return;
+                }
                 if (decision != "attested" && decision != "flagged_revoke") {
                     res.set_content(
                         a4_error(kInvalidParams, "decision must be attested or flagged_revoke"),
@@ -28394,6 +28406,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto campaign_id = param_str(args, "campaign_id");
                 if (campaign_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "campaign_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // The id is checked here, not by the input schema: the schema's pattern is
+                // discovery metadata (the schema validator only runs for approval-gated tools).
+                if (!valid_campaign_id(campaign_id)) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignIdInvalidMessage),
                                     "application/json");
                     return;
                 }
@@ -28568,6 +28587,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto campaign_id = param_str(args, "campaign_id");
                 if (campaign_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "campaign_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // The id is checked here, not by the input schema: the schema's pattern is
+                // discovery metadata (the schema validator only runs for approval-gated tools).
+                if (!valid_campaign_id(campaign_id)) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignIdInvalidMessage),
                                     "application/json");
                     return;
                 }

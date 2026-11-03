@@ -438,6 +438,210 @@ TEST_CASE("not_found: mapping on attestation/get/close for a bogus campaign_id",
     CHECK(close.error().starts_with("not_found:"));
 }
 
+// ── campaign id validation and input bounds (#6939) ─────────────────────────
+
+TEST_CASE("get/record/close refuse a malformed campaign_id with bad_request, never not_found",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Bad ids", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+
+    // A NUL id would truncate to "abc" at the libpq bind; 65 bytes is one over the cap; the empty
+    // id used to be not_found. Every one must be refused before the pool is touched.
+    const std::vector<std::string> bad_ids = {std::string("abc\0def", 7), std::string(65, 'a'),
+                                              std::string(""), std::string("has space"),
+                                              std::string("a.b")};
+    for (const auto& bad : bad_ids) {
+        INFO("id size " << bad.size());
+        auto get = store.get_campaign(bad);
+        REQUIRE_FALSE(get.has_value());
+        CHECK(get.error().starts_with("bad_request:"));
+
+        auto att = store.record_attestation(bad, "user", "alice", "Admin", "attested", "carol", "");
+        REQUIRE_FALSE(att.has_value());
+        CHECK(att.error().starts_with("bad_request:"));
+
+        auto close = store.close_campaign(bad, "admin");
+        REQUIRE_FALSE(close.has_value());
+        CHECK(close.error().starts_with("bad_request:"));
+    }
+
+    // Nothing landed: the real campaign is still open with every row pending.
+    auto view = store.get_campaign(*open_res);
+    REQUIRE(view.has_value());
+    CHECK(view->campaign.status == "open");
+    CHECK(view->pending_count == 3);
+}
+
+TEST_CASE("a well-formed but unknown campaign_id is still not_found (64 bytes accepted)",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string id64(64, 'a');
+    auto get = store.get_campaign(id64);
+    REQUIRE_FALSE(get.has_value());
+    CHECK(get.error().starts_with("not_found:"));
+    auto att = store.record_attestation(id64, "user", "alice", "Admin", "attested", "carol", "");
+    REQUIRE_FALSE(att.has_value());
+    CHECK(att.error().starts_with("not_found:"));
+    auto close = store.close_campaign(id64, "admin");
+    REQUIRE_FALSE(close.has_value());
+    CHECK(close.error().starts_with("not_found:"));
+}
+
+TEST_CASE("record_attestation refuses an embedded NUL in any text field and writes nothing",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("NUL fields", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+    const std::string nul("ab\0cd", 5);
+
+    // principal_id "alice\0x" would truncate to the real grant "alice" and decide it.
+    const std::string alice_nul("alice\0x", 7);
+    auto r1 = store.record_attestation(cid, "user", alice_nul, "Admin", "attested", "carol", "");
+    REQUIRE_FALSE(r1.has_value());
+    CHECK(r1.error().starts_with("bad_request:"));
+    auto r2 = store.record_attestation(cid, "user", "alice", std::string("Admin\0x", 7), "attested",
+                                       "carol", "");
+    REQUIRE_FALSE(r2.has_value());
+    CHECK(r2.error().starts_with("bad_request:"));
+    auto r3 = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", nul);
+    REQUIRE_FALSE(r3.has_value());
+    CHECK(r3.error().starts_with("bad_request:"));
+    auto r4 = store.record_attestation(cid, "user", "alice", "Admin", "attested", nul, "ok");
+    REQUIRE_FALSE(r4.has_value());
+    CHECK(r4.error().starts_with("bad_request:"));
+
+    auto view = store.get_campaign(cid);
+    REQUIRE(view.has_value());
+    CHECK(view->pending_count == 3);
+    for (const auto& a : view->attestations) {
+        CHECK(a.decision == "pending");
+        CHECK(a.reviewer.empty());
+        CHECK(a.justification.empty());
+    }
+}
+
+TEST_CASE("record_attestation refuses an embedded NUL in principal_type and writes nothing",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("NUL type", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    // "user\0x" would truncate to the real principal_type "user" and decide alice's row.
+    auto r = store.record_attestation(cid, std::string("user\0x", 6), "alice", "Admin", "attested",
+                                      "carol", "");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().starts_with("bad_request:"));
+    CHECK(r.error().find("principal_type") != std::string::npos);
+
+    auto view = store.get_campaign(cid);
+    REQUIRE(view.has_value());
+    CHECK(view->pending_count == 3);
+    for (const auto& a : view->attestations) {
+        CHECK(a.decision == "pending");
+        CHECK(a.reviewer.empty());
+    }
+}
+
+TEST_CASE("close_campaign refuses an embedded NUL in closed_by and leaves the campaign open",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("NUL closer", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    auto close = store.close_campaign(cid, std::string("admin\0x", 7));
+    REQUIRE_FALSE(close.has_value());
+    CHECK(close.error().starts_with("bad_request:"));
+    CHECK(close.error().find("closed_by") != std::string::npos);
+
+    auto view = store.get_campaign(cid);
+    REQUIRE(view.has_value());
+    CHECK(view->campaign.status == "open");
+    CHECK(view->campaign.closed_by.empty());
+    CHECK(view->pending_count == 3);
+
+    // A clean close of the same campaign still works afterwards.
+    REQUIRE(store.close_campaign(cid, "admin").has_value());
+}
+
+TEST_CASE("open_campaign refuses an embedded NUL in title or created_by and creates nothing",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto bad_title =
+        store.open_campaign(std::string("Q3\0x", 4), "admin", three_grants(), "enabled");
+    REQUIRE_FALSE(bad_title.has_value());
+    CHECK(bad_title.error().starts_with("bad_request:"));
+    CHECK(bad_title.error().find("title") != std::string::npos);
+
+    auto bad_creator =
+        store.open_campaign("Q3", std::string("admin\0x", 7), three_grants(), "enabled");
+    REQUIRE_FALSE(bad_creator.has_value());
+    CHECK(bad_creator.error().starts_with("bad_request:"));
+    CHECK(bad_creator.error().find("created_by") != std::string::npos);
+
+    auto campaigns = store.list_campaigns();
+    REQUIRE(campaigns.has_value());
+    CHECK(campaigns->empty());
+}
+
+TEST_CASE("record_attestation caps justification at 4096 bytes",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Justification cap", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+    REQUIRE(yuzu::server::kMaxJustificationBytes == 4096);
+
+    auto over = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol",
+                                         std::string(4097, 'j'));
+    REQUIRE_FALSE(over.has_value());
+    CHECK(over.error().starts_with("bad_request:"));
+    auto still_pending = store.get_campaign(cid);
+    REQUIRE(still_pending.has_value());
+    CHECK(still_pending->pending_count == 3);
+
+    auto at_cap = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol",
+                                           std::string(4096, 'j'));
+    REQUIRE(at_cap.has_value());
+    auto decided = store.get_campaign(cid);
+    REQUIRE(decided.has_value());
+    CHECK(decided->pending_count == 2);
+    for (const auto& a : decided->attestations)
+        if (a.principal_id == "alice")
+            CHECK(a.justification.size() == 4096);
+}
+
 TEST_CASE("record_attestation on a grant never in the frozen population is not_found",
           "[access_review][store][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);

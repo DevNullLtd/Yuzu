@@ -1,5 +1,6 @@
 #include "access_review_store.hpp"
 
+#include "access_review_model.hpp"
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -161,6 +162,13 @@ AccessReviewStore::open_campaign(std::string title, std::string created_by,
         return std::unexpected("title cannot be empty");
     if (created_by.empty())
         return std::unexpected("created_by cannot be empty");
+    // libpq binds c_str() (pg/pg_exec.hpp): an embedded NUL would truncate the stored value, so
+    // the campaign recorded would not carry the title or creator named. Refuse before the pool is
+    // touched.
+    if (title.find('\0') != std::string::npos)
+        return std::unexpected("bad_request: title contains a NUL byte");
+    if (created_by.find('\0') != std::string::npos)
+        return std::unexpected("bad_request: created_by contains a NUL byte");
     if (rbac_enforcement != "enabled" && rbac_enforcement != "disabled" &&
         rbac_enforcement != "degraded")
         return std::unexpected("rbac_enforcement must be 'enabled', 'disabled', or 'degraded'");
@@ -229,9 +237,26 @@ AccessReviewStore::record_attestation(const std::string& campaign_id,
         return std::unexpected("database not open");
     if (decision != "attested" && decision != "flagged_revoke")
         return std::unexpected("decision must be 'attested' or 'flagged_revoke'");
-    if (campaign_id.empty() || principal_type.empty() || principal_id.empty() ||
-        role_name.empty())
+    if (!valid_campaign_id(campaign_id))
+        return std::unexpected("bad_request: campaign_id invalid");
+    if (principal_type.empty() || principal_id.empty() || role_name.empty())
         return std::unexpected("campaign_id/principal_type/principal_id/role_name required");
+    // libpq binds c_str() (pg/pg_exec.hpp): an embedded NUL would truncate the value, so the
+    // row written or matched would not be the one named. Refuse before the pool is touched.
+    const auto has_nul = [](const std::string& s) { return s.find('\0') != std::string::npos; };
+    if (has_nul(principal_type))
+        return std::unexpected("bad_request: principal_type contains a NUL byte");
+    if (has_nul(principal_id))
+        return std::unexpected("bad_request: principal_id contains a NUL byte");
+    if (has_nul(role_name))
+        return std::unexpected("bad_request: role_name contains a NUL byte");
+    if (has_nul(reviewer))
+        return std::unexpected("bad_request: reviewer contains a NUL byte");
+    if (has_nul(justification))
+        return std::unexpected("bad_request: justification contains a NUL byte");
+    if (justification.size() > kMaxJustificationBytes)
+        return std::unexpected("bad_request: justification exceeds " +
+                               std::to_string(kMaxJustificationBytes) + " bytes");
 
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
@@ -265,8 +290,8 @@ std::expected<CampaignView, std::string>
 AccessReviewStore::get_campaign(const std::string& campaign_id) {
     if (!open_)
         return std::unexpected("database not open");
-    if (campaign_id.empty())
-        return std::unexpected("not_found: campaign_id required");
+    if (!valid_campaign_id(campaign_id))
+        return std::unexpected("bad_request: campaign_id invalid");
 
     // Both reads share one REPEATABLE READ transaction so a concurrent
     // attestation write between the campaign-row read and the attestation-rows
@@ -336,10 +361,13 @@ std::expected<void, std::string>
 AccessReviewStore::close_campaign(const std::string& campaign_id, const std::string& closed_by) {
     if (!open_)
         return std::unexpected("database not open");
-    if (campaign_id.empty())
-        return std::unexpected("not_found: campaign_id required");
+    if (!valid_campaign_id(campaign_id))
+        return std::unexpected("bad_request: campaign_id invalid");
     if (closed_by.empty())
         return std::unexpected("closed_by cannot be empty");
+    // libpq binds c_str() (pg/pg_exec.hpp): a NUL would truncate the recorded closer.
+    if (closed_by.find('\0') != std::string::npos)
+        return std::unexpected("bad_request: closed_by contains a NUL byte");
 
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)

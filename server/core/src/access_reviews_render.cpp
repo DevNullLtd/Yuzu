@@ -209,15 +209,6 @@ std::string grant_row(const AccessReviewRow& r) {
 
 } // namespace
 
-bool valid_campaign_id(std::string_view id) {
-    if (id.empty() || id.size() > 64)
-        return false;
-    return std::all_of(id.begin(), id.end(), [](unsigned char c) {
-        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-               c == '_' || c == '-';
-    });
-}
-
 CampaignDerived derive_campaign_counts(const CampaignView& v) {
     CampaignDerived d;
     std::set<std::string> who;

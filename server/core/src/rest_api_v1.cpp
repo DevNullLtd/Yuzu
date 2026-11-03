@@ -535,24 +535,30 @@ static std::string_view confirm_rotation_error_remediation(const std::string& er
 // per access_review_store.hpp's documented contract, `get_campaign` /
 // `record_attestation` / `close_campaign` signal "no such campaign / no such
 // frozen grant / campaign not open" via an `unexpected` payload PREFIXED
-// `"not_found: "` (machine-checkable). That prefix maps to 404; every other
-// `unexpected` (a genuine write/read failure — lease timeout, query error) is
-// a transient 503, never a 400 — the caller did nothing wrong, the store did.
+// `"not_found: "` (machine-checkable). That prefix maps to 404. A `"bad_request: "`
+// prefix (campaign_id shape, an embedded NUL, an oversized justification) maps
+// to 400: client input the store refused before touching the pool. Every other
+// `unexpected` (a genuine write/read failure, lease timeout, query error) is a
+// transient 503, never a 400: the caller did nothing wrong, the store did.
 //
-// Contract pin: this classifier is binary (not_found: -> 404, else -> 503)
-// because every route above pre-validates its own inputs (title/decision/
-// principal_type/principal_id/role_name all required) BEFORE ever calling
-// into the store, so the store's own input-validation error strings (e.g.
-// "title cannot be empty", "decision must be...") never actually reach this
-// function today — they would fall into the `else -> 503` arm, which is
-// wrong (client error, not a transient failure). Callers MUST keep
-// pre-validating those fields. If a future code path calls into
-// AccessReviewStore without pre-validating, add a machine-checkable
-// `bad_request:` prefix to that store error and a 400 arm here (and in the
-// MCP twin mcp_error_for_access_review_msg in mcp_server.cpp) rather than
-// letting it fall through to 503.
+// The id routes also run `valid_campaign_id` before the store, so for a campaign
+// id the `bad_request:` arm is the backstop for a caller that skips it.
+//
+// Contract pin: any other store-side input-validation string (e.g. "title
+// cannot be empty", "decision must be...") never actually reaches this function
+// today, because every route above pre-validates its own inputs (title/decision/
+// principal_type/principal_id/role_name all required) BEFORE ever calling into
+// the store; unprefixed, such a string would fall into the `else -> 503` arm,
+// which is wrong (client error, not a transient failure). Callers MUST keep
+// pre-validating those fields, and any new store-side validation error gets the
+// machine-checkable `bad_request:` prefix (the arm below, and the MCP twin
+// mcp_error_for_access_review_msg in mcp_server.cpp, already map it).
 static int access_review_error_status(const std::string& err) {
-    return err.starts_with("not_found:") ? 404 : 503;
+    if (err.starts_with("not_found:"))
+        return 404;
+    if (err.starts_with("bad_request:"))
+        return 400;
+    return 503;
 }
 
 // SoftwareDeploymentStore error classifier — mirrors discovery_routes.cpp's
@@ -10593,6 +10599,12 @@ void RestApiV1::register_routes(
             if (deny_engine_session(*session, req, res, audit_fn, "access_review.get",
                                     "AccessReview"))
                 return;
+            if (!valid_campaign_id(campaign_id)) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, kCampaignIdInvalidMessage),
+                                "application/json");
+                return;
+            }
 
             auto view_res = access_review_store->get_campaign(campaign_id);
             if (!view_res) {
@@ -10664,6 +10676,12 @@ void RestApiV1::register_routes(
                                         "/api/v1/access-reviews/{id}/attestations",
                                         "access_review.attested", true))
                 return;
+            if (!valid_campaign_id(campaign_id)) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, kCampaignIdInvalidMessage),
+                                "application/json");
+                return;
+            }
 
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded()) {
@@ -10768,6 +10786,12 @@ void RestApiV1::register_routes(
             if (ar_refuse_browser_write(req, res, *session, "/api/v1/access-reviews/{id}/close",
                                         "access_review.closed", false))
                 return;
+            if (!valid_campaign_id(campaign_id)) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, kCampaignIdInvalidMessage),
+                                "application/json");
+                return;
+            }
 
             auto close_res = access_review_store->close_campaign(campaign_id, session->username);
             if (!close_res) {

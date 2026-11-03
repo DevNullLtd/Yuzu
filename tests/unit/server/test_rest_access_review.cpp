@@ -1739,3 +1739,189 @@ TEST_CASE("access-reviews: the browser-write gate runs after the permission gate
     CHECK_FALSE(has_audit(h, "csrf.denied", "denied", "/api/v1/access-reviews",
                           "cross-site or header-less browser write refused"));
 }
+
+// ── Central campaign id validation (#6939) ──────────────────────────────────
+
+namespace {
+
+constexpr const char* kCampaignIdMessage =
+    "campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -";
+
+/// Ids that must be refused before any store call. The first is the dangerous one: a real
+/// campaign id followed by a NUL. libpq binds c_str(), so without the check the bound id would
+/// truncate back to the real campaign and the mutation would land on it. TestRouteSink does NOT
+/// percent-decode (test_route_sink.hpp), so the NUL is a literal byte in the path here; httplib
+/// decodes `%00` in a route capture to exactly that byte in production.
+std::vector<std::pair<std::string, std::string>> bad_campaign_ids(const std::string& real_cid) {
+    return {{"real id then NUL", real_cid + std::string("\0x", 2)},
+            {"NUL in the middle", std::string("abc\0def", 7)},
+            {"65 characters", std::string(65, 'a')},
+            {"disallowed dot", "bad.id"},
+            {"disallowed colon", "a:b"}};
+}
+
+} // namespace
+
+TEST_CASE("REST get/attest/close refuse a malformed campaign id with 400 and touch nothing",
+          "[pg][access_review][rest][campaign_id][6939]") {
+    AccessReviewHarness h;
+    seed_one_grant(h);
+    const auto cid = h.open_campaign_rest("id validation");
+    const int pending0 = pending_in(h, cid);
+    REQUIRE(pending0 >= 1);
+
+    // Control: the same grant with a well-formed but unknown id reaches the store and is 404,
+    // so the 400s below come from the id check and not from a routing or body problem.
+    {
+        auto control = h.sink.Get("/api/v1/access-reviews/abc");
+        REQUIRE(control);
+        CHECK(control->status == 404);
+    }
+
+    const nlohmann::json attest_body = {{"principal_type", "user"},
+                                       {"principal_id", "csrfuser"},
+                                       {"role_name", "CsrfRole"},
+                                       {"decision", "attested"}};
+
+    for (const auto& [label, bad] : bad_campaign_ids(cid)) {
+        INFO("case: " << label << " (size " << bad.size() << ")");
+        h.audit_log.clear();
+
+        const auto expect_refused = [&](const std::unique_ptr<httplib::Response>& res) {
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            auto body = nlohmann::json::parse(res->body, nullptr, false);
+            REQUIRE_FALSE(body.is_discarded());
+            CHECK(body["error"]["message"] == kCampaignIdMessage);
+        };
+
+        expect_refused(h.sink.Get("/api/v1/access-reviews/" + bad));
+        expect_refused(
+            h.sink.Post("/api/v1/access-reviews/" + bad + "/attestations", attest_body.dump()));
+        expect_refused(h.sink.Post("/api/v1/access-reviews/" + bad + "/close", ""));
+
+        // No audit row for a refused id, on any of the three routes.
+        CHECK(h.audit_log.empty());
+
+        // The real campaign is untouched: still open, every row still pending.
+        auto view = h.access_review_store->get_campaign(cid);
+        REQUIRE(view.has_value());
+        CHECK(view->campaign.status == "open");
+        CHECK(pending_in(h, cid) == pending0);
+    }
+
+    // A valid id still works end to end on all three routes.
+    auto get_ok = h.sink.Get("/api/v1/access-reviews/" + cid);
+    REQUIRE(get_ok);
+    CHECK(get_ok->status == 200);
+    auto attest_ok =
+        h.sink.Post("/api/v1/access-reviews/" + cid + "/attestations", attest_body.dump());
+    REQUIRE(attest_ok);
+    CHECK(attest_ok->status == 200);
+    CHECK(pending_in(h, cid) == pending0 - 1);
+    auto close_ok = h.sink.Post("/api/v1/access-reviews/" + cid + "/close", "");
+    REQUIRE(close_ok);
+    CHECK(close_ok->status == 200);
+}
+
+TEST_CASE("REST id check runs after the permission gate, so a denied caller gets the gate's answer",
+          "[pg][access_review][rest][campaign_id][6939]") {
+    AccessReviewHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return !(t == "AccessReview" && op == "Read");
+    };
+    auto res = h.sink.Get("/api/v1/access-reviews/" + std::string("abc\0def", 7));
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("MCP get/record/close refuse a malformed campaign id with invalid-params and touch "
+          "nothing",
+          "[pg][access_review][mcp][campaign_id][6939]") {
+    AccessReviewHarness h;
+    seed_one_grant(h);
+    const auto cid = h.open_campaign_rest("mcp id validation");
+    const int pending0 = pending_in(h, cid);
+    REQUIRE(pending0 >= 1);
+
+    const auto code_and_message = [](const std::unique_ptr<httplib::Response>& res) {
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body.contains("error"));
+        return std::make_pair(body["error"]["code"].get<int>(),
+                              body["error"]["message"].get<std::string>());
+    };
+
+    for (const auto& [label, bad] : bad_campaign_ids(cid)) {
+        INFO("case: " << label << " (size " << bad.size() << ")");
+        h.audit_log.clear();
+
+        const auto [c1, m1] = code_and_message(h.mcp_call_tool("get_access_review", {{"campaign_id", bad}}));
+        CHECK(c1 == yuzu::server::mcp::kInvalidParams);
+        CHECK(m1 == kCampaignIdMessage);
+
+        const auto [c2, m2] = code_and_message(
+            h.mcp_call_tool("record_attestation", {{"campaign_id", bad},
+                                                   {"principal_type", "user"},
+                                                   {"principal_id", "csrfuser"},
+                                                   {"role_name", "CsrfRole"},
+                                                   {"decision", "attested"}}));
+        CHECK(c2 == yuzu::server::mcp::kInvalidParams);
+        CHECK(m2 == kCampaignIdMessage);
+
+        const auto [c3, m3] =
+            code_and_message(h.mcp_call_tool("close_access_review", {{"campaign_id", bad}}));
+        CHECK(c3 == yuzu::server::mcp::kInvalidParams);
+        CHECK(m3 == kCampaignIdMessage);
+
+        // No domain audit row from the refused call, and nothing changed.
+        for (const auto& r : h.audit_log)
+            CHECK(r.action.rfind("access_review.", 0) != 0);
+        auto view = h.access_review_store->get_campaign(cid);
+        REQUIRE(view.has_value());
+        CHECK(view->campaign.status == "open");
+        CHECK(pending_in(h, cid) == pending0);
+    }
+
+    // A valid id still works end to end.
+    auto get_ok = h.mcp_call_tool("get_access_review", {{"campaign_id", cid}});
+    REQUIRE(get_ok);
+    CHECK(nlohmann::json::parse(get_ok->body).contains("result"));
+    auto close_ok = h.mcp_call_tool("close_access_review", {{"campaign_id", cid}});
+    REQUIRE(close_ok);
+    CHECK(nlohmann::json::parse(close_ok->body).contains("result"));
+}
+
+TEST_CASE("the store's bad_request prefix maps to 400 and invalid-params, not 503",
+          "[pg][access_review][rest][mcp][campaign_id][6939]") {
+    AccessReviewHarness h;
+    seed_one_grant(h);
+    const auto cid = h.open_campaign_rest("justification cap");
+    const int pending0 = pending_in(h, cid);
+    REQUIRE(pending0 >= 1);
+
+    // The justification cap lives in the store, so the transports reach it with a well-formed id.
+    const std::string huge(4097, 'j');
+    auto rest = h.sink.Post("/api/v1/access-reviews/" + cid + "/attestations",
+                            nlohmann::json{{"principal_type", "user"},
+                                           {"principal_id", "csrfuser"},
+                                           {"role_name", "CsrfRole"},
+                                           {"decision", "attested"},
+                                           {"justification", huge}}
+                                .dump());
+    REQUIRE(rest);
+    CHECK(rest->status == 400);
+
+    auto mcp = h.mcp_call_tool("record_attestation", {{"campaign_id", cid},
+                                                      {"principal_type", "user"},
+                                                      {"principal_id", "csrfuser"},
+                                                      {"role_name", "CsrfRole"},
+                                                      {"decision", "attested"},
+                                                      {"justification", huge}});
+    REQUIRE(mcp);
+    auto body = nlohmann::json::parse(mcp->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(pending_in(h, cid) == pending0);
+}

@@ -738,3 +738,31 @@ TEST_CASE("to_csv: CWE-1236 — a leading formula-trigger byte is neutralized wi
         CHECK(csv.find(",normal-id,Normal Name,") != std::string::npos);
     }
 }
+
+// ── valid_campaign_id: the single shared campaign id validator (#6939) ───────
+
+TEST_CASE("valid_campaign_id: length and alphabet boundaries", "[access_review][model][campaign_id]") {
+    using yuzu::server::kCampaignIdMaxLen;
+    using yuzu::server::valid_campaign_id;
+    static_assert(kCampaignIdMaxLen == 64);
+
+    CHECK(valid_campaign_id("a"));                          // shortest
+    CHECK(valid_campaign_id(std::string(64, 'a')));         // longest
+    CHECK_FALSE(valid_campaign_id(std::string(65, 'a')));   // one over
+    CHECK_FALSE(valid_campaign_id(""));                     // empty
+    CHECK(valid_campaign_id("-"));
+    CHECK(valid_campaign_id("_"));
+    CHECK(valid_campaign_id("a41c0e92d7b3f518"));           // the minted shape
+    CHECK(valid_campaign_id("AZaz09_-"));
+    CHECK_FALSE(valid_campaign_id("."));
+    CHECK_FALSE(valid_campaign_id("a.b"));
+    CHECK_FALSE(valid_campaign_id("a b"));
+    CHECK_FALSE(valid_campaign_id("a/b"));
+    CHECK_FALSE(valid_campaign_id("a:b"));
+    CHECK_FALSE(valid_campaign_id("\xC3\xA4"));             // non-ASCII bytes
+    // The whole view is tested, so a NUL anywhere is refused even though a c_str() reader would
+    // stop at it (the libpq bind truncation this validator exists to prevent).
+    CHECK_FALSE(valid_campaign_id(std::string("\0", 1)));
+    CHECK_FALSE(valid_campaign_id(std::string("abc\0def", 7)));
+    CHECK_FALSE(valid_campaign_id(std::string("abc\0", 4)));
+}

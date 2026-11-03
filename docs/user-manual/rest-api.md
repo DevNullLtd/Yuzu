@@ -4287,7 +4287,7 @@ below.
 | `title` | string | Yes | Human-readable campaign name |
 
 **Responses:** `201` — `{campaign_id, grant_count}`. `400` — invalid JSON,
-or `title` missing/empty. `403` without `AccessReview:Attest` (or an
+or `title` missing, empty or containing a NUL byte. `403` without `AccessReview:Attest` (or an
 engine-classed caller), or for a browser (session-cookie) request that
 carries no `Origin`/`Referer` naming this site (audited as `csrf.denied`;
 API-token callers are exempt). `415` — `Content-Type` is not
@@ -4304,6 +4304,13 @@ attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`
 (the review-completeness number).
 
 **Permission:** `AccessReview:Read`.
+
+**Campaign id:** the `{id}` path segment must be 1 to 64 characters of `A-Z`,
+`a-z`, `0-9`, `_` or `-`; anything else (including an empty or over-long
+id, or one carrying a NUL byte) is refused with `400` and the message
+`campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -`, before the
+store is read, and writes no audit row. The check runs after the permission
+gate, so a caller without the permission still gets the `403`.
 
 **Responses:** `200` —
 
@@ -4326,9 +4333,10 @@ attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`
 }
 ```
 
-`403` without `AccessReview:Read` (or an engine-classed caller). `404` — no
-campaign with that id. `503` — the access-review store is unavailable, or a
-genuine read failure.
+`400`: the campaign id is malformed (see the rule above). `403` without
+`AccessReview:Read` (or an engine-classed caller). `404` — no campaign with
+that id. `503` — the access-review store is unavailable, or a genuine read
+failure.
 
 Audited as `access_review.get`.
 
@@ -4337,6 +4345,13 @@ Audited as `access_review.get`.
 Record one reviewer decision against a grant frozen into an open campaign.
 
 **Permission:** `AccessReview:Attest`.
+
+**Campaign id:** the `{id}` path segment must be 1 to 64 characters of `A-Z`,
+`a-z`, `0-9`, `_` or `-`; anything else (including an empty or over-long
+id, or one carrying a NUL byte) is refused with `400` and the message
+`campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -`, before the
+store is read, and writes no audit row. The check runs after the permission
+gate, so a caller without the permission still gets the `403`.
 
 **Request body:**
 
@@ -4356,7 +4371,7 @@ Record one reviewer decision against a grant frozen into an open campaign.
 | `principal_id` | string | Yes | Principal identifier |
 | `role_name` | string | Yes | Role being reviewed |
 | `decision` | string | Yes | `attested` \| `flagged_revoke` |
-| `justification` | string | No | Free-text reviewer note |
+| `justification` | string | No | Free-text reviewer note, at most 4096 bytes |
 
 **`flagged_revoke` records evidence ONLY — it never itself revokes the
 grant.** No RBAC/EnginePrincipal mutation happens on this path; acting on
@@ -4364,9 +4379,11 @@ the flag (unassigning the role, revoking the engine principal, etc.) is a
 separate, explicit operator action performed after reading this evidence.
 flag ≠ revoke.
 
-**Responses:** `200` — `{recorded: true}`. `400` — `principal_type`,
-`principal_id`, or `role_name` missing, or `decision` is neither `attested`
-nor `flagged_revoke`. `403` without `AccessReview:Attest` (or an engine-classed
+**Responses:** `200` — `{recorded: true}`. `400`: the campaign id is
+malformed (see the rule above), `principal_type`, `principal_id`, or
+`role_name` is missing, `decision` is neither `attested` nor
+`flagged_revoke`, `justification` is longer than 4096 bytes, or `principal_type`,
+`principal_id`, `role_name` or `justification` contains a NUL byte. `403` without `AccessReview:Attest` (or an engine-classed
 caller), or for a browser (session-cookie) request that carries no
 `Origin`/`Referer` naming this site (audited as `csrf.denied`; API-token
 callers are exempt). `404` — no campaign with that id, no such frozen grant in it, or
@@ -4393,7 +4410,15 @@ forces to completion.
 
 **Permission:** `AccessReview:Attest`.
 
-**Responses:** `200` — `{closed: true}`. `403` without `AccessReview:Attest`
+**Campaign id:** the `{id}` path segment must be 1 to 64 characters of `A-Z`,
+`a-z`, `0-9`, `_` or `-`; anything else (including an empty or over-long
+id, or one carrying a NUL byte) is refused with `400` and the message
+`campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -`, before the
+store is read, and writes no audit row. The check runs after the permission
+gate, so a caller without the permission still gets the `403`.
+
+**Responses:** `200` — `{closed: true}`. `400`: the campaign id is malformed
+(see the rule above). `403` without `AccessReview:Attest`
 (or an engine-classed caller), or for a browser (session-cookie) request that
 carries no `Origin`/`Referer` naming this site (audited as `csrf.denied`;
 API-token callers are exempt). `404` — no campaign with that id, or already

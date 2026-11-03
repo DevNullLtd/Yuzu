@@ -46,10 +46,10 @@ inline constexpr std::string_view kGrantsUnavailable =
     "The grant population could not be read, so the list is unknown. This is not no grants.";
 inline constexpr std::string_view kSelectCampaign = "Select a campaign from the list to review its grants.";
 
-/// The campaign id shape the routes and the page script accept: the store mints 16 hex digits;
-/// this is deliberately wider but excludes every URL-significant byte, so an id that passes can
-/// be placed in a query value or a path segment unchanged.
-[[nodiscard]] bool valid_campaign_id(std::string_view id);
+/// The campaign id shape the routes and the page script accept. The single definition lives in
+/// `access_review_model.hpp` (`yuzu::server::valid_campaign_id`); re-exported here so the page
+/// routes keep their unqualified call.
+using yuzu::server::valid_campaign_id;
 
 struct CampaignDerived {
     int total = 0;
