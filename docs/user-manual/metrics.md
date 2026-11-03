@@ -1148,7 +1148,7 @@ caller).
 ## Engine-credential confirm metric (#2404)
 
 ```
-# HELP yuzu_engine_principal_confirm_total Engine-credential rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient); store-reaching calls only, pre-store denials excluded (#2404)
+# HELP yuzu_engine_principal_confirm_total Engine-credential rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient|secret_mismatch); store-reaching calls only, pre-store denials excluded (#2404; secret_mismatch added #3015 proof-of-possession)
 # TYPE yuzu_engine_principal_confirm_total counter
 yuzu_engine_principal_confirm_total{surface="rest",result="success"} 0
 yuzu_engine_principal_confirm_total{surface="rest",result="conflict"} 0
@@ -1158,19 +1158,29 @@ yuzu_engine_principal_confirm_total{surface="mcp",result="success"} 0
 yuzu_engine_principal_confirm_total{surface="mcp",result="conflict"} 0
 yuzu_engine_principal_confirm_total{surface="mcp",result="client_error"} 0
 yuzu_engine_principal_confirm_total{surface="mcp",result="transient"} 0
+yuzu_engine_principal_confirm_total{surface="rest",result="secret_mismatch"} 0
+yuzu_engine_principal_confirm_total{surface="mcp",result="secret_mismatch"} 0
 ```
 
-All 8 series (the closed `surface` × `result` cross-product) are pre-seeded to
+All 10 series (the closed `surface` × `result` cross-product) are pre-seeded to
 `0` at startup so `absent()` alerts stay meaningful. The family makes a
 credential-**confirm** retry storm alertable, which `yuzu_http_requests_total`
 cannot show (it has no per-route label). `result` mirrors the shared
 store-error taxonomy (`engine_store_error_class.hpp`): `conflict` is a terminal
 409/kInvalidParams (a replay after the rotation already resolved, a moved-on
-pin, or unresolved rotation metadata — the client must not blindly retry),
+pin, unresolved rotation metadata, or a malformed two-credential pair, which
+is store corruption and not a replay — the client must not blindly retry),
 `client_error` is a 400 (more-than-two or non-engine active credentials),
 `transient` is a retryable 503 (store unavailable, lock contention, a persist
-failure, or the ambiguous empty/malformed-pair "no in-flight rotation"), and
-`success` is a completed confirm.
+failure, or the ambiguous empty read "no in-flight rotation to confirm"),
+`secret_mismatch` is a presented secret that does not verify (403), and
+`success` is a completed confirm. A malformed two-credential pair used to count
+as `transient`; it now counts as `conflict`, so a persistent malformed pair is
+visible on the `conflict` series, not on `transient`; the REST confirm route also
+writes a warning log line on the server, and on MCP the signals are the
+`conflict` series and the `engine_principal.credential.confirm` failure audit
+row. Alert authors who watch this family for store
+corruption should watch `conflict` as well.
 
 **Scope contract.** Counted only when a confirm reaches `ApiTokenStore::confirm_rotation`
 **or** trips the store-open guard (which increments `result="transient"`);
@@ -1189,7 +1199,11 @@ label (bounded cardinality only) — pair it with the
 (metric-is-the-signal / audit-row-is-the-evidence). A useful alert is
 `increase(yuzu_engine_principal_confirm_total{result="conflict"}[15m]) > <n>`
 to catch a client stuck replaying a resolved confirm, and
-`increase(...{result="transient"}[15m])` for a genuine store-health storm.
+`increase(...{result="transient"}[15m])` for a genuine store-health storm. A
+`conflict` count that keeps growing for one principal after its client has
+stopped replaying can also be a malformed two-credential pair that every retry
+meets again; the matching `engine_principal.credential.confirm` failure rows say
+`rotation pair is malformed`.
 
 **Semantics for alert authors:** this counts confirm **attempts** that reach
 the store, not logical rotations — a client retrying a `transient` blip 20 times
@@ -1243,25 +1257,27 @@ A server predating this metrics family, or a scrape config dropping the
 `yuzu_rotation_sweep_*` series, reads as a silently-healthy sweep — none of
 these are paired with their own "series is absent" companion alert today
 (unlike `YuzuAuditRetentionNotRunning`/`YuzuAuditRetentionMetricMissing`);
-that gap is tracked, not closed, by this round.
+that gap is tracked, not closed.
 
 ## Human API-token confirm metric (P2 #11)
 
 ```
-# HELP yuzu_api_token_confirm_total Human API-token rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient); store-reaching calls only, pre-store denials excluded - the human-owned twin of yuzu_engine_principal_confirm_total
+# HELP yuzu_api_token_confirm_total Human API-token rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient|secret_mismatch); store-reaching calls only, pre-store denials excluded - the human-owned twin of yuzu_engine_principal_confirm_total (secret_mismatch added #3015 proof-of-possession)
 # TYPE yuzu_api_token_confirm_total counter
 yuzu_api_token_confirm_total{surface="rest",result="success"} 0
 yuzu_api_token_confirm_total{surface="rest",result="conflict"} 0
 yuzu_api_token_confirm_total{surface="rest",result="client_error"} 0
 yuzu_api_token_confirm_total{surface="rest",result="transient"} 0
+yuzu_api_token_confirm_total{surface="rest",result="secret_mismatch"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="success"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="conflict"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="client_error"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="transient"} 0
+yuzu_api_token_confirm_total{surface="mcp",result="secret_mismatch"} 0
 ```
 
 The human-owned twin of [`yuzu_engine_principal_confirm_total`](#engine-credential-confirm-metric-2404)
-directly above — same closed `surface` x `result` cross-product (8 series),
+directly above — same closed `surface` x `result` cross-product (10 series),
 pre-seeded to `0` at startup for the same `absent()`-alert reason, and the
 same intended scope contract: counted only when a confirm reaches the
 credential store or trips the store-open guard (`result="transient"`),
