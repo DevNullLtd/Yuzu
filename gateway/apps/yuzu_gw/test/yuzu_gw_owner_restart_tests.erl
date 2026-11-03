@@ -41,6 +41,8 @@ owner_restart_test_() ->
                      fun crashed_owner_sends_disconnected/0}},
       {timeout, 60, {"stream still open: the session is re-established and a command reaches "
                      "the agent, with no reconnect", fun open_stream_is_recovered/0}},
+      {timeout, 60, {"a restarted owner keeps the agent's hostname, in its info and in the "
+                     "registry row (Phase 1c G1)", fun restarted_owner_keeps_hostname/0}},
       {timeout, 60, {"stream gone: DISCONNECTED only, no resurrection, no child left",
                      fun gone_stream_is_not_resurrected/0}},
       {timeout, 60, {"an owner that crashes on every start gives up after its budget with one "
@@ -162,6 +164,31 @@ open_stream_is_recovered() ->
                                              #{}),
     ?assertEqual(ok, wait_until(fun() -> frames_with(Conn, <<"or-cmd-1">>) > 0 end, ?PROMPT_MS)),
     ?assertEqual([recovered], outcomes()).
+
+%% Phase 1c G1: the owner keeps the hostname alone, so a restarted owner must
+%% rebuild it from the owner table's copy of the start arguments. Both the
+%% successor's get_info/1 and the registry row (list_agents/2, which
+%% ListAgents and QueryInventory read) carry the original hostname.
+restarted_owner_keeps_hostname() ->
+    {ok, _} = application:ensure_all_started(yuzu_gw),
+    Id = <<"or-hostname">>,
+    Info = #{agent_id => Id, hostname => <<"h-or-restart">>},
+    #{owner := Owner, session := S} =
+        start_with_stream(Id, <<Id/binary, "-session">>, fun relay_stream/1,
+                          #{agent_info => Info}),
+    ?assertEqual([<<"h-or-restart">>], row_hostnames(Id)),
+    exit(Owner, kill),
+    ?assertEqual(ok, wait_until(fun() -> length(notices(S, 'CONNECTED')) >= 2 end, ?PROMPT_MS)),
+    {ok, New} = yuzu_gw_registry:lookup(Id),
+    ?assertNotEqual(Owner, New),
+    {ok, NewInfo} = yuzu_gw_agent:get_info(New),
+    ?assertEqual(<<"h-or-restart">>, maps:get(hostname, NewInfo)),
+    ?assertEqual([<<"h-or-restart">>], row_hostnames(Id)),
+    ?assertEqual([recovered], outcomes()).
+
+row_hostnames(Id) ->
+    {Agents, _} = yuzu_gw_registry:list_agents(100000, undefined),
+    [H || #{agent_id := I, hostname := H} <- Agents, I =:= Id].
 
 gone_stream_is_not_resurrected() ->
     {ok, _} = application:ensure_all_started(yuzu_gw),
@@ -525,12 +552,14 @@ start_with_stream(Id, Session, Fun) ->
 %% A stream process (Fun(Conn) is its body once its owner is known) whose owner
 %% is started through the agent supervisor, as the Subscribe handler does.
 %% Opts: bind => true binds the session to the stand-in connection (its
-%% heartbeats are then admitted on that connection only).
+%% heartbeats are then admitted on that connection only); agent_info => Map
+%% replaces the default AgentInfo (#{agent_id => Id}).
 start_with_stream(Id, Session, Fun, Opts) ->
     Parent = self(),
     Conn = spawn(fun conn_loop/0),
     Stream = spawn(fun() ->
-                           Args0 = #{agent_id => Id, agent_info => #{agent_id => Id},
+                           AgentInfo = maps:get(agent_info, Opts, #{agent_id => Id}),
+                           Args0 = #{agent_id => Id, agent_info => AgentInfo,
                                      stream_pid => self(), peer_addr => <<"127.0.0.1">>,
                                      session_id => Session,
                                      register_req => #{info => #{agent_id => Id}}},

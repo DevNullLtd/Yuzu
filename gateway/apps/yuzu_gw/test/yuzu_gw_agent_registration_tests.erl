@@ -33,6 +33,8 @@ registration_test_() ->
                      fun start_child_does_not_wait_for_the_registry/0}},
       {"start_agent answers once the agent is in the routing table",
        fun start_agent_waits_for_registration/0},
+      {"the registry row carries the agent's hostname (Phase 1c G1)",
+       fun registry_row_carries_hostname/0},
       {"the agent joins its own {agent, Id} group and no other",
        fun agent_joins_only_its_own_group/0},
       {"a superseded agent leaves {agent, Id}",
@@ -113,6 +115,19 @@ start_agent_waits_for_registration() ->
     %% No polling: the answer means the row is there.
     ?assertEqual({ok, Pid}, yuzu_gw_registry:lookup(Id)),
     ?assertEqual([Pid], pg:get_local_members(yuzu_gw, {agent, Id})).
+
+%% Phase 1c G1: the owner keeps the hostname alone; the row it writes on
+%% registering must still carry it, as read by list_agents/2 (the accessor
+%% behind ListAgents and QueryInventory).
+registry_row_carries_hostname() ->
+    Id = <<"reg-hostname-row-1">>,
+    Args = args(Id),
+    {ok, Pid} = yuzu_gw_agent_sup:start_agent(
+                  Args#{agent_info => #{hostname => <<"h-row">>,
+                                        plugins => [#{name => <<"svc">>}]}}),
+    {Agents, _} = yuzu_gw_registry:list_agents(100000, undefined),
+    ?assertMatch([#{pid := Pid, hostname := <<"h-row">>}],
+                 [A || #{agent_id := I} = A <- Agents, I =:= Id]).
 
 %% The registry joins no pg group; the agent joins `{agent, Id}' (read by the
 %% cross-node lookup fallback) itself, and leaves it when it disconnects.
