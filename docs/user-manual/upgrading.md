@@ -45,7 +45,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 - On Windows, before upgrading, run `certutil -verify -urlfetch <certificate file>` against the certificate chain each outbound HTTPS target presents, on the host that runs the server or agent. A failure to build a trusted chain there points to a refusal after the upgrade; a clean result is a good sign, not a guarantee, because the check is not confirmed to test the `serverAuth` usage. `openssl s_client -connect <host>:<port> -servername <host> -showcerts` prints the chain a target sends. Judge trust against the machine certificate store (confirm the chain's root is under Local Computer in `certlm.msc`); a service account's own user store is normally empty (not verified by Yuzu).
 - On Windows, deploy any private or inspection root that outbound HTTPS needs to the Windows certificate store (`certlm.msc` or group policy). A root installed only in one user's certificate store is not necessarily trusted by a service running under a different account, so install it in the machine store.
 
-**Rollback.** No migration and no schema change, and this change writes no new durable state. A return to an earlier build is outside the deployment contract below, and it does not reverse the Echo `echo.db` trim described in the next section.
+**Rollback.** No migration and no schema change, and this change writes no new durable state. A return to an earlier build is outside the deployment contract below, and it does not reverse the Echo `echo.db` trim described in the "Echo holds `echo.db` to a byte budget" section below.
 
 ## ⚠️ Breaking: stored response rows are capped per command and device (256 by default) (#561)
 
