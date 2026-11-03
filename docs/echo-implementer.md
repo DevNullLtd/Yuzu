@@ -297,6 +297,17 @@ rejected, replay keys seeded, tables dropped, file sizes and the WAL size at com
 the retired tables' own column lists, which live in `echo_fold_schema.cpp` (`legacy_live_columns`); they
 are the last copy of the raw schema and exist only to read old files and to answer `$X_Live` reads.
 
+Three operational facts about the migration. (1) Plugin `init()` blocks for the whole migration:
+`agents/core/src/agent.cpp` runs every plugin's init in its load loop (about :1057-1085), before the
+Register RPC and before the heartbeat thread starts (about :2005 and :2582), so the agent registers
+after the migration, and the Windows SCM and systemd (`Type=simple`) have no readiness deadline it can
+trip. Agent-level start-to-registered time is not measured. (2) The transaction's WAL is not bounded by
+the file's size: 325.7 MB on a 241.8 MB file (1.35 times) in the one measurement. The twice-the-file
+free-space pre-check covers that case (WAL plus new file about 404 MB under the 483 MB demanded); no
+general bound is proven. (3) A failed earlier step (v8) makes `open()` refuse before the roll-up step
+runs; the plugin's init fails (`init_failed` in the heartbeat's `yuzu.plugins_failed`) until a start
+succeeds.
+
 Consequences for code that reads the store:
 - `echo_usage.cpp` is fed the process fold's events inside the process transaction
   (`usage_fold_in` rides `fold_rows`'s `extra` hook), so there is no read marker and no lag;
@@ -473,7 +484,7 @@ Routine debugging entry points:
 | "Echo isn't recording anything for source X" | `echo.status` output → `<source>_enabled` row. Then `compatibility` action to confirm OS support. Then check the agent log for "Echo plugin initialized". |
 | "Query returns 0 rows but I know the event happened" | Check the collect interval (`fast_interval` / `slow_interval`) vs the event lifetime — anything shorter than the interval is sub-resolution. |
 | "TCP collector shows a flood of `connected` events" | Almost always a restart artifact. Confirm against the agent's start time. |
-| "echo.db is huge" | `status` returns `db_size_bytes` (used pages plus the WAL, not the file size) against `db_budget_bytes`. If it's growing without bound the rollup trigger may not be firing — check trigger registration in `init()`. A file that stays large while `db_size_bytes` is within budget is an older database waiting for its one-off `VACUUM` (`db_auto_vacuum|deferred` means a conversion was wanted and could not run: the volume lacked twice the used size free, or the `VACUUM` failed; the marker clears only when a conversion succeeds). `budget_over_bytes` above 0 has several causes: a long `echo.sql` read pinning the log (clears at the next checkpoint), an eviction pass that failed (retried next pass), a pass skipped by the retention clock guard (`retention_guard|__budget__|<n>`), an unreadable setting (`db_budget_bytes|unknown`), a catch-up still draining, or only exempt rows left (newest 24 hours of raw capture rows, hourly rows under 48 hours, daily and monthly rows, the `usage` tables, paused or errored sources and `netconn`, `netqual`, `power`, `removable`, `registry`); see the user manual, "If `budget_over_bytes` stays above 0". |
+| "echo.db is huge" | `status` returns `db_size_bytes` (used pages plus the WAL, not the file size) against `db_budget_bytes`. If it's growing without bound, check that the maintenance pass (`echo.rollup`, the budget pass) is running and `budget_over_bytes`: there is no aggregation pass any more, and the tiers grow only through the folds and shrink only through retention and the byte budget; confirm the triggers registered in `init()`. A file that stays large while `db_size_bytes` is within budget is an older database waiting for its one-off `VACUUM` (`db_auto_vacuum|deferred` means a conversion was wanted and could not run: the volume lacked twice the used size free, or the `VACUUM` failed; the marker clears only when a conversion succeeds). `budget_over_bytes` above 0 has several causes: a long `echo.sql` read pinning the log (clears at the next checkpoint), an eviction pass that failed (retried next pass), a pass skipped by the retention clock guard (`retention_guard|__budget__|<n>`), an unreadable setting (`db_budget_bytes|unknown`), a catch-up still draining, or only exempt rows left (hourly rows under 48 hours, daily and monthly rows, the `usage` tables, paused or errored sources and `netconn`, `netqual`, `power`, `removable`, `registry`); see the user manual, "If `budget_over_bytes` stays above 0". |
 | "Schema migration failed at startup" | `agent.log` will show `EchoDatabase: migrated to schema version N` on success or the SQLite error on failure. Migrations are idempotent — fixing the underlying issue and restarting will retry. |
 
 For new-source bring-up, the smallest viable change is: add a

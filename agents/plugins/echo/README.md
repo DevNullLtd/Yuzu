@@ -536,7 +536,7 @@ their declared columns at all; see Caveats.
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `status` | string | - | all | `-` | Declared as a literal status token; the plugin's actual response line is `echo\|rollup\|<n>\|rows_aggregated` (a single positional line, not a status/rows_aggregated pair), so this column is not populated by the current wire format — see Caveats and known gaps. Values: not emitted by the current wire format. |
-| `rows_aggregated` | int32 | - | Windows, Linux, macOS | `-` | Number of rows the aggregation pass moved into the hourly/daily/monthly tiers this cycle (run_aggregation's return value); carried as the third field of the `echo\|rollup\|<n>\|rows_aggregated` line rather than a named column. Values: non-negative integer. |
+| `rows_aggregated` | int32 | - | Windows, Linux, macOS | `-` | Always 0: Echo folds every event into the hourly, daily and monthly tiers as it arrives, so there is no aggregation pass to count. The field stays in the reply shape so a stored client that parses it keeps working; it is the third field of the `echo\|rollup\|<n>\|rows_aggregated` line rather than a named column. Values: 0. |
 
 **`crossplatform.echo.service_state_changes` — `output`**
 

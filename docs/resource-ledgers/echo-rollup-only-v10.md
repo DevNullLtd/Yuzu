@@ -32,10 +32,14 @@ releases exactly the resource listed.
   writes meanwhile; the open has not returned, so none is running yet. The query connection does not
   exist yet, so no reader pins the WAL.
 - **Disk:** the pre-check refuses a volume with less than twice the file free (the open fails with
-  `kFreeSpaceRefusalPrefix`, nothing changed). The transaction's WAL is at most about the file's size;
-  it is checkpointed to zero after the commit, before the VACUUM, whose copy and journal are the only
+  `kFreeSpaceRefusalPrefix`, nothing changed). The transaction's WAL is not bounded by the file's size
+  (325.7 MB on a 241.8 MB file, 1.35 times, one measurement); the check covers that case (WAL plus
+  the new file about 404 MB, under the 483 MB demanded) and no general bound is proven. The WAL is
+  checkpointed to zero after the commit, before the VACUUM, whose copy and journal are the only
   transient space and are bounded by the second free-space check (else the VACUUM is deferred and the
-  maintenance pass retries daily).
+  maintenance pass retries daily). Follow-up #6891 (the VACUUM's locks) is narrowed, not closed: the
+  open-time conversion runs before any trigger exists, but the daily `maybe_vacuum_to_incremental`
+  retry still runs on the trigger thread and holds the locks for its duration.
 - **Failure:** a fault, crash or power loss before COMMIT leaves schema v9 and every retired table
   intact (SQLite's WAL recovery discards the unfinished transaction); the next open redoes the step.
 - **After COMMIT:** the connection must be in autocommit (`sqlite3_get_autocommit`); a wedged one is
@@ -70,3 +74,14 @@ releases exactly the resource listed.
   not end on its deadline, and by a slice that finds the wall clock stepped back
   (`budget_slice_clock`). The marker is cleared (`clear_deferred_marker`) when a conversion succeeds;
   a non-positive reading is never stored as a marker.
+
+### Test seams (no production caller)
+- **`OpenSeams::free_bytes`, `OpenSeams::v10_after_drop`** (`echo_db.hpp`): empty in production. The
+  first replaces the volume's free-space reading in the two migration checks; the second runs inside
+  the v10 transaction after the drops and may fail it. Both are by-value `std::function`s in the
+  caller's `OpenSeams`, owned by the test for the call of `open()`.
+- **`RegistryReader::committed`** (`echo_registry_source.hpp`): null in production. When set, it is
+  called with the rows of every tick whose fold and cursor committed, on the tick's own thread after
+  the commit. The roll-up tier keeps no writer pid, attribution detail or source, so a test reads what
+  a tick decided here. The observer owns nothing of the source's; it takes the rows by const reference
+  and must not retain them.

@@ -30,17 +30,20 @@
  *        stamp schema_version 10.
  *
  * AFTER the commit: the connection must be in autocommit (B3), the WAL is checkpointed to zero
- * (secure_delete=ON zeroes every dropped raw page into the WAL, so the WAL after COMMIT is about
- * the size of the file), and the one VACUUM that returns the freed pages runs if the volume still
+ * (secure_delete=ON zeroes every dropped raw page into the WAL, so the WAL after COMMIT is as
+ * large as the file or larger: 325.7 MB on a 241.8 MB file, 1.35 times, in the one measurement
+ * taken), and the one VACUUM that returns the freed pages runs if the volume still
  * has twice the file's size free; otherwise `auto_vacuum_deferred_at` is set and the maintenance
  * pass retries daily.
  *
  * BOUNDS. Before it starts the migration refuses a volume with less than twice the database file
  * free (so Echo stays offline until the space is freed and the agent restarts, rather than risking
- * the host's disk). The transaction's WAL is at most about the size of the file (the converted
- * summary bytes plus the zeroed raw pages), and is checkpointed to zero before the VACUUM, whose
- * temporary copy and journal are at most twice the post-drop file; the two free-space checks bound
- * both phases. The write lock is held for the whole run (tens of seconds on a 250 MiB file): no
+ * the host's disk). The transaction's WAL (the converted summary bytes plus the zeroed raw pages)
+ * is NOT bounded by the file's size: it measured 1.35 times the file. The twice-the-file check
+ * covers the measured case (WAL 325.7 MB plus the new file about 79 MB is about 404 MB, under the
+ * 483 MB demanded for a 241.8 MB file); no general bound is proven. The WAL is checkpointed to
+ * zero before the VACUUM, whose temporary copy and journal are at most twice the post-drop file,
+ * and the second free-space check bounds that phase. The write lock is held for the whole run (tens of seconds on a 250 MiB file): no
  * collector writes meanwhile, and a collector call that finds the database busy retries on its
  * next tick.
  *

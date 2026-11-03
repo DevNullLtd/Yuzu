@@ -1805,7 +1805,7 @@
           "values": null
         },
         {
-          "description": "Number of rows the aggregation pass moved into the hourly/daily/monthly tiers this cycle (run_aggregation's return value); carried as the third field of the `echo|rollup|<n>|rows_aggregated` line rather than a named column. Values: non-negative integer.",
+          "description": "Always 0: Echo folds every event into the hourly, daily and monthly tiers as it arrives, so there is no aggregation pass to count. The field stays in the reply shape so a stored client that parses it keeps working; it is the third field of the `echo|rollup|<n>|rows_aggregated` line rather than a named column. Values: 0.",
           "example": "-",
           "name": "rows_aggregated",
           "platforms": [

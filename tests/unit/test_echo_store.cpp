@@ -3171,6 +3171,77 @@ TEST_CASE("EchoDatabase v7->v8: a failed flip rolls the whole migration back, th
     remove_db_files(tmp);
 }
 
+TEST_CASE("EchoDatabase v7: a failed v8 step blocks the roll-up step and leaves the raw capture "
+          "rows intact until a reopen succeeds",
+          "[echo][store][migration][v8][v10][atomic]") {
+    // A v7 file that still holds raw capture rows, with a trigger that fails the v8 flip. The
+    // roll-up step must refuse to run past the failed step: it would take the version to 10 and
+    // v8 would never be retried. After the fault is removed one reopen walks v7 to v10.
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_v8_");
+    {
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(tmp.string().c_str(), &owner.db) == SQLITE_OK);
+        const char* seed = R"(
+            CREATE TABLE echo_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+            INSERT INTO echo_config (key, value) VALUES ('schema_version', '7');
+            INSERT INTO echo_config (key, value) VALUES ('netqual_enabled', 'false');
+            CREATE TABLE procperf_live (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER, snapshot_id INTEGER, name TEXT, version TEXT NOT NULL DEFAULT '',
+                instances INTEGER, cpu_pct REAL, ws_bytes INTEGER);
+            CREATE TABLE procperf_hourly (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hour_ts INTEGER, name TEXT, version TEXT NOT NULL DEFAULT '', samples INTEGER,
+                instances_max INTEGER, cpu_avg REAL, cpu_max REAL, ws_avg_bytes INTEGER,
+                ws_max_bytes INTEGER, is_kthread INTEGER NOT NULL DEFAULT 0);
+            ALTER TABLE procperf_live ADD COLUMN is_kthread INTEGER NOT NULL DEFAULT 0;
+            INSERT INTO procperf_live (ts, snapshot_id, name, version, instances, cpu_pct, ws_bytes)
+                VALUES (7300, 1, 'app.exe', '2.0', 1, 3.0, 10);
+            CREATE TRIGGER yuzu_test_v8_abort BEFORE UPDATE ON echo_config
+                WHEN NEW.key = 'netqual_enabled'
+                BEGIN SELECT RAISE(ABORT, 'injected'); END;
+        )";
+        REQUIRE(sqlite3_exec(owner.db, seed, nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    {
+        auto db = EchoDatabase::open(tmp);
+        REQUIRE_FALSE(db.has_value());
+        CHECK(db.error().find("earlier migration step") != std::string::npos);
+    }
+    {
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(tmp.string().c_str(), &owner.db) == SQLITE_OK);
+        const auto scalar = [&](const char* sql) {
+            sqlite3_stmt* st = nullptr;
+            REQUIRE(sqlite3_prepare_v2(owner.db, sql, -1, &st, nullptr) == SQLITE_OK);
+            std::string v;
+            if (sqlite3_step(st) == SQLITE_ROW)
+                v = reinterpret_cast<const char*>(sqlite3_column_text(st, 0));
+            sqlite3_finalize(st);
+            return v;
+        };
+        CHECK(scalar("SELECT value FROM echo_config WHERE key = 'schema_version'") == "7");
+        CHECK(scalar("SELECT COUNT(*) FROM procperf_live") == "1");
+        CHECK(scalar("SELECT COUNT(*) FROM procperf_hourly") == "0");
+        // No transaction or lock survived the refused open: autocommit, and a writer can begin.
+        CHECK(sqlite3_get_autocommit(owner.db) == 1);
+        CHECK(sqlite3_exec(owner.db, "BEGIN IMMEDIATE; ROLLBACK;", nullptr, nullptr, nullptr) ==
+              SQLITE_OK);
+        REQUIRE(sqlite3_exec(owner.db, "DROP TRIGGER yuzu_test_v8_abort", nullptr, nullptr,
+                             nullptr) == SQLITE_OK);
+    }
+    {
+        auto db = EchoDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 10);
+        CHECK(db->get_config("netqual_enabled", "") == "true");
+        auto row = db->execute_query("SELECT version FROM procperf_hourly WHERE name = 'app.exe'");
+        REQUIRE(row.has_value());
+        CHECK(row->rows.size() == 1);
+    }
+    remove_db_files(tmp);
+}
+
 namespace {
 
 // Denies the Nth read of echo_config.value on the FIRST connection a later EchoDatabase::open()
