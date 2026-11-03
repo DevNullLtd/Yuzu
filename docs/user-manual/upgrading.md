@@ -2,6 +2,17 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: `echo.sql` refuses `WITH`, `NATURAL`, `USING` and bound-parameter markers
+
+**What changed.** The Echo agent plugin's `echo.sql` action refuses a query before it is prepared when it uses a common table expression, a `NATURAL` or `USING` join, or a parameter marker (`?`, `$x`, `:x`, `@x`, `#x`). A query that starts with `WITH` is answered `only SELECT queries are allowed`; `WITH` elsewhere, `NATURAL` and `USING` are answered `query contains forbidden keyword: <word>`; a marker is answered `query contains a bound-parameter marker`. Write a join with `ON` and a CTE as a subquery; `$`-prefixed table names such as `$Process_Hourly` still work.
+
+**Who is affected.** Anything that stores or replays an `echo.sql` query text: stored schedules, pinned or re-evaluated result sets, workflow steps, and REST and MCP callers.
+
+**Before you upgrade.** Search those stores for `WITH`, `NATURAL`, `USING`, a `$` that is not a `$Table_Name` placeholder, or any of `? : @ #`, outside string literals, and rewrite the queries.
+
+**Mixed fleet.** An agent that is not yet upgraded still answers these queries, so one stored query answers differently per agent version. Compare a result set's `device_count` with the source execution's `agents_failure` to see whether agents refused it.
+
+**Rolling back.** Clean: nothing is stored differently, and an older agent accepts the queries again.
 ## ⚠️ Breaking: stored response rows are capped per command and device (256 by default) (#561)
 
 - **What changed:** the response store keeps at most 256 rows for one command on one device (`--response-max-rows-per-agent`, env `YUZU_RESPONSE_MAX_ROWS_PER_AGENT`, range 1-65536). Rows past the cap are dropped, newest first, and the row just before the dropped frames ends with a `...[rows past per-agent cap dropped]` marker. One terminal-status row is still recorded past the cap when none exists, so the command's outcome shows.

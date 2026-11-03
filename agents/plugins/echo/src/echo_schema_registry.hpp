@@ -24,9 +24,33 @@ namespace yuzu::echo {
 
 // ── Column and table metadata ───────────────────────────────────────────────
 
+/// What a column is in a roll-up tier table (echo_fold_schema.hpp). Only the
+/// roll-up declarations set anything but the default; every `{name, type}`
+/// initialiser in build_sources() keeps compiling untouched.
+enum class ColumnRole {
+    kBucket,    ///< the tier's time bucket (hour_ts / day_ts / month_ts)
+    kKey,       ///< part of the (bucket, keys...) identity of a roll-up row
+    kMeasure,   ///< a merged value (see MergeOp)
+    kGenerated, ///< VIRTUAL generated column derived from measures; never written
+};
+
+/// How a measure merges when a fold lands on an existing (bucket, keys) row.
+enum class MergeOp {
+    kNone, ///< not a merged value (keys, generated columns, plain registry columns)
+    kSum,  ///< m = m + incoming
+    kMax,  ///< m = MAX(m, incoming)
+    kMin,  ///< m = MIN(m, incoming)
+    kLast, ///< m = incoming iff incoming `guard` >= stored `guard` (ties take the later arrival)
+};
+
 struct ColumnDef {
     std::string_view name;
     std::string_view sql_type; // INTEGER, TEXT, REAL
+    ColumnRole role = ColumnRole::kMeasure;
+    MergeOp merge = MergeOp::kNone;
+    bool interned = false;            ///< TEXT key stored as an echo_dict id
+    std::string_view generated_expr{}; ///< SQL of a kGenerated column
+    std::string_view guard{};          ///< kLast only: the INTEGER column that orders it
 };
 
 enum class RetentionType { kRowCount, kTimeBased };
