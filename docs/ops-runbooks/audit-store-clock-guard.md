@@ -70,7 +70,11 @@ The RBAC enforcement read (`GET /api/v1/rbac/enforcement`, audit action `rbac.en
 another such route: each served REST read adds one audit INSERT (each MCP read adds two,
 `rbac.enforcement.read` and `mcp.get_rbac_enforcement`), and on REST it fails closed, so an audit
 outage answers it `503` with `Sec-Audit-Failed: true` and no state (the MCP twin returns the data with
-`audit_persisted: false`). Do not use that read to confirm enforcement state during an audit outage; read the `yuzu_server_rbac_enforcement_enabled` gauge or the `rbac_enabled` field of `GET /api/v1/me` instead (both are per-replica cached views and neither writes an audit row).
+`audit_persisted: false`). Do not use that read to confirm enforcement state during an audit outage; read the
+`yuzu_server_rbac_enforcement_enabled` gauge or the `rbac_enabled` field of `GET /api/v1/me` instead
+(both are per-replica cached views and neither writes an audit row). Neither the gauge nor
+`GET /api/v1/me` reports the degraded (fail-closed) state of the RBAC store, so during an audit outage
+that is also an RBAC-store outage they can show a stale value.
 
 Check, in order: `/healthz` `stores.audit` (a failed migration or an
 unreachable `--postgres-dsn` closes the store — the log says so explicitly);

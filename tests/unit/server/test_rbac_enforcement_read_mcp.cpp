@@ -702,8 +702,7 @@ TEST_CASE("MCP get_rbac_enforcement: either audit row dropping reports audit_per
     }
 }
 
-TEST_CASE("MCP get_rbac_enforcement: an unwired audit callback serves the data with audit_persisted:true "
-          "and writes no row",
+TEST_CASE("MCP get_rbac_enforcement: an unwired audit callback serves the data with audit_persisted:true",
           "[pg][rbac_enforcement_read][mcp]") {
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);
@@ -716,8 +715,11 @@ TEST_CASE("MCP get_rbac_enforcement: an unwired audit callback serves the data w
     CHECK(sc["enabled"] == false);
     CHECK(sc["unconfirmed"] == false);
     CHECK(sc["administrator"] == "may");
+    // The discriminating assertion is audit_persisted: it fails if an empty callback is ever
+    // treated as a persist failure. The two lines below only document that nothing was wired to
+    // record into (they cannot fail while the callback is empty).
     CHECK(sc["audit_persisted"] == true);
-    CHECK(rig.audit_log.empty()); // nothing was wired to record into
+    CHECK(rig.audit_log.empty());
     CHECK(rig.no_tool_rows());
 }
 

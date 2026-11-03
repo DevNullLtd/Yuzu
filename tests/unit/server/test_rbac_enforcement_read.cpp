@@ -678,10 +678,12 @@ TEST_CASE("GET /api/v1/rbac/enforcement: a missing rbac_enabled row is a 200 wit
     // With the durable row absent, a refresh still reads write_generation but cannot confirm
     // rbac_enabled: it leaves the cached value alone (never coerced to false) and does NOT advance
     // the freshness clock (maybe_refresh_generation, row_absent). Once the last confirmed refresh is
-    // past the stale-serve bound the view therefore reads degraded. All this case asserts about
-    // `administrator` is that it is never `may` and equals the hint computed from the same stores:
-    // the regime check re-reads the durable flag (read_rbac_enabled_lockfree), which fails on an
-    // absent row and so answers unavailable, and a stale-off view with no grant row is unconfirmed.
+    // past the stale-serve bound the view therefore reads degraded. `administrator` is
+    // `unconfirmed` in both sections: the regime check re-reads the durable flag
+    // (read_rbac_enabled_lockfree), which fails on an absent row and so answers unavailable (the
+    // cached-on section, where the caller holds the grant), and a stale-off view with no grant row
+    // is unconfirmed (the cached-off section). It is also pinned equal to the hint computed from
+    // the same stores.
     const auto verify = [&h](bool cached_on) {
         delete_rbac_enabled_row(h);
         h.rbac->age_refresh_state_for_test(std::chrono::milliseconds(5200));
@@ -693,7 +695,7 @@ TEST_CASE("GET /api/v1/rbac/enforcement: a missing rbac_enabled row is a 200 wit
         const auto d = data_of(res->body);
         CHECK(d["unconfirmed"] == true);
         CHECK(d["enabled"] == cached_on); // the cached value is served unchanged
-        CHECK(d["administrator"] != "may");
+        CHECK(d["administrator"] == "unconfirmed");
         CHECK(d["administrator"].get<std::string>() == std::string(to_string(hint_of(h))));
         // No driver or relation text reaches the caller.
         CHECK(res->body.find("rbac_meta") == std::string::npos);
@@ -703,7 +705,7 @@ TEST_CASE("GET /api/v1/rbac/enforcement: a missing rbac_enabled row is a 200 wit
         REQUIRE(count_rows(h, kAuditAction) == 1);
         CHECK(h.audit_log.front().detail.starts_with(std::string("enabled=") +
                                                      (cached_on ? "true" : "false") +
-                                                     "; unconfirmed=true; administrator="));
+                                                     "; unconfirmed=true; administrator=unconfirmed"));
     };
 
     SECTION("cached off") {

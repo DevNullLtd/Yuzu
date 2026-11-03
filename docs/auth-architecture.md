@@ -3723,9 +3723,12 @@ an advisory `administrator` verdict (`may`, `may_not`, `unconfirmed`); the MCP t
   account (for example a SAML sign-in, a SCIM-deactivated account, a temporarily elevated
   session, or an Administrator held only through a group) reads `may_not`, because only durable
   user-type grants count with enforcement on, and the local account role with it off (clause 3).
-  With enforcement on, an OIDC administrator who holds the grant reads `may`: an OIDC sign-in
-  provisions an active local account row (`provision_sso_identity`); with enforcement off the local
-  account role counts instead, and that row's role is `user`. A just-revoked Administrator
+  In practice an OpenID Connect principal reads `may_not` today: the assignment routes cannot write
+  a grant for an `oidc:` principal id (see #5182), and a first sign-in whose account provisioning
+  failed leaves no account row (`provision_sso_identity` is fail-soft: a failure is logged and the
+  login proceeds). A grant installed by other means (direct SQL, see "If the guard refuses an action
+  you intend" in `docs/user-manual/rbac.md`) on an active provisioned account would read `may` with
+  enforcement on. A just-revoked Administrator
   reads `may_not` on a fresh read; what can lag on another replica is the cached `enabled` value,
   which only selects which source applies.
 - **Advisory, not a promise.** `may` means the RBAC administration routes would admit this

@@ -231,7 +231,7 @@ Minting is a cookie-session write: it needs a same-site `Origin` or `Referer` (s
 - With RBAC enforcement on, an account whose role is `user` but which holds the `Administrator` grant (and an active account row) now sees the controls. Before, it saw none, although the server would have admitted it.
 - With RBAC enforcement on, an account administrator who does not hold the `Administrator` grant no longer sees a live switch (and sees the Role assignments panel only if it holds `AccessReview:Read`, which `Administrator` and `Reviewer` do). Before, the page drew the switch and the server then refused the click.
 - That same `user`-role account holding the grant is drawn a live switch, but the only change it can offer is turning enforcement off, and the server refuses that with a `409` and a remediation (it needs a local administrator account); nothing changes. The hint models who may attempt the change, not whether the change would leave you an administrator.
-- A signed-in administrator whose grant has no active account row (an SSO-only principal) is shown no control, because the server would refuse it.
+- A signed-in administrator whose grant has no active account row (for example a SAML principal) is shown no control, because the server would refuse it.
 - When a store cannot answer, **Assign role** and the enforcement switch are drawn disabled with "Your administrator authority could not be confirmed. Reload to try again." instead of live, and the per-row **Remove** controls are left out until the check can be answered.
 - With RBAC enforcement off, nothing changes for a local administrator account.
 

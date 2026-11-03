@@ -3376,9 +3376,12 @@ with enforcement off, it looks at the caller's local account role (an inactive a
 confirmed absence). So an account whose Administrator authority is not a durable grant on an
 active local account (for example a SAML sign-in, a SCIM-deactivated account, a temporarily
 elevated session, or an Administrator held only through a group) reads `may_not` even when it can
-act as an administrator in some other way. With enforcement on, an OIDC administrator who holds the
-grant reads `may`: an OIDC sign-in provisions an active local account row (with enforcement off the
-local account role counts instead, and that row's role is `user`). A
+act as an administrator in some other way. In practice an OpenID Connect principal reads `may_not`
+today: the assignment routes cannot write a grant for an `oidc:` principal id (see
+[#5182](https://github.com/Tr3kkR/Yuzu/issues/5182)), and a first sign-in whose account provisioning
+failed leaves no account row. A grant installed by other means (direct SQL, see "If the guard refuses
+an action you intend" in [RBAC](rbac.md)) on an active provisioned account would read `may` with
+enforcement on. A
 just-revoked Administrator reads `may_not` on a fresh read; what can lag on another replica is the
 cached `enabled` value, which only selects which of the two sources applies. On REST an engine
 session reads `may_not` (engines are not Administrators), and so does an MCP-tier token, because
@@ -3421,8 +3424,8 @@ curl -s -b cookies.txt http://localhost:8080/api/v1/rbac/enforcement
 With an API token instead of a session cookie:
 
 ```bash
-curl -s -H "Authorization: Bearer $TOKEN" \
-  "https://yuzu.example.com/api/v1/rbac/enforcement"
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/rbac/enforcement
+# {"data":{"enabled":true,"unconfirmed":false,"administrator":"may"},"meta":{"api_version":"v1"}}
 ```
 
 A plain API token gets a real verdict (`may`, `may_not` or `unconfirmed`), while an MCP-tier token
