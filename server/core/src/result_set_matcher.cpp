@@ -442,13 +442,15 @@ bool references_raw_capture_table(std::string_view sql) {
     // read maximal [A-Za-z0-9_] runs: '$' is not a word character, so `$Process_Live` reads as
     // the run `process_live`, and every registry dollar name lowercases to its real table name.
     // An unterminated token runs to the end of the input, as SQLite reads it.
-    // A single-quoted token in table position is a table, as SQLite reads it (`FROM
-    // 'process_live'`, `JOIN 'tcp_live'`, `main.'process_live'`, `FROM ('process_live')` all
-    // read the raw table): a '...' whose content is a raw table name (a leading '$' allowed) is
-    // a reference when the previous non-blank character is a `,`, `.` or `(`, or the previous
-    // word is FROM or JOIN. Over-refusal accepted: a string literal equal to a raw table name
-    // in a select list after a comma (`SELECT a, 'process_live'`) or inside `IN (...)` is
-    // refused; the same literal in a comparison or first in the select list is not.
+    // A '...' token whose whole content is a raw table name (one leading '$' allowed,
+    // case-folded) is a reference WHEREVER it stands. SQLite reads such a token as the table in
+    // more positions than a keyword list can enumerate (`FROM 'process_live'`,
+    // `JOIN 'tcp_live'`, `main.'process_live'`, `FROM ('process_live')`, `x IN 'process_live'`,
+    // `NOT IN 'tcp_live'`, each verified on sqlite3; a position rule missed the IN forms), so
+    // the rule has no look-behind and the scan stays one linear pass. The price is a documented
+    // over-refusal: a string literal that is exactly a raw table name (`WHERE name =
+    // 'process_live'`) is refused; a literal that merely contains one (`'see process_live'`)
+    // is not.
     // The agent's scan_sql (echo_sql_executor.cpp) knows '...', -- and /* */ only and reads a
     // double-quoted, backtick or bracket token as code, so the two scanners disagree only where
     // this one refuses more, never less.
@@ -465,25 +467,6 @@ bool references_raw_capture_table(std::string_view sql) {
         for (auto& c : word)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         return std::find(kRealNames.begin(), kRealNames.end(), word) != kRealNames.end();
-    };
-    // Whether the token starting at `i` follows FROM, JOIN, a comma, a dot or an opening
-    // parenthesis (a comment before it is already blanked).
-    const auto in_table_position = [&](std::size_t i) {
-        std::size_t k = i;
-        while (k > 0 && std::isspace(static_cast<unsigned char>(text[k - 1])) != 0)
-            --k;
-        if (k == 0)
-            return false;
-        const char prev = text[k - 1];
-        if (prev == ',' || prev == '.' || prev == '(')
-            return true;
-        std::size_t w = k;
-        while (w > 0 && is_word(text[w - 1]))
-            --w;
-        std::string word = text.substr(w, k - w);
-        for (auto& c : word)
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        return word == "from" || word == "join";
     };
     const auto quoted_end = [&](std::size_t i, char close, bool doubles) {
         std::size_t j = i + 1;
@@ -507,7 +490,7 @@ bool references_raw_capture_table(std::string_view sql) {
             std::string_view content(text.data() + i + 1, end - i - 1);
             if (!content.empty() && text[end - 1] == '\'')
                 content.remove_suffix(1); // the closing quote (absent when unterminated)
-            if (in_table_position(i) && is_real_name(content))
+            if (is_real_name(content))
                 return true;
         } else if (text[i] == '"' || text[i] == '`') {
             end = quoted_end(i, text[i], true);

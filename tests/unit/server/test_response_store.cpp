@@ -928,6 +928,94 @@ TEST_CASE("ResponseStore: query_by_execution pages by keyset over a tied timesta
     CHECK(offset_seen.size() == 3); // four rows remain; one was skipped
 }
 
+TEST_CASE("ResponseStore: query_by_execution breaks a timestamp tie by id descending whatever "
+          "the heap order",
+          "[pg][response_store][execution_id][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    for (int i = 0; i < 5; ++i) {
+        StoredResponse r;
+        r.instruction_id = "cmd-tie";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 1;
+        r.output = "ok";
+        r.execution_id = "exec-tie";
+        r.timestamp = 1700000000;
+        store.store(r);
+    }
+    auto before = store.query_by_execution("exec-tie", kAllRows);
+    REQUIRE(before.has_value());
+    REQUIRE(before->size() == 5);
+    int64_t lowest = before->front().id;
+    for (const auto& r : *before)
+        lowest = std::min(lowest, r.id);
+    // Move the lowest-id row to the end of the heap (an UPDATE writes a new tuple version). A
+    // read ordered by timestamp alone returns the tie in heap or index-entry order, which now
+    // places that row first or last and never in id order; only `, id DESC` keeps the order
+    // total. The read is one query with a limit above the row count, so no page boundary and
+    // no cursor is involved.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds(5));
+        REQUIRE(lease);
+        pg::PgResult upd = pg::exec_params(
+            lease.get(), "UPDATE response_store.responses SET output = 'moved' WHERE id = $1",
+            std::vector<std::string>{std::to_string(lowest)});
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+    ResponseQuery q;
+    q.limit = 100;
+    auto rows = store.query_by_execution("exec-tie", kAllRows, q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 5);
+    for (std::size_t i = 1; i < rows->size(); ++i) {
+        INFO("row " << i);
+        CHECK((*rows)[i - 1].id > (*rows)[i].id);
+    }
+    CHECK(rows->back().id == lowest);
+}
+
+TEST_CASE("ResponseStore: the keyset cursor orders by timestamp before id across distinct "
+          "timestamps",
+          "[pg][response_store][execution_id][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    // Timestamps are agent-supplied, so an older answer stored later carries a higher id than
+    // a newer one. Stored in this order: newest (lowest id), oldest, middle (highest id).
+    auto seed = [&](const std::string& agent, int64_t ts) {
+        StoredResponse r;
+        r.instruction_id = "cmd-cursor";
+        r.agent_id = agent;
+        r.status = 1;
+        r.output = "ok";
+        r.execution_id = "exec-cursor";
+        r.timestamp = ts;
+        store.store(r);
+    };
+    seed("agent-newest", 1700000300);
+    seed("agent-oldest", 1700000100);
+    seed("agent-middle", 1700000200);
+    ResponseQuery q;
+    q.limit = 1;
+    std::vector<std::string> walked;
+    for (int pages = 0; pages < 5; ++pages) {
+        auto page = store.query_by_execution("exec-cursor", kAllRows, q);
+        REQUIRE(page.has_value());
+        if (page->empty())
+            break;
+        REQUIRE(page->size() == 1);
+        walked.push_back(page->front().agent_id);
+        // After the newest row (the lowest id) the cursor must still reach the middle row,
+        // whose id is the highest: a cursor on `id` alone, or on `timestamp <= ts AND id < id`,
+        // drops it.
+        q.continue_after = {page->front().timestamp, page->front().id};
+    }
+    CHECK(walked == std::vector<std::string>{"agent-newest", "agent-middle", "agent-oldest"});
+}
+
 TEST_CASE("ResponseStore PR2: query_by_execution rejects empty sentinel (engaged-empty, not "
           "a degrade)",
           "[pg][response_store][execution_id]") {

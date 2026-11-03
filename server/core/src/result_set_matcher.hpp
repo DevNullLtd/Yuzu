@@ -100,15 +100,19 @@ void bind_declared_columns(nlohmann::json& matcher, const std::string& result_sc
 
 /// True when the stored echo SQL still reads a raw capture table: one of the sixteen real
 /// `<source>_live` table names, or its `$<Source>_Live` spelling (the `$` is not a word character,
-/// so both tokenise to the same lower-cased name), as a whole identifier outside `'...'` string
-/// literals and comments (case-insensitive). Quoted identifiers (`"..."`, `` `...` ``, `[...]`)
-/// are read as SQLite tokenises them: their content is checked like code, and a `'`, `--` or
-/// `/*` inside one never hides the code after it. Roll-up is the only mode, so such a query
+/// so both tokenise to the same lower-cased name), as a whole identifier outside comments
+/// (case-insensitive), or as the whole content of a `'...'` token wherever it stands (SQLite
+/// reads `FROM 'process_live'`, `main.'process_live'` and `x IN 'process_live'` as the table;
+/// the rule is position-free, so `WHERE name = 'process_live'` is refused too, while a longer
+/// literal such as `'see process_live'` is not). Quoted identifiers (`"..."`, `` `...` ``,
+/// `[...]`) are read as SQLite tokenises them: their content is checked like code, and a `'`,
+/// `--` or `/*` inside one never hides the code after it. Roll-up is the only mode, so such a query
 /// answers with no rows (the shims) rather than an error, and re-evaluating it would silently
 /// build an empty set. `usage_live` and an unknown `$Foo_Live` are not matched: the agent
-/// answers those with an error, which the failure signal counts. Two false positives are
+/// answers those with an error, which the failure signal counts. Three false positives are
 /// accepted (the predicate fails closed): a name inside a double-quoted string literal
-/// (`SELECT "$Process_Live"`), and a CTE that shadows a shim name. Pure; used by the REST and
+/// (`SELECT "$Process_Live"`), a single-quoted literal that is exactly a raw table name, and
+/// a CTE that shadows a shim name. Pure; used by the REST and
 /// MCP re-evaluation and create paths (RESULT_SET_REEVAL_STALE_SOURCE).
 bool references_raw_capture_table(std::string_view sql);
 

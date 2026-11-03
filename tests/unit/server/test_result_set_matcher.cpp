@@ -626,7 +626,7 @@ TEST_CASE("raw capture table predicate: roll-up tiers and look-alikes pass", "[r
 
 TEST_CASE("raw capture table predicate: literals and comments are not table references",
           "[result_set][matcher]") {
-    CHECK_FALSE(references_raw_capture_table("SELECT '$Process_Live' AS label FROM $Process_Hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 'label $Process_Live' FROM $Process_Hourly"));
     CHECK_FALSE(references_raw_capture_table("SELECT 'it''s process_live' FROM $Process_Hourly"));
     CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly -- was $Process_Live\n"));
     CHECK_FALSE(references_raw_capture_table("SELECT /* process_live */ 1 FROM $Process_Hourly"));
@@ -672,7 +672,8 @@ TEST_CASE("raw capture table predicate: quoted identifiers are tokens and never 
     CHECK(references_raw_capture_table("SELECT \"$Process_Live\" FROM $Process_Hourly"));
 }
 
-TEST_CASE("raw capture table predicate: a single-quoted name in table position is a table",
+TEST_CASE("raw capture table predicate: a single-quoted raw table name is a reference wherever "
+          "it stands",
           "[result_set][matcher]") {
     // SQLite reads a single-quoted token where a table name is expected as an identifier
     // (verified against sqlite3: each of these returns the raw table's rows).
@@ -689,20 +690,53 @@ TEST_CASE("raw capture table predicate: a single-quoted name in table position i
     CHECK(references_raw_capture_table("SELECT 1\nFROM\t'process_live'"));
     CHECK(references_raw_capture_table("SELECT 1 FROM/* c */'process_live'"));
     CHECK(references_raw_capture_table("SELECT 1 FROM -- c\n'process_live'"));
-    // The same literal where SQLite reads a string stays a string.
-    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name = 'process_live'"));
-    CHECK_FALSE(references_raw_capture_table("SELECT 'process_live' AS label FROM $Process_Hourly"));
-    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name LIKE 'tcp_live'"));
+    // The IN forms SQLite also reads as the table (`select 42 in 'process_live'` scans it); a
+    // rule keyed on the preceding keyword missed every one of these.
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a IN 'process_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a NOT IN 'tcp_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a IN/**/'tcp_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a IN -- c\n'tcp_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE (a, b) IN 'process_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a IN main.'process_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a IN '$Process_Live'"));
+    // The documented over-refusal: a string literal that is exactly a raw table name is refused
+    // wherever it stands, the position-free rule's price for closing every IN form.
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name = 'process_live'"));
+    CHECK(references_raw_capture_table("SELECT 'process_live' AS label FROM $Process_Hourly"));
+    CHECK(references_raw_capture_table("SELECT '$Process_Live' AS label FROM $Process_Hourly"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name LIKE 'tcp_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name IS NOT 'tcp_live'"));
+    CHECK(references_raw_capture_table("SELECT a, 'process_live' FROM $Process_Hourly"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name IN ('process_live')"));
     // Content that is not a bare raw table name is never a reference, wherever it stands.
     CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly, 'process_lives'"));
     CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM 'it''s process_live'"));
-    // An unterminated single-quoted name in table position is refused (fail closed); SQLite
-    // would reject the statement as unterminated, so nothing is lost.
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name = 'see process_live'"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a IN 'see tcp_live'"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name = 'process_live '"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name = '$$process_live'"));
+    // An unterminated single-quoted name is refused (fail closed); SQLite would reject the
+    // statement as unterminated, so nothing is lost.
     CHECK(references_raw_capture_table("SELECT 1 FROM 'process_live"));
-    // The accepted over-refusals: a literal equal to a raw table name after a comma or an
-    // opening parenthesis, where SQLite would read a string.
-    CHECK(references_raw_capture_table("SELECT a, 'process_live' FROM $Process_Hourly"));
-    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name IN ('process_live')"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a = 'process_live"));
+}
+
+TEST_CASE("raw capture table predicate: a 100000-byte run of literals is decided correctly",
+          "[result_set][matcher]") {
+    // The request cap is 100000 bytes. Every literal is blanked in the one pass that finds it
+    // (no look-behind over the earlier blanks), so a run of thousands of literals costs one
+    // scan; the assertions pin the verdicts at that size, with no wall-clock bound.
+    std::string sql = "SELECT 1 FROM $Process_Hourly WHERE a = ";
+    while (sql.size() < 100000 - 20)
+        sql += "'x' || ";
+    CHECK_FALSE(references_raw_capture_table(sql + "'x'"));
+    CHECK(references_raw_capture_table(sql + "'process_live'"));
+    std::string words = "SELECT 1 FROM $Process_Hourly WHERE a = ";
+    words += std::string(50000, 'w');
+    while (words.size() < 100000 - 20)
+        words += " || 'x'";
+    CHECK_FALSE(references_raw_capture_table(words + " || ''"));
+    CHECK(references_raw_capture_table(words + " || '$TCP_Live'"));
 }
 
 TEST_CASE("answer_lacks_matcher_column: a success answer from a table without the column",
