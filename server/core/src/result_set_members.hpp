@@ -46,11 +46,13 @@ struct ResultSetMembers : std::vector<std::string> {
 inline constexpr int kResultSetMembersPageRows = 500;
 
 /// The agent ids that satisfy `pending`'s matcher, in order of first appearance in the store's read
-/// (which is newest row first, `timestamp DESC`, not first-response order), plus `agents_failed`;
-/// `std::nullopt` when the store read degraded (the caller skips this pending set for this tick
-/// rather than materialize a false-empty membership, ADR-0039). The read pages through every
-/// stored row of the execution, `page_rows` at a time, up to `max_rows` (default: the store's
-/// per-set member cap, one row per agent at least); a row past that bound sets `truncated`.
+/// (which is newest row first, `timestamp DESC, id DESC`, not first-response order), plus
+/// `agents_failed`; `std::nullopt` when the store read degraded (the caller skips this pending set
+/// for this tick rather than materialize a false-empty membership, ADR-0039). The read pages
+/// through every stored row of the execution by keyset (`ResponseQuery::continue_after`, never
+/// `offset`: rows sharing a timestamp, or a row reaped between two pages, cannot skip a row),
+/// `page_rows` at a time, up to `max_rows` (default: the store's per-set member cap, one row per
+/// agent at least); a row past that bound sets `truncated`.
 [[nodiscard]] inline std::optional<ResultSetMembers>
 result_set_members(ResponseStore& responses, const ForensicsPluginSet* plugins,
                    const PendingSet& pending, int page_rows = kResultSetMembersPageRows,
@@ -62,7 +64,7 @@ result_set_members(ResponseStore& responses, const ForensicsPluginSet* plugins,
     std::unordered_set<std::string> failed;
     ResponseQuery page;
     page.limit = page_rows;
-    for (int read = 0;; page.offset += page_rows) {
+    for (int read = 0;;) {
         auto rows = responses.query_by_execution(pending.source_execution_id, tier, page);
         if (!rows)
             return std::nullopt;
@@ -84,6 +86,7 @@ result_set_members(ResponseStore& responses, const ForensicsPluginSet* plugins,
         read += static_cast<int>(rows->size());
         if (static_cast<int>(rows->size()) < page_rows)
             break;
+        page.continue_after = {rows->back().timestamp, rows->back().id};
     }
     for (const auto& id : failed)
         if (!seen.contains(id))

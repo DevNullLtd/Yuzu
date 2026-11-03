@@ -51,8 +51,9 @@ metadata:
     for too little free disk space or a failed VACUUM, which stays until a
     conversion succeeds).
     Per capture source it reports config|<src>_rows|<n>, the rows held for that
-    source (an agent from before the roll-up-only release reports the same count
-    as config|<src>_live_rows|<n>, and the server reads either).
+    source (an agent from before the roll-up-only release reports
+    config|<src>_live_rows|<n> instead; the server shows a dash for it rather
+    than reading that figure as the hourly count).
     module_dedup_overflow_total and tcp_closing_dedup_overflow_total count how
     often the hourly de-duplication sets filled and were cleared.
     An exception inside any action ends the reply with a fixed error|internal

@@ -856,6 +856,78 @@ TEST_CASE("ResponseStore PR2: query_by_execution returns only matching exec",
     CHECK((*from_b)[0].output == "from-exec-B");
 }
 
+TEST_CASE("ResponseStore: query_by_execution pages by keyset over a tied timestamp and past a "
+          "row reaped between two pages",
+          "[pg][response_store][execution_id][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    // Five rows at ONE timestamp (epoch seconds; a fleet answers in bursts).
+    for (int i = 0; i < 5; ++i) {
+        StoredResponse r;
+        r.instruction_id = "cmd-keyset";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 1;
+        r.output = "ok";
+        r.execution_id = "exec-keyset";
+        r.timestamp = 1700000000;
+        store.store(r);
+    }
+    ResponseQuery q;
+    q.limit = 2;
+    auto page1 = store.query_by_execution("exec-keyset", kAllRows, q);
+    REQUIRE(page1.has_value());
+    REQUIRE(page1->size() == 2);
+    // The order is total: newest first, then id descending inside the tie.
+    CHECK((*page1)[0].id > (*page1)[1].id);
+
+    // A row of the first page is reaped before the second page is read. An offset walk would
+    // shift the remaining rows up by one and skip the first unread row; the keyset read does
+    // not, because it continues from the last row seen, not from a position.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds(5));
+        REQUIRE(lease);
+        pg::PgResult del = pg::exec_params(
+            lease.get(), "DELETE FROM response_store.responses WHERE id = $1",
+            std::vector<std::string>{std::to_string((*page1)[0].id)});
+        REQUIRE(del.status() == PGRES_COMMAND_OK);
+    }
+
+    std::set<std::string> seen{(*page1)[0].agent_id, (*page1)[1].agent_id};
+    int64_t last_id = (*page1)[1].id;
+    q.continue_after = {(*page1)[1].timestamp, (*page1)[1].id};
+    for (int pages = 0; pages < 10; ++pages) {
+        auto page = store.query_by_execution("exec-keyset", kAllRows, q);
+        REQUIRE(page.has_value());
+        for (const auto& r : *page) {
+            CHECK(r.id < last_id); // strictly after the cursor in read order, never a repeat
+            last_id = r.id;
+            CHECK(seen.insert(r.agent_id).second);
+        }
+        if (page->size() < 2)
+            break;
+        q.continue_after = {page->back().timestamp, page->back().id};
+    }
+    CHECK(seen == std::set<std::string>{"agent-0", "agent-1", "agent-2", "agent-3", "agent-4"});
+
+    // The same walk by offset, for contrast, skips the row that moved up into page one.
+    ResponseQuery by_offset;
+    by_offset.limit = 2;
+    by_offset.offset = 2;
+    auto offset_page2 = store.query_by_execution("exec-keyset", kAllRows, by_offset);
+    REQUIRE(offset_page2.has_value());
+    std::set<std::string> offset_seen{(*page1)[1].agent_id};
+    for (const auto& r : *offset_page2)
+        offset_seen.insert(r.agent_id);
+    by_offset.offset = 4;
+    auto offset_page3 = store.query_by_execution("exec-keyset", kAllRows, by_offset);
+    REQUIRE(offset_page3.has_value());
+    for (const auto& r : *offset_page3)
+        offset_seen.insert(r.agent_id);
+    CHECK(offset_seen.size() == 3); // four rows remain; one was skipped
+}
+
 TEST_CASE("ResponseStore PR2: query_by_execution rejects empty sentinel (engaged-empty, not "
           "a degrade)",
           "[pg][response_store][execution_id]") {

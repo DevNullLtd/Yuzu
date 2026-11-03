@@ -4786,6 +4786,28 @@ TEST_CASE("materialise: the members read pages past the store's default row limi
         CHECK(read.agents_failed == 0);
         CHECK_FALSE(read.partial);
     }
+    SECTION("rows that share one timestamp are each read once across page boundaries") {
+        // Timestamps are epoch seconds, so a fleet's answers tie. Two rows per page over seven
+        // rows at one timestamp: an offset walk over `timestamp DESC` alone has no total order
+        // at the page boundaries; the keyset read has one. Every member and the failed agent
+        // must be seen exactly once.
+        for (int i = 0; i < 6; ++i)
+            put_exec_row(responses, exec, "agent-" + std::to_string(i), 1, kOneRow, 100);
+        put_exec_row(responses, exec, "agent-refused", 1, "error|refused", 100);
+        PendingSet pending;
+        pending.id = set_id;
+        pending.source_execution_id = exec;
+        pending.matcher = R"({"kind":"echo_rows_ge","n":1})";
+        const auto* plugins = &yuzu::server::test::forensics_plugin_set();
+        auto paged = result_set_members(responses, plugins, pending, 2, 100);
+        REQUIRE(paged.has_value());
+        CHECK_FALSE(paged->truncated);
+        CHECK(paged->agents_failed == 1);
+        std::vector<std::string> members(paged->begin(), paged->end());
+        std::sort(members.begin(), members.end());
+        CHECK(members == std::vector<std::string>{"agent-0", "agent-1", "agent-2", "agent-3",
+                                                  "agent-4", "agent-5"});
+    }
     SECTION("the read reports truncated only when rows lie past its bound") {
         for (int i = 0; i < 6; ++i)
             put_exec_row(responses, exec, "agent-" + std::to_string(i), 1, kOneRow, 100 + i);
@@ -4857,11 +4879,22 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
     CHECK(src.find("result_set_store_->materialize(p.id, members, agents_failed)") !=
           std::string::npos);
     CHECK(src.find("agents_failed = found->agents_failed;") != std::string::npos);
-    const auto truncated = src.find("if (found->truncated) {");
-    REQUIRE(truncated != std::string::npos);
-    const auto marked = src.find("result_set_store_->mark_failed(", truncated);
+    // The truncated branch: between its `if` and the line that adopts the membership, the set
+    // is marked failed and the branch ends in `continue;` with nothing but the closing brace
+    // after it, so a truncated read can never fall through into `materialize`.
+    const auto open = src.find("if (found->truncated) {");
+    REQUIRE(open != std::string::npos);
+    const auto adopt = src.find("agents_failed = found->agents_failed;", open);
+    REQUIRE(adopt != std::string::npos);
+    const std::string branch = src.substr(open, adopt - open);
+    const auto marked = branch.find("result_set_store_->mark_failed(");
     REQUIRE(marked != std::string::npos);
-    CHECK(marked - truncated < 1200);
+    const auto cont = branch.rfind("continue;");
+    REQUIRE(cont != std::string::npos);
+    CHECK(cont > marked);
+    CHECK(branch.substr(cont + std::string("continue;").size()).find_first_not_of(" \t\r\n}") ==
+          std::string::npos);
+    CHECK(marked < 1200);
 }
 
 TEST_CASE("materialise: a success-status error| answer under the default matcher is a member "

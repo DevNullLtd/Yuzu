@@ -654,10 +654,11 @@ TEST_CASE("raw capture table predicate: quoted identifiers are tokens and never 
     CHECK(references_raw_capture_table("SELECT 1 FROM \"Process_Live\""));
     CHECK(references_raw_capture_table("SELECT 1 FROM [process_live]"));
     CHECK(references_raw_capture_table("SELECT 1 FROM `PROCESS_LIVE`"));
-    // A literal after a quoted identifier is still a literal.
-    CHECK_FALSE(references_raw_capture_table("SELECT \"x'\" , 'process_live' FROM $Process_Hourly"));
-    CHECK_FALSE(references_raw_capture_table("SELECT [x'] , 'process_live' FROM $Process_Hourly"));
-    CHECK_FALSE(references_raw_capture_table("SELECT `x'` , '$Process_Live' FROM $Process_Hourly"));
+    // A literal after a quoted identifier is still a literal (its content is not a bare raw
+    // table name, so the comma before it does not make it a table reference).
+    CHECK_FALSE(references_raw_capture_table("SELECT \"x'\" , 'see process_live' FROM $Process_Hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT [x'] , 'see process_live' FROM $Process_Hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT `x'` , 'see $Process_Live' FROM $Process_Hourly"));
     // An unterminated quoted identifier runs to the end, as SQLite reads it; its content is
     // still read like code (fails closed), and it never hides a reference before it.
     CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE a = \"process_live"));
@@ -669,6 +670,39 @@ TEST_CASE("raw capture table predicate: quoted identifiers are tokens and never 
     // The accepted false positive: a name inside a double-quoted string literal is read as an
     // identifier and refused (the predicate fails closed).
     CHECK(references_raw_capture_table("SELECT \"$Process_Live\" FROM $Process_Hourly"));
+}
+
+TEST_CASE("raw capture table predicate: a single-quoted name in table position is a table",
+          "[result_set][matcher]") {
+    // SQLite reads a single-quoted token where a table name is expected as an identifier
+    // (verified against sqlite3: each of these returns the raw table's rows).
+    CHECK(references_raw_capture_table("SELECT * FROM 'process_live'"));
+    CHECK(references_raw_capture_table("SELECT * FROM 'PROCESS_LIVE'"));
+    CHECK(references_raw_capture_table("SELECT * FROM '$Process_Live'"));
+    CHECK(references_raw_capture_table("SELECT * FROM main.'process_live'"));
+    CHECK(references_raw_capture_table("SELECT * FROM 'main'.'process_live'"));
+    CHECK(references_raw_capture_table("SELECT * FROM main . 'process_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $TCP_Hourly JOIN 'tcp_live' ON 1"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $TCP_Hourly LEFT JOIN 'tcp_live' ON 1"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $TCP_Hourly, 'tcp_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM ('process_live')"));
+    CHECK(references_raw_capture_table("SELECT 1\nFROM\t'process_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM/* c */'process_live'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM -- c\n'process_live'"));
+    // The same literal where SQLite reads a string stays a string.
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name = 'process_live'"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 'process_live' AS label FROM $Process_Hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name LIKE 'tcp_live'"));
+    // Content that is not a bare raw table name is never a reference, wherever it stands.
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly, 'process_lives'"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM 'it''s process_live'"));
+    // An unterminated single-quoted name in table position is refused (fail closed); SQLite
+    // would reject the statement as unterminated, so nothing is lost.
+    CHECK(references_raw_capture_table("SELECT 1 FROM 'process_live"));
+    // The accepted over-refusals: a literal equal to a raw table name after a comma or an
+    // opening parenthesis, where SQLite would read a string.
+    CHECK(references_raw_capture_table("SELECT a, 'process_live' FROM $Process_Hourly"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM $Process_Hourly WHERE name IN ('process_live')"));
 }
 
 TEST_CASE("answer_lacks_matcher_column: a success answer from a table without the column",

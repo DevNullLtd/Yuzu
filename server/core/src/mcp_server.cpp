@@ -638,7 +638,7 @@ static_assert(kMaxFacetValueBytes == 2048,
 // nine result-set outputSchemas inside kTools[], so the nine copies cannot drift. They sit above the
 // array because scripts/ci/check-api-parity.py refuses a preprocessor line inside it; both are
 // #undef'd right after it.
-#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are not counted. 0 without information for a set filled before this release or by an older server replica"},"partial":{"type":"boolean","description":"True when agents_failed is above zero: at least one answering agent failed. Says nothing about agents that never answered; false without information for a set filled before this release or by an older server replica"})j"
+#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are not counted. 0 without information for a set filled before this release or by an older server replica, and 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed is above zero: at least one answering agent failed. Says nothing about agents that never answered; false without information for a set filled before this release or by an older server replica, and false for a failed set"})j"
 #define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j"
 static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
@@ -1306,7 +1306,9 @@ static const ToolDef kTools[] = {
      "the server only length-checks (max 100000 bytes). Membership is every agent that "
      "returned >=1 row (include_empty=true widens to every responder); an agent whose "
      "query failed is not a member, and the filled set reports how many in agents_failed "
-     "with partial=true. SQL that reads a raw capture table ($<Source>_Live or a "
+     "with partial=true (an execution with more than 100000 stored answers marks the set "
+     "failed instead, with agents_failed 0 and the reason in the server log). SQL that "
+     "reads a raw capture table ($<Source>_Live or a "
      "<source>_live table, which Echo no longer keeps) is refused with "
      "RESULT_SET_REEVAL_STALE_SOURCE: query the hourly roll-up instead, for example "
      "$Process_Hourly. Dispatches to "
