@@ -1376,6 +1376,61 @@ TEST_CASE("v10 migration: a mark over a source with nothing to fold migrates whe
     CHECK(db.get_config("rollup_process_hourly_at", "absent") == "absent");
 }
 
+TEST_CASE("v10 migration: a mark ahead of the clock refuses when any one table of its source holds a row",
+          "[echo][v10][migration][marks]") {
+    Seeded seeded;
+    // nothing_to_fold must read the raw table and every converted tier: a source whose ONLY data
+    // sits in one of them still has something the mark would have to bound, so the mark is not
+    // ignored. Each section seeds exactly one table, so dropping that table from the check (or
+    // stopping the tier loop short of it) turns the refusal into a silent migration. Only a
+    // source with an old summary tier carries a mark the migration reads, so the cursor sources
+    // (power, removable, registry: raw table only in v9) cannot reach this check; tcp stands
+    // for the second raw table.
+    const int64_t excursion = kH0 + int64_t{100} * 365 * 86400;
+    const int64_t day = kH0 - kH0 % 86400;
+    const int64_t month = day - 86400; // 2026-11-01T00:00:00Z
+    std::string source = "process";
+    std::function<void(sqlite3*)> fill;
+    SECTION("the process raw table only") {
+        fill = [](sqlite3* db) {
+            insert_raw(db, "process", {I(kT0), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
+        };
+    }
+    SECTION("the tcp raw table only") {
+        source = "tcp";
+        fill = [](sqlite3* db) {
+            insert_raw(db, "tcp", {I(kT0), I(1), T("connected"), T("tcp"), T("10.0.0.5"), I(51000),
+                                   T("93.184.216.34"), T("example.org"), I(443), T("ESTABLISHED"),
+                                   I(100), T("chrome")});
+        };
+    }
+    SECTION("the process daily tier only") {
+        fill = [day](sqlite3* db) {
+            exec(db, std::format("INSERT INTO process_daily VALUES (NULL, {}, 'a.exe', 'u', 1, 0)", day));
+        };
+    }
+    SECTION("the process monthly tier only") {
+        fill = [month](sqlite3* db) {
+            exec(db, std::format("INSERT INTO process_monthly VALUES (NULL, {}, 'a.exe', 'u', 1, 0)", month));
+        };
+    }
+    seed(seeded, [&](sqlite3* db) {
+        fill(db);
+        exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_{0}_hourly_at', '{1}'), "
+                             "('rollup_{0}_daily_at', '{1}'), ('rollup_{0}_monthly_at', '{1}')",
+                             source, excursion));
+    });
+    const auto before = snapshot(seeded.tmp.path);
+    const auto failed = EchoDatabase::open(seeded.tmp.path);
+    REQUIRE(!failed.has_value());
+    INFO(failed.error());
+    CHECK(failed.error().find(std::format("echo_config 'rollup_{}_", source)) != std::string::npos);
+    CHECK(failed.error().find("is ahead of the clock") != std::string::npos);
+    CHECK(failed.error().find(std::format("{} ", source)) != std::string::npos);
+    CHECK(failed.error().find("tier holds no bucket at or before the clock") != std::string::npos);
+    CHECK(snapshot(seeded.tmp.path) == before);
+}
+
 TEST_CASE("v10 migration: a daily or monthly mark ahead of the clock is replaced by that tier's own bucket end",
           "[echo][v10][migration][marks]") {
     Seeded seeded;
