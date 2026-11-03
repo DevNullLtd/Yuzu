@@ -8,6 +8,8 @@
 
 #include <yuzu/agent/process_enum.hpp>
 
+#include <wire_utf8.hpp> // yuzu::shared::utf8_scalar_len: the cap must not split a scalar
+
 #include <charconv>
 #include <cstdint>
 #include <iterator>
@@ -155,7 +157,26 @@ std::string read_proc_bytes(std::istream& in) noexcept {
     } catch (...) {
         // Keep what was read before the failure (see the declaration).
     }
+    if (out.size() == kProcReadCap)
+        trim_incomplete_utf8_tail(out);
     return out;
+}
+
+void trim_incomplete_utf8_tail(std::string& s) noexcept {
+    // A UTF-8 scalar is at most 4 bytes, so only the last 3 can be an unfinished one. Walk back
+    // over continuation bytes to the lead byte; a lead whose sequence does not complete inside
+    // `s` is cut off with its continuations. ASCII or a complete scalar at the end: untouched.
+    for (std::size_t k = 1; k <= 3 && k <= s.size(); ++k) {
+        const std::size_t i = s.size() - k;
+        const auto c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80)
+            return;
+        if ((c & 0xC0u) == 0x80u)
+            continue; // continuation byte: keep walking back to its lead
+        if (yuzu::shared::utf8_scalar_len(s, i) == 0)
+            s.resize(i);
+        return;
+    }
 }
 
 #if defined(__linux__) || defined(__APPLE__)

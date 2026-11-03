@@ -3565,6 +3565,48 @@ TEST_CASE("adopt_legacy_echo_db: an oversized marker reads as a mismatch and ref
     CHECK_FALSE(fs::exists(d.path() / "echo.db"));
 }
 
+TEST_CASE("adopt_legacy_echo_db: a stale marker with no echo.db sidecar is rewritten before the "
+          "first move",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    // A marker from an earlier, fully undone attempt (no echo.db sidecar is left) records a
+    // tar.db that no longer exists in that shape: it must not be trusted as this adoption's own.
+    spit_file(d.path() / "echo.db.adopting", "1 2\n");
+    // -wal moves, then -shm collides: the interrupted state shows which marker preceded the move.
+    spit_file(d.path() / "tar.db-shm", "legacy shm");
+    spit_file(d.path() / "echo.db-shm", "foreign shm");
+
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(fs::exists(d.path() / "echo.db-wal"));
+    CHECK(slurp_file(d.path() / "echo.db.adopting") ==
+          *yuzu::agent::detail::legacy_echo_fingerprint(d.path() / "tar.db"));
+
+    fs::remove(d.path() / "echo.db-shm");
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+    CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db.adopting"));
+}
+
+TEST_CASE("adopt_legacy_echo_db: a marker that cannot be written refuses before anything moves",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    const auto wal = slurp_file(d.path() / "tar.db-wal");
+    // A directory at the marker path: the atomic writer cannot rename its temp file over it.
+    REQUIRE(fs::create_directory(d.path() / "echo.db.adopting"));
+
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error().find("cannot record the adoption marker") != std::string::npos);
+    CHECK(fs::exists(d.path() / "tar.db"));
+    CHECK(slurp_file(d.path() / "tar.db-wal") == wal);
+    CHECK_FALSE(fs::exists(d.path() / "echo.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db-wal"));
+    CHECK(fs::is_directory(d.path() / "echo.db.adopting"));
+}
+
 TEST_CASE("adopt_legacy_echo_db: a spent marker left behind without a tar.db is deleted at boot",
           "[echo][store][adopt]") {
     ScratchDir d;

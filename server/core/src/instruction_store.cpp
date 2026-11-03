@@ -200,14 +200,20 @@ std::string normalize_to_array_helper(const nlohmann::json& v) {
 // rewrites the rest; the equivalent here is a `tar` that is protected when its left context L
 // AND its right context R both hold, so it is rewritten only when (NOT L) OR (NOT R):
 // `(?:(?<!L)|(?!tar R))` per guard, which Postgres ARE (lookbehind since 9.6) accepts. The word
-// boundary `\b` of the script is `\y` in ARE. Ported: captured data (`tar|123`), archive file
-// names (`.tar.gz`, `x.tar`, `tar.exe`, `modern-tar`), the archive command shapes (`tar -x`,
-// `tar xzf`, `tar --strip..`), a `tar` piped to another tool, and `tar` beside another package
-// in a package list (`tar unzip git`). NOT widened to `\s*\|`: the shipped `tar|snapshot`
-// response line must still become `echo|snapshot`. The script's remaining guards protect prose
-// sentences of repository files ("Never tar the postgres", "tar preserves"); they are not
-// ported, so an operator edit of a builtin-shaped row that uses one of those exact phrases is
-// rewritten. Quotes are doubled because the chain sits inside single-quoted SQL.
+// boundary `\b` of the script is `\y` in ARE. Ported (script lines 94, 97-100, 102, 103 and 107):
+// captured data (`tar|123`), archive file names (`.tar.gz`, `x.tar`, `tar.exe`, `modern-tar`),
+// the archive command shapes (`tar -x`, `tar xzf`, `tar --strip..`), a `tar` piped to another
+// tool, and `tar` beside another package in a package list (`tar unzip git`). NOT widened to
+// `\s*\|`: the shipped `tar|snapshot` response line must still become `echo|snapshot`. NOT
+// ported, so an operator edit of a builtin-shaped row using one of these exact shapes IS
+// rewritten: `<tar@debian.org>`, `unzip tar`, `zip tar`, `curl tar`, `--entrypoint tar`,
+// `tar/zstd`, `tar archive`, `tar stream`, `tar) tar`,
+// `.tar.gz tar` at a line end, and the prose sentences of repository files (`sh, cp, tar, ls`,
+// `sh ls cp tar cat`, "Never tar the postgres", "tar preserves", "tar takes SIGPIPE",
+// "tar unpacks", "filesystem-level `tar`", "by `tar`-ing", "and tar takes"). The shipped builtin
+// definitions contain none of them (they pass the chain byte-identical to the seeded text);
+// the carried-forward database that could is the unsupported upgrade path. Quotes are doubled
+// because the chain sits inside single-quoted SQL.
 constexpr const char* kEchoRenameBareTarGuards =
     "(?!tar\\|\\d)"                                      // captured data
     "(?!tar\\.(?:gz|xz|zst|bz2|lz|lzma|Z)(?![A-Za-z]))"    // .tar.gz and kin
@@ -298,10 +304,15 @@ std::string echo_rename_definitions_sql() {
     //    (schedules, approvals, policies, device tokens, workflows) rewrite their references to
     //    the Echo id unconditionally and would silently re-point at the other definition. The raise
     //    aborts this migration's transaction, the store does not open, and server startup refuses
-    //    (server.cpp: the InstructionStore is built first and a store that is not open sets
-    //    startup_failed_, which the dependent stores' construction is gated on). It is part of
-    //    this one migration only: no standing guard on the `crossplatform.tar.` namespace, which
-    //    is unreserved and may legitimately hold an operator-authored id once this has run.
+    //    (server.cpp: a store that is not open sets startup_failed_, which the construction of
+    //    every store built after the InstructionStore - ExecutionTracker, ScheduleEngine,
+    //    CommandOutboxStore, ApprovalManager, ResultSetStore, PolicyStore, WorkflowEngine - is
+    //    gated on). Two stores are built BEFORE it and have already committed their own rename
+    //    rewrites when this raises: PluginConfigStore (kill switches, enablement rules) and
+    //    ResponseStore; the runbook in docs/user-manual/upgrading.md ("Definition id collision")
+    //    says so, which is why it forbids returning to the older build. It is part of this one
+    //    migration only: no standing guard on the `crossplatform.tar.` namespace, which is
+    //    unreserved and may legitimately hold an operator-authored id once this has run.
     sql +=
         "DO $echo_collision$ BEGIN "
         "IF EXISTS (SELECT 1 FROM instruction_definitions WHERE id LIKE 'crossplatform.tar.%') "

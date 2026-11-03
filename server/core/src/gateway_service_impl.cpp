@@ -252,12 +252,15 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         metrics_->describe(
             "yuzu_server_gateway_route_write_failed_total",
             "HA WS-4: GatewayRouteStore directory writes/reads (register_fresh/"
-            "announce_connected/deregister/renew_leases/reclaim_tombstoned_session) "
+            "announce_connected/deregister/renew_leases/reclaim_tombstoned_session/"
+            "set_legacy_echo_wire_name) "
             "that degraded instead of succeeding, by op and reason. PER-SITE posture "
             "(4.2b, extended 4.4 round-2 review UP-4/COMP-6): register_fresh, and the "
             "replay-ADOPT decision's own renew_leases/reclaim_tombstoned_session calls, "
             "are fail-CLOSED (the ProxyRegister RPC returns UNAVAILABLE); every other "
-            "writer (announce_connected, BatchHeartbeat's own renew_leases, deregister) "
+            "writer (announce_connected, BatchHeartbeat's own renew_leases, deregister, "
+            "and the adopted-session set_legacy_echo_wire_name flag refresh, whose lost "
+            "write leaves the flag stale until the next fresh register or adoption) "
             "stays fail-OPEN (the RPC proceeds, integrity living at the fallback-only "
             "dispatch reader's trust predicate) - so for the fail-open writers this "
             "counter is the only signal a systemic write failure would otherwise leave "

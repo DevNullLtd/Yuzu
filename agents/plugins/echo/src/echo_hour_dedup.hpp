@@ -19,7 +19,12 @@
  * undo costs one erase per admitted key, not a copy of the whole set (up to 20,000 strings) on
  * every tick. An hour change or overflow clear inside a batch is not undone: that costs at most
  * one repeated row per key, the same worst case the clear already has. A batch left open (an
- * exception between begin and commit) is rolled back by the next begin_batch().
+ * exception between begin and commit) is rolled back by the next begin_batch(); BatchScope
+ * below makes that the destructor's job so no tick can leave one open.
+ *
+ * A key admitted OUTSIDE a batch (the nstat drain filters before its insert) is given back with
+ * release() when the row it admitted is dropped unstored, so the next sighting in the hour is
+ * stored instead of being read as a repeat.
  */
 
 #include <cstddef>
@@ -82,12 +87,15 @@ public:
         batch_open_ = false;
     }
     /// The rows were not stored: erase the keys admitted since begin_batch().
-    void rollback_batch() {
+    void rollback_batch() noexcept {
         for (const auto& k : admitted_)
             keys_.erase(k);
         admitted_.clear();
         batch_open_ = false;
     }
+    /// The row `key` admitted was dropped without being stored: forget the key so the next
+    /// sighting this hour is stored. A key from an earlier hour is already gone (no-op).
+    void release(const std::string& key) noexcept { keys_.erase(key); }
     /// Keys admitted in the open batch (what a rollback would erase).
     [[nodiscard]] std::size_t batch_admitted() const noexcept { return admitted_.size(); }
     [[nodiscard]] std::size_t size() const noexcept { return keys_.size(); }
@@ -108,6 +116,32 @@ private:
     std::unordered_set<std::string> keys_;
     std::vector<std::string> admitted_;
     bool batch_open_{false};
+};
+
+/// One tick's batch on a HourlySeenSet: begins on construction and, unless commit() was called,
+/// rolls back on destruction, so an exception (or an early return) between the filter and the
+/// insert can never leave the admitted keys consumed or the batch open for the next tick to
+/// inherit. commit() and rollback() are idempotent and end the scope's responsibility.
+class BatchScope {
+public:
+    explicit BatchScope(HourlySeenSet& set) : set_(&set) { set_->begin_batch(); }
+    ~BatchScope() { rollback(); }
+    BatchScope(const BatchScope&) = delete;
+    BatchScope& operator=(const BatchScope&) = delete;
+
+    void commit() noexcept {
+        if (set_)
+            set_->commit_batch();
+        set_ = nullptr;
+    }
+    void rollback() noexcept {
+        if (set_)
+            set_->rollback_batch();
+        set_ = nullptr;
+    }
+
+private:
+    HourlySeenSet* set_;
 };
 
 } // namespace yuzu::echo

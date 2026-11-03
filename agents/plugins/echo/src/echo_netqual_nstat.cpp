@@ -326,8 +326,9 @@ NetworkEvent network_event_from_nstat_flow(const NstatFlowEvent& e, std::int64_t
     // ESTABLISHED label this stream always stored, because the fleet-snapshot reader keeps only
     // ESTABLISHED rows and nstat never upgrades a row. The closing-socket hourly de-duplication
     // is NOT applied here: it runs before conversion, in nstat_dedupe_closing_opens, at the
-    // plugin's drain site, so a repeated subscription dump of flows already in TIME_WAIT stores
-    // one row per (process, remote) per hour exactly as the poll leg does.
+    // plugin's drain site, and covers OPEN events only, so a repeated subscription dump of flows
+    // already in TIME_WAIT stores one `connected` row per (process, remote) per hour. Close
+    // events are never filtered (the poll leg stores no close for such a socket; this leg does).
     ev.state = !e.is_open ? std::string{"CLOSED"}
                           : (tcp_state_is_closing(e.state) ? e.state : std::string{"ESTABLISHED"});
     ev.pid = e.pid;
@@ -344,6 +345,15 @@ std::vector<NstatFlowEvent> nstat_dedupe_closing_opens(std::vector<NstatFlowEven
             e.ts_unix, tcp_closing_key(e.process_name, e.remote_addr, e.remote_port));
     });
     return events;
+}
+
+void nstat_release_closing_keys(const NetworkEvent* first, const NetworkEvent* last,
+                                HourlySeenSet& seen) {
+    for (; first != last; ++first) {
+        if (first->action == "connected" && tcp_state_is_closing(first->state))
+            seen.release(tcp_closing_key(first->process_name, first->remote_addr,
+                                         first->remote_port));
+    }
 }
 
 TcpQualitySample nstat_build_quality_sample(const FlowState& flow) {

@@ -522,6 +522,14 @@ NetworkEvent network_event_from_nstat_flow(const NstatFlowEvent& e, std::int64_t
 std::vector<NstatFlowEvent> nstat_dedupe_closing_opens(std::vector<NstatFlowEvent> events,
                                                        HourlySeenSet& seen);
 
+/// PURE. The undo of nstat_dedupe_closing_opens for rows that will never be stored: when the
+/// plugin drops typed rows from its insert-retry backlog (the backlog cap, a layout mismatch, a
+/// confirmed disable), every closing-state `connected` row among them gives its hourly key back
+/// to `seen`, so the next sighting of that process and remote in the hour is stored rather than
+/// read as a repeat of a row that was lost. Rows of any other shape hold no key.
+void nstat_release_closing_keys(const NetworkEvent* first, const NetworkEvent* last,
+                                HourlySeenSet& seen);
+
 /// PURE. Derives one TcpQualitySample from a live flow. `lost` is
 /// nq_delta_clamped(txretransmit_cum, txretransmit_prev_snapshot) — the
 /// per-tick delta, never the raw cumulative (memo §6.3, SIGNAL DISCIPLINE,

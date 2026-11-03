@@ -929,7 +929,9 @@ TEST_CASE("nstat_dedupe_closing_opens: the key is process plus remote address pl
     constexpr std::int64_t ts = 1'700'000'400;
     HourlySeenSet seen;
     auto live = closing_open(ts, "curl", "203.0.113.9", 443, "ESTABLISHED");
-    auto close = closing_open(ts, "curl", "203.0.113.9", 443, "");
+    // A close keeps the flow's last-known closing state, so only `is_open` tells it from the
+    // deduplicated open: deleting the `!e.is_open` arm would filter it.
+    auto close = closing_open(ts, "curl", "203.0.113.9", 443);
     close.is_open = false;
 
     std::vector<NstatFlowEvent> batch{
@@ -946,6 +948,39 @@ TEST_CASE("nstat_dedupe_closing_opens: the key is process plus remote address pl
     // Order is preserved: the first four are the distinct closing opens.
     CHECK(kept[1].remote_port == 8443);
     CHECK(kept[2].process_name == "wget");
+    CHECK_FALSE(kept[6].is_open);
+    CHECK_FALSE(kept[7].is_open);
+}
+
+TEST_CASE("nstat_release_closing_keys: a dropped closing-state row gives its hourly key back so "
+          "the next sighting in the hour is stored",
+          "[echo][netqual][nstat]") {
+    constexpr std::int64_t ts = 1'700'000'400;
+    HourlySeenSet seen;
+    auto kept = nstat_dedupe_closing_opens({closing_open(ts, "curl", "203.0.113.9", 443)}, seen);
+    REQUIRE(kept.size() == 1);
+    // The typed row the plugin would have inserted, then dropped from its retry backlog.
+    std::vector<NetworkEvent> dropped{network_event_from_nstat_flow(kept[0], 1)};
+
+    // Still admitted: a re-sighting is a repeat.
+    CHECK(nstat_dedupe_closing_opens({closing_open(ts + 5, "curl", "203.0.113.9", 443)}, seen)
+              .empty());
+
+    nstat_release_closing_keys(dropped.data(), dropped.data() + dropped.size(), seen);
+    CHECK(nstat_dedupe_closing_opens({closing_open(ts + 10, "curl", "203.0.113.9", 443)}, seen)
+              .size() == 1);
+
+    // Rows that hold no key (a live open, a close) release nothing: the key just re-admitted
+    // stays and the next re-sighting is still a repeat.
+    auto close = closing_open(ts, "curl", "203.0.113.9", 443);
+    close.is_open = false;
+    std::vector<NetworkEvent> keyless{
+        network_event_from_nstat_flow(closing_open(ts, "curl", "203.0.113.9", 443, "ESTABLISHED"),
+                                      1),
+        network_event_from_nstat_flow(close, 1)};
+    nstat_release_closing_keys(keyless.data(), keyless.data() + keyless.size(), seen);
+    CHECK(nstat_dedupe_closing_opens({closing_open(ts + 15, "curl", "203.0.113.9", 443)}, seen)
+              .empty());
 }
 
 // -- #6895: the seen set undoes a failed commit without a whole-set copy ------
@@ -995,5 +1030,34 @@ TEST_CASE("HourlySeenSet batch: a commit keeps the keys and an unfinished batch 
     // Outside a batch nothing is recorded.
     seen.commit_batch();
     CHECK(seen.first_this_hour(ts, "plain"));
+    CHECK(seen.batch_admitted() == 0);
+}
+
+TEST_CASE("BatchScope: leaving the scope without a commit rolls the batch back and a commit "
+          "keeps it",
+          "[echo][netqual][dedup]") {
+    constexpr std::int64_t ts = 1'700'000'400;
+    HourlySeenSet seen;
+    {
+        BatchScope batch{seen};
+        REQUIRE(seen.first_this_hour(ts, "abandoned")); // e.g. an exception before the commit
+    }
+    CHECK(seen.batch_admitted() == 0);
+    CHECK(seen.first_this_hour(ts, "abandoned")); // erased by the destructor: admissible again
+
+    {
+        BatchScope batch{seen};
+        REQUIRE(seen.first_this_hour(ts, "kept"));
+        batch.commit();
+    }
+    CHECK_FALSE(seen.first_this_hour(ts, "kept"));
+
+    {
+        BatchScope batch{seen};
+        REQUIRE(seen.first_this_hour(ts, "undone"));
+        batch.rollback();
+        batch.commit(); // after a rollback the scope is closed: nothing to keep
+    }
+    CHECK(seen.first_this_hour(ts, "undone"));
     CHECK(seen.batch_admitted() == 0);
 }

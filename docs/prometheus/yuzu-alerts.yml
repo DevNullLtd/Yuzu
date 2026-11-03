@@ -695,10 +695,12 @@ groups:
       # root cause, so one rule covers reads and writes.
       # `op="register_fresh"` is the fail-CLOSED write (ProxyRegister's
       # fresh-registration branch returns UNAVAILABLE on this); the other
-      # five writer SITES (announce_connected, both ProxyRegister renew
-      # branches, BatchHeartbeat's renew, deregister) — which collapse to
-      # three fail-OPEN `op` label values (announce_connected, renew_leases,
-      # deregister; see the label set in docs/user-manual/metrics.md) — are
+      # six writer SITES (announce_connected, both ProxyRegister renew
+      # branches, BatchHeartbeat's renew, deregister, the adopted-session
+      # set_legacy_echo_wire_name flag refresh) — which collapse to
+      # four fail-OPEN `op` label values (announce_connected, renew_leases,
+      # deregister, set_legacy_echo_wire_name; see the label set in
+      # docs/user-manual/metrics.md) — are
       # deliberately fail-OPEN, so a rate here can mean silent directory drift even with
       # no visible RPC failure. INITIAL / conservative threshold — no fleet
       # background-rate data exists yet to tune against (same lesson as the
@@ -739,7 +741,12 @@ groups:
             announce_connected leaves the row NON-ROUTABLE (cluster_id/gateway_node
             NULL) — lease renewal does NOT repopulate placement, so it does NOT
             self-heal on the lease TTL and needs another CONNECTED / agent
-            re-registration to restore routing. op="session_lookup" is the
+            re-registration to restore routing. op="set_legacy_echo_wire_name"
+            (an upgrade-window shim) leaves the row's legacy plugin-name flag
+            stale: nothing repairs it until that agent registers fresh or is
+            adopted again, and until then a directory-routed Echo dispatch to
+            it is written under the wrong plugin name and the agent answers
+            plugin_not_found. op="session_lookup" is the
             batched READ that resolves gateway session ids (HA WS-5): while it
             fails, BatchHeartbeat is fail-SOFT (locally hinted pairs are still
             acked and renewed, unreadable ids with no local hint are neither
