@@ -20,6 +20,7 @@
 #include "echo_sql_executor.hpp"
 #include "echo_status_format.hpp"
 #include "test_helpers.hpp"
+#include "test_log_capture.hpp"
 
 #include <sqlite3.h>
 
@@ -610,7 +611,7 @@ TEST_CASE("v10 migration: every source converts exactly (differential against a 
     CHECK(migrated.get_config("usage_gap_count") == "1"); // history the app_usage plugin still reads
 }
 
-TEST_CASE("v10 migration: raw rows below the rollup mark are not counted twice",
+TEST_CASE("v10 migration: raw rows below the rollup mark are logged and not counted twice",
           "[echo][v10][migration]") {
     Seeded seeded;
     // Hour H0 was rolled up (mark = H0 + 1 h): its two raw rows are already in process_hourly. The
@@ -625,7 +626,11 @@ TEST_CASE("v10 migration: raw rows below the rollup mark are not counted twice",
         exec(db, std::format("INSERT INTO echo_config VALUES ('rollup_process_hourly_at', '{}')",
                              kNextHour));
     });
+    yuzu::test::LogCapture logs;
     auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    // the two rows below the mark are not folded, and the migration says how many
+    CHECK(logs.text().find("2 raw rows older than the old roll-up mark") != std::string::npos);
     // 2 (legacy hourly) + nothing from below the mark, in hour H0
     CHECK(n(db, std::format("SELECT start_count FROM process_hourly WHERE hour_ts = {}", kH0)) == 2);
     // the row AT the mark second and the one after it are folded (a mark is the first unrolled second)

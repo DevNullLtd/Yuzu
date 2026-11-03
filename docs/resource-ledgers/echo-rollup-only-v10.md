@@ -42,6 +42,11 @@ releases exactly the resource listed.
   retry still runs on the trigger thread and holds the locks for its duration.
 - **Failure:** a fault, crash or power loss before COMMIT leaves schema v9 and every retired table
   intact (SQLite's WAL recovery discards the unfinished transaction); the next open redoes the step.
+- **Rows not folded:** raw rows older than the first old tier's mark (`ts < mark`) are dropped with the
+  raw tables, not folded: the old roll-up already summarised them except rows a process-event backfill
+  wrote and rows its clock-gap clamp skipped, and its `GROUP BY` kept no identity to tell the two apart,
+  so folding them would double-count the first group. The count is in the migration's log line. The DROP
+  has no clock-derived cutoff, so `clock-guarded-retention.md` has no row for it.
 - **After COMMIT:** the connection must be in autocommit (`sqlite3_get_autocommit`); a wedged one is
   returned as an error and `open()` closes it, never publishes it.
 

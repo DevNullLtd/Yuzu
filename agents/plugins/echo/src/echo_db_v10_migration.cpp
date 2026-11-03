@@ -524,6 +524,7 @@ RegistryEvent decode_registry(const RawRow& r) {
 struct Report {
     int64_t legacy_tier_rows{0};
     int64_t raw_rows{0};
+    int64_t below_mark{0}; // raw rows older than the old roll-up mark: not folded, counted
     int64_t rejected{0};
     int64_t ring_keys{0};
 };
@@ -688,6 +689,20 @@ private:
         if (h_.poisoned())
             return std::unexpected(h_.error());
         const int64_t min_ts = from.value_or(std::numeric_limits<int64_t>::min());
+
+        // Rows older than the mark are not folded: the old roll-up already summarised them, except
+        // those a process-event backfill wrote or the clock-gap clamp skipped, and the old GROUP BY
+        // destroyed the identity that would tell the two apart. They are counted so the drop is
+        // visible. With no mark nothing is below it.
+        if (from) {
+            auto st = prep(h_, std::format("SELECT COUNT(*) FROM {}_live WHERE ts < ?1", def.name));
+            if (!st)
+                return std::unexpected(h_.error());
+            sqlite3_bind_int64(st.get(), 1, min_ts);
+            if (sqlite3_step(st.get()) != SQLITE_ROW)
+                return std::unexpected(std::string("step failed: ") + sqlite3_errmsg(h_.raw()));
+            report_.below_mark += sqlite3_column_int64(st.get(), 0);
+        }
 
         // The newest kReplayRingDepth rows of a cursor source seed its replay ring.
         int64_t seed_from_id = 0;
@@ -998,11 +1013,14 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
 
     const StorageBytes end = db.storage_bytes();
     spdlog::info("EchoDatabase: migrated to schema version 10 (roll-up tiers) in {} s: {} old summary "
-                 "rows converted, {} raw rows folded, {} rejected, {} replay keys seeded, {} tables "
-                 "dropped; file {} -> {} bytes, WAL {} bytes at commit; VACUUM {}",
+                 "rows converted, {} raw rows folded, {} raw rows older than the old roll-up mark were "
+                 "not folded (already summarised by the old roll-up, except rows written by a "
+                 "process-event backfill or skipped by the clock-gap clamp; the two cannot be told "
+                 "apart), {} rejected, {} replay keys seeded, {} tables dropped; file {} -> {} bytes, "
+                 "WAL {} bytes at commit; VACUUM {}",
                  std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - started).count(),
-                 report.legacy_tier_rows, report.raw_rows, report.rejected, report.ring_keys,
-                 dropped, before.file_bytes(), end.ok ? end.file_bytes() : 0,
+                 report.legacy_tier_rows, report.raw_rows, report.below_mark, report.rejected,
+                 report.ring_keys, dropped, before.file_bytes(), end.ok ? end.file_bytes() : 0,
                  after_commit.wal_bytes, vacuum_note);
     return {};
 }

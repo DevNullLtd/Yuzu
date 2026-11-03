@@ -275,7 +275,7 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
 
 1. Pre-check: the volume holds twice the file free, else the open fails with a message that begins
    with `kFreeSpaceRefusalPrefix`; the plugin then loads offline (`storage_state|offline|free_space`,
-   no trigger registered) instead of failing to load. A free-space figure that cannot be read migrates without the pre-check (logged), and a database with nothing to migrate needs no room.
+   no trigger registered) instead of failing to load. A free-space figure that cannot be read is a refusal too (the 2x check is mandatory, never skipped) and is logged; a database with nothing to migrate needs no room.
 2. Rename each old summary tier to `<name>_legacy`, install the roll-up schema, then convert every
    legacy row into the interned table (an average becomes `avg * samples`, a sum column is rebuilt
    from it, the keys intern through the dictionary).
@@ -283,7 +283,11 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    `rollup_<src>_<to>_at` mark (absent means "fold all"), then fold the raw rows at or after the
    first old tier's mark (`ts >= mark`: a mark is the half-open end of the last rolled bucket).
    Sixteen decoders read the raw columns through `legacy_live_columns()`; a row the delta rules
-   reject is counted and dropped.
+   reject is counted and dropped. Raw rows older than that mark are dropped with the raw tables, by
+   design: the old roll-up already summarised them, except rows a process-event backfill wrote with
+   historical timestamps and rows the old aggregator's clock-gap clamp skipped while the mark still
+   advanced. The old `GROUP BY` destroyed the row identity that would tell the two apart, so folding
+   them would double-count the first group; the migration logs how many it left unfolded.
 4. Seed the replay ring with the newest 4096 `record_key`s of each cursor source, drop the retired
    tables, delete the rollup marks, `usage_hwm_id` and `usage_lag_events`, create the empty `$X_Live`
    shim views (`legacy_live_shim_ddl()`), and write `schema_version` 10.
