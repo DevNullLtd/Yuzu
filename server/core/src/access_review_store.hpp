@@ -240,7 +240,9 @@ public:
     /// `valid_campaign_id` (`access_review_model.hpp`; an empty id included),
     /// when `principal_type`/`principal_id`/`role_name`/`justification`/
     /// `reviewer` holds an embedded NUL (libpq binds `c_str()`, so a NUL would
-    /// silently truncate the value), or when `justification` exceeds
+    /// silently truncate the value), when `reviewer` is empty, when
+    /// `principal_type`/`principal_id`/`role_name` exceeds its cap
+    /// (`kPrincipalIdMaxLen`/`kRoleNameMaxLen`), or when `justification` exceeds
     /// `kMaxJustificationBytes`, all checked before the pool is touched;
     /// `unexpected("forbidden: ...")` (403) when `principal_type == "user"` and
     /// `principal_id == reviewer` (byte-exact), also decided before the pool is

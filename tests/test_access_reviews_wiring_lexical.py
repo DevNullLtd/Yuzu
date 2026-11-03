@@ -12,6 +12,17 @@ access_reviews::register_access_reviews_routes( ... ):
   3. `.grants_fn` reads the grant TABLE through build_access_review (not a roster walk, so orphan
      grants are kept) and stamps access_review_rbac_enforcement.
 
+It also pins two properties of the attestation write path that no route test can see:
+
+  4. Every `record_attestation(` caller outside the store runs `evaluate_attestation_sod(` first, in
+     its own handler (today: the REST route and the MCP tool). A third caller without the gate would
+     let a reviewer decide a grant they own or belong to.
+  5. Every error string `AccessReviewStore` returns is either one of the three machine-checkable
+     prefixes the two classifiers key on, or a string recorded here as a genuine fault (503 /
+     internal-error). A new unprefixed client-validation string would otherwise be answered as a
+     retryable store failure. The REST and MCP classifiers must both delegate to the one shared
+     `classify_store_error` (a local copy is how they drift apart).
+
 Same method as test_access_audit_wiring_lexical.py (comments stripped, whitespace collapsed,
 in-memory mutations prove each pattern is live). Lexical only.
 
@@ -21,7 +32,10 @@ import re
 import sys
 import unittest
 
-from test_access_audit_wiring_lexical import SERVER_CPP, block
+from test_access_audit_wiring_lexical import SERVER_CPP, block, normalise
+
+SRC_DIR = SERVER_CPP.parent
+STORE_CPP = SRC_DIR / "access_review_store.cpp"
 
 TAG = "test_access_reviews_wiring_lexical"
 HINT = (" (this gate pins the Access reviews production wiring; if server.cpp was legitimately"
@@ -69,6 +83,53 @@ def problems(src):
     return out
 
 
+# A handler boundary: the nearest one before a record_attestation( call opens its own region.
+HANDLER_START = re.compile(r"sink\.(?:Get|Post|Put|Delete)\(|if \(tool_name == ")
+CALL = re.compile(r"(?:->|\.)\s*record_attestation\s*\(")
+
+
+def gate_problems(name, src):
+    """Every record_attestation( call in `src` has evaluate_attestation_sod( earlier in its handler."""
+    t = normalise(src)
+    out = []
+    for call in CALL.finditer(t):
+        starts = [m.start() for m in HANDLER_START.finditer(t, 0, call.start())]
+        region = t[(starts[-1] if starts else 0):call.start()]
+        if "evaluate_attestation_sod(" not in region:
+            out.append(f"{name}: a record_attestation( call is not preceded by evaluate_attestation_sod( in its handler")
+    return out
+
+
+def attesting_sources():
+    for path in sorted(SRC_DIR.glob("*.[ch]pp")):
+        if path.name.startswith("access_review_store."):
+            continue
+        yield path
+
+
+# Unprefixed store errors, all answered 503 / internal-error. Entries are matched as prefixes. The
+# first six are validation strings the handlers pre-empt (never reachable through them today).
+KNOWN_UNPREFIXED = (
+    "database not open", "title cannot be empty", "created_by cannot be empty",
+    "rbac_enforcement must be", "decision must be", "campaign_id/principal_type",
+    "closed_by cannot be empty", "open_campaign failed", "record_attestation failed",
+    "get_campaign failed", "database unavailable", "close_campaign write failed",
+    "list_campaigns read failed",
+)
+PREFIXES = ("not_found:", "bad_request:", "forbidden:")
+UNEXPECTED = re.compile(r'unexpected\(\s*(?:error_msg\.empty\(\)\s*\?\s*|std::string\()?"((?:[^"\\]|\\.)*)"')
+
+
+def store_error_problems(src):
+    out = []
+    for m in UNEXPECTED.finditer(src):
+        lit = m.group(1)
+        if lit.startswith(PREFIXES) or lit.startswith(KNOWN_UNPREFIXED):
+            continue
+        out.append(f"access_review_store.cpp returns an unclassified error string: {lit!r}")
+    return out
+
+
 # (pattern, replacement, expected substring of a problem)
 MUTATIONS = [
     (r"httplib::Response scratch;\s*return draw_perm_fn\(req, scratch, type, op\);", "return true;",
@@ -101,6 +162,77 @@ class ReviewsWiring(unittest.TestCase):
                 p = problems(mutated)
                 self.assertTrue(p, "mutation was NOT detected by the gate")
                 self.assertIn(expected, p[0])
+
+GATED = 'sink.Post(R"(/x)", [](auto&) { auto v = access_review_sod::evaluate_attestation_sod(a); s->record_attestation(b); });'
+UNGATED = 'sink.Post(R"(/x)", [](auto&) { s->record_attestation(b); });'
+STALE_GATE = ('sink.Post(R"(/a)", [](auto&) { evaluate_attestation_sod(a); });'
+              ' sink.Post(R"(/b)", [](auto&) { s->record_attestation(b); });')
+
+
+class AttestGate(unittest.TestCase):
+    def test_real_callers_are_gated(self):
+        callers = 0
+        for path in attesting_sources():
+            text = path.read_text(encoding="utf-8")
+            callers += len(CALL.findall(normalise(text)))
+            p = gate_problems(path.name, text)
+            for m in p:
+                print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
+            self.assertEqual(p, [])
+        # rest_api_v1.cpp and mcp_server.cpp: a lexer that lost the calls must not pass silently.
+        self.assertEqual(callers, 2)
+
+    def test_pattern_is_live(self):
+        self.assertEqual(gate_problems("f", GATED), [])
+        self.assertEqual(len(gate_problems("f", UNGATED)), 1)
+        # A gate in another handler earlier in the file does not cover a later ungated one.
+        self.assertEqual(len(gate_problems("f", STALE_GATE)), 1)
+        self.assertEqual(len(gate_problems("f", GATED + " " + UNGATED)), 1)
+
+
+CLASSIFIERS = (
+    ("rest_api_v1.cpp", "static int access_review_error_status(const std::string& err) {",
+     "store_error_http_status(access_review_sod::classify_store_error(err))"),
+    ("mcp_server.cpp", "int mcp_error_for_access_review_msg(const std::string& msg) {",
+     "store_error_jsonrpc_code(access_review_sod::classify_store_error(msg))"),
+)
+
+
+def classifier_problems(name, src, head, call):
+    t = normalise(src)
+    at = t.find(head)
+    if at < 0:
+        return [f"{name}: the access review store-error classifier is no longer defined as `{head}`"]
+    body = t[at + len(head):t.find("}", at)]
+    if call not in body:
+        return [f"{name}: the access review store-error classifier no longer delegates to the shared classify_store_error"]
+    return []
+
+
+class StoreErrorStrings(unittest.TestCase):
+    def test_both_classifiers_delegate(self):
+        for name, head, call in CLASSIFIERS:
+            text = (SRC_DIR / name).read_text(encoding="utf-8")
+            p = classifier_problems(name, text, head, call)
+            for m in p:
+                print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
+            self.assertEqual(p, [])
+            # Pattern is live: a local prefix test in the same body is caught.
+            local = text.replace(call, 'err.starts_with("not_found:") ? 404 : 503', 1)
+            self.assertTrue(classifier_problems(name, local, head, call))
+
+    def test_every_error_string_is_classified(self):
+        src = STORE_CPP.read_text(encoding="utf-8")
+        self.assertGreaterEqual(len(UNEXPECTED.findall(src)), 25, "lexer lost the error strings")
+        p = store_error_problems(src)
+        for m in p:
+            print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
+        self.assertEqual(p, [])
+
+    def test_pattern_is_live(self):
+        self.assertEqual(store_error_problems('return std::unexpected("bad_request: x");'), [])
+        self.assertEqual(store_error_problems('return std::unexpected("database not open");'), [])
+        self.assertEqual(len(store_error_problems('return std::unexpected("title is too long");')), 1)
 
 
 if __name__ == "__main__":

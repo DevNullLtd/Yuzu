@@ -393,6 +393,11 @@ AccessReviewStore::record_attestation(const std::string& campaign_id,
         return std::unexpected("bad_request: campaign_id invalid");
     if (principal_type.empty() || principal_id.empty() || role_name.empty())
         return std::unexpected("campaign_id/principal_type/principal_id/role_name required");
+    // The decision's author is recorded in the history and is half of the reviewer-differs-from-
+    // subject comparison, so an empty reviewer is refused (close_campaign does the same for
+    // closed_by).
+    if (reviewer.empty())
+        return std::unexpected("bad_request: reviewer cannot be empty");
     // libpq binds c_str() (pg/pg_exec.hpp): an embedded NUL would truncate the value, so the
     // row written or matched would not be the one named. Refuse before the pool is touched.
     const auto has_nul = [](const std::string& s) { return s.find('\0') != std::string::npos; };
@@ -402,6 +407,10 @@ AccessReviewStore::record_attestation(const std::string& campaign_id,
         return std::unexpected("bad_request: principal_id contains a NUL byte");
     if (has_nul(role_name))
         return std::unexpected("bad_request: role_name contains a NUL byte");
+    // The same caps the transports enforce before their gate (access_review_model.hpp); here as
+    // the backstop for a caller that skips it, so no stored row names an unbounded tuple.
+    if (!attest_grant_fields_within_bounds(principal_type, principal_id, role_name))
+        return std::unexpected("bad_request: " + std::string(kGrantFieldInvalidMessage));
     if (has_nul(reviewer))
         return std::unexpected("bad_request: reviewer contains a NUL byte");
     if (has_nul(justification))

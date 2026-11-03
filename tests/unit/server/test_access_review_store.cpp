@@ -31,6 +31,7 @@
  * the plain-migration-test carve-out documented on that macro.
  */
 
+#include "access_review_model.hpp"
 #include "access_review_store.hpp"
 
 #include "pg/pg_pool.hpp"
@@ -803,6 +804,50 @@ TEST_CASE("open_campaign refuses an embedded NUL in title or created_by and crea
     CHECK(campaigns->empty());
 }
 
+TEST_CASE("record_attestation refuses an empty reviewer and an over-long grant field, and writes "
+          "nothing",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign("Bounds", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    // An empty reviewer: bad_request (400), the same posture as close_campaign's empty closed_by.
+    auto empty = store.record_attestation(cid, "user", "alice", "Admin", "attested", "", "ok");
+    REQUIRE_FALSE(empty.has_value());
+    CHECK(empty.error().starts_with("bad_request:"));
+    CHECK(empty.error().find("reviewer") != std::string::npos);
+
+    // Each grant field is capped at 256 bytes; one more is bad_request with the shared text, and
+    // exactly 256 passes the bound (not_found: no such frozen grant).
+    const std::string text = "bad_request: " + std::string(yuzu::server::kGrantFieldInvalidMessage);
+    const std::string over(257, 'a');
+    const std::string at_cap(256, 'a');
+    auto r1 = store.record_attestation(cid, "user", over, "Admin", "attested", "carol", "");
+    REQUIRE_FALSE(r1.has_value());
+    CHECK(r1.error() == text);
+    auto r2 = store.record_attestation(cid, "user", "alice", over, "attested", "carol", "");
+    REQUIRE_FALSE(r2.has_value());
+    CHECK(r2.error() == text);
+    auto r3 = store.record_attestation(cid, over, "alice", "Admin", "attested", "carol", "");
+    REQUIRE_FALSE(r3.has_value());
+    CHECK(r3.error() == text);
+    auto ok_len = store.record_attestation(cid, "user", at_cap, "Admin", "attested", "carol", "");
+    REQUIRE_FALSE(ok_len.has_value());
+    CHECK(ok_len.error().starts_with("not_found:"));
+
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    CHECK(view->pending_count == 3);
+    for (const auto& a : view->attestations) {
+        CHECK(a.decision == "pending");
+        CHECK(a.history.empty());
+    }
+}
+
 TEST_CASE("record_attestation caps justification at 4096 bytes",
           "[access_review][store][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
@@ -1030,8 +1075,14 @@ bool integrity_violation(const std::string& sqlstate) {
 
 } // namespace
 
+// The "zero-row UPDATE emulation" below pins the DATABASE guard: a history row committed with no
+// matching state change is refused at COMMIT by the deferred consistency trigger. It does NOT run
+// record_attestation's own `PQntuples(upd) == 0` return-false branch: under the attestation row
+// lock that branch is unreachable through the public API, so it is covered by review, not by this
+// test (the trigger is the backstop for the case where it ever were reached).
 TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation, and the "
-          "store still works afterwards (orphan rollback)",
+          "deferred trigger refuses an orphan history row at COMMIT (database guard, not the C++ "
+          "return-false branch)",
           "[access_review][store][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1131,6 +1182,132 @@ TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation
     CHECK(next->seq == 1);
     auto cl = store.close_campaign(cid, "admin");
     CHECK(cl.has_value());
+}
+
+namespace {
+
+// "SQLSTATE|primary message" of a failed statement; "" when it succeeded.
+std::string failure_of(PGconn* conn, const std::string& sql) {
+    PgResult r{PQexec(conn, sql.c_str())};
+    if (r.ok())
+        return "";
+    const char* st = PQresultErrorField(r.get(), PG_DIAG_SQLSTATE);
+    const char* msg = PQresultErrorField(r.get(), PG_DIAG_MESSAGE_PRIMARY);
+    return std::string(st != nullptr ? st : "?") + "|" + (msg != nullptr ? msg : "");
+}
+
+} // namespace
+
+// Each probe runs in its own transaction on the group/eng grant (pending, seq 0): insert the
+// history row a seq+1 advance would need (reviewer carol, justification 'j', decided_at 5,
+// previous 'pending'), then UPDATE the state row to seq 1 with ONE value that does not match it.
+// The control run advances with every value matching and the guard lets it through, so each refusal
+// below is that single field, not the probe's own shape. The message text names the guard clause.
+TEST_CASE("schema v3 guard: every field the state row must share with its history row is checked, "
+          "and the key, snapshot and +1 clauses refuse",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign("Guard probes", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PGconn* c = conn.get();
+    const std::string att = "access_review_store.access_review_attestation";
+    const std::string hist = "access_review_store.access_review_attestation_history";
+    const std::string where = " WHERE campaign_id='" + cid +
+                              "' AND principal_type='group' AND principal_id='eng' "
+                              "AND role_name='Reader'";
+    const auto insert_history = [&](int seq) {
+        return "INSERT INTO " + hist +
+               " (campaign_id, principal_type, principal_id, role_name, seq, decision, "
+               "previous_decision, reviewer, justification, decided_at_ms) VALUES ('" +
+               cid + "','group','eng','Reader'," + std::to_string(seq) +
+               ",'attested','pending','carol','j',5)";
+    };
+    // The state UPDATE with every value matching the history row, `set` overriding one.
+    const auto update_state = [&](const std::string& decision, const std::string& reviewer,
+                                  const std::string& decided_at, const std::string& justification,
+                                  int seq, const std::string& extra = "") {
+        return "UPDATE " + att + " SET decision='" + decision + "', reviewer='" + reviewer +
+               "', decided_at_ms=" + decided_at + ", justification='" + justification +
+               "', decision_seq=" + std::to_string(seq) + extra + where;
+    };
+    const auto probe = [&](int hist_seq, const std::string& update) {
+        REQUIRE(failure_of(c, "BEGIN").empty());
+        REQUIRE(failure_of(c, insert_history(hist_seq)).empty());
+        auto out = failure_of(c, update);
+        REQUIRE(failure_of(c, "ROLLBACK").empty());
+        return out;
+    };
+
+    // Control: every value matches, seq advances by one: the guard allows the UPDATE.
+    CHECK(probe(1, update_state("attested", "carol", "5", "j", 1)).empty());
+
+    // No matching history row: one probe per compared field (the NOT EXISTS clause of the guard).
+    const auto expect = [&](const std::string& got, const std::string& clause) {
+        INFO("got: " << got);
+        CHECK(got.starts_with("23"));
+        CHECK(got.find(clause) != std::string::npos);
+    };
+    const std::string no_history = "no matching history row at seq 1";
+    // reviewer (h.reviewer = NEW.reviewer)
+    expect(probe(1, update_state("attested", "dave", "5", "j", 1)), no_history);
+    // justification (h.justification = NEW.justification)
+    expect(probe(1, update_state("attested", "carol", "5", "other", 1)), no_history);
+    // decided_at_ms (h.decided_at_ms = NEW.decided_at_ms)
+    expect(probe(1, update_state("attested", "carol", "6", "j", 1)), no_history);
+    // decision (h.decision = NEW.decision)
+    expect(probe(1, update_state("flagged_revoke", "carol", "5", "j", 1)), no_history);
+    // previous_decision (h.previous_decision = OLD.decision): the history row says the old
+    // decision was 'attested' while the state row's OLD decision is 'pending'.
+    {
+        REQUIRE(failure_of(c, "BEGIN").empty());
+        REQUIRE(failure_of(
+                    c, "INSERT INTO " + hist +
+                           " (campaign_id, principal_type, principal_id, role_name, seq, "
+                           "decision, previous_decision, reviewer, justification, decided_at_ms) "
+                           "VALUES ('" +
+                           cid + "','group','eng','Reader',1,'attested','attested','carol','j',5)")
+                    .empty());
+        const auto got = failure_of(c, update_state("attested", "carol", "5", "j", 1));
+        REQUIRE(failure_of(c, "ROLLBACK").empty());
+        expect(got, no_history);
+    }
+
+    // Key and grant_snapshot are immutable even with a valid +1 advance and a matching history row
+    // (the clause that runs BEFORE the seq check, so these are not the seq clause's refusals).
+    expect(probe(1, update_state("attested", "carol", "5", "j", 1,
+                                 ", grant_snapshot='{\"changed\":true}'")),
+           "key and grant_snapshot are immutable");
+    expect(probe(1, update_state("attested", "carol", "5", "j", 1, ", principal_id='eng2'")),
+           "key and grant_snapshot are immutable");
+    expect(probe(1, update_state("attested", "carol", "5", "j", 1, ", role_name='Other'")),
+           "key and grant_snapshot are immutable");
+
+    // A +2 jump is refused by the seq clause even with a history row at the target seq.
+    expect(probe(2, update_state("attested", "carol", "5", "j", 2)),
+           "decision_seq must advance by exactly one (old 0, new 2)");
+    // A no-advance UPDATE (seq unchanged) is refused by the same clause.
+    expect(probe(1, update_state("attested", "carol", "5", "j", 0)),
+           "decision_seq must advance by exactly one (old 0, new 0)");
+
+    // Nothing from any probe landed: the grant is still pending at seq 0 with no history.
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    const auto* eng = find_row(*view, "group", "eng", "Reader");
+    REQUIRE(eng != nullptr);
+    CHECK(eng->decision == "pending");
+    CHECK(eng->decision_seq == 0);
+    CHECK(eng->history.empty());
+    // And the store still records on that grant.
+    auto next = store.record_attestation(cid, "group", "eng", "Reader", "attested", "dave", "");
+    REQUIRE(next.has_value());
+    CHECK(next->seq == 1);
 }
 
 // ── Concurrency on the HeldLocks seam (no sleeps, no thread loops) ──────────
@@ -1273,12 +1450,14 @@ TEST_CASE("an attest issued while a close is in flight waits, then is not_found 
 // A queued close does NOT stop a NEW attest from taking its FOR SHARE on the campaign row, so
 // under a continuous attest stream a close can wait for the whole lock_timeout and answer a write
 // failure. Documented behaviour (access_review_store.hpp), pinned here so a change to it is seen.
-// The short lock_timeout keeps the test to about a second; nothing else sleeps.
+// The close can only return at its lock_timeout (attest A never releases), so the ordering is
+// decided by a flag attest B sets and the close reads at the moment it returns, not by how fast B
+// is: the 3 s timeout leaves B room on a loaded runner, and nothing else sleeps.
 TEST_CASE("a close waiting behind an attest does not block a new attest of another grant, and "
           "ends in a retryable write failure at lock_timeout, never not_found",
           "[access_review][store][pg][concurrency]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 6, .lock_timeout_ms = 1000}};
+    PgPool pool{{.conninfo = db.dsn(), .size = 6, .lock_timeout_ms = 3000}};
     AccessReviewStore store{pool};
     REQUIRE(store.is_open());
     auto open_res = store.open_campaign("Starvation", "admin", three_grants(), "enabled");
@@ -1286,25 +1465,27 @@ TEST_CASE("a close waiting behind an attest does not block a new attest of anoth
     const auto cid = *open_res;
 
     std::expected<void, std::string> closed;
-    std::atomic<bool> close_returned{false};
+    std::atomic<bool> b_done{false};
+    bool b_done_when_close_returned = false;
     yuzu::test::HeldLocks held(pool);
     held.run(grant_lock_sql(cid)); // attest A in flight: its row, and FOR SHARE on the campaign
     yuzu::test::Workers workers([&] { held.rollback(); });
     workers.add([&] {
         closed = store.close_campaign(cid, "admin");
-        close_returned = true;
+        b_done_when_close_returned = b_done.load();
     });
     REQUIRE(yuzu::test::wait_for_lock_waiter(pool)); // the close is parked behind attest A
 
     // Attest B, a different grant of the same campaign, is issued AFTER the close queued.
     auto b = store.record_attestation(cid, "group", "eng", "Reader", "attested", "carol", "");
+    b_done = true;
     REQUIRE(b.has_value());
     CHECK(b->seq == 1);
     CHECK(b->previous_decision == "pending");
-    // It completed while the close was still waiting.
-    CHECK_FALSE(close_returned.load());
 
     workers.join_all(); // attest A never releases: the close times out on its own
+    // B had completed before the close gave up: it was not blocked behind the queued close.
+    CHECK(b_done_when_close_returned);
     REQUIRE_FALSE(closed.has_value());
     CHECK_FALSE(closed.error().starts_with("not_found:"));
     CHECK(closed.error().starts_with("close_campaign write failed"));

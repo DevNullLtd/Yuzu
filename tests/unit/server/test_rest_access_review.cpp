@@ -70,6 +70,7 @@
 #include <vector>
 
 #include "test_auth_db_pg_helper.hpp"
+#include "../test_log_capture.hpp"
 
 using namespace yuzu::server;
 
@@ -102,8 +103,9 @@ yuzu::test::PgTestTemplate access_review_rest_tpl{"accrevresttx",
 // .cpp's SwinvShared, the reference conversion). Built lazily; at testRunEnded
 // the pool is drained and the clone dropped (keep_until_run_end). Every test
 // in this file is CRUD-only against these stores (the store-down arms pass
-// nullptr rather than breaking the schema), so there are no per-case-database
-// carve-outs.
+// nullptr rather than breaking the schema), EXCEPT the cases that DROP a table to
+// force a degrade: they take a per-test migrated clone through the harness's
+// `own_pool` (the shared reset's TRUNCATE cannot repair a dropped table).
 struct AccRevShared {
     yuzu::test::PostgresTestDb db{access_review_rest_tpl};
     std::optional<yuzu::server::pg::PgPool> pool;
@@ -2114,6 +2116,25 @@ TEST_CASE("attestation SoD gate: pure decisions with no store, and the store-err
           SodOutcome::kPass);
     CHECK(sod::evaluate_attestation_sod("bob", "user", "carol", nullptr, nullptr).outcome ==
           SodOutcome::kPass);
+    // An embedded NUL is a different subject (the comparison is over every byte, not a c_str()).
+    CHECK(sod::evaluate_attestation_sod("bob", "user", std::string("bob\0x", 5), nullptr, nullptr)
+              .outcome == SodOutcome::kPass);
+    CHECK(sod::evaluate_attestation_sod(std::string("bob\0x", 5), "user", "bob", nullptr, nullptr)
+              .outcome == SodOutcome::kPass);
+    // Prefixed identities (an SSO principal's stable name): exact match is refused, a case or
+    // whitespace variant is another reviewer.
+    CHECK(sod::evaluate_attestation_sod("oidc:iss#sub", "user", "oidc:iss#sub", nullptr, nullptr)
+              .outcome == SodOutcome::kSelfSubject);
+    CHECK(sod::evaluate_attestation_sod("saml:idp#nameid", "user", "saml:idp#nameid", nullptr,
+                                        nullptr)
+              .outcome == SodOutcome::kSelfSubject);
+    CHECK(sod::evaluate_attestation_sod("OIDC:iss#sub", "user", "oidc:iss#sub", nullptr, nullptr)
+              .outcome == SodOutcome::kPass);
+    CHECK(sod::evaluate_attestation_sod("oidc:iss#sub ", "user", "oidc:iss#sub", nullptr, nullptr)
+              .outcome == SodOutcome::kPass);
+    CHECK(sod::evaluate_attestation_sod("saml:idp#NameID", "user", "saml:idp#nameid", nullptr,
+                                        nullptr)
+              .outcome == SodOutcome::kPass);
     // An unknown type is the store's not_found, never a separation-of-duties answer.
     CHECK(sod::evaluate_attestation_sod("bob", "robot", "bob", nullptr, nullptr).outcome ==
           SodOutcome::kPass);
@@ -2638,6 +2659,310 @@ TEST_CASE("attestation SoD: a refusal stands and a recorded decision stands when
         CHECK(body["result"]["structuredContent"]["audit_persisted"] == false);
         CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 1);
     }
+}
+
+// ── Byte-exact subject comparison, input bounds, store-failure answers (#4752 round 7) ─────────
+
+TEST_CASE("attestation SoD: the engine-owner and group-member rules compare byte-exact",
+          "[pg][access_review][sod][4752]") {
+    AccessReviewHarness h;
+    seed_engine_grant(h, "engine:svc", "bob");
+    seed_group_grant(h, "eng", "bob");
+    using sod::SodOutcome;
+    const auto verdict = [&h](const std::string& reviewer, const char* type,
+                              const std::string& id) {
+        return sod::evaluate_attestation_sod(reviewer, type, id, h.eps.get(), h.rbac.get()).outcome;
+    };
+
+    // Engine: the owner's exact name is refused; a case or whitespace variant is another reviewer.
+    CHECK(verdict("bob", "engine", "engine:svc") == SodOutcome::kEngineOwner);
+    CHECK(verdict("Bob", "engine", "engine:svc") == SodOutcome::kPass);
+    CHECK(verdict("BOB", "engine", "engine:svc") == SodOutcome::kPass);
+    CHECK(verdict("bob ", "engine", "engine:svc") == SodOutcome::kPass);
+    CHECK(verdict(" bob", "engine", "engine:svc") == SodOutcome::kPass);
+    // A variant of the engine id names no principal row, so it is an orphan grant (admitted).
+    CHECK(verdict("bob", "engine", "ENGINE:svc") == SodOutcome::kPass);
+    CHECK(verdict("bob", "engine", "engine:svc ") == SodOutcome::kPass);
+
+    // Group: the same exactness on the member name and on the group name.
+    CHECK(verdict("bob", "group", "eng") == SodOutcome::kGroupMember);
+    CHECK(verdict("Bob", "group", "eng") == SodOutcome::kPass);
+    CHECK(verdict("bob ", "group", "eng") == SodOutcome::kPass);
+    CHECK(verdict("bob", "group", "Eng") == SodOutcome::kPass);
+    CHECK(verdict("bob", "group", "eng ") == SodOutcome::kPass);
+    // A NUL in the group id is a different name: it compares over every byte.
+    CHECK(verdict("bob", "group", std::string("eng\0x", 5)) == SodOutcome::kPass);
+    // (A NUL in an ENGINE id reaches EnginePrincipalStore::get, whose bound value c_str() would
+    // truncate; the transports refuse it before the gate, see the bounds case below, so it is not
+    // pinned here.)
+}
+
+TEST_CASE("attestation SoD at the route: a case or whitespace variant of the subject is another "
+          "reviewer on all three rules; the exact name is refused",
+          "[pg][access_review][rest][sod][4752]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    seed_engine_grant(h, "engine:svc", "bob");
+    seed_group_grant(h, "eng", "bob");
+    // SSO principals are stored under their stable, prefixed name.
+    REQUIRE(h.rbac->assign_role({"user", "oidc:iss#sub", "Operator"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "saml:idp#nameid", "Operator"}).has_value());
+    const auto cid = h.open_campaign_rest("sod byte exact");
+
+    struct Rule {
+        const char* type;
+        const char* id;
+        const char* role;
+        const char* exact;   // refused
+        const char* variant; // admitted
+        const char* refusal;
+    };
+    const Rule rules[] = {
+        {"user", "bob", "Operator", "bob", "Bob", "self_subject"},
+        {"user", "bob", "Operator", "bob", "bob ", "self_subject"},
+        {"user", "oidc:iss#sub", "Operator", "oidc:iss#sub", "OIDC:iss#sub", "self_subject"},
+        {"user", "saml:idp#nameid", "Operator", "saml:idp#nameid", "saml:idp#nameid ",
+         "self_subject"},
+        {"engine", "engine:svc", "Writer", "bob", "Bob", "engine_owner"},
+        {"engine", "engine:svc", "Writer", "bob", "bob ", "engine_owner"},
+        {"group", "eng", "Reader", "bob", "Bob", "group_member"},
+        {"group", "eng", "Reader", "bob", "bob ", "group_member"},
+    };
+    for (const auto& r : rules) {
+        INFO(r.type << " " << r.id << " exact='" << r.exact << "' variant='" << r.variant << "'");
+        const double before = refused_count(h, "rest", r.refusal);
+        h.session_user = r.exact;
+        check_rest_sod_refusal(h.sink.Post(attest_url(cid), sod_body(r.type, r.id, r.role)));
+        CHECK(refused_count(h, "rest", r.refusal) == before + 1.0);
+
+        h.session_user = r.variant;
+        auto ok = h.sink.Post(attest_url(cid), sod_body(r.type, r.id, r.role));
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        CHECK(refused_count(h, "rest", r.refusal) == before + 1.0); // the variant was not refused
+        CHECK(grant_row(h, cid, r.type, r.id, r.role).reviewer == r.variant);
+    }
+
+    // MCP reaches the same answers through the same gate.
+    h.session_user = "bob";
+    CHECK(mcp_error_of(h.mcp_call_tool("record_attestation",
+                                       sod_args(cid, "engine", "engine:svc", "Writer")))["code"] ==
+          yuzu::server::mcp::kPermissionDenied);
+    h.session_user = "Bob";
+    auto mcp_ok =
+        h.mcp_call_tool("record_attestation", sod_args(cid, "engine", "engine:svc", "Writer"));
+    REQUIRE(mcp_ok);
+    CHECK(nlohmann::json::parse(mcp_ok->body).contains("result"));
+}
+
+TEST_CASE("attestation bounds: an over-long or NUL-bearing principal_type, principal_id or "
+          "role_name is 400 / invalid-params before the gate, with no audit row and no counter",
+          "[pg][access_review][rest][mcp][sod][4752]") {
+    AccessReviewHarness h;
+    seed_engine_grant(h, "engine:svc", "bob");
+    seed_group_grant(h, "eng", "bob");
+    const auto cid = h.open_campaign_rest("sod bounds");
+    h.session_user = "carol";
+    h.audit_log.clear();
+
+    const std::string max_id(256, 'a');
+    const std::string long_id(257, 'a');
+    const std::string nul_engine("engine:svc\0x", 12);
+    const std::string nul_group("eng\0x", 5);
+    struct Case {
+        const char* label;
+        std::string type, id, role;
+    };
+    const std::vector<Case> cases = {
+        {"engine id over 256", "engine", long_id, "Writer"},
+        {"group id over 256", "group", long_id, "Reader"},
+        {"role over 256", "group", "eng", long_id},
+        {"type over 256", long_id, "eng", "Reader"},
+        {"engine id with NUL", "engine", nul_engine, "Writer"},
+        {"group id with NUL", "group", nul_group, "Reader"},
+        {"role with NUL", "group", "eng", std::string("Reader\0x", 8)},
+        {"type with NUL", std::string("group\0x", 7), "eng", "Reader"},
+    };
+    const auto no_refusal_counted = [&h] {
+        for (const char* surface : {"rest", "mcp"})
+            for (const char* reason :
+                 {"self_subject", "engine_owner", "group_member", "check_unavailable"})
+                if (refused_count(h, surface, reason) != 0.0)
+                    return false;
+        return true;
+    };
+    for (const auto& c : cases) {
+        INFO(c.label);
+        auto rest = h.sink.Post(attest_url(cid), sod_body(c.type, c.id, c.role));
+        REQUIRE(rest);
+        CHECK(rest->status == 400);
+        const auto body = nlohmann::json::parse(rest->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body["error"]["message"] == std::string(kGrantFieldInvalidMessage));
+
+        const auto err = mcp_error_of(
+            h.mcp_call_tool("record_attestation", sod_args(cid, c.type, c.id, c.role)));
+        CHECK(err["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(err["message"] == std::string(kGrantFieldInvalidMessage));
+
+        // Nothing was audited (no forged `denied` row for a grant that does not exist), nothing
+        // was counted, and nothing was recorded.
+        CHECK(h.audit_log.empty());
+        CHECK(no_refusal_counted());
+    }
+    CHECK(grant_row(h, cid, "group", "eng", "Reader").history.empty());
+    CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer").history.empty());
+
+    // The boundary is inclusive: exactly 256 bytes passes the bound and reaches the store, which
+    // answers not_found for a grant that was never frozen (404 / invalid-params, not 400's text).
+    auto at_cap = h.sink.Post(attest_url(cid), sod_body("group", max_id, "Reader"));
+    REQUIRE(at_cap);
+    CHECK(at_cap->status == 404);
+    auto at_cap_role = h.sink.Post(attest_url(cid), sod_body("group", "eng", max_id));
+    REQUIRE(at_cap_role);
+    CHECK(at_cap_role->status == 404);
+}
+
+TEST_CASE("attestation store failure: REST and MCP answer a fixed message with a retry hint, log "
+          "the raw error, and never put database text in the response or the audit rows",
+          "[pg][access_review][rest][mcp][degrade][4752]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_rest_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    REQUIRE(pool.valid());
+    AccessReviewHarness h{true, true, &pool};
+    seed_user_grant(h, "bob");
+    const auto cid = h.open_campaign_rest("store failure");
+    // The pre-read passes, then the history INSERT fails with a libpq message that names the
+    // relation: the shape of a genuine write fault.
+    drop_table_cascade(db.dsn(), "access_review_store.access_review_attestation_history");
+    h.session_user = "carol";
+    h.audit_log.clear();
+    const std::string tuple = " principal_type=user principal_id=bob role=Operator";
+    const std::string fixed(sod::kStoreFailureMessage);
+    const auto leaks_db_text = [](const std::string& text) {
+        return text.find("does not exist") != std::string::npos ||
+               text.find("relation \\\"") != std::string::npos ||
+               text.find("relation \"") != std::string::npos ||
+               text.find("access_review_attestation_history") != std::string::npos ||
+               text.find("history write failed") != std::string::npos ||
+               text.find("ERROR:") != std::string::npos;
+    };
+
+    SECTION("REST") {
+        yuzu::test::LogCapture logs;
+        auto res = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
+        logs.stop();
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        const auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body["error"]["message"] == fixed);
+        CHECK(body["error"]["retry_after_ms"] == 5000);
+        CHECK_FALSE(leaks_db_text(res->body));
+
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "failure");
+        CHECK(rows[0].target_id == cid);
+        CHECK(rows[0].detail == fixed + tuple);
+        CHECK_FALSE(leaks_db_text(rows[0].detail));
+
+        // The raw error went to the server log, on one line, not to the caller.
+        const auto log_text = logs.text();
+        CHECK(log_text.find("access review attestation store failure") != std::string::npos);
+        CHECK(log_text.find("history write failed") != std::string::npos);
+    }
+
+    SECTION("MCP") {
+        const auto err = mcp_error_of(
+            h.mcp_call_tool("record_attestation", sod_args(cid, "user", "bob", "Operator")));
+        CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(err["message"] == fixed);
+        CHECK(err["data"]["retry_after_ms"] == 5000);
+        CHECK(err["data"]["remediation"] == std::string(sod::kStoreFailureRemediation));
+        CHECK_FALSE(leaks_db_text(err.dump()));
+
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "failure");
+        CHECK(rows[0].detail == fixed + tuple);
+        const auto wrapper = audit_rows(h, "mcp.record_attestation");
+        REQUIRE(wrapper.size() == 1);
+        CHECK(wrapper[0].result == "failure");
+        CHECK(wrapper[0].detail == fixed);
+        for (const auto& r : h.audit_log)
+            CHECK_FALSE(leaks_db_text(r.detail));
+    }
+}
+
+TEST_CASE("access review store errors: every string the store returns maps to one REST status and "
+          "one MCP code, through the shared classifier both transports delegate to",
+          "[access_review][sod][classifier][4752]") {
+    // Every error AccessReviewStore can return (access_review_store.cpp's unexpected( sites; the
+    // Python lexical gate fails when a site returns a string that is neither prefixed nor listed
+    // in its own table). Prefixed strings are client or business refusals; every other string is a
+    // genuine fault the caller did not cause.
+    struct Row {
+        const char* err;
+        int http;
+        int jsonrpc;
+    };
+    using yuzu::server::mcp::kInternalError;
+    using yuzu::server::mcp::kInvalidParams;
+    using yuzu::server::mcp::kPermissionDenied;
+    const Row rows[] = {
+        {"not_found: no frozen grant matches (campaign_id, principal_type, principal_id, "
+         "role_name) in an open campaign",
+         404, kInvalidParams},
+        {"not_found: no campaign with this id", 404, kInvalidParams},
+        {"not_found: campaign missing or already closed", 404, kInvalidParams},
+        {"bad_request: campaign_id invalid", 400, kInvalidParams},
+        {"bad_request: title contains a NUL byte", 400, kInvalidParams},
+        {"bad_request: created_by contains a NUL byte", 400, kInvalidParams},
+        {"bad_request: principal_type contains a NUL byte", 400, kInvalidParams},
+        {"bad_request: principal_id contains a NUL byte", 400, kInvalidParams},
+        {"bad_request: role_name contains a NUL byte", 400, kInvalidParams},
+        {"bad_request: reviewer contains a NUL byte", 400, kInvalidParams},
+        {"bad_request: reviewer cannot be empty", 400, kInvalidParams},
+        {"bad_request: justification contains a NUL byte", 400, kInvalidParams},
+        {"bad_request: justification exceeds 4096 bytes", 400, kInvalidParams},
+        {"bad_request: closed_by contains a NUL byte", 400, kInvalidParams},
+        {"forbidden: reviewer is the subject of this grant", 403, kPermissionDenied},
+        {"database not open", 503, kInternalError},
+        {"database unavailable \xe2\x80\x94 try again", 503, kInternalError},
+        {"open_campaign failed", 503, kInternalError},
+        {"get_campaign failed", 503, kInternalError},
+        {"record_attestation read failed: ERROR: x", 503, kInternalError},
+        {"record_attestation history write failed: ERROR: x", 503, kInternalError},
+        {"record_attestation write failed: ERROR: x", 503, kInternalError},
+        {"record_attestation write failed: the decision did not advance", 503, kInternalError},
+        {"record_attestation failed: database unavailable or the decision was not committed, try "
+         "again",
+         503, kInternalError},
+        {"close_campaign write failed: ERROR: x", 503, kInternalError},
+        {"list_campaigns read failed: ERROR: x", 503, kInternalError},
+        // Validation strings the handlers pre-empt; unprefixed, so today they classify as a fault.
+        {"title cannot be empty", 503, kInternalError},
+        {"created_by cannot be empty", 503, kInternalError},
+        {"closed_by cannot be empty", 503, kInternalError},
+        {"decision must be 'attested' or 'flagged_revoke'", 503, kInternalError},
+        {"campaign_id/principal_type/principal_id/role_name required", 503, kInternalError},
+        {"rbac_enforcement must be 'enabled', 'disabled', or 'degraded'", 503, kInternalError},
+        {"", 503, kInternalError},
+    };
+    for (const auto& r : rows) {
+        INFO("store error: " << r.err);
+        const auto cls = sod::classify_store_error(r.err);
+        CHECK(sod::store_error_http_status(cls) == r.http);
+        CHECK(sod::store_error_jsonrpc_code(cls) == r.jsonrpc);
+    }
+    // The prefix is the whole contract: a prefix that is not at the start is not a refusal, and
+    // the check is case-sensitive.
+    CHECK(sod::store_error_http_status(sod::classify_store_error("x not_found: y")) == 503);
+    CHECK(sod::store_error_http_status(sod::classify_store_error("Not_Found: y")) == 503);
+    // The user-rule refusal also maps onto the gate's own outcome (one wire answer, both paths).
+    CHECK(
+        sod::sod_from_store_error("forbidden: reviewer is the subject of this grant").has_value());
 }
 
 // ── Decision history on the read surfaces (#4752) ───────────────────────────

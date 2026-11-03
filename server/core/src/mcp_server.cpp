@@ -3453,10 +3453,10 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$"},)j"
      R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
-     R"j("principal_id":{"type":"string","minLength":1},)j"
-     R"j("role_name":{"type":"string","minLength":1},)j"
+     R"j("principal_id":{"type":"string","minLength":1,"maxLength":256},)j"
+     R"j("role_name":{"type":"string","minLength":1,"maxLength":256},)j"
      R"j("decision":{"type":"string","enum":["attested","flagged_revoke"]},)j"
-     R"j("justification":{"type":"string"})j"
+     R"j("justification":{"type":"string","maxLength":4096})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
      R"j({"type":"object","properties":{"recorded":{"type":"boolean"}},"required":["recorded"]})j"},
 
@@ -3475,7 +3475,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$"})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string","enum":["user","group","engine"]},"principal_id":{"type":"string"},"role_name":{"type":"string"},"decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"decided_at_ms":{"type":"integer"},"justification":{"type":"string"},"decision_seq":{"type":"integer"},"history":{"type":"array","items":{"type":"object","properties":{"seq":{"type":"integer"},"decision":{"type":"string","enum":["attested","flagged_revoke"]},"previous_decision":{"type":"string","enum":["","pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"justification":{"type":"string"},"decided_at_ms":{"type":"integer"}},"required":["seq","decision","previous_decision","reviewer","justification","decided_at_ms"]}}},"required":["principal_type","principal_id","role_name","decision","reviewer","decided_at_ms","justification","decision_seq","history"]}},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
+     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string","enum":["user","group","engine"]},"principal_id":{"type":"string"},"role_name":{"type":"string"},"decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"decided_at_ms":{"type":"integer"},"justification":{"type":"string"},"grant_snapshot":{"type":["object","null"]},"decision_seq":{"type":"integer"},"history":{"type":"array","items":{"type":"object","properties":{"seq":{"type":"integer"},"decision":{"type":"string","enum":["attested","flagged_revoke"]},"previous_decision":{"type":"string","enum":["","pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"justification":{"type":"string"},"decided_at_ms":{"type":"integer"}},"required":["seq","decision","previous_decision","reviewer","justification","decided_at_ms"]}}},"required":["principal_type","principal_id","role_name","decision","reviewer","decided_at_ms","justification","grant_snapshot","decision_seq","history"]}},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
     {"list_access_reviews",
      "List every review campaign's metadata (NOT its attestations — use get_access_review "
@@ -6100,10 +6100,7 @@ int mcp_error_for_store_msg(const std::string& msg) {
 // arm below and the matching 400 arm in rest_api_v1.cpp's
 // access_review_error_status already map it).
 int mcp_error_for_access_review_msg(const std::string& msg) {
-    if (msg.starts_with("forbidden:"))
-        return kPermissionDenied;
-    return (msg.starts_with("not_found:") || msg.starts_with("bad_request:")) ? kInvalidParams
-                                                                              : kInternalError;
+    return access_review_sod::store_error_jsonrpc_code(access_review_sod::classify_store_error(msg));
 }
 
 // B4 (#2146 API-parity) — ManagementGroupStore error → JSON-RPC code + retry
@@ -28399,6 +28396,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Bound the grant tuple BEFORE the gate (the REST twin does the same): the gate's
+                // refusal rows and the failure row embed it, so an unbounded or NUL-bearing id
+                // would write a forged, oversized audit row per call. The schema's maxLength is
+                // discovery metadata only; this is the enforcement.
+                if (!attest_grant_fields_within_bounds(principal_type, principal_id, role_name)) {
+                    res.set_content(a4_error(kInvalidParams, kGrantFieldInvalidMessage),
+                                    "application/json");
+                    return;
+                }
                 // decision selects the audit verb so the two outcomes are
                 // separately countable evidence, matching the REST twin exactly. Every
                 // row of this verb has one shape: target_id = the campaign alone, the
@@ -28444,6 +28450,25 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (const auto sod =
                             access_review_sod::sod_from_store_error(rec_res.error())) {
                         refuse({*sod, {}});
+                        return;
+                    }
+                    if (access_review_sod::classify_store_error(rec_res.error()) ==
+                        access_review_sod::StoreErrorClass::kTransient) {
+                        // A fault that is not the caller's (see the REST twin): the raw text goes
+                        // to the log, the caller gets a fixed message and a retry hint, and both
+                        // audit rows carry the fixed message, never the raw error.
+                        access_review_sod::log_store_failure(campaign_id, "mcp", rec_res.error());
+                        const bool failure_audit_ok = yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, audit_action, "failure", "AccessReview", campaign_id,
+                            access_review_sod::store_failure_audit_detail(tuple_detail));
+                        const bool wrapper_ok = mcp_audit(
+                            "failure", std::string(access_review_sod::kStoreFailureMessage));
+                        res.set_content(
+                            a4_error(kInternalError, access_review_sod::kStoreFailureMessage,
+                                     access_review_sod::kStoreFailureRemediation,
+                                     static_cast<long>(access_review_sod::kStoreFailureRetryMs),
+                                     {}, failure_audit_ok && wrapper_ok),
+                            "application/json");
                         return;
                     }
                     const bool denied_audit_ok = yuzu::server::detail::try_persist_audit(

@@ -650,7 +650,7 @@ public:
     /// `yuzu_server_rbac_read_degrade_total` (the ADR-0017 admit-then-filter chokepoint's read, also
     /// used by the attestation separation-of-duties gate). Errors: `kRbacErrStoreNotOpen`,
     /// `kRbacErrCircuitBreakerOpen`, `kRbacErrPoolAcquireTimeout`, `"query failed: ..."`.
-    std::expected<std::vector<std::string>, std::string>
+    [[nodiscard]] std::expected<std::vector<std::string>, std::string>
     user_rbac_group_names_checked(const std::string& username) const;
     std::expected<void, std::string> add_group_member(const std::string& group_name,
                                                       const std::string& username);

@@ -200,6 +200,31 @@ inline constexpr std::size_t kCampaignIdMaxLen = 64;
 inline constexpr std::string_view kCampaignIdInvalidMessage =
     "campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -";
 
+/// Longest `principal_type` / `principal_id` and `role_name` an attestation names, in bytes. A
+/// frozen grant is read from the role and engine stores, whose ids are far shorter; the cap bounds
+/// what a caller can make an audit row (and a log line) carry before any existence proof.
+inline constexpr std::size_t kPrincipalIdMaxLen = 256;
+inline constexpr std::size_t kRoleNameMaxLen = 256;
+
+/// The refusal text REST (400) and MCP (invalid-params) return for an attestation grant field that
+/// is over its cap or holds a NUL byte, so the two transports (and the store backstop, which
+/// prefixes `bad_request: `) cannot drift. An EMPTY field keeps its own "required" refusal.
+inline constexpr std::string_view kGrantFieldInvalidMessage =
+    "principal_type, principal_id and role_name must be 1-256 bytes without NUL";
+
+/// True when `principal_type`, `principal_id` and `role_name` are each within their cap and free of
+/// a NUL byte (emptiness is the caller's own check). `pg/pg_exec.hpp` binds `c_str()`, so a NUL
+/// would truncate the bound value and name a different grant than the one audited.
+[[nodiscard]] inline bool attest_grant_fields_within_bounds(std::string_view principal_type,
+                                                            std::string_view principal_id,
+                                                            std::string_view role_name) noexcept {
+    const auto ok = [](std::string_view s, std::size_t cap) {
+        return s.size() <= cap && s.find('\0') == std::string_view::npos;
+    };
+    return ok(principal_type, kPrincipalIdMaxLen) && ok(principal_id, kPrincipalIdMaxLen) &&
+           ok(role_name, kRoleNameMaxLen);
+}
+
 /// The single shared campaign id validator: 1..kCampaignIdMaxLen bytes, each in `[A-Za-z0-9_-]`.
 /// REST, MCP and the Access page all call this (the Settings fragment does from its own change);
 /// never fork a second copy. It tests every byte of the view, so an embedded NUL is rejected:

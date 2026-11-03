@@ -63,6 +63,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <httplib.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -96,6 +97,84 @@ inline constexpr std::string_view kSodUnavailableRemediation = "retry the reques
 
 /// `retry_after_ms` for the check-unavailable answer, REST and MCP alike.
 inline constexpr std::int64_t kSodUnavailableRetryMs = mcp::kMcpStoreFaultRetryMs;
+
+/// How a store error string is answered, REST and MCP alike. The store marks a client or business
+/// refusal with a machine-checkable prefix; anything else is a genuine read/write fault the caller
+/// did not cause. ONE classifier: `access_review_error_status` (REST) and
+/// `mcp_error_for_access_review_msg` (MCP) both delegate here so the two cannot disagree, and a
+/// test pins every string the store returns.
+enum class StoreErrorClass { kNotFound, kBadRequest, kForbidden, kTransient };
+
+[[nodiscard]] inline StoreErrorClass classify_store_error(std::string_view err) {
+    if (err.starts_with("not_found:"))
+        return StoreErrorClass::kNotFound;
+    if (err.starts_with("bad_request:"))
+        return StoreErrorClass::kBadRequest;
+    if (err.starts_with("forbidden:"))
+        return StoreErrorClass::kForbidden;
+    return StoreErrorClass::kTransient;
+}
+
+[[nodiscard]] inline int store_error_http_status(StoreErrorClass c) {
+    switch (c) {
+    case StoreErrorClass::kNotFound:
+        return 404;
+    case StoreErrorClass::kBadRequest:
+        return 400;
+    case StoreErrorClass::kForbidden:
+        return 403;
+    case StoreErrorClass::kTransient:
+        break;
+    }
+    return 503;
+}
+
+[[nodiscard]] inline int store_error_jsonrpc_code(StoreErrorClass c) {
+    switch (c) {
+    case StoreErrorClass::kNotFound:
+    case StoreErrorClass::kBadRequest:
+        return mcp::kInvalidParams;
+    case StoreErrorClass::kForbidden:
+        return mcp::kPermissionDenied;
+    case StoreErrorClass::kTransient:
+        break;
+    }
+    return mcp::kInternalError;
+}
+
+/// What a caller is told when the store fails to record a decision for a reason that is not the
+/// caller's (a lease timeout, a query error, a lost COMMIT acknowledgement). Fixed text: the raw
+/// store error can carry `PQerrorMessage` output (relation, constraint and trigger names, CONTEXT
+/// lines), which is logged server-side and never returned. A lost COMMIT may have committed the
+/// decision, so the message tells the caller to read before retrying.
+inline constexpr std::string_view kStoreFailureMessage =
+    "the decision store is unavailable or the decision may not have been committed; read the "
+    "campaign and compare decision_seq before retrying";
+inline constexpr std::string_view kStoreFailureRemediation =
+    "read the campaign and compare decision_seq before retrying";
+
+/// `retry_after_ms` for the store-failure answer, the same constant the check-unavailable answer
+/// uses.
+inline constexpr std::int64_t kStoreFailureRetryMs = kSodUnavailableRetryMs;
+
+/// Longest slice of the raw store error written to the log.
+inline constexpr std::size_t kStoreFailureLogMaxBytes = 512;
+
+/// Write the raw store error to the server log (bounded, control bytes neutralised so it cannot
+/// forge a log line). The campaign id is validated before the store is reached.
+inline void log_store_failure(std::string_view campaign_id, std::string_view surface,
+                              std::string_view err) {
+    const std::string_view head = err.substr(0, kStoreFailureLogMaxBytes);
+    spdlog::warn("access review attestation store failure: surface={} campaign={} error='{}'",
+                 surface, campaign_id, ::yuzu::log_key_token(head));
+}
+
+/// The failure audit row's detail: the fixed message plus the grant tuple. Never the raw error.
+[[nodiscard]] inline std::string store_failure_audit_detail(const std::string& tuple_detail) {
+    std::string out{kStoreFailureMessage};
+    out += tuple_detail;
+    return out;
+}
 
 /// The wire-neutral answer for one non-pass outcome.
 struct SodRefusal {
