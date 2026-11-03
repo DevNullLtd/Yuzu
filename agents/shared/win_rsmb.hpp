@@ -14,9 +14,10 @@
  * there must be on the record. For the 'RSMB' provider the kernel returns a copy of the SMBIOS
  * table the firmware handed over at boot, which it already holds in memory: the call does no
  * device I/O, takes no driver round trip and waits on nothing a wedged device could hold. That is
- * the difference from the synchronous DeviceIoControl volume reads that #3925 / the writer's
- * `agent:windows_volumes_unbounded` withhold, which can block indefinitely on a stalled VSS or
- * storage provider. The size is capped (kMaxRsmbBytes) and the probe/fill retry is bounded
+ * the difference from the synchronous DeviceIoControl volume reads (tracked in #3925, and withheld
+ * by the device-record writer as `agent:windows_volumes_unbounded`), which can block indefinitely
+ * on a stalled VSS or storage provider. This is the documented behaviour of the provider and the
+ * precedent firmware_posture has shipped on; it has NOT been measured under a stalled provider. The size is capped (kMaxRsmbBytes) and the probe/fill retry is bounded
  * (kMaxRsmbAttempts), so the call count and the allocation are bounded too. If a measurement ever
  * shows this call blocking, the fix is bounded_wait.hpp here, in one place.
  */

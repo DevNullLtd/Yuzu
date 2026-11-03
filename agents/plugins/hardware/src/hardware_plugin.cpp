@@ -482,8 +482,11 @@ int do_processors(yuzu::CommandContext& ctx) {
                       arch = wmi_row_uint32(row, "Architecture");
                   const auto stepping = yuzu::hardware::estate::stepping_field(
                       wmi_row_string(row, "ProcessorId"), arch, wmi_row_string(row, "Stepping"));
-                  ctx.write_output(std::format("cpu|{}|{}|{}|{}|{}|{}|{}", idx++, name, cores,
-                                               threads, mhz, socket, stepping));
+                  // `name` is WMI text: escape it like the appended columns, or a '|' in it shifts
+                  // every later column (and a newline would forge a row).
+                  ctx.write_output(std::format("cpu|{}|{}|{}|{}|{}|{}|{}", idx++,
+                                               yuzu::util::safe_output_field(name), cores, threads,
+                                               mhz, socket, stepping));
               });
     // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
     // doc comment above.
@@ -582,8 +585,10 @@ int do_memory(yuzu::CommandContext& ctx) {
                   }
                   auto size_mb = capacity / (1024 * 1024);
                   // The module's own identity strings; OEM filler and empty -> "-".
+                  // `slot` (DeviceLocator) is WMI text: escaped like the appended identity columns.
                   ctx.write_output(std::format(
-                      "dimm|{}|{}|{}|{}|{}|{}|{}", slot, size_mb, type_str, speed,
+                      "dimm|{}|{}|{}|{}|{}|{}|{}", yuzu::util::safe_output_field(slot), size_mb,
+                      type_str, speed,
                       yuzu::hardware::estate::dimm_identity_field(
                           wmi_row_string(row, "Manufacturer")),
                       yuzu::hardware::estate::dimm_identity_field(
@@ -794,7 +799,8 @@ int do_drivers(yuzu::CommandContext& ctx) {
 // stays CONSTRAINED on Linux/macOS: both return a value, but only the
 // aggregate total, not full per-DIMM detail, without additional privilege /
 // API surface. The four hardware-estate actions (chassis/baseboard/swap/
-// machine_id) are PLANNED on every leg (rung 1): a dispatch answers one
+// machine_id) are read on Windows (rung 1, hardware_estate_win.cpp) and still
+// PLANNED on Linux and macOS (rung 1): there a dispatch answers one
 // unsupported status row, `<os>:planned`, and reads nothing.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {

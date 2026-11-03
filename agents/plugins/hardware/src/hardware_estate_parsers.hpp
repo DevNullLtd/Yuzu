@@ -89,6 +89,11 @@ struct Report {
 
 // -- field hygiene -------------------------------------------------------------------------
 
+/// Longest identity string a row carries. SMBIOS strings are bounded only by the 1 MiB table, and the
+/// on-demand response is not clamped the way the daily record is, so cap here. 256 bytes is several
+/// times any real serial, part number or vendor string.
+inline constexpr std::size_t kMaxIdentityBytes = 256;
+
 /// A free-text identity field read from firmware or WMI, ready for a row: right-trimmed, OEM
 /// filler (or empty) -> "-", and escaped through safe_output_field. This is the single place a
 /// leg turns "the firmware said nothing real" into the absent marker.
@@ -99,6 +104,14 @@ struct Report {
     // conversion; scrubbing them is a no-op.)
     std::string scrubbed{raw_in};
     yuzu::shared::scrub_wire_bytes(scrubbed);
+    if (scrubbed.size() > kMaxIdentityBytes) {
+        // Cut on a UTF-8 scalar boundary: the string is well-formed after the scrub, so back up over
+        // continuation bytes (10xxxxxx) to the lead byte of the scalar the cut would split.
+        std::size_t cut = kMaxIdentityBytes;
+        while (cut > 0 && (static_cast<unsigned char>(scrubbed[cut]) & 0xC0u) == 0x80u)
+            --cut;
+        scrubbed.resize(cut);
+    }
     std::string_view raw{scrubbed};
     // is_placeholder / rtrim are right-trim only (the walker's contract); a leg also drops leading
     // blanks so padded filler ("  Default string") is still filler and a real value never starts
@@ -338,8 +351,8 @@ inline constexpr std::uint32_t kArchX64 = 9;
 
 /// `stepping` column. On x86/x64 the stepping is the low nibble of CPUID leaf 1 EAX, which is the
 /// last 8 hex digits of Win32_Processor.ProcessorId ("BFEBFBFF000906EA" -> EAX 0x000906EA ->
-/// stepping 10). Anywhere else (arm64, an unknown architecture, an unparsable id) the class's own Stepping string is used
-/// when it is a plain decimal number, else "-". Decimal, no padding.
+/// stepping 10). Anywhere else (arm64, an unknown architecture, an unparsable id) the class's own
+/// Stepping string is used when it is a plain decimal number, else "-". Decimal, no padding.
 [[nodiscard]] inline std::string stepping_field(std::string_view processor_id,
                                                 std::optional<std::uint32_t> architecture,
                                                 std::string_view stepping_property) {

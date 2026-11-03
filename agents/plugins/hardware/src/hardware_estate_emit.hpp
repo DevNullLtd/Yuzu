@@ -5,9 +5,10 @@
  * the status row first, the data rows after it, and the typed result the device-record writer
  * reads its section level from. Every OS leg calls this, so the grammar cannot drift.
  *
- * Always returns 0 (run_windows alone returns 1, when this function itself throws). A degraded read
- * is reported through the typed result, never through the return code: a non-zero rc makes the writer record the whole section as `agent:rc=<n>`
- * unavailable and discards the reason.
+ * Returns 0 for every outcome. (run_windows, the caller, returns 1 only when this function itself
+ * throws.) A degraded read is reported through the typed result, never through the return code: a
+ * non-zero rc makes the writer record the whole section as `agent:rc=<n>` unavailable and discards
+ * the reason.
  *
  * `set_result_status` ASSIGNS (the last call wins), so a leg calls emit_report exactly once, with
  * the finished summary -- never per item.

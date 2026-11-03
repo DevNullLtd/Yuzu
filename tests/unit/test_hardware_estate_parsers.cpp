@@ -87,6 +87,21 @@ TEST_CASE("estate: firmware bytes that are not UTF-8 are scrubbed before they re
     CHECK(est::clean_identity_opt(std::optional<std::string>{"X\x80Y"}) == "X?Y");
 }
 
+TEST_CASE("estate: an identity string is capped on a UTF-8 boundary", "[hardware_estate]") {
+    // SMBIOS strings are bounded only by the 1 MiB table; the on-demand response is not clamped like
+    // the daily record, so the field is capped. The cut never splits a multi-byte scalar.
+    const std::string long_ascii(5000, 'A');
+    CHECK(est::clean_identity(long_ascii).size() == est::kMaxIdentityBytes);
+    std::string multi;
+    for (int i = 0; i < 400; ++i) multi += "\xC3\xA9"; // 400 x U+00E9, 800 bytes
+    const std::string cut = est::clean_identity(multi);
+    CHECK(cut.size() <= est::kMaxIdentityBytes);
+    CHECK(cut.size() % 2 == 0);            // whole scalars only
+    CHECK(yuzu::shared::count_invalid_wire_bytes(cut) == 0);
+    // exactly at the cap is untouched
+    CHECK(est::clean_identity(std::string(est::kMaxIdentityBytes, 'B')).size() == est::kMaxIdentityBytes);
+}
+
 // -- chassis / baseboard from SMBIOS ---------------------------------------------------------
 
 TEST_CASE("estate: chassis from the real kingsley capture", "[hardware_estate]") {

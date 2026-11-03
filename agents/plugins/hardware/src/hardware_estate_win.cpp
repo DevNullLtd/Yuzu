@@ -15,13 +15,15 @@
  *
  * BOUNDEDNESS (roadmap Principle 14: no unbounded OS call on the daily sync thread).
  *   - The WMI reads ride run_bounded_wmi_query: per-Next wait, whole-enumeration and row cap.
- *   - The registry read is one RegGetValueW against a local hive, size-capped.
+ *   - The registry read is one RegOpenKeyExW plus a RegQueryValueExW size probe and fill against a
+ *     local hive, size-capped.
  *   - GetSystemFirmwareTable('RSMB') copies a table the kernel already holds; the argument is in
  *     win_rsmb.hpp.
  * No DeviceIoControl is used anywhere here.
  *
- * PRIVILEGE. All four reads were measured readable by an unprivileged account in S-H1 (RSMB, the
- * MachineGuid value, and the Win32_PageFile* classes under a non-admin virtual service account).
+ * PRIVILEGE. All four reads were measured readable by an unprivileged account (RSMB, the
+ * MachineGuid value, and the Win32_PageFile* classes, run under a non-admin NT SERVICE virtual
+ * account; the capture is docs/samples/windows.txt).
  * A refusal on another host is reported `permission_denied`, never as an absent value.
  */
 #ifdef _WIN32

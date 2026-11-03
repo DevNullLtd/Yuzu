@@ -17,8 +17,8 @@
  *
  * CROSS-OS CONTRACT. H.11 (Linux, /etc/machine-id) and any later leg call hash_machine_id with
  * the same label and algorithm string so one machine's digest is comparable across legs that
- * read the same id. The label and algorithm token are pinned by tests/unit/test_machine_id_hash
- * (inside test_hmac_sha256.cpp); changing either is a coordinated change of every stored value.
+ * read the same id. The label and algorithm token are pinned by the [machine_id_hash] cases in
+ * tests/unit/test_hmac_sha256.cpp; changing either is a coordinated change of every stored value.
  *
  * NORMALISATION. The input is trimmed of ASCII whitespace, stripped of one pair of surrounding
  * braces and lowercased, so `{ABCD-...}` and `abcd-...` hash identically. Windows stores
