@@ -126,7 +126,7 @@
     stream_pid  :: pid() | undefined,     %% subscribe handler process
     stream_mon  :: reference() | undefined, %% monitor ref for stream_pid
     %% The agent's hostname. It replaces the whole AgentInfo the field used to
-    %% hold (about 26 KB for an agent with 69 plugins, measured
+    %% hold (about 26 KiB for an agent with 69 plugins, measured
     %% 2026-10-26): this process reads only the hostname of it (registry
     %% row, re-register, get_info), and the owner table keeps the start
     %% arguments for a restart. A supervised owner holds no AgentInfo at all
