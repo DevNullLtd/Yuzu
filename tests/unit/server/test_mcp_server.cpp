@@ -5765,7 +5765,8 @@ TEST_CASE("MCP Integration: tools/call list_agents", "[mcp][integration]") {
 // through fleet_read_fn_ (ADR-0017 World A), never a bare tier_allows + perm_fn. ──────
 
 namespace {
-// Agent ids a list_agents response names, from content[0].text (the bare array).
+// Agent ids a list_agents response names, from content[0].text (a bare array, or the
+// {agents, scope_basis} object when scoped).
 std::vector<std::string> list_agents_ids(const std::unique_ptr<httplib::Response>& res) {
     std::vector<std::string> ids;
     auto body = nlohmann::json::parse(res->body);
@@ -14407,6 +14408,7 @@ TEST_CASE("MCP list_agents (#4041): a group-only caller gets its own devices thr
     CHECK(body["result"]["structuredContent"]["agents"].size() == 1);
     CHECK(body["result"]["structuredContent"].value("scope_basis", "") == "authority_scoped");
     CHECK(list_agents_text(res).value("scope_basis", "") == "authority_scoped");
+    REQUIRE_FALSE(rig.ts.audit_log.empty());
     CHECK(rig.ts.audit_log.back() == "mcp.list_agents|success");
 }
 
@@ -14421,6 +14423,7 @@ TEST_CASE("MCP list_agents (#4041): a global grant sees every device, unscoped",
     CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001", "agent-002"});
     auto body = nlohmann::json::parse(res->body);
     CHECK_FALSE(body["result"]["structuredContent"].contains("scope_basis"));
+    CHECK(list_agents_text(res).is_array()); // unscoped read keeps the bare-array text
 }
 
 TEST_CASE("MCP list_agents (#4041): RBAC off leaves every device visible, unscoped",
@@ -14434,6 +14437,7 @@ TEST_CASE("MCP list_agents (#4041): RBAC off leaves every device visible, unscop
     CHECK(list_agents_ids(res) == std::vector<std::string>{"agent-001", "agent-002"});
     auto body = nlohmann::json::parse(res->body);
     CHECK_FALSE(body["result"]["structuredContent"].contains("scope_basis"));
+    CHECK(list_agents_text(res).is_array()); // unscoped read keeps the bare-array text
 }
 
 TEST_CASE("MCP list_agents (#4041): no grant of any kind is refused with no rows",

@@ -650,7 +650,7 @@ static const ToolDef kTools[] = {
      "permission denial is terminal; an authorization-store failure is a retryable 503 with "
      "retry_after_ms, never an empty list; an unwired server is a non-retryable internal error.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}},"scope_basis":{"type":"string","enum":["authority_scoped"]}},"required":["agents"]})j"},
+     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the list holds only devices within that scope. A status, set whether or not any device was hidden; never a count."}},"required":["agents"]})j"},
 
     // ── #4027 API-parity read twins: Echo process-tree / capture-sources device
     // pickers + retention-paused source list. Requires Infrastructure:Read,
@@ -9122,6 +9122,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!fleet_read_fn_) {
                     spdlog::error("list_agents: fleet_read_fn_ unwired — misconfigured "
                                   "call site; failing closed");
+                    mcp_audit("failure");
                     res.set_content(error_response(id, kInternalError, "service unavailable"),
                                     "application/json");
                     return;
