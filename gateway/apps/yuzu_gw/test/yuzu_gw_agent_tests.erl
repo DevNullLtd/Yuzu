@@ -77,6 +77,8 @@ agent_test_() ->
       {"get_info returns state", fun get_info_works/0},
       {"the owner keeps the hostname, not the whole AgentInfo (Phase 1c G1)",
        fun owner_keeps_hostname_not_agent_info/0},
+      {"code_change reduces a pre-G1 AgentInfo field to its hostname",
+       fun code_change_reduces_agent_info_to_hostname/0},
       {"stream handler death triggers disconnect", fun stream_handler_death/0},
       {"stream handler death in connecting state", fun stream_handler_death_connecting/0},
       {"HA WS-4 4.4: reannounce for the CURRENT session re-sends CONNECTED",
@@ -432,6 +434,41 @@ owner_keeps_hostname_not_agent_info() ->
     ?assertNot(maps:is_key(agent_info, Info)),
     {_State, Data} = sys:get_state(Pid),
     ?assertEqual(nomatch, binary:match(term_to_binary(Data), Marker)),
+    stop_agent(Pid).
+
+%% Phase 1c G1: a #data record from before G1 holds the whole AgentInfo map in
+%% the hostname position. code_change/4 reduces it to the hostname, and the
+%% upgraded owner still answers get_info/1 and dispatches.
+code_change_reduces_agent_info_to_hostname() ->
+    Args = #{agent_id   => <<"g1-cc">>,
+             session_id => <<"sess-g1-cc">>,
+             stream_pid => self(),
+             agent_info => #{hostname => <<"host-g1-cc">>,
+                             plugins  => [#{name => <<"svc">>}]},
+             peer_addr  => <<"127.0.0.1">>},
+    {ok, Pid} = yuzu_gw_agent:start_link(Args),
+    unlink(Pid),
+    OldInfo = #{hostname => <<"host-g1-cc">>, plugins => [#{name => <<"svc">>}]},
+    %% Put the old AgentInfo map where the hostname is: the only field of the
+    %% record that holds the binary <<"host-g1-cc">>.
+    Upgrade = fun(<<"host-g1-cc">>) -> OldInfo; (Other) -> Other end,
+    _ = sys:replace_state(Pid, fun({St, Data}) ->
+                                       {St, list_to_tuple([Upgrade(E) || E <- tuple_to_list(Data)])}
+                               end),
+    {_, Old} = sys:get_state(Pid),
+    ?assert(lists:member(OldInfo, tuple_to_list(Old))),
+    ok = sys:suspend(Pid),
+    ok = sys:change_code(Pid, yuzu_gw_agent, old_vsn, []),
+    ok = sys:resume(Pid),
+    {_, New} = sys:get_state(Pid),
+    ?assertNot(lists:member(OldInfo, tuple_to_list(New))),
+    {ok, Info} = yuzu_gw_agent:get_info(Pid),
+    ?assertEqual(<<"host-g1-cc">>, maps:get(hostname, Info)),
+    yuzu_gw_agent:dispatch(Pid, #{command_id => <<"cmd-g1-cc">>, plugin => <<"svc">>},
+                           {self(), make_ref()}),
+    receive {send_command, _} -> ok
+    after 2000 -> ?assert(false, "Expected {send_command, _} after code_change")
+    end,
     stop_agent(Pid).
 
 stream_handler_death() ->
