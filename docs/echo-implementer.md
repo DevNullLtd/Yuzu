@@ -51,22 +51,19 @@ What Echo is **not**:
 
 ```
                 ┌────────── echo plugin ──────────┐
-collect_fast    │ enumerate_processes()           │       writes
-  (60s) ──────► │ enumerate_connections()         │ ───►  process_live
-                │   diff vs echo_state             │       tcp_live
-collect_slow    │ enumerate_services()            │       service_live
-  (300s) ─────► │ enumerate_users()               │       user_live
-                │   diff vs echo_state             │
-                │ insert_*_events()               │
-rollup          │   echo_aggregator runs SQL       │
-  (15min) ────► │   INSERT INTO ..._hourly        │ ───►  *_hourly / *_daily / *_monthly
-                │   from each lower tier          │
-                │ run_retention():                │
-                │   retention_sql() row-count     │ ───►  trims to a row ceiling
-                │   guarded capped DELETE (time)  │ ───►  paced, clock-guarded
+collect_fast    │ enumerate_processes()           │       fold (one transaction
+  (60s) ──────► │ enumerate_connections()         │ ───►  with the baseline) into
+                │   diff vs echo_state             │       <src>_hourly_r /
+collect_slow    │ enumerate_services()            │       <src>_daily_r /
+  (300s) ─────► │ enumerate_users()               │       <src>_monthly_r
+                │   diff vs echo_state             │       (+ echo_dict)
+                │ fold_*_events()                 │
+rollup          │ run_retention():                │
+  (15min) ────► │   guarded capped DELETE (time)  │ ───►  paced, clock-guarded
+                │   row-count trim (2 plain tables)│
                 │ run_budget():                   │
-                │   evict summarised raw rows     │ ───►  holds echo.db under
-                │   then old hourly rows          │       db_budget_bytes
+                │   evict old hourly rows         │ ───►  holds echo.db under
+                │ dictionary sweep (weekly)       │       db_budget_bytes
                 └─────────────────────────────────┘
 ```
 
@@ -76,39 +73,48 @@ Flow:
    their respective intervals (configurable via the `configure` action).
 2. Each collector enumerates its source, reads the previous snapshot
    from `echo_state` (a key-value table inside `echo.db`), diffs them with
-   `compute_*_events()` to produce typed event rows, and inserts via
-   `EchoDatabase::insert_*_events()`.
-3. Periodically (`rollup` action, 15 min default) `echo_aggregator` runs
-   the rollup SQL from the schema registry to build hourly summaries
-   from live, daily from hourly, monthly from daily. Each tier has
-   independent retention.
+   `compute_*_events()` to produce typed event rows, and folds them with
+   `EchoDatabase::fold_*_events()`: the events become tier contributions
+   (`echo_fold.hpp`, section 3.1) written to the hourly, daily and monthly
+   tables in one transaction with the baseline. There is no aggregation
+   pass and no raw capture row.
+3. Periodically (`rollup` action, 15 min default) the maintenance pass runs
+   `run_retention` (time-based, clock-guarded, over the physical `_r` tables).
+   Each tier has independent retention (90 days hourly, 180 days daily, a
+   year monthly).
 4. The same maintenance pass then holds the database to its byte budget
-   (`db_budget_bytes`), in this fixed order: aggregation, retention,
-   `run_budget`, the one-off conversion `VACUUM` gate, file hygiene
-   (`incremental_vacuum(256)` and a WAL checkpoint). `run_budget` takes only
-   raw capture rows that their first summary tier has already passed (hourly,
-   or daily for `user` and `software`; never the newest 24 hours, and for
-   `process` only rows the usage fold has read), then hourly rows older than
-   48 hours (5 days for `procperf`), in 1,000-row transactions that also bump
-   the persisted eviction counter, stopping after 2 seconds. It pauses while an
-   `echo.sql` read holds the WAL above its allowance and retries on the next
-   pass. A table whose probe or delete fails is skipped for the rest of that
-   pass while the others continue; the pass counts as failed and arms no
-   catch-up. A pass that ends on the deadline with rows left to evict arms a
-   catch-up slice that `do_collect_fast` runs after its collect (outside
-   `collect_mu_`, under `try_lock` on `rollup_mu_`, so it never waits on a
-   rollup). Every slice of that drain runs with the clock reading the arming
-   pass was admitted with, never a fresh one: a slice has no retention-guard
-   contact of its own. The conversion `VACUUM` writes its deferral marker before it runs
-   and clears it on success, and `incremental_vacuum(256)` repeats while the
-   pass's deadline allows (at least one step). The budget is hard for eligible
-   data pages and soft for the WAL, and rows that are never evicted can hold
-   used pages above the target; `budget_over_bytes` in `status` reports the
-   overage, measured when `status` runs. A new source with a summary tier is
-   picked up by the budget from the registry with no change; a source with raw
-   capture rows only (no `rollup_sql`) is never evicted.
+   (`db_budget_bytes`), in this fixed order: retention, `run_budget`, the
+   one-off conversion `VACUUM` gate, file hygiene (`incremental_vacuum(256)`
+   and a WAL checkpoint), then the weekly dictionary sweep. `run_budget` takes
+   only hourly rows older than 48 hours (5 days for `procperf`), from the
+   largest hourly table, oldest bucket first, in 1,000-row transactions that
+   also bump the persisted eviction counter, stopping after 2 seconds. The
+   daily and monthly tiers carry the same events at a coarser grain and are
+   never touched. It pauses while an `echo.sql` read holds the WAL above its
+   allowance and retries on the next pass. A table whose probe or delete fails
+   is skipped for the rest of that pass while the others continue; the pass
+   counts as failed and arms no catch-up. A pass that ends on the deadline
+   with rows left to evict arms a catch-up slice that `do_collect_fast` runs
+   after its collect (outside `collect_mu_`, under `try_lock` on
+   `rollup_mu_`, so it never waits on a rollup). Every slice of that drain
+   runs with the clock reading the arming pass was admitted with, never a
+   later forward one: a slice has no retention-guard contact of its own. It
+   reads a fresh clock only to refuse: a clock that stepped BACK below the
+   admitted reading disarms the drain (`budget_slice_clock`), because that
+   reading's floors would sit above rows written since the step. The
+   conversion `VACUUM` writes its deferral marker before it runs and clears it
+   on success, and `incremental_vacuum(256)` repeats while the pass's deadline
+   allows (at least one step). An unusable stored `db_budget_bytes` (present
+   but not a whole number of at least 32 MiB) is "unknown", never the
+   default, and the pass is skipped. The budget is hard for eligible data
+   pages and soft for the WAL, and rows that are never evicted can hold used
+   pages above the target; `budget_over_bytes` in `status` reports the
+   overage, measured when `status` runs. A new source is picked up by the
+   budget from the roll-up declarations with no change (it is listed in
+   `budget_hourly_eligible_sources()`, which `test_echo_aggregator.cpp` pins
+   to a literal so a new source is a decision).
 
-Two in-memory structures keep the raw capture volume down. `HourlySeenSet`
+Two in-memory structures keep the folded event volume down. `HourlySeenSet`
 (`echo_hour_dedup.hpp`) is membership-only, holds at most 20,000 keys, is
 cleared on any change of hour (forward or backward) and on overflow (counted in
 `status`), and is used through copy-filter-commit, so a failed insert re-filters
@@ -120,13 +126,14 @@ erased before any wholesale clear) and fills `process_name` on `tcp` and
 `module` rows.
 
 The schema registry (`echo_schema_registry.cpp`) is the single source of
-truth for table shape, retention behavior, rollup SQL, and per-OS
-support metadata. Adding a new capture source means: append to
-`build_sources()`, populate `os_support`, write the collector, write
-the diff, wire the typed insert, write tests, and declare the source's
-roll-up columns (a `FoldSourceDef` in `echo_fold_schema.cpp`, a `*_delta` in
-`echo_fold.hpp` and their test pins, section 3.1). The roll-up DDL is generated
-from that declaration.
+truth for retention behavior and per-OS support metadata; the tier columns come
+from the roll-up declarations (`FoldSourceDef`, `echo_fold_schema.cpp`), which
+the registry copies into each tier's `GranularityDef`. Adding a new capture
+source means: append to `build_sources()`, populate `os_support`, write the
+collector, write the diff, wire the typed fold, write tests, and declare the
+source's roll-up columns (a `FoldSourceDef`, a `*_delta` in `echo_fold.hpp` and
+their test pins, section 3.1). The roll-up DDL is generated from that
+declaration.
 
 ---
 
@@ -164,20 +171,20 @@ PR M14, but `kCreateSchema` kept recreating it on every open — v5 stops that a
 drops it from already-migrated databases, #2093). Bumps go in the same
 function, never in `applies_*` collectors.
 
-### 3.1 Roll-up-only storage model (substrate staged, not wired)
+### 3.1 Roll-up-only storage model
 
 **Roll-up is the only model.** The recorded design ruling is: "roll-up mode should be the only way
 of operating for echo at all, I don't want this as a configurable thing, it's the only method of
 operation." So there is no config key, flag, mode switch, environment variable or runtime toggle
-between raw capture rows and roll-ups, and none is to be added. The code in this section is
-staged: it is built and tested, but nothing opens, writes or reads it. `EchoDatabase::open()`
-changes only by forcing the derived view allowlist (`is_fold_view`) to initialise; the collectors,
-the aggregator and every setting do not reference it.
+between raw capture rows and roll-ups, and none is to be added. Every collector folds through
+`EchoDatabase::fold_*_events()` (an `EchoFold` the database owns); the raw `<src>_live` tables and the
+aggregation chain are gone, and schema v10 (below) is the flip.
 
 **Where it lives.** `echo_fold_schema.{hpp,cpp}` declare the 17 sources' tier columns and
 generate the DDL; `echo_fold.{hpp,cpp}` hold the pure fold core (bucket math, `TierAccumulator`,
 the 17 `*_delta` functions) and the `EchoFold` writer. Per-column `role`, `merge`, `interned`,
 `generated_expr` and `guard` are additive fields on `ColumnDef` (`echo_schema_registry.hpp`).
+`echo_db_v10_migration.cpp` holds the one-transaction migration from schema v9 (below).
 
 **Shape.**
 - `echo_dict(id, text)` holds every interned string once. A text key is stored as `<key>_id`.
@@ -259,32 +266,61 @@ get `query contains forbidden keyword: <word>` with the replacement (a subquery,
 authorizer rule is defence in depth behind those refusals, not the closure. Direct reads of `echo_dict`, `echo_fold_seen` and any `_r` table, and the `usage_*`
 tables, stay denied.
 
-**Installing the roll-up schema on an existing database.** `install_fold_schema` drops an empty
-legacy tier table (a view cannot take its name) and refuses one that holds rows, naming it and its
-count. Once it has run:
-- `open()`'s registry DDL fails (`views may not be indexed`, rolled back, logged each boot) while
-  the registry tier DDL still creates these tables; the 16 tiers the registry does not declare have no retention row.
-- `purge_source`, the rollup `INSERT` and the retention and budget `DELETE`s address tier tables by
-  name and fail on views. `purge_source` must also delete the source's `_r` and `echo_fold_seen`
-  rows, run GC to completion and `TRUNCATE`-checkpoint; the ring is count-bounded and holds key
-  text (a hash of the key is the preferred shape).
-- The GC live-set scan is O(total rows): 3.92M roll-up rows took about 1.6 s of a 2 s deadline on
-  an M4. A caller must pass a deadline taken from a measured scan time (or replace the EXCEPT chain
-  with an in-memory mark of live ids); `GcResult::live_set_built == false` is the starvation signal.
-- `run_usage_fold` reads `process_live`; the schema version stays 9 and nothing marks the roll-up
-  shape; callers chunk backfills.
-- A `kLast` enrichment column is replaced by a later event that omits the field; a `historical`
-  mapdrive row with ts 0 folds into bucket 0; mapdrive `historical` (deduplicated by raw rows) and
-  netconn (a high-water mark in `echo_config`) have no transactional replay guard through
-  `fold_rows`.
-- Any deleter of `echo_dict` rows goes through `EchoFold`.
+**The v10 switch-over.** `EchoDatabase::open()` runs the schema ladder (the v2..v8 steps, then v9, the
+table rename) and then the v10 step. The v10 step runs only from v9: a step below it that failed
+rolled itself back and is retried on the next open, and the open is REFUSED meanwhile (a retryable
+error), so the version never skips past a step that did not finish. A database with none of the
+retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10` does, in ONE
+`BEGIN IMMEDIATE` transaction:
+
+1. Pre-check: the volume holds twice the file free, else the open fails with a message that begins
+   with `kFreeSpaceRefusalPrefix`; the plugin then loads offline (`storage_state|offline|free_space`,
+   no trigger registered) instead of failing to load. A free-space figure that cannot be read migrates without the pre-check (logged), and a database with nothing to migrate needs no room.
+2. Rename each old summary tier to `<name>_legacy`, install the roll-up schema, then convert every
+   legacy row into the interned table (an average becomes `avg * samples`, a sum column is rebuilt
+   from it, the keys intern through the dictionary).
+3. Finish the tier-to-tier roll-ups the old aggregator had not yet performed, using each source's
+   `rollup_<src>_<to>_at` mark (absent means "fold all"), then fold the raw rows at or after the
+   first old tier's mark (`ts >= mark`: a mark is the half-open end of the last rolled bucket).
+   Sixteen decoders read the raw columns through `legacy_live_columns()`; a row the delta rules
+   reject is counted and dropped.
+4. Seed the replay ring with the newest 4096 `record_key`s of each cursor source, drop the retired
+   tables, delete the rollup marks, `usage_hwm_id` and `usage_lag_events`, create the empty `$X_Live`
+   shim views (`legacy_live_shim_ddl()`), and write `schema_version` 10.
+
+A failure at any step, a crash or a power loss before the commit leaves the retired tables intact and the
+next open retries from v9. After the commit `open()` refuses if the connection is not in autocommit mode
+(a wedged connection is never published), checkpoints and truncates the WAL, and runs one `VACUUM`
+when the volume holds twice the new file free (else it records `auto_vacuum_deferred_at` and the daily
+maintenance pass retries). The log line carries the duration, rows converted, rows folded, rows
+rejected, replay keys seeded, tables dropped, file sizes and the WAL size at commit. The migration needs
+the retired tables' own column lists, which live in `echo_fold_schema.cpp` (`legacy_live_columns`); they
+are the last copy of the raw schema and exist only to read old files and to answer `$X_Live` reads.
+
+Consequences for code that reads the store:
+- `echo_usage.cpp` is fed the process fold's events inside the process transaction
+  (`usage_fold_in` rides `fold_rows`'s `extra` hook), so there is no read marker and no lag;
+  `PendingBaseline` stamps and folds nothing. A fault in either half rolls back both, and the retried
+  tick folds both once.
+- `purge_source` deletes the source's `_r` rows and `echo_fold_seen` rows and sweeps the dictionary.
+- The status counts (`<src>_rows`, `<src>_oldest_ts`) read the finest tier; `<src>_live_rows` prints the
+  same figure for one release.
 - `is_fold_view` is case-sensitive: a query that names a view `Process_Hourly` does not reach it.
 - No fold view may gain a WHERE, JOIN or filter: the pinned column-less `_r` read is sound only
   while every view is a WHERE-less, JOIN-less single-table projection.
+- A `kLast` enrichment column is replaced by a later event that omits the field; a `historical`
+  mapdrive event's identity is remembered, as a hash, in the replay ring under the source
+  `mapdrive_historical`, so a retried enumeration adds no second count; netconn has a high-water
+  mark in `echo_config` and no transactional replay guard through `fold_rows`.
+- Any deleter of `echo_dict` rows goes through `EchoFold`.
+
+**Releases.** Cut no release between the change that introduced v10 and the dashboard change that
+follows it: until then the Echo pages, the process-tree viewer and the canned queries in
+`echo_warehouse.yaml` still read the raw names (empty on v10) or label hourly buckets as raw rows.
 
 **Adding a source or tier.** Five edits, each pinned by a test that fails until it matches: the
-registry row (`build_sources()`, section 8) where the tier has a `GranularityDef` (16 of the 34
-views have none, so no retention row and no `$` name); a `FoldSourceDef` at the same index in
+registry row (`build_sources()`, section 8) (the tiers' `GranularityDef`s are derived from the
+roll-up declarations, so the registry's tier lists and the declarations cannot drift); a `FoldSourceDef` at the same index in
 `fold_sources()`; a `*_delta` in `echo_fold.hpp`; the count pins in `test_echo_fold.cpp` (17
 sources, 34 tiers, 18 registry tiers, 16 shims); the capability TSV rows and the regenerated
 `docs/os-capability-matrix.md`.
@@ -295,7 +331,7 @@ sources, 34 tiers, 18 registry tiers, 16 shims); the capability TSV rows and the
 
 | Operation | echo.db behavior |
 |-----------|-----------------|
-| **In-place agent upgrade** | echo.db is preserved (lives in the agent data dir, not the install dir). Schema migration runs at first open of the new binary. Rows captured by the old binary are trimmed to `db_budget_bytes` on the first maintenance pass (used pages above the budget less 16 MiB; raw capture rows older than 24 h that their first summary tier has passed, then hourly rows older than 48 h, 5 days for `procperf`), and an older file is converted to incremental auto_vacuum by one `VACUUM` once it is at or under the target or eviction is exhausted and the volume has twice the used size free; rollups continue. On Windows, the first open also re-secures `echo.db` and its sidecars, and refuses the open when the files are owned by an account other than SYSTEM, Administrators or the agent's (for example after the agent's service account changed; the new account also needs access to the files): see `docs/user-manual/echo.md` "Data storage". |
+| **In-place agent upgrade** | echo.db is preserved (lives in the agent data dir, not the install dir). Schema migration runs at first open of the new binary: the v10 roll-up migration converts every raw row and old summary into the tiers in one transaction (section 3.1), or refuses for lack of free space and leaves the file untouched. Afterwards the file is trimmed to `db_budget_bytes` on the first maintenance pass (used pages above the budget less 16 MiB; hourly rows older than 48 h, 5 days for `procperf`), and an older file is converted to incremental auto_vacuum by one `VACUUM` once it is at or under the target or eviction is exhausted and the volume has twice the used size free; rollups continue. On Windows, the first open also re-secures `echo.db` and its sidecars, and refuses the open when the files are owned by an account other than SYSTEM, Administrators or the agent's (for example after the agent's service account changed; the new account also needs access to the files): see `docs/user-manual/echo.md` "Data storage". |
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | echo.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe Echo data, delete `<data_dir>/echo.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing echo.db, runs migration if the schema version differs, and resumes collection. State in `echo_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/echo.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no echo.db — the next collect_fast creates it from scratch. The old echo.db at the previous path is orphaned but not deleted. Operator concern, not Echo's. |
@@ -389,7 +425,7 @@ Steady-state CPU cost on a typical 8-core workstation, measured against
 | `enumerate_services()` (140 services) | ~50 ms | ~80 ms (dominated by `systemctl` fork on Linux) |
 | `enumerate_users()` (5 sessions) | <1 ms | <1 ms |
 | `compute_*_events()` (full diff) | <2 ms total | <3 ms |
-| `insert_*_events()` (~50 rows, batched) | ~1 ms | ~2 ms |
+| `fold_*_events()` (~50 events, batched) | ~1 ms | ~2 ms |
 | Rollup pass (15 min) | ~5–15 ms | ~20 ms |
 
 Worst observed full collect_fast: ~25 ms. Worst observed collect_slow:
@@ -471,16 +507,17 @@ header):
    platforms whose collector is `kPlanned`. Enforce a per-cycle cap with a
    `spdlog::warn` on truncation (there is no agent `/metrics` and no event bus, so
    a log line is the truncation signal — not a metric or audit event).
-3. **`echo_db.{hpp,cpp}`** — add the warehouse-row struct (e.g. `ArpEvent`, next to
-   `NetworkEvent`) and `insert_<source>_events()` (mirror `insert_network_events`:
-   `BEGIN`/prepared insert/`COMMIT`, `StmtPtr` RAII).
+3. **`echo_db.{hpp,cpp}`** — add the event struct (e.g. `ArpEvent`, next to
+   `NetworkEvent`) and `fold_<source>_events()` (mirror `fold_arp_events`: a thin wrapper that
+   builds the source's `TierAccumulator` with its `*_delta` and folds it through
+   `EchoFold` in one transaction with the optional baseline `StateWrite`).
 4. **`echo_diff.cpp`** — implement `compute_<source>_events()`: an `unordered_map`
    keyed on the source's identity (delimiter `\x1f`, which never appears in the
    data) → `appeared`/`removed`. Keep value-only fields (TTL, entry_type) **out**
    of the key so they don't churn the warehouse.
 5. **`echo_schema_registry.cpp`** `build_sources()` — add ONE `CaptureSourceDef`.
-   This is the single source of truth for the raw-capture tables (the roll-up tables and views are
-   declared apart, section 3.1): it auto-drives the warehouse DDL, the
+   This is the single source of truth for retention and per-OS support (the roll-up columns are
+   declared in `fold_sources()`, section 3.1; each tier's `GranularityDef` is derived from them): it auto-drives the warehouse DDL, the
    `$Name_Tier` → `name_tier` translation, the read-only-SQL authorizer allowlist
    (`is_queryable_table`, the #760/#631 chokepoint — **no hardcoded list to
    touch**), and the `status` / `compatibility` / `configure` / `snapshot` actions.
@@ -489,14 +526,10 @@ header):
    the trusted `execute_query` is for registry-generated SQL only — never route
    operator input to it.
    Declare a row for **every** OS (`kSupported`/`kSupportedConstrained`/`kPlanned`/
-   `kUnsupported`) — the schema-invariant test requires it. Add a `rollup_sql`
-   branch per non-live tier. Budget eligibility is structural: a source whose
-   first non-live tier carries `rollup_sql` has its raw capture rows evicted
-   below that tier's mark (24 h floor), and any `hourly` tier is evicted past
-   48 h (5 days for `procperf`); a second reader of a source's raw rows (as
-   `usage` reads `process_live`) needs its own high-water predicate like
-   `usage_hwm_id`, and the drift-guard test in `test_echo_aggregator.cpp` pins
-   both eligible sets, so a new source fails loudly until it is added there. **Every capture source ships `default_enabled =
+   `kUnsupported`) — the schema-invariant test requires it. Budget eligibility is structural: a
+   source with an `hourly` roll-up tier has hourly rows older than 48 h (5 days for `procperf`)
+   evicted under size pressure, and the drift-guard test in `test_echo_aggregator.cpp` pins the
+   eligible set, so a new source fails loudly until it is added there. **Every capture source ships `default_enabled =
    true`** (Alex ruling 2026-10-21: all sources, every OS, no exceptions). The
    registry-wide test in `test_echo_schema_registry.cpp` fails any source that
    declares `false`, so a new source must ship enabled. The retrospective-reach
@@ -509,7 +542,7 @@ header):
    block in `EchoDatabase::open`), not by changing the registry alone.
 6. **`echo_plugin.cpp`** — add a leg in `collect_fast_impl` (or `collect_slow_impl`)
    gated on `source_enabled(*db_, "<source>")`: enumerate → diff →
-   `typed.empty() ? db_->set_state(key, json) : db_->insert_<src>_events(typed,
+   `typed.empty() ? db_->set_state(key, json) : db_->fold_<src>_events(typed,
    StateWrite{key, json})` (events and baseline commit in one transaction, #1654).
    On failure emit `error|<src> insert failed` (had events) or
    `error|<src> state_save_failed` (baseline-only) and call
@@ -538,7 +571,7 @@ header):
     listed in section 3.1 ("Adding a source or tier").
 
 **`usage` is not an example of this pattern.** It is a DERIVED source (a fold over
-`process_live`, `echo_usage.cpp`/`echo_usage.hpp`) — no `enumerate_<source>()`, no
+the process fold's events, `echo_usage.cpp`/`echo_usage.hpp`) — no `enumerate_<source>()`, no
 `compute_<source>_events()` diff, no collector `.cpp` of its own. Its lifecycle
 (`usage_set_enabled`/`usage_ensure_baselined`, echo_usage.cpp) runs on a
 `Disabled`/`PendingBaseline`/`Active` state machine, not the diff/poll cadence
@@ -584,14 +617,14 @@ cursor.** What it adds to the pattern:
 - **Two stores, one transaction.** What changed comes from a
   `RegNotifyChangeKeyValue` subtree watch and a per-root baseline diff; each
   root's baseline lives in an `echo_state` row (`registry:<root>`) and is written
-  by `insert_registry_events_and_cursor` in the SAME transaction as the rows and
+  by `insert_registry_events_and_cursor` (a fold) in the SAME transaction as the rows and
   the cursor, so a baseline can never advance without the rows that explain it.
   A baseline read goes through the tri-state `try_get_state`; `get_state`'s
   empty-on-failure would read a transient SQLite error as "no baseline" and
   silently re-baseline. The baselines hold each value's type, size and hash (a baseline an
   older build wrote also holds a rendered prefix) and are readable through
-  `echo.sql` like `registry_live` itself;
-  `purge_source("registry")` erases the table, the cursor row and every
+  `echo.sql`;
+  `purge_source("registry")` erases the tiers, the replay ring, the cursor row and every
   `registry:%` baseline in one transaction.
 - **Four read statuses.** Complete, Absent, Unreadable, Capped. Removals are
   derived only from Complete and Absent reads; an Unreadable read changes

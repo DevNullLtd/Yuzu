@@ -130,6 +130,7 @@ struct UserSession {
     std::string domain;
     std::string logon_type; // interactive, remote, service
     std::string session_id;
+    bool disconnected{false}; // Windows: the session is logged on but detached (WTSDisconnected)
 };
 
 /// One installed-software entry, as enumerated for the `software` source diff.

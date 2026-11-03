@@ -538,7 +538,13 @@ TEST_CASE("generate_fold_ddl: every view keeps the registry's columns first, in 
             ++checked;
         }
     }
-    CHECK(checked == 18); // every tier the registry declares
+    // Every tier the roll-up declarations carry is a tier of the registry, and the other way round.
+    std::size_t declared = 0;
+    for (const auto& d : fold_sources())
+        if (!d.own_tables)
+            declared += d.tiers.size();
+    CHECK(checked == static_cast<int>(declared));
+    CHECK(checked == 34);
 }
 
 TEST_CASE("is_fold_view, is_fold_internal_table and legacy_live_shim_names", "[echo][fold][schema]") {
@@ -1142,7 +1148,15 @@ TEST_CASE("identity_digest: deterministic, and covers exactly the fields the raw
 
 TEST_CASE("install_fold_schema: replaces a legacy tier table with its view, idempotently",
           "[echo][fold][writer]") {
+    // open() has installed the schema already; put a legacy tier TABLE back where the view is, as a
+    // file written before roll-up looked, and re-install.
+    const auto legacy_in_place = [](FoldDb& d) {
+        REQUIRE(d.db.execute_sql("DROP VIEW process_hourly"));
+        REQUIRE(d.db.execute_sql("CREATE TABLE process_hourly (id INTEGER PRIMARY KEY, hour_ts INTEGER, "
+                                 "name TEXT, user TEXT)"));
+    };
     auto f = make_fold_db(/*install=*/false);
+    legacy_in_place(*f);
     CHECK(f->n("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_hourly'") == 1);
     REQUIRE(f->fold.install_fold_schema(f->db).has_value());
     CHECK(f->n("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_hourly'") == 0);
@@ -1150,14 +1164,17 @@ TEST_CASE("install_fold_schema: replaces a legacy tier table with its view, idem
     CHECK(f->n("SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='netqual_hourly'") == 1);
     REQUIRE(f->fold.install_fold_schema(f->db).has_value());
 
-    // A legacy table that holds rows refuses the install and keeps them.
+    // A legacy table that holds rows refuses the install and keeps them; the refusal rolls the
+    // whole install back, so a view the install would have recreated stays absent.
     auto g = make_fold_db(/*install=*/false);
+    legacy_in_place(*g);
+    REQUIRE(g->db.execute_sql("DROP VIEW tcp_hourly"));
     REQUIRE(g->db.execute_sql("INSERT INTO process_hourly(hour_ts, name, user) VALUES (1, 'a', 'u')"));
     const auto refused = g->fold.install_fold_schema(g->db);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().find("process_hourly holds 1 rows; move them aside") != std::string::npos);
     CHECK(g->n("SELECT COUNT(*) FROM process_hourly") == 1);
-    CHECK(g->n("SELECT COUNT(*) FROM sqlite_master WHERE name = 'echo_dict'") == 0);
+    CHECK(g->n("SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='tcp_hourly'") == 0);
 }
 
 TEST_CASE("fold_rows: counts, text round-trip, and refusals", "[echo][fold][writer]") {

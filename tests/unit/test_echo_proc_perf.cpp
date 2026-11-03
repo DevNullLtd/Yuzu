@@ -14,6 +14,7 @@
  * box; the rest runs on every host.
  */
 
+#include "echo_fold_schema.hpp"
 #include "echo_local_image_path.hpp"
 #include "echo_proc_perf.hpp"
 #include "echo_schema_registry.hpp"
@@ -319,38 +320,45 @@ TEST_CASE("procperf: registry declares both tiers, dollar names translate",
     CHECK(is_queryable_table("procperf_hourly"));
 }
 
-TEST_CASE("procperf: hourly rollup SQL exists and groups per (hour, name, version)",
+TEST_CASE("procperf: the hourly tier keys on (hour, name, version, is_kthread)",
           "[echo][procperf][schema]") {
-    const auto sql = rollup_sql("procperf", "hourly");
-    REQUIRE(!sql.empty());
-    CHECK(sql.find("procperf_hourly") != std::string::npos);
-    // version is part of the app identity — it must appear in BOTH the column
-    // list and the GROUP BY, or the hourly tier would collapse distinct
-    // versions of one app into a single (mislabelled) row.
-    CHECK(sql.find("GROUP BY (ts / 3600) * 3600, name, version") != std::string::npos);
-    CHECK(sql.find("(hour_ts, name, version,") != std::string::npos);
-    CHECK(sql.find("MAX(instances)") != std::string::npos);
-    // is_kthread rides the GROUP BY as an identity column (never aggregated)
-    // so a kernel-thread and non-kernel-thread row sharing a (name, version)
-    // never collapse into one mislabelled row.
-    CHECK(sql.find("is_kthread") != std::string::npos);
-    CHECK(sql.find("GROUP BY (ts / 3600) * 3600, name, version, is_kthread") != std::string::npos);
+    const auto* def = fold_source("procperf");
+    REQUIRE(def != nullptr);
+    // version is part of the app identity -- it must be a KEY of the tier (and so of its unique
+    // index), or the hourly tier would collapse distinct versions of one app into a single
+    // (mislabelled) row. is_kthread is an identity column too, never aggregated, so a kernel
+    // thread and a non-kernel-thread row sharing a (name, version) never collapse.
+    std::vector<std::string> keys;
+    for (const auto& c : def->columns)
+        if (c.role == ColumnRole::kKey)
+            keys.emplace_back(c.name);
+    CHECK(keys == std::vector<std::string>{"name", "version", "is_kthread"});
+    const auto ddl = generate_fold_ddl();
+    CHECK(ddl.find("CREATE UNIQUE INDEX IF NOT EXISTS procperf_hourly_r_uq ON "
+                   "procperf_hourly_r(hour_ts, name_id, version_id, is_kthread)") != std::string::npos);
+    // The per-hour peak instance count is a MAX, the application sampler's old MAX(instances).
+    for (const auto& c : def->columns)
+        if (c.name == "instances_max")
+            CHECK(c.merge == MergeOp::kMax);
 }
 
-TEST_CASE("procperf: live columns carry name but never a cmdline", "[echo][procperf][schema]") {
+TEST_CASE("procperf: the tiers carry name but never a cmdline", "[echo][procperf][schema]") {
     // Privacy pin: the A2 tier records image NAMES only. A cmdline column
     // appearing here is a design regression, not an addition.
-    const auto ddl = generate_warehouse_ddl();
-    const auto pos = ddl.find("CREATE TABLE IF NOT EXISTS procperf_live");
-    REQUIRE(pos != std::string::npos);
-    const auto end = ddl.find(");", pos);
-    const auto table_ddl = ddl.substr(pos, end - pos);
-    CHECK(table_ddl.find("name TEXT") != std::string::npos);
-    CHECK(table_ddl.find("version TEXT") != std::string::npos); // the app-identity dimension
-    CHECK(table_ddl.find("is_kthread INTEGER") != std::string::npos); // kernel-thread marker
-    CHECK(table_ddl.find("cmdline") == std::string::npos);
-    CHECK(table_ddl.find("user") == std::string::npos);
-    CHECK(table_ddl.find("path") == std::string::npos); // never the image PATH (privacy)
+    const auto* def = fold_source("procperf");
+    REQUIRE(def != nullptr);
+    std::string cols;
+    for (const auto& c : def->columns)
+        cols += std::string{c.name} + " " + std::string{c.sql_type} + ";";
+    CHECK(cols.find("name TEXT") != std::string::npos);
+    CHECK(cols.find("version TEXT") != std::string::npos);        // the app-identity dimension
+    CHECK(cols.find("is_kthread INTEGER") != std::string::npos);  // kernel-thread marker
+    CHECK(cols.find("cmdline") == std::string::npos);
+    CHECK(cols.find("user") == std::string::npos);
+    CHECK(cols.find("path") == std::string::npos); // never the image PATH (privacy)
+    // and the retired raw table's shim answers with no more than it ever did
+    for (const auto& c : legacy_live_columns("procperf"))
+        CHECK(c.name != "cmdline");
 }
 
 TEST_CASE("procperf #538: a reset baseline (post-disable) emits no off-period-spanning row",

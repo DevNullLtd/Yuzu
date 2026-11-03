@@ -131,10 +131,19 @@ TEST_CASE("echo_retention_tiers.tsv matches capture_sources() retention defaults
     }
 
     // Pin rows the retention surface leans on, so a lock-step edit still fails.
-    CHECK(table_rows.count(Row{"process", "live", "rows", 100000}) == 1);
-    CHECK(table_rows.count(Row{"perf", "live", "seconds", 604800}) == 1);
+    // The roll-up tiers replaced the raw tables: 90 days hourly, 180 days daily, a year monthly.
+    CHECK(table_rows.count(Row{"process", "hourly", "seconds", 7776000}) == 1);
+    CHECK(table_rows.count(Row{"perf", "hourly", "seconds", 7776000}) == 1);
+    CHECK(table_rows.count(Row{"process", "daily", "seconds", 15552000}) == 1);
     CHECK(table_rows.count(Row{"process", "monthly", "seconds", 31536000}) == 1);
     CHECK(table_rows.count(Row{"netqual", "boot", "rows", 400}) == 1);
+    // The usage tables are the one source that keeps its own storage: a live table and a daily tier.
+    CHECK(table_rows.count(Row{"usage", "live", "rows", 200000}) == 1);
+    CHECK(table_rows.count(Row{"usage", "daily", "seconds", 2678400}) == 1);
+    // No raw `live` table survives for any other source.
+    for (const auto& r : table_rows)
+        if (std::get<1>(r) == "live")
+            CHECK(std::get<0>(r) == "usage");
     CHECK(table_sources.size() == 17);
     CHECK(table_rows.size() == 37);
 }

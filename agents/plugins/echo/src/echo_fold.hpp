@@ -6,10 +6,10 @@
  *
  * ROLL-UP IS THE ONLY STORAGE MODEL. Raw capture rows are not kept, and there is
  * no setting, flag, mode switch or environment variable that selects between the
- * two; none may be added. This header is staged, not wired: no collector,
- * aggregator, action or config surface opens, writes or reads these tables, and
- * EchoDatabase::open() changes only by forcing the derived view allowlist
- * (is_fold_view) to initialise.
+ * two; none may be added. Every collector writes through EchoDatabase's fold_*
+ * wrappers, which build a TierAccumulator with the matching *_delta below and hand
+ * it to the ONE EchoFold the database owns; the schema is installed by
+ * EchoDatabase::open() (a fresh database) or by its v10 migration (an existing one).
  *
  * Two halves:
  *   - PURE CORE (this header, no I/O): bucket_start, Value, TierRow,
@@ -346,32 +346,14 @@ private:
 /// never written. Every right-hand side of the DO UPDATE sees the stored row, so
 /// a kLast guard compares against the OLD guard value.
 [[nodiscard]] inline std::string tier_upsert_sql(const FoldSourceDef& def, std::string_view tier) {
-    std::vector<std::string> keys, measures, sets;
+    std::vector<std::string> keys, measures;
     const auto bucket = std::string{ts_column_for_suffix(tier)};
     for (const auto& c : def.columns) {
         const std::string name = physical_column_name(c);
-        if (c.role == ColumnRole::kKey) {
+        if (c.role == ColumnRole::kKey)
             keys.push_back(name);
-        } else if (c.role == ColumnRole::kMeasure) {
+        else if (c.role == ColumnRole::kMeasure)
             measures.push_back(name);
-            switch (c.merge) {
-            case MergeOp::kSum:
-                sets.push_back(std::format("{0}={0}+excluded.{0}", name));
-                break;
-            case MergeOp::kMax:
-                sets.push_back(std::format("{0}=MAX({0},excluded.{0})", name));
-                break;
-            case MergeOp::kMin:
-                sets.push_back(std::format("{0}=MIN({0},excluded.{0})", name));
-                break;
-            case MergeOp::kLast:
-                sets.push_back(std::format(
-                    "{0}=CASE WHEN excluded.{1}>={1} THEN excluded.{0} ELSE {0} END", name, c.guard));
-                break;
-            case MergeOp::kNone:
-                break;
-            }
-        }
     }
     const auto join = [](const std::vector<std::string>& v, std::string_view sep) {
         std::string out;
@@ -388,7 +370,7 @@ private:
                        "RETURNING id",
                        physical_table_name(def.name, tier), join(insert_cols, ","),
                        join(std::vector<std::string>(insert_cols.size(), "?"), ","),
-                       join(conflict, ","), join(sets, ","));
+                       join(conflict, ","), fold_upsert_assignments(def));
 }
 
 // ── Replay identity (cursor sources) ────────────────────────────────────────
@@ -404,20 +386,25 @@ struct KeyedContribution {
     NamedValues measures;
 };
 
-/// First 8 bytes of SHA-256 over the length-prefixed field list, as a signed 64-bit
-/// value. Length prefixes (not a separator) so no field value can forge a boundary.
+/// SHA-256 (hex) over the length-prefixed field list. Length prefixes (not a separator) so no
+/// field value can forge a boundary.
 /// 64 bits distinguish payloads; this is a replay check, not an adversarial boundary.
 /// The digest is PERSISTED in echo_fold_seen: changing the field set a delta feeds
 /// in, or this encoding, makes every stored digest a false collision, so such a change
 /// must clear the ring (DELETE FROM echo_fold_seen) in the same schema step.
-[[nodiscard]] inline int64_t identity_digest(const std::vector<std::string>& fields) {
+[[nodiscard]] inline std::string identity_hex(const std::vector<std::string>& fields) {
     std::string buf;
     for (const auto& f : fields) {
         buf += std::to_string(f.size());
         buf += ':';
         buf += f;
     }
-    const std::string hex = yuzu::shared::sha256_hex(buf);
+    return yuzu::shared::sha256_hex(buf);
+}
+
+/// First 8 bytes of identity_hex, as a signed 64-bit value.
+[[nodiscard]] inline int64_t identity_digest(const std::vector<std::string>& fields) {
+    const std::string hex = identity_hex(fields);
     uint64_t v = 0;
     std::from_chars(hex.data(), hex.data() + 16, v, 16);
     return static_cast<int64_t>(v);
@@ -444,8 +431,13 @@ inline void process_delta(const std::vector<ProcessEvent>& events, TierAccumulat
         const char* measure = pick(e.action, {{"started", "start_count"}, {"stopped", "stop_count"}});
         if (!measure)
             continue;
-        // parent_name, abnormal_exit_count, elevated_count, spoofed_parent_count: zero.
-        acc.add(e.ts, {{"name", vt(e.name)}, {"user", vt(e.user)}}, {{measure, vi(1)}});
+        // elevated_count, spoofed_parent_count: zero. An exit with a non-zero status is abnormal;
+        // only a stream carries one, so the poll leaves abnormal_exit_count at zero.
+        NamedValues measures{{measure, vi(1)}};
+        if (e.action == "stopped" && e.exit_code != 0)
+            measures.emplace_back("abnormal_exit_count", vi(1));
+        acc.add(e.ts, {{"name", vt(e.name)}, {"user", vt(e.user)}, {"parent_name", vt(e.parent_name)}},
+                measures);
     }
 }
 
@@ -506,10 +498,12 @@ inline void service_delta(const std::vector<ServiceEvent>& events, TierAccumulat
 
 inline void user_delta(const std::vector<UserEvent>& events, TierAccumulator& acc) {
     for (const auto& e : events) {
-        const char* measure = pick(e.action, {{"login", "login_count"}, {"logout", "logout_count"}});
+        const char* measure = pick(e.action, {{"login", "login_count"},
+                                              {"logout", "logout_count"},
+                                              {"disconnect", "disconnect_count"}});
         if (!measure)
             continue;
-        // disconnect_count, session_s_sum: zero.
+        // session_s_sum: zero.
         acc.add(e.ts,
                 {{"user", vt(e.user)}, {"domain", vt(e.domain)}, {"logon_type", vt(e.logon_type)}},
                 {{measure, vi(1)}});
@@ -671,14 +665,14 @@ inline std::vector<KeyedContribution> removable_delta(const std::vector<Removabl
                                     e.image_path,   std::to_string(e.pid), e.evidence};
         if (e.action != "capture_gap" && e.action != "present_at_baseline")
             id.push_back(std::to_string(e.ts));
-        // disk_id, partition_count: zero / ''.
+        // disk_id: ''. partition_count is a maximum and not part of the identity digest above.
         out.push_back({e.record_key, identity_digest(id), e.ts,
                        {{"action", vt(e.action)}, {"device_key", vt(e.device_key)},
                         {"vendor", vt(e.vendor)}, {"product", vt(e.product)},
                         {"serial", vt(e.serial)}, {"bus", vt(e.bus)}, {"volume", vt(e.volume)},
                         {"image_path", vt(e.image_path)}},
                        {{"event_count", vi(1)}, {"first_ts", vi(e.ts)}, {"last_ts", vi(e.ts)},
-                        {"size_bytes", vi(e.size_bytes)}}});
+                        {"size_bytes", vi(e.size_bytes)}, {"partition_count", vi(e.partition_count)}}});
     }
     return out;
 }
@@ -814,7 +808,9 @@ struct GcResult {
  * inside a running statement, which rolls the whole batch back. It does NOT cover mutex
  * acquisition, BEGIN IMMEDIATE's busy wait (5 s), or COMMIT I/O.
  *
- * NOT called from EchoDatabase::open(), the collectors or the aggregator.
+ * OWNERSHIP. EchoDatabase owns the one instance (built in open(), destroyed with it), so
+ * "one EchoFold per database" holds by construction; the collectors, the aggregator and
+ * the dictionary GC reach it only through EchoDatabase.
  */
 class EchoFold {
 public:
@@ -831,8 +827,10 @@ public:
     /// view in one transaction. A LEGACY TABLE whose name a view will take is
     /// dropped first (a view cannot be created over an existing table of the same
     /// name, and CREATE VIEW IF NOT EXISTS would then silently do nothing); one that
-    /// holds rows refuses the install, naming the table and its row count. This
-    /// method has NO production caller. Clears the dictionary cache.
+    /// holds rows refuses the install, naming the table and its row count. Called by
+    /// EchoDatabase::open() for a database with no legacy tables; the v10 migration of an
+    /// existing one MOVES the rows first (echo_db_v10_migration.cpp) and runs the same DDL in
+    /// its own transaction. Clears the dictionary cache.
     [[nodiscard]] std::expected<void, std::string> install_fold_schema(EchoDatabase& db);
 
     /// Fold a snapshot-diff source's accumulated batch (plus its optional baseline
@@ -840,9 +838,28 @@ public:
     /// to the persisted counter in the same transaction. Additive, not idempotent: a
     /// snapshot source is replay-safe only because its baseline StateWrite commits in
     /// this same transaction.
+    ///
+    /// `extra`, when set, runs INSIDE that same transaction after the tier upserts and before
+    /// the commit: its writes commit or roll back with the fold (the process fold passes the
+    /// usage fold here, so a tick's process tiers and usage rows are one unit). It receives the
+    /// transaction's handle and must not call any EchoDatabase method that takes the database
+    /// mutex; an error it returns rolls the whole fold back.
+    using ExtraFn = std::function<std::expected<void, std::string>(TransactionHandle&)>;
     [[nodiscard]] std::expected<FoldResult, std::string>
     fold_rows(EchoDatabase& db, std::string_view source, const TierAccumulator& acc,
-              const std::optional<StateWrite>& state = std::nullopt);
+              const std::optional<StateWrite>& state = std::nullopt, const ExtraFn& extra = {});
+
+    /// The body of fold_rows' transaction on a handle the CALLER owns: upsert `acc` into every
+    /// tier of `source` and write `state`, through a transaction-local interner over an EMPTY
+    /// cache, so a rollback of the caller's transaction leaves this instance's cache untouched.
+    /// For the v10 migration only, which folds a database's retired raw rows inside its own single
+    /// transaction. Takes NEITHER op_mu_ nor the database mutex (the caller holds the latter
+    /// inside checked_transaction), so it is valid only while no other thread can reach this
+    /// instance, i.e. inside EchoDatabase::open() before the object is returned. Rejected events
+    /// are not counted (the caller owns that policy); returns the RETURNING row count.
+    [[nodiscard]] std::expected<std::size_t, std::string>
+    fold_in(TransactionHandle& h, std::string_view source, const TierAccumulator& acc,
+            const std::optional<StateWrite>& state = std::nullopt);
 
     /// Fold a cursor source's contributions through the digest-checked replay ring,
     /// and commit the cursor and the baseline StateWrites in the SAME transaction.
@@ -869,6 +886,15 @@ private:
 
     /// echo_state UPSERT inside a fold transaction (a member: it needs EchoDatabase's friendship).
     static bool write_state(TransactionHandle& h, const StateWrite& w);
+
+    /// The transaction body fold_rows and fold_in share: upsert every tier of `def`, write `state`.
+    /// New dictionary ids go to `staged`; `cache` is only read. The RETURNING row count, or the
+    /// handle's error.
+    static std::expected<std::size_t, std::string>
+    fold_body(TransactionHandle& h, const FoldSourceDef& def, const TierAccumulator& acc,
+              const std::optional<StateWrite>& state,
+              const std::unordered_map<std::string, int64_t>& cache,
+              std::unordered_map<std::string, int64_t>& staged);
 
     NowFn now_;
     std::mutex op_mu_;

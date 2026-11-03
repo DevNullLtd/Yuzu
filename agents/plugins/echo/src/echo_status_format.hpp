@@ -52,6 +52,31 @@ format_storage_offline_lines(bool query_engine_available) {
     };
 }
 
+/// The prefix of EchoDatabase::open's refusal when the v10 roll-up migration finds less than twice
+/// the database file free on its volume (echo_db_v10_migration.cpp). The plugin tells that refusal
+/// from every other open failure by this text.
+inline constexpr std::string_view kFreeSpaceRefusalPrefix = "not enough free disk space to migrate";
+
+[[nodiscard]] inline bool is_free_space_refusal(std::string_view open_error) {
+    return open_error.find(kFreeSpaceRefusalPrefix) != std::string_view::npos;
+}
+
+/// The complete `echo status` reply when the database was never opened because the migration was
+/// refused for lack of free disk space, in the order it must be written (`error|` FIRST, for the
+/// reason format_storage_offline_lines documents). `token` is the reason (`free_space`); `detail` is
+/// the open error, which names the two figures. The plugin has loaded but nothing collects and no
+/// trigger is registered: restart the agent once the space is freed.
+[[nodiscard]] inline std::vector<std::string> format_storage_refused_lines(std::string_view token,
+                                                                           std::string_view detail) {
+    return {
+        std::string{"error|Echo storage is offline on this endpoint: "}
+            .append(detail)
+            .append(". Collection and retention are stopped and the database was not changed. "
+                    "Restart the agent after freeing the space."),
+        std::string{"storage_state|offline|"}.append(token),
+    };
+}
+
 /// `db_health|<ok|quarantined>|<epoch>` (#1567). `quarantined` iff THIS open
 /// quarantined a corrupt echo.db (epoch = when); otherwise `ok` with the epoch of
 /// the last persisted quarantine (0 = never).

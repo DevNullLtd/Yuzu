@@ -130,7 +130,7 @@ def problems(collector_src, plugin_src):
         out.append("a MountPoints2 child-open failure no longer skips the row and reaches "
                    "note_failure")
 
-    if not re.search(r"typed\.empty\(\) \|\| db_->insert_mapdrive_events\( ?typed, std::nullopt, "
+    if not re.search(r"typed\.empty\(\) \|\| db_->fold_mapdrive_events\( ?typed, std::nullopt, "
                      r"/\*skip_known_historical=\*/true\)", p):
         out.append("the first-pass insert no longer passes skip_known_historical=true")
     if "dropped from the pending set" not in p:

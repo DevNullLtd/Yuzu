@@ -313,9 +313,9 @@ TEST_CASE("mapdrive parse_samba_logs: connect events from both log shapes",
     CHECK(out[2].ts == 1782980100); // inline ISO timestamp (2026-07-02T08:15:00 UTC)
 }
 
-// ── insert round-trip: historical (incl. ts=0) + live rows ────────────────────
+// ── fold round-trip: historical (incl. ts=0) + live rows ──────────────────────
 
-TEST_CASE("mapdrive insert: historical + live rows round-trip through EchoDatabase",
+TEST_CASE("mapdrive fold: historical + live rows are rolled up by mapping, with the right counts",
           "[echo][mapdrive][db]") {
     yuzu::test::TempDbFile tmp{std::string_view{"echo-mapdrive-"}};
     auto opened = EchoDatabase::open(tmp.path);
@@ -331,39 +331,40 @@ TEST_CASE("mapdrive insert: historical + live rows round-trip through EchoDataba
         {0, 5, "historical", "outbound", "", "\\\\nas\\pub", "nas", "bob", "SMB", "historical"},
         {2000, 6, "appeared", "inbound", "", "", "client1", "carol", "SMB", "live"},
     };
-    REQUIRE(db.insert_mapdrive_events(rows));
+    REQUIRE(db.fold_mapdrive_events(rows));
 
+    // One roll-up row per mapping (direction, mount, remote path, remote host) and hour. The
+    // username, provider and origin are not stored: a roll-up keeps what the mapping IS.
     auto res = db.execute_query(
-        "SELECT ts, action, direction, local_mount, remote_path, remote_host, username, "
-        "provider, origin FROM mapdrive_live ORDER BY id");
+        "SELECT hour_ts, direction, local_mount, remote_path, remote_host, appear_count, "
+        "remove_count, historical_count FROM mapdrive_hourly ORDER BY direction DESC, remote_path");
     REQUIRE(res.has_value());
     REQUIRE(res->rows.size() == 3);
 
-    // Historical row with a real timestamp. Assert the string columns individually
-    // (remote_path/remote_host/username/provider) so a bind-order transposition in
-    // insert_mapdrive_events cannot pass undetected.
-    CHECK(res->rows[0][0] == "1000");
-    CHECK(res->rows[0][1] == "historical");
-    CHECK(res->rows[0][2] == "outbound");
-    CHECK(res->rows[0][3] == "Z:");
-    CHECK(res->rows[0][4] == "\\\\srv\\share"); // remote_path
-    CHECK(res->rows[0][5] == "srv");            // remote_host
-    CHECK(res->rows[0][6] == "alice");          // username
-    CHECK(res->rows[0][7] == "SMB");            // provider
-    CHECK(res->rows[0][8] == "historical");     // origin
+    // Assert the string columns individually so a key transposition in the delta cannot pass
+    // undetected. DESC puts "outbound" before "inbound"; within it nas sorts before srv.
+    CHECK(res->rows[0][1] == "outbound");
+    CHECK(res->rows[0][3] == "\\\\nas\\pub"); // remote_path
+    CHECK(res->rows[0][4] == "nas");              // remote_host
+    CHECK(res->rows[0][0] == "0");                // ts=0 is bucket 0 (not dropped / defaulted away)
+    CHECK(res->rows[0][2] == "");                 // deviceless -- an empty local_mount round-trips
+    CHECK(res->rows[0][7] == "1");                // historical_count
 
-    // Historical row with ts=0 is preserved as 0 (not dropped / defaulted away).
-    CHECK(res->rows[1][0] == "0");
-    CHECK(res->rows[1][3] == ""); // deviceless — empty local_mount round-trips
-    CHECK(res->rows[1][8] == "historical");
+    CHECK(res->rows[1][1] == "outbound");
+    CHECK(res->rows[1][2] == "Z:");
+    CHECK(res->rows[1][3] == "\\\\srv\\share");
+    CHECK(res->rows[1][4] == "srv");
+    CHECK(res->rows[1][0] == "0"); // ts=1000 floors to hour 0
+    CHECK(res->rows[1][7] == "1");
 
     // Live inbound row.
-    CHECK(res->rows[2][1] == "appeared");
-    CHECK(res->rows[2][2] == "inbound");
-    CHECK(res->rows[2][8] == "live");
+    CHECK(res->rows[2][1] == "inbound");
+    CHECK(res->rows[2][4] == "client1");
+    CHECK(res->rows[2][5] == "1"); // appear_count
+    CHECK(res->rows[2][7] == "0");
 
-    // Empty batch is a success (matches the arp/dns/software insert contract).
-    CHECK(db.insert_mapdrive_events({}));
+    // Empty batch is a success (matches the arp/dns/software contract).
+    CHECK(db.fold_mapdrive_events({}));
 }
 
 // ── \x1f key collision safety with ':' / '\\' / space fields ──────────────────
@@ -1247,62 +1248,70 @@ TEST_CASE("mapdrive backfill commit_first_pass: a failing pending write never wr
     }
 }
 
-// ── skip_known_historical: duplicate-free retry insert, first-recorded-ts rule ─
+// ── skip_known_historical: a retried enumeration counts each mapping once ─────
 
-TEST_CASE("mapdrive insert: skip_known_historical adds no duplicate on an identity already "
-          "recorded as historical, and keeps that row's first-recorded ts",
+TEST_CASE("mapdrive fold: skip_known_historical counts no mapping twice, whichever call folded it "
+          "first",
           "[echo][mapdrive][backfill][db]") {
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_mapdrive_backfill_"}};
     auto opened = EchoDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
-    REQUIRE(db.create_warehouse_tables());
 
-    // First pass: one historical row recorded at ts=1000.
+    const auto historical_total = [&]() {
+        auto res = db.execute_query("SELECT COALESCE(SUM(historical_count), 0) FROM mapdrive_hourly");
+        REQUIRE(res.has_value());
+        return res->rows[0][0];
+    };
+
+    // First pass: one historical mapping, folded by the PLAIN call (not the retry's flag).
     const std::vector<MapDriveEvent> first_pass = {
         {1000, 5, "historical", "outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB",
          "historical"},
     };
-    REQUIRE(db.insert_mapdrive_events(first_pass));
+    REQUIRE(db.fold_mapdrive_events(first_pass));
+    CHECK(historical_total() == "1");
 
-    const auto count_historical = [&]() {
-        auto res = db.execute_query(
-            "SELECT COUNT(*) FROM mapdrive_live WHERE origin='historical'");
-        REQUIRE(res.has_value());
-        return res->rows[0][0];
-    };
-    CHECK(count_historical() == "1");
-
-    // Retry batch: the SAME identity, re-observed with a LATER ts (as a real retry would see
-    // it), plus one genuinely NEW identity. skip_known_historical=true must add only the new row.
+    // Retry batch: the SAME identity, re-observed with a LATER ts (as a real retry would see it),
+    // plus one genuinely NEW identity. skip_known_historical=true must count only the new one --
+    // the identity was remembered by the plain call above. FAILS WITHOUT the identity ring: the
+    // fold is additive, so the retry would count the first mapping twice.
     const std::vector<MapDriveEvent> retry_batch = {
         {9999, 6, "historical", "outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB",
          "historical"}, // same identity as above, later ts
         {9999, 6, "historical", "outbound", "Y:", "\\\\srv\\other", "srv", "alice", "SMB",
          "historical"}, // new identity
     };
-    REQUIRE(db.insert_mapdrive_events(retry_batch, std::nullopt, /*skip_known_historical=*/true));
-    CHECK(count_historical() == "2"); // one new row, the duplicate skipped
+    REQUIRE(db.fold_mapdrive_events(retry_batch, std::nullopt, /*skip_known_historical=*/true));
+    CHECK(historical_total() == "2"); // one new mapping counted, the duplicate skipped
+    // ... and the same retry again changes nothing
+    REQUIRE(db.fold_mapdrive_events(retry_batch, std::nullopt, true));
+    CHECK(historical_total() == "2");
 
-    auto res = db.execute_query(
-        "SELECT ts FROM mapdrive_live WHERE direction='outbound' AND local_mount='Z:' AND "
-        "remote_path='\\\\srv\\share' AND remote_host='srv' AND username='alice'");
-    REQUIRE(res.has_value());
-    REQUIRE(res->rows.size() == 1);
-    CHECK(res->rows[0][0] == "1000"); // first-recorded ts, unchanged by the later retry
-
-    // A LIVE row sharing the same identity does not suppress a historical insert (the NOT
-    // EXISTS subquery is scoped to origin='historical' only).
+    // A LIVE event sharing the identity does not suppress a historical one, and is not itself
+    // remembered or skipped (only `historical` events are deduplicated).
     const std::vector<MapDriveEvent> live_same_identity = {
         {5000, 7, "appeared", "outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB", "live"},
     };
-    REQUIRE(db.insert_mapdrive_events(live_same_identity));
+    REQUIRE(db.fold_mapdrive_events(live_same_identity, std::nullopt, true));
+    REQUIRE(db.fold_mapdrive_events(live_same_identity, std::nullopt, true)); // not deduplicated
+    {
+        auto res = db.execute_query("SELECT SUM(appear_count) FROM mapdrive_hourly");
+        REQUIRE(res.has_value());
+        CHECK(res->rows[0][0] == "2");
+    }
     const std::vector<MapDriveEvent> retry_again = {
         {20000, 8, "historical", "outbound", "W:", "\\\\srv\\third", "srv", "alice", "SMB",
          "historical"},
     };
-    REQUIRE(db.insert_mapdrive_events(retry_again, std::nullopt, true));
-    CHECK(count_historical() == "3"); // the live row never counted; one more historical added
+    REQUIRE(db.fold_mapdrive_events(retry_again, std::nullopt, true));
+    CHECK(historical_total() == "3"); // one more mapping, the live events never counted
+
+    // purge_source forgets the identities too: the same enumeration counts afresh.
+    REQUIRE(db.purge_source("mapdrive").has_value());
+    CHECK(historical_total() == "0");
+    REQUIRE(db.fold_mapdrive_events(first_pass, std::nullopt, true));
+    CHECK(historical_total() == "1");
 }
 
 TEST_CASE("mapdrive backfill decide_walk_gate: a failed pin or a still-running abandoned worker "

@@ -1,9 +1,16 @@
 /**
- * echo_schema_registry.cpp -- Capture source definitions, DDL generation,
- *                            $-name translation, and rollup/retention SQL.
+ * echo_schema_registry.cpp -- Capture source definitions, DDL generation and
+ *                            $-name translation.
+ *
+ * Roll-up is the only storage model. A source's hourly / daily / monthly tiers are not
+ * declared here: build_sources() derives them from fold_sources() (echo_fold_schema.cpp),
+ * so a tier's column list exists exactly once. What the registry declares by hand is what
+ * the fold does not own: the OS support rows, `netqual_boot` and the `usage` tables.
  */
 
 #include "echo_schema_registry.hpp"
+
+#include "echo_fold_schema.hpp"
 
 #include <algorithm>
 #include <format>
@@ -16,12 +23,39 @@ namespace {
 
 // ── Source definitions ──────────────────────────────────────────────────────
 
-// Common columns present in all live tables (id, ts, snapshot_id are implicit
-// in DDL generation; we list the data columns here).
-// "action" is the event type (started/stopped, connected/disconnected, etc.)
+// Default retention of a derived tier, in seconds. The fold tiers replaced the raw table,
+// so the summary tiers carry the whole record: 90 days hourly, 180 days daily, a year monthly.
+constexpr int64_t kHourlyRetentionSec = 7776000;
+constexpr int64_t kDailyRetentionSec = 15552000;
+constexpr int64_t kMonthlyRetentionSec = 31536000;
+
+// Append the hourly / daily / monthly granularity of every fold source: the bucket column
+// first, then the view's columns in view order, copied from the one declaration.
+void append_fold_tiers(std::vector<CaptureSourceDef>& sources) {
+    for (const auto& fold : fold_sources()) {
+        if (fold.own_tables)
+            continue;
+        const auto src = std::find_if(sources.begin(), sources.end(),
+                                      [&](const CaptureSourceDef& s) { return s.name == fold.name; });
+        if (src == sources.end())
+            continue;
+        for (const auto tier : fold.tiers) {
+            GranularityDef g;
+            g.suffix = tier;
+            g.retention_type = RetentionType::kTimeBased;
+            g.retention_default = tier == "hourly"  ? kHourlyRetentionSec
+                                  : tier == "daily" ? kDailyRetentionSec
+                                                    : kMonthlyRetentionSec;
+            g.columns.push_back({ts_column_for_suffix(tier), "INTEGER"});
+            g.columns.insert(g.columns.end(), fold.columns.begin(), fold.columns.end());
+            src->granularities.push_back(std::move(g));
+        }
+    }
+}
 
 const std::vector<CaptureSourceDef>& build_sources() {
-    static const std::vector<CaptureSourceDef> sources = {
+    static const std::vector<CaptureSourceDef> sources = [] {
+    std::vector<CaptureSourceDef> s = {
         // ── Process ─────────────────────────────────────────────────────
         {
             .name = "process",
@@ -43,63 +77,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "on BOTH paths — no command line (works-council posture); the poll "
                  "blanks the proc_pidpath image it would otherwise place in cmdline."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kRowCount,
-                    // Raised 5k→100k for the gap-free ETW stream on Windows (the
-                    // poll produced far fewer rows). ~100k × ~150 B ≈ ~15 MB
-                    // bounded; the hourly/daily/monthly count rollups carry the
-                    // long tail. Non-Windows poll simply never fills it.
-                    .retention_default = 100000,
-                    .columns = {
-                        {"ts",          "INTEGER"},
-                        {"snapshot_id", "INTEGER"},
-                        {"action",      "TEXT"},
-                        {"pid",         "INTEGER"},
-                        {"ppid",        "INTEGER"},
-                        {"name",        "TEXT"},
-                        {"cmdline",     "TEXT"},
-                        {"user",        "TEXT"},
-                    },
-                },
-                {
-                    .suffix = "hourly",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 86400, // 24 hours
-                    .columns = {
-                        {"hour_ts",     "INTEGER"},
-                        {"name",        "TEXT"},
-                        {"user",        "TEXT"},
-                        {"start_count", "INTEGER"},
-                        {"stop_count",  "INTEGER"},
-                    },
-                },
-                {
-                    .suffix = "daily",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 2678400, // 31 days
-                    .columns = {
-                        {"day_ts",      "INTEGER"},
-                        {"name",        "TEXT"},
-                        {"user",        "TEXT"},
-                        {"start_count", "INTEGER"},
-                        {"stop_count",  "INTEGER"},
-                    },
-                },
-                {
-                    .suffix = "monthly",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 31536000, // 12 months (~365 days)
-                    .columns = {
-                        {"month_ts",    "INTEGER"},
-                        {"name",        "TEXT"},
-                        {"user",        "TEXT"},
-                        {"start_count", "INTEGER"},
-                        {"stop_count",  "INTEGER"},
-                    },
-                },
-            },
+            .granularities = {},
         },
 
         // ── TCP ─────────────────────────────────────────────────────────
@@ -139,69 +117,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "short-lived sockets that close before the per-fd query may "
                  "produce empty rows."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kRowCount,
-                    .retention_default = 5000,
-                    .columns = {
-                        {"ts",           "INTEGER"},
-                        {"snapshot_id",  "INTEGER"},
-                        {"action",       "TEXT"},
-                        {"proto",        "TEXT"},
-                        {"local_addr",   "TEXT"},
-                        {"local_port",   "INTEGER"},
-                        {"remote_addr",  "TEXT"},
-                        {"remote_host",  "TEXT"},
-                        {"remote_port",  "INTEGER"},
-                        {"state",        "TEXT"},
-                        {"pid",          "INTEGER"},
-                        {"process_name", "TEXT"},
-                    },
-                },
-                {
-                    .suffix = "hourly",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 86400,
-                    .columns = {
-                        {"hour_ts",          "INTEGER"},
-                        {"remote_addr",      "TEXT"},
-                        {"remote_port",      "INTEGER"},
-                        {"proto",            "TEXT"},
-                        {"process_name",     "TEXT"},
-                        {"connect_count",    "INTEGER"},
-                        {"disconnect_count", "INTEGER"},
-                    },
-                },
-                {
-                    .suffix = "daily",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 2678400,
-                    .columns = {
-                        {"day_ts",           "INTEGER"},
-                        {"remote_addr",      "TEXT"},
-                        {"remote_port",      "INTEGER"},
-                        {"proto",            "TEXT"},
-                        {"process_name",     "TEXT"},
-                        {"connect_count",    "INTEGER"},
-                        {"disconnect_count", "INTEGER"},
-                    },
-                },
-                {
-                    .suffix = "monthly",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 31536000,
-                    .columns = {
-                        {"month_ts",         "INTEGER"},
-                        {"remote_addr",      "TEXT"},
-                        {"remote_port",      "INTEGER"},
-                        {"proto",            "TEXT"},
-                        {"process_name",     "TEXT"},
-                        {"connect_count",    "INTEGER"},
-                        {"disconnect_count", "INTEGER"},
-                    },
-                },
-            },
+            .granularities = {},
         },
 
         // ── Service ─────────────────────────────────────────────────────
@@ -220,35 +136,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "launchctl list — no startup_type, status is binary "
                  "running/stopped only."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kRowCount,
-                    .retention_default = 5000,
-                    .columns = {
-                        {"ts",                "INTEGER"},
-                        {"snapshot_id",       "INTEGER"},
-                        {"action",            "TEXT"},
-                        {"name",              "TEXT"},
-                        {"display_name",      "TEXT"},
-                        {"status",            "TEXT"},
-                        {"prev_status",       "TEXT"},
-                        {"startup_type",      "TEXT"},
-                        {"prev_startup_type", "TEXT"},
-                    },
-                },
-                {
-                    .suffix = "hourly",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 86400,
-                    .columns = {
-                        {"hour_ts",        "INTEGER"},
-                        {"name",           "TEXT"},
-                        {"status_changes", "INTEGER"},
-                        {"last_status",    "TEXT"},
-                    },
-                },
-            },
+            .granularities = {},
         },
 
         // ── User ────────────────────────────────────────────────────────
@@ -271,34 +159,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "not an X display (:...). "
                  "GUI logins are not always reflected in utmpx."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kRowCount,
-                    .retention_default = 5000,
-                    .columns = {
-                        {"ts",          "INTEGER"},
-                        {"snapshot_id", "INTEGER"},
-                        {"action",      "TEXT"},
-                        {"user",        "TEXT"},
-                        {"domain",      "TEXT"},
-                        {"logon_type",  "TEXT"},
-                        {"session_id",  "TEXT"},
-                    },
-                },
-                {
-                    .suffix = "daily",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 2678400,
-                    .columns = {
-                        {"day_ts",      "INTEGER"},
-                        {"user",        "TEXT"},
-                        {"domain",      "TEXT"},
-                        {"login_count", "INTEGER"},
-                        {"logout_count","INTEGER"},
-                    },
-                },
-            },
+            .granularities = {},
         },
 
         // ── Perf (BRD A1 — continuous device performance sampling) ──────
@@ -324,48 +185,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {"macos",   OsSupportStatus::kPlanned,    "host_statistics",
                  "host_processor_info / host_statistics64 + IOKit counters."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 604800, // 7 days of 30 s samples ≈ 20k rows
-                    .columns = {
-                        {"ts",                "INTEGER"},
-                        {"snapshot_id",       "INTEGER"},
-                        {"cpu_pct",           "REAL"},
-                        {"mem_used_pct",      "REAL"},
-                        {"commit_pct",        "REAL"},
-                        {"disk_read_bps",     "INTEGER"},
-                        {"disk_write_bps",    "INTEGER"},
-                        {"disk_read_lat_us",  "INTEGER"},
-                        {"disk_write_lat_us", "INTEGER"},
-                        {"net_rx_bps",        "INTEGER"},
-                        {"net_tx_bps",        "INTEGER"},
-                    },
-                },
-                {
-                    .suffix = "hourly",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 2678400, // 31 days
-                    .columns = {
-                        {"hour_ts",            "INTEGER"},
-                        {"samples",            "INTEGER"},
-                        {"cpu_avg",            "REAL"},
-                        {"cpu_max",            "REAL"},
-                        {"mem_avg",            "REAL"},
-                        {"mem_max",            "REAL"},
-                        {"commit_avg",         "REAL"},
-                        {"read_bps_avg",       "INTEGER"},
-                        {"write_bps_avg",      "INTEGER"},
-                        {"read_lat_us_avg",    "INTEGER"},
-                        {"write_lat_us_avg",   "INTEGER"},
-                        {"read_lat_us_max",    "INTEGER"},
-                        {"write_lat_us_max",   "INTEGER"},
-                        {"rx_bps_avg",         "INTEGER"},
-                        {"tx_bps_avg",         "INTEGER"},
-                    },
-                },
-            },
+            .granularities = {},
         },
 
         // ── BRD A2: top-N per-application resource samples ───────────────
@@ -393,40 +213,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {"macos",   OsSupportStatus::kPlanned,    "libproc",
                  "proc_pid_rusage / proc_taskinfo per sysctl PID list."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 604800, // 7 days × ≤20 rows/30 s ≈ 400k small rows
-                    .columns = {
-                        {"ts",          "INTEGER"},
-                        {"snapshot_id", "INTEGER"},
-                        {"name",        "TEXT"},
-                        {"version",     "TEXT"},
-                        {"instances",   "INTEGER"},
-                        {"cpu_pct",     "REAL"},
-                        {"ws_bytes",    "INTEGER"},
-                        {"is_kthread",  "INTEGER"},
-                    },
-                },
-                {
-                    .suffix = "hourly",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 2678400, // 31 days, per (hour, app)
-                    .columns = {
-                        {"hour_ts",       "INTEGER"},
-                        {"name",          "TEXT"},
-                        {"version",       "TEXT"},
-                        {"is_kthread",    "INTEGER"},
-                        {"samples",       "INTEGER"},
-                        {"instances_max", "INTEGER"},
-                        {"cpu_avg",       "REAL"},
-                        {"cpu_max",       "REAL"},
-                        {"ws_avg_bytes",  "INTEGER"},
-                        {"ws_max_bytes",  "INTEGER"},
-                    },
-                },
-            },
+            .granularities = {},
         },
 
         // ── netqual (BRD Workstream E — per-connection TCP quality) ──────
@@ -471,27 +258,6 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "risk — see the roadmap 2.1 spike memo)."},
             },
             .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kRowCount,
-                    // Per-connection rows are far more numerous than the device
-                    // perf tier; the collector's per-tick top-N cap is the real
-                    // bound, this row cap is the deterministic storage backstop.
-                    .retention_default = 100000,
-                    .columns = {
-                        {"ts",            "INTEGER"},
-                        {"snapshot_id",   "INTEGER"},
-                        {"proto",         "TEXT"},
-                        {"remote_bucket", "TEXT"},
-                        {"process_name",  "TEXT"},
-                        {"rtt_us",        "INTEGER"},
-                        {"rtt_var_us",    "INTEGER"},
-                        {"lost",          "INTEGER"},
-                        {"retrans",       "INTEGER"},
-                        {"segs_out",      "INTEGER"},
-                        {"ca_state",      "INTEGER"},
-                    },
-                },
                 // Boot baseline (ADR-0020): ONE row per boot, written at plugin
                 // init from cumulative-since-boot OS counters (Windows:
                 // GetTcpStatisticsEx2 v4+v6 + GetIfTable2 non-loopback totals).
@@ -563,67 +329,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "rides the message, so signing needs no extra call. Wired in "
                  "M4/M5."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kRowCount,
-                    // The edge risk-filter (unsigned/kernel/blocked at full
-                    // fidelity; signed system modules first-seen-then-count) is
-                    // the real bound; this row cap is the deterministic backstop.
-                    .retention_default = 100000,
-                    .columns = {
-                        {"ts",            "INTEGER"},
-                        {"snapshot_id",   "INTEGER"},
-                        {"action",        "TEXT"},
-                        {"pid",           "INTEGER"},
-                        {"process_name",  "TEXT"},
-                        {"module_name",   "TEXT"},
-                        {"module_dir",    "TEXT"},
-                        {"signed_state",  "TEXT"},
-                        {"signer",        "TEXT"},
-                        {"is_kernel",     "INTEGER"},
-                    },
-                },
-                {
-                    .suffix = "hourly",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 86400, // 24 hours
-                    .columns = {
-                        {"hour_ts",      "INTEGER"},
-                        {"module_name",  "TEXT"},
-                        {"signer",       "TEXT"},
-                        {"signed_state", "TEXT"},
-                        {"is_kernel",    "INTEGER"},
-                        {"load_count",   "INTEGER"},
-                    },
-                },
-                {
-                    .suffix = "daily",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 2678400, // 31 days
-                    .columns = {
-                        {"day_ts",       "INTEGER"},
-                        {"module_name",  "TEXT"},
-                        {"signer",       "TEXT"},
-                        {"signed_state", "TEXT"},
-                        {"is_kernel",    "INTEGER"},
-                        {"load_count",   "INTEGER"},
-                    },
-                },
-                {
-                    .suffix = "monthly",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 31536000, // 12 months (~365 days)
-                    .columns = {
-                        {"month_ts",     "INTEGER"},
-                        {"module_name",  "TEXT"},
-                        {"signer",       "TEXT"},
-                        {"signed_state", "TEXT"},
-                        {"is_kernel",    "INTEGER"},
-                        {"load_count",   "INTEGER"},
-                    },
-                },
-            },
+            .granularities = {},
         },
 
         // ── Software install/uninstall events (Phase 8 Wave 1) ────────────────
@@ -655,49 +361,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "system_profiler SPApplicationsDataType + pkgutil diff (reuse of "
                  "the installed_apps enumeration). Wired in a fast-follow."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kRowCount,
-                    // Install/uninstall is very low-volume — 5000 rows holds years
-                    // of change history on a normal endpoint.
-                    .retention_default = 5000,
-                    .columns = {
-                        {"ts",           "INTEGER"},
-                        {"snapshot_id",  "INTEGER"},
-                        {"action",       "TEXT"}, // installed, removed, upgraded
-                        {"name",         "TEXT"},
-                        {"version",      "TEXT"},
-                        {"prev_version", "TEXT"}, // populated only for 'upgraded'
-                        {"publisher",    "TEXT"},
-                        {"install_date", "TEXT"}, // registry InstallDate (YYYYMMDD) where present
-                    },
-                },
-                {
-                    .suffix = "daily",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 2678400, // 31 days
-                    .columns = {
-                        {"day_ts",        "INTEGER"},
-                        {"name",          "TEXT"},
-                        {"install_count", "INTEGER"},
-                        {"remove_count",  "INTEGER"},
-                        {"upgrade_count", "INTEGER"},
-                    },
-                },
-                {
-                    .suffix = "monthly",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 31536000, // 12 months (~365 days)
-                    .columns = {
-                        {"month_ts",      "INTEGER"},
-                        {"name",          "TEXT"},
-                        {"install_count", "INTEGER"},
-                        {"remove_count",  "INTEGER"},
-                        {"upgrade_count", "INTEGER"},
-                    },
-                },
-            },
+            .granularities = {},
         },
 
         // ── ARP / address-resolution table (ADR-0015) ─────────────────────
@@ -733,35 +397,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "shared record carries none). Capped at kArpEntryCap=2048 "
                  "live entries."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kRowCount,
-                    .retention_default = 5000,
-                    .columns = {
-                        {"ts",          "INTEGER"},
-                        {"snapshot_id", "INTEGER"},
-                        {"action",      "TEXT"},
-                        {"interface",   "TEXT"},
-                        {"ip_address",  "TEXT"},
-                        {"mac_address", "TEXT"},
-                        {"entry_type",  "TEXT"},
-                    },
-                },
-                {
-                    .suffix = "hourly",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 86400, // 24 hours
-                    .columns = {
-                        {"hour_ts",      "INTEGER"},
-                        {"interface",    "TEXT"},
-                        {"ip_address",   "TEXT"},
-                        {"mac_address",  "TEXT"},
-                        {"appear_count", "INTEGER"},
-                        {"remove_count", "INTEGER"},
-                    },
-                },
-            },
+            .granularities = {},
         },
 
         // ── DNS resolution cache (ADR-0015) ───────────────────────────────
@@ -790,35 +426,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "(ttl_remaining_s reported -1, constrained). Wired in the macOS "
                  "follow-up."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kRowCount,
-                    .retention_default = 5000,
-                    .columns = {
-                        {"ts",              "INTEGER"},
-                        {"snapshot_id",     "INTEGER"},
-                        {"action",          "TEXT"},
-                        {"name",            "TEXT"},
-                        {"record_type",     "TEXT"},
-                        {"data",            "TEXT"},
-                        {"ttl_remaining_s", "INTEGER"},
-                        {"source",          "TEXT"},
-                    },
-                },
-                {
-                    .suffix = "hourly",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 86400, // 24 hours
-                    .columns = {
-                        {"hour_ts",      "INTEGER"},
-                        {"name",         "TEXT"},
-                        {"record_type",  "TEXT"},
-                        {"appear_count", "INTEGER"},
-                        {"remove_count", "INTEGER"},
-                    },
-                },
-            },
+            .granularities = {},
         },
 
         // ── netconn (ADR-0020 — connectivity-transition timeline) ─────────
@@ -850,25 +458,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {"macos",   OsSupportStatus::kPlanned,   "oslog",
                  "configd/Wi-Fi subsystem transitions via OSLog."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kRowCount,
-                    .retention_default = 20000,
-                    .columns = {
-                        {"ts",          "INTEGER"},
-                        {"snapshot_id", "INTEGER"},
-                        {"action",      "TEXT"}, // connected/disconnected/wifi_connected/
-                                                 // wifi_connect_failed/wifi_disconnected/
-                                                 // capability_changed
-                        {"channel",     "TEXT"}, // networkprofile/ncsi/wlan
-                        {"category",    "TEXT"}, // public/private/domain ("" when n/a)
-                        {"capability",  "TEXT"}, // none/local/internet ("" when n/a)
-                        {"iface_kind",  "TEXT"}, // wifi ("" when unknown)
-                        {"reason_code", "INTEGER"}, // WLAN reason / NCSI change reason
-                    },
-                },
-            },
+            .granularities = {},
         },
 
         // ── Mapped drives (capability-map §3.8) ───────────────────────────
@@ -917,39 +507,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "exposes only the current mount table, nothing historical) — "
                  "honestly out of reach for an unprivileged agent."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kRowCount,
-                    .retention_default = 5000,
-                    .columns = {
-                        {"ts",          "INTEGER"},
-                        {"snapshot_id", "INTEGER"},
-                        {"action",      "TEXT"}, // appeared, removed, historical
-                        {"direction",   "TEXT"}, // outbound, inbound
-                        {"local_mount", "TEXT"},
-                        {"remote_path", "TEXT"},
-                        {"remote_host", "TEXT"},
-                        {"username",    "TEXT"},
-                        {"provider",    "TEXT"},
-                        {"origin",      "TEXT"}, // live, historical
-                    },
-                },
-                {
-                    .suffix = "hourly",
-                    .retention_type = RetentionType::kTimeBased,
-                    .retention_default = 86400, // 24 hours
-                    .columns = {
-                        {"hour_ts",      "INTEGER"},
-                        {"direction",    "TEXT"},
-                        {"local_mount",  "TEXT"},
-                        {"remote_path",  "TEXT"},
-                        {"remote_host",  "TEXT"},
-                        {"appear_count", "INTEGER"},
-                        {"remove_count", "INTEGER"},
-                    },
-                },
-            },
+            .granularities = {},
         },
 
         // ── power (cursor-model seam, echo_cursor.hpp) — sleep/wake/AC-power
@@ -973,7 +531,6 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .name = "power",
             .dollar_name = "Power",
             .default_enabled = true,
-            .unique_key_column = "record_key",
             .os_support = {
                 {"windows", OsSupportStatus::kSupportedConstrained, "powerbroadcast",
                  "Suspend/resume + AC transitions via "
@@ -988,21 +545,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "unprivileged on this Mac 2026-09-04, 9,629 lines: "
                  "hardware-probe measurement, Wave 6), cursor-model."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kRowCount,
-                    .retention_default = 20000,
-                    .columns = {
-                        {"ts",          "INTEGER"},
-                        {"snapshot_id", "INTEGER"},
-                        {"action",      "TEXT"}, // sleep, wake, ac_attached,
-                                                 // ac_detached, capture_gap
-                        {"detail",      "TEXT"},
-                        {"record_key",  "TEXT"}, // UNIQUE — replay idempotence
-                    },
-                },
-            },
+            .granularities = {},
         },
 
         // ── removable (cursor-model seam, echo_cursor.hpp) — removable-media
@@ -1023,7 +566,6 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .name = "removable",
             .dollar_name = "Removable",
             .default_enabled = true,
-            .unique_key_column = "record_key",
             .os_support = {
                 {"windows", OsSupportStatus::kSupported, "wevtapi",
                  "EvtQuery over Microsoft-Windows-Partition/Diagnostic (+ "
@@ -1039,32 +581,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "(headers confirmed in the CLT SDK, hardware-probe measurement, Wave 6), "
                  "cursor-model."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kRowCount,
-                    .retention_default = 20000,
-                    .columns = {
-                        {"ts",          "INTEGER"},
-                        {"snapshot_id", "INTEGER"},
-                        {"action",      "TEXT"}, // attached, detached,
-                                                 // present_at_baseline,
-                                                 // exec_from_removable,
-                                                 // capture_gap
-                        {"device_key",  "TEXT"},
-                        {"vendor",      "TEXT"},
-                        {"product",     "TEXT"},
-                        {"serial",      "TEXT"},
-                        {"bus",         "TEXT"},
-                        {"volume",      "TEXT"},
-                        {"size_bytes",  "INTEGER"},
-                        {"image_path",  "TEXT"},    // typed identity column (P-004)
-                        {"pid",         "INTEGER"}, // typed identity column (P-004)
-                        {"evidence",    "TEXT"},    // forensic/value only — not identity
-                        {"record_key",  "TEXT"},    // UNIQUE — replay idempotence
-                    },
-                },
-            },
+            .granularities = {},
         },
         // ── registry (cursor-model seam, echo_cursor.hpp) — registry value and key
         // changes under a curated persistence/policy watch list (HKLM and each
@@ -1084,7 +601,6 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .name = "registry",
             .dollar_name = "Registry",
             .default_enabled = true,
-            .unique_key_column = "record_key",
             .os_support = {
                 {"windows", OsSupportStatus::kSupported, "regnotify+etw",
                  "RegNotifyChangeKeyValue subtree watch + baseline diff (what changed: the new "
@@ -1097,45 +613,16 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {"macos",   OsSupportStatus::kUnsupported, "",
                  "The Windows registry does not exist on this platform."},
             },
-            .granularities = {
-                {
-                    .suffix = "live",
-                    .retention_type = RetentionType::kRowCount,
-                    .retention_default = 500000,
-                    .columns = {
-                        {"ts",                  "INTEGER"},
-                        {"snapshot_id",         "INTEGER"},
-                        {"hive",                "TEXT"},    // HKLM | HKU
-                        {"key_path",            "TEXT"},
-                        {"value_name",          "TEXT"},    // "" for key_removed / capture_gap
-                        {"action",              "TEXT"},    // added, changed, removed,
-                                                            // key_removed, capture_gap
-                        {"data_type",           "TEXT"},
-                        {"data",                "TEXT"},    // UNMASKED; '' when n/a (data_type '' = no value)
-                        {"data_size",           "INTEGER"},
-                        {"data_truncated",      "INTEGER"},
-                        {"prev_data_type",      "TEXT"},
-                        {"prev_data",           "TEXT"},
-                        {"prev_data_size",      "INTEGER"},
-                        {"prev_data_truncated", "INTEGER"},
-                        {"actor_pid",           "INTEGER"}, // 0 = no writer named (see detail)
-                        {"actor_image",         "TEXT"},    // '' when no writer is named
-                        {"source",              "TEXT"},    // notify | reconcile
-                        {"observed_at",         "INTEGER"}, // unix ms the read saw it
-                        {"detail",              "TEXT"},    // attr:* on a change row; the gap text on a gap
-                        {"record_key",          "TEXT"},    // UNIQUE — replay idempotence
-                    },
-                },
-            },
+            .granularities = {},
         },
 
         // ── Usage (Wave 7 PR7.2b) — DERIVED from `process`: a checked_
-        // transaction fold (echo_usage.cpp run_usage_fold) pairs started/
+        // transaction fold (echo_usage.cpp usage_fold_in) pairs started/
         // stopped by (pid, exe_key) into runs; usage_live holds OPEN runs
         // (deleted when closed), usage_daily the per-executable daily
-        // aggregate. No collector, no rollup_sql; the fold is driven from
-        // collect_fast after the process insert and carries its own gap
-        // check against process_live's row-cap prune. DEFAULT-ON per
+        // aggregate. No collector, no roll-up tiers of its own; the fold is
+        // fed the process events inside the process fold's transaction.
+        // DEFAULT-ON per
         // Alex's 2026-09-04 ruling (see docs/user-manual/echo.md).
         // usage_daily_user (per-day username membership) and the two
         // UNIQUE indexes (usage_live(pid, exe_key), usage_daily(day_ts,
@@ -1198,6 +685,9 @@ const std::vector<CaptureSourceDef>& build_sources() {
             },
         },
     };
+    append_fold_tiers(s);
+    return s;
+    }();
     return sources;
 }
 
@@ -1215,6 +705,9 @@ const std::unordered_map<std::string, std::string>& dollar_name_map() {
                 std::string real = std::format("{}_{}", src.name, g.suffix);
                 m[dollar] = real;
             }
+            // $Process_Live and friends: the retired raw tables answer with an empty view.
+            if (is_legacy_live_shim(std::format("{}_live", src.name)))
+                m[std::format("${}_Live", src.dollar_name)] = std::format("{}_live", src.name);
         }
         return m;
     }();
@@ -1269,7 +762,7 @@ std::string_view support_level_name(OsSupportStatus status) {
 
 // Get the timestamp column name for a granularity suffix. Public since #2361:
 // the retention clock guard in `run_retention` needs the same column the DDL
-// indexes and `retention_sql`'s time branch filters on, and a second copy of
+// indexes and the retention delete filters on, and a second copy of
 // this mapping in the aggregator would be a silent divergence waiting to happen.
 std::string_view ts_column_for_suffix(std::string_view suffix) {
     if (suffix == "live")    return "ts";
@@ -1399,6 +892,11 @@ std::string generate_warehouse_ddl() {
     for (const auto& src : build_sources()) {
         for (const auto& g : src.granularities) {
             std::string table_name = std::format("{}_{}", src.name, g.suffix);
+            // The roll-up tiers are VIEWS over `<table>_r` tables (generate_fold_ddl creates
+            // both). A CREATE TABLE here would collide with the view, and an index on a view
+            // fails the whole batch ("views may not be indexed") on EVERY open.
+            if (is_fold_view(table_name))
+                continue;
 
             ddl << "CREATE TABLE IF NOT EXISTS " << table_name << " (\n";
             ddl << "    id INTEGER PRIMARY KEY AUTOINCREMENT";
@@ -1418,41 +916,6 @@ std::string generate_warehouse_ddl() {
             auto ts_col = ts_column_for_suffix(g.suffix);
             ddl << std::format("CREATE INDEX IF NOT EXISTS idx_{0}_{1} ON {0}({1});\n",
                                table_name, ts_col);
-
-            // Extra indexes for live tables
-            if (g.suffix == "live" && src.name == "process") {
-                ddl << std::format("CREATE INDEX IF NOT EXISTS idx_{0}_name ON {0}(name);\n",
-                                   table_name);
-            }
-            if (g.suffix == "live" && src.name == "tcp") {
-                ddl << std::format("CREATE INDEX IF NOT EXISTS idx_{0}_remote ON {0}(remote_addr);\n",
-                                   table_name);
-            }
-            if (g.suffix == "live" && src.name == "software") {
-                ddl << std::format("CREATE INDEX IF NOT EXISTS idx_{0}_name ON {0}(name);\n",
-                                   table_name);
-            }
-            if (g.suffix == "live" && src.name == "module") {
-                ddl << std::format("CREATE INDEX IF NOT EXISTS idx_{0}_name ON {0}(module_name);\n",
-                                   table_name);
-                // The canonical "unsigned image loaded in the last 24h" query
-                // filters signed_state; index it so that scan stays cheap once a
-                // collector populates module_live.
-                ddl << std::format(
-                    "CREATE INDEX IF NOT EXISTS idx_{0}_signed_state ON {0}(signed_state);\n",
-                    table_name);
-            }
-
-            // Cursor-model replay idempotence (echo_cursor.hpp rule 3): a
-            // source that declares unique_key_column gets a UNIQUE index on
-            // it for the live tier, so INSERT OR IGNORE makes a replayed
-            // event a no-op instead of a duplicate row.
-            if (g.suffix == "live" && !src.unique_key_column.empty()) {
-                ddl << std::format(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS {0}_record_key_uq ON {0}({1});\n",
-                    table_name, src.unique_key_column);
-            }
-
             ddl << "\n";
         }
     }
@@ -1499,6 +962,10 @@ bool is_queryable_table(std::string_view real_table_name) {
         // no-oracle reasoning this function already documents.
         for (const char* usage_table : {"usage_live", "usage_daily", "usage_daily_user"})
             s.erase(usage_table);
+        // The retired raw tables' shim views: a stored `$X_Live` query still reads an (empty)
+        // relation instead of failing at the authorizer.
+        for (const auto& shim : legacy_live_shim_names())
+            s.insert(shim);
         return s;
     }();
     return allowed.contains(std::string(real_table_name));
@@ -1514,6 +981,14 @@ std::vector<std::string> all_dollar_names() {
 }
 
 std::vector<std::string> columns_for_table(const std::string& real_table_name) {
+    if (is_legacy_live_shim(real_table_name)) {
+        // `process_live` -> the source `process`: the legacy column list, `id` first.
+        std::vector<std::string> cols{"id"};
+        for (const auto& c : legacy_live_columns(
+                 std::string_view{real_table_name}.substr(0, real_table_name.size() - 5)))
+            cols.emplace_back(c.name);
+        return cols;
+    }
     auto& refs = table_ref_map();
     auto it = refs.find(real_table_name);
     if (it == refs.end())
@@ -1529,272 +1004,6 @@ std::vector<std::string> columns_for_table(const std::string& real_table_name) {
         cols.emplace_back(c.name);
     }
     return cols;
-}
-
-std::string rollup_sql(std::string_view source_name, std::string_view target_suffix) {
-    // ── Process rollups ─────────────────────────────────────────────────
-    if (source_name == "process") {
-        if (target_suffix == "hourly") {
-            return R"(INSERT INTO process_hourly (hour_ts, name, user, start_count, stop_count)
-SELECT (ts / 3600) * 3600, name, user,
-       SUM(CASE WHEN action = 'started' THEN 1 ELSE 0 END),
-       SUM(CASE WHEN action = 'stopped' THEN 1 ELSE 0 END)
-FROM process_live
-WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 3600) * 3600, name, user)";
-        }
-        if (target_suffix == "daily") {
-            return R"(INSERT INTO process_daily (day_ts, name, user, start_count, stop_count)
-SELECT (hour_ts / 86400) * 86400, name, user,
-       SUM(start_count), SUM(stop_count)
-FROM process_hourly
-WHERE hour_ts >= ? AND hour_ts < ?
-GROUP BY (hour_ts / 86400) * 86400, name, user)";
-        }
-        if (target_suffix == "monthly") {
-            // M2: Use strftime for calendar-month boundaries instead of fixed 30-day approximation
-            return R"(INSERT INTO process_monthly (month_ts, name, user, start_count, stop_count)
-SELECT CAST(strftime('%s', date(day_ts, 'unixepoch', 'start of month')) AS INTEGER), name, user,
-       SUM(start_count), SUM(stop_count)
-FROM process_daily
-WHERE day_ts >= ? AND day_ts < ?
-GROUP BY strftime('%Y-%m', day_ts, 'unixepoch'), name, user)";
-        }
-    }
-
-    // ── TCP rollups ─────────────────────────────────────────────────────
-    if (source_name == "tcp") {
-        if (target_suffix == "hourly") {
-            return R"(INSERT INTO tcp_hourly (hour_ts, remote_addr, remote_port, proto, process_name, connect_count, disconnect_count)
-SELECT (ts / 3600) * 3600, remote_addr, remote_port, proto, process_name,
-       SUM(CASE WHEN action = 'connected' THEN 1 ELSE 0 END),
-       SUM(CASE WHEN action = 'disconnected' THEN 1 ELSE 0 END)
-FROM tcp_live
-WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 3600) * 3600, remote_addr, remote_port, proto, process_name)";
-        }
-        if (target_suffix == "daily") {
-            return R"(INSERT INTO tcp_daily (day_ts, remote_addr, remote_port, proto, process_name, connect_count, disconnect_count)
-SELECT (hour_ts / 86400) * 86400, remote_addr, remote_port, proto, process_name,
-       SUM(connect_count), SUM(disconnect_count)
-FROM tcp_hourly
-WHERE hour_ts >= ? AND hour_ts < ?
-GROUP BY (hour_ts / 86400) * 86400, remote_addr, remote_port, proto, process_name)";
-        }
-        if (target_suffix == "monthly") {
-            return R"(INSERT INTO tcp_monthly (month_ts, remote_addr, remote_port, proto, process_name, connect_count, disconnect_count)
-SELECT CAST(strftime('%s', date(day_ts, 'unixepoch', 'start of month')) AS INTEGER),
-       remote_addr, remote_port, proto, process_name,
-       SUM(connect_count), SUM(disconnect_count)
-FROM tcp_daily
-WHERE day_ts >= ? AND day_ts < ?
-GROUP BY strftime('%Y-%m', day_ts, 'unixepoch'), remote_addr, remote_port, proto, process_name)";
-        }
-    }
-
-    // ── Service rollups ─────────────────────────────────────────────────
-    if (source_name == "service") {
-        if (target_suffix == "hourly") {
-            return R"(INSERT INTO service_hourly (hour_ts, name, status_changes, last_status)
-SELECT (ts / 3600) * 3600, name,
-       SUM(CASE WHEN action = 'state_changed' THEN 1 ELSE 0 END),
-       (SELECT s2.status FROM service_live s2
-        WHERE s2.name = service_live.name AND s2.ts >= ? AND s2.ts < ?
-        ORDER BY s2.ts DESC LIMIT 1)
-FROM service_live
-WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 3600) * 3600, name)";
-        }
-    }
-
-    // ── User rollups ────────────────────────────────────────────────────
-    if (source_name == "user") {
-        if (target_suffix == "daily") {
-            return R"(INSERT INTO user_daily (day_ts, user, domain, login_count, logout_count)
-SELECT (ts / 86400) * 86400, user, domain,
-       SUM(CASE WHEN action = 'login' THEN 1 ELSE 0 END),
-       SUM(CASE WHEN action = 'logout' THEN 1 ELSE 0 END)
-FROM user_live
-WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 86400) * 86400, user, domain)";
-        }
-    }
-
-    // ── Perf rollups (BRD A1) ───────────────────────────────────────────
-    if (source_name == "perf") {
-        if (target_suffix == "hourly") {
-            return R"(INSERT INTO perf_hourly (hour_ts, samples, cpu_avg, cpu_max, mem_avg, mem_max, commit_avg,
-    read_bps_avg, write_bps_avg, read_lat_us_avg, write_lat_us_avg,
-    read_lat_us_max, write_lat_us_max, rx_bps_avg, tx_bps_avg)
-SELECT (ts / 3600) * 3600, COUNT(*),
-       AVG(cpu_pct), MAX(cpu_pct), AVG(mem_used_pct), MAX(mem_used_pct), AVG(commit_pct),
-       CAST(AVG(disk_read_bps) AS INTEGER), CAST(AVG(disk_write_bps) AS INTEGER),
-       CAST(AVG(disk_read_lat_us) AS INTEGER), CAST(AVG(disk_write_lat_us) AS INTEGER),
-       MAX(disk_read_lat_us), MAX(disk_write_lat_us),
-       CAST(AVG(net_rx_bps) AS INTEGER), CAST(AVG(net_tx_bps) AS INTEGER)
-FROM perf_live
-WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 3600) * 3600)";
-        }
-    }
-
-    // ── Per-app perf rollups (BRD A2) — per (hour, app name, version) ────
-    // is_kthread rides the GROUP BY as an identity column (module_hourly's
-    // is_kernel precedent) — never aggregated, since every instance sharing
-    // one (name, version) group agrees on it (derive_proc_samples OR's it
-    // across instances of the same name).
-    if (source_name == "procperf") {
-        if (target_suffix == "hourly") {
-            return R"(INSERT INTO procperf_hourly (hour_ts, name, version, is_kthread, samples,
-    instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes)
-SELECT (ts / 3600) * 3600, name, version, is_kthread, COUNT(*), MAX(instances),
-       AVG(cpu_pct), MAX(cpu_pct),
-       CAST(AVG(ws_bytes) AS INTEGER), MAX(ws_bytes)
-FROM procperf_live
-WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 3600) * 3600, name, version, is_kthread)";
-        }
-    }
-
-    // ── Module / image-load rollups (M1) — per (module, signer, sig, kernel) ──
-    // load_count counts 'loaded' events only; 'seed'/'blocked'/'unloaded' stay
-    // visible at full fidelity in module_live and are not folded into the count.
-    if (source_name == "module") {
-        if (target_suffix == "hourly") {
-            return R"(INSERT INTO module_hourly (hour_ts, module_name, signer, signed_state, is_kernel, load_count)
-SELECT (ts / 3600) * 3600, module_name, signer, signed_state, is_kernel,
-       SUM(CASE WHEN action = 'loaded' THEN 1 ELSE 0 END)
-FROM module_live
-WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 3600) * 3600, module_name, signer, signed_state, is_kernel)";
-        }
-        if (target_suffix == "daily") {
-            return R"(INSERT INTO module_daily (day_ts, module_name, signer, signed_state, is_kernel, load_count)
-SELECT (hour_ts / 86400) * 86400, module_name, signer, signed_state, is_kernel,
-       SUM(load_count)
-FROM module_hourly
-WHERE hour_ts >= ? AND hour_ts < ?
-GROUP BY (hour_ts / 86400) * 86400, module_name, signer, signed_state, is_kernel)";
-        }
-        if (target_suffix == "monthly") {
-            return R"(INSERT INTO module_monthly (month_ts, module_name, signer, signed_state, is_kernel, load_count)
-SELECT CAST(strftime('%s', date(day_ts, 'unixepoch', 'start of month')) AS INTEGER),
-       module_name, signer, signed_state, is_kernel,
-       SUM(load_count)
-FROM module_daily
-WHERE day_ts >= ? AND day_ts < ?
-GROUP BY strftime('%Y-%m', day_ts, 'unixepoch'), module_name, signer, signed_state, is_kernel)";
-        }
-    }
-
-    // ── Software rollups (Phase 8 Wave 1) — per name ─────────────────────────
-    // Counts install/remove/upgrade events per application name (machine scope
-    // only). The count tier is "how many install events", not "by which build"
-    // (that detail stays at full fidelity in software_live).
-    if (source_name == "software") {
-        if (target_suffix == "daily") {
-            return R"(INSERT INTO software_daily (day_ts, name, install_count, remove_count, upgrade_count)
-SELECT (ts / 86400) * 86400, name,
-       SUM(CASE WHEN action = 'installed' THEN 1 ELSE 0 END),
-       SUM(CASE WHEN action = 'removed' THEN 1 ELSE 0 END),
-       SUM(CASE WHEN action = 'upgraded' THEN 1 ELSE 0 END)
-FROM software_live
-WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 86400) * 86400, name)";
-        }
-        if (target_suffix == "monthly") {
-            return R"(INSERT INTO software_monthly (month_ts, name, install_count, remove_count, upgrade_count)
-SELECT CAST(strftime('%s', date(day_ts, 'unixepoch', 'start of month')) AS INTEGER),
-       name,
-       SUM(install_count), SUM(remove_count), SUM(upgrade_count)
-FROM software_daily
-WHERE day_ts >= ? AND day_ts < ?
-GROUP BY strftime('%Y-%m', day_ts, 'unixepoch'), name)";
-        }
-    }
-
-    // ── ARP rollups (ADR-0015) — per (interface, ip, mac) binding ────────
-    if (source_name == "arp") {
-        if (target_suffix == "hourly") {
-            return R"(INSERT INTO arp_hourly (hour_ts, interface, ip_address, mac_address, appear_count, remove_count)
-SELECT (ts / 3600) * 3600, interface, ip_address, mac_address,
-       SUM(CASE WHEN action = 'appeared' THEN 1 ELSE 0 END),
-       SUM(CASE WHEN action = 'removed' THEN 1 ELSE 0 END)
-FROM arp_live
-WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 3600) * 3600, interface, ip_address, mac_address)";
-        }
-    }
-
-    // ── DNS rollups (ADR-0015) — per (name, record_type) ─────────────────
-    if (source_name == "dns") {
-        if (target_suffix == "hourly") {
-            return R"(INSERT INTO dns_hourly (hour_ts, name, record_type, appear_count, remove_count)
-SELECT (ts / 3600) * 3600, name, record_type,
-       SUM(CASE WHEN action = 'appeared' THEN 1 ELSE 0 END),
-       SUM(CASE WHEN action = 'removed' THEN 1 ELSE 0 END)
-FROM dns_live
-WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 3600) * 3600, name, record_type)";
-        }
-    }
-
-    // ── Mapped-drive rollups (capability-map §3.8) — per (direction, mount, remote) ──
-    // Only live appeared/removed transitions roll up. `historical` backfill rows
-    // are EXCLUDED by the action filter: a backfill row can carry a RECENT artifact
-    // timestamp (registry last-write, event-log time) that lands inside the current
-    // hour, so without the filter its group would emit a $MapDrive_Hourly row with
-    // both counts zero. `username` is intentionally dropped from the hourly grain
-    // (aggregate-by-mapping, matching process_hourly which drops pid/cmdline).
-    if (source_name == "mapdrive") {
-        if (target_suffix == "hourly") {
-            return R"(INSERT INTO mapdrive_hourly (hour_ts, direction, local_mount, remote_path, remote_host, appear_count, remove_count)
-SELECT (ts / 3600) * 3600, direction, local_mount, remote_path, remote_host,
-       SUM(CASE WHEN action = 'appeared' THEN 1 ELSE 0 END),
-       SUM(CASE WHEN action = 'removed' THEN 1 ELSE 0 END)
-FROM mapdrive_live
-WHERE ts >= ? AND ts < ? AND action IN ('appeared', 'removed')
-GROUP BY (ts / 3600) * 3600, direction, local_mount, remote_path, remote_host)";
-        }
-    }
-
-    return {};
-}
-
-std::string retention_sql(const std::string& real_table_name, int64_t now_epoch) {
-    auto& refs = table_ref_map();
-    auto it = refs.find(real_table_name);
-    if (it == refs.end())
-        return {};
-
-    const auto& src = build_sources()[it->second.source_idx];
-    const auto& gran = src.granularities[it->second.gran_idx];
-
-    if (gran.retention_type == RetentionType::kRowCount) {
-        // H6: Use OFFSET boundary instead of NOT IN anti-pattern — O(n) vs O(n*k)
-        return std::format(
-            "DELETE FROM {} WHERE id <= "
-            "(SELECT id FROM {} ORDER BY id DESC LIMIT 1 OFFSET {})",
-            real_table_name, real_table_name, gran.retention_default);
-    } else {
-        // NEITHER BRANCH'S SQL RUNS IN PRODUCTION as of #2361. `run_retention`
-        // builds both the time-based and the row-count DELETE at the caller so it
-        // can bound them -- the time-based one because an unbounded age delete is
-        // the wipe the clock guard exists to prevent, the row-count one because
-        // the whole batch runs under one held database mutex. This function is
-        // now called ONLY as an `.empty()` probe for "is this a retention-bearing
-        // table?", plus the text these tests pin.
-        //
-        // Kept, and kept byte-identical, because `test_echo_warehouse.cpp` and
-        // `test_echo_perf.cpp` pin this exact SQL text. So a future author who
-        // "fixes" either formula HERE gets a green suite and no behaviour change
-        // whatsoever -- change `run_retention` instead.
-        int64_t cutoff = now_epoch - gran.retention_default;
-        auto ts_col = ts_column_for_suffix(gran.suffix);
-        return std::format(
-            "DELETE FROM {} WHERE {} < {}",
-            real_table_name, ts_col, cutoff);
-    }
 }
 
 } // namespace yuzu::echo

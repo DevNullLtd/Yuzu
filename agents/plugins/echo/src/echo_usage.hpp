@@ -4,28 +4,17 @@
  * echo_usage.hpp -- pure process-event pairing fold for the Echo `usage` source
  * (machine-scope app-usage aggregate), plus the fold's lifecycle contract.
  *
- * Architect decision: `usage` is a DERIVED FOLD over process_live on the fast
- * tick, NOT a CursorSource. Its persisted state is a high-water mark over
- * process_live.id plus an open-run table (usage_live) -- both advanced
- * transactionally by run_usage_fold() (echo_usage.cpp). This header is the
- * PURE half: no SQLite, no clock reads -- every function takes `now`
- * injected, matching echo_cursor.hpp's own now-injection shape, so the
- * pairing logic is fully exercised by test_echo_usage.cpp against fixture
- * ProcessEvent sequences with no DB and no wall clock.
- *
- * DRAIN ARITHMETIC (why the gap check in echo_usage.cpp is load-bearing):
- * the fast tick runs every 60s (echo_plugin.cpp kFastIntervalDefault) and
- * run_usage_fold caps itself at max_events_per_tick=20000 rows/tick, i.e.
- * ~333 events/s sustained before the fold starts trailing the write rate.
- * process_live holds up to 100k rows (kRowCount, echo_schema_registry.cpp);
- * its row-cap prune runs on the rollup cadence and deletes at most 5000 of
- * the LOWEST ids per pass (echo_aggregator.cpp run_retention). So a fold that
- * falls behind by more than the prune's per-pass headroom can find its next
- * unprocessed id already gone -- that is a genuine capture gap, and
- * echo_usage.cpp's MIN(id) check against the persisted high-water mark is the
- * honesty backstop for exactly that tail: it turns a silent skip into a
- * counted, reported loss (usage_gap_count / usage_gap_lost_events) rather
- * than an unnoticed hole in usage_daily.
+ * `usage` is a DERIVED FOLD over the process events of a tick, NOT a CursorSource. It is
+ * EVENT-FED: the process fold (EchoDatabase::fold_process_events) hands the tick's
+ * ProcessEvents to usage_fold_in() inside the SAME transaction that upserts the process
+ * tiers, so the two commit or roll back together. There is no high-water mark, no lag and no
+ * gap check: raw process rows are no longer stored, and a failed tick re-offers the same
+ * events to both folds (the stream path's pending_stream_evs_ retry, the snapshot path's
+ * re-diff), so nothing is read twice or missed. The persisted state is the open-run table
+ * (usage_live) plus a few echo_config facts. This header is the PURE half: no SQLite, no
+ * clock reads -- every function takes `now` injected, so the pairing logic is fully
+ * exercised by test_echo_usage.cpp against fixture ProcessEvent sequences with no DB and no
+ * wall clock.
  *
  * LIFECYCLE (Wave 7 PR7.2b redo -- replaces marker-existence with an explicit
  * state derived from three persisted facts, never written at boot/configure
@@ -37,7 +26,7 @@
  *                      has ever been written, or a read of either failed --
  *                      both fail TOWARD re-baselining, never toward Active).
  *   Active         -- enabled AND the two generations match: the fold's
- *                      cursor/open-run state was established under the
+ *                      open-run state was established under the
  *                      CURRENT activation period, not a stale one.
  *
  * `usage_generation` is bumped -- atomically, alongside the enabled flag --
@@ -185,7 +174,7 @@ constexpr size_t kMaxOpenRuns = 20000;
 /// `a - b`, saturating at the int64 range boundary instead of invoking UB on
 /// overflow. Adversarial review (Wave 7 PR7.2): `now - start_ts` in
 /// expire_open_runs overflows when `start_ts` is an extreme value (e.g.
-/// INT64_MIN from a corrupt/adversarial process_live row) and `now` is a
+/// INT64_MIN from a corrupt/adversarial process event) and `now` is a
 /// plausible epoch second -- reproduced under UBSan. Every caller here only
 /// ever compares the result against a small positive `max_age`, so
 /// saturating (rather than, say, throwing) is the right degrade: a
@@ -257,7 +246,7 @@ constexpr size_t kMaxOpenRuns = 20000;
  * increments and nullopt is returned -- there is nothing to close.
  *
  * Any other `action` value is ignored (returns nullopt, no state change) --
- * process_live's action column is "started"/"stopped" only, so this is
+ * the process event action is "started"/"stopped" only, so this is
  * defensive, not a documented input.
  */
 [[nodiscard]] inline std::optional<ClosedRun> apply_event(FoldState& state,
@@ -407,8 +396,8 @@ struct DailyDelta {
             d.last_seen = r.start_ts;
         }
         // Non-negative by apply_event's clamp, but NOT representability-safe:
-        // an extreme start_ts (e.g. INT64_MIN from a corrupt process_live
-        // row) still overflows a plain subtraction (governance Gate 3
+        // an extreme start_ts (e.g. INT64_MIN from a corrupt process
+        // event) still overflows a plain subtraction (governance Gate 3
         // cpp-expert finding -- this file's own saturating_sub was added for
         // exactly this threat model and missed this call site). The
         // accumulator needs its own saturating add too, since a second
@@ -440,19 +429,12 @@ enum class LifecycleState {
 };
 
 /**
- * Outcome of one run_usage_fold() pass (echo_usage.cpp). `ok == false` means
- * the whole pass ROLLED BACK -- hwm_id is the value BEFORE the attempt (the
- * store's actual persisted hwm is unchanged), and every other field is
- * whatever was computed before the failing step, informational only.
+ * Outcome of one usage_sweep() pass (echo_usage.cpp). `ok == false` means the whole pass ROLLED
+ * BACK and nothing changed.
  */
 struct UsageFoldResult {
     bool ok{false};
     std::string error;
-    int64_t events_seen{0};
-    int64_t runs_closed{0};
-    int64_t hwm_id{0};
-    int64_t lag_events{0};
-    bool gap_detected{false};
 };
 
 /// Derive the current lifecycle state (see the file banner). Reads three
@@ -481,31 +463,36 @@ struct UsageFoldResult {
  * sites into one function is the fix, not a convenience.
  *
  * A no-op (returns {} immediately) unless the state is PendingBaseline.
- * Otherwise attempts ONE checked_transaction: read the current process
- * boundary, clear the open-run table, and persist the matching cursor
- * (usage_hwm_id), coverage time (usage_coverage_since, informational only --
- * lifecycle gating is by generation, not this), and the active generation,
- * all together. On failure NOTHING is written (forward-only guarantee
- * intact; the caller retries) -- unlike the retired `usage_rebaseline`'s
- * predecessor, there is no window where hwm/coverage persist without the
- * generation, or vice versa.
+ * Otherwise attempts ONE checked_transaction: clear the open-run table, and persist the
+ * coverage time (usage_coverage_since, informational only -- lifecycle gating is by
+ * generation, not this) and the active generation, all together. On failure NOTHING is
+ * written (forward-only guarantee intact; the caller retries) -- there is no window where the
+ * coverage time persists without the generation, or vice versa.
  */
 [[nodiscard]] std::expected<void, std::string> usage_ensure_baselined(EchoDatabase& db, int64_t now);
 
 /**
- * Read process_live rows since the persisted `usage_hwm_id`, fold them
- * (pairing, expiry, cap) against the open-run table (usage_live), and
- * commit the whole result -- usage_daily/usage_daily_user upsert, usage_live
- * open-set update, and every echo_config counter -- as ONE
- * checked_transaction, INCLUDING the reads that decide it (see echo_usage.cpp
- * for why: the whole point is that no concurrent purge/configure/retention
- * pass can observe or produce a state between this pass's read and its
- * write). Requires the source to be in `LifecycleState::Active` -- if
- * `PendingBaseline`, attempts `usage_ensure_baselined` first and folds
- * nothing this tick either way (a freshly-established baseline has nothing
- * yet to fold forward from).
+ * Fold `events` (one tick's process events) into the usage tables ON THE CALLER'S TRANSACTION
+ * `h`: pair started/stopped against the open-run table (usage_live), expire and cap it,
+ * upsert usage_daily / usage_daily_user, and write the cumulative echo_config counters. The
+ * lifecycle is read through `h` too, so the decision and the writes are one snapshot: a
+ * disabled source (usage or process) folds nothing; a source awaiting its baseline stamps it
+ * (clearing usage_live) and folds nothing this tick; an Active source folds.
+ *
+ * Passed as EchoFold::fold_rows' `extra` by the process fold, so a tick's process tiers and
+ * its usage rows commit or roll back together. Must not call any EchoDatabase method that
+ * takes the database mutex (the caller holds it); every read here goes through `h`. An error
+ * return poisons `h` and rolls the caller's whole transaction back.
  */
-[[nodiscard]] UsageFoldResult run_usage_fold(EchoDatabase& db, int64_t now,
-                                             int64_t max_events_per_tick = 20000);
+[[nodiscard]] std::expected<void, std::string>
+usage_fold_in(TransactionHandle& h, int64_t now, const std::vector<ProcessEvent>& events);
+
+/**
+ * The per-tick sweep with no events: expire and cap the open runs, advance the last-fold
+ * anchor and publish usage_feeder_enabled -- usage_fold_in on its own transaction. The fast
+ * tick calls it after the process fold, so an open run ages out even on a tick with no
+ * process event. A disabled or not-yet-baselined source is not a failure.
+ */
+[[nodiscard]] UsageFoldResult usage_sweep(EchoDatabase& db, int64_t now);
 
 } // namespace yuzu::echo::usage

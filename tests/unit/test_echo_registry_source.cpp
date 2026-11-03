@@ -13,6 +13,7 @@
 
 #include "echo_cursor.hpp"
 #include "echo_db.hpp"
+#include "echo_fold_schema.hpp"
 #include "echo_registry_parsers.hpp"
 #include "echo_registry_source.hpp"
 #include "echo_schema_registry.hpp"
@@ -929,13 +930,15 @@ TEST_CASE("registry schema constants agree with the registry", "[echo][registry]
             def = &s;
     REQUIRE(def != nullptr);
     CHECK(def->default_enabled);
-    CHECK(def->unique_key_column == "record_key");
-    REQUIRE(def->granularities.size() == 1);
-    CHECK(def->granularities[0].suffix == "live");
-    CHECK(def->granularities[0].retention_type == RetentionType::kRowCount);
+    // roll-up only: an hourly and a daily tier, no raw table (the replay ring replaces record_key's
+    // UNIQUE index)
+    REQUIRE(def->granularities.size() == 2);
+    CHECK(def->granularities[0].suffix == "hourly");
+    CHECK(def->granularities[1].suffix == "daily");
+    CHECK(def->granularities[0].retention_type == RetentionType::kTimeBased);
     CHECK(kEtwKeywordMask == 0x4300); // SetValueKey | DeleteValueKey | DeleteKey, never OpenKey/CreateKey
     CHECK(supported_capture_method("registry", "windows") == "regnotify+etw");
-    CHECK(generate_warehouse_ddl().find("registry_live_record_key_uq") != std::string::npos);
+    CHECK(generate_warehouse_ddl().find("registry_live") == std::string::npos);
 }
 
 #ifndef _WIN32
@@ -963,11 +966,77 @@ struct TestDb {
     }
 };
 
+// Every row a tick committed since make_db(). The roll-up tier keeps no writer pid, attribution
+// detail, source or record key, so what a tick DECIDED is read from the reader's `committed`
+// observer; what the database KEEPS is read from the registry tiers.
+std::vector<RegistryEvent>& committed_rows() {
+    static std::vector<RegistryEvent> rows;
+    return rows;
+}
+
+void record_committed(const std::vector<RegistryEvent>& rows) {
+    auto& all = committed_rows();
+    all.insert(all.end(), rows.begin(), rows.end());
+}
+
 TestDb make_db() {
+    committed_rows().clear();
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_registry_");
     auto r = EchoDatabase::open(tmp);
     REQUIRE(r.has_value());
     return TestDb{std::move(*r), tmp};
+}
+
+// Run `sql` over the committed rows laid out as the retired raw `registry_live` table (its columns
+// in their old order, `id` first, `record_key` unique with first-write-wins, as the raw store did),
+// so each assertion about a row's pid, detail, source or key keeps its original query.
+QueryResult ql(const std::string& sql) {
+    yuzu::test::SqliteHandleOwner<sqlite3> h;
+    REQUIRE(sqlite3_open(":memory:", &h.db) == SQLITE_OK);
+    std::string cols;
+    std::string marks;
+    for (const auto& c : legacy_live_columns("registry")) {
+        cols += (cols.empty() ? "" : ",") + std::string{c.name};
+        marks += marks.empty() ? "?" : ",?";
+    }
+    std::string ddl = "CREATE TABLE registry_live (id INTEGER PRIMARY KEY";
+    for (const auto& c : legacy_live_columns("registry"))
+        ddl += ", " + std::string{c.name} + " " + std::string{c.sql_type};
+    ddl += ", UNIQUE(record_key))";
+    REQUIRE(sqlite3_exec(h.db, ddl.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    const std::string ins = "INSERT OR IGNORE INTO registry_live (" + cols + ") VALUES (" + marks + ")";
+    for (const auto& e : committed_rows()) {
+        sqlite3_stmt* st = nullptr;
+        REQUIRE(sqlite3_prepare_v2(h.db, ins.c_str(), -1, &st, nullptr) == SQLITE_OK);
+        int i = 1;
+        const auto text = [&](const std::string& v) {
+            sqlite3_bind_text(st, i++, v.c_str(), static_cast<int>(v.size()), SQLITE_TRANSIENT);
+        };
+        const auto num = [&](std::int64_t v) { sqlite3_bind_int64(st, i++, v); };
+        num(e.ts); num(e.snapshot_id); text(e.hive); text(e.key_path); text(e.value_name);
+        text(e.action); text(e.data_type); text(e.data); num(e.data_size); num(e.data_truncated);
+        text(e.prev_data_type); text(e.prev_data); num(e.prev_data_size); num(e.prev_data_truncated);
+        num(e.actor_pid); text(e.actor_image); text(e.source); num(e.observed_at); text(e.detail);
+        text(e.record_key);
+        REQUIRE(sqlite3_step(st) == SQLITE_DONE);
+        sqlite3_finalize(st);
+    }
+    sqlite3_stmt* st = nullptr;
+    REQUIRE(sqlite3_prepare_v2(h.db, sql.c_str(), -1, &st, nullptr) == SQLITE_OK);
+    QueryResult out;
+    const int n = sqlite3_column_count(st);
+    for (int c = 0; c < n; ++c)
+        out.columns.emplace_back(sqlite3_column_name(st, c));
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        QueryRow row;
+        for (int c = 0; c < n; ++c) {
+            const auto* t = sqlite3_column_text(st, c);
+            row.emplace_back(t ? reinterpret_cast<const char*>(t) : "");
+        }
+        out.rows.push_back(std::move(row));
+    }
+    sqlite3_finalize(st);
+    return out;
 }
 
 const std::string kRoot = "HKLM\\SOFTWARE\\yuzu_test_r";
@@ -1018,6 +1087,7 @@ struct Fake {
         r.rearm = [this](const std::string& root) { return !unarmed.contains(root); };
         r.start = [] {};
         r.stop = [] {};
+        r.committed = record_committed;
         return r;
     }
 };
@@ -1043,8 +1113,9 @@ QueryResult q(EchoDatabase& db, const std::string& sql) {
     return *r;
 }
 
+// Events the database kept: the roll-up counts one per event in `change_count`.
 std::int64_t count_rows(EchoDatabase& db) {
-    return std::stoll(q(db, "SELECT COUNT(*) FROM registry_live").rows.at(0).at(0));
+    return std::stoll(q(db, "SELECT COALESCE(SUM(change_count), 0) FROM registry_hourly").rows.at(0).at(0));
 }
 
 RegistryCursor read_cursor(EchoDatabase& db) {
@@ -1053,13 +1124,13 @@ RegistryCursor read_cursor(EchoDatabase& db) {
     return decode_registry_cursor(*c);
 }
 
-// Fails every INSERT into registry_live from a second connection until released.
+// Fails every INSERT into the registry hourly tier from a second connection until released.
 struct InsertTrap {
     sqlite3* h{nullptr};
     explicit InsertTrap(const fs::path& p) {
         REQUIRE(sqlite3_open(p.string().c_str(), &h) == SQLITE_OK);
         REQUIRE(sqlite3_exec(h,
-                             "CREATE TRIGGER yuzu_test_trap BEFORE INSERT ON registry_live "
+                             "CREATE TRIGGER yuzu_test_trap BEFORE INSERT ON registry_hourly_r "
                              "BEGIN SELECT RAISE(ABORT, 'trap'); END",
                              nullptr, nullptr, nullptr) == SQLITE_OK);
     }
@@ -1157,7 +1228,7 @@ TEST_CASE("registry source: baseline tick writes baselines and no rows; a change
     f.clock = T0 + 300 * SEC;
     const auto third = tick(t.db, *src);
     CHECK(third.events_emitted == 1);
-    const auto rows = q(t.db, "SELECT action, hive, key_path, value_name, data, prev_data, "
+    const auto rows = ql("SELECT action, hive, key_path, value_name, data, prev_data, "
                               "actor_pid, actor_image, detail, observed_at, source, "
                               "prev_data_truncated, prev_data_size, ts FROM registry_live");
     REQUIRE(rows.rows.size() == 1);
@@ -1184,6 +1255,22 @@ TEST_CASE("registry source: baseline tick writes baselines and no rows; a change
     f.clock = T0 + 400 * SEC;
     CHECK(tick(t.db, *src).events_emitted == 0); // nothing dirty, nothing held: nothing more
     CHECK(count_rows(t.db) == 1);
+
+    // What the database keeps of that row is the roll-up tier: the key, the count, the last
+    // value, its type and the writer's image. The pid, the attribution detail and the source above
+    // are not stored.
+    const auto kept = q(t.db, "SELECT hive, key_path, value_name, action, change_count, last_data, "
+                              "last_data_type, last_actor_image FROM registry_hourly");
+    REQUIRE(kept.rows.size() == 1);
+    CHECK(kept.rows[0][0] == "HKLM");
+    CHECK(kept.rows[0][1] == "SOFTWARE\\yuzu_test_r\\Svc");
+    CHECK(kept.rows[0][2] == "Start");
+    CHECK(kept.rows[0][3] == "changed");
+    CHECK(kept.rows[0][4] == "1");
+    CHECK(kept.rows[0][5] == "2");
+    CHECK(kept.rows[0][6] == ql("SELECT data_type FROM registry_live").rows.at(0).at(0));
+    CHECK(kept.rows[0][7].empty());
+    CHECK(q(t.db, "SELECT COUNT(*) FROM registry_daily").rows.at(0).at(0) == "1"); // both tiers written
 }
 
 TEST_CASE("registry source: a burst well before the tick is written in that same tick",
@@ -1202,7 +1289,7 @@ TEST_CASE("registry source: a burst well before the tick is written in that same
     src->push_event_for_test(ev(T0 + 49 * SEC + SEC / 2, 812, RegistryEtwOp::Set, "Start", 4, 4, "services.exe"));
     CHECK(tick(t.db, *src).events_emitted == 1);
     CHECK(read_cursor(t.db).held.empty());
-    const auto rows = q(t.db, "SELECT actor_pid, detail FROM registry_live");
+    const auto rows = ql("SELECT actor_pid, detail FROM registry_live");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "812");
     CHECK(rows.rows[0][1] == "attr:corr");
@@ -1225,7 +1312,7 @@ TEST_CASE("registry source: a pushed event attributes by correlation; two pids a
         src->push_event_for_test(ev(held.window_hi + SEC, 78, RegistryEtwOp::Set, "Start", 4, 4, "y.exe"));
         f.clock = T0 + 300 * SEC;
         tick(t.db, *src);
-        const auto rows = q(t.db, "SELECT actor_pid, actor_image, detail FROM registry_live");
+        const auto rows = ql("SELECT actor_pid, actor_image, detail FROM registry_live");
         REQUIRE(rows.rows.size() == 1);
         if (two_pids) {
             CHECK(rows.rows[0][0] == "0"); // never a writer named when it is ambiguous
@@ -1257,7 +1344,7 @@ TEST_CASE("registry source: with the session down a change lands as attr:off at 
     // written by the tick that saw the change and nothing is held in the cursor.
     CHECK(tick(t.db, *src).events_emitted == 1);
     CHECK(read_cursor(t.db).held.empty());
-    const auto rows = q(t.db, "SELECT actor_pid, detail FROM registry_live");
+    const auto rows = ql("SELECT actor_pid, detail FROM registry_live");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "0");
     CHECK(rows.rows[0][1] == "attr:off");
@@ -1317,7 +1404,7 @@ TEST_CASE("registry source: a failed commit rolls back in memory and replays cle
 
     f.clock += SEC;
     tick(t.db, *src); // the trap is gone: re-reads, re-derives everything, commits
-    const auto rows = q(t.db, "SELECT actor_pid, detail, record_key FROM registry_live "
+    const auto rows = ql("SELECT actor_pid, detail, record_key FROM registry_live "
                               "WHERE action <> 'capture_gap'");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "5");
@@ -1328,7 +1415,7 @@ TEST_CASE("registry source: a failed commit rolls back in memory and replays cle
     CHECK(rows.rows[0][2] ==
           registry_diff_record_key(held.source, held.observed_at, held.action, held.key, held.value));
     // the loss counter was not absorbed by the failed tick: the replay reports it, once
-    const auto gaps = q(t.db, "SELECT detail FROM registry_live WHERE record_key LIKE 'gap:loss:%'");
+    const auto gaps = ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:loss:%'");
     REQUIRE(gaps.rows.size() == 1);
     CHECK(gaps.rows[0][0] == "gap:loss:3");
 }
@@ -1343,7 +1430,7 @@ TEST_CASE("registry source: lost cursor; restart; baseline loss; storage errors"
     SECTION("malformed stored cursor -> CursorLost, one gap row, every root re-baselined") {
         const auto r = src->collect(t.db, std::optional<std::string>{"{not json"});
         CHECK(r.outcome == CursorOutcome::CursorLost);
-        const auto rows = q(t.db, "SELECT action, detail FROM registry_live");
+        const auto rows = ql("SELECT action, detail FROM registry_live");
         REQUIRE(rows.rows.size() == 1);
         CHECK(rows.rows[0][0] == "capture_gap");
         CHECK_THAT(rows.rows[0][1], ContainsSubstring("gap:cursorlost"));
@@ -1367,7 +1454,7 @@ TEST_CASE("registry source: lost cursor; restart; baseline loss; storage errors"
         CHECK(read_cursor(t.db).held.empty());
         f2.clock = T0 + 600 * SEC;
         CHECK(tick(t.db, *src2).events_emitted == 0);
-        const auto rows = q(t.db, "SELECT action, detail, source FROM registry_live ORDER BY id");
+        const auto rows = ql("SELECT action, detail, source FROM registry_live ORDER BY id");
         REQUIRE(rows.rows.size() == 2);
         CHECK(rows.rows[0][0] == "capture_gap");
         CHECK(rows.rows[0][1].find("gap:restart") == 0);
@@ -1397,7 +1484,7 @@ TEST_CASE("registry source: lost cursor; restart; baseline loss; storage errors"
         tick(t.db, *src2);
         f2.clock = T0 + 600 * SEC;
         tick(t.db, *src2);
-        const auto rows = q(t.db, "SELECT data, actor_pid, detail FROM registry_live "
+        const auto rows = ql("SELECT data, actor_pid, detail FROM registry_live "
                                   "WHERE action = 'changed' ORDER BY id");
         REQUIRE(rows.rows.size() == 2);
         CHECK(rows.rows[0][0] == "2");
@@ -1421,7 +1508,7 @@ TEST_CASE("registry source: lost cursor; restart; baseline loss; storage errors"
         src2->push_event_for_test(ev(held.window_lo + SEC / 2, 5, RegistryEtwOp::Set, "Start"));
         f2.clock = T0 + 500 * SEC;
         CHECK(tick(t.db, *src2).outcome == CursorOutcome::Advanced);
-        const auto rows = q(t.db, "SELECT action, actor_pid, detail FROM registry_live ORDER BY id");
+        const auto rows = ql("SELECT action, actor_pid, detail FROM registry_live ORDER BY id");
         REQUIRE(rows.rows.size() == 2);
         CHECK(rows.rows[0][2].find("gap:restart") == 0);
         CHECK(rows.rows[1][0] == "changed");
@@ -1454,7 +1541,7 @@ TEST_CASE("registry source: lost cursor; restart; baseline loss; storage errors"
         f.dirty->mark(kRoot, f.clock);
         f.reads[kRoot] = svc(2);
         tick(t.db, *src);
-        const auto rows = q(t.db, "SELECT detail FROM registry_live");
+        const auto rows = ql("SELECT detail FROM registry_live");
         REQUIRE(rows.rows.size() == 1); // the gap only: no change was invented from the lost baseline
         CHECK_THAT(rows.rows[0][0], ContainsSubstring("gap:baselinelost"));
         // a malformed baseline is treated the same way
@@ -1499,7 +1586,7 @@ TEST_CASE("registry source: disable discards the paused window; re-enable re-bas
     f.clock = T0 + 100 * SEC;
     const auto r = tick(t.db, *src);
     CHECK(r.outcome == CursorOutcome::CursorLost);
-    const auto rows = q(t.db, "SELECT detail FROM registry_live");
+    const auto rows = ql("SELECT detail FROM registry_live");
     REQUIRE(rows.rows.size() == 1); // the gap; the paused-window change is NOT reported
     CHECK_THAT(rows.rows[0][0], ContainsSubstring("gap:disabled"));
     CHECK(read_cursor(t.db).held.empty());
@@ -1516,7 +1603,7 @@ TEST_CASE("registry source: a candidate held across a disable finalises as lost-
     src->on_enabled_changed(true);
     f.clock = T0 + 300 * SEC;
     tick(t.db, *src);
-    const auto rows = q(t.db, "SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
+    const auto rows = ql("SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "0");
     CHECK(rows.rows[0][1] == "attr:lost-restart");
@@ -1552,7 +1639,7 @@ TEST_CASE("registry source: buffer overflow becomes a loss epoch that degrades o
     CHECK(cur.loss[0].lo == T0 + 95 * SEC + SEC / 2); // the evicted event's own timestamp
     CHECK(cur.loss[0].hi == T0 + 95 * SEC + SEC / 2);
     CHECK(cur.held.size() == 2); // the settle hold keeps both
-    const auto gap = q(t.db, "SELECT detail FROM registry_live");
+    const auto gap = ql("SELECT detail FROM registry_live");
     REQUIRE(gap.rows.size() == 1);
     CHECK(gap.rows[0][0] == "gap:loss:1");
     CHECK(t.db.get_config("registry_etw_dropped", "") == "1");
@@ -1561,7 +1648,7 @@ TEST_CASE("registry source: buffer overflow becomes a loss epoch that degrades o
     // candidate it overlaps, and the disjoint one attributes.
     f.clock = T0 + 200 * SEC;
     tick(t.db, *src);
-    const auto rows = q(t.db, "SELECT key_path, actor_pid, detail FROM registry_live "
+    const auto rows = ql("SELECT key_path, actor_pid, detail FROM registry_live "
                               "WHERE action != 'capture_gap' ORDER BY value_name");
     REQUIRE(rows.rows.size() == 2);
     CHECK(rows.rows[0][2] == "attr:corr"); // Count, root B: its window is disjoint from the epoch
@@ -1570,7 +1657,7 @@ TEST_CASE("registry source: buffer overflow becomes a loss epoch that degrades o
     CHECK(rows.rows[1][1] == "0");
     // The eviction was reported by the first tick and absorbed with its commit: the second tick
     // (no new eviction) writes no second gap row.
-    CHECK(std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
+    CHECK(std::stoll(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
                         .rows.at(0).at(0)) == 1);
 }
 
@@ -1585,7 +1672,7 @@ TEST_CASE("registry source: kernel loss and a failed loss query are loss, report
     f.clock = T0 + 100 * SEC;
     f.loss.events_lost = 3;
     tick(t.db, *src);
-    auto gap = q(t.db, "SELECT detail FROM registry_live");
+    auto gap = ql("SELECT detail FROM registry_live");
     REQUIRE(gap.rows.size() == 1);
     CHECK(gap.rows[0][0] == "gap:loss:3");
     CHECK(t.db.get_config("registry_etw_lost", "") == "3");
@@ -1596,7 +1683,7 @@ TEST_CASE("registry source: kernel loss and a failed loss query are loss, report
     f.loss.query_ok = false; // the query failing is itself loss ...
     f.clock = T0 + 300 * SEC;
     tick(t.db, *src);
-    gap = q(t.db, "SELECT detail FROM registry_live ORDER BY id");
+    gap = ql("SELECT detail FROM registry_live ORDER BY id");
     REQUIRE(gap.rows.size() == 2);
     CHECK(gap.rows[1][0] == "gap:loss:1");
     f.loss.query_ok = true; // ... and recovering is not
@@ -1608,7 +1695,7 @@ TEST_CASE("registry source: kernel loss and a failed loss query are loss, report
     f.loss.decode_failed = 2; // callback decode failures are loss too
     f.clock = T0 + 500 * SEC;
     tick(t.db, *src);
-    gap = q(t.db, "SELECT detail FROM registry_live ORDER BY id");
+    gap = ql("SELECT detail FROM registry_live ORDER BY id");
     REQUIRE(gap.rows.size() == 3);
     CHECK(gap.rows[2][0] == "gap:loss:2");
 }
@@ -1643,7 +1730,7 @@ TEST_CASE("registry source: loss over a held window degrades it (kernel counters
         if (mode == Loss::FailedQuery)
             f.loss.query_ok = false;
         tick(t.db, *src);
-        const auto rows = q(t.db, "SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
+        const auto rows = ql("SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
         REQUIRE(rows.rows.size() == 1);
         if (mode == Loss::None) { // the control: the same setup attributes when nothing was lost
             CHECK(rows.rows[0][0] == "812");
@@ -1684,7 +1771,7 @@ TEST_CASE("registry source: an eviction during loss sampling cannot select the s
     REQUIRE(fired);
     REQUIRE(f.buffer->drop_info().count == 1); // the positive control: the eviction happened mid-tick
 
-    const auto rows = q(t.db, "SELECT actor_pid, actor_image, detail FROM registry_live WHERE action = 'changed'");
+    const auto rows = ql("SELECT actor_pid, actor_image, detail FROM registry_live WHERE action = 'changed'");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "0"); // never the survivor
     CHECK(rows.rows[0][1].empty());
@@ -1747,7 +1834,7 @@ TEST_CASE("registry source: a kernel loss counted after the reads lies inside it
 
         f.clock = T0 + 300 * SEC; // the window has settled; no new loss is reported
         tick(t.db, *src);
-        const auto rows = q(t.db, "SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
+        const auto rows = ql("SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
         REQUIRE(rows.rows.size() == 1);
         if (lose) {
             CHECK(rows.rows[0][0] == "0"); // never the bystander across a reported loss
@@ -1849,11 +1936,11 @@ TEST_CASE("registry source: a budget-deferred never-complete root keeps its pend
 
     d.f.clock = T0 + 401 * SEC;
     tick(d.t.db, *d.src);
-    const auto rows = q(d.t.db, "SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
+    const auto rows = ql("SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "0"); // two writers: never the survivor
     CHECK(rows.rows[0][1] == "attr:ambiguous:2");
-    CHECK(q(d.t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
              .rows.at(0).at(0) == "0");
 }
 
@@ -1866,11 +1953,11 @@ TEST_CASE("registry source: a budget-deferred never-complete root keeps the loss
 
     d.f.clock = T0 + 401 * SEC;
     tick(d.t.db, *d.src);
-    const auto rows = q(d.t.db, "SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
+    const auto rows = ql("SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "0");
     CHECK(rows.rows[0][1] == "attr:degraded");
-    CHECK(q(d.t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
              .rows.at(0).at(0) == "1");
 }
 
@@ -1914,7 +2001,7 @@ TEST_CASE("registry source: read statuses; status keys; fair root scheduling",
         CHECK(t.db.get_config("registry_watch_roots", "") == "2");
         CHECK(read_cursor(t.db).roots.at(kRoot).window_base == 0); // a Capped read does not advance it
         // ... and the held change lands, the only non-gap row
-        CHECK(std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE action <> 'capture_gap'")
+        CHECK(std::stoll(ql("SELECT COUNT(*) FROM registry_live WHERE action <> 'capture_gap'")
                             .rows.at(0).at(0)) == 1);
     }
 
@@ -1982,11 +2069,11 @@ TEST_CASE("registry source: an unreadable root and a denied child set that gains
     auto src = make_registry_cursor_source(scope1(), f.reader());
     const std::string locked = kRoot + "\\Locked";
     auto gap_count = [&] {
-        return std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
+        return std::stoll(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
                              .rows.at(0).at(0));
     };
     auto last_gap = [&] {
-        return q(t.db, "SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+        return ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
                        "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
     };
     // A read of the root with Svc\Start = `start`, optionally with Locked readable and holding a value.
@@ -2019,7 +2106,7 @@ TEST_CASE("registry source: an unreadable root and a denied child set that gains
     // values are kept (no `removed` rows), the root is NOT unreadable, and ONE gap names it.
     CHECK(next_tick(read(2, false, {locked})).events_emitted == 2);
     CHECK(count_rows(t.db) == 2);
-    CHECK(std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE action IN ('removed','key_removed')")
+    CHECK(std::stoll(ql("SELECT COUNT(*) FROM registry_live WHERE action IN ('removed','key_removed')")
                         .rows.at(0).at(0)) == 0);
     CHECK(gap_count() == 1);
     CHECK_THAT(last_gap(), ContainsSubstring("gap:unreadable:" + kRoot));
@@ -2073,11 +2160,11 @@ TEST_CASE("registry source: the denied child set writes a gap only when it gains
     auto src = make_registry_cursor_source(scope1(), f.reader());
     const std::string a = kRoot + "\\A", b = kRoot + "\\B", c = kRoot + "\\C", d = kRoot + "\\D";
     auto gap_count = [&] {
-        return std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
+        return std::stoll(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
                              .rows.at(0).at(0));
     };
     auto last_gap = [&] {
-        return q(t.db, "SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+        return ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
                        "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
     };
     auto stored = [&] { return read_cursor(t.db).roots.at(kRoot).skipped; };
@@ -2225,7 +2312,7 @@ TEST_CASE("registry source: a root that stays Unreadable under budget pressure k
         CHECK(f.read_calls[0] == (i % 2 == 0 ? kRoot : kRoot2));
         CHECK(read_cursor(t.db).roots.at(kRoot).status == "unreadable");
     }
-    const auto gaps = q(t.db, "SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'");
+    const auto gaps = ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'");
     REQUIRE(gaps.rows.size() == 1);
     CHECK_THAT(gaps.rows[0][0], ContainsSubstring("gap:unreadable:" + kRoot + " (the root could not be read"));
     CHECK(count_rows(t.db) == 1); // B's unchanged reads wrote nothing
@@ -2254,7 +2341,7 @@ TEST_CASE("registry source: a control-set switch re-baselines CurrentControlSet 
     f.clock = T0 + 200 * SEC;
     f.dirty->mark(svc_root, f.clock);
     tick(t.db, *src);
-    const auto rows = q(t.db, "SELECT detail FROM registry_live");
+    const auto rows = ql("SELECT detail FROM registry_live");
     REQUIRE(rows.rows.size() == 1); // one gap; no removed/added storm
     CHECK_THAT(rows.rows[0][0], ContainsSubstring("control set changed"));
     CHECK(read_cursor(t.db).ccs == "ControlSet002");
@@ -2571,6 +2658,7 @@ RegistryReader live_reader() {
     auto r = make_windows_registry_reader();
     auto inner = r.now_ts;
     r.now_ts = [inner] { return inner() + g_clock_offset.load(); };
+    r.committed = record_committed;
     return r;
 }
 
@@ -2659,7 +2747,7 @@ TEST_CASE("registry live: set, change and delete through a pre-opened handle are
         mine("LiveVal", RegistryEtwOp::Set));
     run.transition([&] { RegDeleteValueW(key.h, L"LiveVal"); }, mine("LiveVal", RegistryEtwOp::DeleteValue));
 
-    const auto rows = q(run.t.db, "SELECT action, data, prev_data, actor_pid, actor_image, detail, source, ts "
+    const auto rows = ql("SELECT action, data, prev_data, actor_pid, actor_image, detail, source, ts "
                                   "FROM registry_live WHERE value_name = 'LiveVal' ORDER BY id");
     REQUIRE(rows.rows.size() == 3);
     CHECK(rows.rows[0][0] == "added");
@@ -2691,7 +2779,7 @@ TEST_CASE("registry live: with the ETW leg disabled the same transitions land as
     tick(run.t.db, *run.src); // baseline
     DWORD v = 7;
     run.transition([&] { RegSetValueExW(key.h, L"OffVal", 0, REG_DWORD, reinterpret_cast<BYTE*>(&v), 4); });
-    const auto rows = q(run.t.db, "SELECT actor_pid, actor_image, detail FROM registry_live "
+    const auto rows = ql("SELECT actor_pid, actor_image, detail FROM registry_live "
                                   "WHERE value_name = 'OffVal'");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "0");
@@ -2748,7 +2836,7 @@ TEST_CASE("registry live: a deleted and recreated root re-arms (R13)", "[echo][r
         RegDeleteTreeW(HKEY_LOCAL_MACHINE, key.path.c_str());
         RegDeleteKeyW(HKEY_LOCAL_MACHINE, key.path.c_str());
     }); // Absent: values and the key removed
-    const auto removed = q(run.t.db, "SELECT COUNT(*) FROM registry_live WHERE action IN ('removed','key_removed')");
+    const auto removed = ql("SELECT COUNT(*) FROM registry_live WHERE action IN ('removed','key_removed')");
     CHECK(std::stoi(removed.rows[0][0]) >= 1);
 
     // Recreated: the root is unarmed, so this tick re-opens it and arms it again ...
@@ -2757,7 +2845,7 @@ TEST_CASE("registry live: a deleted and recreated root re-arms (R13)", "[echo][r
     CHECK(run.t.db.get_config("registry_watch_roots_unarmed", "") == "0"); // armed again
     // ... and a write after that is reported by the key watch itself, not by a hand-made mark.
     run.transition([&] { RegSetValueExW(key.h, L"Again", 0, REG_DWORD, reinterpret_cast<BYTE*>(&v), 4); });
-    CHECK(std::stoi(q(run.t.db, "SELECT COUNT(*) FROM registry_live WHERE value_name = 'Again' AND action = 'added'")
+    CHECK(std::stoi(ql("SELECT COUNT(*) FROM registry_live WHERE value_name = 'Again' AND action = 'added'")
                        .rows[0][0]) == 1);
 }
 
