@@ -2487,7 +2487,15 @@ TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the app
                                "must differ from the subject of the grant",
                                "the reviewer must differ from the subject of this grant; ask another "
                                "reviewer to record this decision",
-                               "get_access_review and compare decision_seq before retrying"})
+                               "at most 256 bytes each and justification at most 4096 bytes",
+                               "at most 100 recorded decisions",
+                               "refused with invalid params and records nothing",
+                               "returns decision_seq",
+                               "previous_decision",
+                               "retry_after_ms can mean the decision was recorded anyway",
+                               "before retrying, call get_access_review, compare decision_seq",
+                               "match reviewer, justification and decided_at_ms",
+                               "a blind retry appends another identical decision"})
         CHECK(rdesc.find(needle) != std::string::npos);
     for (const char* stale : {"UPSERT", "OVERWRITES", "not retained"})
         CHECK(rdesc.find(stale) == std::string::npos);

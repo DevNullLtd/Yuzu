@@ -154,6 +154,15 @@ std::string history_block(const AccessReviewAttestationRow& a) {
     if (a.history.empty())
         return "<span class=\"sub\">" + marker + "</span>";
     std::string out = "<details class=\"ar-history\"><summary class=\"sub\">" + marker + "</summary>";
+    // The read returns only a grant's latest entries (kMaxDecisionsPerGrant): say so when the
+    // count recorded is larger than what is listed.
+    if (recorded > a.history.size()) {
+        const std::size_t hidden = recorded - a.history.size();
+        out += "<span class=\"sub\">" + std::to_string(hidden) +
+               (hidden == 1 ? " earlier decision is not shown"
+                            : " earlier decisions are not shown") +
+               "</span>";
+    }
     for (std::size_t i = 0; i < a.history.size(); ++i)
         out += history_entry(a, i);
     return out + "</details>";

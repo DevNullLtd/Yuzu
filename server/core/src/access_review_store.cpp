@@ -456,6 +456,12 @@ AccessReviewStore::record_attestation(const std::string& campaign_id,
         }
         const std::string old_decision = PQgetvalue(pre.get(), 0, 0);
         const std::int32_t old_seq = static_cast<std::int32_t>(to_i64(PQgetvalue(pre.get(), 0, 1)));
+        // Per-grant cap, decided under the row lock so two racing attests cannot both pass it.
+        // Returning false rolls the transaction back: no history row, state unchanged.
+        if (old_seq >= kMaxDecisionsPerGrant) {
+            error_msg = "bad_request: " + std::string(kDecisionCapMessage);
+            return false;
+        }
         const std::string new_seq = std::to_string(old_seq + 1);
 
         pg::PgResult hist = pg::exec_params(
@@ -585,12 +591,26 @@ AccessReviewStore::get_campaign(const std::string& campaign_id, bool include_his
         if (include_history) {
             // Same snapshot as the two reads above. Both result sets are ordered by the grant's
             // 4-tuple, so a history row's grant is found by a forward merge, not a search.
-            std::string hsql = std::string("SELECT ") + kHistoryCols +
-                               " FROM access_review_store.access_review_attestation_history "
-                               "WHERE campaign_id=$1 "
-                               "ORDER BY principal_type, principal_id, role_name, seq";
-            pg::PgResult hres =
-                pg::exec_params(conn, hsql.c_str(), std::vector<std::string>{campaign_id});
+            // Each grant returns only its latest kMaxDecisionsPerGrant entries (`seq` greater than
+            // the state row's decision_seq minus the cap), so a grant carrying more rows than the
+            // write cap allows (written by other means) cannot make this read unbounded.
+            // decision_seq stays the total count, so truncation reads as decision_seq > entries.
+            // COALESCE keeps a history row whose state row is missing, so the merge below still
+            // reports that corruption instead of the row silently vanishing.
+            std::string hsql =
+                std::string("SELECT ") + kHistoryCols +
+                " FROM access_review_store.access_review_attestation_history h "
+                "WHERE campaign_id=$1 "
+                "  AND seq > COALESCE((SELECT a.decision_seq "
+                "                      FROM access_review_store.access_review_attestation a "
+                "                      WHERE a.campaign_id = h.campaign_id "
+                "                        AND a.principal_type = h.principal_type "
+                "                        AND a.principal_id = h.principal_id "
+                "                        AND a.role_name = h.role_name), 0) - $2::integer "
+                "ORDER BY principal_type, principal_id, role_name, seq";
+            pg::PgResult hres = pg::exec_params(
+                conn, hsql.c_str(),
+                std::vector<std::string>{campaign_id, std::to_string(kMaxDecisionsPerGrant)});
             if (hres.status() != PGRES_TUPLES_OK) {
                 error_msg = std::string("get_campaign history read failed: ") +
                             PQerrorMessage(conn);

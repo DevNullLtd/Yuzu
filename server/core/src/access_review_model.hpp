@@ -212,6 +212,19 @@ inline constexpr std::size_t kRoleNameMaxLen = 256;
 inline constexpr std::string_view kGrantFieldInvalidMessage =
     "principal_type, principal_id and role_name must be 1-256 bytes without NUL";
 
+/// Most decisions one grant keeps. `record_attestation` refuses the next one (`bad_request:` +
+/// `kDecisionCapMessage`, nothing written) and `get_campaign(id, true)` returns at most this many
+/// history entries per grant (the latest), so one grant cannot make a read or a response grow
+/// without bound. `decision_seq` stays the total count: a consumer detects a truncated history as
+/// `decision_seq > history.size()`. Same type as `decision_seq`.
+inline constexpr std::int32_t kMaxDecisionsPerGrant = 100;
+
+/// The refusal text REST (400) and MCP (invalid-params) return for a decision past the cap, so the
+/// two transports (and the store, which prefixes `bad_request: `) cannot drift.
+inline constexpr std::string_view kDecisionCapMessage =
+    "this grant already has the maximum number of recorded decisions (100); a further decision "
+    "cannot be recorded";
+
 /// True when `principal_type`, `principal_id` and `role_name` are each within their cap and free of
 /// a NUL byte (emptiness is the caller's own check). `pg/pg_exec.hpp` binds `c_str()`, so a NUL
 /// would truncate the bound value and name a different grant than the one audited.

@@ -2262,7 +2262,15 @@ TEST_CASE("attestation SoD: a different reviewer records, and every decision is 
         auto r1 = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
         REQUIRE(r1);
         CHECK(r1->status == 200);
-        CHECK(nlohmann::json::parse(r1->body)["data"]["recorded"] == true);
+        // The success body names what the decision superseded: a first decision answers seq 1
+        // over `pending`.
+        const auto b1 = nlohmann::json::parse(r1->body)["data"];
+        REQUIRE(b1.contains("decision_seq"));
+        REQUIRE(b1.contains("previous_decision"));
+        CHECK(b1["recorded"] == true);
+        CHECK(b1["decision_seq"] == 1);
+        CHECK(b1["previous_decision"] == "pending");
+        CHECK(b1.size() == 3);
         CHECK(r1->get_header_value("Sec-Audit-Failed").empty());
         auto rows = audit_rows(h, "access_review.attested");
         REQUIRE(rows.size() == 1);
@@ -2273,6 +2281,10 @@ TEST_CASE("attestation SoD: a different reviewer records, and every decision is 
         auto r2 = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
         REQUIRE(r2);
         CHECK(r2->status == 200);
+        // An identical repeat appends too: seq 2, superseding the attested decision.
+        const auto b2 = nlohmann::json::parse(r2->body)["data"];
+        CHECK(b2["decision_seq"] == 2);
+        CHECK(b2["previous_decision"] == "attested");
         rows = audit_rows(h, "access_review.attested");
         REQUIRE(rows.size() == 2);
         CHECK(rows[1].target_id == cid);
@@ -2282,6 +2294,9 @@ TEST_CASE("attestation SoD: a different reviewer records, and every decision is 
             h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator", "flagged_revoke"));
         REQUIRE(r3);
         CHECK(r3->status == 200);
+        const auto b3 = nlohmann::json::parse(r3->body)["data"];
+        CHECK(b3["decision_seq"] == 3);
+        CHECK(b3["previous_decision"] == "attested");
         const auto flagged = audit_rows(h, "access_review.flagged");
         REQUIRE(flagged.size() == 1);
         CHECK(flagged[0].detail ==
@@ -2293,6 +2308,13 @@ TEST_CASE("attestation SoD: a different reviewer records, and every decision is 
         CHECK(row.decision_seq == 3);
         REQUIRE(row.history.size() == 3);
         CHECK(row.history[2].previous_decision == "attested");
+        // An attest over the flag reports that it replaced a flagged_revoke decision.
+        auto r4 = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
+        REQUIRE(r4);
+        CHECK(r4->status == 200);
+        const auto b4 = nlohmann::json::parse(r4->body)["data"];
+        CHECK(b4["decision_seq"] == 4);
+        CHECK(b4["previous_decision"] == "flagged_revoke");
         // No refusal was counted.
         CHECK(refused_count(h, "rest", "self_subject") == 0.0);
     }
@@ -2302,14 +2324,34 @@ TEST_CASE("attestation SoD: a different reviewer records, and every decision is 
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("result"));
-        CHECK(body["result"]["structuredContent"]["recorded"] == true);
-        CHECK_FALSE(body["result"]["structuredContent"].contains("audit_persisted"));
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK(sc["recorded"] == true);
+        REQUIRE(sc.contains("decision_seq"));
+        REQUIRE(sc.contains("previous_decision"));
+        CHECK(sc["decision_seq"] == 1);
+        CHECK(sc["previous_decision"] == "pending");
+        CHECK_FALSE(sc.contains("audit_persisted"));
         const auto rows = audit_rows(h, "access_review.attested");
         REQUIRE(rows.size() == 1);
         CHECK(rows[0].result == "success");
         CHECK(rows[0].target_id == cid);
         CHECK(rows[0].detail == "decision=attested previous=pending seq=1 sod=pass" + tuple);
         CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 1);
+
+        // A second call (a different decision) reports seq 2 over the first.
+        auto again = h.mcp_call_tool("record_attestation",
+                                     sod_args(cid, "user", "bob", "Operator", "flagged_revoke"));
+        REQUIRE(again);
+        const auto sc2 = nlohmann::json::parse(again->body)["result"]["structuredContent"];
+        CHECK(sc2["decision_seq"] == 2);
+        CHECK(sc2["previous_decision"] == "attested");
+        // And an identical repeat appends at 3 over the flag it repeats.
+        auto third = h.mcp_call_tool("record_attestation",
+                                     sod_args(cid, "user", "bob", "Operator", "flagged_revoke"));
+        REQUIRE(third);
+        const auto sc3 = nlohmann::json::parse(third->body)["result"]["structuredContent"];
+        CHECK(sc3["decision_seq"] == 3);
+        CHECK(sc3["previous_decision"] == "flagged_revoke");
     }
 }
 
@@ -2926,6 +2968,9 @@ TEST_CASE("access review store errors: every string the store returns maps to on
         {"bad_request: reviewer cannot be empty", 400, kInvalidParams},
         {"bad_request: justification contains a NUL byte", 400, kInvalidParams},
         {"bad_request: justification exceeds 4096 bytes", 400, kInvalidParams},
+        {"bad_request: this grant already has the maximum number of recorded decisions (100); a "
+         "further decision cannot be recorded",
+         400, kInvalidParams},
         {"bad_request: closed_by contains a NUL byte", 400, kInvalidParams},
         {"forbidden: reviewer is the subject of this grant", 403, kPermissionDenied},
         {"database not open", 503, kInternalError},
@@ -3106,4 +3151,249 @@ TEST_CASE("decision history: REST, MCP and the Access page agree, and the OpenAP
     // The justification carries markup; it reaches the page escaped only.
     CHECK(frag->body.find("left &lt;the&gt; team") != std::string::npos);
     CHECK(frag->body.find("left <the> team") == std::string::npos);
+}
+
+// ── Per-grant decision cap and the success body (#4752) ────────────────────
+
+namespace {
+
+// Fill one grant to exactly `kMaxDecisionsPerGrant` decisions through the store, which the REST and
+// MCP handlers sit on (the cap is the store's, so this is the same state a run of real attests
+// leaves).
+void fill_grant_to_cap(AccessReviewHarness& h, const std::string& cid, const std::string& user,
+                       const std::string& reviewer) {
+    for (std::int32_t i = 1; i <= yuzu::server::kMaxDecisionsPerGrant; ++i) {
+        auto r = h.access_review_store->record_attestation(
+            cid, "user", user, "Operator", i % 2 ? "attested" : "flagged_revoke", reviewer, "");
+        REQUIRE(r.has_value());
+        REQUIRE(r->seq == i);
+    }
+}
+
+} // namespace
+
+TEST_CASE("attestation cap: the decision after the 100th is 400 on REST and invalid-params on MCP, "
+          "audited as a failure, and writes nothing",
+          "[pg][access_review][rest][mcp][4752]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    seed_user_grant(h, "erin");
+    const auto cid = h.open_campaign_rest("decision cap");
+    fill_grant_to_cap(h, cid, "bob", "carol");
+    h.session_user = "carol";
+    h.audit_log.clear();
+    const std::string tuple = " principal_type=user principal_id=bob role=Operator";
+    const std::string expected = "bad_request: " + std::string(yuzu::server::kDecisionCapMessage);
+
+    const auto unchanged = [&] {
+        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        CHECK(row.decision_seq == 100);
+        CHECK(row.decision == "flagged_revoke"); // the 100th decision is even
+        CHECK(row.reviewer == "carol");
+        CHECK(row.history.size() == 100);
+        CHECK(row.history.back().seq == 100);
+    };
+
+    SECTION("REST") {
+        auto res = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body.contains("error")); // a success body here means the cap was not enforced
+        CHECK(body["error"]["message"] == expected);
+        CHECK(body["error"]["retry_after_ms"].is_null()); // a refusal, not a retryable fault
+        // The existing bad_request path: one failure row under the attested verb, the campaign as
+        // target and the grant tuple in the detail; no success row, no flagged row.
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "failure");
+        CHECK(rows[0].target_id == cid);
+        CHECK(rows[0].detail.starts_with("bad_request:"));
+        CHECK(rows[0].detail.ends_with(tuple));
+        CHECK(audit_rows(h, "access_review.flagged").empty());
+        unchanged();
+
+        // The refusal repeats and still writes nothing.
+        auto again = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator", "attested"));
+        REQUIRE(again);
+        CHECK(again->status == 400);
+        unchanged();
+
+        // Another grant in the same campaign is unaffected.
+        auto other = h.sink.Post(attest_url(cid), sod_body("user", "erin", "Operator"));
+        REQUIRE(other);
+        CHECK(other->status == 200);
+        CHECK(nlohmann::json::parse(other->body)["data"]["decision_seq"] == 1);
+    }
+
+    SECTION("MCP") {
+        auto res = h.mcp_call_tool("record_attestation", sod_args(cid, "user", "bob", "Operator"));
+        const auto err = mcp_error_of(res);
+        CHECK(err["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(err["message"] == expected);
+        const auto rows = audit_rows(h, "access_review.attested");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "failure");
+        CHECK(rows[0].target_id == cid);
+        CHECK(rows[0].detail.starts_with("bad_request:"));
+        CHECK(rows[0].detail.ends_with(tuple));
+        const auto wrapper = audit_rows(h, "mcp.record_attestation");
+        REQUIRE(wrapper.size() == 1);
+        CHECK(wrapper[0].result == "failure");
+        unchanged();
+
+        auto other =
+            h.mcp_call_tool("record_attestation", sod_args(cid, "user", "erin", "Operator"));
+        REQUIRE(other);
+        const auto sc = nlohmann::json::parse(other->body)["result"]["structuredContent"];
+        REQUIRE(sc.contains("decision_seq"));
+        CHECK(sc["decision_seq"] == 1);
+        CHECK(sc["previous_decision"] == "pending");
+    }
+}
+
+TEST_CASE("attestation success body: OpenAPI and the MCP output schema name exactly the fields the "
+          "handlers return",
+          "[pg][access_review][rest][mcp][4752]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    const auto cid = h.open_campaign_rest("success schema");
+    h.session_user = "carol";
+
+    auto rest = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
+    REQUIRE(rest);
+    REQUIRE(rest->status == 200);
+    const auto data = nlohmann::json::parse(rest->body)["data"];
+
+    const auto spec = nlohmann::json::parse(yuzu::server::openapi_spec_json());
+    const auto& ok = spec["paths"]["/access-reviews/{id}/attestations"]["post"]["responses"]["200"];
+    const auto& props =
+        ok["content"]["application/json"]["schema"]["properties"]["data"]["properties"];
+    CHECK(props.size() == data.size());
+    for (auto it = data.begin(); it != data.end(); ++it)
+        CHECK(props.contains(it.key()));
+    CHECK(ok["content"]["application/json"]["schema"]["properties"]["data"]["required"].size() ==
+          data.size());
+
+    nlohmann::json list = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/list"}};
+    auto tools = h.mcp_call(list.dump());
+    REQUIRE(tools);
+    const auto tool_list = nlohmann::json::parse(tools->body)["result"]["tools"];
+    bool found = false;
+    for (const auto& t : tool_list) {
+        if (t["name"] != "record_attestation")
+            continue;
+        found = true;
+        const auto& out = t["outputSchema"];
+        CHECK(out["properties"]["decision_seq"]["type"] == "integer");
+        CHECK(out["properties"]["previous_decision"]["type"] == "string");
+        CHECK(out["properties"].size() == 3);
+        CHECK(out["required"].size() == 3);
+    }
+    CHECK(found);
+}
+
+TEST_CASE("bounded history read: a grant carrying 105 history rows returns its latest 100, and the "
+          "Access page says how many earlier decisions are not shown",
+          "[pg][access_review][rest][access-reviews][4752]") {
+    // A per-test migrated clone: the guard triggers are disabled below, which must not reach the
+    // file-wide shared database.
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_rest_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    REQUIRE(pool.valid());
+    AccessReviewHarness h{true, true, &pool};
+    seed_user_grant(h, "bob");
+    seed_user_grant(h, "erin");
+    const auto cid = h.open_campaign_rest("bounded read");
+    h.session_user = "carol";
+    REQUIRE(h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"))->status == 200);
+    REQUIRE(h.sink.Post(attest_url(cid), sod_body("user", "erin", "Operator"))->status == 200);
+
+    {
+        yuzu::server::pg::PgConn c{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        const std::string att = "access_review_store.access_review_attestation";
+        const std::string hist = "access_review_store.access_review_attestation_history";
+        for (const std::string sql :
+             {"ALTER TABLE " + att + " DISABLE TRIGGER access_review_attestation_guard",
+              "ALTER TABLE " + hist + " DISABLE TRIGGER access_review_history_consistent",
+              "INSERT INTO " + hist +
+                  " (campaign_id, principal_type, principal_id, role_name, seq, decision, "
+                  "previous_decision, reviewer, justification, decided_at_ms) "
+                  "SELECT '" + cid + "','user','bob','Operator', g, 'attested', 'attested', "
+                  "'carol', '', g FROM generate_series(2,105) g",
+              "UPDATE " + att + " SET decision_seq=105 WHERE campaign_id='" + cid +
+                  "' AND principal_id='bob'"}) {
+            yuzu::server::pg::PgResult r{PQexec(c.get(), sql.c_str())};
+            INFO(sql);
+            REQUIRE(r.ok());
+        }
+    }
+
+    auto view = h.access_review_store->get_campaign(cid, /*include_history=*/true);
+    REQUIRE(view.has_value());
+    const yuzu::server::AccessReviewAttestationRow* bob = nullptr;
+    const yuzu::server::AccessReviewAttestationRow* erin = nullptr;
+    for (const auto& a : view->attestations)
+        (a.principal_id == "bob" ? bob : erin) = &a;
+    REQUIRE(bob != nullptr);
+    REQUIRE(erin != nullptr);
+    CHECK(bob->decision_seq == 105);
+    REQUIRE(bob->history.size() == 100);
+    CHECK(bob->history.front().seq == 6);
+    CHECK(bob->history.back().seq == 105);
+    for (std::size_t i = 1; i < bob->history.size(); ++i)
+        CHECK(bob->history[i].seq == bob->history[i - 1].seq + 1);
+    // The other grant keeps its whole (one-entry) history.
+    CHECK(erin->decision_seq == 1);
+    CHECK(erin->history.size() == 1);
+
+    // Without history the shape is unchanged: no entries, the total still reported.
+    auto bare = h.access_review_store->get_campaign(cid);
+    REQUIRE(bare.has_value());
+    for (const auto& a : bare->attestations)
+        CHECK(a.history.empty());
+
+    // The write cap still holds past the cap: nothing more is recorded for the over-cap grant.
+    auto over = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
+    REQUIRE(over);
+    CHECK(over->status == 400);
+
+    // The Access page names the gap.
+    yuzu::server::test::TestRouteSink page;
+    yuzu::server::access_reviews::ReviewsDeps d;
+    d.auth_fn = [&h](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = h.session_user;
+        s.role = h.session_role;
+        return s;
+    };
+    d.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                   const std::string&) { return true; };
+    d.quiet_perm_fn = d.perm_fn;
+    d.probe_perm_fn = [](const httplib::Request&, const std::string&, const std::string&) {
+        return true;
+    };
+    d.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+    d.list_campaigns_fn = []() -> std::expected<std::vector<AccessReviewCampaignRow>, std::string> {
+        return std::vector<AccessReviewCampaignRow>{};
+    };
+    d.get_campaign_fn = [&h](const std::string& id) {
+        return h.access_review_store->get_campaign(id, /*include_history=*/true);
+    };
+    d.grants_fn = []() -> std::expected<yuzu::server::access_reviews::GrantsView, std::string> {
+        return yuzu::server::access_reviews::GrantsView{};
+    };
+    yuzu::server::access_reviews::register_access_reviews_routes(page, std::move(d));
+    const auto frag = page.Get("/fragments/access/reviews/campaign?id=" + cid);
+    REQUIRE(frag);
+    REQUIRE(frag->status == 200);
+    CHECK(frag->body.find("5 earlier decisions are not shown") != std::string::npos);
+    CHECK(frag->body.find("#6 attested") != std::string::npos);
+    CHECK(frag->body.find("#5 attested") == std::string::npos);
+    // The grant with a complete history shows no such line (the phrase appears once).
+    const auto first = frag->body.find("earlier decisions are not shown");
+    CHECK(frag->body.find("earlier decisions are not shown", first + 1) == std::string::npos);
 }

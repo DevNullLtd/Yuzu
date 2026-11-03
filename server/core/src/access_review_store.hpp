@@ -249,7 +249,10 @@ public:
     /// touched, so it precedes `not_found`; `unexpected("not_found: ...")` (404)
     /// when the (campaign_id, principal_type, principal_id, role_name) tuple is
     /// not in the frozen population, OR the campaign is not open (closed
-    /// campaigns are immutable evidence, see `close_campaign`). Any other
+    /// campaigns are immutable evidence, see `close_campaign`);
+    /// `unexpected("bad_request: " + kDecisionCapMessage)` (400) when the grant
+    /// already holds `kMaxDecisionsPerGrant` decisions, decided inside the
+    /// transaction under the row lock (nothing is written). Any other
     /// `unexpected(msg)` is a genuine write failure (503/retry). The engine-owner
     /// and group-member rules are NOT enforced here (they need other stores); the
     /// route layer's gate owns them.
@@ -261,7 +264,10 @@ public:
     /// Full evidentiary state for one campaign: metadata + every frozen
     /// attestation row + `pending_count`. With `include_history` each row also
     /// carries its `history` (every recorded decision in `seq` order), read in
-    /// the same REPEATABLE READ snapshot; it defaults to false so a caller that
+    /// the same REPEATABLE READ snapshot, capped at the latest
+    /// `kMaxDecisionsPerGrant` entries per grant (a backstop: the write cap keeps
+    /// a grant at or under it, so `decision_seq > history.size()` means rows were
+    /// added by other means); it defaults to false so a caller that
     /// shows only the latest decision stays one cheap read.
     /// `unexpected("bad_request: ...")`
     /// when `campaign_id` fails `valid_campaign_id` (empty included), checked

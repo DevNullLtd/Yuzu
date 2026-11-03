@@ -3444,10 +3444,17 @@ static const ToolDef kTools[] = {
      "differ from the subject of the grant: a user grant naming the caller, an engine "
      "principal the caller owns, or a group the caller belongs to is refused with a "
      "permission-denied result, 'the reviewer must differ from the subject of this grant; ask "
-     "another reviewer to record this decision', and records nothing. If the connection drops "
-     "before the answer arrives, call get_access_review and compare decision_seq before "
-     "retrying: a retry after an unacknowledged commit appends an identical decision, which is "
-     "kept and visible, not an error. Mirrors POST "
+     "another reviewer to record this decision', and records nothing. principal_id and "
+     "role_name are at most 256 bytes each and justification at most 4096 bytes. Each grant "
+     "keeps at most 100 recorded decisions: a further one is refused with invalid params and "
+     "records nothing. A successful call returns decision_seq (this decision's position in the "
+     "grant's history, 1 for the first) and previous_decision (the decision it superseded, "
+     "'pending' for the first), so you can see when you replaced another reviewer's decision. "
+     "An internal error that carries retry_after_ms can mean the decision was recorded anyway "
+     "(a lost commit acknowledgement): before retrying, call get_access_review, compare "
+     "decision_seq with the value you last saw and look for your own entry (match reviewer, "
+     "justification and decided_at_ms), because a blind retry appends another identical "
+     "decision, which is kept and visible, not an error. Mirrors POST "
      "/api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested or "
      "access_review.flagged (by decision). Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
@@ -3458,7 +3465,7 @@ static const ToolDef kTools[] = {
      R"j("decision":{"type":"string","enum":["attested","flagged_revoke"]},)j"
      R"j("justification":{"type":"string","maxLength":4096})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
-     R"j({"type":"object","properties":{"recorded":{"type":"boolean"}},"required":["recorded"]})j"},
+     R"j({"type":"object","properties":{"recorded":{"type":"boolean"},"decision_seq":{"type":"integer"},"previous_decision":{"type":"string","enum":["pending","attested","flagged_revoke"]}},"required":["recorded","decision_seq","previous_decision"]})j"},
 
     {"get_access_review",
      "Full evidentiary state of one review campaign: metadata plus every frozen "
@@ -3467,7 +3474,9 @@ static const ToolDef kTools[] = {
      "decision recorded for that grant oldest first as {seq, decision, previous_decision, "
      "reviewer, justification, decided_at_ms}; previous_decision \"\" means not recorded (the "
      "decision predates the history), never pending. The response grows with every "
-     "re-recorded decision. "
+     "re-recorded decision, up to 100 decisions per grant; a history lists at most the latest "
+     "100, so decision_seq greater than the number of history entries means earlier ones are "
+     "not shown. "
      "campaign.rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state frozen "
      "AT OPEN (empty string for a campaign opened before this field existed). Mirrors GET "
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
@@ -28499,7 +28508,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     access_review_sod::attest_success_detail(decision, rec_res->previous_decision,
                                                              rec_res->seq, tuple_detail));
                 JObj payload;
-                payload.add("recorded", true);
+                payload.add("recorded", true)
+                    .add("decision_seq", static_cast<int64_t>(rec_res->seq))
+                    .add("previous_decision", rec_res->previous_decision);
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 mcp_audit("success", campaign_id);

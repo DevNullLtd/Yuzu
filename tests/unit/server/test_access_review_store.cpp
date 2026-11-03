@@ -444,6 +444,133 @@ TEST_CASE("record_attestation: an identical repeat decision appends at seq+1 too
     CHECK(row->history[1].previous_decision == "attested");
 }
 
+TEST_CASE("record_attestation: a grant keeps at most kMaxDecisionsPerGrant decisions; the next is "
+          "refused with bad_request and writes nothing",
+          "[access_review][store][pg][4752]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Cap", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    for (std::int32_t i = 1; i <= yuzu::server::kMaxDecisionsPerGrant; ++i) {
+        const std::string decision = i % 2 ? "attested" : "flagged_revoke";
+        auto r = store.record_attestation(cid, "group", "eng", "Reader", decision, "carol", "n");
+        REQUIRE(r.has_value());
+        CHECK(r->seq == i);
+        CHECK(r->previous_decision ==
+              (i == 1 ? "pending" : (i % 2 ? "flagged_revoke" : "attested")));
+    }
+
+    const std::string expected =
+        "bad_request: " + std::string(yuzu::server::kDecisionCapMessage);
+    for (int attempt = 0; attempt < 2; ++attempt) { // refused again, never a different answer
+        auto over =
+            store.record_attestation(cid, "group", "eng", "Reader", "attested", "dave", "x");
+        REQUIRE_FALSE(over.has_value());
+        CHECK(over.error() == expected);
+    }
+
+    auto view = store.get_campaign(cid, /*include_history=*/true);
+    REQUIRE(view.has_value());
+    const auto* row = find_row(*view, "group", "eng", "Reader");
+    REQUIRE(row != nullptr);
+    CHECK(row->decision_seq == 100);
+    CHECK(row->decision == "flagged_revoke"); // the 100th decision, not the refused one
+    CHECK(row->reviewer == "carol");
+    REQUIRE(row->history.size() == 100);
+    CHECK(row->history.front().seq == 1);
+    CHECK(row->history.back().seq == 100);
+
+    // A different grant of the same campaign is unaffected.
+    auto other = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "ok");
+    REQUIRE(other.has_value());
+    CHECK(other->seq == 1);
+    CHECK(other->previous_decision == "pending");
+}
+
+TEST_CASE("get_campaign(include_history) returns each grant's latest kMaxDecisionsPerGrant entries "
+          "in ascending order and keeps decision_seq as the total",
+          "[access_review][store][pg][4752]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Bounded", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+    REQUIRE(store.record_attestation(cid, "group", "eng", "Reader", "attested", "carol", "first")
+                .has_value());
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "one")
+                .has_value());
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "dave", "two")
+                .has_value());
+
+    {
+        // The per-test clone lets the owner reach the state the write cap prevents: 105 history
+        // rows for one grant. Both guard triggers are disabled here, in this database only.
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const std::string att = "access_review_store.access_review_attestation";
+        const std::string hist = "access_review_store.access_review_attestation_history";
+        for (const std::string sql :
+             {"ALTER TABLE " + att + " DISABLE TRIGGER access_review_attestation_guard",
+              "ALTER TABLE " + hist + " DISABLE TRIGGER access_review_history_consistent",
+              "INSERT INTO " + hist +
+                  " (campaign_id, principal_type, principal_id, role_name, seq, decision, "
+                  "previous_decision, reviewer, justification, decided_at_ms) "
+                  "SELECT '" + cid + "','group','eng','Reader', g, 'attested', 'attested', "
+                  "'carol', 'row ' || g, g FROM generate_series(2,105) g",
+              "UPDATE " + att + " SET decision_seq=105 WHERE campaign_id='" + cid +
+                  "' AND principal_id='eng'"}) {
+            PgResult r{PQexec(conn.get(), sql.c_str())};
+            INFO(sql);
+            REQUIRE(r.ok());
+        }
+    }
+
+    auto view = store.get_campaign(cid, /*include_history=*/true);
+    REQUIRE(view.has_value());
+    const auto* eng = find_row(*view, "group", "eng", "Reader");
+    REQUIRE(eng != nullptr);
+    CHECK(eng->decision_seq == 105); // the total, so truncation reads as decision_seq > entries
+    REQUIRE(eng->history.size() == 100);
+    CHECK(eng->history.front().seq == 6);
+    CHECK(eng->history.back().seq == 105);
+    for (std::size_t i = 0; i < eng->history.size(); ++i)
+        CHECK(eng->history[i].seq == 6 + static_cast<std::int32_t>(i));
+    CHECK(eng->history.front().justification == "row 6");
+
+    // The other grants are not cut: alice keeps both entries, the pending grant has none.
+    const auto* alice = find_row(*view, "user", "alice", "Admin");
+    REQUIRE(alice != nullptr);
+    CHECK(alice->decision_seq == 2);
+    REQUIRE(alice->history.size() == 2);
+    CHECK(alice->history[0].seq == 1);
+    CHECK(alice->history[1].seq == 2);
+    const auto* pending = find_row(*view, "engine", "engine:svc", "Writer");
+    REQUIRE(pending != nullptr);
+    CHECK(pending->decision_seq == 0);
+    CHECK(pending->history.empty());
+
+    // The default read is unchanged: no history, the total still reported.
+    auto bare = store.get_campaign(cid);
+    REQUIRE(bare.has_value());
+    const auto* bare_eng = find_row(*bare, "group", "eng", "Reader");
+    REQUIRE(bare_eng != nullptr);
+    CHECK(bare_eng->decision_seq == 105);
+    CHECK(bare_eng->history.empty());
+
+    // Past the cap the write is refused, so the row stays at 105.
+    auto over = store.record_attestation(cid, "group", "eng", "Reader", "attested", "erin", "x");
+    REQUIRE_FALSE(over.has_value());
+    CHECK(over.error().starts_with("bad_request:"));
+}
+
 TEST_CASE("record_attestation: the reviewer must differ from the subject of a user grant",
           "[access_review][store][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
