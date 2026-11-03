@@ -2343,7 +2343,11 @@ Download the current certificate revocation list (DER). **Public** — no
 authentication. Returns `Content-Type: application/pkix-crl`,
 `Cache-Control: no-cache, must-revalidate`. `503` if no CRL has been published
 yet (transient — the server pre-publishes at startup and republishes on each
-revocation).
+revocation). Each CRL is valid for 48 hours from the moment it is built (`nextUpdate`),
+and the server rebuilds it when less than 24 hours remain, so a fleet with no
+revocations gets a new CRL about once a day. A consumer that fetches on a schedule
+should refresh well within 24 hours (hourly is typical; the response is small),
+and should alert when the `nextUpdate` of the CRL it holds has passed.
 
 ```bash
 curl https://yuzu.example.com/api/v1/ca/crl -o yuzu.crl
@@ -2419,7 +2423,7 @@ returns the same five fields at the top level of its result.
   ],
   "count": 1,
   "meta": { "api_version": "v1", "limit": 200, "offset": 0, "has_more": false,
-            "crl_version": 14, "crl_published_at": 1710849600, "crl_next_update": 1711454400,
+            "crl_version": 14, "crl_published_at": 1710849600, "crl_next_update": 1711022400,
             "crl_revoked_count": 2, "crl_stale": false }
 }
 ```

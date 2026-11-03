@@ -893,7 +893,8 @@ What changes on **every** deployment, including single-server:
 - **A revocation missing from the served CRL is now republished automatically.**
   Previously, if a revoke's own CRL publish failed, the revocation stayed out of
   `GET /api/v1/ca/crl` until the next revoke or until the CRL was within 24 h of
-  its `nextUpdate` (up to ~6 days); retrying the revoke returns "already
+  its `nextUpdate` (up to ~6 days at the 7-day validity then in force; about 1 day
+  since #6016); retrying the revoke returns "already
   revoked" and does not publish. The freshness pass now also republishes, on its
   next 15 s tick, whenever the latest CRL was not built from the current revoked
   set (after a failed attempt it waits 5 minutes before trying again). You may
