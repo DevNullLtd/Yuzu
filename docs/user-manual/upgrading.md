@@ -52,7 +52,7 @@ Lowering `db_budget_bytes` later deletes history the same way, within 15 minutes
 
 **Who is affected.** SIEM rules that match `user.role_change` with result `denied` or detail `user_not_found` and were (unknowingly) counting outages; scripts that treat a `404` from the role route as permanent; IdP connectors that treated the old `200` as success.
 
-**What to do.** Retry on `503`. Add `store_unavailable` to any `failure` rule on these actions. See the SCIM guide, "When the user store cannot answer a deactivation", for what the SCIM change does not cover.
+**What to do.** Retry on `503`. Add `store_unavailable` to any `failure` rule on these actions. The one `503` not to retry is the sticky one an enrolled administrator can get on the role route right after the MFA factor-binding cutover: it carries no `Retry-After`, is audited as `mfa.step_up.required` (not `user.role_change`) with `reason=mfa_proof_unavailable`, and clears only after `yuzu-server --mfa-reset <user>` (see "Breaking: MFA proofs are bound to the factor they were earned with" below). See the SCIM guide, "When the user store cannot answer a deactivation", for what the SCIM change does not cover.
 
 ## ⚠️ Breaking: the scoped-permission audit row changes shape and separates a store outage from a missing grant (#3739)
 
@@ -543,7 +543,7 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   factor cannot be decrypted, answers `503` to local (password) sessions only, since those are the
   only sessions whose enrollment is read from the store; API-token and MCP-token callers pass
   before any store read, and OIDC sessions are judged on the identity provider's assertion. The
-  `503` still carries `meta.mfa_step_up_required: true`, with no `challenge_url`, and writes an
+  `503` still carries `meta.mfa_step_up_required: true` (the binding refusals that carry a `reason` carry `false`; see the MFA factor-binding cutover section below), with no `challenge_url`, and writes an
   `mfa.step_up.required` audit row whose `detail` names the cause (an unexpected failure inside the
   check itself, or a session that could not be fingerprinted, is recorded as
   `reason=chokepoint_exception`). Retry; re-proving cannot help. A client
@@ -648,6 +648,8 @@ process per account; the first reset applies both migrations and later ones find
 with the number of enrolled accounts. Resetting the break-glass account under `sso-only` needs one extra restart
 (standard mode, enrol, then `sso-only`; see "Break-glass account under `sso-only`" below). Rehearse it (below) to get
 your own figure before you pick the window.
+
+**Rigs that ran an earlier build of this change.** A development or UAT database that ran an earlier iteration of this branch can already record `auth` 3 and `session_store` 3 with an older trigger body. The version number is the same, so the migration is skipped, and the server refuses to start because the boot check pins the trigger function body byte for byte. Recreate such a database; do not repair it by hand.
 
 **Table locks.** Each migration waits at most 3 seconds for its table lock (`auth.users`, `session_store.sessions`).
 One that cannot get it fails the boot, or the first `--mfa-reset`, and is rolled back whole and retried on the next
