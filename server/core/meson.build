@@ -608,12 +608,26 @@ yuzu_key_provider_dep = declare_dependency(
 # final exe/test link over the IR of both archives.
 #
 # yuzu_server_routes_lib holds server.cpp, rest_api_v1.cpp, mcp_server.cpp,
-# mcp_tools_discovery.cpp and the *_routes / *_ui handlers. yuzu_server_core_lib
-# holds everything else. Keep the edge ONE-WAY: nothing in yuzu_server_core_lib
-# should reference a symbol defined in yuzu_server_routes_lib, so the cut stays
-# movable. Nothing enforces it at link time (both libs are always linked
-# together and neither the MSVC linker nor GNU ld rejects a cycle); `nm` over
-# the two .a.p object dirs shows a violation.
+# mcp_tools_discovery.cpp and the *_routes / *_ui handlers EXCEPT auth_routes,
+# home_ui and login_ui, which core-lib files call. yuzu_server_core_lib holds
+# everything else.
+#
+# Which lib does a new TU belong in? The default is core. Put it in routes only
+# if it includes or calls something defined in server.cpp, rest_api_v1.cpp,
+# mcp_server.cpp or a *_routes / *_ui TU; pure renderers, models, stores and
+# API seams stay in core. Keep the edge ONE-WAY: nothing in yuzu_server_core_lib
+# may reference a symbol defined in yuzu_server_routes_lib, so the cut stays
+# movable. Nothing enforces that at link time (both libs are always linked
+# together, and neither the MSVC linker nor GNU ld rejects a cycle). On
+# Linux/macOS, `nm` over the two libs' .a.p object dirs shows a violation (an
+# undefined symbol in a core object that only a routes object defines);
+# check_core_presentation_link.py covers only the enrolled families, not this.
+# Routes-lib static initialisers (shell::bake in the *_ui TUs) call into core,
+# so keep core free of order-sensitive namespace-scope dynamic initialisation.
+#
+# Re-split trigger: split again along the REST/MCP handler layer (rest_api_v1,
+# mcp_*) when either archive passes about 3.2 GiB (80% of the 4 GiB cap) in the
+# Windows release+LTO job.
 #
 # Both targets MUST use the SAME cpp_args and dependencies: CPPHTTPLIB_*
 # defines change httplib class layout, and a mismatch is an ODR violation the
@@ -626,7 +640,6 @@ yuzu_server_core_deps = [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
 yuzu_server_core_deps += auth_crypto_deps
 yuzu_server_core_deps += https_deps
 yuzu_server_core_deps += saml_deps
-
 
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
@@ -1043,8 +1056,9 @@ yuzu_server_core_dep = declare_dependency(
   include_directories: [include_directories('include'), include_directories('../../common/include')],
   # CPPHTTPLIB_OPENSSL_SUPPORT gates real data members on httplib::ClientImpl/
   # SSLClient (header-only, inline definitions) — every consumer TU must define
-  # it identically to yuzu_server_core_cpp_args (shared by both server-core libs), or the linker folds
-  # mismatched-layout definitions of the same class into one symbol (ODR
+  # it identically to yuzu_server_core_cpp_args (shared by both server-core
+  # libs), or the linker folds mismatched-layout definitions of the same class
+  # into one symbol (ODR
   # violation). main.cpp transitively includes <httplib.h> via scim_routes.hpp
   # without this propagated, which corrupted httplib::Client objects on first
   # use (SIGSEGV in NvdClient::fetch_paginated's first request).
@@ -1052,10 +1066,7 @@ yuzu_server_core_dep = declare_dependency(
   # is propagated for the same reason: without it, a consumer TU falls back to
   # httplib's default listen() backlog of 5 instead of the intended 128.
   compile_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'],
-  dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
-                 sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
-                 libpq_dep, yuzu_key_provider_dep] + auth_crypto_deps + https_deps
-               + saml_deps,
+  dependencies: yuzu_server_core_deps,
 )
 
 yuzu_server_exe = executable(

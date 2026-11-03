@@ -111,9 +111,7 @@ std::string make_correlation_id() {
     auto t = std::chrono::duration_cast<std::chrono::milliseconds>(
                  std::chrono::system_clock::now().time_since_epoch())
                  .count();
-    // std::format keeps the buffer-size reasoning out of the call site;
-    // the surrounding file already uses std::format for the JObj double
-    // path. governance round cpp-expert L-1.
+    // std::format keeps the buffer-size reasoning out of the call site.
     return std::format("req-{:x}-{:x}", static_cast<std::uint64_t>(t), n);
 }
 

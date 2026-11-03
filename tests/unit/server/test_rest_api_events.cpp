@@ -290,6 +290,50 @@ TEST_CASE("error_json_a4: envelope carries remediation hint when present",
     REQUIRE(body.find(R"("remediation":"request Execution:Read")") != std::string::npos);
 }
 
+// Exact-bytes goldens for the A4 error builder. The substring cases above pin the
+// presence of fields; these pin the whole wire body, key order and the JSON string
+// escaping. error_json_a4 lives in rest_a4_envelope.cpp with its own private copy of
+// the JSON object builder (rest_api_v1.cpp and mcp_server.cpp keep theirs), so a
+// divergence between the copies must fail here rather than change every denial body.
+TEST_CASE("error_json_a4: exact wire bytes for every overload", "[events][envelope][a4][golden]") {
+    // 1. No-retry overload: retry_after_ms is ALWAYS a key (A4), null when unset;
+    //    remediation is omitted when empty.
+    CHECK(detail::error_json_a4(404, "execution not found", "req-abc-1") ==
+          R"json({"error":{"code":404,"message":"execution not found","correlation_id":"req-abc-1","retry_after_ms":null},"meta":{"api_version":"v1"}})json");
+
+    // 2. Concrete-retry overload: 5000 with a remediation hint, and 0 (a concrete
+    //    number, not "unset") with an empty remediation.
+    CHECK(detail::error_json_a4(503, "store degraded", "req-r-1", std::int64_t{5000},
+                                "retry shortly") ==
+          R"json({"error":{"code":503,"message":"store degraded","correlation_id":"req-r-1","retry_after_ms":5000,"remediation":"retry shortly"},"meta":{"api_version":"v1"}})json");
+    CHECK(detail::error_json_a4(503, "store degraded", "req-r-2", std::int64_t{0}, "") ==
+          R"json({"error":{"code":503,"message":"store degraded","correlation_id":"req-r-2","retry_after_ms":0},"meta":{"api_version":"v1"}})json");
+
+    // 3. Full A4ErrorOpts form: every optional field, in emission order.
+    detail::A4ErrorOpts full;
+    full.retry_after_ms = 250;
+    full.remediation = "ask an approver";
+    full.permission = "Execution:Execute";
+    full.approval_id = "ap-1";
+    full.status_url = "/api/v1/approvals/ap-1";
+    CHECK(detail::error_json_a4(409, "approval required", "req-o-1", full) ==
+          R"json({"error":{"code":409,"message":"approval required","correlation_id":"req-o-1","retry_after_ms":250,"remediation":"ask an approver","permission":"Execution:Execute","approval_id":"ap-1","status_url":"/api/v1/approvals/ap-1"},"meta":{"api_version":"v1"}})json");
+
+    // 4. Only the permission specialisation set: nothing else leaks in.
+    detail::A4ErrorOpts perm_only;
+    perm_only.permission = "Execution:Read";
+    CHECK(detail::error_json_a4(403, "denied", "req-o-2", perm_only) ==
+          R"json({"error":{"code":403,"message":"denied","correlation_id":"req-o-2","retry_after_ms":null,"permission":"Execution:Read"},"meta":{"api_version":"v1"}})json");
+}
+
+TEST_CASE("error_json_a4: JSON string escaping in message, correlation id and remediation",
+          "[events][envelope][a4][golden]") {
+    // Quote, backslash, LF, a raw 0x01 control byte (-> \u0001), TAB, CR, BS, FF.
+    const std::string message = std::string("q\"b\\n\n") + std::string(1, '\x01') + "t\t|\r\b\f";
+    CHECK(detail::error_json_a4(400, message, "c\"\t1", "r\n") ==
+          R"json({"error":{"code":400,"message":"q\"b\\n\n\u0001t\t|\r\b\f","correlation_id":"c\"\t1","retry_after_ms":null,"remediation":"r\n"},"meta":{"api_version":"v1"}})json");
+}
+
 TEST_CASE("make_correlation_id: monotonic + unique within a process", "[events][envelope][a4]") {
     auto a = detail::make_correlation_id();
     auto b = detail::make_correlation_id();

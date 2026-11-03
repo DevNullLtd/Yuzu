@@ -87,8 +87,12 @@ ROOT = Path(__file__).resolve().parents[2]
 # One entry per enrolled family. `core`/`presentation` are OBJECT-FILE STEMS
 # (the source file's name under server/core/src, without the `.cpp`
 # extension) - find_object resolves each stem inside CORE_TARGET_OBJ_DIRS (the
-# yuzu_server_core static library's `.p` directory, hard-coded below). A family
-# whose TUs live in another meson target needs its own per-family directory.
+# `.p` object directories of the two server-core static libraries,
+# yuzu_server_core and yuzu_server_routes, hard-coded below; which library a
+# TU is in is a 4 GiB archive-size cut, NOT the core/presentation seam this
+# gate enforces - a family's core and presentation stems may share a library
+# or not). A family whose TUs live in another meson target needs its own
+# per-family directory.
 FAMILIES: dict[str, dict[str, list[str]]] = {
     "dex": {
         "core": [
@@ -135,13 +139,13 @@ def find_build_dir(explicit: str | None) -> Path:
     )
 
 
-#: The core library target's own object directory (UP-10) - restricting the
-#: object lookup to here, rather than an `rglob` over the whole build tree,
-#: avoids ever picking up a stale or duplicate object compiled into a
-#: DIFFERENT target's `.p` directory (e.g. a future test binary that also
-#: compiles one of these same source files) - `find_object` below now
-#: errors clearly if the wanted object is missing or duplicated even within
-#: this single, narrower directory, rather than silently matching whichever
+#: The server-core library targets' own object directories (UP-10) -
+#: restricting the object lookup to these, rather than an `rglob` over the
+#: whole build tree, avoids ever picking up a stale or duplicate object
+#: compiled into a DIFFERENT target's `.p` directory (e.g. a future test
+#: binary that also compiles one of these same source files) - `find_object`
+#: below errors clearly if the wanted object is missing or duplicated even
+#: within these narrower directories, rather than silently matching whichever
 #: copy `rglob` happened to find first across the whole tree.
 #: server-core is TWO static libraries (server/core/meson.build, LNK1248 split);
 #: a stem's object lives in exactly one of them, so both are searched.
@@ -181,7 +185,10 @@ def find_object(build_dir: Path, stem: str) -> Path:
     if len(matches) > 1:
         raise SystemExit(
             f"check_core_presentation_link: ambiguous object for '{stem}' under "
-            f"{[str(d) for d in obj_dirs]}: {sorted(str(m) for m in matches)}"
+            f"{[str(d) for d in obj_dirs]}: {sorted(str(m) for m in matches)} - "
+            f"a source file belongs to exactly one server-core library, so a "
+            f"stale object survived a move between them: delete the stale "
+            f"`*.a.p` directory entry (or both `*.a.p` directories) and rebuild"
         )
     return matches[0]
 
