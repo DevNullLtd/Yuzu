@@ -566,10 +566,10 @@ Settings uses, so the two stay equivalent.
      it. The affected account often cannot read the Role assignments panel itself (it needs
      `AccessReview:Read`), so another Administrator has to check its grants there or in the
      access-review export.
-  3. The session is not a local account with an active row. SAML administrators, OpenID Connect administrators without a
-     durable grant (in practice all of them today), MCP-tier and
-     service-scoped tokens and engine credentials are never offered the controls, and JIT
-     elevation does not count. An account whose role is `user` that holds the grant sees the
+  3. The session is not a local account with an active row and a grant. SAML administrators
+     (no account row) and OpenID Connect administrators (an account row, but in practice no
+     durable grant today), MCP-tier and service-scoped tokens and engine credentials are never
+     offered the controls, and JIT elevation does not count. An account whose role is `user` that holds the grant sees the
      controls but still reads "not available to your account" on the Users and Account panels,
      which need the `Administrator` account role.
   4. The controls are disabled with "Your administrator authority could not be confirmed.

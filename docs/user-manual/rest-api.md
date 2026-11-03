@@ -3417,14 +3417,14 @@ interval is a reasonable default. **Cadence:** each call writes one audit row (t
 twin), so poll no faster than that 5000 ms interval.
 
 ```bash
-curl -s -b cookies.txt http://localhost:8080/api/v1/rbac/enforcement
+curl -s -b cookies.txt https://yuzu.example.com/api/v1/rbac/enforcement
 # {"data":{"enabled":true,"unconfirmed":false,"administrator":"may"},"meta":{"api_version":"v1"}}
 ```
 
 With an API token instead of a session cookie:
 
 ```bash
-curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/rbac/enforcement
+curl -s -H "Authorization: Bearer $TOKEN" https://yuzu.example.com/api/v1/rbac/enforcement
 # {"data":{"enabled":true,"unconfirmed":false,"administrator":"may"},"meta":{"api_version":"v1"}}
 ```
 
