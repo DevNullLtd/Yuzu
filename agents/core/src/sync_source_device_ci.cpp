@@ -3,9 +3,13 @@
 #include "local_dispatcher.hpp"
 #include "sync_canonical.hpp" // sanitize_utf8_strict / clamp_field / sha256_hex
 
+#include <inventory_status_row.hpp> // parse_status_row: the plugins' own status-row grammar
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
+#include <cassert>
 #include <charconv>
 #include <cstdint>
 #include <optional>
@@ -22,7 +26,7 @@ namespace {
 // parse never truncates differently from what this source hashed. The blob cap
 // (kDeviceCiMaxBlobBytes, sync_source_device_ci.hpp) must stay <= the server's (server >= agent):
 // the server accepts everything this source can send; the two are equal by contract.
-constexpr std::size_t kMaxFieldLen = 1024;
+constexpr std::size_t kMaxFieldLen = detail::kCiClampField;
 
 // ── UTF-8 scrub + field clamp ───────────────────────────────────────────────
 // sanitize_utf8_strict / clamp_field live in sync_canonical.{hpp,cpp} — one
@@ -52,11 +56,17 @@ std::vector<std::string_view> split_lines(std::string_view out) {
     return lines;
 }
 
-std::vector<std::string_view> split_pipe(std::string_view line) {
+// `unescaped_only` splits only on a '|' that is not preceded by a backslash. The plugins write a
+// literal pipe as `\|` and fold every literal backslash to '/' (yuzu::util::safe_output_field), so
+// a backslash before a '|' is always the escape. Tokens stay escaped; unescape_pipes undoes it.
+// The v1 positions keep the raw split: their bytes are frozen.
+std::vector<std::string_view> split_pipe(std::string_view line, bool unescaped_only = false) {
     std::vector<std::string_view> tok;
     std::size_t fp = 0;
     while (true) {
         std::size_t bar = line.find('|', fp);
+        while (unescaped_only && bar != std::string_view::npos && bar > 0 && line[bar - 1] == '\\')
+            bar = line.find('|', bar + 1);
         if (bar == std::string_view::npos) {
             tok.push_back(line.substr(fp));
             break;
@@ -65,6 +75,16 @@ std::vector<std::string_view> split_pipe(std::string_view line) {
         fp = bar + 1;
     }
     return tok;
+}
+
+// "a\|b" -> "a|b". Applied to a token of an unescaped split, before the clamp.
+std::string unescape_pipes(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ++i)
+        if (!(s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '|'))
+            out += s[i];
+    return out;
 }
 
 // First `key|value` line's value column ("" if absent). For scalar actions.
@@ -95,12 +115,27 @@ bool meaningful_mac(std::string_view mac) {
     return false;
 }
 
-} // namespace
+// The clamp-join shared by the v1 blob and the v2 scalar record: each field scrubbed + clamped,
+// 0x1F-joined, one 0x1E terminator. ONE loop, so the v2 scalar record's first 22 fields can never
+// drift from the frozen v1 bytes.
+std::string clamp_join_record(const std::string* fields, std::size_t n) {
+    std::string canon;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (i)
+            canon += '\x1f';
+        canon += clamp_field(fields[i], kMaxFieldLen);
+    }
+    canon += '\x1e';
+    return canon;
+}
 
-std::string device_ci_canonical_blob(const CiRecord& rec) {
-    // POSITIONAL — field order is the contract (see CiRecord). Each field is
-    // scrub+clamp'd here; the server re-clamps on parse (idempotent) and rejoins.
-    const std::string fields[] = {
+constexpr std::size_t kV1Fields = 22;
+
+// The frozen v1 positions, in wire order -- the ONE list behind both the v1 blob and the v2 scalar
+// record's first 22 fields. POSITIONAL: field order is the contract (see CiRecord). The return type
+// pins the count at compile time (CTAD deduces std::array<std::string, N> from the initialisers).
+std::array<std::string, kV1Fields> v1_fields(const CiRecord& rec) {
+    return std::array{
         rec.manufacturer, rec.model,       rec.serial,        rec.system_uuid,
         rec.hostname,     rec.domain,      rec.ou,            rec.bios_vendor,
         rec.bios_version, rec.bios_date,   rec.cpu_model,     rec.cpu_cores,
@@ -108,16 +143,374 @@ std::string device_ci_canonical_blob(const CiRecord& rec) {
         rec.macs_summary, rec.nic_count,   rec.os_name,       rec.os_version,
         rec.os_build,     rec.arch,
     };
-    std::string canon;
-    bool first = true;
-    for (const auto& f : fields) {
-        if (!first)
-            canon += '\x1f';
-        canon += clamp_field(f, kMaxFieldLen);
-        first = false;
+}
+
+} // namespace
+
+std::string device_ci_canonical_blob(const CiRecord& rec) {
+    // Each field is scrub+clamp'd in the join; the server re-clamps on parse (idempotent) and
+    // rejoins.
+    const auto fields = v1_fields(rec);
+    return clamp_join_record(fields.data(), fields.size());
+}
+
+// ── v2 writer ───────────────────────────────────────────────────────────────
+
+namespace {
+
+constexpr std::string_view kLevelOk = "ok";
+constexpr std::string_view kLevelConstrained = "constrained";
+constexpr std::string_view kLevelUnavailable = "unavailable";
+constexpr std::string_view kLevelDenied = "permission_denied";
+
+constexpr std::size_t kBaseReasonMax = kMaxFieldLen - kCiAgentCapReserve;
+
+// Reasons the agent authors beyond the typed ones (the contract is in the header).
+constexpr std::string_view kReasonWindowsVolumesUnbounded = "agent:windows_volumes_unbounded";
+constexpr std::string_view kReasonMountPointsRedacted = "agent:mount_points_redacted";
+
+#ifdef _WIN32
+constexpr bool kWindowsHost = true;
+#else
+constexpr bool kWindowsHost = false;
+#endif
+
+struct SectionStatus {
+    std::string level;
+    std::string reason; ///< base reason, already clamped to kMaxFieldLen - kCiAgentCapReserve
+};
+
+// The plugin's own `status|<action>|<level>|<tokens>` row token, "" when absent. parse_status_row
+// returns field 4 verbatim, so a literal "-" (the grammar's "no tokens") is normalised here.
+std::string status_row_token(std::string_view captured, std::string_view action) {
+    for (auto line : split_lines(captured)) {
+        auto t = split_pipe(line);
+        if (auto row = yuzu::shared::parse_status_row(t, action))
+            return row->tokens == "-" ? std::string{} : std::move(row->tokens);
     }
-    canon += '\x1e';
-    return canon;
+    return {};
+}
+
+// Per-action result -> section status. Failure (rc / truncation / plugin absent) outranks the
+// typed result; reason is typed provenance, else the plugin's own status-row token, else "".
+SectionStatus section_status_of(const CiActionResult& r, std::string_view action,
+                                bool plugin_loaded) {
+    const auto make = [&](std::string_view level, std::string reason) {
+        return SectionStatus{std::string(level), clamp_field(reason, kBaseReasonMax)};
+    };
+    if (!plugin_loaded)
+        return make(kLevelUnavailable, "agent:plugin_not_loaded");
+    if (r.rc != 0) {
+        // A plugin that predates the action answers `unknown action: <name>` at rc 1. That prefix
+        // is the convention of the hardware and disk_actions plugins, not the plugin ABI: a plugin
+        // that answers differently maps to `agent:rc=<n>` -- the section is unavailable either way,
+        // only the reason token is less specific.
+        return make(kLevelUnavailable, std::string_view(r.captured).starts_with("unknown action")
+                                           ? "agent:action_absent"
+                                           : "agent:rc=" + std::to_string(r.rc));
+    }
+    if (r.truncated)
+        return make(kLevelUnavailable, "agent:truncated");
+
+    std::string_view level;
+    switch (r.status) {
+    case YUZU_RESULT_STATUS_CONSTRAINED:
+        level = kLevelConstrained;
+        break;
+    case YUZU_RESULT_STATUS_UNAVAILABLE:
+        level = kLevelUnavailable;
+        break;
+    case YUZU_RESULT_STATUS_PERMISSION_DENIED:
+        level = kLevelDenied;
+        break;
+    default: // UNDECLARED / OK
+        level = kLevelOk;
+        break;
+    }
+    return make(level, !r.provenance.empty() ? r.provenance : status_row_token(r.captured, action));
+}
+
+bool rows_allowed(const SectionStatus& s) {
+    return s.level == kLevelOk || s.level == kLevelConstrained;
+}
+
+// One wire row `kind 1F c1 .. 1F cn 1E` from a plugin data line, or nullopt when the line is not a
+// row of this kind (a status line, another kind, or an empty-result placeholder). `plugin_kind` is
+// the row token the plugin prints; swap drops used_mb (plugin column 3: volatile telemetry).
+std::optional<std::string> project_row(const CiV2Section& sec, std::string_view plugin_kind,
+                                       const std::vector<std::string_view>& t, bool& redacted) {
+    if (t.empty() || t[0] != plugin_kind)
+        return std::nullopt;
+    if (sec.token == std::string_view("disk") && t.size() >= 4 && t[2] == "unknown" &&
+        t[3] == "0")
+        return std::nullopt; // the hardware disk sentinel (same predicate as build_device_ci_record)
+    if (sec.token == std::string_view("dimm") && t.size() >= 3 && t[1] == "unknown" &&
+        t[2] == "0")
+        return std::nullopt; // the hardware empty-result dimm sentinel (not a DIMM)
+    if (sec.token == std::string_view("volume") && t.size() >= 2 && t[1] == "-")
+        return std::nullopt; // the disk_actions empty-result placeholder (volume name "-")
+    const bool swap = sec.token == std::string_view("swap");
+    // The plugin column holding the comma-separated mount points (volume: column 2, partition:
+    // column 5); 0 for every other kind.
+    const std::size_t mount_col = sec.token == std::string_view("volume")      ? 2
+                                  : sec.token == std::string_view("partition") ? 5
+                                                                               : 0;
+    std::string row(sec.token);
+    for (int c = 0; c < sec.n_fields; ++c) {
+        const std::size_t src = swap && c == 2 ? 4 : static_cast<std::size_t>(c) + 1;
+        row += '\x1f';
+        if (src < t.size()) {
+            std::string cell = unescape_pipes(t[src]);
+            if (src == mount_col) {
+                // clamp_field strips the framing bytes later; strip them first so one inside a root
+                // ("/Us\x1fers") cannot hide a personal path from the match.
+                std::erase_if(cell, [](char ch) { return ch == '\x1f' || ch == '\x1e' || ch == '\0'; });
+                cell = redact_mount_points(cell, redacted);
+            }
+            row += clamp_field(cell, kMaxFieldLen);
+        }
+    }
+    row += '\x1e';
+    return row;
+}
+
+std::vector<std::string> project_rows(const CiV2Section& sec, std::string_view plugin_kind,
+                                      std::string_view captured, bool& redacted) {
+    std::vector<std::string> rows;
+    for (auto line : split_lines(captured)) {
+        auto t = split_pipe(line, /*unescaped_only=*/true);
+        if (yuzu::shared::is_status_line(t))
+            continue;
+        if (auto row = project_row(sec, plugin_kind, t, redacted))
+            rows.push_back(std::move(*row));
+    }
+    std::sort(rows.begin(), rows.end());
+    return rows;
+}
+
+// The data row of a scalar section's capture that sorts first as a line, split on the unescaped pipe
+// (empty when none). Choosing by sort order, not by position, keeps the scalar record independent of
+// the plugin's row order like the list sections are. The tokens are still escaped: the caller
+// unescapes the ones it copies.
+std::vector<std::string_view> first_row(std::string_view captured, std::string_view kind) {
+    std::vector<std::string_view> best;
+    std::string_view best_line;
+    for (auto line : split_lines(captured)) {
+        auto t = split_pipe(line, /*unescaped_only=*/true);
+        if (!t.empty() && t[0] == kind && (best.empty() || line < best_line)) {
+            best = std::move(t);
+            best_line = line;
+        }
+    }
+    return best;
+}
+
+struct SectionBuild {
+    SectionStatus st;
+    std::vector<std::string> rows;
+    std::size_t total{0}; ///< rows before any cap or trim
+    std::string cap;      ///< "" or "agent_cap:<kept>/<total>" -- ONE slot, replaced never appended
+    std::string status_record;
+
+    void set_cap() {
+        cap = "agent_cap:" + std::to_string(rows.size()) + "/" + std::to_string(total);
+    }
+    void render(std::string_view token) {
+        std::string reason = st.reason;
+        if (!cap.empty())
+            reason += (reason.empty() ? "" : ";") + cap;
+        const std::string_view level = cap.empty() ? std::string_view(st.level) : kLevelConstrained;
+        status_record = "status\x1f" + std::string(token) + "\x1f" + std::string(level) + "\x1f" +
+                        reason + "\x1e";
+    }
+};
+
+} // namespace
+
+std::string device_ci_canonical_blob_v2(const CiRecord& rec, const CiSectionInputs& in) {
+    // Section inputs, POSITIONALLY parallel to kCiV2Sections: result, the status-row action name,
+    // the section token (the plugin's data-row kind), and whether the owning plugin is loaded.
+    // The per-section loop asserts each token against the registry entry it is paired with, so a
+    // reordered registry fails every writer test rather than silently misrouting rows.
+    struct Src {
+        const CiActionResult* res;
+        const char* action;
+        const char* token;
+        bool loaded;
+    };
+    const Src srcs[kCiV2SectionCount] = {
+        {&in.chassis, "chassis", "chassis", true},
+        {&in.baseboard, "baseboard", "baseboard", true},
+        {&in.machine_id, "machine_id", "machine_id", true},
+        {&in.processors, "processors", "cpu", true},
+        {&in.memory, "memory", "dimm", true},
+        {&in.disks, "disks", "disk", true},
+        {&in.swap, "swap", "swap", true},
+        {&in.volumes, "volumes", "volume", in.disk_actions_loaded},
+        {&in.partitions, "partitions", "partition", in.disk_actions_loaded},
+        {&in.topology, "topology", "topology", in.disk_actions_loaded},
+    };
+
+    std::vector<SectionBuild> sections(kCiV2SectionCount);
+    for (std::size_t i = 0; i < kCiV2SectionCount; ++i) {
+        const auto& def = kCiV2Sections[i];
+        assert(std::string_view(srcs[i].token) == def.token);
+        auto& b = sections[i];
+        b.st = section_status_of(*srcs[i].res, srcs[i].action, srcs[i].loaded);
+        // Failure provenance: a failed section projects nothing.
+        if (def.row_cap > 0 && rows_allowed(b.st)) {
+            bool redacted = false;
+            b.rows = project_rows(def, def.token, srcs[i].res->captured, redacted);
+            if (redacted) {
+                // The token leads, so the reason clamp can never be the thing that drops it.
+                b.st.level = std::string(kLevelConstrained);
+                b.st.reason = clamp_field(std::string(kReasonMountPointsRedacted) +
+                                              (b.st.reason.empty() ? "" : ";" + b.st.reason),
+                                          kBaseReasonMax);
+            }
+            b.total = b.rows.size();
+            if (b.rows.size() > static_cast<std::size_t>(def.row_cap)) {
+                b.rows.resize(static_cast<std::size_t>(def.row_cap));
+                b.set_cap();
+            }
+        }
+        b.render(def.token);
+    }
+
+    // Scalar record: the 22 v1 fields, then positions 22-32 from the first chassis / baseboard /
+    // machine_id row, only when that section is readable (blank = not reported).
+    std::array<std::string, detail::kCiScalarFields> f;
+    {
+        auto v1 = v1_fields(rec);
+        std::move(v1.begin(), v1.end(), f.begin());
+    }
+    constexpr std::size_t kChassisFirst = kV1Fields;
+    constexpr std::size_t kBaseboardFirst = kChassisFirst + 4;
+    constexpr std::size_t kMachineIdFirst = kBaseboardFirst + 4;
+    static_assert(kMachineIdFirst + 3 == detail::kCiScalarFields,
+                  "device_ci v2: the appended scalar groups must exactly fill the scalar record");
+    const auto fill = [&](std::size_t sec, std::string_view kind, std::size_t first,
+                          std::size_t n) {
+        if (!rows_allowed(sections[sec].st))
+            return;
+        const auto t = first_row(srcs[sec].res->captured, kind);
+        for (std::size_t c = 0; c < n; ++c)
+            if (c + 1 < t.size())
+                f[first + c] = unescape_pipes(t[c + 1]);
+    };
+    fill(0, "chassis", kChassisFirst, 4);     // type, serial, asset_tag, source
+    fill(1, "baseboard", kBaseboardFirst, 4); // vendor, product, serial, source
+    fill(2, "machine_id", kMachineIdFirst, 3); // hash, algorithm, source
+    const std::string scalar_record = clamp_join_record(f.data(), f.size());
+
+    std::size_t total = 1 + scalar_record.size();
+    for (const auto& b : sections) {
+        total += b.status_record.size();
+        for (const auto& r : b.rows)
+            total += r.size();
+    }
+
+    // Ceiling trim: pop tail rows kind by kind in kCiV2TrimOrder until the blob fits. Running
+    // total, so a pop costs O(1) plus one status re-render. Scalar and status records are never
+    // popped; the header static_assert is the termination proof.
+    std::size_t trim_idx[std::size(kCiV2TrimOrder)]{};
+    for (std::size_t t = 0; t < std::size(kCiV2TrimOrder); ++t)
+        for (std::size_t i = 0; i < kCiV2SectionCount; ++i)
+            if (std::string_view(kCiV2Sections[i].token) == kCiV2TrimOrder[t])
+                trim_idx[t] = i; // present exactly once (header static_assert)
+    while (total > kDeviceCiMaxBlobBytes) {
+        bool popped = false;
+        for (const std::size_t idx : trim_idx) {
+            auto& b = sections[idx];
+            if (b.rows.empty())
+                continue;
+            total -= b.rows.back().size();
+            b.rows.pop_back();
+            const std::size_t old_status = b.status_record.size();
+            b.set_cap();
+            b.render(kCiV2Sections[idx].token);
+            total = total - old_status + b.status_record.size();
+            popped = true;
+            break;
+        }
+        if (!popped)
+            break; // unreachable (static_assert); the caller's size guard is the backstop
+    }
+
+    std::string blob;
+    blob.reserve(total);
+    blob += '\x02';
+    blob += scalar_record;
+    for (const auto& b : sections) {
+        blob += b.status_record;
+        for (const auto& r : b.rows)
+            blob += r;
+    }
+    return blob;
+}
+
+CiActionResult windows_volumes_deferred_result() {
+    CiActionResult r;
+    r.status = YUZU_RESULT_STATUS_UNAVAILABLE;
+    r.provenance = std::string(kReasonWindowsVolumesUnbounded);
+    return r;
+}
+
+namespace {
+
+constexpr std::string_view kRedactedMount = "[redacted]";
+
+// Path roots, compared after any drive letter, lower-cased, with '\' folded to '/', on a segment
+// boundary. The first three name an account; /Volumes holds user-chosen labels (the boot volume's
+// name included), so every entry under it goes. The Linux volumes and partitions legs emit no mount
+// points yet; the leg that does must add the roots it reports under a user name here
+// (/media/<user>, /run/media/<user>) and say so in the ADR-0016 "Mount points" paragraph.
+constexpr std::string_view kPersonalMountRoots[] = {"/users", "/documents and settings", "/home",
+                                                    "/volumes"};
+
+bool mount_entry_is_personal(std::string_view entry) {
+    std::string p(entry);
+    for (char& c : p)
+        c = c == '\\' ? '/' : (c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c);
+    std::string_view v = p;
+    const bool drive = v.size() >= 2 && v[1] == ':' && (v[0] >= 'a' && v[0] <= 'z');
+    if (drive)
+        v.remove_prefix(2);
+    else if (v.empty() || v.front() != '/')
+        return true; // not a path: the tail of a label that itself held a comma
+    // macOS can spell the firmlinked user tree under the Data volume; judge it as the bare path.
+    constexpr std::string_view kDataVolume = "/system/volumes/data";
+    if (v.starts_with(kDataVolume) && v.size() > kDataVolume.size() && v[kDataVolume.size()] == '/')
+        v.remove_prefix(kDataVolume.size());
+    for (const auto root : kPersonalMountRoots)
+        if (v.starts_with(root) && (v.size() == root.size() || v[root.size()] == '/'))
+            return true;
+    return false;
+}
+
+} // namespace
+
+std::string redact_mount_points(std::string_view csv, bool& redacted) {
+    if (csv == "-") // the plugins' "no mount point" placeholder
+        return std::string(csv);
+    std::string out;
+    for (std::size_t pos = 0;;) {
+        const std::size_t comma = csv.find(',', pos);
+        const std::string_view piece =
+            csv.substr(pos, comma == std::string_view::npos ? comma : comma - pos);
+        if (pos != 0)
+            out += ',';
+        if (!piece.empty() && mount_entry_is_personal(piece)) {
+            out += kRedactedMount;
+            redacted = true;
+        } else {
+            out += piece;
+        }
+        if (comma == std::string_view::npos)
+            break;
+        pos = comma + 1;
+    }
+    return out;
 }
 
 bool core_identity_unavailable(const CiRecord& rec) {
@@ -219,12 +612,13 @@ CiRecord build_device_ci_record(const CiPluginOutputs& out) {
 SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
                                  const YuzuPluginDescriptor* device_identity,
                                  const YuzuPluginDescriptor* os_info,
-                                 const YuzuPluginDescriptor* network_config) {
+                                 const YuzuPluginDescriptor* network_config,
+                                 const YuzuPluginDescriptor* disk_actions) {
     SyncSource src;
     src.name = "device_ci";
     src.interval = std::chrono::hours{24};
-    src.collect = [hardware, device_identity, os_info,
-                   network_config]() -> std::optional<std::pair<std::string, std::string>> {
+    src.collect = [hardware, device_identity, os_info, network_config,
+                   disk_actions]() -> std::optional<std::pair<std::string, std::string>> {
         if (hardware == nullptr || device_identity == nullptr || os_info == nullptr ||
             network_config == nullptr) {
             spdlog::debug("sync: a device_ci source plugin is not loaded — source idle "
@@ -237,29 +631,45 @@ SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
         }
 
         LocalDispatcher dispatcher;
-        // Run one action, returning its captured stdout. Any rc!=0 or a truncated
+        CiSectionInputs inputs;
+        // Dispatcher result -> the section writer's input (typed metadata + captured stdout).
+        auto to_action_result = [](LocalDispatcher::Result&& r) {
+            CiActionResult a;
+            a.rc = r.rc;
+            a.truncated = r.truncated;
+            a.status = r.result_status;
+            a.provenance = std::move(r.result_provenance);
+            a.captured = std::move(r.captured);
+            return a;
+        };
+        // Run one REQUIRED action, returning its captured stdout. Any rc!=0 or a truncated
         // capture aborts the whole cycle (skip — never sync a partial CI record,
-        // which would flap the hash). nullopt propagates the abort.
-        auto run = [&](const YuzuPluginDescriptor* d,
-                       const char* action) -> std::optional<std::string> {
-            LocalDispatcher::Result r = dispatcher.run(d, action);
-            if (r.rc != 0) {
+        // which would flap the hash). nullopt propagates the abort. `meta`, when given,
+        // receives the action's typed result for its section status.
+        auto run = [&](const YuzuPluginDescriptor* d, const char* action,
+                       CiActionResult* meta) -> std::optional<std::string> {
+            CiActionResult a = to_action_result(dispatcher.run(d, action));
+            if (a.rc != 0) {
                 spdlog::warn("sync: device_ci action '{}' rc={} — skipping this cycle", action,
-                             r.rc);
+                             a.rc);
                 return std::nullopt;
             }
-            if (r.truncated) {
+            if (a.truncated) {
                 spdlog::warn("sync: device_ci action '{}' output truncated — skipping this cycle",
                              action);
                 return std::nullopt;
             }
-            return std::move(r.captured);
+            if (meta) { // the three actions with a section keep both copies
+                *meta = std::move(a);
+                return meta->captured;
+            }
+            return std::move(a.captured);
         };
 
         CiPluginOutputs o;
-        auto get = [&](const YuzuPluginDescriptor* d, const char* action,
-                       std::string& dst) -> bool {
-            auto r = run(d, action);
+        auto get = [&](const YuzuPluginDescriptor* d, const char* action, std::string& dst,
+                       CiActionResult* meta = nullptr) -> bool {
+            auto r = run(d, action, meta);
             if (!r)
                 return false;
             dst = std::move(*r);
@@ -269,8 +679,9 @@ SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
         // not dispatched once one fails). Never sync a partial CI record.
         if (!get(hardware, "manufacturer", o.manufacturer) || !get(hardware, "model", o.model) ||
             !get(hardware, "system", o.system) || !get(hardware, "bios", o.bios) ||
-            !get(hardware, "processors", o.processors) || !get(hardware, "memory", o.memory) ||
-            !get(hardware, "disks", o.disks) ||
+            !get(hardware, "processors", o.processors, &inputs.processors) ||
+            !get(hardware, "memory", o.memory, &inputs.memory) ||
+            !get(hardware, "disks", o.disks, &inputs.disks) ||
             !get(device_identity, "device_name", o.device_name) ||
             !get(device_identity, "domain", o.domain) || !get(device_identity, "ou", o.ou) ||
             !get(os_info, "os_name", o.os_name) || !get(os_info, "os_version", o.os_version) ||
@@ -292,7 +703,34 @@ SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
             return std::nullopt;
         }
 
-        std::string blob = device_ci_canonical_blob(rec);
+        // The section actions added with v2 never abort the cycle: a failure, truncation or an
+        // absent plugin becomes a typed section status in the blob. A planned leg is the norm
+        // until the legs land, so a degraded section is only a debug line.
+        auto run_section = [&](const YuzuPluginDescriptor* d, const char* action,
+                               CiActionResult& dst) {
+            dst = to_action_result(dispatcher.run(d, action));
+            if (dst.rc != 0 || dst.truncated || dst.status == YUZU_RESULT_STATUS_UNAVAILABLE ||
+                dst.status == YUZU_RESULT_STATUS_PERMISSION_DENIED)
+                spdlog::debug("sync: device_ci section action '{}' degraded (rc={}, truncated={})",
+                              action, dst.rc, dst.truncated);
+        };
+        run_section(hardware, "chassis", inputs.chassis);
+        run_section(hardware, "baseboard", inputs.baseboard);
+        run_section(hardware, "swap", inputs.swap);
+        run_section(hardware, "machine_id", inputs.machine_id);
+        inputs.disk_actions_loaded = disk_actions != nullptr;
+        if (disk_actions != nullptr) {
+            // The Windows volumes leg has no deadline on its DeviceIoControl calls (see
+            // windows_volumes_deferred_result); partitions and topology there are status-only.
+            if constexpr (kWindowsHost)
+                inputs.volumes = windows_volumes_deferred_result();
+            else
+                run_section(disk_actions, "volumes", inputs.volumes);
+            run_section(disk_actions, "partitions", inputs.partitions);
+            run_section(disk_actions, "topology", inputs.topology);
+        }
+
+        std::string blob = device_ci_canonical_blob_v2(rec, inputs);
         if (blob.size() > kDeviceCiMaxBlobBytes) {
             spdlog::warn("sync: device_ci blob {} B exceeds {} B cap — skipping this cycle",
                          blob.size(), kDeviceCiMaxBlobBytes);
