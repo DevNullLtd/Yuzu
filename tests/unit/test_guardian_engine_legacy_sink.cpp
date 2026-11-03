@@ -442,7 +442,7 @@ TEST_CASE("legacy_sink_dropped_unwired(): 0 until a sink is wired, then incremen
 
 // ── #5690: the census orders by the event stamp, so the stamp keeps its sub-second part ────
 
-TEST_CASE("an emitted guard event carries a millisecond-resolution timestamp, not whole seconds "
+TEST_CASE("an emitted guard event carries a millisecond-resolution timestamp and not whole seconds "
           "(#5690)",
           "[guardian][engine][legacy_sink]") {
     LegacySinkFixture f;
@@ -966,8 +966,10 @@ TEST_CASE("#4783 gap: legacy_sink_kick() stamps a still-open gap's repair with "
         // which by construction (the sleep above) is in a strictly LATER second.
         CHECK(captured[0].timestamp().seconds() == last_lost_secs);
         CHECK(captured[0].timestamp().seconds() < now_at_kick_secs);
-        // The sub-second part of last_lost travels too (the census orders by it, #5690).
-        CHECK(captured[0].timestamp().nanos() == last_lost_ns % 1'000'000'000);
+        // The sub-second part of last_lost travels too, floored to the millisecond scale of a live
+        // event (the census orders by it, #5690).
+        CHECK(captured[0].timestamp().nanos() ==
+              (last_lost_ns % 1'000'000'000) / 1'000'000 * 1'000'000); // floored to ms
     }
 
     REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));

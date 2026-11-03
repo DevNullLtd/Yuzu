@@ -212,7 +212,7 @@ public:
     /// still be overwritten by a repair covering that second loss, which stamping
     /// with `now` instead of `last_lost` would otherwise let a stale repair do to
     /// a NEWER, already-delivered real verdict, via the server's own
-    /// `updated_at >=` upsert guard — belt-and-braces alongside the executor's own
+    /// census ordering key — belt-and-braces alongside the executor's own
     /// seq-guarded clearing and dequeue-time supersession check, see
     /// guardian_legacy_sink_executor.hpp's class doc comment). The server's
     /// census goes fail-closed (errored) for a gapped rule until either the
@@ -1273,7 +1273,7 @@ private:
     /// covering that second loss); every real guard callsite leaves it at
     /// nullopt and keeps stamping `now`. This is belt-and-braces alongside the
     /// executor's own seq-guarded clearing and dequeue-time supersession check —
-    /// it lets the server's existing `updated_at >=` upsert guard independently
+    /// it lets the server's census ordering key independently
     /// reject a stale repair, even if it somehow still reached the wire.
     ///
     /// `expected_gap_lost_seq` (adversarial-review finding, 2026-09-24): threaded

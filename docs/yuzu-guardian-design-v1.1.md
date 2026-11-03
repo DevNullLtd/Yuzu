@@ -1216,7 +1216,9 @@ The census row is written in the same transaction as the event that causes it, u
 savepoint (`census_upsert`). A refused write (rule deleted) or a failed write rolls back to that
 savepoint and neither failure discards the event; a failed write other than the foreign-key refusal
 is counted on `yuzu_server_guardian_census_proj_failures_total`. The row keeps the verdict with the greatest
-ordering tuple `(key, ingest_seq)`, the key being the agent stamp limited to receipt plus 300 s; an event whose
+ordering tuple `(key, ingest_seq)`, the key being the agent stamp limited to receipt plus 300 s (one flagged
+exception: a later arrival with a usable key below the high-water mark takes the row once the mark has been
+stale for an hour of database time); an event whose
 census write failed stays stored with `projection_pending`, and a redelivery of it repairs the census from its
 stored ordering inputs. `order_uncertain` is sticky and disclosed on every read. Under one `census_upsert`
 savepoint a writer locks every pending event of the pair in `ingest_seq` order in one statement, then the census

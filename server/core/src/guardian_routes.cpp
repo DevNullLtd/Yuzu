@@ -2157,8 +2157,8 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
              "</div></div></div>";
         if (total.uncertain > 0)
             h += "<div class=\"gp-note\">" + uncertain_phrase(total.uncertain) +
-                 ": the figures above count each pair at the greatest verdict that reached "
-                 "the census, which may not be the latest.</div>";
+                 ": the figures above count each pair at the verdict the census holds, "
+                 "which may not be the latest.</div>";
     }
 
     // Stat tiles (mode-aware: remediation tiles only when an Enforce member exists).
@@ -2540,7 +2540,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
              "</div></div></div>";
         if (d_uncertain > 0)
             h += "<div class=\"gp-note\">" + uncertain_phrase(d_uncertain) +
-                 ": each device is counted at the greatest verdict that reached the census, "
+                 ": each device is counted at the verdict the census holds, "
                  "which may not be the latest.</div>";
     }
     {

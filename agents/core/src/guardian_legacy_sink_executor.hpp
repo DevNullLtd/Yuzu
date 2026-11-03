@@ -29,7 +29,7 @@
  * event is delivered in admission order or counted as lost; two events for the
  * SAME rule_id never collapse into one slot (drift.detected, drift.remediated,
  * remediation.failed, guard.compliant, guard.unhealthy are all distinct census
- * signals - the server orders same-second events by ARRIVAL order, so reordering
+ * signals - the server orders events with an identical stamp by ARRIVAL order (and flags the pair), so reordering
  * is a correctness bug, not just a cardinality change). Bounded by BOTH
  * `max_events` and `max_bytes` (Event::ByteSizeLong(), computed once at offer()).
  *
@@ -94,7 +94,7 @@
  * repair_seq at all), the repair is SKIPPED - never sent - and counted in
  * `repairs_suppressed`. This is the piece that actually closes the reported
  * symptom (a stale synthetic repair overwriting a newer real verdict on the
- * server via its own `updated_at >=` upsert guard): checking supersession only
+ * server via its own census ordering key): checking supersession only
  * at kick/fire time is not enough, because the supersession can happen AFTER
  * the repair is already queued and BEFORE it reaches the front.
  *

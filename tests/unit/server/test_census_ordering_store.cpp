@@ -316,7 +316,7 @@ TEST_CASE("census ordering: an adopted v4 object not as this version creates it 
         exec_sql(db.dsn(), "INSERT INTO " + st + " (agent_id, rule_id, state, updated_at, key_ns, "
                                                 "ingest_seq, seq_hwm) VALUES ('a1', 'r1', "
                                                 "'compliant', 't', 1, 1, 500)");
-        exec_sql(db.dsn(), "SELECT setval('" + seq + "', 1, false)");
+        exec_sql(db.dsn(), "SELECT setval('" + seq + "', 2, false)"); // above ingest_seq (1) and at or below seq_hwm (500)
     }
     SECTION("the sequence was reseeded below the retained maximum") {
         exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
@@ -1239,7 +1239,7 @@ TEST_CASE("census ordering: the uncertain-rule count honours the caller's scope"
     CHECK_FALSE(closed.uncertain_rule_count(Scope{}).has_value());
 }
 
-TEST_CASE("census ordering: a stale high-water mark stops freezing the verdict after an hour (UP-11)",
+TEST_CASE("census ordering: a stale high-water mark stops freezing the verdict after an hour (#5690 UP-11)",
           "[pg][guaranteed_state_store][db][census][ordering][stale]") {
     // An agent clock that steps backwards stamps every later event below the mark. Within the hour
     // after the mark last rose the verdict is held and flagged; after it, arrival order governs
@@ -1332,7 +1332,7 @@ std::string hwm_recv_is_db_now(const std::string& dsn, const std::string& agent)
                  kSchema + ".guardian_agent_rule_status WHERE agent_id = '" + agent + "'");
 }
 
-TEST_CASE("census ordering: a pending event that shares a key with a different verdict is flagged (UP-3)",
+TEST_CASE("census ordering: a pending event that shares a key with a different verdict is flagged (#5690 UP-3)",
           "[pg][guaranteed_state_store][db][census][ordering][tie]") {
     // Governance Gate 8 pass 2: nine reviewers found that a PENDING event with the same key as a
     // later, different verdict was retired as dominated with the row left clean. A pending event's
@@ -1411,6 +1411,39 @@ TEST_CASE("census ordering: a pending event that shares a key with a different v
     }
 }
 
+TEST_CASE("census ordering: only the fold flags a pending same-key peer that a lower-key lower-sequence arrival sees",
+          "[pg][guaranteed_state_store][db][census][ordering][tie]") {
+    // The schedule where the fold's same-key term is the ONLY thing that flags the row (found in
+    // governance, Gate 8 pass 3): Q (errored, key 300) projects and commits first; P (drifted, the
+    // same key, a LOWER sequence) became pending meanwhile; Z (key 100, a sequence BELOW Q's)
+    // then projects. Z neither applies nor flags in the upsert (key and sequence both below the row),
+    // and the clear would retire P as dominated. Sequences are placed by hand (setval and a
+    // hand-written pending row), because three concurrent ingests cannot be ordered otherwise.
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    const std::string seq = std::string(kSchema) + ".guaranteed_state_events_ingest_seq_seq";
+
+    exec_sql(db.dsn(), "SELECT setval('" + seq + "', 10, false)");
+    REQUIRE(store.insert_event_classified(ev("q", "r1", "a", kErrored, kBase + 300)).outcome ==
+            EventInsertOutcome::Inserted); // seq 10, unflagged
+    REQUIRE(census(db.dsn(), "a", "r1") ==
+            "errored|" + key_str(kBase + 300) + "|" + key_str(kBase + 300) + "|false");
+    exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                           ".guaranteed_state_events (event_id, rule_id, agent_id, event_type, "
+                           "severity, timestamp, ingest_seq, proj_key, projection_pending) "
+                           "OVERRIDING SYSTEM VALUE VALUES ('p', 'r1', 'a', 'drift.detected', "
+                           "'high', 't', 3, " + key_str(kBase + 300) + ", true)");
+    exec_sql(db.dsn(), "SELECT setval('" + seq + "', 5, false)");
+    REQUIRE(store.insert_event_classified(ev("z", "r1", "a", kCompliant, kBase + 100)).outcome ==
+            EventInsertOutcome::Inserted); // seq 5: below Q's, above P's
+    CHECK(census(db.dsn(), "a", "r1") ==
+          "errored|" + key_str(kBase + 300) + "|" + key_str(kBase + 300) + "|true");
+    CHECK(pending_count(db.dsn()) == "0");
+}
+
 TEST_CASE("census ordering: a lower-sequence arrival with the same key and a different verdict is flagged",
           "[pg][guaranteed_state_store][db][census][ordering][tie][lockorder]") {
     // The non-apply branch and the WHERE disjunct for a tie, reached deterministically: W1 (the
@@ -1474,8 +1507,12 @@ TEST_CASE("census ordering: recovery needs a later arrival than the applied verd
           "errored|" + key_str(kBase + 600) + "|" + key_str(kBase + 1000) + "|true");
 }
 
-TEST_CASE("census ordering: the mark's time is the database clock, set when the mark rises",
+TEST_CASE("census ordering: the mark's time is the database clock and is set when the mark rises",
           "[pg][guaranteed_state_store][db][census][ordering][stale]") {
+    // Note: the test server and the database share a host clock, so these cases cannot tell a
+    // replica's clock from the database's; the clock authority is established by the SQL (the stamp
+    // is `statement_timestamp()` in the statement text), and these cases pin that the stamp is a
+    // current time and not an agent stamp or an event receipt.
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
@@ -1511,6 +1548,28 @@ TEST_CASE("census ordering: the mark's time is the database clock, set when the 
                 EventInsertOutcome::Inserted); // sees e2: the fold raises the mark to its key
         CHECK(census(db.dsn(), "a", "r1").find("|" + key_str(kBase + 400) + "|") != std::string::npos);
         CHECK(hwm_recv_is_db_now(db.dsn(), "a") == "true");
+    }
+    SECTION("a recorded time four minutes ahead is inside the slack: the verdict is still held") {
+        REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase + 1000)).outcome ==
+                EventInsertOutcome::Inserted);
+        exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
+                               ".guardian_agent_rule_status SET hwm_recv_ns = hwm_recv_ns + "
+                               "240000000000");
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 500)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "drifted|" + key_str(kBase + 1000) + "|" + key_str(kBase + 1000) + "|true");
+    }
+    SECTION("a recorded time six minutes ahead is past the slack: it counts as stale") {
+        REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase + 1000)).outcome ==
+                EventInsertOutcome::Inserted);
+        exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
+                               ".guardian_agent_rule_status SET hwm_recv_ns = hwm_recv_ns + "
+                               "360000000000");
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 500)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "compliant|" + key_str(kBase + 500) + "|" + key_str(kBase + 1000) + "|true");
     }
     SECTION("a recorded time in the database's future counts as stale, never as an indefinite hold") {
         REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase + 1000)).outcome ==

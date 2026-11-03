@@ -655,7 +655,8 @@ std::string ordering_schema_defect(PGconn* conn) {
            "named objects (a missing column needs no drop) and run \"UPDATE public.schema_meta "
            "SET version = 3 WHERE store = "
            "'guaranteed_state_store'\", then restart, which re-runs the v4 migration. If v4 was "
-           "used, dropping an object discards ordering evidence, so reconcile by hand. A "
+           "used, dropping an object discards ordering evidence, so reconcile by hand (a missing "
+           "seq_hwm or hwm_recv_ns column needs no drop: the version-3 reset adds it without loss). A "
            "sequence refusal is repaired, with every replica stopped, by setval of the "
            "ingest_seq sequence to the larger of the event maximum and the census ingest_seq and "
            "seq_hwm maxima with is_called true; the store never reseeds it";
@@ -1246,8 +1247,9 @@ std::expected<void, std::string> project_observation(PGconn* conn,
 
 // ── Census ordering (schema v4, #5690) ───────────────────────────────────────────────────────
 //
-// The contract: a census row says which verdict has the greatest ordering key among the events
-// that reached it, never "the latest event". `key_ns` is K = min(agent stamp, receipt + 300 s),
+// The contract: a census row says which verdict the ordering rules below chose among the events
+// that reached it, never "the latest event" (usually the event with the greatest key; the one
+// flagged exception is the stale-mark recovery). `key_ns` is K = min(agent stamp, receipt + 300 s),
 // 0 when the stamp is absent or unusable; ties break by `ingest_seq`, the sequence value the event
 // INSERT allocated (later arrival = higher sequence, not emission or commit order; distinct events
 // have unique values, duplicate deliveries reuse one, values are not contiguous). `order_uncertain`
@@ -1265,7 +1267,7 @@ std::expected<void, std::string> project_observation(PGconn* conn,
 // The invariant the statements below maintain: a row that is NOT flagged and has no pending event
 // holds the event with the greatest key, which is also the event with the greatest arrival
 // sequence, and no other event of the pair shares that key with a different verdict. A recovered
-// row is always flagged. (Checked by randomised schedule exploration in governance, Gate 8.)
+// row is always flagged. (Checked by randomised schedule exploration against these statements.)
 //
 // A first-delivery event whose census write fails stays stored with `projection_pending`; a
 // redelivery repairs it. No application-level pair lock, no heal clause and no repair skip:
@@ -1399,17 +1401,23 @@ constexpr const char* kCensusLockAll =
     "OR (e.proj_key <> 0 AND e.proj_key = COALESCE(c.key_ns, 0) "                                  \
     "    AND e.ingest_seq <> COALESCE(c.ingest_seq, 0)))"
 
-// Fold the seen events into the existing row (UPDATE arm only; a no-op when the row is absent).
-// CORRELATED on c so Postgres re-evaluates it against the row's latest version after a lock wait.
 // The time every `hwm_recv_ns` stamp and the stale-mark test use: the DATABASE clock, never a
-// replica's, so every replica agrees on it (the AuthDB #3715 precedent). `clock_timestamp()` is read
-// at evaluation, so it can differ by microseconds between two uses in one statement.
-#define YUZU_CENSUS_DB_NOW_NS_ "(floor(extract(epoch FROM clock_timestamp()) * 1000000000))::bigint"
+// replica's, so every replica agrees on it (the AuthDB #3715 precedent). `statement_timestamp()` is
+// ONE value for the whole statement, so the six expansions of the recovery test below cannot
+// disagree with one another and tear a row (a volatile `clock_timestamp()` could, measured). It is
+// read at statement START, before any row-lock wait, so a time recorded by a transaction that
+// started later can look slightly in the future: the future-dated clause carries a slack for that.
+#define YUZU_CENSUS_DB_NOW_NS_ "(floor(extract(epoch FROM statement_timestamp()) * 1000000000))::bigint"
+// A recorded time more than this far ahead of the database clock (five minutes) is a stepped-back
+// clock, not a lock wait.
+#define YUZU_CENSUS_FUTURE_SLACK_NS_ "300000000000"
 
 #define YUZU_CENSUS_FOLD_MAX_KEY_                                                                 \
     "(SELECT max(e.proj_key) FROM guaranteed_state_store.guaranteed_state_events e "               \
     "  WHERE e.event_id = ANY($3::text[]) AND " YUZU_CENSUS_SEEN_DISAGREES_ ")"
 
+// Fold the seen events into the existing row (UPDATE arm only; a no-op when the row is absent).
+// CORRELATED on c so Postgres re-evaluates it against the row's latest version after a lock wait.
 // `hwm_recv_ns` becomes the database time when the fold raises the mark.
 constexpr const char* kCensusFold =
     "UPDATE guaranteed_state_store.guardian_agent_rule_status c "
@@ -1436,13 +1444,14 @@ constexpr const char* kCensusFold =
 
 // Stale-mark recovery R: a usable key below the mark, a later arrival than the applied verdict, and
 // a mark that last rose more than YUZU_CENSUS_STALE_NS_ (1 hour of database time) ago, or whose
-// recorded time is in the database's future (a stepped-back clock: treated as stale, never as an
-// indefinite hold). A row with no recorded time (hwm_recv_ns NULL) never recovers.
+// recorded time is more than YUZU_CENSUS_FUTURE_SLACK_NS_ in the database's future (a stepped-back
+// clock: treated as stale, never as an indefinite hold; a smaller step lengthens the hold by up to
+// the step). A row with no recorded time (hwm_recv_ns NULL) never recovers.
 #define YUZU_CENSUS_STALE_NS_ "3600000000000"
 #define YUZU_CENSUS_RECOVER_                                                                      \
     "(EXCLUDED.key_ns > 0 AND EXCLUDED.key_ns < COALESCE(c.ts_hwm, 0) "                            \
     "AND EXCLUDED.ingest_seq > COALESCE(c.ingest_seq, 0) AND c.hwm_recv_ns IS NOT NULL "           \
-    "AND (c.hwm_recv_ns > " YUZU_CENSUS_DB_NOW_NS_ " "                                             \
+    "AND (c.hwm_recv_ns > " YUZU_CENSUS_DB_NOW_NS_ " + " YUZU_CENSUS_FUTURE_SLACK_NS_ " "        \
     "     OR " YUZU_CENSUS_DB_NOW_NS_ " - c.hwm_recv_ns > " YUZU_CENSUS_STALE_NS_ "))"
 
 #define YUZU_CENSUS_APPLY_ "(" YUZU_CENSUS_APPLY_P_ " OR " YUZU_CENSUS_RECOVER_ ")"
@@ -1532,6 +1541,7 @@ constexpr const char* kCensusMarkPending =
 #undef YUZU_CENSUS_TIE_
 #undef YUZU_CENSUS_FOLD_MAX_KEY_
 #undef YUZU_CENSUS_DB_NOW_NS_
+#undef YUZU_CENSUS_FUTURE_SLACK_NS_
 
 constexpr const char* kCensusRuleFkName = "guardian_agent_rule_status_rule_fk";
 // The two unique constraints an event INSERT can hit; the boot shape check requires both names.
