@@ -3099,8 +3099,8 @@ struct OfflineRig {
 
 } // namespace
 
-TEST_CASE("registry source: a failed HKEY_USERS enumeration keeps the cursor, the baselines and "
-          "the HKU mark, and the next tick re-enumerates",
+TEST_CASE("registry source: a failed HKEY_USERS enumeration keeps the cursor and the HKU mark "
+          "and the next tick re-enumerates",
           "[echo][registry][lifecycle]") {
     OfflineRig r;
     const auto root = uroot(kSidA);
