@@ -358,8 +358,8 @@ operator-visible notes:
   - **Counting.** Each refused frame counts on
     `yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}` (see [metrics.md](metrics.md))
     and logs a rate-limited warning. To find the command and device, grep the server log for
-    `per-agent row cap (` ... `reached for instruction= agent=` (the warning is rate-limited, the
-    counter is exact).
+    `per-agent row cap (` — one line carries the cap, the command and the device (the warning is
+    rate-limited, the counter is exact).
   - **Concurrency.** There is no lock around the count and the insert, so two writers for the same
     command and device at once (a direct stream and a gateway forward) can overshoot the cap by the
     number of concurrent writers.

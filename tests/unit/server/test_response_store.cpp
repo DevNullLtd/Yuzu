@@ -3808,7 +3808,9 @@ TEST_CASE("ResponseStore: a capped pair's row before the gap ends with the row-c
         frame.timestamp = ts;
         f.store.store(frame);
     }
-    for (const auto& r : pair_rows(f.store, "cmd-mark", "agent-3"))
+    const auto agent3 = pair_rows(f.store, "cmd-mark", "agent-3");
+    REQUIRE(agent3.size() == 4);
+    for (const auto& r : agent3)
         CHECK(r.output == (r.timestamp == 300 ? "frame" + marker : std::string("frame")));
 
     // The overflow terminal row is NOT marked at insert: rows == cap is reachable with zero drops,
@@ -3832,7 +3834,7 @@ TEST_CASE("ResponseStore: a capped pair's row before the gap ends with the row-c
 
 TEST_CASE("ResponseStore: a marker that cannot be written drops the frame as a query_error",
           "[pg][response_store][cap]") {
-    // Fail-closed branch of the marker UPDATE (the only UPDATE store() issues): a trigger that
+    // Fail-closed branch of the marker UPDATE (the only UPDATE store() issues on `responses`): a trigger that
     // raises fails that statement alone, the INSERT path is untouched, so this discriminates the
     // marker failure from every other store() failure.
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

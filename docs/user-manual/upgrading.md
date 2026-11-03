@@ -7,7 +7,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 - **What changed:** the response store keeps at most 256 rows for one command on one device (`--response-max-rows-per-agent`, env `YUZU_RESPONSE_MAX_ROWS_PER_AGENT`, range 1-65536). Rows past the cap are dropped, newest first, and the row just before the dropped frames ends with a `...[rows past per-agent cap dropped]` marker. One terminal-status row is still recorded past the cap when none exists, so the command's outcome shows.
 - **Affected:** any caller that reads the full output of a command streaming more than about 16 MiB to one device (for example through `/api/v1/responses` or the executions drawer): it now gets the first part and the marker, not the tail.
 - **To keep the full output:** raise `--response-max-rows-per-agent` for such commands, and watch `yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}` and the informational alert `YuzuResponsePerAgentCapDrops`.
-- **Index:** a database index supporting the cap is built once, on the first start of this version.
+- **Index:** a database index supporting the cap is created with the schema at first start (instant on a fresh database).
 
 ## ⚠️ Breaking: `GET /api/v1/dex/apps` now covers every platform by default
 
