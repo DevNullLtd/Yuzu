@@ -212,10 +212,10 @@ namespace detail {
         const Product& p = table[i];
         if (!detail::is_ident(detail::sv(p.id), true) ||
             !detail::is_ident(detail::sv(p.ecosystem), true) || detail::sv(p.title).empty() ||
-            // The collector compares a row's title, which arrives wire-escaped (`\|`, `\\`), with
-            // this raw one, so a title holding either byte would never map and its source's stored
-            // rows would be removed.
-            detail::sv(p.title).find_first_of("|\\") != std::string_view::npos ||
+            // The collector compares a row's title, which arrives wire-escaped (`\|`, `\\`) and
+            // with CR/LF folded to a space, with this raw one, so a title holding any of those
+            // bytes would never map and its source's stored rows would be removed.
+            detail::sv(p.title).find_first_of("|\\\r\n") != std::string_view::npos ||
             detail::sv(p.vendor).empty() || detail::sv(p.kind) != "app")
             return false;
         for (std::size_t j = 0; j < i; ++j)
