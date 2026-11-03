@@ -1288,7 +1288,7 @@ TEST_CASE("census ordering: a stale high-water mark stops freezing the verdict a
         CHECK(census(db.dsn(), "a", "r1") ==
               "drifted|" + key_str(kBase + 1000) + "|" + key_str(kBase + 1000) + "|true");
     }
-    SECTION("a row with no recorded receipt never recovers") {
+    SECTION("a row with no recorded mark time never recovers") {
         exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
                                ".guardian_agent_rule_status SET hwm_recv_ns = NULL");
         REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 500)).outcome ==
@@ -1296,7 +1296,7 @@ TEST_CASE("census ordering: a stale high-water mark stops freezing the verdict a
         CHECK(census(db.dsn(), "a", "r1") ==
               "drifted|" + key_str(kBase + 1000) + "|" + key_str(kBase + 1000) + "|true");
     }
-    SECTION("the receipt time moves only when the mark rises") {
+    SECTION("the mark time moves only when the mark rises") {
         const std::string before = query_scalar(
             db.dsn(), std::string("SELECT hwm_recv_ns FROM ") + kSchema +
                           ".guardian_agent_rule_status WHERE agent_id = 'a'");

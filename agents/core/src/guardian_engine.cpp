@@ -3114,7 +3114,7 @@ void GuardianEngine::emit_guard_event(
             : static_cast<std::int64_t>(now_ms);
     std::int64_t stamp_secs = stamp_ms / 1000;
     std::int64_t stamp_sub_ms = stamp_ms % 1000;
-    if (stamp_sub_ms < 0) { // floor, as protobuf Timestamp requires nanos in [0, 1e9)
+    if (stamp_sub_ms < 0) { // C++ division truncates toward zero; correct to a floor so nanos is in [0, 1e9)
         stamp_sub_ms += 1000;
         --stamp_secs;
     }
