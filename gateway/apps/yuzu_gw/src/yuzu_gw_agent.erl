@@ -133,7 +133,8 @@
     %% once it has registered, because drop_request/1 empties register_req; an
     %% owner started directly (no owner_key) keeps the request, and so its
     %% AgentInfo, in register_req. The tuple position is unchanged, so the
-    %% pre-G1 code_change/4 clause finds the old AgentInfo map here.
+    %% code_change/4 clause for a record from before the owner kept the
+    %% hostname alone finds the old AgentInfo map here.
     %% (stream_pid's position does not depend on this: it precedes the field.)
     hostname    :: binary(),
     register_req :: map(),                %% verbatim RegisterRequest (for upstream-reconnect replay)
@@ -846,9 +847,9 @@ code_change(_OldVsn, State, Data0, Extra) when is_tuple(Data0), element(1, Data0
 code_change(_OldVsn, State, Data0, Extra) when is_tuple(Data0), element(1, Data0) =:= data,
                                                 tuple_size(Data0) =:= tuple_size(#data{}),
                                                 is_map(element(#data.hostname, Data0)) ->
-    %% A record from before the owner kept the hostname alone (2026-10-26): the field held the whole
-    %% AgentInfo; only its hostname is kept. Matched as a tuple, not as
-    %% #data{}, whose field is now typed binary().
+    %% A record from before the owner kept the hostname alone (2026-10-26):
+    %% the field held the whole AgentInfo; only its hostname is kept. Matched
+    %% as a tuple, not as #data{}, whose field is now typed binary().
     Info = element(#data.hostname, Data0),
     code_change(_OldVsn, State, setelement(#data.hostname, Data0, hostname_of(Info)), Extra);
 code_change(_OldVsn, State, #data{pending = Pending} = Data, _Extra) ->

@@ -77,11 +77,11 @@ agent_test_() ->
       {"get_info returns state", fun get_info_works/0},
       {"the owner keeps the hostname, not the whole AgentInfo",
        fun owner_keeps_hostname_not_agent_info/0},
-      {"code_change reduces a pre-G1 AgentInfo field to its hostname",
+      {"code_change reduces an old record's AgentInfo field to its hostname",
        fun code_change_reduces_agent_info_to_hostname/0},
       {"the hostname is read from a binary key, an atom key, or defaults to <<>>",
        fun hostname_key_shapes/0},
-      {"code_change/4 on a pre-OWNER-RESTART, pre-G1 tuple (chaos CH-3)",
+      {"code_change/4 on an old record: no owner_key, whole AgentInfo in the hostname slot",
        fun code_change_pure_pre_g1_tuple/0},
       {"stream handler death triggers disconnect", fun stream_handler_death/0},
       {"stream handler death in connecting state", fun stream_handler_death_connecting/0},
@@ -465,8 +465,8 @@ hostname_key_shapes() ->
               stop_agent(Pid)
       end, Cases).
 
-%% Chaos CH-3: code_change/4 called directly on a record from before both
-%% OWNER-RESTART and the hostname-only owner (one element short, the AgentInfo
+%% code_change/4 called directly on a record from before both owner restart
+%% (no owner_key) and the hostname-only owner (one element short, the AgentInfo
 %% map in the hostname slot). The tuple is built from a live owner's state, so the
 %% test does not hard-code the record: the hostname slot is the one element
 %% holding the owner's unique hostname, and the last element is dropped.
@@ -498,8 +498,8 @@ code_change_pure_pre_g1_tuple() ->
       end, Cases).
 
 %% The owner keeps the hostname alone: a #data record from an earlier build
-%% holds the whole AgentInfo map in the hostname position. code_change/4 reduces it to the hostname, and the
-%% upgraded owner still answers get_info/1 and dispatches.
+%% holds the whole AgentInfo map in the hostname position. code_change/4
+%% reduces it to the hostname, and the upgraded owner still answers get_info/1 and dispatches.
 code_change_reduces_agent_info_to_hostname() ->
     Args = #{agent_id   => <<"g1-cc">>,
              session_id => <<"sess-g1-cc">>,
