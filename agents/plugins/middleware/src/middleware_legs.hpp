@@ -80,7 +80,7 @@ using LegFn = int (*)(yuzu::CommandContext&, const Product&);
 /// ^(windows|macos|linux):[a-z0-9_]+(:[a-z0-9_]+)*$; the catch-all's `internal_error` is the
 /// one OS-neutral token. An unknown action writes ONE non-status line and returns 1 (no
 /// status row); a throwing leg gets `status|<action>|constrained|internal_error` appended
-/// (the LAST status row wins) and returns 1 -- a genuine internal failure is a failed command.
+/// (a second status row: the collector fails the call on rc=1 before it parses any row, and the typed result status becomes constrained) and returns 1 -- a genuine internal failure is a failed command.
 inline int execute_action(yuzu::CommandContext& ctx, std::string_view action, LegFn leg) {
     const Product* p = nullptr;
     try {
