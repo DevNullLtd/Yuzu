@@ -588,3 +588,68 @@ TEST_CASE("matcher: a two-column definition over a key/value plugin is unchanged
     CHECK(response_matches(m.dump(), kOk, "status|ok"));
     CHECK_FALSE(response_matches(m.dump(), kOk, "status|no"));
 }
+
+// ── references_raw_capture_table: persisted SQL that still reads a raw capture table ───────────
+
+TEST_CASE("raw capture table predicate: dollar names and real names", "[result_set][matcher]") {
+    CHECK(references_raw_capture_table("SELECT pid FROM $Process_Live"));
+    CHECK(references_raw_capture_table("select * from $process_live where pid = 1"));
+    // The shape of the chained sets in test_chrome_ir_chain.cpp.
+    CHECK(references_raw_capture_table("SELECT pid FROM process_live WHERE name='chrome.exe'"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM main.PROCESS_LIVE"));
+    CHECK(references_raw_capture_table("SELECT a FROM t JOIN $TCP_Live ON 1"));
+    CHECK(references_raw_capture_table("SELECT 1 FROM \"registry_live\""));
+}
+
+TEST_CASE("raw capture table predicate: every one of the sixteen real tables", "[result_set][matcher]") {
+    for (const char* t : {"process", "tcp", "service", "user", "perf", "procperf", "netqual",
+                          "module", "software", "arp", "dns", "netconn", "mapdrive", "power",
+                          "removable", "registry"}) {
+        INFO(t);
+        CHECK(references_raw_capture_table(std::string("SELECT 1 FROM ") + t + "_live"));
+    }
+}
+
+TEST_CASE("raw capture table predicate: roll-up tiers and look-alikes pass", "[result_set][matcher]") {
+    CHECK_FALSE(references_raw_capture_table("SELECT name FROM $Process_Hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT name FROM $Process_Daily"));
+    CHECK_FALSE(references_raw_capture_table("SELECT name FROM process_hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM process_lived"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM my_process_live"));
+    // usage_live is the open-runs table, not a raw capture table.
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM usage_live"));
+    CHECK_FALSE(references_raw_capture_table(""));
+}
+
+TEST_CASE("raw capture table predicate: literals and comments are not table references",
+          "[result_set][matcher]") {
+    CHECK_FALSE(references_raw_capture_table("SELECT '$Process_Live' AS label FROM $Process_Hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 'it''s process_live' FROM $Process_Hourly"));
+    CHECK_FALSE(references_raw_capture_table("SELECT 1 FROM $Process_Hourly -- was $Process_Live\n"));
+    CHECK_FALSE(references_raw_capture_table("SELECT /* process_live */ 1 FROM $Process_Hourly"));
+    // A literal that ends before the reference does not hide it.
+    CHECK(references_raw_capture_table("SELECT 'x' FROM process_live"));
+    // An unterminated literal hides the rest, never the part before it.
+    CHECK(references_raw_capture_table("SELECT 1 FROM process_live WHERE a = 'unterminated"));
+}
+
+TEST_CASE("instruction raw capture predicate: stored param first then schema default",
+          "[result_set][matcher]") {
+    const std::string schema =
+        R"({"type":"object","properties":{"sql":{"type":"string","default":"SELECT 1 FROM $TCP_Live"}}})";
+    const std::string hourly_schema =
+        R"({"type":"object","properties":{"sql":{"type":"string","default":"SELECT 1 FROM $TCP_Hourly"}}})";
+    // A stored param decides, whatever the default is.
+    CHECK(instruction_reads_raw_capture_table(nlohmann::json{{"sql", "SELECT 1 FROM process_live"}},
+                                              hourly_schema));
+    CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json{{"sql", "SELECT 1 FROM $TCP_Hourly"}},
+                                                    schema));
+    // No stored param: the definition's own default runs.
+    CHECK(instruction_reads_raw_capture_table(nlohmann::json::object(), schema));
+    CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json::object(), hourly_schema));
+    CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json(), hourly_schema));
+    // Nothing to read: not a refusal.
+    CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json::object(), ""));
+    CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json::object(), "not json"));
+    CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json::object(), R"({"properties":{}})"));
+}

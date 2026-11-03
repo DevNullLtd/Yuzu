@@ -385,7 +385,7 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
         return body;
     }
 
-    if (kind == "capture_sources") { // echo status: config|<src>_enabled|v, config|<src>_live_rows|N
+    if (kind == "capture_sources") { // echo status: config|<src>_enabled|v, config|<src>_rows|N (alias <src>_live_rows)
         // Display order + presentation metadata. The server does NOT link the agent's
         // echo_schema_registry, so source name/$-table/category are held here; we only
         // render a row for a source the agent actually reported (its `<src>_enabled` key
@@ -417,8 +417,12 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             s.dollar = m.dollar;
             s.category = m.category;
             s.enabled = (en->second == "true");
-            if (auto it = cfg.find(std::string(m.name) + "_live_rows"); it != cfg.end()) {
-                try { s.live_rows = std::stoll(it->second); } catch (...) {}
+            // Row count: `<src>_rows`, else the one-release alias `<src>_live_rows`.
+            auto rows_it = cfg.find(std::string(m.name) + "_rows");
+            if (rows_it == cfg.end())
+                rows_it = cfg.find(std::string(m.name) + "_live_rows");
+            if (rows_it != cfg.end()) {
+                try { s.live_rows = std::stoll(rows_it->second); } catch (...) {}
             }
             if (s.enabled) ++on;
             rows.push_back(std::move(s));

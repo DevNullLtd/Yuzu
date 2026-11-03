@@ -3368,8 +3368,11 @@ DashboardRoutes::gather_echo_retention_paused(const std::string& username,
                 p != kv.end()) {
                 try { row.paused_at = std::stoll(p->second); } catch (...) {}
             }
-            if (auto lr = kv.find(std::string{source} + "_live_rows");
-                lr != kv.end()) {
+            // Row count: `<src>_rows`, else the one-release alias `<src>_live_rows`.
+            auto lr = kv.find(std::string{source} + "_rows");
+            if (lr == kv.end())
+                lr = kv.find(std::string{source} + "_live_rows");
+            if (lr != kv.end()) {
                 try { row.live_rows = std::stoll(lr->second); } catch (...) {}
             }
             if (auto ot = kv.find(std::string{source} + "_oldest_ts");

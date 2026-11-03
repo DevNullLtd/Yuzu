@@ -11,6 +11,7 @@
 /// excludes the Forensics plugins outright (`deny_all()`), and an unwired set refuses every row.
 /// A Forensics-sourced set therefore materializes empty, for every creator.
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -23,11 +24,23 @@
 
 namespace yuzu::server {
 
+/// The membership of a pending set: the agent ids that satisfy the matcher, plus how many agents
+/// are absent from it because their query failed. Derives from the id vector so a caller that only
+/// needs the members (the forensics tier tests) reads it exactly as before.
+struct ResultSetMembers : std::vector<std::string> {
+    /// Distinct agents with NO row satisfying the matcher and at least one failed row (status not
+    /// success, or output starting `error|`). Matching decides first: an agent with any matching
+    /// row is a member and is never counted here, so under the default matcher a success-status
+    /// `error|` answer is a member, and the count only moves for an agent whose every row failed
+    /// or failed to match while at least one failed.
+    int64_t agents_failed{0};
+};
+
 /// The agent ids that satisfy `pending`'s matcher, in order of first appearance in the store's read
-/// (which is newest row first, `timestamp DESC`, not first-response order); `std::nullopt` when the
-/// store read degraded (the caller skips this pending set for this tick rather than materialize a
-/// false-empty membership, ADR-0039).
-[[nodiscard]] inline std::optional<std::vector<std::string>>
+/// (which is newest row first, `timestamp DESC`, not first-response order), plus `agents_failed`;
+/// `std::nullopt` when the store read degraded (the caller skips this pending set for this tick
+/// rather than materialize a false-empty membership, ADR-0039).
+[[nodiscard]] inline std::optional<ResultSetMembers>
 result_set_members(ResponseStore& responses, const ForensicsPluginSet* plugins,
                    const PendingSet& pending) {
     const auto tier = plugins ? ResponseTierFilter::exclude(*plugins, authz::deny_all())
@@ -35,14 +48,21 @@ result_set_members(ResponseStore& responses, const ForensicsPluginSet* plugins,
     auto rows = responses.query_by_execution(pending.source_execution_id, tier);
     if (!rows)
         return std::nullopt;
-    std::vector<std::string> members;
+    ResultSetMembers members;
     std::unordered_set<std::string> seen;
+    std::unordered_set<std::string> failed;
     for (const auto& r : *rows) {
-        if (!rs_matcher::response_matches(pending.matcher, r.status, r.output))
+        if (!rs_matcher::response_matches(pending.matcher, r.status, r.output)) {
+            if (r.status != rs_matcher::kStatusSuccess || r.output.starts_with("error|"))
+                failed.insert(r.agent_id);
             continue;
+        }
         if (seen.insert(r.agent_id).second)
             members.push_back(r.agent_id);
     }
+    for (const auto& id : failed)
+        if (!seen.contains(id))
+            ++members.agents_failed;
     return members;
 }
 

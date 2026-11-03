@@ -5608,36 +5608,39 @@ is absent or not open, which is "unknown", not zero. The two differ after a runt
 `PUT /api/config/<key>`, which is stored but not applied (see
 [When a change takes effect](#when-a-change-takes-effect)).
 
-`echo` publishes the Echo warehouse retention tiers: `tick_seconds` (the agent's prune
-tick, 900) and `tiers`, one row per source and tier (`live`, `hourly`, `daily`, `monthly`,
-`boot`). Each row has `limit_kind` (`rows` or `seconds`), `limit`, `bucket_seconds` (the
-roll-up bucket: 0 for `live`/`boot`, 3600, 86400, or 2678400 for a month, the 31-day worst
-case) and `guaranteed_depth_seconds`. Roll-up rows age from the start of their bucket, so
-a time-based tier is guaranteed for `limit - bucket_seconds` (a 365-day monthly tier is
-guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depends on how
-fast a device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not
-where it sits: a record is still in its finer tier until the coarser roll-up closes. It holds while
-the device is within its `db_budget_bytes` (default 250 MiB): a device over its byte budget removes
-raw capture rows older than 24 h that their first summary tier has passed and hourly rows older
-than 48 h (5 days for `procperf`) inside these depths, oldest first, until it is back under;
-`echo.status` reports it as `budget_evicted_raw_rows_total` and `budget_evicted_hourly_rows_total`
-(see the Echo manual, The database byte budget). It is a
-floor on rows that exist, not on coverage: after an agent is offline longer than a tier's
-roll-up catch-up window (2 h hourly, 2 d daily, about 62 d monthly) the missed span is a gap in
-that tier, not a deeper tier. The
-`usage`/`live` row is a backstop, not an operative bound: the usage fold bounds its own open
-set (20,000 runs) before this limit can apply.
+`echo` publishes the Echo warehouse retention tiers: `tick_seconds` (the cadence of the agent's
+retention pass, 900), `db_budget_bytes` (the default byte budget, 262144000) and `tiers`, one
+row per source and tier (`hourly`, `daily`, `monthly`, `boot`). Echo keeps roll-up tiers only,
+so `hourly` is the finest tier: there is no raw tier and no setting that brings one back. Each row has
+`limit_kind` (`rows` or `seconds`), `limit`, `bucket_seconds` (the roll-up bucket: 0 for `boot`,
+3600, 86400, or 2678400 for a month, the 31-day worst case), `guaranteed_depth_seconds` and
+`budget_dependent`. Roll-up rows age from the start of their bucket, so a time-based tier is
+guaranteed for `limit - bucket_seconds` (a 365-day monthly tier is guaranteed for 334 days). It is
+`null` for `rows` tiers, whose time depth depends on how fast a device writes.
+`guaranteed_depth_seconds` is a floor on how long a record is kept, not where it sits: a record is
+still in its finer tier until the coarser roll-up closes. `budget_dependent` is `true` for the
+`hourly` tier only. A device over its `db_budget_bytes` removes hourly rows older than 48 h
+(5 days for `procperf`) inside their depth, oldest first, until it is back under, so an hourly
+row's depth holds only while the device is within its budget; the other tiers are never removed
+for size. `echo.status` reports it as `budget_evicted_hourly_rows_total` (see the Echo manual,
+The database byte budget). It is a floor on rows that exist, not on coverage: after an agent is
+offline longer than a tier's roll-up catch-up window (2 h hourly, 2 d daily, about 62 d monthly)
+the missed span is a gap in that tier, not a deeper tier. The `usage` row is a backstop, not an
+operative bound: the usage fold bounds its own open set (20,000 runs) before this limit can apply.
 
-These are the registry **defaults** an agent of this server's release applies (agents on other
-releases may differ), not per-device readings: Echo prunes on the agent, so the server has no
-live value. Every source's tiers are declared on every OS; where a source does not run on the
-agent's OS (see the OS compatibility matrix in the Echo manual) its tier applies to an empty
-table. A paused or errored source is never pruned (per-device paused sources: [`GET /api/v1/echo/retention-paused`](#get-apiv1echoretention-paused)); while the agent is running, rows may
-outlive their limit by up to `tick_seconds` (an offline agent or a disabled plugin prunes
-nothing), longer when the retention clock guard declines a prune, shorter by any plausible
-forward skew of the endpoint clock, which the guard does not decline (the depth is measured on
-the agent's own clock), and longer still while a backlog drains through the per-pass delete cap
-(5,000 rows per table per tick). `echo` is `null` only if the server's embedded table cannot be read. A server older than this release omits `echo`; treat absent like `null`.
+These are the registry **defaults** the current release applies (agents on other releases may
+differ), not per-device readings: Echo prunes on the agent, so the server holds no per-device
+value. Every source's tiers are declared on every OS; where a source does not run on the agent's
+OS (see the OS compatibility matrix in the Echo manual) its tier applies to an empty table. A
+paused or errored source is never pruned (per-device paused sources:
+[`GET /api/v1/echo/retention-paused`](#get-apiv1echoretention-paused)) and becomes eligible again
+when it is re-enabled. `tick_seconds` is the cadence of the retention pass, not a bound: while the
+agent is running a row can outlive its limit by that tick and by ordinary scheduling lag (an offline
+agent or a disabled plugin prunes nothing), longer when the retention clock guard declines a prune,
+shorter by any plausible forward skew of the endpoint clock, which the guard does not decline (the
+depth is measured on the agent's own clock), and longer still while a backlog drains through the
+per-pass delete cap (5,000 rows per table per tick). `echo` is `null` only if the server's embedded
+table cannot be read. A server older than this release omits `echo`; treat absent like `null`.
 
 The order of `tiers` is unspecified; match rows by (`source`, `tier`). Clients must tolerate
 unknown `tier` and `limit_kind` values: a new tier is an additive change. A per-device or
@@ -5656,11 +5659,12 @@ server-enforced reading, if one ever ships, lands under a new key, never by rede
     },
     "echo": {
       "tick_seconds": 900,
+      "db_budget_bytes": 262144000,
       "tiers": [
-        { "source": "process", "tier": "live", "limit_kind": "rows", "limit": 100000,
-          "bucket_seconds": 0, "guaranteed_depth_seconds": null },
+        { "source": "process", "tier": "hourly", "limit_kind": "seconds", "limit": 86400,
+          "bucket_seconds": 3600, "guaranteed_depth_seconds": 82800, "budget_dependent": true },
         { "source": "process", "tier": "daily", "limit_kind": "seconds", "limit": 2678400,
-          "bucket_seconds": 86400, "guaranteed_depth_seconds": 2592000 }
+          "bucket_seconds": 86400, "guaranteed_depth_seconds": 2592000, "budget_dependent": false }
       ]
     }
   },
@@ -7583,6 +7587,7 @@ re-eval, unchanged.
 |---|---|
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent set; or missing `sql` / `instruction_id`. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
+| 400 | `RESULT_SET_REEVAL_STALE_SOURCE` — on `from-echo-query`, the `sql` reads a raw capture table (a `$<Source>_Live` name or a `<source>_live` table); on `re-eval`, the stored SQL does (for an `instruction_result` set, the stored `sql` param, else the definition's default). Echo keeps roll-up tiers only, so such a query answers with no rows and the set would be silently empty. Nothing is dispatched; query the hourly roll-up instead (for example `$Process_Hourly`). A match inside a string literal or a comment is not a reference. This is a behaviour change for a stale client that stored a set over a `$<Source>_Live` name |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"echo_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too, and so is a column matcher (no `kind`) whose `column`, `op` or `value` is present but not a string or whose `value_set` is present but not an array (`{"column":5,"op":"eq"}` used to qualify every responder; a stored one now matches no device, while a MISSING key keeps the accept-all default so a typo cannot silently empty the set); it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` that carries `declared_columns`, `plugin` or `row_discriminator`. These three keys are server-authored: when the matcher's `column` is a column the instruction definition declares in its `result_schema`, the server stores them (`declared_columns` = field names in output order, `plugin` = the definition's plugin) so a column matcher works on any plugin's pipe-row output, not only Echo or JSON. The header row and short status rows (`status\|not_found`, `not_available\|<reason>`) are skipped. A column the definition does not declare stores nothing extra |
@@ -8220,11 +8225,13 @@ The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-wal
   "source_kind": "manual_curate",
   "status": "materialized",
   "source_execution_id": "",
-  "device_count": 42
+  "device_count": 42,
+  "agents_failed": 0,
+  "partial": false
 }
 ```
 
-`parent_id` is `""` when the set has no parent. `source_kind` is one of `manual_curate` (direct `POST /result-sets`), `inventory_query`, `echo_query`, or `instruction_result`. `status` is `pending` until an asynchronous producer's dispatch responses land, then `materialized` (or `failed` if the dispatch could not be materialized).
+`agents_failed` counts the agents that answered an asynchronous producer's dispatch with a failure (a non-success status, or output starting `error|`) and never produced a matching row. They are absent from the set because their query failed, not because they do not match, so `partial` is `true` whenever `agents_failed` is above zero and the set may be missing devices. An agent that failed once and later matched is a member and is not counted. Both are `0` / `false` for a set that is not filled from agent answers, and while a set is still `pending`. `parent_id` is `""` when the set has no parent. `source_kind` is one of `manual_curate` (direct `POST /result-sets`), `inventory_query`, `echo_query`, or `instruction_result`. `status` is `pending` until an asynchronous producer's dispatch responses land, then `materialized` (or `failed` if the dispatch could not be materialized).
 
 #### `GET /api/v1/result-sets`
 

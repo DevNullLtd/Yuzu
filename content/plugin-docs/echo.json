@@ -509,7 +509,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Per-day process activity for the last 30 days, aggregated from $Process_Daily. Each row is (date, process_name, user, start_count, stop_count). Useful for trend questions (\"did $process_name run more often last week than the week before?\") that would be O(N) over $Process_Live.",
+      "description": "Per-day process activity for the last 30 days, aggregated from $Process_Daily. Each row is (date, process_name, user, start_count, stop_count). Useful for trend questions (\"did $process_name run more often last week than the week before?\") that would be O(N) over $Process_Hourly.",
       "display_name": "Echo: Daily process summary",
       "execute_roles": [
         "endpoint-admin",
@@ -593,7 +593,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Show all listening TCP ports with the process that owns them.",
+      "description": "Show the TCP ports that opened a listening socket, with the owning process and how many listening sockets opened and closed, from the hourly roll-up. The roll-up keeps counts per hour, not a list of the sockets open right now, and no pid.",
       "display_name": "Echo: Listening Ports",
       "execute_roles": [
         "endpoint-admin",
@@ -614,7 +614,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Show recently started processes with parent-child relationships for the last hour.",
+      "description": "Show the processes started in the last hour with the name of their parent, from the hourly roll-up. The roll-up keeps names and counts per hour, not pids, so the tree is by parent name.",
       "display_name": "Echo: Process Tree",
       "execute_roles": [
         "endpoint-admin",
@@ -635,7 +635,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Queries the Echo event database for system activity records within a time range. Events include process starts/stops, network connections opened/closed, service state changes, and user logins/logouts. Results are pipe-delimited: timestamp|event_type|event_action|snapshot_id|detail_json. The detail_json field contains a JSON object with type-specific fields: Process events: {\"pid\":N, \"ppid\":N, \"name\":\"...\", \"cmdline\":\"...\", \"user\":\"...\"} Network events: {\"proto\":\"tcp\", \"local_addr\":\"...\", \"local_port\":N, \"remote_addr\":\"...\", \"remote_host\":\"...\", \"remote_port\":N, \"state\":\"...\", \"pid\":N} Service events: {\"name\":\"...\", \"display_name\":\"...\", \"status\":\"...\", \"startup_type\":\"...\"} User events: {\"user\":\"...\", \"domain\":\"...\", \"logon_type\":\"...\", \"session_id\":\"...\"}",
+      "description": "Queries the Echo hourly roll-up for system activity within a time range. Echo keeps hourly, daily and monthly roll-up tiers only, so each row is one hour bucket of one capture source: process starts/stops, network connections opened/closed, service state changes, and user logins/logouts are counted per hour, not listed one by one. Results are pipe-delimited: timestamp|event_type|event_action|snapshot_id|detail_json, where timestamp is the bucket start, event_action is always bucket and snapshot_id is 0. The detail_json field contains a JSON object holding that bucket's key fields and counts, named as the columns of the source's hourly table are (for example name, user, start_count and stop_count for a process). For anything finer than that, or for daily and monthly figures, use echo.sql over the $<Source>_Hourly, $<Source>_Daily and $<Source>_Monthly tables.",
       "display_name": "Query Echo Events",
       "execute_roles": [
         "endpoint-admin",
@@ -656,7 +656,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Recent ARP / neighbour-table activity (ADR-0015) — IP<->MAC bindings per interface with their appeared/removed action. Requires the `arp` capture source to be enabled on the device (the default).",
+      "description": "Recent ARP / neighbour-table activity (ADR-0015) — IP<->MAC bindings per interface with their appeared and removed counts per hour, from the hourly roll-up. Requires the `arp` capture source to be enabled on the device (the default).",
       "display_name": "Echo: ARP table (recent)",
       "execute_roles": [
         "endpoint-admin",
@@ -675,7 +675,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Recent DNS resolver-cache state (ADR-0015) — name/record_type/data/TTL with their appeared/removed action. Device-level (no per-process attribution). Requires the `dns` capture source to be enabled on the device (the default).",
+      "description": "Recent DNS resolver-cache state (ADR-0015) — name/record_type/data with their appeared and removed counts per hour, from the hourly roll-up. Device-level (no per-process attribution). Requires the `dns` capture source to be enabled on the device (the default).",
       "display_name": "Echo: DNS cache (recent)",
       "execute_roles": [
         "endpoint-admin",
@@ -694,7 +694,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Mapped network-share activity (capability-map §3.8) in both directions — outbound (drives this host maps to remote shares) and inbound (remote hosts mapping this host's shares). Live rows carry appeared/removed; historical rows (origin='historical', from registry / fstab / event-log backfill) carry action='historical'. Requires the `mapdrive` capture source to be enabled on the device (the default); rows expose usernames + share paths.",
+      "description": "Mapped network-share activity (capability-map §3.8) in both directions — outbound (drives this host maps to remote shares) and inbound (remote hosts mapping this host's shares), as appeared and removed counts per hour from the hourly roll-up. Mappings found by the one-time historical backfill (registry / fstab / event-log) are counted in historical_count. Requires the `mapdrive` capture source to be enabled on the device (the default); rows expose share paths.",
       "display_name": "Echo: Mapped drives (recent + historical)",
       "execute_roles": [
         "endpoint-admin",
@@ -714,7 +714,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Show all processes that started or stopped in the last 24 hours.",
+      "description": "Show process starts and stops per hour for the last 24 hours, from the hourly roll-up.",
       "display_name": "Echo: Recent Processes",
       "execute_roles": [
         "endpoint-admin",
@@ -735,7 +735,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Same as `echo.recent_processes` but emits human-readable ISO-8601 timestamps via `datetime(ts, 'unixepoch')` instead of epoch seconds. Use this when piping query output to a human reader; use `echo.recent_processes` when piping to another tool that expects epoch seconds.",
+      "description": "Same as `echo.recent_processes` but emits human-readable ISO-8601 timestamps via `datetime(hour_ts, 'unixepoch')` instead of epoch seconds. Use this when piping query output to a human reader; use `echo.recent_processes` when piping to another tool that expects epoch seconds.",
       "display_name": "Echo: Recent processes (ISO timestamps)",
       "execute_roles": [
         "endpoint-admin",
@@ -756,7 +756,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Force an immediate maintenance pass (normally runs every 15 minutes). Aggregates raw capture rows into hourly, daily, and monthly summary tables, permanently deletes rows older than each tier's retention limit, and then enforces the database byte budget (db_budget_bytes): while the database is over it, the pass permanently deletes the oldest raw capture rows that their first summary tier has already passed (hourly, or daily for user and software), never the newest 24 hours, then hourly rows older than 48 hours (5 days for procperf), even inside their retention window; paused or errored sources (an unreadable <source>_enabled counts as errored) are exempt. It may also run the one-off VACUUM that converts an older database to incremental auto_vacuum (collectors, status and configure wait while it runs). Classified Destructive/Irreversible with no approval gate: an operator who can dispatch it deletes history immediately and cannot undo it.",
+      "description": "Force an immediate maintenance pass (normally runs every 15 minutes). Capture rows are folded into the hourly, daily and monthly roll-up tiers as they arrive, so this pass does no aggregation: it permanently deletes rows older than each tier's retention limit, and then enforces the database byte budget (db_budget_bytes): while the database is over it, the pass permanently deletes the oldest hourly rows, never those newer than 48 hours (5 days for procperf), even inside their retention window; paused or errored sources (an unreadable <source>_enabled counts as errored) are exempt. It may also run the one-off VACUUM that converts an older database to incremental auto_vacuum (collectors, status and configure wait while it runs). Classified Destructive/Irreversible with no approval gate: an operator who can dispatch it deletes history immediately and cannot undo it.",
       "display_name": "Echo: Run Aggregation",
       "execute_roles": [
         "endpoint-admin"
@@ -776,7 +776,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Show recent service start/stop/state_changed events.",
+      "description": "Show recent service state changes per hour, from the hourly roll-up.",
       "display_name": "Echo: Service State Changes",
       "execute_roles": [
         "endpoint-admin",
@@ -817,7 +817,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Execute an arbitrary SELECT query against the Echo warehouse tables on each targeted agent. Use $-prefixed table names ($Process_Live, $TCP_Hourly, etc.) which are translated to real table names on the agent. Only SELECT queries are permitted.",
+      "description": "Execute an arbitrary SELECT query against the Echo warehouse tables on each targeted agent. Use $-prefixed table names ($Process_Hourly, $TCP_Daily, etc.) which are translated to real table names on the agent. Only SELECT queries are permitted.",
       "display_name": "Echo: SQL Query",
       "execute_roles": [
         "endpoint-admin",
@@ -838,7 +838,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Returns the current status of the Echo database including record count, oldest and newest event timestamps, the database size (used pages plus the write-ahead log), and the configured retention period. Use this to verify Echo is collecting data and to monitor disk usage. Also reports both the configured network_capture_method and the network_capture_method_effective (the mechanism actually collecting — always polling today), so status never misrepresents the active capture mechanism. On the healthy path the FIRST line is storage_state|ok. Offline means a wedged rollback closed the Echo database, so collection and retention are both stopped until the agent restarts and every other field is withheld -- the reply is then just an error| line followed by storage_state|offline, and the action exits non-zero. The order is REVERSED on that path: error| comes FIRST, because server and dashboard consumers key off the output starting with error|, so do not assume storage_state is always the first line. Historical data NORMALLY stays queryable via echo sql, but only when the read-only query connection is itself available; the error| line states which case applies, so do not infer echo sql access from storage_state|offline alone. Reports the retention clock guard counters (#2361): retention_guard_declines_total and retention_guard_failures_total are always present, with per-table retention_guard|<table>|<n> and retention_guard_failed|<table>|<n> lines for any table with a non-zero count (retention_guard|__budget__|<n> is not a table: the byte-budget pass was skipped because the retention clock guard refused this pass's clock; it is counted in neither total). Read the two totals TOGETHER - a zero declines total only means the endpoint's clock is behaving if the failures total is also zero. Scrape this across the fleet to find hosts whose clocks need attention; the agent has no /metrics endpoint. Reports the byte budget: db_budget_bytes (the configured cap; unknown when the setting could not be read, in which case that pass is skipped and retried), budget_over_bytes (how far used pages plus the write-ahead log sit above the budget when status runs, measured then and not cached from the last pass; 0 within budget, unknown when the size or the setting cannot be read; above 0 while an echo.sql read pins the log, after an eviction pass that failed or was skipped, while a catch-up is still draining, or when only exempt rows remain), budget_evicted_raw_rows_total and budget_evicted_hourly_rows_total (cumulative rows the budget removed), and db_auto_vacuum (incremental; none; or deferred once a one-off conversion was wanted and could not run, for too little free disk space or a failed VACUUM, which stays until a conversion succeeds). module_dedup_overflow_total and tcp_closing_dedup_overflow_total count how often the hourly de-duplication sets filled and were cleared. An exception inside any action ends the reply with a fixed error|internal line and exit code 1; it can follow lines already written, so a consumer must not assume error| is first on that path; the cause is in the agent log.",
+      "description": "Returns the current status of the Echo database including record count, oldest and newest event timestamps, the database size (used pages plus the write-ahead log), and the configured retention period. Use this to verify Echo is collecting data and to monitor disk usage. Also reports both the configured network_capture_method and the network_capture_method_effective (the mechanism actually collecting — always polling today), so status never misrepresents the active capture mechanism. On the healthy path the FIRST line is storage_state|ok. Offline means a wedged rollback closed the Echo database, so collection and retention are both stopped until the agent restarts and every other field is withheld -- the reply is then just an error| line followed by storage_state|offline, and the action exits non-zero. The order is REVERSED on that path: error| comes FIRST, because server and dashboard consumers key off the output starting with error|, so do not assume storage_state is always the first line. Historical data NORMALLY stays queryable via echo sql, but only when the read-only query connection is itself available; the error| line states which case applies, so do not infer echo sql access from storage_state|offline alone. Reports the retention clock guard counters (#2361): retention_guard_declines_total and retention_guard_failures_total are always present, with per-table retention_guard|<table>|<n> and retention_guard_failed|<table>|<n> lines for any table with a non-zero count (retention_guard|__budget__|<n> is not a table: the byte-budget pass was skipped because the retention clock guard refused this pass's clock; it is counted in neither total). Read the two totals TOGETHER - a zero declines total only means the endpoint's clock is behaving if the failures total is also zero. Scrape this across the fleet to find hosts whose clocks need attention; the agent has no /metrics endpoint. Reports the byte budget: db_budget_bytes (the configured cap; unknown when the setting could not be read, in which case that pass is skipped and retried), budget_over_bytes (how far used pages plus the write-ahead log sit above the budget when status runs, measured then and not cached from the last pass; 0 within budget, unknown when the size or the setting cannot be read; above 0 while an echo.sql read pins the log, after an eviction pass that failed or was skipped, while a catch-up is still draining, or when only exempt rows remain), budget_evicted_raw_rows_total and budget_evicted_hourly_rows_total (cumulative rows the budget removed), and db_auto_vacuum (incremental; none; or deferred once a one-off conversion was wanted and could not run, for too little free disk space or a failed VACUUM, which stays until a conversion succeeds). Per capture source it reports config|<src>_rows|<n>, the rows held for that source (an agent from before the roll-up-only release reports the same count as config|<src>_live_rows|<n>, and the server reads either). module_dedup_overflow_total and tcp_closing_dedup_overflow_total count how often the hourly de-duplication sets filled and were cleared. An exception inside any action ends the reply with a fixed error|internal line and exit code 1; it can follow lines already written, so a consumer must not assume error| is first on that path; the cause is in the agent log.",
       "display_name": "Echo Status",
       "execute_roles": [
         "endpoint-admin",
@@ -880,7 +880,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Show recent user login and logout events.",
+      "description": "Show recent user logins and logouts per hour, from the hourly roll-up.",
       "display_name": "Echo: User Sessions",
       "execute_roles": [
         "endpoint-admin",
@@ -917,7 +917,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.echo.configure",
-      "description": "Cap on what echo.db holds (used pages plus the write-ahead log), in whole bytes. Minimum 33554432 (32 MiB). Default 262144000 (250 MiB). A value below the minimum, or one that is not a whole number, is refused with an error| line and nothing changes. When the database is over budget the maintenance pass removes raw capture rows that their first summary tier has already passed (hourly, or daily for user and software), oldest first and never the newest 24 hours, then hourly rows older than 48 hours (5 days for procperf). Daily and monthly rows are never removed, nor are the usage tables, sources with no summary tier (netconn, netqual, power, removable, registry), or paused or errored sources (an unreadable <source>_enabled counts as errored). Requires an agent newer than v0.15.0; an older agent ignores this key beside other keys and refuses it alone (error|no valid configuration parameters provided). Lowering it permanently deletes the oldest eligible history within 15 minutes, before its tier's retention limit; raising it again does not restore it.\n",
+      "description": "Cap on what echo.db holds (used pages plus the write-ahead log), in whole bytes. Minimum 33554432 (32 MiB). Default 262144000 (250 MiB). A value below the minimum, or one that is not a whole number, is refused with an error| line and nothing changes. When the database is over budget the maintenance pass removes hourly rows, oldest first, never those newer than 48 hours (5 days for procperf), even inside their retention window. Daily and monthly rows are never removed, nor are the usage tables, or paused or errored sources (an unreadable <source>_enabled counts as errored). Requires an agent newer than v0.15.0; an older agent ignores this key beside other keys and refuses it alone (error|no valid configuration parameters provided). Lowering it permanently deletes the oldest eligible history within 15 minutes, before its tier's retention limit; raising it again does not restore it.\n",
       "name": "db_budget_bytes",
       "required": false,
       "type": "string"
@@ -1025,7 +1025,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.echo.configure",
-      "description": "Enable or disable the per-connection TCP-quality sampler (netqual source → $NetQual_Live, plus the per-boot retrospective baseline $NetQual_Boot). **On by default**; only a coarse destination class (loopback/private/public) is stored, raw remote addresses are dropped at the edge. Linux (netlink INET_DIAG) and Windows (TCP ESTATS — ADR-0020); **Windows requires an elevated agent** (non-elevated records nothing and echo.status reports netqual_capture_method=none). macOS is planned. Independent of tcp_enabled. Queried via echo.sql only ($NetQual_Live / $NetQual_Boot); the legacy echo.query / echo.export actions do not surface netqual. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the per-connection TCP-quality sampler (netqual source → $NetQual_Hourly, plus the per-boot retrospective baseline $NetQual_Boot). **On by default**; only a coarse destination class (loopback/private/public) is stored, raw remote addresses are dropped at the edge. Linux (netlink INET_DIAG) and Windows (TCP ESTATS — ADR-0020); **Windows requires an elevated agent** (non-elevated records nothing and echo.status reports netqual_capture_method=none). macOS is planned. Independent of tcp_enabled. Queried via echo.sql only ($NetQual_Hourly / $NetQual_Boot); the legacy echo.query / echo.export actions do not surface netqual. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "netqual_enabled",
       "required": false,
       "type": "string"
@@ -1036,7 +1036,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.echo.configure",
-      "description": "Enable or disable the connectivity-transition source (netconn → $NetConn_Live, ADR-0020). **On by default**. Windows reads the OS-retained NetworkProfile / NCSI / WLAN-AutoConfig event logs, so the FIRST read backfills connectivity history from BEFORE the source was enabled (bounded by netconn_lookback_seconds; set that to 0 for forward-only). Only closed enum tokens + numeric reason codes are stored — NO SSID, BSSID, profile name, interface GUID, or MAC. Windows-only collector today (Linux journald / macOS oslog planned; the table is queryable-empty there). Queried via echo.sql only ($NetConn_Live); the legacy echo.query / echo.export actions do not surface netconn. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the connectivity-transition source (netconn → $NetConn_Hourly, ADR-0020). **On by default**. Windows reads the OS-retained NetworkProfile / NCSI / WLAN-AutoConfig event logs, so the FIRST read backfills connectivity history from BEFORE the source was enabled (bounded by netconn_lookback_seconds; set that to 0 for forward-only). Only closed enum tokens + numeric reason codes are stored — NO SSID, BSSID, profile name, interface GUID, or MAC. Windows-only collector today (Linux journald / macOS oslog planned; the table is queryable-empty there). Queried via echo.sql only ($NetConn_Hourly); the legacy echo.query / echo.export actions do not surface netconn. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "netconn_enabled",
       "required": false,
       "type": "string"
@@ -1113,7 +1113,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.echo.configure",
-      "description": "Enable or disable the mapped-drive capture source (capability-map §3.8, mapdrive → $MapDrive_*). Records network-share mappings in BOTH directions — outbound (drives this host maps to remote shares) and inbound (remote hosts mapping this host's shares, the lateral-movement signal). **On by default** — rows expose usernames and remote share paths. Windows + Linux (macOS planned); inbound needs local-admin / Server-Operator on Windows and Samba on Linux and degrades to empty otherwise. NOTE: the one-time HISTORICAL backfill (all PREVIOUSLY mapped drives, from the registry / fstab / event logs) is seeded at agent init, so it materializes on the first agent restart AFTER you enable this (or after upgrade, where it is now on by default). See software_enabled for disable semantics (disabling leaves existing rows queryable). degrades to empty otherwise. NOTE: the HISTORICAL backfill (all PREVIOUSLY mapped drives, from the registry / fstab / event logs) runs its first pass at agent init, so it materializes on the first agent restart AFTER you enable this; any profile whose hive could not be read on that first pass (including a logged-out profile the offline hive-file guard refuses) is retried individually, bounded at 7 attempts per profile 24 hours apart, until it resolves or is abandoned. See software_enabled for disable semantics (same opt-in posture; disabling leaves existing rows queryable). Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the mapped-drive capture source (capability-map §3.8, mapdrive → $MapDrive_*). Records network-share mappings in BOTH directions — outbound (drives this host maps to remote shares) and inbound (remote hosts mapping this host's shares, the lateral-movement signal). **On by default** — rows expose usernames and remote share paths. Windows + Linux (macOS planned); inbound needs local-admin / Server-Operator on Windows and Samba on Linux and degrades to empty otherwise. NOTE: the HISTORICAL backfill (all PREVIOUSLY mapped drives, from the registry / fstab / event logs) runs its first pass at agent init, so it materializes on the first agent restart AFTER you enable this; any profile whose hive could not be read on that first pass (including a logged-out profile the offline hive-file guard refuses) is retried individually, bounded at 7 attempts per profile 24 hours apart, until it resolves or is abandoned. See software_enabled for disable semantics (same opt-in posture; disabling leaves existing rows queryable). Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "mapdrive_enabled",
       "required": false,
       "type": "string"
@@ -1124,7 +1124,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.echo.configure",
-      "description": "Enable or disable the sleep/wake/AC-power transition source (power → $Power_Live, cursor-model seam). **ON by default (\"true\")**, like every other capture source. The SOC 2 data inventory classifies $Power_Live as usage-class / behavioral-adjacent, because the TIMING of sleep/wake and AC events is a presence and working-hours proxy. Treat it as co-determination-relevant and use power_lookback_seconds=0 where a retrospective read is not lawful. The source WILL use a durable log-position cursor (not a snapshot diff), so a restart will resume from where it left off rather than re-scanning; a lost/invalid cursor or a wrapped OS event log will re-baseline forward and record a capture_gap rather than replaying from the beginning. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the sleep/wake/AC-power transition source (power → $Power_Hourly, cursor-model seam). **ON by default (\"true\")**, like every other capture source. The TIMING of sleep/wake and AC events is a presence and working-hours proxy. Treat it as co-determination-relevant and use power_lookback_seconds=0 where a retrospective read is not lawful. The source WILL use a durable log-position cursor (not a snapshot diff), so a restart will resume from where it left off rather than re-scanning; a lost/invalid cursor or a wrapped OS event log will re-baseline forward and record a capture_gap rather than replaying from the beginning. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "power_enabled",
       "required": false,
       "type": "string"
@@ -1146,7 +1146,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.echo.configure",
-      "description": "Enable or disable the removable-media attach/detach source (removable → $Removable_Live, cursor-model seam), including exec_from_removable correlation (a process observed running from a removable volume). **ON by default (\"true\")**, like every other capture source. This is the MORE sensitive of power and removable. The SOC 2 data inventory classifies $Removable_Live as usage/identity-class: it records device vendor, product and SERIAL, plus the executed binary path and pid of any process running from a removable volume. Treat it as co-determination-relevant and set removable_lookback_seconds=0 where a retrospective read of OS-retained removable history is not lawful. The source WILL use the same durable log-position cursor model as power (see power_enabled) — a lost/invalid cursor will re-baseline forward and record a capture_gap rather than replaying history. Queried via echo.sql only ($Removable_Live); the legacy echo.query / echo.export actions do not surface removable. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the removable-media attach/detach source (removable → $Removable_Hourly, cursor-model seam), including exec_from_removable correlation (a process observed running from a removable volume). **ON by default (\"true\")**, like every other capture source. This is the MORE sensitive of power and removable. It records device vendor, product and SERIAL, plus the executed binary path and pid of any process running from a removable volume. Treat it as co-determination-relevant and set removable_lookback_seconds=0 where a retrospective read of OS-retained removable history is not lawful. The source WILL use the same durable log-position cursor model as power (see power_enabled) — a lost/invalid cursor will re-baseline forward and record a capture_gap rather than replaying history. Queried via echo.sql only ($Removable_Hourly); the legacy echo.query / echo.export actions do not surface removable. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "removable_enabled",
       "required": false,
       "type": "string"
@@ -1168,7 +1168,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.echo.configure",
-      "description": "Enable or disable the Windows registry change source (registry → $Registry_Live, cursor-model seam). **ON by default (\"true\")**, like every other capture source. Windows only; on Linux and macOS the source is listed as unsupported and records nothing. A curated watch list (Run and RunOnce, Services, Image File Execution Options, AppInit_DLLs, Winlogon, LSA, Policies and Defender under HKLM, plus Run, RunOnce, Policies and Winlogon under every loaded user hive) is watched for changes; each added or changed value is recorded with its new value (up to 512 bytes of text), a removed value by its name, and a changed or removed value also carries the type and size of its old value, never the old value itself. VALUES ARE STORED UNMASKED: the new value of every value added or changed under a watched key is readable through echo.sql in $Registry_Live (for example a Winlogon autologon DefaultPassword when it changes). A value that has not changed is not: the per-key baseline in echo_state holds only its type, size and an unsalted hash. The source's cursor row (echo_cursor) holds the new value of a change still waiting for its writer. A baseline written by an older build also holds up to 512 bytes of each value it saw until a complete read of that root rewrites it (a key under a subtree the read could not open keeps its earlier entry), and a cursor row built from one also holds the old value until that change is written (the next slow tick at most). Treat all three accordingly, or set \"false\" to opt out. The acting process is CORRELATED to each change from a write-only Kernel-Registry ETW session (value writes, value deletions and key deletions) by value name, type, size and time window: actor_pid and actor_image name the single process that made a matching write, which is a lead to verify against $Process_Live, not proof, and detail says attr:corr, attr:ambiguous, attr:none, attr:degraded, attr:off or attr:lost-restart. The ETW session needs an elevated agent; without one rows say attr:off and the key watch alone runs. A change is read at the slow tick that sees it (every slow_interval, 300 s by default) and its row lands in that tick once its writer is settled, or in the next one when the write was within a few seconds of the tick or was found by the full re-read of every watched key (every 12 slow ticks, hourly at the default). A change whose marker cannot depend on a later event (attr:off, attr:lost-restart) is written in the tick that sees it, never held. A value written and reverted between two reads is not recorded. A key is baselined silently at its first read, so for a user hive that loads at logon (or a user who logs off and back on) anything written to its watched keys before that first read is not a row. Retention is a row count (500000 rows). Setting \"false\" pauses capture and a later \"true\" re-baselines every watched key (no row is invented for what changed while paused). Requires an agent newer than v0.14.1; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the Windows registry change source (registry → $Registry_Hourly, cursor-model seam). **ON by default (\"true\")**, like every other capture source. Windows only; on Linux and macOS the source is listed as unsupported and records nothing. A curated watch list (Run and RunOnce, Services, Image File Execution Options, AppInit_DLLs, Winlogon, LSA, Policies and Defender under HKLM, plus Run, RunOnce, Policies and Winlogon under every loaded user hive) is watched for changes; each added or changed value is recorded with its new value (up to 512 bytes of text), a removed value by its name, and a changed or removed value also carries the type and size of its old value, never the old value itself. VALUES ARE STORED UNMASKED: the new value of every value added or changed under a watched key is readable through echo.sql in $Registry_Hourly (its last_data column holds the latest value of each hourly bucket; for example a Winlogon autologon DefaultPassword when it changes). A value that has not changed is not: the per-key baseline in echo_state holds only its type, size and an unsalted hash. The source's cursor row (echo_cursor) holds the new value of a change still waiting for its writer. A baseline written by an older build also holds up to 512 bytes of each value it saw until a complete read of that root rewrites it (a key under a subtree the read could not open keeps its earlier entry), and a cursor row built from one also holds the old value until that change is written (the next slow tick at most). Treat all three accordingly, or set \"false\" to opt out. The acting process is CORRELATED to each change from a write-only Kernel-Registry ETW session (value writes, value deletions and key deletions) by value name, type, size and time window: actor_pid and actor_image name the single process that made a matching write, which is a lead to verify against $Process_Hourly, not proof, and detail says attr:corr, attr:ambiguous, attr:none, attr:degraded, attr:off or attr:lost-restart. The ETW session needs an elevated agent; without one rows say attr:off and the key watch alone runs. A change is read at the slow tick that sees it (every slow_interval, 300 s by default) and its row lands in that tick once its writer is settled, or in the next one when the write was within a few seconds of the tick or was found by the full re-read of every watched key (every 12 slow ticks, hourly at the default). A change whose marker cannot depend on a later event (attr:off, attr:lost-restart) is written in the tick that sees it, never held. A value written and reverted between two reads is not recorded. A key is baselined silently at its first read, so for a user hive that loads at logon (or a user who logs off and back on) anything written to its watched keys before that first read is not a row. Retention is by age, set per tier. Setting \"false\" pauses capture and a later \"true\" re-baselines every watched key (no row is invented for what changed while paused). Requires an agent newer than v0.14.1; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "registry_enabled",
       "required": false,
       "type": "string"
@@ -1179,7 +1179,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.echo.configure",
-      "description": "Enable or disable the `usage` derived fold (usage → $Usage_Live / $Usage_Daily), a checked_transaction-based pairing of the process source's started/stopped events into per-executable run/duration aggregates plus a per-day distinct-user count. **ON by default (\"true\")**, like every other capture source. The SOC 2 data inventory classifies $Usage_Live/$Usage_Daily as usage-class / behavioral-adjacent: $Usage_Live persists the owning pid and user for each open run, and the per-day username membership (queryable via echo.sql) reveals which applications run on a device, when, and by whom. Treat as co-determination-relevant, same basis as power/removable. Forward-only, no retrospective backfill: disabling and later re-enabling always re-baselines from the moment of re-enable, never a retrospective fold over whatever process history accrued during the disabled window — this is a lifecycle-state-machine property, not a best-effort marker check. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the `usage` derived fold (usage → the open-run table usage_live and $Usage_Daily), a checked_transaction-based pairing of the process source's started/stopped events into per-executable run/duration aggregates plus a per-day distinct-user count. **ON by default (\"true\")**, like every other capture source. usage_live persists the owning pid and user for each open run, and the per-day username membership (queryable via echo.sql) reveals which applications run on a device, when, and by whom. Treat as co-determination-relevant, same basis as power/removable. Forward-only, no retrospective backfill: disabling and later re-enabling always re-baselines from the moment of re-enable, never a retrospective fold over whatever process history accrued during the disabled window — this is a lifecycle-state-machine property, not a best-effort marker check. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "usage_enabled",
       "required": false,
       "type": "string"
@@ -1204,7 +1204,7 @@
     },
     {
       "constraints": null,
-      "default": "SELECT ts, process_name, pid, remote_port, proto FROM $TCP_Live WHERE remote_addr = '10.0.0.1' ORDER BY ts DESC LIMIT 500",
+      "default": "SELECT hour_ts, process_name, remote_port, proto, connect_count FROM $TCP_Hourly WHERE remote_addr = '10.0.0.1' ORDER BY hour_ts DESC LIMIT 500",
       "definition_id": "crossplatform.echo.connections_to_ip",
       "description": "Query with target IP. Edit the IP address in the WHERE clause.",
       "name": "sql",
@@ -1276,7 +1276,7 @@
     },
     {
       "constraints": null,
-      "default": "SELECT local_port, proto, pid, process_name FROM $TCP_Live WHERE state = 'LISTEN' ORDER BY local_port",
+      "default": "SELECT remote_port AS local_port, proto, process_name, SUM(listen_open_count) AS open_count, SUM(listen_close_count) AS close_count FROM $TCP_Hourly WHERE remote_addr = '*' GROUP BY remote_port, proto, process_name HAVING SUM(listen_open_count) > 0 ORDER BY local_port",
       "definition_id": "crossplatform.echo.listening_ports",
       "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
       "name": "sql",
@@ -1285,7 +1285,7 @@
     },
     {
       "constraints": null,
-      "default": "SELECT pid, ppid, name, user, ts FROM $Process_Live WHERE action = 'started' AND ts > strftime('%s','now','-1 hours') ORDER BY ts",
+      "default": "SELECT hour_ts, parent_name, name, user, start_count FROM $Process_Hourly WHERE start_count > 0 AND hour_ts > strftime('%s','now','-1 hours') ORDER BY hour_ts, parent_name, name",
       "definition_id": "crossplatform.echo.process_tree",
       "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
       "name": "sql",
@@ -1344,7 +1344,7 @@
     },
     {
       "constraints": null,
-      "default": "SELECT interface, ip_address, mac_address, entry_type, action, ts FROM $ARP_Live ORDER BY ts DESC LIMIT 500",
+      "default": "SELECT hour_ts, interface, ip_address, mac_address, appear_count, remove_count, is_router, rebind_count FROM $ARP_Hourly ORDER BY hour_ts DESC LIMIT 500",
       "definition_id": "crossplatform.echo.recent_arp",
       "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
       "name": "sql",
@@ -1353,7 +1353,7 @@
     },
     {
       "constraints": null,
-      "default": "SELECT name, record_type, data, ttl_remaining_s, source, action, ts FROM $DNS_Live ORDER BY ts DESC LIMIT 500",
+      "default": "SELECT hour_ts, name, record_type, data, appear_count, remove_count, negative_count FROM $DNS_Hourly ORDER BY hour_ts DESC LIMIT 500",
       "definition_id": "crossplatform.echo.recent_dns",
       "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
       "name": "sql",
@@ -1362,7 +1362,7 @@
     },
     {
       "constraints": null,
-      "default": "SELECT direction, local_mount, remote_path, remote_host, username, provider, origin, action, ts FROM $MapDrive_Live ORDER BY ts DESC LIMIT 500",
+      "default": "SELECT hour_ts, direction, local_mount, remote_path, remote_host, appear_count, remove_count, historical_count, last_ts FROM $MapDrive_Hourly ORDER BY hour_ts DESC LIMIT 500",
       "definition_id": "crossplatform.echo.recent_mapdrive",
       "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
       "name": "sql",
@@ -1371,7 +1371,7 @@
     },
     {
       "constraints": null,
-      "default": "SELECT name, pid, cmdline, user, ts FROM $Process_Live WHERE ts > strftime('%s','now','-24 hours') ORDER BY ts DESC LIMIT 500",
+      "default": "SELECT hour_ts, name, user, start_count, stop_count FROM $Process_Hourly WHERE hour_ts > strftime('%s','now','-24 hours') ORDER BY hour_ts DESC, start_count DESC LIMIT 500",
       "definition_id": "crossplatform.echo.recent_processes",
       "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
       "name": "sql",
@@ -1380,7 +1380,7 @@
     },
     {
       "constraints": null,
-      "default": "SELECT datetime(ts, 'unixepoch') AS event_time, action, name, pid, user FROM $Process_Live WHERE ts > strftime('%s', 'now', '-24 hours') ORDER BY ts DESC LIMIT 500",
+      "default": "SELECT datetime(hour_ts, 'unixepoch') AS hour, name, user, start_count, stop_count FROM $Process_Hourly WHERE hour_ts > strftime('%s', 'now', '-24 hours') ORDER BY hour_ts DESC, start_count DESC LIMIT 500",
       "definition_id": "crossplatform.echo.recent_processes_iso",
       "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
       "name": "sql",
@@ -1389,7 +1389,7 @@
     },
     {
       "constraints": null,
-      "default": "SELECT ts, name, action, status, prev_status FROM $Service_Live WHERE action = 'state_changed' ORDER BY ts DESC LIMIT 200",
+      "default": "SELECT hour_ts, name, status_changes, last_status, last_ts FROM $Service_Hourly WHERE status_changes > 0 ORDER BY hour_ts DESC LIMIT 200",
       "definition_id": "crossplatform.echo.service_state_changes",
       "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
       "name": "sql",
@@ -1400,14 +1400,14 @@
       "constraints": null,
       "default": null,
       "definition_id": "crossplatform.echo.sql",
-      "description": "A SELECT query using $-prefixed table names. Available tables include $Process_Live, $Process_Hourly, $Process_Daily, $Process_Monthly, $TCP_Live, $TCP_Hourly, $TCP_Daily, $TCP_Monthly, $Service_Live, $Service_Hourly, $User_Live, $User_Daily, and $ARP_Live/$ARP_Hourly and $DNS_Live/$DNS_Hourly (ADR-0015; need arp_enabled / dns_enabled left on; $ARP_* is collected on Windows, Linux and macOS (constrained), $DNS_* on Windows only today — empty elsewhere).\n",
+      "description": "A SELECT query using $-prefixed table names. Echo keeps roll-up tiers only, so hourly is the finest. Available tables include $Process_Hourly, $Process_Daily, $Process_Monthly, $TCP_Hourly, $TCP_Daily, $TCP_Monthly, $Service_Hourly, $User_Hourly, $User_Daily, and $ARP_Hourly and $DNS_Hourly (ADR-0015; need arp_enabled / dns_enabled left on; $ARP_* is collected on Windows, Linux and macOS (constrained), $DNS_* on Windows only today — empty elsewhere).\n",
       "name": "sql",
       "required": true,
       "type": "string"
     },
     {
       "constraints": null,
-      "default": "SELECT process_name, remote_addr, remote_port, proto, COUNT(*) as conn_count FROM $TCP_Live GROUP BY process_name, remote_addr, remote_port, proto ORDER BY conn_count DESC LIMIT 200",
+      "default": "SELECT process_name, remote_addr, remote_port, proto, SUM(connect_count) AS conn_count FROM $TCP_Hourly WHERE remote_addr != '*' GROUP BY process_name, remote_addr, remote_port, proto ORDER BY conn_count DESC LIMIT 200",
       "definition_id": "crossplatform.echo.tcp_by_process",
       "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
       "name": "sql",
@@ -1416,7 +1416,7 @@
     },
     {
       "constraints": null,
-      "default": "SELECT ts, user, domain, logon_type, action FROM $User_Live ORDER BY ts DESC LIMIT 200",
+      "default": "SELECT hour_ts, user, domain, logon_type, login_count, logout_count FROM $User_Hourly ORDER BY hour_ts DESC LIMIT 200",
       "definition_id": "crossplatform.echo.user_sessions",
       "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
       "name": "sql",
@@ -1652,7 +1652,7 @@
     {
       "columns": [
         {
-          "description": "Unix epoch seconds the event was recorded.",
+          "description": "Unix epoch seconds of the start of the hour bucket the row summarises.",
           "example": "-",
           "name": "timestamp",
           "platforms": [
@@ -1676,7 +1676,7 @@
           "values": null
         },
         {
-          "description": "The lifecycle verb for this event (e.g. started/stopped, appeared/removed, opened/closed); the vocabulary is source-specific. Values: free text, source-dependent verb.",
+          "description": "Always bucket: each row is an hourly roll-up of the source, not a single event. Values: bucket.",
           "example": "-",
           "name": "event_action",
           "platforms": [
@@ -1688,7 +1688,7 @@
           "values": null
         },
         {
-          "description": "Internal id of the collection cycle that produced this row, used to correlate rows from the same tick. Values: integer.",
+          "description": "Always 0: roll-up rows do not belong to a single collection cycle. Values: 0.",
           "example": "-",
           "name": "snapshot_id",
           "platforms": [
@@ -1700,7 +1700,7 @@
           "values": null
         },
         {
-          "description": "JSON object with type-specific fields (see metadata.description for the per-type shape); empty string on the default (no type filter) union branches, which project only ts/event_type/action/snapshot_id. Values: JSON object, or empty string.",
+          "description": "JSON object with the bucket's key fields and counts, named as the source's hourly table columns are (see metadata.description); empty string on the default (no type filter) union branches, which project only ts/event_type/action/snapshot_id. Values: JSON object, or empty string.",
           "example": "-",
           "name": "detail_json",
           "platforms": [
@@ -1805,7 +1805,7 @@
           "values": null
         },
         {
-          "description": "Number of rows the aggregation pass moved into the hourly/daily/monthly tiers this cycle (run_aggregation's return value); carried as the third field of the `echo|rollup|<n>|rows_aggregated` line rather than a named column. Values: non-negative integer.",
+          "description": "Count carried as the third field of the `echo|rollup|<n>|rows_aggregated` line rather than a named column. Values: non-negative integer.",
           "example": "-",
           "name": "rows_aggregated",
           "platforms": [
@@ -2826,7 +2826,8 @@
     "changelog": [
       "changelog.d/2026-10-30-echo-db-budget.added.md",
       "changelog.d/2026-10-30-echo-db-budget.changed.md",
-      "changelog.d/2026-10-30-echo-db-budget.fixed.md"
+      "changelog.d/2026-10-30-echo-db-budget.fixed.md",
+      "changelog.d/2026-11-03-echo-rollup-only-server.changed.md"
     ],
     "definitions": [
       "content/definitions/echo.yaml",

@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
+#include <array>
+#include <cctype>
 #include <limits>
 #include <optional>
 #include <string>
@@ -395,6 +397,75 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
     // Matcher present but a recognised key is MISSING (or no recognised key at all) → fall back to
     // default so a typo can't silently empty the set; the operator still gets responders.
     return true;
+}
+
+bool references_raw_capture_table(std::string_view sql) {
+    static constexpr std::array<std::string_view, 16> kRealNames{
+        "process_live",  "tcp_live",     "service_live",   "user_live",
+        "perf_live",     "procperf_live", "netqual_live",   "module_live",
+        "software_live", "arp_live",     "dns_live",       "netconn_live",
+        "mapdrive_live", "power_live",   "removable_live", "registry_live"};
+    const auto is_word = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+    };
+    // Single pass: blank out '...' literals and -- / block comments, then read maximal
+    // [A-Za-z0-9_] runs and ask of each whether it was introduced by '$'.
+    std::string text(sql);
+    for (std::size_t i = 0; i < text.size();) {
+        std::size_t end = i;
+        if (text[i] == '\'') {
+            end = text.find('\'', i + 1);
+            end = end == std::string::npos ? text.size() : end + 1;
+        } else if (text.compare(i, 2, "--") == 0) {
+            end = text.find('\n', i);
+            end = end == std::string::npos ? text.size() : end;
+        } else if (text.compare(i, 2, "/*") == 0) {
+            end = text.find("*/", i + 2);
+            end = end == std::string::npos ? text.size() : end + 2;
+        } else {
+            ++i;
+            continue;
+        }
+        text.replace(i, end - i, end - i, ' ');
+        i = end;
+    }
+    for (std::size_t i = 0; i < text.size();) {
+        if (!is_word(text[i])) {
+            ++i;
+            continue;
+        }
+        std::size_t j = i;
+        while (j < text.size() && is_word(text[j]))
+            ++j;
+        std::string word = text.substr(i, j - i);
+        for (auto& c : word)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        const bool dollar = i > 0 && text[i - 1] == '$';
+        constexpr std::string_view kSuffix = "_live";
+        if (dollar) {
+            if (word.size() > kSuffix.size() &&
+                word.compare(word.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0)
+                return true;
+        } else if (std::find(kRealNames.begin(), kRealNames.end(), word) != kRealNames.end()) {
+            return true;
+        }
+        i = j;
+    }
+    return false;
+}
+
+bool instruction_reads_raw_capture_table(const nlohmann::json& params,
+                                         std::string_view parameter_schema) {
+    if (params.is_object() && params.contains("sql") && params["sql"].is_string())
+        return references_raw_capture_table(params["sql"].get_ref<const std::string&>());
+    const auto schema = nlohmann::json::parse(parameter_schema, nullptr, false);
+    if (!schema.is_object() || !schema.contains("properties") ||
+        !schema["properties"].is_object() || !schema["properties"].contains("sql"))
+        return false;
+    const auto& prop = schema["properties"]["sql"];
+    if (!prop.is_object() || !prop.contains("default") || !prop["default"].is_string())
+        return false;
+    return references_raw_capture_table(prop["default"].get_ref<const std::string&>());
 }
 
 } // namespace yuzu::server::rs_matcher

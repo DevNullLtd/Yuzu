@@ -47,6 +47,7 @@
 #include "license_store.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
+#include "result_set_model.hpp"
 #include "settings_model.hpp"
 #include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "software_deployment_store.hpp"
@@ -2139,6 +2140,8 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
             return "integer";
         if (v.is_string())
             return "string";
+        if (v.is_boolean())
+            return "boolean";
         if (v.is_object())
             return "object";
         if (v.is_array())
@@ -2190,6 +2193,12 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     CHECK(echo.at("properties").at("tick_seconds").value("type", "") ==
           type_of(real["echo"]["tick_seconds"]));
     CHECK_FALSE(echo.at("properties").at("tick_seconds").value("nullable", false));
+    // The byte budget is published once at the echo level, as the agent's default.
+    REQUIRE(real["echo"].contains("db_budget_bytes"));
+    CHECK(real["echo"]["db_budget_bytes"].get<long long>() == 262144000);
+    CHECK(echo.at("properties").at("db_budget_bytes").value("type", "") ==
+          type_of(real["echo"]["db_budget_bytes"]));
+    CHECK_FALSE(echo.at("properties").at("db_budget_bytes").value("nullable", false));
 
     // Every real tier: the declared keys, the declared types, and a null depth exactly on rows
     // tiers (so `nullable` is needed and is not decoration).
@@ -2232,6 +2241,15 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     }
     CHECK(saw_rows);
     CHECK(saw_seconds);
+    // Every row says whether the byte budget can shorten it; only hourly can.
+    const json& budget_dep = item.at("properties").at("budget_dependent");
+    CHECK(budget_dep.value("type", "") == "boolean");
+    CHECK_FALSE(budget_dep.value("nullable", false));
+    for (const auto& tier : real["echo"]["tiers"]) {
+        INFO("tier: " << tier.dump());
+        REQUIRE(tier.contains("budget_dependent"));
+        CHECK(tier.at("budget_dependent").get<bool>() == (tier.at("tier") == "hourly"));
+    }
     const json& depth = item.at("properties").at("guaranteed_depth_seconds");
     CHECK(depth.value("type", "") == "integer");
     CHECK(depth.value("nullable", false));
@@ -2261,4 +2279,47 @@ TEST_CASE("openapi_spec_json(): the data-retention operation documents the Echo 
 
     const std::string ok = get_op["responses"]["200"].value("description", "");
     CHECK(ok.find("echo: {tick_seconds, tiers") != std::string::npos);
+}
+
+TEST_CASE("openapi_spec_json(): the ResultSet schema declares what result_set_json emits",
+          "[openapi][result_set][agents_failed]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const json& schema = spec.at("components").at("schemas").at("ResultSet");
+    const json real = yuzu::server::result_set_json(yuzu::server::ResultSet{});
+
+    std::set<std::string> emitted;
+    for (auto it = real.begin(); it != real.end(); ++it)
+        emitted.insert(it.key());
+    std::set<std::string> declared;
+    for (auto it = schema.at("properties").begin(); it != schema.at("properties").end(); ++it)
+        declared.insert(it.key());
+    std::set<std::string> required;
+    for (const auto& k : schema.at("required"))
+        required.insert(k.get<std::string>());
+    CHECK(declared == emitted);
+    CHECK(required == emitted);
+
+    // The failure signal: a count and a flag derived from it.
+    CHECK(schema.at("properties").at("agents_failed").value("type", "") == "integer");
+    CHECK(schema.at("properties").at("partial").value("type", "") == "boolean");
+    CHECK(real.at("agents_failed").get<long long>() == 0);
+    CHECK_FALSE(real.at("partial").get<bool>());
+    yuzu::server::ResultSet failed;
+    failed.agents_failed = 2;
+    const json partial = yuzu::server::result_set_json(failed);
+    CHECK(partial.at("agents_failed").get<long long>() == 2);
+    CHECK(partial.at("partial").get<bool>());
+}
+
+TEST_CASE("openapi_spec_json(): the re-eval and from-echo-query routes document the stale-source refusal",
+          "[openapi][result_set][stale_source]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    for (const char* path : {"/result-sets/{id}/re-eval", "/result-sets/from-echo-query"}) {
+        INFO(path);
+        const json& bad = spec.at("paths").at(path).at("post").at("responses").at("400");
+        CHECK(bad.at("description").get<std::string>().find("RESULT_SET_REEVAL_STALE_SOURCE") !=
+              std::string::npos);
+    }
 }

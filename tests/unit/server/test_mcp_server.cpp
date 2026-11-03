@@ -37284,6 +37284,137 @@ TEST_CASE("MCP create_result_set: a malformed or empty parent_id is refused with
     }
 }
 
+// Roll-up only: every tool that returns a result set reports the failure signal, and a set stored
+// over a raw capture table is refused rather than re-run to an empty membership.
+TEST_CASE("MCP result-sets: every result-set output schema lists agents_failed and partial as required",
+          "[mcp][integration][result-sets][agents_failed]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+
+    // An object schema is a result-set row when it declares source_execution_id.
+    int row_schemas = 0;
+    const std::function<void(const nlohmann::json&, const std::string&)> visit =
+        [&](const nlohmann::json& node, const std::string& tool) {
+            if (node.is_object()) {
+                if (node.contains("properties") && node["properties"].is_object() &&
+                    node["properties"].contains("source_execution_id")) {
+                    ++row_schemas;
+                    INFO(tool);
+                    CHECK(node["properties"].contains("agents_failed"));
+                    CHECK(node["properties"].contains("partial"));
+                    CHECK(node["properties"]["agents_failed"]["type"] == "integer");
+                    CHECK(node["properties"]["partial"]["type"] == "boolean");
+                    const auto& req = node["required"];
+                    CHECK(std::find(req.begin(), req.end(), "agents_failed") != req.end());
+                    CHECK(std::find(req.begin(), req.end(), "partial") != req.end());
+                }
+                for (const auto& kv : node.items())
+                    visit(kv.value(), tool);
+            } else if (node.is_array()) {
+                for (const auto& v : node)
+                    visit(v, tool);
+            }
+        };
+    for (const auto& t : tools)
+        if (t.contains("outputSchema"))
+            visit(t["outputSchema"], t["name"].get<std::string>());
+    CHECK(row_schemas == 9);
+}
+
+TEST_CASE("MCP result-sets: a query over a raw capture table is refused with the stale-source token",
+          "[pg][mcp][integration][result-sets][stale_source]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+
+    int dispatched = 0;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatched;
+        return {.sent = 1, .command_id = "cmd-1"};
+    };
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    ts.start_with_dispatch(dispatch, "operator");
+
+    const auto seed = [&](const std::string& kind, const nlohmann::json& payload) {
+        CreateRequest cr;
+        cr.owner_principal = "test-user"; // McpTestServer's default session principal
+        cr.name = "seed";
+        cr.source_kind = kind;
+        cr.source_payload = payload.dump();
+        auto seeded = rs_bundle.get()->create_materialized(cr, {});
+        REQUIRE(seeded.has_value());
+        return seeded->id;
+    };
+    const auto reeval = [&](const std::string& id) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+            id + R"("}}})");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    const auto is_stale = [](const nlohmann::json& body) {
+        return body.contains("error") && body["error"]["code"] == kInvalidParams &&
+               body["error"]["message"].get<std::string>().find(
+                   "RESULT_SET_REEVAL_STALE_SOURCE") != std::string::npos;
+    };
+
+    SECTION("reevaluate_result_set over $Process_Live") {
+        const auto id = seed(std::string(source_kind::kEchoQuery),
+                             nlohmann::json{{"sql", "SELECT pid FROM $Process_Live"}});
+        CHECK(is_stale(reeval(id)));
+        CHECK(dispatched == 0);
+    }
+    SECTION("reevaluate_result_set over the real table name") {
+        const auto id = seed(std::string(source_kind::kEchoQuery),
+                             nlohmann::json{{"sql", "SELECT pid FROM process_live WHERE name='chrome.exe'"}});
+        CHECK(is_stale(reeval(id)));
+        CHECK(dispatched == 0);
+    }
+    SECTION("reevaluate_result_set over $Process_Hourly is not refused") {
+        const auto id = seed(std::string(source_kind::kEchoQuery),
+                             nlohmann::json{{"sql", "SELECT name FROM $Process_Hourly"}});
+        CHECK_FALSE(is_stale(reeval(id)));
+        CHECK(dispatched == 1);
+    }
+    SECTION("reevaluate_result_set of an instruction_result whose definition default is stale") {
+        yuzu::server::InstructionDefinition def;
+        def.name = "Canned echo query";
+        def.version = "1.0";
+        def.plugin = "echo";
+        def.action = "sql";
+        def.type = "question";
+        def.description = "canned";
+        def.parameter_schema =
+            R"({"type":"object","properties":{"sql":{"type":"string","default":"SELECT 1 FROM $TCP_Live"}}})";
+        def.enabled = true;
+        auto created = instr.create_definition(def);
+        REQUIRE(created.has_value());
+        const auto id = seed(std::string(source_kind::kInstructionResult),
+                             nlohmann::json{{"instruction_id", *created}, {"params", nlohmann::json::object()}});
+        CHECK(is_stale(reeval(id)));
+        CHECK(dispatched == 0);
+    }
+    SECTION("create_result_set_from_echo_query over $Process_Live") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"create_result_set_from_echo_query","arguments":{"sql":"SELECT pid FROM $Process_Live"}}})");
+        REQUIRE(res);
+        CHECK(is_stale(nlohmann::json::parse(res->body)));
+        CHECK(dispatched == 0);
+    }
+}
+
 // Gate 4 unhappy-path finding (#4364 re-review): create_result_set has no
 // source_kind allowlist and only bounds source_kind's own length, so a row
 // can be minted directly (bypassing the create-time params checks

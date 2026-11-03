@@ -205,6 +205,11 @@ const std::vector<pg::PgMigration>& migrations() {
          "UPDATE result_sets SET source_payload = replace(source_payload, "
          "'crossplatform.tar.', 'crossplatform.echo.') "
          "WHERE source_payload LIKE '%crossplatform.tar.%';"},
+        // v4: agents whose query failed are counted, not silently dropped from an async set
+        // (see ResultSet::agents_failed). IF NOT EXISTS keeps a re-run a no-op.
+        {4,
+         "ALTER TABLE result_sets ADD COLUMN IF NOT EXISTS agents_failed BIGINT NOT NULL "
+         "DEFAULT 0;"},
     };
     return kMigrations;
 }
@@ -219,7 +224,8 @@ bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
 
 constexpr const char* kRowCols =
     "id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, "
-    "source_kind, source_payload, status, source_execution_id, matcher, device_count";
+    "source_kind, source_payload, status, source_execution_id, matcher, device_count, "
+    "agents_failed";
 
 ResultSet read_row(PGresult* res, int i) {
     ResultSet r;
@@ -243,6 +249,7 @@ ResultSet read_row(PGresult* res, int i) {
     r.source_execution_id = PQgetvalue(res, i, c++);
     r.matcher = PQgetvalue(res, i, c++);
     r.device_count = to_i64(PQgetvalue(res, i, c++));
+    r.agents_failed = to_i64(PQgetvalue(res, i, c++));
     return r;
 }
 
@@ -1010,7 +1017,7 @@ std::vector<PendingSet> ResultSetStore::list_pending() {
 }
 
 std::expected<void, ResultSetError> ResultSetStore::materialize(
-    const std::string& id, const std::vector<std::string>& members) {
+    const std::string& id, const std::vector<std::string>& members, int64_t agents_failed) {
     if (!open_)
         return std::unexpected(ResultSetError::DbError);
 
@@ -1047,8 +1054,10 @@ std::expected<void, ResultSetError> ResultSetStore::materialize(
         pg::PgResult upd = pg::exec_params(
             conn,
             "UPDATE result_set_store.result_sets SET status = 'materialized', "
-            "device_count = $1::bigint WHERE id = $2 AND status = 'pending' RETURNING id",
-            std::vector<std::string>{std::to_string(static_cast<int64_t>(uniq.size())), id});
+            "device_count = $1::bigint, agents_failed = $2::bigint "
+            "WHERE id = $3 AND status = 'pending' RETURNING id",
+            std::vector<std::string>{std::to_string(static_cast<int64_t>(uniq.size())),
+                                     std::to_string(agents_failed), id});
         if (upd.status() != PGRES_TUPLES_OK) {
             spdlog::error("ResultSetStore::materialize: update failed: {}", PQerrorMessage(conn));
             return false;

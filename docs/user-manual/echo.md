@@ -882,6 +882,19 @@ condition clears.
 
 Echo includes a typed data warehouse that replaces the legacy flat `tar_events` table with structured, tiered tables optimized for different query time horizons.
 
+### Roll-up is the only mode
+
+Echo keeps roll-up tiers only. This is settled, not a mode: there is no configuration key, flag or environment variable that brings raw capture rows back.
+
+- **No raw tier.** Each batch a capture source records is folded into that source's tiers as it arrives. Hourly is the finest tier; daily and monthly sit above it for the sources that have them.
+- **Hourly depends on the byte budget.** A database over `db_budget_bytes` (default 250 MiB) removes hourly rows older than 48 hours (5 days for `procperf`), oldest first, until it is back under. Daily and monthly rows are never removed for size. The retention API marks the tier with `budget_dependent` (see [`GET /api/v1/settings/data-retention`](rest-api.md)).
+- **Default retention.** Hourly rows are kept 90 days, daily rows 180 days and monthly rows 365 days, each measured from the start of its bucket. The Settings data page and `GET /api/v1/settings/data-retention` list the figures per source.
+- **Query the roll-ups.** Read `$<Source>_Hourly`, `$<Source>_Daily` and `$<Source>_Monthly` through `echo.sql`. The canned queries in `content/definitions/echo_warehouse.yaml` all read the hourly tier. A roll-up row holds names, keys and counts per bucket, not individual events, so it carries no pid and no per-event timestamp.
+- **One-release alias for the old names.** For one release an agent answers a query over a `$<Source>_Live` name (or a `<source>_live` table) with an empty result set that keeps the old column header, instead of an error. Move such queries to the hourly tier. The status key that reports a source's row count is `<src>_rows`; the server also reads `<src>_live_rows`, which an agent from before this release still sends.
+- **Stored result sets over a raw table are refused.** Re-evaluating a result set whose query reads a raw capture table, and creating one from such a query, is refused with `RESULT_SET_REEVAL_STALE_SOURCE` and dispatches nothing (see [Result sets](rest-api.md#result-sets)). Without the refusal the set would be rebuilt as an empty membership with no error.
+
+A result set built from an Echo query reports `agents_failed` and `partial`. An agent whose query answered with an error, or with a non-success status, and never produced a matching row is counted there and is not a member, so a partial set is not read as "those devices do not match".
+
 ### Warehouse tables
 
 Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent translates to real SQLite table names at execution time. Each capture source has multiple granularity tiers:
@@ -983,24 +996,23 @@ POST /api/v1/instructions/execute
   "plugin": "echo",
   "action": "sql",
   "parameters": {
-    "sql": "SELECT name, pid, cmdline FROM $Process_Live ORDER BY ts DESC LIMIT 50"
+    "sql": "SELECT hour_ts, name, user, start_count, stop_count FROM $Process_Hourly ORDER BY hour_ts DESC LIMIT 50"
   }
 }
 ```
 
+Queries read the roll-up tiers (see [Roll-up is the only mode](#roll-up-is-the-only-mode)): `$<Source>_Hourly` is the finest, and a query over a `$<Source>_Live` name returns no rows during the one-release alias window.
+
 Pre-built queries are available in `content/definitions/echo_warehouse.yaml`, covering common use cases like recent processes, TCP connections by process, listening ports, hourly summaries, service state changes, user sessions, and process trees.
 
-### Rollup aggregation
+### Rollup and retention
 
-The warehouse automatically runs a rollup aggregation cycle every 15 minutes. Each cycle:
+Capture rows are folded into every tier of their source as they arrive, so the maintenance pass does no aggregation. The warehouse runs that pass every 15 minutes. Each cycle:
 
-1. Aggregates raw capture rows into hourly summaries
-2. Aggregates hourly data into daily summaries
-3. Aggregates daily data into monthly summaries
-4. Enforces retention limits on each tier
-5. Enforces the database byte budget, including rows still inside their retention window, runs the one-off VACUUM check and trims the write-ahead log (see [The database byte budget](#the-database-byte-budget))
+1. Enforces retention limits on each tier
+2. Enforces the database byte budget, including hourly rows still inside their retention window, runs the one-off VACUUM check and trims the write-ahead log (see [The database byte budget](#the-database-byte-budget))
 
-To force an immediate rollup, use the `echo.rollup` action.
+To force an immediate pass, use the `echo.rollup` action.
 
 ### Safety controls
 

@@ -18312,14 +18312,16 @@ private:
                             // tick rather than risk a false-empty membership (ADR-0039) - it
                             // retries on the next 2s tick.
                             std::vector<std::string> members;
+                            int64_t agents_failed = 0;
                             if (response_store_) {
                                 auto found =
                                     result_set_members(*response_store_, forensics_plugins(), p);
                                 if (!found)
                                     continue;
+                                agents_failed = found->agents_failed;
                                 members = std::move(*found);
                             }
-                            if (result_set_store_->materialize(p.id, members)) {
+                            if (result_set_store_->materialize(p.id, members, agents_failed)) {
                                 metrics_
                                     .counter("yuzu_result_sets_total",
                                              {{"source_kind", p.source_kind},

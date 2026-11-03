@@ -256,7 +256,8 @@ TEST_CASE("device live capture sources: toggle state + $-table + read-only link"
     std::vector<LiveCaptureSource> rows{{"process", "Process", "Activity", true, 1234},
                                         {"arp", "ARP", "Network", false, -1}};
     const auto h = render_device_live_capture_sources(rows);
-    CHECK(h.find("$Process_Live") != std::string::npos);
+    CHECK(h.find("$Process_Hourly") != std::string::npos);
+    CHECK(h.find("_Live") == std::string::npos);
     CHECK(h.find("1234") != std::string::npos);
     CHECK(h.find("ls-sw on") != std::string::npos);  // process enabled (toggle on)
     CHECK(h.find("src-off") != std::string::npos);   // arp disabled

@@ -299,6 +299,39 @@ TEST_CASE("gather_echo_retention_paused: extra_scope_is_authoritative bypasses "
     }
 }
 
+TEST_CASE("gather_echo_retention_paused: row count reads <src>_rows then <src>_live_rows",
+          "[pg][server][echo][retention-render]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    grant_visibility(mg, {"agent-new", "agent-old", "agent-both"});
+
+    // Only the new key: fails if the <src>_rows lookup is removed.
+    rs.store(mk_resp("agent-new", 10, "config|process_enabled|false\nconfig|process_rows|111\n"));
+    // Only the one-release alias: fails if the fallback lookup is removed.
+    rs.store(mk_resp("agent-old", 10, "config|process_enabled|false\nconfig|process_live_rows|222\n"));
+    // Both present: the new key wins.
+    rs.store(mk_resp("agent-both", 10,
+                     "config|process_enabled|false\nconfig|process_live_rows|1\nconfig|process_rows|333\n"));
+
+    DashboardEchoRetentionTestAccess acc;
+    acc.set_stores(&rs, &mg);
+    acc.set_scan(kUser, kScan, 3, 1);
+
+    const auto scan = acc.routes.gather_echo_retention_paused(kUser);
+    const auto rows_of = [&](const char* agent) {
+        for (const auto& r : scan.rows)
+            if (r.agent_id == agent)
+                return r.live_rows;
+        return int64_t{-1000};
+    };
+    CHECK(rows_of("agent-new") == 111);
+    CHECK(rows_of("agent-old") == 222);
+    CHECK(rows_of("agent-both") == 333);
+}
+
 TEST_CASE("render_echo_retention_paused: paused_at==0 sorts oldest with schema badge (#558)",
           "[pg][server][echo][retention-render]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
