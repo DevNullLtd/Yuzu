@@ -1596,8 +1596,9 @@ flip, with a red-first test each:
     `guard.compliant` for a skipped rule, so it no longer repairs a lost recovery event by
     accident, and server-state loss (a Postgres restore, an outbox drop) no longer self-heals by
     re-push; an explicit census resync mechanism is a flip precondition, tracked in #5718 (since
-    #5674 PR1 the census write is in the event transaction under a savepoint, though a
-    Redelivered event still does not repair it; and `guard.errored` is now a census state, #5667
+    #5674 PR1 the census write is in the event transaction under a savepoint, and since #5690
+    PR2a-1 a Redelivered event repairs a census write that failed (the event is stored with
+    pending evidence), though it still does not repair a row the re-push loss left stale; and `guard.errored` is now a census state, #5667
     residual (a), so more stale census rows can exist than when this loss was first written); (2) it no longer restarts the `pending_initial` demotion clock; (3) a crash after
     the absent-row sweep and before the per-rule rewrites leaves the previous rows for carried
     rules, i.e. OLD content, including a rule the push disabled or changed, until the next push
@@ -2417,14 +2418,15 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   RESOLVED means the state mapping and its tests are done; it is not "DONE with no
   residual". Residuals to resolve or risk-accept before PR-6 sign-off (the Sign-off row's gate; the
   "pre-PR-5" tags elsewhere in this section are the original tag, kept for history): (a) on the single-event
-  ingest path a Redelivered event returns before the census write, so mixed-version redelivery never
-  repairs a census row; since #5674 PR1 the census write is in the event transaction under a
+  ingest path a Redelivered event repairs a census write that failed (#5690 PR2a-1: the event is
+  stored with pending evidence) and otherwise returns before the census write, so mixed-version
+  redelivery of an event that was projected never repairs a census row; since #5674 PR1 the census write is in the event transaction under a
   savepoint, a failed write keeps the event and is counted on
   `yuzu_server_guardian_census_proj_failures_total` (so a transient Postgres failure still leaves a detached rule showing its last verdict, now visibly), and a deleted rule's census rows are removed with it; (b)
   recovery after a spark re-arm is by code reading only, with no agent-level detach,
-  re-arm, compliant-edge test (#5676); (c) the row timestamp is agent-asserted with no
-  server clamp (`guardian_ingest.cpp:293`) and a `>=` tie rule
-  (the `ON CONFLICT ... WHERE EXCLUDED.updated_at >=` guard in `project_rule_status()`), so clock skew or a same-second tie across the
+  re-arm, compliant-edge test (#5676); (c) the census orders by a key limited to server receipt plus 300 s (#5690 PR2a-1;
+  the text timestamp `guardian_ingest.cpp:293` still feeds the TEXT column only) with ties broken by the
+  event INSERT's `ingest_seq`, and flags a refused or unprovable ordering (`order_uncertain`), so clock skew or a same-second tie across the
   lifecycle and compliance lanes can leave a false compliant (#5690; live today
   for guard.unhealthy; the agent-side hold, PR #5776, delays each overtake by up to
   H = 1 s and then permits up to N = 64, but cannot close the same-second tie); (d) the census is absent from the decommission cascade, so

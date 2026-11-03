@@ -1197,16 +1197,32 @@ CREATE TABLE guardian_agent_rule_status (
     agent_id TEXT NOT NULL,
     rule_id TEXT NOT NULL REFERENCES guaranteed_state_rules(rule_id) ON DELETE CASCADE,
     state TEXT NOT NULL, updated_at TEXT NOT NULL,
+    -- schema v4 (#5690): the ordering tuple of the applied event, the high-water mark of
+    -- the keys seen, and the sticky flag. NULL key_ns / ingest_seq = a row written before v4.
+    key_ns BIGINT, ingest_seq BIGINT, ts_hwm BIGINT,
+    order_uncertain BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (agent_id, rule_id)
 );
 CREATE INDEX idx_gars_rule ON guardian_agent_rule_status(rule_id);
+
+-- guaranteed_state_events gains (schema v4): ingest_seq BIGINT GENERATED ALWAYS AS IDENTITY
+-- (CACHE 1 NO CYCLE) with a UNIQUE index idx_gse_ingest_seq; proj_key BIGINT (NULL = pre-v4
+-- event, 0 = unusable key); proj_key_capped BOOLEAN; projection_pending BOOLEAN. The partial
+-- index idx_gse_pending ON (rule_id, agent_id) WHERE projection_pending serves the pair lock,
+-- the readers and delete_rule.
 ```
 
 The census row is written in the same transaction as the event that causes it, under its own
 savepoint (`census_upsert`). A refused write (rule deleted) or a failed write rolls back to that
 savepoint and neither failure discards the event; a failed write other than the foreign-key refusal
-is counted on `yuzu_server_guardian_census_proj_failures_total`. Redelivery of an event that is already stored
-returns before the census write and does not repair the census.
+is counted on `yuzu_server_guardian_census_proj_failures_total`. The row keeps the verdict with the greatest
+ordering tuple `(key, ingest_seq)`, the key being the agent stamp limited to receipt plus 300 s; an event whose
+census write failed stays stored with `projection_pending`, and a redelivery of it repairs the census from its
+stored ordering inputs. `order_uncertain` is sticky and disclosed on every read. Under one `census_upsert`
+savepoint a writer locks every pending event of the pair in `ingest_seq` order in one statement, then the census
+row; `delete_rule` locks the rule's pending events the same way before it retires them and deletes the rule. No
+consumer may read clean over an uncertain or pending pair. See the user manual's Compliance overview for the
+operator-facing contract.
 
 ### 9.2 REST API endpoints
 
