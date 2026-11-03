@@ -73,14 +73,6 @@ namespace yuzu::agent {
 
 namespace detail {
 
-/// <data_dir>/echo.db.adopting: the adoption-intent marker beside `echo_db`.
-[[nodiscard]] inline std::filesystem::path legacy_echo_adoption_marker(
-    const std::filesystem::path& echo_db) {
-    std::filesystem::path marker = echo_db;
-    marker += ".adopting";
-    return marker;
-}
-
 /// What the marker records about the legacy main file: its size and mtime.
 [[nodiscard]] inline std::expected<std::string, std::string>
 legacy_echo_fingerprint(const std::filesystem::path& legacy) {
@@ -93,15 +85,6 @@ legacy_echo_fingerprint(const std::filesystem::path& legacy) {
     if (ec)
         return std::unexpected(std::format("cannot stat {}: {}", legacy.string(), ec.message()));
     return std::format("{} {}\n", size, mtime.time_since_epoch().count());
-}
-
-/// The marker's bytes, or nullopt when it is absent or unreadable (both count as "no marker").
-[[nodiscard]] inline std::optional<std::string>
-read_legacy_echo_marker(const std::filesystem::path& marker) {
-    std::ifstream in(marker, std::ios::binary);
-    if (!in)
-        return std::nullopt;
-    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
 }
 
 } // namespace detail
@@ -120,6 +103,10 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
     if (ec)
         return std::unexpected(std::format("cannot stat {}: {}", legacy.string(), ec.message()));
 
+    // <data_dir>/echo.db.adopting: the adoption-intent marker (path only; no I/O here).
+    fs::path marker = echo_db;
+    marker += ".adopting";
+
     if (echo_present && legacy_present) {
         spdlog::warn("Legacy {} exists beside {}: two independent databases. {} is used; the legacy "
                      "file and its sidecars are left untouched for the operator",
@@ -133,9 +120,9 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
         // A marker outliving the main-file rename (its removal failed) is spent: delete it, or a
         // later downgrade that recreates tar.db could be mistaken for this adoption's resume.
         std::error_code mec;
-        if (fs::remove(detail::legacy_echo_adoption_marker(echo_db), mec); mec)
-            spdlog::warn("Cannot remove the spent adoption marker {}: {}",
-                         detail::legacy_echo_adoption_marker(echo_db).string(), mec.message());
+        if (fs::remove(marker, mec); mec)
+            spdlog::warn("Cannot remove the spent adoption marker {}: {}", marker.string(),
+                         mec.message());
         for (const char* suffix : kSidecars) {
             fs::path stray = legacy;
             stray += suffix;
@@ -154,11 +141,14 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
     // Resume safety (#6752): an echo.db sidecar whose legacy twin is absent was either moved by an
     // earlier run of THIS adoption or is stale. It is provably ours only when the marker records
     // tar.db exactly as it is now (see the header comment); otherwise fail closed, moving nothing.
-    const fs::path marker = detail::legacy_echo_adoption_marker(echo_db);
     const auto fingerprint = detail::legacy_echo_fingerprint(legacy);
     if (!fingerprint)
         return std::unexpected(fingerprint.error());
-    const auto recorded = detail::read_legacy_echo_marker(marker);
+    // An absent or unreadable marker both read as "no marker".
+    std::ifstream in(marker, std::ios::binary);
+    std::optional<std::string> recorded;
+    if (in)
+        recorded.emplace(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
     const bool marker_matches = recorded && *recorded == *fingerprint;
     if (!marker_matches) {
         for (const char* suffix : kSidecars) {

@@ -60,9 +60,6 @@ public:
         return true;
     }
 
-    /// Forget `key` (no-op when absent).
-    void erase(const std::string& key) { keys_.erase(key); }
-
     /// Start recording admitted keys. An earlier batch that was never committed is rolled back
     /// first, so an exception between begin and commit cannot leave its keys consumed.
     void begin_batch() {
@@ -77,7 +74,7 @@ public:
     /// The rows were not stored: erase the keys admitted since begin_batch().
     void rollback_batch() {
         for (const auto& k : admitted_)
-            erase(k);
+            keys_.erase(k);
         admitted_.clear();
         batch_open_ = false;
     }

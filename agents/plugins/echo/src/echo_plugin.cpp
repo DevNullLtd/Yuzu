@@ -2182,11 +2182,11 @@ private:
                     }
                 } else {
                     total_events += static_cast<int>(mrows.size());
-                    module_seen_.commit_batch();
                 }
-            } else {
-                module_seen_.commit_batch(); // nothing to store, nothing to undo
             }
+            // Keeps the admitted keys on success or an empty batch; after the rollback above the
+            // journal is already empty, so this is a no-op there.
+            module_seen_.commit_batch();
             module_overflows_.store(module_seen_.overflows(), std::memory_order_relaxed);
             if (auto d = module_stream_->dropped(); d > last_module_dropped_) {
                 spdlog::warn("ECHO: module stream ring overflow — {} dropped (+{} since last drain)",
