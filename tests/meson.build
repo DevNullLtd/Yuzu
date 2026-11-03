@@ -462,6 +462,7 @@ agent_test_exe = executable(
     'unit/test_quarantine_parsers.cpp',       # Wave 2 WP-F: pure netsh/iptables/pfctl output parsers
     'unit/test_quarantine_argv.cpp',          # Wave 2 WP-F remediation: pure mutating-argv construction (FN-03)
     'unit/test_quarantine_serialization.cpp', # Wave 2 P4: MutationGate bounded-wait serialization (#3286)
+    'unit/test_reconnect_backoff.cpp',        # HA WS-13 (#291): jittered reconnect delay, pure, random source injected
     'unit/test_server_address_parsers.cpp',   # #3429 round 4: pure host:port / IP-literal helpers for
                                                 # server_address_resolver.cpp's boot-time DNS resolution
     'unit/test_server_address_resolver.cpp',  # #3429 round 4 fix: resolve_bounded's deadline wrapper,
@@ -647,6 +648,10 @@ agent_test_exe = executable(
     'unit/test_pkg_inventory_local_dispatcher.cpp', # Wave 10 PR10.1-c: real pkg_inventory plugin via LocalDispatcher, unguarded on every OS
     '../agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp', # Wave 10 PR10.1-c: run_macos (the slot-guarded entry point execute() calls); self-gated to __APPLE__, empty elsewhere
     '../agents/plugins/pkg_inventory/src/pkg_inventory_linux.cpp', # pkg_inventory Linux legs: run_linux (self-gated to __linux__, empty elsewhere)
+    'unit/test_middleware_parsers.cpp',   # SAM.2: product table, pure kv/file-name parsers and the generic runner over a FakeFs, unguarded on every OS
+    'unit/test_middleware_linux_parsers.cpp',       # SAM.2: Linux leg over a materialized tree manifest (REAL registered-install capture plus labelled inline cases; body POSIX-only)
+    'unit/test_middleware_local_dispatcher.cpp',    # SAM.2: real middleware plugin via LocalDispatcher and the table-generated descriptors, unguarded on every OS
+    '../agents/plugins/middleware/src/middleware_linux.cpp', # SAM.2: run_linux (self-gated to __linux__, empty elsewhere)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp, config_checks.hpp
@@ -672,6 +677,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
     include_directories('../agents/plugins/system_hardening/src'),  # system_hardening_*parsers.hpp (pure helpers), Wave 8 PR8.1-b
     include_directories('../agents/plugins/pkg_inventory/src'),  # Wave 10 PR10.1-c: pkg_inventory_*_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/middleware/src'),  # middleware_parsers.hpp / middleware_runner.hpp (SAM.2 pure helpers)
     include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
     include_directories('../agents/plugins/app_usage/src'),  # Wave 7b PR7b.3: app_usage_parsers.hpp
     include_directories('../agents/plugins/execution_artifacts/src'),  # Wave 7b PR7b.1
@@ -865,6 +871,7 @@ agent_test_exe = executable(
                 system_hardening_plugin_lib,  # Wave 8 PR8.1-b
                 runtimes_plugin_lib,  # Wave 10 PR10.1-b
                 pkg_inventory_plugin_lib,  # Wave 10 PR10.1-c
+                middleware_plugin_lib,  # SAM.2: test_middleware_local_dispatcher.cpp loads the real plugin by path
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak
@@ -1537,6 +1544,7 @@ if build_server
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
       'unit/server/test_agent_health_store.cpp',
+      'unit/server/test_dedup_fleet_tags.cpp', # #3663: pure parse/classify of the yuzu.dedup_* heartbeat tags (the 10-char wrap cap is only observable here)
       'unit/server/test_instruction_store.cpp',
       'unit/server/test_instruction_store_signing.cpp',
       'unit/server/test_instruction_yaml.cpp',
@@ -1568,6 +1576,7 @@ if build_server
       'unit/server/test_schedule_runner.cpp',
       'unit/server/test_rbac_store.cpp',
       'unit/server/test_rbac_admin_predicate.cpp', # A2: is_rbac_administrator/is_self_target
+      'unit/server/test_rbac_admin_hint.cpp', # #6034: rbac_admin_hint == the real POST assign / PUT enforcement answer, per persona
       'unit/server/test_rbac_role_assignment.cpp', # A2: POST/DELETE .../rbac/roles/{name}/assignments + MCP twins
       'unit/server/test_rbac_enforcement_toggle.cpp', # A1: PUT /api/v1/rbac/enforcement + MCP twin
       'unit/server/test_guardian_generation_raise.cpp', # POST .../guaranteed-state/policy-generation/raise + MCP twin raise_guardian_policy_generation
@@ -1783,6 +1792,8 @@ if build_server
       'unit/server/test_plugin_page_model.cpp', # System > Plugins and updates: pure panel goldens
       'unit/server/test_settings_plugins_page.cpp', # System > Plugins and updates: page pins and fragment gates
       'unit/server/test_settings_plugins_authz.cpp', # System > Plugins and updates: [pg] the fragments through the REAL probe gates (denial rows: token yes, cookie no)
+      'unit/server/test_settings_engine_panel_authz.cpp', # #5882: [pg] Settings Engine Principals panel vs its REST twin through the REAL gates (RBAC off/on personas)
+      'unit/server/test_settings_access_review_engine_authz.cpp', # #6744: [pg] Settings Access reviews fragments refuse an engine session (custom-role AccessReview:Read), as the REST twins do
       'unit/server/test_ca_panel_render.cpp', # System > Certificates and secrets: pure CA panel goldens
       'unit/server/test_kek_panel_render.cpp', # System > Certificates and secrets: pure KEK status panel goldens
       'unit/server/test_settings_pki_page.cpp', # System > Certificates and secrets: page pins, page gate, KEK fragment
@@ -3596,6 +3607,15 @@ test('runtimes definition columns',
   timeout: 30,
 )
 
+# middleware's definition-column contract (content/definitions/middleware.yaml): row_kind first and the
+# column order match the wire row middleware_parsers.hpp emits; parses the YAML directly.
+test('middleware definition columns',
+  _python3_test,
+  args: [files('test_middleware_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # filesystem.find_by_hash's definition (content/definitions/filesystem.yaml): version 0.4.0, the
 # three declared columns and the row_kind values the declared-column result matcher binds to
 # (#5624); the C++ matcher test keeps a copy of the schema, this pins it to the shipped definition.
@@ -4032,6 +4052,18 @@ test('agent command-dedup wiring lexical gate (#3668)',
   timeout: 30,
 )
 
+# Command-dedup fleet telemetry (#3663): the agent's `yuzu.dedup_*` heartbeat tags and the
+# server's yuzu_fleet_agents_dedup_* table share no header (no upward server -> agent edge), so
+# nothing in the compiler binds them. This pins that every emitted tag has a server row and vice
+# versa, plus the HELP registration, metrics.md, and the YuzuDedupStoreDegraded alert + its
+# promtool case. Carries its own in-memory mutation self-test. No build required.
+test('agent command-dedup fleet telemetry drift gate (#3663)',
+  _python3_test,
+  args: [files('test_dedup_fleet_tags_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # Echo rename upgrade window: static lexical gate pinning that agent.cpp still CALLS the tested
 # tar.db adoption helper and the KV re-key after KvStore::open( and before the first plugin
 # init (no Agent::run() seam exists to test that, #1492). Carries its own in-memory mutation
@@ -4050,6 +4082,17 @@ test('Echo adoption boot wiring lexical gate',
 test('access users production wiring lexical gate',
   _python3_test,
   args: [files('test_access_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #6744: the engine-session belt of the Settings fragments (engine-principals, access-reviews and its
+# campaign view). Pins that is_engine() is called once (inside refuse_engine_session), that each of the
+# three handlers calls the belt in the order permission gate, auth_fn_, belt, render, and that no second
+# copy reappears. The unit tests need Postgres; this one needs nothing. Source-text only, so Python.
+test('settings engine session belt lexical gate',
+  _python3_test,
+  args: [files('test_settings_engine_belt_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

@@ -185,6 +185,24 @@ void bump_provenance_denied(auth::AuthManager* auth_mgr) {
         m->counter("yuzu_scim_provenance_denied_total").increment();
 }
 
+/// #6836 / #6835: bumped wherever a store read FAILED (a store fault, not a refusal) and the
+/// request was answered with a retryable 503 (for the revive arm: after the guarded undo): the
+/// provenance read of `provenance_ok`, the role read of `deprovision_role_ok` and of a POST
+/// revive (#6836), the SCIM token check `require_bearer` (guard "bearer") and the User / Group
+/// lookups (guard "resource", #6835). `guard` is one of `kScimGuardStoreUnavailableGuards`
+/// (scim_routes.hpp; server.cpp pre-seeds exactly that set to 0 at boot); it carries no username
+/// or scim_id. This is the signal `YuzuScimGuardStoreUnavailable` keys on: unlike an audit row
+/// (written to the same store that is failing) it survives an outage, and it is deliberately NOT
+/// `yuzu_scim_provenance_denied_total` or `yuzu_scim_auth_failures_total`, which mean "SCIM tried
+/// to touch an account it does not own" and "a token was compared and rejected".
+void bump_guard_store_unavailable(auth::AuthManager* auth_mgr, std::string_view guard) {
+    if (!auth_mgr)
+        return;
+    if (auto* m = auth_mgr->metrics_registry())
+        m->counter("yuzu_scim_guard_store_unavailable_total", {{"guard", std::string(guard)}})
+            .increment();
+}
+
 /// #2021 slice 2: bumped every time `recompute_scim_user_role` actually
 /// changes a SCIM-provisioned user's role (promotion OR demotion).
 void bump_role_changed(auth::AuthManager* auth_mgr) {
@@ -521,6 +539,38 @@ void send_scim_unavailable(httplib::Response& res, std::string_view detail) {
     res.set_content(scim::error(503, detail).dump(), kScimJson);
 }
 
+/// #6835: a read of the SCIM store FAILED (lease timeout or query error) where the caller was
+/// about to answer 404 / 409 or skip a check on the strength of "not found". Answers the
+/// retryable 503, logs at ERROR with the call site and the target id (CWE-117 neutralised), and
+/// counts `yuzu_scim_guard_store_unavailable_total{guard="resource"}`.
+///
+/// AUDIT POLICY: a MUTATING request (`audit_action` set: POST/PUT/PATCH/DELETE) is audited under
+/// its own verb with result `failure` and detail `store_unavailable: lookup (<site>)`, like the
+/// #6836 guards: it is a mutation attempt that did not run, and for a deprovision the row is the
+/// only per-resource evidence that the IdP's first attempt was deferred. The row is best-effort
+/// (the audit store is usually the same database that just failed). A read-only GET passes
+/// `audit_action == nullptr`: it has no audit verb of its own, and a row per polled GET would
+/// trip `YuzuScimAuditWriteFailures` ("a committed mutation lost its evidence") for requests that
+/// changed nothing; its trail is the log line and the counter. The caller must
+/// `record_request(..., 503)` and return. There are deliberately NO default arguments for the
+/// audit triple: a forgotten argument must be a compile error, never a silently unaudited
+/// mutation.
+void respond_store_read_unavailable(auth::AuthManager* auth_mgr, AuditStore* audit_store,
+                                    const httplib::Request& req, httplib::Response& res,
+                                    std::string_view site, const char* audit_action,
+                                    const std::string& target_id,
+                                    const std::string& target_type) {
+    spdlog::error("ScimRoutes: {} (target '{}') - SCIM store unavailable; answering 503, not a "
+                  "404/409",
+                  site, ::yuzu::log_token(target_id));
+    bump_guard_store_unavailable(auth_mgr, kScimGuardResource);
+    send_scim_unavailable(res, "temporarily unable to read the SCIM store (store unavailable); "
+                               "retry");
+    if (audit_action)
+        audit(auth_mgr, audit_store, req, audit_action, "failure", target_id,
+              "store_unavailable: lookup (" + std::string(site) + ")", target_type);
+}
+
 /// BEST-EFFORT early refusal for a deactivation site, run BEFORE any linked credential is
 /// revoked. Returns true when it refused (409 `mutability` already sent, audited, counted,
 /// escalated); false to proceed. Advisory only: `AuthManager::would_strand_last_administrator`
@@ -792,11 +842,14 @@ std::vector<std::string> fold_group_member_ops(const std::vector<std::string>& c
 /// Bearer gate shared by every /scim/v2/* route. Reads ONLY the
 /// `Authorization: Bearer <token>` header (no cookie/CSRF — there is no
 /// session on this surface) and validates it against ScimStore's hashed
-/// token(s). On failure, sends 401 + WWW-Authenticate + a SCIM error body,
+/// token(s). On a rejected token, sends 401 + WWW-Authenticate + a SCIM error body,
 /// audits `scim.auth.denied` + bumps `yuzu_scim_auth_failures_total`
 /// (M-BEARER-AUDIT — a rejected bearer against a surface that can
 /// provision/deprovision operator accounts is a credential-guess/replay
 /// signal), and returns false so the caller can bail out of the handler.
+/// #6835: if the token store itself FAILED (the token was never compared) it sends the
+/// retryable 503 instead and writes neither credential-failure signal: those two now mean "a
+/// token was actually compared and rejected".
 bool require_bearer(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* audit_store,
                     const httplib::Request& req, httplib::Response& res) {
     constexpr std::string_view kPrefix = "Bearer ";
@@ -805,8 +858,28 @@ bool require_bearer(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditSto
         h.size() > kPrefix.size() && h.compare(0, kPrefix.size(), kPrefix) == 0) {
         token = h.substr(kPrefix.size());
     }
-    if (!scim_store || !scim_store->is_open() || token.empty() ||
-        !scim_store->validate_token(token)) {
+    // #6835: a store FAULT while checking the token is not a credential failure. A 401 here tells
+    // the IdP its token is bad (Okta / Entra / OneLogin may pause or quarantine provisioning), and
+    // would count as a credential-guess signal (`scim.auth.denied`, `yuzu_scim_auth_failures_total`)
+    // for what is an outage. The credential was NOT checked: answer the retryable 503 and leave
+    // the credential-failure signals alone. A null / closed store and an empty token stay 401.
+    ScimStore::TokenCheck token_check = ScimStore::TokenCheck::Invalid;
+    if (scim_store && scim_store->is_open() && !token.empty())
+        token_check = scim_store->validate_token_checked(token);
+    if (token_check == ScimStore::TokenCheck::Unavailable) {
+        // One line per minute at ERROR (the rest at debug): this branch is reachable by an
+        // unauthenticated flood during an outage. The counter below stays exact.
+        if (refusal_log_throttle().should_warn("bearer:store_unavailable"))
+            spdlog::error("ScimRoutes: bearer validation - SCIM token store unavailable; "
+                          "answering 503, not a credential failure (401)");
+        else
+            spdlog::debug("ScimRoutes: bearer validation - SCIM token store unavailable (503)");
+        bump_guard_store_unavailable(auth_mgr, kScimGuardBearer);
+        send_scim_unavailable(res, "temporarily unable to authenticate the request (store "
+                                   "unavailable); retry");
+        return false;
+    }
+    if (token_check != ScimStore::TokenCheck::Valid) {
         res.status = 401;
         res.set_header("WWW-Authenticate", "Bearer");
         res.set_content(scim::error(401, "invalid or missing bearer token").dump(), kScimJson);
@@ -828,9 +901,24 @@ bool require_bearer(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditSto
 /// Returns true iff the mutation may proceed. On refusal, sends 404 (NEVER
 /// 403 — a 403 would confirm to the IdP that a local account by this name
 /// exists) and audits `scim.user.provenance_denied`.
-bool provenance_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
-                   const httplib::Request& req, const std::string& username,
-                   const std::string& scim_id, httplib::Response& res) {
+///
+/// #6836: a STORE ERROR reading the provenance is not a refusal. `get_provisioning_source` is
+/// tri-state (`std::expected`), so a lease timeout or query error (`is_store_unavailable`) is told
+/// apart from a definitive `UserNotFound` / non-`scim` answer. The error arm answers the retryable
+/// 503 (`send_scim_unavailable`), audits `audit_action` (the CALLER's own verb, the #4068
+/// precedent) with result `failure` and a `store_unavailable:` detail, counts
+/// `yuzu_scim_guard_store_unavailable_total{guard="provenance"}` and does NOT count
+/// `yuzu_scim_provenance_denied_total` (a denial signal). It still returns false: the response is
+/// already sent, so every caller bails exactly as it does for a refusal. THIS GUARD mutates
+/// nothing, but it does not promise the REQUEST did: PUT (always) and PATCH-with-externalId run
+/// it again AFTER `deactivate()`/`reactivate()` has committed an `active` change, so a 503 there
+/// is returned for a request whose activation change was already applied. The audit then shows
+/// that change's success row followed by this `failure` row; the IdP's retry finds the account in
+/// the requested state and completes.
+[[nodiscard]] bool provenance_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
+                                const httplib::Request& req, const std::string& username,
+                                const std::string& scim_id, std::string_view audit_action,
+                                httplib::Response& res) {
     AuthDB* db = auth_mgr ? auth_mgr->auth_db_ptr() : nullptr;
     if (!db) {
         // No persistent AuthDB configured — SCIM cannot durably record/verify
@@ -846,6 +934,17 @@ bool provenance_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
         return false;
     }
     auto source = db->get_provisioning_source(username);
+    if (!source && is_store_unavailable(source.error())) {
+        spdlog::error("ScimRoutes: provenance check — auth store unavailable reading '{}' "
+                      "(scim_id={}); answering 503, not a provenance refusal",
+                      ::yuzu::log_token(username), scim_id);
+        send_scim_unavailable(res, "temporarily unable to verify the account's provenance "
+                                   "(authorization store unavailable); retry");
+        audit(auth_mgr, audit_store, req, std::string(audit_action), "failure", scim_id,
+              "store_unavailable: provenance check");
+        bump_guard_store_unavailable(auth_mgr, kScimGuardProvenance);
+        return false;
+    }
     if (!source || *source != kProvisioningSourceScim) {
         spdlog::warn("SCIM: refusing to mutate account '{}' (scim_id={}) — "
                     "provisioning_source is not 'scim' (this account was not created by SCIM)",
@@ -868,19 +967,26 @@ bool provenance_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
 /// durable row is `admin`. The SCIM deprovision/revive guards previously
 /// treated that `nullopt` as "no elevation on file, allowed", which is
 /// fail-OPEN: a cold-cache process would deactivate a DB-elevated admin an
-/// IdP pushes `active:false` for. Returns `nullopt` only when the role
+/// IdP pushes `active:false` for. Returns an error only when the role
 /// genuinely cannot be determined (no `AuthDB` configured, or
 /// `AuthDB::get_user` errors / finds no active row for `username`) —
-/// every caller MUST treat `nullopt` as "refuse", never as "allowed"
-/// (S-ROLE-FAILCLOSED).
-std::optional<auth::Role> db_authoritative_role(auth::AuthManager* auth_mgr,
-                                                const std::string& username) {
+/// every caller MUST treat an error as "refuse" (or, for a store fault,
+/// "retry"), never as "allowed" (S-ROLE-FAILCLOSED; `classify_role_read`).
+///
+/// #6836: this form keeps WHY there is no role. `QueryFailed` and the other `is_store_unavailable`
+/// errors are a store fault (retry, 503); `UserNotFound` (no ACTIVE row) and `InvalidUsername` are
+/// definitive. A missing `AuthDB` is reported as `UserNotFound`, not as a fault: it is a permanent
+/// misconfiguration, not a transient outage, so it stays the fail-closed 404 (`provenance_ok`
+/// treats it the same way). The earlier form that folded every error into `nullopt` ("no role")
+/// is gone: its only remaining caller, the POST-revive role re-check, now uses this one.
+std::expected<auth::Role, AuthDBError>
+db_authoritative_role_checked(auth::AuthManager* auth_mgr, const std::string& username) {
     AuthDB* db = auth_mgr ? auth_mgr->auth_db_ptr() : nullptr;
     if (!db)
-        return std::nullopt;
+        return std::unexpected(AuthDBError::UserNotFound);
     auto entry = db->get_user(username);
     if (!entry)
-        return std::nullopt;
+        return std::unexpected(entry.error());
     return entry->role;
 }
 
@@ -893,17 +999,30 @@ std::optional<auth::Role> db_authoritative_role(auth::AuthManager* auth_mgr,
 /// the admin group — before SCIM may tear it down; this is a sequencing
 /// requirement, not a permanent carve-out for operator-owned accounts.
 /// Checked only while the account is still ACTIVE. Role is read via
-/// `db_authoritative_role` (H2) — the DB row, never the AuthManager
+/// `db_authoritative_role_checked` (H2, #6836) — the DB row, never the AuthManager
 /// in-memory cache, which can be cold on a freshly-started process. Returns
-/// true iff the deprovision may proceed; FAILS CLOSED (refuses) if the role
-/// cannot be determined at all, not just when it resolves to something
-/// other than `user`. On refusal sends 404 (never 403 — matches the
+/// `Ok` iff the deprovision may proceed; FAILS CLOSED (`Refused`) if the role
+/// cannot be determined for a DEFINITIVE reason (no active row, invalid name,
+/// no `AuthDB`), not just when it resolves to something other than `user`. On
+/// refusal sends 404 (never 403 — matches the
 /// provenance guard's no-existence-oracle posture) and reuses
 /// `scim.user.provenance_denied` (same "SCIM does not own this account's
 /// lifecycle right now" refusal class).
-bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
-                        const httplib::Request& req, const std::string& username,
-                        const std::string& scim_id, httplib::Response& res) {
+///
+/// #6836: `Unavailable` is a store fault reading the role
+/// (`is_store_unavailable`): the retryable 503 is sent, `audit_action` is audited with result
+/// `failure` and a `store_unavailable:` detail, `yuzu_scim_guard_store_unavailable_total{guard=
+/// "role"}` is counted, this guard mutates nothing and NEITHER the denial counter
+/// NOR the ADR-2001 D1 "role-refused with a linked identity" escalation fires, because nothing
+/// was refused. `Refused` is the unchanged 404 (a non-`user` role, no ACTIVE row, or an invalid
+/// name) and is the only value the D1 callers escalate on.
+[[nodiscard]] GuardVerdict deprovision_role_ok(auth::AuthManager* auth_mgr,
+                                               AuditStore* audit_store,
+                                               const httplib::Request& req,
+                                               const std::string& username,
+                                               const std::string& scim_id,
+                                               std::string_view audit_action,
+                                               httplib::Response& res) {
     // #2021 (Groups->role): deliberately NOT weakened for a group-elevated
     // admin. A SCIM user promoted to admin via Group membership still fails
     // this guard exactly like an operator-elevated one — the IdP must
@@ -914,20 +1033,32 @@ bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
     // group-promoting an account to admin and deprovisioning it in the same
     // breath in a way that could race an operator's own admin actions on
     // that account. Do not add a bypass for the group-elevated case.
-    auto role = db_authoritative_role(auth_mgr, username);
-    if (!role.has_value() || *role != auth::Role::user) {
+    const auto role = db_authoritative_role_checked(auth_mgr, username);
+    const auto verdict = classify_role_read(role);
+    if (verdict == GuardVerdict::Unavailable) {
+        spdlog::error("ScimRoutes: deprovision role check — auth store unavailable reading '{}' "
+                      "(scim_id={}); answering 503, not a role refusal",
+                      ::yuzu::log_token(username), scim_id);
+        send_scim_unavailable(res, "temporarily unable to verify the account's role "
+                                   "(authorization store unavailable); retry");
+        audit(auth_mgr, audit_store, req, std::string(audit_action), "failure", scim_id,
+              "store_unavailable: role check");
+        bump_guard_store_unavailable(auth_mgr, kScimGuardRole);
+        return GuardVerdict::Unavailable;
+    }
+    if (verdict == GuardVerdict::Refused) {
         spdlog::warn("SCIM: refusing to deprovision '{}' (scim_id={}) — role is not 'user' or "
                     "could not be authoritatively determined (an operator may have elevated "
-                    "this account outside SCIM's ownership, or the DB-authoritative role read "
-                    "failed closed)",
+                    "this account outside SCIM's ownership, or the account has no active "
+                    "row)",
                     username, scim_id);
         send_scim_error(res, 404, "resource not found");
         audit(auth_mgr, audit_store, req, "scim.user.provenance_denied", "denied", scim_id,
              "role is not 'user' (or undetermined) for username=" + username);
         bump_provenance_denied(auth_mgr);
-        return false;
+        return GuardVerdict::Refused;
     }
-    return true;
+    return GuardVerdict::Ok;
 }
 
 /// What `recompute_scim_user_role` tells a per-member loop (#4966). Six values in four classes
@@ -1030,7 +1161,7 @@ struct RecomputeOutcome {
 /// now-stale role gets corrected by whichever recompute runs last.
 ///
 /// LOCK ORDER (do not invert): `kRecomputeMu` → `AuthManager::mu_` (taken
-/// and released inside `db_authoritative_role`/`update_role`). The
+/// and released inside `db_authoritative_role_checked`/`update_role`). The
 /// `ScimStore` calls (`get_by_scim_id`/`list_group_display_names_for_user`)
 /// no longer hold any process-wide lock across their PgPool round-trip — a
 /// per-connection Postgres lease is not a mutex this function's callers can
@@ -1124,7 +1255,7 @@ RecomputeOutcome recompute_scim_user_role(ScimStore* scim_store, auth::AuthManag
     auth::Role resolved = auth::resolve_role_from_groups(*groups, scim_admin_group);
 
     // Step 4: fail-closed on an undetermined current role (S-ROLE-FAILCLOSED
-    // posture, matching db_authoritative_role's every other caller).
+    // posture, matching db_authoritative_role_checked's every other caller).
     // `get_user` returns the ACTIVE row only; `UserNotFound` is therefore "no active row", which
     // is either no row at all or a soft-deleted one (see `get_role_including_inactive`). Neither
     // can hold a session, so there is nothing to retain. Any other error is a failed read.
@@ -1705,10 +1836,16 @@ bool deactivate(ScimStore* scim_store, ApiTokenStore* token_store, auth::AuthMan
                 AnalyticsEventStore* analytics_store = nullptr,
                 const DeprovisionedFn& on_deprovisioned = DeprovisionedFn{}) {
     const DeprovisionCtx ctx{scim_store, token_store, analytics_store};
-    if (!provenance_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id, res))
+    if (!provenance_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id,
+                       audit_action, res))
         return false;
-    if (!deprovision_role_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id,
-                             res)) {
+    const auto role_verdict = deprovision_role_ok(auth_mgr, audit_store, req, resource.username,
+                                                  resource.scim_id, audit_action, res);
+    // #6836: a store fault (503, already sent and audited) is not a refusal: skip the D1
+    // escalation below, which says a human must terminate linked identities by hand.
+    if (role_verdict == GuardVerdict::Unavailable)
+        return false;
+    if (role_verdict == GuardVerdict::Refused) {
         // ADR-2001 D1: deprovision_role_ok already sent 404 + audited
         // scim.user.provenance_denied — #2021's protection for a manually-
         // elevated account stands, and this deprovision is NOT auto-
@@ -1880,7 +2017,8 @@ ProvisionPrecheck provisioning_prechecks(auth::AuthManager* auth_mgr, const std:
 /// enforced via the failure-counter alert).
 bool reactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* audit_store,
                 const httplib::Request& req, httplib::Response& res, const ScimResource& resource) {
-    if (!provenance_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id, res))
+    if (!provenance_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id,
+                       "scim.user.reactivated", res))
         return false;
     // #4966: the SAME pre-checks `POST /Users` applies to a revive, before anything is
     // reactivated: an elevated tombstone or a name holding an Administrator grant is never
@@ -2027,12 +2165,22 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         // is provisioned RIGHT NOW — a re-POST for an already-provisioned
         // (active OR PATCH-deactivated-but-not-DELETEd) identity is a
         // protocol error; the IdP should PATCH/PUT instead.
-        if (scim_store->get_by_username(input.user_name).has_value()) {
-            send_scim_error(res, 409, "userName already exists", "uniqueness");
-            audit(auth_mgr, audit_store, req, "scim.user.provisioned", "denied", input.user_name,
-                 "userName already exists");
-            record_request(auth_mgr, "create", 409);
-            return;
+        // #6835: a store FAULT here is not "no live mapping": falling through would try the
+        // create on top of an unanswered uniqueness check.
+        {
+            const auto existing = scim_store->get_by_username_checked(input.user_name);
+            if (!existing) {
+                respond_store_read_unavailable(auth_mgr, audit_store, req, res, "user lookup (create)", "scim.user.provisioned", input.user_name, "User");
+                record_request(auth_mgr, "create", 503);
+                return;
+            }
+            if (existing->has_value()) {
+                send_scim_error(res, 409, "userName already exists", "uniqueness");
+                audit(auth_mgr, audit_store, req, "scim.user.provisioned", "denied",
+                      input.user_name, "userName already exists");
+                record_request(auth_mgr, "create", 409);
+                return;
+            }
         }
 
         // Step 2 (M-LIFECYCLE — revive-on-reprovision): no live scim_resource
@@ -2167,7 +2315,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             // path. Checked AFTER reactivate_user() (not before): the
             // tombstoned row is soft-deleted, so a plain cache read has no
             // entry for it until reactivate_user() loads it. Role is read
-            // via `db_authoritative_role` (H2, consistency with
+            // via `db_authoritative_role_checked` (H2, consistency with
             // deprovision_role_ok) — the DB row, never the AuthManager
             // in-memory cache — and FAILS CLOSED (refuses) if the role
             // cannot be determined at all, not just when it resolves to
@@ -2176,27 +2324,64 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             // account stays down, not just that this response says 404.
             // Same posture as the deprovision role guard: 404 (never 403 —
             // no existence oracle), scim.user.provenance_denied.
-            if (auto role = db_authoritative_role(auth_mgr, input.user_name);
-                !role.has_value() || *role != auth::Role::user) {
-                spdlog::warn("ScimRoutes: refusing to revive '{}' via POST — role is not "
-                            "'user' (an operator elevated this account before it was "
-                            "tombstoned)",
-                            input.user_name);
+            //
+            // #6836 (the same defect class as the deprovision guards): a STORE FAULT reading
+            // the role is not a refusal. It takes the SAME guarded undo (the account stays down:
+            // fail closed) but answers the retryable 503 with a `store_unavailable:` audit row
+            // and the guard counter, and does NOT count a provenance denial: the IdP retries the
+            // POST and the revive converges once the store answers.
+            const auto role_verdict =
+                classify_role_read(db_authoritative_role_checked(auth_mgr, input.user_name));
+            const bool role_read_failed = role_verdict == GuardVerdict::Unavailable;
+            if (role_verdict != GuardVerdict::Ok) {
+                if (role_read_failed) {
+                    spdlog::error("ScimRoutes: revive role check — auth store unavailable "
+                                  "reading '{}'; undoing the reactivation and answering 503, "
+                                  "not a role refusal",
+                                  ::yuzu::log_token(input.user_name));
+                    // Counted BEFORE the undo: the undo needs the same store, so in a real
+                    // outage it is likely to fail too, and that 500 path must still move the
+                    // signal YuzuScimGuardStoreUnavailable keys on. (Cost note: each retried
+                    // revive does a pre-check read, a reactivation write, a role read and a
+                    // guarded undo: heavier than a deprovision 503, bounded by the IdP's
+                    // retry rate and the fixed Retry-After: 2.)
+                    bump_guard_store_unavailable(auth_mgr, kScimGuardRole);
+                } else {
+                    spdlog::warn("ScimRoutes: refusing to revive '{}' via POST — role is not "
+                                "'user' (an operator elevated this account before it was "
+                                "tombstoned)",
+                                input.user_name);
+                }
                 // The pre-check above already refused an elevated tombstone, so reaching here
                 // means the role changed in the window between that read and the reactivation (a
-                // concurrent operator promotion): a rare race, handled by a GUARDED undo. If the
-                // undo cannot complete (the guard refuses it: this account is by definition the
-                // last counted administrator, or a store fault) the account may stay ACTIVE at an
-                // elevated role (the outcome is in scim.user.compensation_failed); fail closed
-                // (500) so the IdP retries, escalate it
-                // (compensate_created_account), and do not claim a 404 that a retry cannot fix.
+                // concurrent operator promotion), or the role read faulted: handled by a GUARDED
+                // undo. If the undo cannot complete (the guard refuses it: this account is by
+                // definition the last counted administrator, or a store fault) the account may
+                // stay ACTIVE at an elevated role (the outcome is in
+                // scim.user.compensation_failed); fail closed (500) so the IdP retries, escalate
+                // it (compensate_created_account), and do not claim a 404/503 that a retry
+                // cannot fix.
                 if (!compensate_created_account(auth_mgr, audit_store, analytics_store, req,
-                                                input.user_name, "revive_role_refusal_undo")) {
+                                                input.user_name,
+                                                role_read_failed ? "revive_role_read_fault_undo"
+                                                                 : "revive_role_refusal_undo")) {
                     send_scim_error(res, 500, "failed to revive the underlying account");
                     audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure",
                          input.user_name,
-                         "role-refusal undo did not complete; see scim.user.compensation_failed");
+                         role_read_failed
+                             ? "store_unavailable: revive role check; undo did not complete; see "
+                               "scim.user.compensation_failed"
+                             : "role-refusal undo did not complete; see "
+                               "scim.user.compensation_failed");
                     record_request(auth_mgr, "create", 500);
+                    return;
+                }
+                if (role_read_failed) {
+                    send_scim_unavailable(res, "temporarily unable to verify the account's role "
+                                               "(authorization store unavailable); retry");
+                    audit(auth_mgr, audit_store, req, "scim.user.provisioned", "failure",
+                          input.user_name, "store_unavailable: revive role check");
+                    record_request(auth_mgr, "create", 503);
                     return;
                 }
                 send_scim_error(res, 404, "resource not found");
@@ -2482,7 +2667,13 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     return;
                 }
                 auto id = req.matches[1].str();
-                auto resource = scim_store->get_by_scim_id(id);
+                auto resource_lookup = scim_store->get_by_scim_id_checked(id);
+                if (!resource_lookup) {
+                    respond_store_read_unavailable(auth_mgr, audit_store, req, res, "user lookup (get)", nullptr, id, "User");
+                    record_request(auth_mgr, "get", 503);
+                    return;
+                }
+                auto resource = std::move(*resource_lookup);
                 if (!resource) {
                     send_scim_error(res, 404, "resource not found");
                     record_request(auth_mgr, "get", 404);
@@ -2543,8 +2734,14 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     }
                     std::vector<json> resources;
                     int total = 0;
-                    if (auto resource = scim_store->get_by_username(*filter_username)) {
-                        resources.push_back(scim::user_to_json(*resource, base));
+                    const auto found = scim_store->get_by_username_checked(*filter_username);
+                    if (!found) {
+                        respond_store_read_unavailable(auth_mgr, audit_store, req, res, "user lookup (list filter)", nullptr, std::string{}, "User");
+                        record_request(auth_mgr, "list", 503);
+                        return;
+                    }
+                    if (*found) {
+                        resources.push_back(scim::user_to_json(**found, base));
                         total = 1;
                     }
                     res.set_content(
@@ -2580,7 +2777,13 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     return;
                 }
                 auto id = req.matches[1].str();
-                auto resource = scim_store->get_by_scim_id(id);
+                auto resource_lookup = scim_store->get_by_scim_id_checked(id);
+                if (!resource_lookup) {
+                    respond_store_read_unavailable(auth_mgr, audit_store, req, res, "user lookup (replace)", "scim.user.updated", id, "User");
+                    record_request(auth_mgr, "replace", 503);
+                    return;
+                }
+                auto resource = std::move(*resource_lookup);
                 if (!resource) {
                     send_scim_error(res, 404, "resource not found");
                     record_request(auth_mgr, "replace", 404);
@@ -2707,13 +2910,14 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 // every inactive-but-legitimately-SCIM-owned account (its
                 // DB-authoritative read only resolves an ACTIVE row).
                 if (!provenance_ok(auth_mgr, audit_store, req, resource->username,
-                                   resource->scim_id, res)) {
+                                   resource->scim_id, "scim.user.updated", res)) {
                     record_request(auth_mgr, "replace", res.status);
                     return;
                 }
                 if (resource->active &&
-                    !deprovision_role_ok(auth_mgr, audit_store, req, resource->username,
-                                         resource->scim_id, res)) {
+                    deprovision_role_ok(auth_mgr, audit_store, req, resource->username,
+                                        resource->scim_id, "scim.user.updated", res) !=
+                        GuardVerdict::Ok) {
                     record_request(auth_mgr, "replace", res.status);
                     return;
                 }
@@ -2760,7 +2964,13 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       return;
                   }
                   auto id = req.matches[1].str();
-                  auto resource = scim_store->get_by_scim_id(id);
+                  auto resource_lookup = scim_store->get_by_scim_id_checked(id);
+                  if (!resource_lookup) {
+                      respond_store_read_unavailable(auth_mgr, audit_store, req, res, "user lookup (patch)", "scim.user.updated", id, "User");
+                      record_request(auth_mgr, "patch", 503);
+                      return;
+                  }
+                  auto resource = std::move(*resource_lookup);
                   if (!resource) {
                       send_scim_error(res, 404, "resource not found");
                       record_request(auth_mgr, "patch", 404);
@@ -2880,13 +3090,14 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       // further being torn down once inactive, and
                       // `deprovision_role_ok` only resolves an ACTIVE row).
                       if (!provenance_ok(auth_mgr, audit_store, req, resource->username,
-                                        resource->scim_id, res)) {
+                                        resource->scim_id, "scim.user.updated", res)) {
                           record_request(auth_mgr, "patch", res.status);
                           return;
                       }
                       if (resource->active &&
-                          !deprovision_role_ok(auth_mgr, audit_store, req, resource->username,
-                                              resource->scim_id, res)) {
+                          deprovision_role_ok(auth_mgr, audit_store, req, resource->username,
+                                             resource->scim_id, "scim.user.updated", res) !=
+                              GuardVerdict::Ok) {
                           record_request(auth_mgr, "patch", res.status);
                           return;
                       }
@@ -2933,7 +3144,13 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                        return;
                    }
                    auto id = req.matches[1].str();
-                   auto resource = scim_store->get_by_scim_id(id);
+                   auto resource_lookup = scim_store->get_by_scim_id_checked(id);
+                   if (!resource_lookup) {
+                       respond_store_read_unavailable(auth_mgr, audit_store, req, res, "user lookup (delete)", "scim.user.deleted", id, "User");
+                       record_request(auth_mgr, "delete", 503);
+                       return;
+                   }
+                   auto resource = std::move(*resource_lookup);
                    if (!resource) {
                        send_scim_error(res, 404, "resource not found");
                        record_request(auth_mgr, "delete", 404);
@@ -2944,12 +3161,20 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                    bool erasure_link_read_failed = false;      // R2-1: reported after the hook
                    if (resource->active) {
                        if (!provenance_ok(auth_mgr, audit_store, req, resource->username, id,
-                                         res)) {
+                                         "scim.user.deleted", res)) {
                            record_request(auth_mgr, "delete", res.status);
                            return;
                        }
-                       if (!deprovision_role_ok(auth_mgr, audit_store, req, resource->username,
-                                               id, res)) {
+                       const auto role_verdict =
+                           deprovision_role_ok(auth_mgr, audit_store, req, resource->username, id,
+                                              "scim.user.deleted", res);
+                       if (role_verdict == GuardVerdict::Unavailable) {
+                           // #6836: 503 already sent and audited; a store fault is not a
+                           // refusal, so no D1 escalation.
+                           record_request(auth_mgr, "delete", res.status);
+                           return;
+                       }
+                       if (role_verdict == GuardVerdict::Refused) {
                            // ADR-2001 D1 — same loud-refusal signal as
                            // deactivate()'s doc comment: deprovision_role_ok
                            // already sent 404 + audited
@@ -3016,7 +3241,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                        // down (see deprovision_role_ok's doc comment — the
                        // in-memory role cache has no entry to check anyway).
                        if (!provenance_ok(auth_mgr, audit_store, req, resource->username, id,
-                                         res)) {
+                                         "scim.user.deleted", res)) {
                            record_request(auth_mgr, "delete", res.status);
                            return;
                        }
@@ -3131,15 +3356,47 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             return;
         }
 
+        // #6835: resolve the members BEFORE the group row exists, and BEFORE the duplicate check.
+        // Could not resolve every member means persisting the partial set would silently drop
+        // real members from a brand-new group, so the request is refused with a retryable 503 -
+        // and because nothing has been created yet there is nothing to roll back: the IdP's
+        // retry meets no duplicate-displayName 409 against an empty group, and no concurrent
+        // PUT/PATCH can have added a member (and so conferred a role) to a group this request
+        // is about to remove. The audit row carries no target id for the same reason.
+        //
+        // The duplicate check comes AFTER the resolution so that its window to `create_group`
+        // stays the single round trip it always was: there is no DB UNIQUE on displayName, and
+        // with the check first, up to kMaxGroupMembers sequential reads would sit between the
+        // check and the insert, widening the two-concurrent-POST duplicate race (and a
+        // duplicate named like the admin group keeps conferring admin). The cost is that a
+        // duplicate-named request resolves its members before it is refused with 409.
+        auto members_resolved = resolve_member_values(scim_store, input.member_values);
+        if (!members_resolved.has_value()) {
+            send_scim_unavailable(res, "membership unavailable");
+            audit(auth_mgr, audit_store, req, "scim.group.created", "failure", "",
+                  "member resolution unavailable; no group was created", "Group");
+            record_request(auth_mgr, "group_create", 503);
+            return;
+        }
+
         // Idempotent-create on displayName — no DB-level UNIQUE (ScimStore's
         // doc comment on get_group_by_display_name); the routes layer owns
         // the 409.
-        if (scim_store->get_group_by_display_name(input.display_name).has_value()) {
-            send_scim_error(res, 409, "displayName already exists", "uniqueness");
-            audit(auth_mgr, audit_store, req, "scim.group.created", "denied", "",
-                 "displayName already exists: " + neutral_free_text(input.display_name), "Group");
-            record_request(auth_mgr, "group_create", 409);
-            return;
+        {
+            const auto existing = scim_store->get_group_by_display_name_checked(input.display_name);
+            if (!existing) {
+                respond_store_read_unavailable(auth_mgr, audit_store, req, res, "group lookup (create)", "scim.group.created", std::string{}, "Group");
+                record_request(auth_mgr, "group_create", 503);
+                return;
+            }
+            if (existing->has_value()) {
+                send_scim_error(res, 409, "displayName already exists", "uniqueness");
+                audit(auth_mgr, audit_store, req, "scim.group.created", "denied", "",
+                      "displayName already exists: " + neutral_free_text(input.display_name),
+                      "Group");
+                record_request(auth_mgr, "group_create", 409);
+                return;
+            }
         }
 
         auto group = scim_store->create_group(input.display_name, input.external_id);
@@ -3151,16 +3408,6 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             return;
         }
 
-        auto members_resolved = resolve_member_values(scim_store, input.member_values);
-        if (!members_resolved.has_value()) {
-            // Could not resolve every member — persisting the partial set
-            // would silently drop real members from a brand-new group.
-            send_scim_error(res, 503, "membership unavailable");
-            audit(auth_mgr, audit_store, req, "scim.group.created", "failure", group->scim_id,
-                 "member resolution unavailable", "Group");
-            record_request(auth_mgr, "group_create", 503);
-            return;
-        }
         const std::vector<std::string>& members = *members_resolved;
         if (!members.empty() && !scim_store->set_group_members(group->scim_id, members)) {
             spdlog::error("ScimRoutes: set_group_members failed for group scim_id={}",
@@ -3198,7 +3445,13 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     return;
                 }
                 auto id = req.matches[1].str();
-                auto group = scim_store->get_group_by_id(id);
+                auto group_lookup = scim_store->get_group_by_id_checked(id);
+                if (!group_lookup) {
+                    respond_store_read_unavailable(auth_mgr, audit_store, req, res, "group lookup (group_get)", nullptr, id, "Group");
+                    record_request(auth_mgr, "group_get", 503);
+                    return;
+                }
+                auto group = std::move(*group_lookup);
                 if (!group) {
                     send_scim_error(res, 404, "resource not found");
                     record_request(auth_mgr, "group_get", 404);
@@ -3209,7 +3462,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 // reconciling connector may then "restore" that emptiness.
                 auto members = scim_store->list_group_member_user_scim_ids(id);
                 if (!members.has_value()) {
-                    send_scim_error(res, 503, "membership unavailable");
+                    send_scim_unavailable(res, "membership unavailable");
                     record_request(auth_mgr, "group_get", 503);
                     return;
                 }
@@ -3265,10 +3518,17 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     }
                     std::vector<json> resources;
                     int total = 0;
-                    if (auto group = scim_store->get_group_by_display_name(*filter_name)) {
+                    const auto found_group =
+                        scim_store->get_group_by_display_name_checked(*filter_name);
+                    if (!found_group) {
+                        respond_store_read_unavailable(auth_mgr, audit_store, req, res, "group lookup (list filter)", nullptr, std::string{}, "Group");
+                        record_request(auth_mgr, "group_list", 503);
+                        return;
+                    }
+                    if (const auto& group = *found_group) {
                         auto members = scim_store->list_group_member_user_scim_ids(group->scim_id);
                         if (!members.has_value()) { // fail closed, never "empty group"
-                            send_scim_error(res, 503, "membership unavailable");
+                            send_scim_unavailable(res, "membership unavailable");
                             record_request(auth_mgr, "group_list", 503);
                             return;
                         }
@@ -3291,7 +3551,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 for (const auto& g : page) {
                     auto members = scim_store->list_group_member_user_scim_ids(g.scim_id);
                     if (!members.has_value()) { // fail closed, never "empty group"
-                        send_scim_error(res, 503, "membership unavailable");
+                        send_scim_unavailable(res, "membership unavailable");
                         record_request(auth_mgr, "group_list", 503);
                         return;
                     }
@@ -3342,7 +3602,13 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     return;
                 }
                 auto id = req.matches[1].str();
-                auto group = scim_store->get_group_by_id(id);
+                auto group_lookup = scim_store->get_group_by_id_checked(id);
+                if (!group_lookup) {
+                    respond_store_read_unavailable(auth_mgr, audit_store, req, res, "group lookup (group_replace)", "scim.group.updated", id, "Group");
+                    record_request(auth_mgr, "group_replace", 503);
+                    return;
+                }
+                auto group = std::move(*group_lookup);
                 if (!group) {
                     send_scim_error(res, 404, "resource not found");
                     record_request(auth_mgr, "group_replace", 404);
@@ -3383,8 +3649,14 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 // admin) group's displayName is refused — mirrors the
                 // create-time 409 (S1526).
                 if (input.display_name != group->display_name) {
-                    if (auto existing = scim_store->get_group_by_display_name(input.display_name);
-                        existing && existing->scim_id != id) {
+                    const auto existing =
+                        scim_store->get_group_by_display_name_checked(input.display_name);
+                    if (!existing) {
+                        respond_store_read_unavailable(auth_mgr, audit_store, req, res, "group lookup (rename, replace)", "scim.group.updated", id, "Group");
+                        record_request(auth_mgr, "group_replace", 503);
+                        return;
+                    }
+                    if (*existing && (*existing)->scim_id != id) {
                         send_scim_error(res, 409, "displayName already exists", "uniqueness");
                         audit(auth_mgr, audit_store, req, "scim.group.updated", "denied", id,
                              "displayName already exists", "Group");
@@ -3409,7 +3681,13 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     // The pre-lock snapshot still serves the early, cheap rename-uniqueness
                     // check above, which only refuses and writes nothing. Also covers the
                     // group having been deleted in that window.
-                    const auto current = scim_store->get_group_by_id(id);
+                    auto current_lookup = scim_store->get_group_by_id_checked(id);
+                    if (!current_lookup) {
+                        respond_store_read_unavailable(auth_mgr, audit_store, req, res, "group lookup (group_replace, current)", "scim.group.updated", id, "Group");
+                        record_request(auth_mgr, "group_replace", 503);
+                        return;
+                    }
+                    const auto current = std::move(*current_lookup);
                     if (!current) {
                         send_scim_error(res, 404, "resource not found");
                         record_request(auth_mgr, "group_replace", 404);
@@ -3436,7 +3714,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                      "membership for group scim_id={}; refusing the replace "
                                      "(fail-closed, role recompute would be incomplete)",
                                      id);
-                        send_scim_error(res, 503, "membership unavailable");
+                        send_scim_unavailable(res, "membership unavailable");
                         audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id,
                              "membership snapshot unavailable", "Group");
                         record_request(auth_mgr, "group_replace", 503);
@@ -3450,7 +3728,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                      "member for group scim_id={}; refusing the replace "
                                      "(fail-closed, would persist a partial set)",
                                      id);
-                        send_scim_error(res, 503, "membership unavailable");
+                        send_scim_unavailable(res, "membership unavailable");
                         audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id,
                              "member resolution unavailable", "Group");
                         record_request(auth_mgr, "group_replace", 503);
@@ -3524,7 +3802,13 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       return;
                   }
                   auto id = req.matches[1].str();
-                  auto group = scim_store->get_group_by_id(id);
+                  auto group_lookup = scim_store->get_group_by_id_checked(id);
+                  if (!group_lookup) {
+                      respond_store_read_unavailable(auth_mgr, audit_store, req, res, "group lookup (group_patch)", "scim.group.updated", id, "Group");
+                      record_request(auth_mgr, "group_patch", 503);
+                      return;
+                  }
+                  auto group = std::move(*group_lookup);
                   if (!group) {
                       send_scim_error(res, 404, "resource not found");
                       record_request(auth_mgr, "group_patch", 404);
@@ -3582,7 +3866,13 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       // display_name drives the --scim-admin-group match,
                       // could re-promote/un-demote members). Also covers the
                       // group having been deleted entirely in that window.
-                      auto current = scim_store->get_group_by_id(id);
+                      auto current_lookup = scim_store->get_group_by_id_checked(id);
+                      if (!current_lookup) {
+                          respond_store_read_unavailable(auth_mgr, audit_store, req, res, "group lookup (group_patch, current)", "scim.group.updated", id, "Group");
+                          record_request(auth_mgr, "group_patch", 503);
+                          return;
+                      }
+                      auto current = std::move(*current_lookup);
                       if (!current) {
                           send_scim_error(res, 404, "resource not found");
                           record_request(auth_mgr, "group_patch", 404);
@@ -3613,7 +3903,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                        "(fail-closed, folding onto an empty set would delete "
                                        "the real membership)",
                                        id);
-                          send_scim_error(res, 503, "membership unavailable");
+                          send_scim_unavailable(res, "membership unavailable");
                           audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id,
                                "membership read unavailable", "Group");
                           record_request(auth_mgr, "group_patch", 503);
@@ -3637,7 +3927,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                        "member for group scim_id={}; refusing the patch "
                                        "(fail-closed, would persist a partial set)",
                                        id);
-                          send_scim_error(res, 503, "membership unavailable");
+                          send_scim_unavailable(res, "membership unavailable");
                           audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id,
                                "member resolution unavailable", "Group");
                           record_request(auth_mgr, "group_patch", 503);
@@ -3668,8 +3958,14 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       // Step 3b: rename-uniqueness — refused BEFORE any mutation
                       // (arch-S4/UP-2), same as before.
                       if (renamed) {
-                          if (auto existing = scim_store->get_group_by_display_name(final_display);
-                              existing && existing->scim_id != id) {
+                          const auto existing =
+                              scim_store->get_group_by_display_name_checked(final_display);
+                          if (!existing) {
+                              respond_store_read_unavailable(auth_mgr, audit_store, req, res, "group lookup (rename, patch)", "scim.group.updated", id, "Group");
+                              record_request(auth_mgr, "group_patch", 503);
+                              return;
+                          }
+                          if (*existing && (*existing)->scim_id != id) {
                               send_scim_error(res, 409, "displayName already exists", "uniqueness");
                               audit(auth_mgr, audit_store, req, "scim.group.updated", "denied", id,
                                    "displayName already exists", "Group");
@@ -3754,7 +4050,13 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                        return;
                    }
                    auto id = req.matches[1].str();
-                   auto group = scim_store->get_group_by_id(id);
+                   auto group_lookup = scim_store->get_group_by_id_checked(id);
+                   if (!group_lookup) {
+                       respond_store_read_unavailable(auth_mgr, audit_store, req, res, "group lookup (group_delete)", "scim.group.deleted", id, "Group");
+                       record_request(auth_mgr, "group_delete", 503);
+                       return;
+                   }
+                   auto group = std::move(*group_lookup);
                    if (!group) {
                        send_scim_error(res, 404, "resource not found");
                        record_request(auth_mgr, "group_delete", 404);
@@ -3790,7 +4092,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                         "(fail-closed, members would keep a role this group "
                                         "conferred)",
                                         id);
-                           send_scim_error(res, 503, "membership unavailable");
+                           send_scim_unavailable(res, "membership unavailable");
                            audit(auth_mgr, audit_store, req, "scim.group.deleted", "failure", id,
                                 "membership snapshot unavailable", "Group");
                            record_request(auth_mgr, "group_delete", 503);

@@ -105,6 +105,18 @@ before #2376, treat the grant-population export as having been accessible to all
 authenticated principals unless RBAC was explicitly enabled on that deployment.** Full
 decision record: `docs/security-reviews/authz-topology-floor-2026-08-05.md`.
 
+**Addendum — the Settings Access reviews panel did not refuse engine sessions until #6744
+(CC6.1/CC6.2).** Every `/api/v1/access-reviews` route and MCP twin refused an engine principal's
+session ("only a human can sign this evidence"), but the two Settings fragments
+(`GET /fragments/settings/access-reviews` and its `/campaign` view) did not, so an engine
+principal holding `AccessReview:Read` through a custom role could read the grant population and
+the campaign attestation rows through them; #6744 closes it, and a refused engine session now
+writes a denied `access_review.list` / `access_review.get` row. For the period before the fix the
+audit log cannot show such a read (a successful read wrote no row), and the
+`engine_principal.audit.no_admin` check does not flag a custom role granting only
+`AccessReview:Read`, so an auditor testing that period should review the custom roles assigned to
+engine principals for `AccessReview:Read` rather than rely on the audit trail.
+
 **Addendum — the access-review export now states whether RBAC was actually enforced
 (CC6.2, RBAC delivery plan A3).** #2376 above closed *who* can read the grant-population
 export; it did not address a separate gap this section's own evidence framing had:

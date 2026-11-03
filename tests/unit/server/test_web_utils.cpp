@@ -925,6 +925,21 @@ TEST_CASE("audit_token: neutralises k=v structural delimiters + control bytes",
     CHECK(audit_token(std::string("a\tb")) == "a_b");
 }
 
+TEST_CASE("flatten_audit_text: one line, trailing whitespace dropped, nothing else changed",
+          "[web_utils][audit]") {
+    CHECK(flatten_audit_text("") == "");
+    CHECK(flatten_audit_text("plain text") == "plain text");
+    // A libpq message: trailing newline, often a second CONTEXT line.
+    CHECK(flatten_audit_text("revoke did not persist: ERROR: boom\n") ==
+          "revoke did not persist: ERROR: boom");
+    CHECK(flatten_audit_text("ERROR: boom\nCONTEXT: PL/pgSQL function f()\n") ==
+          "ERROR: boom CONTEXT: PL/pgSQL function f()");
+    CHECK(flatten_audit_text("a\r\nb\r\n") == "a  b");
+    CHECK(flatten_audit_text("trailing \t \n") == "trailing");
+    // Delimiters are left alone: this is not the caller-value neutraliser.
+    CHECK(flatten_audit_text("k=v, x") == "k=v, x");
+}
+
 // ── mcp_body_exceeds_cap (#2437) ────────────────────────────────────────────
 //
 // The pre-routing transport cap's DECISION. Extracted from server.cpp's

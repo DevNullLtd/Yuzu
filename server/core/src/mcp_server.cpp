@@ -2655,6 +2655,15 @@ static const ToolDef kTools[] = {
      "revoked identity with a still-valid credential). TERMINAL and irreversible — never "
      "un-revocable; a false-positive response mints a successor principal instead (pass "
      "superseded_by on the successor's own creation, then reference this principal here). "
+     "Order matters: the credentials die first, then the identity. A retryable error "
+     "(retry_after_ms 5000) after the credentials died means the principal may still be active "
+     "with zero credentials; repeating the call finishes the revoke. Repeating is safe (a "
+     "revoke by a concurrent request that wins is reported as success; the repeat reports "
+     "credentials_revoked 0), but the supervised tier consumes the approval ticket before the "
+     "handler runs, so a retry after a retryable error needs a NEW approval ticket. Cap your "
+     "retries at a few attempts, then read the principal "
+     "with get_engine_principal and report its state to an administrator. The failure audit "
+     "row carries the number of credentials the failed call revoked. "
      "Mirrors DELETE /api/v1/engine-principals/{id}. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
@@ -2687,16 +2696,19 @@ static const ToolDef kTools[] = {
 
     {"rotate_engine_credential",
      "Rotate an engine principal's credential via the overlap-pair workflow (design doc §7): "
-     "mints a successor (both credentials valid during the overlap window, default+minimum 7 "
-     "days, floor 24h), auto-revokes the predecessor at window end. BOUNDED-IDEMPOTENT, not "
+     "mints a successor (both credentials valid during the overlap window, default 7 days, "
+     "minimum 1 day = 24h), auto-revokes the predecessor at window end. BOUNDED-IDEMPOTENT, not "
      "generally idempotent: a re-call within a short grace window after the original mint "
      "re-serves the SAME successor secret (each reveal — original or replay — is independently "
-     "audited as engine_principal.credential.reveal); once the grace window lapses, a re-call "
-     "errors and the caller must recover over REST (find the stuck successor with GET "
-     "/api/v1/engine-principals/{id}, revoke it with DELETE /api/v1/tokens/{token_id} as an "
-     "administrator, then rotate again), never an indefinite retry, and never revoke the "
-     "principal, which is terminal. If the read-back answers but finds no linked successor, the "
-     "secret is withheld with NO retry hint: inspect the principal's credentials first. Mirrors POST "
+     "audited as engine_principal.credential.reveal; a re-call is a new tool call, so under the "
+     "supervised tier it needs a NEW approval ticket, the one before it having been consumed "
+     "before the handler ran); once the grace window lapses, a re-call "
+     "errors and the caller must recover (find the stuck successor with GET "
+     "/api/v1/engine-principals/{id}, revoke it with DELETE /api/v1/tokens/{token_id} or the "
+     "revoke_api_token tool as an administrator, then rotate again), never an indefinite retry, "
+     "and never revoke the principal, which is terminal. If the read-back answers but finds "
+     "no linked successor, the secret is withheld with NO retry hint: inspect the principal's "
+     "credentials first. Mirrors POST "
      "/api/v1/engine-principals/{id}/credentials/rotate. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
@@ -2716,13 +2728,16 @@ static const ToolDef kTools[] = {
      "successor secret (#3015 proof of possession, SOC 2 CC6.3) — this call revokes the "
      "predecessor on success, so it must not proceed on token_id alone; a wrong secret is refused "
      "with a distinct error, checked only after every other admission gate has already passed. "
-     "Replaying a confirm after this rotation already resolved (a network-dropped success, a double-submit) returns a "
+     "Replaying a confirm after this rotation already resolved (a network-dropped success, a "
+     "double-submit) returns a "
      "TERMINAL already-confirmed/already-resolved error (not a retryable one) - do not retry; "
      "re-rotate if a fresh rotation is needed. If confirm instead reports 'rotation confirmation "
      "unavailable' (the initiator binding is lost or in dispute), do NOT call "
      "revoke_engine_principal - that is TERMINAL and destroys BOTH credentials plus the "
-     "principal itself; there is no MCP twin for per-credential revoke, so resolve this case via "
-     "REST: DELETE /api/v1/tokens/{token_id} on the SPECIFIC credential you no longer trust. "
+     "principal itself. Revoke the SPECIFIC credential you no longer trust instead, with "
+     "DELETE /api/v1/tokens/{token_id} or the revoke_api_token tool (approval-gated at the "
+     "supervised tier, ApiToken:Delete; only an effective administrator or the token's owner "
+     "can revoke it, anyone else gets 'token not found'). "
      "Note: the approval gate applies two independent "
      "checks before this logic runs. (1) An exact replay carrying an already-consumed "
      "approval_id is denied ('approval already used'; submit a new request for a fresh ticket). "
@@ -2755,9 +2770,9 @@ static const ToolDef kTools[] = {
 
     {"rotate_api_token",
      "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3): mints "
-     "a successor token alongside the still-valid predecessor for the overlap window (default+"
-     "minimum 7 days, floor 24h). BOUNDED-IDEMPOTENT, not generally idempotent: a re-call within "
-     "a short grace window after the original mint re-serves the SAME successor secret (each "
+     "a successor token alongside the still-valid predecessor for the overlap window (default "
+     "7 days, minimum 1 day = 24h). BOUNDED-IDEMPOTENT, not generally idempotent: a re-call "
+     "within a short grace window after the original mint re-serves the SAME successor secret (each "
      "reveal — original or replay — is independently audited as api_token.reveal); once the "
      "grace window lapses, a re-call errors and the caller must fall back to an explicit new "
      "token or the compromise runbook — never an indefinite retry. Self-service ONLY: the "
@@ -26529,42 +26544,83 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::size_t credentials_revoked = *credentials_revoked_res;
+                // #6716: from here on the credentials ARE revoked. A failure row below
+                // carries that count, because the repeat call (which the retry hint
+                // invites) revokes 0 and records no count, so it would otherwise
+                // appear in no audit row at all. Same detail as the REST route.
+                const std::string revoked_count_detail =
+                    "credentials_revoked=" + std::to_string(credentials_revoked);
+                const auto fail_after_credentials = [&](const std::string& why) {
+                    // `why` may be a multi-line store error: one line, so the count stays
+                    // on the same physical line as the rest of the detail.
+                    const std::string detail =
+                        flatten_audit_text(why) + "; " + revoked_count_detail;
+                    mcp_audit("failure", detail);
+                    (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
+                                   principal_id, detail);
+                };
                 auto revoked_res = engine_principal_store_->revoke(principal_id, superseded_by);
                 if (!revoked_res) {
-                    mcp_audit("failure", revoked_res.error());
-                    (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
-                                   principal_id, revoked_res.error());
+                    fail_after_credentials(revoked_res.error());
                     res.set_content(a4_error(kInternalError, revoked_res.error(),
                                              "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
                 const bool revoked = *revoked_res;
-                if (!revoked && already_revoked) {
-                    // Idempotent no-op: the principal was already terminal before
-                    // this call, so `revoke()` returning false here is expected,
-                    // not an error — proceed to the success response below (same
-                    // as the REST route falling through this case).
-                } else if (!revoked) {
-                    // Genuine store failure (authoritative posture, EnginePrincipalStore
-                    // doc comment): a lease/query failure returns false, never a
-                    // silent success. Distinct from "already revoked" above — this is
-                    // retryable/partial-revoke state, not a permanent client-input
-                    // error, so map it to a 503-class retryable error rather than
-                    // kInvalidParams (which would misleadingly read as "bad request,
-                    // don't retry").
-                    mcp_audit("failure", "engine principal store failed to revoke");
-                    (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
-                                   principal_id, "store_unavailable");
-                    res.set_content(a4_error(kInternalError,
-                                             "failed to revoke engine principal — try again",
-                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
+                bool revoked_by_concurrent_request = false;
+                if (!revoked && !already_revoked) {
+                    // EnginePrincipalStore::revoke returns false ONLY when its UPDATE
+                    // matched no active row (a lease or query failure is the error arm
+                    // above). With `already_revoked` false at the read above, the
+                    // reachable cause is a concurrent revoke that landed between that
+                    // read and this write. Re-read to tell that apart from an identity
+                    // that is still active (mirrors the REST DELETE route).
+                    auto reread = engine_principal_store_->get(principal_id);
+                    if (reread && *reread && (*reread)->lifecycle_state != "active") {
+                        // The winner did the work and this call killed the credentials:
+                        // idempotent success, not a failure.
+                        revoked_by_concurrent_request = true;
+                    } else {
+                        // Still active (or gone, or unreadable): the identity is not
+                        // confirmed revoked and its credentials are already dead, the
+                        // same state as the revoke-error arm above, so the same hint.
+                        std::string why;
+                        if (!reread)
+                            why = "revoke matched no active row and the re-read failed: " +
+                                  reread.error();
+                        else if (!*reread)
+                            why = "revoke matched no active row and the principal is no longer "
+                                  "found";
+                        else
+                            why = "revoke matched no active row but the principal is still "
+                                  "active";
+                        fail_after_credentials(why);
+                        res.set_content(a4_error(kInternalError,
+                                                 "failed to revoke engine principal — try again",
+                                                 "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                        return;
+                    }
                 }
+                // `!revoked && already_revoked` is the idempotent no-op: the principal
+                // was already terminal before this call, so `false` is expected, not an
+                // error. The REST route falls through it the same way.
+                // The race row carries the same detail the REST route writes. A
+                // caller-supplied superseded_by was NOT persisted (the winner's value
+                // stands), so the row does not claim it was.
+                const std::string success_detail =
+                    revoked_by_concurrent_request
+                        ? revoked_count_detail + "; revoked_by_concurrent_request" +
+                              (superseded_by.empty() ? "" : "; superseded_by_not_persisted") +
+                              (reason.empty() ? "" : "; reason=" + audit_token(reason))
+                        // The caller's reason is sanitised here too: a raw one could carry
+                        // `credentials_revoked=0; revoked_by_concurrent_request` and read as
+                        // the race row of a revoke that did not race.
+                        : audit_token(reason);
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "engine_principal.revoke", "success", "EnginePrincipal",
-                    principal_id, reason);
+                    principal_id, success_detail);
                 if (!audit_ok) {
                     // #3937: fail closed (parity with REST #2466 + plugin-config MCP
                     // precedent). The principal + its credentials were revoked but the
@@ -27038,11 +27094,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     const bool denied_audit_ok =
                         audit_fn(req, "engine_principal.credential.confirm", "failure",
                                 "EnginePrincipal", principal_id, confirmed.error());
+                    // #6716: retry_after_ms only for the retryable (Transient ->
+                    // kInternalError) class, never for conflict / secret mismatch /
+                    // client validation. Mirrors rotate_engine_credential above and
+                    // the human-token confirm twin below.
+                    const int code = mcp_error_for_store_msg(confirmed.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_store_msg(confirmed.error()),
-                                       confirmed.error(),
-                                       denied_audit_ok ? std::string_view{}
-                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, confirmed.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     return;
                 }

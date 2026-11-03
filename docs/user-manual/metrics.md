@@ -645,12 +645,14 @@ pre-seeded to 0 at boot so `increase()` alerting is meaningful.
 | `yuzu_auth_session_reap_total` | counter, no labels | Expired durable-session rows deleted by the ~15-minute clock-guarded retention sweep — the storage-limitation evidence artifact; belongs alongside the `Yuzu*Retention*` series on a retention dashboard. |
 | `yuzu_auth_session_reap_clock_anomaly_total` | counter, no labels | The **DB-PRIMARY** clock-integrity monitor (ADR-2002 §4 mitigation (a)): a reap pass was declined because Postgres `now()` (read in-SQL — the same clock that authors `expires_at`) was implausibly ahead of/behind the persisted anchor, i.e. a backward/forward DB-primary clock step. A backward step is what would un-expire sessions / extend elevation & MFA windows toward their authored max. `YuzuSessionReapClockAnomaly` alerts on it — investigate the **database primary's** clock first. |
 | `yuzu_auth_local_clock_backward_total` | counter, no labels | The **LOCAL host-clock** drift monitor (#3715): a replica's own wall clock was observed falling behind monotonic time. DISTINCT from the reap series — under DB-clock authority session adjudication no longer rides this host's wall clock, so a local wobble is a host-health signal, NOT a session-integrity one (do not conflate the two during a clock incident). Observe-only today; no dedicated alert. |
-| `yuzu_auth_get_user_role_store_error_total` | counter, no labels | `AuthManager::get_user_role()` (the DB-authoritative role lookup) hit a genuine AuthDB store error, not a plain not-found/invalid-username miss (#4020). It counts every caller, with different outcomes (#4068): on the legacy API-token path the request is floored to `Role::user` (`auth_routes.cpp`'s `.value_or(Role::user)`), so the counter is the only caller-visible signal that a store degradation is silently demoting requests; the Settings create-user and role-change routes and SCIM `PUT`/`PATCH` `active:false` answer a retryable `503` (audit detail `store_unavailable`); the SCIM create-race re-read still answers `500` but records `store_unavailable: concurrent-create re-read` in its audit detail. The paired `spdlog::error` line is easy to miss under load. Pre-seeded to 0; no dedicated alert yet (tracked in #4069). |
+| `yuzu_auth_get_user_role_store_error_total` | counter, no labels | `AuthManager::get_user_role()` (the DB-authoritative role lookup) hit a genuine AuthDB store error, not a plain not-found/invalid-username miss (#4020). It counts every caller, with different outcomes (#4068): on the legacy API-token path the request is floored to `Role::user` (`auth_routes.cpp`'s `.value_or(Role::user)`), so the counter is the only caller-visible signal that a store degradation is silently demoting requests; the Settings create-user and role-change routes and SCIM `PUT`/`PATCH` `active:false` on a resource whose mirror already reads inactive (the #4068 branch only; the #6836 provenance and role re-checks count on `yuzu_scim_guard_store_unavailable_total` instead and do not move this counter) answer a retryable `503` (audit detail `store_unavailable`); the SCIM create-race re-read still answers `500` but records `store_unavailable: concurrent-create re-read` in its audit detail. The paired `spdlog::error` line is easy to miss under load. Pre-seeded to 0; no dedicated alert yet (tracked in #4069). |
 
 | Metric | Type | Meaning |
 |---|---|---|
+| `yuzu_scim_auth_failures_total` | counter, no labels | A `/scim/v2/*` request was rejected `401` by the bearer gate because its token was missing, malformed or wrong (a credential-guess or replay signal against a surface that can provision and deprovision accounts); pairs with `scim.auth.denied` audit rows. (#6835) It does NOT move when the token check could not read the store: that is a `503`, counted on `yuzu_scim_guard_store_unavailable_total{guard="bearer"}`. An alert or dashboard keyed on this counter no longer sees database outages; one that fired during past outages should be re-checked. |
 | `yuzu_scim_compensation_failed_total` | counter, label `outcome` | #4966: a SCIM same-request compensation (the guarded undo of an account created or revived earlier in the same request) that did not complete, by `outcome` (`guard_refused_last_administrator`: the account is left active; `deactivated_but_session_wipe_failed`: deactivated, a session may survive; `store_failure`: state indeterminate). Pairs with the `scim.user.compensation_failed` audit row and a critical analytics event (a no-op under `--no-analytics`: the audit row and this counter still fire); every increment needs an operator to check the account. Zero-seeded for all three outcomes. No alert rule ships with it yet; tracked in #5673. |
 | `yuzu_scim_group_recompute_skipped_total` | counter, label `cause` (`promotion`/`undetermined`) | #4966: SCIM Group role-recompute members not applied in one Group request. `promotion`: skipped after the first failed guarded write of the request (the fail-safe direction; demotions are always attempted, so there is no demotion series). `undetermined`: a read the decision needed failed, so the member's role was left untouched and it is unknown whether an administrator was kept. Each increment is recorded by one `scim.group.recompute_incomplete` audit row naming the members (first 20 named; the count is exact). Nothing repairs them automatically: see the SCIM provisioning guide, "Known limits of the Group role recompute". Zero-seeded for both causes. No alert rule ships with it yet; tracked in #5673. |
+| `yuzu_scim_guard_store_unavailable_total` | counter, label `guard` (`provenance`/`role`/`bearer`/`resource`) | A SCIM request could not READ the store behind a check and answered a retryable `503` + `Retry-After: 2` instead of acting or answering a false `401`/`404`/`409`. The `guard` label is a closed set of four and carries no username; all four series are pre-seeded at 0 at boot. `provenance` and `role` (#6836): the provenance or role re-check before a SCIM deactivate, delete, reactivate or update (and, for `guard="role"`, the role re-check after the reactivation of a `POST` that revives a removed account) could not be answered by the user store (a lease timeout or a failed query); the request is audited as its own action, `failure`, `store_unavailable: provenance check`/`role check`, instead of `404`. For the `POST` revive it is incremented BEFORE the undo, so it (and the alert) also moves when the undo fails and the answer is `500`. `bearer` (#6835): the SCIM bearer-token check could not read the token store, so the token was not checked; this was a false `401` (and a false `scim.auth.denied` row and `yuzu_scim_auth_failures_total` increment). `resource` (#6835): a SCIM User or Group lookup, a duplicate check (`POST /Users`, `POST /Groups`, the rename of a Group) or a `userName eq` / `displayName eq` filter query could not read the SCIM store; this was a false `404`, `409`, empty list or skipped duplicate check. `bearer` and the `GET` / list-filter `resource` faults write no audit row (a `GET` has no audit verb, the bearer check has no verb or identity, and a row per polled `GET` would trip `YuzuScimAuditWriteFailures`); a mutating request's `resource` fault is audited best effort as `failure` on its own verb with detail `store_unavailable: lookup (<site>)` (the audit store is usually the same database that just failed). The server `ERROR` log (`ScimRoutes: bearer validation` throttled to one per minute, `ScimRoutes: user lookup (...)`, `ScimRoutes: group lookup (...)`, each naming the target id) and this counter are the trail. Alert `YuzuScimGuardStoreUnavailable` (warning, any increase over 1h) covers all four guards. The counter is in memory, so it moves during an outage, but the rule fires only when Prometheus manages to scrape `/metrics`: a remote scrape of the authenticated `/metrics` resolves its session or API token against Postgres and the handler reads Postgres, so it can fail during a full outage (a localhost scrape, `--metrics-no-auth` or a still-cached token works). `YuzuServerPostgresUnreachable` (`yuzu_server_pg_reachable`) and `YuzuPgConnectFailing` need a working scrape too, so they are not an honest backstop for a total outage either: the backstops for that case are the `/readyz` readiness probe and an operator-defined `up == 0` (scrape target down) alert on the server job (none ships). The SCIM alert then fires after recovery (from the increase over the gap) or at once for a partial fault. `YuzuScimAuditWriteFailures` (`yuzu_scim_audit_write_failures_total`) can fire for a mutating request that changed nothing: its `503` is audited best effort under its own verb (`scim.user.provisioned`, `scim.user.updated`, `scim.user.deleted`, `scim.group.created`, `scim.group.updated`, `scim.group.deleted`, `result=failure`, detail beginning `store_unavailable:`), and when the audit store is down too that row is lost and the counter moves. Distinct from `yuzu_scim_provenance_denied_total`, which counts real refusals and does not move for any of these faults. Not covered: the unfiltered `GET /Users` and `GET /Groups` (`list()` / `count()` fail open, #2481, so an unfiltered list can answer an empty `200` while a filtered one answers `503`); the `POST` create reads other than the duplicate check, including the concurrent-create re-read (`get_by_username` after a failed create) and `find_by_external_id` (#6837, a fault there falls through to the later `500`); the tombstone-role `500` in the revive pre-check (`POST` revive and `PATCH`/`PUT` `active:true`; the grant-read fault in the same pre-check already answers `503`) and the `500` when the reactivation's own post-commit re-read fails (`failed to revive the underlying account`, no undo), neither covered by #6836 or #6835 (same defect class as #6837, which does not list them); post-mutation re-fetches that already answer `500`; no reconciliation sweep (#6838). |
 | `yuzu_scim_role_changes_total` | counter, no labels | SCIM-provisioned user role changes APPLIED through SCIM Group membership (`--scim-admin-group`): a promotion or a demotion by the group-membership-driven role recompute. A no-op recompute does not count. A sustained rate is normal IdP group churn, not an anomaly. Zero-seeded at boot. |
 | `yuzu_scim_role_change_failures_total` | counter, no labels | SCIM-driven role changes that did not complete during the group recompute: the guarded role write did not complete (a store failure, so the role may not have changed; a user that vanished; a promotion refused for an inactive account), OR the role did change but its durable session wipe failed. A sustained non-zero rate means role changes are not taking effect cleanly. A refusal by the last-Administrator guard is NOT counted here (see `yuzu_server_rbac_last_admin_guard_refused_total{transport="scim"}`). Zero-seeded at boot. No alert rule ships; tracked in #5673. |
 | `yuzu_scim_deprovision_role_refused_with_active_link_total` | counter, no labels | D1: a deprovision was refused (the slug's role is not `user`, per the #2021 provenance guard) for a slug with an active linked federated identity — that identity's tokens were deliberately **not** auto-revoked (auto-revoking on an IdP's unilateral say-so would reopen the #2021 hazard). A human must terminate the linked identity's credentials manually. |
@@ -783,9 +785,9 @@ same clock-guarded sweep the audit store uses.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `yuzu_server_response_ingest_dropped_total{reason}` | counter | Response result rows that did not persist, by `reason` (`store_not_open` / `pool_acquire_timeout` / `query_error` / `malformed_identity_field`). Fail-soft by design — the command is still tracked on the executions ladder — but a sustained non-zero rate means drawer/Echo result history is silently lossy. `malformed_identity_field` is a distinct case: `instruction_id`/`execution_id`/`plugin`/`agent_id` are bound unsanitized (see ADR-0039 "Ingest bounds") — a value containing an embedded NUL byte is rejected outright rather than silently truncated at the NUL, so a non-zero rate here means an agent sent a malformed identity field, not a store health problem. See `YuzuResponseMalformedIdentityDrops` (informational, not store-health) vs. `YuzuResponseIngestDrops` (excludes this reason). |
+| `yuzu_server_response_ingest_dropped_total{reason}` | counter | Response result rows that did not persist, by `reason` (`store_not_open` / `pool_acquire_timeout` / `query_error` / `malformed_identity_field` / `per_agent_cap`). Fail-soft by design — the command is still tracked on the executions ladder — but a sustained non-zero rate means drawer/Echo result history is silently lossy. `malformed_identity_field` is a distinct case: `instruction_id`/`execution_id`/`plugin`/`agent_id` are bound unsanitized (see ADR-0039 "Ingest bounds") — a value containing an embedded NUL byte is rejected outright rather than silently truncated at the NUL, so a non-zero rate here means an agent sent a malformed identity field, not a store health problem. See `YuzuResponseMalformedIdentityDrops` (informational, not store-health) vs. `YuzuResponseIngestDrops` (excludes this reason). `per_agent_cap` is likewise agent behaviour: an agent already had `--response-max-rows-per-agent` rows stored for that command on that device, so the frame was refused (see "Rows per agent are bounded" in [response-store.md](response-store.md)); `YuzuResponsePerAgentCapDrops` (informational) reports it and `YuzuResponseIngestDrops` excludes it too. |
 | `yuzu_server_response_facets_dropped_total{reason}` | counter | Facet rows (distinct (column, value) pairs) of a stored response that did not persist, by `reason`: `value_too_long` (a value over 2048 bytes is excluded from the response's facets, not truncated, because a prefix would be a different value than the one the agent reported; counts the distinct excluded (column, value) pairs), `cap` (distinct facets past the per-response limit of 5,000; the facets on the most lines are kept, ties broken by column index and then value, so the same output always keeps the same facets; a rare value, such as a single package on one host, sorts late and is the first to be cut, and nothing marks that response as capped) or `batch_failed` (the facet insert failed and was rolled back to its savepoint, so none of that response's facets persisted; counts the facets that were pending, and is also logged as a warning that names the `response_id`; a `cap` response likewise logs a warning, a `value_too_long` exclusion logs only at debug level). A facet counter moves only for a response that was stored and whose commit succeeded; in every such case the response row and its output persist, so `yuzu_server_response_ingest_dropped_total` does not move, and a failed commit publishes nothing. If the savepoint machinery itself fails (creating the savepoint, or rolling back to it after a failed insert), the transaction is aborted and the whole response is dropped; that is counted by `yuzu_server_response_ingest_dropped_total{reason="query_error"}` only, and no facet counter moves. A dropped facet is missing from the dashboard facet filter, group-from-results and the agent-count preview, and nothing marks the affected response (see "Facets are bounded" in [response-store.md](response-store.md)). The unit is facet rows, not responses, and one response can count in both `cap` and `batch_failed` (the facets kept after the cap are the ones that were pending when the insert failed). All three reasons are pre-seeded at 0 at startup. A non-zero `value_too_long` rate is expected wherever commands return very long fields; a non-zero `batch_failed` rate is not, and means a facet row the database refused (for example an unusually long `instruction_id`, which is the command id the agent echoed). No alert rule ships and none is owed yet: this is a data-completeness signal, not a store-health signal, and `YuzuResponseIngestDrops` covers only `yuzu_server_response_ingest_dropped_total`. A per-response marker and alert are tracked in #5630. |
-| `yuzu_server_response_read_degrade_total{reason,source}` | counter | Response reads that returned a **degrade** (nullopt, not empty), by `reason` (`store_not_open` / `pool_acquire_timeout` / `query_error` — the same three as the row above, excluding `malformed_identity_field`, which is write-path only) and `source` (`response_store`). The store seam distinguishes empty from degraded so a consumer renders a degrade banner rather than misreading a blip as "no responses". |
+| `yuzu_server_response_read_degrade_total{reason,source}` | counter | Response reads that returned a **degrade** (nullopt, not empty), by `reason` (`store_not_open` / `pool_acquire_timeout` / `query_error` — the three store-health reasons of the row above, excluding `malformed_identity_field` and `per_agent_cap`, which are write-path only) and `source` (`response_store`). The store seam distinguishes empty from degraded so a consumer renders a degrade banner rather than misreading a blip as "no responses". |
 | `yuzu_server_response_reap_passes_total{result}` | counter | TTL reap passes, by `result`: `swept` (deleted the full expired set), `capped` (hit the per-pass row cap of 10,000 OR the delete-time budget — a backlog likely remains either way; a sustained non-zero rate means expiry is outrunning the drain on this high-write store. Since the reap chunk-cascade fix (#2691 Gate 5), the delete-time budget can be hit before any row in a chunk is actually deleted, so `capped` no longer guarantees rows were removed this pass — it guarantees a backlog probe found one), `noop` (nothing expired), `declined` (the retention classifier vetoed a would-wipe or implausible-clock pass), `declined_no_anchor` (first pass ever against a store with expired rows present — declines once, the next pass drains), `skipped_lock` (another replica held the advisory lock), `failed` (the pass errored). As with the audit reaper, alert on the total NOT increasing — a reaper that never runs leaves every result flat at 0, identical to a quiet healthy store while the table grows — **and** alert on a sustained `capped` rate. |
 | `yuzu_server_forensics_tier_withheld_total{reason}` | counter | Stored-response reads whose Forensics-tier visibility could not be resolved (#4990), by `reason`: `rbac_unavailable` (the global `Forensics:Read` check was answered unavailable by the authorization store: not open, breaker open, pool timeout, or a failed role or permission query) or `unwired` (a dependency of the resolver was never wired; a running server should not show it). There is no scoped (management-group) read tier, so there is no reason for one. Each count is a read that was refused with a retryable error (a `503` on REST and the legacy routes, `kInternalError` with `retry_after_ms` on MCP) or that showed a notice instead of rows; no Forensics row was served and no partial result returned; this covers sessions, API tokens, MCP tokens and engine principals. A service-scoped token under a degraded store is default-denied (a definitive refusal) and is not counted, and when a whole-store outage fails the surface's earlier admission gate (`Response:Read`, or `Inventory:Read` and `Execution:Execute` on the Hardware poll) first, that gate's own answer is returned and this counter does not move. A definitive refusal (a caller who simply lacks `Forensics:Read`) is **not** counted, so the series stays flat on a healthy server whatever the callers' roles. Pre-seeded to 0 for each reason at start. Operational, not a security event. The `YuzuForensicsTierUnresolved` alert (`rate(...[5m]) > 0` for 10 minutes) does not fire on a single refusal or a burst shorter than about 5 minutes; a failure that keeps recurring fires after about 10 minutes. The edge is the 5-minute rate window: a refusal that recurs only every 5 minutes or longer leaves the rate false between events and does not fire, by design, while one recurring about every 285 seconds still fires. The cause is usually PostgreSQL pool saturation or a store outage, so correlate with `yuzu_server_rbac_read_degrade_total` and the server log line `Forensics-tier visibility could not be resolved`. |
 | `yuzu_exec_correlation_write_degrade_total` | counter | Dispatch-time writes of the per-dispatch record (`command_execution`: command id, plugin, execution id) that did not land (#4990): no pool lease within the budget (2 seconds for a single dispatch, 250 milliseconds in the operator Guardian rule push, which writes one record per target), a lock or statement timeout, or a query error. After the first failed write in that push, the remaining targets skip the write and each one counts here too, so one outage push adds one count per target from a single real write attempt. Dispatch itself is not refused or retried, but every response to a command whose record was not written is stored `~unverified` (Forensics-tier, withheld from callers without `Forensics:Read`) and the executions drawer misses that command's agent events. A failure is also logged. Alert: `YuzuDispatchRecordWriteFailing` (a non-zero rate for 10 minutes; it does not detect a store outage that leaves fewer than about one dispatch every 5 minutes, so read the counter itself too). Check PostgreSQL health and the `yuzu_pg_*` pool and lock metrics first. |
@@ -1147,7 +1149,7 @@ caller).
 ## Engine-credential confirm metric (#2404)
 
 ```
-# HELP yuzu_engine_principal_confirm_total Engine-credential rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient); store-reaching calls only, pre-store denials excluded (#2404)
+# HELP yuzu_engine_principal_confirm_total Engine-credential rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient|secret_mismatch); store-reaching calls only, pre-store denials excluded (#2404; secret_mismatch added #3015 proof-of-possession)
 # TYPE yuzu_engine_principal_confirm_total counter
 yuzu_engine_principal_confirm_total{surface="rest",result="success"} 0
 yuzu_engine_principal_confirm_total{surface="rest",result="conflict"} 0
@@ -1157,19 +1159,29 @@ yuzu_engine_principal_confirm_total{surface="mcp",result="success"} 0
 yuzu_engine_principal_confirm_total{surface="mcp",result="conflict"} 0
 yuzu_engine_principal_confirm_total{surface="mcp",result="client_error"} 0
 yuzu_engine_principal_confirm_total{surface="mcp",result="transient"} 0
+yuzu_engine_principal_confirm_total{surface="rest",result="secret_mismatch"} 0
+yuzu_engine_principal_confirm_total{surface="mcp",result="secret_mismatch"} 0
 ```
 
-All 8 series (the closed `surface` × `result` cross-product) are pre-seeded to
+All 10 series (the closed `surface` × `result` cross-product) are pre-seeded to
 `0` at startup so `absent()` alerts stay meaningful. The family makes a
 credential-**confirm** retry storm alertable, which `yuzu_http_requests_total`
 cannot show (it has no per-route label). `result` mirrors the shared
 store-error taxonomy (`engine_store_error_class.hpp`): `conflict` is a terminal
 409/kInvalidParams (a replay after the rotation already resolved, a moved-on
-pin, or unresolved rotation metadata — the client must not blindly retry),
+pin, unresolved rotation metadata, or a malformed two-credential pair, which
+is store corruption and not a replay — the client must not blindly retry),
 `client_error` is a 400 (more-than-two or non-engine active credentials),
 `transient` is a retryable 503 (store unavailable, lock contention, a persist
-failure, or the ambiguous empty/malformed-pair "no in-flight rotation"), and
-`success` is a completed confirm.
+failure, or the ambiguous empty read "no in-flight rotation to confirm"),
+`secret_mismatch` is a presented secret that does not verify (403), and
+`success` is a completed confirm. A malformed two-credential pair used to count
+as `transient`; it now counts as `conflict`, so a persistent malformed pair is
+visible on the `conflict` series, not on `transient`; the REST confirm route also
+writes a warning log line on the server, and on MCP the signals are the
+`conflict` series and the `engine_principal.credential.confirm` failure audit
+row. Alert authors who watch this family for store
+corruption should watch `conflict` as well.
 
 **Scope contract.** Counted only when a confirm reaches `ApiTokenStore::confirm_rotation`
 **or** trips the store-open guard (which increments `result="transient"`);
@@ -1188,7 +1200,11 @@ label (bounded cardinality only) — pair it with the
 (metric-is-the-signal / audit-row-is-the-evidence). A useful alert is
 `increase(yuzu_engine_principal_confirm_total{result="conflict"}[15m]) > <n>`
 to catch a client stuck replaying a resolved confirm, and
-`increase(...{result="transient"}[15m])` for a genuine store-health storm.
+`increase(...{result="transient"}[15m])` for a genuine store-health storm. A
+`conflict` count that keeps growing for one principal after its client has
+stopped replaying can also be a malformed two-credential pair that every retry
+meets again; the matching `engine_principal.credential.confirm` failure rows say
+`rotation pair is malformed`.
 
 **Semantics for alert authors:** this counts confirm **attempts** that reach
 the store, not logical rotations — a client retrying a `transient` blip 20 times
@@ -1242,25 +1258,27 @@ A server predating this metrics family, or a scrape config dropping the
 `yuzu_rotation_sweep_*` series, reads as a silently-healthy sweep — none of
 these are paired with their own "series is absent" companion alert today
 (unlike `YuzuAuditRetentionNotRunning`/`YuzuAuditRetentionMetricMissing`);
-that gap is tracked, not closed, by this round.
+that gap is tracked, not closed.
 
 ## Human API-token confirm metric (P2 #11)
 
 ```
-# HELP yuzu_api_token_confirm_total Human API-token rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient); store-reaching calls only, pre-store denials excluded - the human-owned twin of yuzu_engine_principal_confirm_total
+# HELP yuzu_api_token_confirm_total Human API-token rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient|secret_mismatch); store-reaching calls only, pre-store denials excluded - the human-owned twin of yuzu_engine_principal_confirm_total (secret_mismatch added #3015 proof-of-possession)
 # TYPE yuzu_api_token_confirm_total counter
 yuzu_api_token_confirm_total{surface="rest",result="success"} 0
 yuzu_api_token_confirm_total{surface="rest",result="conflict"} 0
 yuzu_api_token_confirm_total{surface="rest",result="client_error"} 0
 yuzu_api_token_confirm_total{surface="rest",result="transient"} 0
+yuzu_api_token_confirm_total{surface="rest",result="secret_mismatch"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="success"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="conflict"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="client_error"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="transient"} 0
+yuzu_api_token_confirm_total{surface="mcp",result="secret_mismatch"} 0
 ```
 
 The human-owned twin of [`yuzu_engine_principal_confirm_total`](#engine-credential-confirm-metric-2404)
-directly above — same closed `surface` x `result` cross-product (8 series),
+directly above — same closed `surface` x `result` cross-product (10 series),
 pre-seeded to `0` at startup for the same `absent()`-alert reason, and the
 same intended scope contract: counted only when a confirm reaches the
 credential store or trips the store-open guard (`result="transient"`),
@@ -1692,12 +1710,97 @@ disconnect, plugin load) over a bidirectional stream. This is used internally
 by the gateway and can be consumed by custom integrations that prefer gRPC over
 SSE.
 
+### Agent command-dedup store telemetry (#3663)
+
+Every agent keeps a small durable store (`command_dedup.db`) so a redelivered command is
+replayed or answered `RUNNING` instead of executing twice (see [Command Replay
+Protection](security-hardening.md#command-replay-protection)). If that store cannot be opened or
+written, the agent **fails open**: it keeps running commands, undeduplicated, so a single disk
+fault does not drop the endpoint out of remote-control reach. That is a deliberate availability
+choice, which is why it has to be visible.
+
+**How it reaches you.** The agent has no `/metrics` endpoint, so its dedup signals travel on the
+heartbeat as the status tags `yuzu.dedup_degraded` (0 or 1), `yuzu.dedup_replays`,
+`yuzu.dedup_claim_errors`, `yuzu.dedup_record_terminal_misses`, `yuzu.dedup_record_errors`,
+`yuzu.dedup_release_errors` and `yuzu.dedup_rows`, and the server derives the
+`yuzu_fleet_agents_dedup_*` gauges and `yuzu_fleet_dedup_rows_max` from them on each ~15 s sweep.
+
+**Population and scope: read this before trusting a number.**
+
+- Every gauge counts the agents with a **heartbeat in the last 90 seconds**. An agent that is
+  offline, or that heartbeats slower than 90 s (keep `--heartbeat` below 90 s, preferably 60 s or
+  less), drops out of every count, including `reporting`. A degraded agent that goes offline
+  therefore leaves the count **without having been fixed**.
+- The health store is **per core replica**: each replica exports only the agents attached to it.
+  Scrape every replica and sum the counts (`sum by (job) (...)`) but take the **max** of
+  `yuzu_fleet_dedup_rows_max` (`max by (job) (...)`); during a failover one agent can be counted on
+  two replicas for a few minutes.
+- Agents that predate these tags contribute nothing, and `yuzu.dedup_rows` only exists on agents
+  that include #3663. `yuzu_fleet_agents_dedup_reporting` is the denominator: a 0 in the counts is
+  only reassuring when `reporting` is close to the number of agents you expect (compare it with
+  `yuzu_fleet_agents_healthy`; this is a monitor-only ratio, there is no alert on it).
+- The counts can exceed `reporting`. `reporting` counts agents with a valid `yuzu.dedup_degraded`
+  flag; an agent whose flag was rejected (and is counted in `tag_rejected`) can still be counted by
+  a counter gauge whose own tag was valid.
+
+**Reading the gauges.**
+
+- The counter-derived gauges count **agents**, not events. The agent's counters are per-process
+  and restart from 0, so a fleet sum would fall whenever an agent restarted and could not back an
+  `increase()` alert. Counting agents with a value above 0 is restart-robust, but it means
+  "has happened since that agent last started", not "is happening now".
+- `yuzu_fleet_agents_dedup_store_degraded` is the only live reading, so it is the only gauge with
+  an alert, `YuzuDedupStoreDegraded`. **It covers a store that failed to OPEN, and only that.** A
+  store that opened and later fails writes (a disk filling after boot) leaves `degraded` at 0 and
+  shows only on `yuzu_fleet_agents_dedup_claim_erroring` (and `..._record_erroring`,
+  `..._release_erroring`), which have no alert (a windowed signal that clears on recovery is
+  tracked in #6932).
+- `YuzuDedupStoreDegraded` is a **sample rule** in `docs/prometheus/yuzu-alerts.yml`. It is a control
+  only once you load that file into your Prometheus and route `severity=warning` in Alertmanager;
+  neither is done by any compose or Helm file the project ships. It is agent-self-reported, so one
+  forged or buggy agent can keep it firing.
+
+**When `YuzuDedupStoreDegraded` fires.** There is no page or API yet that lists which endpoints are
+affected (tracked in #6931), so the count tells you how many to find. Check the agent log on
+suspect endpoints for `Failed to open command dedup store` (the usual causes are a full or
+read-only data directory or a permissions fault on `command_dedup.db`), fix the cause, and restart
+the agent. The count drops within about 45 seconds of the restart (the agent sends its first
+heartbeat one interval, 30 s by default, after it starts, then the server sweeps every 15 s), and
+the alert resolves about 5 minutes after that, so it can still fire for an agent that was just fixed.
+A restart does **not** re-send an in-flight operator command to the agent: an offline agent gets no
+queued commands (by code reading; a chaos run to measure it is tracked in #6935). But while an
+endpoint has no durable dedup record, a command redelivered to it by **any** path is not absorbed:
+the server tries a gateway forward up to three times with the same command id, and a scheduled
+command can be re-driven after a fault (the undelivered backlog is visible as
+`yuzu_server_command_outbox_pending`, but it counts every undelivered occurrence and does not
+identify re-drives). You cannot see from the product whether a redelivery is in
+flight, so do not delay the fix for it; restarting after the fix restores protection for later
+commands. "Resolved" means the agent is back, counted in `reporting`, with `store_degraded` at 0; a
+count that fell only because the agent went offline is not resolved.
+
+**The capacity gauge.** `yuzu_fleet_dedup_rows_max` is the largest store, in rows, that any agent
+reports. The store keeps the newest 20,000 terminal rows, so a healthy value tops out near
+20,500. It is an **approximate cached count that can over-read**, for example after a burst of
+queue-full releases, so treat it as a hint: investigate sustained values above about 25,000 (in-flight
+rows left by crashed commands are never evicted and are one way to get there). It is a MAX of
+agent-reported values, so one forged value up to 1,000,000,000 owns it and it names no agent. It is
+also per core replica: take the max across replicas, not the sum. There is no alert on it.
+
+**Not covered:** an agent that recovered from a **corrupt** dedup store (#3665) loses its replay history but is not
+degraded. It reports the per-process `yuzu.dedup_quarantined` tag, which the server does not read
+and which returns to 0 on the next agent restart, so no gauge counts it (a restart-surviving
+marker with its consumer is tracked in #6933). An agent whose heartbeat carries more than 512
+status tags (or an oversized tag) has **all** its tags dropped by the gateway and vanishes from
+every dedup count; the gateway counts this as
+`yuzu_gw_heartbeat_buffer_dropped_total{reason="heartbeat_oversize"}`, which no shipped alert
+watches yet (#6934).
+
 ## Fleet performance gauges (DEX)
 
 Published on every fleet-health sweep (~15 s). A metric nobody reported is
 **absent**, never zero (exception: server-owned agent counts such as
-`yuzu_fleet_echo_db_corruption_agents` and `yuzu_fleet_inventory_sync_skipping{source}`
-are published every sweep, 0 included); values are validated server-side (forged
+`yuzu_fleet_echo_db_corruption_agents`, `yuzu_fleet_inventory_sync_skipping{source}` and
+the `yuzu_fleet_agents_dedup_*` counts are published every sweep, 0 included); values are validated server-side (forged
 non-finite / out-of-range readings are rejected).
 
 | Metric | Type | Description |
@@ -1706,6 +1809,15 @@ non-finite / out-of-range readings are rejected).
 | `yuzu_fleet_echo_db_corruption_agents` | gauge | Agents whose Echo database has **ever** been quarantined as corrupt (#1567) — cumulative per agent since install, so read a **rising** value as the signal, not the absolute number; an agent that recovered still counts. Derived from the heartbeat tag `yuzu.plugin.echo.db_corruption_total`, published by the echo plugin (the agent has no `/metrics` endpoint, so a per-agent counter is not scrapable). Counts only agents currently reporting heartbeats. Example alert: `delta(yuzu_fleet_echo_db_corruption_agents[1h]) > 0` (a gauge, so use `delta`; an agent returning from offline after a quarantine re-raises it once). |
 | `yuzu_fleet_plugin_init_failed{plugin}` | gauge | Agents reporting a plugin that failed init, per plugin name (heartbeat tag `yuzu.plugins_failed`); distinguishes "failed to load" from "not installed". Absent-not-zero: the family is empty when no agent reports a failure. At most 64 named labels per sweep (lexicographically first); the rest are summed under `plugin="other"`. |
 | `yuzu_fleet_inventory_sync_skipping{source}` | gauge | Agents currently reporting heartbeats whose daily-sync `source` skipped its most recent collection cycle(s) (#5332), from the heartbeat tag `yuzu.sync.<source>.skip_streak` (> 0; today only `source="installed_software"`, written by agents that include the skip-visibility change, #5327); the cause is in the agent's own log, and the agent also publishes it as the `yuzu.sync.<source>.last_skip` heartbeat tag (no server page or API returns that tag yet). Published every sweep, 0 included. Counts only agents currently reporting heartbeats. The gauge only counts agents that emit the skip-streak heartbeat tag: an agent that does not emit it (older agents, during a rollout, or in a mixed-version fleet) contributes zero even when its collector is skipping, so a zero gauge does not establish that all collectors are healthy. Correlate with `yuzu_inventory_stale_agents{source="installed_software"}` (see the inventory manual) to tell an online host whose collector is skipping from an offline one, but do not subtract one from the other: they count different populations (live heartbeats vs stored-receipt age). |
+| `yuzu_fleet_agents_dedup_store_degraded` | gauge | Agents whose durable command-dedup store **could not be opened** (#3663), from the heartbeat tag `yuzu.dedup_degraded` = 1. These agents still run commands but **without replay protection**, so a redelivered command may execute twice (at-least-once, fail-open by design). Covers a store that failed to OPEN only: a store that opened and later failed writes shows on `yuzu_fleet_agents_dedup_claim_erroring`, which has no alert. A **live** 0/1 reading recomputed every sweep, over agents with a heartbeat in the last 90 s, exported per core replica (sum across replicas): it clears within about 45 s of the restart (with the default 30 s heartbeat), and an agent offline for more than 90 s leaves it without having been fixed. Published every sweep, 0 included. Sample alert: `YuzuDedupStoreDegraded`. See [Agent command-dedup store telemetry](#agent-command-dedup-store-telemetry-3663). |
+| `yuzu_fleet_agents_dedup_replaying` | gauge | Agents that have served at least one durable terminal-outcome replay **since their last restart** (`yuzu.dedup_replays` > 0). Informational: a replay is the store doing its job, so non-zero is normal. Latches until the agent restarts. Published every sweep, 0 included. No alert. |
+| `yuzu_fleet_agents_dedup_claim_erroring` | gauge | Agents whose dedup store has failed at least one claim since their last restart (`yuzu.dedup_claim_errors` > 0): each is a command that ran undeduplicated because a store write failed **after** boot (full disk, I/O error). Unlike `dedup_store_degraded`, the store did open. Latches until restart. Published every sweep, 0 included. No alert. |
+| `yuzu_fleet_agents_dedup_record_terminal_missing` | gauge | Agents that have recorded at least one terminal outcome matching no in-flight row since their last restart (`yuzu.dedup_record_terminal_misses` > 0): the command ran undeduplicated, or a duplicate terminal arrived. Not a measure of the ring-eviction double-execute, which is not separately detectable. Latches until restart. Published every sweep, 0 included. No alert. |
+| `yuzu_fleet_agents_dedup_record_erroring` | gauge | Agents whose store failed to record at least one terminal outcome since their last restart (`yuzu.dedup_record_errors` > 0): a redelivery of that command answers `RUNNING` rather than replaying its result. Latches until restart. Published every sweep, 0 included. No alert. |
+| `yuzu_fleet_agents_dedup_release_erroring` | gauge | Agents whose store failed at least one claim release since their last restart (`yuzu.dedup_release_errors` > 0): a possibly-leaked claim, which answers `RUNNING` to every redelivery of that command and never re-runs it. Latches until restart. Published every sweep, 0 included. No alert. |
+| `yuzu_fleet_agents_dedup_reporting` | gauge | Agents with a heartbeat in the last 90 s whose latest heartbeat carried a valid `yuzu.dedup_degraded` flag, i.e. the agents the `yuzu_fleet_agents_dedup_*` counts are measuring. Per core replica (sum across replicas). An agent that predates the tag, or whose flag was rejected, is not counted, so a 0 in the counts is only reassuring when this is non-zero and close to the number of agents you expect; the counts can exceed it when an agent's flag was rejected but another of its dedup tags was valid. Published every sweep, 0 included. |
+| `yuzu_fleet_agents_dedup_tag_rejected` | gauge | Agents whose latest heartbeat carried at least one `yuzu.dedup_*` value the server rejected: non-numeric, empty, longer than 10 characters, above 1,000,000,000, or a degraded flag other than 0 or 1. A rejected value is dropped from the counts, never clamped; an agent is counted once however many of its tags are bad. >0 means an agent is sending malformed or forged dedup tags. Published every sweep, 0 included. |
+| `yuzu_fleet_dedup_rows_max` | gauge | The largest durable command-dedup store, in rows (in-flight + terminal), reported by any agent (heartbeat tag `yuzu.dedup_rows`, an **approximate cached count** that can over-read after a burst of released claims). The store is a ring that keeps the newest 20,000 terminal rows, so a healthy value tops out near 20,500; in-flight rows left by crashed commands are never evicted and are one way it grows beyond that. A MAX of agent-reported values, per core replica (take the max across replicas, not the sum): one forged value up to 1,000,000,000 owns it and it names no agent, so treat it as a hint and investigate sustained values above about 25,000. **Absent** (not 0) when no agent reports a valid value; an old agent without the tag contributes nothing. No alert. |
 | `yuzu_fleet_perf_reporting` | gauge | Devices contributing at least one perf metric this sweep (the same any-of-three definition the `/dex` Performance tab's Reporting card uses) |
 | `yuzu_fleet_perf_cpu_pct{stat}` | gauge | Fleet CPU busy %, `stat` = `avg` / `p50` / `p90` / `max` |
 | `yuzu_fleet_perf_commit_pct{stat}` | gauge | Fleet memory commit % of limit, same `stat` labels |
@@ -2505,6 +2617,13 @@ yuzu_scim_compensation_failed_total{outcome="store_failure"} 0
 # TYPE yuzu_scim_group_recompute_skipped_total counter
 yuzu_scim_group_recompute_skipped_total{cause="promotion"} 0
 yuzu_scim_group_recompute_skipped_total{cause="undetermined"} 0
+
+# HELP yuzu_scim_guard_store_unavailable_total Total SCIM requests answered 503 (retryable) because a read of the store they depend on FAILED (a lease timeout or query error), by guard: provenance and role are the AuthDB reads of the deprovision and revive guards (role includes the POST-revive role re-check), bearer is the SCIM token check (was a false 401), resource is a user or group lookup (was a false 404/409). Distinct from yuzu_scim_provenance_denied_total and yuzu_scim_auth_failures_total: nothing was refused, no credential was judged bad, and nothing was mutated by the failed read; the IdP is expected to retry. A sustained rate means SCIM provisioning, and above all leaver deactivation, is being delayed by a store fault
+# TYPE yuzu_scim_guard_store_unavailable_total counter
+yuzu_scim_guard_store_unavailable_total{guard="provenance"} 0
+yuzu_scim_guard_store_unavailable_total{guard="role"} 0
+yuzu_scim_guard_store_unavailable_total{guard="bearer"} 0
+yuzu_scim_guard_store_unavailable_total{guard="resource"} 0
 
 # HELP yuzu_scim_role_changes_total Total SCIM-provisioned user role changes applied via SCIM Group membership (--scim-admin-group), by the group-membership-driven role-recompute core - a sustained rate is a normal signal of IdP group-membership churn, not itself an anomaly
 # TYPE yuzu_scim_role_changes_total counter

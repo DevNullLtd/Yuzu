@@ -809,16 +809,22 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   "Gateway-proxied agents: revocation scope").
 - **CRL distribution:** point external consumers at `GET /api/v1/ca/crl`. The
   server keeps the CRL fresh on its own — a background freshness check
-  re-publishes when the latest CRL is missing or within 24h of `nextUpdate`, so a
-  fleet with no revocations never serves an expired CRL and a failed startup
-  pre-publish self-heals on the next **successful leader** tick. That freshness
+  re-publishes when the latest CRL is missing or within 24h of `nextUpdate`. A CRL
+  is valid for 48 hours from the moment it is built (`kCrlValidity`, #6016), so a
+  fleet with no revocations gets a new CRL about once a day and a healthy leader
+  keeps it from expiring. The same check lets a failed startup pre-publish self-heal
+  on the next **successful leader** tick. That freshness
   re-publish is `FencedLeaderOnly` (WS-3, ADR-2002) — under a leadership pause (a
   lost coordination connection; look for `[HA] … FencedLeaderOnly background loops
   are PAUSED`) it does NOT run, so `/api/v1/ca/crl` can stay 503 (or serve a CRL
   past `nextUpdate`) until leadership is re-acquired. On a single-replica deployment
   a *transient* coordination loss is momentary, but a *persistent* one keeps it
   paused until leadership returns — investigate the coordination connection, don't
-  wait it out. The *operator revoke* publish path is unfenced and republishes
+  wait it out: with no leader publishing, the served CRL passes its `nextUpdate`
+  24 to 48 hours after leadership is lost (each CRL is valid for 48 hours from its
+  own build, and a healthy leader rebuilds it at the 24-hour mark), and a consumer
+  that refuses an expired CRL then fails closed. Restarting any server replica republishes the CRL at startup,
+  independent of leadership. The *operator revoke* publish path is unfenced and republishes
   immediately. If that republish fails, it increments
   `yuzu_server_ca_crl_publish_failures_total` and audits `ca.crl.published`
   `result=failure` — alert on it: the public CRL is stale while server-side
