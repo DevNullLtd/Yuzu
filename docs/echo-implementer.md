@@ -200,7 +200,7 @@ on every event: the INSERT carries the value, so its `NOT NULL DEFAULT 0` never 
 only a delta that writes a placeholder 0 holds the minimum at 0 (the `netqual` delta does for
 `rtt_us_min`). Averages are `*_sum` plus `samples`; the `*_avg` names are generated, so consumers
 keep their columns and every average is an exact weighted mean (an INTEGER-declared one truncates
-it, as the legacy rollup's `CAST(AVG(..) AS INTEGER)` did).
+it, as the legacy rollup's `CAST(AVG(..) AS INTEGER)` does).
 
 **Cursor sources.** `power`, `removable` and `registry` fold through `fold_cursor_rows`, with a
 durable per-source ring (`echo_fold_seen`, newest 4096 keys). A key already in the ring is a replay
@@ -236,11 +236,11 @@ double counts; `kMax`, `kMin` and `kLast` do not).
 (`echo_dict_orphan`, dropped at the pass end), then deletes the orphans by id, 2000 per statement,
 until none remain or the deadline passes. `op_mu_` is held for the pass, so no fold adds a
 reference meanwhile; a retention delete only creates orphans. The deadline is cooperative: a
-progress handler interrupts a running statement (it rolls back) and the loop checks before each
-one. A pass whose scan outruns the deadline deletes nothing and reports `live_set_built = false`.
-It does not cover mutex acquisition, `BEGIN IMMEDIATE`'s 5 s busy wait or COMMIT I/O. A real
-failure is returned as an error, never as an empty success. An interned string outlives its last
-row until the next pass.
+progress handler interrupts a running statement (its batch rolls back) and the loop checks before
+each batch starts. A pass whose scan outruns the deadline deletes nothing and reports
+`live_set_built = false`. It does not cover mutex acquisition, `BEGIN IMMEDIATE`'s 5 s busy wait or
+COMMIT I/O. A real failure is returned as an error, never as an empty success. An interned string
+outlives its last row until the next pass.
 
 **`echo.sql` and the authorizer.** The views read the dictionary and the `_r` tables, so
 `echo_query_authorizer` lets those tables be read ONLY when SQLite reports the access under a
@@ -262,12 +262,15 @@ tables, stay denied.
 **Installing the roll-up schema on an existing database.** `install_fold_schema` drops an empty
 legacy tier table (a view cannot take its name) and refuses one that holds rows, naming it and its
 count. Once it has run:
-- `open()`'s registry DDL fails (`views may not be indexed`, rolled back, logged each boot) until
-  the registry tier DDL retires; the 16 tiers the registry does not declare have no retention row.
+- `open()`'s registry DDL fails (`views may not be indexed`, rolled back, logged each boot) while
+  the registry tier DDL still creates these tables; the 16 tiers the registry does not declare have no retention row.
 - `purge_source`, the rollup `INSERT` and the retention and budget `DELETE`s address tier tables by
   name and fail on views. `purge_source` must also delete the source's `_r` and `echo_fold_seen`
   rows, run GC to completion and `TRUNCATE`-checkpoint; the ring is count-bounded and holds key
   text (a hash of the key is the preferred shape).
+- The GC live-set scan is O(total rows): 3.92M roll-up rows took about 1.6 s of a 2 s deadline on
+  an M4. A caller must pass a deadline taken from a measured scan time (or replace the EXCEPT chain
+  with an in-memory mark of live ids); `GcResult::live_set_built == false` is the starvation signal.
 - `run_usage_fold` reads `process_live`; the schema version stays 9 and nothing marks the roll-up
   shape; callers chunk backfills.
 - A `kLast` enrichment column is replaced by a later event that omits the field; a `historical`
@@ -275,6 +278,9 @@ count. Once it has run:
   netconn (a high-water mark in `echo_config`) have no transactional replay guard through
   `fold_rows`.
 - Any deleter of `echo_dict` rows goes through `EchoFold`.
+- `is_fold_view` is case-sensitive: a query that names a view `Process_Hourly` does not reach it.
+- No fold view may gain a WHERE, JOIN or filter: the pinned column-less `_r` read is sound only
+  while every view is a WHERE-less, JOIN-less single-table projection.
 
 **Adding a source or tier.** Five edits, each pinned by a test that fails until it matches: the
 registry row (`build_sources()`, section 8) where the tier has a `GranularityDef` (16 of the 34

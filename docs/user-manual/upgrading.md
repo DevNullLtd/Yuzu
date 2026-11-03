@@ -8,9 +8,9 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Who is affected.** Anything that stores or replays an `echo.sql` query text: stored schedules, pinned or re-evaluated result sets, workflow steps, and REST and MCP callers.
 
-**Before you upgrade.** Search those stores for `WITH`, `NATURAL`, `USING` and for `?`, `$`, `:`, `@`, `#` outside string literals, and rewrite the queries.
+**Before you upgrade.** Search those stores for `WITH`, `NATURAL`, `USING`, a `$` that is not a `$Table_Name` placeholder, or any of `? : @ #`, outside string literals, and rewrite the queries.
 
-**Mixed fleet.** An agent that is not yet upgraded still answers these queries, so one stored query answers differently per agent version. Compare a result set's `device_count` with the source execution's `agents_failure` to see which agents refused it.
+**Mixed fleet.** An agent that is not yet upgraded still answers these queries, so one stored query answers differently per agent version. Compare a result set's `device_count` with the source execution's `agents_failure` to see whether agents refused it.
 
 **Rolling back.** Clean: nothing is stored differently, and an older agent accepts the queries again.
 

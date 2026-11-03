@@ -6,8 +6,8 @@
  * Roll-up is the only storage model; none of this is wired into open(). Fixtures
  * are in-process: a raw :memory: handle for DDL-only cases, a temp-file
  * EchoDatabase (yuzu_test_ prefix, shared helper) wherever the fold writer or the
- * read-only query connection is involved. Nothing sleeps or polls; the GC deadline
- * is driven by an injected clock.
+ * read-only query connection is involved. Nothing polls; the one bounded negative wait
+ * (150 ms) can only false-pass. The GC deadline is driven by an injected clock.
  */
 
 #include "echo_collectors.hpp"
@@ -80,7 +80,7 @@ bool exec(sqlite3* db, const std::string& sql) {
     char* raw = nullptr;
     const int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &raw);
     const std::unique_ptr<char, decltype(&sqlite3_free)> err{raw, &sqlite3_free};
-    INFO("sqlite: " << (err ? err.get() : ""));
+    UNSCOPED_INFO("sqlite: " << (err ? err.get() : "")); // INFO would pop before the caller asserts
     return rc == SQLITE_OK;
 }
 
@@ -287,7 +287,7 @@ TEST_CASE("TierAccumulator: an unrepresentable stamp rejects that event only",
     CHECK(acc.rows("monthly").size() == 2);
 }
 
-TEST_CASE("TierAccumulator: a sum saturates, and a non-finite measure rejects that event only",
+TEST_CASE("TierAccumulator: a sum saturates; a non-finite measure rejects that event only",
           "[echo][fold][merge]") {
     constexpr auto kMax = std::numeric_limits<int64_t>::max();
     constexpr auto kMin = std::numeric_limits<int64_t>::min();
@@ -704,7 +704,7 @@ TEST_CASE("tcp_delta: connect, disconnect, failed, listen, unknown", "[echo][fol
     CHECK(mi(acc, l, "connect_count") == 0);
 }
 
-TEST_CASE("module_delta: loaded counts, seed and unloaded contribute nothing, blocked is counted",
+TEST_CASE("module_delta: loaded counts; seed and unloaded contribute nothing; blocked is counted",
           "[echo][fold][delta]") {
     const auto row = [](const char* action, const char* module) {
         ModuleRow r;
@@ -1091,10 +1091,9 @@ TEST_CASE("identity_digest: deterministic, and covers exactly the fields the raw
         identity[i](s);
         CHECK(reg(r) != reg(s));
     }
-    r.action = s.action = "capture_gap"; // a gap carries nothing but its action
-    s.hive = "HKU";
-    s.data = "other";
-    s.observed_at = 9;
+    for (const auto& edit : identity)
+        edit(s); // every identity field of `s` now differs from `r` ...
+    r.action = s.action = "capture_gap"; // ... yet a gap carries nothing but its action
     CHECK(reg(r) == reg(s));
 
     // removable: every stored field is identity; `ts` is too, except for capture_gap and
@@ -1234,7 +1233,7 @@ TEST_CASE("fold_rows: perf averages are weighted means across separate folds; an
     CHECK(r[0][0] == "3");
     CHECK(std::stod(r[0][1]) == 30.0); // (10 + 20 + 60) / 3
     CHECK(std::stod(r[0][2]) == 60.0);
-    CHECK(r[0][3] == "1000"); // 3001 / 3 truncated, as CAST(AVG(..) AS INTEGER) was
+    CHECK(r[0][3] == "1000"); // 3001 / 3 truncated, as CAST(AVG(..) AS INTEGER) is
     CHECK(f->n("SELECT COUNT(*) FROM perf_daily_r") == 1);
 }
 
@@ -1632,7 +1631,7 @@ TEST_CASE("gc_dictionary: a real failure is an error, never an empty success", "
     CHECK_FALSE(g.has_value());
 }
 
-TEST_CASE("dictionary_orphans_sql: one EXCEPT term per interned key column, inside SQLite's compound limit",
+TEST_CASE("dictionary_orphans_sql: one EXCEPT term per interned key column; the chain fits SQLite's compound limit",
           "[echo][fold][gc]") {
     std::size_t terms = 0;
     for (const auto& d : fold_sources())
@@ -1738,7 +1737,7 @@ TEST_CASE("fold and GC serialise: no dangling dictionary id after concurrent use
 
     CHECK(fold_errors == 0);
     CHECK(gc_errors == 0);
-    CHECK(gc_deleted > 0); // GC really ran against live data: at least the seed strings went
+    CHECK(gc_deleted > 0); // GC really ran: at least the seed strings went
     CHECK(integrity_violations(*f) == 0);
 
     // Positive control: the same check does see a dangling id.
@@ -1855,12 +1854,11 @@ TEST_CASE("operator SQL: NATURAL and USING joins never reach the dictionary or t
         const char* sql;
         bool authorizer_admits; // observed on the shipped SQLite, pinned
     };
-    // Observed: the authorizer alone ADMITS a NATURAL join and a USING join over real
-    // columns (the dictionary's size; the user's presence in the usage table), because
-    // those column reads never reach it. USING over the rowid alias `id` is the one
-    // shape it still catches: a rowid-alias read leaves the table column-less, which is
-    // reported, and the dictionary is denied column-less. That is why the validator, not
-    // the authorizer, is the closure for NATURAL / USING; these pins say so.
+    // Observed: the authorizer alone ADMITS a NATURAL join and a USING join over real columns (the
+    // dictionary or a usage table), because those column reads never reach it. USING over the rowid
+    // alias `id` is the one shape it still catches: a rowid-alias read leaves the table
+    // column-less, which is reported, and the dictionary is denied column-less. That is why the
+    // validator, not the authorizer, is the closure for NATURAL / USING; these pins say so.
     const Probe probes[] = {
         {"SELECT COUNT(*) FROM echo_dict a NATURAL JOIN echo_dict b", true},
         {"SELECT COUNT(*) FROM echo_dict a JOIN echo_dict b USING (text)", true},
@@ -1935,7 +1933,7 @@ TEST_CASE("operator SQL: a CTE can never shadow a roll-up view name", "[echo][fo
     }
 }
 
-TEST_CASE("validate_and_translate_sql: a quoted identifier is one token, and $ names translate in it",
+TEST_CASE("validate_and_translate_sql: a quoted identifier is one token and $ names translate in it",
           "[echo][fold][authorizer][sql]") {
     // Quoted identifiers that merely contain a keyword or a comment or quote marker validate.
     for (const char* sql : {"SELECT 1 AS \"with\"", "SELECT 1 AS `natural`", "SELECT 1 AS [using]",
@@ -1961,9 +1959,9 @@ TEST_CASE("validate_and_translate_sql: a quoted identifier is one token, and $ n
 }
 
 TEST_CASE("operator SQL: no validator-accepted string runs a refused payload", "[echo][fold][authorizer][sql]") {
-    // A seeded differential corpus: runs of every token that swallows text in SQLite (the three
-    // identifier quotings, both comments, and the variable token with its "(...)" body) around a
-    // payload only the validator stands in front of. Whatever the validator accepts must not run it.
+    // A differential corpus: the tokens that swallow text in SQLite (the three identifier quotings,
+    // both comments, and the variable token with its "(...)" body) placed before a payload only the
+    // validator guards. Whatever the validator accepts must not run it.
     auto f = make_fold_db();
     fold_names(*f, {"zz_sentinel"});
     const std::string payloads[] = {
@@ -1984,34 +1982,28 @@ TEST_CASE("operator SQL: no validator-accepted string runs a refused payload", "
     for (const auto& p : payloads) // positive control: the detector sees each payload when it runs
         REQUIRE(leaks(f->db.execute_user_query("SELECT 1, " + p)));
 
-    const char* const tokens[] = {"'", "\"", "`", "[", "]", "--", "/*", "*/", "@x(", "$x(", ":x(", "#x(", ")", "\n", " "};
-    uint32_t rng = 20261103; // fixed seed: the corpus is the same on every run
-    const auto next = [&](uint32_t n) {
-        rng = rng * 1664525u + 1013904223u;
-        return (rng >> 16) % n;
-    };
-    const auto run_of = [&](uint32_t max_len) {
-        std::string out;
-        for (uint32_t k = next(max_len + 1); k > 0; --k)
-            out += tokens[next(std::size(tokens))];
-        return out;
-    };
     int accepted = 0, parameter_refusals = 0;
-    for (int i = 0; i < 4000; ++i) {
-        std::string sql = next(2) ? "SELECT 1 AS " : "SELECT 1, "; // sequenced: same corpus on every compiler
-        sql += run_of(4);
-        sql += ", ";
-        sql += payloads[next(2)];
-        sql += run_of(2);
+    const auto probe = [&](const std::string& sql) { // refused, or it runs without leaking a payload
         INFO(sql);
         const auto v = validate_and_translate_sql(sql);
-        if (!v) {
-            parameter_refusals += v.error().find("bound-parameter marker") != std::string::npos;
-            continue;
-        }
-        ++accepted;
-        CHECK_FALSE(leaks(f->db.execute_user_query(*v)));
-    }
+        parameter_refusals += !v && v.error().find("bound-parameter marker") != std::string::npos;
+        accepted += v.has_value();
+        if (v)
+            CHECK_FALSE(leaks(f->db.execute_user_query(*v)));
+    };
+    // The known swallowing shapes, each in front of each payload: a quoted identifier holding a
+    // comment opener, and a variable token whose "(...)" body holds one.
+    for (const char* unit : {"1 AS \"--\"", "1 AS `--`", "1 AS [--]", "1 AS \"/*\"", "@x(--)", "$x(--)",
+                             ":x(--)", "#x(--)", "@x(/*)"})
+        for (const auto& p : payloads)
+            probe(std::string("SELECT ") + unit + ", " + p);
+    // Then every pair of swallowing tokens in front of each payload, as an alias or a select item.
+    const char* const tokens[] = {"'", "\"", "`", "[", "]", "--", "/*", "*/", "@x(", "$x(", ":x(", "#x(", ")", "\n", " "};
+    for (const char* a : tokens)
+        for (const char* b : tokens)
+            for (const auto& p : payloads)
+                for (const char* lead : {"SELECT 1 AS ", "SELECT 1, "})
+                    probe(std::string(lead) + a + b + ", " + p);
     CHECK(accepted > 0);           // not vacuous: the validator does accept some of the corpus
     CHECK(parameter_refusals > 0); // and the corpus does reach the variable-token shapes
 }

@@ -537,8 +537,8 @@ std::expected<GcResult, std::string> EchoFold::gc_dictionary(EchoDatabase& db,
         return std::unexpected(r.error());
     };
 
-    // Cooperative: checked before each statement starts, and by the progress handler
-    // while one executes. Not mutex acquisition, BEGIN IMMEDIATE's busy wait or COMMIT I/O.
+    // Cooperative: checked before each batch starts and by the progress handler inside a statement
+    // (the batch rolls back). Not mutex acquisition, BEGIN IMMEDIATE's busy wait or COMMIT I/O.
     if (now() >= deadline) {
         out.deadline_hit = true;
         return out;

@@ -5,6 +5,7 @@
  *  1. SELECT-only keyword check
  *  2. $-name whitelist translation
  *  3. Single-statement enforcement (reject trailing SQL)
+ * Run order: 1 (SELECT start), 2, then 1b (keywords, parameter markers), 3 on the translated text.
  */
 
 #include "echo_sql_executor.hpp"

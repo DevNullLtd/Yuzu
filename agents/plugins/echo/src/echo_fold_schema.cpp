@@ -44,7 +44,7 @@ constexpr ColumnDef g_avg(std::string_view n, std::string_view type, std::string
 }
 
 // Average = sum / samples; 0 for an empty bucket. An INTEGER-declared average truncates, as
-// the legacy rollup's CAST(AVG(..) AS INTEGER) did; a REAL one is the exact mean.
+// the legacy rollup's CAST(AVG(..) AS INTEGER) does; a REAL one is the exact mean.
 #define YUZU_FOLD_AVG(sum_col) "CASE WHEN samples>0 THEN " sum_col "*1.0/samples ELSE 0 END"
 #define YUZU_FOLD_IAVG(sum_col) "CASE WHEN samples>0 THEN " sum_col "/samples ELSE 0 END"
 

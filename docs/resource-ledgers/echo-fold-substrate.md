@@ -1,8 +1,8 @@
 # Resource Ledger: Echo roll-up fold substrate (`echo_fold.cpp`, `echo_fold_schema.cpp`)
 
-New owned resources introduced by `EchoFold` and the code behind it. Nothing here is wired into
-`EchoDatabase::open()`, a collector or a setting; every path (normal return, early return,
-error result, exception unwind) releases exactly the resource listed.
+New owned resources introduced by `EchoFold` and the code behind it. Nothing is wired into a
+collector or a setting; `EchoDatabase::open()` only forces the view-name allowlist to initialise.
+Every exit path (normal, early, error result, exception unwind) releases exactly the resource listed.
 
 ## Resources
 
@@ -41,8 +41,8 @@ error result, exception unwind) releases exactly the resource listed.
 - **Site:** `GcProgress` in `gc_dictionary`, installed with `sqlite3_progress_handler(db, 1000, ...)`
   inside each GC transaction.
 - **Owner type:** the `GcProgress` scope guard; the destructor clears the handler on every exit.
-- **What the deadline covers:** statement execution (the handler interrupts a running statement,
-  which rolls back) and a check before each statement starts. **What it does not
+- **What the deadline covers:** statement execution (the handler interrupts a running statement
+  and its whole batch rolls back) and a check before each batch starts. **What it does not
   cover:** mutex acquisition, `BEGIN IMMEDIATE`'s 5 s busy wait (`echo_db.cpp`), and COMMIT I/O. It
   is a cooperative bound, not an end-to-end one.
 - **Context lifetime:** the callback reads a `std::function` owned by the guard; the guard outlives
@@ -51,7 +51,9 @@ error result, exception unwind) releases exactly the resource listed.
 ### GC orphan table
 - **Site:** `temp.echo_dict_orphan`, created by `gc_dictionary` at the start of a pass (one scan
   of the live set) and read by the batch deletes; a temp table, so it lives on the connection only.
-- **Owner type:** the pass. Dropped at the start of the next pass and on every exit from this one.
+- **Owner type:** the local `DropOrphans` guard in `gc_dictionary`; on every exit its destructor runs the
+  DROP through `EchoDatabase::execute_sql` (takes `EchoDatabase::mu_` under `op_mu_`). A failed drop is
+  logged and retried by the next pass's first statement (`DROP TABLE IF EXISTS temp.echo_dict_orphan`).
 
 ### `echo_fold_seen` replay ring
 - **Site:** the `echo_fold_seen` table, written by `fold_cursor_rows` in the same transaction as
@@ -68,5 +70,6 @@ error result, exception unwind) releases exactly the resource listed.
   mutated; `open()` forces the view-name set so no query thread initialises it.
 
 ## Not introduced
-No thread, socket, temp file, callback registered with the host, or library handle. The unit
-tests that exercise concurrency start two `std::thread`s inside the test and join them.
+No thread, socket, library handle or file of its own, and no callback registered with the host. The
+GC orphan table is a SQLite TEMP table in the connection's temp database. The unit tests that
+exercise concurrency start two `std::thread`s inside the test and join them.

@@ -809,10 +809,10 @@ struct GcResult {
  * cache holding an id the database does not have. Counts come from RETURNING row
  * counts, never sqlite3_changes().
  *
- * GC DEADLINE IS COOPERATIVE. It is checked before each statement starts and by
- * sqlite3_progress_handler inside a running one, which then rolls its transaction
- * back. It does NOT cover mutex acquisition, BEGIN IMMEDIATE's busy wait (5 s), or
- * COMMIT I/O.
+ * GC DEADLINE IS COOPERATIVE. It is checked before each batch starts (a batch is one
+ * transaction; the live-set scan is three statements) and by sqlite3_progress_handler
+ * inside a running statement, which rolls the whole batch back. It does NOT cover mutex
+ * acquisition, BEGIN IMMEDIATE's busy wait (5 s), or COMMIT I/O.
  *
  * NOT called from EchoDatabase::open(), the collectors or the aggregator.
  */
