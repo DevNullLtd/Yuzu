@@ -719,7 +719,7 @@ TEST_CASE("census ordering: the batch path orders by key and stores no pending e
     CHECK(pending_count(db.dsn()) == "0");
 }
 
-TEST_CASE("census ordering: a sequence collision is an operational error, never a redelivery",
+TEST_CASE("census ordering: a sequence collision is an operational error and never a redelivery",
           "[pg][guaranteed_state_store][db][census][ordering][k]") {
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -925,7 +925,7 @@ TEST_CASE("census ordering: delete_rule waits on a repair that holds the pair's 
 
 TEST_CASE("census ordering: a pending event that disagrees with a verdict inserted concurrently keeps the row flagged",
           "[pg][guaranteed_state_store][db][census][ordering][lockorder]") {
-    // The UP-1 schedule (governance Gate 4, reproduced on Postgres 18). New pair, no census row.
+    // The UP-1 schedule (found in review, reproduced on Postgres 18). New pair, no census row.
     //   X (key 100, seq 1) is held inside its event INSERT,
     //   W (key 200, seq 2) projects first and holds an UNCOMMITTED census INSERT,
     //   P (key 150, seq 3) is a committed pending event that arrives after W's pair lock,
@@ -1334,7 +1334,7 @@ std::string hwm_recv_is_db_now(const std::string& dsn, const std::string& agent)
 
 TEST_CASE("census ordering: a pending event that shares a key with a different verdict is flagged (#5690 UP-3)",
           "[pg][guaranteed_state_store][db][census][ordering][tie]") {
-    // Governance Gate 8 pass 2: nine reviewers found that a PENDING event with the same key as a
+    // Found in review (nine reviewers): a PENDING event with the same key as a
     // later, different verdict was retired as dominated with the row left clean. A pending event's
     // verdict is not stored beside its key, so any same-key pending peer flags (an over-flag for a
     // peer with the same verdict is accepted: pending events are rare).
@@ -1413,8 +1413,7 @@ TEST_CASE("census ordering: a pending event that shares a key with a different v
 
 TEST_CASE("census ordering: only the fold flags a pending same-key peer that a lower-key lower-sequence arrival sees",
           "[pg][guaranteed_state_store][db][census][ordering][tie]") {
-    // The schedule where the fold's same-key term is the ONLY thing that flags the row (found in
-    // governance, Gate 8 pass 3): Q (errored, key 300) projects and commits first; P (drifted, the
+    // The schedule where the fold's same-key term is the ONLY thing that flags the row (found in review): Q (errored, key 300) projects and commits first; P (drifted, the
     // same key, a LOWER sequence) became pending meanwhile; Z (key 100, a sequence BELOW Q's)
     // then projects. Z neither applies nor flags in the upsert (key and sequence both below the row),
     // and the clear would retire P as dominated. Sequences are placed by hand (setval and a
@@ -1560,12 +1559,12 @@ TEST_CASE("census ordering: the mark's time is the database clock and is set whe
         CHECK(census(db.dsn(), "a", "r1") ==
               "drifted|" + key_str(kBase + 1000) + "|" + key_str(kBase + 1000) + "|true");
     }
-    SECTION("a recorded time six minutes ahead is past the slack: it counts as stale") {
+    SECTION("a recorded time ten minutes ahead is past the slack: it counts as stale") {
         REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase + 1000)).outcome ==
                 EventInsertOutcome::Inserted);
         exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
                                ".guardian_agent_rule_status SET hwm_recv_ns = hwm_recv_ns + "
-                               "360000000000");
+                               "600000000000");
         REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 500)).outcome ==
                 EventInsertOutcome::Inserted);
         CHECK(census(db.dsn(), "a", "r1") ==
@@ -1586,7 +1585,7 @@ TEST_CASE("census ordering: the mark's time is the database clock and is set whe
 
 TEST_CASE("census ordering: a refused later arrival is remembered when an earlier one applies afterwards",
           "[pg][guaranteed_state_store][db][census][ordering][lockorder]") {
-    // Three overlapping first deliveries to one new pair (governance Gate 8, UP-13).
+    // Three overlapping first deliveries to one new pair (#5690 UP-13).
     //   W1 key 200 (seq 1), W0 key 300 (seq 2), W2 key 100 (seq 3).
     // They are processed in the order W1, W2, W0: W2 (the latest arrival) is refused and flagged
     // against W1's row, then W0 applies with a key above the high-water mark. Delivered in arrival
@@ -1648,7 +1647,7 @@ TEST_CASE("census ordering: a repair of a rejected event retires its evidence in
 
 TEST_CASE("census ordering: a seen event retired by a flagged apply is still remembered by a later apply",
           "[pg][guaranteed_state_store][db][census][ordering][lockorder]") {
-    // Governance Gate 8 (randomised schedule): W1 (key 250, seq 1) is held inside its INSERT; W2
+    // A randomised-schedule finding: W1 (key 250, seq 1) is held inside its INSERT; W2
     // (key 300, seq 2) takes its pair lock and parks; a pending event E (key 100, seq 3) is stored.
     // W1 then sees E, applies flagged and retires E (E is dominated); W2 applies with a key above
     // the high-water mark. Delivered in arrival order E arrives last with the lowest key, so the

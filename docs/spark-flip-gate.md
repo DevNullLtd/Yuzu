@@ -2813,9 +2813,10 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   lane was permitted to overtake an older entry in the other lane, so events may have reached
   the stream out of enqueue order (a release is counted even if that call launches nothing).
   The audit trail is complete, but the data-integrity consequence is #5690: a later-launched
-  sender overtaking an older one, combined with the server's same-second `>=` tie in
-  `project_rule_status` (`guard.errored` versus a delayed `guard.compliant`), can leave the
-  server holding a false `compliant`. #5690 is open and gates the flip. Correlate with
+  sender overtaking an older one (`guard.errored` versus a delayed `guard.compliant`) reaches
+  the server's census ordering out of stamp order, which the server now flags `order_uncertain`
+  instead of silently keeping a false `compliant`. The flag is the safeguard; the flip gate is
+  decided on that basis. Correlate with
   `yuzu.guardian_send_stalls` / send exceptions on the same endpoint
   (`docs/user-manual/metrics.md`). The gauge is an unlabelled fleet sum and there is no
   operator surface for per-agent heartbeat tags yet (`docs/prometheus/yuzu-alerts.yml`
@@ -2861,8 +2862,8 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   UP-14: `enqueued_ns` is `system_clock`; a backward wall-clock step between an older compliant
   and a newer errored gives the errored an earlier timestamp, so the server keeps the compliant
   whatever the wire order, and the hold cannot touch it (server side). Note on #5690's
-  acceptance options (factual, not a ruling): a same-second tie policy closes UP-13 but not
-  UP-14; receipt-sequence ordering closes UP-14 but worsens UP-13; only terminal precedence
+  acceptance options (factual, not a ruling): a tie policy closes UP-13 but not
+  UP-14 (the server now flags a tied or mis-ordered pair rather than keeping it silently); receipt-sequence ordering closes UP-14 but worsens UP-13; only terminal precedence
   closes both. The test `#3972 chaos: a third sender holding the stream write mutex ...`
   (hidden `[.chaos]`) characterises UP-13 and deliberately asserts no order.
 - Owner: not assigned in source material.

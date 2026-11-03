@@ -6042,7 +6042,7 @@ TEST_CASE("REST dex/signals, dex/scope and dex/signals/{obs_type}: a window outs
     }
 }
 
-TEST_CASE("REST guaranteed-state: order_uncertain and projection_pending on the row routes, "
+TEST_CASE("REST guaranteed-state: order_uncertain and projection_pending on the row routes and "
           "uncertain_rules on the rollups (#5690)",
           "[pg][rest][guaranteed_state][ordering]") {
     RestGsHarness h;

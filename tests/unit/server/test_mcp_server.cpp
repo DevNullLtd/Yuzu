@@ -43951,7 +43951,7 @@ TEST_CASE("MCP runtime config: the set_runtime_config description names exactly 
     CHECK(refused.find("oidc_") != std::string::npos);
 }
 
-TEST_CASE("MCP Guardian: the twins carry order_uncertain, projection_pending and uncertain_rules "
+TEST_CASE("MCP Guardian: the twins carry order_uncertain and projection_pending and uncertain_rules "
           "(#5690)",
           "[pg][mcp][integration][guardian][ordering]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);

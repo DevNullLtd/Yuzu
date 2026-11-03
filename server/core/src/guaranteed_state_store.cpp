@@ -1259,8 +1259,8 @@ std::expected<void, std::string> project_observation(PGconn* conn,
 // clears only on a key strictly above the mark. A same-key pair of different verdicts is flagged
 // because the agent stamped both with the same instant, so arrival order is the only order left
 // and it is not emission order. `hwm_recv_ns` is the DATABASE time at which `ts_hwm` last rose:
-// once an event arrives more than `YUZU_CENSUS_STALE_NS_` after it (or the recorded time is in the
-// database's future) with a usable key below the mark and a later arrival than the applied
+// once an event arrives more than `YUZU_CENSUS_STALE_NS_` after it (or the recorded time is more
+// than `YUZU_CENSUS_FUTURE_SLACK_NS_` in the database's future) with a usable key below the mark and a later arrival than the applied
 // verdict, the mark is treated as stale (an agent clock stepped back) and the verdict follows
 // arrival order, still flagged until a key passes the mark.
 //
@@ -1410,6 +1410,10 @@ constexpr const char* kCensusLockAll =
 #define YUZU_CENSUS_DB_NOW_NS_ "(floor(extract(epoch FROM statement_timestamp()) * 1000000000))::bigint"
 // A recorded time more than this far ahead of the database clock (five minutes) is a stepped-back
 // clock, not a lock wait.
+// (Unrelated to `kReceiptSkewCapNs`, which bounds an agent stamp ahead of receipt; both happen to be
+// 300 s.) The slack assumes a statement does not wait on a row lock longer than the pool's
+// statement timeout (30 s by default); a configuration that raises that past 300 s reopens a
+// spurious recovery, which is still flagged.
 #define YUZU_CENSUS_FUTURE_SLACK_NS_ "300000000000"
 
 #define YUZU_CENSUS_FOLD_MAX_KEY_                                                                 \

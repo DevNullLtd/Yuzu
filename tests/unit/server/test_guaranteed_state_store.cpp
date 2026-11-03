@@ -3515,7 +3515,7 @@ TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state 
         CHECK(census()[{"a1", "r2"}] == "compliant");
     }
     SECTION("D5: an exact redelivery of the errored event never reaches the census write") {
-        // Equal timestamps (compliant arrives after errored, so it wins the >= tie): had the
+        // Equal timestamps (compliant arrives after errored, so it wins the same-key tie by arrival, and the pair is flagged, #5690): had the
         // redelivery reached the upsert, the tie would flip the row to errored, so the final
         // census assertion can observe a reached census write.
         const auto errored = ev("d5x", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z");

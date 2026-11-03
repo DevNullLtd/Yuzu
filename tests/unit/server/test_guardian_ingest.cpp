@@ -735,7 +735,7 @@ TEST_CASE("guardian ingest: agent_stamp_ns validates the wire stamp once (#5690 
     CHECK(*top < std::numeric_limits<std::int64_t>::max());
 }
 
-TEST_CASE("guardian ingest: an event with an empty rule_id is refused, not stored (#5690)",
+TEST_CASE("guardian ingest: an event with an empty rule_id is refused and not stored (#5690)",
           "[pg][guardian][ingest][ordering]") {
     YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
