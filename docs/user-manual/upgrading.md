@@ -649,7 +649,7 @@ with the number of enrolled accounts. Resetting the break-glass account under `s
 (standard mode, enrol, then `sso-only`; see "Break-glass account under `sso-only`" below). Rehearse it (below) to get
 your own figure before you pick the window.
 
-**Rigs that ran an earlier build of this change.** A development or UAT database that ran an earlier iteration of this branch can already record `auth` 3 and `session_store` 3 with an older trigger body. The version number is the same, so the migration is skipped, and the server refuses to start because the boot check pins the trigger function body byte for byte. Recreate such a database; do not repair it by hand.
+**Rigs that ran an earlier build of this change.** A development or UAT database that ran an earlier iteration of this branch can already record `auth` 3 and `session_store` 3 with an older trigger body. The version number is the same, so the migration is skipped, and the server refuses to start because the boot check pins the trigger function body byte for byte. Recreate such a database. The trigger repair in the auth-store recovery runbook can restore the trigger bodies, but it does not account for any other difference an earlier iteration left, so it is not a supported way to carry a development database across.
 
 **Table locks.** Each migration waits at most 3 seconds for its table lock (`auth.users`, `session_store.sessions`).
 One that cannot get it fails the boot, or the first `--mfa-reset`, and is rolled back whole and retried on the next
