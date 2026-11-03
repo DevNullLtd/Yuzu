@@ -53,7 +53,7 @@
 /// the predicate, as A1 does.
 ///
 /// SCOPE EXTENSION (#6034, the Users and roles page hint): `rbac_admin_hint` (below) is the
-/// ONE advisory composition of this predicate with `RbacAdminSurface::kRest`, then
+/// ONE advisory composition of this predicate (on the caller's `RbacAdminSurface`), then
 /// `RbacStore::check_caller_authorized_under_current_regime`. The A2 assign and unassign routes
 /// call those same two functions in that order; the A1 enforcement route (`PUT
 /// /api/v1/rbac/enforcement`) calls the predicate and applies the regime rule INSIDE
@@ -63,9 +63,13 @@
 /// `/access/users` draws the Assign button and the enforcement switch from the authority the
 /// server will apply rather than from the session's base account role. HINT ONLY, never a
 /// gate: it adds no admission logic of its own, writes no audit row and no response, and every
-/// action it hints at keeps its own unchanged gate. Its one production call site is the Access
+/// action it hints at keeps its own unchanged gate. It has TWO production callers: the Access
 /// wiring lambda in `server.cpp` (`rbac_admin_hint_fn`), which passes `kRest` because the
-/// controls call the REST routes. A new caller needs the same proof the rest of this header
+/// controls call the REST routes, and `read_rbac_enforcement` in `rbac_enforcement_read.hpp`
+/// (#6033), which forwards the surface of the transport it serves (`kRest` for `GET
+/// /api/v1/rbac/enforcement`, `kMcp` for `get_rbac_enforcement`). The read consumes the answer
+/// and changes no admission input of either function: it calls the hint once on the caller's
+/// own session and returns a label. A new caller needs the same proof the rest of this header
 /// asks for: it must not change the admission input set of either function.
 ///
 /// THE RULE: a caller passes iff they hold a DURABLE `Administrator`

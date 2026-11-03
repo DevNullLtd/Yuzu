@@ -436,7 +436,7 @@ While a just-in-time elevation is active, `effective_role` is `admin`, `elevated
 | `auth_source` | Always present. How the session authenticated: `local`, `oidc`, `saml`, `api_token`, `mcp_token` or `engine_token`. |
 | `mcp_tier` | The MCP authorization tier of an MCP token; an empty string for any other session. |
 | `scope_service` | The service tag of a service-scoped token; an empty string when the session is not service-scoped. |
-| `rbac_enabled` | The server's cached view of the RBAC switch. It can lag a change made on another replica, and it does not report the degraded state in which enforcement fails closed (tracked in #6033). |
+| `rbac_enabled` | The server's cached view of the RBAC switch. It can lag a change made on another replica, and it does not report the degraded state in which enforcement fails closed; read that from [`GET /api/v1/rbac/enforcement`](#get-apiv1rbacenforcement) (its `unconfirmed` field). |
 | `rbac_role` | Deprecated display field: the first DIRECT role assignment in role-name order. Omitted for an engine principal while RBAC is off, for an engine principal with no grant while RBAC is on, and when the role-store read failed. For a human with no direct role it shows the legacy label `Administrator` or `Viewer`, including while RBAC is on; that label is not a grant and not authority. Read `rbac_roles` instead. |
 | `rbac_roles` | The principal's DIRECT role assignments only; roles held through a group grant are not listed. It is not access-review evidence: the access-review export (`AccessReview:Read`) is. With RBAC off it is `[]`. Omitted when the role-store read failed. |
 | `rbac_roles_resolved` | `false` only when the role-store read failed; it is `true` otherwise, including with RBAC off (no read is made then, so `true` is not proof that enforcement is off). When `false` the route still answers `200` and omits `rbac_role` and `rbac_roles`; treat an absent list as unknown, not as "no roles". |
@@ -3323,6 +3323,71 @@ MCP twins: `assign_rbac_role` / `unassign_rbac_role` — see
 
 ---
 
+#### `GET /api/v1/rbac/enforcement`
+
+Read the RBAC enforcement state as this server replica sees it, plus an advisory
+verdict on whether the caller could change it. The machine twin of the
+**Enforce roles** panel (`GET /fragments/access/enforcement`) on the Users and
+roles page; the write is `PUT /api/v1/rbac/enforcement` below.
+
+**Permission:** any signed-in session, the same as its fragment and `GET /api/v1/me`. No
+`require_permission` or permission gate is applied, and the route is not RBAC-gated (the same
+class as `GET /api/v1/me` and `POST /api/v1/rbac/check`): the RBAC store is the data this route
+reads, not its gate. A service-scoped API token is refused `403` before anything is read,
+because the route reports fleet-wide RBAC state. An MCP-tier token and an engine session are
+not refused: they get a `200`, and an MCP-tier token reads `administrator: "may_not"` (see below).
+Nothing about any other principal is returned.
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "unconfirmed": false,
+    "administrator": "may"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `enabled` | The serving replica's cached view of the enforcement switch, for display. It is a cached view: on another replica it can lag the durable value by a bounded stale-serve window (#2703), and a replica that never observed an enable can read `false` while another replica enforces. |
+| `unconfirmed` | `true` when that cached view could not be re-confirmed against the store (a degraded read). `enabled: true` with `unconfirmed: true` is possible; enforcement is in effect either way and `unconfirmed` means only that the displayed value could not be confirmed. `unconfirmed: false` is not a guarantee that no other replica disagrees. |
+| `administrator` | An advisory verdict on the caller's own credential: `may`, `may_not` or `unconfirmed`. |
+
+`administrator` is computed from the durable stores (the durable-Administrator check, then the
+regime check) on the REST surface, independently of `enabled` and `unconfirmed`, so
+`unconfirmed: true` with `administrator: "may"` and `unconfirmed: false` with
+`administrator: "unconfirmed"` are both legitimate. It is never forced to `unconfirmed` because
+the cached view is degraded. `may` means the RBAC administration routes would admit this
+credential's durable authority now. It does NOT promise that `PUT /api/v1/rbac/enforcement`
+succeeds: it excludes the MFA step-up, the MCP tier and approval ladder, and the PUT's
+destination-regime `409`. `may_not` for an MCP-tier token means "this credential cannot administer
+RBAC through REST", not "its owner lacks the Administrator role". The server decides again on
+every PUT.
+
+**Errors:** `401`: no valid session (a bare refusal, no audit row); `403`: a service-scoped
+token (audited as a `denied` row, see below; the body names no permission that would admit the
+caller); `503`: the RBAC store is not open (retryable, `retry_after_ms` is set, no audit row),
+or the audit row for a successful read could not be saved (see below).
+
+**Audit:** a successful read writes `rbac.enforcement.read` with a server-derived detail such
+as `enabled=true; unconfirmed=false; administrator=may` (nothing from the session or the request
+is embedded). On a deployment with a wired audit sink this fails closed: a row that cannot be
+saved answers `503` with `Sec-Audit-Failed: true` and the body is never sent. With no audit sink
+wired (audit off) the read succeeds without a row, so read "every successful read is audited" as
+"every successful read on a deployment with a wired sink". The `401` and the store-not-open
+`503` write no row, like the `PUT` and the fragment. A service-scoped refusal writes a `denied`
+row. See `docs/user-manual/audit-log.md`.
+
+**Headers:** `Cache-Control: no-store, private`.
+
+MCP twin: `get_rbac_enforcement`, see `docs/user-manual/mcp.md`.
+
+---
+
 #### `PUT /api/v1/rbac/enforcement`
 
 Enable or disable RBAC enforcement fleet-wide (durable; every replica
@@ -3387,10 +3452,10 @@ administrator after the switch (enabling: no fleet-wide `Administrator`
 grant; disabling: local account role is not `admin`) — the response's
 `remediation` field names the exact follow-up call; `503` — the RBAC or
 `AuthDB` store is unavailable, or (on an otherwise-successful toggle) its
-audit row could not persist: treat the change as unconfirmed and check it with the access-review export's `rbac_enforcement` label (`GET /api/v1/access-reviews/export`, `AccessReview:Read`). `GET /api/v1/me` (`rbac_enabled`) is only the cached view; it can lag on another replica and does not report the unconfirmed (degraded) state (#6033). Audited `rbac.enforcement_changed` — see
+audit row could not persist: treat the change as unconfirmed and check it with `GET /api/v1/rbac/enforcement` (above; it reports the unconfirmed state) or the access-review export's `rbac_enforcement` label (`GET /api/v1/access-reviews/export`, `AccessReview:Read`). `GET /api/v1/me` (`rbac_enabled`) is only the cached view; it can lag on another replica and does not report the unconfirmed (degraded) state. Audited `rbac.enforcement_changed` — see
 `docs/user-manual/audit-log.md`.
 
-There is no `GET` twin: this route's own response echoes the authoritative post-write value, and the access-review export's `rbac_enforcement` label (`enabled`, `disabled` or `degraded`; `GET /api/v1/access-reviews/export`, which also writes an `access_review.exported` audit row) is the strongest available read. It is still the serving replica's view (see the degrade-versus-outage note in `docs/user-manual/rbac.md`). `GET /api/v1/me` (`rbac_enabled`) is the cached view only: it can lag on another replica and does not report the degraded state (#6033).
+This route's own response echoes the authoritative post-write value. The read is `GET /api/v1/rbac/enforcement` (above), which reports the cached view and its unconfirmed state for any signed-in session; the access-review export's `rbac_enforcement` label (`enabled`, `disabled` or `degraded`; `GET /api/v1/access-reviews/export`, which also writes an `access_review.exported` audit row) is the stronger read for an auditor. Both are still the serving replica's view (see the degrade-versus-outage note in `docs/user-manual/rbac.md`). `GET /api/v1/me` (`rbac_enabled`) is the cached view only: it can lag on another replica and does not report the degraded state.
 
 MCP twin: `set_rbac_enforcement` — see `docs/user-manual/mcp.md`.
 

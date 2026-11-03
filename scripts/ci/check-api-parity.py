@@ -477,8 +477,8 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 #
 # 227 (origin/dev) -> 228 (Users and roles page): GET /fragments/access/enforcement has only the REST twin
 # GET /api/v1/me, which omits the unconfirmed (degraded) bit (`twinned-rest-only`). The MCP tool
-# get_me is the twin of the raw flag only, so this row still needs the degraded-bit read tracked in
-# #6033.
+# get_me is the twin of the raw flag only, so this row needed the degraded-bit read tracked in
+# #6033 (since delivered: see the 212 -> 211 line below).
 #
 # 228 -> 225 (Seam PR2): the three hardware rows (get.fragments-hardware-list, -hardware-ci,
 # -hardware-quarantine) gained MCP twins (list_hardware_ci, get_hardware_ci, list_quarantined_devices).
@@ -495,7 +495,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # (GET/PUT /api/v1/config and the MCP tools get_runtime_config / set_runtime_config).
 # 213 -> 212 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me flipped from planned to twinned
 # (GET /api/v1/me + the get_me MCP tool).
-BASELINE_UNTWINNED = 212
+# 212 -> 211 (enforcement read twins, ADR-1005 2026-11-03 entry): get.fragments-access-enforcement flipped from
+# `twinned-rest-only` to `twinned` (GET /api/v1/rbac/enforcement + the get_rbac_enforcement MCP tool, #6033).
+BASELINE_UNTWINNED = 211
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -2363,7 +2365,7 @@ GATE_PARITY_KNOWN_MISMATCHES = {
 # holds no gate call this script recognises (owner-only reads that call auth_fn alone, helper
 # gates such as sw_admit, member-function gates) cannot be compared, so it fails closed unless it
 # is named here.
-GATE_PARITY_NO_GATE_MAX = 13
+GATE_PARITY_NO_GATE_MAX = 14
 GATE_PARITY_NO_GATE_ALLOWED = {
     ("DELETE", "/api/v1/result-sets/{param}", "delete_result_set"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
@@ -2386,6 +2388,13 @@ GATE_PARITY_NO_GATE_ALLOWED = {
         "`denied`, a documented asymmetry; an explicit self-only service-scope policy is a "
         "follow-up recorded as exception:#6432 revisit:2026-11-30, confirmed "
         "by the ADR owner (ADR-1005 2026-10-24 entry)"),
+    ("GET", "/api/v1/rbac/enforcement", "get_rbac_enforcement"): (
+        "session-only for parity with its HTML fragment and GET /api/v1/me: the route calls auth_fn "
+        "behind a service-scope refusal and holds no RBAC gate call, because a "
+        "perm_fn(Infrastructure, Read) gate would make the machine twin stricter than its fragment "
+        "and invent an authority the route does not have. The RBAC store is the data the route "
+        "reads, not its gate; the tool is gated at Infrastructure:Read for the MCP tier ladder and "
+        "the default-denied service-scope class only (ADR-1005 2026-11-03 entry)"),
     ("GET", "/api/v1/result-sets", "list_result_sets"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
         "call (result-set precedent)"),

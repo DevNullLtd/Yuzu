@@ -18,6 +18,8 @@ curl -s -b cookies.txt -X PUT \
   -d '{"enabled": true}'
 ```
 
+To read the current setting, any signed-in session may call `GET /api/v1/rbac/enforcement` (or the `get_rbac_enforcement` MCP tool). It returns `enabled` (this replica's cached view of the switch), `unconfirmed` (that view could not be re-confirmed; enforcement is treated as on until it can be) and an advisory `administrator` verdict (`may`, `may_not` or `unconfirmed`) on whether your own credential could change it. The verdict is computed from the durable stores independently of the other two fields, so `unconfirmed: true` with `administrator: "may"` is possible; `may` means the administration routes would admit your durable authority now, and it does not promise the toggle succeeds (REST MFA step-up, the MCP tier and approval ladder, and the `409` destination check below are outside it). A readonly-tier MCP administrator reads `may` and `set_rbac_enforcement` still refuses it. On REST an MCP-tier token reads `may_not`: that credential cannot administer RBAC through REST, which says nothing about its owner's roles. The value is a per-replica cached view, so a replica that never observed an enable can read `enabled: false, unconfirmed: false` while another replica enforces; for an auditor, the access-review export's `rbac_enforcement` label is the stronger read. The route is session-only (it is not RBAC-gated, like `GET /api/v1/me`), refuses a service-scoped token, returns nothing about other principals, and audits each successful read as `rbac.enforcement.read` on a deployment with a wired audit sink (REST fails closed with `503` and `Sec-Audit-Failed` when that row cannot be saved).
+
 A call authorised by a session cookie must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`); without one, or with one naming another site, it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers need no header. The same rule applies to the two role-assignment routes under "Fleet-Wide Role Assignment" below.
 
 The toggle refuses unless the **calling operator** passes BOTH of the following: a `403` unless they hold authority under the regime that is durably true **right now** (the SOURCE regime — this closes a cross-replica cache-staleness gap in the outer admin gate itself, see below), and a `409` unless they would remain a durable administrator under the **destination** regime after the switch — it never gambles with a lockout.
@@ -530,7 +532,7 @@ Settings uses, so the two stay equivalent.
   persist, the page says so and waits for you to choose to continue instead of redirecting at once.
   "Sign out all other sessions" is shown as not available yet.
 - **Turning enforcement on or off.** The **RBAC enforcement** panel shows the current setting to
-  every signed-in user (the cached view that `GET /api/v1/me` reports as `rbac_enabled`, plus an unconfirmed state that `/me` cannot show) and gives a durable
+  every signed-in user (the cached view that `GET /api/v1/me` reports as `rbac_enabled`, plus an unconfirmed state that `/me` cannot show; `GET /api/v1/rbac/enforcement` returns both) and gives a durable
   Administrator (the same check as above) an **Enforce roles** switch. For anyone else the switch is disabled with
   "Only a durable Administrator can change this."; when the authority check cannot be answered it is disabled
   with "Your administrator authority could not be confirmed. Reload to try again." The switch always shows what the server holds: clicking it
@@ -551,7 +553,8 @@ Settings uses, so the two stay equivalent.
      an active local administrator account (the check reads the RBAC store for the regime and
      the authentication database for the account). The RBAC enforcement panel shows which
      regime applies; `rbac_enabled` in `GET /api/v1/me` is the server's cached view of the
-     switch, can lag a change, and does not report the could-not-confirm state.
+     switch, can lag a change, and does not report the could-not-confirm state;
+     `GET /api/v1/rbac/enforcement` reports that state and the same advisory `administrator` verdict the page draws the switch from.
   2. Enforcement is on and the account does not hold the fleet-wide `Administrator` grant, as
      with an account administrator created after RBAC was enabled. Another Administrator assigns
      it. The affected account often cannot read the Role assignments panel itself (it needs
@@ -1107,6 +1110,7 @@ Assign this role alongside any other roles. Because deny overrides allow, the us
 | `DELETE` | `/api/v1/rbac/roles/{name}` | Delete a custom role | Planned |
 | `POST` | `/api/v1/rbac/roles/{name}/assignments` | Assign one of the 7 non-`ITServiceOwner` built-in roles to a human user, fleet-wide (A2) | Implemented |
 | `DELETE` | `/api/v1/rbac/roles/{name}/assignments/{principal_id}` | Unassign a fleet-wide role from a human user (A2) | Implemented |
+| `GET` | `/api/v1/rbac/enforcement` | Read the enforcement state (cached view, unconfirmed bit) and the caller's advisory administrator verdict; any signed-in session (#6033) | Implemented |
 | `PUT` | `/api/v1/rbac/enforcement` | Enable or disable RBAC enforcement fleet-wide (A1) | Implemented |
 | `GET` | `/api/v1/rbac/roles/assignments` | Fleet-wide "who currently holds which role" — the complete grant table, gated `AccessReview:Read` (see the securable table below) | Implemented |
 

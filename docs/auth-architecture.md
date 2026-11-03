@@ -3684,6 +3684,53 @@ only when a change cannot be expressed as an idempotent additive re-seed
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
 
+## Enforcement-state read (#6033)
+
+`GET /api/v1/rbac/enforcement` and the MCP tool `get_rbac_enforcement` are the machine twins of
+the enforcement fragment (`GET /fragments/access/enforcement`). Both call ONE builder,
+`read_rbac_enforcement` (`rbac_enforcement_read.hpp`), and return `enabled`, `unconfirmed` and
+an advisory `administrator` verdict (`may`, `may_not`, `unconfirmed`); the MCP tool adds
+`audit_persisted`.
+
+- **Two independent groups.** `enabled`/`unconfirmed` are the serving replica's cached view
+  (`is_rbac_enabled()` and `rbac_enabled_view_degraded()`, read through the two display accessors
+  only, never `rbac_enforcement_label()`, which routed clause 4 of the A2/A1 row reserves).
+  `administrator` is `rbac_admin_hint` on the caller's own surface (`kRest` for the route, `kMcp`
+  for the tool; the surface has no default, clause 5), read from the durable stores. The hint
+  now has two production callers, the `rbac_admin_hint_fn` wiring in `server.cpp` and
+  `read_rbac_enforcement`; the read consumes the answer and changes no admission input of either
+  function. The HTML fragment's habit of skipping the hint when the view is degraded is a
+  rendering decision and is deliberately not copied: `administrator` is never forced to
+  `unconfirmed` because the view is degraded.
+- **Advisory, not a promise.** `may` means the RBAC administration routes would admit this
+  credential's durable authority now. It excludes REST MFA step-up, the MCP tier and approval
+  ladder (a readonly-tier administrator reads `may` on MCP and `set_rbac_enforcement` still
+  refuses it), and the enforcement PUT's destination-regime `409`. On REST an MCP-tier token reads
+  `may_not` because the predicate denies it structurally on `kRest`: "this credential cannot
+  administer RBAC through REST", not "its owner lacks Administrator". The REST route does not add
+  `deny_mcp_token_session` or `deny_engine_session` to a read that discloses nothing about
+  anyone else.
+- **Gate (owner ruling, ADR-1005 2026-11-03 entry).** The REST route is session-only (`auth_fn`),
+  with no `perm_fn`, for parity with its fragment and `GET /api/v1/me`: a
+  `perm_fn(Infrastructure, Read)` gate would make the machine twin stricter than the fragment
+  and invent an authority the route does not have. It is therefore not RBAC-gated, the same
+  class as `GET /api/v1/me` and `POST /api/v1/rbac/check`, and is recorded as one
+  `GATE_PARITY_NO_GATE_ALLOWED` entry. A service-scoped token is refused on both transports
+  (REST `deny_fleet_wide_service_scoped` with no permission named, per clause 5 of the
+  service-scope row; MCP `ServiceScopeClass` `denied`) and the pair is never added to
+  `kServiceScopeGlobalSafe`. Nothing about other principals is returned, so the topology floor
+  (`kTopologyFloor`) is not engaged.
+- **Audit.** Every successful read writes `rbac.enforcement.read` with a server-derived detail
+  (`enabled=...; unconfirmed=...; administrator=...`) and nothing taken from the session. REST
+  fails closed (`503` plus `Sec-Audit-Failed`, body never sent); MCP also writes the generic
+  `mcp.get_rbac_enforcement` row, attempts both independently and reports
+  `audit_persisted:false` if either drops. An empty audit callback is audit-off and the read
+  succeeds, so "every read is audited" holds for a deployment with a wired sink. The null or
+  closed RBAC store `503` and a bare `401` write no row (matching the PUT and the fragment).
+- **Residual: a cached view.** A replica that never observed an enable can read
+  `enabled:false, unconfirmed:false` while another replica enforces, bounded by the stale-serve
+  window (#2703). The access-review export's `rbac_enforcement` label is the stronger read.
+
 ## Render-time permission probes (capability hints)
 
 Six `AuthRoutes` methods answer a permission question without writing a denial row for an

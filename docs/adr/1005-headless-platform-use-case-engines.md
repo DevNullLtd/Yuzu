@@ -1114,6 +1114,52 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      surface; the migration guide (`docs/user-manual/upgrading.md`) lists the
      old and new names. The ledger records the retirement because the policy
      requires it.
+   - **2026-11-03 - `GET /api/v1/rbac/enforcement` and `get_rbac_enforcement`:
+     the machine twins of the enforcement fragment, session-only, and one
+     `GATE_PARITY_NO_GATE_ALLOWED` entry (#6033). Ruled by the ADR owner in the
+     authoring session; like the entries above it is a session statement, not a
+     signed decision.** Four parts.
+     First, `get.fragments-access-enforcement` flips from `twinned-rest-only`
+     to `twinned` (untwinned 212 to 211; the live pin is in
+     `scripts/ci/check-api-parity.py`). Both twins return
+     `{enabled, unconfirmed, administrator}` (the MCP tool adds
+     `audit_persisted`): `enabled` and `unconfirmed` are this replica's cached
+     enforcement view and whether it could be re-confirmed, and
+     `administrator` (`may`, `may_not`, `unconfirmed`) is the advisory
+     administration hint on the caller's own surface, computed from the durable
+     stores independently of that view. Second, the REST route is
+     session-only: it calls `auth_fn`, refuses a service-scoped token, and
+     holds no `perm_fn` gate. The ground is parity with its HTML fragment and
+     with `GET /api/v1/me`, both session-only; a
+     `perm_fn(Infrastructure, Read)` gate would make the machine twin stricter
+     than the fragment and invent an authority the route does not have. The
+     RBAC store is the data the route reads, not its gate. The gate-parity check
+     therefore reads it as a route with no gate call it can read, and one
+     entry, `("GET", "/api/v1/rbac/enforcement", "get_rbac_enforcement")`, is
+     added to `GATE_PARITY_NO_GATE_ALLOWED` (`GATE_PARITY_NO_GATE_MAX` rises
+     from 13 to 14). The tool's `Infrastructure:Read` row drives MCP tier
+     classification and the default-denied service-scope class only; it is
+     never classified under `kServiceScopeGlobalSafe`. Third, the rejected
+     alternative: gating the route on `perm_fn(Infrastructure, Read)`. It was
+     rejected for the reason above. The earlier rationale that the route would
+     return 403 in exactly the window where `unconfirmed` is true is not a
+     ground: the two windows overlap but are not equal. Fourth, the residuals,
+     stated plainly:
+     (a) REST and MCP differ for an MCP-tier token. On REST it gets a 200 with
+     `administrator:"may_not"` (the predicate denies it structurally on the REST
+     surface), meaning "this credential cannot administer RBAC through REST";
+     on MCP the tier ladder governs it, and a readonly-tier administrator reads
+     `may` and is still refused by `set_rbac_enforcement`.
+     (b) The view is cached per replica: a replica that never observed an enable
+     can read `enabled:false, unconfirmed:false` while another replica
+     enforces, bounded by the stale-serve window (#2703).
+     (c) The REST route is not RBAC-gated, the same class as `GET /api/v1/me`
+     and `POST /api/v1/rbac/check`.
+     (d) "Audit every read" means every read on a deployment with a wired audit
+     sink: REST fails closed on an audit-write failure (503 with
+     `Sec-Audit-Failed`, body never sent), MCP reports `audit_persisted:false`,
+     and an empty audit callback is audit-off. The null or closed RBAC store 503
+     and a bare 401 write no audit row, matching the PUT and the fragment.
 
 ## Interim rules (until the named follow-ups ship)
 
