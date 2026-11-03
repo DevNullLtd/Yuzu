@@ -93,6 +93,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -200,17 +201,28 @@ inline constexpr std::size_t kCampaignIdMaxLen = 64;
 inline constexpr std::string_view kCampaignIdInvalidMessage =
     "campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -";
 
-/// Longest `principal_type` / `principal_id` and `role_name` an attestation names, in bytes. A
-/// frozen grant is read from the role and engine stores, whose ids are far shorter; the cap bounds
-/// what a caller can make an audit row (and a log line) carry before any existence proof.
-inline constexpr std::size_t kPrincipalIdMaxLen = 256;
-inline constexpr std::size_t kRoleNameMaxLen = 256;
+/// Longest `principal_type` / `principal_id` and `role_name` an attestation names, in bytes. The
+/// cap bounds what a caller can make an audit row (and a log line) carry before any existence proof,
+/// and must still admit every grant the stores can freeze: an OIDC principal is
+/// `oidc:<iss>#<sub>` with `iss` and `sub` each capped at 255 bytes by `oidc_provider.cpp` (about
+/// 516 bytes), a SAML principal caps each component the same way, and an IdP group is stored as
+/// `<source>:<external_id>` with an external id up to 512 bytes (`kMaxExternalIdLength` in
+/// `rbac_store.cpp`). `RbacStore::create_role` and the engine principal id carry no length cap of
+/// their own, so 1024 is a bound on what is attestable, not a proven upper bound of every store.
+/// A row carries at most three such fields (`audit_token` neutralises bytes but does not shorten
+/// them), so an audit row stays under about 3.3 KiB.
+inline constexpr std::size_t kPrincipalIdMaxLen = 1024;
+inline constexpr std::size_t kRoleNameMaxLen = 1024;
 
 /// The refusal text REST (400) and MCP (invalid-params) return for an attestation grant field that
 /// is over its cap or holds a NUL byte, so the two transports (and the store backstop, which
-/// prefixes `bad_request: `) cannot drift. An EMPTY field keeps its own "required" refusal.
+/// prefixes `bad_request: `) cannot drift. An EMPTY field keeps its own "required" refusal. The
+/// number is spelled out in the text, so the `static_assert`s below pin it to the constants:
+/// change the text and the asserts together with `kPrincipalIdMaxLen`/`kRoleNameMaxLen`.
 inline constexpr std::string_view kGrantFieldInvalidMessage =
-    "principal_type, principal_id and role_name must be 1-256 bytes without NUL";
+    "principal_type, principal_id and role_name must be 1-1024 bytes without NUL";
+static_assert(kPrincipalIdMaxLen == 1024 && kRoleNameMaxLen == 1024,
+              "kGrantFieldInvalidMessage spells out 1024: update the text with the constants");
 
 /// Most decisions one grant keeps. `record_attestation` refuses the next one (`bad_request:` +
 /// `kDecisionCapMessage`, nothing written) and `get_campaign(id, true)` returns at most this many
@@ -220,10 +232,29 @@ inline constexpr std::string_view kGrantFieldInvalidMessage =
 inline constexpr std::int32_t kMaxDecisionsPerGrant = 100;
 
 /// The refusal text REST (400) and MCP (invalid-params) return for a decision past the cap, so the
-/// two transports (and the store, which prefixes `bad_request: `) cannot drift.
+/// two transports (and the store, which prefixes `bad_request: `; the handlers strip that prefix
+/// for this one refusal) cannot drift. It spells out 100, pinned below.
 inline constexpr std::string_view kDecisionCapMessage =
-    "this grant already has the maximum number of recorded decisions (100); a further decision "
-    "cannot be recorded";
+    "this grant already has the maximum number of recorded decisions (100) in this campaign; no "
+    "further decision can be recorded on it. Close the campaign and open a new one to review it "
+    "again. If an earlier attempt may have been recorded, read the campaign first";
+static_assert(kMaxDecisionsPerGrant == 100,
+              "kDecisionCapMessage spells out 100: update the text with the constant");
+
+/// The `bad_request: ` prefix the store puts on a refusal it classifies as the caller's.
+inline constexpr std::string_view kBadRequestPrefix = "bad_request: ";
+
+/// The wire text of the cap refusal: the store's `bad_request: <kDecisionCapMessage>` without the
+/// classification prefix, or `nullopt` for any other store error. Exact match, so no other
+/// `bad_request:` string changes behaviour.
+[[nodiscard]] inline std::optional<std::string_view>
+decision_cap_wire_message(std::string_view store_error) noexcept {
+    if (store_error.size() == kBadRequestPrefix.size() + kDecisionCapMessage.size() &&
+        store_error.starts_with(kBadRequestPrefix) &&
+        store_error.substr(kBadRequestPrefix.size()) == kDecisionCapMessage)
+        return kDecisionCapMessage;
+    return std::nullopt;
+}
 
 /// True when `principal_type`, `principal_id` and `role_name` are each within their cap and free of
 /// a NUL byte (emptiness is the caller's own check). `pg/pg_exec.hpp` binds `c_str()`, so a NUL

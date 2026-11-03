@@ -4352,7 +4352,10 @@ number of entries means earlier ones are not shown (the write cap keeps a grant 
 or under 100, so this appears only if rows were added or removed by other means).
 The Settings campaign fragment shows the latest decision only and has
 no marker for earlier ones; that difference is intended. The Access page shows the
-latest decision with a marker and the earlier ones behind a disclosure. The marker
+latest decision with a marker and the earlier ones behind a disclosure; when the
+grant has more recorded decisions than are listed, the disclosure starts with the
+line "N earlier decisions are not shown" ("1 earlier decision is not shown" for
+one). The marker
 reads "re-recorded" when every later entry repeats the one before it exactly (the
 same decision, reviewer and justification), which is what a retry after an
 unacknowledged commit produces (see `POST .../attestations` below), and
@@ -4394,8 +4397,8 @@ gate, so a caller without the permission still gets the `403`.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `principal_type` | string | Yes | `user` \| `group` \| `engine` |
-| `principal_id` | string | Yes | Principal identifier, 1 to 256 bytes, no NUL byte |
-| `role_name` | string | Yes | Role being reviewed, 1 to 256 bytes, no NUL byte |
+| `principal_id` | string | Yes | Principal identifier, 1 to 1024 bytes, no NUL byte |
+| `role_name` | string | Yes | Role being reviewed, 1 to 1024 bytes, no NUL byte |
 | `decision` | string | Yes | `attested` \| `flagged_revoke` |
 | `justification` | string | No | Free-text reviewer note, at most 4096 bytes. It is kept with the decision and the application never deletes it: do not enter personal data beyond what the review requires. |
 
@@ -4409,21 +4412,23 @@ flag ≠ revoke.
 `decision_seq` is this decision's position in the grant's history (`1` for the
 first) and `previous_decision` is the decision it replaced (`pending` for the
 first), so a reviewer working from a stale view can see that it replaced another
-decision. `400`: the campaign id is
-malformed (see the rule above), `principal_type`, `principal_id`, or
-`role_name` is missing, `decision` is neither `attested` nor
-`flagged_revoke`, `principal_type`, `principal_id` or `role_name` is longer than
-256 bytes or contains a NUL byte, `justification` is longer than 4096 bytes or
-contains a NUL byte (the justification bounds are checked by the store, after the
-separation-of-duties gate, and write a `failure` audit row), or the grant already holds the maximum of 100 recorded
-decisions (nothing is recorded). The grant-field `400` carries the message
-`principal_type, principal_id and role_name must be 1-256 bytes without NUL`. It is
-decided before any lookup, so it holds for all three principal types, and it writes
-no audit row (the schema `maxLength` values are discovery metadata; the handler
-enforces the limit). The decision-cap `400` carries the message `this grant already
-has the maximum number of recorded decisions (100); a further decision cannot be
-recorded`, is decided in the store, leaves the state unchanged and writes a
-`failure` audit row. `403`
+decision. `400`, one cause each:
+
+- The campaign id is malformed (see the rule above).
+- `principal_type`, `principal_id` or `role_name` is missing, or `decision` is neither `attested` nor
+  `flagged_revoke`.
+- `principal_type`, `principal_id` or `role_name` is longer than 1024 bytes or contains a NUL byte. The
+  message is `principal_type, principal_id and role_name must be 1-1024 bytes without NUL`. It is decided
+  before any lookup, so it holds for all three principal types, and it writes no audit row (the schema
+  `maxLength` values are discovery metadata; the handler enforces the limit).
+- `justification` is longer than 4096 bytes or contains a NUL byte. The store checks this after the
+  separation-of-duties gate and writes a `failure` audit row.
+- The grant already holds the maximum of 100 recorded decisions. The message is
+  `this grant already has the maximum number of recorded decisions (100) in this campaign; no further decision can be recorded on it. Close the campaign and open a new one to review it again. If an earlier attempt may have been recorded, read the campaign first`,
+  with no `bad_request:` prefix. It is decided in the store, leaves the state unchanged and writes a
+  `failure` audit row.
+
+Other statuses: `403`
 without `AccessReview:Attest` (or an engine-classed caller), for a browser
 (session-cookie) request that carries no `Origin`/`Referer` naming this site
 (audited as `csrf.denied`; API-token callers are exempt), or because the reviewer
@@ -4452,7 +4457,7 @@ attest, so an owner who transferred an engine, or a member who left a group, bef
 attesting is admitted. Engine ownership is a live read. Group membership is read
 from Yuzu's stored membership, which an identity provider updates only when that
 member signs in: a change at the identity provider is not seen by the group rule
-until then (the session lifetime, not milliseconds), and a sign-in whose token
+until that member next signs in interactively (a long-lived API or MCP token can outlast it), and a sign-in whose token
 skips the membership refresh (for example an Entra groups-overage token) does not
 refresh it. For identity-provider-governed groups the group rule is therefore not
 a current-membership check; review those groups at the identity provider when the
@@ -4466,7 +4471,10 @@ appended to the grant's history at the next `seq`, with the decision it replaced
 Only the grant's current decision, reviewer and justification are replaced, and
 a grant cannot return to `pending`. An identical repeat is appended too, as a new
 entry. `decision_seq` in the `GET /api/v1/access-reviews/{id}` response shows how
-many decisions the grant has. `record_attestation`'s MCP `destructiveHint` stays
+many decisions the grant has. A grant keeps at most 100: the 100th decision is
+final, and no further decision is accepted on that grant in that campaign. The
+history and the audit rows identify who wrote the entries. To review the grant
+again, close the campaign and open a new one, which freezes a fresh population. `record_attestation`'s MCP `destructiveHint` stays
 `true` because the current decision is replaced with no route back to pending; the
 earlier one is retained in the history.
 
@@ -4476,7 +4484,9 @@ cannot tell whether it was recorded and answers a write failure (`503`). Before
 retrying, `GET /api/v1/access-reviews/{id}`, compare `decision_seq` with the value
 you last saw and look for your own entry (match `reviewer`, `justification` and
 `decided_at_ms`). A blind retry after an unacknowledged commit appends an identical
-decision at the next `seq`; it is kept and visible, never an error. The first
+decision at the next `seq`; it is kept and visible, never an error, until the
+grant reaches its limit of 100 decisions, after which the request is refused (read
+the campaign first if your earlier attempt may have been recorded). The first
 attempt writes a `failure` audit row, so an auditor sees a failure row next to a
 committed decision. There is no idempotency key.
 
@@ -4504,7 +4514,9 @@ separately countable/alertable, not one verb with a buried field. Every row of
 these two verbs for an outcome that reaches the gate or the store has
 `target_id=<campaign_id>` alone and the grant in the detail as
 `principal_type=<t> principal_id=<id> role=<role>`; the refusal of an engine session
-and the `415` refusal carry an empty `target_id`. Each value is passed through the
+and the `415` refusal carry an empty `target_id`. On the REST route the engine-session
+refusal writes that row; on the MCP twin it writes only the `mcp.record_attestation`
+wrapper row and no `access_review.*` row. Each value is passed through the
 audit token filter, which folds spaces and a few separators, so two grants whose ids
 fold to the same text cannot be told apart in a row, a success row included. A
 success row also carries `seq`, which numbers the decisions of one grant: with the
@@ -4569,7 +4581,9 @@ Audited as `access_review.closed`.
 
 Every `access_review.*` verb above additionally records `result=denied`
 (`detail="engine_session_denied"`) when the caller's own session is
-engine-classed — see the "Engine-session denial" note above.
+engine-classed on a REST route — see the "Engine-session denial" note above. An
+engine session refused by an MCP twin writes only the `mcp.<tool>` wrapper row and no
+`access_review.*` row.
 The Settings Access reviews fragments (`GET /fragments/settings/access-reviews` and its
 `/campaign` view) write the same denied rows, under `access_review.list` and
 `access_review.get`, with an empty `target_id`.

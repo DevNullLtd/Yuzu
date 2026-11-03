@@ -3753,7 +3753,14 @@ topology floor" above); `AccessReview:Attest` is admin-only through the legacy r
    a separate, explicit, separately reviewed decision. The per-grant decision history
    (`access_review_attestation_history`) is append-only against the application path by a database guard, with
    the limits stated under "The decision history" below. It is not owner-proof. Nothing prunes it, so growth is
-   bounded only by the per-grant limit of 100 decisions; avoid scripted re-attest loops.
+   bounded only by the per-grant limit of 100 decisions; avoid scripted re-attest loops. Personal-data
+   redaction has no application path: it is a database-administrator procedure that must cover the state row's
+   latest reviewer and justification, the history rows, the subject id (part of a primary key and of a
+   restricted foreign key, so redacting key columns is not feasible without rewriting keys and the frozen
+   snapshot), the campaign's `created_by` and `closed_by`, and the audit rows (kept for the audit retention
+   period); "re-verify" means checking that the guard triggers are enabled again and that the consistency
+   trigger holds. The procedure has not been exercised (SOC 2 data-inventory row in
+   `docs/enterprise-readiness-soc2-first-customer.md`).
 5. **The reviewer must differ from the subject of the grant (#4752).** The rules, the window and the residuals
    are under "Separation of duties" below. Every decision is appended with the value it replaced, never
    overwritten, and REST and MCP share one refusal helper, `server/core/src/access_review_attest_gate.hpp`.
@@ -3806,7 +3813,7 @@ member who left a group, before attesting is admitted. Engine ownership is a liv
 (`EnginePrincipalStore::get` selects the current row). Group membership is read from Yuzu's stored membership
 (`rbac_store.group_members`), which an identity provider updates only when that member signs in (the Entra and
 SAML login paths call `reconcile_idp_memberships`). A change at the identity provider is not seen by the group
-rule until then, which is the session lifetime, not milliseconds, and a sign-in whose token skips the
+rule until that member next signs in interactively (a long-lived API or MCP token can outlast it), and a sign-in whose token skips the
 membership refresh (for example an Entra groups-overage token) does not refresh it. For identity-provider-
 governed groups the rule is therefore not a current-membership check. The compensating step is a review of
 those groups at the identity provider at campaign close.
@@ -3814,7 +3821,9 @@ those groups at the identity provider at campaign close.
 **Evidence of independence for engine and group grants.** For these two types the history row does not record
 the ownership or membership basis. Independence is evidenced by the `sod=pass` audit row, which is written
 set-and-proceed and kept for the audit retention period, so export audit rows to the evidence store within
-that period. Recording the basis in the history row is tracked under #6060.
+that period. If that row was not persisted (`audit_persisted:false` on MCP, `Sec-Audit-Failed` on REST), an
+assessor should treat that grant's independence as unevidenced. Recording the basis in the history row is
+tracked under #6060.
 
 **Two identities of one person.** `Session::username` is the stable principal (a local name, `oidc:<iss>#<sub>`
 or `saml:...`; a token session carries its owner's). A person who holds a local account and an SSO identity, or
@@ -3850,21 +3859,30 @@ triggers protect the frozen grants, the decisions and the history. The campaign 
 campaign, so a database credential holder can reopen one. The independent evidence is the audit store and its
 export, not this table.
 
-**Bounds.** `principal_type`, `principal_id` and `role_name` are 1 to 256 bytes without a NUL byte and
+**Bounds.** `principal_type`, `principal_id` and `role_name` are 1 to 1024 bytes without a NUL byte (the
+longest ids the identity stores produce are about 520 bytes: `oidc:<iss>#<sub>` with each part capped at 255,
+and an IdP group `<source>:<external_id>` with an external id of up to 512) and
 `justification` is at most 4096 bytes. The REST and MCP handlers enforce the grant-field limit before the gate
-(a `400` / invalid-params with the message `principal_type, principal_id and role_name must be 1-256 bytes
+(a `400` / invalid-params with the message `principal_type, principal_id and role_name must be 1-1024 bytes
 without NUL`, no audit row, and the same for all three grant types because it is decided before any lookup),
 and the store checks it again as a backstop; the schema `maxLength` values are discovery metadata only. A grant
 keeps at most 100 decisions: the 101st is refused inside the transaction with `400` / invalid-params and the
-message `this grant already has the maximum number of recorded decisions (100); a further decision cannot be
-recorded`, nothing is written, and a `failure` audit row is written. A history read returns at most the latest
+message `this grant already has the maximum number of recorded decisions (100) in this campaign; no further
+decision can be recorded on it. Close the campaign and open a new one to review it again. If an earlier attempt
+may have been recorded, read the campaign first` (the store returns it with a `bad_request: ` classification
+prefix that the handlers strip, so it is not on the wire), nothing is written, and a `failure` audit row is
+written. The 100th decision is final: the grant takes no further decision in that campaign, the history and
+the audit rows identify who wrote the entries, and the remedy is to close the campaign and open a new one (a
+new campaign freezes a fresh population). A history read returns at most the latest
 100 entries of a grant; `decision_seq` stays the total, so `decision_seq` greater than the number of entries
 means earlier ones are not shown. A successful attest answers `{recorded, decision_seq, previous_decision}`.
 
 **Lost COMMIT.** One history event is one committed decision transaction. When the connection drops after
 COMMIT was sent, the server cannot tell whether the decision was recorded and answers a write failure (503 on
 REST). Before retrying, GET the campaign and compare `decision_seq`. A retry after an unacknowledged commit
-appends an identical decision at seq+1; it is kept and visible, never an error. The first attempt writes a
+appends an identical decision at seq+1; it is kept and visible, never an error, until the grant reaches its
+limit of 100 decisions, after which the request is refused (read the campaign first if your earlier attempt
+may have been recorded). The first attempt writes a
 `result=failure` audit row whose fixed text says the decision store is unavailable or the decision may not have
 been committed (`kStoreFailureMessage`), so an auditor sees a failure row next to a committed decision. To tell
 whether a decision landed, read the campaign, compare `decision_seq` with the value you last saw and match your

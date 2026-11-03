@@ -948,11 +948,13 @@ TEST_CASE("record_attestation refuses an empty reviewer and an over-long grant f
     CHECK(empty.error().starts_with("bad_request:"));
     CHECK(empty.error().find("reviewer") != std::string::npos);
 
-    // Each grant field is capped at 256 bytes; one more is bad_request with the shared text, and
-    // exactly 256 passes the bound (not_found: no such frozen grant).
+    // Each grant field is capped at 1024 bytes; one more is bad_request with the shared text, and
+    // exactly 1024 passes the bound (not_found: no such frozen grant).
+    REQUIRE(yuzu::server::kPrincipalIdMaxLen == 1024);
+    REQUIRE(yuzu::server::kRoleNameMaxLen == 1024);
     const std::string text = "bad_request: " + std::string(yuzu::server::kGrantFieldInvalidMessage);
-    const std::string over(257, 'a');
-    const std::string at_cap(256, 'a');
+    const std::string over(1025, 'a');
+    const std::string at_cap(1024, 'a');
     auto r1 = store.record_attestation(cid, "user", over, "Admin", "attested", "carol", "");
     REQUIRE_FALSE(r1.has_value());
     CHECK(r1.error() == text);
@@ -973,6 +975,46 @@ TEST_CASE("record_attestation refuses an empty reviewer and an over-long grant f
         CHECK(a.decision == "pending");
         CHECK(a.history.empty());
     }
+}
+
+TEST_CASE("record_attestation: a frozen grant with the longest ids the identity stores produce "
+          "can be attested, and exactly 1024 bytes is the limit",
+          "[access_review][store][pg][4752]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    // `oidc:<iss>#<sub>` at the 255-byte caps of oidc_provider.cpp (516 bytes), an IdP group
+    // `<source>:<external_id>` with a 512-byte external id (about 530), and a role name at the
+    // attestable limit.
+    const std::string oidc_id = "oidc:" + std::string(255, 'i') + "#" + std::string(255, 's');
+    const std::string group_id = "saml:" + std::string(525, 'g');
+    const std::string max_role(yuzu::server::kRoleNameMaxLen, 'r');
+    const std::string max_id(yuzu::server::kPrincipalIdMaxLen, 'p');
+    REQUIRE(oidc_id.size() == 516);
+    std::vector<GrantRef> grants = {
+        GrantRef{"user", oidc_id, "Operator", R"({"display_name":"sso"})"},
+        GrantRef{"group", group_id, max_role, R"({"display_name":"idp"})"},
+        GrantRef{"engine", max_id, "Writer", R"({"display_name":"max"})"},
+    };
+    auto open_res = store.open_campaign("Long ids", "admin", grants, "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    for (const auto& g : grants) {
+        INFO(g.principal_type);
+        auto r = store.record_attestation(cid, g.principal_type, g.principal_id, g.role_name,
+                                          "attested", "carol", "ok");
+        REQUIRE(r.has_value());
+        CHECK(r->seq == 1);
+    }
+    auto view = store.get_campaign(cid, /*include_history=*/true);
+    REQUIRE(view.has_value());
+    CHECK(view->pending_count == 0);
+    const auto* row = find_row(*view, "group", group_id, max_role);
+    REQUIRE(row != nullptr);
+    CHECK(row->history.size() == 1);
 }
 
 TEST_CASE("record_attestation caps justification at 4096 bytes",

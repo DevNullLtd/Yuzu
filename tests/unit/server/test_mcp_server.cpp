@@ -2487,7 +2487,9 @@ TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the app
                                "must differ from the subject of the grant",
                                "the reviewer must differ from the subject of this grant; ask another "
                                "reviewer to record this decision",
-                               "at most 256 bytes each and justification at most 4096 bytes",
+                               "at most 1024 bytes each and justification at most 4096 bytes",
+                               "the 100th is final",
+                               "until the grant reaches its limit of 100 decisions",
                                "at most 100 recorded decisions",
                                "refused with invalid params and records nothing",
                                "returns decision_seq",

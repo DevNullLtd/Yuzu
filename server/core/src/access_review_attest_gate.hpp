@@ -64,6 +64,7 @@
 #include "rest_audit.hpp" // try_persist_audit / emit_behavioral_audit
 #include "web_utils.hpp"  // audit_token, flatten_audit_text
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 
 #include <httplib.h>
@@ -161,8 +162,9 @@ inline constexpr std::string_view kStoreFailureRemediation =
 /// uses.
 inline constexpr std::int64_t kStoreFailureRetryMs = kSodUnavailableRetryMs;
 
-/// Longest slice of the raw store error written to the log.
-inline constexpr std::size_t kStoreFailureLogMaxBytes = 512;
+/// Longest slice of the raw store error handed to `log_key_token`, which itself shortens to its own
+/// cap (`kGuardianLogIdMaxBytes`, 256 bytes): the same number, so the line carries at most 256.
+inline constexpr std::size_t kStoreFailureLogMaxBytes = ::yuzu::kGuardianLogIdMaxBytes;
 
 /// Write the raw store error to the server log (bounded, control bytes neutralised so it cannot
 /// forge a log line). The campaign id is validated before the store is reached.
@@ -220,7 +222,7 @@ struct SodRefusal {
 /// The store's in-write refusal (`forbidden:`) is the user rule, caught after the gate: map it onto
 /// the same outcome so the wire answer is byte-identical. `nullopt` for any other store error.
 [[nodiscard]] inline std::optional<SodOutcome> sod_from_store_error(std::string_view err) {
-    if (err.starts_with("forbidden:"))
+    if (classify_store_error(err) == StoreErrorClass::kForbidden)
         return SodOutcome::kSelfSubject;
     return std::nullopt;
 }

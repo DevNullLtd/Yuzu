@@ -16,11 +16,14 @@ It also pins two properties of the attestation write path that no route test can
 
   4. Every `record_attestation(` caller outside the store runs `evaluate_attestation_sod(` first, in
      its own handler (today: the REST route and the MCP tool). A third caller without the gate would
-     let a reviewer decide a grant they own or belong to.
-  5. Every error string `AccessReviewStore` returns is either one of the three machine-checkable
-     prefixes the two classifiers key on, or a string recorded here as a genuine fault (503 /
-     internal-error). A new unprefixed client-validation string would otherwise be answered as a
-     retryable store failure. The REST and MCP classifiers must both delegate to the one shared
+     let a reviewer decide a grant they own or belong to. This is a source-text check: a helper
+     lambda placed after a gated handler, or `std::bind` / member-pointer use of the call, can
+     evade it. The exactly-two-callers assertion is the backstop for that.
+  5. Every error string `AccessReviewStore` returns as a DIRECT string literal after `unexpected(`
+     is either one of the three machine-checkable prefixes the two classifiers key on, or a string
+     recorded here as a genuine fault (503 / internal-error). A new unprefixed client-validation
+     string would otherwise be answered as a retryable store failure. A message built in a variable
+     (the decision-cap refusal) is outside this check; the classifier test covers it. The REST and MCP classifiers must both delegate to the one shared
      `classify_store_error` (a local copy is how they drift apart).
 
 Same method as test_access_audit_wiring_lexical.py (comments stripped, whitespace collapsed,

@@ -3445,23 +3445,26 @@ static const ToolDef kTools[] = {
      "principal the caller owns, or a group the caller belongs to is refused with a "
      "permission-denied result, 'the reviewer must differ from the subject of this grant; ask "
      "another reviewer to record this decision', and records nothing. principal_id and "
-     "role_name are at most 256 bytes each and justification at most 4096 bytes. Each grant "
-     "keeps at most 100 recorded decisions: a further one is refused with invalid params and "
-     "records nothing. A successful call returns decision_seq (this decision's position in the "
-     "grant's history, 1 for the first) and previous_decision (the decision it superseded, "
-     "'pending' for the first), so you can see when you replaced another reviewer's decision. "
+     "role_name are at most 1024 bytes each and justification at most 4096 bytes. Each grant "
+     "keeps at most 100 recorded decisions, the 100th is final: a further one is refused with "
+     "invalid params and records nothing, and the way to review that grant again is to close "
+     "the campaign and open a new one. A successful call returns decision_seq (this "
+     "decision's position in the grant's history, 1 for the first) and previous_decision "
+     "(the decision it superseded, 'pending' for the first), so you can see when you replaced "
+     "another reviewer's decision. "
      "An internal error that carries retry_after_ms can mean the decision was recorded anyway "
      "(a lost commit acknowledgement): before retrying, call get_access_review, compare "
      "decision_seq with the value you last saw and look for your own entry (match reviewer, "
      "justification and decided_at_ms), because a blind retry appends another identical "
-     "decision, which is kept and visible, not an error. Mirrors POST "
+     "decision, which is kept and visible, not an error, until the grant reaches its limit of "
+     "100 decisions, after which the request is refused. Mirrors POST "
      "/api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested or "
      "access_review.flagged (by decision). Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$"},)j"
      R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
-     R"j("principal_id":{"type":"string","minLength":1,"maxLength":256},)j"
-     R"j("role_name":{"type":"string","minLength":1,"maxLength":256},)j"
+     R"j("principal_id":{"type":"string","minLength":1,"maxLength":1024},)j"
+     R"j("role_name":{"type":"string","minLength":1,"maxLength":1024},)j"
      R"j("decision":{"type":"string","enum":["attested","flagged_revoke"]},)j"
      R"j("justification":{"type":"string","maxLength":4096})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
@@ -28484,9 +28487,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         audit_fn, req, audit_action, "failure", "AccessReview", campaign_id,
                         flatten_audit_text(rec_res.error()) + tuple_detail);
                     mcp_audit("failure", rec_res.error());
+                    // The cap refusal goes out without the store's `bad_request: ` classification
+                    // prefix; every other store refusal keeps the text it has always had.
+                    const std::string wire_text{
+                        decision_cap_wire_message(rec_res.error()).value_or(rec_res.error())};
                     res.set_content(
                         error_response(id, mcp_error_for_access_review_msg(rec_res.error()),
-                                       rec_res.error(),
+                                       wire_text,
                                        denied_audit_ok
                                            ? std::string_view{}
                                            : std::string_view{R"({"audit_persisted":false})"}),

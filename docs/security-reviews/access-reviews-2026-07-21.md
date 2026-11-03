@@ -482,9 +482,10 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
   `GET /api/v1/access-reviews/{id}` and `get_access_review` return `decision_seq` and `history`.
   `record_attestation` keeps `destructiveHint:true`, now because the current decision is replaced
   with no route back to `pending`, not because the earlier decision is lost.
-- Input bounds: `principal_type`, `principal_id` and `role_name` are 1 to 256 bytes without NUL
-  and `justification` is at most 4096 bytes; a grant keeps at most 100 decisions (the 101st is
-  refused with `400`, nothing written) and a history read returns at most the latest 100 entries
+- Input bounds: `principal_type`, `principal_id` and `role_name` are 1 to 1024 bytes without NUL
+  and `justification` is at most 4096 bytes; a grant keeps at most 100 decisions (the 100th is
+  final: the 101st is refused with `400`, nothing written, and the grant can be reviewed again
+  only in a new campaign, which freezes a fresh population) and a history read returns at most the latest 100 entries
   of a grant. A success answers `{recorded, decision_seq, previous_decision}`.
 - Audit shape: `target_id` is the campaign id alone and the grant is in `detail`, for every
   outcome that reaches the gate or the store (the refusal of an engine session and the
@@ -505,7 +506,8 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
    under epic #6060. Separately, both reads see the state at the moment of the attest: engine
    ownership is a live read, but group membership is read from Yuzu's stored membership, which an
    identity provider updates only when that member signs in. A change at the identity provider is
-   not seen until then (the session lifetime, not milliseconds), and a token that skips the
+   not seen until that member next signs in interactively (a long-lived API or MCP token can
+   outlast it), and a token that skips the
    membership refresh (for example Entra groups-overage) is not refreshed. For
    identity-provider-governed groups the rule is therefore not a current-membership check; a
    review of those groups at the identity provider at campaign close is the compensating step.
@@ -513,7 +515,9 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
    admitted. For engine and group grants the history row does not record the ownership or
    membership basis: independence is evidenced by the `sod=pass` audit row (set-and-proceed, kept
    for the audit retention period), so export audit rows to the evidence store within that
-   period. Recording the basis in the history row is tracked under #6060.
+   period; if that row was not persisted (`audit_persisted:false` on MCP, `Sec-Audit-Failed` on
+   REST), treat that grant's independence as unevidenced. Recording the basis in the history
+   row is tracked under #6060.
 2. The history is append-only against the application path and ordinary SQL (triggers, `RESTRICT`
    keys and a deferred consistency check), not against the application's database credential, a
    role granted TRUNCATE, or a database administrator. A data-only restore into a migrated schema
@@ -521,7 +525,13 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
    independent evidence. The guard triggers protect the frozen grants, the decisions and the
    history; the campaign row (status, `closed_at_ms`, `closed_by`, title) is protected by the
    application only, which refuses further decisions on a closed campaign, so a database
-   credential holder can reopen a closed campaign.
+   credential holder can reopen a closed campaign. Personal-data redaction has no application
+   path. It is a database-administrator procedure that must cover the state row's latest reviewer
+   and justification, the history rows, the subject id (part of a primary key and of a restricted
+   foreign key, so redacting key columns is not feasible without rewriting keys and the frozen
+   snapshot), the campaign's `created_by` and `closed_by`, and the audit rows (kept for the audit
+   retention period); "re-verify" means checking that the guard triggers are enabled again and
+   that the consistency trigger holds. The procedure has not been exercised.
 3. A person with two identities (a local account and an SSO identity) counts as two reviewers (the
    accepted exception in `docs/enterprise-readiness-soc2-first-customer.md`).
 4. Every attestation audit row records the grant through the audit token filter, which folds
@@ -531,7 +541,8 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
    subject to that folding.
 5. The decision is committed before its audit row is written, and a failed audit write never undoes
    it. After a dropped connection the outcome of an attestation can be unknown: read the campaign
-   and compare `decision_seq` before retrying; a retry appends an identical decision.
+   and compare `decision_seq` before retrying; a retry appends an identical decision until the
+   grant reaches its limit of 100 decisions, after which the request is refused.
 6. Under a continuous stream of attestations a `close` can wait up to the pool's lock timeout and
    answer `503`; retry it.
 

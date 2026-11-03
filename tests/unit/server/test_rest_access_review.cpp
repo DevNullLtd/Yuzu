@@ -2807,8 +2807,8 @@ TEST_CASE("attestation bounds: an over-long or NUL-bearing principal_type, princ
     h.session_user = "carol";
     h.audit_log.clear();
 
-    const std::string max_id(256, 'a');
-    const std::string long_id(257, 'a');
+    const std::string max_id(yuzu::server::kPrincipalIdMaxLen, 'a');
+    const std::string long_id(yuzu::server::kPrincipalIdMaxLen + 1, 'a');
     const std::string nul_engine("engine:svc\0x", 12);
     const std::string nul_group("eng\0x", 5);
     struct Case {
@@ -2816,10 +2816,10 @@ TEST_CASE("attestation bounds: an over-long or NUL-bearing principal_type, princ
         std::string type, id, role;
     };
     const std::vector<Case> cases = {
-        {"engine id over 256", "engine", long_id, "Writer"},
-        {"group id over 256", "group", long_id, "Reader"},
-        {"role over 256", "group", "eng", long_id},
-        {"type over 256", long_id, "eng", "Reader"},
+        {"engine id over 1024", "engine", long_id, "Writer"},
+        {"group id over 1024", "group", long_id, "Reader"},
+        {"role over 1024", "group", "eng", long_id},
+        {"type over 1024", long_id, "eng", "Reader"},
         {"engine id with NUL", "engine", nul_engine, "Writer"},
         {"group id with NUL", "group", nul_group, "Reader"},
         {"role with NUL", "group", "eng", std::string("Reader\0x", 8)},
@@ -2855,7 +2855,7 @@ TEST_CASE("attestation bounds: an over-long or NUL-bearing principal_type, princ
     CHECK(grant_row(h, cid, "group", "eng", "Reader").history.empty());
     CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer").history.empty());
 
-    // The boundary is inclusive: exactly 256 bytes passes the bound and reaches the store, which
+    // The boundary is inclusive: exactly 1024 bytes passes the bound and reaches the store, which
     // answers not_found for a grant that was never frozen (404 / invalid-params, not 400's text).
     auto at_cap = h.sink.Post(attest_url(cid), sod_body("group", max_id, "Reader"));
     REQUIRE(at_cap);
@@ -2863,6 +2863,54 @@ TEST_CASE("attestation bounds: an over-long or NUL-bearing principal_type, princ
     auto at_cap_role = h.sink.Post(attest_url(cid), sod_body("group", "eng", max_id));
     REQUIRE(at_cap_role);
     CHECK(at_cap_role->status == 404);
+}
+
+TEST_CASE("attestation bounds: a frozen grant with the longest ids the identity stores produce "
+          "can be attested on REST and MCP, and its audit rows stay bounded",
+          "[pg][access_review][rest][mcp][sod][4752]") {
+    AccessReviewHarness h;
+    // `oidc:<iss>#<sub>` with iss and sub at their 255-byte caps (oidc_provider.cpp): 516 bytes.
+    const std::string oidc_id = "oidc:" + std::string(255, 'i') + "#" + std::string(255, 's');
+    REQUIRE(oidc_id.size() == 516);
+    // An IdP group is `<source>:<external_id>` with an external id up to 512 bytes: about 530.
+    const std::string group_id = "oidc:" + std::string(525, 'g');
+    // A role name has no store-side cap; one well past the old 256-byte bound.
+    const std::string long_role(600, 'r');
+    REQUIRE(oidc_id.size() <= yuzu::server::kPrincipalIdMaxLen);
+    REQUIRE(group_id.size() <= yuzu::server::kPrincipalIdMaxLen);
+    REQUIRE(h.rbac->assign_role({"user", oidc_id, "Operator"}).has_value());
+    seed_group_grant(h, group_id, "bob", long_role);
+    const auto cid = h.open_campaign_rest("long ids");
+    // The grants really are frozen with these ids (the tuple is exactly what the page shows).
+    REQUIRE(grant_row(h, cid, "user", oidc_id, "Operator").decision == "pending");
+    REQUIRE(grant_row(h, cid, "group", group_id, long_role).decision == "pending");
+    h.session_user = "carol";
+    h.audit_log.clear();
+
+    auto rest_user = h.sink.Post(attest_url(cid), sod_body("user", oidc_id, "Operator"));
+    REQUIRE(rest_user);
+    CHECK(rest_user->status == 200);
+    auto rest_group = h.sink.Post(attest_url(cid), sod_body("group", group_id, long_role));
+    REQUIRE(rest_group);
+    CHECK(rest_group->status == 200);
+    auto mcp_group =
+        h.mcp_call_tool("record_attestation", sod_args(cid, "group", group_id, long_role));
+    REQUIRE(mcp_group);
+    CHECK(nlohmann::json::parse(mcp_group->body).contains("result"));
+
+    CHECK(grant_row(h, cid, "user", oidc_id, "Operator").decision == "attested");
+    CHECK(grant_row(h, cid, "group", group_id, long_role).decision_seq == 2);
+
+    // The audit rows carry the tuple through audit_token, which neutralises bytes but does not
+    // shorten, so a row is bounded by the three field caps plus its fixed labels: a few KiB.
+    const auto rows = audit_rows(h, "access_review.attested");
+    REQUIRE(rows.size() == 3);
+    const std::size_t bound = 2 * yuzu::server::kPrincipalIdMaxLen +
+                              yuzu::server::kRoleNameMaxLen + 256;
+    for (const auto& r : rows) {
+        CHECK(r.detail.size() > 600); // the long ids really are in the row
+        CHECK(r.detail.size() <= bound);
+    }
 }
 
 TEST_CASE("attestation store failure: REST and MCP answer a fixed message with a retry hint, log "
@@ -2941,9 +2989,10 @@ TEST_CASE("access review store errors: every string the store returns maps to on
           "one MCP code, through the shared classifier both transports delegate to",
           "[access_review][sod][classifier][4752]") {
     // Every error AccessReviewStore can return (access_review_store.cpp's unexpected( sites; the
-    // Python lexical gate fails when a site returns a string that is neither prefixed nor listed
-    // in its own table). Prefixed strings are client or business refusals; every other string is a
-    // genuine fault the caller did not cause.
+    // Python lexical gate checks the DIRECT string literals after `unexpected(` against its own
+    // table; a message built in a variable, like the decision-cap refusal, is covered below).
+    // Prefixed strings are client or business refusals; every other string is a genuine fault
+    // the caller did not cause.
     struct Row {
         const char* err;
         int http;
@@ -2968,9 +3017,6 @@ TEST_CASE("access review store errors: every string the store returns maps to on
         {"bad_request: reviewer cannot be empty", 400, kInvalidParams},
         {"bad_request: justification contains a NUL byte", 400, kInvalidParams},
         {"bad_request: justification exceeds 4096 bytes", 400, kInvalidParams},
-        {"bad_request: this grant already has the maximum number of recorded decisions (100); a "
-         "further decision cannot be recorded",
-         400, kInvalidParams},
         {"bad_request: closed_by contains a NUL byte", 400, kInvalidParams},
         {"forbidden: reviewer is the subject of this grant", 403, kPermissionDenied},
         {"database not open", 503, kInternalError},
@@ -3008,6 +3054,21 @@ TEST_CASE("access review store errors: every string the store returns maps to on
     // The user-rule refusal also maps onto the gate's own outcome (one wire answer, both paths).
     CHECK(
         sod::sod_from_store_error("forbidden: reviewer is the subject of this grant").has_value());
+    CHECK_FALSE(sod::sod_from_store_error("bad_request: x").has_value());
+    CHECK_FALSE(sod::sod_from_store_error("record_attestation write failed: x").has_value());
+
+    // The decision-cap refusal: the store returns it prefixed (classified 400 / invalid params),
+    // the handlers put only the bare message on the wire, and no other string is rewritten.
+    const std::string cap_err = "bad_request: " + std::string(yuzu::server::kDecisionCapMessage);
+    const auto cap_cls = sod::classify_store_error(cap_err);
+    CHECK(sod::store_error_http_status(cap_cls) == 400);
+    CHECK(sod::store_error_jsonrpc_code(cap_cls) == kInvalidParams);
+    CHECK(yuzu::server::decision_cap_wire_message(cap_err) == yuzu::server::kDecisionCapMessage);
+    CHECK_FALSE(yuzu::server::decision_cap_wire_message(
+                    std::string(yuzu::server::kDecisionCapMessage)));
+    CHECK_FALSE(yuzu::server::decision_cap_wire_message(cap_err + " "));
+    CHECK_FALSE(yuzu::server::decision_cap_wire_message("bad_request: reviewer cannot be empty"));
+    CHECK_FALSE(yuzu::server::decision_cap_wire_message(""));
 }
 
 // ── Decision history on the read surfaces (#4752) ───────────────────────────
@@ -3183,7 +3244,10 @@ TEST_CASE("attestation cap: the decision after the 100th is 400 on REST and inva
     h.session_user = "carol";
     h.audit_log.clear();
     const std::string tuple = " principal_type=user principal_id=bob role=Operator";
-    const std::string expected = "bad_request: " + std::string(yuzu::server::kDecisionCapMessage);
+    // The wire text is the bare message: the store's `bad_request: ` classification prefix is
+    // stripped for this refusal (the audit detail below keeps the store text).
+    const std::string expected{yuzu::server::kDecisionCapMessage};
+    REQUIRE_FALSE(expected.starts_with("bad_request"));
 
     const auto unchanged = [&] {
         const auto row = grant_row(h, cid, "user", "bob", "Operator");
@@ -3292,6 +3356,62 @@ TEST_CASE("attestation success body: OpenAPI and the MCP output schema name exac
         CHECK(out["required"].size() == 3);
     }
     CHECK(found);
+}
+
+// The limits are spelled out in the MCP schema, the MCP description and the OpenAPI text. Each is
+// rendered here from the constants, so a change to a constant that leaves one of them behind fails.
+TEST_CASE("attestation limits: the MCP input schema and description and the OpenAPI text carry "
+          "the constants' numbers",
+          "[pg][access_review][rest][mcp][4752]") {
+    AccessReviewHarness h;
+    const std::string principal_max = std::to_string(yuzu::server::kPrincipalIdMaxLen);
+    const std::string role_max = std::to_string(yuzu::server::kRoleNameMaxLen);
+    const std::string just_max = std::to_string(yuzu::server::kMaxJustificationBytes);
+    const std::string cap = std::to_string(yuzu::server::kMaxDecisionsPerGrant);
+
+    nlohmann::json list = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/list"}};
+    auto tools = h.mcp_call(list.dump());
+    REQUIRE(tools);
+    bool found = false;
+    for (const auto& t : nlohmann::json::parse(tools->body)["result"]["tools"]) {
+        if (t["name"] != "record_attestation")
+            continue;
+        found = true;
+        const auto& in = t["inputSchema"]["properties"];
+        CHECK(in["principal_id"]["maxLength"] == yuzu::server::kPrincipalIdMaxLen);
+        CHECK(in["role_name"]["maxLength"] == yuzu::server::kRoleNameMaxLen);
+        CHECK(in["justification"]["maxLength"] == yuzu::server::kMaxJustificationBytes);
+        const auto desc = t["description"].get<std::string>();
+        CHECK(desc.find("principal_id and role_name are at most " + principal_max +
+                        " bytes each and justification at most " + just_max + " bytes") !=
+              std::string::npos);
+        CHECK(desc.find("at most " + cap + " recorded decisions") != std::string::npos);
+    }
+    CHECK(found);
+
+    const auto spec = nlohmann::json::parse(yuzu::server::openapi_spec_json());
+    const auto& post = spec["paths"]["/access-reviews/{id}/attestations"]["post"];
+    const auto& body =
+        post["requestBody"]["content"]["application/json"]["schema"]["properties"];
+    CHECK(body["principal_id"]["maxLength"] == yuzu::server::kPrincipalIdMaxLen);
+    CHECK(body["role_name"]["maxLength"] == yuzu::server::kRoleNameMaxLen);
+    CHECK(body["justification"]["maxLength"] == yuzu::server::kMaxJustificationBytes);
+    const auto bad = post["responses"]["400"]["description"].get<std::string>();
+    CHECK(bad.find("over " + principal_max + " bytes") != std::string::npos);
+    CHECK(bad.find("maximum of " + cap + " recorded decisions") != std::string::npos);
+    CHECK(post["description"].get<std::string>().find("at most " + cap + " decisions") !=
+          std::string::npos);
+    // The 503 text quotes the fixed store-failure message and its retry hint.
+    const auto unavailable = post["responses"]["503"]["description"].get<std::string>();
+    CHECK(unavailable.find(std::string(sod::kStoreFailureMessage)) != std::string::npos);
+    CHECK(unavailable.find("retry_after_ms " + std::to_string(sod::kStoreFailureRetryMs)) !=
+          std::string::npos);
+    // The shared refusal texts spell the same numbers.
+    CHECK(std::string(yuzu::server::kGrantFieldInvalidMessage).find("1-" + principal_max) !=
+          std::string::npos);
+    CHECK(std::string(yuzu::server::kDecisionCapMessage).find("(" + cap + ")") !=
+          std::string::npos);
+    CHECK(principal_max == role_max); // the text names one number for both fields
 }
 
 TEST_CASE("bounded history read: a grant carrying 105 history rows returns its latest 100, and the "
