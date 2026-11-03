@@ -649,9 +649,10 @@ pre-seeded to 0 at boot so `increase()` alerting is meaningful.
 
 | Metric | Type | Meaning |
 |---|---|---|
+| `yuzu_scim_auth_failures_total` | counter, no labels | A `/scim/v2/*` request was rejected `401` by the bearer gate because its token was missing, malformed or wrong (a credential-guess or replay signal against a surface that can provision and deprovision accounts); pairs with `scim.auth.denied` audit rows. (#6835) It does NOT move when the token check could not read the store: that is a `503`, counted on `yuzu_scim_guard_store_unavailable_total{guard="bearer"}`. An alert or dashboard keyed on this counter no longer sees database outages; one that fired during past outages should be re-checked. |
 | `yuzu_scim_compensation_failed_total` | counter, label `outcome` | #4966: a SCIM same-request compensation (the guarded undo of an account created or revived earlier in the same request) that did not complete, by `outcome` (`guard_refused_last_administrator`: the account is left active; `deactivated_but_session_wipe_failed`: deactivated, a session may survive; `store_failure`: state indeterminate). Pairs with the `scim.user.compensation_failed` audit row and a critical analytics event (a no-op under `--no-analytics`: the audit row and this counter still fire); every increment needs an operator to check the account. Zero-seeded for all three outcomes. No alert rule ships with it yet; tracked in #5673. |
 | `yuzu_scim_group_recompute_skipped_total` | counter, label `cause` (`promotion`/`undetermined`) | #4966: SCIM Group role-recompute members not applied in one Group request. `promotion`: skipped after the first failed guarded write of the request (the fail-safe direction; demotions are always attempted, so there is no demotion series). `undetermined`: a read the decision needed failed, so the member's role was left untouched and it is unknown whether an administrator was kept. Each increment is recorded by one `scim.group.recompute_incomplete` audit row naming the members (first 20 named; the count is exact). Nothing repairs them automatically: see the SCIM provisioning guide, "Known limits of the Group role recompute". Zero-seeded for both causes. No alert rule ships with it yet; tracked in #5673. |
-| `yuzu_scim_guard_store_unavailable_total` | counter, label `guard` (`provenance`/`role`) | #6836: the provenance or role re-check before a SCIM deactivate, delete, reactivate or update (and, for `guard="role"`, the role re-check after the reactivation of a `POST` that revives a removed account) could not be answered by the user store (a lease timeout or a failed query), so the request answered a retryable `503` + `Retry-After: 2` (audited as the request's own action, `failure`, `store_unavailable: provenance check`/`role check`) instead of `404`. The `guard` label is bounded to those two values and carries no username. Pre-seeded at 0 at boot. For the `POST` revive it is incremented BEFORE the undo, so it (and the alert) also moves when the undo fails and the answer is `500`. Alert `YuzuScimGuardStoreUnavailable` (warning, any increase over 1h). Distinct from `yuzu_scim_provenance_denied_total`, which counts real refusals and no longer moves for a deactivate, delete, reactivate, update or a `POST` that revives a removed account during an outage. Not covered: the `POST` create reads (the provisioning-source read and the duplicate/race reads) are tracked in #6837; the tombstone-role `500` in the revive pre-check (`POST` revive and `PATCH`/`PUT` `active:true`; the grant-read fault in the same pre-check already answers `503`) and the `500` when the reactivation's own post-commit re-read fails (`failed to revive the underlying account`, no undo) are not covered by this change either (same defect class as #6837, which does not list them); it does not cover the bearer-validation `401` of a full outage (#6835). |
+| `yuzu_scim_guard_store_unavailable_total` | counter, label `guard` (`provenance`/`role`/`bearer`/`resource`) | A SCIM request could not READ the store behind a check and answered a retryable `503` + `Retry-After: 2` instead of acting or answering a false `401`/`404`/`409`. The `guard` label is a closed set of four and carries no username; all four series are pre-seeded at 0 at boot. `provenance` and `role` (#6836): the provenance or role re-check before a SCIM deactivate, delete, reactivate or update (and, for `guard="role"`, the role re-check after the reactivation of a `POST` that revives a removed account) could not be answered by the user store (a lease timeout or a failed query); the request is audited as its own action, `failure`, `store_unavailable: provenance check`/`role check`, instead of `404`. For the `POST` revive it is incremented BEFORE the undo, so it (and the alert) also moves when the undo fails and the answer is `500`. `bearer` (#6835): the SCIM bearer-token check could not read the token store, so the token was not checked; this was a false `401` (and a false `scim.auth.denied` row and `yuzu_scim_auth_failures_total` increment). `resource` (#6835): a SCIM User or Group lookup, a duplicate check (`POST /Users`, `POST /Groups`, the rename of a Group) or a `userName eq` / `displayName eq` filter query could not read the SCIM store; this was a false `404`, `409`, empty list or skipped duplicate check. `bearer` and the `GET` / list-filter `resource` faults write no audit row (a `GET` has no audit verb, the bearer check has no verb or identity, and a row per polled `GET` would trip `YuzuScimAuditWriteFailures`); a mutating request's `resource` fault is audited best effort as `failure` on its own verb with detail `store_unavailable: lookup (<site>)` (the audit store is usually the same database that just failed). The server `ERROR` log (`ScimRoutes: bearer validation` throttled to one per minute, `ScimRoutes: user lookup (...)`, `ScimRoutes: group lookup (...)`, each naming the target id) and this counter are the trail. Alert `YuzuScimGuardStoreUnavailable` (warning, any increase over 1h) covers all four guards. The counter is in memory, so it moves during an outage, but the rule fires only when Prometheus manages to scrape `/metrics`: a remote scrape of the authenticated `/metrics` resolves its session or API token against Postgres and the handler reads Postgres, so it can fail during a full outage (a localhost scrape, `--metrics-no-auth` or a still-cached token works). `YuzuServerPostgresUnreachable` (`yuzu_server_pg_reachable`) and `YuzuPgConnectFailing` need a working scrape too, so they are not an honest backstop for a total outage either: the backstops for that case are the `/readyz` readiness probe and an operator-defined `up == 0` (scrape target down) alert on the server job (none ships). The SCIM alert then fires after recovery (from the increase over the gap) or at once for a partial fault. `YuzuScimAuditWriteFailures` (`yuzu_scim_audit_write_failures_total`) can fire for a mutating request that changed nothing: its `503` is audited best effort under its own verb (`scim.user.provisioned`, `scim.user.updated`, `scim.user.deleted`, `scim.group.created`, `scim.group.updated`, `scim.group.deleted`, `result=failure`, detail beginning `store_unavailable:`), and when the audit store is down too that row is lost and the counter moves. Distinct from `yuzu_scim_provenance_denied_total`, which counts real refusals and does not move for any of these faults. Not covered: the unfiltered `GET /Users` and `GET /Groups` (`list()` / `count()` fail open, #2481, so an unfiltered list can answer an empty `200` while a filtered one answers `503`); the `POST` create reads other than the duplicate check, including the concurrent-create re-read (`get_by_username` after a failed create) and `find_by_external_id` (#6837, a fault there falls through to the later `500`); the tombstone-role `500` in the revive pre-check (`POST` revive and `PATCH`/`PUT` `active:true`; the grant-read fault in the same pre-check already answers `503`) and the `500` when the reactivation's own post-commit re-read fails (`failed to revive the underlying account`, no undo), neither covered by #6836 or #6835 (same defect class as #6837, which does not list them); post-mutation re-fetches that already answer `500`; no reconciliation sweep (#6838). |
 | `yuzu_scim_role_changes_total` | counter, no labels | SCIM-provisioned user role changes APPLIED through SCIM Group membership (`--scim-admin-group`): a promotion or a demotion by the group-membership-driven role recompute. A no-op recompute does not count. A sustained rate is normal IdP group churn, not an anomaly. Zero-seeded at boot. |
 | `yuzu_scim_role_change_failures_total` | counter, no labels | SCIM-driven role changes that did not complete during the group recompute: the guarded role write did not complete (a store failure, so the role may not have changed; a user that vanished; a promotion refused for an inactive account), OR the role did change but its durable session wipe failed. A sustained non-zero rate means role changes are not taking effect cleanly. A refusal by the last-Administrator guard is NOT counted here (see `yuzu_server_rbac_last_admin_guard_refused_total{transport="scim"}`). Zero-seeded at boot. No alert rule ships; tracked in #5673. |
 | `yuzu_scim_deprovision_role_refused_with_active_link_total` | counter, no labels | D1: a deprovision was refused (the slug's role is not `user`, per the #2021 provenance guard) for a slug with an active linked federated identity — that identity's tokens were deliberately **not** auto-revoked (auto-revoking on an IdP's unilateral say-so would reopen the #2021 hazard). A human must terminate the linked identity's credentials manually. |
@@ -1148,7 +1149,7 @@ caller).
 ## Engine-credential confirm metric (#2404)
 
 ```
-# HELP yuzu_engine_principal_confirm_total Engine-credential rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient); store-reaching calls only, pre-store denials excluded (#2404)
+# HELP yuzu_engine_principal_confirm_total Engine-credential rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient|secret_mismatch); store-reaching calls only, pre-store denials excluded (#2404; secret_mismatch added #3015 proof-of-possession)
 # TYPE yuzu_engine_principal_confirm_total counter
 yuzu_engine_principal_confirm_total{surface="rest",result="success"} 0
 yuzu_engine_principal_confirm_total{surface="rest",result="conflict"} 0
@@ -1158,19 +1159,29 @@ yuzu_engine_principal_confirm_total{surface="mcp",result="success"} 0
 yuzu_engine_principal_confirm_total{surface="mcp",result="conflict"} 0
 yuzu_engine_principal_confirm_total{surface="mcp",result="client_error"} 0
 yuzu_engine_principal_confirm_total{surface="mcp",result="transient"} 0
+yuzu_engine_principal_confirm_total{surface="rest",result="secret_mismatch"} 0
+yuzu_engine_principal_confirm_total{surface="mcp",result="secret_mismatch"} 0
 ```
 
-All 8 series (the closed `surface` × `result` cross-product) are pre-seeded to
+All 10 series (the closed `surface` × `result` cross-product) are pre-seeded to
 `0` at startup so `absent()` alerts stay meaningful. The family makes a
 credential-**confirm** retry storm alertable, which `yuzu_http_requests_total`
 cannot show (it has no per-route label). `result` mirrors the shared
 store-error taxonomy (`engine_store_error_class.hpp`): `conflict` is a terminal
 409/kInvalidParams (a replay after the rotation already resolved, a moved-on
-pin, or unresolved rotation metadata — the client must not blindly retry),
+pin, unresolved rotation metadata, or a malformed two-credential pair, which
+is store corruption and not a replay — the client must not blindly retry),
 `client_error` is a 400 (more-than-two or non-engine active credentials),
 `transient` is a retryable 503 (store unavailable, lock contention, a persist
-failure, or the ambiguous empty/malformed-pair "no in-flight rotation"), and
-`success` is a completed confirm.
+failure, or the ambiguous empty read "no in-flight rotation to confirm"),
+`secret_mismatch` is a presented secret that does not verify (403), and
+`success` is a completed confirm. A malformed two-credential pair used to count
+as `transient`; it now counts as `conflict`, so a persistent malformed pair is
+visible on the `conflict` series, not on `transient`; the REST confirm route also
+writes a warning log line on the server, and on MCP the signals are the
+`conflict` series and the `engine_principal.credential.confirm` failure audit
+row. Alert authors who watch this family for store
+corruption should watch `conflict` as well.
 
 **Scope contract.** Counted only when a confirm reaches `ApiTokenStore::confirm_rotation`
 **or** trips the store-open guard (which increments `result="transient"`);
@@ -1189,7 +1200,11 @@ label (bounded cardinality only) — pair it with the
 (metric-is-the-signal / audit-row-is-the-evidence). A useful alert is
 `increase(yuzu_engine_principal_confirm_total{result="conflict"}[15m]) > <n>`
 to catch a client stuck replaying a resolved confirm, and
-`increase(...{result="transient"}[15m])` for a genuine store-health storm.
+`increase(...{result="transient"}[15m])` for a genuine store-health storm. A
+`conflict` count that keeps growing for one principal after its client has
+stopped replaying can also be a malformed two-credential pair that every retry
+meets again; the matching `engine_principal.credential.confirm` failure rows say
+`rotation pair is malformed`.
 
 **Semantics for alert authors:** this counts confirm **attempts** that reach
 the store, not logical rotations — a client retrying a `transient` blip 20 times
@@ -1243,25 +1258,27 @@ A server predating this metrics family, or a scrape config dropping the
 `yuzu_rotation_sweep_*` series, reads as a silently-healthy sweep — none of
 these are paired with their own "series is absent" companion alert today
 (unlike `YuzuAuditRetentionNotRunning`/`YuzuAuditRetentionMetricMissing`);
-that gap is tracked, not closed, by this round.
+that gap is tracked, not closed.
 
 ## Human API-token confirm metric (P2 #11)
 
 ```
-# HELP yuzu_api_token_confirm_total Human API-token rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient); store-reaching calls only, pre-store denials excluded - the human-owned twin of yuzu_engine_principal_confirm_total
+# HELP yuzu_api_token_confirm_total Human API-token rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient|secret_mismatch); store-reaching calls only, pre-store denials excluded - the human-owned twin of yuzu_engine_principal_confirm_total (secret_mismatch added #3015 proof-of-possession)
 # TYPE yuzu_api_token_confirm_total counter
 yuzu_api_token_confirm_total{surface="rest",result="success"} 0
 yuzu_api_token_confirm_total{surface="rest",result="conflict"} 0
 yuzu_api_token_confirm_total{surface="rest",result="client_error"} 0
 yuzu_api_token_confirm_total{surface="rest",result="transient"} 0
+yuzu_api_token_confirm_total{surface="rest",result="secret_mismatch"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="success"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="conflict"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="client_error"} 0
 yuzu_api_token_confirm_total{surface="mcp",result="transient"} 0
+yuzu_api_token_confirm_total{surface="mcp",result="secret_mismatch"} 0
 ```
 
 The human-owned twin of [`yuzu_engine_principal_confirm_total`](#engine-credential-confirm-metric-2404)
-directly above — same closed `surface` x `result` cross-product (8 series),
+directly above — same closed `surface` x `result` cross-product (10 series),
 pre-seeded to `0` at startup for the same `absent()`-alert reason, and the
 same intended scope contract: counted only when a confirm reaches the
 credential store or trips the store-open guard (`result="transient"`),
@@ -2601,10 +2618,12 @@ yuzu_scim_compensation_failed_total{outcome="store_failure"} 0
 yuzu_scim_group_recompute_skipped_total{cause="promotion"} 0
 yuzu_scim_group_recompute_skipped_total{cause="undetermined"} 0
 
-# HELP yuzu_scim_guard_store_unavailable_total SCIM provenance or role re-checks the user store could not answer, by guard
+# HELP yuzu_scim_guard_store_unavailable_total Total SCIM requests answered 503 (retryable) because a read of the store they depend on FAILED (a lease timeout or query error), by guard: provenance and role are the AuthDB reads of the deprovision and revive guards (role includes the POST-revive role re-check), bearer is the SCIM token check (was a false 401), resource is a user or group lookup (was a false 404/409). Distinct from yuzu_scim_provenance_denied_total and yuzu_scim_auth_failures_total: nothing was refused, no credential was judged bad, and nothing was mutated by the failed read; the IdP is expected to retry. A sustained rate means SCIM provisioning, and above all leaver deactivation, is being delayed by a store fault
 # TYPE yuzu_scim_guard_store_unavailable_total counter
 yuzu_scim_guard_store_unavailable_total{guard="provenance"} 0
 yuzu_scim_guard_store_unavailable_total{guard="role"} 0
+yuzu_scim_guard_store_unavailable_total{guard="bearer"} 0
+yuzu_scim_guard_store_unavailable_total{guard="resource"} 0
 
 # HELP yuzu_scim_role_changes_total Total SCIM-provisioned user role changes applied via SCIM Group membership (--scim-admin-group), by the group-membership-driven role-recompute core - a sustained rate is a normal signal of IdP group-membership churn, not itself an anomaly
 # TYPE yuzu_scim_role_changes_total counter

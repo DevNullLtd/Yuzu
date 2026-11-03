@@ -2069,11 +2069,14 @@ TEST_CASE("wiring: every direct session or token validator is either the resolve
     // and POST /api/v1/elevate/revoke (kExempt), all validating their own cookie only.
     // settings_routes.cpp: the MFA enrolment confirm (kExempt), which compares the cookie
     // session's username and auth source with the resolved session before stamping proof on it.
-    // scim_routes.cpp: the SCIM bearer store (SCIM rows are kExempt).
+    // scim_routes.cpp: the SCIM bearer store (SCIM rows are kExempt). Its one call is
+    // `ScimStore::validate_token_checked` (#6835: the tri-state form, so a store fault is a 503 and
+    // not a 401); it is a different class from `ApiTokenStore`, authorises no gated handler and
+    // mints no session.
     std::map<std::string, Count> allowed{
         {"auth_routes.cpp", {1 + 5, 2, 1}},
         {"settings_routes.cpp", {1, 0, 0}},
-        {"scim_routes.cpp", {0, 1, 0}},
+        {"scim_routes.cpp", {0, 0, 1}},
     };
     for (const auto& [file, c] : found) {
         INFO("file: " << file << " (validate_session calls " << c.session << ", validate_token calls "

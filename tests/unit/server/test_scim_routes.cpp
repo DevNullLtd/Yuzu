@@ -4637,6 +4637,7 @@ TEST_CASE("ScimRoutes: PATCH Groups fails closed and preserves membership when t
                                            {"value", json::array({json{{"value", "ghost"}}})}}})}});
     REQUIRE(res);
     CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
 
     restore_membership_table(f.auth_db.dsn());
 
@@ -4657,6 +4658,7 @@ TEST_CASE("ScimRoutes: PUT Groups fails closed when the membership snapshot is u
                      {{"displayName", "PutFailClosedRenamed"}, {"members", json::array()}});
     REQUIRE(res);
     CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2"); // #6835: the contract on every 503
 
     restore_membership_table(f.auth_db.dsn());
 
@@ -4681,6 +4683,7 @@ TEST_CASE("ScimRoutes: DELETE Groups fails closed when the membership snapshot i
     auto res = f.del("/scim/v2/Groups/" + group_id);
     REQUIRE(res);
     CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
 
     restore_membership_table(f.auth_db.dsn());
     CHECK(f.scim_store->get_group_by_id(group_id).has_value()); // still there
@@ -4698,9 +4701,11 @@ TEST_CASE("ScimRoutes: GET Groups fails closed rather than rendering an empty me
     auto single = f.get("/scim/v2/Groups/" + group_id);
     REQUIRE(single);
     CHECK(single->status == 503);
+    CHECK(single->get_header_value("Retry-After") == "2");
     auto listed = f.get("/scim/v2/Groups");
     REQUIRE(listed);
     CHECK(listed->status == 503);
+    CHECK(listed->get_header_value("Retry-After") == "2");
 
     restore_membership_table(f.auth_db.dsn());
 }
@@ -6613,14 +6618,13 @@ TEST_CASE("ScimRoutes: PUT active=false on a desynced mirror answers a retryable
     CHECK_FALSE(f.auth_mgr.get_user_role("ursula2").has_value());
 }
 
-// CHARACTERISATION (governance Gate 5, CH-1): the same store outage answers differently depending
-// on WHERE it bites. Each cell is a measured fact, pinned so the follow-up that makes the
-// remaining one a retryable 503 (#6835: tri-state ScimStore reads / bearer validation) is a
-// deliberate, visible edit of these values. #6836 flipped the first cell (404 -> 503); the second
-// (401 at bearer validation) still awaits #6835.
-TEST_CASE("ScimRoutes: characterisation - a whole-pool outage still answers 401 at bearer "
-          "validation (#6835); the provenance cell was flipped to 503 by #6836",
-          "[pg][scim][routes][patch][deprovision][store-error][characterisation]") {
+// The store-outage cells first pinned as a CHARACTERISATION (governance Gate 5, CH-1) of what the
+// #4068 fix did not cover. Both known gaps are now closed: #6836 flipped the provenance cell
+// (404 -> 503) and #6835 the bearer cell (401 -> 503). Kept as the compact two-cell regression;
+// the all-verbs matrix is in the #6835 tests below.
+TEST_CASE("ScimRoutes: the two cells the #4068 fix left open now answer a retryable 503: "
+          "provenance (#6836) and a whole-pool outage at bearer validation (#6835)",
+          "[pg][scim][routes][patch][deprovision][store-error]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "chara"}})->body);
     const auto id = created["id"].get<std::string>();
@@ -6642,7 +6646,7 @@ TEST_CASE("ScimRoutes: characterisation - a whole-pool outage still answers 401 
         CHECK(f.auth_mgr.get_user_role("chara").has_value()); // still live
     }
 
-    SECTION("whole-pool outage: the bearer check fails first -> 401") {
+    SECTION("whole-pool outage: the bearer check fails first -> 503 (#6835)") {
         std::unique_ptr<httplib::Response> res;
         {
             auto held = drain_fixture_pool(f.auth_db.pool());
@@ -6650,9 +6654,10 @@ TEST_CASE("ScimRoutes: characterisation - a whole-pool outage still answers 401 
             res = f.patch("/scim/v2/Users/" + id, patch_body);
         }
         REQUIRE(res);
-        // KNOWN GAP (pre-existing): validate_token returns false when it cannot lease, so a pool
-        // outage is a credential failure on this surface, before any #4068 code runs.
-        CHECK(res->status == 401);
+        // #6835: validate_token_checked reports Unavailable when it cannot lease, so a pool
+        // outage is a retryable 503 and not a credential failure (401) on this surface.
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "2");
         CHECK(f.auth_mgr.get_user_role("chara").has_value());
     }
 }
@@ -7197,4 +7202,590 @@ TEST_CASE("ScimRoutes: a store fault at the POST-revive role re-check undoes the
     REQUIRE(role.has_value());
     CHECK(*role == auth::Role::user);
     CHECK(f.scim_store->get_by_username("rex").has_value());
+}
+
+// ── #6835: a SCIM-store fault is a retryable 503 on every verb, never 401 / 404 / 409 ───────────
+//
+// Three fault shapes, because they bite different code: a WHOLE-POOL outage fails the bearer check
+// first (it was a false 401 on every verb); a fault confined to `scim_resources` / `scim_groups`
+// lets the bearer check pass and fails the resource / Group LOOKUP (it was a false 404, a false
+// "no duplicate" on POST, an empty filter result). The 503 carries Retry-After, writes no
+// credential-failure signal and mutates nothing; a genuinely bad token is still 401 and a
+// genuinely missing resource still 404.
+
+namespace {
+
+/// `scim_store.scim_groups` moved aside: every Group lookup fails while the bearer check, the
+/// Users table and the membership table keep working. RAII-restored.
+class ScimGroupsFault : public yuzu::test::SqlFault {
+public:
+    explicit ScimGroupsFault(yuzu::server::pg::PgPool& pool)
+        : SqlFault(pool, "ALTER TABLE scim_store.scim_groups RENAME TO scim_groups_gone",
+                   "ALTER TABLE scim_store.scim_groups_gone RENAME TO scim_groups") {}
+};
+
+void check_retryable_503(const std::unique_ptr<httplib::Response>& res, const std::string& what) {
+    INFO(what);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->body.find("store unavailable") != std::string::npos);
+    CHECK(json::parse(res->body)["status"] == "503");
+}
+
+std::size_t audit_rows_of_action(Fixture& f, const char* action) {
+    AuditQuery q;
+    q.action = action;
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    return rows->size();
+}
+
+double auth_failures(Fixture& f) {
+    return f.metrics.counter("yuzu_scim_auth_failures_total").value();
+}
+
+} // namespace
+
+TEST_CASE("ScimRoutes: a whole-pool outage answers a retryable 503 on EVERY verb, never 401, "
+          "writes no credential-failure signal and mutates nothing (#6835)",
+          "[pg][scim][routes][store-error][outage]") {
+    Fixture f;
+    auto user = json::parse(f.post("/scim/v2/Users", {{"userName", "dora"}})->body);
+    const auto uid = user["id"].get<std::string>();
+    auto group = json::parse(f.post("/scim/v2/Groups", {{"displayName", "g-outage"}})->body);
+    const auto gid = group["id"].get<std::string>();
+    const auto failures_before = auth_failures(f);
+    const auto denied_before = audit_rows_of_action(f, "scim.auth.denied");
+
+    std::vector<std::pair<std::string, std::unique_ptr<httplib::Response>>> answers;
+    {
+        auto held = drain_fixture_pool(f.auth_db.pool());
+        REQUIRE_FALSE(held.empty());
+        answers.emplace_back("GET /Users", f.get("/scim/v2/Users"));
+        answers.emplace_back("GET /Users/{id}", f.get("/scim/v2/Users/" + uid));
+        answers.emplace_back("POST /Users", f.post("/scim/v2/Users", {{"userName", "ezra"}}));
+        answers.emplace_back("PUT /Users/{id}",
+                             f.put("/scim/v2/Users/" + uid, {{"userName", "dora"}, {"active", true}}));
+        answers.emplace_back("PATCH /Users/{id}", f.patch("/scim/v2/Users/" + uid, deactivate_ops()));
+        answers.emplace_back("DELETE /Users/{id}", f.del("/scim/v2/Users/" + uid));
+        answers.emplace_back("GET /Groups", f.get("/scim/v2/Groups"));
+        answers.emplace_back("GET /Groups/{id}", f.get("/scim/v2/Groups/" + gid));
+        answers.emplace_back("POST /Groups", f.post("/scim/v2/Groups", {{"displayName", "g2"}}));
+        answers.emplace_back("PUT /Groups/{id}",
+                             f.put("/scim/v2/Groups/" + gid, {{"displayName", "g-outage"}}));
+        answers.emplace_back("PATCH /Groups/{id}",
+                             f.patch("/scim/v2/Groups/" + gid,
+                                     json{{"Operations", json::array({{{"op", "replace"},
+                                                                       {"path", "displayName"},
+                                                                       {"value", "g3"}}})}}));
+        answers.emplace_back("DELETE /Groups/{id}", f.del("/scim/v2/Groups/" + gid));
+    }
+    for (const auto& [what, res] : answers)
+        check_retryable_503(res, what);
+
+    // The credential-failure signals did not move: an outage is not a credential-guess. NOTE the
+    // audit-row count below cannot OBSERVE a write attempt here (the audit store shares the
+    // drained pool, so a row would have been lost anyway); the failures-counter check above is the
+    // real one in this test, and `ScimTokensFault` below checks the row with the audit store UP.
+    CHECK(auth_failures(f) == failures_before);
+    CHECK(audit_rows_of_action(f, "scim.auth.denied") == denied_before);
+    // The outage-proof signal did: one count per request.
+    CHECK(guard_unavailable(f, "bearer") == static_cast<double>(answers.size()));
+    CHECK(guard_unavailable(f, "resource") == 0.0);
+
+    // Nothing was mutated, and the same requests work once the pool is back.
+    auto after_user = f.get("/scim/v2/Users/" + uid);
+    REQUIRE(after_user);
+    CHECK(after_user->status == 200);
+    CHECK(json::parse(after_user->body)["active"] == true);
+    CHECK(f.auth_mgr.get_user_role("dora").has_value());
+    auto after_group = f.get("/scim/v2/Groups/" + gid);
+    REQUIRE(after_group);
+    CHECK(after_group->status == 200);
+    CHECK(json::parse(after_group->body)["displayName"] == "g-outage");
+}
+
+TEST_CASE("ScimRoutes: a fault confined to the SCIM resource table (the bearer check still "
+          "works) answers 503 on every User lookup, not 404 / 409 / an empty list (#6835)",
+          "[pg][scim][routes][store-error][outage]") {
+    Fixture f;
+    auto user = json::parse(f.post("/scim/v2/Users", {{"userName", "dora"}})->body);
+    const auto uid = user["id"].get<std::string>();
+    const auto failures_before = auth_failures(f);
+
+    std::vector<std::pair<std::string, std::unique_ptr<httplib::Response>>> answers;
+    {
+        ScimResourcesFault fault{f.auth_db.pool()};
+        fault.arm();
+        answers.emplace_back("GET /Users/{id}", f.get("/scim/v2/Users/" + uid));
+        answers.emplace_back("PUT /Users/{id}",
+                             f.put("/scim/v2/Users/" + uid, {{"userName", "dora"}, {"active", true}}));
+        answers.emplace_back("PATCH /Users/{id}", f.patch("/scim/v2/Users/" + uid, deactivate_ops()));
+        answers.emplace_back("DELETE /Users/{id}", f.del("/scim/v2/Users/" + uid));
+        // The duplicate check: a fault must NOT read as 'no live mapping' and fall through.
+        answers.emplace_back("POST /Users (duplicate check)",
+                             f.post("/scim/v2/Users", {{"userName", "dora"}}));
+        // The filter: a fault must NOT read as an empty (totalResults 0) list.
+        answers.emplace_back("GET /Users?filter=userName",
+                             f.get(R"(/scim/v2/Users?filter=userName%20eq%20%22dora%22)"));
+        fault.repair();
+    }
+    for (const auto& [what, res] : answers)
+        check_retryable_503(res, what);
+
+    CHECK(guard_unavailable(f, "resource") == static_cast<double>(answers.size()));
+    CHECK(guard_unavailable(f, "bearer") == 0.0);
+    CHECK(auth_failures(f) == failures_before);
+
+    // Not deprovisioned, not recreated: the account is live and the mapping untouched.
+    CHECK(f.auth_mgr.get_user_role("dora").has_value());
+    auto resource = f.scim_store->get_by_scim_id(uid);
+    REQUIRE(resource.has_value());
+    CHECK(resource->active);
+    // The mutating attempts are audited as FAILURES under their own verb (the audit store is up
+    // here); none of them succeeded. GET and the list filter write no row.
+    CHECK(rows_with_result(f, "scim.user.updated", uid, "failure") == 2); // PUT, PATCH
+    CHECK(rows_with_result(f, "scim.user.deleted", uid, "failure") == 1);
+    CHECK(rows_with_result(f, "scim.user.updated", uid, "success") == 0);
+    CHECK(rows_with_result(f, "scim.user.deleted", uid, "success") == 0);
+    CHECK(rows_with_result(f, "scim.user.deactivated", uid, "success") == 0);
+    for (const auto& r : audit_rows(f, "scim.user.deleted", uid))
+        CHECK(r.detail == "store_unavailable: lookup (user lookup (delete))");
+    std::size_t create_faults = 0;
+    for (const auto& r : audit_rows(f, "scim.user.provisioned", "dora"))
+        if (r.result == "failure" && r.detail == "store_unavailable: lookup (user lookup (create))")
+            ++create_faults;
+    CHECK(create_faults == 1);
+    // Exactly the four write attempts were audited (PUT, PATCH, DELETE, POST): the GET and the
+    // list filter wrote nothing, and no other verb received a failure row.
+    std::size_t all_failures = 0;
+    for (const char* action : {"scim.user.provisioned", "scim.user.updated", "scim.user.deleted",
+                               "scim.user.deactivated", "scim.user.reactivated"}) {
+        AuditQuery q;
+        q.action = action;
+        auto rows = f.audit_store->query(q);
+        REQUIRE(rows.has_value());
+        for (const auto& r : *rows)
+            if (r.result == "failure")
+                ++all_failures;
+    }
+    CHECK(all_failures == 4);
+}
+
+TEST_CASE("ScimRoutes: a fault confined to the SCIM Group table answers 503 on every Group "
+          "lookup, not 404 / 409 / an empty list (#6835)",
+          "[pg][scim][routes][store-error][outage]") {
+    Fixture f;
+    auto group = json::parse(f.post("/scim/v2/Groups", {{"displayName", "g-outage"}})->body);
+    const auto gid = group["id"].get<std::string>();
+
+    std::vector<std::pair<std::string, std::unique_ptr<httplib::Response>>> answers;
+    {
+        ScimGroupsFault fault{f.auth_db.pool()};
+        fault.arm();
+        answers.emplace_back("GET /Groups/{id}", f.get("/scim/v2/Groups/" + gid));
+        answers.emplace_back("PUT /Groups/{id}",
+                             f.put("/scim/v2/Groups/" + gid, {{"displayName", "g-outage"}}));
+        answers.emplace_back("PATCH /Groups/{id}",
+                             f.patch("/scim/v2/Groups/" + gid,
+                                     json{{"Operations", json::array({{{"op", "replace"},
+                                                                       {"path", "displayName"},
+                                                                       {"value", "g3"}}})}}));
+        answers.emplace_back("DELETE /Groups/{id}", f.del("/scim/v2/Groups/" + gid));
+        answers.emplace_back("POST /Groups (duplicate check)",
+                             f.post("/scim/v2/Groups", {{"displayName", "g-outage"}}));
+        answers.emplace_back("GET /Groups?filter=displayName",
+                             f.get(R"(/scim/v2/Groups?filter=displayName%20eq%20%22g-outage%22)"));
+        fault.repair();
+    }
+    for (const auto& [what, res] : answers)
+        check_retryable_503(res, what);
+    CHECK(guard_unavailable(f, "resource") == static_cast<double>(answers.size()));
+    // Write attempts are audited as failures under their own Group verb; GET and the filter are
+    // not (the audit store is up here, so the counts are real).
+    {
+        const auto count = [&](const char* action, const char* result) {
+            AuditQuery q;
+            q.action = action;
+            auto rows = f.audit_store->query(q);
+            REQUIRE(rows.has_value());
+            std::size_t n = 0;
+            for (const auto& r : *rows)
+                if (r.result == result)
+                    ++n;
+            return n;
+        };
+        CHECK(count("scim.group.updated", "failure") == 2); // PUT, PATCH
+        CHECK(count("scim.group.deleted", "failure") == 1);
+        CHECK(count("scim.group.created", "failure") == 1); // the duplicate check
+        CHECK(count("scim.group.updated", "success") == 0);
+        CHECK(count("scim.group.deleted", "success") == 0);
+    }
+
+    // The Group still exists under its old name.
+    auto after = f.get("/scim/v2/Groups/" + gid);
+    REQUIRE(after);
+    CHECK(after->status == 200);
+    CHECK(json::parse(after->body)["displayName"] == "g-outage");
+}
+
+TEST_CASE("ScimRoutes: on a healthy store a bad token is still 401 and a missing resource still "
+          "404, and neither counts as a store fault (#6835)",
+          "[pg][scim][routes][auth][store-error]") {
+    Fixture f;
+    const auto failures_before = auth_failures(f);
+    const auto denied_before = audit_rows_of_action(f, "scim.auth.denied");
+
+    auto bad = f.sink.dispatch("GET", "/scim/v2/Users", "", "application/json",
+                               {{"Authorization", "Bearer not-the-token"}});
+    REQUIRE(bad);
+    CHECK(bad->status == 401);
+    CHECK(bad->get_header_value("WWW-Authenticate") == "Bearer");
+    CHECK(bad->get_header_value("Retry-After").empty());
+    CHECK(auth_failures(f) == failures_before + 1.0);
+    CHECK(audit_rows_of_action(f, "scim.auth.denied") == denied_before + 1);
+
+    const std::string missing(32, '0');
+    for (const auto& path : {"/scim/v2/Users/" + missing, "/scim/v2/Groups/" + missing}) {
+        auto res = f.get(path);
+        REQUIRE(res);
+        INFO(path);
+        CHECK(res->status == 404);
+        CHECK(res->get_header_value("Retry-After").empty());
+    }
+    CHECK(guard_unavailable(f, "bearer") == 0.0);
+    CHECK(guard_unavailable(f, "resource") == 0.0);
+}
+
+namespace {
+
+/// `scim_store.scim_tokens` moved aside: the bearer check's query FAILS (the lease works), while
+/// every other store, including the AUDIT store, stays up. This is the shape that makes
+/// "no `scim.auth.denied` row on a store fault" observable, and it exercises the query-failure
+/// arm of `validate_token_checked` (the whole-pool test only reaches the lease-timeout arm).
+class ScimTokensFault : public yuzu::test::SqlFault {
+public:
+    explicit ScimTokensFault(yuzu::server::pg::PgPool& pool)
+        : SqlFault(pool, "ALTER TABLE scim_store.scim_tokens RENAME TO scim_tokens_gone",
+                   "ALTER TABLE scim_store.scim_tokens_gone RENAME TO scim_tokens") {}
+};
+
+/// A stateful read-count fault on `scim_store.scim_groups` for ONE group row: the table is swapped
+/// for a view over the renamed table whose WHERE calls a gate function that counts evaluations of
+/// `target_id` on a SEQUENCE (non-transactional, so a raised read does not roll its own count
+/// back) and raises on exactly the `nth`. A plain rename fault fails the FIRST Group lookup of a
+/// request and can never reach the later ones (the in-mutex `current` re-read, the rename
+/// duplicate check); this one fails exactly the chosen read. Every other statement passes.
+/// Per-test throwaway database only.
+class NthGroupReadFault : public yuzu::test::SqlFault {
+public:
+    NthGroupReadFault(yuzu::server::pg::PgPool& pool, const std::string& target_id, int nth)
+        : SqlFault(
+              pool,
+              "DO $do$ BEGIN "
+              "CREATE SEQUENCE public.yuzu_test_grp_hits; "
+              "CREATE FUNCTION public.yuzu_test_grp_gate(p_id text) RETURNS boolean LANGUAGE "
+              "plpgsql AS $b$ DECLARE n bigint; BEGIN "
+              "IF p_id = '" + target_id + "' THEN n := nextval('public.yuzu_test_grp_hits'); "
+              "IF n = " + std::to_string(nth) + " THEN RAISE EXCEPTION 'yuzu_test: injected group "
+              "read fault'; END IF; END IF; RETURN true; END $b$; "
+              "ALTER TABLE scim_store.scim_groups RENAME TO scim_groups_real; "
+              "CREATE VIEW scim_store.scim_groups AS SELECT * FROM scim_store.scim_groups_real "
+              "WHERE public.yuzu_test_grp_gate(scim_id); "
+              "END $do$",
+              "DO $do$ BEGIN "
+              "IF EXISTS (SELECT 1 FROM pg_views WHERE schemaname = 'scim_store' AND viewname = "
+              "'scim_groups') THEN DROP VIEW scim_store.scim_groups; END IF; "
+              "IF to_regclass('scim_store.scim_groups_real') IS NOT NULL THEN "
+              "ALTER TABLE scim_store.scim_groups_real RENAME TO scim_groups; END IF; "
+              "DROP FUNCTION IF EXISTS public.yuzu_test_grp_gate(text); "
+              "DROP SEQUENCE IF EXISTS public.yuzu_test_grp_hits; "
+              "END $do$") {}
+};
+
+} // namespace
+
+TEST_CASE("ScimRoutes: a fault in the SCIM token table (the audit store still up) answers 503 at "
+          "bearer validation and writes no scim.auth.denied row (#6835)",
+          "[pg][scim][routes][store-error][auth]") {
+    Fixture f;
+    const auto failures_before = auth_failures(f);
+    const auto denied_before = audit_rows_of_action(f, "scim.auth.denied");
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        ScimTokensFault fault{f.auth_db.pool()};
+        fault.arm();
+        res = f.get("/scim/v2/Users");
+        fault.repair();
+    }
+    check_retryable_503(res, "GET /Users with the token table unreadable");
+    // The query-failure arm of validate_token_checked, with the audit store UP: the absence of a
+    // row below is a real observation, not a lost write.
+    CHECK(guard_unavailable(f, "bearer") == 1.0);
+    CHECK(auth_failures(f) == failures_before);
+    CHECK(audit_rows_of_action(f, "scim.auth.denied") == denied_before);
+
+    // The same token works once the table is back (it was never judged bad).
+    auto again = f.get("/scim/v2/Users");
+    REQUIRE(again);
+    CHECK(again->status == 200);
+}
+
+TEST_CASE("ScimRoutes: the Group checks that sit AFTER the first lookup (the in-mutex re-read "
+          "and the rename duplicate check) answer 503 too, and change nothing (#6835)",
+          "[pg][scim][routes][store-error][outage]") {
+    Fixture f;
+    auto g = json::parse(f.post("/scim/v2/Groups", {{"displayName", "g-target"}})->body);
+    auto h = json::parse(f.post("/scim/v2/Groups", {{"displayName", "g-other"}})->body);
+    const auto gid = g["id"].get<std::string>();
+    const auto hid = h["id"].get<std::string>();
+
+    std::unique_ptr<httplib::Response> res;
+    std::string expected_site;
+    const auto rename_ops = json{{"Operations", json::array({{{"op", "replace"},
+                                                              {"path", "displayName"},
+                                                              {"value", "g-other"}}})}};
+    const auto same_name_ops = json{{"Operations", json::array({{{"op", "replace"},
+                                                                 {"path", "displayName"},
+                                                                 {"value", "g-target"}}})}};
+
+    SECTION("PUT: the in-mutex 'current' re-read (the 2nd read of the group)") {
+        NthGroupReadFault fault{f.auth_db.pool(), gid, 2};
+        fault.arm();
+        res = f.put("/scim/v2/Groups/" + gid, {{"displayName", "g-target"}});
+        fault.repair();
+        expected_site = "group lookup (group_replace, current)";
+    }
+    SECTION("PATCH: the in-mutex 'current' re-read (the 2nd read of the group)") {
+        NthGroupReadFault fault{f.auth_db.pool(), gid, 2};
+        fault.arm();
+        res = f.patch("/scim/v2/Groups/" + gid, same_name_ops);
+        fault.repair();
+        expected_site = "group lookup (group_patch, current)";
+    }
+    SECTION("PUT: the rename duplicate check (the 1st read of the OTHER group)") {
+        NthGroupReadFault fault{f.auth_db.pool(), hid, 1};
+        fault.arm();
+        res = f.put("/scim/v2/Groups/" + gid, {{"displayName", "g-other"}});
+        fault.repair();
+        expected_site = "group lookup (rename, replace)";
+    }
+    SECTION("PATCH: the rename duplicate check (the 1st read of the OTHER group)") {
+        NthGroupReadFault fault{f.auth_db.pool(), hid, 1};
+        fault.arm();
+        res = f.patch("/scim/v2/Groups/" + gid, rename_ops);
+        fault.repair();
+        expected_site = "group lookup (rename, patch)";
+    }
+    check_retryable_503(res, expected_site);
+    CHECK(guard_unavailable(f, "resource") == 1.0);
+
+    // The audit detail names the EXACT site: this proves the 503 came from the intended check and
+    // not from the first lookup.
+    AuditQuery q;
+    q.action = "scim.group.updated";
+    q.target_id = gid;
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    std::size_t matched = 0;
+    for (const auto& r : *rows)
+        if (r.result == "failure" && r.detail == "store_unavailable: lookup (" + expected_site + ")")
+            ++matched;
+    CHECK(matched == 1);
+
+    // Nothing changed: both groups keep their names and a following request is not wedged by the
+    // group mutation mutex.
+    auto after_g = f.get("/scim/v2/Groups/" + gid);
+    REQUIRE(after_g);
+    CHECK(after_g->status == 200);
+    CHECK(json::parse(after_g->body)["displayName"] == "g-target");
+    auto after_h = f.get("/scim/v2/Groups/" + hid);
+    REQUIRE(after_h);
+    CHECK(json::parse(after_h->body)["displayName"] == "g-other");
+    auto follow = f.put("/scim/v2/Groups/" + gid, {{"displayName", "g-target"}});
+    REQUIRE(follow);
+    CHECK(follow->status == 200);
+}
+
+// ── #6835: the POST /Groups no-create-on-membership-503 case, the other membership 503 sites, healthy-store pins ─────────
+
+TEST_CASE("ScimRoutes: POST /Groups whose members cannot be resolved answers 503, creates NO group, "
+          "and the IdP's retry then creates it with the member (#6835)",
+          "[pg][scim][routes][store-error][outage]") {
+    Fixture f;
+    auto created = f.post("/scim/v2/Users", {{"userName", "gmember"}});
+    REQUIRE(created);
+    const auto uid = json::parse(created->body)["id"].get<std::string>();
+    const json body{{"displayName", "g-nothing-created"},
+                    {"members", json::array({json{{"value", uid}}})}};
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        // Member resolution reads scim_resources; the duplicate-displayName check reads
+        // scim_groups, which stays healthy, so the request reaches the member read.
+        ScimResourcesFault fault{f.auth_db.pool()};
+        fault.arm();
+        res = f.post("/scim/v2/Groups", body);
+        fault.repair();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(json::parse(res->body)["detail"] == "membership unavailable");
+
+    // Members are resolved BEFORE the group row is written, so the refused request left nothing
+    // behind: no empty group for a retry to meet as a 409 and nothing a concurrent PUT/PATCH could
+    // have added a member (and a role) to.
+    const auto after = f.scim_store->get_group_by_display_name_checked("g-nothing-created");
+    REQUIRE(after.has_value());
+    CHECK_FALSE(after->has_value());
+
+    // The failure row says no group was created and carries no group id.
+    AuditQuery q;
+    q.action = "scim.group.created";
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    std::size_t refused = 0;
+    for (const auto& r : *rows)
+        if (r.result == "failure" && r.target_id.empty() &&
+            r.detail.find("no group was created") != std::string::npos)
+            ++refused;
+    CHECK(refused == 1);
+
+    // The retry converges and carries the member.
+    auto retry = f.post("/scim/v2/Groups", body);
+    REQUIRE(retry);
+    CHECK(retry->status == 201);
+    const auto retried = json::parse(retry->body);
+    CHECK(retried["displayName"] == "g-nothing-created");
+    REQUIRE(retried.contains("members"));
+    CHECK(retried["members"].size() == 1);
+}
+
+// hide_membership_table / restore_membership_table live in the block that is compiled out
+// under ThreadSanitizer (#438), so this test is too.
+#ifndef YUZU_SCIM_TSAN_BUILD
+TEST_CASE("ScimRoutes: PUT and PATCH /Groups whose members cannot be resolved, and the filtered "
+          "GET whose membership cannot be read, answer 503 with Retry-After (#6835)",
+          "[pg][scim][routes][store-error][outage]") {
+    Fixture f;
+    auto user_res = f.post("/scim/v2/Users", {{"userName", "gmember2"}});
+    REQUIRE(user_res);
+    const auto uid = json::parse(user_res->body)["id"].get<std::string>();
+    auto group_res = f.post("/scim/v2/Groups", {{"displayName", "g-members"}});
+    REQUIRE(group_res);
+    const auto gid = json::parse(group_res->body)["id"].get<std::string>();
+
+    SECTION("PUT: member resolution reads the user table") {
+        std::unique_ptr<httplib::Response> res;
+        {
+            ScimResourcesFault fault{f.auth_db.pool()};
+            fault.arm();
+            res = f.put("/scim/v2/Groups/" + gid,
+                        {{"displayName", "g-members"},
+                         {"members", json::array({json{{"value", uid}}})}});
+            fault.repair();
+        }
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "2");
+    }
+    SECTION("PATCH: member resolution reads the user table") {
+        std::unique_ptr<httplib::Response> res;
+        {
+            ScimResourcesFault fault{f.auth_db.pool()};
+            fault.arm();
+            res = f.patch("/scim/v2/Groups/" + gid,
+                          json{{"Operations",
+                                json::array({json{{"op", "add"},
+                                                  {"path", "members"},
+                                                  {"value", json::array({json{{"value", uid}}})}}})}});
+            fault.repair();
+        }
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "2");
+    }
+    SECTION("GET ?filter=displayName: the membership table is unreadable") {
+        hide_membership_table(f.auth_db.dsn());
+        auto res = f.get(R"(/scim/v2/Groups?filter=displayName%20eq%20%22g-members%22)");
+        restore_membership_table(f.auth_db.dsn());
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "2");
+    }
+    // Nothing was added to the group by any of the faulted requests.
+    auto after = f.get("/scim/v2/Groups/" + gid);
+    REQUIRE(after);
+    CHECK(after->status == 200);
+    CHECK(json::parse(after->body)["members"].size() == 0);
+}
+
+TEST_CASE("ScimRoutes: POST /Groups whose membership WRITE fails after the group was created answers "
+          "500, leaves the empty group, and the retry meets 409 (documented known limit, #6835)",
+          "[pg][scim][routes][store-error][outage]") {
+    Fixture f;
+    auto created = f.post("/scim/v2/Users", {{"userName", "gmember3"}});
+    REQUIRE(created);
+    const auto uid = json::parse(created->body)["id"].get<std::string>();
+    const json body{{"displayName", "g-write-fails"},
+                    {"members", json::array({json{{"value", uid}}})}};
+
+    // Member RESOLUTION reads scim_resources (healthy) and the group row is created in
+    // scim_groups (healthy); only the member WRITE touches scim_group_members.
+    hide_membership_table(f.auth_db.dsn());
+    auto res = f.post("/scim/v2/Groups", body);
+    restore_membership_table(f.auth_db.dsn());
+    REQUIRE(res);
+    CHECK(res->status == 500);
+
+    // The group row was created before the membership write failed and is NOT rolled back.
+    const auto after = f.scim_store->get_group_by_display_name_checked("g-write-fails");
+    REQUIRE(after.has_value());
+    CHECK(after->has_value());
+
+    // So the retry meets the duplicate-displayName 409 until the empty group is removed.
+    auto retry = f.post("/scim/v2/Groups", body);
+    REQUIRE(retry);
+    CHECK(retry->status == 409);
+}
+#endif // YUZU_SCIM_TSAN_BUILD
+
+TEST_CASE("ScimRoutes: on a healthy store the converted lookups still answer their definitive "
+          "outcomes: an empty filter hit, a filter hit, a duplicate 409, an unknown id 404 "
+          "(#6835)",
+          "[pg][scim][routes]") {
+    Fixture f;
+    // A filter MISS is an empty 200 list, never a 404 or a 503.
+    auto miss = f.get(R"(/scim/v2/Users?filter=userName%20eq%20%22nobody%22)");
+    REQUIRE(miss);
+    CHECK(miss->status == 200);
+    CHECK(json::parse(miss->body)["totalResults"] == 0);
+
+    // A Group filter HIT lists the group; a duplicate displayName is a 409.
+    auto group_res = f.post("/scim/v2/Groups", {{"displayName", "g-healthy"}});
+    REQUIRE(group_res);
+    CHECK(group_res->status == 201);
+    auto hit = f.get(R"(/scim/v2/Groups?filter=displayName%20eq%20%22g-healthy%22)");
+    REQUIRE(hit);
+    CHECK(hit->status == 200);
+    CHECK(json::parse(hit->body)["totalResults"] == 1);
+    auto dup = f.post("/scim/v2/Groups", {{"displayName", "g-healthy"}});
+    REQUIRE(dup);
+    CHECK(dup->status == 409);
+    CHECK(json::parse(dup->body)["scimType"] == "uniqueness");
+
+    // PUT and PATCH of an unknown Group are 404 (only GET and DELETE were pinned before).
+    const std::string missing(32, '0');
+    auto put = f.put("/scim/v2/Groups/" + missing, {{"displayName", "x"}});
+    REQUIRE(put);
+    CHECK(put->status == 404);
+    auto patch = f.patch("/scim/v2/Groups/" + missing,
+                         json{{"Operations", json::array({{{"op", "replace"},
+                                                           {"path", "displayName"},
+                                                           {"value", "y"}}})}});
+    REQUIRE(patch);
+    CHECK(patch->status == 404);
 }
