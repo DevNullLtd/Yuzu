@@ -2399,7 +2399,12 @@ already confirmed` / `no rotation in flight ... already the sole active
 credential`), instead of the previous retryable `503`. A confirm that finds
 **more than two** active credentials likewise now returns a terminal `400`
 (was `503`). Only a genuinely-empty read and an unrecognized two-credential
-pair stay `503`.
+pair stay `503`. *(Since superseded for the unrecognized two-credential pair:
+#6716 made it a terminal `409` / MCP `kInvalidParams` too, because it is a
+positive read of the stored rows that no retry can repair. Only the genuinely
+empty read stays `503`. The metric label moves with it: the
+`yuzu_engine_principal_confirm_total` series for that case is `conflict`, no
+longer `transient`.)*
 
 **Not a breaking change** by this file's convention — no previously-succeeding
 call is rejected; the first, real confirm still returns `200` identically. But

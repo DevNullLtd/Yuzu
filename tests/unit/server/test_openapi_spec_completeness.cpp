@@ -2352,3 +2352,67 @@ TEST_CASE("openapi_spec_json(): the data-retention operation documents the Echo 
     const std::string ok = get_op["responses"]["200"].value("description", "");
     CHECK(ok.find("echo: {tick_seconds, tiers") != std::string::npos);
 }
+
+TEST_CASE("openapi documents: the response status set of the ten hand-checked operations matches "
+          "what their handlers return",
+          "[openapi][structure][responses]") {
+    // Pins WHICH statuses the document declares per route, not their wording. Each expected set
+    // below was written from the handler (symbol and file named per row), not from the document.
+    //
+    struct Row {
+        const char* path;
+        const char* method;
+        std::set<std::string> statuses;
+    };
+    const std::vector<Row> rows = {
+        // register_routes(): sink.Post("/api/v1/quarantine"): 201; 400 (body, whitelist, dispatch
+        // check cannot classify); 401 (auth_fn); 403 (scoped gate, dispatch check); 500 (gate or
+        // authorizer not wired); 503 (store not open, store fault, attempt audit unavailable).
+        {"/quarantine", "post", {"201", "400", "401", "403", "500", "503"}},
+        // register_routes(): sink.Delete(R"(/api/v1/quarantine/(.+))"): 200; the same refusals.
+        {"/quarantine/{agent_id}", "delete", {"200", "400", "401", "403", "500", "503"}},
+        // register_routes(): sink.Delete(R"(/api/v1/engine-principals/([^/]+))"): 200; 401 and
+        // 403 (step-up, perm_fn, engine session); 404 (no such principal); 503 (six causes). It
+        // has no input-validation 400.
+        {"/engine-principals/{id}", "delete", {"200", "401", "403", "404", "503"}},
+        // register_routes(): the .../credentials/rotate handler: 200; 400 (body, overlap_secs,
+        // engine_store_error_status ClientValidation); 401; 403; 409 (conflict class); 503.
+        {"/engine-principals/{id}/credentials/rotate", "post", {"200", "400", "401", "403", "409", "503"}},
+        // register_routes(): the .../credentials/confirm handler: 200; 400 (token_id or secret
+        // missing, validation class); 401; 403 (also a wrong secret); 409; 503.
+        {"/engine-principals/{id}/credentials/confirm", "post", {"200", "400", "401", "403", "409", "503"}},
+        // AuthRoutes elevate handler (auth_routes.cpp, sink.Post("/api/v1/elevate")): 200; 400
+        // (justification, duration); 401 (session, dead window, step-up); 403 (eligibility,
+        // identity source, amr, MFA); 500 (grant audit unrecordable); 503 (auth store).
+        {"/elevate", "post", {"200", "400", "401", "403", "500", "503"}},
+        // register_routes(): sink.Delete("/api/v1/sessions"): 200; 400 (username missing or
+        // malformed); 401 (step-up); 403 (perm_fn); 500 (empty session username); 503
+        // (session_revoke_fn not wired).
+        {"/sessions", "delete", {"200", "400", "401", "403", "500", "503"}},
+        // register_routes(): sink.Delete("/api/v1/sessions/me"): 200; 403 (MCP-tier or
+        // service-scoped token); 401 (auth_fn, unauthenticated); 500 (empty session username);
+        // 503 (session_revoke_fn not wired).
+        {"/sessions/me", "delete", {"200", "401", "403", "500", "503"}},
+        // file_retrieval_routes.cpp register_mint(): 201; 400 (invalid JSON body, ttl_secs,
+        // expected_sha256, and a MintError that is not kUnavailable); 401 (auth_fn); 403
+        // (require_permission UploadGrant:Write); 503 (store or entropy).
+        {"/upload-grants", "post", {"201", "400", "401", "403", "503"}},
+        // SettingsRoutes sink.Get("/api/v2/agent/plugin-policy") (settings_routes.cpp): 200; 401
+        // and 403 (perm_fn_ PluginSigning:Read); 500 (bundle on disk unreadable); 503 (audit
+        // unavailable, runtime config store unavailable, bundle changed while serving).
+        {"/v2/agent/plugin-policy", "get", {"200", "401", "403", "500", "503"}},
+    };
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        for (const auto& row : rows) {
+            INFO(row.method << " " << row.path);
+            REQUIRE(spec["paths"].contains(row.path));
+            REQUIRE(spec["paths"][row.path].contains(row.method));
+            std::set<std::string> declared;
+            for (const auto& [code, response] : spec["paths"][row.path][row.method]["responses"].items())
+                declared.insert(code);
+            CHECK(declared == row.statuses);
+        }
+    }
+}

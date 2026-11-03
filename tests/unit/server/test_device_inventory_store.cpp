@@ -131,7 +131,7 @@ std::string sample_blob() { return build_blob(clean_fields()); }
 // (tests/unit/test_device_ci_sync.cpp) assembles the SAME bytes from the SAME literal
 // fields — the forward contract the agent-side device_ci_canonical_blob_v2 must reproduce.
 // Placeholder serials only; the DIMM serial is '-'.
-constexpr const char* kCrossPinHashV2 = "26037f18de08a8a21facd746eef7ec0a722479ee2009df9b6f14edea35ef0a62";
+constexpr const char* kCrossPinHashV2 = "e810ec4a9b2db6286a30f7eddc72beb9090ad52f59d5529be769cec2a3acb36d";
 
 // One 0x1F-joined, 0x1E-terminated record.
 std::string join_rec(const std::vector<std::string>& f) {
@@ -173,7 +173,7 @@ std::vector<std::vector<std::string>> v2_records() {
         {"status", "swap", "ok", ""},
         {"swap", "/swapfile", "2048", "proc_swaps"},
         {"status", "volume", "ok", ""},
-        {"volume", "C:", "C:\\", "\\\\?\\Volume{1}", "NTFS", "511705088", "-"},
+        {"volume", "C:", "C:/", "\\\\?\\Volume{1}", "NTFS", "511705088", "-"},
         {"status", "partition", "ok", ""},
         {"partition", "0", "1", "536870912", "EFI", "-", "-"},
         {"status", "topology", "ok", ""},
@@ -1249,7 +1249,7 @@ TEST_CASE("v2 full ingest stores the scalars and the rows of every section", "[p
     CHECK(dimm->rows[0][6] == "-");
     const auto* vol = find_section(*secs, "volume");
     REQUIRE(vol != nullptr);
-    CHECK(vol->rows[0][1] == "C:\\");
+    CHECK(vol->rows[0][1] == "C:/");
 
     SECTION("hash-only with the v2 hash is touched; a stale hash and a cold agent need_full") {
         CHECK(store.apply_device_ci("agent-v2", h, std::nullopt, 2) ==

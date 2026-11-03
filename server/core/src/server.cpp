@@ -3799,7 +3799,10 @@ public:
                           "already committed, so a lost audit row does not roll it back. This "
                           "metric is the CC6.8 evidence-integrity alert signal - a sustained "
                           "non-zero rate means the SCIM audit trail has gaps, not that the "
-                          "mutation itself failed",
+                          "mutation itself failed. Exception: the `store_unavailable` failure "
+                          "rows of a request answered 503 (#6835/#6836) record an attempt that "
+                          "changed nothing, so a lost one moves this counter without any "
+                          "committed change losing its evidence",
                           "counter");
         metrics_.describe("yuzu_scim_provenance_denied_total",
                           "Total SCIM mutations refused because the target account's "
@@ -3811,14 +3814,17 @@ public:
                           "signal",
                           "counter");
         metrics_.describe("yuzu_scim_guard_store_unavailable_total",
-                          "Total SCIM mutations answered 503 (retryable) because the AuthDB "
-                          "read inside the provenance or role guard FAILED (a lease timeout or "
-                          "query error), by guard (provenance|role); the role guard includes "
-                          "the POST-revive role re-check. Distinct from "
-                          "yuzu_scim_provenance_denied_total: nothing was refused and nothing "
-                          "was mutated by the failed guard, the IdP is expected to retry. A "
-                          "sustained rate means SCIM deprovisioning is being delayed by an "
-                          "auth-store fault",
+                          "Total SCIM requests answered 503 (retryable) because a read of the "
+                          "store they depend on FAILED (a lease timeout or query error), by "
+                          "guard: provenance and role are the AuthDB reads of the deprovision "
+                          "and revive guards (role includes the POST-revive role re-check), "
+                          "bearer is the SCIM token check (was a false 401), resource is a "
+                          "user or group lookup (was a false 404/409). Distinct from "
+                          "yuzu_scim_provenance_denied_total and "
+                          "yuzu_scim_auth_failures_total: nothing was refused, no credential "
+                          "was judged bad, and nothing was mutated by the failed read; the IdP "
+                          "is expected to retry. A sustained rate means SCIM provisioning, and "
+                          "above all leaver deactivation, is being delayed by a store fault",
                           "counter");
         // SCIM v2 Groups->role application core (#2021). Bumped only when
         // recompute_scim_user_role ACTUALLY changes a role (promotion or
