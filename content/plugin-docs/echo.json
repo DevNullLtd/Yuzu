@@ -2826,7 +2826,9 @@
     "changelog": [
       "changelog.d/2026-10-30-echo-db-budget.added.md",
       "changelog.d/2026-10-30-echo-db-budget.changed.md",
-      "changelog.d/2026-10-30-echo-db-budget.fixed.md"
+      "changelog.d/2026-10-30-echo-db-budget.fixed.md",
+      "changelog.d/2026-11-03-echo-rollup-only-ui.changed.md",
+      "changelog.d/2026-11-03-echo-rollup-only-ui.removed.md"
     ],
     "definitions": [
       "content/definitions/echo.yaml",

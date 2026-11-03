@@ -13,11 +13,11 @@
 ///   * Roll-up only: there are no process ids, command lines, paths or start/exit
 ///     times. A node is a process NAME (per user) with the counts the hour recorded.
 ///   * The parent link is by NAME only (`parent_name` carries no user), so two parents
-///     sharing a name occupy one position; children attach to the first such node.
+///     sharing a name occupy one position; children attach to the one with the lowest user.
 ///   * The input is agent-controlled and the name graph has cycles and fan-in by
 ///     construction (bash under bash, svchost under svchost, cmd/conhost/cmd), so the
 ///     builder places every (name, user) node exactly once under one deterministic
-///     parent and breaks any cycle.
+///     parent and breaks any cycle. The result does not depend on row order.
 ///   * The agent forbids recursive CTEs, so the tree is built HERE in C++ from flat
 ///     rows, never in SQL.
 
@@ -55,7 +55,9 @@ struct EchoTcpHourRow {
 };
 
 /// One row out of `$DNS_Hourly` — device DNS resolver-cache activity in an hour. The
-/// cache carries NO process, so this is never joined to a node. Agent-controlled.
+/// cache carries NO process, so this is never joined to a node. Agent-controlled. Only the
+/// appear / remove counts the agent measures are read: it does not write the "no such
+/// name" count yet, so none is shown.
 struct EchoDnsHourRow {
     std::int64_t hour_ts = 0;
     std::string name;
@@ -63,11 +65,11 @@ struct EchoDnsHourRow {
     std::string data;
     std::int64_t appear_count = 0;
     std::int64_t remove_count = 0;
-    std::int64_t negative_count = 0;
 };
 
 /// One row out of `$ARP_Hourly` — device ARP / neighbour activity in an hour. No process.
-/// Agent-controlled.
+/// Agent-controlled. As with DNS, only the measured appear / remove counts are read (the
+/// router role and MAC-rebind count are not written by the agent yet).
 struct EchoArpHourRow {
     std::int64_t hour_ts = 0;
     std::string iface; ///< NB: 'interface' is a Win32 COM macro under full <windows.h>
@@ -75,15 +77,13 @@ struct EchoArpHourRow {
     std::string mac_address;
     std::int64_t appear_count = 0;
     std::int64_t remove_count = 0;
-    bool is_router = false;
-    std::int64_t rebind_count = 0;
 };
 
 /// One process NAME (per user) in the selected hour, addressed by a stable `node_id` =
 /// its index in `EchoProcTree::nodes`. Children/parent are node_ids.
 struct EchoProcNode {
     std::string name;
-    std::string parent_name; ///< as recorded (first row's); the tree link is `parent`
+    std::string parent_name; ///< the parent name with the most starts (ties: lowest name); the link is `parent`
     std::string user;
     std::int64_t start_count = 0;
     std::int64_t stop_count = 0;
@@ -129,6 +129,15 @@ inline constexpr std::size_t kMaxEchoTcpOutputBytes = 4ull * 1024 * 1024;   //  
 /// fragment so a future change to either cap can't silently move the other (ADR-0015
 /// review LOW-E).
 inline constexpr std::size_t kMaxEchoDeviceNetOutputBytes = 4ull * 1024 * 1024; //  4 MiB
+/// Byte cap for the capture-sources `echo status` reply (same 4 MiB family as the device-net
+/// cap). Enforced at the route; a larger reply is refused with a note, never parsed.
+inline constexpr std::size_t kMaxEchoStatusOutputBytes = 4ull * 1024 * 1024; //  4 MiB
+
+/// Rows one `echo.sql` answer carries at most: the agent's `do_sql` passes no row limit, so
+/// `EchoDatabase::execute_user_query` applies its default `max_rows` (echo_db.hpp:826) and
+/// the answer is cut there whatever LIMIT the query text names. An answer at this count may
+/// be incomplete and is never presented as complete.
+inline constexpr std::size_t kEchoAgentRowCap = 10000;
 
 /// Canonicalize a `preset` query token to one of the known window tokens
 /// {1h, 24h, 7d, custom}, mapping any empty/unrecognized value to the `24h` default
@@ -146,33 +155,81 @@ std::string normalize_echo_os(const std::string& os);
 // ── Parsers (defensive, mirroring parse_dex_perf_output's __schema__ contract) ──
 // All expect the agent's `echo.sql` output: a `__schema__|col1|col2|…` header line
 // (cell 0 is the literal marker, cells 1..N name the data columns) followed by
-// pipe-delimited data rows. Columns are located BY NAME from the schema line, so a
-// column reorder can't misalign fields. An `error|…` first line, a missing/wrong
-// schema, torn rows, and out-of-range numbers are all skipped/rejected — a forged
-// agent payload can shrink the result but never corrupt the parse.
+// pipe-delimited data rows and a `__total__|N` trailer. Columns are located BY NAME from
+// the schema line, so a column reorder can't misalign fields. An `error|…` first line, a
+// missing/wrong schema, rows whose cell count is not the schema's width, and out-of-range
+// numbers are all skipped/rejected and COUNTED (`EchoParseStats::unreadable`), so a forged or
+// damaged payload can shrink the result but never goes unreported.
+//
+// What the wire cannot protect: the agent writes each cell raw, joined by `|`, one row per
+// line, with no escaping. A process name that itself contains `|` or a newline can therefore
+// shift cells or forge a whole row, and a forged row whose cell count is exactly the schema
+// width is indistinguishable from a real one. The server bounds the damage (a row with the
+// wrong cell count is dropped and counted, splitting stops at width+1 cells so a pipe-heavy
+// line cannot amplify memory) but a forged payload CAN mis-attribute cells until the agent
+// escapes them.
+
+/// Split `line` on `|` into at most `max_cells` cells; the last keeps the unsplit remainder, so
+/// a caller that wants `width` cells passes width+1 and a line with more is recognisable as too
+/// wide, while a pipe-heavy line costs one remainder copy rather than a string per pipe.
+/// Pure + free so the bound is unit-testable.
+std::vector<std::string> echo_split_pipe(const std::string& line, std::size_t max_cells);
+
+/// What a parse could not use. Pass one to a parser to learn whether the answer was usable.
+struct EchoParseStats {
+    bool schema = false;          ///< a usable `__schema__` header with the required columns was found
+    std::size_t unreadable = 0;   ///< data rows dropped: wrong cell count, or a required number that did not parse
+};
 
 /// Parse `$Process_Hourly` rows. Required columns: hour_ts, name, parent_name, user,
 /// start_count, stop_count (abnormal_exit_count optional → 0). Bounded to `max_rows`
 /// to bound work against a response-spam payload.
 std::vector<EchoProcHourRow> parse_echo_process_hourly_output(const std::string& output,
-                                                              std::size_t max_rows = 120000);
+                                                              std::size_t max_rows = 120000,
+                                                              EchoParseStats* stats = nullptr);
 
 /// Parse `$TCP_Hourly` rows. Required columns: hour_ts, process_name, remote_addr
 /// (remote_port, proto, connect_count, disconnect_count, failed_count optional).
 /// Bounded to `max_rows`.
 std::vector<EchoTcpHourRow> parse_echo_tcp_hourly_output(const std::string& output,
-                                                         std::size_t max_rows = 20000);
+                                                         std::size_t max_rows = 20000,
+                                                         EchoParseStats* stats = nullptr);
 
 /// Parse `$DNS_Hourly` rows (ADR-0015). Required columns: hour_ts, name, record_type
-/// (data, appear_count, remove_count, negative_count optional). Bounded to `max_rows`.
+/// (data, appear_count, remove_count optional). Bounded to `max_rows`.
 std::vector<EchoDnsHourRow> parse_echo_dns_hourly_output(const std::string& output,
-                                                         std::size_t max_rows = 20000);
+                                                         std::size_t max_rows = 20000,
+                                                         EchoParseStats* stats = nullptr);
 
 /// Parse `$ARP_Hourly` rows (ADR-0015). Required columns: hour_ts, ip_address,
-/// mac_address (interface, appear_count, remove_count, is_router, rebind_count
-/// optional). Bounded to `max_rows`.
+/// mac_address (interface, appear_count, remove_count optional). Bounded to `max_rows`.
 std::vector<EchoArpHourRow> parse_echo_arp_hourly_output(const std::string& output,
-                                                         std::size_t max_rows = 20000);
+                                                         std::size_t max_rows = 20000,
+                                                         EchoParseStats* stats = nullptr);
+
+/// The distinct hours of a `SELECT DISTINCT hour_ts …` answer, newest first (the Hour
+/// selector's source). Bounded to kEchoMaxWindowHours.
+std::vector<std::int64_t> parse_echo_hours_output(const std::string& output,
+                                                  EchoParseStats* stats = nullptr);
+
+/// Turn an agent's failure text (an `error|…` reply, or a command's error detail) into the
+/// sentence shown to the operator. An agent that predates the roll-up tables answers with a
+/// SQLite "no such column" / "no such table" or the registry's "unknown table"; that gets
+/// the one actionable instruction instead of the raw text. Plain text: the caller escapes.
+std::string echo_agent_error_note(const std::string& agent_text);
+
+/// What a read could not give the operator, shown beside (or instead of) the rows.
+struct EchoReadNotes {
+    std::string error;          ///< plain text: the read failed, no rows are shown
+    std::size_t unreadable = 0; ///< rows the parser dropped
+    bool cut = false;           ///< the answer reached kEchoAgentRowCap, so rows may be missing
+};
+
+/// The warning banners for `notes.unreadable` and `notes.cut` (empty when neither is set;
+/// `notes.error` is rendered by its caller). `subject` / `row_noun` name what was read
+/// ("Results" / "rows", or "Connection results" / "connection rows").
+std::string render_echo_read_notes(const EchoReadNotes& notes, const std::string& subject = "Results",
+                                   const std::string& row_noun = "rows");
 
 // ── Window + tree ───────────────────────────────────────────────────────────
 
@@ -212,17 +269,17 @@ std::int64_t parse_ts_param(const std::string& s);
 /// instead of silently rendering an unbounded or shifted window. Never throws.
 std::optional<std::int64_t> parse_ts_param_strict(const std::string& s);
 
-/// The distinct `hour_ts` values present in `rows`, newest first.
-std::vector<std::int64_t> echo_process_hours(const std::vector<EchoProcHourRow>& rows);
-
 /// Build the name-level tree for `hour_ts` from `rows` (rows of other hours are
-/// ignored). Nodes are keyed (name, user) in row order, summing the counts of rows that
-/// share the key; a node's parent is the FIRST node named by its first row's
-/// `parent_name`. A node is a root when its parent name is empty, unknown or its own
-/// name, and a cycle (a under b, b under a) is cut at its lowest-index member, so every
-/// node is placed exactly once and the walk terminates on any input. Always the FULL
-/// tree — anomalies-only and text filtering is a client-side display concern (each
-/// rendered row carries data-anom). Cap-guarded.
+/// ignored). Nodes are keyed (name, user), summing the counts of rows that share the key.
+/// A node's parent NAME is the one its rows name with the most summed starts (ties: the
+/// lowest name; a name other than the node's own is preferred, an empty one is ignored), and
+/// the link goes to the node of that name with the lowest user. A node is a root when that
+/// name is empty, unknown or its own, and a cycle (a under b, b under a) is cut at its
+/// lowest (name, user) member, so every node is placed exactly once, the walk terminates on
+/// any input, and the result does not depend on row order. Every row is checked for a
+/// suspicious spawn by its own parent name, whatever the placement. Always the FULL tree —
+/// anomalies-only and text filtering is a client-side display concern (each rendered row
+/// carries data-anom). Cap-guarded.
 EchoProcTree build_echo_process_tree(const std::vector<EchoProcHourRow>& rows, std::int64_t hour_ts);
 
 /// True if a `parent_name → child_name` pair is a suspicious spawn (case-insensitive
@@ -235,6 +292,13 @@ bool echo_is_suspicious_spawn(const std::string& parent_name, const std::string&
 // Co-located with the engine (like dex_routes' render_* helpers) so the HTML-escape
 // of agent-controlled fields is unit-testable without the HTTP sink.
 
+/// Work counters a caller can ask render_echo_tree_fragment to fill (tests only): the net
+/// cell of a process name is built once and reused by every node bearing that name.
+struct EchoRenderStats {
+    std::size_t net_cells_built = 0;
+    std::size_t net_cells_reused = 0;
+};
+
 /// Render the tree fragment: the banner + the nested `<details>/<summary>` tree. Every
 /// node is rendered (no server-side filtering); each row carries `data-anom` so the
 /// toolbar's client-side filters (Anomalies-only, text) can show/hide without a
@@ -243,7 +307,7 @@ bool echo_is_suspicious_spawn(const std::string& parent_name, const std::string&
 /// `/fragments/echo/process-tree/detail?token=…&node=…` into `#echo-tree-detail`.
 /// `token` keys the reconstruction cache the detail route reads.
 std::string render_echo_tree_fragment(const EchoProcTree& tree, const std::vector<EchoTcpHourRow>& conns,
-                                      const std::string& token);
+                                      const std::string& token, EchoRenderStats* stats = nullptr);
 
 /// Render one node's detail panel — name, parent name, user, the hour's start / stop /
 /// abnormal-exit counts, anomaly evidence, and the connections recorded under the same
@@ -251,18 +315,24 @@ std::string render_echo_tree_fragment(const EchoProcTree& tree, const std::vecto
 std::string render_echo_proc_detail(const EchoProcNode& node, const std::vector<EchoTcpHourRow>& conns);
 
 /// Render the device DNS-cache activity panel (ADR-0015) for `hour_ts` — a collapsible
-/// `<details>` with a compact table of the rows of that hour (appeared / removed / no
-/// such name counts). Device-level, NOT per process. Agent fields are HTML-escaped.
-/// Pure (no DB/HTTP) so it is unit-testable directly.
-std::string render_echo_dns_panel(const std::vector<EchoDnsHourRow>& rows, std::int64_t hour_ts);
+/// `<details>` with a compact table of the rows of that hour (appeared / removed counts).
+/// Device-level, NOT per process. Agent fields are HTML-escaped. `notes.error` replaces the
+/// table with an in-panel error (a failed read is never shown as "nothing recorded");
+/// `notes.unreadable` / `notes.cut` add their banners. Pure (no DB/HTTP) so it is
+/// unit-testable directly.
+std::string render_echo_dns_panel(const std::vector<EchoDnsHourRow>& rows, std::int64_t hour_ts,
+                                  const EchoReadNotes& notes = {});
 
 /// Render the device ARP-table activity panel (ADR-0015) for `hour_ts`: appeared /
-/// removed counts, the router role and MAC rebinds.
-std::string render_echo_arp_panel(const std::vector<EchoArpHourRow>& rows, std::int64_t hour_ts);
+/// removed counts per interface, IP and MAC. Notes as for the DNS panel.
+std::string render_echo_arp_panel(const std::vector<EchoArpHourRow>& rows, std::int64_t hour_ts,
+                                  const EchoReadNotes& notes = {});
 
 /// Render the Capture-sources cards (ADR-0015) from a device's `echo status` output
-/// (per-source `<src>_enabled` / `<src>_rows` — or `<src>_live_rows` from an agent that
-/// predates the rename — / `<src>_oldest_ts`). Produces the filter chips + one card per
+/// (per-source `<src>_enabled` / `<src>_rows` / `<src>_oldest_ts`). A status that carries a
+/// source's `<src>_live_rows` but not its `<src>_rows` comes from an agent without the
+/// roll-up tables: that count is NOT shown (a dash), and one note above the cards says to
+/// upgrade the agent. Produces the filter chips + one card per
 /// reported source with staged (not-yet-pushed) toggles + the push/discard bar — the
 /// page JS handles staging and the Push dispatch. Category, always-on classification,
 /// the hourly `$`-name and the kept tiers are presentation metadata held here (the

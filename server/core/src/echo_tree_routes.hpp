@@ -4,10 +4,10 @@
 
 /// @file echo_tree_routes.hpp
 /// The Echo process-tree viewer route module — Frame 3 of the `/echo` dashboard page.
-/// Picks ONE live host, dispatches two canned read-only `echo.sql` queries to it
-/// ($Process_Hourly + $TCP_Hourly), polls the response store (the device-page "Get live
-/// info" dispatch/poll seam), builds a per-host name-level process tree for one hour of
-/// a chosen window (echo_process_tree.hpp), and renders the HTMX fragments.
+/// Picks ONE live host, dispatches three canned read-only `echo.sql` queries to it (the
+/// window's hour list, then $Process_Hourly + $TCP_Hourly for ONE hour), polls the response
+/// store (the device-page "Get live info" dispatch/poll seam), builds a per-host name-level
+/// process tree for that hour (echo_process_tree.hpp), and renders the HTMX fragments.
 ///
 /// Product UI: HTMX, server-rendered, dark-theme only; htmx core attrs only (CSP
 /// blocks hx-on). Per-host only; data from the agent's local echo.db only.
@@ -37,17 +37,17 @@
 /// cache `token` is a CSPRNG value minted and cached ONLY by `/result` itself
 /// (`cache_render_detail`/`ReconEntry`, principal-bound) — no other path mints
 /// one, so a `/detail` twin genuinely has no input to accept today. `/result`'s
-/// `pcmd`/`tcmd` command-ids are ordinary `echo sql` dispatch results
+/// `pcmd`/`tcmd`/`hcmd` command-ids are ordinary `echo sql` dispatch results
 /// (`plugin_action_catalogue_a.hpp`: `Infrastructure:Read`, `execute_gate=None`)
 /// and COULD in principle be minted by an operator through the already-twinned
 /// generic dispatch surface (`execute_instruction` / `POST /api/command`) by
-/// reproducing the two canned `$Process_Hourly`/`$TCP_Hourly` SELECTs verbatim —
+/// reproducing the three canned `$Process_Hourly`/`$TCP_Hourly` SELECTs verbatim —
 /// there is no dedicated API path, only that indirect route, so shipping a real
 /// `/result` twin would still need a caller to hand-derive those exact queries
 /// AND a new async "not ready yet" polling contract (REST/MCP have no htmx
 /// auto-reissue mechanism to lean on). Deferred as scope for now — see the
 /// #4027 ledger row for the recorded `exception:` reasoning. Revisit once Batch C
-/// lands a `/run` twin that mints pcmd/tcmd (and a token) directly over the API.
+/// lands a `/run` twin that mints pcmd/tcmd/hcmd (and a token) directly over the API.
 
 #include <yuzu/server/auth.hpp>
 

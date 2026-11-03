@@ -173,35 +173,108 @@ TEST_CASE("echo parse: tcp hourly __schema__ output", "[echo][tree][parse]") {
 
 TEST_CASE("echo parse: dns hourly schema-located; skips torn and error rows", "[echo][dns][panel]") {
     const std::string out =
-        "__schema__|hour_ts|name|record_type|data|appear_count|remove_count|negative_count\n"
-        "7200|example.com|A|93.184.216.34|3|2|0\n"
+        "__schema__|hour_ts|name|record_type|data|appear_count|remove_count\n"
+        "7200|example.com|A|93.184.216.34|3|2\n"
         "torn-row-missing-cells\n"
-        "7200|evil.test|A||0|0|5\n"
-        "total|2\n";
-    const auto rows = parse_echo_dns_hourly_output(out);
+        "7200|evil.test|A||0|5\n"
+        "__total__|2\n";
+    EchoParseStats st;
+    const auto rows = parse_echo_dns_hourly_output(out, 20000, &st);
     REQUIRE(rows.size() == 2);
     CHECK(rows[0].name == "example.com");
     CHECK(rows[0].record_type == "A");
     CHECK(rows[0].appear_count == 3);
     CHECK(rows[0].remove_count == 2);
-    CHECK(rows[1].negative_count == 5);
+    CHECK(rows[1].remove_count == 5);
+    CHECK(st.schema);
+    CHECK(st.unreadable == 1); // the torn row; the trailer is not a row
     CHECK(parse_echo_dns_hourly_output("error|dns source disabled\n").empty());
     CHECK(parse_echo_dns_hourly_output("__schema__|hour_ts|name\n7200|x\n").empty());
 }
 
 TEST_CASE("echo parse: arp hourly schema-located", "[echo][arp][panel]") {
     const std::string out =
-        "__schema__|hour_ts|interface|ip_address|mac_address|appear_count|remove_count|is_router|"
-        "rebind_count\n"
-        "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0|1|0\n"
-        "7200|eth0|10.0.0.7|11:22:33:44:55:66|2|2|0|3\n";
+        "__schema__|hour_ts|interface|ip_address|mac_address|appear_count|remove_count\n"
+        "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0\n"
+        "7200|eth0|10.0.0.7|11:22:33:44:55:66|2|2\n";
     const auto rows = parse_echo_arp_hourly_output(out);
     REQUIRE(rows.size() == 2);
     CHECK(rows[0].iface == "eth0");
-    CHECK(rows[0].is_router);
-    CHECK_FALSE(rows[1].is_router);
-    CHECK(rows[1].rebind_count == 3);
+    CHECK(rows[0].appear_count == 1);
+    CHECK(rows[1].ip_address == "10.0.0.7");
+    CHECK(rows[1].remove_count == 2);
     CHECK(parse_echo_arp_hourly_output("__schema__|hour_ts|interface\n7200|eth0\n").empty());
+}
+
+TEST_CASE("echo parse: the hour list is distinct newest first and bounded", "[echo][tree][parse]") {
+    EchoParseStats st;
+    const auto hours = parse_echo_hours_output(
+        "__schema__|hour_ts\n3600\n10800\n7200\n7200\n__total__|4\n", &st);
+    CHECK(hours == std::vector<std::int64_t>{10800, 7200, 3600});
+    CHECK(st.schema);
+    CHECK(st.unreadable == 0);
+    CHECK(parse_echo_hours_output("error|nope\n").empty());
+    CHECK(parse_echo_hours_output("").empty());
+    std::string many = "__schema__|hour_ts\n";
+    for (int i = 0; i < 400; ++i)
+        many += std::to_string(3600 * (i + 1)) + "\n";
+    CHECK(parse_echo_hours_output(many).size() == static_cast<std::size_t>(kEchoMaxWindowHours));
+}
+
+// B6: the agent writes cells raw, so a `|` or newline inside a value shifts cells or forges a row.
+// The server cannot undo that, but it must not accept a row whose cell count is not the schema's
+// width, must count what it dropped and must not amplify memory on a pipe-heavy line.
+TEST_CASE("echo parse: a row with extra cells is dropped and counted", "[echo][tree][parse][security]") {
+    const std::string out =
+        "__schema__|hour_ts|name|parent_name|user|start_count|stop_count|abnormal_exit_count\n"
+        "3600|ok||u|1|1|0\n"
+        "3600|x|winword.exe|SYSTEM|5|5|0|9|9\n" // a name carrying pipes: 9 cells, not 7
+        "3600|torn||u|1|1\n"                      // 6 cells
+        "abc|bad-hour||u|1|1|0\n"                 // a required number that does not parse
+        "__total__|4\n";
+    EchoParseStats st;
+    const auto rows = parse_echo_process_hourly_output(out, 120000, &st);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].name == "ok");
+    CHECK(st.schema);
+    CHECK(st.unreadable == 3);
+    // The same payload without a stats pointer parses the same.
+    CHECK(parse_echo_process_hourly_output(out).size() == 1);
+}
+
+TEST_CASE("echo parse: a payload with no schema reports none and an error payload reads nothing",
+          "[echo][tree][parse]") {
+    EchoParseStats st;
+    CHECK(parse_echo_process_hourly_output("3600|ok||u|1|1|0\n", 120000, &st).empty());
+    CHECK_FALSE(st.schema);
+    EchoParseStats err;
+    CHECK(parse_echo_tcp_hourly_output("error|no such column: failed_count", 20000, &err).empty());
+    CHECK_FALSE(err.schema);
+    // A schema far wider than any Echo table is refused as the wrong shape.
+    std::string wide = "__schema__";
+    for (int i = 0; i < 200; ++i)
+        wide += "|c" + std::to_string(i);
+    EchoParseStats w;
+    CHECK(parse_echo_process_hourly_output(wide + "\n", 120000, &w).empty());
+    CHECK_FALSE(w.schema);
+}
+
+TEST_CASE("echo_split_pipe stops splitting at the bound", "[echo][tree][parse][security]") {
+    CHECK(echo_split_pipe("a|b|c", 10) == std::vector<std::string>{"a", "b", "c"});
+    // width 3 → bound 4: a fourth cell holds the unsplit remainder.
+    CHECK(echo_split_pipe("a|b|c|d|e|f", 4) == std::vector<std::string>{"a", "b", "c", "d|e|f"});
+    CHECK(echo_split_pipe("a|b", 1) == std::vector<std::string>{"a|b"});
+    // A 1 MiB line of pipes yields at most width+1 cells, not a million.
+    const std::string pipes(1 << 20, '|');
+    const auto cells = echo_split_pipe(pipes, 8);
+    CHECK(cells.size() == 8);
+    CHECK(cells.back().size() == pipes.size() - 7);
+    // End to end: such a line in a process answer is one unreadable row.
+    EchoParseStats st;
+    const std::string out =
+        "__schema__|hour_ts|name|parent_name|user|start_count|stop_count\n" + pipes + "\n";
+    CHECK(parse_echo_process_hourly_output(out, 120000, &st).empty());
+    CHECK(st.unreadable == 1);
 }
 
 // =============================================================================
@@ -279,13 +352,6 @@ TEST_CASE("echo window: custom range floors to the hour; unset ends default; rev
 // =============================================================================
 // Name-level tree
 // =============================================================================
-
-TEST_CASE("echo tree: echo_process_hours lists distinct hours newest first", "[echo][tree]") {
-    const std::vector<EchoProcHourRow> rows{hr(7200, "a", ""), hr(3600, "b", ""), hr(7200, "c", ""),
-                                            hr(10800, "d", "")};
-    CHECK(echo_process_hours(rows) == std::vector<std::int64_t>{10800, 7200, 3600});
-    CHECK(echo_process_hours({}).empty());
-}
 
 TEST_CASE("echo tree: three hours each build their own name-level tree", "[echo][tree]") {
     const std::int64_t h1 = 3600, h2 = 7200, h3 = 10800;
@@ -384,23 +450,34 @@ TEST_CASE("echo tree: a longer cycle with a tail renders every node exactly once
         CHECK(rendered_rows(html, n) == 1);
 }
 
-TEST_CASE("echo tree: a name with two parents is placed once under the first and counts are summed",
+TEST_CASE("echo tree: a name with two parents is placed once under the one with the most starts",
           "[echo][tree][fan-in]") {
     const std::vector<EchoProcHourRow> rows{
         hr(3600, "p1", "", "u", 1, 0),          hr(3600, "p2", "", "u", 1, 0),
-        hr(3600, "x", "p1", "u", 3, 2, 1),      // first row: parent p1 wins
-        hr(3600, "x", "p2", "u", 4, 4, 0)};     // same (name, user), other parent
+        hr(3600, "x", "p1", "u", 3, 2, 1),      // 3 starts under p1
+        hr(3600, "x", "p2", "u", 4, 4, 0)};     // 4 starts under p2: p2 wins
     const auto t = build_echo_process_tree(rows, 3600);
     REQUIRE(t.nodes.size() == 3);
     const auto* x = find_node(t, "x");
     REQUIRE(x != nullptr);
-    CHECK(t.nodes[x->parent].name == "p1");
-    CHECK(x->parent_name == "p1");
+    CHECK(t.nodes[x->parent].name == "p2");
+    CHECK(x->parent_name == "p2");
     CHECK(x->start_count == 7);
     CHECK(x->stop_count == 6);
     CHECK(x->abnormal_exit_count == 1);
-    CHECK(find_node(t, "p2")->children.empty());
+    CHECK(find_node(t, "p1")->children.empty());
     CHECK(rendered_rows(render_echo_tree_fragment(t, {}, kToken), "x") == 1);
+
+    // Equal starts: the lowest parent name wins, whichever row came first.
+    const auto tie = build_echo_process_tree(
+        {hr(3600, "pb", ""), hr(3600, "pa", ""), hr(3600, "x", "pb", "u", 2), hr(3600, "x", "pa", "u", 2)},
+        3600);
+    CHECK(find_node(tie, "x")->parent_name == "pa");
+    // A parent other than the node's own name beats its own, which can never be placed.
+    const auto self = build_echo_process_tree(
+        {hr(3600, "sshd", ""), hr(3600, "bash", "bash", "u", 9), hr(3600, "bash", "sshd", "u", 1)}, 3600);
+    CHECK(find_node(self, "bash")->parent_name == "sshd");
+    CHECK(self.nodes[find_node(self, "bash")->parent].name == "sshd");
 }
 
 TEST_CASE("echo tree: the same name under two users is two nodes; the parent link is by name",
@@ -411,12 +488,12 @@ TEST_CASE("echo tree: the same name under two users is two nodes; the parent lin
     const auto t = build_echo_process_tree(rows, 3600);
     REQUIRE(t.nodes.size() == 3);
     REQUIRE(t.roots.size() == 2);
-    // The child attaches to the FIRST svchost in row order, never to both.
-    const auto* first = find_node(t, "svchost", "SYSTEM");
-    const auto* second = find_node(t, "svchost", "NETWORK SERVICE");
-    REQUIRE((first && second));
-    CHECK(first->children.size() == 1);
-    CHECK(second->children.empty());
+    // The child attaches to ONE svchost, the one with the lowest user, never to both.
+    const auto* low = find_node(t, "svchost", "NETWORK SERVICE");
+    const auto* high = find_node(t, "svchost", "SYSTEM");
+    REQUIRE((low && high));
+    CHECK(low->children.size() == 1);
+    CHECK(high->children.empty());
     CHECK(rendered_rows(render_echo_tree_fragment(t, {}, kToken), "wuauserv") == 1);
 }
 
@@ -483,6 +560,66 @@ TEST_CASE("echo anomaly: suspicious parent->child and abnormal exits are flagged
     CHECK(html.find("data-anom=\"0\"") != std::string::npos);
 }
 
+// B2: the spawn check runs on every stored row, whatever the placement, and the tree does not
+// depend on row order.
+TEST_CASE("echo anomaly: the result does not depend on row order", "[echo][tree][anomaly]") {
+    // cmd.exe is started under explorer.exe (benign) and under winword.exe (flagged).
+    const std::vector<EchoProcHourRow> a{
+        hr(3600, "explorer.exe", ""), hr(3600, "winword.exe", ""),
+        hr(3600, "cmd.exe", "explorer.exe", "bob", 2), hr(3600, "cmd.exe", "winword.exe", "bob", 1)};
+    std::vector<EchoProcHourRow> b = a;
+    std::reverse(b.begin(), b.end());
+    const auto ta = build_echo_process_tree(a, 3600);
+    const auto tb = build_echo_process_tree(b, 3600);
+    CHECK(ta.anomaly_count == 1);
+    CHECK(tb.anomaly_count == 1);
+    for (const auto* t : {&ta, &tb}) {
+        const auto* cmd = find_node(*t, "cmd.exe");
+        REQUIRE(cmd != nullptr);
+        CHECK(cmd->anomaly);
+        CHECK(cmd->anomaly_evidence.find("winword.exe") != std::string::npos);
+        CHECK(cmd->parent_name == "explorer.exe"); // 2 starts beat 1, in either order
+        CHECK(t->nodes[cmd->parent].name == "explorer.exe");
+        CHECK(cmd->start_count == 3); // all the starts are summed on the one node
+    }
+}
+
+TEST_CASE("echo anomaly: a parent that ran all hour or is spelled in another case still flags",
+          "[echo][tree][anomaly]") {
+    // outlook.exe has no row of its own in the hour (it started yesterday and is still running).
+    const auto none = build_echo_process_tree({hr(3600, "powershell.exe", "outlook.exe", "bob")}, 3600);
+    REQUIRE(none.nodes.size() == 1);
+    CHECK(none.nodes[0].parent == EchoProcNode::kNoParent); // not linkable...
+    CHECK(none.nodes[0].anomaly);                           // ...and still flagged
+    CHECK(none.anomaly_count == 1);
+    // WINWORD.EXE vs the node winword.exe: the link is by exact name, the check is not.
+    const auto cased = build_echo_process_tree(
+        {hr(3600, "winword.exe", "", "bob"), hr(3600, "cmd.exe", "WINWORD.EXE", "bob")}, 3600);
+    CHECK(find_node(cased, "cmd.exe")->anomaly);
+    // Distinct spellings of the same flagged parent keep one evidence line each.
+    const auto both = build_echo_process_tree(
+        {hr(3600, "cmd.exe", "WINWORD.EXE", "bob"), hr(3600, "cmd.exe", "winword.exe", "bob")}, 3600);
+    CHECK(both.anomaly_count == 1);
+    CHECK(both.nodes[0].anomaly_evidence.find("WINWORD.EXE") != std::string::npos);
+    CHECK(both.nodes[0].anomaly_evidence.find("winword.exe") != std::string::npos);
+}
+
+TEST_CASE("echo anomaly: a wscript.exe and cmd.exe cycle still flags the pair", "[echo][tree][anomaly][cycle]") {
+    std::vector<EchoProcHourRow> rows{hr(3600, "wscript.exe", "cmd.exe", "bob"),
+                                      hr(3600, "cmd.exe", "wscript.exe", "bob")};
+    for (int order = 0; order < 2; ++order) {
+        if (order == 1)
+            std::reverse(rows.begin(), rows.end());
+        const auto t = build_echo_process_tree(rows, 3600);
+        REQUIRE(t.nodes.size() == 2);
+        REQUIRE(t.roots.size() == 1);
+        // The cycle is cut at its lowest (name, user) member whichever row came first.
+        CHECK(t.nodes[t.roots[0]].name == "cmd.exe");
+        CHECK(t.anomaly_count == 1); // wscript.exe -> cmd.exe is on the denylist
+        CHECK(find_node(t, "cmd.exe")->anomaly);
+    }
+}
+
 TEST_CASE("echo anomaly: a name with more stops than starts is a soft flag and not an anomaly",
           "[echo][tree][anomaly]") {
     const auto t = build_echo_process_tree({hr(3600, "daemon", "", "root", 1, 4)}, 3600);
@@ -544,6 +681,29 @@ TEST_CASE("echo render: net summary joins by name then dedups then orders public
     // A connection under another name is not attached to either node.
     CHECK(html.find("198.51.100.1") == std::string::npos);
     CHECK(count_occurrences(html, "tt-net-ico") == 1);
+}
+
+// S1: nodes sharing a process name show the same net cell, so it is built once per name.
+// Counted, not timed: the work is "cells built", not a clock reading.
+TEST_CASE("echo render: the net cell is built once per process name and not once per node",
+          "[echo][tree][render][net]") {
+    std::vector<EchoProcHourRow> rows;
+    for (int i = 0; i < 500; ++i)
+        rows.push_back(hr(7200, "svchost", "", ("user" + std::to_string(i)).c_str()));
+    rows.push_back(hr(7200, "other", ""));
+    const auto t = build_echo_process_tree(rows, 7200);
+    REQUIRE(t.nodes.size() == 501);
+    std::vector<EchoTcpHourRow> conns;
+    for (int i = 0; i < 20000; ++i)
+        conns.push_back(conn(7200, "svchost", ("10.0." + std::to_string(i / 250) + "." +
+                                               std::to_string(i % 250)).c_str(), 443));
+    conns.push_back(conn(7200, "other", "203.0.113.9", 443));
+    EchoRenderStats stats;
+    const auto html = render_echo_tree_fragment(t, conns, kToken, &stats);
+    CHECK(stats.net_cells_built == 2);     // svchost once, other once
+    CHECK(stats.net_cells_reused == 499);  // the other 499 svchost nodes
+    // Every node still carries its cell.
+    CHECK(count_occurrences(html, "class=\"tt-net\"") + count_occurrences(html, "class=\"tt-net tt-net-pub\"") == 501);
 }
 
 TEST_CASE("echo render: agent-controlled fields are HTML-escaped", "[echo][tree][render]") {
@@ -695,7 +855,6 @@ TEST_CASE("render_echo_dns_panel: only the selected hour; counts shown; fields e
     a.data = "1.1.1.1";
     a.appear_count = 14;
     a.remove_count = 13;
-    a.negative_count = 2;
     rows.push_back(a);
     EchoDnsHourRow other = a;
     other.hour_ts = 3600;
@@ -706,8 +865,10 @@ TEST_CASE("render_echo_dns_panel: only the selected hour; counts shown; fields e
     CHECK(html.find("&lt;b&gt;evil") != std::string::npos);
     CHECK(html.find("<b>evil") == std::string::npos);
     CHECK(html.find("older.test") == std::string::npos);
-    CHECK(html.find("<th>No such name</th>") != std::string::npos);
-    CHECK(html.find("<td>14</td><td>13</td><td>2</td>") != std::string::npos);
+    CHECK(html.find("<td>14</td><td>13</td></tr>") != std::string::npos);
+    // Only the counts the agent measures are columns: no "no such name" count it never writes.
+    CHECK(html.find("<th>Appeared</th><th>Removed</th></tr>") != std::string::npos);
+    CHECK(html.find("No such name") == std::string::npos);
     CHECK(html.find("<th>TTL</th>") == std::string::npos);
     CHECK(html.find("<th>Src</th>") == std::string::npos);
     // An hour with no rows says so.
@@ -716,29 +877,113 @@ TEST_CASE("render_echo_dns_panel: only the selected hour; counts shown; fields e
     CHECK(none.find("devnet-empty") != std::string::npos);
 }
 
-TEST_CASE("render_echo_arp_panel: counts and router role and rebinds for the selected hour",
+TEST_CASE("render_echo_arp_panel: appeared and removed counts for the selected hour",
           "[echo][arp][panel]") {
-    EchoArpHourRow router;
-    router.hour_ts = 7200;
-    router.iface = "eth0";
-    router.ip_address = "10.0.0.1";
-    router.mac_address = "aa:bb:cc:dd:ee:ff";
-    router.appear_count = 1;
-    router.is_router = true;
-    EchoArpHourRow rebound = router;
-    rebound.ip_address = "10.0.0.7";
-    rebound.is_router = false;
-    rebound.rebind_count = 3;
-    EchoArpHourRow older = router;
+    EchoArpHourRow first;
+    first.hour_ts = 7200;
+    first.iface = "eth0";
+    first.ip_address = "10.0.0.1";
+    first.mac_address = "aa:bb:cc:dd:ee:ff";
+    first.appear_count = 1;
+    EchoArpHourRow second = first;
+    second.ip_address = "10.0.0.7";
+    second.appear_count = 4;
+    second.remove_count = 3;
+    EchoArpHourRow older = first;
     older.hour_ts = 3600;
     older.ip_address = "10.9.9.9";
-    const auto html = render_echo_arp_panel({router, rebound, older}, 7200);
+    const auto html = render_echo_arp_panel({first, second, older}, 7200);
     CHECK(html.find("devnet-count\">2<") != std::string::npos);
-    CHECK(html.find("pill info\">router<") != std::string::npos);
-    CHECK(html.find("3 MAC changes") != std::string::npos);
+    CHECK(html.find("<td>4</td><td>3</td></tr>") != std::string::npos);
     CHECK(html.find("10.9.9.9") == std::string::npos);
     CHECK(html.find("<th>Type</th>") == std::string::npos);
+    // Role and rebinds are not measured by the agent yet, so they are not columns or claims.
+    for (const char* gone : {"<th>Role</th>", "<th>Rebinds</th>", "router", "MAC change", "rebind"})
+        CHECK(html.find(gone) == std::string::npos);
     CHECK(render_echo_arp_panel({}, 7200).find("devnet-empty") != std::string::npos);
+}
+
+// B4/B1/B6: a failed, cut or partly unreadable read is said in the panel, never shown as quiet.
+TEST_CASE("render_echo_dns_panel and arp: a failed read is an error and never an empty note",
+          "[echo][dns][arp][panel]") {
+    EchoReadNotes failed;
+    failed.error = "This device runs an agent without the roll-up store: upgrade the agent";
+    for (const auto& html : {render_echo_dns_panel({}, 7200, failed), render_echo_arp_panel({}, 7200, failed)}) {
+        CHECK(html.find("upgrade the agent") != std::string::npos);
+        CHECK(html.find("devnet-empty") == std::string::npos);
+        CHECK(html.find("recorded for this hour") == std::string::npos);
+        CHECK(html.find("devnet-count\">&mdash;<") != std::string::npos);
+        CHECK(html.find("<table") == std::string::npos);
+    }
+    // The error is agent text: escaped.
+    EchoReadNotes hostile;
+    hostile.error = "<img src=x>";
+    const auto esc = render_echo_dns_panel({}, 7200, hostile);
+    CHECK(esc.find("<img src=x>") == std::string::npos);
+    CHECK(esc.find("&lt;img") != std::string::npos);
+}
+
+TEST_CASE("render_echo_dns_panel and arp: cut and unreadable notes sit above the rows",
+          "[echo][dns][arp][panel]") {
+    EchoDnsHourRow d;
+    d.hour_ts = 7200;
+    d.name = "example.test";
+    EchoReadNotes notes;
+    notes.cut = true;
+    notes.unreadable = 3;
+    const auto html = render_echo_dns_panel({d}, 7200, notes);
+    const auto cut = html.find("Results were cut at 10,000 rows for this hour");
+    const auto bad = html.find("3 rows unreadable");
+    const auto table = html.find("<table");
+    REQUIRE((cut != std::string::npos && bad != std::string::npos && table != std::string::npos));
+    CHECK(cut < table);
+    CHECK(bad < table);
+    CHECK(html.find("example.test") != std::string::npos); // the rows that did read are still shown
+}
+
+TEST_CASE("render_echo_read_notes: says nothing when there is nothing to say", "[echo][tree][render]") {
+    CHECK(render_echo_read_notes({}).empty());
+    EchoReadNotes one;
+    one.unreadable = 1;
+    CHECK(render_echo_read_notes(one).find("1 row unreadable") != std::string::npos);
+    EchoReadNotes cut;
+    cut.cut = true;
+    const auto conn = render_echo_read_notes(cut, "Connection results", "connection rows");
+    CHECK(conn.find("Connection results were cut at 10,000 rows for this hour") != std::string::npos);
+    EchoReadNotes both = cut;
+    both.unreadable = 2;
+    CHECK(render_echo_read_notes(both, "Results", "<b>rows").find("&lt;b&gt;rows unreadable") !=
+          std::string::npos);
+}
+
+// B4: one pure mapping from an agent failure to the sentence the operator reads.
+TEST_CASE("echo_agent_error_note: a missing roll-up table or column says to upgrade the agent",
+          "[echo][routes][skew]") {
+    const std::string upgrade = "This device runs an agent without the roll-up store: upgrade the agent";
+    // Every shape an agent without the roll-up tables answers with, for every table we read.
+    for (const char* skew : {"error|no such column: parent_name", "error|query failed: no such column: failed_count",
+                             "error|query failed: no such table: process_hourly",
+                             "error|unknown table: $Process_Hourly", "error|unknown table: $DNS_Hourly",
+                             "error|QUERY FAILED: NO SUCH COLUMN: is_router",
+                             "no such column: parent_name"}) { // a command's error detail has no prefix
+        INFO(skew);
+        CHECK(echo_agent_error_note(skew) == upgrade);
+    }
+}
+
+TEST_CASE("echo_agent_error_note: any other failure keeps its reason and only its first record",
+          "[echo][routes][skew]") {
+    CHECK(echo_agent_error_note("error|database is locked") == "The device reported an error: database is locked");
+    CHECK(echo_agent_error_note("database is locked") == "The device reported an error: database is locked");
+    // Only the first record of a multi-record reply; the next record never leaks in.
+    const auto note = echo_agent_error_note("error|Echo storage is offline.\nstorage_state|offline");
+    CHECK(note == "The device reported an error: Echo storage is offline.");
+    CHECK(note.find("storage_state") == std::string::npos);
+    // A reply with no reason still says it failed.
+    CHECK(echo_agent_error_note("error|") == "The device reported an error.");
+    CHECK(echo_agent_error_note("") == "The device reported an error.");
+    // Bounded: a long reason is cut, not echoed whole.
+    CHECK(echo_agent_error_note("error|" + std::string(5000, 'x')).size() < 500);
 }
 
 // =============================================================================
@@ -781,7 +1026,7 @@ TEST_CASE("render_echo_capture_sources: cards; hourly names; staged toggles; dev
     CHECK(card(html, "dns").find("Hourly</span></dd>") != std::string::npos); // hourly only
 }
 
-TEST_CASE("render_echo_capture_sources: row count reads <src>_rows then <src>_live_rows",
+TEST_CASE("render_echo_capture_sources: the row count reads <src>_rows and never relabels <src>_live_rows",
           "[echo][capture-sources]") {
     const auto rows_of = [](const std::string& status) {
         const std::string c = card(render_echo_capture_sources("d", status), "process");
@@ -789,20 +1034,41 @@ TEST_CASE("render_echo_capture_sources: row count reads <src>_rows then <src>_li
         REQUIRE(b != std::string::npos);
         return c.substr(b, c.find("</dd>", b) - b);
     };
-    // `_rows` alone.
+    const std::string upgrade = "This device runs an agent without the roll-up tables; upgrade the agent";
+    const auto note_count = [&](const std::string& status) {
+        return count_occurrences(render_echo_capture_sources("d", status), upgrade);
+    };
+    // `_rows` alone: shown, no note.
     CHECK(rows_of("config|process_enabled|true\nconfig|process_rows|111\n").find(">111<") !=
           std::string::npos);
-    // `_live_rows` alone (an agent that predates the rename).
-    CHECK(rows_of("config|process_enabled|true\nconfig|process_live_rows|222\n").find(">222<") !=
-          std::string::npos);
-    // Both: `_rows` wins.
+    CHECK(note_count("config|process_enabled|true\nconfig|process_rows|111\n") == 0);
+    // `_live_rows` alone (an agent without the roll-up tables): the raw count is NOT shown as an
+    // hourly row count; a dash, and ONE note above the cards.
+    const auto alias = rows_of("config|process_enabled|true\nconfig|process_live_rows|222\n");
+    CHECK(alias.find("222") == std::string::npos);
+    CHECK(alias.find("&mdash;") != std::string::npos);
+    CHECK(note_count("config|process_enabled|true\nconfig|process_live_rows|222\n") == 1);
+    const std::string html = render_echo_capture_sources(
+        "d", "config|process_enabled|true\nconfig|process_live_rows|222\n");
+    CHECK(html.find(upgrade) < html.find("id=\"capCards\"")); // above the cards
+    // Several sources on the same old agent: still one note.
+    CHECK(note_count("config|process_enabled|true\nconfig|process_live_rows|1\n"
+                     "config|tcp_enabled|true\nconfig|tcp_live_rows|2\n") == 1);
+    // Both keys for one source: `_rows` wins and there is nothing to say.
     const auto both = rows_of("config|process_enabled|true\nconfig|process_live_rows|222\nconfig|process_rows|111\n");
     CHECK(both.find(">111<") != std::string::npos);
     CHECK(both.find("222") == std::string::npos);
-    // Neither: unknown is a dash, not a false zero.
+    CHECK(note_count("config|process_enabled|true\nconfig|process_live_rows|222\nconfig|process_rows|111\n") == 0);
+    // One source answers both while another answers only the alias: the note is for the second.
+    CHECK(note_count("config|process_enabled|true\nconfig|process_rows|111\n"
+                     "config|tcp_enabled|true\nconfig|tcp_live_rows|2\n") == 1);
+    // Neither: unknown is a dash, not a false zero, and not an upgrade claim.
     const auto none = rows_of("config|process_enabled|true\n");
     CHECK(none.find("&mdash;") != std::string::npos);
     CHECK(none.find(">0<") == std::string::npos);
+    CHECK(note_count("config|process_enabled|true\n") == 0);
+    // The old wording is gone.
+    CHECK(html.find("live data") == std::string::npos);
 }
 
 TEST_CASE("render_echo_capture_sources: the registry source gets the System chip and a NEW badge",
@@ -897,7 +1163,14 @@ TEST_CASE("Echo renderers add no personal-data or privacy or usage-class wording
         render_echo_dns_panel({}, 3600) + render_echo_arp_panel({}, 3600) +
         render_echo_capture_sources(
             "d", "config|process_enabled|true\nconfig|dns_enabled|true\nconfig|arp_enabled|true\n"
-                 "config|registry_enabled|true\nconfig|service_enabled|false\n");
+                 "config|registry_enabled|true\nconfig|service_enabled|false\n") +
+        // the failure, cut, unreadable and old-agent wording added for honest reads
+        render_echo_capture_sources("d", "config|process_enabled|true\nconfig|process_live_rows|1\n") +
+        render_echo_read_notes(EchoReadNotes{.unreadable = 2, .cut = true}) +
+        render_echo_read_notes(EchoReadNotes{.unreadable = 1, .cut = true}, "Connection results",
+                               "connection rows") +
+        render_echo_dns_panel({}, 3600, EchoReadNotes{.error = echo_agent_error_note("error|no such column: x")}) +
+        render_echo_arp_panel({}, 3600, EchoReadNotes{.error = echo_agent_error_note("error|boom")});
     const std::string text = lower(all);
     for (const char* banned : {"pii", "personal", "privacy", "sensitive", "usage-class", "usage class",
                                "gdpr", "badge-pii"})

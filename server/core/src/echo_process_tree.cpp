@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <format>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
@@ -22,12 +23,14 @@
 
 namespace yuzu::server {
 
-namespace {
-
-std::vector<std::string> split_pipe(const std::string& line) {
+std::vector<std::string> echo_split_pipe(const std::string& line, std::size_t max_cells) {
     std::vector<std::string> out;
     std::size_t pos = 0;
     while (true) {
+        if (out.size() + 1 >= max_cells) {
+            out.push_back(line.substr(pos));
+            return out;
+        }
         const auto bar = line.find('|', pos);
         if (bar == std::string::npos) {
             out.push_back(line.substr(pos));
@@ -37,6 +40,8 @@ std::vector<std::string> split_pipe(const std::string& line) {
         pos = bar + 1;
     }
 }
+
+namespace {
 
 std::string to_lower(std::string s) {
     for (char& c : s)
@@ -111,22 +116,30 @@ std::int64_t sat_add(std::int64_t a, std::int64_t b) {
     return a > INT64_MAX - b ? INT64_MAX : a + b; // both non-negative (parsed by cell_i64)
 }
 
+/// The widest schema accepted (data columns). The real tables have under ten.
+constexpr std::size_t kMaxSchemaColumns = 64;
+
 /// Shared `__schema__` walker for the hourly parsers. `cols` names the data columns the
 /// caller wants; the first `n_required` MUST exist in the schema or the whole payload is
 /// refused (wrong shape — refuse rather than guess). `row_fn(at)` runs once per data row
 /// with `at(k)` → the cell of `cols[k]` ("" when that column is absent) and returns false
-/// to skip the row. An `error|…` first line, a trailer ("total|N") and a torn row (fewer
-/// cells than the furthest PRESENT column) never reach `row_fn`. Stops after `max_rows`
-/// accepted rows.
+/// to skip the row. An `error|…` first line and the `__total__|N` trailer never reach
+/// `row_fn`; a row whose cell count is not exactly the schema's width (torn, or carrying
+/// extra cells from a `|` in a value) is dropped and counted in `stats->unreadable`, as is
+/// a row `row_fn` refuses. Stops after `max_rows` accepted rows.
 template <class RowFn>
 void walk_schema_rows(const std::string& output, std::size_t max_rows,
                       const std::vector<std::string_view>& cols, std::size_t n_required,
-                      RowFn&& row_fn) {
+                      EchoParseStats* stats, RowFn&& row_fn) {
     std::vector<int> idx;
-    int need = 0;
+    std::size_t width = 0; // data columns the schema declares
     bool have_schema = false;
     std::size_t accepted = 0;
     std::size_t pos = 0;
+    const auto drop = [&] {
+        if (stats)
+            ++stats->unreadable;
+    };
     while (pos < output.size() && accepted < max_rows) {
         const auto nl = output.find('\n', pos);
         std::string line = output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
@@ -140,26 +153,35 @@ void walk_schema_rows(const std::string& output, std::size_t max_rows,
                 return; // agent-side error payload
             if (!line.starts_with("__schema__|"))
                 continue;
-            const auto schema = split_pipe(line);
+            const auto schema = echo_split_pipe(line, kMaxSchemaColumns + 2);
+            if (schema.size() > kMaxSchemaColumns + 1)
+                return; // wrong shape: far wider than any Echo table
             for (const auto c : cols)
                 idx.push_back(schema_index(schema, c));
             for (std::size_t k = 0; k < n_required; ++k)
                 if (idx[k] < 0)
                     return; // wrong shape
-            for (const int i : idx)
-                need = (std::max)(need, i);
+            width = schema.size() - 1;
             have_schema = true;
+            if (stats)
+                stats->schema = true;
             continue;
         }
-        const auto cells = split_pipe(line);
-        if (static_cast<int>(cells.size()) <= need)
-            continue; // trailer or torn row
+        const auto cells = echo_split_pipe(line, width + 1);
+        if (cells.size() != width) {
+            // The trailer is `__total__|N`; anything else with the wrong width is unreadable.
+            if (!(cells.size() == 2 && cells[0] == "__total__"))
+                drop();
+            continue;
+        }
         static const std::string kEmpty;
         const auto at = [&](std::size_t k) -> const std::string& {
             return idx[k] >= 0 ? cells[static_cast<std::size_t>(idx[k])] : kEmpty;
         };
         if (row_fn(at))
             ++accepted;
+        else
+            drop();
     }
 }
 
@@ -184,12 +206,13 @@ bool echo_is_suspicious_spawn(const std::string& parent_name, const std::string&
 }
 
 std::vector<EchoProcHourRow> parse_echo_process_hourly_output(const std::string& output,
-                                                              std::size_t max_rows) {
+                                                              std::size_t max_rows,
+                                                              EchoParseStats* stats) {
     std::vector<EchoProcHourRow> out;
     walk_schema_rows(output, max_rows,
                      {"hour_ts", "name", "parent_name", "user", "start_count", "stop_count",
                       "abnormal_exit_count"},
-                     6, [&](const auto& at) {
+                     6, stats, [&](const auto& at) {
                          const auto hour = cell_i64(at(0));
                          const auto starts = cell_i64(at(4));
                          const auto stops = cell_i64(at(5));
@@ -210,12 +233,13 @@ std::vector<EchoProcHourRow> parse_echo_process_hourly_output(const std::string&
 }
 
 std::vector<EchoTcpHourRow> parse_echo_tcp_hourly_output(const std::string& output,
-                                                         std::size_t max_rows) {
+                                                         std::size_t max_rows,
+                                                         EchoParseStats* stats) {
     std::vector<EchoTcpHourRow> out;
     walk_schema_rows(output, max_rows,
                      {"hour_ts", "process_name", "remote_addr", "remote_port", "proto",
                       "connect_count", "disconnect_count", "failed_count"},
-                     3, [&](const auto& at) {
+                     3, stats, [&](const auto& at) {
                          const auto hour = cell_i64(at(0));
                          if (!hour)
                              return false;
@@ -235,12 +259,12 @@ std::vector<EchoTcpHourRow> parse_echo_tcp_hourly_output(const std::string& outp
 }
 
 std::vector<EchoDnsHourRow> parse_echo_dns_hourly_output(const std::string& output,
-                                                         std::size_t max_rows) {
+                                                         std::size_t max_rows,
+                                                         EchoParseStats* stats) {
     std::vector<EchoDnsHourRow> out;
     walk_schema_rows(output, max_rows,
-                     {"hour_ts", "name", "record_type", "data", "appear_count", "remove_count",
-                      "negative_count"},
-                     3, [&](const auto& at) {
+                     {"hour_ts", "name", "record_type", "data", "appear_count", "remove_count"}, 3,
+                     stats, [&](const auto& at) {
                          const auto hour = cell_i64(at(0));
                          if (!hour)
                              return false;
@@ -251,7 +275,6 @@ std::vector<EchoDnsHourRow> parse_echo_dns_hourly_output(const std::string& outp
                          r.data = at(3);
                          r.appear_count = cell_count(at(4));
                          r.remove_count = cell_count(at(5));
-                         r.negative_count = cell_count(at(6));
                          out.push_back(std::move(r));
                          return true;
                      });
@@ -259,12 +282,13 @@ std::vector<EchoDnsHourRow> parse_echo_dns_hourly_output(const std::string& outp
 }
 
 std::vector<EchoArpHourRow> parse_echo_arp_hourly_output(const std::string& output,
-                                                         std::size_t max_rows) {
+                                                         std::size_t max_rows,
+                                                         EchoParseStats* stats) {
     std::vector<EchoArpHourRow> out;
     walk_schema_rows(output, max_rows,
                      {"hour_ts", "ip_address", "mac_address", "interface", "appear_count",
-                      "remove_count", "is_router", "rebind_count"},
-                     3, [&](const auto& at) {
+                      "remove_count"},
+                     3, stats, [&](const auto& at) {
                          const auto hour = cell_i64(at(0));
                          if (!hour)
                              return false;
@@ -275,12 +299,25 @@ std::vector<EchoArpHourRow> parse_echo_arp_hourly_output(const std::string& outp
                          r.iface = at(3);
                          r.appear_count = cell_count(at(4));
                          r.remove_count = cell_count(at(5));
-                         r.is_router = cell_count(at(6)) != 0;
-                         r.rebind_count = cell_count(at(7));
                          out.push_back(std::move(r));
                          return true;
                      });
     return out;
+}
+
+std::vector<std::int64_t> parse_echo_hours_output(const std::string& output, EchoParseStats* stats) {
+    std::vector<std::int64_t> hours;
+    walk_schema_rows(output, static_cast<std::size_t>(kEchoMaxWindowHours), {"hour_ts"}, 1, stats,
+                     [&](const auto& at) {
+                         const auto hour = cell_i64(at(0));
+                         if (!hour)
+                             return false;
+                         hours.push_back(*hour);
+                         return true;
+                     });
+    std::sort(hours.begin(), hours.end(), std::greater<>());
+    hours.erase(std::unique(hours.begin(), hours.end()), hours.end());
+    return hours;
 }
 
 EchoWindow resolve_echo_window(const std::string& preset, std::int64_t custom_from,
@@ -447,26 +484,21 @@ std::optional<std::int64_t> parse_ts_param_strict(const std::string& s) {
     return v;
 }
 
-std::vector<std::int64_t> echo_process_hours(const std::vector<EchoProcHourRow>& rows) {
-    std::vector<std::int64_t> hours;
-    hours.reserve(rows.size());
-    for (const auto& r : rows)
-        hours.push_back(r.hour_ts);
-    std::sort(hours.begin(), hours.end(), std::greater<>());
-    hours.erase(std::unique(hours.begin(), hours.end()), hours.end());
-    return hours;
-}
-
 EchoProcTree build_echo_process_tree(const std::vector<EchoProcHourRow>& rows, std::int64_t hour_ts) {
     EchoProcTree tree;
     tree.hour_ts = hour_ts;
     constexpr std::size_t kNone = EchoProcNode::kNoParent;
+    constexpr std::size_t kMaxSpawnEvidence = 16; // distinct evidence lines kept per node
 
-    // 1. One node per (name, user) in row order; rows sharing the key sum their counts.
-    //    The key is length-prefixed so an agent-chosen name cannot collide with another
-    //    (name, user) pair by embedding a delimiter.
+    // 1. One node per (name, user); rows sharing the key sum their counts. The key is
+    //    length-prefixed so an agent-chosen name cannot collide with another (name, user)
+    //    pair by embedding a delimiter. Per node, remember the parents its rows name (with
+    //    their summed starts) and every suspicious spawn: the placement and the anomaly flag
+    //    are decided from ALL rows, never from whichever came first.
     std::unordered_map<std::string, std::size_t> by_key;
-    std::unordered_map<std::string, std::size_t> first_by_name; // parent-link target
+    std::unordered_map<std::string, std::size_t> first_by_name; // parent-link target: lowest user
+    std::vector<std::map<std::string, std::int64_t>> parent_starts;
+    std::vector<std::vector<std::string>> spawn_evidence;
     for (const auto& r : rows) {
         if (r.hour_ts != hour_ts)
             continue;
@@ -479,22 +511,50 @@ EchoProcTree build_echo_process_tree(const std::vector<EchoProcHourRow>& rows, s
             }
             EchoProcNode n;
             n.name = r.name;
-            n.parent_name = r.parent_name; // the FIRST row's parent wins
             n.user = r.user;
-            first_by_name.try_emplace(r.name, tree.nodes.size());
-            it = by_key.emplace(std::move(key), tree.nodes.size()).first;
+            const std::size_t id = tree.nodes.size();
+            const auto [fit, fresh] = first_by_name.try_emplace(r.name, id);
+            if (!fresh && r.user < tree.nodes[fit->second].user)
+                fit->second = id;
+            it = by_key.emplace(std::move(key), id).first;
             tree.nodes.push_back(std::move(n));
+            parent_starts.emplace_back();
+            spawn_evidence.emplace_back();
         }
-        EchoProcNode& n = tree.nodes[it->second];
+        const std::size_t id = it->second;
+        EchoProcNode& n = tree.nodes[id];
         n.start_count = sat_add(n.start_count, r.start_count);
         n.stop_count = sat_add(n.stop_count, r.stop_count);
         n.abnormal_exit_count = sat_add(n.abnormal_exit_count, r.abnormal_exit_count);
+        if (!r.parent_name.empty()) {
+            auto& sum = parent_starts[id][r.parent_name];
+            sum = sat_add(sum, r.start_count);
+        }
+        std::string spawn;
+        if (echo_is_suspicious_spawn(r.parent_name, r.name, &spawn)) {
+            auto& ev = spawn_evidence[id];
+            if (ev.size() < kMaxSpawnEvidence && std::find(ev.begin(), ev.end(), spawn) == ev.end())
+                ev.push_back(std::move(spawn));
+        }
     }
 
-    // 2. Parent link by NAME: the first node bearing `parent_name`. An empty, unknown or
-    //    self-named parent leaves the node a root.
+    // 2. Parent link by NAME. A node's parent name is the one with the most summed starts
+    //    (ties: the lowest name, the map's order); a name other than its own wins over its
+    //    own, which can never be placed. An empty, unknown or self-named parent leaves the
+    //    node a root.
     const std::size_t count = tree.nodes.size();
-    for (auto& n : tree.nodes) {
+    for (std::size_t i = 0; i < count; ++i) {
+        EchoProcNode& n = tree.nodes[i];
+        bool best_self = false;
+        std::int64_t best_sum = -1;
+        for (const auto& [pname, sum] : parent_starts[i]) {
+            const bool self = pname == n.name;
+            if (best_sum < 0 || (best_self && !self) || (best_self == self && sum > best_sum)) {
+                n.parent_name = pname;
+                best_self = self;
+                best_sum = sum;
+            }
+        }
         if (n.parent_name.empty() || n.parent_name == n.name)
             continue;
         const auto it = first_by_name.find(n.parent_name);
@@ -505,7 +565,13 @@ EchoProcTree build_echo_process_tree(const std::vector<EchoProcHourRow>& rows, s
     // 3. Cycle cut (placed-once pass). The name graph can loop (a under b, b under a), and
     //    the pid-incarnation walk the old engine used does not fit it. Every node is walked
     //    at most once (state 2 = settled), so this is O(n) even for a 50k-deep chain; a walk
-    //    that re-enters its own path found a cycle, which is cut at its lowest-index member.
+    //    that re-enters its own path found a cycle, which is cut at its lowest (name, user)
+    //    member whichever node the walk entered it from.
+    const auto id_less = [&](std::size_t a, std::size_t b) {
+        const EchoProcNode& x = tree.nodes[a];
+        const EchoProcNode& y = tree.nodes[b];
+        return x.name != y.name ? x.name < y.name : x.user < y.user;
+    };
     std::vector<unsigned char> state(count, 0); // 0 new, 1 on the current walk, 2 settled
     std::vector<std::size_t> path;
     for (std::size_t s = 0; s < count; ++s) {
@@ -518,7 +584,7 @@ EchoProcTree build_echo_process_tree(const std::vector<EchoProcHourRow>& rows, s
         }
         if (cur != kNone && state[cur] == 1) {
             const auto entry = std::find(path.begin(), path.end(), cur);
-            tree.nodes[*std::min_element(entry, path.end())].parent = kNone;
+            tree.nodes[*std::min_element(entry, path.end(), id_less)].parent = kNone;
         }
         for (const std::size_t id : path)
             state[id] = 2;
@@ -531,26 +597,20 @@ EchoProcTree build_echo_process_tree(const std::vector<EchoProcHourRow>& rows, s
         else
             tree.nodes[tree.nodes[i].parent].children.push_back(i);
     }
-    const auto sib_less = [&](std::size_t a, std::size_t b) {
-        const EchoProcNode& x = tree.nodes[a];
-        const EchoProcNode& y = tree.nodes[b];
-        if (x.name != y.name)
-            return x.name < y.name;
-        return x.user < y.user;
-    };
-    std::sort(tree.roots.begin(), tree.roots.end(), sib_less);
+    std::sort(tree.roots.begin(), tree.roots.end(), id_less);
     for (auto& n : tree.nodes)
-        std::sort(n.children.begin(), n.children.end(), sib_less);
+        std::sort(n.children.begin(), n.children.end(), id_less);
 
-    // 5. Flags + totals. An abnormal exit or a suspicious spawn by name is an anomaly; a
-    //    name with more stops than starts is a soft flag (it started before the hour).
-    for (auto& n : tree.nodes) {
+    // 5. Flags + totals. An abnormal exit or a suspicious spawn by name (any row, whatever
+    //    the placement) is an anomaly; a name with more stops than starts is a soft flag (it
+    //    started before the hour).
+    for (std::size_t i = 0; i < count; ++i) {
+        EchoProcNode& n = tree.nodes[i];
         n.stops_exceed_starts = n.stop_count > n.start_count;
         std::string evidence;
         if (n.abnormal_exit_count > 0)
             evidence = std::to_string(n.abnormal_exit_count) + " abnormal exit(s) in this hour";
-        std::string spawn;
-        if (n.parent != kNone && echo_is_suspicious_spawn(tree.nodes[n.parent].name, n.name, &spawn)) {
+        for (const auto& spawn : spawn_evidence[i]) {
             if (!evidence.empty())
                 evidence += "; ";
             evidence += spawn;
@@ -671,12 +731,36 @@ std::string net_cell(const std::vector<const EchoTcpHourRow*>& conns) {
     return cell;
 }
 
-using ConnIndex = std::unordered_map<std::string, std::vector<const EchoTcpHourRow*>>;
+/// The hour's connections by owning process NAME, plus each name's rendered net cell. Every
+/// node sharing a name shows the same cell, so it is built once per name, not once per node
+/// (N same-name users x M connection rows would otherwise be N x M work).
+struct NetCells {
+    std::unordered_map<std::string, std::vector<const EchoTcpHourRow*>> by_name;
+    std::unordered_map<std::string, std::string> html;
+    EchoRenderStats* stats = nullptr;
+
+    /// The cell for `name`; empty when it has no connections.
+    const std::string& cell(const std::string& name) {
+        static const std::string kNone;
+        const auto it = by_name.find(name);
+        if (it == by_name.end())
+            return kNone;
+        const auto [memo, fresh] = html.try_emplace(name);
+        if (fresh) {
+            memo->second = net_cell(it->second);
+            if (stats)
+                ++stats->net_cells_built;
+        } else if (stats) {
+            ++stats->net_cells_reused;
+        }
+        return memo->second;
+    }
+};
 
 /// One node's summary row (the clickable line). `node_id` addresses the detail; the
 /// row carries data-anom for the client-side filter.
 std::string node_summary_row(const EchoProcTree& tree, std::size_t id, const std::string& token,
-                             const ConnIndex& conn_index) {
+                             NetCells& net) {
     const EchoProcNode& n = tree.nodes[id];
     std::string row;
     row += "<a class=\"echo-tree-row\" data-anom=\"";
@@ -694,9 +778,7 @@ std::string node_summary_row(const EchoProcTree& tree, std::size_t id, const std
     if (n.stops_exceed_starts)
         row += " &middot; more stops than starts";
     row += "</span>";
-    const auto it = conn_index.find(n.name);
-    if (it != conn_index.end())
-        row += net_cell(it->second);
+    row += net.cell(n.name);
     if (n.anomaly)
         row += "<span class=\"tt-anom\" title=\"" + html_escape(n.anomaly_evidence) +
                "\">\xE2\x9A\xA0</span>";
@@ -705,7 +787,7 @@ std::string node_summary_row(const EchoProcTree& tree, std::size_t id, const std
 }
 
 void render_node(const EchoProcTree& tree, std::size_t id, int depth, const std::string& token,
-                 const ConnIndex& conn_index, std::string& out) {
+                 NetCells& net, std::string& out) {
     if (id >= tree.nodes.size())
         return;
     if (depth > kEchoRenderDepthCap) {
@@ -714,27 +796,28 @@ void render_node(const EchoProcTree& tree, std::size_t id, int depth, const std:
     }
     const EchoProcNode& n = tree.nodes[id];
     if (n.children.empty()) {
-        out += "<div class=\"echo-tree-leaf\">" + node_summary_row(tree, id, token, conn_index) +
+        out += "<div class=\"echo-tree-leaf\">" + node_summary_row(tree, id, token, net) +
                "</div>";
         return;
     }
     // Expand the first two levels by default; deeper branches start collapsed.
     out += depth < 2 ? "<details open class=\"echo-tree-node\">" : "<details class=\"echo-tree-node\">";
-    out += "<summary>" + node_summary_row(tree, id, token, conn_index) + "</summary>";
+    out += "<summary>" + node_summary_row(tree, id, token, net) + "</summary>";
     out += "<div class=\"echo-tree-children\">";
     for (const std::size_t c : n.children)
-        render_node(tree, c, depth + 1, token, conn_index, out);
+        render_node(tree, c, depth + 1, token, net, out);
     out += "</div></details>";
 }
 
 } // namespace
 
 std::string render_echo_tree_fragment(const EchoProcTree& tree, const std::vector<EchoTcpHourRow>& conns,
-                                      const std::string& token) {
+                                      const std::string& token, EchoRenderStats* stats) {
     // Index the hour's connections by owning process NAME for the inline net summary.
-    ConnIndex conn_index;
+    NetCells net;
+    net.stats = stats;
     for (const auto& c : conns)
-        conn_index[c.process_name].push_back(&c);
+        net.by_name[c.process_name].push_back(&c);
 
     std::string h;
     h += "<div class=\"echo-tree-banner\">";
@@ -772,7 +855,7 @@ std::string render_echo_tree_fragment(const EchoProcTree& tree, const std::vecto
          "filters.</div>";
     h += "<div class=\"echo-tree\">";
     for (const std::size_t r : tree.roots)
-        render_node(tree, r, 0, token, conn_index, h);
+        render_node(tree, r, 0, token, net, h);
     h += "</div>";
     return h;
 }
@@ -831,37 +914,77 @@ std::string render_echo_proc_detail(const EchoProcNode& node, const std::vector<
     return h;
 }
 
+// ── Read notes (a failed, cut or partly unreadable read is said, never shown as empty) ──
+
+std::string echo_agent_error_note(const std::string& agent_text) {
+    const std::string shown = agent_error_display(agent_text);
+    const std::string lower = to_lower(shown);
+    // A device whose agent predates the roll-up tables fails the whole query: SQLite names the
+    // missing column or table, and the registry names an unknown `$` table.
+    for (const char* skew : {"no such column", "no such table", "unknown table"})
+        if (lower.find(skew) != std::string::npos)
+            return "This device runs an agent without the roll-up store: upgrade the agent";
+    return shown.empty() ? std::string("The device reported an error.")
+                         : "The device reported an error: " + shown;
+}
+
+std::string render_echo_read_notes(const EchoReadNotes& notes, const std::string& subject,
+                                   const std::string& row_noun) {
+    static_assert(kEchoAgentRowCap == 10000, "the note below spells the cap out as 10,000");
+    std::string h;
+    if (notes.cut)
+        h += "<div class=\"echo-tree-warn\">" + html_escape(subject) +
+             " were cut at 10,000 rows for this hour &mdash; what is shown may be incomplete.</div>";
+    if (notes.unreadable > 0) {
+        // "1 row unreadable": the noun arrives in the plural.
+        const std::string noun = notes.unreadable == 1 && row_noun.ends_with('s')
+                                     ? row_noun.substr(0, row_noun.size() - 1)
+                                     : row_noun;
+        h += "<div class=\"echo-tree-warn\">" + std::to_string(notes.unreadable) + " " +
+             html_escape(noun) + " unreadable.</div>";
+    }
+    return h;
+}
+
 // ── Device DNS/ARP panels (ADR-0015) — device-level, NOT per process ──────────
 
 namespace {
 
-// Shared shell of the DNS and ARP panels: the hour filter, summary count, empty note, table
-// head, 500-row cap and caveat. Each panel supplies only its own columns.
+// Shared shell of the DNS and ARP panels: the hour filter, summary count, notes, empty note,
+// table head, 500-row cap and caveat. Each panel supplies only its own columns. A failed read
+// (`notes.error`) shows the error in place of the table and a dash for the count.
 template <typename Row, typename RowFn>
 std::string render_devnet_panel(const std::vector<Row>& rows, std::int64_t hour_ts, const char* title,
                                 const char* empty_what, const char* source, const char* thead,
-                                RowFn row_html, const std::string& caveat) {
+                                RowFn row_html, const std::string& caveat, const EchoReadNotes& notes) {
     std::vector<const Row*> cur;
     for (const auto& r : rows)
         if (r.hour_ts == hour_ts)
             cur.push_back(&r);
     std::string h = "<details class=\"devnet-panel\" open>";
     h += std::string("<summary><span><span class=\"devnet-title-ico\">&#9783;</span>") + title +
-         "</span><span class=\"devnet-count\">" + std::to_string(cur.size()) + "</span></summary>";
-    if (cur.empty()) {
-        h += std::string("<div class=\"devnet-empty\">No ") + empty_what +
-             " recorded for this hour &mdash; the <code>" + source +
-             "</code> source may be disabled on this device.</div>";
+         "</span><span class=\"devnet-count\">" +
+         (notes.error.empty() ? std::to_string(cur.size()) : std::string("&mdash;")) +
+         "</span></summary>";
+    if (!notes.error.empty()) {
+        h += "<div class=\"echo-tree-warn\">" + html_escape(notes.error) + "</div>";
     } else {
-        h += std::string("<div class=\"devnet-body\"><table class=\"devnet-table\"><thead><tr>") + thead +
-             "</tr></thead><tbody>";
-        std::size_t shown = 0;
-        for (const auto* r : cur) {
-            if (shown++ >= 500)
-                break;
-            h += row_html(*r);
+        h += render_echo_read_notes(notes);
+        if (cur.empty()) {
+            h += std::string("<div class=\"devnet-empty\">No ") + empty_what +
+                 " recorded for this hour &mdash; the <code>" + source +
+                 "</code> source may be disabled on this device.</div>";
+        } else {
+            h += std::string("<div class=\"devnet-body\"><table class=\"devnet-table\"><thead><tr>") +
+                 thead + "</tr></thead><tbody>";
+            std::size_t shown = 0;
+            for (const auto* r : cur) {
+                if (shown++ >= 500)
+                    break;
+                h += row_html(*r);
+            }
+            h += "</tbody></table></div>";
         }
-        h += "</tbody></table></div>";
     }
     h += "<div class=\"devnet-caveat\">" + caveat + "</div></details>";
     return h;
@@ -869,46 +992,42 @@ std::string render_devnet_panel(const std::vector<Row>& rows, std::int64_t hour_
 
 } // namespace
 
-std::string render_echo_dns_panel(const std::vector<EchoDnsHourRow>& rows, std::int64_t hour_ts) {
+std::string render_echo_dns_panel(const std::vector<EchoDnsHourRow>& rows, std::int64_t hour_ts,
+                                  const EchoReadNotes& notes) {
     return render_devnet_panel(
         rows, hour_ts, "DNS cache activity", "DNS cache activity", "dns",
-        "<th>Name</th><th>Type</th><th>Data</th><th>Appeared</th><th>Removed</th><th>No such name</th>",
+        "<th>Name</th><th>Type</th><th>Data</th><th>Appeared</th><th>Removed</th>",
         [](const EchoDnsHourRow& r) {
             std::string h = "<tr><td>" + html_escape(r.name) + "</td>";
             h += "<td class=\"dn-type\">" + html_escape(r.record_type) + "</td>";
             h += "<td class=\"dn-data\">" +
                  (r.data.empty() ? std::string("&mdash;") : html_escape(r.data)) + "</td>";
             h += "<td>" + std::to_string(r.appear_count) + "</td>";
-            h += "<td>" + std::to_string(r.remove_count) + "</td>";
-            h += "<td>" + std::to_string(r.negative_count) + "</td></tr>";
+            h += "<td>" + std::to_string(r.remove_count) + "</td></tr>";
             return h;
         },
         "Counts of cache entries seen appearing and being removed in the hour from " +
             html_escape(format_iso_utc(hour_ts)) +
-            ". Device resolver state, <strong>not</strong> per process.");
+            ". Device resolver state, <strong>not</strong> per process.",
+        notes);
 }
 
-std::string render_echo_arp_panel(const std::vector<EchoArpHourRow>& rows, std::int64_t hour_ts) {
+std::string render_echo_arp_panel(const std::vector<EchoArpHourRow>& rows, std::int64_t hour_ts,
+                                  const EchoReadNotes& notes) {
     return render_devnet_panel(
         rows, hour_ts, "ARP table activity", "ARP activity", "arp",
-        "<th>Interface</th><th>IP address</th><th>MAC address</th><th>Appeared</th><th>Removed</th>"
-        "<th>Role</th><th>Rebinds</th>",
+        "<th>Interface</th><th>IP address</th><th>MAC address</th><th>Appeared</th><th>Removed</th>",
         [](const EchoArpHourRow& r) {
             std::string h = "<tr><td>" + html_escape(r.iface) + "</td>";
             h += "<td>" + html_escape(r.ip_address) + "</td>";
             h += "<td class=\"arp-mac\">" + html_escape(r.mac_address) + "</td>";
             h += "<td>" + std::to_string(r.appear_count) + "</td>";
-            h += "<td>" + std::to_string(r.remove_count) + "</td>";
-            h += "<td>" + std::string(r.is_router ? "<span class=\"pill info\">router</span>" : "&mdash;") +
-                 "</td>";
-            h += "<td>" +
-                 (r.rebind_count > 0 ? "<span class=\"pill warn\">" + std::to_string(r.rebind_count) +
-                                           " MAC change" + (r.rebind_count == 1 ? "" : "s") + "</span>"
-                                     : std::string("0")) +
-                 "</td></tr>";
+            h += "<td>" + std::to_string(r.remove_count) + "</td></tr>";
             return h;
         },
-        "A rebind means the same IP address answered from a different MAC address during the hour.");
+        "Counts of neighbour entries seen appearing and being removed in the hour from " +
+            html_escape(format_iso_utc(hour_ts)) + ". Device neighbour-table state.",
+        notes);
 }
 
 // ── Capture-sources frame (ADR-0015) ─────────────────────────────────────────
@@ -924,7 +1043,7 @@ std::string render_echo_capture_sources(const std::string& device, const std::st
         pos = (nl == std::string::npos) ? status_output.size() : nl + 1;
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
-        const auto c = split_pipe(line);
+        const auto c = echo_split_pipe(line, 4); // config|key|value (+ the unsplit rest)
         if (c.size() >= 3 && c[0] == "config")
             cfg[c[1]] = c[2];
     }
@@ -972,6 +1091,16 @@ std::string render_echo_capture_sources(const std::string& device, const std::st
              "</a>";
     h += "</span></div>";
 
+    // An agent without the roll-up tables answers `<src>_live_rows`, not `<src>_rows`: its raw
+    // count is not an hourly row count, so it is never shown as one. One note says why.
+    bool without_rollup = false;
+    for (const auto& m : kSources)
+        if (cfg.count(std::string(m.name) + "_live_rows") && !cfg.count(std::string(m.name) + "_rows"))
+            without_rollup = true;
+    if (without_rollup)
+        h += "<div class=\"echo-tree-warn\">This device runs an agent without the roll-up tables; "
+             "upgrade the agent.</div>";
+
     h += "<div class=\"cards\" id=\"capCards\" data-device=\"" + html_escape(device) + "\">";
 
     // A bucket start as "YYYY-MM-DD HH:MM UTC"; "&mdash;" when the key is absent or unparseable.
@@ -990,16 +1119,9 @@ std::string render_echo_capture_sources(const std::string& device, const std::st
             continue; // not reported by this agent — skip
         ++rendered;
         const bool enabled = cfg.at(en_key) != "false";
-        // The agent publishes `<src>_rows`; one that predates the rename still answers
-        // `<src>_live_rows`. Neither key → unknown, shown as a dash rather than a false 0.
-        std::string rows = "&mdash;";
-        for (const char* suffix : {"_rows", "_live_rows"}) {
-            const auto it = cfg.find(std::string(m.name) + suffix);
-            if (it != cfg.end()) {
-                rows = html_escape(it->second);
-                break;
-            }
-        }
+        // The agent publishes `<src>_rows`. No key → unknown, shown as a dash rather than a false 0.
+        const auto rows_it = cfg.find(std::string(m.name) + "_rows");
+        const std::string rows = rows_it != cfg.end() ? html_escape(rows_it->second) : "&mdash;";
         const auto oldest = cfg.find(std::string(m.name) + "_oldest_ts");
         const auto paused = cfg.find(std::string(m.name) + "_paused_at");
 

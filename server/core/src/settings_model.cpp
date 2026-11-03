@@ -361,12 +361,17 @@ std::string render_echo_tiers(const nlohmann::json& echo) {
         }
     }
     std::string html = "<div class=\"tw echo-tiers\">";
-    if (echo.contains("db_budget_bytes") && echo.at("db_budget_bytes").is_number_integer())
+    if (echo.contains("db_budget_bytes") && echo.at("db_budget_bytes").is_number_integer()) {
+        // Both figures come from the payload: the budget is configurable, so no default is
+        // quoted here. MiB is rounded to the nearest whole number (no `bytes + half` overflow).
+        const auto bytes = echo.at("db_budget_bytes").get<std::int64_t>();
+        constexpr std::int64_t kMiB = 1048576;
+        const auto mib = bytes / kMiB + (bytes % kMiB >= kMiB / 2 ? 1 : 0);
         html += "<p class=\"hint\" style=\"padding:12px 16px 0\">Byte budget per "
                 "device: " +
-                with_thousands(echo.at("db_budget_bytes").get<std::int64_t>()) +
-                " bytes (250 MiB default); hourly history is kept while the device is within "
-                "it.</p>";
+                with_thousands(bytes) + " bytes (" + with_thousands(mib) +
+                " MiB); hourly history is kept while the device is within it.</p>";
+    }
     html +=
         "<table><caption>Echo capture sources</caption><thead><tr>"
         "<th>Source</th><th>Hourly</th><th>Daily</th><th>Monthly</th><th>Boot</th>"
@@ -388,7 +393,7 @@ std::string render_echo_tiers(const nlohmann::json& echo) {
             "held while the device is within its byte budget, counted from the start of the "
             "bucket on the agent's clock; it is the deepest guaranteed tier. A device over budget "
             "removes hourly rows older than 48 hours (5 days for per-process performance). Daily "
-            "rows are kept 180 days. ";
+            "rows are kept for the time shown in the Daily column. ";
     const auto tick = echo.value("tick_seconds", 0);
     if (tick > 0)
         html += "Old rows are pruned every " + std::to_string(tick) +

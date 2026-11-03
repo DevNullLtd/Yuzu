@@ -178,23 +178,39 @@ No changes to the `echo.sql` agent action; the change is purely server-side scop
 
 ### 5.1 Reconstruction model (as-built)
 
-- The viewer dispatches two canned, **read-only** `echo.sql` queries to ONE selected
-  live host — `SELECT … FROM $Process_Hourly` and `… FROM $TCP_Hourly` — through the
-  same dispatch-and-poll seam the device-page "Get live info" uses (untracked
-  dispatch, `execution_id=""`, so it never enters the executions drawer). The agent
-  runs them on its read-only authorizer connection (#760/#631). Both queries are
-  bounded by whole-hour `int64` limits.
+- The viewer dispatches three canned, **read-only** `echo.sql` queries to ONE selected
+  live host through the same dispatch-and-poll seam the device-page "Get live info" uses
+  (untracked dispatch, `execution_id=""`, so it never enters the executions drawer): a
+  `SELECT DISTINCT hour_ts FROM $Process_Hourly` over the window (the Hour selector, at
+  most 168 hours), and `… FROM $Process_Hourly` and `… FROM $TCP_Hourly` for **one
+  hour** (`WHERE hour_ts = <hour>`). The agent runs them on its read-only authorizer
+  connection (#760/#631). Every bound is an `int64` built from whole-hour values.
+- **An answer is never shown as complete when it may not be.** The agent's `echo.sql`
+  applies its own row limit (10,000 rows by default, whatever `LIMIT` the query names), so
+  an answer at that count is flagged ("Results were cut at 10,000 rows for this hour"). A
+  long answer arrives as several response frames; the page reads every frame of the
+  command, and keeps polling until the command has finished. A row with the wrong number
+  of cells is dropped and counted ("N rows unreadable"); a failed read or a device whose
+  agent has no roll-up store says so ("upgrade the agent") instead of showing an empty
+  tree. The agent writes each cell raw, joined by `|`, so a process name that itself
+  contains `|` or a newline can still shift cells or forge a row until the agent escapes
+  them (the server cannot tell a forged row with the right cell count from a real one).
 - The hourly roll-up carries no process id, so the tree is **name-level**: one node per
   process name (and user) in the chosen hour, linked to its parent **by name** from
   the row's `parent_name`. A name whose parent is itself, or that has no parent row,
   becomes a root; a name reached by more than one parent is placed once, under the
-  first, with its counts summed; cycles terminate and every node is shown once. The
-  render is capped at 50k names and a display depth limit, and says so when either applies.
+  parent with the most starts (ties: the lowest name), with its counts summed; cycles
+  terminate at their lowest (name, user) member and every node is shown once, whatever
+  order the rows arrive in. The suspicious-spawn check runs on every row, whichever
+  parent the node is placed under. The render is capped at 50k names and a display
+  depth limit, and says so when either applies.
 - **Timescale controls.** Preset chips — **Last hour · Last 24 hours · Last 7 days**
   (whole hourly buckets ending at the last complete hour) — plus a **custom From/To
   (UTC)** box that floors to the hour. The default is 24 hours. A window is at most 168
   hourly buckets. The tree itself shows **one hour**: an **Hour** selector lists the
-  hours in the window that have rows, newest first, and the newest is shown by default.
+  hours the device reports for the window, newest first; the window's last complete
+  hour is shown by default, and an hour asked for that the device did not report is
+  offered too, so the box and the banner agree.
   There are no boot or agent-install anchors (they need process ids and raw capture
   rows, which the roll-up does not keep).
 
@@ -226,8 +242,12 @@ The server renders the **full** tree for the hour; display filtering is client-s
   the detail panel.
 - **Device network.** Beside the tree, device-level **DNS** and **ARP** panels read
   `$DNS_Hourly` and `$ARP_Hourly` for the same hour (`GET
-  /fragments/echo/process-tree/device-net`): per-hour appear / remove counts, a "no such
-  name" count for DNS, and the router role and rebind count for ARP.
+  /fragments/echo/process-tree/device-net`): per-hour appear / remove counts. The agent
+  does not write a DNS "no such name" count or the ARP router role and rebind count yet,
+  so those columns are not shown; they return when the agent writes them. Each panel
+  reads for the device the tree was built for (the device id travels in the URL), a
+  new run or a note clears them, and a render is audited as `echo.dns.read` /
+  `echo.arp.read` with the hour and row count.
 
 ### 5.3 Layout & detail panel
 
