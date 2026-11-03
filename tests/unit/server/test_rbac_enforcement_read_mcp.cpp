@@ -12,7 +12,10 @@
  *   - the dual audit: the domain row `rbac.enforcement.read` AND the generic `mcp.get_rbac_enforcement`
  *     row are each attempted, and `audit_persisted:false` reports either one dropping with the data
  *     still returned;
- *   - the `administrator` verdict on the kMcp surface (no tier rule), independent of `unconfirmed`.
+ *   - the `administrator` verdict on the kMcp surface (no tier rule), which can disagree with
+ *     `unconfirmed` in any combination;
+ *   - the SESSION-ONLY posture: the tool never consults the permission callback, so a plain
+ *     non-administrator with every permission denied still reads its own verdict.
  *
  * The tool is driven through its OWN handler (`McpRig`) built on the stores of an `RbacRoleHarness`,
  * not the harness's handler, because three cases need what the harness cannot give: a null or closed
@@ -59,16 +62,30 @@ struct McpRig {
     bool disabled{false};
     std::vector<AuditRecord> audit_log;
     std::set<std::string> drop_actions; ///< rows for these actions are attempted but not persisted
+    bool deny_all_perm{false};          ///< the permission callback refuses every pair it is asked
+    std::vector<std::string> perm_asked; ///< every "Type:Op" the permission callback was asked
     yuzu::server::mcp::McpServer server;
     yuzu::server::mcp::McpServer::HandlerFn handler;
+
+    // The callbacks capture `this`, so a copy would point at the original's members.
+    McpRig(const McpRig&) = delete;
+    McpRig& operator=(const McpRig&) = delete;
 
     McpRig(RbacRoleHarness& harness, RbacStore* store) : h(harness) {
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<yuzu::server::auth::Session> {
             return h.session_with_tier(h.session_mcp_tier);
         };
-        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) -> bool { return true; };
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
+                              const std::string& type, const std::string& op) -> bool {
+            perm_asked.push_back(type + ":" + op);
+            if (deny_all_perm) {
+                res.status = 403;
+                res.set_content(R"({"error":"forbidden"})", "application/json");
+                return false;
+            }
+            return true;
+        };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
@@ -143,9 +160,11 @@ struct McpRig {
     /// The served tools/list entry for the tool.
     nlohmann::json served_tool() {
         const auto list = raw(R"({"jsonrpc":"2.0","method":"tools/list","id":2})");
+        REQUIRE(list.contains("result")); // const operator[] on a missing key is undefined
+        REQUIRE(list["result"].contains("tools"));
         nlohmann::json found;
         for (const auto& t : list["result"]["tools"])
-            if (t["name"] == kTool)
+            if (t.contains("name") && t["name"] == kTool)
                 found = t;
         REQUIRE(found.is_object()); // a missing tool must fail here, never pass a check vacuously
         return found;
@@ -175,6 +194,8 @@ struct McpRig {
 nlohmann::json success_body(McpRig& rig, const nlohmann::json& body) {
     REQUIRE(body.contains("result"));
     REQUIRE_FALSE(body.contains("error"));
+    REQUIRE(body["result"].contains("structuredContent")); // const operator[] on a missing key is undefined
+    REQUIRE(body["result"].contains("content"));
     const auto& sc = body["result"]["structuredContent"];
     REQUIRE(sc.is_object());
     CHECK(yuzu::test::schema_violation(rig.served_tool()["outputSchema"], sc) == "");
@@ -261,9 +282,13 @@ TEST_CASE("MCP get_rbac_enforcement: served metadata is typed, strict and read-o
     CHECK(desc.find("audit_persisted") != std::string::npos);
     CHECK(desc.find("retry_after_ms") != std::string::npos);
     // The stale pointer to the tracking issue is gone from the sibling get_me text.
+    // Held in a local: a range-for over a member of a returned temporary would dangle.
+    const auto all_tools = rig.raw(R"({"jsonrpc":"2.0","method":"tools/list","id":3})");
+    REQUIRE(all_tools.contains("result"));
+    REQUIRE(all_tools["result"].contains("tools"));
     nlohmann::json me;
-    for (const auto& t : rig.raw(R"({"jsonrpc":"2.0","method":"tools/list","id":3})")["result"]["tools"])
-        if (t["name"] == "get_me")
+    for (const auto& t : all_tools["result"]["tools"])
+        if (t.contains("name") && t["name"] == "get_me")
             me = t;
     REQUIRE(me.is_object());
     CHECK(me["description"].get<std::string>().find("#6033") == std::string::npos);
@@ -342,6 +367,28 @@ TEST_CASE("MCP get_rbac_enforcement: RBAC on, administrator and non-administrato
     }
 }
 
+// ── Session-only: no permission gate ───────────────────────────────────────────────────────────
+
+TEST_CASE("MCP get_rbac_enforcement: session-only gate: a plain non-administrator with every "
+          "permission denied still reads may_not and no permission is asked",
+          "[pg][rbac_enforcement_read][mcp]") {
+    RbacRoleHarness h;
+    // A local account with no admin authority and no grants: the caller a permission gate would
+    // refuse, and the one who most needs the answer.
+    REQUIRE(h.auth_db->upsert_user(h.session_user, "hash", "salt", auth::Role::user).has_value());
+    McpRig rig{h, h.rbac.get()};
+    rig.deny_all_perm = true;
+
+    const auto body = rig.call();
+    CHECK(rig.perm_asked.empty()); // the tool never consults the permission callback
+    rig.deny_all_perm = false;     // so the metadata read inside success_body is unaffected
+    const auto sc = success_body(rig, body);
+    CHECK(sc["enabled"] == false);
+    CHECK(sc["unconfirmed"] == false);
+    CHECK(sc["administrator"] == "may_not");
+    CHECK(rig.rows("rbac.enforcement.read", "success") == 1);
+}
+
 // ── The kMcp surface: no tier rule ─────────────────────────────────────────────────────────────
 
 TEST_CASE("MCP get_rbac_enforcement: the principal REST reads as may_not for an MCP-tier token "
@@ -377,7 +424,8 @@ TEST_CASE("MCP get_rbac_enforcement: the readonly tier is admitted and a durable
 
     // `may` is advisory: the same credential cannot change enforcement at this tier.
     const auto mutation = rig.call_tool("set_rbac_enforcement", {{"enabled", true}});
-    CHECK(mutation.contains("error"));
+    REQUIRE(mutation.contains("error"));
+    CHECK(mutation["error"]["code"] == yuzu::server::mcp::kTierDenied);
     CHECK_FALSE(mutation.contains("result"));
     CHECK_FALSE(h.rbac->is_rbac_enabled());
 }
@@ -505,6 +553,41 @@ TEST_CASE("MCP get_rbac_enforcement: a degraded enforcement view gives unconfirm
     }
 }
 
+TEST_CASE("MCP get_rbac_enforcement: a degraded view with RBAC off is enabled:false, unconfirmed:true, "
+          "administrator:unconfirmed, and the domain audit row says so",
+          "[pg][rbac_enforcement_read][mcp]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false); // a local administrator, RBAC durably off
+
+    // A second replica of the RBAC store on its own one-connection pool, observing the durable
+    // OFF at construction; holding its only connection and ageing its refresh readings past the
+    // stale-serve bound degrades the view (the technique of the case above, with RBAC off).
+    yuzu::server::pg::PgPool pool_b{{.conninfo = h.auth_db.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(5200));
+    REQUIRE(replica_b.rbac_enabled_view_degraded());
+
+    McpRig rig{h, &replica_b};
+    const auto body = rig.call();
+    const auto sc = success_body(rig, body);
+    CHECK(sc["enabled"] == false); // a stale off: the degraded view is treated as enforcement in effect
+    CHECK(sc["unconfirmed"] == true);
+    CHECK(sc["administrator"] == "unconfirmed");
+    check_no_store_text(body);
+
+    REQUIRE(rig.rows("rbac.enforcement.read", "success") == 1);
+    const AuditRecord* domain = nullptr;
+    for (const auto& r : rig.audit_log)
+        if (r.action == "rbac.enforcement.read")
+            domain = &r;
+    REQUIRE(domain != nullptr);
+    CHECK(domain->detail == "enabled=false; unconfirmed=true; administrator=unconfirmed");
+}
+
 // ── Arguments ──────────────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("MCP get_rbac_enforcement: any supplied argument is refused with invalid params and "
@@ -523,6 +606,7 @@ TEST_CASE("MCP get_rbac_enforcement: any supplied argument is refused with inval
     SECTION("a non-object arguments value") {
         const auto body = rig.call_tool(kTool, nlohmann::json::array({1}));
         REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
         CHECK_FALSE(body.contains("result"));
     }
     CHECK(rig.no_tool_rows());
@@ -612,9 +696,10 @@ TEST_CASE("MCP get_rbac_enforcement: audit rows carry nothing the session suppli
     McpRig rig{h, h.rbac.get()};
 
     const auto sc = success_body(rig, rig.call());
-    // Whatever the verdict for a name no account can hold, it is one of the three spellings.
-    CHECK((sc["administrator"] == "may" || sc["administrator"] == "may_not" ||
-           sc["administrator"] == "unconfirmed"));
+    // A name no account can hold has no durable admin row, and an invalid name is a definitive
+    // absence (not a store fault), so the verdict is may_not. The served schema's enum already
+    // bounds the spelling; pinning the value is what makes this check mean something.
+    CHECK(sc["administrator"] == "may_not");
     REQUIRE(rig.rows("rbac.enforcement.read", "success") == 1);
     for (const auto& r : rig.audit_log) {
         INFO("action=" << r.action << " detail=" << r.detail << " target_id=" << r.target_id);

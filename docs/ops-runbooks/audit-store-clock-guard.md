@@ -66,6 +66,10 @@ approve and reject), and the evidence for whatever is happening right now is not
 The response reads (`response.read`, on `/api/responses/*` and `/api/v1/responses/*`) are among them,
 and every served read there adds one audit INSERT, so a polling script on those routes raises audit
 volume; the audit reaper's retention cap is the only backpressure.
+The RBAC enforcement read (`GET /api/v1/rbac/enforcement`, audit action `rbac.enforcement.read`) is
+another such route: each served read adds one audit INSERT, and on REST it fails closed, so an audit
+outage answers it `503` with `Sec-Audit-Failed: true` and no state (the MCP twin returns the data with
+`audit_persisted: false`). Do not use that read to confirm enforcement state during an audit outage.
 
 Check, in order: `/healthz` `stores.audit` (a failed migration or an
 unreachable `--postgres-dsn` closes the store — the log says so explicitly);

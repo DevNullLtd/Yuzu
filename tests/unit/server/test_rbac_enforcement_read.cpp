@@ -7,15 +7,19 @@
  *   1. The builder with no database: the wire spelling of the verdict, and the one error it has
  *      (a null or closed RBAC store), which the REST route answers as a retryable 503.
  *   2. The builder on a DEGRADED enforcement view. `unconfirmed` (the cached view's freshness) and
- *      `administrator` (the hint, read from the durable stores) are independent, so a degraded
- *      view still reports the hint verbatim: an engine or an MCP-tier credential on REST is
- *      `may_not`, a confirmed administrator is `may`, an administrator with no grant row follows
- *      the hint (`unconfirmed`, because the degraded view cannot call a missing row a denial).
+ *      `administrator` (the hint, whose verdict comes from the durable stores) answer different
+ *      questions, and the builder neither forces nor suppresses the verdict on a degraded view:
+ *      an engine or an MCP-tier credential on REST is `may_not`, a confirmed administrator is
+ *      `may`, an administrator with no grant row follows the hint (`unconfirmed`, because a
+ *      store that cannot confirm the answer cannot call a missing row a denial).
  *   3. The REST route through the shared RbacRoleHarness: the body for RBAC off and on, the
  *      verdict equals `rbac_admin_hint(..., kRest)` for the personas the hint matrix already pins
  *      (P1, P2, P3, P7c, P13), the structural cases (MCP-tier token, engine, SAML, service-scoped),
  *      and the audit contract (one server-authored row per successful read, fail closed when the
- *      row cannot be persisted, nothing written for a bare 401 or an unavailable store).
+ *      row cannot be persisted, nothing written for a bare 401 or an unavailable store). It also
+ *      pins the SESSION-ONLY gate (a permission callback that denies everything is never
+ *      consulted) and serves a degraded view through the route, so the wire `unconfirmed` is the
+ *      store's flag and not a constant.
  *
  * Layers 2 and 3 are PG-gated and skip when YUZU_TEST_POSTGRES_DSN is unset (a skip is NOT a
  * pass). Layer 1 needs no database: its closed store is built over a pool that never connects.
@@ -158,12 +162,25 @@ void degrade_view(RbacStore& replica, pg::PgPool& pool) {
 struct ReadRoute {
     std::vector<AuditRecord> audit_log;
     std::string username{"admin"};
+    /// False stands in for the production auth callback on a request with no session: it writes
+    /// the 401 itself and yields no session (the shared harness's hook writes nothing).
+    bool authenticated{true};
     RestApiV1 api;
     yuzu::server::test::TestRouteSink sink;
 
+    // The handlers capture `this`, so a copy would point at the original's members.
+    ReadRoute(const ReadRoute&) = delete;
+    ReadRoute& operator=(const ReadRoute&) = delete;
+
     ReadRoute(RbacStore* rbac, AuthDB* auth_db, bool audit_wired) {
         RestApiV1::AuthFn auth_fn = [this](const httplib::Request&,
-                                           httplib::Response&) -> std::optional<auth::Session> {
+                                           httplib::Response& res) -> std::optional<auth::Session> {
+            if (!authenticated) {
+                res.status = 401;
+                res.set_content(R"({"error":{"code":401,"message":"unauthorized"}})",
+                                "application/json");
+                return std::nullopt;
+            }
             auth::Session s;
             s.username = username;
             return s;
@@ -501,6 +518,83 @@ TEST_CASE("GET /api/v1/rbac/enforcement: a SAML principal is 200 with administra
     CHECK(d["administrator"] == "may_not");
 }
 
+TEST_CASE("GET /api/v1/rbac/enforcement: session-only gate: with every permission denied the read still answers 200 and no permission is asked",
+          "[pg][rbac_enforcement_read]") {
+    RbacRoleHarness h;
+    // A plain local account with no admin authority and no grants: the sort of caller a
+    // permission gate would refuse, and the one who most needs to read `may_not`.
+    make_user(h, h.session_user, auth::Role::user);
+    std::vector<std::string> asked;
+    h.perm_override = [&asked](const std::string& type, const std::string& op) {
+        asked.push_back(type + ":" + op);
+        return false;
+    };
+
+    const auto res = h.sink.Get(kPath);
+    REQUIRE(res);
+    INFO("status=" << res->status << " body=" << res->body);
+    REQUIRE(res->status == 200);
+    const auto d = data_of(res->body);
+    CHECK(d["enabled"] == false);
+    CHECK(d["unconfirmed"] == false);
+    CHECK(d["administrator"] == "may_not");
+    CHECK(asked.empty()); // the route never consults the permission callback
+    CHECK(count_rows(h, kAuditAction) == 1);
+}
+
+TEST_CASE("GET /api/v1/rbac/enforcement: a degraded view is served on the wire and audited as unconfirmed:true",
+          "[pg][rbac_enforcement_read]") {
+    RbacRoleHarness h;
+    pg::PgPool pool_b{{.conninfo = h.auth_db.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+
+    SECTION("RBAC off: enabled:false, unconfirmed:true, administrator:unconfirmed") {
+        // A local administrator with no Administrator grant row, RBAC durably off. The degraded
+        // view is treated as enforcement in effect, so the missing row cannot be called a denial.
+        make_user(h, h.session_user, auth::Role::admin);
+        RbacStore replica{pool_b};
+        REQUIRE(replica.is_open());
+        degrade_view(replica, pool_b);
+
+        ReadRoute route{&replica, h.auth_db.get(), /*audit_wired=*/true};
+        route.username = h.session_user;
+        const auto res = route.sink.Get(kPath);
+        REQUIRE(res);
+        INFO("status=" << res->status << " body=" << res->body);
+        REQUIRE(res->status == 200);
+        const auto d = data_of(res->body);
+        CHECK(d["enabled"] == false);
+        CHECK(d["unconfirmed"] == true);
+        CHECK(d["administrator"] == "unconfirmed");
+
+        REQUIRE(route.audit_log.size() == 1);
+        CHECK(route.audit_log.front().action == kAuditAction);
+        CHECK(route.audit_log.front().detail ==
+              "enabled=false; unconfirmed=true; administrator=unconfirmed");
+    }
+
+    SECTION("RBAC on: a confirmed administrator reads may while unconfirmed is true") {
+        h.make_caller_admin(/*rbac_on=*/true);
+        RbacStore replica{pool_b};
+        REQUIRE(replica.is_open());
+        degrade_view(replica, pool_b);
+
+        ReadRoute route{&replica, h.auth_db.get(), /*audit_wired=*/true};
+        route.username = h.session_user;
+        const auto res = route.sink.Get(kPath);
+        REQUIRE(res);
+        INFO("status=" << res->status << " body=" << res->body);
+        REQUIRE(res->status == 200);
+        const auto d = data_of(res->body);
+        CHECK(d["enabled"] == true); // a cached "on" gone stale: enforcement is in effect either way
+        CHECK(d["unconfirmed"] == true);
+        CHECK(d["administrator"] == "may");
+
+        REQUIRE(route.audit_log.size() == 1);
+        CHECK(route.audit_log.front().detail == "enabled=true; unconfirmed=true; administrator=may");
+    }
+}
+
 TEST_CASE("GET /api/v1/rbac/enforcement: a service-scoped token is 403 with a denied audit row and no permission named",
           "[pg][rbac_enforcement_read]") {
     RbacRoleHarness h;
@@ -533,8 +627,28 @@ TEST_CASE("GET /api/v1/rbac/enforcement: an unauthenticated call writes no audit
 
     const auto res = h.sink.Get(kPath);
     REQUIRE(res);
+    // The harness hook writes no 401, so the status is the sink's pre-set default: the route
+    // added no status, no body and no cache header of its own. The real 401 is the next case.
+    CHECK(res->status == 200);
     CHECK(res->body.empty());
+    CHECK_FALSE(res->has_header("Cache-Control"));
     CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("GET /api/v1/rbac/enforcement: a request with no session is the auth callback's 401 and no state",
+          "[rbac_enforcement_read]") {
+    // No database: the auth callback answers before any store is touched.
+    ReadRoute route{nullptr, nullptr, /*audit_wired=*/true};
+    route.authenticated = false;
+
+    const auto res = route.sink.Get(kPath);
+    REQUIRE(res);
+    INFO("status=" << res->status << " body=" << res->body);
+    CHECK(res->status == 401);
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    CHECK(res->body.find("\"administrator\"") == std::string::npos);
+    CHECK(res->body.find("\"enabled\"") == std::string::npos);
+    CHECK(route.audit_log.empty());
 }
 
 TEST_CASE("GET /api/v1/rbac/enforcement: an audit row that cannot be persisted is a 503 with Sec-Audit-Failed and no state",

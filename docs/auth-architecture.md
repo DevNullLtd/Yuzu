@@ -3692,18 +3692,33 @@ the enforcement fragment (`GET /fragments/access/enforcement`). Both call ONE bu
 an advisory `administrator` verdict (`may`, `may_not`, `unconfirmed`); the MCP tool adds
 `audit_persisted`.
 
-- **Two independent groups.** `enabled`/`unconfirmed` are the serving replica's cached view
-  (`is_rbac_enabled()` and `rbac_enabled_view_degraded()`, read through the two display accessors
-  only, never `rbac_enforcement_label()`, which routed clause 4 of the A2/A1 row reserves).
-  `administrator` is `rbac_admin_hint` on the caller's own surface (`kRest` for the route, `kMcp`
-  for the tool; the surface has no default, clause 5), read from the durable stores. The hint
-  now has two production callers, the `rbac_admin_hint_fn` wiring in `server.cpp` and
-  `read_rbac_enforcement`; the read consumes the answer and changes no admission input of either
-  function. The HTML fragment's habit of skipping the hint when the view is degraded is a
-  rendering decision and is deliberately not copied: `administrator` is never forced to
-  `unconfirmed` because the view is degraded.
+- **Two groups answering different questions.** `enabled`/`unconfirmed` are the serving replica's
+  cached view (`is_rbac_enabled()` and `rbac_enabled_view_degraded()`, read through the two display
+  accessors only, never `rbac_enforcement_label()`, which routed clause 4 of the A2/A1 row
+  reserves). **Client rule: when `unconfirmed` is true, treat enforcement as ON whatever `enabled`
+  says** (a stale off is treated as on; a stale on is on either way). `administrator` is
+  `rbac_admin_hint` on the caller's own surface (`kRest` for the route, `kMcp` for the tool; the
+  surface has no default, clause 5). The builder calls it once and neither forces nor suppresses
+  the result when the view is degraded. The predicate behind it does consult the cached enforcement
+  label, but only to choose which durable source answers (Administrator grant rows when enforcement
+  is on or unconfirmed, the local account role when it is off); the answer itself is read from those
+  rows and then the regime check. So it is not independent of cache state: while the view is
+  unconfirmed an account with no Administrator grant row reads `administrator: "unconfirmed"`.
+  The two uses of "unconfirmed" (the boolean about the view, the value about the verdict) can
+  appear in any combination. The hint now has two production callers, the `rbac_admin_hint_fn`
+  wiring in `server.cpp` and `read_rbac_enforcement`; the read consumes the answer and changes no
+  admission input of either function. The HTML fragment's habit of skipping the hint when the view
+  is degraded is a rendering decision and is deliberately not copied.
+- **`administrator` defined.** `may` = the RBAC administration routes (role assignment and
+  `PUT /rbac/enforcement`) would admit this credential's durable authority now; `may_not` = they
+  would refuse it; `unconfirmed` = a required store could not answer, retry. A client treats any
+  value it does not recognise as `unconfirmed`. Engine, service-scoped and (on REST) MCP-tier
+  credentials are `may_not` from structural checks before any store is read; SSO-only principals,
+  SCIM-deactivated accounts, JIT-elevated administrators and group-held Administrators read
+  `may_not` because only durable user-type grants count (clause 3). A just-revoked Administrator
+  reads `may_not` on a fresh read, but a cached view on another replica can lag.
 - **Advisory, not a promise.** `may` means the RBAC administration routes would admit this
-  credential's durable authority now. It excludes REST MFA step-up, the MCP tier and approval
+  credential's durable authority now. It is not a go signal for a mutation. It excludes REST MFA step-up, the MCP tier and approval
   ladder (a readonly-tier administrator reads `may` on MCP and `set_rbac_enforcement` still
   refuses it), and the enforcement PUT's destination-regime `409`. On REST an MCP-tier token reads
   `may_not` because the predicate denies it structurally on `kRest`: "this credential cannot
@@ -3726,7 +3741,7 @@ an advisory `administrator` verdict (`may`, `may_not`, `unconfirmed`); the MCP t
   `mcp.get_rbac_enforcement` row, attempts both independently and reports
   `audit_persisted:false` if either drops. An empty audit callback is audit-off and the read
   succeeds, so "every read is audited" holds for a deployment with a wired sink. The null or
-  closed RBAC store `503` and a bare `401` write no row (matching the PUT and the fragment).
+  closed RBAC store `503` and a bare `401` write no row (matching the PUT and the fragment). A REST service-scoped refusal does write a `denied` row. The fragment and `GET /api/v1/me` read the same state unaudited.
 - **Residual: a cached view.** A replica that never observed an enable can read
   `enabled:false, unconfirmed:false` while another replica enforces, bounded by the stale-serve
   window (#2703). The access-review export's `rbac_enforcement` label is the stronger read.

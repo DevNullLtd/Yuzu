@@ -4,18 +4,25 @@
 /// The ONE builder behind the machine twins of `GET /fragments/access/enforcement`:
 /// `GET /api/v1/rbac/enforcement` (REST) and the MCP tool `get_rbac_enforcement` (#6033).
 ///
-/// It returns three facts, and the two groups are INDEPENDENT:
+/// It returns three facts, and the two groups answer DIFFERENT questions:
 ///   * `enabled` / `unconfirmed` describe the freshness of this replica's cached enforcement
-///     view (`is_rbac_enabled()` and `rbac_enabled_view_degraded()`). `enabled:true,
-///     unconfirmed:true` is possible (a cached "on" gone stale): enforcement is in effect either
-///     way, and `unconfirmed` means only that the displayed value could not be re-confirmed.
-///   * `administrator` is `rbac_admin_hint` on the CALLER's surface. It reads the durable stores
-///     (the durable-Administrator predicate, then the regime check), never the cached view, so
-///     `unconfirmed:true` with `administrator:may` and `unconfirmed:false` with
-///     `administrator:unconfirmed` are both legitimate. The HTML fragment skips the hint on a
-///     degraded view only because it cannot draw a usable switch then; that is a rendering
-///     decision, not an authority fact, and this builder deliberately does NOT copy it: an
-///     engine or an MCP-tier credential on REST is definitively `may_not` in every store state.
+///     view (`is_rbac_enabled()` and `rbac_enabled_view_degraded()`). When `unconfirmed` is true
+///     enforcement is to be treated as IN EFFECT whatever `enabled` says: a stale "off" is
+///     treated as on, and a stale "on" is on either way (`enabled:false, unconfirmed:true` and
+///     `enabled:true, unconfirmed:true` are both possible).
+///   * `administrator` is `rbac_admin_hint` on the CALLER's surface. The builder calls it once and
+///     neither forces nor suppresses the result when the view is degraded. The predicate behind
+///     it does consult the cached enforcement label, but only to choose which durable source
+///     answers (Administrator grant rows when enforcement is on or unconfirmed, the local
+///     account role when it is off); the answer itself is read from those durable rows and then
+///     the regime check. So it is not independent of cache state: while the view is degraded an
+///     account with no Administrator grant row reads `unconfirmed`, and `enabled:false,
+///     unconfirmed:true` with `administrator:unconfirmed` is a real answer. Every combination of
+///     the two groups is legitimate. The HTML fragment skips the hint on a degraded view only
+///     because it cannot draw a usable switch then; that is a rendering decision, not an
+///     authority fact, and this builder deliberately does NOT copy it. An engine, a
+///     service-scoped or (on REST) an MCP-tier credential is `may_not` from structural checks
+///     before any store is read.
 ///
 /// `administrator` is ADVISORY. `may` means the RBAC administration routes would admit this
 /// credential's durable authority now. It does NOT promise a mutation succeeds: REST MFA
@@ -73,7 +80,9 @@ struct RbacEnforcementRead {
 /// Reads the enforcement state and the caller's verdict. The error string is for the server log
 /// ONLY (it is a fixed server-authored string, never driver text); a transport answers a
 /// retryable 503-class refusal and never echoes it. An unwired or closed RBAC store is the only
-/// error: a degraded view is NOT an error, it is `unconfirmed:true`.
+/// error, and it is returned BEFORE the hint is consulted (so a closed store never yields a
+/// verdict of any kind, `may_not` included); a degraded view is NOT an error, it is
+/// `unconfirmed:true`.
 [[nodiscard]] inline std::expected<RbacEnforcementRead, std::string>
 read_rbac_enforcement(const auth::Session& session, AuthDB* auth_db, const RbacStore* rbac_store,
                       RbacAdminSurface surface) {

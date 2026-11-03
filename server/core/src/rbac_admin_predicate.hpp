@@ -284,7 +284,8 @@ enum class RbacAdminGate {
 /// logic of its own that could drift. That does not bind the routes: a change to any of the
 /// three routes' gate sequence needs a matching row in `test_rbac_admin_hint.cpp`. Neither
 /// function it calls writes an audit row or a response; this one does not either. A null or
-/// closed `rbac_store` is `kUnconfirmed`, never `kMayNot`.
+/// closed `rbac_store` is `kUnconfirmed`, except for the structural exclusions (engine,
+/// service-scoped, and an MCP-tier token on REST), which are `kMayNot` before any store is read.
 [[nodiscard]] inline RbacAdminHint rbac_admin_hint(const auth::Session& session, AuthDB* auth_db,
                                                     const RbacStore* rbac_store,
                                                     RbacAdminSurface surface) {

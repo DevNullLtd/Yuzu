@@ -1126,8 +1126,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `audit_persisted`): `enabled` and `unconfirmed` are this replica's cached
      enforcement view and whether it could be re-confirmed, and
      `administrator` (`may`, `may_not`, `unconfirmed`) is the advisory
-     administration hint on the caller's own surface, computed from the durable
-     stores independently of that view. Second, the REST route is
+     administration hint on the caller's own surface, decided from durable
+     grant rows or the local account role (the cached view only selects which
+     applies); it is neither forced nor hidden when the view is unconfirmed, but
+     an account with no Administrator grant row reads `unconfirmed` then. Second, the REST route is
      session-only: it calls `auth_fn`, refuses a service-scoped token, and
      holds no `perm_fn` gate. The ground is parity with its HTML fragment and
      with `GET /api/v1/me`, both session-only; a
@@ -1141,10 +1143,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      classification and the default-denied service-scope class only; it is
      never classified under `kServiceScopeGlobalSafe`. Third, the rejected
      alternative: gating the route on `perm_fn(Infrastructure, Read)`. It was
-     rejected for the reason above. The earlier rationale that the route would
-     return 403 in exactly the window where `unconfirmed` is true is not a
-     ground: the two windows overlap but are not equal. Fourth, the residuals,
-     stated plainly:
+     rejected for the reason above. Fourth, the residuals, stated plainly:
      (a) REST and MCP differ for an MCP-tier token. On REST it gets a 200 with
      `administrator:"may_not"` (the predicate denies it structurally on the REST
      surface), meaning "this credential cannot administer RBAC through REST";
@@ -1155,6 +1154,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      enforces, bounded by the stale-serve window (#2703).
      (c) The REST route is not RBAC-gated, the same class as `GET /api/v1/me`
      and `POST /api/v1/rbac/check`.
+     Retiring the two session-only `NO_GATE` entries (this route and
+     `GET /api/v1/me`) is tracked by #6432, the same follow-up the `get_me`
+     sibling entry names (`exception:#6432 revisit:2026-11-30`).
      (d) "Audit every read" means every read on a deployment with a wired audit
      sink: REST fails closed on an audit-write failure (503 with
      `Sec-Audit-Failed`, body never sent), MCP reports `audit_persisted:false`,
