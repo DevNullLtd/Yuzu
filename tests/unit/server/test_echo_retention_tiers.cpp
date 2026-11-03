@@ -143,16 +143,21 @@ TEST_CASE("parse_echo_retention_tiers tolerates framing quirks", "[echo][retenti
 }
 
 TEST_CASE("the embedded Echo retention table parses", "[echo][retention]") {
+    // Holds on a table that still carries `live` rows (the parser skips them) and on one that has
+    // none: it pins what the parser guarantees, not the row count of the shipped table.
     auto r = parse_echo_retention_tiers(yuzu::server::kEchoRetentionTiersTsv);
     REQUIRE(r.has_value());
-    const auto* live = find(*r, "process", "live");
-    REQUIRE(live);
-    CHECK(live->row_count);
-    CHECK(live->limit == 100000);
-    const auto* perf = find(*r, "perf", "live");
-    REQUIRE(perf);
-    CHECK_FALSE(perf->row_count);
-    CHECK(perf->limit == 604800);
+    REQUIRE_FALSE(r->empty());
+    for (const auto& t : *r)
+        CHECK(t.tier != "live");
+    CHECK(find(*r, "process", "live") == nullptr);
+    CHECK(find(*r, "perf", "live") == nullptr);
+    const auto* hourly = find(*r, "process", "hourly");
+    REQUIRE(hourly);
+    CHECK_FALSE(hourly->row_count);
+    CHECK(hourly->limit > 0);
+    CHECK(find(*r, "process", "daily"));
+    CHECK(find(*r, "process", "monthly"));
 }
 
 TEST_CASE("bucket_seconds per tier", "[echo][retention]") {

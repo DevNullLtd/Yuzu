@@ -454,12 +454,18 @@ TEST_CASE("build_data_retention_settings publishes the Echo retention tiers",
                 return &t;
         return nullptr;
     };
-    const auto* live = find("process", "live");
-    REQUIRE(live);
-    CHECK(live->at("limit_kind") == "rows");
-    CHECK(live->at("limit").get<long long>() == 100000);
-    CHECK(live->at("bucket_seconds").get<long long>() == 0);
-    CHECK(live->at("guaranteed_depth_seconds").is_null());
+    // Roll-up only: the parser skips `live` rows, so no tier named live is published, whether or
+    // not the embedded table still carries them.
+    for (const auto& t : tiers)
+        CHECK(t.at("tier") != "live");
+    CHECK(find("process", "live") == nullptr);
+    const auto* hourly = find("process", "hourly");
+    REQUIRE(hourly);
+    CHECK(hourly->at("limit_kind") == "seconds");
+    CHECK(hourly->at("bucket_seconds").get<long long>() == 3600);
+    CHECK(hourly->at("guaranteed_depth_seconds").get<long long>() ==
+          hourly->at("limit").get<long long>() - 3600);
+    CHECK(hourly->at("budget_dependent").get<bool>());
     const auto* daily = find("process", "daily");
     REQUIRE(daily);
     CHECK(daily->at("guaranteed_depth_seconds").get<long long>() == 2592000);
@@ -508,10 +514,13 @@ TEST_CASE("render_retention_table appends the Echo tier table after the three wi
     const auto wo = sm::render_retention_table(without);
     CHECK(w.compare(0, wo.size(), wo) == 0);
     CHECK_FALSE(has(wo, "Echo capture sources"));
-    for (const char* n : {"<caption>Echo capture sources</caption>", "<th>Exact</th>", "<th>Boot</th>",
-                          "<th>Look again after</th>", ">process<", "100,000 rows", ">1 day<",
-                          ">31 days<", ">12 months<", ">11 months<", "400 rows", "Row count only",
-                          ">7 days<", ">30 days<", "every 900 s", "never pruned", "not per-device"})
+    // Only what the builder guarantees on a table with or without `live` rows: the Exact column
+    // and the live-row cells (100,000 rows, Row count only, 1 day, 7 days) belong to the renderer
+    // and the table contents, which other changes own.
+    for (const char* n : {"<caption>Echo capture sources</caption>", "<th>Boot</th>",
+                          "<th>Look again after</th>", ">process<", ">31 days<", ">12 months<",
+                          ">11 months<", "400 rows", ">30 days<", "every 900 s", "never pruned",
+                          "not per-device"})
         CHECK(has(w, n));
     const auto cap = w.find("<caption");
     REQUIRE(cap != std::string::npos);
