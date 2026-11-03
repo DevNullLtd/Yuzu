@@ -10,8 +10,9 @@
  *      `administrator` (the hint, whose verdict comes from the durable stores) answer different
  *      questions, and the builder neither forces nor suppresses the verdict on a degraded view:
  *      an engine or an MCP-tier credential on REST is `may_not`, a confirmed administrator is
- *      `may`, an administrator with no grant row follows the hint (`unconfirmed`, because a
- *      store that cannot confirm the answer cannot call a missing row a denial).
+ *      `may`, an administrator with no grant row follows the hint: `unconfirmed` while the
+ *      cached value is a stale OFF (a store that cannot confirm the answer cannot call a missing
+ *      row a denial), `may_not` while it is a stale ON (the label is then `enabled`).
  *   3. The REST route through the shared RbacRoleHarness: the body for RBAC off and on, the
  *      verdict equals `rbac_admin_hint(..., kRest)` for the personas the hint matrix already pins
  *      (P1, P2, P3, P7c, P13), the structural cases (MCP-tier token, engine, SAML, service-scoped),
@@ -333,7 +334,7 @@ TEST_CASE("read_rbac_enforcement: a degraded view is unconfirmed:true and admini
         CHECK(r->administrator == RbacAdminHint::kMay);
     }
 
-    SECTION("an administrator with no grant row follows the hint (unconfirmed), not may_not") {
+    SECTION("a stale-off view: an administrator with no grant row follows the hint (unconfirmed), not may_not") {
         make_user(h, h.session_user, auth::Role::user);
         RbacStore replica{pool_b};
         REQUIRE(replica.is_open());
@@ -346,7 +347,8 @@ TEST_CASE("read_rbac_enforcement: a degraded view is unconfirmed:true and admini
         REQUIRE(r.has_value());
         CHECK(r->unconfirmed);
         CHECK(r->administrator == hint);
-        // The degraded view cannot call a missing grant row a confirmed denial.
+        // A stale OFF view cannot call a missing grant row a confirmed denial (a stale ON
+        // view can: see the stale-on route case, which reads may_not).
         CHECK(r->administrator == RbacAdminHint::kUnconfirmed);
     }
 
