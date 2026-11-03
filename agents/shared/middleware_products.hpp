@@ -215,8 +215,9 @@ namespace detail {
             !detail::is_ident(detail::sv(p.ecosystem), true) || detail::sv(p.title).empty() ||
             // The collector compares a row's title, as it arrives on the wire, with this raw one. The
             // wire form turns `|` into `\|`, `\` into `/`, CR/LF into a space and any byte the scrub
-            // rejects into `?`, so only plain printable ASCII without `|` or `\` survives unchanged;
-            // any other title would never map and its source's stored rows would be removed.
+            // rejects into `?`. Plain printable ASCII without `|` or `\` survives unchanged, and the check is
+            // deliberately stricter than that (valid non-ASCII UTF-8 is refused too, so a title never
+            // depends on the scrub); any other title would never map and its stored rows would go.
             std::ranges::any_of(detail::sv(p.title),
                                 [](char c) { return c < 0x20 || c > 0x7E || c == '|' || c == '\\'; }) ||
             detail::sv(p.vendor).empty() || detail::sv(p.kind) != "app")
