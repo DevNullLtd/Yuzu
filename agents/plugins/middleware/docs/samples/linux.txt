@@ -1,0 +1,6 @@
+captured: linux Ubuntu 26.04.1 LTS x86_64 · container · 2026-10-29 · euid 2001 · leg-hash ca94f832e087
+== action=ibm_mq
+status|ibm_mq|supported|-
+ibm_mq|IBM MQ|Installation1|9.4.5|/opt/mqm|-
+[result_status] OK / FULL / 
+
