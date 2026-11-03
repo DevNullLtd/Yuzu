@@ -27,7 +27,8 @@
 /// to the store's write budget plus a row-lock wait, normally milliseconds but not a bound this
 /// file can promise. An ownership transfer or membership change that lands inside it is not seen,
 /// and there is no re-read after the commit. Membership can be changed by the reviewer's own SSO
-/// login. The user rule has no such window (it is decided in the write). Revisit under #6060.
+/// login. The user rule has no such window (it is decided in C++ from the arguments, before any
+/// lease; the UPDATE predicate and the history CHECK are backstops). Revisit under #6060.
 ///
 /// Both lookups FAIL CLOSED: a failed or unavailable read is `kUnavailable` (503 / retryable),
 /// never "not a member" and never "not the owner". `get_group_members` is deliberately not used: it
@@ -37,14 +38,17 @@
 /// `saml:...`); a token session carries its owner's. Two identities of one human are two reviewers
 /// (the accepted exception recorded in docs/enterprise-readiness-soc2-first-customer.md).
 ///
-/// Audit shape, ONE for every outcome of the verb (`access_review.attested` or
-/// `access_review.flagged`, by the requested decision): `target_type=AccessReview`, `target_id` =
+/// Audit shape, ONE for every outcome of the verb that reaches this gate or the store
+/// (`access_review.attested` or `access_review.flagged`, by the requested decision; the REST
+/// refusal of an engine session and of a non-JSON body run earlier and carry an empty
+/// `target_id`): `target_type=AccessReview`, `target_id` =
 /// the campaign id alone, and the grant tuple in the detail as
 /// ` principal_type=<tok> principal_id=<tok> role=<tok>` after the outcome fields. Each tuple field
 /// goes through `audit_token` (CWE-117), which folds a space, so a REFUSAL row (there is no history
 /// row to recover the exact tuple from) can read the same for two distinct raw ids that fold to one
-/// token. That collision is a DISCLOSED residual; a success row carries `seq`, the exact key into
-/// the attestation history.
+/// token. That collision is a DISCLOSED residual and applies to success rows too: `seq` numbers
+/// decisions per grant, so the campaign id and the grant identify one history entry unless two
+/// grants fold to the same text.
 ///
 /// A refusal is written BEFORE its response body. A failed audit persist never lifts the refusal:
 /// REST sets `Sec-Audit-Failed: true`, MCP puts `audit_persisted:false` in the error data. The
