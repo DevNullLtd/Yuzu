@@ -2354,9 +2354,10 @@ TEST_CASE("SettingsRoutes engine-principals fragment: a credential read that can
     // A second principal with NO credential, so the recovery phase pins the Mint form too.
     REQUIRE(engine_store->create("Idle", "bob", "j", "internal", "admin", "engine:panel-none")
                 .has_value());
-    // A revoked principal: its "Detail:" cell is the revoke-detail audit lookup, which is
-    // skipped once a credential read has failed. (No audit store is wired in this harness, so a
-    // healthy render says "(not recorded)" and a skipped one says "(unavailable)".)
+    // A revoked principal: its "Detail (earliest retained record):" cell is the revoke-detail
+    // audit lookup, which is skipped once a credential read has failed. (No audit store is wired
+    // in this harness, so a healthy render says "(not recorded)" and a skipped one says
+    // "(unavailable)".)
     REQUIRE(engine_store->create("Gone", "bob", "j", "internal", "admin", "engine:panel-gone")
                 .has_value());
     REQUIRE(engine_store->revoke("engine:panel-gone").value_or(false));
@@ -2395,13 +2396,17 @@ TEST_CASE("SettingsRoutes engine-principals fragment: a credential read that can
             // The principal rows, read from the principal store, are still shown.
             CHECK(res->body.find("engine:panel-deg") != std::string::npos);
             CHECK(res->body.find("engine:panel-none") != std::string::npos);
-            // The revoked row's detail cell carries the not-looked-up label (this harness wires\n            // no audit store, so the label, not the absence of the query, is what is pinned).
-            CHECK(res->body.find("Detail: (unavailable)") != std::string::npos);
-            CHECK(res->body.find("Detail: (not recorded)") == std::string::npos);
+            // The revoked row's detail cell carries the not-looked-up label (this harness wires
+            // no audit store, so the label, not the absence of the query, is what is pinned).
+            CHECK(res->body.find("Detail (earliest retained record): (unavailable)") !=
+                  std::string::npos);
+            CHECK(res->body.find("Detail (earliest retained record): (not recorded)") ==
+                  std::string::npos);
         }
         auto res = h.sink.Get("/fragments/settings/engine-principals");
         REQUIRE(res);
-        CHECK(res->body.find("Detail: (not recorded)") != std::string::npos);
+        CHECK(res->body.find("Detail (earliest retained record): (not recorded)") !=
+              std::string::npos);
         CHECK(res->body.find("unavailable") == std::string::npos);
         CHECK(res->body.find("data-engine-action=\"rotate\"") != std::string::npos);
         CHECK(res->body.find("data-engine-action=\"mint\"") != std::string::npos);

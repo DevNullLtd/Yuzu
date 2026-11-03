@@ -22,12 +22,15 @@
 
 #include <sqlite3.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -301,6 +304,186 @@ TEST_CASE("CommandDedupStore: release reports Released on a healthy store",
     CHECK(t.store.release("never-claimed") == ReleaseOutcome::Released);
 }
 
+// ── cached_row_count(): the lock-free heartbeat capacity signal (#3663) ─────────
+
+TEST_CASE("CommandDedupStore: cached_row_count is 0 (known) on a fresh store",
+          "[command_dedup][row_count]") {
+    auto t = make_store();
+    const auto cached = t.store.cached_row_count();
+    REQUIRE(cached.has_value()); // 0 is a reading; nullopt would mean "unknown"
+    CHECK(*cached == 0);
+}
+
+TEST_CASE("CommandDedupStore: cached_row_count tracks claims and agrees with count()",
+          "[command_dedup][row_count]") {
+    auto t = make_store();
+    for (int i = 0; i < 5; ++i)
+        REQUIRE(t.store.claim("cmd-" + std::to_string(i)).status == ClaimStatus::Claimed);
+
+    // A Duplicate claim inserts nothing, so it must not move the count.
+    REQUIRE(t.store.claim("cmd-0").status == ClaimStatus::Duplicate);
+    // Flipping in-flight -> terminal is not a new row either.
+    REQUIRE(t.store.record_terminal("cmd-1", "SUCCESS") == RecordOutcome::Recorded);
+
+    const auto cached = t.store.cached_row_count();
+    const auto real = t.store.count();
+    REQUIRE(cached.has_value());
+    REQUIRE(real.has_value());
+    CHECK(*cached == 5);
+    CHECK(*cached == *real);
+}
+
+TEST_CASE("CommandDedupStore: cached_row_count is exact again after a restart",
+          "[command_dedup][row_count][restart]") {
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    {
+        auto opened = CommandDedupStore::open(path);
+        REQUIRE(opened.has_value());
+        REQUIRE(opened->claim("a").status == ClaimStatus::Claimed);
+        REQUIRE(opened->claim("b").status == ClaimStatus::Claimed);
+        REQUIRE(opened->record_terminal("a", "SUCCESS") == RecordOutcome::Recorded);
+    }
+    // The process-local atomic is gone; the reopened store must re-anchor on the file.
+    auto reopened = CommandDedupStore::open(path);
+    REQUIRE(reopened.has_value());
+    const auto cached = reopened->cached_row_count();
+    REQUIRE(cached.has_value());
+    CHECK(*cached == 2);
+}
+
+TEST_CASE("CommandDedupStore: cached_row_count is re-anchored by the prune and stays bounded",
+          "[command_dedup][row_count][retention]") {
+    auto t = make_store();
+    t.store.set_max_dedup_rows_for_test(50);
+
+    const std::int64_t overflow =
+        50 + static_cast<std::int64_t>(CommandDedupStore::kPruneInterval) + 100;
+    for (std::int64_t i = 0; i < overflow; ++i) {
+        auto id = "fill-" + std::to_string(i);
+        REQUIRE(t.store.claim(id).status == ClaimStatus::Claimed);
+        REQUIRE(t.store.record_terminal(id, "SUCCESS") == RecordOutcome::Recorded);
+    }
+
+    const auto cached = t.store.cached_row_count();
+    const auto real = t.store.count();
+    REQUIRE(cached.has_value());
+    REQUIRE(real.has_value());
+    // Without a release() the cache must equal the table exactly, not merely be near it.
+    CHECK(*cached == *real);
+    // ...and the eviction must be visible in it: the ring held the table to the bound
+    // plus at most one prune interval, so the cache cannot have kept counting claims.
+    CHECK(*cached <= 50 + static_cast<std::int64_t>(CommandDedupStore::kPruneInterval));
+    CHECK(*cached < overflow);
+}
+
+TEST_CASE("CommandDedupStore: cached_row_count may over-read after a release, never under-read",
+          "[command_dedup][row_count][release]") {
+    auto t = make_store();
+    REQUIRE(t.store.claim("cmd-1").status == ClaimStatus::Claimed);
+    REQUIRE(t.store.release("cmd-1") == ReleaseOutcome::Released);
+
+    const auto cached = t.store.cached_row_count();
+    const auto real = t.store.count();
+    REQUIRE(cached.has_value());
+    REQUIRE(real.has_value());
+    CHECK(*real == 0);
+    // The documented, accepted drift: release() does not decrement. It is an over-read of a
+    // capacity gauge, never an under-read that would hide a store approaching its bound.
+    CHECK(*cached >= *real);
+}
+
+TEST_CASE("CommandDedupStore: cached_row_count survives a move of the store",
+          "[command_dedup][row_count][lifecycle]") {
+    auto t = make_store();
+    REQUIRE(t.store.claim("cmd-1").status == ClaimStatus::Claimed);
+    REQUIRE(t.store.claim("cmd-2").status == ClaimStatus::Claimed);
+
+    CommandDedupStore moved{std::move(t.store)};
+    const auto cached = moved.cached_row_count();
+    REQUIRE(cached.has_value());
+    CHECK(*cached == 2);
+    // The moved-from store no longer owns a database: its count is unknown, not stale.
+    // NOLINTNEXTLINE(bugprone-use-after-move) -- deliberately probing the moved-from state
+    CHECK_FALSE(t.store.cached_row_count().has_value());
+}
+
+namespace {
+// Joins the thread on EVERY exit path, including the exception a failed REQUIRE throws: a
+// std::thread destroyed while joinable calls std::terminate, which would abort the whole test
+// binary and hide every other result. (std::jthread would do this, but it is not available in
+// every supported libc++, e.g. Apple Clang 15's; the rest of the codebase gates it behind
+// __cpp_lib_jthread.)
+struct StopAndJoin {
+    std::atomic<bool>& stop;
+    std::thread& thread;
+    ~StopAndJoin() {
+        stop.store(true, std::memory_order_release);
+        if (thread.joinable())
+            thread.join();
+    }
+};
+} // namespace
+
+TEST_CASE("CommandDedupStore: cached_row_count is safe to read while claims and prunes run",
+          "[command_dedup][row_count][concurrent]") {
+    // The heartbeat thread reads cached_row_count() lock-free while the reader thread claims and
+    // a worker thread records/prunes under mu_. This is the one cross-thread read the cache adds,
+    // so it is the case TSan (nightly) needs: a data race on cached_rows_ or db_ would be flagged
+    // here (verified: with cached_rows_ made a plain int64_t, TSan reports the race; without TSan
+    // the same mutant passes, so this case alone is not a race detector). Without TSan it still
+    // pins the bounds: never negative once known, never beyond the rows ever inserted, and exact
+    // against the table once the writer has stopped.
+    auto t = make_store();
+    t.store.set_max_dedup_rows_for_test(50);
+    constexpr int kCycles = 600; // > kPruneInterval (512), so at least one prune + recount runs
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> reads{0};
+    std::atomic<std::int64_t> lowest{INT64_MAX};
+    std::atomic<std::int64_t> highest{-1};
+    std::thread reader([&] {
+        // do/while: the reader always reads once before it looks at `stop`, so a reader that is
+        // scheduled late still records a value.
+        do {
+            if (const auto rows = t.store.cached_row_count()) {
+                reads.fetch_add(1, std::memory_order_relaxed);
+                std::int64_t cur = lowest.load(std::memory_order_relaxed);
+                while (*rows < cur && !lowest.compare_exchange_weak(cur, *rows)) {}
+                cur = highest.load(std::memory_order_relaxed);
+                while (*rows > cur && !highest.compare_exchange_weak(cur, *rows)) {}
+            }
+            std::this_thread::yield();
+        } while (!stop.load(std::memory_order_acquire));
+    });
+    StopAndJoin guard{stop, reader};
+
+    // Do not start writing until the reader has observed a value, so `reads > 0` below cannot
+    // fail on a loaded runner that has not yet scheduled the reader. The count is known (0) after
+    // construction; the REQUIRE makes a regression that leaves it unknown fail here instead of
+    // spinning until the test runner's timeout.
+    REQUIRE(t.store.cached_row_count().has_value());
+    while (reads.load(std::memory_order_relaxed) == 0)
+        std::this_thread::yield();
+
+    for (int i = 0; i < kCycles; ++i) {
+        const auto id = "conc-" + std::to_string(i);
+        REQUIRE(t.store.claim(id).status == ClaimStatus::Claimed);
+        REQUIRE(t.store.record_terminal(id, "SUCCESS") == RecordOutcome::Recorded);
+    }
+    stop.store(true, std::memory_order_release);
+    reader.join();
+
+    CHECK(reads.load() > 0);
+    CHECK(lowest.load() >= 0); // a known count is never negative
+    CHECK(highest.load() <= kCycles); // never more rows than were ever inserted
+    const auto cached = t.store.cached_row_count();
+    const auto real = t.store.count();
+    REQUIRE(cached.has_value());
+    REQUIRE(real.has_value());
+    CHECK(*cached == *real); // no release() ran, so the cache is exact
+    CHECK(*cached < kCycles); // the prune evicted, and the recount saw it
+}
 
 // ── Corruption recovery (#3665) ──────────────────────────────────────────────
 
@@ -392,6 +575,29 @@ TEST_CASE("CommandDedupStore: a non-database file is quarantined and recreated",
     CHECK(quarantine_siblings(path).size() == 1);
     auto dup = reopened->claim("cmd-after-recovery");
     CHECK(dup.status == ClaimStatus::Duplicate);
+}
+
+TEST_CASE("CommandDedupStore: the fresh store after a quarantine reports a known zero row count",
+          "[command_dedup][lifecycle][corruption][row_count]") {
+    // #3665 recovery builds a NEW store through the same constructor that takes the initial
+    // count. The quarantined file's rows are gone, so the cache must read a KNOWN 0 (an unknown
+    // would look like an agent that does not report the tag), and must then track claims.
+    const auto path = fresh_db_path();
+    yuzu::test::TempDbFile guard{path};
+    QuarantineCleanup qc{path};
+    write_bytes(path, "this is not a sqlite database");
+
+    auto result = CommandDedupStore::open(path);
+    REQUIRE(result.has_value());
+    REQUIRE(result->quarantined_this_open().has_value());
+    auto fresh = result->cached_row_count();
+    REQUIRE(fresh.has_value());
+    CHECK(*fresh == 0);
+
+    REQUIRE(result->claim("cmd-after-recovery").status == ClaimStatus::Claimed);
+    auto after = result->cached_row_count();
+    REQUIRE(after.has_value());
+    CHECK(*after == 1);
 }
 
 TEST_CASE("CommandDedupStore: a file whose schema page is garbage is quarantined",
