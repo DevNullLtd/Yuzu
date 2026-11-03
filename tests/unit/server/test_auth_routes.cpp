@@ -875,9 +875,10 @@ TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from ap
 }
 
 // The "unaffected" side of the rule above: the approval gate is the supervised branch only. An
-// untiered token (and a session, which has no tier) passes the tier belt for Workflow:Execute, and
-// an operator-tier token is refused by the TIER check, not the approval gate (its body names the
-// tier, never an approval).
+// untiered token passes the tier belt for Workflow:Execute (require_tier_policy returns early on an
+// empty tier, so this section guards that early return, not the position of the policy rule; the
+// policy case in test_mcp_server.cpp guards that), and an operator-tier token is refused by the
+// TIER check, not the approval gate (its body names the tier, never an approval).
 TEST_CASE("AuthRoutes::require_permission - Workflow:Execute: untiered token passes the tier belt, "
           "operator tier is refused by tier_allows not the approval gate",
           "[pg][auth_routes][scope][mcp]") {
@@ -892,7 +893,7 @@ TEST_CASE("AuthRoutes::require_permission - Workflow:Execute: untiered token pas
         req.path = "/api/workflows/wf-1/execute";
         httplib::Response res;
         CHECK(fix.ar->require_permission(req, res, "Workflow", "Execute"));
-        CHECK(res.body.find("approval") == std::string::npos);
+        CHECK(res.status != 403);
     }
     SECTION("operator-tier token") {
         auto raw = fix.api_tokens->create_token("wfx-operator", "test_user", now + 3600, "",
