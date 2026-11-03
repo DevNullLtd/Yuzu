@@ -6542,6 +6542,8 @@ does not exist or was soft-deleted; a genuine store degrade returns `503` (ADR-0
 | `scope` | string | Yes | Scope expression selecting target agents |
 | `parameters` | object | No | Override parameters for workflow steps |
 
+**Approval:** `Workflow:Execute` requires an approval ticket at the `supervised` MCP token tier, so a supervised-tier MCP token that calls this route is refused (`403`, approval required on this transport, audit action `auth.approval_required`). No MCP tool maps to `Workflow:Execute` yet, so such a token has no ticket path to run a workflow until the workflow-execute twin lands; use a session or a non-MCP API token. The `operator` tier is refused by the tier check, and an untiered token is unaffected.
+
 #### `GET /api/workflow-executions/{id}`
 
 Get the status of a running or completed workflow execution, including per-step and per-agent
