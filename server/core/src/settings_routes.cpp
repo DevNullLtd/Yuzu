@@ -7230,7 +7230,9 @@ void SettingsRoutes::register_routes(
                                 session->username, "regeneration failed");
                       res.set_content(
                           render_mfa_fragment(*session, {}, {}, {}, {},
-                                              "Could not regenerate codes"),
+                                              "Could not regenerate codes. Your existing "
+                                              "recovery codes should be unchanged; if you "
+                                              "are unsure, regenerate again."),
                           "text/html; charset=utf-8");
                       return;
                   }
