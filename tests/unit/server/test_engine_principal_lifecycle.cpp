@@ -33,6 +33,7 @@
 #include "rbac_store.hpp"
 #include "rest_api_v1.hpp"
 #include "settings_routes.hpp"
+#include "test_identity_revoke_fault.hpp" // IdentityRevokeFault, shared with test_mcp_server.cpp
 #include "test_principal_lock_gate.hpp" // SqlFault: a REAL table moved aside in the throwaway DB
 #include "test_route_sink.hpp"
 
@@ -93,10 +94,13 @@ yuzu::test::PgTestTemplate engine_principal_lifecycle_template{
 // between tests instead of a fresh CREATE DATABASE + new pool per test (the
 // dominant Windows [pg]-shard cost, #2354 — see test_software_inventory_store
 // .cpp's SwinvShared, the reference conversion). Built lazily; at testRunEnded
-// the pool is drained and the clone dropped (keep_until_run_end). Every test
-// in this file is CRUD-only against the store (the fail-closed arms build
-// their own garbage-DSN pools and never touch the shared clone), so there are
-// no per-case-database carve-outs.
+// the pool is drained and the clone dropped (keep_until_run_end). Almost every
+// test in this file is CRUD-only against the store (the fail-closed arms build
+// their own garbage-DSN pools and never touch the shared clone). The one DDL
+// carve-out is `IdentityRevokeFault`, which installs a trigger on this shared
+// engine clone: it removes it on every exit path (including a failed
+// construction) and never throws from its destructor, so a failed case cannot
+// leave the trigger armed for the cases after it.
 struct EpLcShared {
     yuzu::test::PostgresTestDb db{engine_principal_lifecycle_template};
     std::optional<yuzu::server::pg::PgPool> pool;
@@ -112,6 +116,8 @@ EpLcShared& ep_lc_shared() {
     static EpLcShared s;
     return s;
 }
+
+using IdentityRevokeFault = yuzu::server::test::IdentityRevokeFault;
 
 /// Same call-site interface as before; now a fresh store per fixture over the
 /// file-wide shared clone/pool, TRUNCATE-restored at construction (the ctor's
@@ -1251,8 +1257,504 @@ TEST_CASE("Engine-principal REST: a partial rotate whose audit write also drops 
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Retry hints on the engine credential rotate / confirm and principal revoke
+// routes (#6716). A retryable 503 carries Retry-After and the A4 retry_after_ms;
+// a terminal state, or a 503 where state already changed, carries neither.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+/// True when the response carries no retry hint at all: no Retry-After header and a null
+/// `retry_after_ms` in the A4 body.
+bool has_no_retry_hint(const httplib::Response& res) {
+    const auto body = nlohmann::json::parse(res.body, nullptr, false);
+    return !res.has_header("Retry-After") && body.is_object() && body.contains("error") &&
+           body["error"].contains("retry_after_ms") && body["error"]["retry_after_ms"].is_null();
+}
+
+bool has_retry_hint(const httplib::Response& res) {
+    const auto body = nlohmann::json::parse(res.body, nullptr, false);
+    return res.get_header_value("Retry-After") == "2" && body.is_object() &&
+           body.contains("error") && body["error"].contains("retry_after_ms") &&
+           body["error"]["retry_after_ms"].is_number_integer() &&
+           body["error"]["retry_after_ms"].get<int>() == 2000;
+}
+} // namespace
+
+TEST_CASE("Engine-principal REST: rotate, confirm and DELETE answer 503 with a retry hint when "
+          "the stores are not open (no Postgres needed)",
+          "[rest][engine_principal][retry_hint][degraded]") {
+    // An engine store that never opened plus an unwired token store: every one of the three
+    // routes stops at its store-open guard. Needs no live database.
+    yuzu::server::pg::PgPool broken_pool{
+        {.conninfo = "host=127.0.0.1 port=1 connect_timeout=1", .size = 1}};
+    EnginePrincipalStore broken_store{broken_pool};
+    REQUIRE_FALSE(broken_store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    RestApiV1 api;
+    yuzu::server::test::TestRouteSink sink; // after `api`: its handlers capture the owner
+    auth::Session session;
+    session.username = "alice";
+    session.role = auth::Role::admin;
+    auto auth_fn = [&session](const httplib::Request&,
+                              httplib::Response&) -> std::optional<auth::Session> {
+        return session;
+    };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) -> bool { return true; };
+    auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) -> bool {
+        return true;
+    };
+    api.set_engine_principal_store(&broken_store);
+    api.register_routes(sink, auth_fn, perm_fn, audit_fn, /*rbac_store=*/nullptr,
+                        /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
+                        /*quarantine_store=*/nullptr,
+                        /*response_store=*/nullptr,
+                        /*instruction_store=*/nullptr,
+                        /*execution_tracker=*/nullptr,
+                        /*schedule_engine=*/nullptr,
+                        /*approval_manager=*/nullptr,
+                        /*tag_store=*/nullptr,
+                        /*audit_store=*/nullptr,
+                        /*service_group_fn=*/{},
+                        /*tag_push_fn=*/{},
+                        /*inventory_store=*/nullptr,
+                        /*product_pack_store=*/nullptr,
+                        /*sw_deploy_store=*/nullptr,
+                        /*device_token_store=*/nullptr,
+                        /*license_store=*/nullptr,
+                        /*guaranteed_state_store=*/nullptr,
+                        /*metrics_registry=*/&metrics,
+                        /*session_revoke_fn=*/{},
+                        /*execution_event_bus=*/nullptr,
+                        /*result_set_store=*/nullptr,
+                        /*command_dispatch_fn=*/{});
+
+    const std::string pid = "engine:retry-hint";
+    auto rotate = sink.Post("/api/v1/engine-principals/" + pid + "/credentials/rotate", "{}");
+    REQUIRE(rotate);
+    CHECK(rotate->status == 503);
+    CHECK(has_retry_hint(*rotate));
+
+    auto confirm = sink.Post("/api/v1/engine-principals/" + pid + "/credentials/confirm", "{}");
+    REQUIRE(confirm);
+    CHECK(confirm->status == 503);
+    CHECK(has_retry_hint(*confirm));
+
+    auto del = sink.dispatch("DELETE", "/api/v1/engine-principals/" + pid, "{}");
+    REQUIRE(del);
+    CHECK(del->status == 503);
+    CHECK(has_retry_hint(*del));
+}
+
+TEST_CASE("Engine-principal REST: rotate carries a retry hint on a transient store fault and none "
+          "on a terminal conflict",
+          "[pg][rest][engine_principal][rotation][retry_hint][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw1] = h.create_and_mint("rotate-retry-hint");
+    (void)raw1;
+
+    {
+        auto held = hold_all_token_pool_leases();
+        auto res = h.rotate(pid);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_retry_hint(*res));
+    }
+
+    // Terminal: a second operator re-serving the first operator's rotation is a 409.
+    h.session_user = "alice";
+    auto r1 = h.rotate(pid);
+    REQUIRE(r1);
+    REQUIRE(r1->status == 200);
+    h.session_user = "bob";
+    auto r2 = h.rotate(pid);
+    REQUIRE(r2);
+    CHECK(r2->status == 409);
+    CHECK(has_no_retry_hint(*r2));
+}
+
+TEST_CASE("Engine-principal REST: confirm carries a retry hint on a transient store fault and none "
+          "on a terminal state or a post-commit audit failure",
+          "[pg][rest][engine_principal][confirm][retry_hint][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw1] = h.create_and_mint("confirm-retry-hint");
+    (void)raw1;
+    h.session_user = "alice";
+    auto rot = h.rotate(pid);
+    REQUIRE(rot);
+    REQUIRE(rot->status == 200);
+    const auto data = nlohmann::json::parse(rot->body)["data"];
+    const auto token_id = data["token_id"].get<std::string>();
+    const auto secret = data["token"].get<std::string>();
+
+    {
+        auto held = hold_all_token_pool_leases();
+        auto res = h.confirm(pid, token_id, secret);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_retry_hint(*res));
+    }
+
+    // The confirm commits but its audit row drops: 503, state changed, so no hint (the
+    // client must reconcile, not repeat the confirm).
+    h.audit_allow = false;
+    auto audit_dropped = h.confirm(pid, token_id, secret);
+    REQUIRE(audit_dropped);
+    CHECK(audit_dropped->status == 503);
+    CHECK(has_no_retry_hint(*audit_dropped));
+    h.audit_allow = true;
+
+    // Terminal: the replay of a resolved rotation is a 409.
+    auto replay = h.confirm(pid, token_id, secret);
+    REQUIRE(replay);
+    CHECK(replay->status == 409);
+    CHECK(has_no_retry_hint(*replay));
+}
+
+TEST_CASE("Engine-principal REST: DELETE carries a retry hint where nothing has changed yet and "
+          "none once the revoke committed",
+          "[pg][rest][engine_principal][revoke][retry_hint][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw1] = h.create_and_mint("revoke-retry-hint");
+    (void)raw1;
+
+    {
+        // (b) the identity read cannot answer.
+        auto held = hold_all_engine_pool_leases();
+        auto res = h.revoke(pid);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_retry_hint(*res));
+    }
+    {
+        // (c) the credential revoke cannot persist; the identity is untouched.
+        auto held = hold_all_token_pool_leases();
+        auto res = h.revoke(pid);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_retry_hint(*res));
+    }
+    // The identity was never touched (credentials are revoked first).
+    {
+        auto got = h.get(pid);
+        REQUIRE(got);
+        REQUIRE(got->status == 200);
+        CHECK(nlohmann::json::parse(got->body)["data"]["lifecycle_state"].get<std::string>() !=
+              "revoked");
+    }
+
+    // 404 is terminal.
+    auto missing = h.revoke("engine:retry-hint-missing");
+    REQUIRE(missing);
+    CHECK(missing->status == 404);
+    CHECK(has_no_retry_hint(*missing));
+
+    // (f) the revoke commits, then its audit row drops: 503, state changed, no hint.
+    h.audit_allow = false;
+    auto audit_dropped = h.revoke(pid);
+    REQUIRE(audit_dropped);
+    CHECK(audit_dropped->status == 503);
+    CHECK(has_no_retry_hint(*audit_dropped));
+    h.audit_allow = true;
+    auto got = h.get(pid);
+    REQUIRE(got);
+    REQUIRE(got->status == 200);
+    CHECK(nlohmann::json::parse(got->body)["data"]["lifecycle_state"].get<std::string>() ==
+          "revoked");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // No-admin auditor query (§4.2).
 // ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+/// The most recent audit row for `action`, or nullptr.
+const AuditCall* last_audit_for(const std::vector<AuditCall>& log, const std::string& action) {
+    for (auto it = log.rbegin(); it != log.rend(); ++it)
+        if (it->action == action)
+            return &*it;
+    return nullptr;
+}
+
+/// The `action` rows appended at or after index `from`: what ONE call wrote.
+std::vector<AuditCall> audit_rows_since(const std::vector<AuditCall>& log, std::size_t from,
+                                        const std::string& action) {
+    std::vector<AuditCall> rows;
+    for (std::size_t i = from; i < log.size(); ++i)
+        if (log[i].action == action)
+            rows.push_back(log[i]);
+    return rows;
+}
+
+std::size_t audit_count_for(const std::vector<AuditCall>& log, const std::string& action,
+                            const std::string& result) {
+    return static_cast<std::size_t>(
+        std::count_if(log.begin(), log.end(), [&](const AuditCall& a) {
+            return a.action == action && a.result == result;
+        }));
+}
+} // namespace
+
+TEST_CASE("Engine-principal REST: DELETE retries after the credentials are revoked but the "
+          "identity revoke fails or changes nothing",
+          "[pg][rest][engine_principal][revoke][retry_hint]") {
+    RestEngineHarness h;
+    const auto identity_state = [&h](const std::string& pid) {
+        auto got = h.get(pid);
+        REQUIRE(got);
+        REQUIRE(got->status == 200);
+        return nlohmann::json::parse(got->body)["data"];
+    };
+
+    {
+        // (d) the identity revoke errors after the credentials were revoked: 503 with a hint,
+        // and repeating the call finishes the revoke.
+        auto [pid, raw] = h.create_and_mint("revoke-fault-raise");
+        (void)raw;
+        IdentityRevokeFault fault{*ep_lc_shared().pool, IdentityRevokeFault::Mode::Raise};
+        const std::size_t rows_before = h.audit_log.size();
+        auto res = h.revoke(pid);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_retry_hint(*res));
+        // The faulted call wrote exactly one revoke row, and it is the failure row.
+        const auto faulted_rows =
+            audit_rows_since(h.audit_log, rows_before, "engine_principal.revoke");
+        REQUIRE(faulted_rows.size() == 1);
+        CHECK(faulted_rows.front().result == "failure");
+        // Half done: the credential is gone, the identity is still active.
+        const auto mid = identity_state(pid);
+        CHECK(mid["lifecycle_state"].get<std::string>() == "active");
+        CHECK(mid["active_credentials"].empty());
+        // The failure row records how many credentials were already revoked: the repeat call
+        // revokes none, so this row is the only place the count survives.
+        const auto* failure = last_audit_for(h.audit_log, "engine_principal.revoke");
+        REQUIRE(failure != nullptr);
+        CHECK(failure->result == "failure");
+        CHECK(failure->detail.find("credentials_revoked=1") != std::string::npos);
+        CHECK(failure->detail.find("yuzu_test identity revoke fault") != std::string::npos);
+        // A libpq error text ends with a newline: the count must not land on its own line, so
+        // the detail is one line and still ends with the count.
+        CHECK(failure->detail.find('\n') == std::string::npos);
+        CHECK(failure->detail.find('\r') == std::string::npos);
+        CHECK(failure->detail.ends_with("; credentials_revoked=1"));
+        fault.remove();
+        auto again = h.revoke(pid);
+        REQUIRE(again);
+        CHECK(again->status == 200);
+        CHECK(identity_state(pid)["lifecycle_state"].get<std::string>() == "revoked");
+        const auto* success = last_audit_for(h.audit_log, "engine_principal.revoke");
+        REQUIRE(success != nullptr);
+        CHECK(success->result == "success");
+        CHECK(success->detail.find("credentials_revoked=0") != std::string::npos);
+    }
+    {
+        // (e) the identity revoke reports it changed nothing and the principal is still active:
+        // 503 with the same hint as (d) (same state), and repeating the call after the cause is
+        // gone completes the revoke.
+        auto [pid, raw] = h.create_and_mint("revoke-fault-skip");
+        (void)raw;
+        IdentityRevokeFault fault{*ep_lc_shared().pool, IdentityRevokeFault::Mode::Skip};
+        const std::size_t rows_before = h.audit_log.size();
+        auto res = h.revoke(pid);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_retry_hint(*res));
+        // The faulted call wrote exactly one revoke row, and it is the failure row.
+        const auto faulted_rows =
+            audit_rows_since(h.audit_log, rows_before, "engine_principal.revoke");
+        REQUIRE(faulted_rows.size() == 1);
+        CHECK(faulted_rows.front().result == "failure");
+        const auto mid = identity_state(pid);
+        CHECK(mid["lifecycle_state"].get<std::string>() == "active");
+        CHECK(mid["active_credentials"].empty());
+        const auto* failure = last_audit_for(h.audit_log, "engine_principal.revoke");
+        REQUIRE(failure != nullptr);
+        CHECK(failure->result == "failure");
+        CHECK(failure->detail.find("credentials_revoked=1") != std::string::npos);
+        CHECK(failure->detail.find("still active") != std::string::npos);
+        fault.remove();
+        auto again = h.revoke(pid);
+        REQUIRE(again);
+        CHECK(again->status == 200);
+        CHECK(identity_state(pid)["lifecycle_state"].get<std::string>() == "revoked");
+    }
+}
+
+TEST_CASE("Engine-principal REST: DELETE answers 200 idempotent, not 503, when a concurrent "
+          "revoke wins between the handler's read and its write",
+          "[pg][rest][engine_principal][revoke][retry_hint]") {
+    RestEngineHarness h;
+    auto [pid, raw] = h.create_and_mint("revoke-race");
+    (void)raw;
+    const std::size_t failures_before = audit_count_for(h.audit_log, "engine_principal.revoke",
+                                                        "failure");
+
+    IdentityRevokeFault fault{*ep_lc_shared().pool, IdentityRevokeFault::Mode::Race};
+    auto res = h.revoke(pid, "engine:race-successor");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(res->has_header("Retry-After"));
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    const auto data = nlohmann::json::parse(res->body)["data"];
+    CHECK(data["revoked"].get<bool>() == true);
+    CHECK(data["credentials_revoked"].get<int64_t>() == 1);
+
+    // One success row carrying the count, no failure row for the same call.
+    const auto* row = last_audit_for(h.audit_log, "engine_principal.revoke");
+    REQUIRE(row != nullptr);
+    CHECK(row->result == "success");
+    // The winner's write stands: the caller's superseded_by was not persisted, and the row must
+    // not claim it was.
+    CHECK(row->detail ==
+          "credentials_revoked=1; revoked_by_concurrent_request; superseded_by_not_persisted");
+    CHECK(row->detail.find("superseded_by=") == std::string::npos);
+    CHECK(audit_count_for(h.audit_log, "engine_principal.revoke", "failure") == failures_before);
+
+    // Without a superseded_by the race row carries only the count and the race marker.
+    auto [pid2, raw2] = h.create_and_mint("revoke-race-nosup");
+    (void)raw2;
+    auto res2 = h.revoke(pid2);
+    REQUIRE(res2);
+    CHECK(res2->status == 200);
+    const auto* row2 = last_audit_for(h.audit_log, "engine_principal.revoke");
+    REQUIRE(row2 != nullptr);
+    CHECK(row2->result == "success");
+    CHECK(row2->detail == "credentials_revoked=1; revoked_by_concurrent_request");
+
+    auto got = h.get(pid);
+    REQUIRE(got);
+    REQUIRE(got->status == 200);
+    const auto state = nlohmann::json::parse(got->body)["data"];
+    CHECK(state["lifecycle_state"].get<std::string>() == "revoked");
+    CHECK(state["active_credentials"].empty());
+}
+
+TEST_CASE("Engine-principal REST: a credential minted between a faulted DELETE and its repeat is "
+          "revoked by the repeat",
+          "[pg][rest][engine_principal][revoke][retry_hint]") {
+    RestEngineHarness h;
+    auto [pid, raw] = h.create_and_mint("revoke-fault-then-mint");
+    (void)raw;
+
+    IdentityRevokeFault fault{*ep_lc_shared().pool, IdentityRevokeFault::Mode::Raise};
+    auto first = h.revoke(pid);
+    REQUIRE(first);
+    CHECK(first->status == 503);
+    CHECK(has_retry_hint(*first));
+
+    // The identity is still active with zero credentials, so a mint is allowed.
+    auto minted = h.mint(pid);
+    REQUIRE(minted);
+    REQUIRE(minted->status == 201);
+    const auto minted_raw = nlohmann::json::parse(minted->body)["data"]["token"].get<std::string>();
+    CHECK(h.token_store->list_active_for_principal(pid).size() == 1);
+    // The late credential really authenticates until the repeat runs.
+    CHECK(h.token_store->validate_token(minted_raw).has_value());
+
+    fault.remove();
+    auto repeat = h.revoke(pid);
+    REQUIRE(repeat);
+    CHECK(repeat->status == 200);
+    CHECK(nlohmann::json::parse(repeat->body)["data"]["credentials_revoked"].get<int64_t>() == 1);
+
+    // The principal ends revoked and the late credential no longer authenticates.
+    auto got = h.get(pid);
+    REQUIRE(got);
+    REQUIRE(got->status == 200);
+    const auto state = nlohmann::json::parse(got->body)["data"];
+    CHECK(state["lifecycle_state"].get<std::string>() == "revoked");
+    CHECK(state["active_credentials"].empty());
+    CHECK(h.token_store->list_active_for_principal(pid).empty());
+    // The secret that was minted in between no longer authenticates.
+    CHECK_FALSE(h.token_store->validate_token(minted_raw).has_value());
+}
+
+TEST_CASE("Engine-principal REST: a confirm whose audit row drops is not hinted, the replay is a "
+          "409, and no hinted response carries Sec-Audit-Failed",
+          "[pg][rest][engine_principal][confirm][retry_hint][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw1] = h.create_and_mint("confirm-audit-drop");
+    (void)raw1;
+    h.session_user = "alice";
+
+    // Hinted pre-commit 503s (audit available) never carry Sec-Audit-Failed.
+    {
+        auto held = hold_all_token_pool_leases();
+        auto res = h.rotate(pid);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_retry_hint(*res));
+        CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    }
+    auto rot = h.rotate(pid);
+    REQUIRE(rot);
+    REQUIRE(rot->status == 200);
+    const auto data = nlohmann::json::parse(rot->body)["data"];
+    const auto token_id = data["token_id"].get<std::string>();
+    const auto secret = data["token"].get<std::string>();
+    {
+        auto held = hold_all_token_pool_leases();
+        auto res = h.confirm(pid, token_id, secret);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(has_retry_hint(*res));
+        CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+        auto del = h.revoke(pid);
+        REQUIRE(del);
+        CHECK(del->status == 503);
+        CHECK(has_retry_hint(*del));
+        CHECK_FALSE(del->has_header("Sec-Audit-Failed"));
+    }
+
+    // The confirm commits and then its audit row drops: 503, no hint, flagged.
+    h.audit_allow = false;
+    auto dropped = h.confirm(pid, token_id, secret);
+    REQUIRE(dropped);
+    CHECK(dropped->status == 503);
+    CHECK(has_no_retry_hint(*dropped));
+    CHECK(dropped->has_header("Sec-Audit-Failed"));
+    h.audit_allow = true;
+
+    // The rotation was resolved, so the repeat is a terminal 409 with no hint.
+    auto repeat = h.confirm(pid, token_id, secret);
+    REQUIRE(repeat);
+    CHECK(repeat->status == 409);
+    CHECK(has_no_retry_hint(*repeat));
+    CHECK_FALSE(repeat->has_header("Sec-Audit-Failed"));
+}
+
+TEST_CASE("Engine-principal REST: confirm on a malformed two-credential pair is a 409 with no "
+          "retry hint",
+          "[pg][rest][engine_principal][confirm][retry_hint]") {
+    RestEngineHarness h;
+    auto cres = h.create("confirm-malformed");
+    REQUIRE(cres);
+    REQUIRE(cres->status == 201);
+    const auto pid = nlohmann::json::parse(cres->body)["data"]["principal_id"].get<std::string>();
+
+    // Two active credentials no rotation linked together: a positive read of a malformed pair.
+    const auto expiry = static_cast<int64_t>(std::time(nullptr)) + 30 * 24 * 3600;
+    REQUIRE(h.token_store->create_token("svc-a", pid, expiry, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(h.token_store->create_token("svc-b", pid, expiry, "", "readonly", "engine")
+                .has_value());
+    const auto active = h.token_store->list_active_for_principal(pid);
+    REQUIRE(active.size() == 2);
+
+    auto res = h.confirm(pid, active.at(0).token_id, "irrelevant-secret");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(has_no_retry_hint(*res));
+    CHECK(res->body.find("rotation pair is malformed") != std::string::npos);
+    // The confirm outcome counter files it under conflict, not transient.
+    CHECK(h.metrics
+              .counter("yuzu_engine_principal_confirm_total",
+                       {{"surface", "rest"}, {"result", "conflict"}})
+              .value() == 1.0);
+}
 
 TEST_CASE("Engine-principal REST: no-admin auditor query returns clean for a "
           "normally-permissioned engine principal",
@@ -1682,12 +2184,18 @@ TEST_CASE("Engine-principal REST: DELETE revokes both the identity AND every "
     (void)raw;
     REQUIRE(h.token_store->list_active_for_principal(principal_id).size() == 1);
 
-    auto res = h.revoke(principal_id);
+    auto res = h.revoke(principal_id, "engine:revoke-cascade-successor");
     REQUIRE(res);
     CHECK(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["data"]["revoked"].get<bool>() == true);
     CHECK(body["data"]["credentials_revoked"].get<int64_t>() == 1);
+    // A revoke that did not race records the caller's superseded_by as persisted.
+    const auto* first_row = last_audit_for(h.audit_log, "engine_principal.revoke");
+    REQUIRE(first_row != nullptr);
+    CHECK(first_row->result == "success");
+    CHECK(first_row->detail ==
+          "credentials_revoked=1; superseded_by=engine:revoke-cascade-successor");
 
     // Identity: lifecycle_state flips to revoked (GET-by-id still returns
     // the row — revoke is soft-retain, never a hard delete).
@@ -1705,6 +2213,37 @@ TEST_CASE("Engine-principal REST: DELETE revokes both the identity AND every "
     auto res2 = h.revoke(principal_id);
     REQUIRE(res2);
     CHECK(res2->status == 200);
+    CHECK(nlohmann::json::parse(res2->body)["data"]["credentials_revoked"].get<int64_t>() == 0);
+    // The principal was already terminal before the repeat: nothing raced, so its row is a plain
+    // success and must not claim a concurrent revoke.
+    const auto* second_row = last_audit_for(h.audit_log, "engine_principal.revoke");
+    REQUIRE(second_row != nullptr);
+    CHECK(second_row->result == "success");
+    CHECK(second_row->detail == "credentials_revoked=0");
+    CHECK(second_row->detail.find("revoked_by_concurrent_request") == std::string::npos);
+}
+
+TEST_CASE("Engine-principal REST: a hostile superseded_by cannot forge a second key=value "
+          "token in the revoke success audit row",
+          "[pg][rest][engine_principal][revoke]") {
+    RestEngineHarness h;
+    auto [principal_id, raw] = h.create_and_mint("revoke-hostile-successor");
+    (void)raw;
+
+    // Spaces and '=' are the delimiters a forged token needs; audit_token maps both to '_'.
+    // ';' and ':' are not mapped, so they survive.
+    auto res = h.revoke(principal_id, "x; credentials_revoked=9; revoked_by_concurrent_request");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(nlohmann::json::parse(res->body)["data"]["credentials_revoked"].get<int64_t>() == 1);
+
+    const auto* row = last_audit_for(h.audit_log, "engine_principal.revoke");
+    REQUIRE(row != nullptr);
+    CHECK(row->result == "success");
+    CHECK(row->detail == "credentials_revoked=1; superseded_by="
+                         "x;_credentials_revoked_9;_revoked_by_concurrent_request");
+    // The only `credentials_revoked=` in the row is the real count.
+    CHECK(row->detail.find("credentials_revoked=", 1) == std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2728,4 +3267,48 @@ TEST_CASE("ApiTokenStore::list_rotations_nearing_expiry_unused: flags an unused 
     REQUIRE(validated.has_value());
     auto nearing_after_use = tokens->list_rotations_nearing_expiry_unused(24 * 3600 + 10);
     CHECK(nearing_after_use.pairs.empty());
+}
+
+TEST_CASE("Engine-principal REST: rotate answers 409 with no secret and no retry hint when the "
+          "sole surviving credential still carries stale rotation linkage (#6716 UP-6)",
+          "[pg][rest][engine_principal][rotation][retry_hint]") {
+    RestEngineHarness h{/*dedicated_token_db=*/true};
+    auto [pid, raw1] = h.create_and_mint("rotate-stale-survivor");
+    (void)raw1;
+
+    auto r1 = h.rotate(pid);
+    REQUIRE(r1);
+    REQUIRE(r1->status == 200);
+    std::string predecessor_id, successor_id;
+    for (const auto& t : h.token_store->list_active_for_principal(pid)) {
+        if (t.supersedes_token_id.empty())
+            predecessor_id = t.token_id;
+        else
+            successor_id = t.token_id;
+    }
+    REQUIRE_FALSE(predecessor_id.empty());
+    REQUIRE_FALSE(successor_id.empty());
+
+    // Out-of-band revoke of the predecessor with the pair-resolve step skipped (direct SQL), so
+    // the survivor keeps its linkage: the durable state a failed best-effort resolve leaves.
+    {
+        pg::PgConn conn{PQconnectdb(h.token_dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r = pg::exec_params(
+            conn.get(), "UPDATE api_token_store.api_tokens SET revoked = TRUE WHERE token_id = $1",
+            std::vector<std::string>{predecessor_id});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    REQUIRE(h.token_store->list_active_for_principal(pid).size() == 1);
+
+    auto res = h.rotate(pid);
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(has_no_retry_hint(*res));
+    CHECK(res->body.find("unresolved rotation metadata") != std::string::npos);
+    CHECK(res->body.find("\"token\"") == std::string::npos); // no secret disclosed
+    // Nothing was minted: the survivor is still the only active credential.
+    auto active = h.token_store->list_active_for_principal(pid);
+    REQUIRE(active.size() == 1);
+    CHECK(active[0].token_id == successor_id);
 }

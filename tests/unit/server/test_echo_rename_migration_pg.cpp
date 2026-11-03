@@ -541,7 +541,7 @@ TEST_CASE("Echo rename: definition-id references follow in schedules and executi
     CHECK(version_of(dsn, "device_token_store") == "2");
     CHECK(version_of(dsn, "policy_store") == "5");
     CHECK(version_of(dsn, "workflow_engine") == "2");
-    CHECK(version_of(dsn, "response_store") == "3");
+    CHECK(version_of(dsn, "response_store") == "4");
 
     CHECK(one(dsn, "SELECT definition_id FROM schedule_engine.schedules WHERE id = 's1'") ==
           "crossplatform.echo.query");
@@ -805,7 +805,7 @@ TEST_CASE("Echo rename: the history scans of response_store v3 and execution_tra
     yuzu::server::ExecutionTracker tracker{pool};
     REQUIRE(responses.is_open());
     REQUIRE(tracker.is_open());
-    CHECK(version_of(dsn, "response_store") == "3");
+    CHECK(version_of(dsn, "response_store") == "4");
     CHECK(version_of(dsn, "execution_tracker") == "8");
     CHECK(one(dsn, "SELECT instruction_id || '/' || plugin FROM response_store.responses") ==
           "crossplatform.echo.query/echo");
