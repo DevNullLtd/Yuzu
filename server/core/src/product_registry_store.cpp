@@ -381,6 +381,10 @@ ProductRegistryStore::upsert_product(std::string_view norm_key, std::string_view
                      e.what());
         return std::nullopt;
     }
+    if (!ok)
+        spdlog::warn("ProductRegistryStore: upsert_product did not complete for norm_key={} (no "
+                     "connection, or a statement failed - see above): {}",
+                     norm_key, pool_.last_error());
     return ok ? id : std::nullopt;
 }
 
@@ -456,6 +460,10 @@ bool ProductRegistryStore::upsert_alias(std::string_view source, std::string_vie
                      e.what());
         return false;
     }
+    if (!ok)
+        spdlog::warn("ProductRegistryStore: upsert_alias did not complete for ({}, {}) (no "
+                     "connection, or a statement failed - see above): {}",
+                     source, raw_name, pool_.last_error());
     return ok;
 }
 
