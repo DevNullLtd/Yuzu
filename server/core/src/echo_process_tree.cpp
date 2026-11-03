@@ -1,12 +1,11 @@
 /// @file echo_process_tree.cpp
-/// Implementation of the Echo process-tree reconstruction engine + pure renderers.
+/// Implementation of the Echo process-tree engine (hourly roll-up parsers, name-level
+/// tree, window math) + pure renderers.
 /// See echo_process_tree.hpp for the data-source constraints that shape this model.
 
 #include "echo_process_tree.hpp"
 
-#include "web_utils.hpp" // html_escape, format_iso_utc, format_relative_time
-
-#include <unordered_set> // device-net panel current-state reduction (ADR-0015)
+#include "web_utils.hpp" // html_escape, format_iso_utc
 
 #include <algorithm>
 #include <array>
@@ -14,10 +13,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <format>
+#include <functional>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -93,10 +94,79 @@ const std::array<std::string_view, 14> kSuspiciousChildren = {
     "mshta.exe",      "rundll32.exe", "regsvr32.exe", "bitsadmin.exe", "certutil.exe",
     "bash", "sh", "bash.exe", "sh.exe"};
 
+
+/// Parse an agent-supplied count cell: a non-negative integer, or 0 for anything
+/// else (an optional measure that is garbage must not drop the whole row).
+std::int64_t cell_count(const std::string& s) {
+    const auto v = cell_i64(s);
+    return v ? *v : 0;
+}
+
+int cell_port(const std::string& s) {
+    const auto v = cell_i64(s);
+    return (v && *v <= 65535) ? static_cast<int>(*v) : 0;
+}
+
+std::int64_t sat_add(std::int64_t a, std::int64_t b) {
+    return a > INT64_MAX - b ? INT64_MAX : a + b; // both non-negative (parsed by cell_i64)
+}
+
+/// Shared `__schema__` walker for the hourly parsers. `cols` names the data columns the
+/// caller wants; the first `n_required` MUST exist in the schema or the whole payload is
+/// refused (wrong shape — refuse rather than guess). `row_fn(at)` runs once per data row
+/// with `at(k)` → the cell of `cols[k]` ("" when that column is absent) and returns false
+/// to skip the row. An `error|…` first line, a trailer ("total|N") and a torn row (fewer
+/// cells than the furthest PRESENT column) never reach `row_fn`. Stops after `max_rows`
+/// accepted rows.
+template <class RowFn>
+void walk_schema_rows(const std::string& output, std::size_t max_rows,
+                      const std::vector<std::string_view>& cols, std::size_t n_required,
+                      RowFn&& row_fn) {
+    std::vector<int> idx;
+    int need = 0;
+    bool have_schema = false;
+    std::size_t accepted = 0;
+    std::size_t pos = 0;
+    while (pos < output.size() && accepted < max_rows) {
+        const auto nl = output.find('\n', pos);
+        std::string line = output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
+        pos = (nl == std::string::npos) ? output.size() : nl + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty())
+            continue;
+        if (!have_schema) {
+            if (line.starts_with("error|"))
+                return; // agent-side error payload
+            if (!line.starts_with("__schema__|"))
+                continue;
+            const auto schema = split_pipe(line);
+            for (const auto c : cols)
+                idx.push_back(schema_index(schema, c));
+            for (std::size_t k = 0; k < n_required; ++k)
+                if (idx[k] < 0)
+                    return; // wrong shape
+            for (const int i : idx)
+                need = (std::max)(need, i);
+            have_schema = true;
+            continue;
+        }
+        const auto cells = split_pipe(line);
+        if (static_cast<int>(cells.size()) <= need)
+            continue; // trailer or torn row
+        static const std::string kEmpty;
+        const auto at = [&](std::size_t k) -> const std::string& {
+            return idx[k] >= 0 ? cells[static_cast<std::size_t>(idx[k])] : kEmpty;
+        };
+        if (row_fn(at))
+            ++accepted;
+    }
+}
+
 } // namespace
 
 bool echo_is_suspicious_spawn(const std::string& parent_name, const std::string& child_name,
-                             std::string* evidence) {
+                              std::string* evidence) {
     const std::string p = basename_lower(parent_name);
     const std::string c = basename_lower(child_name);
     if (p.empty() || c.empty())
@@ -113,293 +183,137 @@ bool echo_is_suspicious_spawn(const std::string& parent_name, const std::string&
     return true;
 }
 
-std::vector<EchoProcEvent> parse_echo_process_output(const std::string& output, std::size_t max_rows) {
-    std::vector<EchoProcEvent> out;
-    int c_ts = -1, c_action = -1, c_pid = -1, c_ppid = -1, c_name = -1, c_cmd = -1, c_user = -1;
-    bool have_schema = false;
-    std::size_t pos = 0;
-    while (pos < output.size() && out.size() < max_rows) {
-        const auto nl = output.find('\n', pos);
-        std::string line = output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
-        pos = (nl == std::string::npos) ? output.size() : nl + 1;
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (line.empty())
-            continue;
-        if (!have_schema) {
-            if (line.starts_with("error|"))
-                return out; // agent-side error payload
-            if (!line.starts_with("__schema__|"))
-                continue;
-            const auto cols = split_pipe(line);
-            c_ts = schema_index(cols, "ts");
-            c_action = schema_index(cols, "action");
-            c_pid = schema_index(cols, "pid");
-            c_ppid = schema_index(cols, "ppid");
-            c_name = schema_index(cols, "name");
-            c_cmd = schema_index(cols, "cmdline");
-            c_user = schema_index(cols, "user");
-            // ppid/name/user may legitimately be empty cells, but the COLUMNS must
-            // exist; cmdline is optional (Windows omits content, not the column).
-            if (c_ts < 0 || c_action < 0 || c_pid < 0 || c_ppid < 0 || c_name < 0)
-                return out; // wrong shape — refuse rather than guess
-            have_schema = true;
-            continue;
-        }
-        const auto cells = split_pipe(line);
-        const int need = (std::max)({c_ts, c_action, c_pid, c_ppid, c_name,
-                                     c_cmd < 0 ? 0 : c_cmd, c_user < 0 ? 0 : c_user});
-        if (static_cast<int>(cells.size()) <= need)
-            continue; // trailer ("total|N") or torn row
-        const auto ts = cell_i64(cells[static_cast<std::size_t>(c_ts)]);
-        const auto pid = cell_i64(cells[static_cast<std::size_t>(c_pid)]);
-        const auto ppid = cell_i64(cells[static_cast<std::size_t>(c_ppid)]);
-        if (!ts || !pid || !ppid || *pid > UINT32_MAX || *ppid > UINT32_MAX)
-            continue;
-        EchoProcEvent e;
-        e.ts = *ts;
-        e.action = to_lower(cells[static_cast<std::size_t>(c_action)]);
-        e.pid = static_cast<std::uint32_t>(*pid);
-        e.ppid = static_cast<std::uint32_t>(*ppid);
-        e.name = cells[static_cast<std::size_t>(c_name)];
-        if (c_cmd >= 0)
-            e.cmdline = cells[static_cast<std::size_t>(c_cmd)];
-        if (c_user >= 0)
-            e.user = cells[static_cast<std::size_t>(c_user)];
-        out.push_back(std::move(e));
-    }
+std::vector<EchoProcHourRow> parse_echo_process_hourly_output(const std::string& output,
+                                                              std::size_t max_rows) {
+    std::vector<EchoProcHourRow> out;
+    walk_schema_rows(output, max_rows,
+                     {"hour_ts", "name", "parent_name", "user", "start_count", "stop_count",
+                      "abnormal_exit_count"},
+                     6, [&](const auto& at) {
+                         const auto hour = cell_i64(at(0));
+                         const auto starts = cell_i64(at(4));
+                         const auto stops = cell_i64(at(5));
+                         if (!hour || !starts || !stops)
+                             return false;
+                         EchoProcHourRow r;
+                         r.hour_ts = *hour;
+                         r.name = at(1);
+                         r.parent_name = at(2);
+                         r.user = at(3);
+                         r.start_count = *starts;
+                         r.stop_count = *stops;
+                         r.abnormal_exit_count = cell_count(at(6));
+                         out.push_back(std::move(r));
+                         return true;
+                     });
     return out;
 }
 
-std::vector<EchoTcpConn> parse_echo_tcp_output(const std::string& output, std::size_t max_rows) {
-    std::vector<EchoTcpConn> out;
-    int c_pid = -1, c_pname = -1, c_proto = -1, c_lport = -1, c_raddr = -1, c_rport = -1,
-        c_state = -1, c_ts = -1, c_action = -1;
-    bool have_schema = false;
-    std::size_t pos = 0;
-    while (pos < output.size() && out.size() < max_rows) {
-        const auto nl = output.find('\n', pos);
-        std::string line = output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
-        pos = (nl == std::string::npos) ? output.size() : nl + 1;
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (line.empty())
-            continue;
-        if (!have_schema) {
-            if (line.starts_with("error|"))
-                return out;
-            if (!line.starts_with("__schema__|"))
-                continue;
-            const auto cols = split_pipe(line);
-            c_pid = schema_index(cols, "pid");
-            c_pname = schema_index(cols, "process_name");
-            c_proto = schema_index(cols, "proto");
-            c_lport = schema_index(cols, "local_port");
-            c_raddr = schema_index(cols, "remote_addr");
-            c_rport = schema_index(cols, "remote_port");
-            c_state = schema_index(cols, "state");
-            c_ts = schema_index(cols, "ts");
-            c_action = schema_index(cols, "action");
-            if (c_pid < 0 || c_raddr < 0)
-                return out; // need at least the join key + remote
-            have_schema = true;
-            continue;
-        }
-        const auto cells = split_pipe(line);
-        auto at = [&](int idx) -> std::string {
-            return (idx >= 0 && idx < static_cast<int>(cells.size()))
-                       ? cells[static_cast<std::size_t>(idx)]
-                       : std::string{};
-        };
-        const auto pid = cell_i64(at(c_pid));
-        if (!pid || *pid > UINT32_MAX)
-            continue;
-        EchoTcpConn t;
-        t.pid = static_cast<std::uint32_t>(*pid);
-        t.process_name = at(c_pname);
-        t.proto = at(c_proto);
-        if (auto v = cell_i64(at(c_lport)); v && *v <= 65535)
-            t.local_port = static_cast<int>(*v);
-        t.remote_addr = at(c_raddr);
-        if (auto v = cell_i64(at(c_rport)); v && *v <= 65535)
-            t.remote_port = static_cast<int>(*v);
-        t.state = at(c_state);
-        if (auto v = cell_i64(at(c_ts)); v)
-            t.ts = *v;
-        t.action = to_lower(at(c_action));
-        out.push_back(std::move(t));
-    }
+std::vector<EchoTcpHourRow> parse_echo_tcp_hourly_output(const std::string& output,
+                                                         std::size_t max_rows) {
+    std::vector<EchoTcpHourRow> out;
+    walk_schema_rows(output, max_rows,
+                     {"hour_ts", "process_name", "remote_addr", "remote_port", "proto",
+                      "connect_count", "disconnect_count", "failed_count"},
+                     3, [&](const auto& at) {
+                         const auto hour = cell_i64(at(0));
+                         if (!hour)
+                             return false;
+                         EchoTcpHourRow r;
+                         r.hour_ts = *hour;
+                         r.process_name = at(1);
+                         r.remote_addr = at(2);
+                         r.remote_port = cell_port(at(3));
+                         r.proto = at(4);
+                         r.connect_count = cell_count(at(5));
+                         r.disconnect_count = cell_count(at(6));
+                         r.failed_count = cell_count(at(7));
+                         out.push_back(std::move(r));
+                         return true;
+                     });
     return out;
 }
 
-std::vector<EchoDnsCacheEntry> parse_echo_dns_output(const std::string& output, std::size_t max_rows) {
-    std::vector<EchoDnsCacheEntry> out;
-    int c_ts = -1, c_name = -1, c_type = -1, c_data = -1, c_ttl = -1, c_src = -1, c_action = -1;
-    bool have_schema = false;
-    std::size_t pos = 0;
-    while (pos < output.size() && out.size() < max_rows) {
-        const auto nl = output.find('\n', pos);
-        std::string line = output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
-        pos = (nl == std::string::npos) ? output.size() : nl + 1;
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (line.empty())
-            continue;
-        if (!have_schema) {
-            if (line.starts_with("error|"))
-                return out;
-            if (!line.starts_with("__schema__|"))
-                continue;
-            const auto cols = split_pipe(line);
-            c_ts = schema_index(cols, "ts");
-            c_name = schema_index(cols, "name");
-            c_type = schema_index(cols, "record_type");
-            c_data = schema_index(cols, "data");
-            c_ttl = schema_index(cols, "ttl_remaining_s");
-            c_src = schema_index(cols, "source");
-            c_action = schema_index(cols, "action");
-            if (c_name < 0 || c_type < 0 || c_data < 0)
-                return out; // need at least the resolution identity
-            have_schema = true;
-            continue;
-        }
-        const auto cells = split_pipe(line);
-        auto at = [&](int idx) -> std::string {
-            return (idx >= 0 && idx < static_cast<int>(cells.size()))
-                       ? cells[static_cast<std::size_t>(idx)]
-                       : std::string{};
-        };
-        const int need = (std::max)({c_name, c_type, c_data});
-        if (static_cast<int>(cells.size()) <= need)
-            continue; // trailer ("total|N") or torn row
-        EchoDnsCacheEntry e;
-        if (auto v = cell_i64(at(c_ts)); v)
-            e.ts = *v;
-        e.name = at(c_name);
-        e.record_type = at(c_type);
-        e.data = at(c_data);
-        if (auto v = cell_i64(at(c_ttl)); v)
-            e.ttl_remaining_s = *v;
-        e.source = at(c_src);
-        e.action = to_lower(at(c_action));
-        out.push_back(std::move(e));
-    }
+std::vector<EchoDnsHourRow> parse_echo_dns_hourly_output(const std::string& output,
+                                                         std::size_t max_rows) {
+    std::vector<EchoDnsHourRow> out;
+    walk_schema_rows(output, max_rows,
+                     {"hour_ts", "name", "record_type", "data", "appear_count", "remove_count",
+                      "negative_count"},
+                     3, [&](const auto& at) {
+                         const auto hour = cell_i64(at(0));
+                         if (!hour)
+                             return false;
+                         EchoDnsHourRow r;
+                         r.hour_ts = *hour;
+                         r.name = at(1);
+                         r.record_type = at(2);
+                         r.data = at(3);
+                         r.appear_count = cell_count(at(4));
+                         r.remove_count = cell_count(at(5));
+                         r.negative_count = cell_count(at(6));
+                         out.push_back(std::move(r));
+                         return true;
+                     });
     return out;
 }
 
-std::vector<EchoArpEntry> parse_echo_arp_output(const std::string& output, std::size_t max_rows) {
-    std::vector<EchoArpEntry> out;
-    int c_ts = -1, c_iface = -1, c_ip = -1, c_mac = -1, c_type = -1, c_action = -1;
-    bool have_schema = false;
-    std::size_t pos = 0;
-    while (pos < output.size() && out.size() < max_rows) {
-        const auto nl = output.find('\n', pos);
-        std::string line = output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
-        pos = (nl == std::string::npos) ? output.size() : nl + 1;
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (line.empty())
-            continue;
-        if (!have_schema) {
-            if (line.starts_with("error|"))
-                return out;
-            if (!line.starts_with("__schema__|"))
-                continue;
-            const auto cols = split_pipe(line);
-            c_ts = schema_index(cols, "ts");
-            c_iface = schema_index(cols, "interface");
-            c_ip = schema_index(cols, "ip_address");
-            c_mac = schema_index(cols, "mac_address");
-            c_type = schema_index(cols, "entry_type");
-            c_action = schema_index(cols, "action");
-            if (c_ip < 0 || c_mac < 0)
-                return out; // need at least the binding endpoints
-            have_schema = true;
-            continue;
-        }
-        const auto cells = split_pipe(line);
-        auto at = [&](int idx) -> std::string {
-            return (idx >= 0 && idx < static_cast<int>(cells.size()))
-                       ? cells[static_cast<std::size_t>(idx)]
-                       : std::string{};
-        };
-        const int need = (std::max)(c_ip, c_mac);
-        if (static_cast<int>(cells.size()) <= need)
-            continue;
-        EchoArpEntry e;
-        if (auto v = cell_i64(at(c_ts)); v)
-            e.ts = *v;
-        e.iface = at(c_iface);
-        e.ip_address = at(c_ip);
-        e.mac_address = at(c_mac);
-        e.entry_type = at(c_type);
-        e.action = to_lower(at(c_action));
-        out.push_back(std::move(e));
-    }
+std::vector<EchoArpHourRow> parse_echo_arp_hourly_output(const std::string& output,
+                                                         std::size_t max_rows) {
+    std::vector<EchoArpHourRow> out;
+    walk_schema_rows(output, max_rows,
+                     {"hour_ts", "ip_address", "mac_address", "interface", "appear_count",
+                      "remove_count", "is_router", "rebind_count"},
+                     3, [&](const auto& at) {
+                         const auto hour = cell_i64(at(0));
+                         if (!hour)
+                             return false;
+                         EchoArpHourRow r;
+                         r.hour_ts = *hour;
+                         r.ip_address = at(1);
+                         r.mac_address = at(2);
+                         r.iface = at(3);
+                         r.appear_count = cell_count(at(4));
+                         r.remove_count = cell_count(at(5));
+                         r.is_router = cell_count(at(6)) != 0;
+                         r.rebind_count = cell_count(at(7));
+                         out.push_back(std::move(r));
+                         return true;
+                     });
     return out;
-}
-
-EchoTreeAnchors compute_echo_anchors(const std::vector<EchoProcEvent>& events) {
-    EchoTreeAnchors a;
-    bool first = true;
-    std::int64_t boot = 0;
-    for (const auto& e : events) {
-        // Ignore non-positive timestamps — a forged/garbage `ts<=0` must not poison the
-        // "observed since" / install anchor (it would otherwise drag MIN to 0/negative).
-        if (e.ts <= 0)
-            continue;
-        if (first || e.ts < a.observed_since) {
-            a.observed_since = e.ts;
-            first = false;
-        }
-        // Best-effort boot signal: the most-recent START of a canonical root process
-        // (ppid==0 — Windows "System" pid 4 / Linux init pid 1). Echo has no boot-time
-        // column; this is the closest in-band proxy and falls back to install below.
-        const bool start = (e.action == "started" || e.action == "start");
-        if (start && e.ppid == 0 && e.ts > boot)
-            boot = e.ts;
-    }
-    a.install_ts = a.observed_since;
-    a.boot_ts = boot > 0 ? boot : a.observed_since;
-    return a;
 }
 
 EchoWindow resolve_echo_window(const std::string& preset, std::int64_t custom_from,
-                             std::int64_t custom_to, const EchoTreeAnchors& anchors,
-                             std::int64_t now) {
+                               std::int64_t custom_to, std::int64_t now) {
+    constexpr std::int64_t kHour = 3600;
+    const auto floor_hour = [](std::int64_t t) { return t > 0 ? t - t % kHour : std::int64_t{0}; };
+    const std::string p = canonical_echo_preset(preset);
     EchoWindow w;
-    w.to_ts = now;
-    if (preset == "on_boot") {
-        w.from_ts = anchors.boot_ts;
-    } else if (preset == "on_install") {
-        w.from_ts = anchors.install_ts;
-    } else if (preset == "1m") {
-        w.from_ts = now - 60;
-    } else if (preset == "1h") {
-        w.from_ts = now - 3600;
-    } else if (preset == "1d") {
-        w.from_ts = now - 86400;
-    } else if (preset == "custom") {
-        w.from_ts = custom_from > 0 ? custom_from : anchors.install_ts;
-        w.to_ts = custom_to > 0 ? custom_to : now;
+    // The last COMPLETE hour: the bucket before the one `now` falls in.
+    w.to_ts = (std::max)(floor_hour(now) - kHour, std::int64_t{0});
+    if (p == "custom") {
+        if (custom_to > 0)
+            w.to_ts = floor_hour(custom_to);
+        w.from_ts = custom_from > 0 ? floor_hour(custom_from) : w.to_ts - 23 * kHour;
     } else {
-        // default / "10m"
-        w.from_ts = now - 600;
+        const int hours = p == "1h" ? 1 : (p == "7d" ? kEchoMaxWindowHours : 24);
+        w.from_ts = w.to_ts - (hours - 1) * kHour;
     }
     if (w.from_ts < 0)
         w.from_ts = 0;
     if (w.to_ts < w.from_ts)
-        w.to_ts = w.from_ts; // reversed range → point-in-time at `to`
+        w.to_ts = w.from_ts; // reversed range → a single bucket at `from`
+    if ((w.to_ts - w.from_ts) / kHour >= kEchoMaxWindowHours)
+        w.from_ts = w.to_ts - (kEchoMaxWindowHours - 1) * kHour; // keep the newest hours
     return w;
 }
 
 std::string canonical_echo_preset(const std::string& preset) {
     // Keep in lock-step with resolve_echo_window's accepted tokens. Anything else
-    // (empty, garbage, an injection attempt) collapses to the `10m` default.
-    if (preset == "on_boot" || preset == "on_install" || preset == "1m" || preset == "10m" ||
-        preset == "1h" || preset == "1d" || preset == "custom")
+    // (empty, garbage, an injection attempt) collapses to the `24h` default.
+    if (preset == "1h" || preset == "24h" || preset == "7d" || preset == "custom")
         return preset;
-    return "10m";
+    return "24h";
 }
 
 std::string normalize_echo_os(const std::string& os) {
@@ -533,258 +447,139 @@ std::optional<std::int64_t> parse_ts_param_strict(const std::string& s) {
     return v;
 }
 
-namespace {
-
-/// A pid's lifetime as walked from the event stream (one incarnation).
-struct Incarnation {
-    std::uint32_t pid = 0;
-    std::uint32_t ppid = 0;
-    std::string name;
-    std::string cmdline;
-    std::string user;
-    std::int64_t start = 0;
-    std::int64_t end = 0; // 0 = still running at `to`
-    bool start_known = false;
-    bool running = false;
-};
-
-bool is_start(const std::string& action) {
-    return action == "started" || action == "start";
-}
-bool is_stop(const std::string& action) {
-    return action == "stopped" || action == "stop";
+std::vector<std::int64_t> echo_process_hours(const std::vector<EchoProcHourRow>& rows) {
+    std::vector<std::int64_t> hours;
+    hours.reserve(rows.size());
+    for (const auto& r : rows)
+        hours.push_back(r.hour_ts);
+    std::sort(hours.begin(), hours.end(), std::greater<>());
+    hours.erase(std::unique(hours.begin(), hours.end()), hours.end());
+    return hours;
 }
 
-} // namespace
-
-EchoProcTree reconstruct_echo_process_tree(const std::vector<EchoProcEvent>& events_in,
-                                         std::int64_t from_ts, std::int64_t to_ts,
-                                         const EchoTreeAnchors& anchors) {
+EchoProcTree build_echo_process_tree(const std::vector<EchoProcHourRow>& rows, std::int64_t hour_ts) {
     EchoProcTree tree;
-    tree.from_ts = from_ts;
-    tree.to_ts = to_ts;
-    tree.anchors = anchors;
+    tree.hour_ts = hour_ts;
+    constexpr std::size_t kNone = EchoProcNode::kNoParent;
 
-    // 1. Bucket events by pid, only those at or before `to` (defensive even though
-    //    the route fetches ts<=to), sorted by (ts, starts-before-stops).
-    std::unordered_map<std::uint32_t, std::vector<const EchoProcEvent*>> by_pid;
-    for (const auto& e : events_in)
-        if (e.ts <= to_ts)
-            by_pid[e.pid].push_back(&e);
-
-    std::vector<Incarnation> incs;
-    for (auto& [pid, evs] : by_pid) {
-        std::stable_sort(evs.begin(), evs.end(), [](const EchoProcEvent* a, const EchoProcEvent* b) {
-            if (a->ts != b->ts)
-                return a->ts < b->ts;
-            return is_start(a->action) && !is_start(b->action); // starts before stops at a tie
-        });
-        std::optional<Incarnation> cur;
-        for (const EchoProcEvent* e : evs) {
-            if (is_start(e->action)) {
-                if (cur) {
-                    // A start while still "open" means the pid was reused — the prior
-                    // incarnation must have ended; close it at this ts.
-                    cur->end = e->ts;
-                    incs.push_back(std::move(*cur));
-                }
-                Incarnation inc;
-                inc.pid = pid;
-                inc.ppid = e->ppid;
-                inc.name = e->name;
-                inc.cmdline = e->cmdline;
-                inc.user = e->user;
-                inc.start = e->ts;
-                inc.start_known = true;
-                cur = std::move(inc);
-            } else if (is_stop(e->action)) {
-                if (cur) {
-                    cur->end = e->ts;
-                    incs.push_back(std::move(*cur));
-                    cur.reset();
-                } else {
-                    // A stop with no surviving start — its `started` aged out of the
-                    // live cap (no seed). Synthesise a "started before observation"
-                    // incarnation from the stop row's fields (which carry name/ppid).
-                    Incarnation inc;
-                    inc.pid = pid;
-                    inc.ppid = e->ppid;
-                    inc.name = e->name;
-                    inc.cmdline = e->cmdline;
-                    inc.user = e->user;
-                    inc.start = 0;
-                    inc.start_known = false;
-                    inc.end = e->ts;
-                    incs.push_back(std::move(inc));
-                }
-            }
-        }
-        if (cur) { // open at end of stream → running at `to`
-            cur->running = true;
-            cur->end = 0;
-            incs.push_back(std::move(*cur));
-        }
-    }
-
-    // 2. Window-overlap filter: keep an incarnation if it was alive at any point in
-    //    [from, to] — running (alive at `to`) OR it exited at/after `from`.
-    std::vector<Incarnation> kept;
-    kept.reserve(incs.size());
-    for (auto& inc : incs) {
-        if (inc.running || inc.end >= from_ts)
-            kept.push_back(std::move(inc));
-    }
-    // 3. Node cap: on overflow keep RUNNING incarnations first, then the most-recent
-    //    by start. Running-first matters because a long-running process whose start
-    //    aged out has start=0 (start_known=false) — ranking purely by start would drop
-    //    exactly those persistent, often forensically-interesting processes first.
-    if (kept.size() > kEchoTreeMaxNodes) {
-        std::partial_sort(kept.begin(), kept.begin() + kEchoTreeMaxNodes, kept.end(),
-                          [](const Incarnation& a, const Incarnation& b) {
-                              if (a.running != b.running)
-                                  return a.running; // running before exited
-                              return a.start > b.start;
-                          });
-        kept.resize(kEchoTreeMaxNodes);
-        tree.truncated = true;
-    }
-
-    // Materialise nodes (stable node_id = index).
-    tree.nodes.reserve(kept.size());
-    for (const auto& inc : kept) {
-        EchoProcNode n;
-        n.pid = inc.pid;
-        n.ppid = inc.ppid;
-        n.name = inc.name;
-        n.cmdline = inc.cmdline;
-        n.user = inc.user;
-        n.started_ts = inc.start;
-        n.start_known = inc.start_known;
-        n.exited_ts = inc.running ? 0 : inc.end;
-        n.running = inc.running;
-        tree.nodes.push_back(std::move(n));
-    }
-
-    // 4. Parent resolution: a child links to the incarnation of its ppid whose
-    //    lifetime contained the child's start. pid index for the lookup.
-    std::unordered_map<std::uint32_t, std::vector<std::size_t>> pid_to_nodes;
-    for (std::size_t i = 0; i < tree.nodes.size(); ++i)
-        pid_to_nodes[tree.nodes[i].pid].push_back(i);
-
-    auto node_lo = [&](std::size_t id) -> std::int64_t {
-        return tree.nodes[id].start_known ? tree.nodes[id].started_ts : from_ts;
-    };
-    auto node_hi = [&](std::size_t id) -> std::int64_t {
-        return tree.nodes[id].running ? to_ts : tree.nodes[id].exited_ts;
-    };
-    constexpr std::size_t kMaxDepthGuard = 4096;
-    for (std::size_t i = 0; i < tree.nodes.size(); ++i) {
-        EchoProcNode& n = tree.nodes[i];
-        if (n.ppid == 0 || n.ppid == n.pid)
-            continue; // root
-        auto it = pid_to_nodes.find(n.ppid);
-        if (it == pid_to_nodes.end())
-            continue; // parent not present → orphan/reparented root
-        const std::int64_t child_start = node_lo(i);
-        std::size_t best = EchoProcNode::kNoParent;
-        std::int64_t best_lo = INT64_MIN;
-        bool best_contains = false; // a containing parent always beats a non-containing one
-        for (std::size_t pcand : it->second) {
-            if (pcand == i)
+    // 1. One node per (name, user) in row order; rows sharing the key sum their counts.
+    //    The key is length-prefixed so an agent-chosen name cannot collide with another
+    //    (name, user) pair by embedding a delimiter.
+    std::unordered_map<std::string, std::size_t> by_key;
+    std::unordered_map<std::string, std::size_t> first_by_name; // parent-link target
+    for (const auto& r : rows) {
+        if (r.hour_ts != hour_ts)
+            continue;
+        std::string key = std::to_string(r.name.size()) + ':' + r.name + r.user;
+        auto it = by_key.find(key);
+        if (it == by_key.end()) {
+            if (tree.nodes.size() >= kEchoTreeMaxNodes) {
+                tree.truncated = true;
                 continue;
-            const std::int64_t plo = node_lo(pcand), phi = node_hi(pcand);
-            const bool contains = plo <= child_start && child_start <= phi;
-            // Prefer the incarnation whose interval CONTAINS the child's start; among
-            // those, the most-recent (largest plo). Only if none contains, fall back to
-            // the most-recent incarnation that started before the child. `best_contains`
-            // is tracked separately so a containing candidate found AFTER a higher-plo
-            // non-containing fallback still wins (candidates aren't plo-sorted).
-            if (contains) {
-                if (!best_contains || plo >= best_lo) {
-                    best = pcand;
-                    best_lo = plo;
-                    best_contains = true;
-                }
-            } else if (!best_contains && plo <= child_start && plo >= best_lo) {
-                best = pcand;
-                best_lo = plo;
             }
+            EchoProcNode n;
+            n.name = r.name;
+            n.parent_name = r.parent_name; // the FIRST row's parent wins
+            n.user = r.user;
+            first_by_name.try_emplace(r.name, tree.nodes.size());
+            it = by_key.emplace(std::move(key), tree.nodes.size()).first;
+            tree.nodes.push_back(std::move(n));
         }
-        if (best == EchoProcNode::kNoParent)
-            continue; // root
-        // Cycle guard: walking up from `best` must not reach `i` (pid reuse can form
-        // a loop). If it would, leave `i` a root instead of closing the cycle.
-        std::size_t walk = best;
-        std::size_t depth = 0;
-        bool cycle = false;
-        while (walk != EchoProcNode::kNoParent && depth++ < kMaxDepthGuard) {
-            if (walk == i) {
-                cycle = true;
-                break;
-            }
-            walk = tree.nodes[walk].parent;
-        }
-        if (cycle)
-            continue; // keep `i` as a root
-        n.parent = best;
+        EchoProcNode& n = tree.nodes[it->second];
+        n.start_count = sat_add(n.start_count, r.start_count);
+        n.stop_count = sat_add(n.stop_count, r.stop_count);
+        n.abnormal_exit_count = sat_add(n.abnormal_exit_count, r.abnormal_exit_count);
     }
 
-    // 5. Children lists + root set from the final parent fields.
-    for (std::size_t i = 0; i < tree.nodes.size(); ++i) {
-        if (tree.nodes[i].parent == EchoProcNode::kNoParent)
+    // 2. Parent link by NAME: the first node bearing `parent_name`. An empty, unknown or
+    //    self-named parent leaves the node a root.
+    const std::size_t count = tree.nodes.size();
+    for (auto& n : tree.nodes) {
+        if (n.parent_name.empty() || n.parent_name == n.name)
+            continue;
+        const auto it = first_by_name.find(n.parent_name);
+        if (it != first_by_name.end())
+            n.parent = it->second;
+    }
+
+    // 3. Cycle cut (placed-once pass). The name graph can loop (a under b, b under a), and
+    //    the pid-incarnation walk the old engine used does not fit it. Every node is walked
+    //    at most once (state 2 = settled), so this is O(n) even for a 50k-deep chain; a walk
+    //    that re-enters its own path found a cycle, which is cut at its lowest-index member.
+    std::vector<unsigned char> state(count, 0); // 0 new, 1 on the current walk, 2 settled
+    std::vector<std::size_t> path;
+    for (std::size_t s = 0; s < count; ++s) {
+        path.clear();
+        std::size_t cur = s;
+        while (cur != kNone && state[cur] == 0) {
+            state[cur] = 1;
+            path.push_back(cur);
+            cur = tree.nodes[cur].parent;
+        }
+        if (cur != kNone && state[cur] == 1) {
+            const auto entry = std::find(path.begin(), path.end(), cur);
+            tree.nodes[*std::min_element(entry, path.end())].parent = kNone;
+        }
+        for (const std::size_t id : path)
+            state[id] = 2;
+    }
+
+    // 4. Children lists + root set, siblings in (name, user) order.
+    for (std::size_t i = 0; i < count; ++i) {
+        if (tree.nodes[i].parent == kNone)
             tree.roots.push_back(i);
         else
             tree.nodes[tree.nodes[i].parent].children.push_back(i);
     }
-    // Stable sibling order: by pid then start.
-    auto sib_less = [&](std::size_t a, std::size_t b) {
-        if (tree.nodes[a].pid != tree.nodes[b].pid)
-            return tree.nodes[a].pid < tree.nodes[b].pid;
-        return tree.nodes[a].started_ts < tree.nodes[b].started_ts;
+    const auto sib_less = [&](std::size_t a, std::size_t b) {
+        const EchoProcNode& x = tree.nodes[a];
+        const EchoProcNode& y = tree.nodes[b];
+        if (x.name != y.name)
+            return x.name < y.name;
+        return x.user < y.user;
     };
     std::sort(tree.roots.begin(), tree.roots.end(), sib_less);
     for (auto& n : tree.nodes)
         std::sort(n.children.begin(), n.children.end(), sib_less);
 
-    // 6. Anomaly flag: suspicious parent→child name pairs.
+    // 5. Flags + totals. An abnormal exit or a suspicious spawn by name is an anomaly; a
+    //    name with more stops than starts is a soft flag (it started before the hour).
     for (auto& n : tree.nodes) {
-        if (n.parent == EchoProcNode::kNoParent)
-            continue;
-        std::string ev;
-        if (echo_is_suspicious_spawn(tree.nodes[n.parent].name, n.name, &ev)) {
-            n.anomaly = true;
-            n.anomaly_evidence = std::move(ev);
+        n.stops_exceed_starts = n.stop_count > n.start_count;
+        std::string evidence;
+        if (n.abnormal_exit_count > 0)
+            evidence = std::to_string(n.abnormal_exit_count) + " abnormal exit(s) in this hour";
+        std::string spawn;
+        if (n.parent != kNone && echo_is_suspicious_spawn(tree.nodes[n.parent].name, n.name, &spawn)) {
+            if (!evidence.empty())
+                evidence += "; ";
+            evidence += spawn;
         }
+        n.anomaly = !evidence.empty();
+        n.anomaly_evidence = std::move(evidence);
+        if (n.anomaly)
+            ++tree.anomaly_count;
+        tree.start_total = sat_add(tree.start_total, n.start_count);
+        tree.abnormal_total = sat_add(tree.abnormal_total, n.abnormal_exit_count);
     }
 
-    // 7. Counts over the full tree (reachable from roots) — for the banner. Running/
-    //    exited/anomalies-only filtering is applied client-side at display time, so
-    //    the reconstruction itself is never pruned (every node stays addressable by
-    //    the detail route, and a filter toggle needs no re-dispatch).
-    std::vector<bool> seen(tree.nodes.size(), false);
+    // 6. Depth: the renderer collapses branches past kEchoRenderDepthCap, but the totals
+    //    cover the FULL tree (every node stays detail-addressable); flag the mismatch so
+    //    the banner can say the counts include hidden depth. seen[] keeps the walk
+    //    placed-once even if a future edit let a loop through step 3.
+    std::vector<bool> seen(count, false);
     std::vector<std::pair<std::size_t, int>> stack; // {node_id, depth}
-    stack.reserve(tree.roots.size());
-    for (std::size_t r : tree.roots)
+    for (const std::size_t r : tree.roots)
         stack.emplace_back(r, 0);
     while (!stack.empty()) {
         const auto [id, depth] = stack.back();
         stack.pop_back();
-        if (id >= tree.nodes.size() || seen[id])
+        if (id >= count || seen[id])
             continue;
         seen[id] = true;
-        // The renderer collapses branches past kEchoRenderDepthCap, but the counts
-        // here cover the FULL reconstruction (every node stays detail-addressable);
-        // flag the mismatch so the banner can say the count includes hidden depth.
         if (depth > kEchoRenderDepthCap)
             tree.depth_capped = true;
-        const EchoProcNode& n = tree.nodes[id];
-        if (n.running)
-            ++tree.running_count;
-        else
-            ++tree.exited_count;
-        if (n.anomaly)
-            ++tree.anomaly_count;
-        for (std::size_t c : n.children)
+        for (const std::size_t c : tree.nodes[id].children)
             stack.emplace_back(c, depth + 1);
     }
     return tree;
@@ -793,11 +588,6 @@ EchoProcTree reconstruct_echo_process_tree(const std::vector<EchoProcEvent>& eve
 // ── Renderers ────────────────────────────────────────────────────────────────
 
 namespace {
-
-bool os_is_windows(const std::string& os) {
-    const std::string o = to_lower(os);
-    return o.find("win") != std::string::npos;
-}
 
 /// Coarse class of a remote address for inline colouring: "loop" (loopback),
 /// "priv" (RFC1918 / ULA / link-local), "pub" (routable), or "" (empty/unknown).
@@ -825,49 +615,47 @@ std::string remote_class(const std::string& addr) {
     return "pub";
 }
 
-/// One distinct remote endpoint label (`addr:port`, or `:port listen` for a
-/// listener), HTML-escaped, wrapped in a class that colours public egress.
-std::string endpoint_chip(const EchoTcpConn& c) {
+/// One distinct remote endpoint label (`addr:port`, or `listening` for a row with no
+/// remote), HTML-escaped, wrapped in a class that colours public egress.
+std::string endpoint_chip(const EchoTcpHourRow& c) {
     const std::string cls = remote_class(c.remote_addr);
-    std::string label;
-    if (cls.empty() || c.remote_port == 0)
-        label = ":" + std::to_string(c.local_port) + " listen";
-    else
-        label = c.remote_addr + ":" + std::to_string(c.remote_port);
+    const std::string label = (cls.empty() || c.remote_port == 0)
+                                  ? std::string("listening")
+                                  : c.remote_addr + ":" + std::to_string(c.remote_port);
     std::string klass = "tt-ep";
     if (cls == "pub")
         klass += " tt-ep-pub";
     return "<span class=\"" + klass + "\">" + html_escape(label) + "</span>";
 }
 
-/// Inline network summary for a node's connections (already filtered to its pid):
+/// Inline network summary for a node's connections (already filtered to its name):
 /// a count badge + up to two distinct endpoints + "+N", with the full list in the
 /// title. Empty string when the node has no connections.
-std::string net_cell(const std::vector<const EchoTcpConn*>& conns) {
+std::string net_cell(const std::vector<const EchoTcpHourRow*>& conns) {
     if (conns.empty())
         return {};
     // Distinct endpoints, public first, preserving first-seen order otherwise. Dedup
-    // via a hash set (a single pid can own thousands of $TCP_Live rows — O(n) not O(n²)).
-    std::vector<const EchoTcpConn*> distinct;
+    // via a hash set (a single name can own thousands of $TCP_Hourly rows — O(n) not O(n²)).
+    std::vector<const EchoTcpHourRow*> distinct;
     std::unordered_set<std::string> seen;
     bool any_public = false;
-    for (const EchoTcpConn* c : conns) {
-        std::string key = c->remote_addr + ":" + std::to_string(c->remote_port) + "/" +
-                          std::to_string(c->local_port);
+    for (const EchoTcpHourRow* c : conns) {
+        std::string key = c->remote_addr + ":" + std::to_string(c->remote_port) + "/" + c->proto;
         if (!seen.insert(std::move(key)).second)
             continue;
         distinct.push_back(c);
         if (remote_class(c->remote_addr) == "pub")
             any_public = true;
     }
-    std::stable_sort(distinct.begin(), distinct.end(), [](const EchoTcpConn* a, const EchoTcpConn* b) {
-        return (remote_class(a->remote_addr) == "pub") && (remote_class(b->remote_addr) != "pub");
-    });
+    std::stable_sort(distinct.begin(), distinct.end(),
+                     [](const EchoTcpHourRow* a, const EchoTcpHourRow* b) {
+                         return (remote_class(a->remote_addr) == "pub") &&
+                                (remote_class(b->remote_addr) != "pub");
+                     });
     std::string title;
     for (std::size_t i = 0; i < distinct.size() && i < 12; ++i) {
-        const EchoTcpConn* c = distinct[i];
-        title += (c->remote_addr.empty() ? ":" + std::to_string(c->local_port)
-                                         : c->remote_addr + ":" + std::to_string(c->remote_port));
+        const EchoTcpHourRow* c = distinct[i];
+        title += c->remote_addr + ":" + std::to_string(c->remote_port);
         if (!c->proto.empty())
             title += " " + c->proto;
         title += "  ";
@@ -883,32 +671,30 @@ std::string net_cell(const std::vector<const EchoTcpConn*>& conns) {
     return cell;
 }
 
-using ConnIndex = std::unordered_map<std::uint32_t, std::vector<const EchoTcpConn*>>;
+using ConnIndex = std::unordered_map<std::string, std::vector<const EchoTcpHourRow*>>;
 
 /// One node's summary row (the clickable line). `node_id` addresses the detail; the
-/// row carries data-state/data-anom for the client-side filters.
+/// row carries data-anom for the client-side filter.
 std::string node_summary_row(const EchoProcTree& tree, std::size_t id, const std::string& token,
                              const ConnIndex& conn_index) {
     const EchoProcNode& n = tree.nodes[id];
-    const char* state = n.running ? "running" : "exited";
     std::string row;
-    row += "<a class=\"echo-tree-row\" data-state=\"";
-    row += state;
-    row += "\" data-anom=\"";
+    row += "<a class=\"echo-tree-row\" data-anom=\"";
     row += n.anomaly ? "1" : "0";
     row += "\" hx-get=\"/fragments/echo/process-tree/detail?token=" + token +
            "&amp;node=" + std::to_string(id) +
            "\" hx-target=\"#echo-tree-detail\" hx-swap=\"innerHTML\">";
-    row += n.running ? "<span class=\"tt-dot tt-dot-run\"></span>"
-                     : "<span class=\"tt-dot tt-dot-exit\"></span>";
-    row += "<span class=\"tt-pid\">" + std::to_string(n.pid) + "</span>";
     row += "<span class=\"tt-name\">" + html_escape(n.name.empty() ? "(unknown)" : n.name) + "</span>";
     if (!n.user.empty())
         row += "<span class=\"tt-user\">" + html_escape(n.user) + "</span>";
-    if (!n.running)
-        row += "<span class=\"tt-meta\" title=\"" + html_escape(format_iso_utc(n.exited_ts)) +
-               "\">exited " + html_escape(format_relative_time(n.exited_ts, tree.to_ts)) + "</span>";
-    auto it = conn_index.find(n.pid);
+    row += "<span class=\"tt-meta\">started " + std::to_string(n.start_count) + " &middot; stopped " +
+           std::to_string(n.stop_count);
+    if (n.abnormal_exit_count > 0)
+        row += " &middot; " + std::to_string(n.abnormal_exit_count) + " abnormal";
+    if (n.stops_exceed_starts)
+        row += " &middot; more stops than starts";
+    row += "</span>";
+    const auto it = conn_index.find(n.name);
     if (it != conn_index.end())
         row += net_cell(it->second);
     if (n.anomaly)
@@ -916,74 +702,6 @@ std::string node_summary_row(const EchoProcTree& tree, std::size_t id, const std
                "\">\xE2\x9A\xA0</span>";
     row += "</a>";
     return row;
-}
-
-// Group same-name siblings into one collapsible row once there are at least this
-// many (cleans up e.g. dozens of svchost.exe under services.exe).
-constexpr std::size_t kEchoGroupThreshold = 4;
-
-void render_node(const EchoProcTree& tree, std::size_t id, int depth, const std::string& token,
-                 const ConnIndex& conn_index, std::string& out); // fwd (mutual recursion)
-
-/// One collapsed "name ×N" group summarising same-name siblings; expands to the
-/// individual PIDs (each still drill-able). Collapsed by default — the cleanup.
-void render_group(const EchoProcTree& tree, const std::string& name,
-                  const std::vector<std::size_t>& group, int depth, const std::string& token,
-                  const ConnIndex& conn_index, std::string& out) {
-    int run = 0, ex = 0, anom = 0;
-    for (std::size_t id : group) {
-        tree.nodes[id].running ? ++run : ++ex;
-        if (tree.nodes[id].anomaly)
-            ++anom;
-    }
-    out += "<details class=\"echo-tree-node echo-tree-group\"><summary><span class=\"echo-tree-row "
-           "tt-group\">";
-    out += "<span class=\"tt-group-ico\">\xE2\x96\xA6</span>";
-    out += "<span class=\"tt-name\">" + html_escape(name.empty() ? "(unknown)" : name) + "</span>";
-    out += "<span class=\"tt-group-count\">\xC3\x97" + std::to_string(group.size()) + "</span>";
-    out += "<span class=\"tt-meta\">" + std::to_string(run) + " running";
-    if (ex > 0)
-        out += " \xC2\xB7 " + std::to_string(ex) + " exited";
-    out += "</span>";
-    if (anom > 0)
-        out += "<span class=\"tt-anom\">\xE2\x9A\xA0 " + std::to_string(anom) + "</span>";
-    out += "</span></summary><div class=\"echo-tree-children\">";
-    for (std::size_t id : group)
-        render_node(tree, id, depth + 1, token, conn_index, out);
-    out += "</div></details>";
-}
-
-/// Render a sibling set, grouping same-name runs of >= kEchoGroupThreshold into a
-/// single collapsed group (first-appearance order).
-///
-/// First-appearance-ordered bucketing in O(n): the prior nested-loop scan was
-/// O(n²) in per-level fan-out (a forged flat tree can put ~50k distinct-name
-/// children under one parent → ~1.25B string compares at render). This reproduces
-/// the previous output exactly — groups emit in first-appearance order, ids keep
-/// their original order within a group, and a name with < kEchoGroupThreshold
-/// members still renders as individual nodes at its first-appearance position.
-/// Keys are string_views into the stable `tree.nodes[id].name` (tree is const for
-/// the whole render, nodes is never reallocated), so no per-id key copy.
-void render_children(const EchoProcTree& tree, const std::vector<std::size_t>& ids, int depth,
-                     const std::string& token, const ConnIndex& conn_index, std::string& out) {
-    std::vector<std::string_view> order;
-    order.reserve(ids.size());
-    std::unordered_map<std::string_view, std::vector<std::size_t>> buckets;
-    for (std::size_t id : ids) {
-        std::string_view nm{tree.nodes[id].name};
-        auto [it, inserted] = buckets.try_emplace(nm);
-        if (inserted)
-            order.push_back(nm);
-        it->second.push_back(id);
-    }
-    for (std::string_view nm : order) {
-        const auto& group = buckets[nm];
-        if (group.size() >= kEchoGroupThreshold)
-            render_group(tree, std::string(nm), group, depth, token, conn_index, out);
-        else
-            for (std::size_t id : group)
-                render_node(tree, id, depth, token, conn_index, out);
-    }
 }
 
 void render_node(const EchoProcTree& tree, std::size_t id, int depth, const std::string& token,
@@ -1004,55 +722,48 @@ void render_node(const EchoProcTree& tree, std::size_t id, int depth, const std:
     out += depth < 2 ? "<details open class=\"echo-tree-node\">" : "<details class=\"echo-tree-node\">";
     out += "<summary>" + node_summary_row(tree, id, token, conn_index) + "</summary>";
     out += "<div class=\"echo-tree-children\">";
-    render_children(tree, n.children, depth + 1, token, conn_index, out);
+    for (const std::size_t c : n.children)
+        render_node(tree, c, depth + 1, token, conn_index, out);
     out += "</div></details>";
 }
 
 } // namespace
 
-std::string render_echo_tree_fragment(const EchoProcTree& tree, const std::vector<EchoTcpConn>& conns,
-                                     const std::string& device_id, const std::string& token,
-                                     const std::string& os) {
-    (void)device_id;
-    // Index connections by owning pid for the inline per-node net summary.
+std::string render_echo_tree_fragment(const EchoProcTree& tree, const std::vector<EchoTcpHourRow>& conns,
+                                      const std::string& token) {
+    // Index the hour's connections by owning process NAME for the inline net summary.
     ConnIndex conn_index;
     for (const auto& c : conns)
-        conn_index[c.pid].push_back(&c);
+        conn_index[c.process_name].push_back(&c);
 
     std::string h;
-    // Honesty banner.
     h += "<div class=\"echo-tree-banner\">";
-    h += "Window <b>" + html_escape(format_iso_utc(tree.from_ts)) + "</b> \xE2\x86\x92 <b>" +
-         html_escape(format_iso_utc(tree.to_ts)) + "</b>";
-    h += " &middot; observed since " + html_escape(format_iso_utc(tree.anchors.observed_since));
-    h += " &middot; " + std::to_string(tree.running_count + tree.exited_count) + " nodes (" +
-         std::to_string(tree.running_count) + " running / " + std::to_string(tree.exited_count) +
-         " exited)";
+    h += "Hour <b>" + html_escape(format_iso_utc(tree.hour_ts)) + "</b>";
+    h += " &middot; " + std::to_string(tree.nodes.size()) + " process names";
+    h += " &middot; " + std::to_string(tree.start_total) + " starts";
+    h += " &middot; " + std::to_string(tree.abnormal_total) + " abnormal exits";
     h += " &middot; " + std::to_string(tree.anomaly_count) + " flagged";
     h += "</div>";
-    h += "<div class=\"echo-tree-note\">Reconstructed from this host's local Echo database "
-         "(<code>$Process_Live</code>) only \xE2\x80\x94 no seed. Processes whose start event aged "
-         "out of the live cap, or that started before the oldest retained row, may not appear. "
-         "&ldquo;On boot&rdquo;/&ldquo;On agent install&rdquo; anchors are Echo-derived proxies.";
-    if (os_is_windows(os))
-        h += " On Windows the process feeder is ETW (names-only): per-process path and command "
-             "line are not captured.";
-    h += "</div>";
+    h += "<div class=\"echo-tree-note\">Built from this host's hourly roll-up "
+         "(<code>$Process_Hourly</code>) &mdash; names only: process ids, command lines and paths "
+         "are not kept. The parent link is by name, so processes sharing a name share one "
+         "position.</div>";
 
     if (tree.truncated)
         h += "<div class=\"echo-tree-warn\">Tree exceeds the render limit (" +
              std::to_string(kEchoTreeMaxNodes) +
-             " nodes) \xE2\x80\x94 showing the most recent. Narrow the timescale.</div>";
+             " names) \xE2\x80\x94 showing the first " + std::to_string(kEchoTreeMaxNodes) +
+             ". Narrow the window.</div>";
 
     if (tree.depth_capped)
         h += "<div class=\"echo-tree-warn\">Some branches are deeper than the display limit (" +
              std::to_string(kEchoRenderDepthCap) +
              " levels) and are collapsed with \xE2\x80\x9C\xE2\x80\xA6 (depth capped)\xE2\x80\x9D. "
-             "The node counts above include those hidden descendants.</div>";
+             "The counts above include those hidden descendants.</div>";
 
     if (tree.roots.empty()) {
-        h += "<div class=\"echo-tree-empty\">No processes reconstructable for this window. Widen "
-             "the timescale, or the host may have no retained process events.</div>";
+        h += "<div class=\"echo-tree-empty\">No process activity recorded for this hour. Pick another "
+             "hour, or the host may have no hourly rows yet.</div>";
         return h;
     }
 
@@ -1060,49 +771,31 @@ std::string render_echo_tree_fragment(const EchoProcTree& tree, const std::vecto
     h += "<div class=\"echo-tree-nomatch\" style=\"display:none\">No processes match the current "
          "filters.</div>";
     h += "<div class=\"echo-tree\">";
-    std::string body;
-    render_children(tree, tree.roots, 0, token, conn_index, body);
-    h += body;
+    for (const std::size_t r : tree.roots)
+        render_node(tree, r, 0, token, conn_index, h);
     h += "</div>";
     return h;
 }
 
-std::string render_echo_proc_detail(const EchoProcNode& node, const std::vector<EchoTcpConn>& conns,
-                                   const std::string& os) {
-    const bool win = os_is_windows(os);
+std::string render_echo_proc_detail(const EchoProcNode& node, const std::vector<EchoTcpHourRow>& conns) {
     std::string h;
     h += "<div class=\"echo-detail\">";
     h += "<div class=\"echo-detail-title\">" +
-         html_escape(node.name.empty() ? "(unknown)" : node.name) + " <span class=\"echo-tree-pid\">pid " +
-         std::to_string(node.pid) + "</span></div>";
+         html_escape(node.name.empty() ? "(unknown)" : node.name) + "</div>";
 
-    auto kv = [&](const std::string& k, const std::string& v, bool mono = false) {
-        h += "<div class=\"echo-kv\"><span class=\"echo-kv-k\">" + html_escape(k) + "</span>";
-        h += mono ? "<code class=\"echo-kv-v\">" : "<span class=\"echo-kv-v\">";
-        h += html_escape(v);
-        h += mono ? "</code></div>" : "</span></div>";
+    auto kv = [&](const std::string& k, const std::string& v) {
+        h += "<div class=\"echo-kv\"><span class=\"echo-kv-k\">" + html_escape(k) +
+             "</span><span class=\"echo-kv-v\">" + html_escape(v) + "</span></div>";
     };
 
-    kv("PID", std::to_string(node.pid));
-    kv("Parent PID", std::to_string(node.ppid));
+    kv("Parent name", node.parent_name.empty() ? std::string("none") : node.parent_name);
     if (!node.user.empty())
         kv("User", node.user);
-    kv("State", node.running ? "running" : ("exited " + format_iso_utc(node.exited_ts)));
-    kv("Started", node.start_known ? format_iso_utc(node.started_ts)
-                                    : std::string("before observation (start event not retained)"));
-
-    // Path + command line — Echo-only. Windows ETW is names-only (no path/cmdline).
-    if (win) {
-        h += "<div class=\"echo-kv\"><span class=\"echo-kv-k\">Path</span>"
-             "<span class=\"echo-kv-v echo-tree-mute\">\xE2\x80\x94 names-only on Windows (ETW "
-             "feeder)</span></div>";
-        h += "<div class=\"echo-kv\"><span class=\"echo-kv-k\">Command line</span>"
-             "<span class=\"echo-kv-v echo-tree-mute\">\xE2\x80\x94 names-only on Windows (ETW "
-             "feeder)</span></div>";
-    } else {
-        kv("Path / command line",
-           node.cmdline.empty() ? std::string("\xE2\x80\x94 (not captured)") : node.cmdline, true);
-    }
+    kv("Started in this hour", std::to_string(node.start_count));
+    kv("Stopped in this hour", std::to_string(node.stop_count));
+    kv("Abnormal exits", std::to_string(node.abnormal_exit_count));
+    if (node.stops_exceed_starts)
+        kv("Note", "more stops than starts: some instances started before this hour");
 
     if (node.anomaly) {
         h += "<div class=\"echo-detail-anom\"><span class=\"echo-badge echo-badge-anom\">\xE2\x9A\xA0 "
@@ -1110,195 +803,159 @@ std::string render_echo_proc_detail(const EchoProcNode& node, const std::vector<
              html_escape(node.anomaly_evidence) + "</div>";
     }
 
-    // Connections owned by this pid (from $TCP_Live, joined by pid). Most recent first.
+    // Connections recorded under this NAME in the hour (from $TCP_Hourly). The hourly tier
+    // has no pid, so processes sharing a name share the list.
     h += "<div class=\"echo-detail-section\">Connections</div>";
     if (conns.empty()) {
-        h += "<div class=\"echo-tree-mute\">No TCP connections recorded for this PID in the "
-             "window.</div>";
+        h += "<div class=\"echo-tree-mute\">No TCP connections recorded under this name in this "
+             "hour.</div>";
     } else {
-        h += "<table class=\"echo-detail-conns\"><thead><tr><th>Proto</th><th>Local</th>"
-             "<th>Remote</th><th>State</th><th>When</th></tr></thead><tbody>";
+        h += "<table class=\"echo-detail-conns\"><thead><tr><th>Proto</th><th>Remote</th>"
+             "<th>Connects</th><th>Disconnects</th><th>Failed</th></tr></thead><tbody>";
         std::size_t shown = 0;
         for (const auto& c : conns) {
             if (shown++ >= 100)
                 break;
             h += "<tr><td>" + html_escape(c.proto) + "</td>";
-            h += "<td>:" + std::to_string(c.local_port) + "</td>";
             h += "<td>" + html_escape(c.remote_addr) + ":" + std::to_string(c.remote_port) + "</td>";
-            h += "<td>" + html_escape(c.state) + "</td>";
-            h += "<td title=\"" + html_escape(format_iso_utc(c.ts)) + "\">" +
-                 html_escape(c.action.empty() ? std::string("\xE2\x80\x94") : c.action) + "</td></tr>";
+            h += "<td>" + std::to_string(c.connect_count) + "</td>";
+            h += "<td>" + std::to_string(c.disconnect_count) + "</td>";
+            h += "<td>" + std::to_string(c.failed_count) + "</td></tr>";
         }
         h += "</tbody></table>";
     }
+    h += "<div class=\"echo-tree-mute\">Not kept: process ids, command lines and file paths. The parent "
+         "link and the connections are joined by name, so processes sharing a name are shown as one "
+         "position.</div>";
     h += "</div>";
     return h;
 }
 
 // ── Device DNS/ARP panels (ADR-0015) — device-level, NOT per process ──────────
 
-std::string render_echo_dns_panel(const std::vector<EchoDnsCacheEntry>& rows) {
-    // Reduce the appeared/removed event stream (rows assumed newest-first) to the
-    // current cache: newest row per (name, record_type, data) wins; a binding whose
-    // newest action is `removed` is omitted.
-    std::unordered_set<std::string> seen;
-    std::vector<const EchoDnsCacheEntry*> cur;
-    for (const auto& r : rows) {
-        std::string key = r.name + "\x1f" + r.record_type + "\x1f" + r.data;
-        if (!seen.insert(key).second)
-            continue;
-        if (r.action == "removed")
-            continue;
-        cur.push_back(&r);
-    }
+std::string render_echo_dns_panel(const std::vector<EchoDnsHourRow>& rows, std::int64_t hour_ts) {
+    std::vector<const EchoDnsHourRow*> cur;
+    for (const auto& r : rows)
+        if (r.hour_ts == hour_ts)
+            cur.push_back(&r);
     std::string h = "<details class=\"devnet-panel\" open>";
-    h += "<summary><span><span class=\"devnet-title-ico\">&#9783;</span>DNS cache (device)</span>"
+    h += "<summary><span><span class=\"devnet-title-ico\">&#9783;</span>DNS cache activity</span>"
          "<span class=\"devnet-count\">" +
          std::to_string(cur.size()) + "</span></summary>";
     if (cur.empty()) {
-        h += "<div class=\"devnet-empty\">No DNS cache entries &mdash; the <code>dns</code> source "
-             "may be disabled on this device.</div>";
+        h += "<div class=\"devnet-empty\">No DNS cache activity recorded for this hour &mdash; the "
+             "<code>dns</code> source may be disabled on this device.</div>";
     } else {
         h += "<div class=\"devnet-body\"><table class=\"devnet-table\"><thead><tr><th>Name</th>"
-             "<th>Type</th><th>Data</th><th>TTL</th><th>Src</th></tr></thead><tbody>";
+             "<th>Type</th><th>Data</th><th>Appeared</th><th>Removed</th><th>No such name</th>"
+             "</tr></thead><tbody>";
         std::size_t shown = 0;
         for (const auto* r : cur) {
             if (shown++ >= 500)
                 break;
             h += "<tr><td>" + html_escape(r->name) + "</td>";
             h += "<td class=\"dn-type\">" + html_escape(r->record_type) + "</td>";
-            h += "<td class=\"dn-data\">" + html_escape(r->data) + "</td>";
-            h += "<td class=\"dn-ttl\">" +
-                 (r->ttl_remaining_s < 0 ? std::string("\xE2\x80\x94")
-                                         : std::to_string(r->ttl_remaining_s)) +
-                 "</td>";
-            h += "<td class=\"dn-src\">" + html_escape(r->source) + "</td></tr>";
+            h += "<td class=\"dn-data\">" +
+                 (r->data.empty() ? std::string("&mdash;") : html_escape(r->data)) + "</td>";
+            h += "<td>" + std::to_string(r->appear_count) + "</td>";
+            h += "<td>" + std::to_string(r->remove_count) + "</td>";
+            h += "<td>" + std::to_string(r->negative_count) + "</td></tr>";
         }
         h += "</tbody></table></div>";
     }
-    h += "<div class=\"devnet-caveat\">Device resolver-cache state &mdash; <strong>not</strong> "
-         "per-process (the cache carries no PID).</div></details>";
+    h += "<div class=\"devnet-caveat\">Counts of cache entries seen appearing and being removed in the "
+         "hour from " +
+         html_escape(format_iso_utc(hour_ts)) +
+         ". Device resolver state, <strong>not</strong> per process.</div></details>";
     return h;
 }
 
-std::string render_echo_arp_panel(const std::vector<EchoArpEntry>& rows) {
-    std::unordered_set<std::string> seen;
-    std::vector<const EchoArpEntry*> cur;
-    for (const auto& r : rows) {
-        std::string key = r.iface + "\x1f" + r.ip_address + "\x1f" + r.mac_address;
-        if (!seen.insert(key).second)
-            continue;
-        if (r.action == "removed")
-            continue;
-        cur.push_back(&r);
-    }
+std::string render_echo_arp_panel(const std::vector<EchoArpHourRow>& rows, std::int64_t hour_ts) {
+    std::vector<const EchoArpHourRow*> cur;
+    for (const auto& r : rows)
+        if (r.hour_ts == hour_ts)
+            cur.push_back(&r);
     std::string h = "<details class=\"devnet-panel\" open>";
-    h += "<summary><span><span class=\"devnet-title-ico\">&#9783;</span>ARP table (device)</span>"
+    h += "<summary><span><span class=\"devnet-title-ico\">&#9783;</span>ARP table activity</span>"
          "<span class=\"devnet-count\">" +
          std::to_string(cur.size()) + "</span></summary>";
     if (cur.empty()) {
-        h += "<div class=\"devnet-empty\">No ARP entries &mdash; the <code>arp</code> source may be "
-             "disabled on this device.</div>";
+        h += "<div class=\"devnet-empty\">No ARP activity recorded for this hour &mdash; the "
+             "<code>arp</code> source may be disabled on this device.</div>";
     } else {
         h += "<div class=\"devnet-body\"><table class=\"devnet-table\"><thead><tr><th>Interface</th>"
-             "<th>IP address</th><th>MAC</th><th>Type</th></tr></thead><tbody>";
+             "<th>IP address</th><th>MAC address</th><th>Appeared</th><th>Removed</th><th>Role</th>"
+             "<th>Rebinds</th></tr></thead><tbody>";
         std::size_t shown = 0;
         for (const auto* r : cur) {
             if (shown++ >= 500)
                 break;
-            // static → muted; dynamic → accent; incomplete/other/unknown → a distinct
-            // "other" class so an unresolved (no-MAC) neighbour is not coloured as a
-            // healthy dynamic entry (consistency S2).
-            std::string tclass = "arp-type-dynamic";
-            if (r->entry_type == "static")
-                tclass = "arp-type-static";
-            else if (r->entry_type != "dynamic")
-                tclass = "arp-type-other";
             h += "<tr><td>" + html_escape(r->iface) + "</td>";
             h += "<td>" + html_escape(r->ip_address) + "</td>";
             h += "<td class=\"arp-mac\">" + html_escape(r->mac_address) + "</td>";
-            h += "<td class=\"" + tclass + "\">" + html_escape(r->entry_type) + "</td></tr>";
+            h += "<td>" + std::to_string(r->appear_count) + "</td>";
+            h += "<td>" + std::to_string(r->remove_count) + "</td>";
+            h += "<td>" + std::string(r->is_router ? "<span class=\"pill info\">router</span>" : "&mdash;") +
+                 "</td>";
+            h += "<td>" +
+                 (r->rebind_count > 0 ? "<span class=\"pill warn\">" + std::to_string(r->rebind_count) +
+                                            " MAC change" + (r->rebind_count == 1 ? "" : "s") + "</span>"
+                                      : std::string("0")) +
+                 "</td></tr>";
         }
         h += "</tbody></table></div>";
     }
-    h += "<div class=\"devnet-caveat\">Layer-2 adjacency for spoofing / poisoning checks.</div>"
-         "</details>";
+    h += "<div class=\"devnet-caveat\">A rebind means the same IP address answered from a different "
+         "MAC address during the hour.</div></details>";
     return h;
 }
 
 // ── Capture-sources frame (ADR-0015) ─────────────────────────────────────────
 
-std::string render_echo_capture_sources(const std::string& device, const std::string& status_output,
-                                       const std::string& compat_output) {
-    auto each_line = [](const std::string& s, auto&& fn) {
-        std::size_t pos = 0;
-        while (pos < s.size()) {
-            const auto nl = s.find('\n', pos);
-            std::string line = s.substr(pos, (nl == std::string::npos ? s.size() : nl) - pos);
-            pos = (nl == std::string::npos) ? s.size() : nl + 1;
-            if (!line.empty() && line.back() == '\r')
-                line.pop_back();
-            fn(line);
-        }
-    };
-
+std::string render_echo_capture_sources(const std::string& device, const std::string& status_output) {
     // status: config|<key>|<value>
     std::unordered_map<std::string, std::string> cfg;
-    each_line(status_output, [&](const std::string& line) {
+    std::size_t pos = 0;
+    while (pos < status_output.size()) {
+        const auto nl = status_output.find('\n', pos);
+        std::string line =
+            status_output.substr(pos, (nl == std::string::npos ? status_output.size() : nl) - pos);
+        pos = (nl == std::string::npos) ? status_output.size() : nl + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
         const auto c = split_pipe(line);
         if (c.size() >= 3 && c[0] == "config")
             cfg[c[1]] = c[2];
-    });
-    // compatibility: row|<src>|<os>|<status>|<method>|<notes>
-    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> osmap;
-    each_line(compat_output, [&](const std::string& line) {
-        const auto c = split_pipe(line);
-        if (c.size() >= 4 && c[0] == "row")
-            osmap[c[1]][c[2]] = c[3];
-    });
+    }
 
     struct Meta {
         const char* name;
-        const char* dollar;
+        const char* dollar; ///< the HOURLY table — raw capture rows are not kept
         const char* category;
         bool always_on;
         bool is_new;
-        bool pii;
+        const char* tiers; ///< H = hourly, D = daily, M = monthly (the fold schema's tier set)
     };
     // Presentation metadata (the agent's schema registry is not linked here).
     // Category follows docs/user-manual/echo.md's five categories. always_on = the
     // default-enabled core sources (the toggle is locked here; pause/resume uses the
     // configure path, and the State cell still shows the reported <src>_enabled as
-    // "always on" or "paused"). is_new/pii drive the badges.
+    // "always on" or "paused"). is_new drives the badge.
     static const std::array<Meta, 11> kSources = {{
-        {"process", "$Process", "Processes", true, false, false},
-        {"tcp", "$TCP", "Network connections", true, false, false},
-        {"service", "$Service", "Services", true, false, false},
-        {"user", "$User", "User sessions", true, false, false},
-        {"perf", "$Perf", "Performance", true, false, false},
-        {"procperf", "$ProcPerf", "Performance", false, false, false},
-        {"netqual", "$NetQual", "Network connections", false, false, false},
-        {"module", "$Module", "Processes", false, false, false},
-        {"arp", "$ARP", "Network connections", false, true, false},
-        {"dns", "$DNS", "Network connections", false, true, true},
-        // registry (PR11.8): an older agent never reports registry_enabled, so the row is
-        // simply absent; a current agent reports it on every OS, and the OS cells read
-        // unsupported off Windows. Stored values are unmasked, which the user manual
-        // states. No PII badge: the badge marks usage-class sources like $DNS, and
-        // registry values are machine configuration, not per-user behaviour.
-        {"registry", "$Registry", "System", false, true, false},
+        {"process", "$Process_Hourly", "Processes", true, false, "HDM"},
+        {"tcp", "$TCP_Hourly", "Network connections", true, false, "HDM"},
+        {"service", "$Service_Hourly", "Services", true, false, "HD"},
+        {"user", "$User_Hourly", "User sessions", true, false, "HD"},
+        {"perf", "$Perf_Hourly", "Performance", true, false, "HD"},
+        {"procperf", "$ProcPerf_Hourly", "Performance", false, false, "HD"},
+        {"netqual", "$NetQual_Hourly", "Network connections", false, false, "HD"},
+        {"module", "$Module_Hourly", "Processes", false, false, "HDM"},
+        {"arp", "$ARP_Hourly", "Network connections", false, true, "H"},
+        {"dns", "$DNS_Hourly", "Network connections", false, true, "H"},
+        // registry (PR11.8): an older agent never reports registry_enabled, so the card is
+        // simply absent; a current agent reports it on every OS.
+        {"registry", "$Registry_Hourly", "System", false, true, "HD"},
     }};
-
-    auto os_cell = [&](const std::string& src, const char* os) -> std::string {
-        auto s = osmap.find(src);
-        std::string st = (s != osmap.end() && s->second.count(os)) ? s->second.at(os) : "";
-        std::string cls = st == "supported" ? "os-ok" : (st == "constrained" ? "os-con" : "os-planned");
-        if (st.empty()) {
-            st = "\xE2\x80\x94";
-            cls = "os-planned";
-        }
-        return "<td class=\"os-cell " + cls + "\">" + html_escape(st) + "</td>";
-    };
 
     std::string h = "<div class=\"cat-filter\" id=\"capFilter\"><span class=\"filter-label\">"
                     "Category</span><span class=\"echo-seg\"><a class=\"echo-chip on\" onclick=\"filterCap(this,'all')\">All</a>";
@@ -1314,9 +971,16 @@ std::string render_echo_capture_sources(const std::string& device, const std::st
              "</a>";
     h += "</span></div>";
 
-    h += "<table id=\"capTable\" data-device=\"" + html_escape(device) +
-         "\"><thead><tr><th>Source</th><th>Category</th><th>Table</th><th>State</th>"
-         "<th>Live rows</th><th>Windows</th><th>Linux</th><th>macOS</th></tr></thead><tbody>";
+    h += "<div class=\"cards\" id=\"capCards\" data-device=\"" + html_escape(device) + "\">";
+
+    // A bucket start as "YYYY-MM-DD HH:MM UTC"; "&mdash;" when the key is absent or unparseable.
+    const auto bucket_label = [](const std::string& raw) -> std::string {
+        const auto ts = cell_i64(raw);
+        if (!ts || *ts <= 0)
+            return "&mdash;";
+        const std::string iso = format_iso_utc(*ts); // YYYY-MM-DDTHH:MM:SSZ
+        return iso.substr(0, 10) + " " + iso.substr(11, 5) + " UTC";
+    };
 
     int rendered = 0;
     for (const auto& m : kSources) {
@@ -1325,39 +989,58 @@ std::string render_echo_capture_sources(const std::string& device, const std::st
             continue; // not reported by this agent — skip
         ++rendered;
         const bool enabled = cfg.at(en_key) != "false";
-        const std::string rows_key = std::string(m.name) + "_live_rows";
-        const std::string rows = cfg.count(rows_key) ? cfg.at(rows_key) : "0";
+        // The agent publishes `<src>_rows`; one that predates the rename still answers
+        // `<src>_live_rows`. Neither key → unknown, shown as a dash rather than a false 0.
+        std::string rows = "&mdash;";
+        for (const char* suffix : {"_rows", "_live_rows"}) {
+            const auto it = cfg.find(std::string(m.name) + suffix);
+            if (it != cfg.end()) {
+                rows = html_escape(it->second);
+                break;
+            }
+        }
+        const auto oldest = cfg.find(std::string(m.name) + "_oldest_ts");
+        const auto paused = cfg.find(std::string(m.name) + "_paused_at");
 
-        h += "<tr data-cat=\"" + std::string(m.category) + "\"><td><span class=\"src-name\">" +
-             std::string(m.name) + "</span>";
+        h += "<div class=\"card\" data-cat=\"" + std::string(m.category) +
+             "\"><div class=\"top\"><span class=\"nm\"><span class=\"src-name\">" + std::string(m.name) +
+             "</span>";
         if (m.is_new)
             h += " <span class=\"badge badge-new\">NEW</span>";
-        if (m.pii)
-            h += " <span class=\"badge badge-pii\">PII</span>";
-        h += "</td><td class=\"cat\">" + std::string(m.category) + "</td><td class=\"src-dollar\">" +
-             std::string(m.dollar) + "</td><td><div class=\"state-cell\">";
+        h += "</span>";
+        std::string state_txt;
         if (m.always_on && enabled) {
             h += "<label class=\"tgl locked\"><input type=\"checkbox\" checked disabled>"
-                 "<span class=\"sl\"></span></label><span class=\"state-txt state-on\">always on</span>";
+                 "<span class=\"sl\"></span></label>";
+            state_txt = "<span class=\"state-txt state-on\">always on</span>";
         } else if (m.always_on) {
             h += "<label class=\"tgl locked\"><input type=\"checkbox\" disabled>"
-                 "<span class=\"sl\"></span></label><span class=\"state-txt\">paused</span>";
+                 "<span class=\"sl\"></span></label>";
+            state_txt = "<span class=\"state-txt\">paused</span>";
         } else {
             h += "<label class=\"tgl\"><input type=\"checkbox\" data-source=\"" + std::string(m.name) +
                  "\" data-committed=\"" + (enabled ? "true" : "false") + "\"" +
                  (enabled ? " checked" : "") +
-                 " onchange=\"stageCapToggle(this)\"><span class=\"sl\"></span></label>"
-                 "<span class=\"state-txt" +
-                 std::string(enabled ? " state-on" : "") + "\">" + (enabled ? "enabled" : "disabled") +
-                 "</span>";
+                 " onchange=\"stageCapToggle(this)\"><span class=\"sl\"></span></label>";
+            state_txt = std::string("<span class=\"state-txt") + (enabled ? " state-on" : "") + "\">" +
+                        (enabled ? "enabled" : "disabled") + "</span>";
         }
-        h += "</div></td><td><span class=\"badge badge-rows\">" + html_escape(rows) + "</span></td>";
-        h += os_cell(m.name, "windows");
-        h += os_cell(m.name, "linux");
-        h += os_cell(m.name, "macos");
-        h += "</tr>";
+        h += "</div><div class=\"hint\">" + std::string(m.category) + "</div><dl><dt>State</dt><dd>" +
+             state_txt;
+        if (paused != cfg.end() && !enabled && cell_i64(paused->second).value_or(0) > 0)
+            h += " <span class=\"hint\">since " + html_escape(format_iso_utc(*cell_i64(paused->second))) +
+                 "</span>";
+        h += "</dd><dt>Hourly rows</dt><dd class=\"mono\"><span class=\"badge badge-rows\">" + rows +
+             "</span></dd><dt>Oldest bucket</dt><dd class=\"mono\">" +
+             (oldest != cfg.end() ? bucket_label(oldest->second) : std::string("&mdash;")) +
+             "</dd><dt>Hourly table</dt><dd class=\"src-dollar\">" + std::string(m.dollar) +
+             "</dd><dt>Kept as</dt><dd class=\"tiers-mini\">";
+        for (const char* t = m.tiers; *t; ++t)
+            h += std::string("<span>") + (*t == 'H' ? "Hourly" : (*t == 'D' ? "Daily" : "Monthly")) +
+                 "</span>";
+        h += "</dd></dl></div>";
     }
-    h += "</tbody></table>";
+    h += "</div>";
     if (rendered == 0)
         return "<div class=\"devnet-empty\">No capture sources reported by this device.</div>";
     h += "<div class=\"apply-bar note warn\" id=\"capApplyBar\" hidden><span class=\"apply-icon\">&#9888;</span>"

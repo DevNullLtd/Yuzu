@@ -64,6 +64,52 @@ std::string get_param(const httplib::Request& req, const char* k) {
     return req.has_param(k) ? req.get_param_value(k) : std::string{};
 }
 // parse_ts_param lives in echo_process_tree.{hpp,cpp} (pure + unit-tested).
+
+// Resolve the request's `preset`/`from`/`to` into whole hourly buckets plus the optional
+// selected `hour`. An unparseable custom window or hour is refused with an in-panel note
+// (#4644: the lenient parser read it as "unset", which dispatched a query for a window the
+// operator had not typed); returns false when it wrote that note.
+bool parse_tree_window(const httplib::Request& req, httplib::Response& res, std::int64_t now,
+                       EchoWindow& win, std::int64_t& hour) {
+    const std::string preset = get_param(req, "preset");
+    const auto from_ts = parse_ts_param_strict(get_param(req, "from"));
+    const auto to_ts = parse_ts_param_strict(get_param(req, "to"));
+    const auto hour_ts = parse_ts_param_strict(get_param(req, "hour"));
+    if (preset == "custom" && (!from_ts || !to_ts)) {
+        note(res, "The custom window is not a valid time. Use the From and To pickers "
+                  "(UTC), or epoch seconds, and re-run.");
+        return false;
+    }
+    if (!hour_ts) {
+        note(res, "The hour is not a valid time. Pick an hour from the list and re-run.");
+        return false;
+    }
+    win = resolve_echo_window(preset, from_ts.value_or(0), to_ts.value_or(0), now);
+    hour = *hour_ts;
+    return true;
+}
+
+// The Hour selector for a rendered tree: the hours that carry process rows, newest first.
+// A change re-runs the same window with that `hour` (htmx includes the select's own value).
+std::string render_hour_select(const std::vector<std::int64_t>& hours, std::int64_t selected,
+                               const std::string& preset, const std::string& from,
+                               const std::string& to) {
+    if (hours.empty())
+        return {};
+    std::string h = "<div class=\"echo-tree-hourbar\"><label class=\"tt-filter-label\" "
+                    "for=\"echo-tree-hour\">Hour</label><select id=\"echo-tree-hour\" name=\"hour\" "
+                    "class=\"scope-chip-select\" hx-get=\"/fragments/echo/process-tree/run?preset=" +
+                    url_enc(canonical_echo_preset(preset)) + "&amp;from=" + url_enc(from) +
+                    "&amp;to=" + url_enc(to) +
+                    "\" hx-include=\"#echo-tree-host\" hx-trigger=\"change\" "
+                    "hx-target=\"#echo-tree\">";
+    for (std::size_t i = 0; i < hours.size() && i < static_cast<std::size_t>(kEchoMaxWindowHours); ++i)
+        h += "<option value=\"" + std::to_string(hours[i]) + "\"" +
+             (hours[i] == selected ? " selected" : "") + ">" + html_escape(format_iso_utc(hours[i])) +
+             "</option>";
+    h += "</select></div>";
+    return h;
+}
 // The reconstruction cache token is a CSPRNG hex string (random_hex, secure_random.hpp,
 // #801) minted at the /result generation site — never a std::mt19937_64 value.
 
@@ -78,7 +124,7 @@ std::string render_frame(const std::vector<DeviceRow>& devices) {
     h += "<div class=\"echo-tree-toolbar\">";
     // Host picker.
     h += "<select id=\"echo-tree-host\" name=\"device\" class=\"scope-chip-select\" "
-         "hx-get=\"/fragments/echo/process-tree/run?preset=10m\" hx-target=\"#echo-tree\" "
+         "hx-get=\"/fragments/echo/process-tree/run?preset=24h\" hx-target=\"#echo-tree\" "
          "hx-trigger=\"change\">";
     h += "<option value=\"\">Select a host\xE2\x80\xA6</option>";
     std::vector<DeviceRow> rows = devices;
@@ -96,12 +142,9 @@ std::string render_frame(const std::vector<DeviceRow>& devices) {
     h += "</select>";
 
     // Preset chips.
-    const std::array<std::pair<const char*, const char*>, 6> presets = {{{"on_boot", "On boot"},
-                                                                         {"on_install", "On agent install"},
-                                                                         {"1m", "Last minute"},
-                                                                         {"10m", "Last 10m"},
-                                                                         {"1h", "Last hour"},
-                                                                         {"1d", "Last day"}}};
+    // Whole-hour windows over the hourly roll-up; `custom` is the Apply chip below.
+    const std::array<std::pair<const char*, const char*>, 3> presets = {
+        {{"1h", "Last hour"}, {"24h", "Last 24 hours"}, {"7d", "Last 7 days"}}};
     h += "<div class=\"echo-tree-presets\">";
     for (const auto& [tok, label] : presets) {
         h += std::string("<a class=\"echo-chip\" hx-get=\"/fragments/echo/process-tree/run?preset=") +
@@ -119,49 +162,43 @@ std::string render_frame(const std::vector<DeviceRow>& devices) {
 
     h += "</div>"; // toolbar (host + time range)
 
-    // Filter bar — client-side state + anomalies + text filters (no round-trip;
-    // re-applied after every tree swap via the htmx:afterSettle listener).
+    // Filter bar — client-side anomalies + text filters (no round-trip; re-applied after
+    // every tree swap via the htmx:afterSettle listener). No run state without pids, so
+    // there are no Running/Exited chips.
     h += "<div class=\"echo-tree-filterbar\">";
-    h += "<span class=\"tt-filter-label\">Show</span><span class=\"echo-seg\">";
-    h += "<a class=\"echo-chip on\" data-statechip=\"all\" onclick=\"echoTreeState('all',this)\">All</a>";
-    h += "<a class=\"echo-chip\" data-statechip=\"running\" onclick=\"echoTreeState('running',this)\">"
-         "Running</a>";
-    h += "<a class=\"echo-chip\" data-statechip=\"exited\" onclick=\"echoTreeState('exited',this)\">"
-         "Exited</a></span>";
+    h += "<span class=\"tt-filter-label\">Show</span>";
     h += "<label class=\"tt-anom-toggle\"><input type=\"checkbox\" id=\"echo-tree-anom-only\" "
          "onchange=\"applyEchoTreeFilters()\"> Anomalies only</label>";
     h += "<input id=\"echo-tree-filter\" class=\"echo-tree-filter\" type=\"text\" "
-         "placeholder=\"Filter name / IP / PID\xE2\x80\xA6\" oninput=\"applyEchoTreeFilters()\">";
+         "placeholder=\"Filter name, user or IP\xE2\x80\xA6\" oninput=\"applyEchoTreeFilters()\">";
     h += "</div>";
 
     // Two-column layout: scrollable tree on the left, a sticky always-visible detail
     // panel on the right (stacks on narrow viewports).
     h += "<div class=\"echo-tree-layout\">";
     h += "<div class=\"echo-tree-main\"><div id=\"echo-tree\"><div class=\"echo-tree-empty\">Pick a host "
-         "and a timescale to reconstruct its point-in-time process tree.</div></div></div>";
+         "and a time range to see its process tree for one hour.</div></div></div>";
     h += "<aside class=\"echo-tree-side\"><div id=\"echo-tree-detail\"><div class=\"echo-tree-mute\">"
-         "Select a process to see its path, user, connections and anomaly evidence.</div></div></aside>";
+         "Select a process name to see what the hourly record kept for it.</div></div></aside>";
     h += "</div>";
 
-    // Device-level DNS cache + ARP table panels (ADR-0015). Loaded when the host
-    // picker changes — htmx `from:` selector fires this alongside the tree run, with
-    // no hx-on (CSP-safe). Device view, NOT per-process (the DNS cache carries no pid).
-    h += "<div id=\"echo-devnet\" hx-get=\"/fragments/echo/process-tree/device-net\" "
-         "hx-include=\"#echo-tree-host\" hx-trigger=\"change from:#echo-tree-host\" "
-         "hx-swap=\"innerHTML\"></div>";
+    // Device-level DNS cache + ARP table panels (ADR-0015) for the hour the tree shows.
+    // The tree result swaps this placeholder out-of-band with one that loads the panels
+    // for the selected hour (no hx-on: CSP-safe). Device view, NOT per-process.
+    h += "<div id=\"echo-devnet\"></div>";
     return h;
 }
 
 // The self-re-issuing polling fragment (mirrors device live_pending).
 std::string tree_pending(const std::string& device, const std::string& preset,
-                         const std::string& from, const std::string& to,
+                         const std::string& from, const std::string& to, const std::string& hour,
                          const std::string& pcmd, const std::string& tcmd, int attempt) {
     // Explicit hx-target="this" so the poll replaces ITSELF (inside #echo-tree) and
     // never inherits an ancestor's hx-target — otherwise the outerHTML swap would
     // clobber the whole frame body, taking the toolbar with it.
     return "<div hx-get=\"/fragments/echo/process-tree/result?device=" + url_enc(device) +
            "&amp;preset=" + url_enc(preset) + "&amp;from=" + url_enc(from) + "&amp;to=" +
-           url_enc(to) + "&amp;pcmd=" + url_enc(pcmd) + "&amp;tcmd=" + url_enc(tcmd) +
+           url_enc(to) + "&amp;hour=" + url_enc(hour) + "&amp;pcmd=" + url_enc(pcmd) + "&amp;tcmd=" + url_enc(tcmd) +
            "&amp;n=" + std::to_string(attempt) +
            "\" hx-trigger=\"load delay:700ms\" hx-target=\"this\" hx-swap=\"outerHTML\" "
            "class=\"echo-tree-loading\">Reconstructing the process tree\xE2\x80\xA6</div>";
@@ -170,12 +207,13 @@ std::string tree_pending(const std::string& device, const std::string& preset,
 // Self-re-issuing poll for the device-net (DNS cache + ARP table) panels (ADR-0015).
 // Carries both dispatched command_ids; ready when DNS + ARP queries both complete.
 std::string devnet_pending(const std::string& device, const std::string& dcmd,
-                           const std::string& acmd, int attempt) {
+                           const std::string& acmd, const std::string& hour, int attempt) {
     return "<div hx-get=\"/fragments/echo/process-tree/device-net?device=" + url_enc(device) +
            "&amp;dcmd=" + url_enc(dcmd) + "&amp;acmd=" + url_enc(acmd) +
+           "&amp;hour=" + url_enc(hour) +
            "&amp;n=" + std::to_string(attempt) +
            "\" hx-trigger=\"load delay:700ms\" hx-target=\"this\" hx-swap=\"outerHTML\" "
-           "class=\"echo-tree-loading\">Loading device DNS / ARP\xE2\x80\xA6</div>";
+           "class=\"echo-tree-loading\">Loading device DNS / ARP activity\xE2\x80\xA6</div>";
 }
 
 // Capture-sources frame body: device picker (operator-scoped) + a target the table
@@ -417,13 +455,15 @@ std::optional<std::string> EchoTreeRoutes::cache_render_detail(const std::string
         return std::string("<div class=\"echo-tree-note\">That process is no longer in the "
                            "reconstruction. Re-run the tree.</div>");
     const EchoProcNode& node = e.tree.nodes[node_id];
-    std::vector<EchoTcpConn> conns;
+    // The hourly tier has no pid: connections join the node by process NAME.
+    std::vector<EchoTcpHourRow> conns;
     for (const auto& c : e.conns)
-        if (c.pid == node.pid)
+        if (c.process_name == node.name)
             conns.push_back(c);
-    std::sort(conns.begin(), conns.end(),
-              [](const EchoTcpConn& a, const EchoTcpConn& b) { return a.ts > b.ts; });
-    return render_echo_proc_detail(node, conns, e.os);
+    std::sort(conns.begin(), conns.end(), [](const EchoTcpHourRow& a, const EchoTcpHourRow& b) {
+        return a.connect_count > b.connect_count;
+    });
+    return render_echo_proc_detail(node, conns);
 }
 
 void EchoTreeRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
@@ -542,8 +582,9 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         const std::string preset = get_param(req, "preset");
         const std::string from = get_param(req, "from");
         const std::string to = get_param(req, "to");
+        const std::string hour = get_param(req, "hour");
         if (device.empty()) {
-            note(res, "Select a host to reconstruct its process tree.");
+            note(res, "Select a host to see its process tree.");
             return;
         }
         // Per-device scoped Read floor (tier + management group).
@@ -558,37 +599,28 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             note(res, "Live device query is unavailable on this server.");
             return;
         }
-        // SQL fetch is bounded only at the TOP (ts <= to) for a custom `to`; the lower
-        // bound stays oldest-retained so a long-running process started before the
-        // window is still captured (the engine applies `from` as an interval filter).
-        // A custom window that does not parse is refused here (#4644): the lenient parser
-        // read it as "unset", which dispatched an unbounded query for a window the operator
-        // had typed.
-        std::int64_t fetch_to = 0;
-        if (preset == "custom") {
-            const auto from_ts = parse_ts_param_strict(from);
-            const auto to_ts = parse_ts_param_strict(to);
-            if (!from_ts || !to_ts) {
-                note(res, "The custom window is not a valid time. Use the From and To pickers "
-                          "(UTC), or epoch seconds, and re-run.");
-                return;
-            }
-            fetch_to = *to_ts;
-        }
-        // SECURITY: `fetch_to` is interpolated into the echo.sql query STRING handed to
-        // the agent. The agent forbids parameterized/recursive CTEs, so there is NO
-        // bind-parameter path here — this is safe ONLY because `fetch_to` is a
-        // std::int64_t produced by parse_ts_param (digits → number, never a string).
-        // Never interpolate a string-typed value into this query without an
+        // The query covers the window's whole hourly buckets; the selected hour is picked
+        // from the answer. A custom window that does not parse is refused here (#4644).
+        EchoWindow win;
+        std::int64_t hour_ts = 0;
+        if (!parse_tree_window(req, res, now_epoch_seconds(), win, hour_ts))
+            return;
+        // SECURITY: the bucket bounds are interpolated into the echo.sql query STRING handed
+        // to the agent. The agent forbids parameterized/recursive CTEs, so there is NO
+        // bind-parameter path here — this is safe ONLY because both bounds are
+        // std::int64_t values produced by resolve_echo_window (digits → number, never a
+        // string). Never interpolate a string-typed value into this query without an
         // allowlist / quote-escape; doing so would be SQL injection into echo.sql.
-        const std::string where = fetch_to > 0 ? std::format(" WHERE ts <= {}", fetch_to) : "";
+        const std::string range =
+            std::format(" WHERE hour_ts >= {} AND hour_ts <= {}", win.from_ts, win.to_ts);
         const std::string psql =
-            "SELECT ts, action, pid, ppid, name, cmdline, user FROM $Process_Live" + where +
-            " ORDER BY ts DESC LIMIT 100000";
+            "SELECT hour_ts, name, parent_name, user, start_count, stop_count, abnormal_exit_count "
+            "FROM $Process_Hourly" +
+            range + " ORDER BY hour_ts DESC LIMIT 100000";
         const std::string tsql =
-            "SELECT pid, process_name, proto, local_port, remote_addr, remote_port, state, ts, "
-            "action FROM $TCP_Live" +
-            where + " ORDER BY ts DESC LIMIT 5000";
+            "SELECT hour_ts, remote_addr, remote_port, proto, process_name, connect_count, "
+            "disconnect_count, failed_count FROM $TCP_Hourly" +
+            range + " ORDER BY hour_ts DESC LIMIT 20000";
         const auto caller = caller_fn_(req);
         const auto pout = dispatch_fn_("echo", "sql", {device}, "", {{"sql", psql}}, caller);
         const auto tout = dispatch_fn_("echo", "sql", {device}, "", {{"sql", tsql}}, caller);
@@ -610,7 +642,7 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             note(res, "Device offline \xE2\x80\x94 the process tree needs a connected agent.");
             return;
         }
-        res.set_content(tree_pending(device, preset, from, to, pcmd, tcmd, 1),
+        res.set_content(tree_pending(device, preset, from, to, hour, pcmd, tcmd, 1),
                         "text/html; charset=utf-8");
     });
 
@@ -630,6 +662,7 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         const std::string preset = get_param(req, "preset");
         const std::string from = get_param(req, "from");
         const std::string to = get_param(req, "to");
+        const std::string hour = get_param(req, "hour");
         const std::string pcmd = get_param(req, "pcmd");
         const std::string tcmd = get_param(req, "tcmd");
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device))
@@ -670,7 +703,7 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
                           "offline. Re-run to retry.");
                 return;
             }
-            res.set_content(tree_pending(device, preset, from, to, pcmd, tcmd, attempt + 1),
+            res.set_content(tree_pending(device, preset, from, to, hour, pcmd, tcmd, attempt + 1),
                             "text/html; charset=utf-8");
             return;
         }
@@ -697,20 +730,22 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         // the tree still renders (without inline per-process connections) and says so.
         const bool tcp_ok = tcp.ready && !tcp.failed && !tcp.output.starts_with("error|") &&
                             tcp.output.size() <= kMaxEchoTcpOutputBytes;
-        auto events = parse_echo_process_output(proc.output);
-        auto conns = tcp_ok ? parse_echo_tcp_output(tcp.output) : std::vector<EchoTcpConn>{};
-        const auto anchors = compute_echo_anchors(events);
         const std::int64_t now = now_epoch_seconds();
-        const auto from_ts = parse_ts_param_strict(from);
-        const auto to_ts = parse_ts_param_strict(to);
-        if (preset == "custom" && (!from_ts || !to_ts)) {
-            note(res, "The custom window is not a valid time. Use the From and To pickers "
-                      "(UTC), or epoch seconds, and re-run.");
+        EchoWindow win;
+        std::int64_t hour_req = 0;
+        if (!parse_tree_window(req, res, now, win, hour_req))
             return;
-        }
-        const EchoWindow win = resolve_echo_window(preset, from_ts.value_or(0), to_ts.value_or(0),
-                                                 anchors, now);
-        auto tree = reconstruct_echo_process_tree(events, win.from_ts, win.to_ts, anchors);
+        const auto rows = parse_echo_process_hourly_output(proc.output);
+        const auto all_conns = tcp_ok ? parse_echo_tcp_hourly_output(tcp.output)
+                                      : std::vector<EchoTcpHourRow>{};
+        // The tree shows ONE hour: the requested one, else the newest that has rows.
+        const auto hours = echo_process_hours(rows);
+        const std::int64_t shown_hour = hour_req > 0 ? hour_req : (hours.empty() ? 0 : hours.front());
+        auto tree = build_echo_process_tree(rows, shown_hour);
+        std::vector<EchoTcpHourRow> conns;
+        for (const auto& c : all_conns)
+            if (c.hour_ts == shown_hour)
+                conns.push_back(c);
 
         const std::string os = device_os(lookup_fn_ ? lookup_fn_(device) : std::nullopt);
         // CSPRNG cache token (#801). random_hex(16) → 32 lowercase hex chars, matching
@@ -727,17 +762,21 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             return;
         }
         const std::string token = std::move(*token_exp);
-        const int node_count = tree.running_count + tree.exited_count;
+        const int node_count = static_cast<int>(tree.nodes.size());
         const int anomaly_count = tree.anomaly_count;
 
-        // Full tree, rendered once; running/exited/anomalies/text filtering is applied
-        // client-side from the toolbar (each row carries data-state/data-anom), so a
-        // filter toggle needs no re-dispatch.
-        std::string body;
+        // Full tree, rendered once; anomalies/text filtering is applied client-side from
+        // the toolbar (each row carries data-anom), so a filter toggle needs no re-dispatch.
+        std::string body = render_hour_select(hours, shown_hour, preset, from, to);
         if (!tcp_ok)
             body += "<div class=\"echo-tree-warn\">Connection data was unavailable for this host; "
                     "the process tree is shown without per-process network info.</div>";
-        body += render_echo_tree_fragment(tree, conns, device, token, os);
+        body += render_echo_tree_fragment(tree, conns, token);
+        // Out-of-band: point the DNS / ARP panels at the hour this tree shows.
+        body += "<div id=\"echo-devnet\" hx-swap-oob=\"true\" "
+                "hx-get=\"/fragments/echo/process-tree/device-net" +
+                std::string(shown_hour > 0 ? "?hour=" + std::to_string(shown_hour) : "") +
+                "\" hx-include=\"#echo-tree-host\" hx-trigger=\"load\" hx-swap=\"innerHTML\"></div>";
 
         ReconEntry entry;
         entry.device_id = device;
@@ -748,9 +787,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         entry.created = now;
         cache_put(token, std::move(entry));
 
-        // Record the data class exposed (works-council access-audit posture): `os`
-        // distinguishes a names-only Windows read from a behavioral Linux/macOS read
-        // (which carries command lines); `conns` flags whether connection data was shown.
+        // Record the data class exposed (works-council access-audit posture): `os` is the
+        // device's normalized OS; `conns` flags whether connection data was shown.
         (void)detail::emit_behavioral_audit(
             audit_fn_, req, res, "echo.process_tree.read", "success", "Agent", device,
             std::format("preset={} from={} to={} nodes={} anomalies={} os={} conns={}",
@@ -759,11 +797,12 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         res.set_content(body, "text/html; charset=utf-8");
     });
 
-    // -- Device-net panels: DNS cache + ARP table for the selected host (ADR-0015).
-    // Dispatches two canned read-only echo.sql ($DNS_Live, $ARP_Live), polls, renders
-    // DEVICE-level panels (never per-process — the DNS cache has no pid). Same scoped
-    // Read + Execute-probe tier as the tree run; audits echo.dns.read / echo.arp.read as
-    // DISTINCT verbs (DNS is usage-class PII, kept separately countable). --
+    // -- Device-net panels: DNS cache + ARP table activity for the selected host and hour
+    // (ADR-0015). Dispatches two canned read-only echo.sql ($DNS_Hourly, $ARP_Hourly),
+    // polls, renders DEVICE-level panels (never per-process — the DNS cache has no
+    // process). Same scoped Read + Execute-probe tier as the tree run; audits
+    // echo.dns.read / echo.arp.read as DISTINCT verbs (DNS is usage-class PII, kept
+    // separately countable). --
     sink.Get("/fragments/echo/process-tree/device-net", [this, can_execute](
                                                             const httplib::Request& req,
                                                             httplib::Response& res) {
@@ -790,15 +829,28 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         }
         std::string dcmd = get_param(req, "dcmd");
         std::string acmd = get_param(req, "acmd");
+        const std::string hour = get_param(req, "hour");
+        const auto hour_ts = parse_ts_param_strict(hour);
+        if (!hour_ts) {
+            note(res, "The hour is not a valid time. Re-select the host to retry.");
+            return;
+        }
         if (dcmd.empty() || acmd.empty()) {
-            // First call: dispatch the two queries (newest-first; the render reduces the
-            // appeared/removed stream to the current cache).
+            // First call: dispatch the two queries for the hour the tree shows, or for the
+            // default 24-hour window when none was picked (the render then takes the newest
+            // hour that has rows). Both bounds are std::int64_t (see the /run SECURITY note).
+            const EchoWindow win = *hour_ts > 0 ? EchoWindow{*hour_ts, *hour_ts}
+                                                : resolve_echo_window("24h", 0, 0, now_epoch_seconds());
+            const std::string range =
+                std::format(" WHERE hour_ts >= {} AND hour_ts <= {}", win.from_ts, win.to_ts);
             const std::string dsql =
-                "SELECT name, record_type, data, ttl_remaining_s, source, ts, action "
-                "FROM $DNS_Live ORDER BY ts DESC LIMIT 20000";
+                "SELECT hour_ts, name, record_type, data, appear_count, remove_count, "
+                "negative_count FROM $DNS_Hourly" +
+                range + " ORDER BY hour_ts DESC LIMIT 20000";
             const std::string asql =
-                "SELECT interface, ip_address, mac_address, entry_type, ts, action "
-                "FROM $ARP_Live ORDER BY ts DESC LIMIT 20000";
+                "SELECT hour_ts, interface, ip_address, mac_address, appear_count, remove_count, "
+                "is_router, rebind_count FROM $ARP_Hourly" +
+                range + " ORDER BY hour_ts DESC LIMIT 20000";
             const auto caller = caller_fn_(req);
             const auto dout = dispatch_fn_("echo", "sql", {device}, "", {{"sql", dsql}}, caller);
             const auto aout = dispatch_fn_("echo", "sql", {device}, "", {{"sql", asql}}, caller);
@@ -821,7 +873,7 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
                 note(res, "Device offline \xE2\x80\x94 the DNS/ARP panels need a connected agent.");
                 return;
             }
-            res.set_content(devnet_pending(device, dc, ac, 1), "text/html; charset=utf-8");
+            res.set_content(devnet_pending(device, dc, ac, hour, 1), "text/html; charset=utf-8");
             return;
         }
         // Poll: validate the command-id shape (same guard as the tree result route).
@@ -846,20 +898,28 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
                 note(res, "No response from the device (timed out). Re-select the host to retry.");
                 return;
             }
-            res.set_content(devnet_pending(device, dcmd, acmd, attempt + 1),
+            res.set_content(devnet_pending(device, dcmd, acmd, hour, attempt + 1),
                             "text/html; charset=utf-8");
             return;
         }
-        auto dns_rows = (!dns.failed && !dns.output.starts_with("error|") &&
-                         dns.output.size() <= kMaxEchoDeviceNetOutputBytes)
-                            ? parse_echo_dns_output(dns.output)
-                            : std::vector<EchoDnsCacheEntry>{};
-        auto arp_rows = (!arp.failed && !arp.output.starts_with("error|") &&
-                         arp.output.size() <= kMaxEchoDeviceNetOutputBytes)
-                            ? parse_echo_arp_output(arp.output)
-                            : std::vector<EchoArpEntry>{};
-        const std::string body = "<div class=\"devnet-row\">" + render_echo_dns_panel(dns_rows) +
-                                 render_echo_arp_panel(arp_rows) + "</div>";
+        const auto dns_rows = (!dns.failed && !dns.output.starts_with("error|") &&
+                               dns.output.size() <= kMaxEchoDeviceNetOutputBytes)
+                                  ? parse_echo_dns_hourly_output(dns.output)
+                                  : std::vector<EchoDnsHourRow>{};
+        const auto arp_rows = (!arp.failed && !arp.output.starts_with("error|") &&
+                               arp.output.size() <= kMaxEchoDeviceNetOutputBytes)
+                                  ? parse_echo_arp_hourly_output(arp.output)
+                                  : std::vector<EchoArpHourRow>{};
+        // The requested hour, else the newest hour either panel has rows for.
+        std::int64_t shown_hour = *hour_ts;
+        if (shown_hour <= 0) {
+            for (const auto& r : dns_rows)
+                shown_hour = (std::max)(shown_hour, r.hour_ts);
+            for (const auto& r : arp_rows)
+                shown_hour = (std::max)(shown_hour, r.hour_ts);
+        }
+        const std::string body = "<div class=\"devnet-row\">" + render_echo_dns_panel(dns_rows, shown_hour) +
+                                 render_echo_arp_panel(arp_rows, shown_hour) + "</div>";
         res.set_content(body, "text/html; charset=utf-8");
     });
 
@@ -1007,8 +1067,7 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
                           : "The device failed the status query.");
             return;
         }
-        const std::string compat = (!cp.failed && !cp.output.starts_with("error|")) ? cp.output : "";
-        res.set_content(render_echo_capture_sources(device, st.output, compat),
+        res.set_content(render_echo_capture_sources(device, st.output),
                         "text/html; charset=utf-8");
     });
 

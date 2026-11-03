@@ -19,6 +19,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <cctype>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -38,17 +40,26 @@ DexAgentResponse resp(const std::string& agent_id, const std::string& output) {
     return r;
 }
 
-// A canned $Process_Live body: systemd(1) -> bash(100). node 0 is systemd.
+// A canned $Process_Hourly body for hour 7200: systemd -> bash. node 0 is systemd, node 1
+// bash. (parent_name and abnormal_exit_count are agent-folded; fixture-only until then.)
 const char* kProcOut =
-    "__schema__|ts|action|pid|ppid|name|cmdline|user\n"
-    "100|started|1|0|systemd||root\n"
-    "110|started|100|1|bash||alice\n";
+    "__schema__|hour_ts|name|parent_name|user|start_count|stop_count|abnormal_exit_count\n"
+    "7200|systemd||root|1|0|0\n"
+    "7200|bash|systemd|alice|3|3|1\n";
+// Two hours: 7200 (systemd -> bash) is the newest, 3600 holds only cron.
+const char* kProcTwoHours =
+    "__schema__|hour_ts|name|parent_name|user|start_count|stop_count|abnormal_exit_count\n"
+    "7200|systemd||root|1|0|0\n"
+    "7200|bash|systemd|alice|3|3|1\n"
+    "3600|cron||root|2|2|0\n";
 
 // The two canned command ids the result route polls (must start with "echo-").
 const std::string kProcCmd = "echo-p";
 const std::string kTcpCmd = "echo-t";
 // Canned ids for the capture-sources frame's two dispatches (`echo status` and
 // `echo compatibility`), which the route polls by the scmd/ccmd query params.
+const std::string kDnsCmd = "echo-d";
+const std::string kArpCmd = "echo-a";
 const std::string kStatusCmd = "echo-s";
 const std::string kCompatCmd = "echo-c";
 
@@ -83,6 +94,9 @@ struct EchoHarness {
     std::string os = "linux";
     std::string proc_output = kProcOut;
     std::string tcp_output;    // empty → tree renders without conns (best-effort TCP)
+    std::string dns_output;    // canned $DNS_Hourly / $ARP_Hourly replies for the device-net poll
+    std::string arp_output;
+    std::vector<std::string> sql_log; // every echo.sql string a dispatch carried, in order
     // Capture-sources frame: canned `echo status` / `echo compatibility` replies.
     std::string status_output;
     std::string compat_output = "config|dummy|1";
@@ -173,9 +187,14 @@ struct EchoHarness {
             last_dispatch_caller = caller;
             last_dispatch_params = params;
             const auto it = params.find("sql");
-            const bool is_proc =
-                it != params.end() && it->second.find("$Process_Live") != std::string::npos;
-            return {.sent = 1, .command_id = is_proc ? kProcCmd : kTcpCmd};
+            const std::string sql = it != params.end() ? it->second : std::string{};
+            sql_log.push_back(sql);
+            const auto has = [&](const char* t) { return sql.find(t) != std::string::npos; };
+            return {.sent = 1,
+                    .command_id = has("$Process_Hourly") ? kProcCmd
+                                  : has("$DNS_Hourly")   ? kDnsCmd
+                                  : has("$ARP_Hourly")   ? kArpCmd
+                                                         : kTcpCmd};
         };
         // #3133 review fix: mirrors the production idiom (resolve the session,
         // derive a real caller) closely enough for this harness's simplified
@@ -193,6 +212,10 @@ struct EchoHarness {
                 return {resp(device, proc_output)};
             if (cmd == kTcpCmd)
                 return {resp(device, tcp_output)};
+            if (cmd == kDnsCmd)
+                return {resp(device, dns_output)};
+            if (cmd == kArpCmd)
+                return {resp(device, arp_output)};
             if (cmd == kStatusCmd)
                 return {resp(device, status_output)};
             if (cmd == kCompatCmd)
@@ -219,7 +242,7 @@ struct EchoHarness {
     // query, and we control the canned command ids). Returns the response.
     std::unique_ptr<httplib::Response> run_result(const std::string& extra = "") {
         return sink.Get("/fragments/echo/process-tree/result?device=" + device +
-                        "&preset=10m&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd + "&n=1" + extra);
+                        "&preset=24h&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd + "&n=1" + extra);
     }
 
     // Drive the capture-sources frame past the pending poll, the same way
@@ -381,12 +404,12 @@ TEST_CASE("echo routes: /detail audit normalizes the agent-controlled os",
 
 TEST_CASE("echo routes: /run audit neutralizes an injected preset", "[echo][routes][audit]") {
     EchoHarness h;
-    // preset carries an audit-field-forgery attempt; canonicalization maps it to 10m.
+    // preset carries an audit-field-forgery attempt; canonicalization maps it to 24h.
     auto r = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=x%20command_id%3Dforged");
     REQUIRE(r);
     const auto* row = h.find_audit("echo.process_tree.read", "dispatched");
     REQUIRE(row != nullptr);
-    CHECK(row->detail.find("preset=10m") != std::string::npos);
+    CHECK(row->detail.find("preset=24h") != std::string::npos);
     CHECK(row->detail.find("forged") == std::string::npos); // injection neutralized
 }
 
@@ -700,10 +723,10 @@ TEST_CASE("Echo capture-sources: an offline device shows the agent's reason, not
     // The `error|` prefix itself is stripped, not echoed raw.
     CHECK(res->body.find("error|") == std::string::npos);
     // And it must NOT have rendered the sources grid for a dead store. Assert
-    // the id the renderer actually emits (`capTable`, echo_process_tree.cpp:1235)
+    // the id the renderer actually emits (`capCards`, echo_process_tree.cpp)
     // -- an earlier version of this checked for "capture-source-row", a string
     // that exists nowhere in the codebase and so passed vacuously.
-    CHECK(res->body.find("capTable") == std::string::npos);
+    CHECK(res->body.find("capCards") == std::string::npos);
 }
 
 TEST_CASE("Echo capture-sources: a healthy device still renders the sources grid",
@@ -719,10 +742,243 @@ TEST_CASE("Echo capture-sources: a healthy device still renders the sources grid
     auto res = h.run_capture_sources();
     REQUIRE(res != nullptr);
     REQUIRE(res->status == 200);
-    // Positively assert the grid: `capTable` is what the renderer emits.
-    CHECK(res->body.find("capTable") != std::string::npos);
+    // Positively assert the grid: `capCards` is what the renderer emits.
+    CHECK(res->body.find("capCards") != std::string::npos);
     CHECK(res->body.find("Echo storage is offline") == std::string::npos);
     CHECK(res->body.find("failed the status query") == std::string::npos);
+}
+
+// =============================================================================
+// Roll-up only: the hourly SQL, whole-hour windows, the Hour selector, the cards
+// =============================================================================
+
+namespace {
+
+// The number following `key` in `sql` (digits only), or -1.
+std::int64_t number_after(const std::string& sql, const std::string& key) {
+    const auto p = sql.find(key);
+    if (p == std::string::npos)
+        return -1;
+    std::int64_t v = 0;
+    std::size_t i = p + key.size();
+    if (i >= sql.size() || !std::isdigit(static_cast<unsigned char>(sql[i])))
+        return -1;
+    for (; i < sql.size() && std::isdigit(static_cast<unsigned char>(sql[i])); ++i)
+        v = v * 10 + (sql[i] - '0');
+    return v;
+}
+
+} // namespace
+
+TEST_CASE("echo routes: /run dispatches only the hourly tables, with whole-hour bounds",
+          "[echo][routes][sql]") {
+    EchoHarness h;
+    auto r = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=24h");
+    REQUIRE(r);
+    REQUIRE(h.sql_log.size() == 2);
+    const std::string& psql = h.sql_log[0];
+    const std::string& tsql = h.sql_log[1];
+    CHECK(psql.starts_with("SELECT hour_ts, name, parent_name, user, start_count, stop_count, "
+                           "abnormal_exit_count FROM $Process_Hourly WHERE hour_ts >= "));
+    CHECK(psql.ends_with(" ORDER BY hour_ts DESC LIMIT 100000"));
+    CHECK(tsql.starts_with("SELECT hour_ts, remote_addr, remote_port, proto, process_name, "
+                           "connect_count, disconnect_count, failed_count FROM $TCP_Hourly "
+                           "WHERE hour_ts >= "));
+    CHECK(tsql.ends_with(" ORDER BY hour_ts DESC LIMIT 20000"));
+    for (const auto& sql : h.sql_log) {
+        CHECK(sql.find("_Live") == std::string::npos); // no raw capture rows are read
+        const auto from = number_after(sql, "hour_ts >= ");
+        const auto to = number_after(sql, "hour_ts <= ");
+        REQUIRE(from > 0);
+        CHECK(from % 3600 == 0);
+        CHECK(to % 3600 == 0);
+        CHECK((to - from) / 3600 == 23); // 24 whole buckets
+    }
+    // The poll URL carries the window and the (absent) hour.
+    CHECK(r->body.find("process-tree/result") != std::string::npos);
+    CHECK(r->body.find("preset=24h") != std::string::npos);
+    CHECK(r->body.find("hour=") != std::string::npos);
+
+    SECTION("1h is one bucket; a reversed custom range collapses to one") {
+        EchoHarness one;
+        (void)one.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=1h");
+        REQUIRE(one.sql_log.size() == 2);
+        CHECK(number_after(one.sql_log[0], "hour_ts >= ") == number_after(one.sql_log[0], "hour_ts <= "));
+
+        EchoHarness rev;
+        (void)rev.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=custom"
+                           "&from=2026-06-18T13:00&to=2026-06-18T12:00");
+        REQUIRE(rev.sql_log.size() == 2);
+        CHECK(number_after(rev.sql_log[0], "hour_ts >= ") == number_after(rev.sql_log[0], "hour_ts <= "));
+    }
+}
+
+TEST_CASE("echo routes: the frame offers 1h / 24h / 7d / custom and no retired anchors",
+          "[echo][routes][presets]") {
+    EchoHarness h;
+    auto r = h.sink.Get("/fragments/echo/process-tree");
+    REQUIRE(r);
+    for (const char* tok : {"preset=1h", "preset=24h", "preset=7d", "preset=custom"})
+        CHECK(r->body.find(tok) != std::string::npos);
+    for (const char* gone : {"on_boot", "on_install", "preset=1m", "preset=10m", "preset=1d",
+                             "On boot", "On agent install", "data-statechip", "Running", "Exited"})
+        CHECK(r->body.find(gone) == std::string::npos);
+    // The device DNS / ARP placeholder is filled by the tree result, not by a host-change poll.
+    CHECK(r->body.find("id=\"echo-devnet\"></div>") != std::string::npos);
+}
+
+TEST_CASE("echo routes: /result shows the newest hour by default and an Hour selector",
+          "[echo][routes][hour]") {
+    EchoHarness h;
+    h.proc_output = kProcTwoHours;
+    auto r = h.run_result();
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    // Newest hour (7200) shown: systemd + bash, not cron.
+    CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+    CHECK(r->body.find("<span class=\"tt-name\">cron</span>") == std::string::npos);
+    // The selector lists both hours, the shown one selected, and re-runs the same window.
+    CHECK(r->body.find("<option value=\"7200\" selected>") != std::string::npos);
+    CHECK(r->body.find("<option value=\"3600\">") != std::string::npos);
+    CHECK(r->body.find("id=\"echo-tree-hour\" name=\"hour\"") != std::string::npos);
+    CHECK(r->body.find("process-tree/run?preset=24h") != std::string::npos);
+    // Out-of-band: the device DNS / ARP panels follow the shown hour.
+    CHECK(r->body.find("id=\"echo-devnet\" hx-swap-oob=\"true\"") != std::string::npos);
+    CHECK(r->body.find("device-net?hour=7200") != std::string::npos);
+
+    SECTION("an explicit hour picks that hour's tree") {
+        auto older = h.run_result("&hour=3600");
+        REQUIRE(older);
+        CHECK(older->body.find("<span class=\"tt-name\">cron</span>") != std::string::npos);
+        CHECK(older->body.find("<span class=\"tt-name\">bash</span>") == std::string::npos);
+        CHECK(older->body.find("<option value=\"3600\" selected>") != std::string::npos);
+        CHECK(older->body.find("device-net?hour=3600") != std::string::npos);
+    }
+    SECTION("an unparseable hour is refused") {
+        EchoHarness bad;
+        bad.proc_output = kProcTwoHours;
+        auto res = bad.run_result("&hour=yesterday");
+        REQUIRE(res);
+        CHECK(res->body.find("not a valid time") != std::string::npos);
+        CHECK(bad.find_audit("echo.process_tree.read", "success") == nullptr);
+    }
+}
+
+TEST_CASE("echo routes: an agent that predates the fold answers error| and gets the reason",
+          "[echo][routes][skew]") {
+    EchoHarness h;
+    h.proc_output = "error|no such column: parent_name";
+    auto r = h.run_result();
+    REQUIRE(r);
+    CHECK(r->body.find("The device reported an error") != std::string::npos);
+    CHECK(r->body.find("parent_name") != std::string::npos);
+    CHECK(h.find_audit("echo.process_tree.read", "success") == nullptr);
+}
+
+TEST_CASE("echo routes: /detail joins connections by process name", "[echo][routes][detail]") {
+    EchoHarness h;
+    h.tcp_output =
+        "__schema__|hour_ts|remote_addr|remote_port|proto|process_name|connect_count|"
+        "disconnect_count|failed_count\n"
+        "7200|1.2.3.4|443|tcp|bash|5|4|1\n"
+        "3600|9.9.9.9|80|tcp|bash|1|1|0\n"; // another hour: not shown
+    const std::string token = extract_token(h.run_result()->body);
+    REQUIRE(is_32_hex(token));
+    auto bash = h.get_detail(token, 1);
+    REQUIRE(bash);
+    CHECK(bash->body.find("1.2.3.4:443") != std::string::npos);
+    CHECK(bash->body.find("9.9.9.9") == std::string::npos);
+    auto systemd = h.get_detail(token, 0);
+    REQUIRE(systemd);
+    CHECK(systemd->body.find("1.2.3.4") == std::string::npos);
+    CHECK(systemd->body.find("No TCP connections recorded under this name") != std::string::npos);
+}
+
+TEST_CASE("echo routes: /device-net dispatches only the hourly tables for the chosen hour",
+          "[echo][routes][sql]") {
+    SECTION("with an hour: that single bucket") {
+        EchoHarness h;
+        auto r = h.sink.Get("/fragments/echo/process-tree/device-net?device=dev-A&hour=7200");
+        REQUIRE(r);
+        REQUIRE(h.sql_log.size() == 2);
+        CHECK(h.sql_log[0] ==
+              "SELECT hour_ts, name, record_type, data, appear_count, remove_count, negative_count "
+              "FROM $DNS_Hourly WHERE hour_ts >= 7200 AND hour_ts <= 7200 "
+              "ORDER BY hour_ts DESC LIMIT 20000");
+        CHECK(h.sql_log[1] ==
+              "SELECT hour_ts, interface, ip_address, mac_address, appear_count, remove_count, "
+              "is_router, rebind_count FROM $ARP_Hourly WHERE hour_ts >= 7200 AND hour_ts <= 7200 "
+              "ORDER BY hour_ts DESC LIMIT 20000");
+        CHECK(r->body.find("hour=7200") != std::string::npos); // the poll keeps the hour
+    }
+    SECTION("without one: the default 24-hour window") {
+        EchoHarness h;
+        (void)h.sink.Get("/fragments/echo/process-tree/device-net?device=dev-A");
+        REQUIRE(h.sql_log.size() == 2);
+        for (const auto& sql : h.sql_log) {
+            CHECK(sql.find("_Live") == std::string::npos);
+            CHECK((number_after(sql, "hour_ts <= ") - number_after(sql, "hour_ts >= ")) / 3600 == 23);
+        }
+    }
+    SECTION("a bad hour is refused before any dispatch") {
+        EchoHarness h;
+        auto r = h.sink.Get("/fragments/echo/process-tree/device-net?device=dev-A&hour=soon");
+        REQUIRE(r);
+        CHECK(r->body.find("not a valid time") != std::string::npos);
+        CHECK(h.sql_log.empty());
+    }
+}
+
+TEST_CASE("echo routes: /device-net renders the chosen hour's DNS and ARP activity",
+          "[echo][routes][devnet]") {
+    EchoHarness h;
+    h.dns_output =
+        "__schema__|hour_ts|name|record_type|data|appear_count|remove_count|negative_count\n"
+        "7200|new.test|A|1.1.1.1|4|3|0\n"
+        "3600|old.test|A|2.2.2.2|1|1|0\n";
+    h.arp_output =
+        "__schema__|hour_ts|interface|ip_address|mac_address|appear_count|remove_count|is_router|"
+        "rebind_count\n"
+        "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0|1|0\n";
+    const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
+                             "&acmd=" + kArpCmd + "&n=1";
+    auto chosen = h.sink.Get(poll + "&hour=3600");
+    REQUIRE(chosen);
+    CHECK(chosen->body.find("old.test") != std::string::npos);
+    CHECK(chosen->body.find("new.test") == std::string::npos);
+    CHECK(chosen->body.find("No ARP activity recorded for this hour") != std::string::npos);
+    // No hour given: the newest hour present in either answer.
+    auto newest = h.sink.Get(poll);
+    REQUIRE(newest);
+    CHECK(newest->body.find("new.test") != std::string::npos);
+    CHECK(newest->body.find("old.test") == std::string::npos);
+    CHECK(newest->body.find("pill info\">router<") != std::string::npos);
+}
+
+TEST_CASE("echo routes: capture-source cards read <src>_rows, then <src>_live_rows",
+          "[echo][routes][capture-sources]") {
+    SECTION("<src>_rows alone") {
+        EchoHarness h;
+        h.status_output = "config|process_enabled|true\nconfig|process_rows|1234\n";
+        auto res = h.run_capture_sources();
+        REQUIRE(res);
+        CHECK(res->body.find(">1234<") != std::string::npos);
+        CHECK(res->body.find("$Process_Hourly") != std::string::npos);
+    }
+    SECTION("<src>_live_rows alone") {
+        EchoHarness h;
+        h.status_output = "config|process_enabled|true\nconfig|process_live_rows|5678\n";
+        auto res = h.run_capture_sources();
+        REQUIRE(res);
+        CHECK(res->body.find(">5678<") != std::string::npos);
+    }
+    SECTION("neither key: a dash, not zero") {
+        EchoHarness h;
+        h.status_output = "config|process_enabled|true\n";
+        auto res = h.run_capture_sources();
+        REQUIRE(res);
+        CHECK(res->body.find("&mdash;") != std::string::npos);
+    }
 }
 
 // SEC-2/SEC-3 confinement-gap class (found during a docs sweep): devices_fn_
