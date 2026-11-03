@@ -136,6 +136,8 @@ metadata:
   version: 1.0.0
   description: >
     Aggregate TCP connections grouped by process name and remote endpoint.
+    A socket first seen already closing is recorded once per process and remote
+    per hour, so it appears once here and never as a disconnect.
   tags: [echo, warehouse, network, tcp]
 
 spec:
@@ -376,7 +378,9 @@ metadata:
   version: 1.0.0
   description: >
     Show all TCP connections to a specific remote IP address. Replace the
-    target_ip parameter with the IP to investigate.
+    target_ip parameter with the IP to investigate. A socket first seen already
+    closing is recorded once per process and remote per hour, so it appears once
+    here and never as a disconnect.
   tags: [echo, warehouse, network, investigation]
 
 spec:
@@ -433,6 +437,8 @@ metadata:
   version: 1.0.0
   description: >
     Show daily aggregated TCP connection counts by remote address and process.
+    A socket first seen already closing is recorded once per process and remote
+    per hour, so it appears once here and never as a disconnect.
   tags: [echo, warehouse, network, aggregation]
 
 spec:
@@ -751,11 +757,20 @@ metadata:
   displayName: "Echo: Run Aggregation"
   version: 1.0.0
   description: >
-    Force an immediate rollup aggregation cycle (normally runs every 15 minutes).
-    Aggregates live data into hourly, daily, and monthly summary tables and
-    then permanently deletes rows older than each tier's retention limit.
-    Classified Destructive/Irreversible with no approval gate: an operator
-    who can dispatch it deletes history immediately and cannot undo it.
+    Force an immediate maintenance pass (normally runs every 15 minutes).
+    Aggregates raw capture rows into hourly, daily, and monthly summary tables,
+    permanently deletes rows older than each tier's retention limit, and then
+    enforces the database byte budget (db_budget_bytes): while the database is
+    over it, the pass permanently deletes the oldest raw capture rows that
+    their first summary tier has already passed (hourly, or daily for user
+    and software), never the newest 24 hours, then hourly rows older than 48
+    hours (5 days for procperf), even inside their retention window; paused or
+    errored sources (an unreadable <source>_enabled counts as errored) are
+    exempt. It may also run the one-off VACUUM that converts an older database
+    to incremental auto_vacuum (collectors, status and configure wait while it
+    runs). Classified Destructive/Irreversible with no approval gate:
+    an operator who can dispatch it deletes history immediately and cannot
+    undo it.
   tags: [echo, warehouse, rollup, aggregation]
 
 spec:

@@ -340,12 +340,33 @@ public:
     void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
 
     /// ADR-1007 — optional observability sink for the per-device
-    /// concurrency-claim path (skip counts, force-releases). nullptr (the
-    /// default) means no metrics — matches every sibling store's `set_metrics`
-    /// idiom (a post-construction setter, not a constructor parameter, so
-    /// this costs zero changes to any existing `ExecutionTracker(pg::PgPool&)`
-    /// call site).
+    /// concurrency-claim path (skip counts, force-releases) and, since #3834,
+    /// the read-degrade counter of the five `_checked` readers
+    /// (`yuzu_server_execution_tracker_read_degrade_total{method,reason}`).
+    /// nullptr (the default) means no metrics — matches every sibling store's
+    /// `set_metrics` idiom (a post-construction setter, not a constructor
+    /// parameter, so this costs zero changes to any existing
+    /// `ExecutionTracker(pg::PgPool&)` call site).
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
+    /// #3834 — register (describe) and pre-seed to 0 every `(method, reason)` series of
+    /// `yuzu_server_execution_tracker_read_degrade_total` (5 methods x 3 reasons = 15), so a healthy
+    /// store reads "wired, nothing degraded" on a dashboard instead of "series absent" and
+    /// `increase()` has a baseline (docs/observability-conventions.md). The label sets live in
+    /// `execution_tracker.cpp`, and the constants the emit sites use are indexed out of the very
+    /// arrays this function reads, so an emitted label value is a seeded one as long as every emit
+    /// site uses those constants (a convention: `note_read_degrade` accepts any string). Call once
+    /// at boot, next to `set_metrics()`. Static: it needs no store.
+    ///
+    /// The five readers it covers: `query_executions_checked`, `get_execution_checked`,
+    /// `get_agent_statuses_checked`, `get_agent_statuses_for_executions_checked`,
+    /// `get_children_checked`. The counter is bumped INSIDE those bodies, so the unchecked wrappers
+    /// that delegate to them (`query_executions`, `get_agent_statuses`,
+    /// `get_agent_statuses_for_executions`, `get_children`) are counted too; the unchecked
+    /// `get_execution()` has its own body and is NOT counted. A success-empty read (including an
+    /// empty execution-id list) is not a degrade. `store_not_open` can only occur in a harness: a
+    /// running server refuses to boot when the tracker did not open.
+    static void seed_read_degrade_metrics(yuzu::MetricsRegistry& metrics);
 
     // Query
     std::vector<Execution> query_executions(const ExecutionQuery& q = {}) const;

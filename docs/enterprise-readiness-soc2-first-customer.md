@@ -106,6 +106,18 @@ before #2376, treat the grant-population export as having been accessible to all
 authenticated principals unless RBAC was explicitly enabled on that deployment.** Full
 decision record: `docs/security-reviews/authz-topology-floor-2026-08-05.md`.
 
+**Addendum — the Settings Access reviews panel did not refuse engine sessions until #6744
+(CC6.1/CC6.2).** Every `/api/v1/access-reviews` route and MCP twin refused an engine principal's
+session ("only a human can sign this evidence"), but the two Settings fragments
+(`GET /fragments/settings/access-reviews` and its `/campaign` view) did not, so an engine
+principal holding `AccessReview:Read` through a custom role could read the grant population and
+the campaign attestation rows through them; #6744 closes it, and a refused engine session now
+writes a denied `access_review.list` / `access_review.get` row. For the period before the fix the
+audit log cannot show such a read (a successful read wrote no row), and the
+`engine_principal.audit.no_admin` check does not flag a custom role granting only
+`AccessReview:Read`, so an auditor testing that period should review the custom roles assigned to
+engine principals for `AccessReview:Read` rather than rely on the audit trail.
+
 **Addendum — the access-review export now states whether RBAC was actually enforced
 (CC6.2, RBAC delivery plan A3).** #2376 above closed *who* can read the grant-population
 export; it did not address a separate gap this section's own evidence framing had:
@@ -860,6 +872,18 @@ rather than device telemetry and are inventoried here on that basis.
 The fleet visualization cache (`FleetTopologyStore`) is the highest-resolution endpoint telemetry surfaced in the dashboard. It holds at most two snapshots in memory at any time (single-flight refill, no SQLite persistence) and each snapshot is invalidated 60 seconds after the agent dispatch completes; restarting the server purges all cached topology. Process-level fields (`name`, `user`, `category`) are agent-controlled strings rendered after HTML escape and length clamp; the `category` field is computed server-side from a typed enum (`process_category.hpp`) so agents cannot inject arbitrary palette keys. Privacy-sensitive customers can suppress process collection on specific agents via `echo.configure process_enabled=false` (the corresponding cubes in the visualization render with no interior dots) or disable the whole feature with `--viz-disable` / `YUZU_VIZ_DISABLE`.
 
 The Guardian events table is sized for **~10k events/s during a fleet-wide incident** (design doc §9.1), i.e. ~864M rows/day. The 30-day default is the retention/recovery trade-off: long enough to correlate an incident across the standard forensic window, short enough to keep steady-state disk under ~25GB per million endpoints at typical drift rates. Tenants with longer forensic SLAs should raise `guardian_event_retention_days` _and_ provision storage — the product does not auto-trim disk.
+
+#### Agent-side `command_dedup.db` (replay protection, per device)
+
+`command_dedup.db` is the agent's durable command-idempotency store (HA WS-0, ADR-2002; `docs/command-dedup.md`). It is
+listed here so a data-inventory pass finds it. It stores each recent command's terminal response frame: status, exit
+code, plugin result status and a short error or reject text, capped at 64 KiB. It does **not** store streamed command
+output, but the files are still treated as sensitive as a precaution.
+
+| Data | Data class | Default | Retention | Deletion mechanism | Configurable via |
+|---|---|---|---|---|---|
+| `command_dedup.db`: one row per recent `command_id` with the stored terminal `CommandResponse` (status, exit code, plugin result status, short error text; the frame is capped at 64 KiB) | Command metadata: which command ids ran and how they ended. Not streamed output. Local to the endpoint and never sent anywhere by this store; owner-only file mode on POSIX, the data directory's inherited ACL on Windows | **On** | A fixed-size, clock-free ring over the most recent terminal commands (20,000, plus up to 512 between prune passes); in-flight rows are never evicted | Ring eviction. **Not removed by uninstall by default:** the data directory is kept by the DEB, RPM and macOS uninstallers and by a silent Windows uninstall (an interactive Windows uninstall removes it only if the operator answers Yes). Delete the file by hand to erase it | Not configurable |
+| `command_dedup.db.corrupt-<unix-epoch-seconds>[-n]` (+ `-wal`/`-shm`/`-journal`): the previous store, kept when it was too corrupt to open | Same content and sensitivity as above | Created only on a corruption recovery | **The newest 3 are kept; there is no age expiry.** Older ones are removed at the end of each later recovery | Automatic prune at the end of each later recovery, or manual deletion by the operator once reviewed. Also **not removed by uninstall by default** (same installers as above) | Not configurable (the count is a compile-time constant) |
 
 #### Agent-side, transient (no durable store)
 

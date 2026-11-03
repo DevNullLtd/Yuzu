@@ -16,6 +16,7 @@
 #include <format>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace yuzu::echo {
@@ -485,13 +486,18 @@ std::vector<ProcessEvent> compute_process_events(
 std::vector<NetworkEvent> compute_network_events(
     const std::vector<NetConnection>& previous,
     const std::vector<NetConnection>& current,
-    int64_t timestamp, int64_t snapshot_id) {
+    int64_t timestamp, int64_t snapshot_id, HourlySeenSet& closing_seen) {
 
     std::vector<NetworkEvent> events;
 
     auto make_key = [](const NetConnection& c) -> std::string {
         return std::format("{}:{}:{}:{}:{}", c.proto, c.local_addr, c.local_port,
                            c.remote_addr, c.remote_port);
+    };
+    auto emit = [&](const char* action, const NetConnection& c) {
+        events.push_back({timestamp, snapshot_id, action, c.proto, c.local_addr, c.local_port,
+                          c.remote_addr, c.remote_host, c.remote_port, c.state, c.pid,
+                          c.process_name});
     };
 
     std::unordered_map<std::string, const NetConnection*> prev_map;
@@ -501,22 +507,67 @@ std::vector<NetworkEvent> compute_network_events(
     for (const auto& c : current) curr_map[make_key(c)] = &c;
 
     for (const auto& c : current) {
-        if (!prev_map.contains(make_key(c))) {
-            events.push_back({timestamp, snapshot_id, "connected", c.proto,
-                              c.local_addr, c.local_port, c.remote_addr, c.remote_host,
-                              c.remote_port, c.state, c.pid, c.process_name});
+        const bool closing = tcp_state_is_closing(c.state);
+        const auto it = prev_map.find(make_key(c));
+        if (it == prev_map.end()) {
+            if (!closing) {
+                emit("connected", c);
+            } else if (closing_seen.first_this_hour(
+                           timestamp,
+                           std::format("{}\x1f{}\x1f{}", c.process_name, c.remote_addr,
+                                       c.remote_port))) {
+                // First seen already closing: a poll catches most short-lived sockets only in
+                // TIME_WAIT, one per ephemeral port. One row per process and remote per hour
+                // keeps the fact (that process talked to that remote) without the churn.
+                emit("connected", c);
+            }
+            continue;
         }
+        const bool was_closing = tcp_state_is_closing(it->second->state);
+        if (!was_closing && closing)
+            emit("disconnected", c); // the connection ended; the state says how
+        else if (was_closing && !closing)
+            emit("connected", c); // the 4-tuple was reused by a new connection
     }
 
     for (const auto& c : previous) {
-        if (!curr_map.contains(make_key(c))) {
-            events.push_back({timestamp, snapshot_id, "disconnected", c.proto,
-                              c.local_addr, c.local_port, c.remote_addr, c.remote_host,
-                              c.remote_port, c.state, c.pid, c.process_name});
-        }
+        // A socket that was already closing was accounted for when it entered that state.
+        if (!curr_map.contains(make_key(c)) && !tcp_state_is_closing(c.state))
+            emit("disconnected", c);
     }
 
     return events;
+}
+
+std::string pid_name_lookup(const std::unordered_map<uint32_t, PidName>& names, uint32_t pid,
+                            int64_t ts) {
+    if (pid == 0)
+        return {};
+    const auto it = names.find(pid);
+    return (it != names.end() &&
+            (it->second.exited_at == 0 || ts - it->second.exited_at <= kPidNameGraceSec))
+               ? it->second.name
+               : std::string{};
+}
+
+void fill_process_names(std::vector<NetConnection>& conns,
+                        const std::unordered_map<uint32_t, PidName>& names, int64_t ts) {
+    for (auto& c : conns) {
+        if (c.process_name.empty())
+            c.process_name = pid_name_lookup(names, c.pid, ts);
+    }
+}
+
+void note_pid_exits(std::unordered_map<uint32_t, PidName>& names,
+                    const std::vector<yuzu::agent::ProcessInfo>& running, int64_t ts) {
+    std::unordered_set<uint32_t> alive;
+    alive.reserve(running.size());
+    for (const auto& p : running)
+        alive.insert(p.pid);
+    for (auto& [pid, entry] : names) {
+        if (entry.exited_at == 0 && !alive.contains(pid))
+            entry.exited_at = ts;
+    }
 }
 
 std::vector<ServiceEvent> compute_service_events(

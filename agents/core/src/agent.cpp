@@ -21,6 +21,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/agent/reconnect_backoff.hpp>
 #include <yuzu/agent/server_address_resolver.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/agent/trigger_engine.hpp>
@@ -47,6 +48,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "command_frames.hpp"   // make_output_frame / make_final_frame (CommandResponse.action)
 #include "ota_update_thread.hpp" // OTA update thread lifecycle (unit-tested, #2182)
 #include "shutdown_deadline_guard.hpp" // #2233 item 3: end-to-end stop() deadline
+#include "command_dedup_decision.hpp"            // dedup claim/replay decision core (pure, unit-tested)
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
 #include "sync_source_installed_software.hpp" // ADR-0016 source #1
@@ -195,6 +197,12 @@ static_assert(kShutdownDeadlineGrace == kBaselineShutdownGrace,
 constexpr std::string_view kSyncKvNamespace = "__sync__";
 static_assert(is_reserved_plugin_name(kSyncKvNamespace),
               "kSyncKvNamespace must be a reserved plugin name (plugin_loader.hpp)");
+
+// #3668. The command-dedup claim bypass (kDedupBypassPlugin, command_dedup_decision.hpp) names the
+// Guardian side channel, which is dispatched by its reserved name. Bind it to kReservedPluginNames
+// so the constant cannot drift from the loader's reserved list.
+static_assert(is_reserved_plugin_name(kDedupBypassPlugin),
+              "kDedupBypassPlugin must be a reserved plugin name (plugin_loader.hpp)");
 
 #if defined(_WIN32)
 constexpr const char* kAgentOs = "windows";
@@ -895,6 +903,15 @@ public:
                 command_dedup_ =
                     std::make_unique<CommandDedupStore>(std::move(*dedup_result));
                 spdlog::info("Command dedup store ready: {}", dedup_path.string());
+                // #3665: open() recovered from a corrupt file. Protection is back, but the
+                // history is gone — surface it (the store already logged the reason).
+                if (const auto& q = command_dedup_->quarantined_this_open()) {
+                    spdlog::warn("Command dedup history before this boot was lost (corrupt "
+                                 "store quarantined as {}) — a command redelivered after "
+                                 "its original execution may re-execute",
+                                 *q);
+                    metrics_.counter("yuzu_agent_dedup_quarantined_total").increment();
+                }
             } else {
                 spdlog::error("Failed to open command dedup store: {}",
                               dedup_result.error().message);
@@ -1694,22 +1711,35 @@ public:
                     sleep_for(kFirstDelay);
                     LocalDispatcher dispatcher;
                     while (!stop_requested_.load(std::memory_order_acquire)) {
-                        // #1001 / arch-S3 — local-dispatch concerns
-                        // (capture buffer, byte cap, truncation sentinel)
-                        // live in LocalDispatcher. The pump just decides
-                        // what to do with each cycle's result.
-                        auto result = dispatcher.run(echo_descriptor, "fleet_snapshot");
-                        if (result.truncated) {
-                            spdlog::warn("Snapshot pump: capture truncated at {}B; "
-                                         "dropping this cycle's snapshot",
-                                         result.captured.size());
-                        } else if (result.rc == 0 && !result.captured.empty()) {
-                            std::lock_guard lock(snapshot_mu_);
-                            latest_snapshot_ = std::move(result.captured);
-                            latest_snapshot_seq_.fetch_add(1, std::memory_order_acq_rel);
-                        } else if (result.rc != 0) {
-                            spdlog::warn("Snapshot pump: echo.fleet_snapshot rc={}, captured={}B",
-                                         result.rc, result.captured.size());
+                        // This runs on snapshot_pump_thread_ (joined at shutdown); an
+                        // exception escaping a std::thread body calls std::terminate, so a
+                        // cycle's failure (the Echo plugin's process enumeration reads /proc,
+                        // which can throw when a process exits mid-read) is caught here and
+                        // logged. A failed cycle costs one snapshot; the pump goes on.
+                        try {
+                            // #1001 / arch-S3 — local-dispatch concerns
+                            // (capture buffer, byte cap, truncation sentinel)
+                            // live in LocalDispatcher. The pump just decides
+                            // what to do with each cycle's result.
+                            auto result = dispatcher.run(echo_descriptor, "fleet_snapshot");
+                            if (result.truncated) {
+                                spdlog::warn("Snapshot pump: capture truncated at {}B; "
+                                             "dropping this cycle's snapshot",
+                                             result.captured.size());
+                            } else if (result.rc == 0 && !result.captured.empty()) {
+                                std::lock_guard lock(snapshot_mu_);
+                                latest_snapshot_ = std::move(result.captured);
+                                latest_snapshot_seq_.fetch_add(1, std::memory_order_acq_rel);
+                            } else if (result.rc != 0) {
+                                spdlog::warn(
+                                    "Snapshot pump: echo.fleet_snapshot rc={}, captured={}B",
+                                    result.rc, result.captured.size());
+                            }
+                        } catch (const std::exception& e) {
+                            spdlog::warn("Snapshot pump: cycle aborted by an exception: {}",
+                                         e.what());
+                        } catch (...) {
+                            spdlog::warn("Snapshot pump: cycle aborted by an unknown exception");
                         }
                         sleep_for(kInterval);
                     }
@@ -1722,7 +1752,56 @@ public:
 
         // 3. Register with server — with reconnect loop
         int reconnect_count = 0;
-        constexpr int kMaxReconnectDelaySecs = 300; // 5 minutes max backoff
+        // Reconnect delays use decorrelated jitter (reconnect_backoff.hpp, #5990, HA WS-13):
+        // a node loss drops a whole share of the fleet at one instant, and a fixed ladder
+        // would bring them all back in lock step. `reconnect_count` still decides WHETHER to
+        // wait; `reconnect_backoff` decides HOW LONG, from its own previous delay. It is reset
+        // when registration has fully succeeded (below), when a provisioned certificate is
+        // about to be used for the mTLS re-Register, and on the first enrolled-but-no-cert
+        // retry (so that retry grows from the base, not from an approval wait's long delay);
+        // later no-cert retries keep growing across their Register calls. Main-thread only,
+        // so no lock; the engine is seeded from several OS words so two agents started from
+        // one cloned image do not share a sequence.
+        yuzu::agent::ReconnectBackoff reconnect_backoff;
+        // Minimum for the NEXT wait only: raised for the no-cert retries (server CSR throttle),
+        // consumed at the loop top.
+        int reconnect_floor_secs = yuzu::agent::kReconnectBaseSecs;
+        std::mt19937 reconnect_rng{[] {
+            // std::random_device THROWS when no entropy source can be opened, and run() has no
+            // handler on this path (main.cpp calls it bare), so a throw here would be a
+            // std::terminate at boot. reconnect_seed() routes a throw to a clock-derived
+            // fallback instead: weaker seeds, same jitter, and the agent still starts.
+            std::optional<std::random_device> rd;
+            const auto seed_words = yuzu::agent::reconnect_seed(
+                [&rd]() -> std::uint32_t {
+                    if (!rd)
+                        rd.emplace();
+                    return (*rd)();
+                },
+                [i = std::uint64_t{0}]() mutable noexcept -> std::uint32_t {
+                    // splitmix64 over two clocks, the thread id and a call index: not secret,
+                    // but different per call and per process start.
+                    std::uint64_t x =
+                        static_cast<std::uint64_t>(
+                            std::chrono::steady_clock::now().time_since_epoch().count()) ^
+                        (static_cast<std::uint64_t>(
+                             std::chrono::system_clock::now().time_since_epoch().count()) *
+                         0x9E3779B97F4A7C15ULL) ^
+                        (static_cast<std::uint64_t>(
+                             std::hash<std::thread::id>{}(std::this_thread::get_id()))
+                         << 17) ^
+                        (++i * 0xBF58476D1CE4E5B9ULL);
+                    x += 0x9E3779B97F4A7C15ULL;
+                    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+                    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+                    return static_cast<std::uint32_t>(x ^ (x >> 31));
+                });
+            if (seed_words.degraded)
+                spdlog::warn("No OS entropy for the reconnect jitter; using a clock-derived "
+                             "seed (jitter still applies, less well spread across cloned hosts)");
+            std::seed_seq seed(seed_words.words.begin(), seed_words.words.end());
+            return std::mt19937{seed};
+        }()};
         /// Ceiling on a single Register attempt. Generous — a busy server plus TLS plus an
         /// approval check is not instant — but FINITE, which is the whole point: without it a
         /// server that completes TLS and then goes silent parks the main thread forever, and on
@@ -1755,8 +1834,13 @@ public:
 
         while (!stop_requested_.load(std::memory_order_acquire)) {
             if (reconnect_count > 0) {
-                // Exponential backoff: 2^n seconds, capped at 5 minutes
-                int delay = std::min(1 << std::min(reconnect_count, 8), kMaxReconnectDelaySecs);
+                // Decorrelated jitter: random in [1 s, 3 x the previous delay], at most 5 min.
+                const int delay = reconnect_backoff.next(
+                    [&reconnect_rng](int lo, int hi) {
+                        return std::uniform_int_distribution<int>{lo, hi}(reconnect_rng);
+                    },
+                    reconnect_floor_secs);
+                reconnect_floor_secs = yuzu::agent::kReconnectBaseSecs;
                 spdlog::info("Reconnecting in {}s (attempt #{})", delay, reconnect_count);
                 plugin_ctx_.config["agent.reconnect_count"] = std::to_string(reconnect_count);
                 for (int i = 0; i < delay && !stop_requested_.load(std::memory_order_acquire); ++i)
@@ -1961,7 +2045,8 @@ public:
                     continue; // Retry until approved
                 }
 
-                reconnect_count = 0; // Registration succeeded — reset backoff
+                reconnect_count = 0; // Registration succeeded: reset the retry count (the delay
+                                     // state, reconnect_backoff, is reset below)
 
                 // Remove the token file now that it has done its one job. A failed
                 // remove keeps the path set so the next accepted Register retries.
@@ -2010,6 +2095,9 @@ public:
                                 spdlog::error("PKI: failed to rebuild channel with issued cert");
                                 return;
                             }
+                            // This Register succeeded: the mTLS re-Register that follows starts
+                            // again from the base delay, not from an approval wait's long one.
+                            reconnect_backoff.reset();
                             continue; // re-Register over mTLS (binds the cert identity)
                         }
                         // Persist failed (disk full / perms). The server recorded the
@@ -2050,12 +2138,21 @@ public:
                         spdlog::warn("PKI: enrolled but no client cert issued (attempt {}/{}); "
                                      "backing off and retrying",
                                      csr_attempts, kMaxCsrAttempts);
-                        reconnect_count = csr_attempts; // drive exponential backoff
+                        if (csr_attempts == 1)
+                            reconnect_backoff.reset(); // grow from the base, not from an approval wait
+                        // The server issues one cert per agent per 30 s: keep these waits
+                        // long enough that the last bounded retry falls outside that window.
+                        reconnect_floor_secs = yuzu::agent::kReconnectCsrRetryFloorSecs;
+                        reconnect_count = csr_attempts; // gate the wait; the delay grows from here
                         continue;                       // retry Register with the same CSR
                     }
                 }
 
                 session_id_ = resp.session_id();
+                // Registration has fully succeeded (the later no-cert retries above
+                // `continue` before here, so their delays keep growing): the next failure
+                // starts again from the base delay.
+                reconnect_backoff.reset();
                 auto connected_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                               std::chrono::system_clock::now().time_since_epoch())
                                               .count();
@@ -2623,8 +2720,9 @@ public:
                                 spdlog::warn("Heartbeat plugin-tag bridge failed");
                             }
                             // HA WS-0 dedup safety-net signals, emitted every
-                            // heartbeat (the agent has no /metrics; the server-side
-                            // yuzu_fleet_* derivation + alert land with WS-11).
+                            // heartbeat (the agent has no /metrics; the server derives
+                            // the yuzu_fleet_agents_dedup_* gauges + the
+                            // YuzuDedupStoreDegraded alert from these tags, #3663).
                             // "degraded"=1 means the durable store never OPENED (a
                             // real 0/1 reading, never absent-reads-as-zero). It is
                             // the OPEN-failure signal ONLY; a store that opened then
@@ -2638,6 +2736,12 @@ public:
                             // which is not separately detectable. "replays" counts
                             // served terminal replays.
                             tags["yuzu.dedup_degraded"] = command_dedup_ ? "0" : "1";
+                            // #3665: >0 when THIS process start recovered from a corrupt
+                            // command_dedup.db (history before the boot was lost). Without
+                            // this tag the recovery would be visible only in the endpoint's
+                            // own log, since the agent has no /metrics endpoint.
+                            tags["yuzu.dedup_quarantined"] = std::to_string(static_cast<int64_t>(
+                                metrics_.counter("yuzu_agent_dedup_quarantined_total").value()));
                             tags["yuzu.dedup_replays"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_dedup_replays_total").value()));
                             tags["yuzu.dedup_claim_errors"] = std::to_string(static_cast<int64_t>(
@@ -2650,6 +2754,17 @@ public:
                                 metrics_.counter("yuzu_agent_dedup_record_errors_total").value()));
                             tags["yuzu.dedup_release_errors"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_dedup_release_errors_total").value()));
+                            // Capacity signal (#3663): the store's cached row count
+                            // (in-flight + terminal), read lock-free -- the heartbeat
+                            // never takes the store mutex the reader thread claims
+                            // under. ABSENT (not "0") when there is no store or the
+                            // count is unknown, so the server cannot read "unknown"
+                            // as "empty"; dedup_degraded already carries the no-store
+                            // case.
+                            if (command_dedup_) {
+                                if (const auto rows = command_dedup_->cached_row_count())
+                                    tags["yuzu.dedup_rows"] = std::to_string(*rows);
+                            }
                             // OTA signature refusals (#416/#3807). Carried on the
                             // heartbeat for the same reason as the dedup counters
                             // above: the agent has no /metrics endpoint, so this
@@ -3155,7 +3270,7 @@ public:
                                 if (hb_code == grpc::StatusCode::NOT_FOUND ||
                                     hb_code == grpc::StatusCode::UNAUTHENTICATED) {
                                     // A successful Register resets reconnect_count
-                                    // (the normal backoff), so without a damper here
+                                    // and the backoff delay, so without a damper here
                                     // a server that reaps every fresh session would
                                     // drive a fleet-wide register→beat→reject→
                                     // register storm (governance UP-1). Apply an
@@ -3359,42 +3474,51 @@ public:
                     // bypasses the claim: gating on the literal (not the whole
                     // reserved-name set) keeps durable idempotency the SAFE DEFAULT
                     // for any future reserved-name command — a future __update__ OTA
-                    // path is deduplicated unless it, too, opts out here.
+                    // path is deduplicated unless it, too, opts out in should_claim().
+                    // The decision itself (which commands are claimed; replay / RUNNING /
+                    // proceed after the claim) lives in command_dedup_decision.hpp — pure
+                    // and unit-tested (tests/unit/test_command_dedup_decision.cpp, #3668).
+                    // Everything with a side effect stays here.
                     if (cmd.command_id().empty()) {
                         spdlog::warn("Received command with empty command_id — replay "
                                      "protection cannot apply");
-                    } else if (command_dedup_ && cmd.plugin() != "__guard__") {
+                    } else if (should_claim(command_dedup_ != nullptr, cmd.command_id(),
+                                            cmd.plugin())) {
                         auto claim = command_dedup_->claim(cmd.command_id());
+                        // Parse the stored outcome only for a terminal duplicate; the
+                        // decision takes the bool so it stays proto-free.
+                        pb::CommandResponse stored;
+                        const bool stored_parses =
+                            claim.status == ClaimStatus::Duplicate &&
+                            claim.state == DedupState::Terminal &&
+                            stored.ParseFromString(claim.response);
+                        const auto decision =
+                            decide_after_claim(claim.status, claim.state, stored_parses);
                         // Own the in-flight record ONLY when WE claimed it — a
                         // fall-through on Error (fail-open) must NOT later release a
                         // row a concurrent first delivery owns.
-                        claimed_here = (claim.status == ClaimStatus::Claimed);
-                        if (claim.status == ClaimStatus::Error)
+                        claimed_here = decision.owns_claim;
+                        if (decision.count_claim_error)
                             metrics_.counter("yuzu_agent_dedup_claim_errors_total").increment();
-                        if (claim.status == ClaimStatus::Duplicate) {
+                        if (decision.action != DedupAction::Proceed) {
                             pb::CommandResponse dup_resp;
-                            bool replayed = false;
-                            if (claim.state == DedupState::Terminal) {
-                                pb::CommandResponse stored;
-                                if (stored.ParseFromString(claim.response)) {
-                                    dup_resp = std::move(stored);
-                                    auto now_ms =
-                                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                                            std::chrono::system_clock::now().time_since_epoch())
-                                            .count();
-                                    dup_resp.mutable_sent_at()->set_millis_epoch(now_ms);
-                                    replayed = true;
-                                    metrics_.counter("yuzu_agent_dedup_replays_total").increment();
-                                    spdlog::info("Replay of command {} — returning stored "
-                                                 "terminal outcome",
-                                                 cmd.command_id());
-                                } else {
+                            if (decision.action == DedupAction::ReplayStored) {
+                                dup_resp = std::move(stored);
+                                auto now_ms =
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count();
+                                dup_resp.mutable_sent_at()->set_millis_epoch(now_ms);
+                                metrics_.counter("yuzu_agent_dedup_replays_total").increment();
+                                spdlog::info("Replay of command {} — returning stored "
+                                             "terminal outcome",
+                                             cmd.command_id());
+                            } else {
+                                if (claim.status == ClaimStatus::Duplicate &&
+                                    claim.state == DedupState::Terminal)
                                     spdlog::error("Stored terminal outcome for {} failed to "
                                                   "parse — answering RUNNING",
                                                   cmd.command_id());
-                                }
-                            }
-                            if (!replayed) {
                                 dup_resp.set_command_id(cmd.command_id());
                                 dup_resp.set_status(pb::CommandResponse::RUNNING);
                                 // Plain progress text — NOT a parsed sentinel (no
@@ -3432,7 +3556,7 @@ public:
                     // load-time check in plugin_loader.cpp also rejects reserved
                     // names, but defence-in-depth keeps both halves explicit).
                     // See docs/yuzu-guardian-design-v1.1.md §7.2.
-                    if (cmd.plugin() == "__guard__") {
+                    if (cmd.plugin() == kDedupBypassPlugin) {
                         pb::CommandResponse resp;
                         resp.set_command_id(cmd.command_id());
                         auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

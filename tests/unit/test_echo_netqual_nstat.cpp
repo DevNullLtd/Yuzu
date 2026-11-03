@@ -393,6 +393,82 @@ TEST_CASE("nstat_decode_tcp_src_desc decodes an IPv4 flow", "[echo][netqual][nst
     REQUIRE(decoded->process_name == "testproc");
 }
 
+TEST_CASE("nstat_decode_tcp_src_desc decodes the descriptor's TCP state into the open event",
+          "[echo][netqual][nstat]") {
+    const auto decode = [](std::uint32_t state) {
+        TcpDescriptor desc{};
+        desc.local = make_v4({10, 0, 0, 5}, 1);
+        desc.remote = make_v4({10, 0, 0, 6}, 2);
+        desc.state = state;
+        auto decoded = nstat_decode_tcp_src_desc(build_src_desc_msg(7, kNstatProviderTcp, desc));
+        REQUIRE(decoded.has_value());
+        return *decoded;
+    };
+    // TCPS_* values: 4 ESTABLISHED, 10 TIME_WAIT, 1 LISTEN, 5 CLOSE_WAIT.
+    CHECK(decode(4).state == "ESTABLISHED");
+    CHECK(decode(10).state == "TIME_WAIT");
+    CHECK(decode(1).state == "LISTEN");
+    CHECK(decode(5).state == "CLOSE_WAIT");
+    CHECK(decode(99).state == "UNKNOWN"); // never fabricated into a real state
+
+    // The open event carries it, so a socket first reported already closing is not labelled
+    // ESTABLISHED by the plugin.
+    CHECK(nstat_build_open_event(1'700'000'000, decode(10)).state == "TIME_WAIT");
+    CHECK(nstat_build_open_event(1'700'000'000, decode(4)).state == "ESTABLISHED");
+}
+
+TEST_CASE("network_event_from_nstat_flow keeps an ending descriptor state and labels every other "
+          "open state ESTABLISHED",
+          "[echo][netqual][nstat]") {
+    NstatFlowEvent open;
+    open.ts_unix = 1'700'000'123;
+    open.is_open = true;
+    open.proto = "tcp6";
+    open.local_addr = "::1";
+    open.local_port = 5000;
+    open.remote_addr = "2001:db8::1";
+    open.remote_port = 443;
+    open.pid = 321;
+    open.process_name = "curl";
+
+    // The state the descriptor reported is what is stored, not a hard-coded ESTABLISHED.
+    open.state = "TIME_WAIT";
+    const auto closing = network_event_from_nstat_flow(open, 42);
+    CHECK(closing.state == "TIME_WAIT");
+    CHECK(closing.action == "connected");
+    CHECK(closing.ts == 1'700'000'123);
+    CHECK(closing.snapshot_id == 42);
+    CHECK(closing.proto == "tcp6");
+    CHECK(closing.local_addr == "::1");
+    CHECK(closing.local_port == 5000);
+    CHECK(closing.remote_addr == "2001:db8::1");
+    CHECK(closing.remote_port == 443);
+    CHECK(closing.remote_host.empty()); // a lifecycle stream does not resolve names
+    CHECK(closing.pid == 321);
+    CHECK(closing.process_name == "curl");
+
+    // A descriptor that never resolved a state falls back to ESTABLISHED.
+    open.state.clear();
+    CHECK(network_event_from_nstat_flow(open, 42).state == "ESTABLISHED");
+
+    // Only an ending state is kept: a live flow in any other state keeps the ESTABLISHED label
+    // the fleet-snapshot reader (which keeps only ESTABLISHED rows) expects.
+    open.state = "SYN_SENT";
+    CHECK(network_event_from_nstat_flow(open, 42).state == "ESTABLISHED");
+    open.state = "LISTEN";
+    CHECK(network_event_from_nstat_flow(open, 42).state == "ESTABLISHED");
+    open.state = "CLOSE_WAIT";
+    CHECK(network_event_from_nstat_flow(open, 42).state == "CLOSE_WAIT");
+
+    // A close event is stored CLOSED with the disconnected action, whatever it carried.
+    NstatFlowEvent close = open;
+    close.is_open = false;
+    close.state = "ESTABLISHED";
+    const auto closed = network_event_from_nstat_flow(close, 42);
+    CHECK(closed.state == "CLOSED");
+    CHECK(closed.action == "disconnected");
+}
+
 TEST_CASE("nstat_decode_tcp_src_desc decodes the pname process identity",
           "[echo][netqual][nstat]") {
     // The macOS 13.3 tcp descriptor carries only pname (no epname/uid).
