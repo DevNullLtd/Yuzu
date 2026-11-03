@@ -13,6 +13,11 @@ listed **MISSING**; Priority-2 item **13** — item 12 at the time this record
 was written, renumbered on 2026-07-25 when a duplicate `10` in that section
 was corrected).
 
+> **Addendum (2026-11-03, #4752).** The statements below that `record_attestation` is an UPSERT
+> that overwrites a prior decision (under "What shipped", and the `destructiveHint` rationale) are
+> superseded: every decision is now kept and the reviewer must differ from the subject of the
+> grant. See "Addendum (2026-11-03, #4752)" at the end of this document.
+
 ## What shipped
 
 - **Export (stateless):** `GET /api/v1/access-reviews/export?format=json|csv`
@@ -458,3 +463,55 @@ reference.
   "open a new campaign automatically every quarter" primitive. An operator
   or an external scheduler (e.g. a cron'd `open_access_review` MCP call)
   must drive the cadence today.
+
+## Addendum (2026-11-03, #4752): reviewer differs from the subject of the grant; every decision kept
+
+**What changed.** The original design let a reviewer record a decision on a grant that named
+them, and a later decision on the same grant overwrote the earlier one. Now:
+
+- `POST /api/v1/access-reviews/{id}/attestations` and MCP `record_attestation` share one rule
+  (`server/core/src/access_review_attest_gate.hpp`) that requires the reviewer to differ from the
+  subject of the grant: a `user` grant whose `principal_id` equals the reviewer's account name
+  (byte-exact), an engine principal the reviewer owns (revoked ones included), or a group the
+  reviewer belongs to is refused with `403` and nothing is recorded. The `403` names no
+  `permission`, because the caller already holds `AccessReview:Attest`. The rule applies to
+  `Administrator` as well as `Reviewer`, and to an administrator with RBAC off. A lookup that
+  cannot be answered fails closed (`503`, nothing recorded).
+- Every decision is appended to `access_review_attestation_history` (schema v3) with the decision
+  it replaced and a sequence number; the grant row keeps the latest decision and `decision_seq`.
+  `GET /api/v1/access-reviews/{id}` and `get_access_review` return `decision_seq` and `history`.
+  `record_attestation` keeps `destructiveHint:true`, now because the current decision is replaced
+  with no route back to `pending`, not because the earlier decision is lost.
+- Audit shape: `target_id` is the campaign id alone and the grant is in `detail`, for every
+  outcome. A refusal is `result=denied` with `sod_self_subject`, `sod_engine_owner` or
+  `sod_group_member`; an unanswerable check is `result=failure` with `sod_check_unavailable
+  store=engine|rbac`; a success carries `decision= previous= seq= sod=pass`. The metric
+  `yuzu_access_review_attestation_refused_total{surface,reason}` covers both surfaces.
+
+**Residuals, stated as limits.**
+
+1. The engine-owner and group-member rules are a read before the write transaction (the store
+   contract forbids a store consulting another store while it holds a lease). A change that lands
+   between the read and the commit is not seen, nothing re-reads after the commit, and group
+   membership can be changed by the reviewer's own SSO login. The user rule is decided in the
+   write and has no such window. Revisit under epic #6060.
+2. The history is append-only against the application path and ordinary SQL (triggers, `RESTRICT`
+   keys and a deferred consistency check), not against the application's database credential, a
+   role granted TRUNCATE, or a database administrator. A data-only restore into a migrated schema
+   is refused; restore schema and data together. The audit store and its export are the
+   independent evidence.
+3. A person with two identities (a local account and an SSO identity) counts as two reviewers (the
+   accepted exception in `docs/enterprise-readiness-soc2-first-customer.md`).
+4. A refusal row records the grant through the audit token filter, which folds spaces, so two
+   distinct raw `principal_id` values can read the same in a refusal row. A success row carries
+   `seq`, the exact key into the history.
+5. The decision is committed before its audit row is written, and a failed audit write never undoes
+   it. After a dropped connection the outcome of an attestation can be unknown: read the campaign
+   and compare `decision_seq` before retrying; a retry appends an identical decision.
+6. Under a continuous stream of attestations a `close` can wait up to the pool's lock timeout and
+   answer `503`; retry it.
+
+**Deployment.** A database that holds a decision recorded by the subject of the grant makes the
+server refuse to start (the schema v3 migration fails and the store does not open), on every boot,
+until the database is replaced. This is the hard-cutover posture in `docs/user-manual/upgrading.md`
+("Deployment contract (hard cutover)"): fresh database only.

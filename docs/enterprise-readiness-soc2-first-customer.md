@@ -137,6 +137,39 @@ discussion, including the operator-facing metric to correlate against
 inherits this same degrade-vs-outage ambiguity"; field reference:
 `docs/user-manual/rest-api.md` → `GET /api/v1/access-reviews/export`.
 
+**Addendum: access-review attestations now require the reviewer to differ from the subject of
+the grant, and every decision is kept (CC6.2, #4752, 2026-11-03).** Before this change a
+reviewer holding `AccessReview:Attest` could record a decision on a grant that named them, and a
+later decision on a grant replaced the earlier one, so the campaign record could not show who
+decided what, in what order. Now: (1) the reviewer must differ from the subject of the grant, on
+REST (`POST /api/v1/access-reviews/{id}/attestations`) and on MCP (`record_attestation`), through
+one shared rule: a `user` grant whose `principal_id` is the reviewer's account name (byte-exact),
+an engine principal the reviewer owns, or a group the reviewer is a member of (memberships assigned
+by an identity provider included) is refused with `403` and nothing is recorded; the rule applies
+to an administrator with RBAC off as well; (2) every decision is appended to
+`access_review_attestation_history` with the decision it replaced and a sequence number, and the
+grant row keeps only the latest; (3) a refusal writes an `access_review.attested` or
+`access_review.flagged` row with `result=denied` and a fixed token, and moves
+`yuzu_access_review_attestation_refused_total{surface,reason}`; a check that cannot be answered
+fails closed with `503`. Limits an assessor should know, stated as limits: **the engine and group
+rules are decided by a read before the write transaction** (the Postgres store contract forbids one
+store consulting another while it holds a lease), so an ownership transfer or a membership change
+inside that window is not seen, there is no re-read after the commit, and group membership can be
+changed by the reviewer's own SSO login; the user rule has no such window. **The history table is
+append-only against the application path and ordinary SQL, not against the application's database
+credential** (it owns the schema and could disable the guard, forge a matching row or truncate), a
+role granted TRUNCATE, or a database administrator; the independent evidence is the audit store
+and its export. **One person with two identities (a local account and an SSO identity, or two SSO
+identities) counts as two reviewers**; this is the maintainer-accepted exception recorded in the
+approver-assurance addendum below (residual risk (e)), not a four-eyes guarantee across identities,
+and the same compensating controls apply (narrowing the identity sources in use, an
+identity-to-HR-record check at the review, sampling). A decision is committed before its audit row
+is written and a failed audit write never undoes it, so the decision history, not the audit row, is
+the primary record. A deployment that carries forward a database holding a decision recorded by
+the subject of the grant is refused at start (a hard cutover; fresh database only, see
+`docs/user-manual/upgrading.md`). Revisit under the four-eyes primitive work (epic #6060). See
+`docs/auth-architecture.md` "Periodic access reviews".
+
 **Addendum — service-scoped token fleet-wide confinement, durably closed
 (CC6.1/CC6.3, guardian-confinement-2298 PR 3 — "the flip", 2026-08-18).**
 `require_permission`'s service-scoped branch previously admitted any
