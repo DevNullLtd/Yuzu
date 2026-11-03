@@ -3752,7 +3752,8 @@ topology floor" above); `AccessReview:Attest` is admin-only through the legacy r
    pass is adopted; the disposition is recorded in `docs/clock-guarded-retention.md`, and any retention policy is
    a separate, explicit, separately reviewed decision. The per-grant decision history
    (`access_review_attestation_history`) is append-only against the application path by a database guard, with
-   the limits stated under "The decision history" below. It is not owner-proof.
+   the limits stated under "The decision history" below. It is not owner-proof. Nothing prunes it, so growth is
+   bounded only by the per-grant limit of 100 decisions; avoid scripted re-attest loops.
 5. **The reviewer must differ from the subject of the grant (#4752).** The rules, the window and the residuals
    are under "Separation of duties" below. Every decision is appended with the value it replaced, never
    overwritten, and REST and MCP share one refusal helper, `server/core/src/access_review_attest_gate.hpp`.
@@ -3762,15 +3763,16 @@ topology floor" above); `AccessReview:Attest` is admin-only through the legacy r
 permission, session, engine-session and (REST) browser-write checks, on both surfaces. By `principal_type`:
 
 - `user`: the reviewer is the subject when `session->username == principal_id`, compared byte-exact (the same
-  comparison `ApprovalManager::same_human_root` makes). This rule is decided in the write: the store refuses it
-  too (a `forbidden:` result) before any lease is taken, so it holds even for a caller that skips the gate, and
-  it is answered before `not_found`. A self-subject attempt against a closed campaign is therefore refused
-  with 403, not 404.
+  comparison `ApprovalManager::same_human_root` makes). This rule is decided in C++ from the arguments, before
+  any lease is taken: in the gate, and again in the store (a `forbidden:` result), so it holds even for a caller
+  that skips the gate, and it is answered before `not_found`. The UPDATE predicate and the history `CHECK` are
+  backstops. A self-subject attempt against a closed campaign is therefore refused with 403, not 404.
 - `engine`: refused when the reviewer owns the engine principal (`owner_username`), revoked engines included.
   An engine id with no row (an orphan grant) is admitted, because there is no owner to compare against.
 - `group`: refused when the reviewer is a member of the group. A group with no row, or one the reviewer is not
-  in, is admitted. Membership is read with `RbacStore::user_rbac_group_names_checked`, which also covers
-  memberships reconciled from an identity provider at login (`reconcile_idp_memberships`).
+  in, is admitted. Membership is read with `RbacStore::user_rbac_group_names_checked` from Yuzu's stored
+  membership, which also holds memberships reconciled from an identity provider at login
+  (`reconcile_idp_memberships`); see "How fresh the engine and group reads are" below.
 
 The engine and group rules are a pre-read through the owning stores. A lookup that cannot be answered fails
 CLOSED: REST answers 503 with `retry_after_ms`, MCP answers `kInternalError` with
@@ -3795,9 +3797,24 @@ another store, or re-entering the pool, while it holds a lease, so the attest tr
 engine or RBAC store. The window runs from that read to the commit: a pool acquire of up to the store's 4 s
 write budget, a row-lock wait of up to the pool's 10 s `lock_timeout`, and the statements themselves.
 It is normally milliseconds but is not a bound the code promises. An ownership transfer or a membership change
-that lands inside it is not seen, and there is no re-read after the commit. Membership can be changed by the
-reviewer's own SSO login (the Entra and SAML login paths call `reconcile_idp_memberships`). The user rule has
-no such window. Revisit under the four-eyes primitive work (epic #6060).
+that lands inside it is not seen, and there is no re-read after the commit. The user rule has no such window.
+Revisit under the four-eyes primitive work (epic #6060).
+
+**How fresh the engine and group reads are.** This is separate from the window above. Both reads see the state
+at the moment of the attest, not at the moment the campaign opened: an owner who transferred an engine, or a
+member who left a group, before attesting is admitted. Engine ownership is a live read
+(`EnginePrincipalStore::get` selects the current row). Group membership is read from Yuzu's stored membership
+(`rbac_store.group_members`), which an identity provider updates only when that member signs in (the Entra and
+SAML login paths call `reconcile_idp_memberships`). A change at the identity provider is not seen by the group
+rule until then, which is the session lifetime, not milliseconds, and a sign-in whose token skips the
+membership refresh (for example an Entra groups-overage token) does not refresh it. For identity-provider-
+governed groups the rule is therefore not a current-membership check. The compensating step is a review of
+those groups at the identity provider at campaign close.
+
+**Evidence of independence for engine and group grants.** For these two types the history row does not record
+the ownership or membership basis. Independence is evidenced by the `sod=pass` audit row, which is written
+set-and-proceed and kept for the audit retention period, so export audit rows to the evidence store within
+that period. Recording the basis in the history row is tracked under #6060.
 
 **Two identities of one person.** `Session::username` is the stable principal (a local name, `oidc:<iss>#<sub>`
 or `saml:...`; a token session carries its owner's). A person who holds a local account and an SSO identity, or
@@ -3820,32 +3837,53 @@ The store writes the history row in the same transaction as the state change; th
 - both foreign keys are `ON DELETE RESTRICT`, and a `CHECK` on the history table refuses a `user` decision
   whose reviewer is the subject.
 
-An older binary's bare UPDATE during a mixed-version window therefore fails (SQLSTATE class 23, answered as a
-write failure), it does not bypass the reviewer rule. That is the claim, and its limits are part of it:
-append-only against the application path and ordinary SQL. It is NOT held against the application credential:
+A bare UPDATE from an earlier binary against a migrated schema fails (SQLSTATE class 23) and does not bypass
+the reviewer rule; the deployment contract excludes earlier binaries, so this is a backstop, not a supported
+configuration. That is the claim, and its limits are part of it: append-only against the application path and
+ordinary SQL. It is NOT held against the application credential:
 the migration runner creates the schema under that role, so the owner can disable a trigger, forge a matching
 history row or truncate. A role granted TRUNCATE can truncate, and a database administrator can do anything. A
 data-only restore into a migrated schema is refused by the guard; restore schema and data together. A future
-migration that touches attestation rows must disable the triggers inside its own transaction. The independent
-evidence is the audit store and its export, not this table.
+migration that touches attestation rows must disable the triggers inside its own transaction. The guard
+triggers protect the frozen grants, the decisions and the history. The campaign row (`status`, `closed_at_ms`,
+`closed_by`, `title`) is protected by the application only, which refuses further decisions on a closed
+campaign, so a database credential holder can reopen one. The independent evidence is the audit store and its
+export, not this table.
+
+**Bounds.** `principal_type`, `principal_id` and `role_name` are 1 to 256 bytes without a NUL byte and
+`justification` is at most 4096 bytes. The REST and MCP handlers enforce the grant-field limit before the gate
+(a `400` / invalid-params with the message `principal_type, principal_id and role_name must be 1-256 bytes
+without NUL`, no audit row, and the same for all three grant types because it is decided before any lookup),
+and the store checks it again as a backstop; the schema `maxLength` values are discovery metadata only. A grant
+keeps at most 100 decisions: the 101st is refused inside the transaction with `400` / invalid-params and the
+message `this grant already has the maximum number of recorded decisions (100); a further decision cannot be
+recorded`, nothing is written, and a `failure` audit row is written. A history read returns at most the latest
+100 entries of a grant; `decision_seq` stays the total, so `decision_seq` greater than the number of entries
+means earlier ones are not shown. A successful attest answers `{recorded, decision_seq, previous_decision}`.
 
 **Lost COMMIT.** One history event is one committed decision transaction. When the connection drops after
 COMMIT was sent, the server cannot tell whether the decision was recorded and answers a write failure (503 on
 REST). Before retrying, GET the campaign and compare `decision_seq`. A retry after an unacknowledged commit
-appends an identical decision at seq+1; it is kept and visible, never an error, and the first attempt's audit row
-may be missing while its history row exists. There is no idempotency key yet.
+appends an identical decision at seq+1; it is kept and visible, never an error. The first attempt writes a
+`result=failure` audit row whose fixed text says the decision store is unavailable or the decision may not have
+been committed (`kStoreFailureMessage`), so an auditor sees a failure row next to a committed decision. To tell
+whether a decision landed, read the campaign, compare `decision_seq` with the value you last saw and match your
+entry on reviewer, justification and `decided_at_ms`. A store failure that is not the caller's is answered with
+that fixed message and `retry_after_ms` 5000 (`503` on REST, an internal error on MCP), never database text,
+which goes to the server log. There is no idempotency key yet.
 
 **Close starvation.** A queued `close_campaign` does not block a new attestation's lock on the campaign row, so
 under a continuous stream of attestations a close can wait up to the pool's 10 s `lock_timeout` and answer 503.
 Retry the close.
 
-**Hard cutover.** A database that holds a decision recorded by the subject of the grant (an earlier build
+**Hard cutover.** A database that holds a `user` grant decided by the account it names (an earlier build
 allowed it) makes the schema v3 migration fail, the store stay closed at version 2, and the server refuse to
 start (`server.cpp` treats a store that did not open as a startup failure) with a message that names the cause.
-It refuses again on every boot until the database is replaced. Deploy into a fresh database. This is the
-project's "Deployment contract (hard cutover)" posture, a decision of the project owner recorded in
-`docs/user-manual/upgrading.md`; the executable refuses a schema state, it does not verify where the database
-came from.
+It refuses again on every boot until the database is replaced. Deploy into a fresh database. Only that one case
+is detected: decisions on engine or group grants made by earlier builds are not checked and read as "previous:
+not recorded". This is the project's "Deployment contract (hard cutover)" posture, a decision of the project
+owner recorded in `docs/user-manual/upgrading.md`; the executable refuses a schema state, it does not verify
+where the database came from.
 
 ## Render-time permission probes (capability hints)
 

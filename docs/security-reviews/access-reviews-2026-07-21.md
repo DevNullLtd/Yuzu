@@ -482,8 +482,16 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
   `GET /api/v1/access-reviews/{id}` and `get_access_review` return `decision_seq` and `history`.
   `record_attestation` keeps `destructiveHint:true`, now because the current decision is replaced
   with no route back to `pending`, not because the earlier decision is lost.
+- Input bounds: `principal_type`, `principal_id` and `role_name` are 1 to 256 bytes without NUL
+  and `justification` is at most 4096 bytes; a grant keeps at most 100 decisions (the 101st is
+  refused with `400`, nothing written) and a history read returns at most the latest 100 entries
+  of a grant. A success answers `{recorded, decision_seq, previous_decision}`.
 - Audit shape: `target_id` is the campaign id alone and the grant is in `detail`, for every
-  outcome. A refusal is `result=denied` with `sod_self_subject`, `sod_engine_owner` or
+  outcome that reaches the gate or the store (the refusal of an engine session and the
+  unsupported-media-type refusal carry an empty `target_id`). Audit rows written before this
+  build keep the old target shape (`<campaign>:<type>:<id>:<role>`), so archives hold both. A
+  store fault that is not the caller's writes a `failure` row with a fixed message, not database
+  text (the raw error goes to the server log). A refusal is `result=denied` with `sod_self_subject`, `sod_engine_owner` or
   `sod_group_member`; an unanswerable check is `result=failure` with `sod_check_unavailable
   store=engine|rbac`; a success carries `decision= previous= seq= sod=pass`. The metric
   `yuzu_access_review_attestation_refused_total{surface,reason}` covers both surfaces.
@@ -492,26 +500,43 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
 
 1. The engine-owner and group-member rules are a read before the write transaction (the store
    contract forbids a store consulting another store while it holds a lease). A change that lands
-   between the read and the commit is not seen, nothing re-reads after the commit, and group
-   membership can be changed by the reviewer's own SSO login. The user rule is decided in the
-   write and has no such window. Revisit under epic #6060.
+   between the read and the commit is not seen, and nothing re-reads after the commit. The user
+   rule is decided in C++ from the arguments before any lease and has no such window. Revisit
+   under epic #6060. Separately, both reads see the state at the moment of the attest: engine
+   ownership is a live read, but group membership is read from Yuzu's stored membership, which an
+   identity provider updates only when that member signs in. A change at the identity provider is
+   not seen until then (the session lifetime, not milliseconds), and a token that skips the
+   membership refresh (for example Entra groups-overage) is not refreshed. For
+   identity-provider-governed groups the rule is therefore not a current-membership check; a
+   review of those groups at the identity provider at campaign close is the compensating step.
+   An owner who transferred an engine, or a member who left a group, before attesting is
+   admitted. For engine and group grants the history row does not record the ownership or
+   membership basis: independence is evidenced by the `sod=pass` audit row (set-and-proceed, kept
+   for the audit retention period), so export audit rows to the evidence store within that
+   period. Recording the basis in the history row is tracked under #6060.
 2. The history is append-only against the application path and ordinary SQL (triggers, `RESTRICT`
    keys and a deferred consistency check), not against the application's database credential, a
    role granted TRUNCATE, or a database administrator. A data-only restore into a migrated schema
    is refused; restore schema and data together. The audit store and its export are the
-   independent evidence.
+   independent evidence. The guard triggers protect the frozen grants, the decisions and the
+   history; the campaign row (status, `closed_at_ms`, `closed_by`, title) is protected by the
+   application only, which refuses further decisions on a closed campaign, so a database
+   credential holder can reopen a closed campaign.
 3. A person with two identities (a local account and an SSO identity) counts as two reviewers (the
    accepted exception in `docs/enterprise-readiness-soc2-first-customer.md`).
-4. A refusal row records the grant through the audit token filter, which folds spaces, so two
-   distinct raw `principal_id` values can read the same in a refusal row. A success row carries
-   `seq`, the exact key into the history.
+4. Every attestation audit row records the grant through the audit token filter, which folds
+   spaces and a few separators, so two grants whose ids fold to the same audit text cannot be
+   told apart in a row; this applies to success rows as well as refusal rows. `seq` numbers the
+   decisions of one grant, so with the campaign id and the grant it identifies one history entry,
+   subject to that folding.
 5. The decision is committed before its audit row is written, and a failed audit write never undoes
    it. After a dropped connection the outcome of an attestation can be unknown: read the campaign
    and compare `decision_seq` before retrying; a retry appends an identical decision.
 6. Under a continuous stream of attestations a `close` can wait up to the pool's lock timeout and
    answer `503`; retry it.
 
-**Deployment.** A database that holds a decision recorded by the subject of the grant makes the
+**Deployment.** A database that holds a `user` grant decided by the account it names makes the
 server refuse to start (the schema v3 migration fails and the store does not open), on every boot,
-until the database is replaced. This is the hard-cutover posture in `docs/user-manual/upgrading.md`
+until the database is replaced. Only that case is detected: decisions on engine or group grants
+made by earlier builds are not checked and read as "previous: not recorded". This is the hard-cutover posture in `docs/user-manual/upgrading.md`
 ("Deployment contract (hard cutover)"): fresh database only.

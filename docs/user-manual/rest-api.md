@@ -4346,7 +4346,11 @@ that predates the history table, and never means pending), `reviewer`,
 `justification` and `decided_at_ms` (the wall clock of the server replica that
 recorded it). The grant's own `decision`, `reviewer`, `justification` and
 `decided_at_ms` are the latest entry. The response grows with every recorded
-decision. The Settings campaign fragment shows the latest decision only and has
+decision, up to 100 per grant: `history[]` lists at most the latest 100 entries of
+a grant, and `decision_seq` stays the total, so `decision_seq` greater than the
+number of entries means earlier ones are not shown (the write cap keeps a grant at
+or under 100, so this appears only if rows were added or removed by other means).
+The Settings campaign fragment shows the latest decision only and has
 no marker for earlier ones; that difference is intended. The Access page shows the
 latest decision with a marker and the earlier ones behind a disclosure. The marker
 reads "re-recorded" when every later entry repeats the one before it exactly (the
@@ -4390,10 +4394,10 @@ gate, so a caller without the permission still gets the `403`.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `principal_type` | string | Yes | `user` \| `group` \| `engine` |
-| `principal_id` | string | Yes | Principal identifier |
-| `role_name` | string | Yes | Role being reviewed |
+| `principal_id` | string | Yes | Principal identifier, 1 to 256 bytes, no NUL byte |
+| `role_name` | string | Yes | Role being reviewed, 1 to 256 bytes, no NUL byte |
 | `decision` | string | Yes | `attested` \| `flagged_revoke` |
-| `justification` | string | No | Free-text reviewer note, at most 4096 bytes |
+| `justification` | string | No | Free-text reviewer note, at most 4096 bytes. It is kept with the decision and the application never deletes it: do not enter personal data beyond what the review requires. |
 
 **`flagged_revoke` records evidence ONLY — it never itself revokes the
 grant.** No RBAC/EnginePrincipal mutation happens on this path; acting on
@@ -4401,18 +4405,32 @@ the flag (unassigning the role, revoking the engine principal, etc.) is a
 separate, explicit operator action performed after reading this evidence.
 flag ≠ revoke.
 
-**Responses:** `200` — `{recorded: true}`. `400`: the campaign id is
+**Responses:** `200` with `{recorded: true, decision_seq, previous_decision}`:
+`decision_seq` is this decision's position in the grant's history (`1` for the
+first) and `previous_decision` is the decision it replaced (`pending` for the
+first), so a reviewer working from a stale view can see that it replaced another
+decision. `400`: the campaign id is
 malformed (see the rule above), `principal_type`, `principal_id`, or
 `role_name` is missing, `decision` is neither `attested` nor
-`flagged_revoke`, `justification` is longer than 4096 bytes, or `principal_type`,
-`principal_id`, `role_name` or `justification` contains a NUL byte. `403`
+`flagged_revoke`, `principal_type`, `principal_id` or `role_name` is longer than
+256 bytes or contains a NUL byte, `justification` is longer than 4096 bytes or
+contains a NUL byte (the justification bounds are checked by the store, after the
+separation-of-duties gate, and write a `failure` audit row), or the grant already holds the maximum of 100 recorded
+decisions (nothing is recorded). The grant-field `400` carries the message
+`principal_type, principal_id and role_name must be 1-256 bytes without NUL`. It is
+decided before any lookup, so it holds for all three principal types, and it writes
+no audit row (the schema `maxLength` values are discovery metadata; the handler
+enforces the limit). The decision-cap `400` carries the message `this grant already
+has the maximum number of recorded decisions (100); a further decision cannot be
+recorded`, is decided in the store, leaves the state unchanged and writes a
+`failure` audit row. `403`
 without `AccessReview:Attest` (or an engine-classed caller), for a browser
 (session-cookie) request that carries no `Origin`/`Referer` naming this site
 (audited as `csrf.denied`; API-token callers are exempt), or because the reviewer
 is the subject of the grant (see the next paragraph). `404` — no campaign with
 that id, no such frozen grant in it, or the campaign is already closed (a
-reviewer who is the subject of a `user` grant gets the `403` instead, even for a
-closed campaign). `415` — `Content-Type` is not `application/json`. `503` — the
+reviewer who is the subject of the grant, of any of the three types, gets the
+`403` instead, even for a closed campaign). `415` — `Content-Type` is not `application/json`. `503` — the
 access-review store is unavailable, a genuine write failure, or the check that
 the reviewer differs from the subject could not be answered (see below).
 
@@ -4429,6 +4447,19 @@ write, not inside it, so a change to the owner or the membership that lands in
 between is not seen; the user rule has no such gap. The two identities of one
 person (a local account and an SSO identity) count as two reviewers.
 
+**How fresh the engine and group checks are.** Both are read at the moment of the
+attest, so an owner who transferred an engine, or a member who left a group, before
+attesting is admitted. Engine ownership is a live read. Group membership is read
+from Yuzu's stored membership, which an identity provider updates only when that
+member signs in: a change at the identity provider is not seen by the group rule
+until then (the session lifetime, not milliseconds), and a sign-in whose token
+skips the membership refresh (for example an Entra groups-overage token) does not
+refresh it. For identity-provider-governed groups the group rule is therefore not
+a current-membership check; review those groups at the identity provider when the
+campaign closes. For an engine or group grant the history entry does not record the
+ownership or membership basis; the `sod=pass` audit row is the evidence of
+independence (see `docs/auth-architecture.md` "Periodic access reviews").
+
 **Every decision is kept.** A second decision for the same `(campaign_id,
 principal_type, principal_id, role_name)` does not replace the first: it is
 appended to the grant's history at the next `seq`, with the decision it replaced.
@@ -4442,10 +4473,19 @@ earlier one is retained in the history.
 **If the answer is lost, read before retrying.** A decision is recorded when its
 transaction commits. If the connection drops after the commit was sent, the server
 cannot tell whether it was recorded and answers a write failure (`503`). Before
-retrying, `GET /api/v1/access-reviews/{id}` and compare `decision_seq`. A retry
-after an unacknowledged commit appends an identical decision at the next `seq`;
-it is kept and visible, never an error, and the first attempt's audit row may be
-missing while its history entry exists. There is no idempotency key.
+retrying, `GET /api/v1/access-reviews/{id}`, compare `decision_seq` with the value
+you last saw and look for your own entry (match `reviewer`, `justification` and
+`decided_at_ms`). A blind retry after an unacknowledged commit appends an identical
+decision at the next `seq`; it is kept and visible, never an error. The first
+attempt writes a `failure` audit row, so an auditor sees a failure row next to a
+committed decision. There is no idempotency key.
+
+**Store failure answer.** A store failure that is not the caller's (a lease timeout,
+a query error, a lost commit acknowledgement) is answered `503` with the fixed
+message `the decision store is unavailable or the decision may not have been
+committed; read the campaign and compare decision_seq before retrying`,
+`retry_after_ms: 5000` and that remediation. It never carries database text, which
+goes to the server log; the `failure` audit row carries the same fixed message.
 
 **Separation-of-duties answers.** `403` with the message `the reviewer must
 differ from the subject of this grant; ask another reviewer to record this
@@ -4461,11 +4501,16 @@ group lookup could not be answered (nothing is recorded; retry the request).
 Audited as `access_review.attested` (decision `attested`) or
 `access_review.flagged` (decision `flagged_revoke`) — the two outcomes are
 separately countable/alertable, not one verb with a buried field. Every row of
-these two verbs has `target_id=<campaign_id>` alone and the grant in the detail as
-`principal_type=<t> principal_id=<id> role=<role>` (each value passed through the
-audit token filter, which folds spaces, so two different raw ids can read the
-same in a refusal row; a success row also carries `seq`, the exact key into the
-history):
+these two verbs for an outcome that reaches the gate or the store has
+`target_id=<campaign_id>` alone and the grant in the detail as
+`principal_type=<t> principal_id=<id> role=<role>`; the refusal of an engine session
+and the `415` refusal carry an empty `target_id`. Each value is passed through the
+audit token filter, which folds spaces and a few separators, so two grants whose ids
+fold to the same text cannot be told apart in a row, a success row included. A
+success row also carries `seq`, which numbers the decisions of one grant: with the
+campaign id and the grant it identifies one history entry. Rows written before this
+build keep the earlier shape (`target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>`),
+so an archive holds both:
 
 | Outcome | `result` | `detail` (then the grant, as above) |
 |---|---|---|
@@ -4474,7 +4519,8 @@ history):
 | Reviewer owns the engine | `denied` | `sod_engine_owner` |
 | Reviewer is a group member | `denied` | `sod_group_member` |
 | Engine or group lookup unavailable | `failure` | `sod_check_unavailable store=engine` or `store=rbac` |
-| Any other store failure | `failure` | the store's message |
+| Store fault that is not the caller's (lease timeout, query error, lost commit) | `failure` | the fixed store-failure message above, never the database text |
+| Store refusal of the request (the 100-decision cap, a justification over its bound, no such grant or campaign) | `failure` | the store's message |
 
 A refusal row is written before the `403`/`503` body. The recorded decision is
 committed first and its audit row follows: a failed audit write never undoes the

@@ -74,8 +74,9 @@ const std::vector<pg::PgMigration>& migrations() {
         // change); the database only GUARDS, so a state change that is not exactly one appended
         // history row is refused. A writer trigger was rejected because an `IS DISTINCT FROM`
         // trigger records value changes, not decisions (an identical repeat attest would leave
-        // no history). The guard also refuses an older binary's bare UPDATE during a mixed-
-        // version window: it fails (class 23, a 503), it does not bypass the reviewer rule.
+        // no history). A bare UPDATE from an earlier binary against a migrated schema fails
+        // (SQLSTATE class 23) and does not bypass the reviewer rule; the deployment contract
+        // excludes earlier binaries, so this is a backstop, not a supported configuration.
         //
         // Honest limits: append-only against the application path and ordinary SQL, NOT
         // against the application credential. The runner creates the schema under that role, so
@@ -97,9 +98,10 @@ const std::vector<pg::PgMigration>& migrations() {
         // here, every boot, until it is replaced. Every other legacy decided row backfills as
         // seq 1 with previous_decision '' (not recorded; never read as 'pending').
         //
-        // ADD COLUMN and CREATE TRIGGER take ACCESS EXCLUSIVE, so the pool's 10 s lock_timeout
-        // is raised to 30 s as in ca_store v3/v4. The backfill is expected to be empty under
-        // the deployment contract; the statement_timeout bounds a carried-forward one.
+        // ADD COLUMN and ADD CONSTRAINT take ACCESS EXCLUSIVE (CREATE TRIGGER takes SHARE ROW
+        // EXCLUSIVE), so the pool's 10 s lock_timeout is raised to 30 s as in ca_store v3/v4.
+        // The backfill is expected to be empty under the deployment contract; the
+        // statement_timeout bounds a carried-forward one.
         {3,
          "SET LOCAL lock_timeout = '30s'; "
          "SET LOCAL statement_timeout = '300s'; "

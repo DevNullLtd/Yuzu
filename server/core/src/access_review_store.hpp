@@ -248,8 +248,9 @@ public:
     /// `principal_id == reviewer` (byte-exact), also decided before the pool is
     /// touched, so it precedes `not_found`; `unexpected("not_found: ...")` (404)
     /// when the (campaign_id, principal_type, principal_id, role_name) tuple is
-    /// not in the frozen population, OR the campaign is not open (closed
-    /// campaigns are immutable evidence, see `close_campaign`);
+    /// not in the frozen population, OR the campaign is not open (the
+    /// application refuses further decisions on a closed campaign, see
+    /// `close_campaign`; the campaign row itself has no database guard);
     /// `unexpected("bad_request: " + kDecisionCapMessage)` (400) when the grant
     /// already holds `kMaxDecisionsPerGrant` decisions, decided inside the
     /// transaction under the row lock (nothing is written). Any other

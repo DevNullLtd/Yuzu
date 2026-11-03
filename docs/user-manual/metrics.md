@@ -1442,7 +1442,10 @@ Unlike the four series above it is counted for both the REST route and the MCP
 principal the reviewer owns), `group_member` (a group the reviewer belongs to) or
 `check_unavailable` (the engine or group lookup behind the check could not be
 answered, so nothing was recorded; this one is a degraded store, not a reviewer
-doing something wrong). All eight series are pre-seeded to `0`. The counter moves
+doing something wrong, and no dedicated alert ships for it: the group path also
+feeds the existing `yuzu_server_rbac_read_degrade_total` (a pool timeout, an open
+breaker or a query error), while the engine path emits no other metric, so an
+engine lookup outage is visible only here and in the `failure` audit rows). All eight series are pre-seeded to `0`. The counter moves
 whether or not the refusal's audit row could be saved. It is operational, not
 `event="security"`, and has no alert rule; the refusal's own audit row
 (`access_review.attested` / `access_review.flagged` with `result=denied`, or
