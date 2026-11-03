@@ -13,9 +13,13 @@
  * comes back, instead of pinning the set at the future hour and silently dropping every real
  * row after it.
  *
- * Pure and copyable on purpose. Callers filter against a COPY and assign it back only
- * after the rows are committed, so a rolled-back tick re-derives the same rows instead
- * of finding its keys already consumed.
+ * Pure and copyable. A tick filters IN PLACE inside a batch: begin_batch() starts recording the
+ * keys admitted from then on, commit_batch() keeps them, rollback_batch() erases them so a
+ * rolled-back tick re-derives the same rows instead of finding its keys already consumed. The
+ * undo costs one erase per admitted key, not a copy of the whole set (up to 20,000 strings) on
+ * every tick. An hour change or overflow clear inside a batch is not undone: that costs at most
+ * one repeated row per key, the same worst case the clear already has. A batch left open (an
+ * exception between begin and commit) is rolled back by the next begin_batch().
  */
 
 #include <cstddef>
@@ -23,6 +27,7 @@
 #include <string>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace yuzu::echo {
 
@@ -49,9 +54,36 @@ public:
             keys_.clear();
             ++overflows_;
         }
+        if (batch_open_)
+            admitted_.push_back(key);
         keys_.insert(std::move(key));
         return true;
     }
+
+    /// Forget `key` (no-op when absent).
+    void erase(const std::string& key) { keys_.erase(key); }
+
+    /// Start recording admitted keys. An earlier batch that was never committed is rolled back
+    /// first, so an exception between begin and commit cannot leave its keys consumed.
+    void begin_batch() {
+        rollback_batch();
+        batch_open_ = true;
+    }
+    /// The rows were stored: keep the keys admitted since begin_batch().
+    void commit_batch() noexcept {
+        admitted_.clear();
+        batch_open_ = false;
+    }
+    /// The rows were not stored: erase the keys admitted since begin_batch().
+    void rollback_batch() {
+        for (const auto& k : admitted_)
+            erase(k);
+        admitted_.clear();
+        batch_open_ = false;
+    }
+    /// Keys admitted in the open batch (what a rollback would erase).
+    [[nodiscard]] std::size_t batch_admitted() const noexcept { return admitted_.size(); }
+    [[nodiscard]] std::size_t size() const noexcept { return keys_.size(); }
 
     /// Times the cap forced a clear. Monotonic for the life of the process.
     [[nodiscard]] uint64_t overflows() const noexcept { return overflows_; }
@@ -67,6 +99,8 @@ private:
     int64_t hour_{INT64_MIN};
     uint64_t overflows_{0};
     std::unordered_set<std::string> keys_;
+    std::vector<std::string> admitted_;
+    bool batch_open_{false};
 };
 
 } // namespace yuzu::echo

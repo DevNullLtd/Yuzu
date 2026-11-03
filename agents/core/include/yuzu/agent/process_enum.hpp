@@ -56,6 +56,13 @@ namespace detail {
 /// (unlike istream::read / operator<<) has no sentry to catch it, so the exception used to
 /// unwind through the snapshot pump and terminate the agent. On a throw the bytes read before
 /// it are returned. Exposed for the unit test.
+///
+/// Bounded: the read stops at `kProcReadCap` bytes and the prefix is kept. The kernel's argument
+/// limit bounds /proc/<pid>/cmdline only at megabytes, and this runs for every process on every
+/// snapshot; the display value is truncated downstream anyway. A result of exactly `kProcReadCap`
+/// bytes means "possibly truncated" (the reader does not look one byte further to tell).
+inline constexpr std::size_t kProcReadCap = 256 * 1024;
+
 YUZU_EXPORT std::string read_proc_bytes(std::istream& in) noexcept;
 
 #if defined(__linux__) || defined(__APPLE__)

@@ -136,7 +136,7 @@ empty); `n/a` means the source does not apply to that OS. The table is read from
 - **Raw capture row volume.** `tcp`: a socket first seen already closing is one row per process and
   remote per hour; for outbound connections the hourly `connect_count` for these sockets is
   distinct remotes per process per hour, and an inbound socket first seen closing is one row per
-  client socket per hour, because the remote port is the client's ephemeral port. `module` (Windows): unloads are not stored, risky loads always are, and every other load
+  client socket per hour, because the remote port is the client's ephemeral port. The macOS nstat stream applies the same rule to a flow it first reports already closing (such as the dump of existing flows each time it subscribes), sharing one per-hour set with the poll. `module` (Windows): unloads are not stored, risky loads always are, and every other load
   is stored once per hour per loader, module and folder, so `load_count` is distinct combinations
   for ordinary modules; an image with no embedded signature is looked up in the system catalogs
   (a lookup error reads `unknown`, never risky). `registry`: 512-byte values, the old value is not

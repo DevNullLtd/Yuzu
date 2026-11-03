@@ -377,6 +377,23 @@ TEST_CASE("read_proc_bytes reads a whole stream and an empty one", "[echo][fleet
     CHECK(yuzu::agent::detail::read_proc_bytes(empty).empty());
 }
 
+TEST_CASE("read_proc_bytes stops at the cap and keeps the prefix", "[echo][fleet][procread]") {
+    constexpr auto cap = yuzu::agent::detail::kProcReadCap;
+    // A distinct final byte past the cap: if the reader ever looked beyond it, 'Z' would appear.
+    std::string big(cap + 4096, 'a');
+    big.back() = 'Z';
+    std::istringstream in(big);
+    std::string got;
+    REQUIRE_NOTHROW(got = yuzu::agent::detail::read_proc_bytes(in));
+    CHECK(got.size() == cap);
+    CHECK(got == big.substr(0, cap));
+    CHECK(got.find('Z') == std::string::npos);
+
+    // Just under the cap is returned whole.
+    std::istringstream under(std::string(cap - 1, 'b'));
+    CHECK(yuzu::agent::detail::read_proc_bytes(under).size() == cap - 1);
+}
+
 #if defined(__linux__) || defined(__APPLE__)
 
 TEST_CASE("parse_proc_status: Name, PPid and Uid parse with many trailing lines",

@@ -371,7 +371,9 @@ std::string render_echo_tiers(const nlohmann::json& echo) {
             "<p class=\"hint\" style=\"padding:12px 16px 14px\">Look again after is how long a "
             "record is guaranteed to stay in this source's history, measured on the agent's clock. "
             "Roll-up rows age from the start of their bucket, so the monthly figure is a 31-day "
-            "worst-case floor. ";
+            "worst-case floor. A device over its byte budget (db_budget_bytes) removes raw capture "
+            "rows older than 24 hours and hourly rows older than 48 hours inside these depths, "
+            "oldest first. ";
     const auto tick = echo.value("tick_seconds", 0);
     if (tick > 0)
         html += "Old rows are pruned every " + std::to_string(tick) +

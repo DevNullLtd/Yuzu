@@ -112,7 +112,13 @@ std::vector<UserSession> enumerate_users() {
 std::vector<UserSession> enumerate_users() {
     std::vector<UserSession> sessions;
 
-    setutent();
+    // Ends the login-database session on every exit path, including a throwing push_back (#6903).
+    struct UtmpSession {
+        UtmpSession() { setutent(); }
+        ~UtmpSession() { endutent(); }
+        UtmpSession(const UtmpSession&) = delete;
+        UtmpSession& operator=(const UtmpSession&) = delete;
+    } utmp_session;
     struct utmp* entry = nullptr;
     while ((entry = getutent()) != nullptr) {
         if (entry->ut_type != USER_PROCESS)
@@ -122,7 +128,6 @@ std::vector<UserSession> enumerate_users() {
         // (echo_collectors.hpp), which the unit tests drive with hand-built records.
         sessions.push_back(user_session_from_utmp(*entry));
     }
-    endutent();
     return sessions;
 }
 
@@ -132,8 +137,14 @@ std::vector<UserSession> enumerate_users() {
 std::vector<UserSession> enumerate_users() {
     std::vector<UserSession> sessions;
 
-    // Use utmpx API instead of parsing `who` output for reliable field extraction
-    setutxent();
+    // Use utmpx API instead of parsing `who` output for reliable field extraction. The session
+    // ends on every exit path, including a throwing push_back (#6903).
+    struct UtmpxSession {
+        UtmpxSession() { setutxent(); }
+        ~UtmpxSession() { endutxent(); }
+        UtmpxSession(const UtmpxSession&) = delete;
+        UtmpxSession& operator=(const UtmpxSession&) = delete;
+    } utmpx_session;
     struct utmpx* entry = nullptr;
     while ((entry = getutxent()) != nullptr) {
         if (entry->ut_type != USER_PROCESS)
@@ -143,7 +154,6 @@ std::vector<UserSession> enumerate_users() {
         // session: the shared conversion classifies on ut_host (echo_collectors.hpp).
         sessions.push_back(user_session_from_utmp(*entry));
     }
-    endutxent();
     return sessions;
 }
 

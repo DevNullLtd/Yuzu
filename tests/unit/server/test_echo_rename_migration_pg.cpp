@@ -370,6 +370,87 @@ TEST_CASE("Echo rename: instruction_store v3 moves an operator Echo definition's
     CHECK(col("name") == "Hunt");
 }
 
+TEST_CASE("Echo rename: instruction_store v3 keeps the archive tool in an operator-edited "
+          "builtin-shaped row while the feature name and tar|snapshot still rewrite",
+          "[pg][echo][migration][instruction_store]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        yuzu::server::InstructionStore store{pool};
+        REQUIRE(store.is_open());
+    }
+    const std::string& dsn = db.dsn();
+
+    // Builtin-shaped (plugin tar, id crossplatform.tar.*): the prose chain runs over every free
+    // text column. An operator edited it to run the archive tool; each archive shape below must
+    // survive, and each feature-name use beside it must still become Echo.
+    exec_sql(dsn, R"SQL(INSERT INTO instruction_store.instruction_definitions
+        (id, name, type, plugin, description, required_plugins, yaml_source) VALUES
+        ('crossplatform.tar.shellout', 'TAR: Shell', 'question', 'tar',
+         'Runs tar -czf out.tar.gz dir then tar xzf a.tar.gz; reads tar.sql and tar|snapshot|complete',
+         'tar',
+         E'spec:\n  plugin: tar\n  run: tar -czf out.tar.gz dir\n  also: tar --strip-components=1 x\n  pipe: tar | grep x\n  win: tar.exe and modern-tar\n  data: tar|123\n  note: reads tar.status, response tar|snapshot|complete\n'))SQL");
+
+    roll_back(dsn, "instruction_store", 2);
+    {
+        PgPool pool{{.conninfo = dsn, .size = 2}};
+        yuzu::server::InstructionStore store{pool};
+        REQUIRE(store.is_open());
+    }
+    CHECK(version_of(dsn, "instruction_store") == "3");
+
+    const auto col = [&](const char* column) {
+        return one(dsn, std::string("SELECT ") + column +
+                            " FROM instruction_store.instruction_definitions WHERE id = "
+                            "'crossplatform.echo.shellout'");
+    };
+    CHECK(col("name") == "Echo: Shell");
+    CHECK(col("description") ==
+          "Runs tar -czf out.tar.gz dir then tar xzf a.tar.gz; reads echo.sql and "
+          "echo|snapshot|complete");
+    CHECK(col("yaml_source") ==
+          "spec:\n  plugin: echo\n  run: tar -czf out.tar.gz dir\n  also: tar --strip-components=1 x\n"
+          "  pipe: tar | grep x\n  win: tar.exe and modern-tar\n  data: tar|123\n"
+          "  note: reads echo.status, response echo|snapshot|complete\n");
+}
+
+TEST_CASE("Echo rename: instruction_store v3 refuses to open when a legacy definition id "
+          "collides with an existing Echo id, and rewrites nothing",
+          "[pg][echo][migration][instruction_store]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        yuzu::server::InstructionStore store{pool};
+        REQUIRE(store.is_open());
+    }
+    const std::string& dsn = db.dsn();
+
+    // The legacy row and an Echo-named row of the same suffix: the NOT EXISTS guard keeps the
+    // legacy id, and the dependent stores would then re-point at the other definition.
+    exec_sql(dsn,
+             "INSERT INTO instruction_store.instruction_definitions "
+             "(id, name, type, plugin, description) VALUES "
+             "('crossplatform.tar.clash', 'Legacy', 'question', 'tar', 'legacy tar row'), "
+             "('crossplatform.echo.clash', 'Existing', 'question', 'echo', 'pre-existing row'), "
+             "('crossplatform.tar.fine', 'Fine', 'question', 'tar', 'tar row without a clash')");
+
+    roll_back(dsn, "instruction_store", 2);
+    {
+        PgPool pool{{.conninfo = dsn, .size = 2}};
+        yuzu::server::InstructionStore store{pool};
+        CHECK_FALSE(store.is_open()); // the migration transaction failed; startup refuses
+    }
+    // The failed migration rolled back whole: version unchanged, no row rewritten.
+    CHECK(version_of(dsn, "instruction_store") == "2");
+    CHECK(one(dsn, "SELECT plugin || '|' || description FROM "
+                   "instruction_store.instruction_definitions WHERE id = 'crossplatform.tar.clash'") ==
+          "tar|legacy tar row");
+    CHECK(one(dsn, "SELECT count(*) FROM instruction_store.instruction_definitions WHERE id = "
+                   "'crossplatform.tar.fine'") == "1");
+    CHECK(one(dsn, "SELECT description FROM instruction_store.instruction_definitions WHERE id = "
+                   "'crossplatform.echo.clash'") == "pre-existing row");
+}
+
 TEST_CASE("Echo rename: the migrated crossplatform.tar.query row equals the freshly seeded "
           "crossplatform.echo.query row on every column",
           "[pg][echo][migration][instruction_store]") {

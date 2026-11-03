@@ -17,13 +17,28 @@
 // interrupted adoption therefore always looks like "tar.db present, echo.db absent" and resumes
 // on the next boot, and echo.db can never be opened while its WAL still carries the old name.
 //
-// Accepted limit of that resume state: when tar.db is present, its own sidecar is absent and the
-// echo.db sidecar exists, the helper takes the echo.db sidecar to be tar.db's own, already moved.
-// It cannot tell that from a stale one: if an older agent is run against tar.db between the
-// interruption and the next boot, writes, and cleanly checkpoints and deletes its WAL, the
-// re-upgrade pairs the newer tar.db with the earlier echo.db WAL and replays it over the newer
-// file. No cheap check separates the two (a checkpoint writes tar.db after the WAL's last frame,
-// so an mtime or header comparison would refuse legitimate resumes), so the residual is accepted.
+// Adoption-intent marker (#6752). A resume must not pair a NEWER tar.db with an OLDER echo.db WAL:
+// if an older agent is run against tar.db between an interruption and the next boot, writes, and
+// cleanly checkpoints and deletes its WAL, replaying the echo.db WAL over that file would lose or
+// corrupt Echo history. So before the FIRST sidecar move the helper durably writes
+// <data_dir>/echo.db.adopting holding tar.db's size and mtime at that moment, and removes it after
+// the main-file rename. On the next boot:
+//   - tar.db present, an echo.db sidecar present, marker present and equal to tar.db's current
+//     size and mtime: nothing has touched tar.db since the sidecars moved; resume as normal.
+//   - the same with the marker ABSENT or recording a different tar.db: the echo.db sidecar is not
+//     provably this adoption's own (the marker is written before every move it guards), so adoption
+//     fails closed, naming both files, and moves nothing; EchoDatabase::open() then refuses until the
+//     operator resolves the two files.
+// The marker is a plain file written with write_file_atomic (fsync'd on POSIX; on Windows the
+// shared writer documents no flush-by-handle, so a power loss right after the write can lose the
+// marker there, which fails closed rather than open). A marker left behind once tar.db is gone (the
+// removal after the rename failed) is deleted at the next boot. An older agent that never learned
+// of the marker still cannot slip through, because the comparison is against tar.db itself.
+//
+// Open-path ordering (settles the overlap with the v10 schema migration): adoption runs in agent
+// core (agents/core/src/agent.cpp) before any plugin initialises, and the v10 migration runs inside
+// EchoDatabase::open() from EchoPlugin::init, so the marker is already gone before open() runs and
+// a v10 failure never touches it.
 //
 // If both main files exist they are two independent databases (an agent downgraded after the
 // rename, then upgraded again). Nothing is touched: echo.db wins, tar.db and its sidecars are
@@ -44,12 +59,52 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <iterator>
+#include <optional>
 #include <string>
 #include <system_error>
 
 #include <spdlog/spdlog.h>
 
+#include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic: the fsync'd marker write
+
 namespace yuzu::agent {
+
+namespace detail {
+
+/// <data_dir>/echo.db.adopting: the adoption-intent marker beside `echo_db`.
+[[nodiscard]] inline std::filesystem::path legacy_echo_adoption_marker(
+    const std::filesystem::path& echo_db) {
+    std::filesystem::path marker = echo_db;
+    marker += ".adopting";
+    return marker;
+}
+
+/// What the marker records about the legacy main file: its size and mtime.
+[[nodiscard]] inline std::expected<std::string, std::string>
+legacy_echo_fingerprint(const std::filesystem::path& legacy) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const auto size = fs::file_size(legacy, ec);
+    if (ec)
+        return std::unexpected(std::format("cannot stat {}: {}", legacy.string(), ec.message()));
+    const auto mtime = fs::last_write_time(legacy, ec);
+    if (ec)
+        return std::unexpected(std::format("cannot stat {}: {}", legacy.string(), ec.message()));
+    return std::format("{} {}\n", size, mtime.time_since_epoch().count());
+}
+
+/// The marker's bytes, or nullopt when it is absent or unreadable (both count as "no marker").
+[[nodiscard]] inline std::optional<std::string>
+read_legacy_echo_marker(const std::filesystem::path& marker) {
+    std::ifstream in(marker, std::ios::binary);
+    if (!in)
+        return std::nullopt;
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+} // namespace detail
 
 [[nodiscard]] inline std::expected<void, std::string>
 adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
@@ -75,6 +130,12 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
     // No legacy main file: nothing to adopt. A stray legacy sidecar is left where it is, never
     // moved onto echo.db (see the header comment).
     if (!legacy_present) {
+        // A marker outliving the main-file rename (its removal failed) is spent: delete it, or a
+        // later downgrade that recreates tar.db could be mistaken for this adoption's resume.
+        std::error_code mec;
+        if (fs::remove(detail::legacy_echo_adoption_marker(echo_db), mec); mec)
+            spdlog::warn("Cannot remove the spent adoption marker {}: {}",
+                         detail::legacy_echo_adoption_marker(echo_db).string(), mec.message());
         for (const char* suffix : kSidecars) {
             fs::path stray = legacy;
             stray += suffix;
@@ -90,7 +151,44 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
         return {};
     }
 
+    // Resume safety (#6752): an echo.db sidecar whose legacy twin is absent was either moved by an
+    // earlier run of THIS adoption or is stale. It is provably ours only when the marker records
+    // tar.db exactly as it is now (see the header comment); otherwise fail closed, moving nothing.
+    const fs::path marker = detail::legacy_echo_adoption_marker(echo_db);
+    const auto fingerprint = detail::legacy_echo_fingerprint(legacy);
+    if (!fingerprint)
+        return std::unexpected(fingerprint.error());
+    const auto recorded = detail::read_legacy_echo_marker(marker);
+    const bool marker_matches = recorded && *recorded == *fingerprint;
+    if (!marker_matches) {
+        for (const char* suffix : kSidecars) {
+            fs::path from = legacy;
+            from += suffix;
+            fs::path to = echo_db;
+            to += suffix;
+            const bool from_present = fs::exists(from, ec);
+            if (ec)
+                return std::unexpected(
+                    std::format("cannot stat {}: {}", from.string(), ec.message()));
+            const bool to_present = fs::exists(to, ec);
+            if (ec)
+                return std::unexpected(
+                    std::format("cannot stat {}: {}", to.string(), ec.message()));
+            if (to_present && !from_present)
+                return std::unexpected(std::format(
+                    "cannot adopt {}: {} exists but {}, so it cannot be shown to belong to this "
+                    "adoption (it could be an older database's log); nothing was moved, resolve "
+                    "{} by hand",
+                    legacy.string(), to.string(),
+                    recorded ? std::format("{} records a different {}", marker.string(),
+                                           legacy.string())
+                             : std::format("no adoption marker {} exists", marker.string()),
+                    to.string()));
+        }
+    }
+
     // Sidecars first. A source that does not exist is already moved (or never was): success.
+    bool marker_written = marker_matches;
     for (const char* suffix : kSidecars) {
         // path::operator+= appends in the native character type; string() + suffix would narrow
         // a wide Windows path through the ANSI code page first.
@@ -114,6 +212,15 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
             return std::unexpected(
                 std::format("cannot adopt {}: {} and {} both exist; resolve them by hand",
                             legacy.string(), from.string(), to.string()));
+        // Record the intent durably BEFORE the first sidecar leaves its name.
+        if (!marker_written) {
+            if (auto w = yuzu::shared::write_file_atomic(marker, *fingerprint); !w)
+                return std::unexpected(std::format("cannot adopt {}: cannot record the adoption "
+                                                   "marker {}: {}",
+                                                   legacy.string(), marker.string(),
+                                                   w.error().message));
+            marker_written = true;
+        }
         fs::rename(from, to, ec);
         if (ec)
             return std::unexpected(std::format("cannot move {} to {}: {}", from.string(),
@@ -125,6 +232,10 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
     if (ec)
         return std::unexpected(std::format("cannot move {} to {}: {}", legacy.string(),
                                            echo_db.string(), ec.message()));
+    // Adoption is complete; the marker is spent. A failed removal is retried at the next boot.
+    if (std::error_code mec; fs::remove(marker, mec), mec)
+        spdlog::warn("Cannot remove the spent adoption marker {}: {}", marker.string(),
+                     mec.message());
     spdlog::info("Adopted legacy {} as {}", legacy.string(), echo_db.string());
     return {};
 }

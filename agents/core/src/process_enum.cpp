@@ -149,7 +149,8 @@ namespace detail {
 std::string read_proc_bytes(std::istream& in) noexcept {
     std::string out;
     try {
-        for (std::istreambuf_iterator<char> it(in), end; it != end; ++it)
+        for (std::istreambuf_iterator<char> it(in), end; it != end && out.size() < kProcReadCap;
+             ++it)
             out.push_back(*it);
     } catch (...) {
         // Keep what was read before the failure (see the declaration).

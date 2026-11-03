@@ -59,6 +59,7 @@
  */
 
 #include "echo_db.hpp"         // NetworkEvent
+#include "echo_hour_dedup.hpp" // HourlySeenSet
 #include "echo_netqual.hpp"     // TcpQualitySample
 #include "echo_proc_stream.hpp" // EventRing<T>
 
@@ -510,6 +511,16 @@ NstatFlowEvent nstat_build_close_event(std::int64_t ts_unix, const FlowState& la
 /// "CLOSED" (the flow just vanished). nstat is a lifecycle stream, not the DNS-resolving poll,
 /// so remote_host stays empty.
 NetworkEvent network_event_from_nstat_flow(const NstatFlowEvent& e, std::int64_t snapshot_id);
+
+/// PURE. The closing-socket rule of the poll leg (compute_network_events), applied to nstat
+/// lifecycle events: an OPEN event whose descriptor state is ending (TIME_WAIT, CLOSE_WAIT, ...)
+/// is kept only the first time its (process, remote address, remote port) is seen in the hour of
+/// its timestamp, `seen` being the same set the poll leg uses. Every other event (a close, an
+/// open in any non-ending state) passes through unchanged and in order. The subscription dump of
+/// pre-existing flows repeats on every agent restart, so without this a host with thousands of
+/// sockets in TIME_WAIT would store one row per socket each time (#6899).
+std::vector<NstatFlowEvent> nstat_dedupe_closing_opens(std::vector<NstatFlowEvent> events,
+                                                       HourlySeenSet& seen);
 
 /// PURE. Derives one TcpQualitySample from a live flow. `lost` is
 /// nq_delta_clamped(txretransmit_cum, txretransmit_prev_snapshot) — the

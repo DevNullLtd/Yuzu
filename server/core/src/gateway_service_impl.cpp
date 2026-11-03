@@ -284,6 +284,8 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         for (const char* op :
             {"register_fresh", "announce_connected", "deregister", "renew_leases",
              "reclaim_tombstoned_session",
+             // Echo rename shim: the adopted-session refresh of legacy_echo_wire_name.
+             "set_legacy_echo_wire_name",
              // #4669: the read-only pre-check ahead of set_gateway_route —
              // see that call site's comment for why it is a distinct op from
              // "announce_connected".
@@ -1301,6 +1303,19 @@ gw_enrolled:
         spdlog::debug("[gateway] ProxyRegister: adopted presented session {} for agent {} "
                       "(store-confirmed={})",
                       ::yuzu::log_key_token(session_id), safe_agent_id, store_confirmed_adopt);
+        // Upgrade-window shim (removed with the other legacy-name shims): this branch skips
+        // register_fresh, the only other writer of the directory row's legacy plugin-name flag.
+        // The agent's own process restart yields a fresh session (agent.cpp assigns session_id_
+        // from each Register reply), so a changed plugin list normally arrives on the fresh
+        // path; the adopted path re-states the flag from the session just installed, so the
+        // row can never keep rewriting Echo commands to the old name. Fail-open like the other
+        // non-creating writes: the in-memory session already carries the right value.
+        if (gateway_route_store_) {
+            if (auto res = gateway_route_store_->set_legacy_echo_wire_name(
+                    info.agent_id(), session_id, installed->legacy_echo_wire_name);
+                !res)
+                record_route_store_failure(metrics_, "set_legacy_echo_wire_name", res.error());
+        }
     } else {
         // -- Fresh registration (unchanged behavior) --------------------------
         session_id =

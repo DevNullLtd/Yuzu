@@ -13,6 +13,7 @@
 
 #include <macos_socket_walk.hpp> // socket_walk_tcp_state: pure TCPS_* -> name, shared with the libproc walk
 
+#include <algorithm>
 #include <cstring>
 #include <format>
 
@@ -323,15 +324,27 @@ NetworkEvent network_event_from_nstat_flow(const NstatFlowEvent& e, std::int64_t
     // (TIME_WAIT, CLOSE_WAIT, ...), so the stored row says what the socket was. Every other
     // state a live flow can report (SYN_SENT, SYN_RCVD, LISTEN, an unresolved one) stays the
     // ESTABLISHED label this stream always stored, because the fleet-snapshot reader keeps only
-    // ESTABLISHED rows and nstat never upgrades a row. The closing-state rules and the hourly
-    // de-duplication apply to the poll leg (compute_network_events), not to this stream: it
-    // reports a flow in a closing state only in the one-off dump of existing flows at
-    // subscription, so there is no volume to cut.
+    // ESTABLISHED rows and nstat never upgrades a row. The closing-socket hourly de-duplication
+    // is NOT applied here: it runs before conversion, in nstat_dedupe_closing_opens, at the
+    // plugin's drain site, so a repeated subscription dump of flows already in TIME_WAIT stores
+    // one row per (process, remote) per hour exactly as the poll leg does.
     ev.state = !e.is_open ? std::string{"CLOSED"}
                           : (tcp_state_is_closing(e.state) ? e.state : std::string{"ESTABLISHED"});
     ev.pid = e.pid;
     ev.process_name = e.process_name;
     return ev;
+}
+
+std::vector<NstatFlowEvent> nstat_dedupe_closing_opens(std::vector<NstatFlowEvent> events,
+                                                       HourlySeenSet& seen) {
+    std::erase_if(events, [&seen](const NstatFlowEvent& e) {
+        if (!e.is_open || !tcp_state_is_closing(e.state))
+            return false;
+        // The same key compute_network_events (echo_diff.cpp) uses for the poll leg.
+        return !seen.first_this_hour(
+            e.ts_unix, std::format("{}\x1f{}\x1f{}", e.process_name, e.remote_addr, e.remote_port));
+    });
+    return events;
 }
 
 TcpQualitySample nstat_build_quality_sample(const FlowState& flow) {

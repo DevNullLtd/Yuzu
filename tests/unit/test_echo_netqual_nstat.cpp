@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using namespace yuzu::echo;
@@ -880,4 +881,119 @@ TEST_CASE("nstat_stream_is_stalled measures idle from the later of last-event/st
     REQUIRE_FALSE(nstat_stream_is_stalled(0, 0, 9'999, threshold));
     // Backward clock step (now < since) -> negative delta -> not stalled (benign).
     REQUIRE_FALSE(nstat_stream_is_stalled(last, start, last - 500, threshold));
+}
+
+// -- #6899: closing-state opens follow the poll leg's once-per-hour rule ------
+
+namespace {
+
+NstatFlowEvent closing_open(std::int64_t ts, const char* proc, const char* remote, int port,
+                            const char* state = "TIME_WAIT") {
+    NstatFlowEvent e;
+    e.ts_unix = ts;
+    e.is_open = true;
+    e.proto = "tcp";
+    e.local_addr = "10.0.0.2";
+    e.local_port = 50000;
+    e.remote_addr = remote;
+    e.remote_port = port;
+    e.pid = 7;
+    e.process_name = proc;
+    e.state = state;
+    return e;
+}
+
+} // namespace
+
+TEST_CASE("nstat_dedupe_closing_opens: two TIME_WAIT opens for one process and remote in an hour "
+          "store one row, and the next hour stores another",
+          "[echo][netqual][nstat]") {
+    constexpr std::int64_t hour0 = 1'700'000'400; // inside one hour
+    HourlySeenSet seen;
+
+    std::vector<NstatFlowEvent> batch{closing_open(hour0, "curl", "203.0.113.9", 443),
+                                      closing_open(hour0 + 5, "curl", "203.0.113.9", 443)};
+    auto kept = nstat_dedupe_closing_opens(std::move(batch), seen);
+    REQUIRE(kept.size() == 1);
+    // Stored through the same conversion the plugin uses: one row, the ending state kept.
+    CHECK(network_event_from_nstat_flow(kept[0], 1).state == "TIME_WAIT");
+
+    // The next hour records the pair again.
+    std::vector<NstatFlowEvent> later{closing_open(hour0 + 3600, "curl", "203.0.113.9", 443)};
+    CHECK(nstat_dedupe_closing_opens(std::move(later), seen).size() == 1);
+}
+
+TEST_CASE("nstat_dedupe_closing_opens: the key is (process, remote address, remote port) and "
+          "only closing-state opens are filtered",
+          "[echo][netqual][nstat]") {
+    constexpr std::int64_t ts = 1'700'000'400;
+    HourlySeenSet seen;
+    auto live = closing_open(ts, "curl", "203.0.113.9", 443, "ESTABLISHED");
+    auto close = closing_open(ts, "curl", "203.0.113.9", 443, "");
+    close.is_open = false;
+
+    std::vector<NstatFlowEvent> batch{
+        closing_open(ts, "curl", "203.0.113.9", 443),   // first: kept
+        closing_open(ts, "curl", "203.0.113.9", 8443),  // other port: kept
+        closing_open(ts, "wget", "203.0.113.9", 443),   // other process: kept
+        closing_open(ts, "curl", "203.0.113.10", 443),  // other remote: kept
+        closing_open(ts, "curl", "203.0.113.9", 443),   // repeat: dropped
+        live, live,                                      // not closing: never filtered
+        close, close,                                    // closes: never filtered
+    };
+    const auto kept = nstat_dedupe_closing_opens(std::move(batch), seen);
+    CHECK(kept.size() == 8);
+    // Order is preserved: the first four are the distinct closing opens.
+    CHECK(kept[1].remote_port == 8443);
+    CHECK(kept[2].process_name == "wget");
+}
+
+// -- #6895: the seen set undoes a failed commit without a whole-set copy ------
+
+TEST_CASE("HourlySeenSet batch: a rollback erases only the keys the batch admitted",
+          "[echo][netqual][dedup]") {
+    constexpr std::int64_t ts = 1'700'000'400;
+    HourlySeenSet seen;
+    constexpr int kExisting = 20000 - 3;
+    for (int i = 0; i < kExisting; ++i)
+        REQUIRE(seen.first_this_hour(ts, "old" + std::to_string(i)));
+    REQUIRE(seen.size() == static_cast<std::size_t>(kExisting));
+
+    seen.begin_batch();
+    CHECK(seen.first_this_hour(ts, "new1"));
+    CHECK(seen.first_this_hour(ts, "new2"));
+    CHECK_FALSE(seen.first_this_hour(ts, "old5")); // already stored: not part of the batch
+    CHECK(seen.first_this_hour(ts, "new3"));
+    // Count-based cost: the undo list holds the 3 admitted keys, not a copy of 19,997 strings.
+    CHECK(seen.batch_admitted() == 3);
+
+    seen.rollback_batch();
+    CHECK(seen.batch_admitted() == 0);
+    CHECK(seen.size() == static_cast<std::size_t>(kExisting));
+    CHECK_FALSE(seen.first_this_hour(ts, "old5"));  // pre-existing keys survive
+    CHECK(seen.first_this_hour(ts, "new1"));        // the failed batch's keys are admissible again
+    CHECK(seen.overflows() == 0);
+}
+
+TEST_CASE("HourlySeenSet batch: a commit keeps the keys and an unfinished batch is rolled back "
+          "by the next begin",
+          "[echo][netqual][dedup]") {
+    constexpr std::int64_t ts = 1'700'000'400;
+    HourlySeenSet seen;
+
+    seen.begin_batch();
+    REQUIRE(seen.first_this_hour(ts, "kept"));
+    seen.commit_batch();
+    CHECK_FALSE(seen.first_this_hour(ts, "kept"));
+
+    seen.begin_batch();
+    REQUIRE(seen.first_this_hour(ts, "abandoned")); // e.g. an exception before commit
+    seen.begin_batch();                              // the next tick starts a new batch
+    CHECK(seen.first_this_hour(ts, "abandoned"));    // so the abandoned key was erased
+    CHECK_FALSE(seen.first_this_hour(ts, "kept"));
+
+    // Outside a batch nothing is recorded.
+    seen.commit_batch();
+    CHECK(seen.first_this_hour(ts, "plain"));
+    CHECK(seen.batch_admitted() == 0);
 }

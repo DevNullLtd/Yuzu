@@ -198,8 +198,8 @@ New or modified owned resources introduced in `agents/plugins/echo/src/` (`echo_
 - **Failure cleanup:** both are `noexcept` and catch everything, keeping the bytes or fields read
   so far; the previous unbounded `istreambuf_iterator` read could throw when a process exited
   mid-read.
-- **Not covered:** the cmdline read has no size cap of its own (the kernel bounds it by the
-  argument limit); this branch did not add one.
+- **Cap:** `read_proc_bytes` stops at `kProcReadCap` (256 KiB) and keeps the prefix; a result of
+  exactly the cap means possibly truncated. The display value is truncated downstream anyway.
 
 ### Snapshot pump thread (`agents/core/src/agent.cpp`)
 - **Modified, not new.** The body of `snapshot_pump_thread_` now wraps one cycle in
@@ -212,14 +212,23 @@ New or modified owned resources introduced in `agents/plugins/echo/src/` (`echo_
   `getutxent` / `endutxent`), converting each `USER_PROCESS` record through
   `user_session_from_utmp` and `utmp_text`.
 - **Owner type:** the C library's login-database state, opened by the `set*` call and closed by the
-  `end*` call. Neither is wrapped in an RAII owner.
+  `end*` call. A function-local `UtmpSession` / `UtmpxSession` struct owns it (constructor calls
+  `setutent` / `setutxent`, destructor calls `endutent` / `endutxent`), so every exit path ends the
+  session. No shared scope-exit helper exists in `agents/shared` or `agents/core` to reuse.
 - **Buffers:** `utmp_text` copies at most the fixed field width (`ut_user`, `ut_line`, `ut_host`)
   with a bounded `memchr`, so a field with no terminator is not over-read. The returned strings are
   independent copies; the library's static record is not retained.
-- **Not covered:** if `sessions.push_back` or a string allocation throws `std::bad_alloc`,
-  `endutent` / `endutxent` is skipped. The state is process-global and is reset by the next
-  `setutent` / `setutxent`, so nothing accumulates, but the descriptor stays open until then. This
-  loop shape is unchanged from before this branch.
+
+### Legacy database adoption marker (`echo_db_legacy_rename.hpp`)
+- **Site:** `adopt_legacy_echo_db` writes `<data_dir>/echo.db.adopting` before the first sidecar
+  move and removes it after the main-file rename.
+- **Owner type:** the function itself, on the single boot-time call in agent core before any
+  plugin initialises. The file is written with `yuzu::shared::write_file_atomic` (temp file,
+  fsync on POSIX, rename), so no descriptor is held across the adoption. It holds one line: the
+  size and mtime of `tar.db`.
+- **Failure cleanup:** a failed marker write refuses the adoption before anything moves. A failed
+  removal after the rename logs a warning; the next boot (no `tar.db`) deletes the spent marker.
+  An interrupted adoption leaves the marker in place, which is what the resume reads.
 
 ## Not introduced
 No new socket, thread, subprocess, callback context, library handle or allocated C string. The
