@@ -419,6 +419,56 @@ TEST_CASE("instruction_yaml: line-ending and EOF edges", "[instruction_yaml]") {
         CHECK(f.id == "crlf.id");
         CHECK(f.plugin == "p");
     }
+    // #2123: the case above has no blank line, which is why it passed while a
+    // CRLF blank line inside spec: truncated the block and Save reported
+    // "Missing spec.execution.plugin" for a document that has one.
+    SECTION("CRLF with a blank line inside spec, canonical execution block (#2123)") {
+        const std::string crlf = "apiVersion: yuzu.io/v1alpha1\r\n"
+                                 "kind: InstructionDefinition\r\n"
+                                 "metadata:\r\n"
+                                 "  id: crlf.blank.id\r\n"
+                                 "spec:\r\n"
+                                 "  type: action\r\n"
+                                 "\r\n"
+                                 "  execution:\r\n"
+                                 "    plugin: agent_actions\r\n"
+                                 "\r\n"
+                                 "    action: Set_Log_Level\r\n";
+        auto f = parse_definition_yaml(crlf);
+        CHECK(f.id == "crlf.blank.id");
+        CHECK(f.type == "action");
+        CHECK(f.plugin == "agent_actions");
+        CHECK(f.action == "set_log_level");
+        CHECK(validate_definition_yaml(crlf).empty());
+    }
+    SECTION("lone-CR endings with a blank line inside spec (#2123)") {
+        const std::string cr = "apiVersion: yuzu.io/v1alpha1\r"
+                               "kind: InstructionDefinition\r"
+                               "metadata:\r"
+                               "  id: cr.blank.id\r"
+                               "spec:\r"
+                               "  type: action\r"
+                               "\r"
+                               "  execution:\r"
+                               "    plugin: agent_actions\r"
+                               "    action: Set_Log_Level\r";
+        auto f = parse_definition_yaml(cr);
+        CHECK(f.id == "cr.blank.id");
+        CHECK(f.plugin == "agent_actions");
+        CHECK(f.action == "set_log_level");
+    }
+    SECTION("comment line at column 0 inside spec, LF (#2123)") {
+        auto f = parse_definition_yaml("metadata:\n"
+                                       "  id: cmt.id\n"
+                                       "spec:\n"
+                                       "  type: action\n"
+                                       "# execution follows\n"
+                                       "  execution:\n"
+                                       "    plugin: agent_actions\n"
+                                       "    action: Set_Log_Level\n");
+        CHECK(f.plugin == "agent_actions");
+        CHECK(f.action == "set_log_level");
+    }
 }
 
 TEST_CASE("instruction_yaml: block-scalar indicators and comment-only openers are absent",

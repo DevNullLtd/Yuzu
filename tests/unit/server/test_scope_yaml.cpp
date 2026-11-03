@@ -11,6 +11,7 @@
 
 #include "scope_engine.hpp"
 #include "scope_yaml.hpp"
+#include "yaml_scan.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -221,4 +222,99 @@ TEST_CASE("scope_yaml: lowered expression re-parses through the scope engine", "
     auto parsed = yuzu::scope::parse(lowered);
     INFO("lowered = " << lowered);
     CHECK(parsed.has_value());
+}
+
+// ── #2123 regression pins: the fail-open shape end to end ───────────────────
+//
+// A blank or comment line inside `selector:` used to end the block early
+// under CRLF/lone-CR endings (and for comment lines, under LF too), dropping
+// `tags:` and lowering to `ostype == "windows"`: every Windows device instead
+// of Windows devices tagged prod.
+
+namespace {
+
+std::string with_eol(const std::string& lf, const std::string& eol) {
+    std::string out;
+    for (char c : lf) {
+        if (c == '\n')
+            out += eol;
+        else
+            out += c;
+    }
+    return out;
+}
+
+const std::string kWant = "ostype == \"windows\" AND EXISTS tag:prod";
+
+} // namespace
+
+TEST_CASE("scope_yaml: a blank line inside selector keeps every predicate (#2123)",
+          "[scope][dsl]") {
+    const std::string lf = doc("  scope:\n"
+                               "    selector:\n"
+                               "      platform: windows\n"
+                               "\n"
+                               "      tags:\n"
+                               "        - prod\n");
+    SECTION("LF") {
+        CHECK(lower_scope_block(parse_scope_block(lf)) == kWant);
+    }
+    SECTION("CRLF") {
+        CHECK(lower_scope_block(parse_scope_block(with_eol(lf, "\r\n"))) == kWant);
+    }
+    SECTION("lone CR") {
+        CHECK(lower_scope_block(parse_scope_block(with_eol(lf, "\r"))) == kWant);
+    }
+    SECTION("mixed: one CRLF blank line in an LF document") {
+        std::string mixed = lf;
+        mixed.replace(mixed.find("windows\n\n"), 9, "windows\n\r\n");
+        CHECK(lower_scope_block(parse_scope_block(mixed)) == kWant);
+    }
+    SECTION("whitespace-then-CR blank line shallower than the block") {
+        std::string d = lf;
+        d.replace(d.find("windows\n\n"), 9, "windows\n  \r\n");
+        CHECK(lower_scope_block(parse_scope_block(d)) == kWant);
+    }
+}
+
+TEST_CASE("scope_yaml: a comment line inside selector keeps every predicate (#2123)",
+          "[scope][dsl]") {
+    const std::string d = doc("  scope:\n"
+                              "    selector:\n"
+                              "      platform: windows\n"
+                              "# narrow to prod\n"
+                              "      tags:\n"
+                              "        - prod\n");
+    CHECK(lower_scope_block(parse_scope_block(d)) == kWant);
+}
+
+TEST_CASE("scope_yaml: a commented-out tags key does not replace the real one (#2123)",
+          "[scope][dsl]") {
+    const std::string d = doc("  scope:\n"
+                              "    selector:\n"
+                              "      platform: windows\n"
+                              "      # tags: [lab]\n"
+                              "      tags: [prod]\n");
+    CHECK(lower_scope_block(parse_scope_block(d)) == kWant);
+}
+
+TEST_CASE("scope_yaml: CRLF blank line inside spec.assignment keeps rule 1 enforced (#2123)",
+          "[scope][dsl]") {
+    // Pre-fix the truncated assignment block hid managementGroups from
+    // validate_scope_block, so fromResultSet + managementGroups passed.
+    const std::string d = with_eol(doc("  scope:\n"
+                                       "    fromResultSet: rs_abc\n"
+                                       "  assignment:\n"
+                                       "    mode: static\n"
+                                       "\n"
+                                       "    managementGroups:\n"
+                                       "      - g1\n"),
+                                   "\r\n");
+    auto sb = parse_scope_block(d);
+    REQUIRE(sb.has_from_result_set);
+    auto asn = yuzu::server::yaml_scan::extract_yaml_section(d, "spec.assignment");
+    auto err = validate_scope_block(
+        sb, yuzu::server::yaml_scan::extract_yaml_value(asn, "mode"),
+        !yuzu::server::yaml_scan::extract_yaml_list(asn, "managementGroups").empty());
+    CHECK(err.has_value());
 }

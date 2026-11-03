@@ -36,6 +36,7 @@
 #include <chrono>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::server;
@@ -444,6 +445,123 @@ scope:
     REQUIRE(pol.has_value());
     REQUIRE(pol->has_value());
     CHECK((*pol)->scope_expression == "ostype == \"windows\" AND EXISTS tag:prod");
+}
+
+// #2123 fail-open regression pin. A blank or comment line inside the scope
+// selector used to end the block under CRLF/lone-CR endings (comment lines
+// under LF too), so the stored scope_expression lost `EXISTS tag:prod` and the
+// policy evaluated every Windows device. The triggers list carries the same
+// shape, so its count is pinned too. managementGroups is deliberately NOT
+// asserted here: its accepted placement is an open question on #2123.
+TEST_CASE("PolicyStore: scope selector survives blank/comment lines and any line ending (#2123)",
+          "[policy_store][pg][policy][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+
+    const std::string lf = "apiVersion: yuzu.io/v1alpha1\n"
+                           "kind: Policy\n"
+                           "displayName: Line Ending Policy\n"
+                           "fragment: " +
+                           frag.value() +
+                           "\n"
+                           "scope:\n"
+                           "  selector:\n"
+                           "    platform: Windows\n"
+                           "\n"
+                           "    tags:\n"
+                           "      - prod\n"
+                           "triggers:\n"
+                           "  - type: interval\n"
+                           "    interval_seconds: 300\n"
+                           "\n"
+                           "  - type: interval\n"
+                           "    interval_seconds: 600\n";
+    auto with_eol = [](const std::string& s, const std::string& eol) {
+        std::string out;
+        for (char c : s)
+            out += (c == '\n') ? eol : std::string(1, c);
+        return out;
+    };
+    std::string mixed = lf;
+    mixed.replace(mixed.find("Windows\n\n"), 9, "Windows\n\r\n");
+    std::string commented = lf;
+    commented.replace(commented.find("Windows\n\n"), 9, "Windows\n# prod only\n");
+
+    const std::pair<const char*, std::string> cases[] = {
+        {"LF", lf},
+        {"CRLF", with_eol(lf, "\r\n")},
+        {"lone CR inside LF",
+         [&] {
+             std::string d = lf;
+             d.replace(d.find("Windows\n\n"), 9, "Windows\n\r");
+             return d;
+         }()},
+        {"mixed", mixed},
+        {"LF comment line", commented},
+    };
+    for (const auto& [label, yaml] : cases) {
+        INFO("case: " << label);
+        auto result = store.create_policy(yaml);
+        REQUIRE(result.has_value());
+        auto pol = store.get_policy(result.value());
+        REQUIRE(pol.has_value());
+        REQUIRE(pol->has_value());
+        CHECK((*pol)->scope_expression == "ostype == \"windows\" AND EXISTS tag:prod");
+        CHECK((*pol)->triggers.size() == 2);
+    }
+}
+
+// #2123 security review. Placement-neutral on purpose: managementGroups'
+// accepted location is an open question on #2123, so these assert only what
+// must NOT be absorbed, never which nested managementGroups is read.
+TEST_CASE("PolicyStore: list extent never widens groups or drops tags (#2123)",
+          "[policy_store][pg][policy][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    const std::string head = "apiVersion: yuzu.io/v1alpha1\n"
+                             "kind: Policy\n"
+                             "displayName: Extent Policy\n"
+                             "fragment: " +
+                             frag.value() + "\n";
+
+    SECTION("an outer list's item is not absorbed as a management group") {
+        auto result = store.create_policy(head + "spec:\n"
+                                                 "  things:\n"
+                                                 "    - name: a\n"
+                                                 "      managementGroups:\n"
+                                                 "        - g1\n"
+                                                 "    - g2\n");
+        REQUIRE(result.has_value());
+        auto pol = store.get_policy(result.value());
+        REQUIRE(pol.has_value());
+        REQUIRE(pol->has_value());
+        for (const auto& g : (*pol)->management_groups)
+            CHECK(g != "g2");
+    }
+    SECTION("comment text in a multi-line flow list never becomes a group") {
+        auto result =
+            store.create_policy(head + "managementGroups: [g1,  # canary, prod-all,\n  g2]\n");
+        REQUIRE(result.has_value());
+        auto pol = store.get_policy(result.value());
+        REQUIRE(pol.has_value());
+        REQUIRE(pol->has_value());
+        for (const auto& g : (*pol)->management_groups)
+            CHECK(g != "prod-all");
+    }
+    SECTION("an unterminated tags list is rejected, never stored without the tag") {
+        auto result = store.create_policy(head + "scope:\n"
+                                                 "  selector:\n"
+                                                 "    platform: windows\n"
+                                                 "    tags: [prod\n"
+                                                 "other: [x]\n");
+        CHECK_FALSE(result.has_value());
+    }
 }
 
 TEST_CASE("PolicyStore: scope.fromResultSet is rejected for policies (deferred to PR-E2)",
