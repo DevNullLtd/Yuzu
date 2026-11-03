@@ -2277,6 +2277,35 @@ tests:
         eval_time: 45m
         exp_samples: []
 
+  # ── YuzuScimGuardStoreUnavailable (#6836) ────────────────────────────────
+
+  # CASE 54a -- a SCIM guard could not read the auth store (retryable 503); the
+  # bounded `guard` label survives onto the alert.
+  - interval: 1m
+    name: scim guard store unavailable - a guard read fault fires and keeps its guard label
+    input_series:
+      - series: 'yuzu_scim_guard_store_unavailable_total{job="yuzu",instance="s1",guard="role"}'
+        values: "0x30 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimGuardStoreUnavailable", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuScimGuardStoreUnavailable", alertstate="firing", guard="role", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 54b -- a flat (pre-seeded) counter stays quiet.
+  - interval: 1m
+    name: scim guard store unavailable - a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_scim_guard_store_unavailable_total{job="yuzu",instance="s1",guard="provenance"}'
+        values: "0x60"
+      - series: 'yuzu_scim_guard_store_unavailable_total{job="yuzu",instance="s1",guard="role"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimGuardStoreUnavailable"}'
+        eval_time: 45m
+        exp_samples: []
+
   # ── YuzuScimAuditWriteFailures ────────────────────────────────────────────
 
   # CASE 55 -- a committed SCIM mutation lost its audit evidence write. The

@@ -38,12 +38,19 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #include <fcntl.h>  // O_CLOEXEC / O_NONBLOCK / FD_CLOEXEC on the shutdown self-pipe
 #include <unistd.h>
 #endif
+#ifdef __linux__
+#include <linux/capability.h> // capget/capset structs (no libcap dependency)
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#endif
 
 #include <cerrno>
 #include <cstring>
 #include <thread>
 #include <sqlite3.h>
 
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
@@ -328,7 +335,51 @@ static std::unique_ptr<yuzu::agent::Agent> make_agent(yuzu::agent::Config cfg) {
     return yuzu::agent::Agent::create(std::move(cfg));
 }
 
+#ifdef __linux__
+// Drop the inheritable and ambient capability sets so exec'd children do not inherit
+// what the packaged unit grants the agent (CAP_DAC_READ_SEARCH, see yuzu-agent.service).
+// The agent keeps its permitted/effective sets for its own in-process reads.
+//
+// Guarantee: after execve of a binary without file capabilities, a non-root child has
+// no capabilities (P' = (I & F_I) | A' = 0 once I and A are empty). Exceptions: between
+// fork and execve the child is still agent code and holds the agent's sets; a host
+// binary carrying its own file capabilities gets those; setuid-root cannot elevate
+// under NoNewPrivileges. In-process plugin code could re-add inheritable/ambient
+// capabilities, but plugins are trusted code that already holds the effective set.
+//
+// Capability sets are per-thread and new threads inherit from their creator, so this
+// must run before any thread exists: it is the first statement of main().
+//
+// Returns the effective mask on success, nullopt on failure (the caller exits).
+static std::optional<std::uint64_t> clear_child_capabilities() noexcept {
+    // EINVAL = the kernel has no ambient capability support, so there is nothing to clear.
+    if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) != 0 && errno != EINVAL)
+        return std::nullopt;
+
+    __user_cap_header_struct hdr{};
+    hdr.version = _LINUX_CAPABILITY_VERSION_3;
+    hdr.pid = 0; // calling thread
+    __user_cap_data_struct data[2]{};
+    if (syscall(SYS_capget, &hdr, data) != 0)
+        return std::nullopt;
+    data[0].inheritable = 0;
+    data[1].inheritable = 0;
+    if (syscall(SYS_capset, &hdr, data) != 0)
+        return std::nullopt;
+    return (static_cast<std::uint64_t>(data[1].effective) << 32) | data[0].effective;
+}
+#endif
+
 int main(int argc, char* argv[]) {
+#ifdef __linux__
+    // Fail closed: if the child-inheritable capabilities cannot be cleared, do not run.
+    const auto effective_caps = clear_child_capabilities();
+    if (!effective_caps) {
+        std::fputs("yuzu-agent: cannot clear inheritable/ambient capabilities; refusing to start\n",
+                   stderr);
+        return EXIT_FAILURE;
+    }
+#endif
     CLI::App app{"Yuzu Agent", "yuzu-agent"};
     app.set_version_flag("--version",
                          std::format("{}  ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash));
@@ -756,6 +807,11 @@ int main(int argc, char* argv[]) {
     }
 
     spdlog::info("Yuzu Agent v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
+#ifdef __linux__
+    spdlog::info("Linux capabilities: effective {:#x}; inheritable and ambient cleared so "
+                 "exec'd child processes do not inherit them",
+                 *effective_caps);
+#endif
     // SLE (ADR-0024 D11): echo the effective user_ref mode ONCE at startup — the
     // per-agent HMAC key (k_agent) is NEVER logged (roadmap R16), only the mode.
     spdlog::info("software_licensing user_ref mode: {}", cfg.license_scan_user_ref);
