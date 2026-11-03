@@ -339,17 +339,21 @@ TEST_CASE("error_json_a4: exact wire bytes for every overload", "[events][envelo
 
 TEST_CASE("error_json_a4: JSON string escaping in message, correlation id and remediation",
           "[events][envelope][a4][golden]") {
-    // Quote, backslash, LF, a raw 0x01 control byte (-> \u0001), TAB, CR, BS, FF,
+    // Quote, backslash, LF, a raw 0x01 control byte (-> the 6-char escape for U+0001), TAB, CR, BS, FF,
     // then 0x1a and 0x1f (control bytes whose hex digits include a letter, which pins
     // the lowercase `%04x` form, and the top of the < 0x20 range). 0x7f (DEL) and a
     // UTF-8 sequence (U+00E9) are NOT escaped: they pass through as raw bytes.
     const std::string message = std::string("q\"b\\n\n") + std::string(1, '\x01') +
                                 "t\t|\r\b\f" + std::string(1, '\x1a') +
                                 std::string(1, '\x1f') + std::string(1, '\x7f') + "\xc3\xa9";
+    // Ordinary (non-raw) literals on purpose: MSVC 14.44 rejected the raw-string form
+    // of this expectation (C2017/C3850 on its quote and control-character escapes).
     const std::string expected =
-        std::string(R"json({"error":{"code":400,"message":"q\"b\\n\n\u0001t\t|\r\b\f\u001a\u001f)json") +
+        std::string("{\"error\":{\"code\":400,\"message\":\"q\\\"b\\\\n\\n\\u0001t\\t|\\r\\b\\f"
+                    "\\u001a\\u001f") +
         std::string(1, '\x7f') + "\xc3\xa9" +
-        R"json(","correlation_id":"c\"\t1","retry_after_ms":null,"remediation":"r\n"},"meta":{"api_version":"v1"}})json";
+        "\",\"correlation_id\":\"c\\\"\\t1\",\"retry_after_ms\":null,\"remediation\":\"r\\n\"},"
+        "\"meta\":{\"api_version\":\"v1\"}}";
     CHECK(detail::error_json_a4(400, message, "c\"\t1", "r\n") == expected);
 }
 
