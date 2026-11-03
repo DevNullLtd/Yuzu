@@ -1056,8 +1056,13 @@ TEST_CASE("BatchScope: leaving the scope without a commit rolls the batch back a
         BatchScope batch{seen};
         REQUIRE(seen.first_this_hour(ts, "undone"));
         batch.rollback();
-        batch.commit(); // after a rollback the scope is closed: nothing to keep
+        // After a rollback the scope is closed: a key admitted now is not journaled, and the
+        // commit and the destructor that follow have nothing to keep or to undo.
+        REQUIRE(seen.first_this_hour(ts, "after_rollback"));
+        CHECK(seen.batch_admitted() == 0);
+        batch.commit();
     }
     CHECK(seen.first_this_hour(ts, "undone"));
+    CHECK_FALSE(seen.first_this_hour(ts, "after_rollback"));
     CHECK(seen.batch_admitted() == 0);
 }

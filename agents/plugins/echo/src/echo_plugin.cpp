@@ -1834,7 +1834,7 @@ private:
                             // so the next closing-state sighting this hour is not read as a
                             // repeat of a row that was lost (the drain admitted them above).
                             yuzu::echo::nstat_release_closing_keys(
-                                std::to_address(pending_nstat_evs_.begin()), std::to_address(cut),
+                                pending_nstat_evs_.data(), pending_nstat_evs_.data() + excess,
                                 tcp_closing_seen_);
                             pending_nstat_evs_.erase(pending_nstat_evs_.begin(), cut);
                         }
@@ -1878,8 +1878,8 @@ private:
                     // insert rather than let it sit stuck-forever bounded.
                     nstat_client_->drain(); // discard — untrustworthy bytes
                     yuzu::echo::nstat_release_closing_keys(
-                        std::to_address(pending_nstat_evs_.begin()),
-                        std::to_address(pending_nstat_evs_.end()), tcp_closing_seen_);
+                        pending_nstat_evs_.data(),
+                        pending_nstat_evs_.data() + pending_nstat_evs_.size(), tcp_closing_seen_);
                     pending_nstat_evs_.clear();
                     spdlog::warn("ECHO: nstat layout mismatch on stream death — discarding "
                                  "the buffered tcp lifecycle ring");
@@ -1984,9 +1984,9 @@ private:
             // an unreadable flag skips the tick via the plain branch below and
             // leaves the ring buffering rather than discarding live lifecycle events.
             nstat_client_->drain();
-            yuzu::echo::nstat_release_closing_keys(std::to_address(pending_nstat_evs_.begin()),
-                                                   std::to_address(pending_nstat_evs_.end()),
-                                                   tcp_closing_seen_);
+            yuzu::echo::nstat_release_closing_keys(
+                pending_nstat_evs_.data(), pending_nstat_evs_.data() + pending_nstat_evs_.size(),
+                tcp_closing_seen_);
             pending_nstat_evs_.clear();
         } else {
             note_health("tcp", skip_token(tcp_state));
@@ -4333,6 +4333,11 @@ private:
                 if (transition_ok && src_name == "tcp" && nstat_client_ &&
                     (v == "true") != tcp_prev_enabled) {
                     nstat_client_->drain();
+                    // The backlog rows are dropped unstored: give their hourly keys
+                    // back (the drain's own events were never admitted).
+                    yuzu::echo::nstat_release_closing_keys(
+                        pending_nstat_evs_.data(),
+                        pending_nstat_evs_.data() + pending_nstat_evs_.size(), tcp_closing_seen_);
                     pending_nstat_evs_.clear();
                 }
                 // Cursor-model sources (echo_cursor.hpp, P-002): forward the

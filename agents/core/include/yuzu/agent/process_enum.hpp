@@ -59,9 +59,9 @@ namespace detail {
 ///
 /// Bounded: the read stops at `kProcReadCap` bytes and the prefix is kept. The kernel's argument
 /// limit bounds /proc/<pid>/cmdline only at megabytes, and this runs for every process on every
-/// snapshot. Nothing downstream cuts the value again: a command line longer than the cap is
-/// stored and shown as its first 256 KiB with no marker (the reader does not look one byte
-/// further to tell, so a result of exactly the cap means "possibly cut"). The cut lands on a
+/// snapshot. The Echo store keeps a command line longer than the cap as its first 256 KiB with
+/// no marker (the reader does not look one byte further to tell, so a result of exactly the cap
+/// means "possibly cut"); the fleet-snapshot push is clamped again to 4096 bytes on the server. The cut lands on a
 /// UTF-8 scalar boundary: a multi-byte character the cap would split is dropped whole, so the
 /// kept prefix is still well-formed UTF-8 (the snapshot's JSON serialiser rejects a split one).
 inline constexpr std::size_t kProcReadCap = 256 * 1024;

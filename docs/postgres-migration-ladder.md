@@ -55,7 +55,8 @@ for a non-`*Store`-suffixed class (the Wave-4 ladder-blind-spot components below
 > `instruction_store` v3, `schedule_engine` v2, `execution_tracker` v8, `approval_manager` v4,
 > `device_token_store` v2, `plugin_config_store` v4, `result_set_store` v3, `policy_store` v5,
 > `workflow_engine` v2, `response_store` v3 and `command_outbox_store` v3 (`gateway_route_store` v6
-> is a schema change only: one additive column). Each matches nothing on a fresh database, and all
+> is a schema change only: one additive column; `device_token_store` v2 exists in code, but the
+> server never constructs that store, so it does not run on first start). Each matches nothing on a fresh database, and all
 > are data-only except `instruction_store` v3, which ends with a `DO` block that raises when a
 > legacy definition id collides with an existing Echo id, so the store does not open and the
 > server refuses to start (`docs/user-manual/upgrading.md`, "Definition id collision"); the two

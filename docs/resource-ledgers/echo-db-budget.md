@@ -130,7 +130,10 @@ New or modified owned resources introduced in `agents/plugins/echo/src/` (`echo_
 - **Owner type:** the plugin object, guarded by `collect_mu_`. Each set is an
   `std::unordered_set<std::string>` of at most `kDefaultCap` (20,000) keys plus a batch journal
   (`std::vector<std::string>` of the keys admitted since `begin_batch`), so a set holds at most
-  the cap plus one tick's admitted keys (about twice the cap in the worst case).
+  the cap plus the journal. An overflow clear inside a batch empties the set but not the
+  journal, which grows by one string per admitted key, so the journal is bounded by the tick's
+  batch, not by the cap: for tcp one snapshot diff's rows, for modules the retry backlog
+  (`kPendingStreamCap`, 100,000) plus one drain.
 - **Bound and clearing:** `first_this_hour` clears the set when the hour of the timestamp differs
   from the current hour in either direction, and clears it and counts one overflow when a new key
   would exceed the cap. Worst case after either is one repeated row per key, never a missed first
@@ -142,15 +145,17 @@ New or modified owned resources introduced in `agents/plugins/echo/src/` (`echo_
   commits after `insert_module_events` succeeds (or on an empty batch) and rolls back on failure
   (the filtered batch is re-queued, bounded by `kPendingStreamCap`, and the retry re-filters
   identically). The macOS nstat drain admits keys OUTSIDE a batch, before its own insert; a typed
-  row later dropped unstored (the backlog cap, a layout mismatch, a confirmed disable) gives its
+  row later dropped unstored (the backlog cap, a layout mismatch, a confirmed disable, the tcp
+  enable/disable edge) gives its
   key back through `release` (`nstat_release_closing_keys`). The overflow counters mirrored for
   status are `std::atomic`.
 - **Failure cleanup:** `BatchScope`'s destructor rolls back unless `commit` was called, so an
   exception between the filter and the insert erases the admitted keys and leaves no batch open
   for the next tick; `rollback_batch` is `noexcept`. An hour change or an overflow clear inside a
   batch is not undone (one repeated row per key, the clear's own worst case).
-- **Not covered:** a row admitted by the nstat drain whose insert fails and that is then lost with
-  the process (not dropped by the plugin) keeps its key for the rest of the hour.
+- **Not covered:** a release of a key admitted in an earlier hour, after the same key was
+  admitted again in the current hour, erases the new admission and costs one repeated row (the
+  clear's own worst case).
 
 ### Pid-to-name map (`pid_name_`) and the grace window
 - **Site:** `pid_name_` (`std::unordered_map<std::uint32_t, PidName>`) in `echo_plugin.cpp`, written
@@ -211,8 +216,8 @@ New or modified owned resources introduced in `agents/plugins/echo/src/` (`echo_
 - **Cap:** `read_proc_bytes` stops at `kProcReadCap` (256 KiB) and keeps the prefix, cut at a UTF-8
   character boundary (`trim_incomplete_utf8_tail`, using the shared `utf8_scalar_len`) so the
   snapshot's JSON serialiser never sees a split character; a result of exactly the cap means
-  possibly cut. Nothing downstream cuts the value again: a longer command line is stored and shown
-  as its first 256 KiB, with no marker.
+  possibly cut. The Echo store keeps a longer command line as its first 256 KiB, with no marker;
+  the fleet-snapshot push is clamped again to 4096 bytes on the server.
 
 ### Snapshot pump thread (`agents/core/src/agent.cpp`)
 - **Modified, not new.** The body of `snapshot_pump_thread_` now wraps one cycle in

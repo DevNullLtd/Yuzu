@@ -94,7 +94,10 @@ public:
         batch_open_ = false;
     }
     /// The row `key` admitted was dropped without being stored: forget the key so the next
-    /// sighting this hour is stored. A key from an earlier hour is already gone (no-op).
+    /// sighting this hour is stored. This erases by key with no hour check: a key from an
+    /// earlier hour is already gone (no-op) unless the same key was admitted again in the
+    /// current hour, in which case that new admission is erased too and the next sighting is
+    /// stored once more (one repeated row, bounded).
     void release(const std::string& key) noexcept { keys_.erase(key); }
     /// Keys admitted in the open batch (what a rollback would erase).
     [[nodiscard]] std::size_t batch_admitted() const noexcept { return admitted_.size(); }
