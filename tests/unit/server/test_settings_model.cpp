@@ -584,7 +584,7 @@ TEST_CASE("Echo look-again reads guaranteed depth not the limit",
     const auto t = html.substr(html.find("<caption"));
     CHECK(has(t, "<td class=\"look\">11 months</td>"));
     CHECK(has(t, "<td>12 months</td>"));
-    CHECK(count_sub(t, "Row count only") == 1);
+    CHECK(count_sub(t, "No guarantee: budget-dependent") == 1);
     CHECK(has(t, "<td class=\"look\">30 days</td>"));
     const auto d = t.find(">D<");
     REQUIRE(d != std::string::npos);
@@ -600,7 +600,7 @@ TEST_CASE("Echo hint copy renders the supplied tick and each fixed clause",
     const auto t = html.substr(html.find("<caption"));
     CHECK(has(t, "pruned every 123 s"));
     CHECK_FALSE(has(t, "every 900 s"));
-    for (const char* n : {"agent's clock", "31-day worst-case", "not a deeper tier", "never pruned",
+    for (const char* n : {"agent's clock", "deepest guaranteed tier", "not a deeper tier", "never pruned",
                           "not per-device"})
         CHECK(has(t, n));
 }
