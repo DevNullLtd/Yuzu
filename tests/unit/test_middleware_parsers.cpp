@@ -872,6 +872,12 @@ TEST_CASE("middleware parsers: format_row is six escaped fields", "[middleware]"
         const std::string row = mw::format_row("ibm_mq", "T", "bad\xff" "name", "9.2", "/p\xc3", "");
         CHECK(row == "ibm_mq|T|bad?name|9.2|/p?|-");
     }
+    SECTION("a NUL and an overlong or surrogate sequence are replaced, never passed to the wire") {
+        const std::string row = mw::format_row("ibm_mq", "T", std::string{"a\0b", 3}, "9.2",
+                                               "/p\xc0\xaf\xed\xa0\x80q", "");
+        CHECK(row == "ibm_mq|T|a?b|9.2|/p?????q|-");
+        CHECK(row.find('\0') == std::string::npos);
+    }
     SECTION("field_or_dash") {
         CHECK(mw::field_or_dash("") == "-");
         CHECK(mw::field_or_dash("a|b") == "a\\|b");

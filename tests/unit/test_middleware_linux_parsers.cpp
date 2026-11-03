@@ -508,6 +508,20 @@ TEST_CASE("middleware linux: two installations give two rows in file order (SYNT
                                                      mq_row("Installation2", "9.2.5", "/opt/mqm2")});
 }
 
+TEST_CASE("middleware linux: an embedded NUL in installer text is replaced and does not cut the row",
+          "[middleware][linux][ibm_mq]") {
+    // SYNTHETIC: a root-owned mqinst.ini whose Name carries a NUL. The row crosses the plugin ABI as
+    // a C string, so an unscrubbed NUL would end it at the host's strlen while the status row still
+    // says `supported`, and the collector would then drop the source and erase its stored rows.
+    yuzu::test::TempDir dir{"yuzu_test_middleware_nul_"};
+    write_text(dir.path / enumerator_rel(), mq_stanza(std::string{"In\0st", 5}, "/opt/mqm"));
+    const auto run = run_leg(dir.path);
+    CHECK(tokens_of(run) == "-");
+    CHECK(run.rows.front() == "status|ibm_mq|supported|-");
+    CHECK(data_rows(run) == std::vector<std::string>{mq_row("In?st", "-", "/opt/mqm")});
+    for (const auto& r : run.rows) CHECK(r.find('\0') == std::string::npos);
+}
+
 TEST_CASE("middleware linux: component tags alone name no product so the version is - and nothing is tokened",
           "[middleware][linux][ibm_mq]") {
     yuzu::test::TempDir dir{"yuzu_test_middleware_mqcomp_"};

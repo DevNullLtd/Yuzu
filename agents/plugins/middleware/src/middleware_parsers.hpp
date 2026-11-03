@@ -36,7 +36,7 @@
  * list is complete. Nothing here throws on garbage, CRLF, truncated or oversized input.
  *
  * Free-text fields (title, name, version, path, edition) are untrusted installer text and go through
- * field_or_dash (sanitize_utf8 then safe_output_field): a pipe is escaped, a backslash is folded to
+ * field_or_dash (scrub_wire_bytes then safe_output_field): a pipe is escaped, a backslash is folded to
  * '/' and CR/LF to a space, so a value can never shift the field count on the server's escape-aware
  * decoder.
  */
@@ -46,6 +46,7 @@
 #include <ini_parse.hpp>              // yuzu::shared::ini_trim (agents/shared)
 #include <inventory_status_row.hpp>   // yuzu::shared::format_status_row (agents/shared)
 #include <middleware_products.hpp>    // NameForm (agents/shared)
+#include <wire_utf8.hpp>             // yuzu::shared::scrub_wire_bytes (agents/shared)
 
 #include <yuzu/string_utils.hpp>
 
@@ -283,12 +284,17 @@ enum class ItemReason {
 // Formatters return the row WITHOUT a trailing newline (write_output/append_output insert the
 // separator; a formatter-emitted '\n' yields blank rows under LocalDispatcher capture).
 
-/// Untrusted installer text becomes one safe field: invalid UTF-8 bytes are replaced first (the
-/// output crosses the wire as a proto3 `string`, and one invalid byte fails the parse of the whole
-/// chunk), then the pipe-grammar escaper runs. Empty -> "-".
+/// Untrusted installer text becomes one safe field: NUL and every byte outside well-formed UTF-8
+/// are replaced first (scrub_wire_bytes: the output crosses the plugin ABI as a C string, so a NUL
+/// would cut the row at the host's strlen while the status row still says `supported`, and one
+/// invalid byte fails the parse of the whole proto3 `string` chunk), then the pipe-grammar escaper
+/// runs. Empty -> "-".
 [[nodiscard]] inline std::string field_or_dash(std::string_view v) {
-    return v.empty() ? std::string{"-"}
-                     : yuzu::util::safe_output_field(yuzu::util::sanitize_utf8(std::string{v}));
+    if (v.empty())
+        return "-";
+    std::string s{v};
+    yuzu::shared::scrub_wire_bytes(s);
+    return yuzu::util::safe_output_field(s);
 }
 
 /// <action>|<title>|<name>|<version or ->|<install_path>|<edition or ->
