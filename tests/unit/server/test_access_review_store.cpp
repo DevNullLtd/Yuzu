@@ -5,8 +5,10 @@
  * Covers:
  *  - R3 freeze-at-open: `open_campaign` inserts every frozen grant as a
  *    `decision='pending'` row, in one call.
- *  - `record_attestation` transitions a pending row and upserts in place on
- *    a re-attest (no duplicate row).
+ *  - `record_attestation` transitions a pending row and APPENDS on a later
+ *    decision (#4752): the current row advances, every decision is kept in
+ *    the history table, a reviewer cannot decide a `user` grant naming
+ *    themselves, and the schema-v3 guards refuse every raw-SQL route around it.
  *  - the closed-campaign guard: a write into a closed campaign is rejected.
  *  - the `not_found: ` prefix contract on attestation/get/close.
  *  - fail-closed construction, both the migration-drift case (a live but
@@ -35,6 +37,8 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
+#include "test_principal_lock_gate.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -42,8 +46,12 @@
 
 #include <algorithm>
 #include <set>
+#include <chrono>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <vector>
 
 using yuzu::server::AccessReviewStore;
@@ -308,7 +316,9 @@ TEST_CASE("get_campaign: a genuine read failure mid-enumeration is a plain error
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
-        PgResult d{PQexec(conn.get(), "DROP TABLE access_review_store.access_review_attestation")};
+        // CASCADE: the history table's foreign key (schema v3) makes a plain DROP fail.
+        PgResult d{PQexec(conn.get(),
+                          "DROP TABLE access_review_store.access_review_attestation CASCADE")};
         REQUIRE(d.ok());
     }
 
@@ -318,9 +328,22 @@ TEST_CASE("get_campaign: a genuine read failure mid-enumeration is a plain error
     CHECK(view_res.error().find("attestation read failed") != std::string::npos);
 }
 
-// ── record_attestation: transition + upsert ─────────────────────────────────
+// ── record_attestation: transition + append ────────────────────────────────
 
-TEST_CASE("record_attestation transitions a pending row and upserts in place on re-attest",
+namespace {
+
+const yuzu::server::AccessReviewAttestationRow*
+find_row(const yuzu::server::CampaignView& v, std::string_view type, std::string_view id,
+         std::string_view role) {
+    for (const auto& a : v.attestations)
+        if (a.principal_type == type && a.principal_id == id && a.role_name == role)
+            return &a;
+    return nullptr;
+}
+
+} // namespace
+
+TEST_CASE("record_attestation transitions a pending row and APPENDS a later decision",
           "[access_review][store][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -333,41 +356,178 @@ TEST_CASE("record_attestation transitions a pending row and upserts in place on 
 
     auto rec1 = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "ok");
     REQUIRE(rec1.has_value());
+    CHECK(rec1->previous_decision == "pending");
+    CHECK(rec1->seq == 1);
 
     auto view1 = store.get_campaign(cid);
     REQUIRE(view1.has_value());
     CHECK(view1->pending_count == 2);
-    bool found_attested = false;
-    for (const auto& a : view1->attestations) {
-        if (a.principal_type == "user" && a.principal_id == "alice" && a.role_name == "Admin") {
-            found_attested = true;
-            CHECK(a.decision == "attested");
-            CHECK(a.reviewer == "carol");
-            CHECK(a.justification == "ok");
-            CHECK(a.decided_at_ms > 0);
-        }
-    }
-    CHECK(found_attested);
+    const auto* r1 = find_row(*view1, "user", "alice", "Admin");
+    REQUIRE(r1 != nullptr);
+    CHECK(r1->decision == "attested");
+    CHECK(r1->reviewer == "carol");
+    CHECK(r1->justification == "ok");
+    CHECK(r1->decided_at_ms > 0);
+    CHECK(r1->decision_seq == 1);
+    CHECK(r1->history.empty()); // history is opt-in
 
-    // Re-attest the SAME grant with a different decision: overwrites in
-    // place — still exactly one row for this (campaign, principal, role).
+    // A different reviewer decides the SAME grant again: the current row advances to seq 2
+    // and the earlier decision stays in the history, with what it superseded.
     auto rec2 =
         store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "dave", "stale");
     REQUIRE(rec2.has_value());
-    auto view2 = store.get_campaign(cid);
+    CHECK(rec2->previous_decision == "attested");
+    CHECK(rec2->seq == 2);
+
+    auto view2 = store.get_campaign(cid, /*include_history=*/true);
     REQUIRE(view2.has_value());
     CHECK(view2->attestations.size() == 3); // no new row added
-    int matches = 0;
-    for (const auto& a : view2->attestations) {
-        if (a.principal_type == "user" && a.principal_id == "alice" && a.role_name == "Admin") {
-            ++matches;
-            CHECK(a.decision == "flagged_revoke");
-            CHECK(a.reviewer == "dave");
-            CHECK(a.justification == "stale");
+    CHECK(view2->pending_count == 2);       // unchanged: still one non-pending row
+    const auto* r2 = find_row(*view2, "user", "alice", "Admin");
+    REQUIRE(r2 != nullptr);
+    CHECK(r2->decision == "flagged_revoke");
+    CHECK(r2->reviewer == "dave");
+    CHECK(r2->justification == "stale");
+    CHECK(r2->decision_seq == 2);
+    REQUIRE(r2->history.size() == 2);
+    CHECK(r2->history[0].seq == 1);
+    CHECK(r2->history[0].decision == "attested");
+    CHECK(r2->history[0].previous_decision == "pending");
+    CHECK(r2->history[0].reviewer == "carol");
+    CHECK(r2->history[0].justification == "ok");
+    CHECK(r2->history[0].decided_at_ms == r1->decided_at_ms);
+    CHECK(r2->history[1].seq == 2);
+    CHECK(r2->history[1].decision == "flagged_revoke");
+    CHECK(r2->history[1].previous_decision == "attested");
+    CHECK(r2->history[1].reviewer == "dave");
+    CHECK(r2->history[1].justification == "stale");
+    CHECK(r2->history[1].decided_at_ms == r2->decided_at_ms);
+
+    // The other grants are untouched and carry no history.
+    for (const auto& a : view2->attestations)
+        if (a.principal_id != "alice") {
+            CHECK(a.decision == "pending");
+            CHECK(a.decision_seq == 0);
+            CHECK(a.history.empty());
         }
+}
+
+TEST_CASE("record_attestation: an identical repeat decision appends at seq+1 too",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Repeat", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    auto first = store.record_attestation(cid, "group", "eng", "Reader", "attested", "carol", "ok");
+    REQUIRE(first.has_value());
+    CHECK(first->seq == 1);
+    auto again = store.record_attestation(cid, "group", "eng", "Reader", "attested", "carol", "ok");
+    REQUIRE(again.has_value());
+    CHECK(again->previous_decision == "attested"); // equal to the new decision
+    CHECK(again->seq == 2);
+
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    const auto* row = find_row(*view, "group", "eng", "Reader");
+    REQUIRE(row != nullptr);
+    CHECK(row->decision_seq == 2);
+    REQUIRE(row->history.size() == 2);
+    CHECK(row->history[1].decision == "attested");
+    CHECK(row->history[1].previous_decision == "attested");
+}
+
+TEST_CASE("record_attestation: the reviewer must differ from the subject of a user grant",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("SoD", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    auto self = store.record_attestation(cid, "user", "alice", "Admin", "attested", "alice", "me");
+    REQUIRE_FALSE(self.has_value());
+    CHECK(self.error() == "forbidden: reviewer is the subject of this grant");
+
+    // Byte-exact: a different case is a different reviewer (no case folding).
+    auto cased = store.record_attestation(cid, "user", "alice", "Admin", "attested", "Alice", "");
+    REQUIRE(cased.has_value());
+    CHECK(cased->seq == 1);
+
+    // Nothing was written by the refused call (the cased call above wrote seq 1 only).
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    const auto* row = find_row(*view, "user", "alice", "Admin");
+    REQUIRE(row != nullptr);
+    CHECK(row->decision_seq == 1);
+    CHECK(row->history.size() == 1);
+    // A flag cannot be undone by the subject either.
+    auto flagged =
+        store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "carol", "no");
+    REQUIRE(flagged.has_value());
+    auto unflag = store.record_attestation(cid, "user", "alice", "Admin", "attested", "alice", "");
+    REQUIRE_FALSE(unflag.has_value());
+    CHECK(unflag.error().starts_with("forbidden:"));
+    auto after = store.get_campaign(cid, true);
+    REQUIRE(after.has_value());
+    const auto* arow = find_row(*after, "user", "alice", "Admin");
+    REQUIRE(arow != nullptr);
+    CHECK(arow->decision == "flagged_revoke");
+    CHECK(arow->history.size() == 2);
+}
+
+TEST_CASE("record_attestation: a self-subject user decision is forbidden even in a closed or "
+          "unknown campaign, and an engine or group subject is not refused by the store",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("SoD closed", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+    REQUIRE(store.close_campaign(cid, "admin").has_value());
+
+    // forbidden precedes not_found: the caller holds Attest and can read the campaign anyway.
+    auto self_closed =
+        store.record_attestation(cid, "user", "alice", "Admin", "attested", "alice", "");
+    REQUIRE_FALSE(self_closed.has_value());
+    CHECK(self_closed.error().starts_with("forbidden:"));
+    auto self_unknown = store.record_attestation(std::string(64, 'a'), "user", "alice", "Admin",
+                                                 "attested", "alice", "");
+    REQUIRE_FALSE(self_unknown.has_value());
+    CHECK(self_unknown.error().starts_with("forbidden:"));
+    // A malformed campaign id is still a bad_request, ahead of the reviewer rule.
+    auto bad_id = store.record_attestation("bad id", "user", "alice", "Admin", "attested", "alice",
+                                           "");
+    REQUIRE_FALSE(bad_id.has_value());
+    CHECK(bad_id.error().starts_with("bad_request:"));
+
+    // The same reviewer name on an engine or group subject is NOT refused here: those rules need
+    // other stores and belong to the route layer's gate.
+    auto open2 = store.open_campaign("SoD kinds", "admin", three_grants(), "enabled");
+    REQUIRE(open2.has_value());
+    auto grp = store.record_attestation(*open2, "group", "eng", "Reader", "attested", "eng", "");
+    REQUIRE(grp.has_value());
+    auto eng = store.record_attestation(*open2, "engine", "engine:svc", "Writer", "attested",
+                                        "engine:svc", "");
+    REQUIRE(eng.has_value());
+
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    CHECK(view->pending_count == 3);
+    for (const auto& a : view->attestations) {
+        CHECK(a.decision_seq == 0);
+        CHECK(a.history.empty());
     }
-    CHECK(matches == 1);
-    CHECK(view2->pending_count == 2); // unchanged — still one non-pending row
 }
 
 TEST_CASE("record_attestation rejects a decision outside {attested,flagged_revoke}",
@@ -409,10 +569,40 @@ TEST_CASE("record_attestation rejects a write into a closed campaign",
     CHECK(rec.error().starts_with("not_found:"));
 
     // Evidence unchanged: the campaign still shows the row as pending — a
-    // rejected write must never partially land.
-    auto view = store.get_campaign(cid);
+    // rejected write must never partially land, history included.
+    auto view = store.get_campaign(cid, true);
     REQUIRE(view.has_value());
     CHECK(view->pending_count == 3);
+    for (const auto& a : view->attestations)
+        CHECK(a.history.empty());
+}
+
+TEST_CASE("record_attestation into a closed campaign after a decision leaves history unchanged",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Closed after", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "ok")
+                .has_value());
+    REQUIRE(store.close_campaign(cid, "admin").has_value());
+
+    auto late = store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "dave",
+                                         "late");
+    REQUIRE_FALSE(late.has_value());
+    CHECK(late.error().starts_with("not_found:"));
+
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    const auto* row = find_row(*view, "user", "alice", "Admin");
+    REQUIRE(row != nullptr);
+    CHECK(row->decision == "attested");
+    CHECK(row->decision_seq == 1);
+    CHECK(row->history.size() == 1);
 }
 
 // ── not_found: prefix contract ──────────────────────────────────────────────
@@ -809,4 +999,425 @@ TEST_CASE("list_campaigns: a closed campaign's metadata still appears (list is n
     CHECK((*list_res)[0].status == "closed");
     CHECK((*list_res)[0].closed_by == "admin");
     CHECK((*list_res)[0].closed_at_ms > 0);
+}
+
+// ── Schema v3 guards: every raw-SQL route around the store is refused ───────
+
+namespace {
+
+// SQLSTATE of a failed statement; "" when it succeeded.
+std::string sqlstate_of(PGconn* conn, const std::string& sql) {
+    PgResult r{PQexec(conn, sql.c_str())};
+    if (r.ok())
+        return "";
+    const char* st = PQresultErrorField(r.get(), PG_DIAG_SQLSTATE);
+    return st != nullptr ? st : "?";
+}
+
+// First column of the first row, "" when there is none.
+std::string scalar_of(PGconn* conn, const std::string& sql) {
+    PgResult r{PQexec(conn, sql.c_str())};
+    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) == 0)
+        return "";
+    return PQgetvalue(r.get(), 0, 0);
+}
+
+bool integrity_violation(const std::string& sqlstate) {
+    return sqlstate.starts_with("23");
+}
+
+} // namespace
+
+TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation, and the "
+          "store still works afterwards (orphan rollback)",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Guards", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "ok")
+                .has_value());
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PGconn* c = conn.get();
+    const std::string att = "access_review_store.access_review_attestation";
+    const std::string hist = "access_review_store.access_review_attestation_history";
+    const std::string key = "campaign_id='" + cid + "' AND principal_type='";
+
+    // An older binary's bare UPDATE (no history row, no seq advance).
+    CHECK(integrity_violation(sqlstate_of(
+        c, "UPDATE " + att + " SET decision='flagged_revoke', reviewer='dave', "
+           "decided_at_ms=1, justification='x' WHERE " + key + "user' AND principal_id='alice'")));
+    // Resetting the sequence to forge a later primary-key collision.
+    CHECK(integrity_violation(sqlstate_of(
+        c, "UPDATE " + att + " SET decision_seq=0 WHERE " + key + "user' AND principal_id='alice'")));
+    // A decided row inserted directly.
+    CHECK(integrity_violation(sqlstate_of(
+        c, "INSERT INTO " + att + " (campaign_id, principal_type, principal_id, role_name, decision, "
+           "reviewer, decided_at_ms, justification, grant_snapshot) VALUES ('" + cid +
+           "','user','mallory','Admin','attested','carol',1,'','{}')")));
+    // A justification-only edit of a pending row.
+    CHECK(integrity_violation(sqlstate_of(
+        c, "UPDATE " + att + " SET justification='x' WHERE " + key + "group' AND principal_id='eng'")));
+    // History is append-only.
+    CHECK(integrity_violation(sqlstate_of(c, "UPDATE " + hist + " SET reviewer='eve'")));
+    CHECK(integrity_violation(sqlstate_of(c, "DELETE FROM " + hist)));
+    // Evidence rows are never deleted, so neither is a campaign that has any.
+    CHECK(integrity_violation(sqlstate_of(c, "DELETE FROM " + att + " WHERE campaign_id='" + cid + "'")));
+    CHECK(integrity_violation(sqlstate_of(
+        c, "DELETE FROM access_review_store.access_review_campaign WHERE campaign_id='" + cid + "'")));
+    // A history row naming the subject as reviewer fails the table CHECK.
+    CHECK(sqlstate_of(c, "INSERT INTO " + hist + " (campaign_id, principal_type, principal_id, "
+                         "role_name, seq, decision, previous_decision, reviewer, justification, "
+                         "decided_at_ms) VALUES ('" + cid +
+                         "','user','alice','Admin',2,'attested','attested','alice','',9)") ==
+          "23514");
+
+    // A history row committed with no state change is refused AT COMMIT (deferred consistency
+    // guard), so it cannot poison the next decision's primary key.
+    REQUIRE(sqlstate_of(c, "BEGIN").empty());
+    CHECK(sqlstate_of(c, "INSERT INTO " + hist + " (campaign_id, principal_type, principal_id, "
+                         "role_name, seq, decision, previous_decision, reviewer, justification, "
+                         "decided_at_ms) VALUES ('" + cid +
+                         "','group','eng','Reader',1,'attested','pending','carol','',5)")
+              .empty());
+    CHECK(integrity_violation(sqlstate_of(c, "COMMIT")));
+
+    // The zero-row UPDATE emulation (the shape a callback that wrongly returned true would
+    // commit): history inserted, the state UPDATE matched nothing, COMMIT.
+    REQUIRE(sqlstate_of(c, "BEGIN").empty());
+    CHECK(sqlstate_of(c, "INSERT INTO " + hist + " (campaign_id, principal_type, principal_id, "
+                         "role_name, seq, decision, previous_decision, reviewer, justification, "
+                         "decided_at_ms) VALUES ('" + cid +
+                         "','group','eng','Reader',1,'attested','pending','carol','',5)")
+              .empty());
+    CHECK(sqlstate_of(c, "UPDATE " + att + " SET decision='attested', reviewer='carol', "
+                         "decided_at_ms=5, justification='', decision_seq=1 WHERE " + key +
+                         "group' AND principal_id='eng' AND decision_seq=99")
+              .empty());
+    CHECK(integrity_violation(sqlstate_of(c, "COMMIT")));
+
+    // Nothing from any refused statement landed.
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    CHECK(view->attestations.size() == 3);
+    CHECK(view->pending_count == 2);
+    const auto* alice = find_row(*view, "user", "alice", "Admin");
+    REQUIRE(alice != nullptr);
+    CHECK(alice->decision == "attested");
+    CHECK(alice->reviewer == "carol");
+    CHECK(alice->decision_seq == 1);
+    CHECK(alice->history.size() == 1);
+    const auto* eng = find_row(*view, "group", "eng", "Reader");
+    REQUIRE(eng != nullptr);
+    CHECK(eng->decision == "pending");
+    CHECK(eng->decision_seq == 0);
+    CHECK(eng->history.empty());
+
+    // The normal paths still work: a campaign still opens (the pending freeze insert passes the
+    // guard), and the next decision on the grant the failed emulations touched lands at seq 1
+    // with no primary-key collision.
+    CHECK(store.open_campaign("After guards", "admin", three_grants(), "enabled").has_value());
+    auto next = store.record_attestation(cid, "group", "eng", "Reader", "attested", "dave", "");
+    REQUIRE(next.has_value());
+    CHECK(next->previous_decision == "pending");
+    CHECK(next->seq == 1);
+    auto cl = store.close_campaign(cid, "admin");
+    CHECK(cl.has_value());
+}
+
+// ── Concurrency on the HeldLocks seam (no sleeps, no thread loops) ──────────
+
+namespace {
+
+// True once at least `n` backends of this database are blocked on a row lock. A row-lock queue
+// shows the first waiter on `transactionid` and later ones on `tuple`.
+bool wait_for_row_lock_waiters(PgPool& pool, int n) {
+    const auto end = std::chrono::steady_clock::now() + yuzu::test::kLockWaitDeadline;
+    while (std::chrono::steady_clock::now() < end) {
+        if (auto probe = pool.try_acquire_for(std::chrono::milliseconds(100))) {
+            PgResult r{PQexec(probe.get(),
+                              "SELECT count(*) FROM pg_stat_activity WHERE datname = "
+                              "current_database() AND wait_event_type = 'Lock' AND wait_event IN "
+                              "('transactionid', 'tuple')")};
+            if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1 &&
+                std::atoi(PQgetvalue(r.get(), 0, 0)) >= n)
+                return true;
+        }
+        std::this_thread::sleep_for(yuzu::test::kLockWaitPoll);
+    }
+    return false;
+}
+
+std::string grant_lock_sql(const std::string& cid) {
+    // The same locks the attest pre-read takes, on the alice/Admin grant.
+    return "SELECT 1 FROM access_review_store.access_review_attestation a "
+           "JOIN access_review_store.access_review_campaign c ON c.campaign_id = a.campaign_id "
+           "WHERE a.campaign_id='" + cid + "' AND a.principal_type='user' AND "
+           "a.principal_id='alice' AND a.role_name='Admin' FOR UPDATE OF a FOR SHARE OF c";
+}
+
+} // namespace
+
+TEST_CASE("two attests of one grant serialise on the row lock and chain to seq 2",
+          "[access_review][store][pg][concurrency]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign("Chain", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    std::expected<yuzu::server::AttestationOutcome, std::string> r1, r2;
+    yuzu::test::HeldLocks held(pool);
+    held.run(grant_lock_sql(cid));
+    yuzu::test::Workers workers([&] { held.rollback(); });
+    workers.add([&] {
+        r1 = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "a");
+    });
+    workers.add([&] {
+        r2 = store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "dave", "b");
+    });
+    REQUIRE(wait_for_row_lock_waiters(pool, 2)); // both are parked behind the held row
+    held.rollback();
+    workers.join_all();
+
+    REQUIRE(r1.has_value());
+    REQUIRE(r2.has_value());
+    // One of them was first, the other chained behind it.
+    CHECK(((r1->seq == 1 && r2->seq == 2) || (r1->seq == 2 && r2->seq == 1)));
+    CHECK((r1->seq == 1 ? r1->previous_decision : r2->previous_decision) == "pending");
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    const auto* row = find_row(*view, "user", "alice", "Admin");
+    REQUIRE(row != nullptr);
+    CHECK(row->decision_seq == 2);
+    REQUIRE(row->history.size() == 2);
+    CHECK(row->history[0].previous_decision == "pending");
+    CHECK(row->history[1].previous_decision == row->history[0].decision);
+    CHECK(row->history[1].decision == row->decision);
+    CHECK(row->history[1].reviewer == row->reviewer);
+}
+
+TEST_CASE("a close issued while an attest holds its locks waits, then succeeds; an attest after "
+          "the close is not_found",
+          "[access_review][store][pg][concurrency]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign("Close waits", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    std::expected<void, std::string> closed;
+    yuzu::test::HeldLocks held(pool);
+    held.run(grant_lock_sql(cid)); // an in-flight attest: FOR SHARE on the campaign row
+    yuzu::test::Workers workers([&] { held.rollback(); });
+    workers.add([&] { closed = store.close_campaign(cid, "admin"); });
+    REQUIRE(yuzu::test::wait_for_lock_waiter(pool)); // the close is parked behind the attest
+    held.commit();
+    workers.join_all();
+    REQUIRE(closed.has_value());
+
+    auto late = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "");
+    REQUIRE_FALSE(late.has_value());
+    CHECK(late.error().starts_with("not_found:"));
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    CHECK(view->campaign.status == "closed");
+    CHECK(view->pending_count == 3);
+}
+
+TEST_CASE("an attest issued while a close is in flight waits, then is not_found once the close "
+          "commits",
+          "[access_review][store][pg][concurrency]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign("Attest waits", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    std::expected<yuzu::server::AttestationOutcome, std::string> attested;
+    yuzu::test::HeldLocks held(pool);
+    held.run("UPDATE access_review_store.access_review_campaign SET status='closed', "
+             "closed_by='held', closed_at_ms=1 WHERE campaign_id='" + cid + "'");
+    yuzu::test::Workers workers([&] { held.rollback(); });
+    workers.add([&] {
+        attested = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "");
+    });
+    REQUIRE(yuzu::test::wait_for_lock_waiter(pool)); // the attest is parked behind the close
+    held.commit();
+    workers.join_all();
+
+    REQUIRE_FALSE(attested.has_value());
+    CHECK(attested.error().starts_with("not_found:"));
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    CHECK(view->campaign.status == "closed");
+    CHECK(view->pending_count == 3);
+    for (const auto& a : view->attestations)
+        CHECK(a.history.empty());
+}
+
+// ── Migration v2 -> v3 (history table, guards, refusal) ─────────────────────
+
+namespace {
+
+// The shipped v1 + v2 shape (schema-qualified), stamped at version 2, with decided and pending
+// rows. A raw PQexec does not get the runner's search_path, hence the qualification.
+void seed_v2_database(const std::string& dsn) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(
+        conn.get(),
+        "CREATE TABLE public.schema_meta (store TEXT PRIMARY KEY, version INTEGER NOT NULL, "
+        "  upgraded_at BIGINT NOT NULL);"
+        "CREATE SCHEMA access_review_store;"
+        "CREATE TABLE access_review_store.access_review_campaign ("
+        "  campaign_id    TEXT PRIMARY KEY,"
+        "  title          TEXT NOT NULL,"
+        "  status         TEXT NOT NULL CHECK (status IN ('open','closed')),"
+        "  created_by     TEXT NOT NULL,"
+        "  created_at_ms  BIGINT NOT NULL,"
+        "  closed_by      TEXT NOT NULL DEFAULT '',"
+        "  closed_at_ms   BIGINT NOT NULL DEFAULT 0);"
+        "CREATE INDEX access_review_campaign_status_idx "
+        "  ON access_review_store.access_review_campaign (status);"
+        "CREATE TABLE access_review_store.access_review_attestation ("
+        "  campaign_id     TEXT NOT NULL REFERENCES "
+        "    access_review_store.access_review_campaign(campaign_id) ON DELETE CASCADE,"
+        "  principal_type  TEXT NOT NULL CHECK (principal_type IN ('user','group','engine')),"
+        "  principal_id    TEXT NOT NULL,"
+        "  role_name       TEXT NOT NULL,"
+        "  decision        TEXT NOT NULL CHECK (decision IN ('pending','attested','flagged_revoke')),"
+        "  reviewer        TEXT NOT NULL DEFAULT '',"
+        "  decided_at_ms   BIGINT NOT NULL DEFAULT 0,"
+        "  justification   TEXT NOT NULL DEFAULT '',"
+        "  grant_snapshot  TEXT NOT NULL DEFAULT '',"
+        "  PRIMARY KEY (campaign_id, principal_type, principal_id, role_name));"
+        "ALTER TABLE access_review_store.access_review_campaign "
+        "  ADD COLUMN rbac_enforcement TEXT NOT NULL DEFAULT '' "
+        "  CHECK (rbac_enforcement IN ('', 'enabled', 'disabled', 'degraded'));"
+        "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+        "  VALUES ('access_review_store', 2, 1);"
+        "INSERT INTO access_review_store.access_review_campaign "
+        "  (campaign_id, title, status, created_by, created_at_ms, rbac_enforcement) VALUES "
+        "  ('c1','R1','open','admin',1000,'enabled'), ('c2','R2','open','admin',1001,'enabled');"
+        "INSERT INTO access_review_store.access_review_attestation (campaign_id, principal_type, "
+        "  principal_id, role_name, decision, reviewer, decided_at_ms, justification, "
+        "  grant_snapshot) VALUES "
+        "  ('c1','user','alice','Admin','attested','carol',1234,'ok','{}'),"
+        "  ('c1','user','bob','Operator','pending','',0,'','{}'),"
+        "  ('c1','group','eng','Reader','flagged_revoke','dave',1235,'stale','{}'),"
+        "  ('c1','user','erin','Viewer','pending','',0,'','{}'),"
+        "  ('c2','user','zed','Viewer','pending','',0,'','{}');")};
+    REQUIRE(r.ok());
+}
+
+} // namespace
+
+TEST_CASE("AccessReviewStore: a genuine v2->v3 upgrade backfills the history and keeps the "
+          "decided rows",
+          "[access_review][store][pg][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    seed_v2_database(db.dsn());
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        CHECK(scalar_of(conn.get(), "SELECT version FROM public.schema_meta WHERE store = "
+                                    "'access_review_store'") == "3");
+    }
+
+    auto view = store.get_campaign("c1", true);
+    REQUIRE(view.has_value());
+    REQUIRE(view->attestations.size() == 4);
+    CHECK(view->pending_count == 2);
+    // A decided row: seq 1, one backfilled history row, "not recorded" as the prior decision.
+    const auto* alice = find_row(*view, "user", "alice", "Admin");
+    REQUIRE(alice != nullptr);
+    CHECK(alice->decision == "attested");
+    CHECK(alice->decision_seq == 1);
+    REQUIRE(alice->history.size() == 1);
+    CHECK(alice->history[0].seq == 1);
+    CHECK(alice->history[0].decision == "attested");
+    CHECK(alice->history[0].previous_decision.empty());
+    CHECK(alice->history[0].reviewer == "carol");
+    CHECK(alice->history[0].justification == "ok");
+    CHECK(alice->history[0].decided_at_ms == 1234);
+    const auto* eng = find_row(*view, "group", "eng", "Reader");
+    REQUIRE(eng != nullptr);
+    CHECK(eng->decision == "flagged_revoke");
+    CHECK(eng->decision_seq == 1);
+    REQUIRE(eng->history.size() == 1);
+    CHECK(eng->history[0].decided_at_ms == 1235);
+    // A pending row: seq 0 and no history.
+    const auto* bob = find_row(*view, "user", "bob", "Operator");
+    REQUIRE(bob != nullptr);
+    CHECK(bob->decision == "pending");
+    CHECK(bob->decision_seq == 0);
+    CHECK(bob->history.empty());
+
+    // The next decision on a migrated row chains behind the backfill.
+    auto next = store.record_attestation("c1", "user", "alice", "Admin", "flagged_revoke", "dave",
+                                         "revisit");
+    REQUIRE(next.has_value());
+    CHECK(next->previous_decision == "attested");
+    CHECK(next->seq == 2);
+    // And a pending one starts at 1.
+    auto first = store.record_attestation("c1", "user", "bob", "Operator", "attested", "carol", "");
+    REQUIRE(first.has_value());
+    CHECK(first->previous_decision == "pending");
+    CHECK(first->seq == 1);
+}
+
+TEST_CASE("AccessReviewStore: a v2 database holding a self-recorded decision is refused, with "
+          "the version unchanged",
+          "[access_review][store][pg][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    seed_v2_database(db.dsn());
+    {
+        // What the earlier build allowed: the subject of the grant recorded its own decision.
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(
+            conn.get(),
+            "INSERT INTO access_review_store.access_review_attestation (campaign_id, "
+            "principal_type, principal_id, role_name, decision, reviewer, decided_at_ms, "
+            "justification, grant_snapshot) VALUES "
+            "('c1','user','mallory','Admin','attested','mallory',1236,'me','{}')")};
+        REQUIRE(r.ok());
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    yuzu::test::LogCapture log;
+    AccessReviewStore store{pool};
+    log.stop();
+    CHECK_FALSE(store.is_open());
+    // The runner logs the database's message; this is the named refusal, not the history CHECK's.
+    CHECK(log.text().find("1 decision row(s) were recorded by the subject of the grant") !=
+          std::string::npos);
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    CHECK(scalar_of(conn.get(), "SELECT version FROM public.schema_meta WHERE store = "
+                                "'access_review_store'") == "2");
+    // The whole migration rolled back: no history table was left behind.
+    CHECK(scalar_of(conn.get(), "SELECT to_regclass('access_review_store."
+                                "access_review_attestation_history')::text")
+              .empty());
 }

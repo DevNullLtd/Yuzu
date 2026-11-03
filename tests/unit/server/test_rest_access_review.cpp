@@ -147,6 +147,7 @@ void acc_rev_reset() {
         "TRUNCATE engine_principal_store.engine_principals, "
         "access_review_store.access_review_campaign, "
         "access_review_store.access_review_attestation, "
+        "access_review_store.access_review_attestation_history, "
         "rbac_store.principal_roles, rbac_store.group_members, rbac_store.groups, "
         "rbac_store.role_permissions, rbac_store.roles RESTART IDENTITY CASCADE",
         std::vector<std::string>{});
@@ -999,6 +1000,35 @@ TEST_CASE("attest/get/close on an unknown campaign_id -> 404, not 503",
     auto close_res = h.sink.Post("/api/v1/access-reviews/no-such-campaign/close", "");
     REQUIRE(close_res);
     CHECK(close_res->status == 404);
+}
+
+// ── the store's forbidden: refusal -> 403 / kPermissionDenied, never 503 ────
+
+// The store refuses a reviewer who is the subject of a user grant (#4752). The harness session is
+// "admin", so attesting a grant whose principal_id is "admin" is the self-subject case on both
+// transports; the campaign need not exist because the refusal precedes the lookup.
+TEST_CASE("attest on a user grant naming the session user -> 403 REST / kPermissionDenied MCP",
+          "[pg][access_review][rest][sod]") {
+    AccessReviewHarness h;
+
+    auto rest = h.sink.Post("/api/v1/access-reviews/no-such-campaign/attestations",
+                            nlohmann::json{{"principal_type", "user"},
+                                           {"principal_id", "admin"},
+                                           {"role_name", "R"},
+                                           {"decision", "attested"}}
+                                .dump());
+    REQUIRE(rest);
+    CHECK(rest->status == 403);
+
+    auto mcp = h.mcp_call_tool("record_attestation", {{"campaign_id", "no-such-campaign"},
+                                                      {"principal_type", "user"},
+                                                      {"principal_id", "admin"},
+                                                      {"role_name", "R"},
+                                                      {"decision", "attested"}});
+    REQUIRE(mcp);
+    auto body = nlohmann::json::parse(mcp->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
 }
 
 // ── Self-audit ───────────────────────────────────────────────────────────────

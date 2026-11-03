@@ -67,6 +67,141 @@ const std::vector<pg::PgMigration>& migrations() {
         {2,
          "ALTER TABLE access_review_campaign ADD COLUMN rbac_enforcement TEXT NOT NULL DEFAULT '' "
          "CHECK (rbac_enforcement IN ('', 'enabled', 'disabled', 'degraded'));"},
+        // #4752: keep every attestation decision, and require the reviewer to differ from the
+        // subject of the grant. HYBRID design: the current-state row keeps its primary key and
+        // gains `decision_seq`; the new history table is the evidence trail. The STORE writes
+        // the history row (in record_attestation, inside the same transaction as the state
+        // change); the database only GUARDS, so a state change that is not exactly one appended
+        // history row is refused. A writer trigger was rejected because an `IS DISTINCT FROM`
+        // trigger records value changes, not decisions (an identical repeat attest would leave
+        // no history). The guard also refuses an older binary's bare UPDATE during a mixed-
+        // version window: it fails (class 23, a 503), it does not bypass the reviewer rule.
+        //
+        // Honest limits: append-only against the application path and ordinary SQL, NOT
+        // against the application credential. The runner creates the schema under that role, so
+        // it owns the tables and can DISABLE TRIGGER, forge a history row that matches, or
+        // TRUNCATE (row triggers do not fire on TRUNCATE, which is why a test fixture's
+        // TRUNCATE ... CASCADE still works); a role granted TRUNCATE can too. A data-only
+        // restore into a migrated schema is refused by the guard: restore schema and data
+        // together. A future migration that touches attestation rows must DISABLE TRIGGER
+        // inside its own transaction (the ca_store v4 rule).
+        //
+        // Statement order matters. The refusal runs first so a legacy self-recorded decision
+        // surfaces the readable message below rather than the history CHECK's. Every guard is
+        // created AFTER the backfill (which writes through no guard), and the deferred
+        // consistency trigger LAST. Function bodies schema-qualify their table names: a trigger
+        // function runs on a pooled connection that has no store search_path.
+        //
+        // Hard cutover (docs/user-manual/upgrading.md "Deployment contract"): a database
+        // carried forward from a build that let a reviewer decide their own grant is REFUSED
+        // here, every boot, until it is replaced. Every other legacy decided row backfills as
+        // seq 1 with previous_decision '' (not recorded; never read as 'pending').
+        //
+        // ADD COLUMN and CREATE TRIGGER take ACCESS EXCLUSIVE, so the pool's 10 s lock_timeout
+        // is raised to 30 s as in ca_store v3/v4. The backfill is expected to be empty under
+        // the deployment contract; the statement_timeout bounds a carried-forward one.
+        {3,
+         "SET LOCAL lock_timeout = '30s'; "
+         "SET LOCAL statement_timeout = '300s'; "
+         R"sql(
+DO $do$
+DECLARE n bigint;
+BEGIN
+  SELECT count(*) INTO n FROM access_review_store.access_review_attestation
+   WHERE principal_type = 'user' AND principal_id = reviewer AND decision <> 'pending';
+  IF n > 0 THEN
+    RAISE EXCEPTION 'access_review_store: % decision row(s) were recorded by the subject of the grant under an earlier build; this build keeps every decision and requires the reviewer to differ from the subject, so these rows cannot be carried forward. Deploy into a fresh database (docs/user-manual/upgrading.md "Deployment contract"). To list them: SELECT campaign_id, principal_id, role_name FROM access_review_store.access_review_attestation WHERE principal_type = ''user'' AND principal_id = reviewer AND decision <> ''pending''', n
+      USING ERRCODE = 'integrity_constraint_violation';
+  END IF;
+END
+$do$;
+ALTER TABLE access_review_attestation ADD COLUMN decision_seq INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE access_review_attestation_history (
+  campaign_id       TEXT NOT NULL REFERENCES access_review_campaign(campaign_id) ON DELETE RESTRICT,
+  principal_type    TEXT NOT NULL CHECK (principal_type IN ('user','group','engine')),
+  principal_id      TEXT NOT NULL,
+  role_name         TEXT NOT NULL,
+  seq               INTEGER NOT NULL CHECK (seq >= 1),
+  decision          TEXT NOT NULL CHECK (decision IN ('attested','flagged_revoke')),
+  previous_decision TEXT NOT NULL CHECK (previous_decision IN ('','pending','attested','flagged_revoke')),
+  reviewer          TEXT NOT NULL,
+  justification     TEXT NOT NULL DEFAULT '',
+  decided_at_ms     BIGINT NOT NULL,
+  PRIMARY KEY (campaign_id, principal_type, principal_id, role_name, seq),
+  FOREIGN KEY (campaign_id, principal_type, principal_id, role_name)
+    REFERENCES access_review_attestation(campaign_id, principal_type, principal_id, role_name)
+    ON DELETE RESTRICT,
+  CONSTRAINT access_review_history_reviewer_not_subject
+    CHECK (NOT (principal_type = 'user' AND principal_id = reviewer)));
+INSERT INTO access_review_attestation_history
+  (campaign_id, principal_type, principal_id, role_name, seq, decision, previous_decision,
+   reviewer, justification, decided_at_ms)
+  SELECT campaign_id, principal_type, principal_id, role_name, 1, decision, '', reviewer,
+         justification, decided_at_ms
+    FROM access_review_attestation WHERE decision <> 'pending';
+UPDATE access_review_attestation SET decision_seq = 1 WHERE decision <> 'pending';
+ALTER TABLE access_review_attestation ADD CONSTRAINT access_review_attestation_seq_chk
+  CHECK ((decision = 'pending') = (decision_seq = 0));
+CREATE FUNCTION access_review_store.access_review_attestation_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.decision <> 'pending' OR NEW.decision_seq <> 0 THEN
+      RAISE EXCEPTION 'access_review_attestation: a row is inserted pending at seq 0 only (decisions are appended through the history table)' USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'access_review_attestation: rows are never deleted (campaign evidence)' USING ERRCODE = 'integrity_constraint_violation';
+  END IF;
+  IF NEW.campaign_id <> OLD.campaign_id OR NEW.principal_type <> OLD.principal_type
+     OR NEW.principal_id <> OLD.principal_id OR NEW.role_name <> OLD.role_name
+     OR NEW.grant_snapshot <> OLD.grant_snapshot THEN
+    RAISE EXCEPTION 'access_review_attestation: key and grant_snapshot are immutable' USING ERRCODE = 'integrity_constraint_violation';
+  END IF;
+  IF NEW.decision_seq <> OLD.decision_seq + 1 THEN
+    RAISE EXCEPTION 'access_review_attestation: decision_seq must advance by exactly one (old %, new %)', OLD.decision_seq, NEW.decision_seq USING ERRCODE = 'integrity_constraint_violation';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM access_review_store.access_review_attestation_history h
+                  WHERE h.campaign_id = NEW.campaign_id AND h.principal_type = NEW.principal_type
+                    AND h.principal_id = NEW.principal_id AND h.role_name = NEW.role_name
+                    AND h.seq = NEW.decision_seq AND h.decision = NEW.decision
+                    AND h.reviewer = NEW.reviewer AND h.decided_at_ms = NEW.decided_at_ms
+                    AND h.justification = NEW.justification
+                    AND h.previous_decision = OLD.decision) THEN
+    RAISE EXCEPTION 'access_review_attestation: no matching history row at seq % (decisions are appended, never overwritten)', NEW.decision_seq USING ERRCODE = 'integrity_constraint_violation';
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER access_review_attestation_guard BEFORE INSERT OR UPDATE OR DELETE
+  ON access_review_attestation
+  FOR EACH ROW EXECUTE FUNCTION access_review_store.access_review_attestation_guard();
+CREATE FUNCTION access_review_store.access_review_history_keep() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'access_review_attestation_history: a decision row cannot be % (history is append-only)', lower(TG_OP) USING ERRCODE = 'integrity_constraint_violation';
+END $$;
+CREATE TRIGGER access_review_history_keep BEFORE UPDATE OR DELETE
+  ON access_review_attestation_history
+  FOR EACH ROW EXECUTE FUNCTION access_review_store.access_review_history_keep();
+CREATE FUNCTION access_review_store.access_review_history_consistent() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM access_review_store.access_review_attestation a
+                  WHERE a.campaign_id = NEW.campaign_id AND a.principal_type = NEW.principal_type
+                    AND a.principal_id = NEW.principal_id AND a.role_name = NEW.role_name
+                    AND a.decision_seq >= NEW.seq
+                    AND (a.decision_seq <> NEW.seq
+                         OR (a.decision = NEW.decision AND a.reviewer = NEW.reviewer
+                             AND a.decided_at_ms = NEW.decided_at_ms))) THEN
+    RAISE EXCEPTION 'access_review_attestation_history: seq % committed ahead of the current decision (history and state must advance together)', NEW.seq USING ERRCODE = 'integrity_constraint_violation';
+  END IF;
+  RETURN NULL;
+END $$;
+CREATE CONSTRAINT TRIGGER access_review_history_consistent AFTER INSERT
+  ON access_review_attestation_history
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION access_review_store.access_review_history_consistent();
+)sql"},
     };
     return kMigrations;
 }
@@ -127,12 +262,29 @@ AccessReviewAttestationRow read_attestation(PGresult* res, int i) {
     a.decided_at_ms = to_i64(PQgetvalue(res, i, col++));
     a.justification = PQgetvalue(res, i, col++);
     a.grant_snapshot = PQgetvalue(res, i, col++);
+    a.decision_seq = static_cast<std::int32_t>(to_i64(PQgetvalue(res, i, col++)));
     return a;
 }
 
 constexpr const char* kAttestationCols =
     "campaign_id, principal_type, principal_id, role_name, decision, reviewer, decided_at_ms, "
-    "justification, grant_snapshot";
+    "justification, grant_snapshot, decision_seq";
+
+AttestationHistoryRow read_history(PGresult* res, int i) {
+    AttestationHistoryRow h;
+    int col = 4; // the grant's 4-tuple (cols 0-3) is the merge key, read by the caller
+    h.seq = static_cast<std::int32_t>(to_i64(PQgetvalue(res, i, col++)));
+    h.decision = PQgetvalue(res, i, col++);
+    h.previous_decision = PQgetvalue(res, i, col++);
+    h.reviewer = PQgetvalue(res, i, col++);
+    h.justification = PQgetvalue(res, i, col++);
+    h.decided_at_ms = to_i64(PQgetvalue(res, i, col++));
+    return h;
+}
+
+constexpr const char* kHistoryCols =
+    "campaign_id, principal_type, principal_id, role_name, seq, decision, previous_decision, "
+    "reviewer, justification, decided_at_ms";
 
 } // namespace
 
@@ -227,7 +379,7 @@ AccessReviewStore::open_campaign(std::string title, std::string created_by,
     return campaign_id;
 }
 
-std::expected<void, std::string>
+std::expected<AttestationOutcome, std::string>
 AccessReviewStore::record_attestation(const std::string& campaign_id,
                                       const std::string& principal_type,
                                       const std::string& principal_id,
@@ -258,36 +410,110 @@ AccessReviewStore::record_attestation(const std::string& campaign_id,
         return std::unexpected("bad_request: justification exceeds " +
                                std::to_string(kMaxJustificationBytes) + " bytes");
 
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return std::unexpected("database unavailable — try again");
+    // Reviewer != subject for a user grant (#4752), byte-exact (no case folding). Decided from
+    // the arguments alone, before any lease, so it precedes `not_found` for a missing or closed
+    // campaign; the UPDATE's own predicate below is the backstop. The engine-owner and
+    // group-member rules need other stores and are the route layer's, not this store's.
+    if (principal_type == "user" && principal_id == reviewer)
+        return std::unexpected("forbidden: reviewer is the subject of this grant");
 
-    // The `EXISTS (... status='open')` guard makes a closed campaign's
-    // attestation rows immutable — no separate pre-check-then-write race
-    // (the whole thing is one statement).
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE access_review_store.access_review_attestation "
-        "SET decision=$5, reviewer=$6, decided_at_ms=$7::bigint, justification=$8 "
-        "WHERE campaign_id=$1 AND principal_type=$2 AND principal_id=$3 AND role_name=$4 "
-        "  AND EXISTS (SELECT 1 FROM access_review_store.access_review_campaign c "
-        "              WHERE c.campaign_id=$1 AND c.status='open') "
-        "RETURNING campaign_id",
-        std::vector<std::string>{campaign_id, principal_type, principal_id, role_name, decision,
-                                 reviewer, std::to_string(now_ms()), justification});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string("record_attestation write failed: ") +
-                               PQerrorMessage(lease.get()));
-    if (PQntuples(res.get()) == 0)
-        return std::unexpected(
-            "not_found: no pending grant matches (campaign_id, principal_type, principal_id, "
-            "role_name) in an open campaign — it was never in the frozen population, the "
-            "campaign is closed, or the campaign_id is unknown");
-    return {};
+    // One timestamp bound into both statements: the state guard compares it byte-exact against
+    // the history row.
+    const std::string decided_at = std::to_string(now_ms());
+
+    AttestationOutcome outcome;
+    std::string error_msg;
+    bool not_found = false;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // Lock order: the attestation row, then the campaign row (close_campaign takes only
+        // the campaign row, so there is no cycle). FOR SHARE on the campaign makes a close wait
+        // for this decision to commit; an attest after a close sees 'closed' and is refused.
+        pg::PgResult pre = pg::exec_params(
+            conn,
+            "SELECT a.decision, a.decision_seq, c.status "
+            "FROM access_review_store.access_review_attestation a "
+            "JOIN access_review_store.access_review_campaign c ON c.campaign_id = a.campaign_id "
+            "WHERE a.campaign_id=$1 AND a.principal_type=$2 AND a.principal_id=$3 "
+            "  AND a.role_name=$4 "
+            "FOR UPDATE OF a FOR SHARE OF c",
+            std::vector<std::string>{campaign_id, principal_type, principal_id, role_name});
+        if (pre.status() != PGRES_TUPLES_OK) {
+            error_msg = std::string("record_attestation read failed: ") + PQerrorMessage(conn);
+            return false;
+        }
+        if (PQntuples(pre.get()) == 0 || std::string_view{PQgetvalue(pre.get(), 0, 2)} != "open") {
+            not_found = true;
+            return false;
+        }
+        const std::string old_decision = PQgetvalue(pre.get(), 0, 0);
+        const std::int32_t old_seq = static_cast<std::int32_t>(to_i64(PQgetvalue(pre.get(), 0, 1)));
+        const std::string new_seq = std::to_string(old_seq + 1);
+
+        pg::PgResult hist = pg::exec_params(
+            conn,
+            "INSERT INTO access_review_store.access_review_attestation_history "
+            "(campaign_id, principal_type, principal_id, role_name, seq, decision, "
+            " previous_decision, reviewer, justification, decided_at_ms) "
+            "VALUES ($1,$2,$3,$4,$5::integer,$6,$7,$8,$9,$10::bigint)",
+            std::vector<std::string>{campaign_id, principal_type, principal_id, role_name, new_seq,
+                                     decision, old_decision, reviewer, justification,
+                                     decided_at});
+        if (hist.status() != PGRES_COMMAND_OK) {
+            error_msg = std::string("record_attestation history write failed: ") +
+                        PQerrorMessage(conn);
+            return false;
+        }
+
+        // The row lock above makes a zero-row UPDATE unreachable through the public API; it is
+        // still checked, because a `true` return here would COMMIT the history row just
+        // inserted (PgPool::with_txn_for rolls back only on `false`) and the next attest would
+        // collide with it on the primary key. The deferred consistency trigger is the database
+        // backstop for the same case.
+        pg::PgResult upd = pg::exec_params(
+            conn,
+            "UPDATE access_review_store.access_review_attestation "
+            "SET decision=$6, reviewer=$7, decided_at_ms=$8::bigint, justification=$9, "
+            "    decision_seq=$5::integer "
+            "WHERE campaign_id=$1 AND principal_type=$2 AND principal_id=$3 AND role_name=$4 "
+            "  AND decision_seq=$10::integer "
+            "  AND NOT (principal_type='user' AND principal_id=$7) "
+            "  AND EXISTS (SELECT 1 FROM access_review_store.access_review_campaign c "
+            "              WHERE c.campaign_id=$1 AND c.status='open') "
+            "RETURNING decision_seq",
+            std::vector<std::string>{campaign_id, principal_type, principal_id, role_name, new_seq,
+                                     decision, reviewer, decided_at, justification,
+                                     std::to_string(old_seq)});
+        if (upd.status() != PGRES_TUPLES_OK) {
+            error_msg = std::string("record_attestation write failed: ") + PQerrorMessage(conn);
+            return false;
+        }
+        if (PQntuples(upd.get()) == 0) {
+            spdlog::error("AccessReviewStore: attestation UPDATE matched no row after the locked "
+                          "pre-read; rolling back the history row (campaign {})",
+                          campaign_id);
+            error_msg = "record_attestation write failed: the decision did not advance";
+            return false;
+        }
+        outcome.previous_decision = old_decision;
+        outcome.seq = old_seq + 1;
+        return true;
+    });
+
+    if (!ok) {
+        if (not_found)
+            return std::unexpected(
+                "not_found: no frozen grant matches (campaign_id, principal_type, principal_id, "
+                "role_name) in an open campaign");
+        return std::unexpected(error_msg.empty()
+                                   ? "record_attestation failed: database unavailable or the "
+                                     "decision was not committed, try again"
+                                   : error_msg);
+    }
+    return outcome;
 }
 
 std::expected<CampaignView, std::string>
-AccessReviewStore::get_campaign(const std::string& campaign_id) {
+AccessReviewStore::get_campaign(const std::string& campaign_id, bool include_history) {
     if (!open_)
         return std::unexpected("database not open");
     if (!valid_campaign_id(campaign_id))
@@ -345,6 +571,39 @@ AccessReviewStore::get_campaign(const std::string& campaign_id) {
             if (a.decision == "pending")
                 ++view.pending_count;
             view.attestations.push_back(std::move(a));
+        }
+
+        if (include_history) {
+            // Same snapshot as the two reads above. Both result sets are ordered by the grant's
+            // 4-tuple, so a history row's grant is found by a forward merge, not a search.
+            std::string hsql = std::string("SELECT ") + kHistoryCols +
+                               " FROM access_review_store.access_review_attestation_history "
+                               "WHERE campaign_id=$1 "
+                               "ORDER BY principal_type, principal_id, role_name, seq";
+            pg::PgResult hres =
+                pg::exec_params(conn, hsql.c_str(), std::vector<std::string>{campaign_id});
+            if (hres.status() != PGRES_TUPLES_OK) {
+                error_msg = std::string("get_campaign history read failed: ") +
+                            PQerrorMessage(conn);
+                return false;
+            }
+            const int hrows = PQntuples(hres.get());
+            std::size_t at = 0;
+            for (int i = 0; i < hrows; ++i) {
+                const std::string_view ptype = PQgetvalue(hres.get(), i, 1);
+                const std::string_view pid = PQgetvalue(hres.get(), i, 2);
+                const std::string_view role = PQgetvalue(hres.get(), i, 3);
+                while (at < view.attestations.size() &&
+                       !(view.attestations[at].principal_type == ptype &&
+                         view.attestations[at].principal_id == pid &&
+                         view.attestations[at].role_name == role))
+                    ++at;
+                if (at == view.attestations.size()) {
+                    error_msg = "get_campaign history row has no matching attestation row";
+                    return false;
+                }
+                view.attestations[at].history.push_back(read_history(hres.get(), i));
+            }
         }
         return true;
     });

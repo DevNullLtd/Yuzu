@@ -537,7 +537,9 @@ static std::string_view confirm_rotation_error_remediation(const std::string& er
 // frozen grant / campaign not open" via an `unexpected` payload PREFIXED
 // `"not_found: "` (machine-checkable). That prefix maps to 404. A `"bad_request: "`
 // prefix (campaign_id shape, an embedded NUL, an oversized justification) maps
-// to 400: client input the store refused before touching the pool. Every other
+// to 400: client input the store refused before touching the pool. A `"forbidden: "`
+// prefix (the reviewer is the subject of the grant) maps to 403: the caller holds
+// Attest but may not decide this grant. Every other
 // `unexpected` (a genuine write/read failure, lease timeout, query error) is a
 // transient 503, never a 400: the caller did nothing wrong, the store did.
 //
@@ -558,6 +560,8 @@ static int access_review_error_status(const std::string& err) {
         return 404;
     if (err.starts_with("bad_request:"))
         return 400;
+    if (err.starts_with("forbidden:"))
+        return 403;
     return 503;
 }
 

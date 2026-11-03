@@ -6056,8 +6056,10 @@ int mcp_error_for_store_msg(const std::string& msg) {
 // fault, so it maps to kInvalidParams like the REST twin's 404. The
 // "bad_request: " prefix (campaign_id shape, an embedded NUL, an oversized
 // justification) is client input the store refused before touching the pool,
-// so it is kInvalidParams too, like the REST twin's 400. Any other message is
-// a genuine read/write failure -> kInternalError (retryable).
+// so it is kInvalidParams too, like the REST twin's 400. The "forbidden: "
+// prefix (the reviewer is the subject of the grant) is kPermissionDenied, like
+// the REST twin's 403. Any other message is a genuine read/write failure ->
+// kInternalError (retryable).
 //
 // Contract pin: every tool handler above pre-validates its own required
 // fields (title/decision/campaign_id/principal_type/principal_id/role_name)
@@ -6069,6 +6071,8 @@ int mcp_error_for_store_msg(const std::string& msg) {
 // arm below and the matching 400 arm in rest_api_v1.cpp's
 // access_review_error_status already map it).
 int mcp_error_for_access_review_msg(const std::string& msg) {
+    if (msg.starts_with("forbidden:"))
+        return kPermissionDenied;
     return (msg.starts_with("not_found:") || msg.starts_with("bad_request:")) ? kInvalidParams
                                                                               : kInternalError;
 }
