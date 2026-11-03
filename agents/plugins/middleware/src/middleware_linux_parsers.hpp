@@ -393,8 +393,8 @@ struct MountScan {
 };
 
 /// scan_mounts is a DECLARED EXCEPTION to the hop-by-hop rule: `path` is opened by name, so only the leaf is
-/// O_NOFOLLOW and production's `/proc/self` magic link is followed. This is the same read as the
-/// `runtimes` plugin's accepted copy; procfs is kernel-controlled and a swapped link cannot name
+/// O_NOFOLLOW and production's `/proc/self` magic link is followed. This is the same read the
+/// `runtimes` plugin makes; procfs is kernel-controlled and a swapped link cannot name
 /// another process's table.
 inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMountinfoBytes) {
     MountScan s;
