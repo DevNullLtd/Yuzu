@@ -2311,13 +2311,27 @@ TEST_CASE("openapi documents: the response status set of the hand-checked operat
         // and 403 (perm_fn_ PluginSigning:Read); 500 (bundle on disk unreadable); 503 (audit
         // unavailable, runtime config store unavailable, bundle changed while serving).
         {"/v2/agent/plugin-policy", "get", {"200", "401", "403", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Put(.../([^/]+)/([^/]+)): 200; 400 (JSON body, missing
+        // value, parse_plugin_key, value and actor grammar); 413 (parse_json_object_body over
+        // kMaxBodyBytes); 500 (set_config WriteFailed); 503 (store not open, Unavailable, attempt
+        // audit unavailable). 401 (auth_fn) and 403 (perm_fn) are the auth layer, which the
+        // plugin-config rows leave undeclared.
+        {"/plugin-config/{plugin}/{key}", "put", {"200", "400", "413", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Put(.../([^/]+)/([^/]+)/secret): the same shape as the
+        // plain PUT; 503 also covers SecretUnavailable (encrypt failed).
+        {"/plugin-config/{plugin}/{key}/secret", "put", {"200", "400", "413", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Delete(.../([^/]+)/([^/]+)): 200; 400 (the existence
+        // pre-check get_config answers InvalidInput for a bad plugin/key); 404 (pre-check
+        // NotFound, or a concurrent delete); 500 (delete_config WriteFailed); 503 (store not
+        // open, Unavailable, attempt audit unavailable). 403 (perm_fn) is left undeclared.
+        {"/plugin-config/{plugin}/{key}", "delete", {"200", "400", "404", "500", "503"}},
         // plugin_config_routes.cpp, sink.Delete(.../([^/]+)/([^/]+)/secret): 200; 400
         // (parse_plugin_key); 404 (delete_secret NotFound, after the attempted audit row); 500
-        // (WriteFailed) and 403 (perm_fn), which the document does not declare (not part of #6167);
-        // 503 (store not open, Unavailable, attempt audit unavailable).
-        {"/plugin-config/{plugin}/{key}/secret", "delete", {"200", "400", "404", "503"}},
+        // (delete_secret WriteFailed); 503 (store not open, Unavailable, attempt audit
+        // unavailable). 403 (perm_fn) is left undeclared.
+        {"/plugin-config/{plugin}/{key}/secret", "delete", {"200", "400", "404", "500", "503"}},
         // file_retrieval_routes.cpp register_chunk(): 200; 400 (Content-Range, body length, and
-        // the TLS gate, which the document does not declare); 401 (session_unknown); 409
+        // the TLS gate, require_tls kTlsRequired); 401 (session_unknown); 409
         // (offset_mismatch, session_terminal); 410 (expired); 413 (chunk_too_large,
         // size_exceeded); 500 (open or write failed); 503 (store null or unavailable,
         // advance_offset error).
