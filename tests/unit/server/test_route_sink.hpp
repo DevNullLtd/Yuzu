@@ -16,14 +16,14 @@
 // It reproduces httplib::Server's REQUEST PARSING for the handful of fields
 // handlers actually read: the path, the query string, an
 // `application/x-www-form-urlencoded` body (both into the same `req.params`
-// multimap, query first so query values win — httplib's own precedence),
+// ordered multimap, query first so query values win — httplib's own precedence),
 // headers, and the regex captures in `req.matches`. Anything else is NOT
 // modelled, and a test must not be read as evidence about it:
 //   - no percent-decoding of the path (httplib routes on
 //     `decode_path_component`), so `%2E`-encoded paths behave differently;
 //   - no multipart and no chunked transfer-encoding;
-//   - `extra_headers` is a map, so DUPLICATE headers (the classic
-//     `Origin:`-twice CSRF desync probe) cannot be synthesized at all, and
+//   - `extra_headers` is a map, so it cannot carry DUPLICATE headers (the classic
+//     `Origin:`-twice CSRF desync probe); `repeated_headers` can, and
 //     `Request::set_header` SILENTLY DROPS any value failing `is_field_value`
 //     (e.g. one padded with whitespace, which httplib trims on the wire before
 //     it ever reaches set_header) — so a header a test sets may simply not be
@@ -140,9 +140,8 @@ public:
             // Inject test-supplied headers. Done AFTER Content-Type so a
             // test that explicitly overrides Content-Type via the map
             // wins (rare, but a valid scenario).
-            // httplib keeps header duplicates (an unordered_multimap) and a read returns
-            // the first one, whose order differs between standard libraries: erase the
-            // existing value so the per-call header wins everywhere.
+            // httplib keeps header duplicates (an insertion-ordered multimap) and a read
+            // returns the first one: erase the existing value so the per-call header wins.
             for (const auto& [name, value] : extra_headers) {
                 req.headers.erase(name);
                 req.set_header(name, value);

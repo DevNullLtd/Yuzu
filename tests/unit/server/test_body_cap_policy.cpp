@@ -1143,7 +1143,7 @@ TEST_CASE("Pre-routing body cap: duplicate Content-Length headers cannot desync 
                             "Content-Length: 99999999999999999999999\r\n\r\n" +
                             small_body;
     const auto resp = raw_request_status_line(ts.port, req);
-    // Whichever duplicate value httplib's unordered_multimap resolves as
+    // Whichever duplicate value httplib's reader resolves as
     // id=0: either it is the oversize one — refused here, 413, handler
     // never runs — or it is the small one — admitted, and httplib's ACTUAL
     // body read is then bounded to those `small_body.size()` bytes we

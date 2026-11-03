@@ -51,7 +51,7 @@ The clients this covers are the agent plugins `http_client` and `content_dist`
 and, on a Windows server, the OIDC discovery and JWKS fetches (when TLS
 verification is not skipped), webhook delivery, analytics sinks, offload
 targets and the NVD client. Not covered: on Windows the OIDC token exchange
-and directory sync use WinHTTP, which this change does not touch, and the
+and directory sync use WinHTTP, which this section does not cover, and the
 healthcheck probe loads its own trust anchor.
 
 What changes for operators:
