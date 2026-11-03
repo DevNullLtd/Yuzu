@@ -631,11 +631,17 @@ cursor.** What it adds to the pattern:
     in HKU that keeps the profile's NTUSER.DAT locked. The reader's `start()` unloads them once
     (`sweep_leftover_hive_mounts`: the process-wide offline-hive lock first, so no in-process
     mount is in use while it lists HKU; names chosen by the pure `select_stale_hive_mounts`;
-    non-forced `RegUnLoadKeyW`, so a hive a holder has open is retained and logged), through
-    the same gate and bounded worker as a mount. A sweep that could not run at start
-    (`sweep_pending`) runs before the first offline mount that finds the gate open. It is
-    process-wide, so a sibling plugin's leftover goes too; a mount of a second agent process
-    in its handle-less window could also be unloaded, which is not a supported configuration.
+    non-forced `RegUnLoadKeyW`, so a hive whose unload is refused or fails is retained and
+    logged; without `SeRestorePrivilege` nothing is attempted and one `privilege_missing`
+    warning names the mounts), through the same gate and bounded worker as a mount. A sweep
+    whose worker did not return (`sweep_pending`: gate closed, call rejected or timed out) runs
+    before the first offline mount that finds the gate open. Every other outcome completes it,
+    so it is one attempt per start: a refused unload, a missing privilege, a partial HKU
+    listing (`enumerate_hku_subkeys` has no error channel) or an exception is not retried this
+    run, and what it missed waits for the next start or `reg unload`. It is process-wide, so a
+    sibling plugin's leftover goes too; a mount of a second agent process in its handle-less
+    window could also be unloaded: an out-of-process mount is unguarded (`win_reg_handle.hpp`),
+    and that is the default shape on the shared CI pools.
   - *Cursor evolution.* `offline` and `deferred` are optional cursor fields and the
     cursor version is not gated on them (unlike `held`): an older build has no offline
     coverage to lose, so it ignores them and drops those roots through its own

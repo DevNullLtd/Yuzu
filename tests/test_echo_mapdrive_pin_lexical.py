@@ -46,7 +46,8 @@ test_echo_mapdrive.cpp), so this pins the wiring lexically. Invariants:
      (sweep_leftover_hive_mounts) takes the process-wide offline-hive lock BEFORE it lists
      HKEY_USERS (that lock is what keeps it off this process's own live mounts), lists through
      the shared enumerate_hku_subkeys, offers only select_stale_hive_mounts' names to
-     RegUnLoadKeyW under SeRestorePrivilege, and never forces an unload.
+     RegUnLoadKeyW only when SeRestorePrivilege is held, and never forces an unload; the
+     worker sweeps the whole default prefix (no argument).
 
 Robustness: `//` comments are stripped and whitespace is collapsed before matching, so a
 `//`-commented call cannot satisfy a check (`/* */` comments are deliberately NOT stripped). Lexical only: it cannot see a relocation that keeps
@@ -190,8 +191,9 @@ def problems(collector_src, plugin_src, gate_src, registry_src):
             out.append("a closed gate must leave the sweep pending without running it")
         if not re.search(r"bounded_call_ex\(\s*kHiveMountBoundMs\b", sweep):
             out.append("the sweep is no longer bounded by kHiveMountBoundMs")
-        if not re.search(r"const MountWorkerGuard \w+;[^}]*?sweep_leftover_hive_mounts\(", sweep):
-            out.append("the sweep worker no longer counts itself in flight before it sweeps")
+        if not re.search(r"const MountWorkerGuard \w+;[^}]*?sweep_leftover_hive_mounts\(\)", sweep):
+            out.append("the sweep worker no longer counts itself in flight before it sweeps, or "
+                       "no longer sweeps the whole default prefix (no argument)")
         if not re.search(r"BoundedCallStatus::Completed\) \{ tick\.sweep_pending = false; return; \}", sweep):
             out.append("the sweep must clear sweep_pending when, and only when, its worker completed")
         if sweep.count("sweep_pending = false") != 1:
@@ -227,8 +229,10 @@ def problems(collector_src, plugin_src, gate_src, registry_src):
                        "through the unit-tested select_stale_hive_mounts")
         if "enumerate_hku()" in shell:
             out.append("the sweep must not list through Echo's own enumerate_hku")
-        if 'PrivilegeScope restore_priv(L"SeRestorePrivilege")' not in shell:
-            out.append("the sweep no longer enables SeRestorePrivilege for the unload")
+        if ('PrivilegeScope restore_priv(L"SeRestorePrivilege")' not in shell
+                or "if (restore_priv.ok())" not in shell):
+            out.append("the sweep no longer enables SeRestorePrivilege, or no longer gates the "
+                       "unload on holding it")
         if not re.search(r"sweep_hive_mounts\( ?stale, \[\]\(const std::string& name\) \{ return "
                          r"RegUnLoadKeyW\(HKEY_USERS, yuzu::win::to_wide\(name\)\.c_str\(\)\) "
                          r"== ERROR_SUCCESS; \}\);", shell):
@@ -499,6 +503,11 @@ class EchoMapdrivePinLexical(unittest.TestCase):
                    "select_stale_hive_mounts(enumerate_hku(), prefix)")),
             "sweep no longer enables SeRestorePrivilege": dict(r=mutate(
                 r, 'const yuzu::win::PrivilegeScope restore_priv(L"SeRestorePrivilege");', "(void)0;")),
+            "sweep worker narrows the prefix": dict(r=mutate(
+                r, "return yuzu::echo::sweep_leftover_hive_mounts();",
+                   'return yuzu::echo::sweep_leftover_hive_mounts("YUZU_HIVE_S-1-5-21-1");')),
+            "sweep unloads without holding the privilege": dict(r=mutate(
+                r, "if (restore_priv.ok()) {", "if (true) {")),
             "sweep forces the unload": dict(r=mutate(
                 r, "return RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(name).c_str()) == ERROR_SUCCESS;",
                    "return NtUnloadKey2(name) == ERROR_SUCCESS;")),

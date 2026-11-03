@@ -1318,7 +1318,7 @@ TEST_CASE("registry schema constants agree with the registry", "[echo][registry]
 
 // The start-up sweep of leftover YUZU_HIVE_* mounts: the pure decision, with the unload injected.
 
-TEST_CASE("select_stale_hive_mounts: only YUZU_HIVE_ mounts, never a profile hive, .DEFAULT, a _Classes hive or an empty name",
+TEST_CASE("select_stale_hive_mounts: only YUZU_HIVE_ mounts; never a profile hive / .DEFAULT / a _Classes hive / an empty name",
           "[echo][registry][pure]") {
     const std::vector<std::string> hku{".DEFAULT",
                                        "S-1-5-18",
@@ -5429,9 +5429,11 @@ TEST_CASE("registry live: the start-up sweep unloads a leaked YUZU_HIVE_ mount a
     // A mount named by unique_hive_mount_name() itself, salted by this process's fake sid and swept
     // through that sid's own prefix: the production sweep takes every YUZU_HIVE_* mount, and a
     // concurrent job on a shared runner must never lose its own to this case.
+    // `tmp` is declared first so it is destroyed last: a REQUIRE that throws with a mount still
+    // loaded unloads it (`sweep`) before the directory holding its NTUSER.DAT is removed.
+    yuzu::test::TempDir tmp("yuzu_test_regsweep_");
     OfflineMountSweep sweep;
     ScratchHiveKey scratch;
-    yuzu::test::TempDir tmp("yuzu_test_regsweep_");
     fs::create_directories(tmp.path);
     const fs::path hive = tmp.path / "NTUSER.DAT";
     {

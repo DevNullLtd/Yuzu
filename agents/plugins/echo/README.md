@@ -884,7 +884,7 @@ three broken legs; it is one chokepoint. See Caveats item 1.
    backup and restore privileges, which can fail a logon that races it (the profile may load as a
    temporary one); a mount that cannot be unloaded leaves the hive locked until it is released
    (`reg unload`), and the registry source unloads any such leftover `YUZU_HIVE_*` mount, without
-   force, when it starts (one a holder keeps open is logged and left for `reg unload`). Mounts are
+   force, when it starts (one that is refused or fails to unload is logged and left for `reg unload`). Mounts are
    not audited one by one: the latest read time and status per root are
    in the `echo_cursor` row.
 

@@ -199,7 +199,9 @@ select_stale_hive_mounts(const std::vector<std::string>& hku_subkeys,
 /// What a sweep did with each mount it was handed.
 struct HiveSweepResult {
     std::vector<std::string> released; // unloaded
-    std::vector<std::string> retained; // the unload was refused: a holder has the hive open
+    // the unload was refused or failed (a holder has it open, it was already gone, or the
+    // privilege was not held)
+    std::vector<std::string> retained;
 };
 
 /// Offers every name to `unload` (true = the mount is gone), in order. A refusal is recorded and

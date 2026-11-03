@@ -1512,8 +1512,9 @@ OfflineDiscovery discover_offline_profiles(const std::vector<std::string>& loade
 
 // One tick's mount bookkeeping: the first mount to time out (or be refused) stops every later
 // mount this tick -- each would only queue behind the stuck worker's offline-hive mutex. A tick
-// is identified by its absolute deadline, so a new deadline clears the halt. collect() runs on
-// one thread, so no lock.
+// is identified by its absolute deadline, so a new deadline clears the halt. start() touches it
+// once on the starting thread before the first tick; collect() then owns it on one thread --
+// sequenced, so no lock.
 struct OfflineMountTick {
     std::int64_t deadline{0};
     bool halted{false};
@@ -1556,7 +1557,7 @@ void run_pending_hive_sweep(OfflineMountTick& tick) {
     tick.halted_token = decision.attempted ? "skipped_after_timeout" : "skipped_after_rejection";
     spdlog::warn("Echo registry: sweep of leftover hive mounts did not complete ({}); retried "
                  "before the next offline mount",
-                 decision.attempted ? "timeout" : "rejected");
+                 decision.attempted ? "timeout" : "mount_rejected");
 }
 
 // One warning per open -> closed transition of the shared mount gate (a failed module pin, or a
@@ -1697,7 +1698,7 @@ HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix) {
     std::vector<std::string> stale;
     HiveSweepResult r;
     bool privilege_missing = false;
-    {
+    try {
         // Held for the whole sweep, and taken BEFORE the names are listed. Every mount this process
         // makes holds this lock from RegLoadKeyW to the unload (with_user_hive), so while we hold it
         // no `YUZU_HIVE_*` name is an in-process mount in use -- the name carries no process
@@ -1705,9 +1706,8 @@ HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix) {
         // process but never publishes the salt). A mount owned by ANOTHER process that has a handle
         // open fails the non-forced unload below and is retained. Residual: a second Yuzu process's
         // mount in its handle-less window (before it opens the root, or after it closes it and
-        // before it unloads) can be unloaded here; two agents on one host is not a supported
-        // configuration, and win_reg_handle.hpp already discloses that an out-of-process mount is
-        // unguarded.
+        // before it unloads) can be unloaded here; an out-of-process mount is unguarded
+        // (win_reg_handle.hpp), and that is the default shape on the shared CI pools.
         const yuzu::agent::ScopedOfflineHiveLock offline_lock("echo_registry_sweep");
         stale = select_stale_hive_mounts(yuzu::win::enumerate_hku_subkeys(), prefix);
         if (stale.empty())
@@ -1728,6 +1728,11 @@ HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix) {
             r.retained = std::move(stale);
             privilege_missing = true;
         }
+    } catch (...) {
+        // The lock and the privilege scope were released by unwinding. Returning normally makes the
+        // sweep complete: one attempt per start, the same rule privilege_missing follows.
+        spdlog::warn("Echo registry: sweep of leftover hive mounts failed (exception); retried at "
+                     "the next start");
     }
     // Logged after the lock is released, so logging never extends another caller's wait.
     if (privilege_missing) {
@@ -1743,9 +1748,9 @@ HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix) {
     for (const auto& n : r.released)
         spdlog::info("Echo registry: unloaded leftover hive mount HKU\\{}", n);
     for (const auto& n : r.retained)
-        spdlog::warn("Echo registry: leftover hive mount HKU\\{} could not be unloaded -- the "
-                     "profile's NTUSER.DAT stays locked until a holder releases it; retry "
-                     "`reg unload HKU\\{}`",
+        spdlog::warn("Echo registry: leftover hive mount HKU\\{} could not be unloaded (the unload "
+                     "was refused or failed) -- the profile's NTUSER.DAT stays locked until it is "
+                     "released; retry `reg unload HKU\\{}` from an elevated prompt",
                      n, n);
     return r;
 }
