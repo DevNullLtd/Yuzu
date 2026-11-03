@@ -100,6 +100,13 @@ struct GuaranteedStateEventRow {
     int64_t detection_latency_us{0};
     int64_t remediation_latency_us{0};
     std::string timestamp;         // ISO-8601
+    // Census ordering inputs (schema v4, set by the ingest boundary; a direct store caller may
+    // leave both 0). `agent_ns` is the validated agent stamp in nanoseconds, 0 when absent or
+    // unusable; `received_ns` is the server receipt in nanoseconds, 0 = the store substitutes its
+    // own clock. They feed the store's derived key `min(agent_ns, received_ns + 300 s)` and stay
+    // OUT of the duplicate identity. `query_events` does not populate them.
+    std::int64_t agent_ns{0};
+    std::int64_t received_ns{0};
 };
 
 struct GuaranteedStateEventQuery {
