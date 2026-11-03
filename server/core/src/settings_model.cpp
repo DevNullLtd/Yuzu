@@ -362,7 +362,7 @@ std::string render_echo_tiers(const nlohmann::json& echo) {
     }
     std::string html = "<div class=\"tw echo-tiers\">";
     if (echo.contains("db_budget_bytes") && echo.at("db_budget_bytes").is_number_integer())
-        html += "<p class=\"hint echo-budget\" style=\"padding:12px 16px 0\">Byte budget per "
+        html += "<p class=\"hint\" style=\"padding:12px 16px 0\">Byte budget per "
                 "device: " +
                 with_thousands(echo.at("db_budget_bytes").get<std::int64_t>()) +
                 " bytes (250 MiB default); hourly history is kept while the device is within "
@@ -374,8 +374,10 @@ std::string render_echo_tiers(const nlohmann::json& echo) {
     for (const auto& r : rows) {
         html += "<tr><td class=\"mono\">" + html_escape(r.source) + "</td>";
         for (std::size_t i = 0; i < r.cell.size(); ++i)
-            html += std::string(i == 0 && r.budget_dependent ? "<td class=\"budget\">" : "<td>") +
-                    r.cell[i] + "</td>";
+            html += "<td>" + r.cell[i] +
+                    (i == 0 && r.budget_dependent ? " <span class=\"pill info\">budget-dependent</span>"
+                                                  : "") +
+                    "</td>";
         html += "<td class=\"look\">";
         html += r.depth ? echo_duration_text(*r.depth)
                         : "<span class=\"hint\">No guarantee: budget-dependent</span>";

@@ -7,6 +7,7 @@
 /// not populated by the agent until the fold writes them.
 
 #include "echo_process_tree.hpp"
+#include "source_scan.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -18,6 +19,7 @@
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::test::source_scan::count_occurrences;
 
 // The Echo page shell is a raw-string constant in its own TU (echo_page_ui.cpp), at global scope.
 extern const char* const kEchoPageHtml;
@@ -49,16 +51,9 @@ const EchoProcNode* find_node(const EchoProcTree& t, const std::string& name,
     return nullptr;
 }
 
-int count_of(const std::string& hay, const std::string& needle) {
-    int c = 0;
-    for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + needle.size()))
-        ++c;
-    return c;
-}
-
 // Number of rendered tree rows carrying this exact process name.
 int rendered_rows(const std::string& html, const std::string& name) {
-    return count_of(html, "<span class=\"tt-name\">" + name + "</span>");
+    return count_occurrences(html, "<span class=\"tt-name\">" + name + "</span>");
 }
 
 EchoTcpHourRow conn(std::int64_t hour, const char* proc, const char* raddr, int rport,
@@ -439,7 +434,7 @@ TEST_CASE("echo tree: a 5000-deep chain terminates and stops at the depth guard"
     CHECK(html.find("deeper than the display limit") != std::string::npos);
     CHECK(html.find("(depth capped)") != std::string::npos);
     // The render stops at the cap: far fewer rows than nodes.
-    CHECK(count_of(html, "class=\"echo-tree-row\"") <= kEchoRenderDepthCap + 2);
+    CHECK(count_occurrences(html, "class=\"echo-tree-row\"") <= kEchoRenderDepthCap + 2);
 
     // A shallow tree must NOT flag depth_capped.
     CHECK_FALSE(build_echo_process_tree({hr(3600, "root", ""), hr(3600, "child", "root")}, 3600)
@@ -548,7 +543,7 @@ TEST_CASE("echo render: net summary joins by name, dedups, orders public first, 
     CHECK(html.find("tt-net-ico\">\xE2\x86\x97</span>2") != std::string::npos);
     // A connection under another name is not attached to either node.
     CHECK(html.find("198.51.100.1") == std::string::npos);
-    CHECK(count_of(html, "tt-net-ico") == 1);
+    CHECK(count_occurrences(html, "tt-net-ico") == 1);
 }
 
 TEST_CASE("echo render: agent-controlled fields are HTML-escaped", "[echo][tree][render]") {

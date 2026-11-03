@@ -768,12 +768,12 @@ nlohmann::json echo_tier_fixture(bool with_budget, std::int64_t budget = 2621440
 }
 } // namespace
 
-TEST_CASE("render_retention_table Echo tiers: budget line and budget class only with db_budget_bytes",
+TEST_CASE("render_retention_table Echo tiers: budget line and budget-dependent pill only with db_budget_bytes",
           "[settings][settings_model][retention][echo]") {
     const auto with = sm::render_retention_table(echo_tier_fixture(true));
     CHECK(has(with, "Byte budget per device: 262,144,000 bytes (250 MiB default); hourly history "
                     "is kept while the device is within it"));
-    CHECK(has(with, "<td class=\"budget\">2 days</td>"));
+    CHECK(has(with, "<td>2 days <span class=\"pill info\">budget-dependent</span></td>"));
     // arp is not budget-dependent in the fixture: plain hourly cell
     CHECK(has(with, "<td>2 days</td>"));
     CHECK(has(with, "<span class=\"hint\">No guarantee: budget-dependent</span>"));

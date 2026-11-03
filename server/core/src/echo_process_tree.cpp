@@ -833,81 +833,82 @@ std::string render_echo_proc_detail(const EchoProcNode& node, const std::vector<
 
 // ── Device DNS/ARP panels (ADR-0015) — device-level, NOT per process ──────────
 
-std::string render_echo_dns_panel(const std::vector<EchoDnsHourRow>& rows, std::int64_t hour_ts) {
-    std::vector<const EchoDnsHourRow*> cur;
+namespace {
+
+// Shared shell of the DNS and ARP panels: the hour filter, summary count, empty note, table
+// head, 500-row cap and caveat. Each panel supplies only its own columns.
+template <typename Row, typename RowFn>
+std::string render_devnet_panel(const std::vector<Row>& rows, std::int64_t hour_ts, const char* title,
+                                const char* empty_what, const char* source, const char* thead,
+                                RowFn row_html, const std::string& caveat) {
+    std::vector<const Row*> cur;
     for (const auto& r : rows)
         if (r.hour_ts == hour_ts)
             cur.push_back(&r);
     std::string h = "<details class=\"devnet-panel\" open>";
-    h += "<summary><span><span class=\"devnet-title-ico\">&#9783;</span>DNS cache activity</span>"
-         "<span class=\"devnet-count\">" +
-         std::to_string(cur.size()) + "</span></summary>";
+    h += std::string("<summary><span><span class=\"devnet-title-ico\">&#9783;</span>") + title +
+         "</span><span class=\"devnet-count\">" + std::to_string(cur.size()) + "</span></summary>";
     if (cur.empty()) {
-        h += "<div class=\"devnet-empty\">No DNS cache activity recorded for this hour &mdash; the "
-             "<code>dns</code> source may be disabled on this device.</div>";
+        h += std::string("<div class=\"devnet-empty\">No ") + empty_what +
+             " recorded for this hour &mdash; the <code>" + source +
+             "</code> source may be disabled on this device.</div>";
     } else {
-        h += "<div class=\"devnet-body\"><table class=\"devnet-table\"><thead><tr><th>Name</th>"
-             "<th>Type</th><th>Data</th><th>Appeared</th><th>Removed</th><th>No such name</th>"
+        h += std::string("<div class=\"devnet-body\"><table class=\"devnet-table\"><thead><tr>") + thead +
              "</tr></thead><tbody>";
         std::size_t shown = 0;
         for (const auto* r : cur) {
             if (shown++ >= 500)
                 break;
-            h += "<tr><td>" + html_escape(r->name) + "</td>";
-            h += "<td class=\"dn-type\">" + html_escape(r->record_type) + "</td>";
-            h += "<td class=\"dn-data\">" +
-                 (r->data.empty() ? std::string("&mdash;") : html_escape(r->data)) + "</td>";
-            h += "<td>" + std::to_string(r->appear_count) + "</td>";
-            h += "<td>" + std::to_string(r->remove_count) + "</td>";
-            h += "<td>" + std::to_string(r->negative_count) + "</td></tr>";
+            h += row_html(*r);
         }
         h += "</tbody></table></div>";
     }
-    h += "<div class=\"devnet-caveat\">Counts of cache entries seen appearing and being removed in the "
-         "hour from " +
-         html_escape(format_iso_utc(hour_ts)) +
-         ". Device resolver state, <strong>not</strong> per process.</div></details>";
+    h += "<div class=\"devnet-caveat\">" + caveat + "</div></details>";
     return h;
 }
 
+} // namespace
+
+std::string render_echo_dns_panel(const std::vector<EchoDnsHourRow>& rows, std::int64_t hour_ts) {
+    return render_devnet_panel(
+        rows, hour_ts, "DNS cache activity", "DNS cache activity", "dns",
+        "<th>Name</th><th>Type</th><th>Data</th><th>Appeared</th><th>Removed</th><th>No such name</th>",
+        [](const EchoDnsHourRow& r) {
+            std::string h = "<tr><td>" + html_escape(r.name) + "</td>";
+            h += "<td class=\"dn-type\">" + html_escape(r.record_type) + "</td>";
+            h += "<td class=\"dn-data\">" +
+                 (r.data.empty() ? std::string("&mdash;") : html_escape(r.data)) + "</td>";
+            h += "<td>" + std::to_string(r.appear_count) + "</td>";
+            h += "<td>" + std::to_string(r.remove_count) + "</td>";
+            h += "<td>" + std::to_string(r.negative_count) + "</td></tr>";
+            return h;
+        },
+        "Counts of cache entries seen appearing and being removed in the hour from " +
+            html_escape(format_iso_utc(hour_ts)) +
+            ". Device resolver state, <strong>not</strong> per process.");
+}
+
 std::string render_echo_arp_panel(const std::vector<EchoArpHourRow>& rows, std::int64_t hour_ts) {
-    std::vector<const EchoArpHourRow*> cur;
-    for (const auto& r : rows)
-        if (r.hour_ts == hour_ts)
-            cur.push_back(&r);
-    std::string h = "<details class=\"devnet-panel\" open>";
-    h += "<summary><span><span class=\"devnet-title-ico\">&#9783;</span>ARP table activity</span>"
-         "<span class=\"devnet-count\">" +
-         std::to_string(cur.size()) + "</span></summary>";
-    if (cur.empty()) {
-        h += "<div class=\"devnet-empty\">No ARP activity recorded for this hour &mdash; the "
-             "<code>arp</code> source may be disabled on this device.</div>";
-    } else {
-        h += "<div class=\"devnet-body\"><table class=\"devnet-table\"><thead><tr><th>Interface</th>"
-             "<th>IP address</th><th>MAC address</th><th>Appeared</th><th>Removed</th><th>Role</th>"
-             "<th>Rebinds</th></tr></thead><tbody>";
-        std::size_t shown = 0;
-        for (const auto* r : cur) {
-            if (shown++ >= 500)
-                break;
-            h += "<tr><td>" + html_escape(r->iface) + "</td>";
-            h += "<td>" + html_escape(r->ip_address) + "</td>";
-            h += "<td class=\"arp-mac\">" + html_escape(r->mac_address) + "</td>";
-            h += "<td>" + std::to_string(r->appear_count) + "</td>";
-            h += "<td>" + std::to_string(r->remove_count) + "</td>";
-            h += "<td>" + std::string(r->is_router ? "<span class=\"pill info\">router</span>" : "&mdash;") +
+    return render_devnet_panel(
+        rows, hour_ts, "ARP table activity", "ARP activity", "arp",
+        "<th>Interface</th><th>IP address</th><th>MAC address</th><th>Appeared</th><th>Removed</th>"
+        "<th>Role</th><th>Rebinds</th>",
+        [](const EchoArpHourRow& r) {
+            std::string h = "<tr><td>" + html_escape(r.iface) + "</td>";
+            h += "<td>" + html_escape(r.ip_address) + "</td>";
+            h += "<td class=\"arp-mac\">" + html_escape(r.mac_address) + "</td>";
+            h += "<td>" + std::to_string(r.appear_count) + "</td>";
+            h += "<td>" + std::to_string(r.remove_count) + "</td>";
+            h += "<td>" + std::string(r.is_router ? "<span class=\"pill info\">router</span>" : "&mdash;") +
                  "</td>";
             h += "<td>" +
-                 (r->rebind_count > 0 ? "<span class=\"pill warn\">" + std::to_string(r->rebind_count) +
-                                            " MAC change" + (r->rebind_count == 1 ? "" : "s") + "</span>"
-                                      : std::string("0")) +
+                 (r.rebind_count > 0 ? "<span class=\"pill warn\">" + std::to_string(r.rebind_count) +
+                                           " MAC change" + (r.rebind_count == 1 ? "" : "s") + "</span>"
+                                     : std::string("0")) +
                  "</td></tr>";
-        }
-        h += "</tbody></table></div>";
-    }
-    h += "<div class=\"devnet-caveat\">A rebind means the same IP address answered from a different "
-         "MAC address during the hour.</div></details>";
-    return h;
+            return h;
+        },
+        "A rebind means the same IP address answered from a different MAC address during the hour.");
 }
 
 // ── Capture-sources frame (ADR-0015) ─────────────────────────────────────────

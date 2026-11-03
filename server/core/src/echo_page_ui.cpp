@@ -136,8 +136,7 @@ const char* const kEchoPageTemplate = R"HTM(<!DOCTYPE html>
     .echo-tree-note code { color: var(--ink2); }
     .echo-tree-banner b { color: var(--ink); font-weight: 600; }
     .echo-tree-warn { color: var(--warn); }
-    .echo-tree-mute, .echo-tree-pid { color: var(--mut); }
-    .echo-tree-pid { font-size: 12.5px; font-weight: 400; margin-left: 6px; }
+    .echo-tree-mute { color: var(--mut); }
 
     /* Tree */
     .echo-tree { font-family: var(--mds-font-family-mono); font-size: 12.5px; margin-top: 8px; line-height: 1.7; }
@@ -157,13 +156,8 @@ const char* const kEchoPageTemplate = R"HTM(<!DOCTYPE html>
     }
     .echo-tree-row:hover { background: var(--surface2); }
     .echo-tree-row[data-anom="1"] { box-shadow: inset 3px 0 0 var(--bad); }
-    .echo-tree-row[data-state="exited"] { opacity: 0.78; }
-    .tt-dot { width: 8px; height: 8px; flex: 0 0 auto; }
-    .tt-dot-run { background: var(--ok); }
-    .tt-dot-exit { background: var(--faint); }
     .tt-pid { flex: 0 0 auto; min-width: 3.4rem; text-align: right; color: var(--mut); }
     .tt-name { color: var(--ink); font-weight: 600; white-space: nowrap; }
-    .echo-tree-row[data-state="exited"] .tt-name { font-weight: 500; color: var(--mut); }
     .tt-user { color: var(--ink2); font-size: 12px; white-space: nowrap; }
     .tt-meta { color: var(--mut); font-size: 12px; white-space: nowrap; }
     .tt-anom { color: var(--bad); }
@@ -242,10 +236,7 @@ R"HTM(
     table.devnet-table td { padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
     /* Table-prefixed so the cell colours outrank look's .tw table td */
     .devnet-table .dn-type { color: var(--ink); font-weight: 500; }
-    .devnet-table .dn-data, .devnet-table .arp-mac, .devnet-table .arp-type-dynamic { color: var(--ink2); }
-    .devnet-table .dn-ttl { color: var(--mut); text-align: right; }
-    .devnet-table .dn-src, .devnet-table .arp-type-static { color: var(--mut); }
-    .devnet-table .arp-type-other { color: var(--warn); } /* incomplete / unresolved */
+    .devnet-table .dn-data, .devnet-table .arp-mac { color: var(--ink2); }
     .devnet-caveat { padding: 8px 16px; font-size: 12.5px; color: var(--mut); border-top: 1px solid var(--line); }
     .devnet-empty { padding: 28px 16px; text-align: center; color: var(--mut); font-size: 14px; }
 
@@ -253,10 +244,8 @@ R"HTM(
     .cat-filter { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     #capCards .src-name { font-family: var(--mds-font-family-mono); font-size: 12.5px; font-weight: 500; color: var(--ink); }
     #capCards .src-dollar { font-family: var(--mds-font-family-mono); font-size: 12px; color: var(--mut); }
-    #capCards .cat { color: var(--ink2); }
     .badge-new { background: var(--mds-color-bg-info-tinted); color: var(--info); }
     .badge-rows { background: var(--surface2); color: var(--mut); font-family: var(--mds-font-family-mono); }
-    .os-cell { font-size: 12.5px; white-space: nowrap; }
     /* Switch (design .sw): 36x20 track, 16px square knob */
     .tgl { position: relative; display: inline-block; flex: 0 0 36px; width: 36px; height: 20px; }
     .tgl input { opacity: 0; width: 0; height: 0; }
@@ -341,7 +330,6 @@ R"HTM(    <!-- ── Capture sources (ADR-0015) ──────────�
       <div class="echo-frame-body tw" id="capture-sources"
            hx-get="/fragments/echo/capture-sources" hx-trigger="load" hx-swap="innerHTML">
         <div class="placeholder">Loading capture sources&hellip;</div>
-        <!-- Capture-source cards are rendered into this container by the fragment. -->
       </div>
     </div>
     <script>
