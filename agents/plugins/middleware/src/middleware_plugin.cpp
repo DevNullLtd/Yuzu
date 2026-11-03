@@ -85,13 +85,16 @@ public:
 
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        // Yuzu targets exactly these three OSes, so there is deliberately no fourth branch.
+        // Yuzu targets exactly these three OSes: any other target fails the build here rather than
+        // reaching the end of a non-void function.
 #if defined(_WIN32)
         return yuzu::middleware::execute_action(ctx, action, &yuzu::middleware::run_windows);
 #elif defined(__linux__)
         return yuzu::middleware::execute_action(ctx, action, &yuzu::middleware::run_linux);
 #elif defined(__APPLE__)
         return yuzu::middleware::execute_action(ctx, action, &yuzu::middleware::run_macos);
+#else
+#error "unsupported middleware platform"
 #endif
     }
 };
