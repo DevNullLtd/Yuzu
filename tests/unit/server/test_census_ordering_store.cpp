@@ -639,3 +639,144 @@ TEST_CASE("census ordering: two repairs of one pair lock in one order and never 
     CHECK(census(db.dsn(), "a", "r1") ==
           "compliant|" + key_str(kBase + 300) + "|" + key_str(kBase + 300) + "|false");
 }
+
+// ── C4: rule delete, the reaper exemption and the pending gauge ──────────────────────────────
+
+TEST_CASE("census ordering: the pending gauge counts stored evidence and reports an error, not zero",
+          "[pg][guaranteed_state_store][db][census][ordering][gauge]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    CHECK(store.pending_projection_count_checked().value() == 0);
+
+    install_census_fail(db.dsn(), "true");
+    REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase)).outcome ==
+            EventInsertOutcome::Inserted);
+    REQUIRE(store.insert_event_classified(ev("e2", "r1", "b", kDrifted, kBase)).outcome ==
+            EventInsertOutcome::Inserted);
+    CHECK(store.pending_projection_count_checked().value() == 2);
+    remove_census_fail(db.dsn());
+    REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase)).outcome ==
+            EventInsertOutcome::Redelivered);
+    CHECK(store.pending_projection_count_checked().value() == 1);
+
+    PgPool dead{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    GuaranteedStateStore closed(dead);
+    CHECK_FALSE(closed.pending_projection_count_checked().has_value());
+}
+
+TEST_CASE("census ordering: the reaper keeps an expired event that still carries pending evidence",
+          "[pg][guaranteed_state_store][db][census][ordering][reaper]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, /*retention_days=*/30);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    store.reap_expired(); // consume the bootstrap decline on an empty table
+
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(store.insert_event_classified(ev("fresh-" + std::to_string(i), "r1", "f", kDrifted,
+                                                  kBase)).outcome == EventInsertOutcome::Inserted);
+    REQUIRE(store.insert_event_classified(ev("stale-ok", "r1", "s", kDrifted, kBase)).outcome ==
+            EventInsertOutcome::Inserted);
+    install_census_fail(db.dsn(), "true");
+    REQUIRE(store.insert_event_classified(ev("stale-pending", "r1", "p", kDrifted, kBase)).outcome ==
+            EventInsertOutcome::Inserted);
+    remove_census_fail(db.dsn());
+    exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
+                           ".guaranteed_state_events SET ttl_expires_at = 1 "
+                           "WHERE event_id LIKE 'stale-%'");
+
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 1); // only the one with nothing pending
+    CHECK(query_scalar(db.dsn(), std::string("SELECT count(*) FROM ") + kSchema +
+                                     ".guaranteed_state_events WHERE event_id = 'stale-pending'") ==
+          "1");
+
+    // Once a redelivery retires the evidence, the next pass reaps it.
+    REQUIRE(store.insert_event_classified(ev("stale-pending", "r1", "p", kDrifted, kBase)).outcome ==
+            EventInsertOutcome::Redelivered);
+    exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
+                           ".guaranteed_state_events SET ttl_expires_at = 1 "
+                           "WHERE event_id = 'stale-pending'");
+    store.reap_expired();
+    CHECK(query_scalar(db.dsn(), std::string("SELECT count(*) FROM ") + kSchema +
+                                     ".guaranteed_state_events WHERE event_id = 'stale-pending'") ==
+          "0");
+}
+
+TEST_CASE("census ordering: delete_rule retires the rule's pending evidence and removes the rule",
+          "[pg][guaranteed_state_store][db][census][ordering][delete]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.create_rule(make_rule("r2", "guard-two")));
+    install_census_fail(db.dsn(), "true");
+    REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase)).outcome ==
+            EventInsertOutcome::Inserted);
+    REQUIRE(store.insert_event_classified(ev("e2", "r2", "a", kDrifted, kBase)).outcome ==
+            EventInsertOutcome::Inserted);
+    remove_census_fail(db.dsn());
+    REQUIRE(pending_count(db.dsn()) == "2");
+
+    REQUIRE(store.delete_rule("r1").has_value());
+    CHECK(pending_count(db.dsn()) == "1"); // r1's evidence retired, r2's untouched
+    CHECK(store.event_count() == 2);       // the audit rows stay
+    CHECK_FALSE(store.get_rule("r1").value().has_value());
+
+    // A missing rule is "not found" and undoes the retire it would have done.
+    exec_sql(db.dsn(), std::string("DELETE FROM ") + kSchema +
+                           ".guaranteed_state_rules WHERE rule_id = 'r2'");
+    REQUIRE(pending_count(db.dsn()) == "1");
+    const auto gone = store.delete_rule("r2");
+    REQUIRE_FALSE(gone.has_value());
+    CHECK(gone.error().starts_with("not found"));
+    CHECK(pending_count(db.dsn()) == "1");
+}
+
+TEST_CASE("census ordering: delete_rule waits on a repair that holds the pair's rows, no deadlock",
+          "[pg][guaranteed_state_store][db][census][ordering][lockorder]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.insert_event_classified(ev("e0", "r1", "a", kCompliant, kBase + 100)).outcome ==
+            EventInsertOutcome::Inserted);
+    install_census_fail(db.dsn(), "true");
+    const auto p = ev("p1", "r1", "a", kDrifted, kBase + 200);
+    REQUIRE(store.insert_event_classified(p).outcome == EventInsertOutcome::Inserted);
+    remove_census_fail(db.dsn());
+    const auto failures_before = store.census_proj_failures_total();
+
+    std::promise<void> reached;
+    std::promise<void> release;
+    auto reached_f = reached.get_future();
+    auto release_f = release.get_future().share();
+    store.set_census_lock_barrier_for_test([&] {
+        reached.set_value();
+        release_f.wait();
+    });
+
+    EventInsertResult repair_res;
+    std::thread repair([&] { repair_res = store.insert_event_classified(p); });
+    REQUIRE(reached_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    std::expected<void, std::string> del_res;
+    std::thread del([&] { del_res = store.delete_rule("r1"); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // delete_rule is parked on p1
+    release.set_value();
+    repair.join();
+    del.join();
+    store.set_census_lock_barrier_for_test({});
+
+    CHECK(repair_res.outcome == EventInsertOutcome::Redelivered);
+    CHECK(del_res.has_value());
+    CHECK(store.census_proj_failures_total() == failures_before); // no 40P01
+    CHECK(pending_count(db.dsn()) == "0");
+    CHECK(query_scalar(db.dsn(), std::string("SELECT count(*) FROM ") + kSchema +
+                                     ".guardian_agent_rule_status") == "0"); // the delete cascaded
+}

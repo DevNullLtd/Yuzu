@@ -448,6 +448,11 @@ public:
     /// a pool timeout or a failed query, never 0 (the degrade-collapsing `rule_count()` would
     /// read as an empty rule set).
     std::expected<std::size_t, std::string> rule_count_checked() const;
+
+    /// Events stored with pending census evidence (their census write failed; a redelivery or
+    /// `delete_rule` retires it). Bounded by a 5 s statement timeout; an error means "not
+    /// answered", never zero.
+    std::expected<std::int64_t, std::string> pending_projection_count_checked() const;
     std::size_t event_count() const;
 
     // Monotonic policy generation — the version stamp of the rule SET, bumped

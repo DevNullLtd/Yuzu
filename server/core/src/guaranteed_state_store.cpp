@@ -788,6 +788,41 @@ std::expected<void, std::string> GuaranteedStateStore::delete_rule(const std::st
         return std::unexpected("no database connection: " + pool_.last_error());
     PGconn* conn = lease.get();
 
+    // One transaction: lock the rule's pending events, retire them, delete the rule. A census
+    // projection locks the pending events of its pair in ingest_seq order before it touches the
+    // census row, so this takes the rule's pending events in the same order first (a rule-wide
+    // ingest_seq order is consistent with every pair's order) and the two can never wait on each
+    // other in a cycle. A projection that wins the row locks makes this wait; the delete then
+    // cascades the projected census row. A projection that commits a new pending event after the
+    // list is read is not retired here (#6829, #6830's follow-up register).
+    pg::PgResult begin = pg::exec_params(conn, "BEGIN", std::vector<std::string>{});
+    if (begin.status() != PGRES_COMMAND_OK)
+        return std::unexpected(std::string("BEGIN failed: ") + PQerrorMessage(conn));
+    pg::PgTxn txn(conn);
+
+    pg::PgResult locked = pg::exec_params(
+        conn,
+        "SELECT event_id FROM guaranteed_state_store.guaranteed_state_events "
+        "WHERE rule_id = $1 AND projection_pending ORDER BY ingest_seq FOR UPDATE",
+        std::vector<std::string>{rule_id});
+    if (locked.status() != PGRES_TUPLES_OK)
+        return std::unexpected("delete failed: " +
+                               std::string(PQresultErrorMessage(locked.get())));
+    std::vector<std::string> pending_ids;
+    for (int i = 0; i < PQntuples(locked.get()); ++i)
+        pending_ids.emplace_back(PQgetvalue(locked.get(), i, 0));
+    if (!pending_ids.empty()) {
+        const std::vector<std::string_view> views(pending_ids.begin(), pending_ids.end());
+        pg::PgResult retired = pg::exec_params(
+            conn,
+            "UPDATE guaranteed_state_store.guaranteed_state_events "
+            "SET projection_pending = false WHERE event_id = ANY($1::text[])",
+            std::vector<std::string>{pg::to_text_array(views)});
+        if (retired.status() != PGRES_COMMAND_OK)
+            return std::unexpected("delete failed: " +
+                                   std::string(PQresultErrorMessage(retired.get())));
+    }
+
     pg::PgResult res = pg::exec_params(
         conn,
         "DELETE FROM guaranteed_state_store.guaranteed_state_rules WHERE rule_id = $1 "
@@ -796,14 +831,16 @@ std::expected<void, std::string> GuaranteedStateStore::delete_rule(const std::st
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected("delete failed: " + std::string(PQresultErrorMessage(res.get())));
     if (PQntuples(res.get()) == 0)
-        return std::unexpected("not found: rule_id '" + rule_id + "'");
+        return std::unexpected("not found: rule_id '" + rule_id + "'"); // txn rolls back, undoing the retire
 
     // The rule's CURRENT compliance states (unlike the event log, an immutable audit stream
     // kept past rule deletion, the census table holds live state) go with it: the
     // guardian_agent_rule_status foreign key is ON DELETE CASCADE (migration v3), so the one
     // DELETE above removes both in a single statement. The generation bump below stays outside
-    // that statement on purpose: it is best-effort (see bump_policy_generation_on) and a failed
+    // that transaction on purpose: it is best-effort (see bump_policy_generation_on) and a failed
     // bump must not undo the delete.
+    if (!txn.commit())
+        return std::unexpected("delete failed: commit: " + std::string(PQerrorMessage(conn)));
     bump_policy_generation_on(conn); // rule set changed → new generation
     lease.reset();                   // no pool lease held while the hook runs
     notify_rule_mutation();
@@ -3130,6 +3167,52 @@ std::expected<std::size_t, std::string> GuaranteedStateStore::rule_count_checked
     return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 
+// Events whose census write failed and still await a repair. A bounded read: the statement
+// timeout is set first so a hot backlog can never hold a pool connection for long, and the caller
+// publishes the figure only when this succeeds, so a store that cannot answer leaves the previous
+// sample instead of reading as zero.
+std::expected<std::int64_t, std::string> GuaranteedStateStore::pending_projection_count_checked() const {
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSource,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::pending_projection_count_checked: store not open");
+        return std::unexpected("database not open");
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSource,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::pending_projection_count_checked: pool acquire "
+                         "timed out");
+        return std::unexpected("no database connection: " + pool_.last_error());
+    }
+    PGconn* conn = lease.get();
+    pg::PgResult begin = pg::exec_params(conn, "BEGIN", std::vector<std::string>{});
+    if (begin.status() != PGRES_COMMAND_OK)
+        return std::unexpected(std::string("BEGIN failed: ") + PQerrorMessage(conn));
+    pg::PgTxn txn(conn);
+    pg::PgResult timeout = pg::exec_params(conn, "SET LOCAL statement_timeout = '5s'",
+                                           std::vector<std::string>{});
+    pg::PgResult res =
+        timeout.status() == PGRES_COMMAND_OK
+            ? pg::exec_params(conn,
+                              "SELECT count(*) FROM guaranteed_state_store.guaranteed_state_events "
+                              "WHERE projection_pending",
+                              std::vector<std::string>{})
+            : std::move(timeout);
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSource, sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::pending_projection_count_checked: query failed: {}",
+                         ::yuzu::log_key_token(PQresultErrorMessage(res.get())));
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
+    return to_i64(PQgetvalue(res.get(), 0, 0));
+}
+
 std::size_t GuaranteedStateStore::event_count() const {
     if (!open_)
         return 0;
@@ -3412,6 +3495,12 @@ void GuaranteedStateStore::reap_expired() {
             return true;
         }
 
+        // An event with pending census evidence is exempt from this pass: its evidence is the
+        // only record that its verdict never reached the census, and reaping it would make the
+        // loss permanent. The exemption cannot strand an observation: an observation's event
+        // carries the reserved rule id, and a reserved-rule event is never census-bearing, so it
+        // is never pending. A pending event is therefore also never counted as reaped; it ages
+        // out in the pass after a redelivery or `delete_rule` retires it.
         // Lockstep: events AND observations reaped in the SAME guarded pass —
         // the PII projection must never outlive its parent event. Unconditional
         // per-pass cap on each (substrate-tuned: 10x ResultSetStore's cap for
@@ -3428,7 +3517,7 @@ void GuaranteedStateStore::reap_expired() {
             conn,
             "DELETE FROM guaranteed_state_store.guaranteed_state_events WHERE event_id IN ("
             "SELECT event_id FROM guaranteed_state_store.guaranteed_state_events "
-            "WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint "
+            "WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint AND NOT projection_pending "
             "ORDER BY ttl_expires_at ASC, event_id ASC LIMIT $2::bigint) RETURNING event_id",
             std::vector<std::string>{std::to_string(pg_now), std::to_string(kReapCapPerPass)});
         if (ev.status() != PGRES_TUPLES_OK) {
