@@ -228,7 +228,7 @@ struct MapDriveHistory {
  * only for that tick); this function's own poll logic is unchanged and keeps
  * covering UDP always plus TCP whenever nstat is not running/stalled — never
  * a silent lifecycle gap, mirroring the ES-stream-with-poll-fallback shape
- * used for process_live.
+ * used for the process source.
  */
 std::vector<NetConnection> enumerate_connections();
 
@@ -523,7 +523,7 @@ inline const std::vector<std::string> kDefaultRedactionPatterns = {
  * a valid array whose elements were all dropped by parse_pattern_config (`[]`,
  * `[1,2,3]`, all-over-long), or one whose only entry has an empty stripped core
  * (`["*"]`) — can ever cause `password`/`token`/`secret` to be written to
- * `process_live` in plaintext. Every collect path (collect_fast, procperf,
+ * the process tiers in plaintext. Every collect path (collect_fast, procperf,
  * fleet_snapshot) routes its loaded patterns through here. (fjarvis #1532 HIGH.)
  */
 inline std::vector<std::string>

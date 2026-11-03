@@ -2637,7 +2637,8 @@ static_assert(kBudgetProcPerfHourlyFloorSec >= 4 * 86400);
 
 } // namespace
 
-TEST_CASE("run_budget: evicts the largest hourly table first, oldest first, outside the 48 h floor",
+TEST_CASE("run_budget: evicts the largest hourly table first and the oldest rows first "
+          "outside the 48 h floor",
           "[echo][aggregator][budget]") {
     yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_main_"};
     auto db = open_budget_db(tmp);
@@ -2738,7 +2739,8 @@ TEST_CASE("run_budget: daily and monthly tiers and the plain tables are never ev
     CHECK(db.get_config("budget_evicted_hourly_rows_total", "") == std::to_string(res.evicted_hourly));
 }
 
-TEST_CASE("run_budget: paused and errored sources keep their hourly rows, an enabled one gives them up",
+TEST_CASE("run_budget: paused and errored sources keep their hourly rows and an enabled "
+          "one gives them up",
           "[echo][aggregator][budget]") {
     yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_exempt_"};
     auto db = open_budget_db(tmp);
@@ -2971,7 +2973,8 @@ TEST_CASE("run_budget: eviction counters accumulate across passes batch by batch
     CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == 12000 - a.evicted_hourly - b.evicted_hourly);
 }
 
-TEST_CASE("wal_file_bytes: absent is 0, a file is its size, anything unreadable is a failed measurement",
+TEST_CASE("wal_file_bytes: absent is 0; a file is its size; anything unreadable is a "
+          "failed measurement",
           "[echo][aggregator][budget][chaos]") {
     // #6889 review B6: an unreadable log used to count as zero bytes, which reads as "within budget".
     yuzu::test::TempDir dir{"yuzu_test_echo_wal_size_"};
@@ -2991,7 +2994,8 @@ TEST_CASE("wal_file_bytes: absent is 0, a file is its size, anything unreadable 
 }
 
 #ifndef _WIN32
-TEST_CASE("storage_bytes and run_budget: an unreadable log fails the measurement, never reads as empty",
+TEST_CASE("storage_bytes and run_budget: an unreadable log fails the measurement and "
+          "never reads as empty",
           "[echo][aggregator][budget][chaos]") {
     yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_walfail_"};
     auto db = open_budget_db(tmp);
@@ -3256,7 +3260,7 @@ TEST_CASE("parse_budget_bytes accepts whole bytes at or above the minimum only",
     CHECK(kEchoDbBudgetBytesMin == 33554432);
 }
 
-TEST_CASE("budget_from_config: an unreadable or unusable setting is unknown, never the default",
+TEST_CASE("budget_from_config: an unreadable or unusable setting is unknown and never the default",
           "[echo][aggregator][budget][chaos]") {
     using Stored = std::expected<std::optional<std::string>, std::string>;
     const auto present = [](std::string v) { return Stored{std::optional<std::string>{std::move(v)}}; };

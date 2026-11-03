@@ -43,6 +43,7 @@
 #include "test_helpers.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -608,6 +609,48 @@ TEST_CASE("echo plugin: db_budget_bytes validates, persists and shows in status 
         CHECK(status_value("budget_evicted_hourly_rows_total") == std::optional<std::string>{"0"});
     }
 
+    SECTION("the dictionary sweep is reported and paced by its last-run marker") {
+        // The sweep runs inside the maintenance pass, weekly, paced by `dict_gc_last_ts`. The
+        // starved bump (the live-set scan outrunning its 2 s deadline) is not driven here: the
+        // deadline is a constant inside the plugin with no seam.
+        const auto db_path = dir_guard.path / "echo.db";
+        const auto now_s = [] {
+            return std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        };
+        const auto marker = [&] { return std::stoll(status_value("dict_gc_last_ts").value_or("-1")); };
+        const auto set_marker = [&](std::int64_t v) {
+            raw_sql(db_path, std::format("INSERT INTO echo_config (key, value) VALUES "
+                                         "('dict_gc_last_ts', '{}') ON CONFLICT(key) DO UPDATE SET "
+                                         "value = excluded.value",
+                                         v));
+        };
+
+        // never swept: both keys are reported as 0, the reply keeps its rows_aggregated line
+        CHECK(status_value("dict_gc_last_ts") == std::optional<std::string>{"0"});
+        CHECK(status_value("dict_gc_starved_total") == std::optional<std::string>{"0"});
+        const auto before_first = now_s();
+        const auto first = d.run(desc, "rollup");
+        CHECK(first.rc == 0);
+        CHECK(first.captured.find("echo|rollup|0|rows_aggregated") != std::string::npos);
+        CHECK(marker() >= before_first); // an empty dictionary is swept at once
+
+        // swept a day ago: the week has not elapsed, the marker is left alone
+        const auto yesterday = now_s() - 86400;
+        set_marker(yesterday);
+        CHECK(d.run(desc, "rollup").rc == 0);
+        CHECK(marker() == yesterday);
+
+        // swept eight days ago: due, so the sweep runs and the marker advances
+        const auto before_due = now_s();
+        set_marker(before_due - 8 * 86400);
+        CHECK(d.run(desc, "rollup").rc == 0);
+        CHECK(marker() >= before_due);
+
+        CHECK(status_value("dict_gc_starved_total") == std::optional<std::string>{"0"});
+    }
+
     SECTION("an unreadable budget setting reads as unknown, not as the default, and the pass is "
             "skipped") {
         // An unreadable setting is not "within budget" and not the 250 MiB default: status says
@@ -885,8 +928,8 @@ bool wait_for_peer_fin(SockT s) {
 
 } // namespace
 
-TEST_CASE("echo plugin: status counts each source's finest tier, and query and export read the hourly "
-          "views as buckets",
+TEST_CASE("echo plugin: status counts each source's finest tier and query and export "
+          "read the hourly views as buckets",
           "[echo][local_dispatcher][tiers]") {
     // Roll-up is the only store, so there is no raw row to count or list: `status` reports the
     // finest tier's row count and its oldest bucket, and `query` / `export` return hour BUCKETS in

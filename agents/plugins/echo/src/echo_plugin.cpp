@@ -347,14 +347,14 @@ std::vector<yuzu::echo::UserSession> json_to_users(const std::string& s) {
 std::vector<std::string> load_redaction_patterns(yuzu::echo::EchoDatabase& db) {
     // The built-in patterns (`kDefaultRedactionPatterns` — password/secret/token/
     // api_key/credential) are the baseline content-protection layer for
-    // process_live, and they MUST always apply: an operator can ADD patterns via
+    // the process tiers, and they MUST always apply: an operator can ADD patterns via
     // configure but can never fully DISABLE redaction. So union the defaults into
     // whatever is stored — fail-closed (fjarvis HIGH). A bare `parse_pattern_config`
     // fallback was fail-OPEN: it returns the safe built-in set only for an empty or
     // non-array value, but a *valid array whose elements all get dropped* (`[]`,
     // `[1,2,3]`, all-over-long, or `["*"]` whose stripped core is empty) returns an
     // EMPTY vector — silently disabling redaction so `password`/`token`/`secret`
-    // land in process_live in plaintext. collect_fast and procperf called this
+    // land in the process tiers in plaintext. collect_fast and procperf called this
     // without the union do_fleet_snapshot already applied; centralising it here
     // closes all three paths at once and removes the divergent local default list.
     // #541 — parse_pattern_config still bounds + sanitises at load (drops
@@ -1579,7 +1579,7 @@ private:
         // Forensic-pause contract: the ETW collector owns a live session and keeps
         // filling its ring even while the `process` source is disabled. Unlike the
         // poll (which simply doesn't enumerate), the buffered events SURVIVE — so on
-        // the first drain after re-enable they would be persisted into process_live,
+        // the first drain after re-enable they would be folded into the process tiers,
         // capturing exactly the paused window the toggle forbids ("the agent will not
         // STORE what the toggle forbids", as already enforced for boot-backfill).
         // Drain-and-DISCARD each disabled tick so nothing from the paused window is
@@ -1601,8 +1601,8 @@ private:
             const std::string proc_key{yuzu::echo::diff_state_key("process")};
             if (stream_active_) {
                 // Gap-free stream (ETW/Windows or Endpoint Security/macOS)
-                // supersedes the snapshot-diff poll. Same process_live schema +
-                // 'started'/'stopped' so rollups and the $Process_* query surface
+                // supersedes the snapshot-diff poll. Same ProcessEvent shape +
+                // 'started'/'stopped' so the fold and the $Process_* query surface
                 // are unchanged. Names-only (no cmdline — matches the works-council
                 // posture); user resolved at drain (SID on Windows, audit-token uid
                 // on macOS).
@@ -3119,6 +3119,9 @@ private:
             ctx.write_output(std::format(
                 "budget_evicted_hourly_rows_total|{}",
                 db_->get_config(std::string{yuzu::echo::kBudgetEvictedHourlyKey}, "0")));
+            ctx.write_output(std::format("dict_gc_last_ts|{}", db_->get_config("dict_gc_last_ts", "0")));
+            ctx.write_output(
+                std::format("dict_gc_starved_total|{}", db_->get_config("dict_gc_starved_total", "0")));
             // incremental: auto_vacuum is on. deferred: a conversion VACUUM was wanted but the
             // volume lacked the free space (or it failed); retried at most daily. none: a file
             // created before auto_vacuum existed that has not needed the conversion yet.
@@ -4543,13 +4546,14 @@ private:
     void run_dictionary_gc(std::int64_t now_ts) {
         constexpr std::int64_t kDictGcIntervalSec = 7 * 86400;
         constexpr auto kDictGcDeadline = std::chrono::seconds(2);
-        std::int64_t last = 0;
-        {
-            const auto text = db_->get_config("dict_gc_last_ts", "0");
-            const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), last);
-            if (ec != std::errc{} || p != text.data() + text.size())
-                last = 0;
-        }
+        // A stored integer; unset or unparsable reads as 0.
+        const auto read_i64 = [this](const char* key) -> std::int64_t {
+            const auto text = db_->get_config(key, "0");
+            std::int64_t v = 0;
+            const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), v);
+            return ec == std::errc{} && p == text.data() + text.size() ? v : 0;
+        };
+        const std::int64_t last = read_i64("dict_gc_last_ts");
         // A marker ahead of the clock was written during a forward excursion: stale, never a reason
         // to wait.
         if (last > 0 && last <= now_ts && now_ts - last < kDictGcIntervalSec)
@@ -4560,8 +4564,7 @@ private:
             return;
         }
         if (!swept->live_set_built) {
-            const auto total = std::to_string(
-                std::atoll(db_->get_config("dict_gc_starved_total", "0").c_str()) + 1);
+            const auto total = std::to_string(read_i64("dict_gc_starved_total") + 1);
             db_->set_config("dict_gc_starved_total", total);
             spdlog::warn("ECHO: the dictionary sweep's scan did not finish inside its {} s deadline "
                          "(starved {} time(s)); retrying at the next maintenance pass",

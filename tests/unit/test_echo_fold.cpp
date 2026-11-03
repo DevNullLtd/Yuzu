@@ -772,20 +772,22 @@ TEST_CASE("service_delta: the real tokens from compute_service_events", "[echo][
 
 TEST_CASE("user, software, arp and dns deltas", "[echo][fold][delta]") {
     {
-        UserEvent li, lo;
-        li.ts = lo.ts = kT0;
+        UserEvent li, lo, dc;
+        li.ts = lo.ts = dc.ts = kT0;
         li.action = "login";
         lo.action = "logout";
-        li.user = lo.user = "alice";
-        li.domain = lo.domain = "D";
-        li.logon_type = lo.logon_type = "interactive";
+        dc.action = "disconnect";
+        li.user = lo.user = dc.user = "alice";
+        li.domain = lo.domain = dc.domain = "D";
+        li.logon_type = lo.logon_type = dc.logon_type = "interactive";
         auto acc = make_acc("user");
-        user_delta({li, li, lo}, acc);
+        user_delta({li, li, lo, dc}, acc);
         const auto r = row_for(acc, "daily", {{"user", "alice"}});
         CHECK(mi(acc, r, "login_count") == 2);
         CHECK(mi(acc, r, "logout_count") == 1);
+        CHECK(mi(acc, r, "disconnect_count") == 1);
         CHECK(ks(acc, r, "logon_type") == "interactive");
-        check_zero(acc, r, {"disconnect_count", "session_s_sum"});
+        check_zero(acc, r, {"session_s_sum"});
     }
     {
         SoftwareEvent e;
@@ -990,6 +992,7 @@ TEST_CASE("cursor deltas: power, removable and registry clipping and digests", "
     rm.device_key = "usb1";
     rm.vendor = "V";
     rm.size_bytes = 4096;
+    rm.partition_count = 2;
     rm.record_key = "rk1";
     auto racc = make_acc("removable");
     for (const auto& c : removable_delta({rm}))
@@ -997,7 +1000,8 @@ TEST_CASE("cursor deltas: power, removable and registry clipping and digests", "
     const auto rr = racc.rows("daily")[0];
     CHECK(mi(racc, rr, "size_bytes") == 4096);
     CHECK(mi(racc, rr, "first_ts") == kT0);
-    check_zero(racc, rr, {"disk_id", "partition_count"});
+    CHECK(mi(racc, rr, "partition_count") == 2);
+    check_zero(racc, rr, {"disk_id"});
 
     RegistryEvent rg;
     rg.ts = kT0;

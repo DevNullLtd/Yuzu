@@ -320,7 +320,7 @@ TEST_CASE("procperf: registry declares both tiers, dollar names translate",
     CHECK(is_queryable_table("procperf_hourly"));
 }
 
-TEST_CASE("procperf: the hourly tier keys on (hour, name, version, is_kthread)",
+TEST_CASE("procperf: the hourly tier keys on hour + name + version + is_kthread",
           "[echo][procperf][schema]") {
     const auto* def = fold_source("procperf");
     REQUIRE(def != nullptr);

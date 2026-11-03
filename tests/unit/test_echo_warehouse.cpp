@@ -33,7 +33,7 @@ using namespace yuzu::echo;
 
 // ── DDL coverage ───────────────────────────────────────────────────────────
 
-TEST_CASE("Echo warehouse DDL: every source/granularity has a table, and a roll-up tier a view",
+TEST_CASE("Echo warehouse DDL: every source/granularity has a table and a roll-up tier a view",
           "[echo][warehouse][issue60]") {
     const auto plain = generate_warehouse_ddl();
     const auto fold = generate_fold_ddl();

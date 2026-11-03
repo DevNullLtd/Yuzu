@@ -734,8 +734,11 @@ private:
                     dns_delta(decode<DnsEvent>(rows, decode_dns), acc);
                 else if (def.name == "netconn")
                     netconn_delta(decode<NetConnRow>(rows, decode_netconn), acc);
-                else if (def.name == "mapdrive")
-                    mapdrive_delta(decode<MapDriveEvent>(rows, decode_mapdrive), acc);
+                else if (def.name == "mapdrive") {
+                    const auto events = decode<MapDriveEvent>(rows, decode_mapdrive);
+                    mapdrive_delta(events, acc);
+                    remember_historical(events);
+                }
                 else if (def.name == "power")
                     contribute(rows, power_delta(decode<PowerEvent>(rows, decode_power)), def, acc,
                                seed_from_id, seq);
@@ -776,6 +779,35 @@ private:
         for (const auto& r : rows)
             out.push_back(d(r));
         return out;
+    }
+
+    // A historical mapdrive event is a one-time backfill whose count is additive, so the identity of
+    // every one folded is remembered in the replay ring's table, in this same transaction: the
+    // bounded per-profile retry (fold_mapdrive_events under skip_known_historical) then skips it
+    // instead of counting the mapping a second time after the upgrade. The same hash as that
+    // wrapper's, so its lookup finds these.
+    void remember_historical(const std::vector<MapDriveEvent>& events) {
+        auto st = prep(h_, std::format("INSERT INTO {} (source, record_key, digest, seq) "
+                                       "VALUES ('{}', ?, 0, 0) ON CONFLICT DO NOTHING "
+                                       "RETURNING record_key",
+                                       kSeenTable, kMapdriveHistoricalSource));
+        if (!st)
+            return;
+        for (const auto& e : events) {
+            if (e.origin != "historical")
+                continue;
+            const std::string key =
+                identity_hex({e.direction, e.local_mount, e.remote_path, e.remote_host, e.username});
+            sqlite3_reset(st.get());
+            sqlite3_bind_text(st.get(), 1, key.data(), static_cast<int>(key.size()), SQLITE_STATIC);
+            const int rc = sqlite3_step(st.get());
+            if (rc == SQLITE_ROW) {
+                ++report_.ring_keys;
+            } else if (rc != SQLITE_DONE) {
+                h_.fail(std::string("step failed: ") + sqlite3_errmsg(h_.raw()));
+                return;
+            }
+        }
     }
 
     // A cursor source's chunk: each contribution joins the accumulator directly (a raw row is already
@@ -870,10 +902,16 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
         if (!before.ok)
             return std::unexpected("the database size could not be read");
         const auto free_now = free_bytes_of(seams, path);
+        // An unreadable volume is a refusal too: the 2x check is mandatory, never skipped.
         if (!free_now) {
-            spdlog::warn("EchoDatabase v10: the free space on the volume could not be read; "
-                         "migrating without the 2x pre-check");
-        } else if (*free_now < 2 * static_cast<std::uintmax_t>(before.file_bytes())) {
+            return std::unexpected(
+                std::string{kFreeSpaceRefusalPrefix} +
+                std::format(" the Echo database to its roll-up tables: the free space on the volume "
+                            "could not be read and {} bytes are needed (twice the {}-byte database "
+                            "file)",
+                            2 * before.file_bytes(), before.file_bytes()));
+        }
+        if (*free_now < 2 * static_cast<std::uintmax_t>(before.file_bytes())) {
             return std::unexpected(
                 std::string{kFreeSpaceRefusalPrefix} +
                 std::format(" the Echo database to its roll-up tables: {} bytes are free and {} are "

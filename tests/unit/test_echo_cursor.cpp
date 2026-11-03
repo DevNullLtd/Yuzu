@@ -315,7 +315,8 @@ TEST_CASE("EchoDatabase: insert_removable_events_and_cursor round-trips events +
 
 // ── Replay idempotence via the digest-checked replay ring ───────────────────
 
-TEST_CASE("power: a replayed record_key is a no-op (event count unchanged), cursor still advances",
+TEST_CASE("power: a replayed record_key is a no-op (event count unchanged) and the "
+          "cursor still advances",
           "[echo][cursor]") {
     auto t = make_test_db();
     PowerEvent ev;
@@ -489,7 +490,8 @@ TEST_CASE("insert_removable_events_and_cursor rolls back the cursor when the eve
 
 // ── Generated DDL ─────────────────────────────────────────────────────────────
 
-TEST_CASE("Echo DDL: power and removable replay idempotence lives in the ring, not a UNIQUE index",
+TEST_CASE("Echo DDL: power and removable replay idempotence lives in the ring and not a "
+          "UNIQUE index",
           "[echo][cursor][warehouse]") {
     // No raw table, so no record_key column or UNIQUE index in the warehouse DDL; the fold DDL
     // creates the replay ring the cursor sources are deduplicated through, and both tiers' tables.
@@ -505,7 +507,7 @@ TEST_CASE("Echo DDL: power and removable replay idempotence lives in the ring, n
 
 // ── Frozen schema-registry rows ─────────────────────────────────────────────
 
-TEST_CASE("Echo schema registry: power and removable default to ENABLED, roll-up tiers only",
+TEST_CASE("Echo schema registry: power and removable default to ENABLED with roll-up tiers only",
           "[echo][cursor][registry]") {
     bool saw_power = false, saw_removable = false;
     for (const auto& src : capture_sources()) {

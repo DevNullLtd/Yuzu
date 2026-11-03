@@ -409,12 +409,9 @@ spec:
           whole bytes. Minimum 33554432 (32 MiB). Default 262144000 (250 MiB).
           A value below the minimum, or one that is not a whole number, is
           refused with an error| line and nothing changes. When the database
-          is over budget the maintenance pass removes raw capture rows that
-          their first summary tier has already passed (hourly, or daily for
-          user and software), oldest first and never the newest 24 hours, then
-          hourly rows older than 48 hours (5 days for procperf). Daily and
-          monthly rows are never removed, nor are the usage tables, sources
-          with no summary tier (netconn, netqual, power, removable, registry),
+          is over budget the maintenance pass removes hourly rows older than
+          48 hours (5 days for procperf), oldest first. Daily and
+          monthly rows are never removed, nor are the usage tables,
           or paused or errored sources (an unreadable <source>_enabled counts
           as errored). Requires an agent newer than v0.15.0; an older agent
           ignores this key beside other keys and refuses it alone

@@ -315,7 +315,7 @@ TEST_CASE("mapdrive parse_samba_logs: connect events from both log shapes",
 
 // ── fold round-trip: historical (incl. ts=0) + live rows ──────────────────────
 
-TEST_CASE("mapdrive fold: historical + live rows are rolled up by mapping, with the right counts",
+TEST_CASE("mapdrive fold: historical and live rows are rolled up by mapping with the right counts",
           "[echo][mapdrive][db]") {
     yuzu::test::TempDbFile tmp{std::string_view{"echo-mapdrive-"}};
     auto opened = EchoDatabase::open(tmp.path);
@@ -1250,8 +1250,8 @@ TEST_CASE("mapdrive backfill commit_first_pass: a failing pending write never wr
 
 // ── skip_known_historical: a retried enumeration counts each mapping once ─────
 
-TEST_CASE("mapdrive fold: skip_known_historical counts no mapping twice, whichever call folded it "
-          "first",
+TEST_CASE("mapdrive fold: skip_known_historical counts no mapping twice whichever call "
+          "folded it first",
           "[echo][mapdrive][backfill][db]") {
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_mapdrive_backfill_"}};
     auto opened = EchoDatabase::open(tmp.path);

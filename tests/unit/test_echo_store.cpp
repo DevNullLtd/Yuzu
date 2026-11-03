@@ -265,7 +265,8 @@ std::string first_cell(EchoDatabase& db, const std::string& sql) {
 
 } // namespace
 
-TEST_CASE("EchoDatabase: insert_registry_events_and_cursor rolls the change up, replays as a no-op",
+TEST_CASE("EchoDatabase: insert_registry_events_and_cursor rolls the change up and "
+          "replays as a no-op",
           "[echo][store][registry]") {
     auto t = make_test_db();
     auto removed = registry_row("k2", "removed");
@@ -3031,7 +3032,7 @@ void remove_db_files(const fs::path& tmp) {
 
 } // namespace
 
-TEST_CASE("EchoDatabase: a fresh open lands at schema_version 10", "[echo][store][migration][v8]") {
+TEST_CASE("EchoDatabase: a fresh open lands at schema_version 10", "[echo][store][migration][v10]") {
     auto t = make_test_db();
     CHECK(t.db.schema_version() == 10);
 }
@@ -3117,8 +3118,8 @@ TEST_CASE("EchoDatabase v7->v8: an opt-out written after the migration sticks",
     remove_db_files(tmp);
 }
 
-TEST_CASE("EchoDatabase v7->v8: a failed flip rolls the whole migration back, the open refuses, and "
-          "the retry completes",
+TEST_CASE("EchoDatabase v7->v8: a failed flip rolls the whole migration back and the "
+          "open refuses and the retry completes",
           "[echo][store][migration][v8][atomic]") {
     // The trigger fails the flip UPDATE after the paused_at upsert already ran inside the same
     // savepoint: the rollback must undo that, and the roll-up step must NOT run past the failed

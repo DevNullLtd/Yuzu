@@ -758,12 +758,9 @@ metadata:
   version: 1.0.0
   description: >
     Force an immediate maintenance pass (normally runs every 15 minutes).
-    Aggregates raw capture rows into hourly, daily, and monthly summary tables,
-    permanently deletes rows older than each tier's retention limit, and then
+    Permanently deletes rows older than each tier's retention limit, and then
     enforces the database byte budget (db_budget_bytes): while the database is
-    over it, the pass permanently deletes the oldest raw capture rows that
-    their first summary tier has already passed (hourly, or daily for user
-    and software), never the newest 24 hours, then hourly rows older than 48
+    over it, the pass permanently deletes hourly rows older than 48
     hours (5 days for procperf), even inside their retention window; paused or
     errored sources (an unreadable <source>_enabled counts as errored) are
     exempt. It may also run the one-off VACUUM that converts an older database

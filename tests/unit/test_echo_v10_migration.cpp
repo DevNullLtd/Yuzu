@@ -636,7 +636,8 @@ TEST_CASE("v10 migration: raw rows below the rollup mark are not counted twice",
     CHECK(n(db, "SELECT SUM(start_count) FROM process_daily") == 4);
 }
 
-TEST_CASE("v10 migration: a raw row with an unrepresentable stamp is counted as rejected, the rest fold",
+TEST_CASE("v10 migration: a raw row with an unrepresentable stamp is counted as rejected "
+          "and the rest fold",
           "[echo][v10][migration]") {
     Seeded seeded;
     seed(seeded, [&](sqlite3* db) {
@@ -833,6 +834,35 @@ TEST_CASE("v10 migration: a volume with less than twice the file free refuses an
     CHECK(db.get_config("schema_version") == "10");
 }
 
+TEST_CASE("v10 migration: a volume whose free space cannot be read refuses and changes nothing",
+          "[echo][v10][migration][free_space]") {
+    Seeded seeded;
+    seed(seeded, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(kT0), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
+    });
+
+    OpenSeams unreadable;
+    unreadable.free_bytes = [](const fs::path&) -> std::optional<std::uintmax_t> { return std::nullopt; };
+    const auto refused = EchoDatabase::open(seeded.tmp.path, unreadable);
+    REQUIRE(!refused.has_value());
+    CHECK(is_free_space_refusal(refused.error())); // the same offline path as a short volume
+    CHECK(refused.error().find("could not be read") != std::string::npos);
+    CHECK(refused.error().find("bytes are needed") != std::string::npos); // the needed figure is named
+    Db check;
+    open_raw(check, seeded.tmp.path);
+    CHECK(count_of(check.db, "SELECT value FROM echo_config WHERE key = 'schema_version'") == 9);
+    CHECK(count_of(check.db, "SELECT COUNT(*) FROM process_live") == 1);
+    CHECK(!has_table(check.db, "echo_dict"));
+
+    // a readable volume with room opens at v10
+    OpenSeams roomy;
+    roomy.free_bytes = [](const fs::path&) -> std::optional<std::uintmax_t> {
+        return std::uintmax_t{1} << 40;
+    };
+    auto db = open_ok(seeded.tmp.path, roomy);
+    CHECK(db.get_config("schema_version") == "10");
+}
+
 TEST_CASE("v10 migration: the VACUUM runs when there is room and is deferred when there is not",
           "[echo][v10][migration][free_space]") {
     const auto seed_it = [](Seeded& s) {
@@ -866,7 +896,7 @@ TEST_CASE("v10 migration: the VACUUM runs when there is room and is deferred whe
     }
 }
 
-TEST_CASE("v10 migration: a cursor source's recent keys are replays, a reused key is a collision",
+TEST_CASE("v10 migration: a cursor source's recent keys are replays and a reused key is a collision",
           "[echo][v10][migration][cursor]") {
     Seeded seeded;
     const std::vector<PowerEvent> ev{{kT0, 1, "sleep", "lid closed", "power:1"},
@@ -894,6 +924,37 @@ TEST_CASE("v10 migration: a cursor source's recent keys are replays, a reused ke
     CHECK(n(db, "SELECT COUNT(*) FROM echo_fold_seen WHERE source = 'power'") == 0);
     REQUIRE(db.insert_power_events_and_cursor({ev[0]}, "{}").has_value());
     CHECK(n(db, "SELECT SUM(event_count) FROM power_hourly") == 1);
+}
+
+TEST_CASE("v10 migration: a historical mapdrive mapping is remembered so a retry does not count it again",
+          "[echo][v10][migration][mapdrive]") {
+    Seeded seeded;
+    const MapDriveEvent past{kT0,   1,     "historical", "outbound", "Y:",
+                             "\\\\old\\data", "old", "jsmith", "smb",      "historical"};
+    const MapDriveEvent live{kT0 + 60, 1,        "appeared", "outbound", "Z:",
+                             "\\\\srv\\share", "srv", "jsmith", "smb",     "live"};
+    seed(seeded, [&](sqlite3* db) {
+        for (const auto& e : {past, live})
+            insert_raw(db, "mapdrive",
+                       {I(e.ts), I(e.snapshot_id), T(e.action), T(e.direction), T(e.local_mount),
+                        T(e.remote_path), T(e.remote_host), T(e.username), T(e.provider), T(e.origin)});
+    });
+    auto db = open_ok(seeded.tmp.path);
+    CHECK(n(db, "SELECT SUM(historical_count) FROM mapdrive_hourly") == 1);
+    // only the historical identity is remembered (the live appearance is not)
+    CHECK(n(db, "SELECT COUNT(*) FROM echo_fold_seen WHERE source = 'mapdrive_historical'") == 1);
+
+    // the bounded per-profile retry offers the same mapping again: skipped, never recounted
+    REQUIRE(db.fold_mapdrive_events({past}, std::nullopt, true));
+    CHECK(n(db, "SELECT SUM(historical_count) FROM mapdrive_hourly") == 1);
+    CHECK(n(db, "SELECT SUM(historical_count) FROM mapdrive_daily") == 1);
+
+    // a mapping the first pass never saw still folds, and is remembered in turn
+    MapDriveEvent fresh = past;
+    fresh.remote_path = "\\\\other\\data";
+    REQUIRE(db.fold_mapdrive_events({fresh}, std::nullopt, true));
+    CHECK(n(db, "SELECT SUM(historical_count) FROM mapdrive_hourly") == 2);
+    CHECK(n(db, "SELECT COUNT(*) FROM echo_fold_seen WHERE source = 'mapdrive_historical'") == 2);
 }
 
 TEST_CASE("v10 migration: a fresh database gets the roll-up schema directly",

@@ -391,8 +391,8 @@ TEST_CASE("usage: the sweep does nothing (ok=true) while usage or process is dis
     CHECK(count_rows(t.db, "usage_live") == 0);
 }
 
-TEST_CASE("usage: the fold stamps a baseline on the first tick and folds nothing, then folds "
-          "forward from it, never retrospectively",
+TEST_CASE("usage: the fold stamps a baseline on the first tick and folds nothing and "
+          "then folds forward from it and never retrospectively",
           "[echo][usage][fold]") {
     auto t = make_test_db();
     // Events exist BEFORE the fold ever ran -- forward-only must not fold them into usage.
@@ -423,8 +423,8 @@ TEST_CASE("usage: the tick's process tiers and usage rows commit together",
     CHECK(row->rows[0][1] == "100");
 }
 
-TEST_CASE("usage: a fault on usage_daily_user mid-fold commits NOTHING -- not usage_daily, not "
-          "usage_live, not the process tiers",
+TEST_CASE("usage: a fault on usage_daily_user mid-fold commits NOTHING -- not "
+          "usage_daily and not usage_live and not the process tiers",
           "[echo][usage][fold]") {
     // The central regression this whole rewrite exists for (round 1 Blocker 1 / round 2's
     // residual): a partial commit must be structurally impossible, not merely reduced. Fault the
@@ -544,7 +544,7 @@ TEST_CASE("usage: a rollback leaves the connection usable and the same events fo
     CHECK(row->rows[0][1] == "100"); // total_seconds == 100, not 200
 }
 
-TEST_CASE("usage: the fold has no cursor -- no hwm, lag or gap machinery is written",
+TEST_CASE("usage: the fold has no cursor -- no hwm or lag or gap machinery is written",
           "[echo][usage][fold]") {
     auto t = make_test_db();
     REQUIRE(fold_tick(t.db, process_pair(1, "a.exe", 100, 200), 1000));
