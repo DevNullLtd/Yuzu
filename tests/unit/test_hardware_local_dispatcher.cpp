@@ -240,7 +240,7 @@ EstateRun run_estate(const YuzuPluginDescriptor* d, const char* action, std::siz
     for (std::size_t i = 1; i < out.rows.size(); ++i) {
         const auto f = split_pipes(out.rows[i]);
         INFO("data row: " << out.rows[i]);
-        CHECK(f.size() == data_fields);
+        REQUIRE(f.size() == data_fields); // fatal: callers index into the row
         CHECK(f[0] == action);
         out.data.push_back(out.rows[i]);
     }
@@ -268,8 +268,19 @@ TEST_CASE("hardware plugin (windows): estate actions answer a real typed section
         CHECK(r.rc == 0);
         for (const auto& row : r.rows)
             CHECK(row.find("windows:planned") == std::string::npos);
-        // a typed status was declared (never the UNDECLARED default)
+        // a typed status was declared (never the UNDECLARED default) ...
         CHECK(r.result_status != YUZU_RESULT_STATUS_UNDECLARED);
+        // ... and it AGREES with the status row's level: a swapped mapping in emit_report must not
+        // stay green just because both are "something".
+        if (r.status_level == "supported")
+            CHECK(r.result_status == YUZU_RESULT_STATUS_OK);
+        else if (r.status_level == "constrained")
+            CHECK((r.result_status == YUZU_RESULT_STATUS_CONSTRAINED ||
+                   r.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED));
+        else if (r.status_level == "unsupported")
+            CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        else
+            FAIL("unexpected status level: " << r.status_level);
         // rows only accompany a readable section
         if (r.status_level == "unsupported")
             CHECK(r.data.empty());
@@ -283,7 +294,9 @@ TEST_CASE("hardware plugin (windows): machine_id ships a keyed hash, never the r
 
     const auto r = run_estate(plugin->descriptor, "machine_id", 4);
     CHECK(r.rc == 0);
-    if (r.data.empty()) return; // unreadable on this host: the status row says why
+    // Every Windows install has a MachineGuid and an unprivileged account can read it, so this must be
+    // a real, supported row. (An early return on "no data" would let a broken read pass green.)
+    CHECK(r.status_level == "supported");
     REQUIRE(r.data.size() == 1);
     const auto f = split_pipes(r.data[0]);
     CHECK(is_lower_hex64(f[1]));

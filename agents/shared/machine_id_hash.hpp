@@ -15,6 +15,12 @@
  * plainly: anyone who already holds the raw id can recompute the digest. The hash protects the
  * raw id from disclosure through Yuzu; it does not protect against a party that already has it.
  *
+ * NOT systemd's function. `sd_id128_get_machine_app_specific` uses the machine-id as the HMAC KEY and
+ * the application id as the message and returns 128 bits; this derivation does the opposite (the
+ * label is the key, the id is the message) and returns 256-bit hex, so the two are NOT
+ * byte-compatible. A Linux leg must call hash_machine_id, never libsystemd, or one machine's digest
+ * would differ between OSes.
+ *
  * CROSS-OS CONTRACT. H.11 (Linux, /etc/machine-id) and any later leg call hash_machine_id with
  * the same label and algorithm string so one machine's digest is comparable across legs that
  * read the same id. The label and algorithm token are pinned by the [machine_id_hash] cases in

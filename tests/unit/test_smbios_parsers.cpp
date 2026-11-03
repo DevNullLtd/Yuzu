@@ -1095,10 +1095,23 @@ TEST_CASE("smbios: chassis_type_name covers the DSP0134 7.4.1 types and refuses 
     CHECK_FALSE(chassis_type_name(0).has_value());
     CHECK_FALSE(chassis_type_name(37).has_value());
     CHECK_FALSE(chassis_type_name(127).has_value());
-    // every defined value has a non-empty name (a table typo would blank one)
+    // every defined value has exactly its DSP0134 7.4.1 name. This list is written out
+    // independently of kChassisTypeNames, so a typo in the table fails here instead of passing a
+    // non-empty check.
+    static constexpr std::string_view kExpected[] = {
+        "",                  "Other",           "Unknown",        "Desktop",
+        "Low Profile Desktop", "Pizza Box",     "Mini Tower",     "Tower",
+        "Portable",          "Laptop",          "Notebook",       "Hand Held",
+        "Docking Station",   "All in One",      "Sub Notebook",   "Space-saving",
+        "Lunch Box",         "Main Server Chassis", "Expansion Chassis", "SubChassis",
+        "Bus Expansion Chassis", "Peripheral Chassis", "RAID Chassis", "Rack Mount Chassis",
+        "Sealed-case PC",    "Multi-system chassis", "Compact PCI", "Advanced TCA",
+        "Blade",             "Blade Enclosure", "Tablet",         "Convertible",
+        "Detachable",        "IoT Gateway",     "Embedded PC",    "Mini PC",
+        "Stick PC"};
     for (unsigned t = 1; t <= 36; ++t) {
         INFO("type " << t);
         REQUIRE(chassis_type_name(t).has_value());
-        CHECK_FALSE(chassis_type_name(t)->empty());
+        CHECK(*chassis_type_name(t) == kExpected[t]);
     }
 }

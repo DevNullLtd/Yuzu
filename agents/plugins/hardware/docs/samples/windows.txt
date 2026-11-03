@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-03 · NT SERVICE virtual service account (not an administrator) · leg-hash 3fa43aa6c9dc
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-03 · NT SERVICE virtual service account (not an administrator); serial numbers, UUID and machine-id hash replaced with synthetic values · leg-hash 3fa43aa6c9dc
 == action=manufacturer
 manufacturer|Micro Computer (HK) Tech Limited
 [result_status] UNDECLARED / UNKNOWN / 

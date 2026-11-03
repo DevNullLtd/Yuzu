@@ -25,32 +25,43 @@
 
 namespace yuzu::hardware::estate {
 
+/// The typed result an outcome is reported with. A pure mapping (no context needed) so the one place
+/// the status level, the typed status and the provenance rule meet is tested on every host.
+struct ResultCode {
+    YuzuResultStatus status;
+    YuzuResultCompleteness completeness;
+    bool carries_token; ///< true: the failure token is the provenance; false: provenance stays empty
+};
+
+[[nodiscard]] constexpr ResultCode result_code_for(Outcome o) noexcept {
+    switch (o) {
+    case Outcome::ok:
+        // Provenance stays empty on a clean read so the writer does not record a reason for an `ok`
+        // section (it falls back to the status row's token, which is "-").
+        return {YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, false};
+    case Outcome::constrained:
+        return {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL, true};
+    case Outcome::denied:
+        return {YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_PARTIAL, true};
+    case Outcome::unavailable:
+        return {YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN, true};
+    }
+    return {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL, true};
+}
+
 inline int emit_report(yuzu::CommandContext& ctx, std::string_view action, const Report& r) {
     ctx.write_output(status_row_for(action, r));
     for (const auto& row : r.rows)
         ctx.write_output(row);
 
-    switch (r.outcome) {
-    case Outcome::ok:
-        // Provenance stays empty on a clean read so the writer does not record a reason for an
-        // `ok` section (it falls back to the status row's token, which is "-").
-        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, {});
-        break;
-    case Outcome::constrained:
+    if (r.outcome == Outcome::constrained)
         spdlog::warn("hardware: {} degraded read ({})", action, r.token);
-        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              r.token);
-        break;
-    case Outcome::denied:
+    else if (r.outcome == Outcome::denied)
         spdlog::warn("hardware: {} permission denied ({})", action, r.token);
-        ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED,
-                              YUZU_RESULT_COMPLETENESS_PARTIAL, r.token);
-        break;
-    case Outcome::unavailable:
-        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN,
-                              r.token);
-        break;
-    }
+
+    const ResultCode rc = result_code_for(r.outcome);
+    ctx.set_result_status(rc.status, rc.completeness,
+                          rc.carries_token ? std::string_view{r.token} : std::string_view{});
     return 0;
 }
 

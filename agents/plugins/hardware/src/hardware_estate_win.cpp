@@ -50,6 +50,7 @@
 
 #include <cstdint>
 #include <exception>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -117,7 +118,11 @@ MachineIdRead read_machine_guid() {
         out.win32_error = ERROR_INVALID_DATA; // not a string, empty, or not GUID-sized
         return out;
     }
-    // +1 wchar so the buffer is NUL-terminated even if the stored value is not.
+    // One extra wchar so a stored value without its terminator still ends in a NUL (exact for even
+    // byte sizes; for an odd size the last wchar is partly filled, which is harmless because
+    // reg_sz_to_utf8 floors to whole wchars and stops at the first NUL). The type is not re-checked
+    // on this second read: the buffer is bounded by `got`, so a type change could only make us read
+    // bounded bytes as text.
     std::wstring buf(size / sizeof(wchar_t) + 1, L'\0');
     DWORD got = size;
     rc = ::RegQueryValueExW(key.get(), kMachineGuidValue, nullptr, &type,
@@ -144,28 +149,22 @@ Report swap_leg() {
         files.push_back({wmi_row_string(row, "Name"), wmi_row_uint64(row, "AllocatedBaseSize"),
                          wmi_row_uint64(row, "CurrentUsage")});
 
-    std::string constraint;
-    if (usage.truncated)
-        constraint = "wmi:pagefile_usage:row_cap";
-
     std::vector<PageFileSetting> settings;
     auto setting = wmi::run_bounded_wmi_query(
         L"ROOT\\CIMV2", L"SELECT Name, MaximumSize FROM Win32_PageFileSetting");
+    std::optional<Report> setting_failure;
     if (setting.error) {
-        // A missing class just means no configured maximum; any other fault is a degraded total.
-        const Report bad =
+        setting_failure =
             wmi_failure_report("pagefile_setting", *setting.error, setting.rows_before_error);
-        if (bad.outcome != Outcome::unavailable && constraint.empty())
-            constraint = bad.token;
     } else {
         for (const auto& row : setting.rows)
             settings.push_back({wmi_row_string(row, "Name"), wmi_row_uint64(row, "MaximumSize")});
-        // A capped setting list can miss the configured maximum of a page file: the total then
-        // falls back to the (drifting) allocation, which must be visible, not silent.
-        if (setting.truncated && constraint.empty())
-            constraint = "wmi:pagefile_setting:row_cap";
     }
-    return swap_report(files, settings, constraint);
+    // Which constraint (if any) the section reports is decided by the pure, host-tested
+    // swap_constraint_token: a missing setting class is no failure (no configured maximum), a capped
+    // setting list can miss a configured maximum so the total falls back to the drifting allocation.
+    return swap_report(files, settings,
+                       swap_constraint_token(usage.truncated, setting_failure, setting.truncated));
 }
 
 Report build(Kind kind) {

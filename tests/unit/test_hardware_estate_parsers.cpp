@@ -10,6 +10,7 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include "hardware_estate_emit.hpp" // result_code_for (the pure outcome -> typed-result mapping)
 #include "hardware_estate_parsers.hpp"
 
 #include <algorithm>
@@ -98,6 +99,25 @@ TEST_CASE("estate: an identity string is capped on a UTF-8 boundary", "[hardware
     CHECK(cut.size() <= est::kMaxIdentityBytes);
     CHECK(cut.size() % 2 == 0);            // whole scalars only
     CHECK(yuzu::shared::count_invalid_wire_bytes(cut) == 0);
+
+    // The two inputs above put a lead byte exactly at offset 256 (256 is even), so the boundary
+    // back-up never runs and they cannot tell a correct cut from a naive resize(256). These do:
+    // a 1-byte prefix shifts every 2-byte scalar by one, and 3-byte scalars (256 % 3 == 1) always
+    // straddle the cut. Each must back up to a scalar boundary and stay valid UTF-8.
+    const std::string shifted = est::clean_identity("A" + multi);
+    CHECK(yuzu::shared::count_invalid_wire_bytes(shifted) == 0);
+    CHECK(shifted.size() == 255); // 'A' + 127 whole 2-byte scalars; the 128th would end at 257
+    std::string euro; // U+20AC, 3 bytes
+    for (int i = 0; i < 200; ++i) euro += "\xE2\x82\xAC";
+    const std::string euro_cut = est::clean_identity(euro);
+    CHECK(yuzu::shared::count_invalid_wire_bytes(euro_cut) == 0);
+    CHECK(euro_cut.size() == 255); // 85 whole scalars; a naive cut at 256 splits the 86th
+    // a 4-byte scalar straddling the cut
+    std::string clef = "AB"; // U+1D11E, 4 bytes
+    for (int i = 0; i < 100; ++i) clef += "\xF0\x9D\x84\x9E";
+    const std::string clef_cut = est::clean_identity(clef);
+    CHECK(yuzu::shared::count_invalid_wire_bytes(clef_cut) == 0);
+    CHECK(clef_cut.size() <= est::kMaxIdentityBytes);
     // exactly at the cap is untouched
     CHECK(est::clean_identity(std::string(est::kMaxIdentityBytes, 'B')).size() == est::kMaxIdentityBytes);
 }
@@ -387,4 +407,82 @@ TEST_CASE("estate: DIMM identity from the real capture, filler included", "[hard
     }
     CHECK(saw_real);
     CHECK(saw_filler);
+}
+
+// -- Windows cpu / dimm row formatters: the escape that closes S-1 ----------------------------------
+
+TEST_CASE("estate: cpu row formatter escapes WMI text so it cannot shift columns or forge a row",
+          "[hardware_estate]") {
+    // ordinary values are byte-for-byte what the plugin always wrote
+    CHECK(est::format_cpu_row(0, "Intel(R) Core(TM) Ultra 5 125H", 14, 18, 1200, "U3E1", "4") ==
+          "cpu|0|Intel(R) Core(TM) Ultra 5 125H|14|18|1200|U3E1|4");
+    // a '|' in the model would add a column; it is escaped, so the row keeps exactly 8 raw fields
+    const std::string r = est::format_cpu_row(1, "Fab|Cpu", 2, 4, 3000, "-", "-");
+    CHECK(r == "cpu|1|Fab\\|Cpu|2|4|3000|-|-");
+    // a newline would forge a second row
+    const std::string nl = est::format_cpu_row(0, "A\nB", 1, 1, 1, "-", "-");
+    CHECK(nl.find('\n') == std::string::npos);
+    CHECK(nl.find('\r') == std::string::npos);
+}
+
+TEST_CASE("estate: dimm row formatter escapes the slot and keeps the column order", "[hardware_estate]") {
+    CHECK(est::format_dimm_row("Controller1-ChannelA-DIMM0", 32768, "DDR5", 5600, "Micron Technology",
+                               "CT32G56C46S5.C8BA", "0A1B2C3D") ==
+          "dimm|Controller1-ChannelA-DIMM0|32768|DDR5|5600|Micron Technology|CT32G56C46S5.C8BA|0A1B2C3D");
+    const std::string r = est::format_dimm_row("DIMM|A", 8192, "DDR4", 3200, "-", "-", "-");
+    CHECK(r == "dimm|DIMM\\|A|8192|DDR4|3200|-|-|-");
+    CHECK(est::format_dimm_row("A\nB", 1, "DDR4", 1, "-", "-", "-").find('\n') == std::string::npos);
+}
+
+// -- swap: the constraint precedence the Windows TU delegates here --------------------------------------
+
+TEST_CASE("estate: swap constraint precedence", "[hardware_estate]") {
+    const auto none = std::optional<est::Report>{};
+    const auto denied = std::optional<est::Report>{est::Report::failure(est::Outcome::denied, "wmi:pagefile_setting:x")};
+    const auto missing = std::optional<est::Report>{est::Report::failure(est::Outcome::unavailable, "wmi:pagefile_setting:absent")};
+    const auto faulty = std::optional<est::Report>{est::Report::failure(est::Outcome::constrained, "wmi:pagefile_setting:f")};
+
+    CHECK(est::swap_constraint_token(false, none, false).empty());
+    // usage cap wins over everything
+    CHECK(est::swap_constraint_token(true, faulty, true) == "wmi:pagefile_usage:row_cap");
+    // a failed setting query constrains; a MISSING setting class does not (no configured maximum)
+    CHECK(est::swap_constraint_token(false, denied, false) == "wmi:pagefile_setting:x");
+    CHECK(est::swap_constraint_token(false, faulty, false) == "wmi:pagefile_setting:f");
+    CHECK(est::swap_constraint_token(false, missing, false).empty());
+    CHECK(est::swap_constraint_token(false, missing, true).empty()); // a failed query has no rows to cap
+    // a capped setting list (query succeeded) can miss a configured maximum
+    CHECK(est::swap_constraint_token(false, none, true) == "wmi:pagefile_setting:row_cap");
+    // a failure outranks a cap
+    CHECK(est::swap_constraint_token(false, faulty, true) == "wmi:pagefile_setting:f");
+}
+
+// -- the typed result an outcome is reported with ---------------------------------------------------------
+
+TEST_CASE("estate: every outcome maps to the typed result its status-row level promises",
+          "[hardware_estate]") {
+    using est::Outcome;
+    using yuzu::shared::StatusLevel;
+    for (Outcome o : {Outcome::ok, Outcome::constrained, Outcome::denied, Outcome::unavailable}) {
+        INFO("outcome " << static_cast<int>(o));
+        const est::ResultCode rc = est::result_code_for(o);
+        switch (est::status_level_of(o)) {
+        case StatusLevel::supported:   CHECK(rc.status == YUZU_RESULT_STATUS_OK); break;
+        case StatusLevel::unsupported: CHECK(rc.status == YUZU_RESULT_STATUS_UNAVAILABLE); break;
+        case StatusLevel::constrained:
+            CHECK((rc.status == YUZU_RESULT_STATUS_CONSTRAINED ||
+                   rc.status == YUZU_RESULT_STATUS_PERMISSION_DENIED));
+            break;
+        }
+    }
+    // exact pairs the writer and the README promise
+    CHECK(est::result_code_for(Outcome::ok).status == YUZU_RESULT_STATUS_OK);
+    CHECK(est::result_code_for(Outcome::ok).completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK_FALSE(est::result_code_for(Outcome::ok).carries_token); // a clean read records no reason
+    CHECK(est::result_code_for(Outcome::constrained).status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(est::result_code_for(Outcome::denied).status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+    CHECK(est::result_code_for(Outcome::denied).completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(est::result_code_for(Outcome::unavailable).status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(est::result_code_for(Outcome::unavailable).completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+    for (Outcome o : {Outcome::constrained, Outcome::denied, Outcome::unavailable})
+        CHECK(est::result_code_for(o).carries_token); // a degraded read always names why
 }

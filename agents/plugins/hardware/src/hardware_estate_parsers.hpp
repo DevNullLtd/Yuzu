@@ -48,6 +48,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::hardware::estate {
@@ -89,9 +90,10 @@ struct Report {
 
 // -- field hygiene -------------------------------------------------------------------------
 
-/// Longest identity string a row carries. SMBIOS strings are bounded only by the 1 MiB table, and the
-/// on-demand response is not clamped the way the daily record is, so cap here. 256 bytes is several
-/// times any real serial, part number or vendor string.
+/// Longest identity string a row carries, measured on the SOURCE string before escaping (escaping a
+/// '|' or '\\' can roughly double the emitted field). SMBIOS strings are bounded only by the 1 MiB
+/// table, and the on-demand response is not clamped the way the daily record is, so cap here. 256
+/// bytes is several times any real serial, part number or vendor string.
 inline constexpr std::size_t kMaxIdentityBytes = 256;
 
 /// A free-text identity field read from firmware or WMI, ready for a row: right-trimmed, OEM
@@ -384,6 +386,60 @@ inline constexpr std::uint32_t kArchX64 = 9;
 /// and empty -> "-". Part numbers are padded with spaces on real modules; clean_identity trims.
 [[nodiscard]] inline std::string dimm_identity_field(std::string_view raw) {
     return clean_identity(raw);
+}
+
+// -- swap: which constraint token the section carries -------------------------------------------
+
+/// The one constraint token a swap section reports, by precedence: the usage query's row cap, then a
+/// FAILED setting query (a missing setting class is no failure: it means no configured maximum),
+/// then a capped setting list (reported only when the query itself did not fail). Empty = none.
+/// Pure so the precedence is tested on every host; the Windows TU only gathers the three facts.
+[[nodiscard]] inline std::string swap_constraint_token(bool usage_truncated,
+                                                       const std::optional<Report>& setting_failure,
+                                                       bool setting_truncated) {
+    if (usage_truncated)
+        return "wmi:pagefile_usage:row_cap";
+    if (setting_failure)
+        return setting_failure->outcome == Outcome::unavailable ? std::string{}
+                                                                : setting_failure->token;
+    if (setting_truncated)
+        return "wmi:pagefile_setting:row_cap";
+    return {};
+}
+
+// -- Windows cpu / dimm row formatters --------------------------------------------------------------
+
+/// `cpu|idx|name|cores|threads|clock_mhz|socket_designation|stepping`. `name` is WMI text and is
+/// escaped here (a '|' in it would shift every later column, a newline would forge a row);
+/// `socket` and `stepping` arrive already cleaned by socket_designation_field / stepping_field.
+[[nodiscard]] inline std::string format_cpu_row(int idx, std::string_view name, std::uint32_t cores,
+                                                std::uint32_t threads, std::uint32_t clock_mhz,
+                                                std::string_view socket, std::string_view stepping) {
+    std::string r = "cpu|" + std::to_string(idx) + "|" + yuzu::util::safe_output_field(name) + "|" +
+                    std::to_string(cores) + "|" + std::to_string(threads) + "|" +
+                    std::to_string(clock_mhz) + "|";
+    r += socket;
+    r += '|';
+    r += stepping;
+    return r;
+}
+
+/// `dimm|slot|size_mb|type|speed_mhz|manufacturer|part_number|serial`. `slot` (DeviceLocator) is WMI
+/// text and is escaped here; the three identity columns arrive already cleaned by
+/// dimm_identity_field; `type` is a fixed enum string.
+[[nodiscard]] inline std::string format_dimm_row(std::string_view slot, std::uint64_t size_mb,
+                                                 std::string_view type, std::uint32_t speed_mhz,
+                                                 std::string_view manufacturer,
+                                                 std::string_view part_number, std::string_view serial) {
+    std::string r = "dimm|" + yuzu::util::safe_output_field(slot) + "|" + std::to_string(size_mb) + "|";
+    r += type;
+    r += '|' + std::to_string(speed_mhz) + '|';
+    r += manufacturer;
+    r += '|';
+    r += part_number;
+    r += '|';
+    r += serial;
+    return r;
 }
 
 } // namespace yuzu::hardware::estate

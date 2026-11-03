@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <format>
 #include <map>
 #include <optional>
@@ -482,11 +483,8 @@ int do_processors(yuzu::CommandContext& ctx) {
                       arch = wmi_row_uint32(row, "Architecture");
                   const auto stepping = yuzu::hardware::estate::stepping_field(
                       wmi_row_string(row, "ProcessorId"), arch, wmi_row_string(row, "Stepping"));
-                  // `name` is WMI text: escape it like the appended columns, or a '|' in it shifts
-                  // every later column (and a newline would forge a row).
-                  ctx.write_output(std::format("cpu|{}|{}|{}|{}|{}|{}|{}", idx++,
-                                               yuzu::util::safe_output_field(name), cores, threads,
-                                               mhz, socket, stepping));
+                  ctx.write_output(yuzu::hardware::estate::format_cpu_row(
+                      idx++, name, cores, threads, mhz, socket, stepping));
               });
     // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
     // doc comment above.
@@ -585,16 +583,13 @@ int do_memory(yuzu::CommandContext& ctx) {
                   }
                   auto size_mb = capacity / (1024 * 1024);
                   // The module's own identity strings; OEM filler and empty -> "-".
-                  // `slot` (DeviceLocator) is WMI text: escaped like the appended identity columns.
-                  ctx.write_output(std::format(
-                      "dimm|{}|{}|{}|{}|{}|{}|{}", yuzu::util::safe_output_field(slot), size_mb,
-                      type_str, speed,
-                      yuzu::hardware::estate::dimm_identity_field(
-                          wmi_row_string(row, "Manufacturer")),
-                      yuzu::hardware::estate::dimm_identity_field(
-                          wmi_row_string(row, "PartNumber")),
-                      yuzu::hardware::estate::dimm_identity_field(
-                          wmi_row_string(row, "SerialNumber"))));
+                  // The module's own identity strings; OEM filler and empty -> "-". The pure
+                  // formatter escapes `slot` (WMI text) like the appended identity columns.
+                  ctx.write_output(yuzu::hardware::estate::format_dimm_row(
+                      slot, size_mb, type_str, speed,
+                      yuzu::hardware::estate::dimm_identity_field(wmi_row_string(row, "Manufacturer")),
+                      yuzu::hardware::estate::dimm_identity_field(wmi_row_string(row, "PartNumber")),
+                      yuzu::hardware::estate::dimm_identity_field(wmi_row_string(row, "SerialNumber"))));
               });
     // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
     // doc comment above.
@@ -968,8 +963,22 @@ public:
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx, std::string_view action,
-                yuzu::Params /*params*/) override {
+    // The SDK's exported trampoline (sdk/include/yuzu/plugin.hpp _yuzu_execute_) has no try/catch, so an
+    // exception escaping here would cross the C ABI and terminate the agent. Every action below
+    // allocates (std::format, std::string), so contain it: report failure, never throw.
+    int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
+        try {
+            return dispatch(ctx, action, params);
+        } catch (const std::exception& e) {
+            spdlog::error("hardware: action '{}' threw: {}", action, e.what());
+        } catch (...) {
+            spdlog::error("hardware: action '{}' threw a non-standard exception", action);
+        }
+        return 1;
+    }
+
+private:
+    int dispatch(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params /*params*/) {
         if (action == "manufacturer")
             return do_manufacturer(ctx);
         if (action == "model")
