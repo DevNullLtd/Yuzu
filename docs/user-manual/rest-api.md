@@ -8060,7 +8060,7 @@ Family summary: devices per family, version buckets and the coverage denominator
 | Parameter | Type | Description |
 |---|---|---|
 | `family` | string | Restrict to one family id (`openssl`, `libressl`, `boringssl`, `gnutls`, `nss`, `mbedtls`, `wolfssl`, `libgcrypt`, `libsodium`, `nettle`, `botan`, `bouncycastle`); empty means every family |
-| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi` and `python`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python` and `ibm_mq`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
 
 A parameter repeated with differing values, an unknown `family`, a value that is not valid UTF-8 or contains a NUL byte, or an over-long value is a `400`. Unknown query keys are ignored.
 
@@ -8174,7 +8174,7 @@ A CycloneDX **1.7** inventory of the cryptographic *library* packages installed 
 | Parameter | Meaning |
 |---|---|
 | `family` | One family id from the curated table; omitted or empty means every family. An unknown id is a `400`. |
-| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
+| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
 
 ```json
 {
@@ -13022,7 +13022,7 @@ curl -X POST https://yuzu.example.com/api/dashboard/echo-execute \
 
 **Safety controls:**
 - Server-side: validates SELECT-only queries and applies a keyword blocklist (no INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, DETACH, PRAGMA, VACUUM, REINDEX).
-- Agent-side: untrusted queries run on a dedicated **read-only** SQLite connection through a `sqlite3` authorizer that permits only `SELECT`/`READ` of registry-known warehouse tables (`$Process_Live`, `$TCP_Hourly`, …) and scalar/aggregate functions. Writes, `ATTACH`, `PRAGMA`, schema-table reads (`sqlite_master`), recursive CTEs, and multi-statement input are denied at prepare time — the read-only connection makes writes structurally impossible regardless of the query text. `$`-prefixed table names are translated only outside string literals and comments, so the executed query always matches the validated form. Queries exceeding 4KB are rejected. A blocked query returns `query rejected: operation or table not permitted`.
+- Agent-side: untrusted queries run on a dedicated **read-only** SQLite connection through a `sqlite3` authorizer that permits only `SELECT`/`READ` of registry-known warehouse tables (`$Process_Live`, `$TCP_Hourly`, …) and scalar/aggregate functions. Writes, `ATTACH`, `PRAGMA`, schema-table reads (`sqlite_master`) and multi-statement input are denied at prepare time, and common table expressions (`WITH`), `NATURAL` and `USING` joins and bound-parameter markers are refused before the query is prepared (a query that starts with `WITH` gets `only SELECT queries are allowed`) — the read-only connection makes writes structurally impossible regardless of the query text. `$`-prefixed table names are translated in code and inside quoted identifiers, never inside a string literal or a comment, so the executed query always matches the validated form. Queries exceeding 4KB are rejected. A blocked query returns `query rejected: operation or table not permitted`.
 
 #### `GET /echo`
 
@@ -13356,6 +13356,8 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 }
 ```
 
+When the caller's read is confined to a scope (RBAC enforced and `Infrastructure:Read` held only through a management-group role), the text content is instead the object `{"agents": [...], "scope_basis": "authority_scoped"}` and lists only the devices within that scope. `scope_basis` is a status, set whether or not any device was hidden. Callers with a global grant, callers with an engine grant, and non-engine callers while RBAC is off keep the bare array above.
+
 **Response (error):**
 
 ```json
@@ -13385,7 +13387,7 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 
 | Tool | Description |
 |---|---|
-| `list_agents` | List connected agents with status |
+| `list_agents` | List the connected agents the caller may read |
 | `get_agent_details` | Detailed info for a specific agent |
 | `query_audit_log` | Search audit events with filters |
 | `list_definitions` | List instruction definitions |
@@ -13785,9 +13787,45 @@ to any local user via `ps`; the env var is not.
 **Permission:** every endpoint below, including the three discovery
 endpoints, requires `Authorization: Bearer <scim-token>` — validated
 constant-time against the configured token's hash. Missing/invalid → `401`
-+ `WWW-Authenticate: Bearer`. This is unrelated to session cookies, API
-tokens, or RBAC — there is no `role`/permission check on these routes, only
-the bearer credential.
++ `WWW-Authenticate: Bearer`, a `scim.auth.denied` audit row and a
+`yuzu_scim_auth_failures_total` increment. `401` means only that: the token was
+checked and rejected, or missing. If the store behind the check cannot answer
+(#6835: a connection that cannot be leased in time, or a failed query), the answer
+is `503` + `Retry-After: 2` with the detail "temporarily unable to authenticate the
+request (store unavailable); retry" on every route, discovery included; it writes no
+`scim.auth.denied` row and does not move `yuzu_scim_auth_failures_total` (an outage is
+not a credential guess), and counts
+`yuzu_scim_guard_store_unavailable_total{guard="bearer"}`. A SCIM store that is not
+configured or not open, and an empty token, stay `401`. This is unrelated to session
+cookies, API tokens, or RBAC — there is no `role`/permission check on these routes,
+only the bearer credential.
+
+**Store faults on lookups (#6835).** Where a route below answers `404`, `409` or an
+empty/"no duplicate" result on the strength of a SCIM-store read, a failed read (not an
+absent row) is instead `503` + `Retry-After: 2` with the detail "temporarily unable to read
+the SCIM store (store unavailable); retry". This covers `GET`, `PUT`, `PATCH` and `DELETE`
+on `/Users/{id}` and `/Groups/{id}`, the duplicate `userName` and `displayName` checks of
+`POST /Users` and `POST /Groups`, the rename duplicate checks of `PUT`/`PATCH` on a Group,
+and the `userName eq` / `displayName eq` filter queries. The request changes nothing; it
+counts `yuzu_scim_guard_store_unavailable_total{guard="resource"}` and logs an `ERROR`
+(which names the target id). A *mutating* request (`POST`, `PUT`, `PATCH`, `DELETE`) is also
+audited under its own verb (`scim.user.provisioned`, `scim.user.updated`, `scim.user.deleted`,
+`scim.group.created`, `scim.group.updated`, `scim.group.deleted`) as `failure` with detail
+`store_unavailable: lookup (<site>)`; the row is best effort, because the audit store is usually
+the same database that just failed. `GET /Users/{id}`, `GET /Groups/{id}`, the two list filters
+and the bearer-token `503` write no audit row (a `GET` has no audit verb, and a row per polled
+`GET` would trip `YuzuScimAuditWriteFailures` for requests that changed nothing). In a full
+outage the audit store is down too, so no row is written for any of these `503`s and the trail is
+the `ERROR` log plus the counter; when a mutating request's failure row cannot be written,
+`YuzuScimAuditWriteFailures` can fire for a request that changed nothing. A definitively
+missing resource is still `404` and a definitive duplicate still `409`. **Not covered:** the
+unfiltered `GET /Users` and `GET /Groups` (`list()` / `count()` fail open, #2481, so an
+unfiltered list can answer an empty `200` during a store fault while a filtered one answers
+`503`); the `POST /Users` reads other than the duplicate check, including the concurrent-create
+re-read (`get_by_username` after a failed create) and `find_by_external_id` (#6837, a fault there
+falls through to the later `500`); and the post-mutation re-fetches (`500`).
+Operator view of every case:
+[SCIM failure-mode matrix](scim-provisioning.md#scim-failure-mode-matrix).
 
 #### `GET /scim/v2/ServiceProviderConfig`
 
@@ -13821,9 +13859,10 @@ are tolerated and ignored).
 | Status | Condition | Body |
 |---|---|---|
 | `201` + `Location` + `ETag` | Created | SCIM User representation |
-| `409` (`scim_type=uniqueness`) | `userName` already provisioned on a **currently-active** account | SCIM error envelope |
+| `409` (`scim_type=uniqueness`) | `userName` already provisioned on a **currently-active** account (a definitive answer from the duplicate check; a store fault in that check is the `503` below) | SCIM error envelope |
 | `404` | The `userName` already holds an `Administrator` grant, or names a deactivated record whose role is not `user` (nothing is created or reactivated; the answer is a side-effect-free signal to the SCIM bearer holder, not an existence-free one) | SCIM error envelope |
 | `409` (`scim_type=mutability`) | `active:false` on create was refused by the last-Administrator guard (the new account stays active and mapped) | SCIM error envelope |
+| `503` + `Retry-After: 2` | (#6835) The SCIM store could not answer the duplicate-`userName` check; nothing was created, `yuzu_scim_guard_store_unavailable_total{guard="resource"}` counts it, `scim.user.provisioned` / `failure` with detail `store_unavailable: lookup (user lookup (create))` is audited (best effort), and a retry is safe | SCIM error envelope |
 | `500` | A deactivated record's role could not be read, a half-finished create could not be undone (`scim.user.compensation_failed`, state per outcome, see `rbac.md`), or the underlying account write failed | SCIM error envelope |
 | `503` + `Retry-After: 2` | The authorization store was unavailable (the Administrator-grant read failed, or the guarded deactivation for `active:false` timed out or lost its store). The body is the plain SCIM error (no `retry_after_ms` member); the detail says the account state may be indeterminate. After a grant-read failure nothing was created and a retry is safe; after a failed `active:false` deactivation the new account stays active and mapped and a retry of the `POST` answers the userName `409`, so it does not converge. Or (#6836) the role re-check after the reactivation of a revived account could not be read: the reactivation is undone (the account stays down), `Retry-After: 2`, audit `scim.user.provisioned` / `failure` with detail `store_unavailable: revive role check`, counted on `yuzu_scim_guard_store_unavailable_total{guard="role"}` and not on `yuzu_scim_provenance_denied_total`; the IdP's retry of the `POST` converges once the store answers. If the undo cannot complete (likely during a real outage, since the undo needs the same store) the answer is `500`, not `503`: audit detail `store_unavailable: revive role check; undo did not complete; see scim.user.compensation_failed`, a `scim.user.compensation_failed` row, `yuzu_scim_guard_store_unavailable_total{guard="role"}` still counted (it is bumped before the undo), and the account may be left active or indeterminate; an IdP retry revives it idempotently once the store answers | SCIM error envelope |
 
@@ -13844,7 +13883,8 @@ Read a single provisioned user by its SCIM `id`.
 | Status | Condition |
 |---|---|
 | `200` | Found — SCIM User representation |
-| `404` | Unknown `id` |
+| `404` | Unknown `id` (a definitive answer: the store was read and has no such resource) |
+| `503` + `Retry-After: 2` | (#6835) The SCIM store could not be read. Not a `404`; retry. No audit row (a `GET`); counted on `yuzu_scim_guard_store_unavailable_total{guard="resource"}` |
 
 #### `GET /scim/v2/Users?filter=userName eq "x"&startIndex=&count=`
 
@@ -13853,7 +13893,10 @@ call a connector makes before create. **Only `userName eq "value"` is
 supported** (case-insensitive attribute/operator, double-quoted value); any
 other filter expression is rejected `400` (`scim_type=invalidFilter`).
 Response is a SCIM `ListResponse` envelope; `startIndex` is 1-based per RFC
-7644 §3.4.2.
+7644 §3.4.2. (#6835) If the store cannot answer the `userName eq` lookup, the answer is
+`503` + `Retry-After: 2`, not an empty `ListResponse`: a connector that reads an empty list
+as "does not exist" would otherwise try to create a duplicate. The unfiltered list is not
+covered: it fails open and can read as empty or short during an outage (#2481).
 
 #### `PUT /scim/v2/Users/{id}`
 
@@ -13866,8 +13909,9 @@ connectors issue `PUT` rather than `PATCH` for lifecycle changes.
 |---|---|
 | `200` | Replaced — SCIM User representation |
 | `400` (`scim_type=mutability`) | Body includes a `userName` change — rename is out of scope this slice |
-| `404` | Unknown `id`, or the provenance/role guard rejects the target (see below) |
+| `404` | Unknown `id` (a definitive answer; a failed store read is the `503` below), or the provenance/role guard rejects the target (see below) |
 | `409` (`scim_type=mutability`) | `active:false` would remove the fleet's last protected administrator (see "Last-administrator refusal" below) |
+| `503` + `Retry-After: 2` | (#6835) The SCIM store could not be read for the resource lookup. Nothing is changed; audited as `scim.user.updated` / `failure`, detail `store_unavailable: lookup (user lookup (replace))` (best effort); counted on `yuzu_scim_guard_store_unavailable_total{guard="resource"}`; retry |
 | `500` | The account was deactivated but its durable session wipe failed (an IdP retry is not promised to repeat the wipe, #5214), or another account write failed |
 | `503` + `Retry-After: 2` | The guarded deactivation timed out or lost its store (the linked credentials were already revoked; the detail says the account state may be indeterminate), `active:true` could not read the Administrator grants, or (#4068) `active:false` on a resource whose Yuzu mirror already reads inactive could not verify the real account state because the user store did not answer: the request is refused instead of reported as an already-deprovisioned no-op, nothing is changed, and a retry once the store answers repairs a desynced account. Audit `scim.user.deactivated / failure` keyed by the resource's SCIM id with detail `store_unavailable: verifying account state`. A retry finishes the job only when the cause was a lock timeout in which nothing committed; it does not converge after a lost commit acknowledgement (the retry meets the `404` of the role guard on the now-deactivated account, #5214). Or (#6836) the provenance or role re-check could not be read because the user store did not answer: `Retry-After: 2`, audited as the request's own action (`failure`, detail `store_unavailable: provenance check` or `store_unavailable: role check`), counted on `yuzu_scim_guard_store_unavailable_total{guard}` and not on `yuzu_scim_provenance_denied_total`. The guard that fails makes no change. A `PUT`, or a `PATCH` that sets `externalId` together with a change to `active`, applies the `active` change first and then re-checks provenance (and, after a reactivation, the role); if that re-check meets the outage, the `503` follows an already-applied activation change (the audit shows a `success` row for the activation followed by a `scim.user.updated` `failure`) and the IdP's retry, which finds the account already in the requested state, completes. |
 
@@ -13884,19 +13928,19 @@ and explicit `{"path":"active","value":false}` PatchOp forms are accepted.
 | Status | Condition |
 |---|---|
 | `200` | Applied — SCIM User representation |
-| `404` | Unknown `id`, or the provenance/role guard rejects the target (see below) |
+| `404` | Unknown `id` (a definitive answer), or the provenance/role guard rejects the target (see below) |
 | `409` (`scim_type=mutability`) | `active:false` would remove the fleet's last protected administrator (see "Last-administrator refusal" below) |
-| `500` / `503` | As for `PUT` above, including the (#6836) `503` when the provenance or role re-check could not be read |
+| `500` / `503` | As for `PUT` above, including the (#6835) `503` when the resource lookup could not read the SCIM store and the (#6836) `503` when the provenance or role re-check could not be read |
 
 `active:true` applies the same pre-checks as `POST` on a revive (behaviour change: such a request used to reactivate the account): a deactivated record whose role is not `user`, or a username that now holds an `Administrator` grant, is `404` (nothing reactivated), audited as `scim.user.provenance_denied`. A tombstone whose role cannot be read answers `500` and an unreadable grant answer is the `503` above (audit `scim.user.reactivated` / `failure`: `tombstone role unreadable before reactivation` or `administrator grant check unavailable`). Every `404` bumps `yuzu_scim_provenance_denied_total`, which the shipped alert describes as a compromised-IdP signal: this benign case also fires it. An elevated tombstone cannot be re-enabled through SCIM or the dashboard until its role is cleared (see `rbac.md`, "SCIM specifics"); SCIM can deactivate the holder of an `Administrator` grant but cannot reactivate it until the grant is removed.
 
 #### `DELETE /scim/v2/Users/{id}`
 
 Deprovision (equivalent to `PATCH`/`PUT active:false` for IdPs that issue a
-hard delete). `204` on success; `404` if unknown or guard-rejected; `409`
+hard delete). `204` on success; `404` if unknown (a definitive answer) or guard-rejected; `409`
 (`scim_type=mutability`) under the last-administrator refusal below; `500`
 (account deactivated but its durable session wipe failed) or `503` +
-`Retry-After: 2` (the guarded write timed out or lost its store, or (#6836) the provenance or role re-check could not be read; a `DELETE` of an already-inactive mirror runs the provenance check only), as for `PUT`.
+`Retry-After: 2` (the guarded write timed out or lost its store, or (#6836) the provenance or role re-check could not be read; a `DELETE` of an already-inactive mirror runs the provenance check only; or (#6835) the resource lookup could not read the SCIM store, audited best effort as `scim.user.deleted` / `failure` with detail `store_unavailable: lookup (user lookup (delete))`), as for `PUT`.
 
 #### Last-administrator refusal
 
@@ -13980,7 +14024,8 @@ Create a group. Body: `displayName` (required), optional `members[]`
 | Status | Condition | Body |
 |---|---|---|
 | `201` + `Location` + `ETag` | Created | SCIM Group representation |
-| `409` (`scim_type=uniqueness`) | `displayName` already in use | SCIM error envelope |
+| `409` (`scim_type=uniqueness`) | `displayName` already in use (a definitive answer from the duplicate check) | SCIM error envelope |
+| `503` + `Retry-After: 2` | (#6835) The SCIM store could not answer the duplicate-`displayName` check (nothing created; audited best effort as `scim.group.created` / `failure`, detail `store_unavailable: lookup (group lookup (create))`; counted on `guard="resource"`), or a member could not be resolved ("membership unavailable", audited `scim.group.created` / `failure`). In the second case the members are resolved BEFORE the group row is created, so nothing is created, nothing is rolled back, and the retry creates the group normally (`201`, never a `409` against an empty group); the audit row has an empty target id. (A failure to persist the membership after the group was created is a different case: `500` `failed to persist group membership`, and the empty group remains.) | SCIM error envelope |
 
 The success audit row (`scim.group.created`) records `recompute=complete` when
 every affected member's role was recomputed as intended, otherwise
@@ -13989,8 +14034,10 @@ below.
 
 #### `GET /scim/v2/Groups/{id}`
 
-Read a single group by its SCIM `id`. `200` + Group representation, or
-`404` if unknown.
+Read a single group by its SCIM `id`. `200` + Group representation, `404` if unknown
+(a definitive answer), or `503` + `Retry-After: 2` if the SCIM store could not be read
+(#6835; a `GET`, so no audit row; counted on `guard="resource"`) or the Group's members could not be
+read ("membership unavailable", which now also carries `Retry-After: 2`).
 
 #### `GET /scim/v2/Groups?filter=displayName eq "x"&startIndex=&count=`
 
@@ -13998,13 +14045,19 @@ List groups. Same pagination contract as `GET /scim/v2/Users`
 (`startIndex`/`count`, SCIM `ListResponse` envelope, `startIndex` 1-based per
 RFC 7644 §3.4.2). Optional `filter=displayName eq "..."` (case-insensitive
 attribute/operator, double-quoted value); any other filter expression is
-rejected `400` (`scim_type=invalidFilter`).
+rejected `400` (`scim_type=invalidFilter`). (#6835) A failed store read for the
+`displayName eq` lookup is `503` + `Retry-After: 2`, not an empty `ListResponse`. The
+unfiltered list is not covered: it fails open (#2481).
 
 #### `PUT /scim/v2/Groups/{id}`
 
 Replace a group (`displayName`, `members[]`). `200` + Group representation;
 `404` if unknown; `409` (`scim_type=uniqueness`) if the replace would rename
-onto a `displayName` already used by a different group. The success audit row
+onto a `displayName` already used by a different group; `503` + `Retry-After: 2` if the
+SCIM store could not be read for the Group lookup, the re-read of the current Group, or the
+rename duplicate check (#6835; nothing changed, audited best effort as `scim.group.updated` / `failure` with detail `store_unavailable: lookup (<site>)`, counted on `guard="resource"`),
+or if membership could not be read or resolved ("membership unavailable", audited
+`scim.group.updated` / `failure`, now with `Retry-After: 2`). The success audit row
 (`scim.group.updated`) records `recompute=complete` or `recompute=incomplete`
 (the status stays `200`).
 
@@ -14012,12 +14065,19 @@ onto a `displayName` already used by a different group. The success audit row
 
 Add/remove members — RFC 7644 §3.5.2 PatchOp on the `members` path
 (`"op": "add"` / `"op": "remove"`, `"path": "members"`). `200` + Group
-representation, or `404` if unknown. The success audit row (`scim.group.updated`)
+representation, `404` if unknown, or `503` + `Retry-After: 2` if the SCIM store could not be
+read for the Group lookup, the re-read of the current Group or the rename duplicate check
+(#6835; nothing changed, audited best effort as `scim.group.updated` / `failure` with detail `store_unavailable: lookup (<site>)`, counted on `guard="resource"`) or membership could not
+be read or resolved (audited `scim.group.updated` / `failure`, now with `Retry-After: 2`). The
+success audit row (`scim.group.updated`)
 records `recompute=complete` or `recompute=incomplete` (the status stays `200`).
 
 #### `DELETE /scim/v2/Groups/{id}`
 
-Delete a group. `204` on success; `404` if unknown. The success audit row
+Delete a group. `204` on success; `404` if unknown; `503` + `Retry-After: 2` if the SCIM store
+could not be read for the Group lookup (#6835; audited best effort as `scim.group.deleted` / `failure` with detail `store_unavailable: lookup (group lookup (group_delete))`, counted on `guard="resource"`) or
+the membership snapshot could not be read (audited `scim.group.deleted` / `failure`, now with
+`Retry-After: 2`). The success audit row
 (`scim.group.deleted`) records `recompute=complete` or `recompute=incomplete`
 (the status stays `204`).
 
@@ -14032,19 +14092,19 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 
 | Action | Result | When |
 |---|---|---|
-| `scim.user.provisioned` | `success` / `denied` / `failure` | `POST` succeeds (incl. a revived reprovision) / rejected `409` against an active account / rolls back `500`. (#6836) A revive whose role re-check could not be read is `failure` / `503` with `detail` `store_unavailable: revive role check` (`target_id` is the userName; the reactivation was undone); if the undo did not complete it is `failure` / `500` with `detail` `store_unavailable: revive role check; undo did not complete; see scim.user.compensation_failed`. (#4068) A `500` after a failed account create whose concurrent-create re-read hit a user-store error carries `detail` `store_unavailable: concurrent-create re-read` (the answer stays `500`: the create may have committed, so a retry would meet the non-SCIM-account `409`; tracked in #6837) |
-| `scim.user.updated` | `success` / `failure` | `PUT /scim/v2/Users/{id}` succeeds / fails `500`; `failure` / `503` (#6836) with `detail` `store_unavailable: provenance check` or `store_unavailable: role check` when the provenance re-check, or the role re-check on an active resource (including straight after a reactivation), that a `PUT` (always) or a `PATCH` with `externalId` runs before its `externalId` write could not read the user store; when it follows an `active` change, that change was already applied and has its own `success` row |
+| `scim.user.provisioned` | `success` / `denied` / `failure` | `POST` succeeds (incl. a revived reprovision) / rejected `409` against an active account / rolls back `500`. (#6836) A revive whose role re-check could not be read is `failure` / `503` with `detail` `store_unavailable: revive role check` (`target_id` is the userName; the reactivation was undone); if the undo did not complete it is `failure` / `500` with `detail` `store_unavailable: revive role check; undo did not complete; see scim.user.compensation_failed`. (#4068) A `500` after a failed account create whose concurrent-create re-read hit a user-store error carries `detail` `store_unavailable: concurrent-create re-read` (the answer stays `500`: the create may have committed, so a retry would meet the non-SCIM-account `409`; tracked in #6837). (#6835) A SCIM-store fault in the duplicate-`userName` lookup is `failure` / `503` with `detail` `store_unavailable: lookup (user lookup (create))` (`target_id` is the userName; best effort) |
+| `scim.user.updated` | `success` / `failure` | `PUT /scim/v2/Users/{id}` succeeds / fails `500`; `failure` / `503` (#6836) with `detail` `store_unavailable: provenance check` or `store_unavailable: role check` when the provenance re-check, or the role re-check on an active resource (including straight after a reactivation), that a `PUT` (always) or a `PATCH` with `externalId` runs before its `externalId` write could not read the user store; when it follows an `active` change, that change was already applied and has its own `success` row. (#6835) A SCIM-store fault in the resource lookup is `failure` / `503` with `detail` `store_unavailable: lookup (user lookup (replace))` or `(user lookup (patch))` (best effort) |
 | `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write itself could not persist. (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#4068) A desync-repair read that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: verifying account state` (`target_id` is the SCIM id); nothing was changed. (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. |
 | `scim.user.reactivated` | `success` / `failure` | `PATCH`/`PUT` sets `active:true`. `failure` causes: the tombstone's role could not be read (`500`, detail `tombstone role unreadable before reactivation`), the Administrator-grant read was unavailable (`503`, detail `administrator grant check unavailable`), the account or mirror write failed (`500`). An elevated tombstone or a name holding an Administrator grant is NOT a `reactivated` row: it is `scim.user.provenance_denied` (`404`). (#6836) The provenance check inside the reactivation, when the user store could not answer it, is `failure` / `503` with `detail` `store_unavailable: provenance check`; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard="provenance"}`. The role re-check that a `PUT`/`PATCH` carrying `externalId` runs straight after a reactivation is audited as `scim.user.updated`, not `scim.user.reactivated`. |
-| `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed). (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. |
+| `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed). (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. (#6835) A SCIM-store fault in the resource lookup is `failure` / `503` with `detail` `store_unavailable: lookup (user lookup (delete))` (best effort). |
 | `scim.user.provenance_denied` | `denied` | A mutating call targets an account failing the provenance or role guard, or a `POST` or an `active:true` reactivation names a tombstone whose role is not `user` / a username that already holds an `Administrator` grant (the latter two also fire for a benign re-enable of an account an operator elevated or granted outside SCIM). For a deactivate, delete, reactivate, update or a `POST` that revives a removed account, a store fault is not a denial (#6836): when the user store cannot answer the provenance or role read (a `POST` revive re-reads only the role), no `scim.user.provenance_denied` row is written, `yuzu_scim_provenance_denied_total` does not move and the linked-identity escalation does not fire; the request answers `503` and is audited as its own action with `store_unavailable`. The `POST` create reads (the provisioning-source read and the duplicate/race reads) are tracked in #6837; the tombstone-role `500` in the revive pre-check (`POST` revive and `PATCH`/`PUT` `active:true`; the grant-read fault in the same pre-check already answers `503`) and the `500` when the reactivation's own post-commit re-read fails (`failed to revive the underlying account`, no undo) are not covered by this change either (same defect class as #6837, which does not list them). |
 | `scim.user.last_administrator_refused` | `denied` / `partial` | The last-Administrator guard refused a deactivation, delete, `POST` with `active:false` or group-derived demotion (`409` `mutability` on the Users routes; a refused group-derived demotion is not a `409`: the Group request keeps its `2xx` and the member keeps the role). On the Users routes `detail` carries `attempted_action=...`, `early_refusal=true\|false`, `credentials_revoked_before_refusal=true\|false`, `account_remains_active=true` and `live_api_tokens_slug=<n>` (the username's own live tokens; `unknown` if the store could not answer), plus `sessions_not_revoked=true` on an early refusal or `identity_links_unchanged=true` and the revoke summary on a late one; a LATE refusal is `partial` (credentials were revoked), an early one and a refused group-derived demotion are `denied`. `live_api_tokens_slug` is followed by `linked_principals_not_walked=true`: linked OIDC/SAML principals' tokens are not counted. The `revoked_principals=` list is lossy: `,`, space, `=`, control bytes and every byte >= 0x80 become `_`, so two distinct principals can collapse into one token (the exact identity stays in `identity_links`). For a refused group-derived demotion it carries `attempted_action=scim.user.role_changed` and `role_unchanged=true`. Every refusal, including a refused demotion, also raises a critical analytics event |
 | `scim.group.recompute_incomplete` | `partial` | (target type `Group`) A Group request's role recompute did not apply every member as intended (a refused or failed demotion, an undetermined member whose read failed, or promotions skipped after a failed guarded write): `detail` carries `members=<n>` and, per non-empty class, `refused`, `failed`, `undetermined` or `skipped_promotions` with the count and up to 20 usernames (the first 20 are named; the count is exact), then the trigger. Counted on `yuzu_scim_group_recompute_skipped_total{cause}`. The Group request's own status is unchanged, and its `scim.group.created`/`updated`/`deleted` success row says `recompute=incomplete`. A failed demotion is also a `scim.user.role_changed` `failure` row plus a critical analytics event |
 | `scim.user.compensation_failed` | `failure` | The guarded undo of a half-finished create/revive was refused or failed; the request answered `500`. `outcome=guard_refused_last_administrator` leaves the account active; `deactivated_but_session_wipe_failed` leaves it deactivated with a possibly live session; `store_failure` leaves its state indeterminate, so check the account. A critical analytics event and `yuzu_scim_compensation_failed_total{outcome}` accompany it |
-| `scim.auth.denied` | `denied` | Bearer-auth validation fails on any `/scim/v2/*` route, including discovery |
-| `scim.group.created` | `success` / `denied` / `failure` | `POST /scim/v2/Groups` succeeds / rejected `409` - `displayName` collision / rolls back `500`. On `success`, `detail` is `recompute=complete` or `recompute=incomplete` |
-| `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` - rename onto an existing `displayName` / fails `500`. On `success`, `detail` is `recompute=complete` or `recompute=incomplete` |
-| `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed). On `success`, `detail` is `recompute=complete` or `recompute=incomplete` |
+| `scim.auth.denied` | `denied` | Bearer-auth validation fails (missing, malformed or wrong token) on any `/scim/v2/*` route, including discovery. (#6835) Not written when the token check could not read the store: that is a `503`, with no audit row (the request has no verb or identity, and a row per polled `GET` would trip `YuzuScimAuditWriteFailures`), counted on `yuzu_scim_guard_store_unavailable_total{guard="bearer"}` and logged at `ERROR` |
+| `scim.group.created` | `success` / `denied` / `failure` | `POST /scim/v2/Groups` succeeds / rejected `409` - `displayName` collision / fails `500`. On `success`, `detail` is `recompute=complete` or `recompute=incomplete`. (#6835) A SCIM-store fault in the duplicate-`displayName` lookup is `failure` / `503` with `detail` `store_unavailable: lookup (group lookup (create))` (empty target; best effort). A member-resolution `503` is raised before the group row is created: it is `failure` with an empty target id and `detail` `member resolution unavailable; no group was created`, nothing is created (no rollback exists), and the retry creates the group normally (`201`). A `500` `failed to persist group membership` (after the group was created) leaves the empty group in place. |
+| `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` - rename onto an existing `displayName` / fails `500`. On `success`, `detail` is `recompute=complete` or `recompute=incomplete`. (#6835) A SCIM-store fault in the Group lookup, the re-read of the current Group or the rename duplicate check is `failure` / `503` with `detail` `store_unavailable: lookup (<site>)` where `<site>` is `group lookup (group_replace)`, `(group_replace, current)`, `(rename, replace)`, `(group_patch)`, `(group_patch, current)` or `(rename, patch)` (best effort) |
+| `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed). On `success`, `detail` is `recompute=complete` or `recompute=incomplete`. (#6835) A SCIM-store fault in the Group lookup is `failure` / `503` with `detail` `store_unavailable: lookup (group lookup (group_delete))` (best effort) |
 | `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value on user create or a Group create/replace/patch/delete (records `old_role`→`new_role`, `reason=group`) |
 | `scim.user.deprovision_role_refused_with_link` | `failure` | ADR-2001 D1: a role-refused deprovision (`deprovision_role_ok` 404 — the slug's role is not `user`) for a slug with ≥1 active linked OIDC identity, whose tokens are therefore NOT auto-revoked. Always written alongside `yuzu_scim_deprovision_role_refused_with_active_link_total` — see `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision". |
 | `auth.oidc.deprovisioned_denied` | `failure` | ADR-2001 §4/PR3: an OIDC login was refused because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the store could not answer — fail-closed). Emitted from `GET /auth/callback`, not a `/scim/v2/*` route — listed here because it is part of the same ADR-2001 linkage. `detail` carries `reason=linked_scim_resource_inactive;scim_id=<id>` when a resolved resource (deactivated, or orphaned by a hard-deleted `scim_resources` row) drove the denial, or `reason=scim_store_unavailable` when the store could not answer (fail-closed — no `scim_id` to name); and — only on the post-mint re-check path (a concurrent deprovision landed after the primary check) — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). The two `reason` values keep a genuine deprovision (CC6.8 evidence) distinguishable from a store outage. Pairs with `yuzu_auth_oidc_deprovisioned_denied_total`. |
@@ -14055,9 +14115,10 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 #### Metrics
 
 `yuzu_scim_requests_total{op,status}` (now including group ops),
-`yuzu_scim_auth_failures_total`, `yuzu_scim_audit_write_failures_total`,
-`yuzu_scim_provenance_denied_total`, `yuzu_scim_guard_store_unavailable_total` (#6836, label
-`guard`), `yuzu_scim_role_changes_total`,
+`yuzu_scim_auth_failures_total` (a rejected or missing token only; a store fault while
+checking the token does not move it), `yuzu_scim_audit_write_failures_total`,
+`yuzu_scim_provenance_denied_total`, `yuzu_scim_guard_store_unavailable_total` (#6836, #6835;
+label `guard` = `provenance`\|`role`\|`bearer`\|`resource`), `yuzu_scim_role_changes_total`,
 `yuzu_scim_role_change_failures_total` (a role change that was decided but
 failed to durably apply — pairs with `scim.user.role_changed` `failure`
 rows).

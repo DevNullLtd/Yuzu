@@ -47,8 +47,9 @@
  * destructor, after the mutex is released, so logging itself never extends
  * another caller's wait. Prefer it over a bare
  * `std::lock_guard<std::mutex>(offline_hive_mutex())` for any new caller;
- * today with_user_hive() (agents/shared/win_profiles.hpp) is the only call
- * site, serving every plugin that goes through it.
+ * today with_user_hive() (agents/shared/win_profiles.hpp) serves every plugin
+ * that goes through it; execution_artifacts (above) and the Echo registry
+ * start-up sweep (echo_registry_source.cpp) take the lock directly.
  */
 
 #include <yuzu/plugin.h> // YUZU_EXPORT

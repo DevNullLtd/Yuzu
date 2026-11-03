@@ -2235,40 +2235,60 @@ groups:
             scim provenance-denial audit row for the calling IdP/client.
           runbook_url: "https://docs.yuzu.io/runbooks/scim-provenance-denied"
 
-      # #6836: a SCIM deactivate/delete/reactivate/update (or a POST that
-      # revives a removed account) could not READ its provenance or role guard
-      # from the auth store and answered a retryable 503. Distinct from YuzuScimProvenanceDenied above: nothing was refused.
-      # Before #6836 this same fault was reported to the IdP as a 404 and
-      # counted as a provenance denial, so YuzuScimProvenanceDenied fired for
-      # an outage by accident; it no longer does, and this rule replaces that
-      # signal. `guard` is the closed pair provenance|role, pre-seeded to 0.
+      # #6836 / #6835: a SCIM request could not READ the store it needed and
+      # answered a retryable 503 instead of acting. Distinct from
+      # YuzuScimProvenanceDenied above: nothing was refused. `guard` is the
+      # closed set provenance|role (the deprovision / revive guards, #6836) and
+      # bearer|resource (the SCIM token check and the User / Group lookups,
+      # #6835), pre-seeded to 0. Before these changes the same faults were
+      # reported to the IdP as a 404 (and counted as a provenance denial, so
+      # YuzuScimProvenanceDenied fired for an outage by accident) or as a 401
+      # (a credential failure); this rule replaces that signal.
       - alert: YuzuScimGuardStoreUnavailable
         expr: |
           increase(yuzu_scim_guard_store_unavailable_total[1h]) > 0
         labels:
           severity: warning
         annotations:
-          summary: "SCIM could not read the {{ $labels.guard }} guard from the auth store (retryable 503)"
+          summary: "SCIM could not read the store for a {{ $labels.guard }} check (retryable 503)"
           description: >-
             yuzu_scim_guard_store_unavailable_total{guard="{{ $labels.guard }}"}
-            moved: a SCIM deactivate, delete, reactivate or update, or a POST
-            that revives a removed account, could not read its
-            {{ $labels.guard }} check from the auth store and answered 503
-            with Retry-After instead of acting. Nothing was refused and the
-            failed guard changed nothing, but the IdP has to retry for the
-            deprovision to complete, so a sustained rate means leavers'
-            accounts are being deactivated late. This is not a provenance
+            moved: a SCIM request could not read the store behind its
+            {{ $labels.guard }} check and answered 503 with Retry-After
+            instead of acting. guard=bearer is the SCIM token check (the
+            request could not be authenticated, so no SCIM verb was served),
+            guard=resource is a User or Group lookup, guard=provenance and
+            guard=role are the deprovision and revive guards (the role guard
+            includes the role re-check of a POST that revives a removed
+            account). Nothing was refused and the failed read changed nothing,
+            but the IdP has to retry for the work to complete, so a sustained
+            rate means provisioning, and above all leavers' deactivations, are
+            running late. This is not a credential failure or a provenance
             denial (YuzuScimProvenanceDenied is the refusal signal). Check
             /readyz, the yuzu_pg_* pool and connect alerts, and the server
-            ERROR log lines "ScimRoutes: provenance check", "ScimRoutes:
-            deprovision role check" and "ScimRoutes: revive role check"; then
-            confirm in the IdP's provisioning
-            log that the retries succeed. It does not cover a full database
-            outage, where the bearer-token check answers 401 first (#6835). If
-            the audit store is down as well, the request's audit row may be
-            missing and YuzuScimAuditWriteFailures
-            (yuzu_scim_audit_write_failures_total{action="scim.user.deactivated"})
-            can fire for a request that changed nothing.
+            ERROR log lines "ScimRoutes: bearer validation", "ScimRoutes: user
+            lookup", "ScimRoutes: group lookup", "ScimRoutes: provenance check",
+            "ScimRoutes: deprovision role check" and "ScimRoutes: revive role
+            check"; then confirm in the IdP's provisioning log that the retries
+            succeed. The counter is in memory, so it moves while the database
+            is down, but this rule only fires once Prometheus manages to scrape
+            /metrics. Do not rely on it to page DURING a full database outage:
+            a remote scrape of the authenticated /metrics resolves its session
+            or API token against Postgres (it can fail, except for a localhost
+            scrape, --metrics-no-auth, or a still-cached token) and the
+            handler itself reads Postgres. YuzuServerPostgresUnreachable and
+            YuzuPgConnectFailing need a working scrape too, so they are not an
+            honest backstop for a TOTAL outage either; the backstops for that
+            case are the /readyz readiness probe and an operator-defined
+            `up == 0` (scrape target down) alert on the server job (none
+            ships in this file). This rule then fires after recovery from the
+            increase over the gap, or at once when the fault is partial. If
+            the audit store is down as well, the audit row of a mutating
+            request's 503 (scim.user.provisioned, scim.user.updated,
+            scim.user.deleted, scim.group.created, scim.group.updated or
+            scim.group.deleted with result failure) may be missing and
+            YuzuScimAuditWriteFailures can fire for a request that changed
+            nothing.
           runbook_url: "https://docs.yuzu.io/runbooks/scim-guard-store-unavailable"
 
       # Audit-write-failures: a committed SCIM mutation (create/update/patch/
@@ -2299,7 +2319,17 @@ groups:
             advance) — a truly isolated first failure of a given `action`
             may lag up to one evaluation cycle before this rule fires;
             treat a single fresh occurrence with that in mind, and rely on
-            recurrence/sustained failures for confident detection.
+            recurrence/sustained failures for confident detection. This
+            rule may also fire for a request that changed nothing: a SCIM
+            request whose User or Group lookup could not read the store
+            answers 503 and is audited, best effort, under its own verb
+            (scim.user.provisioned, scim.user.updated, scim.user.deleted,
+            scim.group.created, scim.group.updated or scim.group.deleted)
+            with result failure and a detail beginning "store_unavailable:";
+            when the audit store is down too, that failure row is lost and
+            this counter moves for a 503 that mutated nothing. Read
+            yuzu_scim_guard_store_unavailable_total alongside it before
+            treating the gap as lost evidence of a committed change.
           runbook_url: "https://docs.yuzu.io/runbooks/scim-audit-write-failures"
 
   - name: yuzu-mcp
@@ -5806,6 +5836,75 @@ groups:
             (yuzu_inventory_catalog_rollup_duration_seconds vs the 60s budget).
             While it fires, /crypto reads its package names live (slower) if the shared
             catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuSoftwareNormalizationStale
+        # The title normalisation job (SoftwareNormalizationJob) ticks hourly (after a full
+        # capped tick, or one that found the catalogue rollup's title_triples not yet filled,
+        # it ticks again in 60 s; a failed tick always waits the hour) and stamps
+        # yuzu_software_normalization_last_success_timestamp
+        # on a tick with no failed pass. If ticks stop succeeding, the title dimension and
+        # curation queue stop following the fleet. `> 0` GUARD IS LOAD-BEARING: the gauge is
+        # seeded to 0 when the job is constructed, so a naive `now - ts` fires on every cold
+        # boot; the guard skips the building window. A job that has NEVER succeeded is the
+        # Failing rule's case. 7200 s is twice the hourly cadence
+        # (kCatalogueRefreshIntervalSeconds), as for the sibling
+        # YuzuInventoryCatalogRollupStale.
+        expr: |
+          (time() - yuzu_software_normalization_last_success_timestamp) > 7200
+          and yuzu_software_normalization_last_success_timestamp > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Software title normalisation is stale"
+          description: >-
+            The software title normalisation job has not completed a clean tick in over 2h
+            (cadence is 1h). The title dimension and curation queue are frozen at their last
+            good state. Check yuzu_software_normalization_pass_total{outcome="error"} and the
+            server log lines prefixed "Software normalisation:" and "SoftwareTitleDimension:"
+            (Postgres availability, the 60 s per-pass budget). Its candidate source is the
+            catalogue rollup's title_triples table, which this alert cannot watch: if
+            YuzuInventoryCatalogRollupStale or YuzuInventoryCatalogRollupFailing is also
+            firing, fix the rollup first, because a clean tick over a stalled rollup does
+            not alert here.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuSoftwareNormalizationFailing
+        # Sized to the HOURLY cadence. The job adds at most ONE error increment per tick (a
+        # failed tick is never re-armed early), and the wait is measured from the END of a
+        # tick, so a sustained outage's period is 3600 s PLUS the tick's own duration, always
+        # a little over an hour. A rate()/15m window with a 15m hold (the sibling
+        # YuzuInventoryCatalogRollupFailing shape) can never observe that: the single
+        # increment ages out of a 15m window long before `for` elapses. A 2h window is too
+        # tight as well: with a period over 60 min it holds only ONE increment for a couple
+        # of minutes of every period, the expression drops below 2 and `for` resets, so the
+        # alert would go quiet once an hour in a sustained outage. increase()[3h] >= 2 always
+        # holds at least two increments while the period is under 90 min, fires on the second
+        # failed tick and stays firing through the outage; one isolated failure followed by a
+        # success stays quiet. The threshold is >= 2, not > 1: increase() extrapolates to the
+        # window edges (factor >= 1, never below), so a SINGLE increment on a non-zero
+        # baseline (an earlier failure that has aged out of the window) reads a little above 1
+        # (~1.01 on a 1m scrape) for the whole time it stays in the window, while two
+        # increments read >= 2. That holds while the scrape interval is far below 3h. A job
+        # that never succeeded
+        # (the case the Stale rule's `> 0` guard skips) fires at its second failed tick: both
+        # outcome series are seeded at 0 when the job is constructed, so the first failure is
+        # already an increase.
+        expr: |
+          sum by (instance) (increase(yuzu_software_normalization_pass_total{outcome="error"}[3h])) >= 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Software title normalisation ticks are failing"
+          description: >-
+            Two or more hourly software title normalisation ticks failed within 3h. If
+            yuzu_software_normalization_last_success_timestamp is still 0 the job has never
+            completed a tick; otherwise the dimension is frozen at its last good state.
+            Investigate Postgres availability and the server log lines prefixed
+            "Software normalisation:" and "SoftwareTitleDimension:" (a pass over its 60 s
+            budget, a missing alias pack, a failed queue reconcile). The catalogue rollup that
+            fills title_triples has its own alerts (YuzuInventoryCatalogRollupStale and
+            YuzuInventoryCatalogRollupFailing); check them as the upstream cause.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       # YuzuInventoryStaleAgents — SHIPPED DISABLED. The freshness gauge
       # (yuzu_inventory_stale_agents{source}) is exported and graphable, but there

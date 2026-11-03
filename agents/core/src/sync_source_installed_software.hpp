@@ -14,6 +14,7 @@
 ///   windows_optional_features.list          every DISM feature, state in `version`
 ///   msi_packages.list_inventory             machine-context MSI products (ecosystem `msi`)
 ///   runtimes.python                         installed Python interpreters (ecosystem `python`)
+///   middleware.ibm_mq                       installed IBM MQ (ecosystem `ibm_mq`; name and publisher from the product table)
 /// Every row carries `source` = "<plugin>.<action>". NO per-user data (machine
 /// scope only — no PII).
 
@@ -40,7 +41,7 @@ struct SwEntry {
     std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
     std::string kind;      // "package" | "app" | "pkg" | "feat"
-    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi|python
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi|python|ibm_mq
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
@@ -161,6 +162,16 @@ YUZU_EXPORT AdaptedRows parse_runtimes_python_output(const std::string& out, Con
 /// #5186 territory). `feature|unsupported|...` -> unsupported;
 /// `feature|unavailable|<token>` or no feature rows at all -> failed.
 YUZU_EXPORT AdaptedRows parse_windows_optional_features_output(const std::string& out);
+
+/// Adapt `middleware` product output for the product table row `action` names (`status|<id>|<level>|...`
+/// plus six-token `<id>|<title>|<name>|<version or ->|<install_path>|<edition or ->`). A row maps
+/// to {name=title, publisher=vendor, kind, ecosystem} from agents/shared/middleware_products.hpp
+/// ONLY when its title column equals the table title; any other row is dropped and counted, its
+/// siblings kept. install_path and edition are not carried. An unknown `action` -> failed.
+/// The collector's table row uses ConstrainedPolicy::drop_source: a `constrained` answer
+/// contributes no rows (Status::withheld) and the cycle continues; `unsupported` is skipped.
+YUZU_EXPORT AdaptedRows parse_middleware_output(const std::string& out, std::string_view action,
+                                                ConstrainedPolicy policy);
 
 /// The action table's (plugin, action) names in table order, as views into static literals —
 /// for the descriptor pin test (tests/unit/test_inventory_sync_action_table.cpp).

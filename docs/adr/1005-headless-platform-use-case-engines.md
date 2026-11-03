@@ -893,7 +893,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        (`get.api-inventory-tables`, `post.api-inventory-query`,
        `get.api-inventory-param-param`, `get.api-agents`,
        `get.fragments-network-overview`, `get.api-tags`). `get.api-agents`
-       has since moved to a dated exception (the 2026-10-23 entry below).
+       has since moved to a dated exception (the 2026-10-23 entry below), and was
+       twinned on 2026-11-02 (the entry of that date, below).
 
    - **2026-10-23 - MCP twin completeness gates, and `list_agents` as a dated
      exception.** Two parts. First, `scripts/ci/check-api-parity.py` gains a
@@ -1169,6 +1170,54 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `Sec-Audit-Failed`, body never sent), MCP reports `audit_persisted:false`,
      and an empty audit callback is audit-off. The null or closed RBAC store 503
      and a bare 401 write no audit row, matching the PUT and the fragment.
+
+   - **2026-11-02 - the `list_agents` exception (#4041) is resolved for every
+     caller except a service-scoped token.** The 2026-10-23 entry above recorded
+     `get.api-agents` and `get.fragments-devices-list` as `exception:#4041
+     revisit:2027-01-31` because MCP `list_agents` did not go through
+     `require_fleet_read`. Its handler now gates on `fleet_read_fn_` alone, with no
+     separate `tier_allows` or `perm_fn` call of its own (the generic C8 tier check
+     still runs first), and filters its rows to the caller's scope; an unwired gate
+     or device seam fails closed. `get.fragments-devices-list` returns to `twinned`
+     and `get.api-agents` moves to `twinned` for the first time (it was `planned`
+     before the exception), both with `list_agents` as the MCP twin. The two
+     `(4041, "2027-01-31")` pins leave `STRICT_EXCEPTION_PINS` and
+     `BASELINE_UNTWINNED` falls from 212 to 210. The 2026-10-23 entry is left as
+     written; this entry supersedes its second part.
+
+     What changed for a caller, because the gap was over-denial and not a leak
+     (ADR-0017): no caller that was already admitted loses a row. A global allow, an
+     engine grant and, for non-engine callers, RBAC off (the default) still read
+     every connected agent, unfiltered; this entry does not confine them. The change is an
+     admission widening: with RBAC on, a caller whose `Infrastructure:Read` comes
+     only through a management group, including one that also holds a global deny
+     (the additive rule of ADR-0017's 2026-07-24 Update), was refused 403 and now
+     gets that group's devices. An authorization-store failure moves from 403 to a
+     retryable 503, and a denial now audits as `auth.fleet_read_required` rather
+     than `auth.permission_required`. A scoped read carries `scope_basis:
+     "authority_scoped"` in both channels, a status as on `list_hardware_ci`, so
+     `content[0].text` is `{agents, scope_basis}` for such a caller and stays the
+     bare array for everyone else; every caller that gets the object was refused
+     before, so no existing text consumer changes shape. `devices_omitted` is not
+     copied from REST, because a count of hidden devices is an existence oracle
+     (ADR-0032 Decision 11, ADR-0033 section 10, ADR-0017 INV-3); REST still serves
+     it, which #6257 tracks.
+
+     `twinned` holds for every caller but one, the `get.api-me` shape (the
+     2026-10-24 entry above): a service-scoped token is refused at C8 on MCP, where
+     `list_agents` keeps its default `ServiceScopeClass::denied` row, while
+     `GET /api/v1/devices` serves it the tagged subset. The divergence fails closed.
+     Whether to reclassify the row as `confined` is open, because that is new
+     authority for a separate change. The parity gate's check for this pair is
+     lexical and does not prove the tool narrows; the unit tests do.
+
+     Not part of this resolution, and still open: the per-guard drilldown
+     `GET /fragments/guardian/guard/{id}/page`, which has no confinement and follows
+     under #4041, the legacy `GET /api/compliance/{id}`, which has no confinement and
+     no audit (#4333), and the other MCP reads on a bare global gate listed on #4041.
+     So this entry does not establish that MCP list reads are scoped as a class; the
+     tools marked Confined in `docs/user-manual/mcp.md` are. Removing the pins drops
+     the 2027-01-31 revisit date from the ledger, and that date now lives on #4041.
 
 ## Interim rules (until the named follow-ups ship)
 

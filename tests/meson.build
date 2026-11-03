@@ -648,6 +648,10 @@ agent_test_exe = executable(
     'unit/test_pkg_inventory_local_dispatcher.cpp', # Wave 10 PR10.1-c: real pkg_inventory plugin via LocalDispatcher, unguarded on every OS
     '../agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp', # Wave 10 PR10.1-c: run_macos (the slot-guarded entry point execute() calls); self-gated to __APPLE__, empty elsewhere
     '../agents/plugins/pkg_inventory/src/pkg_inventory_linux.cpp', # pkg_inventory Linux legs: run_linux (self-gated to __linux__, empty elsewhere)
+    'unit/test_middleware_parsers.cpp',   # SAM.2: product table, pure kv/file-name parsers and the generic runner over a FakeFs, unguarded on every OS
+    'unit/test_middleware_linux_parsers.cpp',       # SAM.2: Linux leg over a materialized tree manifest (REAL registered-install capture plus labelled inline cases; body POSIX-only)
+    'unit/test_middleware_local_dispatcher.cpp',    # SAM.2: real middleware plugin via LocalDispatcher and the table-generated descriptors, unguarded on every OS
+    '../agents/plugins/middleware/src/middleware_linux.cpp', # SAM.2: run_linux (self-gated to __linux__, empty elsewhere)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp, config_checks.hpp
@@ -673,6 +677,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
     include_directories('../agents/plugins/system_hardening/src'),  # system_hardening_*parsers.hpp (pure helpers), Wave 8 PR8.1-b
     include_directories('../agents/plugins/pkg_inventory/src'),  # Wave 10 PR10.1-c: pkg_inventory_*_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/middleware/src'),  # middleware_parsers.hpp / middleware_runner.hpp (SAM.2 pure helpers)
     include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
     include_directories('../agents/plugins/app_usage/src'),  # Wave 7b PR7b.3: app_usage_parsers.hpp
     include_directories('../agents/plugins/execution_artifacts/src'),  # Wave 7b PR7b.1
@@ -866,6 +871,7 @@ agent_test_exe = executable(
                 system_hardening_plugin_lib,  # Wave 8 PR8.1-b
                 runtimes_plugin_lib,  # Wave 10 PR10.1-b
                 pkg_inventory_plugin_lib,  # Wave 10 PR10.1-c
+                middleware_plugin_lib,  # SAM.2: test_middleware_local_dispatcher.cpp loads the real plugin by path
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak
@@ -1355,6 +1361,8 @@ echo_test_exe = executable(
     'unit/test_echo_power.cpp',                   # Wave 6 PR6.2-b: pmset parser + exact-tail cursor/gap decisions, REAL-CAPTURE fixtures, RunFn-injected
     'unit/test_echo_removable.cpp',               # Wave 6 PR6.3: event-log channel parsers + identity + per-channel cursors, REAL-CAPTURE fixtures
     'unit/test_echo_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
+    'unit/test_echo_fold.cpp',                    # roll-up substrate: bucket math, deltas, merge ops, DDL/view parity, fold writer, replay ring, GC, authorizer
+    'unit/test_echo_fold_sizing.cpp',             # roll-up substrate: bytes-per-row ceilings ([fold_sizing], split into its own test() below)
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/echo/src/echo_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -1366,6 +1374,8 @@ echo_test_exe = executable(
     '../agents/plugins/echo/src/echo_diff.cpp',
     '../agents/plugins/echo/src/echo_software_core.cpp',
     '../agents/plugins/echo/src/echo_schema_registry.cpp',
+    '../agents/plugins/echo/src/echo_fold_schema.cpp',
+    '../agents/plugins/echo/src/echo_fold.cpp',
     '../agents/plugins/echo/src/echo_aggregator.cpp',
     '../agents/plugins/echo/src/echo_usage.cpp',
     '../agents/plugins/echo/src/echo_perf.cpp',
@@ -1400,7 +1410,10 @@ echo_test_exe = executable(
   link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   dependencies: echo_test_deps,
 )
-test('echo unit tests', echo_test_exe, args: ['--durations=yes'], suite: 'echo', timeout: 90)
+# The sizing cases fold 20,000 distinct keys per source, so they run as their own test() with a
+# longer timeout; the main run excludes them (the same filter-split shape as the server shards below).
+test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 90)
+test('echo fold sizing', echo_test_exe, args: ['[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 
 # ── Server unit tests ─────────────────────────────────────────────────────────
 if build_server
@@ -1707,6 +1720,7 @@ if build_server
       'unit/server/test_sle_routes.cpp',
       'unit/server/test_inventory_ci_join.cpp',
       'unit/server/test_software_catalog_rollup.cpp',
+      'unit/server/test_software_normalization_job.cpp',
       'unit/server/test_echo_process_tree.cpp',
       'unit/server/test_echo_timeline_render.cpp', # Echo timeline: pure renderer, goldens, CSS pin
       'unit/server/test_echo_timeline_page.cpp', # Echo timeline page: shell pins, flag default, escaping, script pins
@@ -1959,6 +1973,8 @@ if build_server
       'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_product_normalize.cpp',
       'unit/server/test_product_registry_store.cpp',
+      'unit/server/test_software_normalization_pack.cpp',
+      'unit/server/test_software_title_dimension.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
       'unit/server/test_app_usage_store.cpp',       # Wave 7b PR7b.2
@@ -3599,6 +3615,15 @@ test('firmware_posture definition columns',
 test('runtimes definition columns',
   _python3_test,
   args: [files('test_runtimes_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# middleware's definition-column contract (content/definitions/middleware.yaml): row_kind first and the
+# column order match the wire row middleware_parsers.hpp emits; parses the YAML directly.
+test('middleware definition columns',
+  _python3_test,
+  args: [files('test_middleware_definition.py')],
   suite: 'docs',
   timeout: 30,
 )

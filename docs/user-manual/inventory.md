@@ -17,8 +17,9 @@ cadences.
   `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
   `store_packages` (Linux snaps and flatpaks), and
   `windows_optional_features` `list` and `msi_packages` `list_inventory`
-  (Windows machine-context MSI products), and `runtimes` `python` (installed
-  Python interpreters). An action whose plugin is not loaded, or
+  (Windows machine-context MSI products), `runtimes` `python` (installed
+  Python interpreters), and `middleware` `ibm_mq` (IBM MQ
+  installations; Linux). An action whose plugin is not loaded, or
   that answers "unsupported on this OS", is skipped. A plugin that is not
   loaded is logged at warn (the rows its action produced are removed on the next
   report); without `installed_apps` the source stays idle and sends nothing,
@@ -30,9 +31,10 @@ cadences.
   skips that day's report and keeps the last good state — nothing is deleted. A
   `constrained` `managers` answer that still names at least one present manager
   is accepted: the constraint concerns manager facts the presence row never
-  carried. A `constrained` `runtimes` `python` answer is the other exception: it
-  withholds only the Python rows and the cycle continues, so the stored Python rows
-  are removed until a later read succeeds (see Troubleshooting). A skipped cycle
+  carried. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
+  exception: it withholds only that source's rows and the cycle continues, so the
+  stored rows of that source are removed until a later read succeeds (see
+  Troubleshooting). A skipped cycle
   is retried sooner on a phase-aligned backoff: waits that double from 1 h after
   each consecutive skip (1 h, 2 h, 4 h, 8 h, …), each retry capped so it never
   lands after the next daily slot — up to four extra attempts — then one attempt
@@ -46,7 +48,7 @@ cadences.
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `pkg_inventory.store_packages`,
   `windows_optional_features.list`, `msi_packages.list_inventory`,
-  `runtimes.python`); `package_id`
+  `runtimes.python`, `middleware.ibm_mq`); `package_id`
   is empty for these producers except `msi_packages.list_inventory`, where it is
   the MSI product code. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
@@ -85,19 +87,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -176,6 +178,25 @@ cadences.
   software rows, so the stored `python` rows are removed until a read succeeds again
   (see Troubleshooting). A missing or unreadable version file never does this, the
   row reports the version it could determine.
+
+  **IBM MQ** is collected through the `middleware` plugin's `ibm_mq` action (Linux; `source`
+  `middleware.ibm_mq`) with `kind` `app`, `ecosystem` `ibm_mq`, `name` `IBM MQ` and `publisher`
+  `IBM`, taken from the plugin's product table. `version` is VRM (version.release.modification,
+  for example `9.4.5`); the fix-pack level is not carried. The install path and edition
+  are shown by the `middleware` definition, not carried into installed software. This is a
+  metadata-only read with no subprocess: `mqinst.ini` and the
+  swidtag file names, readable by an unprivileged account (measured as a throwaway
+  unprivileged uid on one IBM MQ 9.4.5.0 Ubuntu-debs install; not measured as the packaged
+  `yuzu-agent` account or on another version or distribution). If the answer is `constrained`
+  (an access or walk fault such as a refused read or a cap; an unusable `mqinst.ini` stanza
+  beside a usable one is only logged) the collector withholds this source's rows for the
+  cycle, logs a warning, and carries on with every other source, rather than failing the
+  whole report. Because each cycle replaces the agent's stored inventory, the withheld IBM MQ
+  rows are REMOVED from the stored inventory until the source recovers, so they are absent
+  from the Software page. The server sees no signal for this and cannot tell a withheld
+  source from one with no IBM MQ installed; the state is visible only by running the
+  `ibm_mq` action on the device and reading its status row. This is the second such exception to the
+  skip-the-cycle rule above, with Python. Windows and macOS answer `unsupported` (planned).
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,
@@ -1131,6 +1152,24 @@ the first `|` (`app` plus one merged cell) while the headers come from the defin
 seven tokens from `GET /api/v1/responses/{id}`, its `/export` or MCP `query_responses`, or search the merged cell
 with the results search box.
 
+### Software title normalisation (server job)
+
+The server turns every distinct installed-software title into a stable identity once an hour, so later software views can group by product instead of by whatever string each endpoint reported.
+
+- **What runs.** A background job reads the distinct (name, publisher, ecosystem) titles the catalogue rollup already computes, and writes one row per title to a permanent title dimension: the canonical publisher, product, edition, category (`web_server`, `database`, `message_broker`, `runtime` or `other`), the package-URL type for package ecosystems, and the version token embedded in the raw name. It works through the most widely installed titles first, in bounded passes of 2,000 titles, and each pass is a single transaction, so a restart never leaves half a batch. With several server replicas, one runs the job at a time.
+- **Cadence.** A quiet fleet is checked once an hour. A tick covers up to 200,000 titles or 60 seconds of work in total, whichever comes first. When it stops at either limit with more waiting (a new pack version, or the first run on a large fleet), the next tick starts after 60 seconds instead of an hour, so a backlog is worked off in back-to-back ticks rather than one tick an hour. The same 60 seconds applies right after a server start or upgrade when the catalogue rollup has not yet produced the title list: the job finds nothing to do and keeps checking every 60 seconds until the rollup has produced the title list, instead of waiting an hour. A tick that fails or times out is retried at the hourly interval, because an immediate retry would pick the same batch and fail the same way.
+- **The alias pack.** Resolution is driven by a versioned alias pack (`YYYY.MM.N`) stored in Postgres. A seed pack ships inside the server and is loaded on first boot only when no pack exists; a newer server build does not replace a pack that is already loaded (the boot log names both versions). If the pack cannot be loaded for any reason, including a transient database error, the server refuses to start and logs `[PG] Refusing to start`.
+- **Settled titles are not re-resolved in this release.** A title is resolved when it first appears and again when the pack version changes, its product is deleted, or a registry write marks it stale (editing a product, or adding or changing an alias, in the product registry store does that). Nothing in the server writes the registry yet: there is no route or screen to add a product or an alias by hand, so in this release a new pack version is what re-resolves settled titles.
+- **Unnormalized never means guessed.** A title resolves only through a curated or pack alias, or to the product whose key is exactly the title's cleaned-up publisher, product and edition; similar-looking products are never used, so a companion title such as a remote-desktop host does not resolve to the main product. A title that does not resolve this way is labelled `unnormalized`, keeps its cleaned-up publisher, product and edition, and has no product. A name that reduces to nothing once versions, architectures and edition words are removed (for example `2019` or `Pro`) is always `unnormalized`. The title is also added to the curation queue with its device count, so the most widely installed unknowns surface first. The queue follows the fleet: counts are refreshed every hour (only when a count changed, or at least daily) and a title that has left the fleet is dropped and comes back, still open, when the title does. A title a curator has rejected stays rejected, even after the title later resolves.
+- **Editions are distinct products.** An alias binds exactly one edition, and a title is never matched to a different edition of the same product, so SQL Server Standard and SQL Server Enterprise resolve separately and an edition the pack does not list lands in the queue rather than on its neighbour.
+- **Automatic product creation is off.** The job does not create products for unmatched titles; they wait in the queue.
+- **What is kept, and for how long.** The title dimension is permanent: it keeps one row for every distinct title the fleet has ever reported, and is never pruned. Titles that embed a version in their name (many do) therefore add rows over time, so the table grows with the number of distinct titles ever seen, not with the current fleet. `yuzu_software_titles` shows how many titles are in the current fleet; the table's size is visible in Postgres. A future retention policy would be a separate decision. The curation queue is different: its open rows always mirror the current fleet, and an empty title list (see below) empties it; only each row's first-queued time is lost, because the rows are rebuilt as titles return.
+- **Titles that are too long.** A title whose name, publisher and ecosystem together exceed 2,400 bytes is left out of the title list, and so is never normalised or queued; this is far beyond any real software name and exists so that one malformed report cannot stop the whole catalogue refresh. Each catalogue refresh that leaves such titles out writes one warning to the server log with their count.
+- **Where to look.** There is no REST route, MCP tool or page for this yet, and install-level normalisation status is not recorded. To inspect the results, query the Postgres tables `product_registry_store.title_dimension` (one row per title) and `product_registry_store.curation_queue`, and read the metrics below.
+- **Known limits of the seed pack.** The seed is a starting set, not a measured one. Its Windows rows bind to the `windows` ecosystem only, so the same product reported as an `msi`, `optional_feature` or `macos_pkgutil` title is queued rather than matched. Several raw names will not match what a collector really reports (a locale suffix, or an edition word the real title omits). The version token recorded for a title is its first version-like word, so `SQL Server 2019` records `2019`. A short generic name with no publisher (`git`, `curl`, `bash`) matches a pack row that carries a product token, so `normalized` does not mean the publisher was verified. And the pack names products with short canonical titles, so a deployment whose registry already holds a longer name for the same product may hold both.
+- **Metrics and alerts.** `yuzu_software_titles{norm_status}`, `yuzu_software_unnormalized_ratio` (install-weighted, the headline coverage figure), `yuzu_software_normalization_curation_queue_size`, `yuzu_software_normalization_pack_info{pack_version}` and the job's run, duration and last-success series. `YuzuSoftwareNormalizationStale` fires when no clean tick has completed for over two hours; `YuzuSoftwareNormalizationFailing` fires when two hourly ticks fail within three hours. The ratio is not exported until the title list has had a first non-empty read, and it keeps its last value if the list later becomes empty; an empty list is never reported as a perfect score.
+- **When the catalogue rollup stalls.** The job's title list is rebuilt by the hourly catalogue rollup, so it inherits that rollup's limits, including its scale ceiling of about 6,000 endpoints. When the rollup stops completing, the title list stops refreshing, the normalisation gauges freeze at their last values and no new title is picked up, while the job itself keeps ticking cleanly, so neither normalisation alert fires. The signal is the catalogue rollup's own alerts (`YuzuInventoryCatalogRollupStale` and `YuzuInventoryCatalogRollupFailing`): check them first.
+
 ## Device-identity inventory (`device_ci`)
 
 A second daily-sync source, **`device_ci`** (ADR-0016 source #3), is live on the
@@ -1151,7 +1190,11 @@ sync, defeating the hash-skip protocol.
 - **Scope / privacy.** Machine-scope only (no per-user data), but serial/UUID/MAC
   are device-persistent identifiers — treat as potentially personal data where a
   device is person-assigned. The same **`--inventory-disable`** flag suppresses
-  `device_ci` along with the other sources (it gates the whole daily-sync thread).
+  `device_ci` along with the other sources (it gates the whole daily-sync thread). A volume
+  or partition mount point under a user profile or under `/Volumes` is replaced with
+  `[redacted]` before it is sent. That removes one route to a personal name and is not a
+  consent mechanism; other folder mounts, free text in the other columns, and the device
+  name, domain and OU are sent as the machine reports them.
 - **Observability.** Ingest shares
   `yuzu_inventory_ingest_total{source="device_ci"}` +
   `yuzu_inventory_ingest_duration_seconds{source="device_ci"}`; read degrades use
@@ -1173,6 +1216,29 @@ sync, defeating the hash-skip protocol.
   device serial and system UUID. Agents keep working unchanged; upgrade the server
   before the agents. No page or API reads the per-device rows yet: these values are stored
   now and become visible when the device-CI read surface ships.
+- **What the agent sends.** An agent that carries this change always sends the versioned
+  record; there is no flag to fall back to the earlier format, and `--inventory-disable`
+  still stops the collection. Each section reports one of four levels:
+  `ok`, `constrained` (partial: read the reason), `unavailable` (the data could not be
+  read on this host) and `permission_denied` (the agent was refused). A section that is
+  `unavailable` or `permission_denied` carries **no rows**, so an empty list under those
+  levels means "not collected", not "the device has none". A reason of the form
+  `<os>:planned` means the collector for that OS is not shipped yet; `agent:action_absent`
+  means the installed plugin predates the section; `agent:plugin_not_loaded` means the
+  disk plugin is not loaded on that host; `agent:windows_volumes_unbounded` means the
+  Windows volume probe was not run, because it has no deadline and the daily sync must not
+  block on a wedged drive, so the Windows `volume` section is `unavailable` with no rows;
+  `agent:mount_points_redacted` means at least one mount point under a user profile or under
+  `/Volumes` was replaced with `[redacted]` and the rest of the row is unchanged. The Windows reason
+  is expected on every Windows host and needs no action; the operator-triggered `volumes` action
+  still works there. To see how many devices report each state, query
+  `SELECT kind, level, reason, count(*) FROM device_inventory_store.device_ci_section GROUP BY kind, level, reason ORDER BY kind, count(*) DESC;`.
+  A reason ending `agent_cap:<kept>/<total>`
+  means the agent kept only the first `kept` of `total` rows (it caps each list to
+  the same limits the server applies, and trims the least valuable lists first if the whole
+  record would be too large); `server_cap:<n>` is the server's own cap. Sections fail
+  independently: one section being unavailable never stops the others, or the base device
+  fields, from being reported.
 
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its
