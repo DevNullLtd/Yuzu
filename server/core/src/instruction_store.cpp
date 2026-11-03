@@ -202,11 +202,12 @@ std::string normalize_to_array_helper(const nlohmann::json& v) {
 // `(?:(?<!L)|(?!tar R))` per guard, which Postgres ARE (lookbehind since 9.6) accepts. The word
 // boundary `\b` of the script is `\y` in ARE. Ported: captured data (`tar|123`), archive file
 // names (`.tar.gz`, `x.tar`, `tar.exe`, `modern-tar`), the archive command shapes (`tar -x`,
-// `tar xzf`, `tar --strip..`) and a `tar` piped to another tool. NOT widened to `\s*\|`: the
-// shipped `tar|snapshot` response line must still become `echo|snapshot`. The script's remaining
-// guards protect sentences of repository files (package lists, "Never tar the postgres"); no
-// shipped definition contains them, so a builtin-shaped row cannot hit them. Quotes are doubled
-// because the chain sits inside single-quoted SQL.
+// `tar xzf`, `tar --strip..`), a `tar` piped to another tool, and `tar` beside another package
+// in a package list (`tar unzip git`). NOT widened to `\s*\|`: the shipped `tar|snapshot`
+// response line must still become `echo|snapshot`. The script's remaining guards protect prose
+// sentences of repository files ("Never tar the postgres", "tar preserves"); they are not
+// ported, so an operator edit of a builtin-shaped row that uses one of those exact phrases is
+// rewritten. Quotes are doubled because the chain sits inside single-quoted SQL.
 constexpr const char* kEchoRenameBareTarGuards =
     "(?!tar\\|\\d)"                                      // captured data
     "(?!tar\\.(?:gz|xz|zst|bz2|lz|lzma|Z)(?![A-Za-z]))"    // .tar.gz and kin
@@ -220,7 +221,8 @@ constexpr const char* kEchoRenameBareTarGuards =
     "dereference|hard|remove|index|label|checkpoint|blocking|record|sparse|ignore|anchored|"
     "auto-|bzip2|lzma|lzop|compress|show|backup|suffix|atime|touch|version|help)|"
     "[xctzvjJ]+f?\\y)|"
-    "\\s*\\|\\s*(?:grep|head|wc|sed|awk|tee|gzip|zstd|xz|sha\\w*)\\y)))";
+    "\\s*\\|\\s*(?:grep|head|wc|sed|awk|tee|gzip|zstd|xz|sha\\w*)\\y|"
+    "\\s+(?:zip|unzip|git|python3-pip|ca-certificates|gzip)\\y)))";
 
 // The token chain the rename script applies to the builtin Echo definitions' prose, as
 // regexp_replace calls over one column expression. Word boundaries are Postgres ARE `\m` / `\M`.

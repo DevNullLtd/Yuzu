@@ -389,7 +389,7 @@ TEST_CASE("Echo rename: instruction_store v3 keeps the archive tool in an operat
         ('crossplatform.tar.shellout', 'TAR: Shell', 'question', 'tar',
          'Runs tar -czf out.tar.gz dir then tar xzf a.tar.gz; reads tar.sql and tar|snapshot|complete',
          'tar',
-         E'spec:\n  plugin: tar\n  run: tar -czf out.tar.gz dir\n  also: tar --strip-components=1 x\n  pipe: tar | grep x\n  win: tar.exe and modern-tar\n  data: tar|123\n  note: reads tar.status, response tar|snapshot|complete\n'))SQL");
+         E'spec:\n  plugin: tar\n  run: tar -czf out.tar.gz dir\n  also: tar --strip-components=1 x\n  pipe: tar | grep x\n  win: tar.exe and modern-tar\n  data: tar|123\n  pkgs: apt-get install -y tar unzip git\n  note: reads tar.status, response tar|snapshot|complete\n'))SQL");
 
     roll_back(dsn, "instruction_store", 2);
     {
@@ -411,6 +411,7 @@ TEST_CASE("Echo rename: instruction_store v3 keeps the archive tool in an operat
     CHECK(col("yaml_source") ==
           "spec:\n  plugin: echo\n  run: tar -czf out.tar.gz dir\n  also: tar --strip-components=1 x\n"
           "  pipe: tar | grep x\n  win: tar.exe and modern-tar\n  data: tar|123\n"
+          "  pkgs: apt-get install -y tar unzip git\n"
           "  note: reads echo.status, response echo|snapshot|complete\n");
 }
 
