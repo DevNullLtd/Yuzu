@@ -19,10 +19,10 @@
           "support": "planned"
         },
         "windows": {
-          "fallback": "not read yet: one unsupported status row, windows:planned",
+          "fallback": "",
           "mechanism": "GetSystemFirmwareTable('RSMB') SMBIOS type 2 via the shared SMBIOS walker",
           "rung": "1",
-          "support": "planned"
+          "support": "supported"
         }
       }
     },
@@ -71,10 +71,10 @@
           "support": "planned"
         },
         "windows": {
-          "fallback": "not read yet: one unsupported status row, windows:planned",
+          "fallback": "",
           "mechanism": "GetSystemFirmwareTable('RSMB') SMBIOS type 3 via the shared SMBIOS walker",
           "rung": "1",
-          "support": "planned"
+          "support": "supported"
         }
       }
     },
@@ -149,10 +149,10 @@
           "support": "planned"
         },
         "windows": {
-          "fallback": "not read yet: one unsupported status row, windows:planned",
-          "mechanism": "keyed hash of the registry MachineGuid",
+          "fallback": "",
+          "mechanism": "HMAC-SHA256 (fixed public label) of the registry MachineGuid",
           "rung": "1",
-          "support": "planned"
+          "support": "supported"
         }
       }
     },
@@ -279,10 +279,10 @@
           "support": "planned"
         },
         "windows": {
-          "fallback": "not read yet: one unsupported status row, windows:planned",
-          "mechanism": "WMI Win32_PageFileUsage",
+          "fallback": "",
+          "mechanism": "WMI Win32_PageFileUsage + Win32_PageFileSetting",
           "rung": "1",
-          "support": "planned"
+          "support": "supported"
         }
       }
     },
@@ -314,11 +314,11 @@
     }
   ],
   "caveats": [
-    "**The eight read actions never set a typed result status.** Every such sample line reads `UNDECLARED / UNKNOWN /` regardless of whether the underlying probe succeeded, partially failed, or hit an unsupported leg (e.g. Linux `manufacturer`/`model`/`bios`/`system` all read `unknown` in the sample, and get the same `UNDECLARED` status as a clean Windows read). A consumer must inspect the row content (`unknown` fields, the `drivers` action's `__truncated__` marker), not the status, to tell success from degradation.",
-    "**Two legs are partial: `drivers` on macOS, `memory` on Linux and macOS.** `drivers` is not implemented on macOS. No public per-driver/kext enumeration API exists; the descriptor declares it `YUZU_SUPPORT_UNSUPPORTED` (`hardware_plugin.cpp:858`) and the macOS sample shows the house `unknown` row rather than a capture. `memory` is aggregate-only on Linux and macOS. Linux needs `dmidecode` (typically root) for per-DIMM detail and falls back to `/proc/meminfo`'s total when unavailable or unprivileged; the Linux sample (captured as root/euid 0 in a container) still shows the aggregate `total` row, meaning `dmidecode` itself found nothing usable in that environment even with root. macOS has no public per-DIMM API at all and always reports the aggregate.",
-    "**A connected-but-empty WMI query now emits an explicit `unknown` row instead of silently emitting nothing** — a deliberate divergence from the plugin's pre-#3404 behavior, made so a consumer can distinguish \"the probe ran and found nothing\" from an unrelated dispatch failure (`hardware_plugin.cpp:190-205`). Do not revert this to match the old silent-gap behavior.",
+    "**The eight read actions never set a typed result status.** Every such sample line reads `UNDECLARED / UNKNOWN /` regardless of whether the underlying probe succeeded, partially failed, or hit an unsupported leg (e.g. Linux `manufacturer`/`model`/`bios`/`system` all read `unknown` in the sample, and get the same `UNDECLARED` status as a clean Windows read). A consumer must inspect the row content (`unknown` fields, the `drivers` action's `__truncated__` marker), not the status, to tell success from degradation. **A connected-but-empty WMI query now emits an explicit `unknown` row instead of silently emitting nothing** — a deliberate divergence from the plugin's pre-#3404 behavior, made so a consumer can distinguish \"the probe ran and found nothing\" from an unrelated dispatch failure (`hardware_plugin.cpp:193-208`). Do not revert this to match the old silent-gap behavior.",
+    "**Two legs are partial: `drivers` on macOS, `memory` on Linux and macOS.** `drivers` is not implemented on macOS. No public per-driver/kext enumeration API exists; the descriptor declares it `YUZU_SUPPORT_UNSUPPORTED` (`hardware_plugin.cpp:876`) and the macOS sample shows the house `unknown` row rather than a capture. `memory` is aggregate-only on Linux and macOS. Linux needs `dmidecode` (typically root) for per-DIMM detail and falls back to `/proc/meminfo`'s total when unavailable or unprivileged; the Linux sample (captured as root/euid 0 in a container) still shows the aggregate `total` row, meaning `dmidecode` itself found nothing usable in that environment even with root. macOS has no public per-DIMM API at all and always reports the aggregate. **Some planned actions can never have a source.** On macOS there is no public source for `chassis`, `baseboard` or `machine_id` (the hardware UUID from `system` already identifies the machine), yet the Linux and macOS legs of all four new actions are advertised `planned`. The per-OS leg PRs move such legs to a typed `unsupported` with a reason; until then a consumer must read `<os>:planned` as \"not read\", never as \"this host has no value\". The appended `cpu`/`dimm` columns (`socket_designation`, `stepping`, `manufacturer`, `part_number`, `serial`) ride on every `cpu`/`dimm` row so downstream schemas are final; Windows fills them, and on Linux and macOS they are still always `-` because no leg reads them yet.",
     "**Windows `disks.interface` reports the WMI-layer bus (`SCSI`), not the physical bus** — both drives in the Windows sample are NVMe/SATA but report `SCSI`, because `Win32_DiskDrive.InterfaceType` reports the storage stack layer WMI actually asks, not the physical connector. `disk_actions.smart` decodes the true bus (`nvme`/`sata`/`usb`) via a lower-level IOCTL and is the more accurate source when that distinction matters.",
-    "**Some planned actions can never have a source.** On macOS there is no public source for `chassis`, `baseboard` or `machine_id` (the hardware UUID from `system` already identifies the machine), yet all four new actions are advertised `planned` on every OS. The per-OS leg PRs move such legs to a typed `unsupported` with a reason; until then a consumer must read `<os>:planned` as \"not read\", never as \"this host has no value\". The appended `cpu`/`dimm` columns are likewise always `-`: `socket_designation`, `stepping`, `manufacturer`, `part_number` and `serial` ride on every `cpu`/`dimm` row so downstream schemas are final, but no leg fills them yet."
+    "**`machine_id` is a keyed hash, not a secret.** The hash is HMAC-SHA256 under the fixed, public, versioned label `yuzu.machine-id.v1` (`agents/shared/machine_id_hash.hpp`, algorithm token `hmac-sha256-app-v1`), the application-specific derivation `machine-id(5)` recommends. It keeps the raw `MachineGuid` from leaving the host and stays stable across an agent reinstall or state wipe; it does NOT protect against a party that already holds the raw identifier, who can recompute it. The label and token are a cross-OS contract pinned by `tests/unit/test_hmac_sha256.cpp`.",
+    "**The Windows estate reads are honest, not complete.** `swap.total_mb` is the configured `MaximumSize` when the page file has one, which is stable. A system-managed page file has none, so the total is `AllocatedBaseSize`, which the OS grows under memory pressure; on such a host the daily value can change between cycles and cause a full upload. It cannot be made stable without inventing a number. `used_mb` is in the on-demand row only; the daily record never carries it. A chassis or baseboard serial, an asset tag, a socket label or a DIMM string that is empty or a known OEM filler (`smbios_parsers.hpp` `kPlaceholders`, matched whole and case-insensitively) is written `-` and the section stays `supported`; marking it `constrained` would present most OEM machines as incomplete. A filler string not in the table is reported verbatim, and a vendor serial of `00000000` is not recognised as filler. `GetSystemFirmwareTable('RSMB')` has no deadline parameter. It copies the SMBIOS table the kernel already holds from boot, with no device I/O, so it cannot wedge the way the synchronous volume ioctls can (#3925); the size is capped at 1 MiB and the probe/fill retry at three attempts (`agents/shared/win_rsmb.hpp`). If a measurement ever shows it blocking, the fix is `bounded_wait.hpp` in that one place. Windows derives `stepping` from the low nibble of CPUID EAX in `Win32_Processor.ProcessorId`; on arm64 it uses the class `Stepping` value when it is a plain decimal, else `-`."
   ],
   "definitions": [
     {
@@ -326,7 +326,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports the baseboard (motherboard) vendor, product and serial number. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands. macOS has no public source and will move to a typed unsupported. It is dispatched by the daily device-record sync: its status, the planned one included, is recorded as the baseboard section, and the baseboard columns of the record fill once the leg reads them.",
+      "description": "Reports the baseboard (motherboard) vendor, product and serial number. Windows reads them from the SMBIOS Baseboard structure; a value the firmware leaves as OEM filler is reported as \"-\". Linux and macOS do not read it yet: every dispatch answers one unsupported status row (linux:planned or macos:planned) until its leg lands, and macOS has no public source and will move to a typed unsupported. It is dispatched by the daily device-record sync: its status is recorded as the baseboard section, and the baseboard columns of the record fill from the row.",
       "display_name": "Baseboard",
       "execute_roles": [
         "endpoint-admin",
@@ -366,7 +366,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports the chassis type, serial number and asset tag. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands. macOS has no public source and will move to a typed unsupported. It is dispatched by the daily device-record sync: its status, the planned one included, is recorded as the chassis section, and the chassis columns of the record fill once the leg reads them.",
+      "description": "Reports the chassis type, serial number and asset tag. Windows reads them from the SMBIOS System Enclosure structure; a value the firmware leaves as OEM filler is reported as \"-\". Linux and macOS do not read it yet: every dispatch answers one unsupported status row (linux:planned or macos:planned) until its leg lands, and macOS has no public source and will move to a typed unsupported. It is dispatched by the daily device-record sync: its status is recorded as the chassis section, and the chassis columns of the record fill from the row.",
       "display_name": "Chassis",
       "execute_roles": [
         "endpoint-admin",
@@ -426,7 +426,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports a keyed hash of the operating system machine identifier. The raw identifier never leaves the host. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands; macOS has no source beyond the hardware UUID that device.hardware.system reports and will move to a typed unsupported. It is dispatched by the daily device-record sync: its status, the planned one included, is recorded as the machine id section, and the hashed machine id column of the record fills once the leg reads it.",
+      "description": "Reports a keyed hash of the operating system machine identifier. The raw identifier never leaves the host. The hash is an HMAC-SHA256 under a fixed, public, versioned label, so it is stable across reinstalls of the agent and is not secret from a party that already holds the raw identifier. Windows reads the registry MachineGuid. Linux and macOS do not read it yet: every dispatch answers one unsupported status row (linux:planned or macos:planned) until its leg lands, and macOS has no source beyond the hardware UUID that device.hardware.system reports and will move to a typed unsupported. It is dispatched by the daily device-record sync: its status is recorded as the machine id section, and the hashed machine id column of the record fills from the row.",
       "display_name": "Machine Identifier (Keyed Hash)",
       "execute_roles": [
         "endpoint-admin",
@@ -529,7 +529,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports swap devices and page files with total and used size in MB. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands. It is dispatched by the daily device-record sync: its status, the planned one included, is recorded as the swap section, and its rows land in that section once the leg reads them (used size is not recorded).",
+      "description": "Reports swap devices and page files with total and used size in MB. Windows reads Win32_PageFileUsage; the total is the configured maximum when the page file has one (Win32_PageFileSetting), else the current allocation, which a system-managed page file grows under memory pressure. No page file is a definitive answer (a supported status row and no data rows). Linux and macOS do not read it yet: every dispatch answers one unsupported status row (linux:planned or macos:planned) until its leg lands. It is dispatched by the daily device-record sync: its status is recorded as the swap section, and its rows land in that section (used size is live telemetry and is not recorded).",
       "display_name": "Swap and Page Files",
       "execute_roles": [
         "endpoint-admin",
@@ -566,14 +566,14 @@
     }
   ],
   "description": "Reports hardware inventory: manufacturer, model, BIOS, CPU, memory, disks, drivers, chassis, baseboard, swap, machine id",
-  "how_it_works": "Twelve independent actions, dispatched by action name (`hardware_plugin.cpp:963`). `manufacturer`/`model`/`processors`/`system` are single native calls per OS (WMI, `sysctlbyname`/IOKit, or a `/sys`/`/proc` file read) with no subprocess. `bios` and `disks` need data no native API on macOS exposes, so those two legs shell out through the agent's bounded subprocess runner (`run_bounded_subprocess`, fixed deadline, no shell) to `system_profiler` and parse its output with a pure header-only parser (`hardware_macos_bios.hpp`, `hardware_disks_macos.hpp`). `memory` tries `dmidecode` on Linux (also via the bounded runner) and falls back to `/proc/meminfo`'s aggregate total when `dmidecode` is missing or fails. `drivers` enumerates `Win32_PnPSignedDriver` on Windows or reads `/proc/modules` on Linux; it is not implemented on macOS (no public per-driver/kext enumeration API). The four newest actions (`chassis`, `baseboard`, `swap`, `machine_id`) read nothing yet: each answers with exactly one `status|<action>|unsupported|<os>:planned` row from the shared planned-leg reporter (`agents/shared/planned_leg.hpp`, called from the dispatch in `hardware_plugin.cpp`), until the per-OS leg PRs land the real reads.\n\nEvery action that can find nothing still emits one row carrying the literal `unknown` in place of an unread value (`hardware_plugin.cpp:243`, `:257`, `:342-344` and equivalents) — never a silent zero-row output — so a consumer can tell \"the probe ran and found nothing\" from \"this action produced no output for an unrelated reason.\" This plugin is deliberately not a live-monitoring feed: every action is a point-in-time read with no polling, no event stream, and (except `drivers`, whose WMI query can take several seconds) no expectation of taking more than a few milliseconds.",
+  "how_it_works": "Twelve independent actions, dispatched by action name (`hardware_plugin.cpp:996`). `manufacturer`/`model`/`processors`/`system` are single native calls per OS (WMI, `sysctlbyname`/IOKit, or a `/sys`/`/proc` file read) with no subprocess. `bios` and `disks` need data no native API on macOS exposes, so those two legs shell out through the agent's bounded subprocess runner (`run_bounded_subprocess`, fixed deadline, no shell) to `system_profiler` and parse its output with a pure header-only parser (`hardware_macos_bios.hpp`, `hardware_disks_macos.hpp`). `memory` tries `dmidecode` on Linux (also via the bounded runner) and falls back to `/proc/meminfo`'s aggregate total when `dmidecode` is missing or fails. `drivers` enumerates `Win32_PnPSignedDriver` on Windows or reads `/proc/modules` on Linux; it is not implemented on macOS (no public per-driver/kext enumeration API). The four newest actions (`chassis`, `baseboard`, `swap`, `machine_id`) are read on Windows by `hardware_estate_win.cpp`: `chassis` and `baseboard` decode the SMBIOS table (`GetSystemFirmwareTable('RSMB')` through the shared reader `agents/shared/win_rsmb.hpp` and the shared walker `agents/shared/smbios_parsers.hpp`), `machine_id` reads the registry `MachineGuid` and ships only an HMAC of it, and `swap` reads `Win32_PageFileUsage` (plus `Win32_PageFileSetting` for the configured maximum) through the bounded WMI helper. Every decision about a row (placeholder handling, the stable swap total, the outcome) is in the pure `hardware_estate_parsers.hpp`, unit-tested on every host. On Linux and macOS they still answer exactly one `status|<action>|unsupported|<os>:planned` row from the shared planned-leg reporter (`agents/shared/planned_leg.hpp`, called from the dispatch in `hardware_plugin.cpp`) until those legs land. On Windows `processors` and `memory` also fill their appended columns (`socket_designation`, `stepping`; `manufacturer`, `part_number`, `serial`) from the WMI classes their rows already come from.\n\nEvery action that can find nothing still emits one row carrying the literal `unknown` in place of an unread value (`hardware_plugin.cpp:243`, `:257`, `:342-344` and equivalents) — never a silent zero-row output — so a consumer can tell \"the probe ran and found nothing\" from \"this action produced no output for an unrelated reason.\" This plugin is deliberately not a live-monitoring feed: every action is a point-in-time read with no polling, no event stream, and (except `drivers`, whose WMI query can take several seconds) no expectation of taking more than a few milliseconds.",
   "inputs": [],
   "kind": {
     "collector": true,
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "c78d09361368",
+  "leg_hash": "3fa43aa6c9dc",
   "manifest_version": 1,
   "name": "hardware",
   "outputs": [
@@ -607,7 +607,7 @@
           "values": null
         },
         {
-          "description": "Baseboard product name, or \"-\" when absent. Status rows: the level (unsupported).",
+          "description": "Baseboard product name, or \"-\" when absent. Status rows: the level (supported, constrained or unsupported).",
           "example": "PRIME B450M-A",
           "name": "product",
           "platforms": [
@@ -619,7 +619,7 @@
           "values": null
         },
         {
-          "description": "Baseboard serial number, or \"-\" when absent. Status rows: the reason token (<os>:planned).",
+          "description": "Baseboard serial number, or \"-\" when absent. Status rows: the reason token (<os>:planned until the leg lands, a failure token on a degraded read, or \"-\").",
           "example": "-",
           "name": "serial",
           "platforms": [
@@ -716,7 +716,7 @@
           "values": null
         },
         {
-          "description": "Chassis serial number, or \"-\" when absent. Status rows: the level (unsupported).",
+          "description": "Chassis serial number, or \"-\" when absent. Status rows: the level (supported, constrained or unsupported).",
           "example": "-",
           "name": "serial",
           "platforms": [
@@ -728,7 +728,7 @@
           "values": null
         },
         {
-          "description": "Chassis asset tag, or \"-\" when absent. Status rows: the reason token (<os>:planned).",
+          "description": "Chassis asset tag, or \"-\" when absent. Status rows: the reason token (<os>:planned until the leg lands, a failure token on a degraded read, or \"-\").",
           "example": "-",
           "name": "asset_tag",
           "platforms": [
@@ -918,7 +918,7 @@
           "values": null
         },
         {
-          "description": "Name of the keyed hash used, or \"-\" when absent. Status rows: the level (unsupported).",
+          "description": "Name of the keyed hash used, or \"-\" when absent. Status rows: the level (supported, constrained or unsupported).",
           "example": "-",
           "name": "algorithm",
           "platforms": [
@@ -930,7 +930,7 @@
           "values": null
         },
         {
-          "description": "Where the identifier was read from, or \"-\" when absent. Status rows: the reason token (<os>:planned).",
+          "description": "Where the identifier was read from, or \"-\" when absent. Status rows: the reason token (<os>:planned until the leg lands, a failure token on a degraded read, or \"-\").",
           "example": "/etc/machine-id",
           "name": "source",
           "platforms": [
@@ -1009,8 +1009,8 @@
           "values": null
         },
         {
-          "description": "DIMM manufacturer. Always \"-\" until a leg reads it. Values: \"-\".",
-          "example": "-",
+          "description": "DIMM manufacturer string as the module reports it; \"-\" when it reports filler or nothing, and on Linux until its leg reads it. Windows reads Win32_PhysicalMemory.Manufacturer. Values: free text, or \"-\".",
+          "example": "Micron Technology",
           "name": "manufacturer",
           "platforms": [
             "windows",
@@ -1020,8 +1020,8 @@
           "values": null
         },
         {
-          "description": "DIMM part number. Always \"-\" until a leg reads it. Values: \"-\".",
-          "example": "-",
+          "description": "DIMM part number, right-trimmed; \"-\" when the module reports filler or nothing, and on Linux until its leg reads it. Windows reads Win32_PhysicalMemory.PartNumber. Values: free text, or \"-\".",
+          "example": "CT32G56C46S5.C8BA",
           "name": "part_number",
           "platforms": [
             "windows",
@@ -1031,8 +1031,8 @@
           "values": null
         },
         {
-          "description": "DIMM serial number. Always \"-\" in this release: a per-module serial is personal data, classified with the system serial, and is not read in this release. Values: \"-\".",
-          "example": "-",
+          "description": "DIMM serial number as the module reports it; \"-\" when it reports filler or nothing, and on Linux until its leg reads it. Windows reads Win32_PhysicalMemory.SerialNumber. Values: free text, or \"-\".",
+          "example": "0A1B2C3D",
           "name": "serial",
           "platforms": [
             "windows",
@@ -1124,8 +1124,8 @@
           "values": null
         },
         {
-          "description": "Socket label (e.g. \"CPU 1\"). Always \"-\" until a leg reads it. Values: \"-\".",
-          "example": "-",
+          "description": "Socket label as the firmware names it (e.g. \"U3E1\", \"CPU 1\"); \"-\" when the firmware reports filler or nothing, and on Linux and macOS until their legs read it. Windows reads Win32_Processor.SocketDesignation. Values: free text, or \"-\".",
+          "example": "FP8",
           "name": "socket_designation",
           "platforms": [
             "windows",
@@ -1136,8 +1136,8 @@
           "values": null
         },
         {
-          "description": "CPU stepping. Always \"-\" until a leg reads it. Values: \"-\".",
-          "example": "-",
+          "description": "CPU stepping as a decimal number; \"-\" when it cannot be read, and on Linux and macOS until their legs read it. Windows derives it from the low nibble of CPUID EAX in Win32_Processor.ProcessorId on x86/x64, and falls back to the class Stepping value elsewhere. Values: a decimal number, or \"-\".",
+          "example": "10",
           "name": "stepping",
           "platforms": [
             "windows",
@@ -1168,7 +1168,7 @@
           ]
         },
         {
-          "description": "Swap device or page-file path, or \"-\" when absent. Status rows: the action name.",
+          "description": "Swap device or page-file path, or \"-\" when absent. Backslashes are written as \"/\" (the plugin row escape), so C:\\pagefile.sys reads C:/pagefile.sys. Status rows: the action name.",
           "example": "/dev/sda3",
           "name": "device",
           "platforms": [
@@ -1180,7 +1180,7 @@
           "values": null
         },
         {
-          "description": "Total size in MB, or \"-\" when unread. Status rows: the level (unsupported).",
+          "description": "Total size in MB, or \"-\" when unread. Status rows: the level (supported, constrained or unsupported).",
           "example": "8192",
           "name": "total_mb",
           "platforms": [
@@ -1192,7 +1192,7 @@
           "values": null
         },
         {
-          "description": "Used size in MB, or \"-\" when unread. Status rows: the reason token (<os>:planned).",
+          "description": "Used size in MB, or \"-\" when unread. Status rows: the reason token (<os>:planned until the leg lands, a failure token on a degraded read, or \"-\").",
           "example": "512",
           "name": "used_mb",
           "platforms": [
@@ -1248,7 +1248,7 @@
       "definition_id": "device.hardware.system"
     }
   ],
-  "outputs_note": "Pipe-delimited rows, one per record via `write_output()`. Scalar actions (`manufacturer`, `model`) emit `key|value`; the rest emit one or more `key|field1|field2|...` rows. A field the underlying probe could not read is the literal string `unknown` rather than an omitted field or an empty row — this applies to every read action's identity/value fields (`manufacturer`, `model`, `bios`, `processors`, `memory`, `disks`, `system`); `processors` rows end in two appended columns (`socket_designation`, `stepping`) and `memory` rows in three (`manufacturer`, `part_number`, `serial`), every one the literal `-` until a leg reads it (a DIMM serial is personal data, classified with the system serial, and is not read in this release). The four planned actions emit one typed status row (`status|<action>|unsupported|<os>:planned`) and nothing else. `drivers` additionally emits `__truncated__` in the name field when the Windows WMI row cap (512, `agents/shared/wmi_bounded.hpp`) is hit (`hardware_plugin.cpp:746-753`).",
+  "outputs_note": "Pipe-delimited rows, one per record via `write_output()`. Scalar actions (`manufacturer`, `model`) emit `key|value`; the rest emit one or more `key|field1|field2|...` rows. A field the underlying probe could not read is the literal string `unknown` rather than an omitted field or an empty row — this applies to every read action's identity/value fields (`manufacturer`, `model`, `bios`, `processors`, `memory`, `disks`, `system`); `processors` rows end in two appended columns (`socket_designation`, `stepping`) and `memory` rows in three (`manufacturer`, `part_number`, `serial`); Windows fills them, and each is the literal `-` where the firmware or module reports filler or nothing, and on Linux and macOS until those legs read them. The four estate actions emit one typed status row first (`status|<action>|<supported|constrained|unsupported>|<token or ->`) and then their data rows; on Linux and macOS today the status row is `status|<action>|unsupported|<os>:planned` and nothing else. In an estate data row `-` means *absent* (the firmware reports no value or OEM filler such as `To Be Filled By O.E.M.`), which leaves the section `supported`; a field that could not be read is never written as a value. `drivers` additionally emits `__truncated__` in the name field when the Windows WMI row cap (512, `agents/shared/wmi_bounded.hpp`) is hit (`hardware_plugin.cpp:765-771`).",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -1257,7 +1257,7 @@
   "privileges": [
     {
       "grant": "None documented for this plugin (`docs/agent-privilege-model.md:96`)",
-      "if_refused": "WMI query returns `error`, action falls back to its `unknown` sentinel row (`wmi_query`, `hardware_plugin.cpp:216-235`)",
+      "if_refused": "WMI query returns `error`, action falls back to its `unknown` sentinel row (`wmi_query`, `hardware_plugin.cpp:219-237`)",
       "measured": "2026-10-27, bare-metal, `LocalSystem (elevated)` (sample stamp)",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
@@ -1270,7 +1270,7 @@
       "runs_as": "agent daemon, default (no extra entitlement)"
     },
     {
-      "grant": "`system` reads `/sys/class/dmi/id/product_serial` + `product_uuid` (mode `0400`); the packaged systemd unit grants the agent `CAP_DAC_READ_SEARCH` as an ambient capability (bounding set limited to that one capability, `NoNewPrivileges` kept), and the dev install script sets `cap_dac_read_search+eip` on the binary instead (`hardware_plugin.cpp:365-371`). The agent clears its inheritable and ambient sets at start, so an exec'd child such as `dmidecode` does not inherit the capability (the in-process read is deliberate). Without the capability (opt-out, `--no-setcap`, or a manual launch) both fields read back `unknown`. The unit also keeps a root-made copy of the firmware tables under `/var/lib/yuzu-agent/dmi/`; this plugin does not read it. Not yet tested on systemd 239 (RHEL 8). `memory`'s `dmidecode` branch typically needs root and fails EPERM unprivileged, silently falling through to the `/proc/meminfo` total (`hardware_plugin.cpp:506-509`).",
+      "grant": "`system` reads `/sys/class/dmi/id/product_serial` + `product_uuid` (mode `0400`); the packaged systemd unit grants the agent `CAP_DAC_READ_SEARCH` as an ambient capability (bounding set limited to that one capability, `NoNewPrivileges` kept), and the dev install script sets `cap_dac_read_search+eip` on the binary instead (`hardware_plugin.cpp:368-374`). The agent clears its inheritable and ambient sets at start, so an exec'd child such as `dmidecode` does not inherit the capability (the in-process read is deliberate). Without the capability (opt-out, `--no-setcap`, or a manual launch) both fields read back `unknown`. The unit also keeps a root-made copy of the firmware tables under `/var/lib/yuzu-agent/dmi/`; this plugin does not read it. Not yet tested on systemd 239 (RHEL 8). `memory`'s `dmidecode` branch typically needs root and fails EPERM unprivileged, silently falling through to the `/proc/meminfo` total (`hardware_plugin.cpp:518-519`).",
       "if_refused": "file read fails, action emits `unknown`",
       "measured": "2026-10-27, vm, euid 0 (sample stamp — root, so the `cap_dac_read_search` gate is not exercised by this capture; WSL VM, no DMI)",
       "os": "Linux",
@@ -1278,7 +1278,32 @@
     }
   ],
   "readme": "agents/plugins/hardware/README.md",
-  "result_status": [],
+  "result_status": [
+    {
+      "completeness": "`FULL`",
+      "provenance": "none",
+      "status": "`OK`",
+      "when": "The read completed. Firmware filler and an empty value are written `-` and do not lower the status; no page file at all is a definitive answer, not a failure."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`smbios:truncated`, `smbios:malformed`, `smbios:chassis_malformed`, `smbios:baseboard_malformed`, `smbios:oversized`, `smbios:size_race`, `smbios:win32_<n>`, `windows:machine_guid:win32_<n>`, `wmi:<class>:<token>`, `wmi:pagefile_usage:row_cap`, `windows:internal_error`",
+      "status": "`CONSTRAINED`",
+      "when": "The read failed or came back partial: a truncated or malformed table or structure (including a table whose walk stopped on a framing fault after the chassis or baseboard structure had decoded: that row is kept, but the section is never reported complete), an oversized table, a size race, a Win32 or WMI fault, or a failed `Win32_PageFileSetting` query (rows are kept, the total may then be the allocation)."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`smbios:win32_5`, `windows:machine_guid:win32_5`, `wmi:<class>:<token>`",
+      "status": "`PERMISSION_DENIED`",
+      "when": "A read was refused (`ERROR_ACCESS_DENIED`, WBEM access denied). No rows."
+    },
+    {
+      "completeness": "`UNKNOWN`",
+      "provenance": "`smbios:absent`, `windows:machine_guid:absent`, `windows:machine_guid:empty`, `wmi:<class>:absent`, `windows:unknown_kind`, `windows:planned`, `linux:planned`, `macos:planned`",
+      "status": "`UNAVAILABLE`",
+      "when": "The source does not exist on this host (no RSMB provider, no `MachineGuid` value, a missing WMI class), or the leg has not landed (`<os>:planned`: one unsupported status row). No rows."
+    }
+  ],
   "samples": {
     "linux": {
       "actions": [
@@ -1294,7 +1319,7 @@
           },
           "row_count": 1,
           "rows": [
-            "manufacturer|unknown"
+            "manufacturer|CORSAIR"
           ],
           "truncated": false
         },
@@ -1310,7 +1335,7 @@
           },
           "row_count": 1,
           "rows": [
-            "model|unknown"
+            "model|CORSAIR AI WORKSTATION 300"
           ],
           "truncated": false
         },
@@ -1326,9 +1351,9 @@
           },
           "row_count": 3,
           "rows": [
-            "bios_vendor|unknown",
-            "bios_version|unknown",
-            "bios_date|unknown"
+            "bios_vendor|American Megatrends International, LLC.",
+            "bios_version|AXB35-02 3.07",
+            "bios_date|10/16/2025"
           ],
           "truncated": false
         },
@@ -1344,7 +1369,7 @@
           },
           "row_count": 1,
           "rows": [
-            "cpu|0|AMD Ryzen 9 PRO 8945HS w/ Radeon 780M Graphics|8|16|3993|-|-"
+            "cpu|0|AMD RYZEN AI MAX+ 395 w/ Radeon 8060S|16|32|2000|-|-"
           ],
           "truncated": false
         },
@@ -1360,7 +1385,7 @@
           },
           "row_count": 1,
           "rows": [
-            "dimm|total|15993|unknown|0|-|-|-"
+            "dimm|total|125125|unknown|0|-|-|-"
           ],
           "truncated": false
         },
@@ -1374,12 +1399,10 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 4,
+          "row_count": 2,
           "rows": [
-            "disk|0|Virtual Disk|1024|HDD|unknown",
-            "disk|1|Virtual Disk|0|HDD|unknown",
-            "disk|2|Virtual Disk|8|HDD|unknown",
-            "disk|3|Virtual Disk|0|HDD|unknown"
+            "disk|0|PCIe SSD|1907|SSD|nvme",
+            "disk|1|PCIe SSD|1907|SSD|nvme"
           ],
           "truncated": false
         },
@@ -1393,13 +1416,13 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 18,
+          "row_count": 141,
           "rows": [
-            "driver|0|xt_nat|||kernel|module",
-            "driver|1|nf_conntrack_netlink|||kernel|module",
-            "driver|2|xt_conntrack|||kernel|module",
-            "driver|3|xt_MASQUERADE|||kernel|module",
-            "driver|4|xfrm_user|||kernel|module"
+            "driver|0|tcp_diag|||kernel|module",
+            "driver|1|inet_diag|||kernel|module",
+            "driver|2|xt_connmark|||kernel|module",
+            "driver|3|xt_mark|||kernel|module",
+            "driver|4|xt_nat|||kernel|module"
           ],
           "truncated": false
         },
@@ -1486,12 +1509,12 @@
         }
       ],
       "stamp": {
-        "date": "2026-10-27",
-        "host_class": "vm",
-        "leg_hash": "c78d09361368",
+        "date": "2026-11-03",
+        "host_class": "bare-metal",
+        "leg_hash": "3fa43aa6c9dc",
         "os": "linux",
         "os_version": "Ubuntu 26.04.1 LTS x86_64",
-        "privilege": "euid 0"
+        "privilege": "euid 1000"
       }
     },
     "macos": {
@@ -1524,7 +1547,7 @@
           },
           "row_count": 1,
           "rows": [
-            "model|Mac16,10"
+            "model|Mac17,8"
           ],
           "truncated": false
         },
@@ -1541,7 +1564,7 @@
           "row_count": 3,
           "rows": [
             "bios_vendor|Apple",
-            "bios_version|18000.161.10",
+            "bios_version|20457.1.29",
             "bios_date|N/A"
           ],
           "truncated": false
@@ -1558,7 +1581,7 @@
           },
           "row_count": 1,
           "rows": [
-            "cpu|0|Apple M4|10|10|0|-|-"
+            "cpu|0|Apple M5 Pro|18|18|0|-|-"
           ],
           "truncated": false
         },
@@ -1574,7 +1597,7 @@
           },
           "row_count": 1,
           "rows": [
-            "dimm|total|32768|unknown|0|-|-|-"
+            "dimm|total|24576|unknown|0|-|-|-"
           ],
           "truncated": false
         },
@@ -1590,7 +1613,7 @@
           },
           "row_count": 1,
           "rows": [
-            "disk|0|APPLE SSD AP0512Z|465|SSD|NVMe"
+            "disk|0|APPLE SSD AP1024Z|931|SSD|NVMe"
           ],
           "truncated": false
         },
@@ -1693,11 +1716,11 @@
         }
       ],
       "stamp": {
-        "date": "2026-10-27",
+        "date": "2026-11-03",
         "host_class": "bare-metal",
-        "leg_hash": "c78d09361368",
+        "leg_hash": "3fa43aa6c9dc",
         "os": "macos",
-        "os_version": "macOS 26.6.2 arm64",
+        "os_version": "macOS 27.0.1 arm64",
         "privilege": "euid 501"
       }
     },
@@ -1731,7 +1754,7 @@
           },
           "row_count": 1,
           "rows": [
-            "model|EliteMini Series"
+            "model|AI Series"
           ],
           "truncated": false
         },
@@ -1748,8 +1771,8 @@
           "row_count": 3,
           "rows": [
             "bios_vendor|American Megatrends International, LLC.",
-            "bios_version|1.06",
-            "bios_date|2025-11-10"
+            "bios_version|1.01",
+            "bios_date|2025-06-19"
           ],
           "truncated": false
         },
@@ -1765,7 +1788,7 @@
           },
           "row_count": 1,
           "rows": [
-            "cpu|0|AMD Ryzen 9 PRO 8945HS w/ Radeon 780M Graphics|8|16|4001|-|-"
+            "cpu|0|Intel(R) Core(TM) Ultra 5 125H|14|18|1200|U3E1|4"
           ],
           "truncated": false
         },
@@ -1781,7 +1804,7 @@
           },
           "row_count": 1,
           "rows": [
-            "dimm|DIMM 0|32768|DDR5|5600|-|-|-"
+            "dimm|Controller1-ChannelA-DIMM0|32768|DDR5|5600|Micron Technology|CT32G56C46S5.C8BA|0A1B2C3D"
           ],
           "truncated": false
         },
@@ -1797,7 +1820,7 @@
           },
           "row_count": 1,
           "rows": [
-            "disk|0|YMTC PC41Q-1TB-B|953|HDD|SCSI"
+            "disk|0|KINGSTON OM8TAP41024K1-A00|953|HDD|SCSI"
           ],
           "truncated": false
         },
@@ -1811,13 +1834,13 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 178,
+          "row_count": 169,
           "rows": [
-            "driver|0|Microsoft iSCSI Initiator|10.0.26100.9711|2006-06-21|Microsoft|SCSIADAPTER",
-            "driver|1|Tailscale Tunnel|0.14.0.0|2021-10-13|WireGuard LLC|NET",
-            "driver|2|WAN Miniport (Network Monitor)|10.0.26100.1|2006-06-21|Microsoft|NET",
-            "driver|3|WAN Miniport (IPv6)|10.0.26100.1|2006-06-21|Microsoft|NET",
-            "driver|4|WAN Miniport (IP)|10.0.26100.1|2006-06-21|Microsoft|NET"
+            "driver|0|Generic software device|10.0.26100.1|2006-06-21|Microsoft|SOFTWAREDEVICE",
+            "driver|1|Generic software device|10.0.26100.1|2006-06-21|Microsoft|SOFTWAREDEVICE",
+            "driver|2|Local Print Queue|10.0.26100.1|2006-06-21|Microsoft|PRINTQUEUE",
+            "driver|3|Local Print Queue|10.0.26100.1|2006-06-21|Microsoft|PRINTQUEUE",
+            "driver|4|Generic software device|10.0.26100.1|2006-06-21|Microsoft|SOFTWAREDEVICE"
           ],
           "truncated": false
         },
@@ -1844,13 +1867,14 @@
           "params": "",
           "rc": 0,
           "result_status": {
-            "completeness": "UNKNOWN",
-            "provenance": "windows:planned",
-            "status": "UNAVAILABLE"
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
           },
-          "row_count": 1,
+          "row_count": 2,
           "rows": [
-            "status|chassis|unsupported|windows:planned"
+            "status|chassis|supported|-",
+            "chassis|Desktop|-|-|smbios"
           ],
           "truncated": false
         },
@@ -1860,13 +1884,14 @@
           "params": "",
           "rc": 0,
           "result_status": {
-            "completeness": "UNKNOWN",
-            "provenance": "windows:planned",
-            "status": "UNAVAILABLE"
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
           },
-          "row_count": 1,
+          "row_count": 2,
           "rows": [
-            "status|baseboard|unsupported|windows:planned"
+            "status|baseboard|supported|-",
+            "baseboard|Shenzhen Meigao Electronic Equipment Co.,Ltd|ARBSC|EXAMPLEBOARD0001|smbios"
           ],
           "truncated": false
         },
@@ -1876,13 +1901,14 @@
           "params": "",
           "rc": 0,
           "result_status": {
-            "completeness": "UNKNOWN",
-            "provenance": "windows:planned",
-            "status": "UNAVAILABLE"
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
           },
-          "row_count": 1,
+          "row_count": 2,
           "rows": [
-            "status|swap|unsupported|windows:planned"
+            "status|swap|supported|-",
+            "swap|C:/pagefile.sys|2432|0|wmi"
           ],
           "truncated": false
         },
@@ -1892,24 +1918,25 @@
           "params": "",
           "rc": 0,
           "result_status": {
-            "completeness": "UNKNOWN",
-            "provenance": "windows:planned",
-            "status": "UNAVAILABLE"
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
           },
-          "row_count": 1,
+          "row_count": 2,
           "rows": [
-            "status|machine_id|unsupported|windows:planned"
+            "status|machine_id|supported|-",
+            "machine_id|40ac51d528153ea3962cfd69f25d3a9d8c918da8e824fc223d5c96a1c1a2b51c|hmac-sha256-app-v1|registry"
           ],
           "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-10-27",
+        "date": "2026-11-03",
         "host_class": "bare-metal",
-        "leg_hash": "c78d09361368",
+        "leg_hash": "3fa43aa6c9dc",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
-        "privilege": "LocalSystem (elevated)"
+        "privilege": "NT SERVICE virtual service account (not an administrator)"
       }
     }
   },
@@ -2033,10 +2060,15 @@
     ],
     "plugin": [
       "agents/plugins/hardware/src/hardware_disks_macos.hpp",
+      "agents/plugins/hardware/src/hardware_estate_emit.hpp",
       "agents/plugins/hardware/src/hardware_estate_legs.hpp",
+      "agents/plugins/hardware/src/hardware_estate_parsers.hpp",
+      "agents/plugins/hardware/src/hardware_estate_win.cpp",
+      "agents/plugins/hardware/src/hardware_estate_win.hpp",
       "agents/plugins/hardware/src/hardware_linux_parsers.hpp",
       "agents/plugins/hardware/src/hardware_macos_bios.hpp",
-      "agents/plugins/hardware/src/hardware_plugin.cpp"
+      "agents/plugins/hardware/src/hardware_plugin.cpp",
+      "agents/plugins/hardware/src/hardware_wmi_rows.hpp"
     ],
     "privilege_row": true,
     "tests": [
@@ -2047,6 +2079,7 @@
       "tests/unit/server/test_hardware_ui.cpp",
       "tests/unit/test_hardware_device_identity_posix_actions.cpp",
       "tests/unit/test_hardware_disks_macos.cpp",
+      "tests/unit/test_hardware_estate_parsers.cpp",
       "tests/unit/test_hardware_linux_parsers.cpp",
       "tests/unit/test_hardware_local_dispatcher.cpp",
       "tests/unit/test_hardware_macos_bios.cpp"

@@ -119,7 +119,7 @@ duplicates.
 | filesystem_posture | 🟡 | ✅ | ✅ | `mounts`/`quotas`/`snapshots`, all volume-level, read-only inventory. Linux: `/proc/self/mountinfo`, `quotactl(Q_GETFMT)`, Btrfs/LVM snapshot capability (not a live inventory). macOS: `getmntinfo`, no per-user/group APFS quota equivalent, APFS snapshot enumeration. Windows: `mounts` (`FindFirstVolumeW`/`GetVolumeInformationW`/`GetDriveTypeW`/`GetDiskFreeSpaceExW`), `quotas` (`IDiskQuotaControl`, read-only) and `snapshots` (`IVssBackupComponents::Query` — VSS, **requires administrative rights**; LocalSystem today per #1442, and `permission_denied` — not an empty set — under an unprivileged account). Built with MSVC and exercised on a live Windows host; the populated-quota path is not asserted.
 | firewall | ✅ | ✅ | ✅ | win/linux/apple all implemented |
 | firmware_posture | ✅ | 🟡 | 🟡 | One read-only `firmware` action, rung 1 on every leg, no spawn: BIOS/firmware vendor, version, release date and update-pending posture. Windows: WMI `Win32_BIOS` (`Manufacturer`, `SMBIOSBIOSVersion`, `ReleaseDate`) through the bounded helper plus the raw SMBIOS type-0 table from `GetSystemFirmwareTable('RSMB')`. Linux: sysfs DMI (`/sys/class/dmi/id/bios_*`) plus fwupd `GetDevices`/`GetUpgrades` over sd-bus (`libsystemd` is a system dependency, never vcpkg); constrained because the populated-DMI shape is not captured from a physical host, a reachable system bus with no fwupd daemon reports `update_pending` `unavailable` (a state, not a failure), and a system bus that cannot be opened reads `update_pending` `unreadable` with `fwupd:bus_open:<errno>`. macOS: IODeviceTree `/rom` and `/chosen` through IOKit plus `sysctlbyname` `hw.model` and `hw.optional.arm64`; constrained because only Apple Silicon is verified (no `/rom`, version is an iBoot tag, no release date, no update verdict). The Windows leg was probed on the-rig as SYSTEM. Securable `Security`, operation `Read`; see `agents/plugins/firmware_posture/README.md` |
-| hardware | ✅ | ✅ | ✅ | linux/apple/win branches throughout; `chassis`/`baseboard`/`swap`/`machine_id` are planned on every OS (one unsupported status row, `<os>:planned`) until their legs land |
+| hardware | ✅ | ✅ | ✅ | linux/apple/win branches throughout; `chassis`/`baseboard`/`swap`/`machine_id` are read on Windows (SMBIOS via `GetSystemFirmwareTable('RSMB')`, the registry `MachineGuid` as a keyed hash, `Win32_PageFileUsage`) and still planned on Linux and macOS (one unsupported status row, `<os>:planned`) until their legs land |
 | http_client | ✅ | ✅ | ✅ | `_WIN32` vs POSIX; HTTPS gated on OpenSSL build option |
 | installed_apps | ✅ | ✅ | ✅ | linux/apple/win branches (feeds inventory sync) |
 | interaction | ✅ | ✅ | 🟡 | win/apple/linux branches. macOS caveat: as a GUI-less root LaunchDaemon `message_box` can't reach a WindowServer session — the `osascript` leg reports an honest `status\|not_reachable` (never a fabricated `response\|ok`), decoded via pure `interaction_parsers.hpp` in `interaction_plugin.cpp`; delivering the dialog to the logged-in user is a deferred per-session helper |
@@ -496,16 +496,16 @@ implementation is.
 | hardware | system | windows | supported | 1 | WMI Win32_BIOS.SerialNumber + Win32_ComputerSystemProduct.UUID | - |
 | hardware | chassis | linux | planned | 1 | /sys/class/dmi/id/chassis_{type,serial,asset_tag} + SMBIOS type 3 | not read yet: one unsupported status row, linux:planned |
 | hardware | chassis | macos | planned | 1 | no public source on Apple hardware; a later change declares it unsupported | not read yet: one unsupported status row, macos:planned |
-| hardware | chassis | windows | planned | 1 | GetSystemFirmwareTable('RSMB') SMBIOS type 3 via the shared SMBIOS walker | not read yet: one unsupported status row, windows:planned |
+| hardware | chassis | windows | supported | 1 | GetSystemFirmwareTable('RSMB') SMBIOS type 3 via the shared SMBIOS walker | - |
 | hardware | baseboard | linux | planned | 1 | /sys/class/dmi/id/board_{vendor,name,serial} + SMBIOS type 2 | not read yet: one unsupported status row, linux:planned |
 | hardware | baseboard | macos | planned | 1 | no public source on Apple hardware; a later change declares it unsupported | not read yet: one unsupported status row, macos:planned |
-| hardware | baseboard | windows | planned | 1 | GetSystemFirmwareTable('RSMB') SMBIOS type 2 via the shared SMBIOS walker | not read yet: one unsupported status row, windows:planned |
+| hardware | baseboard | windows | supported | 1 | GetSystemFirmwareTable('RSMB') SMBIOS type 2 via the shared SMBIOS walker | - |
 | hardware | swap | linux | planned | 1 | /proc/swaps | not read yet: one unsupported status row, linux:planned |
 | hardware | swap | macos | planned | 1 | sysctlbyname(vm.swapusage) | not read yet: one unsupported status row, macos:planned |
-| hardware | swap | windows | planned | 1 | WMI Win32_PageFileUsage | not read yet: one unsupported status row, windows:planned |
+| hardware | swap | windows | supported | 1 | WMI Win32_PageFileUsage + Win32_PageFileSetting | - |
 | hardware | machine_id | linux | planned | 1 | keyed hash of /etc/machine-id | not read yet: one unsupported status row, linux:planned |
 | hardware | machine_id | macos | planned | 1 | no public source beyond the hardware UUID `system` already reports; a later change declares it unsupported | not read yet: one unsupported status row, macos:planned |
-| hardware | machine_id | windows | planned | 1 | keyed hash of the registry MachineGuid | not read yet: one unsupported status row, windows:planned |
+| hardware | machine_id | windows | supported | 1 | HMAC-SHA256 (fixed public label) of the registry MachineGuid | - |
 | http_client | download | linux | supported | 1 | cpp-httplib (native sockets) | - |
 | http_client | download | macos | supported | 1 | cpp-httplib (native sockets) | - |
 | http_client | download | windows | supported | 1 | cpp-httplib (native sockets) | - |

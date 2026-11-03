@@ -9,9 +9,10 @@
  *   "memory"       — Lists installed memory modules.
  *   "disks"        — Lists physical disk drives.
  *   "system"       — Serial number + system UUID (CMDB correlation key).
- *   "chassis", "baseboard", "swap", "machine_id" — PLANNED on every OS: each answers one
- *                    `status|<action>|unsupported|<os>:planned` row until its leg lands
- *                    (the dispatch line in execute()).
+ *   "chassis", "baseboard", "swap", "machine_id" — the hardware-estate actions. Windows reads
+ *                    them (hardware_estate_win.cpp); Linux and macOS still answer one
+ *                    `status|<action>|unsupported|<os>:planned` row until their legs land (the
+ *                    dispatch line in execute()).
  *
  * Output is pipe-delimited, one field per line via write_output():
  *   key|value   (for scalar actions)
@@ -20,10 +21,14 @@
 
 #include <yuzu/plugin.hpp>
 
-#include "hardware_estate_legs.hpp" // chassis/baseboard/swap/machine_id Kind
+#include "hardware_estate_legs.hpp"    // chassis/baseboard/swap/machine_id Kind
+#include "hardware_estate_parsers.hpp"  // pure field hygiene shared by every OS leg
+#include "hardware_estate_win.hpp"      // run_windows (Windows builds only)
+#include "hardware_wmi_rows.hpp"        // shared WMI row accessors (Windows builds only)
 
 #include <planned_leg.hpp> // shared planned-leg reporter (agents/shared)
 
+#include <algorithm>
 #include <cstdint>
 #include <format>
 #include <map>
@@ -154,32 +159,9 @@ std::string io_registry_cf_string(io_object_t entry, CFStringRef key) {
 // the whole enumeration, and the row count (BoundedQueryOptions defaults).
 namespace wmi = yuzu::shared::wmi;
 
-std::string wmi_row_string(const wmi::WmiRow& row, const char* key) {
-    const auto it = row.find(key);
-    return it == row.end() ? std::string{} : it->second;
-}
-
-uint32_t wmi_row_uint32(const wmi::WmiRow& row, const char* key) {
-    const auto s = wmi_row_string(row, key);
-    if (s.empty())
-        return 0;
-    try {
-        return static_cast<uint32_t>(std::stoul(s));
-    } catch (...) {
-        return 0;
-    }
-}
-
-uint64_t wmi_row_uint64(const wmi::WmiRow& row, const char* key) {
-    const auto s = wmi_row_string(row, key);
-    if (s.empty())
-        return 0;
-    try {
-        return std::stoull(s);
-    } catch (...) {
-        return 0;
-    }
-}
+using yuzu::hardware::wmi_rows::wmi_row_string;
+using yuzu::hardware::wmi_rows::wmi_row_uint32;
+using yuzu::hardware::wmi_rows::wmi_row_uint64;
 
 // Run a bounded WQL query against ROOT\CIMV2 and invoke fn(row) once per
 // result row. A connect/query/enumerate failure -- or a genuinely empty
@@ -477,15 +459,31 @@ int do_processors(yuzu::CommandContext& ctx) {
 
 #elif defined(_WIN32)
     int idx = 0;
-    wmi_query(L"SELECT Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed FROM "
-              L"Win32_Processor",
+    wmi_query(L"SELECT Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed, "
+              L"SocketDesignation, ProcessorId, Architecture, Stepping FROM Win32_Processor",
               [&](const wmi::WmiRow& row) {
                   auto name = wmi_row_string(row, "Name");
                   auto cores = wmi_row_uint32(row, "NumberOfCores");
                   auto threads = wmi_row_uint32(row, "NumberOfLogicalProcessors");
                   auto mhz = wmi_row_uint32(row, "MaxClockSpeed");
-                  ctx.write_output(
-                      std::format("cpu|{}|{}|{}|{}|{}|-|-", idx++, name, cores, threads, mhz));
+                  // Appended columns come from the class this row already comes from, so there
+                  // is no cross-source join. MaxClockSpeed (the nominal clock) is stable between
+                  // cycles; a live reading would flap the daily hash.
+                  const auto socket = yuzu::hardware::estate::socket_designation_field(
+                      wmi_row_string(row, "SocketDesignation"));
+                  // An absent Architecture must stay absent: 0 is a real value (x86).
+                  // A present-but-unparsable value is also "unknown", not 0: wmi_row_uint32 maps a
+                  // parse failure to 0, which would read as x86.
+                  std::optional<std::uint32_t> arch;
+                  const std::string arch_s = wmi_row_string(row, "Architecture");
+                  if (!arch_s.empty() && arch_s.size() <= 4 &&
+                      std::all_of(arch_s.begin(), arch_s.end(),
+                                  [](char c) { return c >= '0' && c <= '9'; }))
+                      arch = wmi_row_uint32(row, "Architecture");
+                  const auto stepping = yuzu::hardware::estate::stepping_field(
+                      wmi_row_string(row, "ProcessorId"), arch, wmi_row_string(row, "Stepping"));
+                  ctx.write_output(std::format("cpu|{}|{}|{}|{}|{}|{}|{}", idx++, name, cores,
+                                               threads, mhz, socket, stepping));
               });
     // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
     // doc comment above.
@@ -558,8 +556,8 @@ int do_memory(yuzu::CommandContext& ctx) {
 
 #elif defined(_WIN32)
     bool found = false;
-    wmi_query(L"SELECT DeviceLocator, Capacity, MemoryType, SMBIOSMemoryType, Speed FROM "
-              L"Win32_PhysicalMemory",
+    wmi_query(L"SELECT DeviceLocator, Capacity, MemoryType, SMBIOSMemoryType, Speed, "
+              L"Manufacturer, PartNumber, SerialNumber FROM Win32_PhysicalMemory",
               [&](const wmi::WmiRow& row) {
                   found = true;
                   auto slot = wmi_row_string(row, "DeviceLocator");
@@ -583,8 +581,15 @@ int do_memory(yuzu::CommandContext& ctx) {
                       break;
                   }
                   auto size_mb = capacity / (1024 * 1024);
-                  ctx.write_output(
-                      std::format("dimm|{}|{}|{}|{}|-|-|-", slot, size_mb, type_str, speed));
+                  // The module's own identity strings; OEM filler and empty -> "-".
+                  ctx.write_output(std::format(
+                      "dimm|{}|{}|{}|{}|{}|{}|{}", slot, size_mb, type_str, speed,
+                      yuzu::hardware::estate::dimm_identity_field(
+                          wmi_row_string(row, "Manufacturer")),
+                      yuzu::hardware::estate::dimm_identity_field(
+                          wmi_row_string(row, "PartNumber")),
+                      yuzu::hardware::estate::dimm_identity_field(
+                          wmi_row_string(row, "SerialNumber"))));
               });
     // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
     // doc comment above.
@@ -883,9 +888,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "no public source on Apple hardware; a later change declares it unsupported",
          "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "GetSystemFirmwareTable('RSMB') SMBIOS type 3 via the shared SMBIOS walker",
-         "not read yet: one unsupported status row, windows:planned"},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "GetSystemFirmwareTable('RSMB') SMBIOS type 3 via the shared SMBIOS walker", nullptr},
     },
     {
         /* .action      = */ "baseboard",
@@ -898,9 +902,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "no public source on Apple hardware; a later change declares it unsupported",
          "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "GetSystemFirmwareTable('RSMB') SMBIOS type 2 via the shared SMBIOS walker",
-         "not read yet: one unsupported status row, windows:planned"},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "GetSystemFirmwareTable('RSMB') SMBIOS type 2 via the shared SMBIOS walker", nullptr},
     },
     {
         /* .action      = */ "swap",
@@ -911,8 +914,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_PLANNED, 1, "sysctlbyname(vm.swapusage)",
          "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "WMI Win32_PageFileUsage",
-         "not read yet: one unsupported status row, windows:planned"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_PageFileUsage + Win32_PageFileSetting", nullptr},
     },
     {
         /* .action      = */ "machine_id",
@@ -925,8 +927,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "change declares it unsupported",
          "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "keyed hash of the registry MachineGuid",
-         "not read yet: one unsupported status row, windows:planned"},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "HMAC-SHA256 (fixed public label) of the registry MachineGuid", nullptr},
     },
 };
 
@@ -978,8 +980,13 @@ public:
             return do_drivers(ctx);
         if (action == "system")
             return do_system(ctx);
-        if (auto k = yuzu::hardware::estate::parse_kind(action))
+        if (auto k = yuzu::hardware::estate::parse_kind(action)) {
+#ifdef _WIN32
+            return yuzu::hardware::estate::run_windows(ctx, *k);
+#else
             return yuzu::shared::report_planned(ctx, yuzu::hardware::estate::kind_name(*k));
+#endif
+        }
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

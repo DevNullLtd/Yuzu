@@ -1082,3 +1082,23 @@ TEST_CASE("firmware_posture adapter: the former early-return is preserved", "[sm
         CHECK(r.data.version.value == "v1");
     }
 }
+
+TEST_CASE("smbios: chassis_type_name covers the DSP0134 7.4.1 types and refuses the rest",
+          "[smbios][chassis_type]") {
+    using yuzu::shared::smbios::chassis_type_name;
+    CHECK(chassis_type_name(3) == "Desktop");
+    CHECK(chassis_type_name(9) == "Laptop");
+    CHECK(chassis_type_name(23) == "Rack Mount Chassis");
+    CHECK(chassis_type_name(35) == "Mini PC");
+    CHECK(chassis_type_name(36) == "Stick PC");
+    // 0 is not a defined type, and nothing past 36 is: the caller writes "-", never a guess.
+    CHECK_FALSE(chassis_type_name(0).has_value());
+    CHECK_FALSE(chassis_type_name(37).has_value());
+    CHECK_FALSE(chassis_type_name(127).has_value());
+    // every defined value has a non-empty name (a table typo would blank one)
+    for (unsigned t = 1; t <= 36; ++t) {
+        INFO("type " << t);
+        REQUIRE(chassis_type_name(t).has_value());
+        CHECK_FALSE(chassis_type_name(t)->empty());
+    }
+}
