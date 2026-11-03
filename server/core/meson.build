@@ -612,16 +612,21 @@ yuzu_key_provider_dep = declare_dependency(
 # home_ui and login_ui, which core-lib files call. yuzu_server_core_lib holds
 # everything else.
 #
-# Which lib does a new TU belong in? The default is core. Put it in routes only
-# if it includes or calls something defined in server.cpp, rest_api_v1.cpp,
-# mcp_server.cpp or a *_routes / *_ui TU; pure renderers, models, stores and
-# API seams stay in core. Keep the edge ONE-WAY: nothing in yuzu_server_core_lib
-# may reference a symbol defined in yuzu_server_routes_lib, so the cut stays
-# movable. Nothing enforces that at link time (both libs are always linked
-# together, and neither the MSVC linker nor GNU ld rejects a cycle). On
+# Which lib does a new TU belong in? Handlers and page renderers (*_routes,
+# *_ui) go in routes, unless a core-lib TU calls them: auth_routes, home_ui and
+# login_ui are the three that stayed in core for that reason. Everything else
+# (models, stores, API seams, mcp_* helpers) defaults to core; it goes in routes
+# only if it includes or calls something defined in server.cpp, rest_api_v1.cpp,
+# mcp_server.cpp or a *_routes / *_ui TU (mcp_tools_discovery.cpp is the one such
+# case). Keep the edge ONE-WAY: nothing in yuzu_server_core_lib may reference a
+# symbol defined in yuzu_server_routes_lib, so the cut stays movable. Nothing
+# enforces that at link time (both libs are always linked together, and the MSVC
+# linker, GNU ld under start-group and ld64 do not reject a cycle). On
 # Linux/macOS, `nm` over the two libs' .a.p object dirs shows a violation (an
-# undefined symbol in a core object that only a routes object defines);
-# check_core_presentation_link.py covers only the enrolled families, not this.
+# undefined symbol in a core object that only a routes object defines); on a
+# -Db_lto build use gcc-nm or `nm --plugin`, because plain nm reads LTO objects
+# as empty and the check would pass vacuously. check_core_presentation_link.py
+# covers only the enrolled families, not this.
 # Routes-lib static initialisers (shell::bake in the *_ui TUs) call into core,
 # so keep core free of order-sensitive namespace-scope dynamic initialisation.
 #
@@ -1058,10 +1063,10 @@ yuzu_server_core_dep = declare_dependency(
   # SSLClient (header-only, inline definitions) — every consumer TU must define
   # it identically to yuzu_server_core_cpp_args (shared by both server-core
   # libs), or the linker folds mismatched-layout definitions of the same class
-  # into one symbol (ODR
-  # violation). main.cpp transitively includes <httplib.h> via scim_routes.hpp
-  # without this propagated, which corrupted httplib::Client objects on first
-  # use (SIGSEGV in NvdClient::fetch_paginated's first request).
+  # into one symbol (ODR violation). main.cpp transitively includes
+  # <httplib.h> via scim_routes.hpp without this propagated, which corrupted
+  # httplib::Client objects on first use (SIGSEGV in
+  # NvdClient::fetch_paginated's first request).
   # CPPHTTPLIB_LISTEN_BACKLOG doesn't affect class layout (no ODR hazard), but
   # is propagated for the same reason: without it, a consumer TU falls back to
   # httplib's default listen() backlog of 5 instead of the intended 128.

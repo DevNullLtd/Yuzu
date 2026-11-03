@@ -292,9 +292,9 @@ TEST_CASE("error_json_a4: envelope carries remediation hint when present",
 
 // Exact-bytes goldens for the A4 error builder. The substring cases above pin the
 // presence of fields; these pin the whole wire body, key order and the JSON string
-// escaping. error_json_a4 lives in rest_a4_envelope.cpp with its own private copy of
-// the JSON object builder (rest_api_v1.cpp and mcp_server.cpp keep theirs), so a
-// divergence between the copies must fail here rather than change every denial body.
+// escaping. error_json_a4 lives in rest_a4_envelope.cpp with its own private JSON
+// object builder (rest_api_v1.cpp and mcp_server.cpp keep theirs), so any change to
+// this builder's wire bytes must fail here.
 TEST_CASE("error_json_a4: exact wire bytes for every overload", "[events][envelope][a4][golden]") {
     // 1. No-retry overload: retry_after_ms is ALWAYS a key (A4), null when unset;
     //    remediation is omitted when empty.
@@ -319,6 +319,17 @@ TEST_CASE("error_json_a4: exact wire bytes for every overload", "[events][envelo
     CHECK(detail::error_json_a4(409, "approval required", "req-o-1", full) ==
           R"json({"error":{"code":409,"message":"approval required","correlation_id":"req-o-1","retry_after_ms":250,"remediation":"ask an approver","permission":"Execution:Execute","approval_id":"ap-1","status_url":"/api/v1/approvals/ap-1"},"meta":{"api_version":"v1"}})json");
 
+    // 3b. approval_id and status_url are independent fields: each is emitted
+    //     without the other.
+    detail::A4ErrorOpts approval_only;
+    approval_only.approval_id = "ap-2";
+    CHECK(detail::error_json_a4(409, "approval required", "req-o-3", approval_only) ==
+          R"json({"error":{"code":409,"message":"approval required","correlation_id":"req-o-3","retry_after_ms":null,"approval_id":"ap-2"},"meta":{"api_version":"v1"}})json");
+    detail::A4ErrorOpts status_only;
+    status_only.status_url = "/api/v1/approvals/ap-3";
+    CHECK(detail::error_json_a4(409, "approval required", "req-o-4", status_only) ==
+          R"json({"error":{"code":409,"message":"approval required","correlation_id":"req-o-4","retry_after_ms":null,"status_url":"/api/v1/approvals/ap-3"},"meta":{"api_version":"v1"}})json");
+
     // 4. Only the permission specialisation set: nothing else leaks in.
     detail::A4ErrorOpts perm_only;
     perm_only.permission = "Execution:Read";
@@ -328,10 +339,18 @@ TEST_CASE("error_json_a4: exact wire bytes for every overload", "[events][envelo
 
 TEST_CASE("error_json_a4: JSON string escaping in message, correlation id and remediation",
           "[events][envelope][a4][golden]") {
-    // Quote, backslash, LF, a raw 0x01 control byte (-> \u0001), TAB, CR, BS, FF.
-    const std::string message = std::string("q\"b\\n\n") + std::string(1, '\x01') + "t\t|\r\b\f";
-    CHECK(detail::error_json_a4(400, message, "c\"\t1", "r\n") ==
-          R"json({"error":{"code":400,"message":"q\"b\\n\n\u0001t\t|\r\b\f","correlation_id":"c\"\t1","retry_after_ms":null,"remediation":"r\n"},"meta":{"api_version":"v1"}})json");
+    // Quote, backslash, LF, a raw 0x01 control byte (-> \u0001), TAB, CR, BS, FF,
+    // then 0x1a and 0x1f (control bytes whose hex digits include a letter, which pins
+    // the lowercase `%04x` form, and the top of the < 0x20 range). 0x7f (DEL) and a
+    // UTF-8 sequence (U+00E9) are NOT escaped: they pass through as raw bytes.
+    const std::string message = std::string("q\"b\\n\n") + std::string(1, '\x01') +
+                                "t\t|\r\b\f" + std::string(1, '\x1a') +
+                                std::string(1, '\x1f') + std::string(1, '\x7f') + "\xc3\xa9";
+    const std::string expected =
+        std::string(R"json({"error":{"code":400,"message":"q\"b\\n\n\u0001t\t|\r\b\f\u001a\u001f)json") +
+        std::string(1, '\x7f') + "\xc3\xa9" +
+        R"json(","correlation_id":"c\"\t1","retry_after_ms":null,"remediation":"r\n"},"meta":{"api_version":"v1"}})json";
+    CHECK(detail::error_json_a4(400, message, "c\"\t1", "r\n") == expected);
 }
 
 TEST_CASE("make_correlation_id: monotonic + unique within a process", "[events][envelope][a4]") {

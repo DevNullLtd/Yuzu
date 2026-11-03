@@ -188,7 +188,7 @@ def find_object(build_dir: Path, stem: str) -> Path:
             f"{[str(d) for d in obj_dirs]}: {sorted(str(m) for m in matches)} - "
             f"a source file belongs to exactly one server-core library, so a "
             f"stale object survived a move between them: delete the stale "
-            f"`*.a.p` directory entry (or both `*.a.p` directories) and rebuild"
+            f"object file (or both `*.a.p` directories) and rebuild"
         )
     return matches[0]
 
