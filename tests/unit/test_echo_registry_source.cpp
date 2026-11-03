@@ -3179,7 +3179,7 @@ struct OfflineRig {
     std::string config(const std::string& key) { return t.db.get_config(key, ""); }
     std::int64_t gap_unreadable_rows() {
         return std::stoll(
-           q(t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
+           ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
               .rows.at(0).at(0));
     }
 };
@@ -3314,7 +3314,7 @@ TEST_CASE("registry offline: first sight baselines silently; one mount per hive 
     CHECK(r.next().events_emitted == 1);
     CHECK(r.f.offline_profile_calls == 2);
     CHECK(r.f.offline_calls.size() == 2);
-    const auto rows = q(r.t.db, "SELECT action, hive, key_path, data, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, actor_pid, "
+    const auto rows = ql("SELECT action, hive, key_path, data, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, actor_pid, "
                                 "detail, source, record_key FROM registry_live");
     REQUIRE(rows.rows.size() == 1);
     const auto& row = rows.rows[0];
@@ -3415,7 +3415,7 @@ TEST_CASE("registry offline: a hive with several roots is mounted once, and a re
     r.src->on_enabled_changed(true);
     r.next();
     CHECK(r.f.offline_calls.size() == 4); // one more mount per sid, in THAT tick
-    CHECK(q(r.t.db, "SELECT COUNT(*) FROM registry_live WHERE action = 'changed'")
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'changed'")
              .rows.at(0).at(0) == "0");
     CHECK(count_rows(r.t.db) == 1); // only the disabled-window gap
     CHECK(r.state(a2) != before);   // the new state is the baseline
@@ -3448,7 +3448,7 @@ TEST_CASE("registry offline: a refused hive keeps its baseline, writes one gap r
     r.next();                             // the reconcile
     CHECK(r.f.offline_calls.size() == 2);
     CHECK(r.gap_unreadable_rows() == 1);
-    const auto gap = q(r.t.db, "SELECT action, detail FROM registry_live "
+    const auto gap = ql("SELECT action, detail FROM registry_live "
                                "WHERE record_key LIKE 'gap:unreadable:%'");
     CHECK(gap.rows.at(0).at(0) == "capture_gap");
     CHECK_THAT(gap.rows.at(0).at(1), ContainsSubstring(why));
@@ -3553,7 +3553,7 @@ TEST_CASE("registry offline: a re-enable re-baselines an offline root in THAT ti
     CHECK(r.f.offline_calls.size() == 2); // not the next hourly reconcile
     CHECK(r.state(root) != before);       // the new state is the baseline ...
     CHECK(count_rows(r.t.db) == 1);       // ... and only the disabled-window gap was written
-    CHECK(q(r.t.db, "SELECT COUNT(*) FROM registry_live WHERE action = 'changed'")
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'changed'")
              .rows.at(0).at(0) == "0");
 }
 
@@ -3595,7 +3595,7 @@ TEST_CASE("registry offline: logoff keeps scope, resets the retention term and c
     CHECK(cur.roots.at(root).baselined);
     CHECK(cur.offline == std::vector<OfflineProfile>{prof(kSidA)});
     CHECK(r.state(root) == baseline);          // no leave-scope drop
-    CHECK(q(r.t.db, "SELECT COUNT(*) FROM registry_live WHERE action != 'capture_gap'")
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action != 'capture_gap'")
              .rows.at(0).at(0) == "0");
     // the retention floor is the other root's base alone
     CHECK(retention_watermark(cur.roots, {}) == cur.roots.at(kRoot).window_base);
@@ -3615,7 +3615,7 @@ TEST_CASE("registry offline: logoff keeps scope, resets the retention term and c
     r.tick_to(12);
     r.next();
     REQUIRE(r.f.offline_calls.size() == 1);
-    const auto rows = q(r.t.db, "SELECT prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live "
+    const auto rows = ql("SELECT prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live "
                                 "WHERE action = 'changed'");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == kOldDwordNotStored);
@@ -3644,7 +3644,7 @@ TEST_CASE("registry offline: logon reads the loaded hive at once against the off
     CHECK(r.f.read_calls == std::vector<std::string>{root}); // read in THIS tick
     CHECK(r.f.offline_calls.size() == 1);
     CHECK(r.f.watch_calls.back() == std::vector<std::string>{root});
-    const auto rows = q(r.t.db, "SELECT action, value_name, detail, source FROM registry_live");
+    const auto rows = ql("SELECT action, value_name, detail, source FROM registry_live");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "removed");
     CHECK(rows.rows[0][1] == "once");
@@ -3693,7 +3693,7 @@ TEST_CASE("registry offline: a row takes the key's write time as its ts, as a lo
         r.f.offline_reads[kSidA] =
             hive_read({{root, written ? uread_written(root, 2, written) : uread(root, 2)}});
         REQUIRE(r.next().events_emitted == 1);
-        const auto rows = q(r.t.db, "SELECT action, data, ts, observed_at, "
+        const auto rows = ql("SELECT action, data, ts, observed_at, "
                                     "prev_data_type || '/' || prev_data_size || '/' || prev_data FROM registry_live");
         REQUIRE(rows.rows.size() == 1);
         return rows.rows[0];
@@ -3737,7 +3737,7 @@ TEST_CASE("registry offline: an incomplete profile walk keeps the known scope an
     CHECK(read_cursor(r.t.db).roots.contains(root));
     CHECK(nonempty_baseline(r.state(root))); // the baseline was not erased
     CHECK(r.state(root) != baseline);       // the known path was still read: the change is not lost
-    const auto rows = q(r.t.db, "SELECT prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
+    const auto rows = ql("SELECT prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == kOldDwordNotStored);
     CHECK(rows.rows[0][1] == "2");
@@ -3795,7 +3795,7 @@ TEST_CASE("registry offline: a user who logs off on a tick whose walk is incompl
         CHECK(r.f.offline_profile_calls == walks + 2);
         REQUIRE(r.f.offline_calls.size() == 1);
         CHECK(r.f.offline_calls[0].path == prof(kSidA).path);
-        const auto rows = q(r.t.db, "SELECT action, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
+        const auto rows = ql("SELECT action, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
         REQUIRE(rows.rows.size() == 1);
         CHECK(rows.rows[0][0] == "changed");
         CHECK(rows.rows[0][1] == kOldDwordNotStored);
@@ -3948,7 +3948,7 @@ TEST_CASE("registry offline: a re-enable does not retry a refused offline hive u
         CHECK(r.f.offline_calls.size() == attempts);          // not re-attempted
         CHECK(r.state(root) == kept);                         // baseline (or its absence) kept
         CHECK(r.gap_unreadable_rows() == 1);                  // the refusal row, once
-        CHECK(q(r.t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:disabled:%'")
+        CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:disabled:%'")
                  .rows.at(0).at(0) == "1");                   // the pause row
         CHECK(count_rows(r.t.db) == 2);
         const auto after = read_cursor(r.t.db).roots.at(root);
@@ -4088,7 +4088,7 @@ TEST_CASE("registry offline: the deferred retry marker survives a source restart
     CHECK_FALSE(after.deferred);
     CHECK(after.baselined);
     CHECK(count_rows(r.t.db) == 1); // the change since the persisted baseline
-    CHECK(q(r.t.db, "SELECT detail FROM registry_live").rows.at(0).at(0) == "attr:offline");
+    CHECK(ql("SELECT detail FROM registry_live").rows.at(0).at(0) == "attr:offline");
 
     r.next();
     CHECK(r.f.offline_calls.size() == 3); // back to hourly
@@ -4114,7 +4114,7 @@ TEST_CASE("registry offline: an empty complete discovery (an older build lists n
     CHECK(read_cursor(r.t.db).offline.empty());
     CHECK(empty_baseline(r.state(root))); // shrunk, so a later logon cannot diff against it
     CHECK(count_rows(r.t.db) == 0);
-    CHECK(q(r.t.db, "SELECT COUNT(*) FROM registry_live WHERE action = 'removed'")
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'removed'")
              .rows.at(0).at(0) == "0");
     const auto cursor = r.t.db.get_cursor("registry");
     REQUIRE(cursor.has_value());
@@ -4430,7 +4430,7 @@ TEST_CASE("registry offline: a user who has just logged off is protected by the 
         r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
         r.tick_to(12);
         r.next();
-        const auto rows = q(r.t.db, "SELECT action, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
+        const auto rows = ql("SELECT action, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
         REQUIRE(rows.rows.size() == 1);
         CHECK(rows.rows[0][0] == "changed");
         CHECK(rows.rows[0][1] == kOldDwordNotStored);
@@ -4502,7 +4502,7 @@ TEST_CASE("registry offline: a pathless profile carried from an EARLIER tick is 
         CHECK_FALSE(resolved.roots.at(root).deferred);
         REQUIRE(r.f.offline_calls.size() == mounts + 1);
         CHECK(r.f.offline_calls.back().path == prof(kSidA).path);
-        const auto rows = q(r.t.db, "SELECT action, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
+        const auto rows = ql("SELECT action, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
         REQUIRE(rows.rows.size() == 1);
         CHECK(rows.rows[0][0] == "changed");
         CHECK(rows.rows[0][1] == kOldDwordNotStored);
@@ -4662,7 +4662,7 @@ TEST_CASE("registry offline: a path first learned for a pathless profile is take
             CHECK_FALSE(cur.roots.at(root).deferred);
             REQUIRE(r.f.offline_calls.size() == mounts + 1);
             CHECK(r.f.offline_calls.back().path == prof(kSidA).path);
-            const auto rows = q(r.t.db, "SELECT action, prev_data, data, detail FROM registry_live");
+            const auto rows = ql("SELECT action, prev_data, data, detail FROM registry_live");
             REQUIRE(rows.rows.size() == 1);
             CHECK(rows.rows[0][0] == "changed");
             continue;
@@ -4992,7 +4992,7 @@ TEST_CASE("registry offline: a hive deferred while offline and then read as a lo
     r.tick_to(12);
     r.next(); // the hourly read, against the loaded baseline
     CHECK(r.f.offline_calls.size() == 2);
-    CHECK(q(r.t.db, "SELECT COUNT(*) FROM registry_live WHERE action = 'changed'").rows.at(0).at(0) == "1");
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'changed'").rows.at(0).at(0) == "1");
 }
 
 TEST_CASE("registry offline: a restart does not mount a settled offline hive again - the restart reconcile is for loaded roots",

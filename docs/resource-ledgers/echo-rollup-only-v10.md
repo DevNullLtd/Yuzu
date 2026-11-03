@@ -95,6 +95,23 @@ releases exactly the resource listed.
 - **Lifecycle:** with it set, no trigger is registered and no database exists; every action answers
   `error|` first, then `storage_state|offline|free_space`. A restart with the space freed clears it.
 
+### Registry baselines and the logged-off profile list (carried, not converted)
+- **Site:** the per-root baselines (`echo_state`, key `registry:<root>`) and the registry cursor row
+  (`echo_cursor`, source `registry`, including its `offline` list of `[sid, ProfileImagePath]`
+  entries, its per-root `baselined`/`deferred`/`status` flags and any change held for its writer),
+  written through `insert_registry_events_and_cursor` with the event fold.
+- **Owner type:** the database; the registry source reads and writes them only inside its tick's
+  transaction. The v10 migration neither reads nor rewrites either table, so an upgrade re-baselines
+  no loaded or logged-off root.
+- **What the tier keeps:** a change found in a logged-off user's hive folds into the same hourly and
+  daily buckets as a loaded hive's (`hive`, `key_path`, `value_name`, `action` key a bucket;
+  `change_count`, `last_data`, `last_data_type`, `last_actor_image`, `last_ts` are kept). The offline
+  attribution marker (`source` = `offline`, `detail` = `attr:offline`), the writer's pid, the read
+  time and the record key are decided with the event and are not stored; no column holds them.
+- **Exposure:** `last_data` holds the newest new value (512 bytes) unmasked and the cursor row names
+  each logged-off user's profile path, both readable through `echo.sql`; `purge_source("registry")`
+  on the paused source erases the tiers, the baselines and the cursor row in one transaction.
+
 ### Budget catch-up latch and the conversion marker
 - **Site:** `EchoPlugin::budget_catch_up_` (atomic armed flag plus the admitted clock reading),
   `vacuum_marker_fallback_` and `vacuum_last_attempt_` (atomics), and the `auto_vacuum_deferred_at`
