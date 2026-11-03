@@ -621,7 +621,12 @@ cursor.** What it adds to the pattern:
     also how a cursor from a build without offline hives picks them up. It is
     classified against the loaded list collect() took for that tick (the
     `loaded_sids` argument of the hook), never a second HKU enumeration: a logon
-    between two snapshots cannot leave a baselined profile in neither list.
+    between two snapshots cannot leave a baselined profile in neither list. That
+    loaded list is complete or the tick fails: an enumeration that ends on anything but
+    `ERROR_NO_MORE_ITEMS` throws `IncompleteCaptureError` before any watch, dirty
+    mark, baseline or the cursor is touched (the HKU mark is put back), because a
+    partial list would read a loaded user as logged off; `start()` then arms no watch
+    and the first tick lists again.
   - *The shared gate.* The in-flight counter, worker guard, bound and module pin
     live in `echo_hive_mount_gate.hpp`, one per plugin DLL and shared with the
     mapped-drive walk: a stuck mount worker from EITHER source closes the gate for

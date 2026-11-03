@@ -96,11 +96,11 @@ void RegistryCursorSource::start(EchoDatabase& db) {
         ensure_watch(scope_.roots_for(reader_.loaded_sids()));
     } catch (const IncompleteCaptureError& e) {
         // A partial list would arm a partial watch: arm nothing here. The first collect()
-        // enumerates again (force_all_) and, if that also fails, keeps the cursor and retries.
+        // enumerates again (a restart's force_all_, a fresh baseline or the empty list all
+        // force it) and, if that also fails, keeps the cursor and retries.
         spdlog::warn("Echo registry: the loaded user hives could not be listed at start-up ({}); "
                      "their watches arm on the first tick that can list them",
                      e.what());
-        force_all_ = true;
     }
 }
 
@@ -1488,8 +1488,6 @@ std::vector<std::string> enumerate_hku() {
             RegEnumKeyExW(HKEY_USERS, i, buf, &len, nullptr, nullptr, nullptr, nullptr);
         if (rc == ERROR_NO_MORE_ITEMS)
             break;
-        if (rc == ERROR_MORE_DATA)
-            continue; // a name longer than any SID or its _Classes twin is not a user hive
         if (rc != ERROR_SUCCESS)
             throw IncompleteCaptureError("Echo registry: HKEY_USERS enumeration failed at index " +
                                          std::to_string(i) + " (error " + std::to_string(rc) +
