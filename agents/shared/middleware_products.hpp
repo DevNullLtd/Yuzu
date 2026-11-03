@@ -134,16 +134,6 @@ namespace detail {
     return s != nullptr ? std::string_view{s} : std::string_view{};
 }
 
-/// No byte the wire grammar escapes: the collector compares a row's title, which arrives escaped
-/// (`\|`, `\\`), against the table's raw title, so a title holding either byte would never map and
-/// its source's stored rows would be removed.
-[[nodiscard]] constexpr bool is_wire_plain(std::string_view s) noexcept {
-    for (const char c : s)
-        if (c == '|' || c == '\\')
-            return false;
-    return true;
-}
-
 /// `[a-z][a-z0-9_]*` (alpha_first) or `[a-z0-9_]+`.
 [[nodiscard]] constexpr bool is_ident(std::string_view s, bool alpha_first) noexcept {
     if (s.empty())
@@ -221,7 +211,11 @@ namespace detail {
     for (std::size_t i = 0; i < table.size(); ++i) {
         const Product& p = table[i];
         if (!detail::is_ident(detail::sv(p.id), true) ||
-            !detail::is_ident(detail::sv(p.ecosystem), true) || detail::sv(p.title).empty() || !detail::is_wire_plain(detail::sv(p.title)) ||
+            !detail::is_ident(detail::sv(p.ecosystem), true) || detail::sv(p.title).empty() ||
+            // The collector compares a row's title, which arrives wire-escaped (`\|`, `\\`), with
+            // this raw one, so a title holding either byte would never map and its source's stored
+            // rows would be removed.
+            detail::sv(p.title).find_first_of("|\\") != std::string_view::npos ||
             detail::sv(p.vendor).empty() || detail::sv(p.kind) != "app")
             return false;
         for (std::size_t j = 0; j < i; ++j)

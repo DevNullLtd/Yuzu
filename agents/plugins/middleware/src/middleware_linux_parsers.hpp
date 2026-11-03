@@ -392,8 +392,7 @@ struct MountScan {
     bool ok = false;
 };
 
-///
-/// DECLARED EXCEPTION to the hop-by-hop rule: `path` is opened by name, so only the leaf is
+/// scan_mounts is a DECLARED EXCEPTION to the hop-by-hop rule: `path` is opened by name, so only the leaf is
 /// O_NOFOLLOW and production's `/proc/self` magic link is followed. This is the same read as the
 /// `runtimes` plugin's accepted copy; procfs is kernel-controlled and a swapped link cannot name
 /// another process's table.

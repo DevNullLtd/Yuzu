@@ -46,7 +46,7 @@
 #include <ini_parse.hpp>              // yuzu::shared::ini_trim (agents/shared)
 #include <inventory_status_row.hpp>   // yuzu::shared::format_status_row (agents/shared)
 #include <middleware_products.hpp>    // NameForm (agents/shared)
-#include <wire_utf8.hpp>             // yuzu::shared::scrub_wire_bytes (agents/shared)
+#include <wire_utf8.hpp>              // yuzu::shared::scrub_wire_bytes (agents/shared)
 
 #include <yuzu/string_utils.hpp>
 
