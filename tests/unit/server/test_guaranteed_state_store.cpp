@@ -3465,7 +3465,7 @@ TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state 
           "[pg][guaranteed_state_store][census]") {
     // guard.errored is the #2818 spark subscription-death detach lifecycle event. It
     // must set the per-(agent, rule) census state to "errored" exactly as
-    // guard.unhealthy does. The upsert is ordered by updated_at with `>=` (equal
+    // guard.unhealthy does. The census is ordered by the (key, ingest_seq) tuple, with the agent stamp as the key (equal
     // timestamps overwrite), so D4 characterises that existing tie behaviour.
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

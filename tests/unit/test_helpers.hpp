@@ -1406,17 +1406,37 @@ static_assert(kSqliteOwnerIsSealed<struct SqliteOwnerSealCheck>);
 /// from the agent's wire stamp, so a test that builds an event row directly and wants its
 /// timestamp to decide the order supplies the same instant as `agent_ns`.
 inline std::int64_t iso8601_to_ns(const std::string& ts) {
-    int year_v = 0, month_v = 0, day_v = 0, hour_v = 0, minute_v = 0, second_v = 0;
-    if (std::sscanf(ts.c_str(), "%d-%d-%dT%d:%d:%dZ", &year_v, &month_v, &day_v, &hour_v,
-                    &minute_v, &second_v) != 6)
+    // "YYYY-MM-DDTHH:MM:SSZ": a strtol walk with range checks (the scanf family is not used in
+    // new code, docs/cpp-conventions.md).
+    const char* p = ts.c_str();
+    const auto field = [&p](char sep, long lo, long hi, long& out) {
+        char* end = nullptr;
+        out = std::strtol(p, &end, 10);
+        if (end == p || out < lo || out > hi)
+            return false;
+        if (sep != '\0') {
+            if (*end != sep)
+                return false;
+            ++end;
+        }
+        p = end;
+        return true;
+    };
+    long year_v = 0, month_v = 0, day_v = 0, hour_v = 0, minute_v = 0, second_v = 0;
+    if (!field('-', 1970, 9999, year_v) || !field('-', 1, 12, month_v) ||
+        !field('T', 1, 31, day_v) || !field(':', 0, 23, hour_v) || !field(':', 0, 59, minute_v) ||
+        !field('\0', 0, 60, second_v) || *p != 'Z' || p[1] != '\0')
         return 0;
     using namespace std::chrono;
-    const sys_days date{year{year_v} / month{static_cast<unsigned>(month_v)} /
-                        day{static_cast<unsigned>(day_v)}};
-    const seconds secs =
-        date.time_since_epoch() + hours{hour_v} + minutes{minute_v} + seconds{second_v};
+    const year_month_day ymd{year{static_cast<int>(year_v)},
+                             month{static_cast<unsigned>(month_v)},
+                             day{static_cast<unsigned>(day_v)}};
+    if (!ymd.ok())
+        return 0;
+    const sys_days date{ymd};
+    const seconds secs = date.time_since_epoch() + hours{hour_v} + minutes{minute_v} +
+                         seconds{second_v};
     return static_cast<std::int64_t>(secs.count()) * 1'000'000'000LL;
 }
-
 
 } // namespace yuzu::test

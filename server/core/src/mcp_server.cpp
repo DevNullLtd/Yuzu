@@ -1509,7 +1509,8 @@ static const ToolDef kTools[] = {
      "does. Each row carries order_uncertain (sticky: the greatest ordered verdict persisted for "
      "the pair cannot be proven to be the latest; false does not prove freshness) and "
      "projection_pending (a retained event for the pair has not reached the row, so the state "
-     "shown may lag it). 404-equivalent (kInvalidParams) if rule_id names no rule.",
+     "shown may lag it); a true flag means do not report the pair as settled, and "
+     "get_guardian_device_guards shows the same flags for one device. 404-equivalent (kInvalidParams) if rule_id names no rule.",
      R"({"type":"object","properties":{"rule_id":{"type":"string","minLength":1}},"required":["rule_id"]})",
      R"j({"type":"object","properties":{"rule_id":{"type":"string"},"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["agent_id","state","updated_at","order_uncertain","projection_pending"]}},"total":{"type":"integer"}},"required":["rule_id","agents","total"]})j"},
 
@@ -1706,7 +1707,10 @@ static const ToolDef kTools[] = {
      "compliance signal to act on (draft Baseline, or nothing reported yet) — do not compute "
      "a percentage when false. Per-device behavioral read — every call is audit-logged "
      "(guardian.device.view). Per-device scoped (management-group aware) via the SAME gate "
-     "get_guardian_agent_status uses.",
+     "get_guardian_agent_status uses. Counts and states cover REPRESENTED pairs only and do not "
+     "report ordering uncertainty or pending census evidence: a guard reading compliant here may "
+     "still be order_uncertain or projection_pending; call get_guardian_device_guards for those "
+     "flags before reporting the device as settled.",
      R"j({"type":"object","properties":{)j"
      R"j("baseline":{"type":"string","minLength":1,"maxLength":256,"description":"Baseline name (stable across reseeds, unlike baseline_id)"},)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256})j"
@@ -16170,7 +16174,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto result = guaranteed_state_store->delete_rule(rule_id);
                 if (!result) {
                     (void)yuzu::server::detail::try_persist_audit(
-                        audit_fn, req, "guaranteed_state.rule.delete", "denied",
+                        audit_fn, req, "guaranteed_state.rule.delete",
+                        result.error().starts_with("not found") ? "denied" : "failure",
                         "GuaranteedState", rule_id, result.error());
                     // retry-hint-exempt: mirrors REST's own posture — delete_rule
                     // conflates not-found with a genuine failure into one error

@@ -269,6 +269,13 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         if (ev.rule_id().empty()) {
             spdlog::warn("Guardian: dropping event with an empty rule_id from agent {} event {}",
                          log_id_token(agent_id), log_id_token(ev.event_id()));
+            if (metrics) {
+                try { // best-effort metric; never propagate onto the ingest thread
+                    metrics->counter(kGuardianEventsRejectedMetric, {{"reason", "empty_rule_id"}})
+                        .increment();
+                } catch (...) {
+                }
+            }
             return;
         }
         // #4606 criterion-10 T_server waypoint: server receipt, captured before

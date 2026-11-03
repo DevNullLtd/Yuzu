@@ -2425,7 +2425,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   `yuzu_server_guardian_census_proj_failures_total` (so a transient Postgres failure still leaves a detached rule showing its last verdict, now visibly), and a deleted rule's census rows are removed with it; (b)
   recovery after a spark re-arm is by code reading only, with no agent-level detach,
   re-arm, compliant-edge test (#5676); (c) the census orders by a key limited to server receipt plus 300 s (#5690 PR2a-1;
-  the text timestamp `guardian_ingest.cpp:293` still feeds the TEXT column only) with ties broken by the
+  the text timestamp in `guardian_ingest.cpp` (`ts_to_iso8601`) still feeds the TEXT column only) with ties broken by the
   event INSERT's `ingest_seq`, and flags a refused or unprovable ordering (`order_uncertain`), so clock skew or a same-second tie across the
   lifecycle and compliance lanes can leave a false compliant (#5690; live today
   for guard.unhealthy; the agent-side hold, PR #5776, delays each overtake by up to

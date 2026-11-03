@@ -1220,8 +1220,12 @@ ordering tuple `(key, ingest_seq)`, the key being the agent stamp limited to rec
 census write failed stays stored with `projection_pending`, and a redelivery of it repairs the census from its
 stored ordering inputs. `order_uncertain` is sticky and disclosed on every read. Under one `census_upsert`
 savepoint a writer locks every pending event of the pair in `ingest_seq` order in one statement, then the census
-row; `delete_rule` locks the rule's pending events the same way before it retires them and deletes the rule. No
-consumer may read clean over an uncertain or pending pair. See the user manual's Compliance overview for the
+row; `delete_rule` locks the rule's pending events the same way before it retires them and deletes the rule. The
+event-row waits of single-event ingest, repair and `delete_rule` are acyclic; the batch path (no production
+caller) carries no such guarantee. Every census read that returns per-pair state, or a rollup of it, discloses
+`order_uncertain` and `projection_pending` (or `uncertain_rules`), with one named exception: the device-compliance
+read covers represented pairs only and does not yet report them. A pending event whose pair has no census row is
+visible only on `yuzu_server_guardian_census_pending_events`. See the user manual's Compliance overview for the
 operator-facing contract.
 
 ### 9.2 REST API endpoints

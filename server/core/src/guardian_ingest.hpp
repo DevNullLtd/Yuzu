@@ -76,6 +76,11 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
 [[nodiscard]] std::optional<std::int64_t> agent_stamp_ns(bool has_timestamp, std::int64_t seconds,
                                                          std::int32_t nanos) noexcept;
 
+/// Counter of events the ingest boundary refuses before they reach the store, by `reason`
+/// (today only `empty_rule_id`: an event with no rule id cannot be projected or matched and is
+/// not stored). Warm-created at startup (server.cpp) so the series reads 0, not absent.
+inline constexpr char kGuardianEventsRejectedMetric[] = "yuzu_server_guardian_events_rejected_total";
+
 /// Prometheus metric name for the store-operation latency histogram: server-side latency of
 /// `insert_event_classified` (the classify+store SQLite txn) for one Guardian event, split by
 /// outcome `status`. Shared by the observe site (guardian_ingest.cpp) and the describe +

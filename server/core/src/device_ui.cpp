@@ -1038,6 +1038,10 @@ std::string render_device_guardian_lens(const std::string& agent_id,
          "</tr></thead><tbody>";
     for (const auto& g : guards)
         h += "<tr><td class=\"name\">" + esc(g.name) + "</td><td>" + guard_state_badge(g.state) +
+             (g.order_uncertain || g.projection_pending
+                  ? " <span class=\"gp-mute\" title=\"The ordering of this verdict cannot be proven, "
+                    "or a retained event is not yet reflected\">&middot; ordering uncertain</span>"
+                  : std::string{}) +
              "</td><td class=\"gp-mute\">" + esc(g.updated_at) + "</td></tr>";
     h += "</tbody></table>";
     h += "<div class=\"gp-note\">Per-guard state from "

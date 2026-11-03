@@ -4041,6 +4041,32 @@ public:
                           "outcome and is not counted; a failure to retire the evidence of "
                           "such an event is an ingest error.",
                           "counter");
+        metrics_.describe("yuzu_server_guardian_census_projection_total",
+                          "Compliance-census projections by source (first_delivery, repair, "
+                          "batch) and outcome (applied, refused_flagged, refused_noop, "
+                          "pending_retired, rejected, failed, abandoned). A refused outcome means "
+                          "the event was dominated by the stored verdict; refused_flagged also "
+                          "marks the pair order_uncertain. pending_retired is a repair that found "
+                          "its evidence already retired; rejected is a write refused because the "
+                          "rule is gone (not a fault); failed is a fault that leaves pending "
+                          "evidence (see ..._census_proj_failures_total); abandoned aborted the "
+                          "transaction (counted again as an ingest error). Counted when the "
+                          "projection returns, before the transaction commits. Resets on server "
+                          "restart.",
+                          "counter");
+        metrics_.describe("yuzu_server_guardian_events_rejected_total",
+                          "Guardian events refused at the ingest boundary before reaching the "
+                          "store, by reason. empty_rule_id: the event carried no rule id, so it "
+                          "could not be projected or matched, and it is not stored. Resets on "
+                          "server restart.",
+                          "counter");
+        for (const char* source : {"first_delivery", "repair", "batch"})
+            for (const char* outcome : {"applied", "refused_flagged", "refused_noop",
+                                        "pending_retired", "rejected", "failed", "abandoned"})
+                metrics_.counter("yuzu_server_guardian_census_projection_total",
+                                 {{"source", source}, {"outcome", outcome}});
+        metrics_.counter("yuzu_server_guardian_events_rejected_total",
+                         {{"reason", "empty_rule_id"}});
         metrics_.describe("yuzu_server_guardian_census_pending_events",
                           "Guardian events stored with pending census evidence: their census "
                           "write failed and no redelivery has repaired it. Not updated while "

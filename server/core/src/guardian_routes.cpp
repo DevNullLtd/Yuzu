@@ -222,6 +222,11 @@ struct StateRollup {
     // Guardian DOES now arm (Linux Service) must not be counted here just
     // because it is also absent from some OTHER, stricter bucket.
     int64_t notimpl = 0;
+    // Reported (agent, rule) pairs whose row is order-uncertain or whose retained event is not
+    // yet reflected (#5690). Not a bucket: the pair is ALSO counted in ok/drift/err/unk above, so
+    // it is excluded from total(); every surface that draws a compliance figure from this
+    // rollup shows it beside the figure, never a clean headline over it.
+    int64_t uncertain = 0;
     int64_t total() const { return ok + drift + err + unk + notimpl; }
 };
 std::unordered_map<std::string, StateRollup>
@@ -235,8 +240,15 @@ rollup_by_rule(const std::vector<yuzu::server::GuardianAgentRuleStatus>& rows,
         else if (st == "drifted") ++c.drift;
         else if (st == "errored") ++c.err;
         else ++c.unk;
+        if (s.order_uncertain || s.projection_pending) ++c.uncertain;
     }
     return m;
+}
+
+// Wording shared by every surface that shows the uncertain count beside a compliance figure.
+std::string uncertain_phrase(int64_t n) {
+    return std::to_string(n) + (n == 1 ? " pair" : " pairs") +
+           " with uncertain ordering or an unreflected verdict";
 }
 
 // ── #4252 shared machinery: guard-type-aware "not implemented" + double-count
@@ -634,6 +646,8 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
                 if (s.notimpl > 0)  // macOS/Linux agents the guard targets but can't arm (acb332a)
                     sum += " <span class=\"gs-ni\">&middot; " +
                            std::to_string(s.notimpl) + " not impl</span>";
+                if (s.uncertain > 0)
+                    sum += " <span class=\"gs-warn\">&middot; " + uncertain_phrase(s.uncertain) + "</span>";
                 mid = "<div class=\"gs-pbar\">" + seg("var(--ok)", s.ok) + seg("var(--warn)", s.drift) +
                       seg("var(--bad)", s.err) + seg("var(--faint)", s.unk) + seg(kNotImplColor, s.notimpl) +
                       "</div><div class=\"gs-legend\">" + sum + "</div>";
@@ -703,6 +717,7 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
                     bc.ok += it->second.ok; bc.drift += it->second.drift;
                     bc.err += it->second.err; bc.unk += it->second.unk;
                     bc.notimpl += it->second.notimpl;
+                    bc.uncertain += it->second.uncertain;
                     if (it->second.drift > 0 || it->second.err > 0) ++guards_drifting;
                 }
             }
@@ -729,6 +744,9 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
                       (bc.notimpl > 0 ? " <span class=\"gs-ni\">&middot; " +
                                             std::to_string(bc.notimpl) + " not impl</span>"
                                       : std::string{}) +
+                      (bc.uncertain > 0 ? " <span class=\"gs-warn\">&middot; " +
+                                              uncertain_phrase(bc.uncertain) + "</span>"
+                                        : std::string{}) +
                       "</div>";
             }
 
@@ -871,7 +889,7 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     html += "</div>";
 
     // ── Compliance census ── proportion bar + legend (NOT a donut), from the
-    // per-(agent,rule) status feed. "as of last check-in" framing: figures reflect
+    // per-(agent,rule) status feed. Framing: figures count each pair at the greatest ordered verdict that reached the census, with uncertain or pending pairs shown beside them. Figures reflect
     // each Guard's last reported state, not a live probe.
     html += sech("Compliance &mdash; greatest ordered verdict projected (uncertain or pending pairs are flagged)");
     if (cc_total == 0) {
@@ -2044,6 +2062,7 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
         if (auto it = by_rule.find(rid); it != by_rule.end()) {
             total.ok += it->second.ok; total.drift += it->second.drift;
             total.err += it->second.err; total.unk += it->second.unk;
+            total.uncertain += it->second.uncertain;
             if (it->second.drift > 0 || it->second.err > 0) ++guards_drifting;
             else if (it->second.ok > 0) ++guards_ok;
         }
@@ -2134,6 +2153,10 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
                                       "\"></i>Not implemented <b>" + std::to_string(total.notimpl) + "</b></span>"
                                 : std::string{}) +
              "</div></div></div>";
+        if (total.uncertain > 0)
+            h += "<div class=\"gp-note\">" + uncertain_phrase(total.uncertain) +
+                 ": the figures above count each pair at the greatest verdict that reached "
+                 "the census, which may not be the latest.</div>";
     }
 
     // Stat tiles (mode-aware: remediation tiles only when an Enforce member exists).
@@ -2192,6 +2215,9 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
             else if (c.ok > 0) { rowstate = "ok"; state = "<span class=\"gp-ok\">compliant &middot; " + std::to_string(c.ok) + "</span>"; }
             else if (c.unk > 0) { rowstate = "unk"; state = "<span class=\"gp-unk\">unknown &middot; " + std::to_string(c.unk) + "</span>"; }
             else { rowstate = "unk"; state = "<span class=\"gp-mute\">&mdash;</span>"; }
+            if (c.uncertain > 0)
+                state += " <span class=\"gp-drift\">&middot; " + std::to_string(c.uncertain) +
+                         " uncertain</span>";
             const auto* a = act.count(rid) ? act[rid] : nullptr;
             const std::string sevpill =
                 sev.empty() ? "<span class=\"gp-mute\">&mdash;</span>"
@@ -2331,9 +2357,9 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
             values_html = render_assertion_values(j.value("assertion", nlohmann::json::object()), mode_color);
 
     // Per-device census (current state per agent, from the status feed; offline → unknown).
-    struct DevRow { std::string host; std::string agent_id; std::string state; std::string updated; bool online{false}; };
+    struct DevRow { std::string host; std::string agent_id; std::string state; std::string updated; bool online{false}; bool uncertain{false}; };
     std::vector<DevRow> devs;
-    int64_t d_ok = 0, d_drift = 0, d_err = 0, d_unk = 0, d_notimpl = 0;
+    int64_t d_ok = 0, d_drift = 0, d_err = 0, d_unk = 0, d_notimpl = 0, d_uncertain = 0;
     if (store_ && store_->is_open()) {
         std::unordered_map<std::string, std::string> hostname;
         std::unordered_map<std::string, std::string> agent_os;  // connected agents → platform
@@ -2379,6 +2405,8 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
             d.host = (d.online && !hostname[s.agent_id].empty()) ? hostname[s.agent_id] : s.agent_id.substr(0, 12);
             d.agent_id = s.agent_id;
             d.updated = s.updated_at;
+            d.uncertain = s.order_uncertain || s.projection_pending;
+            if (d.uncertain) ++d_uncertain;
             d.state = d.online ? s.state : "unknown";
             if (d.state == "compliant") ++d_ok;
             else if (d.state == "drifted") ++d_drift;
@@ -2508,6 +2536,10 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
                                   "\"></i>Not implemented <b>" + std::to_string(d_notimpl) + "</b></span>"
                             : std::string{}) +
              "</div></div></div>";
+        if (d_uncertain > 0)
+            h += "<div class=\"gp-note\">" + uncertain_phrase(d_uncertain) +
+                 ": each device is counted at the greatest verdict that reached the census, "
+                 "which may not be the latest.</div>";
     }
     {
         auto tile = [](const std::string& n, const char* tone, const std::string& l, const std::string& sx) {
@@ -2560,7 +2592,11 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
             const std::string statecell =
                 ni ? "<span style=\"color:" + std::string(kNotImplColor) +
                          ";font-weight:500\">&#9679; not yet implemented</span>"
-                   : "<span class=\"" + std::string(cls) + "\">&#9679; " + html_escape(d.state) + "</span>";
+                   : "<span class=\"" + std::string(cls) + "\">&#9679; " + html_escape(d.state) + "</span>" +
+                         (d.uncertain ? " <span class=\"gp-drift\" title=\"The ordering of this device's "
+                                        "verdict cannot be proven, or a retained event is not yet "
+                                        "reflected\">&middot; ordering uncertain</span>"
+                                      : std::string{});
             // not-impl rows carry the platform display name in `updated`, not a timestamp.
             const std::string as_of =
                 ni ? "guard is a no-op on " + html_escape(d.updated)
