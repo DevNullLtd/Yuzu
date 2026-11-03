@@ -18,6 +18,7 @@
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <nlohmann/json.hpp>
 
 #include <cctype>
@@ -1390,6 +1391,125 @@ TEST_CASE("echo routes: a DNS or ARP failure is an error in the panel and never 
         REQUIRE(r);
         CHECK(r->body.find("Results were cut at 10,000 rows for this hour") != std::string::npos);
         CHECK(r->body.find("1 row unreadable") != std::string::npos);
+    }
+}
+
+// G8-1: the agent flushes a long answer as several frames, so a failure status can sit beside the
+// frames that came before it. Any failure fails the whole answer, whichever way the store orders
+// the rows: the head of a failed answer must never read as a finished one.
+namespace {
+DexAgentResponse failure_frame(const std::string& why) {
+    DexAgentResponse f;
+    f.agent_id = "dev-A";
+    f.status = 2;
+    f.error_detail = why;
+    return f;
+}
+const char* kTcpFrameBody =
+    "__schema__|hour_ts|remote_addr|remote_port|proto|process_name|connect_count|"
+    "disconnect_count|failed_count\n7200|10.0.0.1|443|tcp|bash|1|1|0\n__total__|1\n";
+} // namespace
+
+TEST_CASE("echo routes: a failure beside output frames fails the whole answer in either store order",
+          "[echo][routes][frames]") {
+    const bool failure_first = GENERATE(true, false);
+    CAPTURE(failure_first);
+    // The store answers newest first: the frames this test hands back, in the order under test.
+    const auto beside = [&](const std::string& body) {
+        std::vector<DexAgentResponse> v{frame(body), failure_frame("plugin crashed")};
+        if (failure_first)
+            std::swap(v[0], v[1]);
+        return v;
+    };
+    const std::string crashed = "The device reported an error: plugin crashed";
+    const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
+                             "&acmd=" + kArpCmd + "&n=1&hour=7200";
+
+    SECTION("the process tree") {
+        EchoHarness h;
+        h.frames_override[kProcCmd] = beside(kProcOut);
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find(crashed) != std::string::npos);
+        CHECK(r->body.find("tt-name") == std::string::npos);
+        CHECK(h.find_audit("echo.process_tree.read", "success") == nullptr);
+    }
+    SECTION("the connection list keeps the tree and says why it is missing") {
+        EchoHarness h;
+        h.frames_override[kTcpCmd] = beside(kTcpFrameBody);
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+        CHECK(r->body.find("Connection data was unavailable for this host") != std::string::npos);
+        CHECK(r->body.find(crashed) != std::string::npos);
+    }
+    SECTION("the hour list keeps the tree and the shown hour") {
+        EchoHarness h;
+        h.frames_override[kHoursCmd] = beside("__schema__|hour_ts\n7200\n3600\n__total__|2\n");
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+        CHECK(r->body.find("The list of other hours was unavailable") != std::string::npos);
+        CHECK(r->body.find("<option value=\"7200\" selected>") != std::string::npos);
+        CHECK(r->body.find("<option value=\"3600\">") == std::string::npos); // the torn list is not used
+    }
+    SECTION("the DNS panel shows the error and never a quiet hour") {
+        EchoHarness h;
+        h.frames_override[kDnsCmd] = beside(std::string(kDnsSchema) + "7200|a.test|A|1.1.1.1|1|0\n__total__|1\n");
+        h.arp_output = std::string(kArpSchema) + "__total__|0\n";
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find(crashed) != std::string::npos);
+        CHECK(r->body.find("a.test") == std::string::npos);
+        CHECK(r->body.find("No DNS cache activity recorded") == std::string::npos);
+        CHECK(h.find_audit("echo.dns.read", "failure") != nullptr);
+        CHECK(h.find_audit("echo.dns.read", "success") == nullptr);
+    }
+    SECTION("the ARP panel shows the error and never a quiet hour") {
+        EchoHarness h;
+        h.dns_output = std::string(kDnsSchema) + "__total__|0\n";
+        h.frames_override[kArpCmd] = beside(std::string(kArpSchema) +
+                                            "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0\n__total__|1\n");
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find(crashed) != std::string::npos);
+        CHECK(r->body.find("10.0.0.1") == std::string::npos);
+        CHECK(r->body.find("No ARP activity recorded") == std::string::npos);
+        CHECK(h.find_audit("echo.arp.read", "failure") != nullptr);
+        CHECK(h.find_audit("echo.arp.read", "success") == nullptr);
+    }
+}
+
+// G8-2: the frames are merged only up to the answer's own byte cap, then the caller's over-cap
+// branch refuses the answer as it would a single oversize frame.
+TEST_CASE("echo routes: frames that together pass a payload cap take the over-cap path",
+          "[echo][routes][frames]") {
+    const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
+                             "&acmd=" + kArpCmd + "&n=1&hour=7200";
+    SECTION("DNS frames over the device-net cap") {
+        EchoHarness h;
+        const std::string filler(kMaxEchoDeviceNetOutputBytes / 2 + 1, 'x');
+        h.frames_override[kDnsCmd] = {frame(filler), frame(filler), frame(filler),
+                                      frame(std::string(kDnsSchema) + "7200|a.test|A|1.1.1.1|1|0\n")};
+        h.arp_output = std::string(kArpSchema) + "__total__|0\n";
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find("The device returned an unexpectedly large dataset") != std::string::npos);
+        CHECK(r->body.find("a.test") == std::string::npos);
+        CHECK(r->body.find("No DNS cache activity recorded") == std::string::npos);
+        CHECK(h.find_audit("echo.dns.read", "failure") != nullptr);
+    }
+    SECTION("an hour list over its cap keeps the tree and the shown hour") {
+        EchoHarness h;
+        const std::string filler(256 * 1024 + 1, 'x');
+        h.frames_override[kHoursCmd] = {frame(filler),
+                                        frame("__schema__|hour_ts\n7200\n3600\n__total__|2\n")};
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+        CHECK(r->body.find("The list of other hours was unavailable") != std::string::npos);
+        CHECK(r->body.find("<option value=\"7200\" selected>") != std::string::npos);
+        CHECK(r->body.find("<option value=\"3600\">") == std::string::npos);
     }
 }
 

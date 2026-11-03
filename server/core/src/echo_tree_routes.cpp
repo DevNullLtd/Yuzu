@@ -273,9 +273,17 @@ std::string cap_pending(const std::string& device, const std::string& scmd, cons
            "class=\"echo-tree-loading\">Loading capture sources\xE2\x80\xA6</div>";
 }
 
+// The hour list is at most kEchoAgentRowCap epoch lines (~21 bytes each, ~210 KiB), so an honest
+// answer fits well inside this; anything bigger is refused like the other answers' caps.
+constexpr std::size_t kMaxEchoHoursOutputBytes = 256 * 1024;
+
 // Poll one dispatched command for `device`: ready when it has output AND a terminal status
 // (the agent flushes a long answer as several frames, so output seen before the terminal
-// status may be only the head of it), or a terminal status alone. Returns
+// status may be only the head of it), or a terminal status alone. A failure status on ANY of
+// the device's rows fails the whole answer, whatever frames sit beside it and whatever order the
+// store broke ties in: a torn head of a failed answer must never read as complete. The merge
+// stops appending once `max_bytes` is passed, so memory is bounded at the cap plus one frame and
+// the output stays over the cap for the caller's own over-cap branch. Returns
 // {ready, output, failed, error}.
 struct PollResult {
     bool ready = false;
@@ -284,7 +292,7 @@ struct PollResult {
     std::string error;
 };
 PollResult poll_command(const EchoTreeRoutes::ResponsesFn& responses_fn, const std::string& command_id,
-                        const std::string& device) {
+                        const std::string& device, std::size_t max_bytes) {
     PollResult pr;
     if (!responses_fn)
         return pr;
@@ -293,6 +301,7 @@ PollResult poll_command(const EchoTreeRoutes::ResponsesFn& responses_fn, const s
     const auto rows = responses_fn(command_id, device);
     std::vector<const DexAgentResponse*> frames; // every frame that carries output
     const DexAgentResponse* terminal = nullptr;
+    const DexAgentResponse* failure = nullptr; // not `terminal`: that keeps only the LAST row
     for (const auto& r : rows) {
         if (r.agent_id != device)
             continue;
@@ -300,18 +309,28 @@ PollResult poll_command(const EchoTreeRoutes::ResponsesFn& responses_fn, const s
             frames.push_back(&r);
         if (r.status >= 1)
             terminal = &r;
+        if (r.status >= 2 && !failure)
+            failure = &r;
+    }
+    if (failure) {
+        pr.ready = true;
+        pr.failed = true;
+        pr.error = failure->error_detail;
+        return pr;
     }
     if (!frames.empty()) {
         if (!terminal)
             return pr; // still streaming
-        // The store answers newest first. Merge EVERY frame, oldest first, with the frame
-        // that opens with the `__schema__` header ahead of the rest, so the parse order does
-        // not depend on how the store broke ties.
+        // The store answers newest first. Merge frames oldest first, with the frame that opens
+        // with the `__schema__` header ahead of the rest, so the parse order does not depend on
+        // how the store broke ties.
         std::reverse(frames.begin(), frames.end());
         std::stable_partition(frames.begin(), frames.end(), [](const DexAgentResponse* f) {
             return f->output.starts_with("__schema__|");
         });
         for (std::size_t i = 0; i < frames.size(); ++i) {
+            if (pr.output.size() > max_bytes)
+                break; // over the caller's cap already: it will refuse this answer
             if (i > 0)
                 pr.output += '\n';
             pr.output += frames[i]->output;
@@ -319,14 +338,8 @@ PollResult poll_command(const EchoTreeRoutes::ResponsesFn& responses_fn, const s
         pr.ready = true;
         return pr;
     }
-    if (terminal) {
+    if (terminal)
         pr.ready = true; // completed, possibly with no rows
-        if (terminal->status >= 2) {
-            pr.failed = true;
-            pr.error = terminal->error_detail;
-        }
-        return pr;
-    }
     return pr;
 }
 
@@ -764,9 +777,9 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             } catch (...) {
             }
         }
-        const PollResult proc = poll_command(responses_fn_, pcmd, device);
-        const PollResult tcp = poll_command(responses_fn_, tcmd, device);
-        const PollResult hrs = poll_command(responses_fn_, hcmd, device);
+        const PollResult proc = poll_command(responses_fn_, pcmd, device, kMaxEchoProcOutputBytes);
+        const PollResult tcp = poll_command(responses_fn_, tcmd, device, kMaxEchoTcpOutputBytes);
+        const PollResult hrs = poll_command(responses_fn_, hcmd, device, kMaxEchoHoursOutputBytes);
         // The process query is essential; the TCP and hour-list queries are best-effort past
         // their grace.
         const bool side_done = (tcp.ready && hrs.ready) || attempt >= kTcpGraceAttempts;
@@ -837,7 +850,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         const std::int64_t shown_hour = hour_req > 0 ? hour_req : win.to_ts;
         EchoParseStats hrs_stats;
         std::vector<std::int64_t> hours;
-        if (hrs.ready && !hrs.failed && !hrs.output.starts_with("error|"))
+        if (hrs.ready && !hrs.failed && !hrs.output.starts_with("error|") &&
+            hrs.output.size() <= kMaxEchoHoursOutputBytes)
             hours = parse_echo_hours_output(hrs.output, &hrs_stats);
         if (std::find(hours.begin(), hours.end(), shown_hour) == hours.end()) {
             hours.push_back(shown_hour);
@@ -1008,8 +1022,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             } catch (...) {
             }
         }
-        const PollResult dns = poll_command(responses_fn_, dcmd, device);
-        const PollResult arp = poll_command(responses_fn_, acmd, device);
+        const PollResult dns = poll_command(responses_fn_, dcmd, device, kMaxEchoDeviceNetOutputBytes);
+        const PollResult arp = poll_command(responses_fn_, acmd, device, kMaxEchoDeviceNetOutputBytes);
         if (!dns.ready || !arp.ready) {
             if (attempt >= kMaxAttempts) {
                 note(res, "No response from the device (timed out). Re-select the host to retry.");
@@ -1183,8 +1197,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             } catch (...) {
             }
         }
-        const PollResult st = poll_command(responses_fn_, scmd, device);
-        const PollResult cp = poll_command(responses_fn_, ccmd, device);
+        const PollResult st = poll_command(responses_fn_, scmd, device, kMaxEchoStatusOutputBytes);
+        const PollResult cp = poll_command(responses_fn_, ccmd, device, kMaxEchoStatusOutputBytes);
         if (!st.ready || !cp.ready) {
             if (attempt >= kMaxAttempts) {
                 note(res, "No response from the device (timed out). Re-select the host to retry.");
