@@ -292,6 +292,7 @@ TEST_CASE("software page: kind control and the ecosystem and found-by chips", "[
     REQUIRE(count_of(h, "data-g=\"src\"") == software_catalog::kSoftwareSources.size());
     REQUIRE(has(h, "data-g=\"src\" data-v=\"pkg_inventory.store_packages\""));
     REQUIRE(has(h, "data-g=\"src\" data-v=\"msi_packages.list_inventory\""));
+    REQUIRE(has(h, "data-g=\"src\" data-v=\"middleware.ibm_mq\""));
     // Ecosystem chips carry the family cue; the label stays the raw name.
     REQUIRE(has(h, "data-g=\"eco\" data-v=\"brew\" aria-pressed=\"true\" title=\"brew\" data-f=\"mac\""));
 }

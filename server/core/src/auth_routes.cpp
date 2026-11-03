@@ -5236,17 +5236,19 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // governance round (UP-6/UP-7/cons-N2) — source-scope the eligibility
         // grant: `is_elevation_eligible` above keyed on the raw principal
         // STRING alone, so a session whose principal happens to collide
-        // with an eligible row's username (a crafted SAML NameID equal to
-        // `oidc:<iss>#<sub>`, or a legacy `identity_source='local'` row
-        // literally named `oidc:x#y` that somehow has
-        // `elevation_eligible=1`) would otherwise borrow that row's grant.
+        // with an eligible row's username (a legacy `identity_source='local'`
+        // row literally named `oidc:x#y` that somehow has
+        // `elevation_eligible=1`, or any future source that mints a principal
+        // string another source also uses) would otherwise borrow that row's
+        // grant. SAML principals always begin `saml:` (saml_principal_id), so
+        // a SAML NameID alone cannot produce an `oidc:` or local name; this is
+        // defence in depth, not a closed SAML attack.
         // Require the row's `identity_source` to MATCH the session's own
-        // `auth_source`: an OIDC session may only elevate an
-        // `identity_source='oidc'` row; every other session (local,
-        // and — until SAML provisioning exists — saml) requires
-        // `identity_source='local'`. Read fresh via `get_user` rather than
-        // trusting anything cached on `session` (SQLite is the source of
-        // truth for identity_source).
+        // `auth_source`: a direct mapping (`local` to `local`, `oidc` to
+        // `oidc`, `saml` to `saml`), never an "oidc or else local" fallback
+        // (see the comparison below). Read fresh via `get_user` rather than
+        // trusting anything cached on `session` (the auth store, Postgres,
+        // is the source of truth for identity_source).
         auto row = db->get_user(session->username);
         if (!row) {
             audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
@@ -5258,13 +5260,15 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         // The eligible row's `identity_source` must equal the session's own
         // `auth_source` — a DIRECT mapping (`local`↔`local`, `oidc`↔`oidc`,
-        // `saml`↔`saml`), NOT "oidc-or-else-local". A SAML session therefore
-        // expects `identity_source=="saml"`, which no row carries today (SAML
-        // is not provisioned — #1852 fast-follow), so SAML is fail-closed at
-        // this gate; and a SAML NameID crafted to collide with a `local` (or
-        // `oidc`) row can no longer satisfy it. This keeps the guard correct
-        // when SAML provisioning + SAML-MFA land, without a rework (Hermes
-        // cyber-review finding, #1852 hardening).
+        // `saml`↔`saml`), NOT "oidc-or-else-local". A SAML session expects
+        // `identity_source=="saml"`, which no row carries today (SAML is not
+        // provisioned; #1852 fast-follow). Today a SAML session never gets
+        // this far: it has no `auth.users` row, so `is_elevation_eligible`
+        // above answers "not eligible" and it is refused there. This gate is
+        // what stays correct when SAML provisioning + SAML-MFA land: a SAML
+        // session can only ever spend a row whose `identity_source` is
+        // `saml`, never a `local` or `oidc` one (Hermes cyber-review finding,
+        // #1852 hardening).
         //
         // An `engine_token` session (design doc §6/§9) never reaches this
         // comparison at all: `POST /api/v1/elevate` is COOKIE-session only
@@ -5312,7 +5316,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // enforced structurally, plus the `!row` deny two branches up). Were
         // it ever to arrive here, `session->auth_source == "oidc"` is false
         // for "engine_token", so it takes the local-session `else` branch
-        // below (line ~2840), which requires local TOTP enrollment the
+        // below, which requires local TOTP enrollment the
         // engine principal's non-existent `users` row can never satisfy —
         // denied either way.
         const bool oidc_amr_proof = session->auth_source == "oidc" &&

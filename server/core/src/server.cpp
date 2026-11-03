@@ -2370,13 +2370,15 @@ public:
         metrics_.describe("yuzu_server_response_ingest_dropped_total",
                           "Response result rows that did not persist (fail-soft ingest, ADR-0039), "
                           "by reason (store_not_open/pool_acquire_timeout/query_error/"
-                          "malformed_identity_field) - the executions ladder still tracks the "
+                          "malformed_identity_field/per_agent_cap) - the executions ladder still tracks the "
                           "command; a sustained non-zero rate means drawer/Echo result history is "
                           "silently lossy. malformed_identity_field is distinct: an "
                           "instruction_id/execution_id/plugin containing an embedded NUL byte was "
                           "rejected rather than silently truncated (#2691 UP-5) - a non-zero rate "
                           "here means an agent sent a malformed identity field, not store "
-                          "unhealth",
+                          "unhealth. per_agent_cap is likewise agent behaviour: an agent exceeded "
+                          "the per-(command, agent) row cap (--response-max-rows-per-agent), "
+                          "not store unhealth",
                           "counter");
         metrics_.describe("yuzu_server_response_read_degrade_total",
                           "Response reads that returned a degrade (nullopt, not empty) rather than "
@@ -2401,7 +2403,8 @@ public:
         // degrade) — seeded separately so read_degrade_total doesn't carry a
         // spurious always-zero series for a reason it can never emit.
         for (const auto reason :
-             {"store_not_open", "pool_acquire_timeout", "query_error", "malformed_identity_field"})
+             {"store_not_open", "pool_acquire_timeout", "query_error", "malformed_identity_field",
+              "per_agent_cap"})
             metrics_.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}});
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_response_read_degrade_total",
@@ -3769,7 +3772,10 @@ public:
                           "already committed, so a lost audit row does not roll it back. This "
                           "metric is the CC6.8 evidence-integrity alert signal - a sustained "
                           "non-zero rate means the SCIM audit trail has gaps, not that the "
-                          "mutation itself failed",
+                          "mutation itself failed. Exception: the `store_unavailable` failure "
+                          "rows of a request answered 503 (#6835/#6836) record an attempt that "
+                          "changed nothing, so a lost one moves this counter without any "
+                          "committed change losing its evidence",
                           "counter");
         metrics_.describe("yuzu_scim_provenance_denied_total",
                           "Total SCIM mutations refused because the target account's "
@@ -3781,14 +3787,17 @@ public:
                           "signal",
                           "counter");
         metrics_.describe("yuzu_scim_guard_store_unavailable_total",
-                          "Total SCIM mutations answered 503 (retryable) because the AuthDB "
-                          "read inside the provenance or role guard FAILED (a lease timeout or "
-                          "query error), by guard (provenance|role); the role guard includes "
-                          "the POST-revive role re-check. Distinct from "
-                          "yuzu_scim_provenance_denied_total: nothing was refused and nothing "
-                          "was mutated by the failed guard, the IdP is expected to retry. A "
-                          "sustained rate means SCIM deprovisioning is being delayed by an "
-                          "auth-store fault",
+                          "Total SCIM requests answered 503 (retryable) because a read of the "
+                          "store they depend on FAILED (a lease timeout or query error), by "
+                          "guard: provenance and role are the AuthDB reads of the deprovision "
+                          "and revive guards (role includes the POST-revive role re-check), "
+                          "bearer is the SCIM token check (was a false 401), resource is a "
+                          "user or group lookup (was a false 404/409). Distinct from "
+                          "yuzu_scim_provenance_denied_total and "
+                          "yuzu_scim_auth_failures_total: nothing was refused, no credential "
+                          "was judged bad, and nothing was mutated by the failed read; the IdP "
+                          "is expected to retry. A sustained rate means SCIM provisioning, and "
+                          "above all leaver deactivation, is being delayed by a store fault",
                           "counter");
         // SCIM v2 Groups->role application core (#2021). Bumped only when
         // recompute_scim_user_role ACTUALLY changes a role (promotion or
@@ -5646,7 +5655,9 @@ public:
         // the deliberate reset.
         if (pg_pool_ && !startup_failed_) {
             response_store_ =
-                std::make_unique<ResponseStore>(*pg_pool_, cfg_.response_retention_days);
+                std::make_unique<ResponseStore>(*pg_pool_, cfg_.response_retention_days,
+                                                /*now_fn=*/nullptr,
+                                                cfg_.response_max_rows_per_agent);
             if (!response_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: response store migration/open failed "
                               "(database reachable but the response_store schema could not be "
