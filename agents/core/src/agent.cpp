@@ -3629,7 +3629,7 @@ public:
                         if (auto it = cmd.parameters().find("source");
                             it != cmd.parameters().end() && !it->second.empty())
                             source = it->second;
-                        std::string delay_max_s;
+                        std::optional<std::string_view> delay_max_s; // nullopt = key absent
                         if (auto it = cmd.parameters().find("delay_max_s");
                             it != cmd.parameters().end())
                             delay_max_s = it->second;

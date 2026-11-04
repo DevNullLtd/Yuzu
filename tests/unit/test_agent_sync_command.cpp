@@ -96,7 +96,7 @@ std::unique_ptr<SyncScheduler> make_counting_scheduler(int& collects) {
 } // namespace
 
 TEST_CASE("decide_sync_now: unknown action fails, exit_code 2", "[sync][agent_command]") {
-    auto decision = decide_sync_now("status", "all", "", /*inventory_disable=*/false, nullptr);
+    auto decision = decide_sync_now("status", "all", std::nullopt, /*inventory_disable=*/false, nullptr);
     CHECK(decision.status == SyncNowDecision::Status::Failure);
     CHECK(decision.exit_code == 2);
     CHECK(decision.output == "unknown __sync__ action: status");
@@ -104,7 +104,7 @@ TEST_CASE("decide_sync_now: unknown action fails, exit_code 2", "[sync][agent_co
 
 TEST_CASE("decide_sync_now: no scheduler + --inventory-disable names the flag",
           "[sync][agent_command]") {
-    auto decision = decide_sync_now("now", "all", "", /*inventory_disable=*/true, nullptr);
+    auto decision = decide_sync_now("now", "all", std::nullopt, /*inventory_disable=*/true, nullptr);
     CHECK(decision.status == SyncNowDecision::Status::Failure);
     CHECK(decision.exit_code == 1);
     CHECK(decision.output == "daily-sync disabled (--inventory-disable)");
@@ -112,7 +112,7 @@ TEST_CASE("decide_sync_now: no scheduler + --inventory-disable names the flag",
 
 TEST_CASE("decide_sync_now: no scheduler, sync not disabled, says not connected",
           "[sync][agent_command]") {
-    auto decision = decide_sync_now("now", "all", "", /*inventory_disable=*/false, nullptr);
+    auto decision = decide_sync_now("now", "all", std::nullopt, /*inventory_disable=*/false, nullptr);
     CHECK(decision.status == SyncNowDecision::Status::Failure);
     CHECK(decision.exit_code == 1);
     CHECK(decision.output == "daily-sync not running (not connected)");
@@ -121,7 +121,7 @@ TEST_CASE("decide_sync_now: no scheduler, sync not disabled, says not connected"
 TEST_CASE("decide_sync_now: real scheduler + unknown source lists valid names",
           "[sync][agent_command]") {
     auto sched = make_fake_scheduler();
-    auto decision = decide_sync_now("now", "bogus_source", "", /*inventory_disable=*/false, sched.get());
+    auto decision = decide_sync_now("now", "bogus_source", std::nullopt, /*inventory_disable=*/false, sched.get());
     CHECK(decision.status == SyncNowDecision::Status::Failure);
     CHECK(decision.exit_code == 2);
     CHECK(decision.output ==
@@ -131,7 +131,7 @@ TEST_CASE("decide_sync_now: real scheduler + unknown source lists valid names",
 TEST_CASE("decide_sync_now: real scheduler + explicit valid source succeeds",
           "[sync][agent_command]") {
     auto sched = make_fake_scheduler();
-    auto decision = decide_sync_now("now", "device_ci", "", /*inventory_disable=*/false, sched.get());
+    auto decision = decide_sync_now("now", "device_ci", std::nullopt, /*inventory_disable=*/false, sched.get());
     CHECK(decision.status == SyncNowDecision::Status::Success);
     CHECK(decision.exit_code == 0);
     CHECK(decision.output == "requested|device_ci");
@@ -141,7 +141,7 @@ TEST_CASE("decide_sync_now: real scheduler + kAllSources arms every registered s
           "[sync][agent_command]") {
     auto sched = make_fake_scheduler();
     auto decision =
-        decide_sync_now("now", SyncScheduler::kAllSources, "", /*inventory_disable=*/false, sched.get());
+        decide_sync_now("now", SyncScheduler::kAllSources, std::nullopt, /*inventory_disable=*/false, sched.get());
     CHECK(decision.status == SyncNowDecision::Status::Success);
     CHECK(decision.exit_code == 0);
     CHECK(decision.output == "requested|installed_software,device_ci");
@@ -160,7 +160,9 @@ TEST_CASE("decide_sync_now: delay_max_s accepts an integer in 0..86400", "[sync]
 
 TEST_CASE("decide_sync_now: malformed or out-of-range delay_max_s fails exit 2 and arms nothing",
           "[sync][agent_command]") {
-    for (const char* bad : {"abc", "-1", "90000", "1.5", "12s", " 5", "99999999999999999999"}) {
+    // "" is a present-but-empty value: malformed, not absent (absent is std::nullopt above).
+    for (const char* bad :
+         {"", "abc", "-1", "90000", "1.5", "12s", " 5", "99999999999999999999"}) {
         int collects = 0;
         auto sched = make_counting_scheduler(collects);
         auto decision =
@@ -177,7 +179,7 @@ TEST_CASE("decide_sync_now: malformed or out-of-range delay_max_s fails exit 2 a
 TEST_CASE("decide_sync_now: a source list is all-or-nothing", "[sync][agent_command]") {
     SECTION("every name known: armed in registration order") {
         auto sched = make_fake_scheduler();
-        auto decision = decide_sync_now("now", "device_ci,installed_software", "",
+        auto decision = decide_sync_now("now", "device_ci,installed_software", std::nullopt,
                                         /*inventory_disable=*/false, sched.get());
         CHECK(decision.status == SyncNowDecision::Status::Success);
         CHECK(decision.output == "requested|installed_software,device_ci");
@@ -185,7 +187,7 @@ TEST_CASE("decide_sync_now: a source list is all-or-nothing", "[sync][agent_comm
     SECTION("one unknown name: failure naming the valid set, nothing armed") {
         int collects = 0;
         auto sched = make_counting_scheduler(collects);
-        auto decision = decide_sync_now("now", "device_ci,bogus", "",
+        auto decision = decide_sync_now("now", "device_ci,bogus", std::nullopt,
                                         /*inventory_disable=*/false, sched.get());
         CHECK(decision.status == SyncNowDecision::Status::Failure);
         CHECK(decision.exit_code == 2);
@@ -196,7 +198,7 @@ TEST_CASE("decide_sync_now: a source list is all-or-nothing", "[sync][agent_comm
     }
     SECTION("an empty list entry is unknown") {
         auto sched = make_fake_scheduler();
-        auto decision = decide_sync_now("now", "device_ci,", "", /*inventory_disable=*/false,
+        auto decision = decide_sync_now("now", "device_ci,", std::nullopt, /*inventory_disable=*/false,
                                         sched.get());
         CHECK(decision.status == SyncNowDecision::Status::Failure);
     }

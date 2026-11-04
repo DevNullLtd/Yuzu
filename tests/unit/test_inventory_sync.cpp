@@ -3910,3 +3910,36 @@ TEST_CASE("SAM-19: an overdue source is spread on restart and on resume, not fir
         CHECK(r.calls == 2);
     }
 }
+
+TEST_CASE("SAM-19: a delayed request_now still pending at a restart is re-armed by the catch-up "
+          "spread and still sends a full report",
+          "[sync][scheduler][sam19]") {
+    Sam19Rig r;
+    r.add("a");
+    r.sched->tick(kNoon);
+    r.sched->tick(kNoon + 700); // first send
+    REQUIRE(r.calls == 1);
+
+    const std::int64_t t0 = kNoon + 5000;
+    REQUIRE(r.sched->request_now("a", std::chrono::seconds{600}) == std::vector<std::string>{"a"});
+    r.sched->tick(t0); // persists the arm: next_fire in (t0, t0 + 600), force_full = 1
+    const std::int64_t armed = r.next_fire("a");
+    REQUIRE(armed > t0);
+    REQUIRE(r.kv.at("sync.a.force_full") == "1");
+
+    // The agent is back more than one clamped sleep after the armed moment.
+    r.reset_scheduler();
+    r.add("a");
+    const std::int64_t reboot = armed + SyncScheduler::kMaxTickSeconds.count() + 1;
+    r.sched->tick(reboot);
+    CHECK(r.calls == 1); // not fired at once
+    const std::int64_t rearmed = r.next_fire("a");
+    CHECK(rearmed >= reboot); // the catch-up spread replaced the request's offset
+    CHECK(rearmed < reboot + SyncScheduler::kCatchUpWindow.count());
+    CHECK(r.kv.at("sync.a.force_full") == "1");
+
+    r.last_had_blob = false; // an unforced second send would be hash-only (same hash, < 7 d)
+    r.sched->tick(rearmed);
+    CHECK(r.calls == 2);
+    CHECK(r.last_had_blob); // force_full survived the restart and the re-arm
+}

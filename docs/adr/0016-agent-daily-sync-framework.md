@@ -800,7 +800,7 @@ map, and the wire, the KV keys and the heartbeat tags are unchanged.
   arms nothing. `delay_max_s` is an integer from 0 to 86400; absent or 0 is the immediate path.
   When it is above 0 the agent still forces a full report, but fires it at a stable per-agent
   offset in `[0, delay_max_s)` from the request instead of at once. A malformed or out-of-range
-  value fails the command (exit 2). The existing `stagger_seconds` field stays ignored for
+  value fails the command (exit 2); a present but empty value is malformed. The existing `stagger_seconds` field stays ignored for
   `__sync__`. Nothing in the server sends `delay_max_s` yet; that is a separate change.
 - **Installed-software window.** `installed_software` is scheduled inside a nightly window of
   01:00 to 05:00 in the machine's local time, at a stable per-agent moment (`fnv1a(agent:window:source)`
@@ -814,5 +814,6 @@ map, and the wire, the KV keys and the heartbeat tags are unchanged.
   past, which a live agent never has, is re-armed to now plus a stable offset in `[0, 30 min)`,
   both when the agent restarts and when a tick runs long after the previous one (sleep and
   resume). This replaces "fire at once" for an overdue source and is what section 3's startup
-  policy described. First-run jitter (10 minutes) is unchanged, and an operator-forced sync is not
-  subject to it.
+  policy described. First-run jitter (10 minutes) is unchanged. An immediate operator-forced sync
+  is not subject to it; a delayed one still pending at a restart is re-armed by it and still sends
+  a full report.

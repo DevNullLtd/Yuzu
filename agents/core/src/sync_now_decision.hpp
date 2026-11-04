@@ -36,6 +36,7 @@
 
 #include <charconv>
 #include <chrono>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -63,12 +64,13 @@ struct SyncNowDecision {
 ///                        parameter is absent or empty. One name, `all`, or a
 ///                        comma-separated list; all-or-nothing (any unknown
 ///                        name arms nothing).
-///   delay_max_s       - the "delay_max_s" command parameter, "" when absent:
-///                        a plain base-10 integer in [0, 86400]; 0 or absent is
-///                        the immediate path. Anything else is a FAILURE (exit
-///                        2) before request_now is called. The agent spreads
-///                        the fire over [0, delay_max_s) by a stable per-agent
-///                        offset.
+///   delay_max_s       - the "delay_max_s" command parameter, nullopt when the
+///                        key is absent. A present value is a plain base-10
+///                        integer in [0, 86400]; 0 or absent is the immediate
+///                        path. Anything else, an empty value included, is a
+///                        FAILURE (exit 2) before request_now is called. The
+///                        agent spreads the fire over [0, delay_max_s) by a
+///                        stable per-agent offset.
 ///   inventory_disable - cfg_.inventory_disable; used only to pick between the
 ///                        two "scheduler not running" FAILURE messages.
 ///   sched             - the agent's current sync_scheduler_, or null when the
@@ -82,7 +84,7 @@ struct SyncNowDecision {
 /// original inline code was: the arm happens as part of computing the reply.
 [[nodiscard]] inline SyncNowDecision decide_sync_now(std::string_view action,
                                                       std::string_view source_param,
-                                                      std::string_view delay_max_s,
+                                                      std::optional<std::string_view> delay_max_s,
                                                       bool inventory_disable,
                                                       SyncScheduler* sched) {
     if (action != "now") {
@@ -95,14 +97,14 @@ struct SyncNowDecision {
                                    : "daily-sync not running (not connected)"};
     }
     long delay = 0;
-    if (!delay_max_s.empty()) {
-        // from_chars rejects garbage, a leading space or '+', and overflow; ptr != end
-        // rejects trailing characters ("12s", "1.5").
-        const char* const end = delay_max_s.data() + delay_max_s.size();
-        const auto [ptr, ec] = std::from_chars(delay_max_s.data(), end, delay);
+    if (delay_max_s) {
+        // from_chars rejects garbage, an empty range, a leading space or '+', and overflow;
+        // ptr != end rejects trailing characters ("12s", "1.5").
+        const char* const end = delay_max_s->data() + delay_max_s->size();
+        const auto [ptr, ec] = std::from_chars(delay_max_s->data(), end, delay);
         if (ec != std::errc{} || ptr != end || delay < 0 || delay > kSyncNowMaxDelaySeconds) {
             return {SyncNowDecision::Status::Failure, 2,
-                    "invalid delay_max_s '" + std::string(delay_max_s) +
+                    "invalid delay_max_s '" + std::string(*delay_max_s) +
                         "' — expected an integer 0.." + std::to_string(kSyncNowMaxDelaySeconds)};
         }
     }
