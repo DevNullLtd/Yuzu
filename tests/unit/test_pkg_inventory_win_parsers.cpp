@@ -269,13 +269,9 @@ TEST_CASE("win xml: markup inside comments, CDATA and declarations never counts"
                                "version") == std::optional<std::string>{"1"});
 }
 
-TEST_CASE("win xml: the five entities decode, anything else is refused, never guessed",
+TEST_CASE("win xml: a value containing an ampersand is refused, never decoded",
           "[pkg_inventory][windows][xml]") {
-    CHECK(pw::extract_xml_text("<v> 1.0 &amp; &lt;2&gt; &quot;&apos; </v>", "v") ==
-          std::optional<std::string>{"1.0 & <2> \"'"});
-    CHECK_FALSE(pw::extract_xml_text("<v>1&#46;0</v>", "v"));   // numeric reference
-    CHECK_FALSE(pw::extract_xml_text("<v>1&nbsp;0</v>", "v"));  // unknown entity
-    CHECK_FALSE(pw::extract_xml_text("<v>1 & 0</v>", "v"));     // bare ampersand
+    CHECK_FALSE(pw::extract_xml_text("<v>1.0 &amp; 2</v>", "v"));
 }
 
 TEST_CASE("win xml: empty, structured, unterminated and oversized values read as nothing",
@@ -326,20 +322,15 @@ TEST_CASE("win appx: the awkward real names keep their parts", "[pkg_inventory][
     CHECK(p->name == "Clipchamp.Clipchamp");
     CHECK(p->version == "4.7.10220.0");
     CHECK(p->arch == "neutral");
-    CHECK(p->resource == "~");
-    CHECK(p->publisher_id == "yxz26nhyzhsrt");
     // empty resource id (`neutral__`)
     p = pw::parse_package_full_name("Microsoft.AccountsControl_10.0.26100.1_neutral__cw5n1h2txyewy");
     REQUIRE(p);
     CHECK(p->name == "Microsoft.AccountsControl");
-    CHECK(p->resource.empty());
-    CHECK(p->publisher_id == "cw5n1h2txyewy");
     // GUID-prefixed inbox name, upper-case GUID
     p = pw::parse_package_full_name(
         "E2A4F912-2574-4A75-9BB0-0D023378592B_10.0.19640.1000_neutral_neutral_cw5n1h2txyewy");
     REQUIRE(p);
     CHECK(p->name == "E2A4F912-2574-4A75-9BB0-0D023378592B");
-    CHECK(p->resource == "neutral");
     // x64 arch, hyphenated name
     p = pw::parse_package_full_name("AdvancedMicroDevicesInc-RSXCM_22.10.0.0_x64__v2es6h43hjn86");
     REQUIRE(p);
@@ -360,6 +351,9 @@ TEST_CASE("win appx: malformed names are refused", "[pkg_inventory][windows][app
     CHECK_FALSE(pw::parse_package_full_name("Name_1.0_X64__pub"));                   // arch case
     CHECK_FALSE(pw::parse_package_full_name("Name_1.0__res_pub"));                   // empty arch
     CHECK_FALSE(pw::parse_package_full_name("Name_1.0_x64__"));                      // empty publisher
+    CHECK_FALSE(pw::parse_package_full_name("Name_1.0_x64__PUB"));                   // publisher case
+    CHECK_FALSE(pw::parse_package_full_name("Name_1.0_x64_re|s_pub"));               // pipe in resource
+    CHECK_FALSE(pw::parse_package_full_name("Name_1.0._x64__pub"));                  // trailing dot
     CHECK_FALSE(pw::parse_package_full_name(std::string(300, 'a')));
 }
 

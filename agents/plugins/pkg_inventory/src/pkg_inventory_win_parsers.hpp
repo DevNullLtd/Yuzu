@@ -119,32 +119,15 @@ namespace detail {
     return true;
 }
 
-/// Trims XML whitespace, decodes the five predefined entities and refuses anything
-/// else with an `&` in it (numeric references included: never a guess). nullopt for
-/// an empty or over-long value.
+/// Trims XML whitespace and refuses anything with an `&` in it (an entity or numeric
+/// reference is never decoded, never guessed: the one caller reads a version token,
+/// which has none). nullopt for an empty or over-long value.
 [[nodiscard]] inline std::optional<std::string> decode_xml_text(std::string_view raw) {
     while (!raw.empty() && is_xml_ws(raw.front())) raw.remove_prefix(1);
     while (!raw.empty() && is_xml_ws(raw.back())) raw.remove_suffix(1);
-    if (raw.empty() || raw.size() > kMaxXmlValueBytes) return std::nullopt;
-    std::string out;
-    out.reserve(raw.size());
-    for (std::size_t i = 0; i < raw.size(); ++i) {
-        if (raw[i] != '&') {
-            out += raw[i];
-            continue;
-        }
-        const auto semi = raw.find(';', i);
-        if (semi == std::string_view::npos || semi - i > 5) return std::nullopt;
-        const auto ent = raw.substr(i + 1, semi - i - 1);
-        if (ent == "lt") out += '<';
-        else if (ent == "gt") out += '>';
-        else if (ent == "amp") out += '&';
-        else if (ent == "quot") out += '"';
-        else if (ent == "apos") out += '\'';
-        else return std::nullopt;
-        i = semi;
-    }
-    return out;
+    if (raw.empty() || raw.size() > kMaxXmlValueBytes || raw.find('&') != std::string_view::npos)
+        return std::nullopt;
+    return std::string{raw};
 }
 
 } // namespace detail
@@ -153,9 +136,9 @@ namespace detail {
 /// case-insensitively), or nullopt. Comments, CDATA sections, processing
 /// instructions and `<!...>` declarations are skipped, so markup quoted inside
 /// them never counts. The element must hold plain text closed by its own end tag;
-/// an empty element, one holding child markup or CDATA, an unknown or numeric
-/// entity, an empty value and one over kMaxXmlValueBytes all read as nullopt --
-/// the scanner returns what the file says or nothing, never a guess.
+/// an empty element, one holding child markup or CDATA, a value containing any `&`
+/// (entities are not decoded), an empty value and one over kMaxXmlValueBytes all read
+/// as nullopt -- the scanner returns what the file says or nothing, never a guess.
 [[nodiscard]] inline std::optional<std::string> extract_xml_text(std::string_view xml,
                                                                  std::string_view tag) {
     std::size_t pos = 0;
@@ -214,48 +197,51 @@ namespace detail {
 
 // ── pure: Appx PackageFullName ───────────────────────────────────────────
 
-/// `Name_Version_Arch_ResourceId_PublisherId`; views into the parsed string.
+/// The parts of `Name_Version_Arch_ResourceId_PublisherId` a row carries; views into
+/// the parsed string. (ResourceId and PublisherId are validated, not kept.)
 struct AppxName {
     std::string_view name;
     std::string_view version;
     std::string_view arch;
-    std::string_view resource;
-    std::string_view publisher_id;
 };
 
 namespace detail {
 
-[[nodiscard]] inline bool all_of_chars(std::string_view v, bool (*ok)(char)) noexcept {
-    return std::all_of(v.begin(), v.end(), ok);
-}
 [[nodiscard]] constexpr bool is_alnum(char c) noexcept {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
-}
-/// `^[0-9]{1,10}(\.[0-9]{1,10}){0,3}$`
-[[nodiscard]] inline bool appx_version_ok(std::string_view v) noexcept {
-    int parts = 0;
-    std::size_t start = 0;
-    while (start <= v.size()) {
-        const auto dot = v.find('.', start);
-        const auto end = dot == std::string_view::npos ? v.size() : dot;
-        const auto part = v.substr(start, end - start);
-        if (part.empty() || part.size() > 10 || ++parts > 4) return false;
-        if (!std::all_of(part.begin(), part.end(), [](char c) { return c >= '0' && c <= '9'; }))
-            return false;
-        if (dot == std::string_view::npos) return true;
-        start = dot + 1;
-    }
-    return false;
 }
 
 } // namespace detail
 
+/// Dotted-numeric version -> components (`^[0-9]{1,10}(\.[0-9]{1,10}){0,3}$`, so each
+/// fits an unsigned long long), nullopt for anything else. The validator and the
+/// ordering key for choosing the highest of several registered versions.
+[[nodiscard]] inline std::optional<std::vector<unsigned long long>>
+appx_version_parts(std::string_view v) {
+    std::vector<unsigned long long> out;
+    std::size_t start = 0;
+    for (;;) {
+        const auto dot = v.find('.', start);
+        const auto part = v.substr(start, (dot == std::string_view::npos ? v.size() : dot) - start);
+        if (part.empty() || part.size() > 10 || out.size() == 4) return std::nullopt;
+        unsigned long long n = 0;
+        for (const char c : part) {
+            if (c < '0' || c > '9') return std::nullopt;
+            n = n * 10 + static_cast<unsigned>(c - '0');
+        }
+        out.push_back(n);
+        if (dot == std::string_view::npos) return out;
+        start = dot + 1;
+    }
+}
+
 /// Splits a PackageFullName on `_` into exactly five parts and validates each
 /// (nothing here is trusted to be a clean column): a 4- or 6-part name, a name with
-/// a character outside `[A-Za-z0-9.-]`, a malformed version, or an arch outside
-/// `[a-z0-9]{1,16}` is nullopt. Pinned against the real names of a Windows 11 host,
-/// including GUID-prefixed inbox names, a `~` resource id (bundles) and an empty
-/// resource id (`neutral__`).
+/// a character outside `[A-Za-z0-9.-]`, a malformed version, an arch outside
+/// `[a-z0-9]{1,16}`, a resource id outside `[A-Za-z0-9~-]{0,64}` or a publisher id
+/// outside `[a-z0-9]{1,16}` is nullopt. Pinned against the real names of a Windows 11
+/// host, including GUID-prefixed inbox names, a `~` resource id (bundles) and an
+/// empty resource id (`neutral__`).
 [[nodiscard]] inline std::optional<AppxName> parse_package_full_name(std::string_view full) {
     if (full.empty() || full.size() > 255) return std::nullopt;
     std::array<std::string_view, 5> part{};
@@ -277,7 +263,7 @@ namespace detail {
         !std::all_of(name.begin(), name.end(),
                      [](char c) { return detail::is_alnum(c) || c == '.' || c == '-'; }))
         return std::nullopt;
-    if (!detail::appx_version_ok(version)) return std::nullopt;
+    if (!appx_version_parts(version)) return std::nullopt;
     if (arch.empty() || arch.size() > 16 ||
         !std::all_of(arch.begin(), arch.end(),
                      [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'); }))
@@ -290,24 +276,7 @@ namespace detail {
         !std::all_of(publisher.begin(), publisher.end(),
                      [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'); }))
         return std::nullopt;
-    return AppxName{name, version, arch, resource, publisher};
-}
-
-/// Dotted-numeric version -> components, for choosing the highest of several
-/// registered versions. Call only on a version parse_package_full_name accepted.
-[[nodiscard]] inline std::vector<unsigned long long> appx_version_parts(std::string_view v) {
-    std::vector<unsigned long long> out;
-    std::size_t start = 0;
-    while (start <= v.size()) {
-        const auto dot = v.find('.', start);
-        const auto end = dot == std::string_view::npos ? v.size() : dot;
-        unsigned long long n = 0;
-        for (const char c : v.substr(start, end - start)) n = n * 10 + static_cast<unsigned>(c - '0');
-        out.push_back(n);
-        if (dot == std::string_view::npos) break;
-        start = dot + 1;
-    }
-    return out;
+    return AppxName{name, version, arch};
 }
 
 /// The package folder named by a roster `Path` value: the value is a MANIFEST FILE
@@ -510,24 +479,25 @@ manager_rows(const Ops& ops, yuzu::shared::ConstraintAccumulator& acc,
     const auto apps = ops.list_reg_subkeys(kApps, lim.max_roster_keys);
     if (apps.status == OpStatus::ok) {
         detail::note_listing(acc, "appx_applications", apps);
-        const std::string* best = nullptr;
+        std::optional<AppxName> best;
+        const std::string* best_key = nullptr;
         std::vector<unsigned long long> best_ver;
         for (const auto& name : apps.names) {
             const auto p = parse_package_full_name(name);
             if (!p || p->name != kWingetPackageName) continue;
-            auto ver = appx_version_parts(p->version);
-            if (best == nullptr || ver > best_ver) {
-                best = &name;
+            auto ver = appx_version_parts(p->version).value(); // validated by the parse above
+            if (!best || ver > best_ver) {
+                best = p;
+                best_key = &name;
                 best_ver = std::move(ver);
             }
         }
-        if (best != nullptr) {
-            const auto p = parse_package_full_name(*best);
+        if (best) {
             std::string root;
-            if (const auto path = ops.read_reg_string(kApps, *best, "Path");
+            if (const auto path = ops.read_reg_string(kApps, *best_key, "Path");
                 path.status == OpStatus::ok)
                 root = std::string{appx_package_folder(path.value)};
-            rows.push_back(format_manager_row(Manager::winget, Presence::present, p->version, root,
+            rows.push_back(format_manager_row(Manager::winget, Presence::present, best->version, root,
                                               "-", ""));
         }
     } else if (apps.status != OpStatus::absent) {

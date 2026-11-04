@@ -8,16 +8,17 @@
 //     directories are trusted (the callers read machine-wide, admin-writable
 //     trees such as C:\ProgramData);
 //   - a directory is refused;
-//   - at most `cap` bytes are returned. A larger file is read up to the cap and
-//     flagged `truncated` (the callers parse a header-sized prefix), so the read
-//     is bounded in memory and in time whatever the file size;
+//   - at most min(`cap`, kMaxBoundedReadBytes) bytes are returned, by ONE ReadFile.
+//     A larger file is read up to that limit and flagged `truncated` (the callers
+//     parse a header-sized prefix), so the read is bounded in memory and in time
+//     whatever the file size;
 //   - share mode is read|write|delete, so an installer rewriting the file does
 //     not make the agent's read fail with a sharing violation, and the agent's
 //     handle never blocks an uninstall.
 //
 // No file hashing, no process, no dependency beyond windows.h. Status mapping is
 // the caller-facing minimum: absent (file or path not found), denied (access
-// denied), refused (reparse point or directory), error (anything else).
+// denied), error (anything else, a refused reparse point or directory included).
 //
 // Windows-only by construction (#ifdef _WIN32); the header is empty elsewhere.
 #pragma once
@@ -39,7 +40,11 @@
 
 namespace yuzu::win {
 
-enum class BoundedReadStatus { ok, absent, denied, refused, error };
+/// Hard ceiling on one read, whatever `cap` a caller passes: the single ReadFile takes
+/// a DWORD, so this keeps the request far inside it.
+inline constexpr std::size_t kMaxBoundedReadBytes = std::size_t{1} << 20;
+
+enum class BoundedReadStatus { ok, absent, denied, error };
 
 struct BoundedRead {
     BoundedReadStatus status = BoundedReadStatus::error;
@@ -69,27 +74,20 @@ struct BoundedRead {
 
     BY_HANDLE_FILE_INFORMATION info{};
     if (!GetFileInformationByHandle(h, &info)) return out;
-    if ((info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0) {
-        out.status = BoundedReadStatus::refused;
-        return out;
-    }
+    if ((info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0)
+        return out; // refused: status stays `error`
     const std::uint64_t size =
         (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
-    const std::size_t want = static_cast<std::size_t>((std::min)(size, static_cast<std::uint64_t>(cap)));
-    out.truncated = size > cap;
+    const std::size_t limit = (std::min)(cap, kMaxBoundedReadBytes);
+    const std::size_t want = static_cast<std::size_t>((std::min)(size, static_cast<std::uint64_t>(limit)));
+    out.truncated = size > limit;
     out.bytes.resize(want);
-    std::size_t got = 0;
-    while (got < want) {
-        const DWORD chunk = static_cast<DWORD>((std::min)(want - got, std::size_t{1} << 20));
-        DWORD n = 0;
-        if (!ReadFile(h, out.bytes.data() + got, chunk, &n, nullptr)) {
-            out.bytes.clear();
-            return out; // status stays `error`
-        }
-        if (n == 0) break; // the file shrank under us: keep what was read
-        got += n;
+    DWORD n = 0;
+    if (!ReadFile(h, out.bytes.data(), static_cast<DWORD>(want), &n, nullptr)) {
+        out.bytes.clear();
+        return out; // status stays `error`
     }
-    out.bytes.resize(got);
+    out.bytes.resize(n); // the file may have shrunk under us: keep what was read
     out.status = BoundedReadStatus::ok;
     return out;
 }

@@ -402,11 +402,12 @@ AdaptedRows parse_pkg_inventory_packages_output(const std::string& out, Constrai
         else if (tok[4] == "cask")
             e.kind = "app";
         else if (tok[4] == "pkg")
-            e.kind = "pkg"; // Chocolatey; its version is `-` when the nuspec was unreadable
+            e.kind = "pkg"; // Chocolatey
         else
             return true;
-        e.version = tok[4] == "pkg" && tok[3] == "-" ? std::string{}
-                                                     : clamp_field(tok[3], kMaxFieldLen);
+        // `-` is the row grammar's empty-version sentinel (format_package_row), written for a
+        // Chocolatey package whose nuspec was unreadable.
+        e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
         e.ecosystem = std::string(m->ecosystem);
         entries.push_back(std::move(e));
         return true;
