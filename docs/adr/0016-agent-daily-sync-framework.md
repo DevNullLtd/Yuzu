@@ -961,7 +961,7 @@ bytes (never truncated).
 
 The namespace is the lower-cased `/etc/os-release` ID (`distro_id`). `distro` is
 `<distro_id>-<distro_version>` and only when both are known. `arch` is the stored architecture
-when non-empty. An index (`installed_software_purl_idx`, a partial btree `WHERE purl <> ''`) and
+when non-empty, except for `brew`, whose type defines no `arch` qualifier. An index (`installed_software_purl_idx`, a partial btree `WHERE purl <> ''`) and
 `SoftwareInventoryStore::find_by_purl` serve exact lookups; no route, tool or page reads the
 column yet.
 

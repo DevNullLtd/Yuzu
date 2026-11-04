@@ -31,7 +31,8 @@
 ///         (`release` holds pkgrel WITHOUT apk's display 'r'; the composer restores it)
 ///   alpm  pkg:alpm/<distro_id>/<name>@[<epoch>:]<pkgver>[-<pkgrel>]?arch=
 ///         (rolling: the spec lists only `arch`, so no distro qualifier)
-///   brew  formula: pkg:brew/<name>@<version>      (default tap, the spec's own vector form)
+///   brew  formula: pkg:brew/<name>@<version>      (default tap, the spec's own vector form;
+///         no qualifiers: the type defines only repository_url, so arch is not emitted)
 ///         cask:    pkg:brew/homebrew/cask/<name>@<version>
 ///         (formula names lowercased; '@' in a name is encoded %40)
 ///   The Homebrew presence row (`pkg_inventory.managers`) is the package manager itself, not a
@@ -140,7 +141,8 @@ namespace purl_detail {
         if (type != "alpm" && !e.distro_version.empty())
             quals.emplace_back("distro", ascii_lower(e.distro_id) + '-' + e.distro_version);
     }
-    if (!e.arch.empty())
+    // The brew type defines no `arch` qualifier (only repository_url): never invent one.
+    if (type != "brew" && !e.arch.empty())
         quals.emplace_back("arch", e.arch);
 
     std::string out = "pkg:";

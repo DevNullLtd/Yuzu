@@ -72,6 +72,10 @@ TEST_CASE("purl: brew vectors", "[purl_compose]") {
     CHECK(compose_purl(formula("SQLite", "3.43.2")) == "pkg:brew/sqlite@3.43.2"); // lowercased
     CHECK(compose_purl(formula("postgresql@12", "12.17")) == "pkg:brew/postgresql%4012@12.17");
     CHECK(compose_purl(formula("node@20", "20.10.0")) == "pkg:brew/node%4020@20.10.0");
+    // the type defines no `arch` qualifier, so a stored architecture never reaches the purl
+    auto with_arch = formula("sqlite", "3.43.2");
+    with_arch.arch = "arm64";
+    CHECK(compose_purl(with_arch) == "pkg:brew/sqlite@3.43.2");
 
     auto cask = entry("brew", "firefox", "120.0");
     cask.kind = "app";
