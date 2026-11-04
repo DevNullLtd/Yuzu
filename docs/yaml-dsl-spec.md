@@ -780,7 +780,7 @@ Note: For advanced targeting, use the Scope DSL expression language (Section 9) 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `mode` | string | No | `dynamic` | Assignment mode. `dynamic` -- devices matching the scope are continuously included. `static` -- devices are assigned at deployment time and do not change. |
-| `managementGroups` | list of string | No | `[]` | Management group names to which this policy is assigned. |
+| `managementGroups` | list of string | No | `[]` | Management group **ids** (the server-assigned 12-character id, not the display name) to which this policy is assigned. A non-empty list replaces `scope` for targeting. An entry outside letters, digits and `_ . : * -` is refused (#2123). |
 
 #### `spec.fragment`
 
@@ -872,7 +872,8 @@ spec:
   assignment:
     mode: dynamic
     managementGroups:
-      - workstations
+      # the workstations group's id (ids, not names)
+      - 8d41e0c7a2b9
   fragment:
     ref: fragment.service.must_be_running
     with:
@@ -1307,7 +1308,8 @@ from_result_set:rs_01HXYZ AND ostype == "windows"
 ```yaml
 spec:
   scope:
-    fromResultSet: "windows-chrome-suspects"   # id or per-operator alias
+    # fromResultSet: a canonical rs_ id or a per-operator alias
+    fromResultSet: "windows-chrome-suspects"
     selector:                                    # optional refinement (AND-ed)
       platform: windows
       tags:
@@ -1325,6 +1327,7 @@ This lowers to the scope-engine string `from_result_set:windows-chrome-suspects 
 3. References resolve at **invocation** time, not load time. An `InstructionDefinition` carrying a `fromResultSet:` that has since expired is still valid YAML; an invocation-time resolution failure (the set is absent, expired, or not owned — including a set deleted in the window between the pre-dispatch owner-check gate and the registry's own membership read, closed as a TOCTOU by #4981 PR-1) is recorded as an `instruction.scope_resolution_failed` audit row (`INSTRUCTION_SCOPE_RESOLUTION_FAILED`) carrying the result-set id and reason, and — as of governance M1, 2026-07-29 — **aborts the entire dispatch**: zero devices are targeted, including devices matched by other scope atoms (a paired `scope.evaluation_aborted` row records `reason=owner_check_failed`, or one of `db_degraded`/`principal_unresolved`/`presence_degraded`/`unresolvable` for the other abort classes — see `docs/user-manual/rest-api.md`'s audit-event table for the full vocabulary). The previous behavior (proceed with only that reference zeroed) inverted to a fleet-wide match under a `NOT` combinator and is gone.
 4. `fromResultSet` (id or alias), `selector.platform`, and each `selector.tags` entry must contain only letters, digits, and `_ . : * -` (the scope-ident charset). A space, quote, or operator character is rejected at load — these values are lowered into a scope-engine token, so anything else would produce an unparseable or ambiguous expression. **Choose result-set aliases (`name`) from this charset**; an alias with a space cannot be referenced from a scope.
 5. The `scope:` block must use **block form** (`scope:` on its own line, children indented beneath). Inline flow-mapping (`scope: {fromResultSet: x}`) is rejected — the runtime YAML scanner reads only the block form.
+6. **Lines and lists (#2123).** LF, CRLF and a lone CR are all line breaks; blank and `#` comment lines may appear anywhere and never end a block. A comment may not follow a scalar value on the same line (`fromResultSet: x   # note` keeps the comment in the value, which then fails rule 4); put it on its own line. An inline `[ ]` list (`tags: [a, b]`) must close on its own line, and a block list's `- item` lines must share one indent with no item continued on a following line. Within the `selector:` block, a list line the scanner cannot place — a `- item` off the list's column, a line missing its `- `, a `key:` line deeper than `tags:`, a continued item, an unclosed inline list, an empty-string item, a single value where a list is expected (`tags: prod`), or list lines written after a value on the key line (`tags: null` or `tags: [a]` followed by `- prod`) — is rejected at load (its raw text fails rule 4), never lowered with that entry missing, since a dropped tag would widen the scope. A `- item` inside `scope:` but outside `selector:` (for example indented to `selector:`'s own column) is rejected with its own error. `tags: null` (or `~`) on its own means no tags. **Not yet refused (tracked for the fail-closed follow-up on #2123):** a list line indented at or shallower than `scope:` itself, a `- item` written after another key (such as `platform:` under `selector:`, or any key after `managementGroups:`), tab characters in indentation, and a `scope:` or `managementGroups:` line inside a multi-line block scalar (`description: |`), which can be read as the real key. Each of these can still drop or replace an entry without an error, widening the policy: keep a list's `- item` lines together, directly under their key, indent with spaces only, and keep those key names out of multi-line values.
 
 > Tag presence (`EXISTS tag:<name>`) requires the tag to have a **non-empty value**; a device carrying a tag with an empty value is treated as not having it.
 
