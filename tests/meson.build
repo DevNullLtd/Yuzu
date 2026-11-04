@@ -349,6 +349,7 @@ agent_test_exe = executable(
     'unit/test_antivirus_parsers.cpp',
     'unit/test_firewall_parsers.cpp',
     'unit/test_disk_actions_local_dispatcher.cpp', # Wave 6 PR6.1-a-1: real disk_actions dylib/.so/.dll
+    'unit/test_disk_actions_partitions.cpp', # H.5b: pure layer of the Windows partitions leg (runs on every host)
     'unit/test_firewall_local_dispatcher.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_tls_policy.cpp', # #4722: shared TLS cipher policy (common/include/yuzu/tls_policy.hpp), pure
@@ -593,6 +594,8 @@ agent_test_exe = executable(
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_posix_secure_read.cpp',  # shared O_NOFOLLOW dir-open + bounded no-follow file read (agents/shared/posix_secure_read.hpp), POSIX-only bodies
     'unit/test_sha256.cpp',             # shared in-memory SHA-256 (agents/shared/sha256.hpp), portable
+    'unit/test_hmac_sha256.cpp',        # H.5: shared HMAC-SHA-256 (RFC 4231 vectors) + the machine-id hash contract (agents/shared/machine_id_hash.hpp), portable
+    'unit/test_hardware_estate_parsers.cpp', # H.5: pure chassis/baseboard/swap/machine_id row formatters + outcome contract (hardware_estate_parsers.hpp), portable
     'unit/test_base64.cpp',             # shared strict RFC 4648 base64 (agents/shared/base64.hpp), portable
     'unit/test_email_redaction.cpp',    # shared [redacted-email] helper (agents/shared/email_redaction.hpp), portable
     'unit/test_wire_utf8.cpp',          # shared strict-UTF-8 scrubber (agents/shared/wire_utf8.hpp), portable
@@ -1876,6 +1879,7 @@ if build_server
       'unit/server/test_rest_software_packages.cpp',
       'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_software_catalogue.cpp',   # GET /api/v1/inventory/software/catalogue[/versions]
+      'unit/server/test_rest_software_curation.cpp',    # software normalisation curation REST routes
       'unit/server/test_rest_dex_app_perf_devices.cpp',   # version-row "which devices" drill: GET /api/v1/dex/perf/app/devices
       'unit/server/test_rest_devices.cpp',   # #4033 (#2146 Batch A): GET /api/v1/devices[/{id}] + agent-count-preview
       'unit/server/test_group_agent_count_preview.cpp',   # #4033: pure shared create-group-preview model
@@ -1966,8 +1970,8 @@ if build_server
       'unit/server/test_agent_registry_log_neutralisation.cpp',   # #5513: register_agent log lines neutralised
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
-      'unit/server/test_inventory_blob_v3.cpp',          # SAM-13: pure blob-v3 grammar + install-type table
-      'unit/server/test_purl_compose.cpp',               # SAM-13: pure purl composer (purl-spec vectors)
+      'unit/server/test_inventory_blob_v3.cpp',          # pure blob-v3 grammar + install-type table
+      'unit/server/test_purl_compose.cpp',               # pure purl composer (purl-spec vectors)
       'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
       'unit/server/test_crypto_cbom.cpp',                # /crypto CBOM export: CycloneDX 1.7 shaper + goldens
@@ -3153,7 +3157,7 @@ if build_server
       args: [files('../scripts/ci/check_core_presentation_link.py'),
              '--build-dir', meson.project_build_root(), '--verbose'],
       suite: ['server', 'server-checks'],
-      depends: [yuzu_server_core_lib],
+      depends: [yuzu_server_core_lib, yuzu_server_routes_lib],
       timeout: 60,
     )
   endif
@@ -3400,6 +3404,17 @@ test('compose certs volume',
   args: [files('test_compose_certs_volume.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Compose default credentials (#4817): no tracked compose may run Grafana with a
+# known admin password - GF_SECURITY_ADMIN_PASSWORD must be the required
+# ${YUZU_GRAFANA_ADMIN_PASSWORD:?...} - and the UAT launchers must load the
+# password before every `docker compose` call. Stdlib + bash, no Docker.
+test('compose default credentials',
+  _python3_test,
+  args: [files('test_compose_default_credentials.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # Gateway scrape (#5695): every Prometheus config under deploy/prometheus/ and
@@ -4126,6 +4141,15 @@ test('typed-source purge wiring lexical gate (2a-1b)',
   timeout: 30,
 )
 
+# Blob v3: the section counter is read through increase(), so server.cpp must pre-seed its closed
+# facet x outcome series at boot. Source-text only; suite 'docs' as the gate above.
+test('section ingest series seed wiring lexical gate',
+  _python3_test,
+  args: [files('test_section_ingest_seed_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Audit and reviews page: pins the production wiring in server.cpp (the loud perm_fn gate, the
 # audit store read that returns nullopt for a closed store). Source-text only, so Python.
 # Suite 'docs' for the same reason as the Users page gate above.
@@ -4514,6 +4538,15 @@ test('forensics tier wiring lexical',
 test('forensics tier wiring lexical selftest',
   _python3_test,
   args: [files('test_forensics_tier_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #3619: every audit row DashboardRoutes writes has its persist outcome checked (ADR-0033 §9).
+# Pins the bool AuditFn and the absence of direct sink calls; the script self-checks its detector.
+test('dashboard audit checked lexical',
+  _python3_test,
+  args: [files('test_dashboard_audit_checked_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

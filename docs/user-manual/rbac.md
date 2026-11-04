@@ -144,6 +144,11 @@ Recommended order for a fresh install:
 > body carries the same text for every caller, but htmx does not display it for this form). The store-degraded case above answers `503`
 > with its own error toast ("Agent count unavailable. The response store could not be read. Nothing
 > was created. Retry shortly.") on the same channel, and also creates nothing.
+> When the `group.create_from_results` `attempted` audit row cannot be stored (#3619, ADR-0033
+> §9: the row is written after every check above and before the group is created),
+> `group-from-results` answers `503` with `Sec-Audit-Failed: true` and the toast "The audit record
+> could not be stored. Nothing was created. Retry once the audit store recovers.", and creates
+> nothing.
 >
 > **Admission on these three routes is unchanged (#1712 follow-up, tracked for
 > ADR-0017 PR-B).** Each route still gates on its own flat

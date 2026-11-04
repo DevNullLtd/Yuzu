@@ -111,6 +111,7 @@
 #include "step_up_gate.hpp" // MFA step-up chokepoint (policy table: step_up_policy.hpp)
 #include "same_site_write_gate.hpp" // cookie-session writes require a same-site Origin or Referer
 #include "rest_a4_envelope_http.hpp"
+#include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
@@ -234,6 +235,7 @@
 #include "device_containment_routes.hpp"
 #include "device_estate_routes.hpp"
 #include "hardware_routes.hpp"
+#include "software_curation_routes.hpp"
 #include "home_routes.hpp" // Dashboard summary fragment (readout, attention, estate) over injected seams
 #include "home_ui.hpp"     // sign_in_location: where a signed-out page request goes
 #include "home_panels_routes.hpp" // HM-2: Dashboard policies + events fragments
@@ -2117,12 +2119,8 @@ public:
                           "a report skipped because another report for the same agent held its "
                           "lock, certificate_inventory only - not a failure)",
                           "counter");
-        metrics_.describe("yuzu_inventory_section_ingest_total",
-                          "Blob-v3 installed-software section outcomes by facet and outcome "
-                          "(facet = a collector source, component_inventory, or unknown; "
-                          "outcome = stored/status_only/need_full/delta_unsupported/rejected/"
-                          "error; moves only once a v3 agent reports)",
-                          "counter");
+        // Closed facet x outcome label set, pre-seeded so the first refused section counts.
+        seed_section_ingest_series(metrics_);
         cert_ingest_metric::register_metrics(metrics_); // slice-2 PR 2a-2a
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
                           "Time to apply one inventory source's report - the pooled-connection + "
@@ -20074,6 +20072,20 @@ private:
                              .forensics_plugins = forensics_plugins(),
                          });
 
+        // Software normalisation curation REST (queue, curated aliases, pack replace). The
+        // routes borrow product_registry_store_ and are served only until web_server_->stop(),
+        // which precedes the store reset in stop(); the class holds no state of its own.
+        {
+            HttplibRouteSink curation_sink{*web_server_};
+            SoftwareCurationRoutes{}.register_routes(
+                curation_sink, SoftwareCurationRoutes::Deps{
+                                   .auth_fn = auth_fn,
+                                   .perm_fn = perm_fn,
+                                   .audit_fn = audit_fn,
+                                   .registry = product_registry_store_.get(),
+                               });
+        }
+
         // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs
         // attention, estate state). Every figure arrives through a closure over an
         // existing typed read; the gates are the SAME fleet_read_fn / perm_fn the
@@ -20656,10 +20668,12 @@ private:
         dashboard_routes_ = std::make_unique<DashboardRoutes>();
         // #2537: declare the external origins BEFORE register_routes — the
         // handlers capture `this` at registration and read the member per
-        // request, so setting it afterwards would never reach a live route.
+        // request, so setting it afterwards would race the request threads.
         dashboard_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
-        // ADR-0033 section 9: the expression-targeted Send writes its `attempted` row through
-        // this persist-reporting sink BEFORE it dispatches (unwired = that path refuses).
+        // ADR-0033 section 9: every DashboardRoutes mutation (each console send,
+        // group-from-results, Echo re-enable and purge; not EchoTreeRoutes' capture-sources push)
+        // writes its `attempted` row through this persist-reporting sink BEFORE it acts (#3619;
+        // unwired = those mutations refuse with 503).
         dashboard_routes_->set_persist_audit_fn(audit_fn);
         // #1712 / #3290 Phase 2 — same conversion lambda already wired into
         // McpServer's query_installed_software (fleet_read_fn, defined

@@ -3214,6 +3214,22 @@ tests:
           - labels: 'ALERTS{alertname="YuzuInventoryIngestSlow", alertstate="firing", severity="warning"}'
             value: 1
 
+  # CASE - the same shape on phase="full" still fires: widening the selector to include v3 must
+  # not drop the original phase.
+  - interval: 1m
+    name: inventory ingest slow - phase full over 10s still fires
+    input_series:
+      - series: 'yuzu_inventory_ingest_duration_seconds_bucket{job="yuzu",instance="s1",source="installed_software",phase="full",le="+Inf"}'
+        values: "0+12x40"
+      - series: 'yuzu_inventory_ingest_duration_seconds_bucket{job="yuzu",instance="s1",source="installed_software",phase="full",le="10"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryIngestSlow", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryIngestSlow", alertstate="firing", severity="warning"}'
+            value: 1
+
   # CASE - the same slow shape on a phase the rule does not cover (hash_only, a compare with no
   # write) does not fire: the selector widened to the two full-apply phases, not to every phase.
   - interval: 1m
@@ -3230,8 +3246,9 @@ tests:
 
   # ── YuzuInventorySectionIngestRefused ────────────────────────────────────
   #
-  # A refused (grammar) section is counted per facet; the rule fires after a 15m hold and carries
-  # the facet label (sum by (facet)). delta_unsupported has its own info rule further down.
+  # A refused (grammar) section is counted per facet; the rule is an increase over a day with no
+  # hold and carries the facet label (sum by (facet)). delta_unsupported has its own info rule
+  # further down.
   # CASE - a facet whose sections keep being refused fires, naming the facet.
   - interval: 1m
     name: inventory section ingest refused - a rejected facet fires with its facet label
@@ -3240,15 +3257,27 @@ tests:
         values: "0+1x50"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing"}'
-        eval_time: 10m
-        exp_samples: []
-      - expr: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing"}'
         eval_time: 25m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing", facet="installed_apps.list_inventory", severity="warning"}'
             value: 1
 
-  # CASE - delta_unsupported (a delta whose base matched, no delta apply until SAM-14) does NOT
+  # CASE - ONE refused section fires (a pre-seeded 0, then a single increment). RED against the
+  # former `rate(...[15m]) > 0` with `for: 15m`: one increment keeps the rate non-zero for under
+  # 15m, so the hold was never met and a low-cadence refusal never alerted.
+  - interval: 1m
+    name: inventory section ingest refused - a single refusal fires
+    input_series:
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="pkg_inventory.packages",outcome="rejected"}'
+        values: "0x10 1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing", facet="pkg_inventory.packages", severity="warning"}'
+            value: 1
+
+  # CASE - delta_unsupported (a delta whose base matched, the server has no delta apply yet) does NOT
   # fire the warning: it is the expected placeholder and has its own info rule below.
   - interval: 1m
     name: inventory section ingest refused - delta_unsupported does not fire the warning

@@ -35,6 +35,7 @@
 #include "inventory_ingest_outcome.hpp" // InventoryIngestOutcome
 #include "software_inventory_types.hpp"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -335,6 +336,13 @@ enum class V3SectionOutcome {
     kError,            ///< the transaction failed; nothing of this call was applied
 };
 
+/// Every outcome, in the enum's order: the closed `outcome` label set the section counter is
+/// pre-seeded from.
+inline constexpr std::array<V3SectionOutcome, 6> kV3SectionOutcomes = {
+    V3SectionOutcome::kStored,   V3SectionOutcome::kStatusOnly,
+    V3SectionOutcome::kNeedFull, V3SectionOutcome::kDeltaUnsupported,
+    V3SectionOutcome::kRejected, V3SectionOutcome::kError};
+
 [[nodiscard]] constexpr std::string_view v3_section_outcome_name(V3SectionOutcome o) noexcept {
     switch (o) {
     case V3SectionOutcome::kStored:
@@ -419,7 +427,7 @@ public:
     /// the ingest hot path (UP-8); pass `std::move` at the call site.
     /// Blob v2 vs v3: this is the v2 path and is unchanged by v3 except that it stamps the
     /// server-derived key columns on each row and deletes the agent's `software_facet_state`
-    /// rows in the same transaction (a downgraded agent leaves no stale facets). A hash-only
+    /// rows in the same transaction (v2 rows and facet state never describe one agent at once). A hash-only
     /// report works for both: a v3 agent claims its `v3:` report hash, which only a v3 state
     /// can match, and a v2 claim (plain hex) never matches a v3 state.
     InventoryIngestOutcome apply_installed_software(std::string_view agent_id,
@@ -443,9 +451,11 @@ public:
     ///    kDeltaUnsupported when it is (a WARN names the gap). Nothing is lost: the agent falls
     ///    back to a full section.
     ///  - `component_inventory`: grammar-validated, its facet state recorded with an EMPTY
-    ///    section_hash (this store holds no component rows), and answered kNeedFull.
+    ///    section_hash (this store holds no component rows). A `full` or `delta` one is answered
+    ///    kNeedFull; a status-only one is a complete report (kStatusOnly).
     ///  - a refused section (V3Section::refusal) is kRejected; the others still apply.
-    /// A SQL failure rolls the whole call back and answers kError for EVERY section in it.
+    /// A SQL failure rolls the whole call back and answers kError for every section in it that
+    /// was not refused (a refused section stays kRejected).
     /// Returns one result per `report.sections` entry, in order. The stored section hash is
     /// always recomputed from the applied rows, never taken from the wire.
     [[nodiscard]] std::vector<V3SectionResult>
@@ -489,8 +499,11 @@ public:
     /// qualifiers sorted); only blob-v3 rows carry a purl. Rows are ordered (agent_id,
     /// install_id); `limit` defaults to 100 when <= 0 and is clamped to kFleetQueryRowCap, so a
     /// short page is not proof of exhaustion. Returns agent_id, name, version, ecosystem, purl
-    /// and install_id per row. FLEET-WIDE and unscoped like `software_catalog`: a caller that
-    /// exposes it MUST gate it (global `Inventory:Read`, ADR-0017). AUTHORITATIVE read:
+    /// and install_id per row. FLEET-WIDE and unscoped like `software_catalog`, and it returns
+    /// `agent_id` per row, so a caller that exposes it must NOT rest on a bare global
+    /// `Inventory:Read`: it must admit then filter the rows to the agents the caller may read
+    /// (`authorize_list_read` / `require_fleet_read`, ADR-0017), as `query_software` does with
+    /// its `agent_ids` push-down (this method has none yet). AUTHORITATIVE read:
     /// `std::nullopt` on a store/pool/query degrade; an empty `purl` is a precondition miss ->
     /// empty value. No route, tool or page calls this yet.
     [[nodiscard]] std::optional<std::vector<SoftwareFleetRow>> find_by_purl(std::string_view purl,

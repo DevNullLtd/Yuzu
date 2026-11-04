@@ -235,7 +235,8 @@ const std::vector<pg::PgMigration>& migrations() {
         {7,
          // Extended row: package_id / source, plus install_id for keyset paging. The
          // install_location / uninstall_string wire slots (13-14) are reserved and not
-         // stored until ADR-0016 §8 is re-opened (#5186). The two TEXT columns follow the
+         // stored on the v2 path (#5186); the v3 path stores slot 13 under the §8 outcome
+         // recorded in the ADR-0016 v10 Update. The two TEXT columns follow the
          // v5 precedent (constant '' defaults are metadata-only, no rewrite). install_id BIGSERIAL
          // backfills existing rows via a table REWRITE under ACCESS EXCLUSIVE — one
          // sequential pass at server start over a table bounded at agents x kMaxEntries
@@ -348,12 +349,13 @@ const std::vector<pg::PgMigration>& migrations() {
          "  device_count BIGINT NOT NULL,"
          "  PRIMARY KEY (name, publisher, ecosystem));"},
         {10,
-         // SAM-13: blob contract v3 (ADR-0016 Update 2026-11-04). Six server-derived/stored
+         // Blob contract v3 (ADR-0016 Update 2026-11-04). Six server-derived/stored
          // columns on installed_software and a per-(agent, facet) state table.
          // COLUMNS: constant defaults are metadata-only (the v5 precedent), no rewrite.
          // install_type '' means "not derived" and install_scope defaults to 'machine' (the only
          // scope ever collected); '' keys and '' install_location/purl are the v2 path's values.
-         // CHECKs are NOT VALID: new and updated rows are checked, existing rows are not scanned.
+         // CHECKs are NOT VALID: they apply to rows written from here on; a row the v2 path
+         // writes carries the not-derived values above.
          // '' is admitted for exactly the not-derived value above, so a later VALIDATE can never
          // fail. DROP IF EXISTS + ADD keeps a white-box schema_meta rewind idempotent.
          // The install_type list is FROZEN here: a new type needs its own migration (the
@@ -369,11 +371,12 @@ const std::vector<pg::PgMigration>& migrations() {
          // partial btree WHERE purl <> '' (the same partial shape as the instance index), so a
          // row without a purl costs no index entry and the lookup-by-exact-purl read is one seek.
          // Both indexes are built in this transaction, each by its own heap scan.
-         // The index build holds ACCESS EXCLUSIVE for its duration, like v7: accepted under the
-         // hard-cutover posture docs/postgres-migration-ladder.md records for v7 (a deviation
-         // from v7's "must be online" rule, with the build measured at 1.8M rows in the ladder
-         // row); statement_timeout is lifted for this txn as in v7, lock_timeout still bounds
-         // lock acquisition.
+         // The index builds hold ACCESS EXCLUSIVE for their duration: accepted under the
+         // 2026-10-24 fresh-database hard-cutover contract (docs/user-manual/upgrading.md
+         // "Deployment contract (hard cutover)"), as a recorded exception in
+         // docs/postgres-store-playbook.md to the rule that a build on a populated table must
+         // be online (the build is measured at 1.8M rows in the ladder row); statement_timeout is
+         // lifted for this txn as in v7, lock_timeout still bounds lock acquisition.
          // software_facet_state: one row per (agent, facet), the per-section status the v3 blob
          // reports plus the section hash the report hash is built from. A new empty table with a
          // plain primary key: online.
@@ -524,7 +527,8 @@ void append_section_record(std::string& out, const SoftwareEntry& e) {
 
 // Postgres bind form of an entry set: one text[] per inserted column, in the order of the
 // INSERT below. The column list, the SELECT list, the unnest() alias list and this array order
-// are one contract; kInsertColumnCount is checked against it.
+// are one contract; kInsertColumnCount sizes the array and must equal the column count (nothing
+// checks it against the SQL, so change them together).
 constexpr std::size_t kInsertColumnCount = 20;
 
 // Batched insert (#1664): one statement carrying the per-row columns as parallel text[]
@@ -1021,8 +1025,9 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         // legitimate empty inventory: the DELETE above already cleared the rows.
         if (!entries.empty() && !insert_entries(c, agent_id_s, entries))
             return false;
-        // A v2 full report supersedes any v3 state: drop the agent's facet rows so a downgraded
-        // agent leaves no stale facets (and a later v3 contact starts from the v2 transition).
+        // A v2 full report supersedes any v3 state: drop the agent's facet rows so v2 rows and
+        // facet state never describe the same agent at once (and a later v3 contact starts from
+        // the v2 transition).
         pg::PgResult fs = pg::exec_params(
             c, "DELETE FROM software_inventory_store.software_facet_state WHERE agent_id = $1",
             std::vector<std::string>{agent_id_s});
@@ -1160,9 +1165,8 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
         if (any_write) {
             // First v3 contact (or a return from v2): no pre-existing row may outlive the
             // switch, because from here on a section replaces only its own facet's rows. The
-            // facet state goes with them: the v2 path clears it, so a row here can only be a
-            // leftover of an older binary's v2 replace (which does not know the table), and a
-            // stale held facet would otherwise stay in the report hash for ever.
+            // facet state goes with them, so a stale held facet cannot stay in the report hash
+            // for ever.
             if (!was_v3) {
                 pg::PgResult del = pg::exec_params(
                     c,
@@ -1288,7 +1292,7 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
         if ((done[i] == O::kDeltaUnsupported || component_with_records) &&
             unsupported_seen.fetch_add(1, std::memory_order_relaxed) % kReadDegradeLogSample == 0) {
             spdlog::warn("SoftwareInventoryStore: agent={} sent a '{}' {} section this server "
-                         "cannot apply yet (delta apply and the component store are SAM-14): "
+                         "cannot apply yet (delta apply and the component store are not built yet): "
                          "asking for a full section",
                          agent_id, results[i].facet,
                          std::string(v3_status_name(report.sections[i].status)));

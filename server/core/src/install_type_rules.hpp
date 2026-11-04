@@ -7,8 +7,9 @@
 ///
 /// The type is SERVER-derived, never on the wire: the agent already stamps every row with its
 /// `<plugin>.<action>` source (blob slot 16), and that source decides how the software got
-/// onto the machine. A row from a pre-tail (v2, 12-field) agent has an empty source, so it
-/// falls back to the ecosystem. A value outside both tables is '' ("not derived"), which the
+/// onto the machine (except that a Linux package ecosystem under `installed_apps.list_inventory`
+/// reads `package_manager`, like the same row from a pre-tail agent). A row from a pre-tail
+/// (v2, 12-field) agent has an empty source, so it falls back to the ecosystem. A value outside both tables is '' ("not derived"), which the
 /// column's CHECK constraint admits.
 ///
 /// SHARED FILE: sibling workstreams add their own source rows (and nothing else) as their
@@ -78,9 +79,23 @@ install_type_for_ecosystem(std::string_view ecosystem) noexcept {
     return {};
 }
 
-/// The row's install type: the source table first, the ecosystem fallback second, '' last.
+/// The one source whose type the ecosystem refines: `installed_apps.list_inventory` also lists
+/// the Linux packages (dpkg, rpm, pacman, apk), and a pre-tail agent's empty-source row of the
+/// same package is `package_manager` by ecosystem, so the same package must read the same
+/// either way. Every other ecosystem under this source keeps the table's `installer`.
+inline constexpr std::string_view kEcosystemRefinedSource = "installed_apps.list_inventory";
+
+[[nodiscard]] constexpr bool is_linux_package_ecosystem(std::string_view ecosystem) noexcept {
+    return ecosystem == "deb" || ecosystem == "rpm" || ecosystem == "apk" || ecosystem == "pacman";
+}
+
+/// The row's install type: the source table first (the one exception is
+/// `kEcosystemRefinedSource`, where a Linux package ecosystem reads `package_manager`), the
+/// ecosystem fallback second, '' last.
 [[nodiscard]] constexpr std::string_view install_type_for(std::string_view source,
                                                           std::string_view ecosystem) noexcept {
+    if (source == kEcosystemRefinedSource && is_linux_package_ecosystem(ecosystem))
+        return "package_manager";
     for (const auto& row : kInstallTypeBySource) {
         if (row.source == source)
             return row.type;
@@ -114,7 +129,26 @@ namespace install_type_detail {
            });
 }
 
+/// The ecosystem-refined source is a real collector source, its table row is `installer`, and
+/// the refinement moves only the four Linux package ecosystems to `package_manager`.
+[[nodiscard]] consteval bool ecosystem_refinement_well_formed() {
+    namespace sc = software_catalog;
+    return std::ranges::any_of(sc::kSoftwareSources,
+                               [](const auto& src) { return src.value == kEcosystemRefinedSource; }) &&
+           install_type_for(kEcosystemRefinedSource, "") == "installer" &&
+           install_type_for(kEcosystemRefinedSource, "windows") == "installer" &&
+           install_type_for(kEcosystemRefinedSource, "macos_pkgutil") == "installer" &&
+           install_type_for(kEcosystemRefinedSource, "deb") == "package_manager" &&
+           install_type_for(kEcosystemRefinedSource, "rpm") == "package_manager" &&
+           install_type_for(kEcosystemRefinedSource, "apk") == "package_manager" &&
+           install_type_for(kEcosystemRefinedSource, "pacman") == "package_manager";
+}
+
 } // namespace install_type_detail
+
+static_assert(install_type_detail::ecosystem_refinement_well_formed(),
+              "the ecosystem-refined source must be a collector source: Linux package ecosystems "
+              "read package_manager, every other ecosystem keeps the table type");
 
 static_assert(
     install_type_detail::table_total_and_well_formed(),
