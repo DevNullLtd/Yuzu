@@ -32,7 +32,9 @@ ROUTES_CPP = os.path.join("server", "core", "src", "dashboard_routes.cpp")
 ROUTES_HPP = os.path.join("server", "core", "src", "dashboard_routes.hpp")
 TAG = "test_dashboard_audit_checked_lexical"
 
-BARE_CALL = re.compile(r"(?<![\w.>])(?:persist_)?audit_fn_\s*\(")
+# A call through `this->` is still the class's own sink; any other `x.`/`x->` qualifier is a
+# different object (#3619 review: `>` in the lookbehind once let `this->audit_fn_(...)` through).
+BARE_CALL = re.compile(r"(?:\bthis\s*->\s*|(?<![\w.>]))(?:persist_)?audit_fn_\s*\(")
 BOOL_TYPEDEF = re.compile(r"using\s+AuditFn\s*=\s*std::function<\s*bool\s*\(")
 
 
@@ -81,6 +83,11 @@ def self_check() -> list[str]:
         "    spdlog::warn(\"audit_fn_(x)\");\n": 0,
         "    audit_fn_ = std::move(audit_fn);\n": 0,
         "    other.audit_fn_(req);\n": 0,
+        "    other->audit_fn_(req);\n": 0,
+        "    this->audit_fn_(req, a, r, t, i, d);\n": 1,
+        "    this->persist_audit_fn_(req, a, r, t, i, d);\n": 1,
+        "    (void)this -> audit_fn_ (req, a, r, t, i, d);\n": 1,
+        "    detail::try_persist_audit(this->audit_fn_, req, a, r, t, i, d);\n": 0,
     }
     for src, want in cases.items():
         got = len(bare_calls(src))

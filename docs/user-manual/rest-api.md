@@ -13187,7 +13187,7 @@ Dispatch a single-device `echo.configure` with `<source>_enabled=true`. Per-sour
 - 404 with body `Agent not reachable.` for both out-of-scope `device_id` and not-connected agent. Audit detail records the real reason (`scope_violation` vs `agent_not_connected`) server-side.
 - 503 with `Sec-Audit-Failed: true`, the body `The audit record could not be stored, so nothing was sent. Retry once the audit store recovers.` (`data-reason="audit_unavailable"`) and the same text as an `HX-Trigger` error toast, when the `attempted` audit row cannot be stored (#3619). Nothing is dispatched. Counted as `yuzu_echo_source_reenable_total{result="audit_unavailable"}`.
 
-**Audit:** Emits `echo.source.reenable` with `result=attempted` (same `detail`) after every refusal and before the dispatch, then `result=success` and `detail` carrying `device=<id> source=<src>` on success, or `result=failure` with the real rejection reason on rejected attempts.
+**Audit:** Emits `echo.source.reenable` with `result=attempted` (same `detail`) once every check has passed (a refused request writes none) and before the dispatch, then `result=success` and `detail` carrying `device=<id> source=<src>` on success, or `result=failure` with the real rejection reason on rejected attempts.
 
 #### `POST /fragments/echo/retention-paused/purge`
 
@@ -13213,7 +13213,7 @@ Dispatch a single-device `echo.purge_source` that **permanently drops every ware
 - 503 if command dispatch is unavailable.
 - 503 with `Sec-Audit-Failed: true`, the body `The audit record could not be stored, so nothing was sent. Retry once the audit store recovers.` (`data-reason="audit_unavailable"`) and the same text as an `HX-Trigger` error toast, when the `attempted` audit row cannot be stored (#3619). Nothing is purged. Counted as `yuzu_echo_source_purge_total{result="audit_unavailable"}`.
 
-**Audit:** Emits `echo.source.purge` with `result=attempted` (same `detail`) after every refusal and before the dispatch, then `result=success` and `detail` carrying `device=<id> source=<src>` on success (`rbac_denied` on the permission gate; `result=failure` with `scope_violation`/`agent_not_connected` on rejected attempts). Dispatch is fire-and-forget: `rows_deleted` is computed agent-side and appears in the command's **response record** (keyed by `command_id`), not in this dispatch audit row.
+**Audit:** Emits `echo.source.purge` with `result=attempted` (same `detail`) once every check has passed (a refused request writes none) and before the dispatch, then `result=success` and `detail` carrying `device=<id> source=<src>` on success (`rbac_denied` on the permission gate; `result=failure` with `scope_violation`/`agent_not_connected` on rejected attempts). Dispatch is fire-and-forget: `rows_deleted` is computed agent-side and appears in the command's **response record** (keyed by `command_id`), not in this dispatch audit row.
 
 **Metric:** `yuzu_echo_source_purge_total{result}` (counter) — counts dispatch outcomes.
 

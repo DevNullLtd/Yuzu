@@ -4464,7 +4464,7 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "Audit events failing to persist — behavioural-data routes are 503ing"
+          summary: "Audit events failing to persist — behavioural-data routes and audit-first mutations are 503ing"
           description: >-
             yuzu_server_audit_emit_failed_total is rising. Every REST route that uses
             fail-closed audit-on-open (guardian.device.view, dex.device.view,

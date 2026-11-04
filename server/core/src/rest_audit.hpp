@@ -38,7 +38,11 @@
 /// A null / empty `audit_fn` means the deployment runs audit-off; that is NOT
 /// a persistence failure, so the kernel returns `true` and sets no header —
 /// the established `AuditFn` contract (callers that fail closed must keep
-/// serving when audit is simply disabled).
+/// serving when audit is simply disabled). The one deliberate exception is a
+/// mutation's `attempted` row (`DashboardRoutes::audit_attempted`, #3619): it
+/// refuses on an unwired sink, because the mutation must not run without a
+/// row; production always wires the sink there (`server.cpp`), and audit-off
+/// still reports the row as persisted from inside `audit_log`.
 ///
 /// **`result` semantics (#4858) — read this before assuming "success" means
 /// "data was shown".** The bool returned by `try_persist_audit`/
