@@ -1731,6 +1731,38 @@ const std::string& document_text(bool with_guides) {
 
 const char* form_name(bool with_guides) { return with_guides ? "with guides" : "default"; }
 
+/// The member names of a JSON object.
+std::set<std::string> keys_of(const json& obj) {
+    std::set<std::string> out;
+    for (auto it = obj.begin(); it != obj.end(); ++it)
+        out.insert(it.key());
+    return out;
+}
+
+/// The elements of a JSON array of strings.
+std::set<std::string> set_of(const json& arr) {
+    std::set<std::string> out;
+    for (const auto& k : arr)
+        out.insert(k.get<std::string>());
+    return out;
+}
+
+/// The node at the end of a chain of object keys, or nullptr when any step is missing or its
+/// parent is not an object. Lets a pin report a missing node with CHECK and move on to the next
+/// row, where a chain of `.at()` would throw and abandon the rest of the test case.
+const json* find_at(const json& root, std::initializer_list<const char*> keys) {
+    const json* node = &root;
+    for (const char* key : keys) {
+        if (!node->is_object())
+            return nullptr;
+        const auto it = node->find(key);
+        if (it == node->end())
+            return nullptr;
+        node = &*it;
+    }
+    return node;
+}
+
 /// The node a `$ref` names, or the node itself when it is not a reference.
 json resolve_ref(const json& spec, const json& node) {
     if (!node.is_object() || !node.contains("$ref"))
@@ -2111,12 +2143,6 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
     REQUIRE_FALSE(spec.is_discarded());
     const json& schema = spec.at("components").at("schemas").at("SettingsDataRetention");
-    const auto keys_of = [](const json& obj) {
-        std::set<std::string> out;
-        for (auto it = obj.begin(); it != obj.end(); ++it)
-            out.insert(it.key());
-        return out;
-    };
 
     Config cfg;
     const json real = yuzu::server::settings_model::build_data_retention_settings(cfg);
@@ -2127,12 +2153,6 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     REQUIRE(real["echo"].contains("tiers"));
     REQUIRE_FALSE(real["echo"]["tiers"].empty());
 
-    const auto set_of = [](const json& arr) {
-        std::set<std::string> out;
-        for (const auto& k : arr)
-            out.insert(k.get<std::string>());
-        return out;
-    };
     // The JSON type a value has, as the OpenAPI `type` keyword spells it.
     const auto type_of = [](const json& v) -> std::string {
         if (v.is_number_integer())
@@ -2381,9 +2401,12 @@ TEST_CASE("openapi documents: the response status set of the hand-checked operat
             CHECK(has_method);
             if (!has_method)
                 continue;
+            const json* responses = find_at(spec, {"paths", row.path, row.method, "responses"});
+            CHECK(responses != nullptr);
+            if (responses == nullptr || !responses->is_object())
+                continue;
             std::set<std::string> declared;
-            for (const auto& [code, response] :
-                 spec["paths"].at(row.path).at(row.method).at("responses").items())
+            for (const auto& [code, response] : responses->items())
                 declared.insert(code);
             CHECK(declared == row.statuses);
         }
@@ -2396,7 +2419,10 @@ TEST_CASE("openapi documents: the plugin-config success responses reference the 
     // plugin_config_routes.cpp answers GET/PUT of a value as {data: <entry>, meta}, the secret
     // PUT as {data: <metadata>, meta}, and both DELETEs as {deleted: true, meta} (no data
     // wrapper). Each row names the operation, the schema its 200 must reference, and that
-    // schema's required members.
+    // schema's required members. The schema's property keys must equal its required members
+    // exactly, on purpose: a new optional top-level member is an envelope change a client should
+    // be told about, so it has to update this table. The 200 description must also state the
+    // envelope, because a generated client reads that text.
     struct Row {
         const char* path;
         const char* method;
@@ -2413,39 +2439,36 @@ TEST_CASE("openapi documents: the plugin-config success responses reference the 
         {"/plugin-config/{plugin}/{key}/secret", "delete", "PluginConfigDeleteResponse",
          {"deleted", "meta"}},
     };
-    const auto keys_of = [](const json& obj) {
-        std::set<std::string> out;
-        for (auto it = obj.begin(); it != obj.end(); ++it)
-            out.insert(it.key());
-        return out;
-    };
-    const auto set_of = [](const json& arr) {
-        std::set<std::string> out;
-        for (const auto& k : arr)
-            out.insert(k.get<std::string>());
-        return out;
-    };
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
         const json spec = json::parse(document_text(with_guides));
         for (const auto& row : rows) {
             INFO(row.method << " " << row.path);
-            const bool has_op = spec["paths"].contains(row.path) &&
-                                spec["paths"].at(row.path).contains(row.method);
-            CHECK(has_op);
-            if (!has_op)
+            const json* ok =
+                find_at(spec, {"paths", row.path, row.method, "responses", "200"});
+            CHECK(ok != nullptr);
+            if (ok == nullptr)
                 continue;
-            const json& ok = spec["paths"].at(row.path).at(row.method).at("responses").at("200");
-            const std::string ref =
-                ok.at("content").at("application/json").at("schema").value("$ref", "");
-            CHECK(ref == std::string("#/components/schemas/") + row.schema);
-            const json& schemas = spec.at("components").at("schemas");
-            const bool has_schema = schemas.contains(row.schema);
-            CHECK(has_schema);
-            if (!has_schema)
-                continue;
-            CHECK(set_of(schemas.at(row.schema).at("required")) == row.required);
-            CHECK(keys_of(schemas.at(row.schema).at("properties")) == row.required);
+            const json* ref_node =
+                find_at(*ok, {"content", "application/json", "schema", "$ref"});
+            CHECK(ref_node != nullptr);
+            if (ref_node != nullptr && ref_node->is_string())
+                CHECK(ref_node->get<std::string>() ==
+                      std::string("#/components/schemas/") + row.schema);
+            const json* description = find_at(*ok, {"description"});
+            CHECK(description != nullptr);
+            if (description != nullptr && description->is_string())
+                CHECK(description->get<std::string>().find("meta: {api_version}") !=
+                      std::string::npos);
+            const json* required = find_at(spec, {"components", "schemas", row.schema, "required"});
+            const json* properties =
+                find_at(spec, {"components", "schemas", row.schema, "properties"});
+            CHECK(required != nullptr);
+            CHECK(properties != nullptr);
+            if (required != nullptr && required->is_array())
+                CHECK(set_of(*required) == row.required);
+            if (properties != nullptr && properties->is_object())
+                CHECK(keys_of(*properties) == row.required);
         }
     }
 }

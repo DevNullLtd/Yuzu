@@ -9796,10 +9796,10 @@ administrator can read this route but not the panel.
 }
 ```
 
-**Errors:** `401` (not signed in), `403` (no global `PluginConfig:Read`, a confined grant, a
-service-scoped token, or an authorization store that is closed or degraded, which fails closed),
-`503` (the plugin config store is unavailable, or the authorization store is unavailable to an engine
-principal).
+**Errors:** `400` (the `plugin` query parameter is not a valid plugin name), `401` (not signed in),
+`403` (no global `PluginConfig:Read`, a confined grant, a service-scoped token, or an authorization
+store that is closed or degraded, which fails closed), `503` (the plugin config store is
+unavailable, or the authorization store is unavailable to an engine principal).
 
 #### `GET /api/v1/plugin-config/{plugin}/{key}`
 
