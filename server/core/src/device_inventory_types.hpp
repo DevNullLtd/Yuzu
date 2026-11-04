@@ -9,6 +9,7 @@
 /// behaviour lives here — the store keeps its class and every query.
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -80,8 +81,9 @@ struct DeviceCiRecord {
     std::string machine_id_algorithm;
     std::string machine_id_source; ///< wire position 32
     /// v2 only: per-section statuses + list rows, in `kDeviceCiSections` order (only
-    /// sections the blob mentioned). Empty on v1. Not populated by `get_device_ci` —
-    /// read via `get_device_ci_sections`.
+    /// sections the blob mentioned). Empty on v1. Not populated by `get_device_ci`; populated
+    /// by `get_device_ci_with_sections` (one snapshot with the scalars) and readable alone via
+    /// `get_device_ci_sections`.
     std::vector<DeviceCiSection> sections;
 };
 
@@ -92,5 +94,15 @@ struct DeviceCiRecord {
 /// synced" note). Out-params are forbidden in new code (docs/cpp-conventions.md) —
 /// hence `std::expected` rather than an enum + out-param.
 enum class CiReadError { kDegraded };
+
+/// Result of `DeviceInventoryStore::get_device_ci_with_sections`: the record and its v2
+/// sections read in ONE snapshot, so the scalars and the section rows are always the same
+/// replace generation. `record == nullopt` is "no CI record" (a successful read). A record
+/// WITH `sections_failed == true` means the record read succeeded but a section statement
+/// failed: `record->sections` is then empty and must not be read as "the device has none".
+struct DeviceCiWithSections {
+    std::optional<DeviceCiRecord> record;
+    bool sections_failed{false};
+};
 
 } // namespace yuzu::server

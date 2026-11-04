@@ -19762,24 +19762,25 @@ private:
         // by the dashboard fragment, the REST twin and the MCP get_hardware_ci
         // twin (via ToolDeps::ci_detail_fn), so the three can never drift on what
         // "the CI record" means.
-        auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id) -> HardwareCiDetail {
+        auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id,
+                                                      bool with_sections) -> HardwareCiDetail {
             HardwareCiDetail detail;
             apply_identity_read(detail, hw_identity_fn(agent_id));
             if (auto sess = registry_.get_session(agent_id))
                 detail.agent_version = sess->agent_version; // immutable identity field, lock-free
-            detail.ci = device_inventory_store_
-                            ? device_inventory_store_->get_device_ci(agent_id)
-                            : std::expected<std::optional<DeviceCiRecord>, CiReadError>(
-                                  std::unexpected(CiReadError::kDegraded));
-            // The v2 per-section statuses and rows (H.7): only for a FOUND v2 record - a v1 record,
-            // an absent one and a degraded read carry none, and the sections read is a second
-            // REPEATABLE READ transaction best not spent on them. A failure is KEPT as the error
-            // (the REST route 503s on it); it is never flattened to an empty list. Honest limit:
-            // this and `get_device_ci` above are two transactions, so a full replace landing
-            // between them can pair one generation's scalars with the next generation's sections
-            // (both are complete, valid records; the daily cadence makes it rare).
-            if (detail.ci && *detail.ci && (*detail.ci)->blob_version >= 2)
-                detail.ci_sections = device_inventory_store_->get_device_ci_sections(agent_id);
+            if (!device_inventory_store_) {
+                detail.ci = std::unexpected(CiReadError::kDegraded);
+            } else if (with_sections) {
+                // The v2 per-section statuses and rows (H.7): ONLY the REST record route and the
+                // MCP tool ask for them (the dashboard fragment, its sync-now poll and the actions
+                // lens do not render them). The record and its sections come from ONE
+                // REPEATABLE READ snapshot, so the scalars and the rows are always the same
+                // replace generation; the pure mapping keeps a failed sections read as the error
+                // (the REST route 503s and the MCP tool answers a retryable error on it).
+                apply_ci_with_sections_read(detail, device_inventory_store_->get_device_ci_with_sections(agent_id));
+            } else {
+                detail.ci = device_inventory_store_->get_device_ci(agent_id);
+            }
             if (software_inventory_store_) {
                 auto sw = software_inventory_store_->get_agent_software(agent_id);
                 if (sw) {

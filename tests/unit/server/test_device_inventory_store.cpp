@@ -1026,6 +1026,9 @@ TEST_CASE("DeviceInventoryStore degrades (not empty) on a broken pool", "[device
     auto sec = store.get_device_ci_sections("a");
     REQUIRE(!sec.has_value()); // unexpected(kDegraded), never an empty success
     CHECK(sec.error() == CiReadError::kDegraded);
+    auto both = store.get_device_ci_with_sections("a");
+    REQUIRE(!both.has_value()); // a closed store is a degrade, not "no record"
+    CHECK(both.error() == CiReadError::kDegraded);
 }
 
 TEST_CASE("DeviceInventoryStore hash-skip ingest round-trip", "[pg][device_ci]") {
@@ -1384,6 +1387,175 @@ TEST_CASE("get_device_ci_sections on an open store: broken child read degrades; 
         CHECK(find_section(*s, "bogus") == nullptr);
         CHECK(find_section(*s, "cpu") != nullptr);
     }
+}
+
+// ── get_device_ci_with_sections: the record and its sections from ONE snapshot (H.7) ─────────
+
+TEST_CASE("get_device_ci_with_sections: scalars and sections are the same generation after a replace",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const DeviceCiRecord a = distinct_v2_record("A");
+    const DeviceCiRecord b = distinct_v2_record("B");
+    const auto put = [&](const DeviceCiRecord& r) {
+        return store.apply_device_ci("agent-ws", DeviceInventoryStore::canonical_hash(r),
+                                     std::optional<DeviceCiRecord>{r}, 1);
+    };
+    const auto verify = [&](const DeviceCiRecord& want) {
+        auto got = store.get_device_ci_with_sections("agent-ws");
+        REQUIRE(got.has_value());
+        CHECK_FALSE(got->sections_failed);
+        REQUIRE(got->record.has_value());
+        CHECK(got->record->agent_id == "agent-ws");
+        check_scalars_equal(*got->record, want);
+        check_sections_equal(got->record->sections, want.sections);
+    };
+
+    REQUIRE(put(a) == InventoryIngestOutcome::kStored);
+    verify(a);
+    REQUIRE(put(b) == InventoryIngestOutcome::kStored);
+    verify(b); // scalars AND every row are generation B; nothing of A is paired with it
+    // The same read through the two single-purpose readers agrees with the combined one.
+    auto secs = store.get_device_ci_sections("agent-ws");
+    REQUIRE(secs.has_value());
+    check_sections_equal(*secs, b.sections);
+    auto only = store.get_device_ci("agent-ws");
+    REQUIRE(only.has_value());
+    REQUIRE(only->has_value());
+    CHECK((**only).sections.empty()); // get_device_ci still does not read sections
+}
+
+TEST_CASE("get_device_ci_with_sections: a v1 record has no sections and no section read is needed",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const DeviceCiRecord v1 = parse_device_ci_blob(sample_blob());
+    REQUIRE(store.apply_device_ci("agent-v1", DeviceInventoryStore::canonical_hash(v1),
+                                  std::optional<DeviceCiRecord>{v1}, 1) == InventoryIngestOutcome::kStored);
+    // Break every section table: a v1 record must still read fine, proving no section statement ran.
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci_cpu RENAME COLUMN idx TO idx_x");
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci_section RENAME COLUMN kind TO kind_x");
+    auto got = store.get_device_ci_with_sections("agent-v1");
+    REQUIRE(got.has_value());
+    CHECK_FALSE(got->sections_failed);
+    REQUIRE(got->record.has_value());
+    CHECK(got->record->blob_version == 1);
+    CHECK(got->record->serial == "ABC123");
+    CHECK(got->record->sections.empty());
+}
+
+TEST_CASE("get_device_ci_with_sections: an absent agent is an answered absence",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto none = store.get_device_ci_with_sections("nobody");
+    REQUIRE(none.has_value());
+    CHECK_FALSE(none->record.has_value());
+    CHECK_FALSE(none->sections_failed);
+    auto blank = store.get_device_ci_with_sections("");
+    REQUIRE(blank.has_value());
+    CHECK_FALSE(blank->record.has_value());
+}
+
+TEST_CASE("get_device_ci_with_sections: a failed section statement keeps the record and flags the failure",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const DeviceCiRecord a = distinct_v2_record("A");
+    REQUIRE(store.apply_device_ci("agent-sf", DeviceInventoryStore::canonical_hash(a),
+                                  std::optional<DeviceCiRecord>{a}, 1) == InventoryIngestOutcome::kStored);
+
+    SECTION("a per-kind SELECT fails") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci_cpu RENAME COLUMN idx TO idx_x");
+        auto got = store.get_device_ci_with_sections("agent-sf");
+        REQUIRE(got.has_value()); // the record read answered
+        CHECK(got->sections_failed);
+        REQUIRE(got->record.has_value());
+        check_scalars_equal(*got->record, a);
+        CHECK(got->record->sections.empty()); // never a partial list read as "the device has none"
+        // the single-purpose reader degrades on the same fault, so the two agree
+        CHECK_FALSE(store.get_device_ci_sections("agent-sf").has_value());
+    }
+    SECTION("the section-status SELECT fails") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci_section RENAME COLUMN kind TO kind_x");
+        auto got = store.get_device_ci_with_sections("agent-sf");
+        REQUIRE(got.has_value());
+        CHECK(got->sections_failed);
+        REQUIRE(got->record.has_value());
+    }
+    SECTION("a failed record SELECT is a degrade, not a record") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci RENAME COLUMN model TO model_x");
+        auto got = store.get_device_ci_with_sections("agent-sf");
+        REQUIRE_FALSE(got.has_value());
+        CHECK(got.error() == CiReadError::kDegraded);
+    }
+}
+
+TEST_CASE("get_device_ci_with_sections: a concurrent replace never pairs one generation's scalars "
+          "with another's sections",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const DeviceCiRecord a = distinct_v2_record("A");
+    const DeviceCiRecord b = distinct_v2_record("B");
+    const auto put = [&](const DeviceCiRecord& r) {
+        return store.apply_device_ci("agent-race", DeviceInventoryStore::canonical_hash(r),
+                                     std::optional<DeviceCiRecord>{r}, 1);
+    };
+    REQUIRE(put(a) == InventoryIngestOutcome::kStored);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> torn{0};
+    std::atomic<int> reads{0};
+    std::atomic<int> failures{0};
+    std::thread writer([&] {
+        bool flip = true;
+        while (!stop.load()) {
+            if (put(flip ? b : a) != InventoryIngestOutcome::kStored)
+                failures.fetch_add(1);
+            flip = !flip;
+        }
+    });
+    for (int i = 0; i < 400; ++i) {
+        auto got = store.get_device_ci_with_sections("agent-race");
+        if (!got || !got->record || got->sections_failed) {
+            failures.fetch_add(1);
+            continue;
+        }
+        reads.fetch_add(1);
+        // Scalars carry the generation in the model; every section reason carries it too.
+        const char gen = got->record->model.back(); // "model-A" / "model-B"
+        for (const auto& sec : got->record->sections)
+            if (sec.reason.find(std::string("reason-") + gen + "-") != 0)
+                torn.fetch_add(1);
+        if (got->record->sections.size() != a.sections.size())
+            torn.fetch_add(1);
+    }
+    stop.store(true);
+    writer.join();
+    CHECK(failures.load() == 0);
+    CHECK(reads.load() == 400);
+    CHECK(torn.load() == 0);
 }
 
 TEST_CASE("v2 full replace swaps the whole child set; v1 <-> v2 transitions", "[pg][device_ci][v2]") {

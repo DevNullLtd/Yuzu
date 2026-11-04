@@ -22,6 +22,7 @@
 ///  - hardware_ci_json: ci_state discrimination (found/absent/degraded) and
 ///    the independent nullopt-vs-present-empty signal for software/tags.
 
+#include "device_ci_kinds.hpp"
 #include "hardware_list_model.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -293,7 +294,7 @@ TEST_CASE("hw_row_matches: search finds a row by a key=value tag pair", "[hardwa
     CHECK(hw_row_matches(r, hw_search_tokens("team=platform"), "all", "all", ""));
 }
 
-TEST_CASE("hw_row_matches: search finds a row by asset tag, chassis serial or board serial",
+TEST_CASE("hw_row_matches: search finds a row by asset tag or chassis serial or board serial",
           "[hardware][model][search]") {
     InventoryDeviceRow r = make_row("a1");
     r.ci_chassis_asset_tag = "AT-0042-Z";
@@ -808,7 +809,7 @@ TEST_CASE("hardware_ci_json: unavailable and permission_denied sections carry th
     CHECK(topo["rows"].empty());
 }
 
-TEST_CASE("hardware_ci_json: status-only sections carry their *_source and never rows",
+TEST_CASE("hardware_ci_json: status-only sections carry their source value and never rows",
           "[hardware][model][json][sections]") {
     auto d = v2_detail({make_section("chassis", "ok"), make_section("baseboard", "ok", "-"),
                         make_section("machine_id", "constrained", "server:machine_id_shape")});
@@ -822,7 +823,7 @@ TEST_CASE("hardware_ci_json: status-only sections carry their *_source and never
         CHECK(section_of(j, k)["rows"].empty());
 }
 
-TEST_CASE("hardware_ci_json: sections are served in registry order whatever order they arrive in, "
+TEST_CASE("hardware_ci_json: sections are served in registry order whatever order they arrive in "
           "and an unregistered kind is never surfaced",
           "[hardware][model][json][sections]") {
     auto d = v2_detail({make_section("topology", "ok"), make_section("bogus", "ok"),
@@ -837,7 +838,7 @@ TEST_CASE("hardware_ci_json: sections are served in registry order whatever orde
 
 // "Not reported" is not "has none": a v1 record reads absent with an empty list, a failed read
 // reads degraded with a null list, and the three states never collapse.
-TEST_CASE("hardware_ci_json: sections_state tells found, absent and degraded apart",
+TEST_CASE("hardware_ci_json: sections_state tells found from absent from degraded",
           "[hardware][model][json][sections]") {
     // v1 / nothing stored
     const auto absent = hardware_ci_json(v2_detail({}), 0);
@@ -1194,4 +1195,168 @@ TEST_CASE("classify_hardware_ci_read: found, not found, roster unreadable", "[ha
         empty.tags = std::vector<DeviceTag>(1);
         CHECK(classify_hardware_ci_read(empty) == HardwareCiRead::Found);
     }
+}
+
+// ── hardware_ci_json: section edge cases (H.7 Gate 3) ────────────────────────────────────────
+
+// A row shorter than the registry's column count reads the missing trailing cells as null; a longer
+// one has its extra cells ignored. Neither throws, and the row keeps exactly the declared keys.
+TEST_CASE("hardware_ci_json: a section row shorter or longer than the declared columns is bounded",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({make_section("cpu", "ok", "",
+                                     {{"0", "Xeon", "8"},
+                                      {"1", "Epyc", "16", "32", "3000", "CPU1", "B2", "EXTRA1", "EXTRA2"}})});
+    const auto j = hardware_ci_json(d, 0);
+    const auto& rows = section_of(j, "cpu")["rows"];
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].size() == 7);
+    CHECK(rows[0]["idx"] == "0");
+    CHECK(rows[0]["cores"] == "8");
+    CHECK(rows[0]["threads"].is_null());
+    CHECK(rows[0]["stepping"].is_null());
+    CHECK(rows[1].size() == 7); // the two extra cells are ignored
+    CHECK(rows[1]["stepping"] == "B2");
+    CHECK_FALSE(rows[1].contains("EXTRA1"));
+}
+
+// Rows are served only for the recognised `ok` and `constrained` levels, matched exactly: a blank
+// level (rows stored but no status row) and a mixed-case level are neither complete nor row-bearing.
+TEST_CASE("hardware_ci_json: a blank or mixed-case level serves no rows and is not complete",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({make_section("cpu", "", "", {{"0", "Xeon", "8", "16", "2400", "CPU0", "A"}}),
+                        make_section("disk", "OK", "", {{"0", "NVMe", "512", "ssd", "nvme"}}),
+                        make_section("swap", "Constrained", "r", {{"/swap", "1024", "file"}})});
+    const auto j = hardware_ci_json(d, 0);
+    const auto& cpu = section_of(j, "cpu");
+    REQUIRE(cpu.is_object());
+    CHECK(cpu["status"].is_null());
+    CHECK(cpu["complete"] == false);
+    CHECK(cpu["rows"].empty());
+    const auto& disk = section_of(j, "disk");
+    CHECK(disk["status"] == "OK"); // served as the agent sent it, never normalised into a recognised level
+    CHECK(disk["complete"] == false);
+    CHECK(disk["rows"].empty());
+    CHECK(section_of(j, "swap")["complete"] == false);
+    CHECK(section_of(j, "swap")["rows"].empty());
+}
+
+// The registry order picks the first stored section of a kind: a duplicate kind never doubles up.
+TEST_CASE("hardware_ci_json: a duplicated section kind is served once and the first one wins",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({make_section("cpu", "ok", "", {{"0", "First", "1", "1", "1", "S", "x"}}),
+                        make_section("cpu", "unavailable", "dup", {})});
+    const auto j = hardware_ci_json(d, 0);
+    std::size_t n = 0;
+    for (const auto& s : j["ci"]["sections"])
+        n += s["kind"] == "cpu" ? 1 : 0;
+    CHECK(n == 1);
+    CHECK(section_of(j, "cpu")["status"] == "ok");
+    CHECK(section_of(j, "cpu")["rows"][0]["model"] == "First");
+}
+
+// Every registry kind either has a `*_source` mapping in ci_sections_json (status-only kinds) or
+// serves `source: null` (list kinds). A new status-only kind added to the registry without a
+// mapping serves null here and fails, instead of silently carrying a null source.
+TEST_CASE("hardware_ci_json: every status-only registry kind has a source mapping and list kinds serve null",
+          "[hardware][model][json][sections]") {
+    std::vector<DeviceCiSection> all;
+    for (const auto& def : kDeviceCiSections)
+        all.push_back(make_section(def.section, "ok"));
+    auto d = v2_detail(all); // chassis_source, board_source, machine_id_source are all non-blank
+    const auto j = hardware_ci_json(d, 0);
+    REQUIRE(j["ci"]["sections"].size() == kDeviceCiSectionCount);
+    for (const auto& def : kDeviceCiSections) {
+        INFO(def.section);
+        const auto& sec = section_of(j, def.section);
+        REQUIRE(sec.is_object());
+        if (def.table == nullptr)
+            CHECK(sec["source"].is_string());
+        else
+            CHECK(sec["source"].is_null());
+    }
+}
+
+// ── apply_ci_with_sections_read: the store result -> HardwareCiDetail mapping ────────────────
+
+namespace {
+DeviceCiRecord mapped_record(int blob_version) {
+    DeviceCiRecord r;
+    r.agent_id = "a1";
+    r.blob_version = blob_version;
+    r.chassis_serial = "CHS1";
+    return r;
+}
+} // namespace
+
+// Kills: leaving `ci_sections` at a stale value on a failed record read.
+TEST_CASE("apply_ci_with_sections_read: a failed record read is a degraded ci and no sections",
+          "[hardware][model][sections]") {
+    HardwareCiDetail d;
+    d.ci_sections = std::vector<DeviceCiSection>{make_section("cpu", "ok")};
+    apply_ci_with_sections_read(d, std::unexpected(CiReadError::kDegraded));
+    REQUIRE_FALSE(d.ci.has_value());
+    CHECK(d.ci.error() == CiReadError::kDegraded);
+    REQUIRE(d.ci_sections.has_value());
+    CHECK(d.ci_sections->empty());
+    CHECK_FALSE(hardware_ci_sections_unreadable(d)); // ci degraded, not a sections failure
+}
+
+TEST_CASE("apply_ci_with_sections_read: an absent record is an answered nullopt with no sections",
+          "[hardware][model][sections]") {
+    HardwareCiDetail d;
+    apply_ci_with_sections_read(d, DeviceCiWithSections{});
+    REQUIRE(d.ci.has_value());
+    CHECK_FALSE(d.ci->has_value());
+    REQUIRE(d.ci_sections.has_value());
+    CHECK(d.ci_sections->empty());
+}
+
+TEST_CASE("apply_ci_with_sections_read: a v2 record moves its sections into ci_sections",
+          "[hardware][model][sections]") {
+    HardwareCiDetail d;
+    DeviceCiWithSections read;
+    read.record = mapped_record(2);
+    read.record->sections = {make_section("cpu", "ok", "", {{"0", "Xeon"}}), make_section("swap", "unavailable")};
+    apply_ci_with_sections_read(d, std::move(read));
+    REQUIRE(d.ci.has_value());
+    REQUIRE(d.ci->has_value());
+    CHECK((*d.ci)->chassis_serial == "CHS1");
+    CHECK((*d.ci)->sections.empty()); // one home for the rows
+    REQUIRE(d.ci_sections.has_value());
+    REQUIRE(d.ci_sections->size() == 2);
+    CHECK((*d.ci_sections)[0].kind == "cpu");
+    CHECK((*d.ci_sections)[1].level == "unavailable");
+    CHECK_FALSE(hardware_ci_sections_unreadable(d));
+}
+
+// Kills: dropping the `blob_version >= 2` guard (a v1 record never has sections to serve, whatever
+// a caller left in the struct).
+TEST_CASE("apply_ci_with_sections_read: a v1 record serves no sections even if some are present",
+          "[hardware][model][sections]") {
+    HardwareCiDetail d;
+    DeviceCiWithSections read;
+    read.record = mapped_record(1);
+    read.record->sections = {make_section("cpu", "ok")};
+    apply_ci_with_sections_read(d, std::move(read));
+    REQUIRE(d.ci.has_value());
+    REQUIRE(d.ci->has_value());
+    REQUIRE(d.ci_sections.has_value());
+    CHECK(d.ci_sections->empty());
+    CHECK(hardware_ci_json(d, 0)["sections_state"] == "absent");
+}
+
+// Kills: flattening a failed sections read into an empty vector (a 200 that reads "reports none").
+TEST_CASE("apply_ci_with_sections_read: a failed sections read keeps the error and the record",
+          "[hardware][model][sections]") {
+    HardwareCiDetail d;
+    DeviceCiWithSections read;
+    read.record = mapped_record(2);
+    read.sections_failed = true;
+    apply_ci_with_sections_read(d, std::move(read));
+    REQUIRE(d.ci.has_value());
+    REQUIRE(d.ci->has_value());
+    CHECK((*d.ci)->chassis_serial == "CHS1");
+    REQUIRE_FALSE(d.ci_sections.has_value());
+    CHECK(d.ci_sections.error() == CiReadError::kDegraded);
+    CHECK(hardware_ci_sections_unreadable(d));
 }

@@ -930,4 +930,27 @@ void apply_identity_read(HardwareCiDetail& detail,
         detail.identity_degraded = true;
 }
 
+void apply_ci_with_sections_read(HardwareCiDetail& detail,
+                                 std::expected<DeviceCiWithSections, CiReadError> read) {
+    if (!read) {
+        // The record read itself failed: `ci` is the error, and no sections read was made.
+        detail.ci = std::unexpected(read.error());
+        detail.ci_sections = {};
+        return;
+    }
+    detail.ci = std::move(read->record);
+    if (read->sections_failed) {
+        // The record answered but its sections did not: keep the error (never flatten it to an
+        // empty list), so the REST route 503s and the MCP twin answers the same retryable error.
+        detail.ci_sections = std::unexpected(CiReadError::kDegraded);
+        return;
+    }
+    detail.ci_sections = std::vector<DeviceCiSection>{};
+    // Only a v2 record carries sections; a v1 record (or no record) leaves the empty list.
+    if (*detail.ci && (*detail.ci)->blob_version >= 2) {
+        detail.ci_sections = std::move((*detail.ci)->sections);
+        (*detail.ci)->sections.clear(); // moved-from: the sections live in `ci_sections` alone
+    }
+}
+
 } // namespace yuzu::server

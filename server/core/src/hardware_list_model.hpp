@@ -194,12 +194,14 @@ struct HardwareCiDetail {
     /// but the device may exist.
     bool identity_degraded{false};
     std::expected<std::optional<DeviceCiRecord>, CiReadError> ci{std::unexpected(CiReadError::kDegraded)};
-    /// The v2 per-section statuses and list rows (`DeviceInventoryStore::get_device_ci_sections`,
-    /// one REPEATABLE READ read), in registry order. An EMPTY value means "no section stored" (a v1
-    /// agent, a record that carries none, or `ci` itself not found/degraded so the read was not
-    /// made) - never "the device has none". An ERROR means the sections read itself failed: the
-    /// REST route answers 503 (`hardware_ci_sections_unreadable`) and a twin that still serves the
-    /// body reports `sections_state:"degraded"`, never an empty list. Default-constructed = empty.
+    /// The v2 per-section statuses and list rows, in registry order, read in the SAME
+    /// REPEATABLE READ snapshot as `ci` (`DeviceInventoryStore::get_device_ci_with_sections`; see
+    /// `apply_ci_with_sections_read`). An EMPTY value means "no section stored" (a v1 agent, a
+    /// record that carries none, `ci` not found/degraded, or the caller did not ask for sections:
+    /// only the REST record route and the MCP tool do) - never "the device has none". An ERROR
+    /// means the sections read itself failed: both the REST route (503) and the MCP tool (a
+    /// retryable error) answer it via `hardware_ci_sections_unreadable` and withhold the record,
+    /// never an empty list. Default-constructed = empty.
     std::expected<std::vector<DeviceCiSection>, CiReadError> ci_sections{};
     std::optional<std::vector<SoftwareEntry>> software; // nullopt = store degraded/unwired
     bool software_truncated{false};                     // capped at kHwSoftwareCap
@@ -258,6 +260,15 @@ offline_identity_row(const OfflineRosterRead& eps, std::string_view agent_id, st
 void apply_identity_read(HardwareCiDetail& detail,
                          std::expected<std::optional<InventoryDeviceRow>, PresenceReadError> ident);
 
+/// Record+sections read (`DeviceInventoryStore::get_device_ci_with_sections`, ONE snapshot) ->
+/// `ci` and `ci_sections`. A failed read: `ci` is the error and `ci_sections` stays empty (none
+/// was made). Success: `ci` is the record (nullopt when absent) and, for a v2 record only, its
+/// sections are MOVED into `ci_sections` (`ci->sections` is left empty - one home for the rows);
+/// a v1 record or no record leaves `ci_sections` empty. `sections_failed` keeps the error in
+/// `ci_sections` (never an empty list) while `ci` stays the record.
+void apply_ci_with_sections_read(HardwareCiDetail& detail,
+                                 std::expected<DeviceCiWithSections, CiReadError> read);
+
 /// How a `HardwareCiDetail` reads for a single-record request, decided ONCE for every
 /// transport (REST maps it to 200/404/503, the MCP twin to success/not-found/store fault).
 /// Out-of-scope is NOT decided here: the caller checks `authz::in_scope` BEFORE it fetches the
@@ -278,7 +289,7 @@ enum class HardwareCiRead {
 [[nodiscard]] HardwareCiRead classify_hardware_ci_read(const HardwareCiDetail& detail);
 
 /// True iff the v2 sections read FAILED (not merely "nothing stored"). The REST record route maps
-/// it to a 503 with no body (a store error is never an empty 200, H.7); see `ci_sections`.
+/// it to a 503 with no record data (a store error is never an empty 200, H.7); see `ci_sections`.
 [[nodiscard]] inline bool hardware_ci_sections_unreadable(const HardwareCiDetail& detail) noexcept {
     return !detail.ci_sections.has_value();
 }

@@ -64,14 +64,17 @@
 #include "../test_helpers.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -431,35 +434,77 @@ TEST_CASE("REST hardware: the 200/202 bodies are typed in the OpenAPI spec and m
         CHECK(keys_of(schemas["HardwareCiSection"]["properties"]) == keys_of(served));
         CHECK(required_of(schemas["HardwareCiSection"]) == keys_of(served));
     }
-    // The schema's kind enum is the registry, in registry order.
-    std::vector<std::string> enum_kinds;
-    for (const auto& k : schemas["HardwareCiSection"]["properties"]["kind"]["enum"])
-        enum_kinds.push_back(k.get<std::string>());
-    CHECK(enum_kinds == kinds);
-    // Every declared column of every list kind is named in the rows description, so a column
-    // added to the registry without the schema following fails here.
+    // `kind` is an OPEN string (the registry can grow, and a client must ignore kinds it does not
+    // know), so the schema carries no enum; its description lists every registered kind and says so.
+    const auto& kind_schema = schemas["HardwareCiSection"]["properties"]["kind"];
+    CHECK_FALSE(kind_schema.contains("enum"));
+    const auto kind_desc = kind_schema["description"].get<std::string>();
+    for (const auto& k : kinds) {
+        INFO(k);
+        // whole-word match: `volume` must not pass because `volumes` appears, nor `disk` via `disks`
+        const auto at = kind_desc.find(k);
+        REQUIRE(at != std::string::npos);
+        const auto after = at + k.size();
+        CHECK((after >= kind_desc.size() || !(std::isalnum(static_cast<unsigned char>(kind_desc[after])) ||
+                                              kind_desc[after] == '_')));
+    }
+    CHECK(kind_desc.find("must ignore kinds it does not know") != std::string::npos);
+    // The rows description lists, per list kind, its exact column list in a parseable form -
+    // `Columns: <kind>: <col>, <col>; <kind>: ...` - and the parse equals the registry in BOTH
+    // directions: the same kinds and the same columns in the same order. A column added to,
+    // removed from or renamed in the registry without the schema following fails here, and a
+    // column name that merely appears in another kind's clause cannot satisfy it.
     const auto rows_desc =
         schemas["HardwareCiSection"]["properties"]["rows"]["items"]["description"].get<std::string>();
+    const std::string marker = "Columns: ";
+    const auto mk = rows_desc.find(marker);
+    REQUIRE(mk != std::string::npos);
+    std::string clauses = rows_desc.substr(mk + marker.size());
+    if (const auto dot = clauses.find('.'); dot != std::string::npos)
+        clauses.resize(dot); // the columns text carries no '.', the sentence after it starts at one
+    std::map<std::string, std::vector<std::string>> documented;
+    {
+        std::string_view rest = clauses;
+        while (!rest.empty()) {
+            const auto semi = rest.find(';');
+            std::string_view clause = rest.substr(0, semi);
+            const auto colon = clause.find(": ");
+            REQUIRE(colon != std::string_view::npos);
+            const std::string kind{clause.substr(0, colon)};
+            std::vector<std::string> cols;
+            std::string_view list = clause.substr(colon + 2);
+            while (!list.empty()) {
+                const auto comma = list.find(", ");
+                cols.emplace_back(list.substr(0, comma));
+                if (comma == std::string_view::npos)
+                    break;
+                list.remove_prefix(comma + 2);
+            }
+            CHECK(documented.emplace(kind, std::move(cols)).second); // each kind once
+            if (semi == std::string_view::npos)
+                break;
+            rest.remove_prefix(semi + 1);
+            while (!rest.empty() && rest.front() == ' ')
+                rest.remove_prefix(1);
+        }
+    }
+    std::map<std::string, std::vector<std::string>> registry;
     for (const auto& def : kDeviceCiSections) {
         if (def.table == nullptr)
             continue;
-        std::string_view cols = def.columns;
-        std::string_view col;
-        while (!cols.empty()) {
-            const auto comma = cols.find(',');
-            col = cols.substr(0, comma);
-            const std::string needle = std::string(def.section) + " ";
-            const auto at = rows_desc.find(needle);
-            INFO(def.section << "." << col);
-            REQUIRE(at != std::string::npos);
-            // the kind's own clause runs to the next ';'
-            const auto clause = rows_desc.substr(at, rows_desc.find(';', at) - at);
-            CHECK(clause.find(col) != std::string::npos);
+        std::vector<std::string> cols;
+        std::string_view list = def.columns;
+        while (!list.empty()) {
+            const auto comma = list.find(',');
+            cols.emplace_back(list.substr(0, comma));
             if (comma == std::string_view::npos)
                 break;
-            cols.remove_prefix(comma + 1);
+            list.remove_prefix(comma + 1);
         }
+        registry.emplace(def.section, std::move(cols));
     }
+    REQUIRE_FALSE(registry.empty());
+    CHECK(documented == registry);
     // sections and its state are the nullable / enumerated members the description promises.
     CHECK(schemas["HardwareCiRecord"]["properties"]["sections"]["nullable"] == true);
     CHECK(schemas["HardwareRecord"]["properties"]["sections_state"]["enum"] ==

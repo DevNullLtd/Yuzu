@@ -348,7 +348,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
         }
 
-        const HardwareCiDetail detail = deps_.ci_detail_fn(id);
+        // No sections: the fragment (and its sync-now poll) never renders them.
+        const HardwareCiDetail detail = deps_.ci_detail_fn(id, /*with_sections=*/false);
         HwCiAffordances aff = affordances_for(req, id, detail);
         if (lens == "tags")
             aff.can_delete_tags = deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "Tag", "Delete", id);
@@ -738,7 +739,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             res.set_content(detail::a4_error(res, "hardware CI record unavailable"), "application/json");
             return;
         }
-        const HardwareCiDetail detail = deps_.ci_detail_fn(agent_id);
+        const HardwareCiDetail detail = deps_.ci_detail_fn(agent_id, /*with_sections=*/true);
         const HardwareCiRead read = classify_hardware_ci_read(detail);
         if (read == HardwareCiRead::RosterUnreadable) {
             // A failed roster read is never a 404 (#5531).
@@ -792,7 +793,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             {"data", hardware_ci_json(detail, now_secs())},
             {"meta", {{"api_version", "v1"}}},
         };
-        res.set_content(out.dump(), "application/json");
+        // Section rows are agent-supplied bytes: a byte that is not valid UTF-8 must not throw
+        // out of dump() AFTER the access audit row persisted (the MCP twin's dump_replace).
+        res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                        "application/json");
     });
 
     // -- Fragment: Actions lens (the generic action runner catalogue) --
@@ -829,7 +833,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         std::string hostname = id;
         std::string agent_os;
         if (deps_.ci_detail_fn) {
-            auto ident = deps_.ci_detail_fn(id).identity;
+            auto ident = deps_.ci_detail_fn(id, /*with_sections=*/false).identity; // identity only
             if (ident) {
                 if (!ident->hostname.empty()) hostname = ident->hostname;
                 agent_os = ident->os;
