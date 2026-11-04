@@ -1,4 +1,4 @@
-captured: linux Ubuntu 26.04.1 LTS x86_64 · bare-metal · 2026-11-04 · euid 1000 (unprivileged) · leg-hash 57eb79a32570
+captured: linux Ubuntu 26.04.1 LTS x86_64 · bare-metal · 2026-11-04 · euid 1000 (unprivileged) · leg-hash a036c570424f
 == action=smart
 smart|-|-|unknown|unknown|unsupported|-|-|drive health is not implemented on Linux in this release; no mechanism was bound against real hardware
 [result_status] UNAVAILABLE / PARTIAL / linux:smart

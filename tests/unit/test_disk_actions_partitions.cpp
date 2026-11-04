@@ -502,10 +502,98 @@ TEST_CASE("partitions: the cross-check is not consulted when the association alr
         CHECK(cols(row)[6] == "wmi,mount_points_unread");
 }
 
-TEST_CASE("partitions: an unparsable DriveType or DeviceID in the cross-check is ignored",
+TEST_CASE("partitions: an unreadable logical-disk row is constrained, never a vacuous pass",
           "[disk_actions_partitions]") {
-    const auto rep = dp::build_report(
-        ok(bigsenga_partitions()), ok({assoc("Disk #0, Partition #1", "C:")}),
-        ok({ldisk("C:", "3"), ldisk("??", "3"), ldisk("D:", "three"), ldisk("E:", "")}));
+    for (const auto& bad : {ldisk("??", "3"), ldisk("D:", "three"), ldisk("E:", "")}) {
+        INFO("DeviceID=" << bad.at("DeviceID") << " DriveType=" << bad.at("DriveType"));
+        const auto rep = dp::build_report(ok(bigsenga_partitions()),
+                                          ok({assoc("Disk #0, Partition #1", "C:")}),
+                                          ok({ldisk("C:", "3"), bad}));
+        CHECK(rep.level == dp::Level::Constrained);
+        CHECK(rep.reason == "windows:partitions:mount_points:logical_disks:row_unparsed");
+        for (const auto& row : rep.data_rows)
+            CHECK(cols(row)[6] == "wmi,mount_points_partial");
+    }
+}
+
+TEST_CASE("partitions: an empty logical-disk answer on a host with partitions is a provider fault",
+          "[disk_actions_partitions]") {
+    // A host that has partitions has a boot volume; WHERE DriveType = 3 returning nothing would
+    // let any unplaced letter through unnoticed, so it is itself constrained.
+    const auto rep = dp::build_report(ok(bigsenga_partitions()),
+                                      ok({assoc("Disk #0, Partition #1", "C:")}), ok({}));
+    CHECK(rep.level == dp::Level::Constrained);
+    CHECK(rep.reason == "windows:partitions:mount_points:logical_disks:no_rows");
+}
+
+TEST_CASE("partitions: no cross-check supplied performs none", "[disk_actions_partitions]") {
+    const auto rep = dp::build_report(ok(bigsenga_partitions()),
+                                      ok({assoc("Disk #0, Partition #1", "C:")}));
     CHECK(rep.level == dp::Level::Ok);
+}
+
+TEST_CASE("partitions: each sort key breaks a tie on its own", "[disk_actions_partitions]") {
+    // Equal (disk, index); the pairs differ in exactly one of DeviceID, Size, Type, so dropping
+    // any one key from the comparator leaves the output dependent on enumeration order.
+    const auto base = [](const char* size, const char* type, const char* id) {
+        return part("0", "1", size, type, id);
+    };
+    SECTION("DeviceID") {
+        const auto a = base("5", "t", "Disk #0, Partition #1");
+        const auto b = base("5", "t", "Disk #0, Partition #1 b");
+        CHECK(dp::build_report(ok({a, b}), ok({})).data_rows == dp::build_report(ok({b, a}), ok({})).data_rows);
+    }
+    SECTION("Size") {
+        const auto a = base("5", "t", "Disk #0, Partition #1");
+        const auto b = base("6", "t", "Disk #0, Partition #1");
+        CHECK(dp::build_report(ok({a, b}), ok({})).data_rows == dp::build_report(ok({b, a}), ok({})).data_rows);
+    }
+    SECTION("Type") {
+        const auto a = base("5", "t1", "Disk #0, Partition #1");
+        const auto b = base("5", "t2", "Disk #0, Partition #1");
+        CHECK(dp::build_report(ok({a, b}), ok({})).data_rows == dp::build_report(ok({b, a}), ok({})).data_rows);
+    }
+}
+
+TEST_CASE("partitions: a truncated logical-disk query marks every row partial", "[disk_actions_partitions]") {
+    auto d = ok({ldisk("C:", "3")});
+    d.truncated = true;
+    const auto rep = dp::build_report(ok(bigsenga_partitions()),
+                                      ok({assoc("Disk #0, Partition #1", "C:")}), d);
+    REQUIRE(rep.data_rows.size() == 3);
+    for (const auto& row : rep.data_rows)
+        CHECK(cols(row)[6] == "wmi,mount_points_partial");
+}
+
+TEST_CASE("partitions: an unmatched link with a cross-check reports exactly the unmatched link",
+          "[disk_actions_partitions]") {
+    // The stray letter is still placed by the association, so the cross-check has nothing to add.
+    const auto rep = dp::build_report(ok({part("0", "1", "9", "t", "Disk #0, Partition #1")}),
+                                      ok({assoc("Disk #7, Partition #3", "Z:")}),
+                                      ok({ldisk("Z:", "3")}));
+    CHECK(rep.reason == "windows:partitions:mount_points:unmatched_link");
+}
+
+TEST_CASE("partitions: a DeviceID with a quote and a backslash joins through an escaped path",
+          "[disk_actions_partitions]") {
+    // CIM escapes " and \ inside a quoted key value; the join must undo that to match.
+    const std::string id = "Disk \"x\\y\", Partition #1";
+    dp::Row p{{"DiskIndex", "0"}, {"Index", "1"}, {"Size", "5"}, {"Type", "t"}, {"DeviceID", id}};
+    dp::Row l{{"Antecedent", std::string{"\\\\H\\root\\cimv2:Win32_DiskPartition.DeviceID=\"Disk \\\"x\\\\y\\\", Partition #1\""}},
+              {"Dependent", std::string{"\\\\H\\root\\cimv2:Win32_LogicalDisk.DeviceID=\"C:\""}}};
+    const auto rep = dp::build_report(ok({p}), ok({l}));
+    REQUIRE(rep.data_rows.size() == 1);
+    CHECK(cols(rep.data_rows[0])[5] == "C:/");
+    CHECK(rep.level == dp::Level::Ok);
+}
+
+TEST_CASE("partitions: reasons from the association and the cross-check accumulate in order",
+          "[disk_actions_partitions]") {
+    auto links = ok({assoc("Disk #0, Partition #1", "C:")});
+    links.truncated = true;
+    auto d = ok({ldisk("C:", "3")});
+    d.truncated = true;
+    const auto rep = dp::build_report(ok(bigsenga_partitions()), links, d);
+    CHECK(rep.reason ==
+          "windows:partitions:mount_points:row_cap,windows:partitions:mount_points:logical_disks:row_cap");
 }

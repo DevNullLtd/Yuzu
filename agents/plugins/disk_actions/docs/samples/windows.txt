@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-04 · NT SERVICE virtual service account (not an administrator) · leg-hash 57eb79a32570
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-04 · NT SERVICE virtual service account (not an administrator) · leg-hash a036c570424f
 == action=smart
 smart|PhysicalDrive0|KINGSTON OM8TAP41024K1-A00|nvme|ssd|ok|0|100|-
 [result_status] UNDECLARED / UNKNOWN / 

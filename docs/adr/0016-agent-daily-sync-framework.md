@@ -756,8 +756,8 @@ on the thread the agent joins on reconnect and on shutdown, so one wedged drive 
 endpoint unable to reconnect or to stop cleanly. Until those calls have a bound, the Windows writer
 does not run the action: the `volume` section is `unavailable` with `agent:windows_volumes_unbounded`
 and carries no rows. The operator-triggered `volumes` action is unchanged. The Windows
-`partitions` leg reads `Win32_DiskPartition` and `Win32_LogicalDiskToPartition` through the bounded
-WMI helper (`agents/shared/wmi_bounded.hpp`, per-call deadlines), so it runs on the sync thread; only
+`partitions` leg reads `Win32_DiskPartition` and `Win32_LogicalDiskToPartition`, and cross-checks the
+drive letters against `Win32_LogicalDisk`, through the bounded WMI helper (`agents/shared/wmi_bounded.hpp`, per-call deadlines), so it runs on the sync thread; only
 Windows `topology` is status-only (`windows:planned`). No other section is affected. The Windows volume rows return when the platform gap named in `disk_actions_win.cpp` (plugin OS
 calls have no deadline, #3925) is closed. The reason is expected on every Windows host and needs no
 operator action; the operator-triggered `volumes` action still works there.

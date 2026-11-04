@@ -871,15 +871,17 @@ int emit_volumes(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-// partitions: Win32_DiskPartition (rows) + Win32_LogicalDiskToPartition (drive letters), both
-// through the bounded WMI helper (agents/shared/wmi_bounded.hpp), so neither query can wedge the
-// daily-sync thread longer than their own deadlines (the sync-thread boundedness rule in docs/adr/0016-agent-daily-sync-framework.md;
-// the DeviceIoControl-based `volumes` leg is the one still withheld there, #3925). The pure layer
-// (disk_actions_partitions.hpp) owns the row grammar, the outcome contract and the Level ->
-// typed-status mapping; this function owns the two queries, applying that status, and the rule
-// that no exception crosses the plugin ABI (the SDK trampoline has no catch).
+// partitions: Win32_DiskPartition (rows) + Win32_LogicalDiskToPartition (drive letters), with a
+// Win32_LogicalDisk cross-check on those letters, all through the bounded WMI helper
+// (agents/shared/wmi_bounded.hpp). Each call has a deadline, so none can wedge the daily-sync
+// thread indefinitely (the sync-thread boundedness rule in
+// docs/adr/0016-agent-daily-sync-framework.md; the DeviceIoControl-based `volumes` leg is the one
+// still withheld there, #3925). The pure layer (disk_actions_partitions.hpp) owns the row grammar,
+// the outcome contract and the Level -> typed-status mapping; this function owns the queries,
+// applying that status, and the rule that no exception crosses the plugin ABI (the SDK trampoline
+// has no catch).
 //
-// Both classes live in root\cimv2, which grants Authenticated Users local access; the leg was
+// All three classes live in root\cimv2, which grants Authenticated Users local access; the leg was
 // measured under a non-admin NT SERVICE virtual account (README: "Windows partitions").
 //
 // `topology` stays planned: no Windows source has been ruled for it.
@@ -959,7 +961,7 @@ int emit_partitions(yuzu::CommandContext& ctx) {
         // otherwise, and a second failing call just spends the sync thread's time. The local
         // fixed-disk drive letters are the cross-check on the association (see build_report).
         partitions::QueryOutcome links;
-        partitions::QueryOutcome disks;
+        std::optional<partitions::QueryOutcome> disks; // nullopt = cross-check not run
         if (parts.error.empty())
             links = run_partition_query(L"SELECT Antecedent, Dependent FROM Win32_LogicalDiskToPartition");
         if (parts.error.empty() && links.error.empty())

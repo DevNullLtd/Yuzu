@@ -38,7 +38,7 @@
  * the partitions Windows exposes through Win32_DiskPartition, not a byte-exact map of the disk.
  *
  * OUTCOME CONTRACT (the same four levels as the hardware estate legs; rc is 0 for every one)
- *   supported / OK      both queries answered cleanly and returned at least one partition.
+ *   supported / OK      every query answered cleanly and returned at least one partition.
  *   constrained         a partial read: a row or an association the parser could not use, a row
  *                       cap, the association query failed (the partitions are kept, their mount
  *                       points are unknown and say so), or a clean read that returned NO
@@ -243,10 +243,11 @@ inline void finalize(Report& rep, const yuzu::shared::ConstraintAccumulator& acc
 /// succeeded, and `disks` (Win32_LogicalDisk, DriveType 3) only when `links` did; the Windows TU
 /// skips running the later queries otherwise. `disks` is the cross-check that turns "a lettered
 /// local volume the association cannot place" (a dynamic disk, a Storage Space, anything this
-/// class does not map) into a constrained section instead of a silent "no mount point". The
-/// default (no disks supplied) performs no cross-check.
+/// class does not map) into a constrained section instead of a silent "no mount point". An absent
+/// `disks` (nullopt) means the cross-check was not run and performs none; a PRESENT but empty or
+/// unreadable one is itself a constrained finding, never a pass.
 [[nodiscard]] inline Report build_report(const QueryOutcome& parts, const QueryOutcome& links,
-                                         const QueryOutcome& disks = QueryOutcome{}) {
+                                         const std::optional<QueryOutcome>& disks = std::nullopt) {
     Report rep;
     yuzu::shared::ConstraintAccumulator acc;
 
@@ -336,25 +337,43 @@ inline void finalize(Report& rep, const yuzu::shared::ConstraintAccumulator& acc
         // Cross-check against the drive letters Windows itself says exist on local fixed disks:
         // one the association did not place anywhere is invisible to this class (dynamic disks,
         // Storage Spaces, ... -- unmeasured), and its volume must not read as "no mount point".
-        if (!disks.error.empty()) {
-            acc.add_failure("windows:partitions:mount_points:logical_disks:" + disks.error);
-            mounts_partial = true;
-        } else {
-            bool unplaced = false;
-            for (const Row& r : disks.rows) {
-                const auto type = impl::parse_u64(impl::field(r, "DriveType"));
-                const auto letter = impl::drive_letter_mount(impl::field(r, "DeviceID"));
-                if (type && *type == 3 && letter && placed.find(*letter) == placed.end())
-                    unplaced = true;
-            }
-            if (unplaced) {
-                acc.add_failure("windows:partitions:mount_points:unplaced_volume");
+        if (disks) {
+            if (!disks->error.empty()) {
+                acc.add_failure("windows:partitions:mount_points:logical_disks:" + disks->error);
                 mounts_partial = true;
-            }
-            if (disks.truncated) {
-                acc.add_failure("windows:partitions:mount_points:logical_disks:row_cap");
-                acc.mark_incomplete();
-                mounts_partial = true;
+            } else {
+                bool unplaced = false;
+                bool row_unparsed_ld = false;
+                for (const Row& r : disks->rows) {
+                    const auto type = impl::parse_u64(impl::field(r, "DriveType"));
+                    const auto letter = impl::drive_letter_mount(impl::field(r, "DeviceID"));
+                    if (!type || !letter) {
+                        row_unparsed_ld = true; // cannot be placed or excluded, so it is not a pass
+                        continue;
+                    }
+                    if (*type == 3 && placed.find(*letter) == placed.end())
+                        unplaced = true;
+                }
+                if (row_unparsed_ld) {
+                    acc.add_failure("windows:partitions:mount_points:logical_disks:row_unparsed");
+                    mounts_partial = true;
+                }
+                // The query asks for local fixed drives. A host that has partitions has a boot
+                // volume, so a clean answer with none at all is a provider fault, not "no letters":
+                // trusting it would pass the cross-check vacuously.
+                if (disks->rows.empty() && !list.empty()) {
+                    acc.add_failure("windows:partitions:mount_points:logical_disks:no_rows");
+                    mounts_partial = true;
+                }
+                if (unplaced) {
+                    acc.add_failure("windows:partitions:mount_points:unplaced_volume");
+                    mounts_partial = true;
+                }
+                if (disks->truncated) {
+                    acc.add_failure("windows:partitions:mount_points:logical_disks:row_cap");
+                    acc.mark_incomplete();
+                    mounts_partial = true;
+                }
             }
         }
     }

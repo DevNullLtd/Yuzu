@@ -7,8 +7,9 @@
  *               where the OS exposes it, wear indicators.
  *   "volumes" — The mapping between physical drives and the logical volumes
  *               they back.
- *   "partitions" — read on Windows (Win32_DiskPartition + Win32_LogicalDiskToPartition
- *               through bounded WMI); PLANNED on Linux and macOS.
+ *   "partitions" — read on Windows (Win32_DiskPartition + Win32_LogicalDiskToPartition,
+ *               cross-checked against Win32_LogicalDisk, through bounded WMI); PLANNED on
+ *               Linux and macOS.
  *   "topology"   — PLANNED on every OS.
  *               A planned action answers one `status|<action>|unsupported|<os>:planned` row
  *               until its leg lands.
@@ -118,7 +119,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
-         "WMI Win32_DiskPartition + Win32_LogicalDiskToPartition (bounded)",
+         "WMI Win32_DiskPartition + Win32_LogicalDiskToPartition + Win32_LogicalDisk (bounded)",
          "one row per partition Windows exposes through Win32_DiskPartition, with its drive "
          "letters; the 16 MiB Microsoft Reserved partition is not listed by that class, and a "
          "volume mounted on a folder rather than a drive letter shows no mount point"},

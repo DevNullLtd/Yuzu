@@ -5,7 +5,7 @@
 disk_actions_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 
 if host_machine.system() == 'windows'
-  # The partitions leg runs two bounded WMI queries (agents/shared/wmi_bounded.hpp).
+  # The partitions leg runs three bounded WMI queries (agents/shared/wmi_bounded.hpp).
   disk_actions_deps += cxx.find_library('wbemuuid')
   disk_actions_deps += cxx.find_library('ole32')
   disk_actions_deps += cxx.find_library('oleaut32')

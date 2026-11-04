@@ -501,11 +501,13 @@ TEST_CASE("disk_actions plugin: Windows partitions answers a status row then 7-c
     CHECK(std::count_if(rows.begin(), rows.end(),
                         [](const std::string& r) { return r.starts_with("status|"); }) == 1);
     // A clean read declares nothing (derived OK, empty provenance); anything else is CONSTRAINED
-    // here. The status row's word and the typed status must agree.
+    // with a windows:partitions:* provenance. The status row's word and the typed status must agree.
     const bool clean = result.result_status == YUZU_RESULT_STATUS_OK ||
                        result.result_status == YUZU_RESULT_STATUS_UNDECLARED;
     CHECK((clean || result.result_status == YUZU_RESULT_STATUS_CONSTRAINED));
     CHECK(rows[0].starts_with("status|partitions|supported|") == clean);
+    if (!clean)
+        CHECK(result.result_provenance.starts_with("windows:partitions:"));
     // A Windows host that booted from a disk has a system partition.
     REQUIRE(rows.size() >= 2);
     bool saw_physical_drive = false;
@@ -522,20 +524,39 @@ TEST_CASE("disk_actions plugin: Windows partitions answers a status row then 7-c
         CHECK((digits ? f[3] != "0" : f[3] == "-"));
     }
     CHECK(saw_physical_drive);
+    // A clean read means the join worked: this host has a lettered local volume (the boot
+    // volume), so some row must carry a drive letter. Without this a leg that never finds a
+    // letter, or is always constrained, would pass every other check here.
+    if (clean) {
+        const bool any_letter = std::any_of(rows.begin() + 1, rows.end(), [](const std::string& r) {
+            const auto f = split_fields_escape_aware(r);
+            return f.size() == 7 && f[5].size() >= 3 && f[5][0] >= 'A' && f[5][0] <= 'Z' &&
+                   f[5][1] == ':' && f[5][2] == '/';
+        });
+        CHECK(any_letter);
+    }
     // Deterministic: a second read gives the same disk / partition / size / type columns (the
-    // daily-sync blob is hashed). The mount-point and detail columns are left out on purpose: a
-    // drive letter or VHD attached by a concurrent job on a shared runner may legitimately change
-    // them between the two reads.
+    // daily-sync blob is hashed). The mount-point and detail columns are left out on purpose, and
+    // so is a changed row SET: another job on a shared runner may attach or detach a VHD between
+    // the two reads, so a second read that sees a different number of rows is retried once and
+    // the comparison is made only between two reads that agree on the row count.
     auto again = dispatcher.run(plugin->descriptor, "partitions");
-    const auto rows2 = captured_rows(again.captured);
-    REQUIRE(rows2.size() == rows.size());
-    for (std::size_t i = 1; i < rows.size(); ++i) {
-        const auto a = split_fields_escape_aware(rows[i]);
-        const auto b = split_fields_escape_aware(rows2[i]);
-        REQUIRE(a.size() == 7);
-        REQUIRE(b.size() == 7);
-        for (std::size_t c = 0; c < 5; ++c)
-            CHECK(a[c] == b[c]);
+    auto rows2 = captured_rows(again.captured);
+    if (rows2.size() != rows.size()) {
+        again = dispatcher.run(plugin->descriptor, "partitions");
+        rows2 = captured_rows(again.captured);
+    }
+    if (rows2.size() == rows.size()) {
+        for (std::size_t i = 1; i < rows.size(); ++i) {
+            const auto a = split_fields_escape_aware(rows[i]);
+            const auto b = split_fields_escape_aware(rows2[i]);
+            REQUIRE(a.size() == 7);
+            REQUIRE(b.size() == 7);
+            for (std::size_t c = 0; c < 5; ++c)
+                CHECK(a[c] == b[c]);
+        }
+    } else {
+        WARN("partition row count changed between reads (a concurrent job attached or detached a disk); stability not compared");
     }
 }
 #endif // _WIN32
