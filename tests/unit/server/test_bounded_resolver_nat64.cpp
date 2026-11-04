@@ -567,3 +567,31 @@ TEST_CASE("NAT64 discovery: a failed or inconclusive refresh removes nothing; a 
     for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i)
         std::this_thread::sleep_for(10ms);
 }
+
+TEST_CASE("NAT64 discovery: a busy episode is reported once and ends at the next completed lookup",
+          "[bounded_resolver][nat64_discovery]") {
+    DiscoveryRig rig;
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    auto latch = std::make_shared<Latch>();
+    const net::LookupFn blocked = [latch](const std::string&) -> net::ResolveResult {
+        latch->wait();
+        return {net::ResolveStatus::kOk, {}};
+    };
+    (void)net::bounded_resolve("blocker.example", 1ms, blocked, pool); // pins the one slot
+    const auto before = rig.cache.stats.inconclusive.load();
+    for (int i = 0; i < 3; ++i)
+        CHECK(discover(kFullBudget, answering({kPref1}), rig.cache, pool).inconclusive);
+    CHECK(rig.cache.stats.inconclusive.load() == before + 3); // every call is counted ...
+    {
+        std::lock_guard lk(rig.cache.mu);
+        CHECK(rig.cache.busy_logged); // ... but the episode is logged once (the flag gates the line)
+    }
+    latch->release();
+    for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i)
+        std::this_thread::sleep_for(10ms);
+    REQUIRE(pool->in_flight.load() == 0);
+    const auto fair = discover(kFullBudget, answering({kPref1}), rig.cache, pool);
+    CHECK_FALSE(fair.inconclusive);
+    std::lock_guard lk(rig.cache.mu);
+    CHECK_FALSE(rig.cache.busy_logged); // a completed lookup ends the episode (recovery logged once)
+}

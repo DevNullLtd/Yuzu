@@ -77,6 +77,7 @@ struct Nat64DiscoveryCache {
     bool ever_answered{false}; ///< a lookup has ANSWERED since the last reset
     bool overflowed{false};
     bool overflow_logged{false}; ///< the overflow transition was reported once (log once, not per call)
+    bool busy_logged{false}; ///< an inconclusive (busy) episode was reported once; cleared by a fair lookup
     bool last_failed{false};  ///< the most recent lookup did not answer (cached for the negative TTL)
     std::chrono::steady_clock::time_point expires{};
     std::vector<::yuzu::server::oidc::egress::Nat64Prefix> prefixes;
@@ -133,6 +134,27 @@ struct FlightGuard {
     explicit FlightGuard(Nat64DiscoveryCache& c) : cache(c) {}
 };
 
+/// Records an inconclusive call (caller holds `cache.mu`). The FIRST one of a busy episode logs one
+/// warning, in the shared cache like the overflow line, so a stuck probe worker produces one line
+/// per episode, never one per IPv6 vet; `end_busy_episode` logs the recovery.
+inline void note_inconclusive(Nat64DiscoveryCache& cache) {
+    cache.stats.inconclusive.fetch_add(1, std::memory_order_relaxed);
+    if (cache.busy_logged)
+        return;
+    cache.busy_logged = true;
+    spdlog::warn("NAT64 discovery: the ipv4only.arpa lookup could not run or did not finish in "
+                 "time (busy resolver); IPv6 destinations are classified with the prefixes already "
+                 "learned until a lookup completes. Logged once per episode.");
+}
+
+/// A lookup completed (answered or failed) after an inconclusive episode: report the recovery once.
+inline void end_busy_episode(Nat64DiscoveryCache& cache) {
+    if (!cache.busy_logged)
+        return;
+    cache.busy_logged = false;
+    spdlog::info("NAT64 discovery: the ipv4only.arpa lookup completed again; the busy episode ended");
+}
+
 /// The leader's work: one lookup, then the merge into the cache. Runs under a FlightGuard.
 inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCache& cache) {
     namespace egress = ::yuzu::server::oidc::egress;
@@ -168,9 +190,11 @@ inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCach
         cache.stats.failed.fetch_add(1, std::memory_order_relaxed);
         break;
     case Nat64LookupOutcome::kInconclusive:
-        cache.stats.inconclusive.fetch_add(1, std::memory_order_relaxed);
+        note_inconclusive(cache);
         break;
     }
+    if (outcome != Nat64LookupOutcome::kInconclusive)
+        end_busy_episode(cache);
     if (outcome == Nat64LookupOutcome::kInconclusive) {
         // Failed FOR THIS CALL only: nothing is written to the shared state (no negative entry, no
         // TTL change), so the next consumer does a fair lookup of its own.
@@ -277,7 +301,7 @@ inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCach
             // The lookup in flight did not finish within THIS caller's budget, or it ended without
             // filling the cache: inconclusive for this call only, nothing recorded about the
             // resolver.
-            cache.stats.inconclusive.fetch_add(1, std::memory_order_relaxed);
+            detail::note_inconclusive(cache);
             Nat64Discovery d;
             d.stale = true;
             d.inconclusive = true;
@@ -303,6 +327,7 @@ inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCach
         d.inconclusive = true;
         try {
             std::lock_guard lock(cache.mu);
+            detail::note_inconclusive(cache);
             d.ever_answered = cache.ever_answered;
             d.overflowed = cache.overflowed;
             if (!cache.overflowed)
