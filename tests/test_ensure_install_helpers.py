@@ -33,7 +33,7 @@ import unittest
 from pathlib import Path
 
 try:
-    import pty  # for the "a terminal on stdin" cases; absent on Windows, where nothing here runs
+    import pty  # for the "a terminal on stdin" case; absent on Windows, where nothing here runs
 except ImportError:  # pragma: no cover
     pty = None
 
@@ -90,8 +90,11 @@ if [ "${STUB_NPX_CREATES:-1}" = 1 ]; then
   mkdir -p "$(dirname "$STUB_EXE")"; : > "$STUB_EXE"; chmod +x "$STUB_EXE"
 fi
 """
-# A browser binary: one that can print its version, and one too broken even for that.
-BROWSER_RUNS = '#!/bin/sh\necho "Chrome 1.2.3"\n'
+# A browser binary: one that can print its version, and one too broken even for that. BROWSER_RUNS is
+# padded past 64 bytes: a file shorter than an ELF header is judged incomplete from its size alone,
+# whatever it prints, and no real browser is that small.
+BROWSER_RUNS = '#!/bin/sh\n# a stand-in browser, padded so it is not shorter than an ELF header\necho "Chrome 1.2.3"\n'
+assert len(BROWSER_RUNS) >= 64
 BROWSER_BROKEN = "#!/bin/sh\nexit 1\n"
 LDD_MISSING_NSS = '#!/bin/sh\necho "$1" >> "$STUB_LOG.ldd"\nprintf \'\\tlibc.so.6 => /lib/libc.so.6\\n\\tlibnss3.so => not found\\n\'\n'
 LDD_ALL_FOUND = "#!/bin/sh\nprintf '\\tlibc.so.6 => /lib/libc.so.6\\n'\n"
@@ -99,10 +102,10 @@ LDD_ALL_FOUND = "#!/bin/sh\nprintf '\\tlibc.so.6 => /lib/libc.so.6\\n'\n"
 LDD_ALL_FOUND_OBS = ("#!/bin/sh\necho \"ldd " + _FD9 + "\" >> \"$STUB_LOG.fd9\"\n"
                      "printf '\\tlibc.so.6 => /lib/libc.so.6\\n'\n")
 BROWSER_BROKEN_OBS = '#!/bin/sh\necho "chrome ' + _FD9 + '" >> "$STUB_LOG.fd9"\nexit 1\n'
-# timeout/gtimeout: logs "<name> <first four args>" (the scripts call `-k 10 <secs> <cmd>`, with
-# --foreground first only when stdin is a terminal), then runs the command, or pretends to have timed
-# out: with STUB_TIMEOUT_RC set every wrapped command "times out", or only those whose argv contains
-# STUB_TIMEOUT_ONLY.
+# timeout/gtimeout: logs "<name> <first four args>" (the scripts call `-k 10 <secs> <cmd>`, never with
+# --foreground), then runs the command, or pretends to have timed out: with STUB_TIMEOUT_RC set every
+# wrapped command "times out", or only those whose argv contains STUB_TIMEOUT_ONLY. A stray
+# --foreground is skipped over so the wrapped command still runs, and the log line shows it.
 TIMEOUT = """#!/bin/sh
 echo "@N $1 $2 $3 $4" >> "$STUB_LOG"
 if [ -n "$STUB_TIMEOUT_RC" ]; then
@@ -252,8 +255,8 @@ class Sandbox:
 
     def run(self, script, local_bin=False, stdin=subprocess.DEVNULL, timeout=60, **env):
         """Run <script> with an `env -i`-style environment; a None value unsets that variable.
-        stdin is /dev/null (no terminal), so the timeout wrapper never gets --foreground unless a
-        case passes a pty. A script still running after `timeout` seconds is a failure, not a hang."""
+        stdin is /dev/null (no terminal) unless a case passes a pty. A script still running after
+        `timeout` seconds is a failure, not a hang."""
         dirs = [self.bin] + ([self.home / ".local" / "bin"] if local_bin else []) + [self.farm]
         full = {"HOME": str(self.home), "PATH": os.pathsep.join(map(str, dirs)),
                 "STUB_LOG": str(self.log), "YUZU_GCOVR_VENV": str(self.venv),
@@ -301,6 +304,15 @@ class SandboxCase(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         os.mkfifo(path)
         return path
+
+    def stdin_variants(self):
+        """(name, stdin) pairs: no terminal, and (where the platform has ptys) a terminal on stdin."""
+        yield "no terminal on stdin", subprocess.DEVNULL
+        if pty:
+            master, slave = pty.openpty()
+            self.addCleanup(os.close, master)
+            self.addCleanup(os.close, slave)
+            yield "a terminal on stdin", slave
 
     def assert_fd9(self, lines, install_tags, probe_tags):
         """`lines` are "<tag> open|closed" observations. Every tag in install_tags must have been seen
@@ -443,11 +455,21 @@ class EnsurePuppeteer(SandboxCase):
                                            "timeout -k 10 60 node",            # executablePath after install
                                            "timeout -k 10 33 node"])           # the launch check
 
-    def test_a_timed_out_step_says_so(self):
+    def test_a_timed_out_step_says_so_on_stderr(self):
         self.sb.stub("timeout", timeout_stub())
         r = self.run_script(STUB_TIMEOUT_RC="124")
         self.expect(r, 1, "npm ci failed")
-        self.assertIn("timed out after 600s: npm ci", r.stdout)
+        self.assertIn("timed out after 600s: npm ci", r.stderr)
+        self.assertNotIn("timed out", r.stdout)
+
+    def test_a_timed_out_probe_says_so_on_stderr_and_is_never_taken_for_a_path(self):
+        # The notice must not travel down stdout: exe_path's output is captured as the browser path.
+        self.install_modules(1_000_000, 1_000_100)
+        self.sb.stub("timeout", timeout_stub())
+        r = self.run_script(STUB_TIMEOUT_RC="124", STUB_TIMEOUT_ONLY="executablePath")
+        self.expect(r, 1, "node could not load puppeteer")
+        self.assertIn("timed out after 60s: node --input-type=module", r.stderr)
+        self.assertNotIn("timed out", r.stdout)
 
     # --- the lock ----------------------------------------------------------------------------
 
@@ -582,7 +604,10 @@ class EnsurePuppeteer(SandboxCase):
                 if ldd:
                     self.sb.stub("ldd", ldd)
                 r = self.run_script(STUB_LAUNCH="fail")
-                self.expect(r, 1, "NOT reinstalled")
+                self.expect(r, 1, "the browser runs (it prints its version) but will not start headless")
+                self.assertIn("NOT reinstalled", r.stderr)
+                self.assertIn("icudtl.dat", r.stderr)        # a missing sibling file is named as a cause
+                self.assertIn("browsers clear", r.stderr)    # and the recovery command is printed
                 self.assertIn("boom", r.stderr)
                 self.assertIn("Last line: boom", r.stderr)
                 self.assertEqual(self.npx_calls(), [])
@@ -688,19 +713,20 @@ class EnsurePuppeteer(SandboxCase):
             "timeout -k 10 900 npx", self.INSTALL,        # the reinstall
             "timeout -k 10 33 node"])                     # launch check: works
 
-    def test_the_timeout_wrapper_gets_foreground_only_with_a_terminal_on_stdin(self):
-        master, slave = pty.openpty()
-        self.addCleanup(os.close, master)
+    def test_the_timeout_wrapper_is_never_given_foreground(self):
+        # --foreground would leave grandchildren (an orphaned install holding the lock) running after a
+        # timeout; the argv is `-k 10 <secs> ...` with or without a terminal on stdin.
         self.sb.stub("timeout", timeout_stub())
-        try:
-            self.expect(self.run_script(stdin=slave), 0, "ready")
-        finally:
-            os.close(slave)
-        calls = self.sb.calls()
-        self.assertIn("timeout --foreground -k 10 600", calls)
-        self.assertNotIn("timeout -k 10 600 npm", calls)
-        # and the wrapped command still ran
-        self.assertIn(self.NPM_CI, calls)
+        for name, stdin in self.stdin_variants():
+            with self.subTest(name):
+                self.sb.reset_logs()
+                shutil.rmtree(self.pp / "node_modules", ignore_errors=True)
+                self.expect(self.run_script(stdin=stdin), 0, "ready")
+                calls = self.sb.calls()
+                self.assertIn("timeout -k 10 600 npm", calls)
+                self.assertFalse(any("--foreground" in c for c in calls), calls)
+                # and the wrapped command still ran
+                self.assertIn(self.NPM_CI, calls)
 
     # --- the cache directory the heal trusts ---------------------------------------------------
 
@@ -730,16 +756,24 @@ class EnsurePuppeteer(SandboxCase):
     # --- a browser that cannot print its version: incomplete, or merely unrunnable? -------------
 
     def elf_case(self, data, mode=0o755):
-        """The browser is these bytes (a file nothing can execute), its launch fails, no library is
-        missing (there is no ldd) and `--version` fails too: the script must decide from the bytes."""
+        """The browser is these bytes, its launch fails and no library is missing (there is no ldd). Nothing
+        here is a real executable, so `--version` fails too (except for an EMPTY executable, which a
+        shell "runs" as an empty script): the script must decide from the bytes."""
         stale = self.write(self.chrome / "chrome-linux64-1.2.3.zip", "stale")
         keep = self.make_browser(self.chrome / "linux-9.9.9" / "chrome-linux64" / "chrome")
         exe = self.make_binary(data, mode=mode)
         return exe, stale, keep
 
-    def assert_left_alone(self, r, exe, data, stale, keep):
-        self.expect(r, 1, "complete but cannot run")
-        self.assertIn("NOT reinstalled", r.stderr)
+    @staticmethod
+    def shell_runs(exe):
+        """Exit status of `exe --version` as a shell runs it (a shell runs an empty file as a script;
+        a bare execve refuses it)."""
+        return subprocess.run(["bash", "-c", '"$0" --version', str(exe)], capture_output=True).returncode
+
+    def assert_left_alone(self, r, exe, data, stale, keep, why="a complete ELF binary"):
+        self.expect(r, 1, "the browser file cannot run and was NOT reinstalled automatically")
+        self.assertIn(why, r.stderr)
+        self.assertIn("browsers clear", r.stderr)  # the recovery command is printed
         self.assertEqual(self.npx_calls(), [], "a complete binary must not be reinstalled")
         self.assertEqual(exe.read_bytes(), data)
         self.assertTrue(self.build.is_dir())
@@ -771,6 +805,7 @@ class EnsurePuppeteer(SandboxCase):
                 exe, stale, keep = self.elf_case(data)
                 r = self.run_script(STUB_LAUNCH="fail")
                 self.assert_left_alone(r, exe, data, stale, keep)
+                self.assertNotIn("Mach-O", r.stderr)
 
     def test_a_complete_elf_is_left_in_place_whatever_ldd_says_about_libraries_it_finds(self):
         data = elf_bytes(size=4096)
@@ -796,9 +831,22 @@ class EnsurePuppeteer(SandboxCase):
                 self.assert_healed(r, exe, stale, keep)
 
     def test_a_zero_length_browser_is_healed(self):
-        # Not executable: browser_runs refuses it before it is ever run (see the note in the report
-        # about an EXECUTABLE empty file, which a shell happily "runs").
+        # Not executable: browser_runs refuses it before it is ever run.
         exe, stale, keep = self.elf_case(b"", mode=0o644)
+        self.assert_healed(self.run_script(STUB_LAUNCH="fail ok"), exe, stale, keep)
+
+    def test_a_zero_length_executable_is_healed_although_it_runs(self):
+        # A shell "runs" an empty executable (exit 0, no output), so `--version` succeeds; the decision
+        # comes from the FILE (shorter than an ELF header: certainly incomplete), not from running it.
+        exe, stale, keep = self.elf_case(b"", mode=0o755)
+        self.assertEqual(self.shell_runs(exe), 0, "the case needs it to run")
+        self.assert_healed(self.run_script(STUB_LAUNCH="fail ok"), exe, stale, keep)
+
+    def test_a_short_executable_that_prints_its_version_is_healed_too(self):
+        # shorter than an ELF header: incomplete whatever it prints, and even though it "runs"
+        exe, stale, keep = self.elf_case(b"#!/bin/sh\necho Chrome 1\n", mode=0o755)
+        self.assertLess(exe.stat().st_size, 64)
+        self.assertEqual(self.shell_runs(exe), 0)
         self.assert_healed(self.run_script(STUB_LAUNCH="fail ok"), exe, stale, keep)
 
     def test_a_file_that_is_not_an_elf_is_healed(self):
@@ -808,11 +856,53 @@ class EnsurePuppeteer(SandboxCase):
                 ("a shell script", BROWSER_BROKEN.encode()),
                 ("a shell script behind a #! line, 64 bytes or more",
                  b"#!/bin/sh\n" + b"# padding padding padding padding padding padding padding\n" + b"exit 1\n"),
-                ("a Mach-O header (macOS)", bytes.fromhex("cffaedfe0c000001") + bytes(4096))):
+                ("a Mach-O magic but shorter than 64 bytes", bytes.fromhex("cffaedfe0c000001") + bytes(8)),
+                ("a PE magic but shorter than 64 bytes", b"MZ" + bytes(30))):
             with self.subTest(name):
                 self.sb.reset_logs()
                 exe, stale, keep = self.elf_case(data)
                 self.assert_healed(self.run_script(STUB_LAUNCH="fail ok"), exe, stale, keep)
+
+    def test_a_mach_o_or_pe_binary_that_cannot_run_is_never_deleted(self):
+        # There is no completeness check for these formats, so the script must not guess: the file, its
+        # build directory and the archive beside it stay, the installer is not called, and the message
+        # says why and prints the recovery. (A Mach-O or PE file is no ELF: the size arithmetic means
+        # nothing for it.)
+        for name, data in (
+                ("Mach-O 64-bit little endian", bytes.fromhex("cffaedfe0c000001") + bytes(4096)),
+                ("Mach-O 64-bit (big-endian magic)", bytes.fromhex("feedfacf") + bytes(4096)),
+                ("Mach-O 32-bit", bytes.fromhex("feedface") + bytes(4096)),
+                ("Mach-O 32-bit byte-swapped", bytes.fromhex("cefaedfe") + bytes(4096)),
+                ("Mach-O universal", bytes.fromhex("cafebabe") + bytes(4096)),
+                ("Mach-O universal byte-swapped", bytes.fromhex("bebafeca") + bytes(4096)),
+                ("Mach-O at the 64-byte minimum", bytes.fromhex("cffaedfe") + bytes(60)),
+                ("PE (MZ)", b"MZ" + bytes(4094)),
+                ("PE (MZ) at the 64-byte minimum", b"MZ" + bytes(62))):
+            with self.subTest(name):
+                self.sb.reset_logs()
+                exe, stale, keep = self.elf_case(data)
+                r = self.run_script(STUB_LAUNCH="fail")
+                self.assert_left_alone(r, exe, data, stale, keep, why="a Mach-O or PE binary")
+                self.assertIn("cannot check for completeness", r.stderr)
+                self.assertNotIn("complete ELF", r.stderr)
+                self.assertNotIn("removing the partial browser install", r.stdout)
+
+    def test_an_unrecognised_file_that_runs_is_not_deleted_either(self):
+        # >= 64 bytes of script that prints its version: not an ELF (no conclusion from the file) but it
+        # runs, so it is a healthy browser that will not start headless. NEVER healed.
+        stale = self.write(self.chrome / "chrome-linux64-1.2.3.zip", "stale")
+        keep = self.make_browser(self.chrome / "linux-9.9.9" / "chrome-linux64" / "chrome")
+        exe = self.make_binary(BROWSER_RUNS.encode())
+        self.assertGreaterEqual(exe.stat().st_size, 64)
+        r = self.run_script(STUB_LAUNCH="fail")
+        self.expect(r, 1, "the browser runs (it prints its version) but will not start headless")
+        self.assertIn("NOT reinstalled", r.stderr)
+        self.assertIn("icudtl.dat", r.stderr)
+        self.assertIn("browsers clear", r.stderr)
+        self.assertEqual(self.npx_calls(), [])
+        self.assertEqual(exe.read_text(), BROWSER_RUNS)
+        self.assertTrue(self.build.is_dir() and stale.exists() and keep.exists())
+        self.assertEqual(self.sb.side("launches"), ["1"])
 
     def test_an_elf_that_is_not_64_bit_little_endian_is_not_trusted_as_complete(self):
         # The size arithmetic only holds for ELF64 little endian; for anything else there is no
@@ -878,7 +968,7 @@ class GcovrCase(SandboxCase):
         self.stamp = self.sb.venv / ".requirements-ci.sha256"
 
     def run_script(self, local_bin=True, **env):
-        return self.sb.run(self.SCRIPT, local_bin=local_bin, **env)
+        return self.sb.run(self.SCRIPT, local_bin=local_bin, **env)  # env may carry stdin=
 
     def pip_calls(self):
         return [c for c in self.sb.calls() if c.startswith("pip ")]
@@ -1188,10 +1278,60 @@ class EnsureGcovr(GcovrCase):
         self.expect(self.run_script(YUZU_GCOVR_VENV=f"{self.sb.venv}/"), 0, "already installed")
         self.assertEqual(self.pip_calls(), [])
 
+    def test_every_trailing_slash_on_the_venv_path_is_stripped(self):
+        # `dir//` and `dir///` behave exactly like `dir`: one strip would leave `dir/`, so the link would
+        # read `dir//bin/gcovr` and the lock would land inside the venv.
+        self.sb.stub("flock", FLOCK)
+        for slashes in ("//", "///", "/////"):
+            with self.subTest(slashes):
+                venv = self.sb.tmp / f"venv_{len(slashes)}"
+                spelled = f"{venv}{slashes}"
+                self.link.unlink(missing_ok=True)
+                self.sb.reset_logs()
+                self.expect(self.run_script(YUZU_GCOVR_VENV=spelled), 0, "ready (gcovr 8.7)")
+                self.assertEqual(os.readlink(self.link), f"{venv}/bin/gcovr")
+                self.assertTrue(Path(f"{venv}.lock").exists())
+                self.assertFalse((venv / ".lock").exists())
+                self.assertEqual(self.sb.side("venv"), ["marker=1 aside=0"])
+                self.assertEqual((venv / ".requirements-ci.sha256").read_text().strip(), self.sb.req_sha())
+                self.sb.reset_logs()
+                self.expect(self.run_script(YUZU_GCOVR_VENV=spelled), 0, "already installed")
+                self.assertEqual(self.pip_calls(), [])
+
     def test_a_venv_path_that_is_only_slashes_is_refused(self):
-        r = self.run_script(YUZU_GCOVR_VENV="/")
-        self.expect(r, 1, "must not be empty or /")
-        self.assertEqual(self.sb.calls(), [])
+        for spelled in ("/", "//", "///"):
+            with self.subTest(spelled):
+                self.sb.reset_logs()
+                r = self.run_script(YUZU_GCOVR_VENV=spelled)
+                self.expect(r, 1, "must not be empty or /")
+                self.assertEqual(self.sb.calls(), [])
+                self.assertFalse(self.link.is_symlink() or self.link.exists())
+
+    def test_a_symlinked_venv_is_refused_and_nothing_is_created_or_removed(self):
+        real = self.write(self.sb.tmp / "real_dir" / "precious.txt", "precious\n")
+        for name, target, spelling in (
+                ("a link to an existing directory", real.parent, ""),
+                ("the same, spelled with trailing slashes", real.parent, "//"),
+                ("a link to an owned-looking venv", self.write(self.sb.tmp / "ours" / ".yuzu-gcovr-venv", "").parent, ""),
+                ("a dangling link", self.sb.tmp / "nowhere", "")):
+            with self.subTest(name):
+                link = self.sb.tmp / "venv_link"
+                link.unlink(missing_ok=True)
+                link.symlink_to(target)
+                before = sorted(str(p.relative_to(self.sb.tmp)) for p in self.sb.tmp.rglob("*")
+                                if "calls.log" not in p.name)
+                self.sb.reset_logs()
+                r = self.run_script(YUZU_GCOVR_VENV=f"{link}{spelling}")
+                self.expect(r, 1, "is a symlink; point it at the real directory")
+                self.assertEqual(self.sb.calls(), [])
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(os.readlink(link), str(target))
+                self.assertEqual(real.read_text(), "precious\n")
+                after = sorted(str(p.relative_to(self.sb.tmp)) for p in self.sb.tmp.rglob("*")
+                               if "calls.log" not in p.name)
+                self.assertEqual(after, before, "nothing may be created or removed")
+                self.assertFalse(Path(f"{link}.lock").exists())
+                self.assertFalse((self.sb.home / ".local").exists())
 
     # --- refusals and environment ------------------------------------------------------------
 
@@ -1238,11 +1378,12 @@ class EnsureGcovr(GcovrCase):
         self.expect(self.run_script(YUZU_ENSURE_PIP_TIMEOUT="5"), 0, "ready")
         self.assertIn(f"timeout -k 10 5 {self.sb.venv}/bin/pip", self.sb.calls())
 
-    def test_a_timed_out_pip_says_so(self):
+    def test_a_timed_out_pip_says_so_on_stderr(self):
         self.sb.stub("timeout", timeout_stub())
         r = self.run_script(STUB_TIMEOUT_RC="124", STUB_TIMEOUT_ONLY="/bin/pip")
         self.expect(r, 1, "pip could not install")
-        self.assertIn("timed out after 600s", r.stdout)
+        self.assertIn("timed out after 600s", r.stderr)
+        self.assertNotIn("timed out", r.stdout)
 
     def test_venv_creation_runs_under_a_timeout_too(self):
         self.sb.stub("timeout", timeout_stub())
@@ -1253,22 +1394,25 @@ class EnsureGcovr(GcovrCase):
         self.link.unlink()
         r = self.run_script(STUB_TIMEOUT_RC="124", STUB_TIMEOUT_ONLY="-m venv")
         self.expect(r, 1, "could not create the virtualenv")
-        self.assertIn("timed out after 300s: python3 -m", r.stdout)
+        self.assertIn("timed out after 300s: python3 -m", r.stderr)
+        self.assertNotIn("timed out", r.stdout)
         self.assertEqual(self.pip_calls(), [])
 
-    def test_the_timeout_wrapper_gets_foreground_only_with_a_terminal_on_stdin(self):
-        master, slave = pty.openpty()
-        self.addCleanup(os.close, master)
+    def test_the_timeout_wrapper_is_never_given_foreground(self):
+        # --foreground would leave grandchildren (an orphaned pip holding the lock) running after a
+        # timeout; the argv is `-k 10 <secs> ...` with or without a terminal on stdin.
         self.sb.stub("timeout", timeout_stub())
-        try:
-            self.expect(self.run_script(stdin=slave), 0, "ready")
-        finally:
-            os.close(slave)
-        calls = self.sb.calls()
-        self.assertIn("timeout --foreground -k 10 300", calls)  # venv creation
-        self.assertIn("timeout --foreground -k 10 600", calls)  # pip
-        self.assertFalse(any(c.startswith("timeout -k") for c in calls), calls)
-        self.assertEqual(len(self.pip_calls()), 1)  # the wrapped command still ran
+        for i, (name, stdin) in enumerate(self.stdin_variants()):
+            with self.subTest(name):
+                venv = self.sb.tmp / f"venv_fg{i}"
+                self.link.unlink(missing_ok=True)
+                self.sb.reset_logs()
+                self.expect(self.run_script(YUZU_GCOVR_VENV=str(venv), stdin=stdin), 0, "ready")
+                calls = self.sb.calls()
+                self.assertIn("timeout -k 10 300 python3", calls)  # venv creation
+                self.assertIn("timeout -k 10 600 " + str(venv) + "/bin/pip", calls)  # pip
+                self.assertFalse(any("--foreground" in c for c in calls), calls)
+                self.assertEqual(len(self.pip_calls()), 1)  # the wrapped command still ran
 
     # --- the lock ----------------------------------------------------------------------------
 
