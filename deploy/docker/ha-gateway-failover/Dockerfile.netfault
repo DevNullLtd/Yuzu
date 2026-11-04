@@ -5,5 +5,7 @@
 #
 #   docker build -t yuzu-spike-netfault:1 -f Dockerfile.netfault .
 FROM alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f
+# The alpine packages are NOT version-pinned (apk resolves the 3.22 branch at build time); acceptable for
+# a local measurement sidecar that is never shipped.
 RUN apk add --no-cache iptables tcpdump bash curl
 ENTRYPOINT ["/bin/bash"]

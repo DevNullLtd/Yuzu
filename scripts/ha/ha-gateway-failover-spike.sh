@@ -30,6 +30,11 @@
 # victim (FIN/RST seen, or silence), because `docker kill` is not guaranteed to
 # produce the same wire behaviour as a real node loss.
 #
+# Platform: Linux with Docker only (GNU date, /proc/loadavg, flock, network namespaces, cgroup cpusets).
+# Credentials are per-rig, random and throwaway; they appear in this host's process list (docker exec
+# -e PGPASSWORD, the agents' --enrollment-token argument) while the rig runs, which is acceptable for a
+# local measurement rig and is not acceptable for anything shared or long-lived.
+#
 # State (secrets, enrolment token, results) lives under $SPIKE_STATE_ROOT
 # (default ~/.local/share/yuzu/ws13-spike/<salt>), never in the repo. Timings are
 # single-host numbers and are labelled so in the summaries.
@@ -101,8 +106,12 @@ cmd_up() {
     docker image inspect "$NETFAULT_IMAGE" >/dev/null 2>&1 \
         || docker build -q -t "$NETFAULT_IMAGE" -f "$REPO_ROOT/deploy/docker/ha-gateway-failover/Dockerfile.netfault" "$REPO_ROOT/deploy/docker/ha-gateway-failover" >/dev/null \
         || die "cannot build $NETFAULT_IMAGE"
-    docker network ls --format '{{.Name}}' | grep -q . && \
-        [ -z "$(docker network ls -q -f name=yuzu-ha-gw-spike)" ] || die "a yuzu-ha-gw-spike network already exists (a rig is up?)"
+    # Refuse if ANY resource of the fixed compose project exists (the project name is fixed so that
+    # the fixed addresses in the compose file and the CoreDNS zone cannot collide with a second rig).
+    if [ -n "$(docker network ls -q -f name=yuzu-ha-gw-spike)" ] || [ -n "$(docker ps -aq -f name=yuzu-ha-gw-spike)" ] \
+        || [ -n "$(docker volume ls -q -f name=yuzu-ha-gw-spike)" ]; then
+        die "resources of the yuzu-ha-gw-spike project already exist (a rig is up or was not removed with 'down')"
+    fi
 
     local salt="$$-$RANDOM"; STATE="$STATE_ROOT/$salt"
     mkdir -p "$STATE"; chmod 700 "$STATE"; ln -sfn "$STATE" "$STATE_ROOT/current"
@@ -117,6 +126,10 @@ PY
     # 0644: the server runs as a different uid in its container; the file holds a
     # throwaway PBKDF2 hash for a rig-only admin account.
     chmod 644 "$STATE/yuzu-server.cfg"
+    local ncpu; ncpu="$(nproc)"; [ "$ncpu" -ge 4 ] || die "need at least 4 CPUs (found $ncpu)"
+    # Infrastructure on the lower half, agents on the upper half. On an SMT host these are usually
+    # sibling threads of the same cores (logical separation only, not physical).
+    local infra_cpus="0-$((ncpu / 2 - 1))" agent_cpus="$((ncpu / 2))-$((ncpu - 1))"
     local mgmt_addr="gw-mgmt.ha.test:50063" corefile="Corefile.fixed"
     [ "$mgmt" = node1 ] && mgmt_addr="gateway-1:50063"
     [ "$order" = shuffled ] && corefile="Corefile.shuffled"
@@ -125,6 +138,8 @@ SPIKE_PROJECT=yuzu-ha-gw-spike
 SPIKE_TAG=$tag
 SPIKE_MGMT_ADDR=$mgmt_addr
 SPIKE_COREFILE=$corefile
+SPIKE_INFRA_CPUS=$infra_cpus
+SPIKE_AGENT_CPUS=$agent_cpus
 SPIKE_SERVER_CFG=$STATE/yuzu-server.cfg
 SPIKE_ADMIN_PASS=$admin_pass
 YUZU_POSTGRES_PASSWORD=$(openssl rand -hex 24)
@@ -282,8 +297,9 @@ settle_fleet() {
 cmd_mgmt() {
     load_state
     case "${1:-}" in vip) a="gw-mgmt.ha.test:50063";; node1) a="gateway-1:50063";; *) die "usage: mgmt vip|node1";; esac
+    local old="$SPIKE_MGMT_ADDR"
     setenv SPIKE_MGMT_ADDR "$a"; load_state
-    compose up -d --force-recreate server >/dev/null 2>&1 || die "server recreate failed"
+    compose up -d --force-recreate server >/dev/null 2>&1 || { setenv SPIKE_MGMT_ADDR "$old"; die "server recreate failed (state restored)"; }
     load_state   # the REST port is published on a fresh random host port after a recreate
     wait_for "server REST" 120 curl -ksf "$SPIKE_SERVER_URL/login"
     curl -ksf -c "$STATE/cookies" "$SPIKE_SERVER_URL/login" -d "username=admin&password=$SPIKE_ADMIN_PASS" -o /dev/null || die "re-login failed"
@@ -295,57 +311,93 @@ cmd_mgmt() {
 cmd_haproxy() {
     load_state
     case "${1:-}" in default) c=haproxy.cfg;; redispatch) c=haproxy-redispatch.cfg;; *) die "usage: haproxy default|redispatch";; esac
+    local old="${SPIKE_HAPROXY_CFG:-haproxy.cfg}"
     setenv SPIKE_HAPROXY_CFG "$c"; load_state
-    compose up -d --force-recreate haproxy >/dev/null 2>&1 || die "haproxy recreate failed"
+    compose up -d --force-recreate haproxy >/dev/null 2>&1 || { setenv SPIKE_HAPROXY_CFG "$old"; die "haproxy recreate failed (state restored)"; }
     sleep 15; ok "haproxy config now $c"
 }
 
-# export OUTDIR [redispatch-run,...] [void-run=reason,...] : summarised results (one CSV row per
-# run) for the committed record. Raw logs and secrets are NOT exported.
+# export OUTDIR [redispatch-run,...] [run=note,...] : summarised results (one CSV row per run) for
+# the committed record. Everything is RECOMPUTED from the raw run data (routes.csv, gw.csv, the
+# agent logs, the packet captures), not copied from the per-run summary, so a fix to a derivation
+# applies to runs taken before the fix. Raw logs and secrets are NOT exported.
 cmd_export() {
     load_state
     local out="${1:?export OUTDIR}"; mkdir -p "$out"
     python3 -I - "$STATE" "$out" "${2:-}" "${3:-}" <<'PY'
 import csv, glob, json, os, re, sys
-state, out, redisp, void = sys.argv[1:5]
+state, out, redisp, notes = sys.argv[1:5]
 redisp = set(x for x in redisp.split(",") if x)
-void = dict(x.split("=", 1) for x in void.split(",") if "=" in x)
-cols = ["run", "scenario", "mode", "haproxy", "agents", "victim_agents", "load1_at_fault",
+notes = dict(x.split("=", 1) for x in notes.split(",") if "=" in x)
+cols = ["run", "scenario", "mode", "haproxy", "agents", "on_victim_before", "reregistered_n", "load1_at_fault",
         "lost_p50_s", "lost_max_s", "rereg_p50_s", "rereg_p99_s", "rereg_max_s", "register_peak_per_s",
-        "overloaded_log_lines", "first_fin_rst_ms", "readyz_flip_victim_s", "dispatch_delivered",
-        "victim_readyz_200_s_after_undo", "all_routable_s_after_undo", "note"]
+        "busy_in_agent_logs", "first_peer_fin_rst_ms", "victim_readyz_non200_s",
+        "nonroutable_n", "nonroutable_first_s", "nonroutable_last_s", "tombstoned_n", "tombstoned_first_s", "tombstoned_last_s",
+        "dispatch", "victim_readyz_200_s_after_undo", "all_routable_s_after_undo", "invalid", "note"]
+def pct(xs, p):
+    xs = sorted(xs); return xs[min(len(xs) - 1, int(round(p / 100 * (len(xs) - 1))))] if xs else None
+def sec(ms): return "" if ms is None else f"{ms/1000:.1f}"
+def classify(line):
+    # Y delivered | U gateway_unavailable | T accepted, no result inside the wait | H<code> HTTP error | E other error | ? old format
+    if "delivered=" not in line: return "?"
+    m = re.search(r"http=(\d+)", line)
+    if m and m.group(1) != "200": return "H" + m.group(1)
+    if "delivered=1" in line: return "Y"
+    if "gateway_unavailable" in line: return "U"
+    if "error=none" in line: return "T"
+    return "E"
 rows = []
 for f in sorted(glob.glob(state + "/run-*/summary.json")):
-    d = json.load(open(f)); run = os.path.basename(os.path.dirname(f))
+    d = json.load(open(f)); rd = os.path.dirname(f); run = os.path.basename(rd)
     m = re.match(r"run-(\w+)-(dns|vip)-", run); sc, mode = m.group(1), m.group(2)
-    meta = d.get("meta", "")
-    def sec(k, q):
-        v = d[k].get(q); return "" if v is None else f"{v/1000:.1f}"
-    rec = {}
-    rp = os.path.join(os.path.dirname(f), "recovery.txt")
-    if os.path.exists(rp):
-        rec = dict(kv.split("=", 1) for kv in open(rp).read().split() if "=" in kv)
-    caps = [c.get("first_fin_rst_ms_after_fault") for c in d.get("fin_rst_capture", {}).values()]
-    caps = [c for c in caps if c is not None]
-    flips = [v for v in d["readyz_first_non200_s_after_fault"].values() if v is not None]
-    vagents = d["agents_that_changed_gateway_node"]
+    meta = d.get("meta", ""); t0 = int(open(rd + "/fault_ms").read())
+    vic = re.search(r"victim=(yuzu_gw@[0-9.]+)", meta); vic = vic.group(1) if vic else ""
+    vcont = re.search(r"container=(gateway-\d)", meta); vcont = vcont.group(1) if vcont else ""
     load = re.search(r"load=([0-9.]+)", meta)
-    ov = sum(v.get("overloaded", 0) for v in d.get("log_refusal_counts", {}).values())
+    # route state around the fault
+    samples = {}
+    for r in csv.reader(open(rd + "/routes.csv")):
+        if len(r) >= 6: samples.setdefault(r[1], []).append((int(r[0]), r[2], int(r[5])))
+    on_vic = [a for a, seq in samples.items() if [n for t, n, l in seq if t < t0][-1:] == [vic]]
+    def first_after(a, pred):
+        for t, n, l in samples[a]:
+            if t >= t0 and pred(n, l): return (t - t0) / 1000
+    nr = [x for x in (first_after(a, lambda n, l: l == 0) for a in on_vic) if x is not None]
+    tb = [x for x in (first_after(a, lambda n, l: n == "") for a in on_vic) if x is not None]
+    # victim /readyz: first moment TWO consecutive samples are not 200 (one failed exec is not a flip)
+    gw = sorted((int(r[0]), r[2]) for r in csv.reader(open(rd + "/gw.csv")) if len(r) == 4 and r[1] == vcont)
+    flip = ""
+    for i in range(len(gw) - 1):
+        if gw[i][0] >= t0 and gw[i][1] != "200" and gw[i + 1][1] != "200": flip = f"{(gw[i][0] - t0) / 1000:.0f}"; break
+    # packets: only those whose SOURCE is the gateway side (the agent's own FIN after it gives up is not a signal)
+    ip = vic.split("@")[-1]; first = []
+    for cf in glob.glob(rd + "/spike-cap-*.fin_rst.txt"):
+        for l in open(cf, errors="replace"):
+            mm = re.match(r"(\d+\.\d+)\s+.*?\bIP ([0-9.]+)\.\d+ > .*Flags \[([^\]]*)\]", l)
+            if mm and mm.group(2) in (ip, "10.77.12.20") and re.search(r"[FR]", mm.group(3)) and float(mm.group(1)) * 1000 >= t0:
+                first.append(float(mm.group(1)) * 1000 - t0)
+    busy = sum(open(x, errors="replace").read().lower().count("gateway is busy") for x in glob.glob(rd + "/agentlog-*.txt"))
+    rec = {}
+    if os.path.exists(rd + "/recovery.txt"):
+        rec = dict(kv.split("=", 1) for kv in open(rd + "/recovery.txt").read().split() if "=" in kv)
+    regd = d["reregistered_ms_after_fault"]
     rows.append({
         "run": run, "scenario": sc, "mode": mode,
         "haproxy": ("redispatch" if run in redisp else "default") if mode == "vip" else "",
-        "agents": d["agents"], "victim_agents": vagents, "load1_at_fault": load.group(1) if load else "",
-        "lost_p50_s": sec("lost_connection_ms_after_fault", "p50"), "lost_max_s": sec("lost_connection_ms_after_fault", "max"),
-        "rereg_p50_s": sec("reregistered_ms_after_fault", "p50"), "rereg_p99_s": sec("reregistered_ms_after_fault", "p99"),
-        "rereg_max_s": sec("reregistered_ms_after_fault", "max"), "register_peak_per_s": d.get("register_peak_per_s", ""),
-        "overloaded_log_lines": ov, "first_fin_rst_ms": min(caps) if caps else "",
-        "readyz_flip_victim_s": min(flips) if flips else "",
-        "dispatch_delivered": "".join("Y" if "delivered=1" in x else "n" for x in d.get("dispatch", [])),
+        "agents": d["agents"], "on_victim_before": len(on_vic), "reregistered_n": regd["n"],
+        "load1_at_fault": load.group(1) if load else "",
+        "lost_p50_s": sec(d["lost_connection_ms_after_fault"].get("p50")), "lost_max_s": sec(d["lost_connection_ms_after_fault"].get("max")),
+        "rereg_p50_s": sec(regd.get("p50")), "rereg_p99_s": sec(regd.get("p99")), "rereg_max_s": sec(regd.get("max")),
+        "register_peak_per_s": d.get("register_peak_per_s", ""), "busy_in_agent_logs": busy,
+        "first_peer_fin_rst_ms": f"{min(first):.0f}" if first else "", "victim_readyz_non200_s": flip,
+        "nonroutable_n": len(nr), "nonroutable_first_s": f"{min(nr):.0f}" if nr else "", "nonroutable_last_s": f"{max(nr):.0f}" if nr else "",
+        "tombstoned_n": len(tb), "tombstoned_first_s": f"{min(tb):.0f}" if tb else "", "tombstoned_last_s": f"{max(tb):.0f}" if tb else "",
+        "dispatch": "".join(classify(x) for x in d.get("dispatch", [])),
         "victim_readyz_200_s_after_undo": rec.get("victim_readyz_200_s", ""), "all_routable_s_after_undo": rec.get("all_routable_s", ""),
-        "note": void.get(run, ""),
+        "invalid": "yes" if os.path.exists(rd + "/INVALID") else "", "note": notes.get(run, ""),
     })
 with open(os.path.join(out, "results.csv"), "w", newline="") as fh:
-    w = csv.DictWriter(fh, fieldnames=cols); w.writeheader(); w.writerows(rows)
+    w = csv.DictWriter(fh, fieldnames=cols, lineterminator="\n"); w.writeheader(); w.writerows(rows)
 print(f"{len(rows)} runs -> {out}/results.csv")
 PY
 }
@@ -367,6 +419,15 @@ for name, d in rows:
     flip = ",".join(f"{k[-1]}:{v}" for k, v in d["readyz_first_non200_s_after_fault"].items() if v is not None) or "-"
     print(f"| {name} | {d['agents']} | {d['agents_that_changed_gateway_node']} | {g(d,'lost_connection_ms_after_fault','p50')}/{g(d,'lost_connection_ms_after_fault','max')} | {g(d,'reregistered_ms_after_fault','p50')}/{g(d,'reregistered_ms_after_fault','p99')}/{g(d,'reregistered_ms_after_fault','max')} | {d.get('register_peak_per_s','-')} | {flip} | {dd} |")
 PY
+}
+
+# scenario_cleanup : on any exit (including `die` and Ctrl-C) stop this run's sampler and remove its
+# capture containers. It deliberately does NOT undo an injected fault: the next `settle`/`restore`
+# flushes the rules, and silently healing the node would hide that a run was cut short.
+RUN_ACTIVE=""
+scenario_cleanup() {
+    [ -n "$RUN_ACTIVE" ] && sampler_stop "$RUN_ACTIVE" 2>/dev/null
+    local c; for c in $(docker ps -aq -f "name=spike-cap-$$" 2>/dev/null); do docker rm -f "$c" >/dev/null 2>&1; done
 }
 
 # ---- scenarios ---------------------------------------------------------------
@@ -410,9 +471,13 @@ cmd_scenario() {
     for n in gateway-1 gateway-2 gateway-3; do
         docker exec "$(cname $n)" sh -c 'ip -4 -o addr show scope global' 2>/dev/null | grep -q "${victim#*@}\b" && vc="$n"
     done
-    [ -n "$vc" ] || vc="gateway-1"
+    [ -n "$vc" ] || { fail "cannot match victim node $victim to a gateway container (no fallback is taken)"; return 1; }
     note "victim container: $vc"
-    echo "victim=$victim container=$vc total=$total mode=$mode load=$(cut -d' ' -f1-3 /proc/loadavg)" > "$run/meta.txt"
+    # Everything that defines how this run was configured, so a result can be traced to it.
+    echo "victim=$victim container=$vc total=$total mode=$mode window=$window settled=$settle corefile=$SPIKE_COREFILE mgmt=$SPIKE_MGMT_ADDR haproxy=${SPIKE_HAPROXY_CFG:-haproxy.cfg} tag=$SPIKE_TAG script_sha=$(git -C "$REPO_ROOT" hash-object "${BASH_SOURCE[0]}" 2>/dev/null | cut -c1-12) load=$(cut -d' ' -f1-3 /proc/loadavg)" > "$run/meta.txt"
+    RUN_ACTIVE="$run"
+    trap 'scenario_cleanup' EXIT
+    trap 'scenario_cleanup; exit 130' INT TERM
 
     sampler_start "$run"
     # packet capture on up to three agents attached to the victim (FIN/RST vs silence)
@@ -428,17 +493,23 @@ cmd_scenario() {
     note "baseline 15s (capturing on ${#caps[@]} agents)"; sleep 15
 
     local t0; t0=$(ms); echo "$t0" > "$run/fault_ms"; date -u -d "@$((t0 / 1000))" +%FT%T > "$run/fault_iso"
+    local frc=0
     case "$id" in
         NOFAULT) note "no fault injected";;
-        F1)  docker kill "$(cname $vc)" >/dev/null;;
+        F1)  docker kill "$(cname $vc)" >/dev/null || frc=$?;;
         F1g) docker stop -t 40 "$(cname $vc)" >/dev/null &;;
-        F2)  netfault "$(cname $vc)" 'iptables -I INPUT -p tcp --dport 50051 -j DROP; iptables -I OUTPUT -p tcp --sport 50051 -j DROP';;
-        F2p) netfault "$(cname $vc)" 'iptables -I INPUT -j DROP; iptables -I OUTPUT -j DROP; iptables -I INPUT -i lo -j ACCEPT; iptables -I OUTPUT -o lo -j ACCEPT';;
-        F3)  netfault "$(cname $vc)" 'iptables -I OUTPUT -p tcp -d 10.77.12.4 --dport 50055 -j DROP';;
-        F3x) netfault "$(cname $vc)" 'iptables -I OUTPUT -d 10.77.12.4 -j DROP; iptables -I INPUT -s 10.77.12.4 -j DROP';;
+        F2)  netfault "$(cname $vc)" 'iptables -I INPUT -p tcp --dport 50051 -j DROP; iptables -I OUTPUT -p tcp --sport 50051 -j DROP' || frc=$?;;
+        F2p) netfault "$(cname $vc)" 'iptables -I INPUT -j DROP; iptables -I OUTPUT -j DROP; iptables -I INPUT -i lo -j ACCEPT; iptables -I OUTPUT -o lo -j ACCEPT' || frc=$?;;
+        F3)  netfault "$(cname $vc)" 'iptables -I OUTPUT -p tcp -d 10.77.12.4 --dport 50055 -j DROP' || frc=$?;;
+        F3x) netfault "$(cname $vc)" 'iptables -I OUTPUT -d 10.77.12.4 -j DROP; iptables -I INPUT -s 10.77.12.4 -j DROP' || frc=$?;;
         *) sampler_stop "$run"; die "unknown scenario $id";;
     esac
-    note "fault $id injected at $(cat "$run/fault_iso")Z"
+    if [ "$frc" -ne 0 ]; then
+        fail "fault $id was NOT injected (exit $frc): this run is INVALID and must not be used"
+        echo "fault $id exited $frc" > "$run/INVALID"
+    else
+        note "fault $id injected at $(cat "$run/fault_iso")Z"
+    fi
 
     # dispatch probes at +10 s, +120 s, +300 s (to three agents: two on the victim, one elsewhere)
     local probed=0
@@ -539,18 +610,30 @@ for f in glob.glob(f"{run}/gwlog-*.txt") + [f"{run}/serverlog.txt"]:
     if not os.path.exists(f): continue
     txt = open(f, errors="replace").read().lower()
     refusals[os.path.basename(f)] = {"overloaded": txt.count("overloaded"), "unavailable": txt.count("unavailable"), "refus": txt.count("refus")}
+meta = open(f"{run}/meta.txt").read().strip()
+mv = re.search(r"victim=yuzu_gw@([0-9.]+)", meta)
+peers = (mv.group(1) if mv else "", "10.77.12.20")   # the victim node, or the VIP in front of it
+def from_peer(line):  # the packet's SOURCE must be the gateway side; the agent's own FIN is not a signal
+    m = re.search(r"\bIP ([0-9.]+)\.\d+ > ", line)
+    return bool(m and m.group(1) in peers)
+busy = sum(open(f, errors="replace").read().lower().count("gateway is busy") for f in glob.glob(f"{run}/agentlog-*.txt"))
 caps = {}
 for f in glob.glob(f"{run}/spike-cap-*.fin_rst.txt"):
     txt = open(f, errors="replace").read()
-    pk = [l for l in txt.splitlines() if re.search(r"Flags \[[^\]]*[FR][^\]]*\]", l)]
+    pk = [l for l in txt.splitlines() if re.search(r"Flags \[[^\]]*[FR][^\]]*\]", l) and from_peer(l)]
     after = [float(l.split()[0]) * 1000 - t0 for l in pk if re.match(r"\d+\.\d+ ", l) and float(l.split()[0]) * 1000 >= t0]
     caps[os.path.basename(f)] = {"fin_rst_packets": len(pk), "first_fin_rst_ms_after_fault": round(min(after)) if after else None}
 gw = {}
 for r in csv.reader(open(f"{run}/gw.csv")):
     if len(r) == 4: gw.setdefault(r[1], []).append((int(r[0]) - t0, r[2], r[3]))
-readyz_flip = {n: next((t // 1000 for t, rc, _ in v if t >= 0 and rc != "200"), None) for n, v in gw.items()}
+def flip_of(v):  # first moment two consecutive samples are not 200 (one failed exec is not a flip)
+    v = sorted(v)
+    for i in range(len(v) - 1):
+        if v[i][0] >= 0 and v[i][1] != "200" and v[i + 1][1] != "200": return v[i][0] // 1000
+    return None
+readyz_flip = {n: flip_of([(t, rc) for t, rc, _ in v]) for n, v in gw.items()}
 out = {
-    "scenario": sid, "mode": mode, "agents": len(agents), "meta": open(f"{run}/meta.txt").read().strip(),
+    "scenario": sid, "mode": mode, "agents": len(agents), "meta": meta, "busy_in_agent_logs": busy,
     "label": "single host; timings are not production figures",
     "lost_connection_ms_after_fault": summ(lost),
     "reregistered_ms_after_fault": summ(regd),
@@ -575,6 +658,15 @@ PY
 
 main() {
     local sub="${1:-}"; shift || true
+    case "$sub" in
+        up|scenario|mgmt|haproxy|ramp|restore|down)
+            # Two commands acting on one rig at once (a second scenario's settle restarting the agents
+            # under a running one) would invalidate both. A lock file under the state root, held for the
+            # life of this process.
+            mkdir -p "$STATE_ROOT"
+            exec 9>"$STATE_ROOT/.lock"
+            flock -n 9 || die "another $0 command is already running (lock: $STATE_ROOT/.lock)";;
+    esac
     case "$sub" in
         up) cmd_up "$@";; scenario) cmd_scenario "$@";; status) cmd_status;; restore) cmd_restore;; mgmt) cmd_mgmt "$@";; haproxy) cmd_haproxy "$@";; ramp) load_state; ramp "${1:?ramp N}";; report) cmd_report;; export) cmd_export "$@";; down) cmd_down;;
         *) sed -n '2,/^set -uo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 2;;

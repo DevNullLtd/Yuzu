@@ -27,6 +27,11 @@
 ## ghcr.io/<owner>/yuzu-* reference, so it is deliberately NOT in
 ## scripts/check-compose-versions.sh FILES (there is no version tag to check).
 ##
+## CPU pinning: the infrastructure containers use ${SPIKE_INFRA_CPUS} and the agents ${SPIKE_AGENT_CPUS}
+## (the script sets both from the host's CPU count; the defaults assume 32 logical CPUs). On an SMT host
+## the two halves are usually sibling threads of the same cores, so this separates logical CPUs, not
+## physical cores.
+##
 ## Never `down -v` casually: the certs volume holds the CA, and the SANs are fixed on the
 ## first boot of a fresh volume.
 name: ${SPIKE_PROJECT:-yuzu-ha-gw-spike}
