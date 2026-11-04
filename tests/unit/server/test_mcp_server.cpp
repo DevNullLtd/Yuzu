@@ -118,6 +118,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <expected>
 #include <filesystem>
@@ -2529,6 +2530,61 @@ TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the app
     const auto required = items["required"];
     CHECK(std::find(required.begin(), required.end(), "decision_seq") != required.end());
     CHECK(std::find(required.begin(), required.end(), "history") != required.end());
+}
+
+// #4752: the history preview length appears as a literal number in many description strings.
+// The tests above tie some of them to kHistoryJustificationPreviewChars; this sweeps the whole
+// served OpenAPI document and the whole MCP tools/list for every "first|than|to N characters"
+// phrase within 200 characters of the word "justification" and requires N to equal the
+// constant, so a stale literal anywhere fails rather than only the sites a test names.
+TEST_CASE("MCP 4752: every history-preview length in the OpenAPI document and tools/list "
+          "equals kHistoryJustificationPreviewChars",
+          "[mcp][2g][4752][openapi]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+
+    struct Sweep {
+        std::size_t matched = 0;
+        std::vector<std::string> wrong; // context of every site whose number is stale
+    };
+    const auto sweep = [](const std::string& text) {
+        std::string lowered = text;
+        for (auto& c : lowered)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        static const std::regex phrase(R"((first|than|to) (\d+) characters)");
+        constexpr std::size_t kNear = 200;
+        Sweep out;
+        for (std::sregex_iterator it(text.begin(), text.end(), phrase), end; it != end; ++it) {
+            const auto pos = static_cast<std::size_t>(it->position());
+            const std::size_t from = pos > kNear ? pos - kNear : 0;
+            const std::size_t len = std::min(
+                lowered.size() - from, kNear + static_cast<std::size_t>(it->length()) + kNear);
+            if (lowered.substr(from, len).find("justification") == std::string::npos)
+                continue; // an unrelated numeric phrase
+            ++out.matched;
+            if (std::stoll((*it)[2].str()) !=
+                static_cast<long long>(yuzu::server::kHistoryJustificationPreviewChars))
+                out.wrong.push_back(text.substr(from, len));
+        }
+        return out;
+    };
+
+    const auto openapi = sweep(yuzu::server::openapi_spec_with_guides_json());
+    const auto mcp = sweep(res->body);
+    // Floors so a rephrase cannot make the sweep pass vacuously. Counted when this was written:
+    // 7 in the OpenAPI document with guides (the history entry's justification and
+    // justification_truncated descriptions, the Access Reviews guide's decision-history note
+    // twice, GET /access-reviews/{id}, and the POST attestations description twice) and 3 in
+    // tools/list (get_access_review once, record_attestation twice). The sweep also sees, and
+    // skips as unrelated, phrases such as "longer than 512 characters" and "up to 128
+    // characters", which sit more than 200 characters from the word justification.
+    CHECK(openapi.matched >= 7);
+    CHECK(mcp.matched >= 3);
+    // Comparing against an empty vector makes Catch print the stale contexts on failure.
+    CHECK(openapi.wrong == std::vector<std::string>{});
+    CHECK(mcp.wrong == std::vector<std::string>{});
 }
 
 // #2383: C8 fail-closed. The boot validator and the three-way dispatch

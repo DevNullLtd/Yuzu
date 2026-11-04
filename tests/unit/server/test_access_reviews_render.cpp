@@ -13,6 +13,7 @@
  *   - nothing here can revoke: no RBAC or engine-principal route is named in any output.
  */
 
+#include "access_review_store.hpp" // kHistoryJustificationPreviewChars
 #include "access_reviews_render.hpp"
 
 #include <catch2/catch_test_macros.hpp>
