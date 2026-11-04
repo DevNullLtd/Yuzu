@@ -438,7 +438,7 @@ struct RegistryEvent {
     int prev_data_truncated{0};
     int64_t actor_pid{0}; // 0 = no writer named
     std::string actor_image;
-    std::string source;     // notify | reconcile
+    std::string source;     // notify | reconcile | offline
     int64_t observed_at{0}; // unix ms
     std::string detail;     // attr:* on a change row; the gap description on a gap
     std::string record_key; // UNIQUE -- replay idempotence (INSERT OR IGNORE)
@@ -968,6 +968,7 @@ public:
 
 private:
     explicit EchoDatabase(sqlite3* db);
+    friend class EchoFold; // upsert_state_locked, inside the fold's transaction (echo_fold.cpp)
 
     /// echo_state UPSERT on an already-locked handle; shared by set_state() and
     /// the diff-source inserts (which run it inside their transaction).
