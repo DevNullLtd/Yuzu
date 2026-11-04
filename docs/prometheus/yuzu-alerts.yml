@@ -5231,11 +5231,11 @@ groups:
             source is not the facet, a record holding a NUL byte or missing its
             terminator, a cap) - it NEVER self-heals, the agent resends the same bytes
             and the server keeps the facet's previously held rows and section hash (on a
-            device's first v3 report its v2 rows are already replaced, so there are none
-            to keep), so fix the agent (grep the warn-level "v3 section(s) ... refused"
+            device's first v3 call that applies a section its v2 rows are already replaced,
+            so there are none to keep), so fix the agent (grep the warn-level "v3 section(s) ... refused"
             server log line for the agent_id and the refusal reason). facet="unknown"
-            is the exception: the server does not know the facet name, so upgrade the
-            server first.
+            is the exception: the server does not know the facet name, which is a
+            version-skew incident to fix by reprovisioning matching builds.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventorySectionDeltaUnsupported
         # The expected honest placeholder until the delta apply is built (the agent falls

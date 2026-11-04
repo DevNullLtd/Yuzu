@@ -819,8 +819,9 @@ characters of `[a-z0-9_.]`. `status` is `full`, `delta`, `constrained`, `timeout
 `bytes_read` are agent-reported diagnostics: anything that is not plain digits reads as 0. Every
 field passes the v2 field step: scrub to valid UTF-8 first (U+FFFD for each invalid byte), then
 clamp to 1,024 bytes on a codepoint boundary. A `+` row's `source` must equal its section's
-`facet`. Caps per call: 3 MiB of blob (unchanged), 32 sections, 20,000 `+` rows, 20,000 `-`
-records, 20,000 `comp` records.
+`facet`. Caps bound the retained records per call: 3 MiB of blob (unchanged), 32 sections, 20,000 `+` rows, 20,000 `-`
+records, 20,000 `comp` records. A refused section gives its records back, so a call can parse more than
+20,000 in total; the 3 MiB and 32-section caps still bound the work, and refused rows never reach Postgres.
 
 **Every record is terminated, the last one too.** A blob whose final record lacks its `0x1E` was
 cut off: a truncated row refuses the section it sits in (`unterminated`; the complete rows
@@ -1037,12 +1038,12 @@ Three further facts belong to the agent change that sends v3. (1) The shipped
 `SyncScheduler::apply_ack` (`agents/core/src/sync_scheduler.cpp`) matches `need_full` by the
 exact source name, so the per-section token `installed_software:<facet>` reads as a clean sync:
 the scheduler must treat any `installed_software:*` token as a nack of the source, or a
-refused or delta section is never resent. (2) The server must be upgraded before that agent:
-an agent that sends v3 to a server without it is parsed as v2 and loops on a full resend on
-every cycle. (3) `ConstrainedPolicy::drop_source` (the 2026-10-29 Update) removes the source's
+refused or delta section is never resent. (2) Sequencing is same-build only: every server
+replica of the build is up before the agents of that build enroll, and this ADR records no
+behaviour of the record against an earlier server. (3) `ConstrainedPolicy::drop_source` (the 2026-10-29 Update) removes the source's
 rows on a constrained read under v2, because the full replace omits them; under v3 the same
 read is a status-only section and the rows are kept, so the writer must send `full` (honest
-empty) to retire a facet's rows and not a status. The first v3 report of a device also deletes
+empty) to retire a facet's rows and not a status. The first v3 call of a device that applies a section also deletes
 all its v2 rows first, so it should carry `full` for every facet it holds.
 
 **Not in this change.** Delta apply and the `-` deletions; storage of component rows; the agent

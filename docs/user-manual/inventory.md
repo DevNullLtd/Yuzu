@@ -340,7 +340,7 @@ dashboard or the API shows that record yet.
 
 A section the server cannot accept is asked for again by name (`installed_software:<source>` in
 the acknowledgement's `need_full`), while the other sections of the same report are stored. The
-first v3 report from a device removes the rows its earlier v2 reports left, so a device never
+first v3 call from a device that applies a section removes the rows its earlier v2 reports left, so a device never
 shows the same software from two report formats. A `delta` section, and the
 `component_inventory` section, are checked but not applied by this server version: each is
 answered with a request for a full section, so nothing is lost. No shipped agent sends v3 yet;
@@ -353,8 +353,8 @@ again counts as `need_full`. A blob the server cannot split into sections at all
 as `dropped` there, and a call whose transaction failed counts as `error` for every section of the
 call that was not refused (a refused section stays `rejected`).
 
-**Upgrade order, and what the shipped agent does with a per-section request.** Upgrade the server
-before any agent. The agent in this release does not understand the per-section request: it
+**Sequencing, and what the shipped agent does with a per-section request.** Bring up every server
+replica before the agents of the same build enroll. The agent in this release does not understand the per-section request: it
 looks for its own source name in the acknowledgement's `need_full` list, and
 `installed_software:<source>` is not that name, so a per-section request reads to it as a clean
 sync until the agent release that sends v3 reads the new form. Nothing is lost today, because
@@ -370,10 +370,10 @@ refused" names the agent and the reason. The reason is one of `unknown_facet`, `
 `source_mismatch`, `unknown_record`, `bad_record`, `bad_row_hash`, `bad_version_source`, `row_cap`,
 `nul_byte` or `unterminated`. The agent resends the same bytes, so a refusal never clears on its
 own, and the refused facet keeps its previous rows and section hash (its rows go stale; nothing is
-deleted) until the agent is fixed. The one exception is a device's first v3 report: its v2 rows were
+deleted) until the agent is fixed. The one exception is a device's first v3 call that applies a section: its v2 rows were
 already replaced, so a facet refused then has no rows to keep. `facet="unknown"` on the counter means the server does not
-recognise the name: that is almost always an agent newer than the server, so upgrade the server
-first rather than fixing the agent. A blob that cannot be attributed to sections at all (a record
+recognise the name: that is a version-skew incident (an agent and a server of different builds),
+fixed by reprovisioning matching builds rather than by fixing the agent. A blob that cannot be attributed to sections at all (a record
 before any section, a header with no section, an unusable section header, more than 32 sections,
 or over 3 MiB) is counted `dropped`, logged as "unusable v3 ... blob", and asked for again by the
 whole source name.
@@ -1196,7 +1196,7 @@ nesting past `kMcpMaxJsonDepth`, json-dump-depth-guard fix),
 holding a connection >10s — a leading pool-saturation indicator),
 `YuzuInventorySectionIngestRefused` (warning: a v3 section was refused, `outcome="rejected"`,
 at least once in the last day, so a single refusal is enough; the refusal is a grammar failure
-that never self-heals, so fix the agent, except `facet="unknown"`, where the server is older than the agent: upgrade the server),
+that never self-heals, so fix the agent, except `facet="unknown"`, a version-skew incident fixed by reprovisioning matching builds),
 `YuzuInventorySectionDeltaUnsupported` (info, held 1h: a v3 delta was answered with a request
 for a full section because this server cannot apply deltas yet; expected, no action), and
 `YuzuInventoryStaleCountUnavailable` (the freshness gauge may be frozen).
