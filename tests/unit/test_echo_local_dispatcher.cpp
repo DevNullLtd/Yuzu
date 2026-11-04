@@ -756,8 +756,20 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
     const YuzuParam pause_service[] = {{"service_enabled", "false"}};
     REQUIRE(d.run(desc, "configure", pause_service).rc == 0);
     REQUIRE(d.run(desc, "rollup").rc == 0);
-    CHECK(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total").value_or("<absent>") ==
-          "0");
+    // Paused service rows are exempt: all 35 survive. The counter is NOT asserted as 0: any other
+    // enabled source may hold hourly rows past the 48 h floor (the Windows netconn history
+    // backfill does on a long-lived runner), and the pass rightly evicts those. What the pass
+    // evicted is the baseline for the checks below.
+    {
+        const auto kept = raw_sql(db_path, "SELECT count(*) FROM service_hourly_r");
+        REQUIRE(kept.size() == 1);
+        CHECK(kept[0][0] == "35");
+    }
+    const auto evicted_total = [&] {
+        return std::stoll(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total")
+                              .value_or("-1"));
+    };
+    const auto evicted_by_paused_pass = evicted_total();
     const auto over_paused = plugin_status_value(d, desc, "budget_over_bytes");
     REQUIRE(over_paused.has_value());
     CHECK(std::stoll(*over_paused) > 0);
@@ -793,8 +805,7 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
     CHECK(guard_value("retention_guard_failed|__clock_state__|") == clock_failures_before + 1);
     CHECK(guard_value("retention_guard_failures_total|") == failures_before + 1);
     CHECK(guard_value("retention_guard_declines_total|") == declines_before);
-    CHECK(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total").value_or("<absent>") ==
-          "0");
+    CHECK(evicted_total() == evicted_by_paused_pass);
     {
         const auto kept = raw_sql(db_path, "SELECT count(*) FROM service_hourly_r");
         REQUIRE(kept.size() == 1);
@@ -814,8 +825,7 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
 
     // Eviction ran on the public path and took the hourly rows (enforce_budget in do_rollup); the
     // retired raw-row counter stays at its stored value.
-    CHECK(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total").value_or("<absent>") ==
-          "34");
+    CHECK(evicted_total() >= evicted_by_paused_pass + 34);
     CHECK(plugin_status_value(d, desc, "budget_evicted_raw_rows_total") ==
           std::optional<std::string>{"0"});
     // Only the 47 h row is left: the 48 h floor holds.
