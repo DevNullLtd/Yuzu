@@ -3892,8 +3892,8 @@ a control character that JSON escapes to six bytes, plus about 50 MB when review
 estimate of 320 bytes of fixed fields per entry; REST, MCP and the page each hold a copy). The Access page marks a cut entry "(truncated)" and never labels a pair
 in which either entry was cut as a re-recording, because a cut text cannot be shown equal to the next one. A successful attest answers `{recorded, decision_seq, previous_decision}`.
 
-**Database encoding.** The truncation counts characters and assumes a UTF8-encoded database (the shipped image's
-default); on a database with a single-byte encoding a cut can fall inside a multibyte sequence.
+**Database encoding.** The truncation counts characters and assumes a UTF8-encoded database (the HA image sets UTF8
+explicitly; the single-node image inherits the upstream PostgreSQL image's default locale); on a database with a single-byte encoding a cut can fall inside a multibyte sequence.
 
 **Frozen grants whose ids exceed 1024 bytes.** No known creation path produces an id longer than the limit, but a
 frozen grant whose `principal_id` or `role_name` exceeds 1024 bytes cannot be attested (`400`); it stays pending
