@@ -20,8 +20,8 @@
   narrowing, outcomes) and the Echo SQL and status-scan sends keep the request's own answer but
   now mark the response `Sec-Audit-Failed: true` when the row does not persist, instead of
   answering exactly as if it had been recorded. The permission-denial row
-  (`auth.permission_required`) is written by
-  the shared permission gate, not these routes, and a lost one still answers a plain `403`
+  (`auth.permission_required`) is written by the shared permission gate, not these routes, and a
+  lost one still answers a plain `403`
   (tracked in #7096). Expect an `attempted` row ahead of the outcome row of every console send
   that was not expression-targeted (those already wrote one), every group creation, and every Echo
   re-enable and purge. Not covered, among others: `POST /api/command`, MCP

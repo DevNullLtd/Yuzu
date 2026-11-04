@@ -2412,7 +2412,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // its own refusal; counted as the RBAC refusal it is.
                  if (!perm_fn_(req, res, "Execution", "Execute")) {
                      audit_or_flag(req, res, "echo.source.reenable", "failure", "command", "",
-                                   std::format("permission_revoked device={} source={}", device_id, source));
+                                   std::format("permission_revoked device={} source={}", device_id,
+                                               source));
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_reenable_total",
                                            {{"result", "denied"}}).increment();
@@ -2614,7 +2615,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // here (#3619 review). The gate writes its own refusal.
                  if (!perm_fn_(req, res, "Infrastructure", "Delete")) {
                      audit_or_flag(req, res, "echo.source.purge", "failure", "command", "",
-                                   std::format("permission_revoked device={} source={}", device_id, source));
+                                   std::format("permission_revoked device={} source={}", device_id,
+                                               source));
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_purge_total", {{"result", "denied"}})
                              .increment();

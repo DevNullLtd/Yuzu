@@ -1943,4 +1943,6 @@ TEST_CASE("group-from-results audit (UP-5, Gate 5 CH-1): a recheck refusal whose
     CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
     CHECK(h.audit_detail("group.create_from_results", "failure") ==
           "permission_revoked name=perm-revoked-audit-down");
+    CHECK(h.audits_for("group.create_from_results", "failure") == 1);
+    CHECK(h.audits_for("group.create_from_results", "success") == 0);
 }

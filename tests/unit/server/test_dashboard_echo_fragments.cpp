@@ -1180,7 +1180,9 @@ TEST_CASE("dashboard execute audit (#3619 UP-5): Execution:Execute revoked while
     CHECK(res->status == 403);
     CHECK(h.calls.empty());
     // The last gate call is the recheck after the attempted row, of the route's own permission
-    // (the route makes other gate calls before the row, so the count is not pinned here).
+    // (the route makes other gate calls before the row, so the count is not pinned here). This
+    // tells the recheck from admission only because the InstructionDefinition:Read lookup sits
+    // between them; calls.empty() and the failure detail below are the independent guards.
     REQUIRE(h.perms.size() >= 2);
     CHECK(h.perms.back().securable_type == "Execution");
     CHECK(h.perms.back().op == "Execute");
@@ -1214,5 +1216,7 @@ TEST_CASE("fragment purge audit (#3619 UP-5, Gate 5 CH-1): a recheck refusal who
     CHECK(h.audits_for("echo.source.purge", "attempted") == 1);
     CHECK(h.audit_detail("echo.source.purge", "failure") ==
           "permission_revoked device=dev-A source=process"); // attempted, not stored
+    CHECK(h.audits_for("echo.source.purge", "failure") == 1);
+    CHECK(h.audits_for("echo.source.purge", "success") == 0);
     CHECK(h.metric("yuzu_echo_source_purge_total", "denied") == 1.0);
 }

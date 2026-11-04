@@ -10,6 +10,6 @@
   log records `failure` with `permission_revoked`: as
   `reason=permission_revoked <plugin>:<action>` for `command.dispatch`,
   `permission_revoked device=<id> source=<src>` for the Echo rows, and
-  `permission_revoked name=<group>` for `group.create_from_results`. The Echo refusals are counted
-  as `yuzu_echo_source_{reenable,purge}_total{result="denied"}`. A group's `created_by` now names the
-  principal as re-authenticated after the wait.
+  `permission_revoked name=<group name>` for `group.create_from_results`. The Echo refusals are
+  counted as `yuzu_echo_source_{reenable,purge}_total{result="denied"}`. A group's `created_by` now
+  names the principal as re-authenticated after the wait.
