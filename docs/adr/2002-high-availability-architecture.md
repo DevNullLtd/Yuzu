@@ -493,15 +493,24 @@ cluster unit; intra-zone scale is more nodes.
   a deployment with more than one gateway node, and its rollout item for any fleet that still connects
   directly. Losing a server replica does not move agents (the gateway re-registers the agents a restarted or
   replaced server no longer knows, on evidence since #5695: see Context and §7g); agent failover answers
-  losing a gateway node. What the reword does not cover: on a one-gateway deployment the failover items are
-  vacuous, and slice 13.6 (a node that is up but has lost its server), the gateway's single circuit breaker
-  across all upstream endpoints (#5648) and reconcile convergence on two replicas (#5649) are in no clause of
-  the gate and stay open. By deployment shape: a fleet that still connects directly is newly gated (the rollout
-  item); a deployment with several gateway nodes keeps the failover items but the gate no longer reaches slice
-  13.6, which did not exist when the old clause was written and which the matrix row now says belongs to
-  WS-13; a one-gateway deployment is no longer gated on any of WS-13, where the old clause required all of
-  it. Whether 13.6, or the one-gateway case, belongs in the gate is the project lead's decision and is not
-  made here. The gate is **not lifted**.
+  losing a gateway node. By deployment shape: a fleet that still connects directly is newly gated (the rollout
+  item); a deployment with several gateway nodes keeps the failover items.
+- **Gate scope decided (2026-11-04, #6920, by the project lead).** The 13.0 spike record
+  (`docs/ha-spikes/ws13-0-gateway-failover.md`) was input; its figures are single-host and caveated, and five
+  follow-up measurements are #7051. (1) Slice 13.6 (a node that is up but has lost its server) stays **outside**
+  the gate: it leaves agents undispatchable rather than double-dispatching or mis-targeting, and the evidence is
+  thin (in six runs `/readyz` never changed, the breaker never opened in 400 s and no agent moved; dispatch kept
+  working on the single-replica server; route-directory dispatch on two replicas was not tested). It moves **into**
+  the gate if the #7051 loaded-fleet measurement, or the first two-replica run, shows agents staying undispatchable
+  while `/readyz` is green. (2) #5649 (reconcile convergence on two server replicas) and #5648 (a per-endpoint
+  circuit breaker) are **inside** the gate, whatever the gateway count: section 7c's convergence claim holds for
+  one replica only until #5649 is decided and run on two replicas (section 7g), and one dead server out of two can
+  open the gateway's only breaker. Neither is built. (3) A one-gateway deployment is deliberately not gated on the
+  failover items (there is no second node to fail over to; the gateway is then a single point of failure for its
+  fleet, which this gate, about running a second server replica, does not address); the rollout item and (2) still
+  gate it. (4) The management plane is a failover item in its own right and is **inside** the gate as slice 13.7
+  (#7062): the server's `--gateway-command-addr` names one node, and killing it left the fleet undispatchable
+  although every agent had re-attached (2 spike runs, no control run yet). The gate is **not lifted**.
 
 **Status (WS-4): 4.1 done; 4.2a (writer-path hardening) done; 4.2b (Tasks A–D: store layer, per-site
 fail-closed posture + renew correlation, dispatch-wiring, `route_unreadable` consumer + alert rule) done;

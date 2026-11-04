@@ -64,12 +64,19 @@ three-model adversarial review's strongest, unanimous finding:
 > outbox), WS-3, WS-4, WS-5, WS-6, WS-10 are done, WS-8's per-tier
 > `/readyz` exists, the WS-11 leader-observability subset (#4014:
 > leader/epoch metrics and the split-brain alert; **shipped**) ships, AND WS-13
-> is done: its failover items for a deployment with more than one gateway node,
-> and its rollout item for any fleet that still connects directly.** (The last two
-> clauses were added 2026-10-13, and the WS-13 wording was changed 2026-11-02 —
-> agent failover answers losing a GATEWAY node, not a server replica, so slice 13.6 and
-> #5648/#5649 sit in no clause of this gate, and a one-gateway deployment is no longer gated on
-> WS-13 at all (the lead's call whether it should be; see the matrix decision note); the rest of
+> is done: its failover items for a deployment with more than one gateway node
+> (including slice 13.7, the server's management plane still reaching the fleet when the
+> addressed gateway node dies, #7062), and its rollout item for any fleet that still connects
+> directly, AND the two multi-server gateway items are done: the registration reconcile is
+> correct on two server replicas (#5649) and the gateway's circuit breaker is per upstream
+> endpoint (#5648).** (The last two
+> clauses were added 2026-10-13, and the WS-13 wording was changed 2026-11-02 and settled
+> 2026-11-04 (#6920, the project lead): agent failover answers losing a GATEWAY node, not a
+> server replica; #5648/#5649 and slice 13.7 are INSIDE the gate whatever the gateway count;
+> slice 13.6 is OUTSIDE it, moving in if the #7051 loaded-fleet measurement or the first
+> two-replica run shows agents staying undispatchable while `/readyz` is green; a one-gateway
+> deployment is deliberately not gated on the failover items (the gateway is then a single
+> point of failure for its fleet, which this gate does not address); the rest of
 > WS-11 does not gate. Shipping #4014 satisfies only
 > that one clause: **the gate is NOT lifted**, and a durable cluster-capability
 > admission gate, #6528, is separately unbuilt. The epoch fence across a lossy
