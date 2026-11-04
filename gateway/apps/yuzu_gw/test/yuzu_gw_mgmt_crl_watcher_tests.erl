@@ -33,7 +33,7 @@ handle_event(Event, Measurements, Meta, Pid) ->
 %% A stand-in for a CRL that the replace rule reads: only these keys matter to it.
 crl(Number, ThisUpdate, NextUpdate) ->
     #{number => Number, this_update => ThisUpdate, next_update => NextUpdate,
-      issuer => <<>>, revoked => #{}}.
+      issuer => <<>>, signers => [], revoked => #{}}.
 
 %%--------------------------------------------------------------------
 %% Replay protection survives a restart of the WATCHER (sec-F1 / ge-F2)

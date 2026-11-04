@@ -18,7 +18,24 @@
 %%% C++ server really built.
 %%%
 %%% What a loaded CRL is (crl()): the cRLNumber, thisUpdate and nextUpdate as seconds since the
-%%% epoch, the issuer name, and the revoked serials as a map. Nothing else of the file is kept.
+%%% epoch, the issuer name, the public keys of the certificates that verified it and carry its
+%%% issuer name (`signers'), and
+%%% the revoked serials as a map. Nothing else of the file is kept.
+%%%
+%%% parse/3 loads a CRL only as the issuing key's complete list of revoked serials, and refuses
+%%% anything else: a delta CRL (`deltaCRLIndicator'), a scoped one (`issuingDistributionPoint', or
+%%% the X.509 scope and ordering extensions `cRLScope', `statusReferrals', `orderedList' and
+%%% `cRLStreamIdentifier'), an indirect one (a `certificateIssuer' entry extension, whose serials
+%%% belong to another issuer's namespace), an entry that un-revokes (`removeFromCRL'), and any
+%%% extension it does not understand that the CA marked critical (RFC 5280 5.2: a relying party
+%%% that cannot process a critical extension MUST NOT use the CRL). Each is `malformed'. A BASE
+%%% CRL from a CA that also publishes deltas (`freshestCRL') is accepted as the complete list as of
+%%% its thisUpdate; the deltas are never consulted.
+%%%
+%%% Serial numbers are only unique PER ISSUING KEY, and two CAs can carry the same subject name
+%%% (the server CA's subject is `Yuzu Install CA (<hostname>)', reused by a same-host re-root). So
+%%% check/4 does not take a matching issuer NAME as proof that the loaded CRL covers a peer: the
+%%% peer certificate must verify under one of the keys that signed the CRL (`signers').
 %%%
 %%% Replace rule (replace/2). A newly parsed CRL replaces the loaded one when its thisUpdate is
 %%% LATER or its cRLNumber is HIGHER. It is refused only when both are older or equal, and a
@@ -53,10 +70,17 @@
 %% beyond it the CRL is refused (and never evicts a loaded one).
 -define(MAX_FUTURE_S, 3600).
 
+%% X.509 (2019) CRL extensions that scope or order a list: cRLStreamIdentifier, cRLScope,
+%% statusReferrals, orderedList.
+-define(X509_SCOPE_EXTENSIONS, [{2, 5, 29, 40}, {2, 5, 29, 44}, {2, 5, 29, 45}, {2, 5, 29, 47}]).
+
 -type crl() :: #{number := non_neg_integer(),
                  this_update := integer(),
                  next_update := integer(),
                  issuer := term(),
+                 %% The public keys (public_key:pkix_verify/2 form) of the certificates of the
+                 %% verification set that verified this CRL and carry its issuer name.
+                 signers := [term()],
                  revoked := #{non_neg_integer() => true}}.
 
 %% Why a CRL was not loaded (a closed set; the label of yuzu_gw_mgmt_crl_rejected_total
@@ -110,6 +134,8 @@ fields(#'CertificateList'{tbsCertList = #'TBSCertList'{
                               nextUpdate = Next,
                               revokedCertificates = Rev,
                               crlExtensions = Exts}}) ->
+    ok = crl_extensions(Exts),
+    ok = entry_extensions(Rev),
     Number = crl_number(Exts),
     true = Next =/= asn1_NOVALUE,
     ThisEpoch = time_to_epoch(This),
@@ -121,6 +147,58 @@ fields(#'CertificateList'{tbsCertList = #'TBSCertList'{
       next_update => NextEpoch,
       number => Number,
       revoked => revoked(Rev)}.
+
+%% Extensions of the CRL itself. cRLNumber and authorityKeyIdentifier are understood (the latter is
+%% a hint, never a decision). deltaCRLIndicator and issuingDistributionPoint are refused whether or
+%% not they are marked critical: either one means the list is not the complete list of the issuer.
+%% So are the X.509 (not RFC 5280) scope and ordering extensions, which say the same thing about a
+%% list and which a CA may mark non-critical. Everything else is ignored unless the CA marked it
+%% critical.
+crl_extensions(Exts) when is_list(Exts) ->
+    lists:foreach(
+      fun(#'Extension'{extnID = Id, critical = Critical}) ->
+              Refuse = Id =:= ?'id-ce-deltaCRLIndicator'
+                  orelse Id =:= ?'id-ce-issuingDistributionPoint'
+                  orelse lists:member(Id, ?X509_SCOPE_EXTENSIONS)
+                  orelse (Critical =:= true
+                          andalso Id =/= ?'id-ce-cRLNumber'
+                          andalso Id =/= ?'id-ce-authorityKeyIdentifier'),
+              Refuse andalso throw({reject, malformed})
+      end, Exts);
+crl_extensions(_) ->
+    ok.
+
+%% Extensions of the entries. reasonCode, invalidityDate and holdInstructionCode are understood
+%% and change nothing about whether a serial is listed, except reasonCode removeFromCRL, which
+%% only a delta CRL may carry. certificateIssuer makes the CRL indirect (the entry's serial is in
+%% another issuer's namespace) and is refused whether or not it is marked critical.
+entry_extensions(asn1_NOVALUE) ->
+    ok;
+entry_extensions(Entries) when is_list(Entries) ->
+    lists:foreach(
+      fun(#'TBSCertList_revokedCertificates_SEQOF'{crlEntryExtensions = Exts}) ->
+              entry_extension_list(Exts)
+      end, Entries).
+
+entry_extension_list(Exts) when is_list(Exts) ->
+    lists:foreach(
+      fun(#'Extension'{extnID = Id, critical = Critical, extnValue = Value}) ->
+              if
+                  Id =:= ?'id-ce-certificateIssuer' ->
+                      throw({reject, malformed});
+                  Id =:= ?'id-ce-cRLReasons' ->
+                      removeFromCRL =:= public_key:der_decode('CRLReason', Value)
+                          andalso throw({reject, malformed});
+                  Id =:= ?'id-ce-invalidityDate'; Id =:= ?'id-ce-holdInstructionCode' ->
+                      ok;
+                  Critical =:= true ->
+                      throw({reject, malformed});
+                  true ->
+                      ok
+              end
+      end, Exts);
+entry_extension_list(_) ->
+    ok.
 
 %% The cRLNumber extension's value is the raw DER of an INTEGER, not a decoded one.
 crl_number(Exts) when is_list(Exts) ->
@@ -154,10 +232,11 @@ verified(Der, #{issuer := Issuer, this_update := This} = Fields, CaDers, Now) ->
             {error, unverified};
         issuer_mismatch ->
             {error, issuer_mismatch};
-        ok ->
+        {ok, Signers} ->
             case This > Now + ?MAX_FUTURE_S of
                 true  -> {error, future_dated};
-                false -> {ok, maps:with([number, this_update, next_update, issuer, revoked], Fields)}
+                false -> {ok, (maps:with([number, this_update, next_update, issuer, revoked],
+                                         Fields))#{signers => Signers}}
             end
     end.
 
@@ -165,16 +244,52 @@ verified(Der, #{issuer := Issuer, this_update := This} = Fields, CaDers, Now) ->
 %% every certificate is tried, each inside its own try (a CRL that raises against one
 %% certificate says nothing about another). Having verified, the CRL's issuer name must be the
 %% name of the certificate that verified it, so a CRL cannot claim to be issued by a name it
-%% is not signed under.
+%% is not signed under. What is kept is the KEY of each certificate that did both: the revoked
+%% serials mean something only for peers that key issued (check/4). A certificate whose key is
+%% none of RSA, EC or EdDSA (the forms handed to pkix_verify/2 here) cannot be kept, and a CRL that
+%% none of its verifiers can be kept for is `unverified', never loaded unbound.
 verifying_ca(Der, Issuer, CaDers) ->
     Verifying = [Ca || Ca <- CaDers, signature_verifies(Der, Ca)],
     case Verifying of
         [] -> none;
         _ ->
-            case lists:any(fun(Ca) -> dn_matches(dn_of(Ca), Issuer) end, Verifying) of
-                true  -> ok;
-                false -> issuer_mismatch
+            Named = [Ca || Ca <- Verifying, dn_matches(dn_of(Ca), Issuer)],
+            case Named of
+                [] ->
+                    issuer_mismatch;
+                _ ->
+                    case lists:usort([K || Ca <- Named, {ok, K} <- [ca_key(Ca)]]) of
+                        [] -> none;
+                        Keys -> {ok, Keys}
+                    end
             end
+    end.
+
+%% The key of a CA certificate in the form public_key:pkix_verify/2 takes. OTP decodes an EdDSA
+%% key as an ECPoint with NO parameters, and pkix_verify/2 then answers false for every
+%% certificate; the curve is named by the algorithm OID, so it is supplied here. Any other EC
+%% key without parameters cannot be used and is not kept.
+ca_key(CaDer) ->
+    try
+        #'OTPCertificate'{tbsCertificate = #'OTPTBSCertificate'{
+            subjectPublicKeyInfo = #'OTPSubjectPublicKeyInfo'{
+                algorithm = #'PublicKeyAlgorithm'{algorithm = Algorithm, parameters = Params},
+                subjectPublicKey = Key}}} = public_key:pkix_decode_cert(CaDer, otp),
+        case {Key, Algorithm, Params} of
+            {#'RSAPublicKey'{}, _, _} ->
+                {ok, Key};
+            {#'ECPoint'{}, ?'id-Ed25519', asn1_NOVALUE} ->
+                {ok, {Key, {namedCurve, ?'id-Ed25519'}}};
+            {#'ECPoint'{}, ?'id-Ed448', asn1_NOVALUE} ->
+                {ok, {Key, {namedCurve, ?'id-Ed448'}}};
+            {#'ECPoint'{}, _, {namedCurve, _}} ->
+                {ok, {Key, Params}};
+            {#'ECPoint'{}, _, {ecParameters, _}} ->
+                {ok, {Key, Params}};
+            _ ->
+                error
+        end
+    catch _:_ -> error
     end.
 
 signature_verifies(CrlDer, CaDer) ->
@@ -232,13 +347,18 @@ stamp(Year, [M1, M2, D1, D2, H1, H2, N1, N2, S1, S2, $Z]) ->
 -spec replace(crl() | none, crl()) -> replace_result().
 replace(none, New) ->
     {replace, New};
-replace(#{number := N, this_update := T, issuer := I, revoked := R},
-        #{number := N2, this_update := T2, issuer := I2, revoked := R2} = New) ->
+replace(#{number := N, this_update := T, issuer := I, signers := S, revoked := R},
+        #{number := N2, this_update := T2, issuer := I2, signers := S2, revoked := R2} = New) ->
     if
         T2 > T; N2 > N ->
             {replace, New};
-        T2 =:= T, N2 =:= N, I2 =:= I, R2 =:= R ->
+        T2 =:= T, N2 =:= N, I2 =:= I, R2 =:= R, S2 =:= S ->
             unchanged;
+        %% The same list signed by a different key under the same name (the first CRL of a
+        %% same-host re-root): it says nothing new about revocations, but it is the one that
+        %% covers the new root's peers.
+        T2 =:= T, N2 =:= N, I2 =:= I, R2 =:= R ->
+            {replace, New};
         true ->
             {reject, replay}
     end.
@@ -250,14 +370,16 @@ replace(#{number := N, this_update := T, issuer := I, revoked := R},
 %% @doc The decision for one management peer certificate, from the loaded CRL alone:
 %% a pure function, called on the stream path with a persistent_term read.
 %%   no CRL loaded                          revocation_unknown
-%%   the CRL is not this peer's issuer's    revocation_unknown   (a different root; see the docs)
+%%   the CRL is not this peer's issuer's    revocation_unknown   (a different root, or a different
+%%                                          key under the same name; see the docs)
 %%   now > nextUpdate + grace               revocation_stale
 %%   the peer's serial is listed            crl_revoked
 %%   the peer's serial cannot be read       bad_peer_cert
 -spec check(crl() | none, binary(), integer(), non_neg_integer()) -> ok | {reject, check_reject()}.
 check(none, _PeerDer, _Now, _Grace) ->
     {reject, revocation_unknown};
-check(#{issuer := CrlIssuer, next_update := Next, revoked := Revoked}, PeerDer, Now, Grace) ->
+check(#{issuer := CrlIssuer, signers := Signers, next_update := Next, revoked := Revoked},
+      PeerDer, Now, Grace) ->
     case peer_fields(PeerDer) of
         error ->
             {reject, bad_peer_cert};
@@ -266,7 +388,7 @@ check(#{issuer := CrlIssuer, next_update := Next, revoked := Revoked}, PeerDer, 
                 not is_tuple(PeerIssuer) ->
                     {reject, bad_peer_cert};
                 true ->
-                    case names_equal(PeerIssuer, CrlIssuer) of
+                    case names_equal(PeerIssuer, CrlIssuer) andalso issued_by(PeerDer, Signers) of
                         false -> {reject, revocation_unknown};
                         true when Now > Next + Grace -> {reject, revocation_stale};
                         true ->
@@ -277,6 +399,15 @@ check(#{issuer := CrlIssuer, next_update := Next, revoked := Revoked}, PeerDer, 
                     end
             end
     end.
+
+%% Was the peer certificate signed by one of the CRL's signing keys? A serial number identifies a
+%% certificate only among those one key issued, and a name is not a key.
+issued_by(PeerDer, Signers) ->
+    lists:any(fun(Key) ->
+                      try public_key:pkix_verify(PeerDer, Key) =:= true
+                      catch _:_ -> false
+                      end
+              end, Signers).
 
 peer_fields(PeerDer) when is_binary(PeerDer) ->
     try

@@ -14,7 +14,7 @@ pol(Grace) -> #{source => {file, "unused"}, grace_s => Grace, refresh_ms => 1000
                 verify_cacertfiles => [root_pem()]}.
 st() -> #{crl => none, crl_hash => undefined, ca_hash => undefined, etag => undefined, last_reject => undefined}.
 handle_event(E, M, Meta, Pid) -> Pid ! {telemetry, E, M, Meta}, ok.
-crl(N, T, X) -> #{number => N, this_update => T, next_update => X, issuer => <<>>, revoked => #{}}.
+crl(N, T, X) -> #{number => N, this_update => T, next_update => X, issuer => <<>>, signers => [], revoked => #{}}.
 fl() -> receive _ -> fl() after 0 -> ok end.
 ld(P, S, Bin, Now) -> ?SRC:load(P, S, fun(_, _) -> {ok, Bin, undefined} end, Now).
 evs() -> receive {telemetry, _, _, _} = M -> [M | evs()] after 0 -> [] end.

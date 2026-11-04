@@ -482,9 +482,14 @@ groups:
             it did not answer in time; fetch_status means it answered with a
             status other than 200 (503 is "CRL not yet published": the server
             is still starting or its CA is unavailable); malformed or
-            too_large means the bytes are not a usable CRL; unverified or
+            too_large means the bytes are not a usable CRL (malformed also
+            covers a well-formed CRL that is not the issuer's complete base
+            list: a delta, a scoped or indirect one, or one with an
+            extension the gateway cannot process; the Yuzu server publishes
+            none of these, a corporate CA feed can); unverified or
             issuer_mismatch means the CRL was not signed by the CA the
-            management listener trusts; future_dated means the CRL is dated
+            management listener trusts, or by a CA whose key type the
+            gateway cannot bind (RSA, EC and EdDSA are supported); future_dated means the CRL is dated
             more than an hour ahead of THIS gateway's clock (check the clock
             here and on the server); file_unreadable means a {file, Path}
             source or a cacertfile cannot be read. A change to
@@ -513,7 +518,10 @@ groups:
             republishes when under 24 hours remain, so a period with no
             leader stops it, and so does a server that cannot reach the CA
             key; restarting a server replica republishes at startup); restore
-            the fetch before the grace ends.
+            the fetch before the grace ends. The rule compares the
+            Prometheus clock with the CRL's nextUpdate, which the server's
+            clock set, while the gateway refuses on its own clock, so keep
+            all three on NTP.
 
       - alert: YuzuGatewayMgmtCrlRefreshStalled
         expr: |
@@ -537,7 +545,10 @@ groups:
             file_unreadable means a {file, Path}
             source or a cacertfile on a dead mount that has stopped
             answering; malformed and too_large mean the bytes are not a
-            usable CRL; unverified, issuer_mismatch, replay and future_dated
+            usable CRL (malformed includes a well-formed delta, scoped or
+            indirect CRL, or one with an unprocessable critical extension,
+            from a feed that is not the Yuzu server's); unverified,
+            issuer_mismatch, replay and future_dated
             mean the server is serving a CRL this gateway will not take. A
             watcher process that is itself wedged shows no new rejections and
             no new log lines. The rule compares the Prometheus clock with the

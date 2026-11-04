@@ -132,7 +132,7 @@ parse_future_dated_test() ->
 
 crl_map(Number, This) ->
     #{number => Number, this_update => This, next_update => This + 100000,
-      issuer => issuer, revoked => #{}}.
+      issuer => issuer, signers => [], revoked => #{}}.
 
 replace_first_load_test() ->
     New = crl_map(5, 1000),

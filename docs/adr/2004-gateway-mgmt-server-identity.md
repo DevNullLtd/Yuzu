@@ -294,7 +294,9 @@ server API surface to solve a reachability problem the shipped topology does not
 A CRL is accepted only if `public_key:pkix_crl_verify/2` verifies it against a certificate in the
 management listener's `cacertfile`. The issuer name and the authority key identifier are hints and
 are never the authenticity check. A CRL replaces the held one only when its `thisUpdate` is later or
-its `cRLNumber` is higher; an identical CRL is a no-op and an older one is refused (`replay`). One
+its `cRLNumber` is higher; an identical CRL is a no-op and an older one is refused (`replay`).
+It must also be the issuer's complete base list and is bound to the keys that signed it (see "What
+counts as a complete list" and A6(g) below). One
 dated more than an hour ahead is refused (`future_dated`). A refused CRL never evicts the loaded
 one, so a hostile or broken source cannot evict what the gateway process holds. That holds for the
 life of the process: the watcher keeps the mark across its own restart, a gateway process that starts afresh
@@ -308,7 +310,7 @@ After admission and the deny-list, every admitted peer is checked, in `pin` mode
 | Condition | Reason |
 |---|---|
 | a source is set and no CRL is loaded | `revocation_unknown` |
-| the peer's issuer is not the CRL's issuer | `revocation_unknown` |
+| the peer's issuer name is not the CRL's, or the peer certificate does not verify under a key that signed the CRL | `revocation_unknown` |
 | now is past `nextUpdate` plus the grace | `revocation_stale` |
 | the peer's serial is listed | `crl_revoked` |
 | the peer certificate cannot be read | `bad_peer_cert` |
@@ -391,7 +393,21 @@ has a fixed 3-second deadline (5 seconds at boot, plus 2 seconds to read the CA 
 that over the link never refreshes (a persistent `fetch_timeout`). (g) A two-root bundle in the
 management listener's `cacertfile` gets `revocation_unknown` for the peers of the root the held CRL
 does not cover, and a source that alternates CRLs of two issuers makes that flip tick to tick: the
-replace rule compares numbers and times, not issuers. (i) A `{file, Path}` source or a `cacertfile` on a dead mount or a FIFO blocks the read, and a blocked
+replace rule compares numbers and times, not issuers. "The root the held CRL covers" is decided by
+KEY, not by name: the loaded CRL keeps the public keys of the certificates that verified it, and a
+peer is covered only if its certificate verifies under one of them, because serial numbers are
+unique only per issuing key and two roots can share a subject name (the server CA's is
+`Yuzu Install CA (<hostname>)`, reused by a same-host re-root). A first version compared names only
+and so admitted a revoked leaf of the new root while the old root's empty CRL was held (found at
+review of PR #7060). A `cacertfile` holding two roots with one subject name is a transition state: do not keep a retired or compromised root in it, because a CRL signed by either key (with otherwise identical content) rebinds the held CRL to that key, and the peers of the other root get `revocation_unknown` until the next CRL. A root whose key is none of RSA, EC or EdDSA (an RSA-PSS key, say)
+cannot be bound this way and its CRL is refused `unverified`; an EdDSA root is bound by the curve its
+algorithm identifier names. (h) Clocks: a server more than an hour ahead
+publishes CRLs the gateway refuses `future_dated` (the held CRL stays); one days behind publishes
+CRLs already stale, which the gateway does not let replace a CRL still in force; the new
+revocations in such a CRL (a server re-issue among them) then do not land, and the held CRL is
+believed until its own `nextUpdate` plus the grace. That trade (a bounded blind window instead of a
+fail-closed outage) is the owner's decision recorded in A8, and the gateway logs both CRLs' numbers
+and times when it makes it. (i) A `{file, Path}` source or a `cacertfile` on a dead mount or a FIFO blocks the read, and a blocked
 file read cannot be cancelled: killing the worker removes the process but leaves its operating-system
 thread blocked, and a few of those wedge every file operation in the VM (measured). So a file worker
 is never killed: the watcher waits a bounded time, fails the attempt (as `file_unreadable`),
@@ -406,13 +422,20 @@ file open because `file:read_file/1` goes through the VM's file server process, 
 a blocked read stalls every file operation. (The pins watcher still uses `file:read_file/1` for its
 own paths: the same hazard, pre-existing and not changed here.) (j) A restored server database (a
 lower `cRLNumber` with a fresh `thisUpdate`, and fewer revoked certificates) replaces the held CRL
-without any restart, by the owner's replace rule. (h) Clocks: a server more than an hour ahead
-publishes CRLs the gateway refuses `future_dated` (the held CRL stays); one days behind publishes
-CRLs already stale, which the gateway does not let replace a CRL still in force; the new
-revocations in such a CRL (a server re-issue among them) then do not land, and the held CRL is
-believed until its own `nextUpdate` plus the grace. That trade (a bounded blind window instead of a
-fail-closed outage) is the owner's decision recorded in A8, and the gateway logs both CRLs' numbers
-and times when it makes it.
+without any restart, by the owner's replace rule.
+
+**What counts as a complete list.** A CRL is loaded only as the issuer's complete base list of
+revoked serials. One carrying `deltaCRLIndicator`, `issuingDistributionPoint` or one of the X.509
+scope and ordering extensions (`cRLScope`, `statusReferrals`, `orderedList`, `cRLStreamIdentifier`),
+an entry with `certificateIssuer` (an indirect CRL) or a `removeFromCRL` reason, or any extension this
+module does not understand that the CA marked critical, is refused `malformed` (RFC 5280 5.2 forbids using a CRL
+with a critical extension one cannot process). A delta with a higher `cRLNumber` would otherwise
+replace the full list and drop the serials only the base listed. The Yuzu server publishes none of
+these; a corporate CA or a file feed could. Residual: a base CRL from a CA that also publishes deltas
+(`freshestCRL`) is accepted as the complete list as of its `thisUpdate`, and the deltas are never
+consulted, so a revocation that exists only in a later delta never reaches the gateway. A CA that
+publishes deltas should be used with `{file, Path}` fed a freshly built full CRL, or not at all with
+this control.
 
 ### A7. Alternatives considered
 

@@ -7,7 +7,7 @@ against the real clock without re-minting them). `yuzu_gw_mgmt_crl_watcher_tests
 key appears in this directory, because `.gitignore` un-ignores every `*.pem` here.
 
 The set is NOT regenerable from this repository: the CA key was thrown away after minting. A new case
-(a CRL without a `cRLNumber`, a delta CRL, an `issuingDistributionPoint`, a very large list) means
+(a CRL without a `cRLNumber`, a very large list) means
 re-minting every file with `build_crl`/`self_sign_ca`/`issue_leaf` as described below, then updating
 `?THIS` in every test module that carries it and the dates in this file.
 
@@ -35,3 +35,8 @@ The times are fixed in the files (thisUpdate 2026-11-02 14:14:48Z). Tests that d
 inject `now`; nothing here reads the wall clock. The CRLs' own `nextUpdate` is 2026-11-04T14:19:48Z,
 so a test that calls `check` with the real clock would start refusing as `revocation_stale` on
 2026-11-05T14:19:48Z: none does, and none may.
+
+Shapes only another CA or a hostile feed can produce (a delta CRL, an `issuingDistributionPoint`, an
+unknown critical extension, an indirect or un-revoking entry, two CAs with one subject name and two
+keys) are not fixtures: `yuzu_gw_crl_build` makes them in memory, signed by a key generated for the
+test, and `yuzu_gw_mgmt_crl_scope_tests` uses them.

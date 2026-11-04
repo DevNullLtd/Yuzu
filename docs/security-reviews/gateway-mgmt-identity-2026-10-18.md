@@ -135,8 +135,15 @@ not be enabled there. A pin is immune to both.
    gateway that sets `mgmt_crl_source` refuses a withdrawn certificate on the streams it admits after
    its next fetch (within one refresh interval of the server publishing), with no restart, even on a
    connection the server already holds open; a stream already running is not cut. After a CA re-root, the source must serve the
-   new CA's CRL, or unset it: a CRL signed by the old CA no longer verifies against the new
-   `cacertfile`, so the gateway refuses every stream as `revocation_unknown` until it does. A
+   new CA's CRL, or unset it: a CRL signed by the old CA no longer verifies against a new
+   `cacertfile` that holds only the new root, so the gateway refuses every stream as
+   `revocation_unknown` until it does. In a bundle that holds both roots (which share a subject name
+   after a same-host re-root) the old root's CRL verifies, but it covers only peers the old key
+   issued: a peer of the new root gets `revocation_unknown` from it, because the loaded CRL is bound
+   to the keys that signed it and not to a name. The gateway also loads only a CA's complete base
+   CRL (a delta, scoped or indirect CRL, or one with an unprocessable critical extension, is refused
+   `malformed`; ADR 2004 "What counts as a complete list"); a CA that publishes deltas alongside
+   its base CRL has those deltas ignored, which is a residual of using such a CA with this control. A
    gateway with no source still needs the pinned file replaced (within one interval) or the
    deny-list edited (at a gateway restart); an operator who needs fast withdrawal without a CRL
    source can keep a pin in `identity` mode and replace the pinned file.
