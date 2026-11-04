@@ -71,11 +71,13 @@ TEST_CASE("step-up policy: the gated set is exactly the 37 routes with an in-han
 
 TEST_CASE("step-up policy: the table's total and per-class row counts are pinned",
           "[stepup][policy]") {
-    // Executable pins for the table counts (235 mutating REST routes: 37 required, 3 own-gate,
-    // 122 exempt, 73 pending). A row added or reclassified without these numbers moving
+    // Executable pins for the table counts (239 mutating REST routes: 37 required, 3 own-gate,
+    // 126 exempt, 73 pending; #2146 batch B added the two v1 execution cancel/rerun rows, the v1
+    // commands row and the v1 instruction-definition execute row). A row added or reclassified
+    // without these numbers moving
     // together fails here.
-    CHECK(kStepUpPolicyCount == 235);
-    CHECK(count_class(StepUpClass::kExempt) == 122);
+    CHECK(kStepUpPolicyCount == 239);
+    CHECK(count_class(StepUpClass::kExempt) == 126);
     CHECK(count_class(StepUpClass::kPendingRuling) == 73);
     CHECK(count_class(StepUpClass::kRequired) + count_class(StepUpClass::kOwnGate) +
               count_class(StepUpClass::kStrong) + count_class(StepUpClass::kExempt) +
@@ -294,11 +296,12 @@ TEST_CASE("step-up policy: every kExempt reason is one of the named exempt class
           "[stepup][policy]") {
     using namespace step_up_detail;
     const std::set<std::string_view> classes = {
-        kPreSession,         kStepUpProofEndpoint,  kSelfSignOut,       kSelfPrivilegeReduction,
-        kExecutionDispatch,  kApprovalGatedElsewhere, kOperationalData, kReadShaped,
-        kSyncTrigger,        kAgentUploadProtocol,  kScimBearer,        kMcpTransport,
-        kContentAuthoring,   kPolicyLifecycle,      kEvidenceCapture,   kStopsEffect,
-        kAlertingConfig,     kMfaEnrolment,         kSchedulingGatedWork, kSelfNotificationState};
+        kPreSession,           kStepUpProofEndpoint,    kSelfSignOut,     kSelfPrivilegeReduction,
+        kExecutionDispatch,    kApprovalGatedElsewhere, kOperationalData, kReadShaped,
+        kSyncTrigger,          kAgentUploadProtocol,    kScimBearer,      kMcpTransport,
+        kContentAuthoring,     kPolicyLifecycle,        kEvidenceCapture, kCancelsRecord,
+        kCreatesRerunRecord,   kAlertingConfig,         kMfaEnrolment,    kSchedulingGatedWork,
+        kSelfNotificationState};
     std::set<std::string_view> used;
     for (const auto& e : kStepUpPolicy) {
         if (e.cls != StepUpClass::kExempt)

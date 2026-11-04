@@ -518,8 +518,28 @@ public:
     /// return would reintroduce the exact bug this fix closes.
     [[nodiscard]] bool set_agents_targeted(const std::string& execution_id, int agents_targeted);
 
+    /// LEGACY rerun (`/api/executions/{id}/rerun`). Reads the original with the UNCHECKED
+    /// `get_execution` / `get_agent_statuses`, so a degraded store collapses into "original
+    /// execution not found" (and `failed_only` into a zero-device record). That behaviour is
+    /// kept for the legacy handler, whose text the source tripwires pin; every NEW caller uses
+    /// `create_rerun_checked`, which cannot mask a storage fault.
     std::expected<std::string, std::string> create_rerun(const std::string& original_id,
                                                          const std::string& user, bool failed_only);
+
+    /// Why `create_rerun_checked` produced no record. A closed enum, so a caller maps it with a
+    /// `switch` rather than by comparing error text.
+    enum class RerunError {
+        kOriginalNotFound, ///< the original was read successfully and does not exist.
+        kStoreDegraded,    ///< the original (or, for `failed_only`, its agent rows) could not be
+                           ///< READ: pool exhausted, tracker not open, query failed. Unknown
+                           ///< whether the original exists; nothing was written.
+        kWriteFailed,      ///< the reads succeeded but inserting the new record failed.
+    };
+    /// Same record `create_rerun` creates, but every read goes through the degrade-aware
+    /// `get_execution_checked` / `get_agent_statuses_checked`, so an unreadable store is
+    /// `kStoreDegraded`, never a not-found and never a silently zero-sized `failed_only` record.
+    [[nodiscard]] std::expected<std::string, RerunError>
+    create_rerun_checked(const std::string& original_id, const std::string& user, bool failed_only);
 
     /// Returns false on a pool/query failure (governance PR review,
     /// 2026-08-31) — the execution was NOT actually cancelled; callers must
