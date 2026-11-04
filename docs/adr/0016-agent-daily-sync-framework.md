@@ -686,9 +686,7 @@ agent's next full report on the upgraded server.
 **Personal data.** `chassis_serial`, `board_serial` and the DIMM `serial` column join the
 serial/UUID/MAC behavioural-PII tier. The `volume` and `partition` mount-point column can name an
 account or a personal label as the OS reports it, so the agent redacts such entries before sending
-(2026-11-01 entry, "Mount points (personal data)"). The sections read has no REST/MCP/UI route yet;
-the later REST read-surface change must serve it behind the same fail-closed audit as the
-audited `inventory.device.ci` read.
+(2026-11-01 entry, "Mount points (personal data)"). As of the 2026-11-04 entry at the end of this file (H.7), the sections are served on REST and MCP behind the audited `inventory.device.ci` read.
 
 ### 2026-11-01 — `device_ci` blob v2 (agent writer)
 
@@ -790,3 +788,15 @@ absorb any realistic overflow first, so `swap` is a defensive tail.
 the same build enroll, and every replica is on that build. The deployment contract (a fresh
 database, every writer on this build; `docs/user-manual/upgrading.md`, "Deployment contract (hard
 cutover)") excludes an earlier server, so this entry states no behaviour of an agent against one.
+
+### 2026-11-04 — `device_ci` read surface on REST and MCP (H.7)
+
+`GET /api/v1/hardware/{id}` and the MCP tool
+`get_hardware_ci` serve the expanded record behind the fail-closed `inventory.device.ci` audit.
+The chassis, board and DIMM serials and the machine-id hash (with its algorithm and source) are
+served. Section rows are served only for the `ok` and `constrained` levels; a section at any other
+level shows its reason and no rows. The record and its sections are read in one REPEATABLE READ
+snapshot (`get_device_ci_with_sections`), so the scalars and the rows are the same replace
+generation. A failed read of the sections is a `503` on REST and a retryable error on MCP
+(`retry_after_ms` 5000), with the record withheld and the audit detail `state=sections
+unreadable`; it is never a `200` with an empty sections list.

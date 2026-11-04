@@ -564,7 +564,7 @@ place, **Hardware** and **Software**, each its own page:
   **Tags** (new — click a chip to filter by that exact `key` or `key=value`, or type
   `tag=<key>[=<value>]` directly), and the device-CI columns from before (manufacturer,
   model, serial, CPU model + cores/threads, RAM, OS version). All columns except DEX are
-  sortable; a server-side search box (hostname/serial/model/CPU), OS/status filter
+  sortable; a server-side search box (hostname, device id, serial, model, manufacturer, CPU, OS, chassis asset tag, chassis serial, board serial and similar identity fields), OS/status filter
   chips, a filter breadcrumb, and pagination narrow a large fleet. A new checkbox column
   plus a sticky bulk-tag bar let you apply or remove one tag across every selected
   device in one action — under the hood it loops the existing single-device tag routes,
@@ -1208,8 +1208,9 @@ sync, defeating the hash-skip protocol.
   machine-id, each with its source, plus typed per-device rows for CPUs, DIMMs, disks,
   swap, volumes, partitions and storage topology, each section with its own status.
   Partitions are read on Windows only so far (Linux and macOS report `<os>:planned`, meaning
-  not read; storage topology is planned everywhere), and the stored sections are not yet
-  shown in the Hardware pages or API.
+  not read; storage topology is planned everywhere). The stored sections are served by
+  `GET /api/v1/hardware/{id}` and the MCP `get_hardware_ci` tool (they are not rendered in the
+  dashboard Hardware pages yet).
   `blob_version` says which format an agent last sent. A device whose agent is still on
   the original format has **no** section rows stored — read that as "not stored", not
   "the device has none". A section reported `constrained` with reason `server_cap:<n>`
@@ -1243,7 +1244,7 @@ sync, defeating the hash-skip protocol.
   independently: one section being unavailable never stops the others, or the base device
   fields, from being reported.
 
-On Windows the `chassis`, `baseboard`, `swap` and `machine_id` sections now report data (and the `cpu` and `dimm` rows carry the socket, stepping and DIMM identity columns); Linux and macOS still report `<os>:planned` for the four. A Windows section that could not be read reports `constrained`, `permission_denied` or `unavailable` with a reason token such as `smbios:win32_5`, `windows:machine_guid:absent` or `wmi:<class>:<cause>` (where `<class>` is `processors`, `memory`, `pagefile_usage` or `pagefile_setting`); the full token list is in the Result status table of the hardware plugin README (`agents/plugins/hardware/README.md`). On Windows the `cpu` and `dimm` sections also carry a non-`ok` status (with the reason token) when their WMI query fails, instead of reading as an empty `ok` section. Those values are stored in the device record and returned by `GET /api/v1/hardware/{id}` (the chassis, baseboard and machine-id values in `ci`, and every section's status, reason, source and rows in `ci.sections`; a `constrained` section reads as incomplete, and an `unavailable` or `permission_denied` one shows its reason and no rows). The MCP `get_hardware_ci` tool returns the same body, but its published output schema does not describe the new keys yet. They are not yet shown on the Hardware pages. The Hardware list search (`q`) also matches the chassis asset tag, chassis serial and board serial.
+On Windows the `chassis`, `baseboard`, `swap` and `machine_id` sections now report data (and the `cpu` and `dimm` rows carry the socket, stepping and DIMM identity columns); Linux and macOS still report `<os>:planned` for the four. A Windows section that could not be read reports `constrained`, `permission_denied` or `unavailable` with a reason token such as `smbios:win32_5`, `windows:machine_guid:absent` or `wmi:<class>:<cause>` (where `<class>` is `processors`, `memory`, `pagefile_usage` or `pagefile_setting`); the full token list is in the Result status table of the hardware plugin README (`agents/plugins/hardware/README.md`). On Windows the `cpu` and `dimm` sections also carry a non-`ok` status (with the reason token) when their WMI query fails, instead of reading as an empty `ok` section. Those values are stored in the device record and returned by `GET /api/v1/hardware/{id}` (the chassis, baseboard and machine-id values in `ci`, and every section's status, reason, source and rows in `ci.sections`; a `constrained` section reads as incomplete, and an `unavailable` or `permission_denied` one shows its reason and no rows). The MCP `get_hardware_ci` tool returns the same body and its output schema declares the new keys. They are not yet shown on the Hardware pages. The Hardware list search (`q`) also matches the chassis asset tag, chassis serial and board serial.
 
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its
