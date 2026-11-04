@@ -3852,8 +3852,9 @@ A bare UPDATE from an earlier binary against a migrated schema fails (SQLSTATE c
 the reviewer rule; the deployment contract excludes earlier binaries, so this is a backstop, not a supported
 configuration. That is the claim, and its limits are part of it: append-only against the application path and
 ordinary SQL. It is NOT held against the application credential:
-the migration runner creates the schema under that role, so the owner can disable a trigger, forge a matching
-history row or truncate. A role granted TRUNCATE can truncate, and a database administrator can do anything. A
+the migration runner creates the schema under that role, so the owner can disable a trigger (`ALTER TABLE ... DISABLE
+TRIGGER USER` succeeds for a non-superuser owner; `DISABLE TRIGGER ALL` is refused to a non-superuser because it
+includes system triggers), drop a trigger, replace the guard function, forge a matching history row or truncate. A role granted TRUNCATE can truncate, and a database administrator can do anything. A
 data-only restore into a migrated schema is refused by the guard; restore schema and data together. A future
 migration that touches attestation rows must disable the triggers inside its own transaction. The guard
 triggers protect the frozen grants, the decisions and the history. The campaign row (`status`, `closed_at_ms`,
@@ -3887,13 +3888,21 @@ state row. The full text of a superseded entry stays in the database and is not 
 is a database read of `access_review_attestation_history`. A grant adds at most 99 entries of 512 characters
 plus one whole entry to a response, so a response is bounded by the per-grant ceiling times the number of frozen
 grants; there is no per-campaign budget (an accepted limit). At 1000 grants at the limit one copy is at
-most about 87 MB with ASCII text, about 241 MB with 4-byte characters and about 364 MB when every character is
-a control character that JSON escapes to six bytes, plus about 50 MB when reviewer ids are about 520 bytes (an
-estimate of 320 bytes of fixed fields per entry; REST, MCP and the page each hold a copy). The Access page marks a cut entry "(truncated)" and never labels a pair
+most about 76 MB with ASCII text, about 228 MB with 4-byte characters and about 371 MB when every character is
+a control character that JSON escapes to six bytes (measured through `GET /api/v1/access-reviews/{id}` on a
+database holding 1000 grants of 100 entries each; the grant's top-level `justification` repeats its latest entry, so
+each grant carries one more copy of that text than its history shows), plus about 50 MB when reviewer ids are about
+520 bytes (an estimate, not measured). REST, MCP and the page each hold a copy, and the server's peak memory while
+building the REST response was about 14 times its size in that measurement (about 1.5 GB for the 76 MB case and
+about 3.9 GB for the 371 MB case), so size the server for the response, not only for the bytes on the wire. The Access page marks a cut entry "(truncated)" and never labels a pair
 in which either entry was cut as a re-recording, because a cut text cannot be shown equal to the next one. A successful attest answers `{recorded, decision_seq, previous_decision}`.
 
-**Database encoding.** The truncation counts characters and assumes a UTF8-encoded database (the HA image sets UTF8
-explicitly; the single-node image inherits the upstream PostgreSQL image's default locale); on a database with a single-byte encoding a cut can fall inside a multibyte sequence.
+**Database encoding.** The truncation counts characters and assumes a UTF8-encoded database. The server neither
+checks nor sets the encoding. Measured on 2026-11-04: the image the compose files build from `Dockerfile.postgres`, the
+CI `postgres:18.4-bookworm` image and the `postgres:18` image the playbook names all create UTF8 databases
+(`en_US.utf8`), and the HA entrypoint sets UTF8 explicitly. `install-server-postgres.sh` and `setup-rhel9.sh` set no
+encoding, so a cluster they create follows the host's locale at `initdb`; a host in the `C` locale yields `SQL_ASCII`.
+On a database with a single-byte encoding `left()` counts bytes, so a cut can fall inside a multibyte sequence.
 
 **Frozen grants whose ids exceed 1024 bytes.** No known creation path produces an id longer than the limit, but a
 frozen grant whose `principal_id` or `role_name` exceeds 1024 bytes cannot be attested (`400`); it stays pending

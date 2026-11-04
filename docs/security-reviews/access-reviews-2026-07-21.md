@@ -494,10 +494,11 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
   410 MB per copy at 1000 grants, held in several copies by the REST, MCP and page paths). With the
   preview the response is bounded by the per-grant ceiling x the number of frozen grants; there is
   no per-campaign budget (an accepted limit). At 1000 grants, each grant at its 100-decision
-  limit, one copy is at most about 87 MB with ASCII text, about 241 MB with 4-byte characters and
-  about 364 MB when every character is a control character that JSON escapes to six bytes, plus
-  about 50 MB when the reviewer ids are about 520 bytes long (the figures use the test's estimate
-  of 320 bytes of fixed fields per entry). The full
+  limit, one copy is at most about 76 MB with ASCII text, about 228 MB with 4-byte characters and
+  about 371 MB when every character is a control character that JSON escapes to six bytes
+  (measured through the REST route on 2026-11-04), plus about 50 MB when the reviewer ids are
+  about 520 bytes long (an estimate, not measured). The server's peak memory while building the
+  response was about 14 times its size in that measurement (about 3.9 GB for the 371 MB case). The full
   text of a superseded entry stays in the database and is not returned; an assessor exports it with
   a database read of `access_review_attestation_history`. A success answers `{recorded, decision_seq, previous_decision}`.
 - Audit shape: `target_id` is the campaign id alone and the grant is in `detail`, for every
