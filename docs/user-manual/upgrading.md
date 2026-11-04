@@ -576,6 +576,21 @@ window (the silence must expire), then confirm a replica reads `yuzu_server_lead
 This does not lift the safe-to-scale gate (`docs/ha-delivery-matrix.md`); running a second replica is still
 unsupported.
 
+## New: CRL expiry gauges and alerts (#6527)
+
+Additive; no behaviour change and no action is needed to keep a deployment working. Every server with the
+internal CA now exposes `yuzu_server_ca_crl_next_update_timestamp_seconds` and
+`yuzu_server_ca_crl_published_timestamp_seconds` on `/metrics` (reference: `docs/user-manual/metrics.md`), and
+`docs/prometheus/yuzu-alerts.yml` gains `YuzuCaCrlNearExpiry` (warning, under 12 hours of `nextUpdate` left) and
+`YuzuCaCrlExpired` (**critical**, past `nextUpdate`) in the `yuzu-pki` group. **Reload your Prometheus rule file to
+pick them up, and review the new critical rule before you route it**: a deployment whose CRL is already past
+`nextUpdate` pages immediately and one under 12 hours pages after 10 minutes (the leader republishes within
+seconds of boot, so a healthy deployment does neither). The
+alerts take `max by (job)`, so Prometheus must scrape every replica and unrelated Yuzu deployments sharing one
+Prometheus need separate `job`s. An install that brings its own certificates has no internal CA and exports
+nothing. A rollback to a build without the gauges silences both alerts, and no server `up == 0` alert ships, so
+configure one. Runbook: `docs/pki-architecture.md`, "CRL near expiry or expired".
+
 ## Behaviour change: `device.filesystem.find_by_hash` is bounded and reports what it skipped (#5624)
 
 **What changed.** The agent hashes in-process and stops at the first of 20 seconds, 50,000 entries visited, 4 GiB hashed or 100 matches. The limits are fixed; scan a large tree one subdirectory at a time. When anything was skipped or the search stopped early, a `truncated|<reason>|visited=N|...` row precedes `matches_found|N`. Any symlink counts, so most scans have one; scripts must not read it as a match. The result is `CONSTRAINED`/`PARTIAL` when a limit was hit, an entry was unreadable, a network mount, UNC share or non-fixed Windows drive was skipped, or the mount table could not be read (a `network_mount_guard|unavailable` row says so). Symlinks are no longer followed, so a symlink to the target file is not reported; empty files are now hashed. Agents and server may upgrade in either order.

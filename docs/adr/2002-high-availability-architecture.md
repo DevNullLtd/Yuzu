@@ -401,8 +401,8 @@ cases only (a real two-leader state cannot be built against one database), and a
 caught by it — that case is the epoch fence's alone (a frozen process serves no `/metrics`, so no alert on its own series can evaluate;
 `YuzuLeaderNoLeader` fires if no other replica takes over), and `YuzuLeaderCoordinationStale` is the signal for a
 leader that is alive and serving `/metrics` but whose coordination connection stopped answering. The fence is per database: replicas pointed at different databases (a split DSN, a Patroni double-primary) each pass their own fence, and that is the case `SplitBrain` can actually observe. This does not lift the safe-to-scale gate; remediation-claim
-lifecycle counters (#6526), a CRL freshness gauge (#6527) and a durable cluster-capability admission gate
-(#6528) are separate, unshipped items.
+lifecycle counters (#6526), a CRL freshness gauge (#6527, since shipped) and a durable cluster-capability admission gate
+(#6528) are separate items, unshipped unless noted.
 
 ### 7. Gateway cluster topology + routing (Q7)
 **Independent gateway clusters, one per trust zone / region** (internal-vs-external is a trust
