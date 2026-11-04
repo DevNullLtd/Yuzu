@@ -152,6 +152,69 @@ struct NormalizationAliasRow {
 
 enum class PackLoadOutcome { loaded, already_present };
 
+/// Result of `replace_pack`: `same_version` == the stored pack already carries the new pack's
+/// version, nothing was written.
+enum class PackReplaceOutcome { replaced, same_version };
+
+/// One curation-queue entry (an installed-software triple the title dimension could not resolve).
+struct CurationQueueRow {
+    std::string raw_name;
+    std::string raw_publisher;
+    std::string ecosystem;
+    std::int64_t device_count{0};
+    std::string status; ///< "open" | "rejected"
+    std::int64_t first_queued_at{0};
+    std::int64_t last_seen_at{0};
+};
+
+/// Keyset position of `list_curation_queue` (order: device_count DESC, then the triple ASC).
+/// `present == false` is the first page.
+struct CurationCursor {
+    bool present{false};
+    std::int64_t device_count{0};
+    std::string raw_name;
+    std::string raw_publisher;
+    std::string ecosystem;
+};
+
+struct CurationQueuePage {
+    std::vector<CurationQueueRow> rows;
+    bool has_more{false}; ///< more rows follow the last one in `rows`
+};
+
+/// The normalisation layer's headline state, from one read.
+struct NormalizationStatus {
+    std::string pack_version; ///< "" when no pack is stored
+    std::int64_t loaded_at{0};
+    std::string loaded_by;
+    std::int64_t titles_normalized{0};
+    std::int64_t titles_unnormalized{0};
+    std::int64_t queue_open{0};
+    std::int64_t queue_rejected{0};
+};
+
+/// The normalised identity a curated alias binds, derived exactly as the pack parser derives a
+/// pack row (software_normalization_pack.cpp). Pure: no store.
+struct CuratedAliasKeys {
+    std::string source;          ///< `curated:<ecosystem>`
+    std::string alias_key;       ///< edition-bearing, no wildcard
+    std::string alias_publisher; ///< normalised publisher ("" = wildcard)
+    std::string vendor;
+    std::string title;
+    std::string edition;
+    std::string norm_key;
+};
+
+/// `unexpected(reason)` names the first defect (empty title/vendor/product tokens, an edition that
+/// is not an edition token or contradicts `raw_name`). The caller has already checked `ecosystem`.
+[[nodiscard]] std::expected<CuratedAliasKeys, std::string>
+derive_curated_alias(std::string_view ecosystem, std::string_view raw_name,
+                     std::string_view raw_publisher, std::string_view vendor,
+                     std::string_view product, std::string_view edition);
+
+/// Hard ceiling on one `list_curation_queue` page, whatever the caller asks for.
+inline constexpr int kCurationQueueMaxLimit = 500;
+
 /// Error type for the authoritative single-row reads. The success type is an
 /// `std::optional<T>`: a value == found, `std::nullopt` == absent (the read
 /// succeeded, there is genuinely no such row). `std::unexpected(kDegraded)` ==
@@ -250,6 +313,44 @@ public:
     /// Fail-closed for the caller: `std::unexpected(reason)` on any failure.
     [[nodiscard]] std::expected<PackLoadOutcome, std::string>
     load_pack_if_empty(const ParsedPack& pack, std::string_view loaded_by);
+
+    /// The curation queue, `status` = "open" | "rejected" | "" (both), ordered device_count DESC
+    /// then (raw_name, raw_publisher, ecosystem), at most `limit` rows (clamped into
+    /// 1..`kCurationQueueMaxLimit`) after the keyset position `after`. AUTHORITATIVE read:
+    /// `std::nullopt` on a degrade, never an empty page.
+    [[nodiscard]] std::optional<CurationQueuePage>
+    list_curation_queue(std::string_view status, int limit, const CurationCursor& after);
+
+    /// Mark one OPEN queue entry rejected (the queue is not a resolution input, so no
+    /// normalisation lock and no dimension invalidation: a rejected row is preserved by the
+    /// reconciler). `true` == transitioned; `false` == no such open entry (absent or already
+    /// rejected); `unexpected` == SQL/pool failure.
+    [[nodiscard]] std::expected<bool, RegistryReadError>
+    reject_curation(std::string_view raw_name, std::string_view raw_publisher,
+                    std::string_view ecosystem);
+
+    /// Curate one title: mint (or refresh) the canonical product and bind the `curated:<ecosystem>`
+    /// alias to it. ONE transaction behind the blocking normalisation lock (the dimension
+    /// invalidation contract), marking every title-dimension row stale (`pack_version = ''`) in
+    /// that same transaction. The alias key is `alias_key(normalize_title(raw_name))` - it carries
+    /// the edition, no wildcard - and the publisher key is `normalize_vendor(raw_publisher)`.
+    /// Returns the product id; `unexpected(reason)` on any failure (nothing written).
+    [[nodiscard]] std::expected<std::int64_t, std::string>
+    curate_alias(std::string_view ecosystem, std::string_view raw_name,
+                 std::string_view raw_publisher, std::string_view vendor, std::string_view product,
+                 std::string_view edition, std::string_view category, std::string_view cpe_product);
+
+    /// Replace the stored alias pack with `pack` (the runtime counterpart of `load_pack_if_empty`).
+    /// One transaction behind the pack lock AND the blocking normalisation lock: the singleton
+    /// pack row is rewritten, every `pack:` alias is retired and its `pack_version` cleared, then
+    /// the new pack's products and aliases are upserted (re-activating the ones it still carries),
+    /// and every title-dimension row is marked stale. `same_version` when the stored version
+    /// already equals `pack.pack_version`. `unexpected(reason)` on any failure.
+    [[nodiscard]] std::expected<PackReplaceOutcome, std::string>
+    replace_pack(const ParsedPack& pack, std::string_view loaded_by);
+
+    /// Pack version + title/queue counts in one read. AUTHORITATIVE: `std::nullopt` on a degrade.
+    [[nodiscard]] std::optional<NormalizationStatus> normalization_status();
 
     /// The alias read on a CALLER-PINNED connection, for the title dimension owner's
     /// single transaction (a nested lease would need a second pool connection): active

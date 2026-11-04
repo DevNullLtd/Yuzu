@@ -848,6 +848,7 @@ yuzu_server_core_lib = static_library(
     'src/device_ui.cpp',
     'src/group_agent_count_preview.cpp',
     'src/inventory_routes.cpp',
+    'src/software_curation_routes.cpp',
     'src/inventory_ui.cpp',
     'src/inventory_ci_join.cpp',
     'src/hardware_list_model.cpp',
