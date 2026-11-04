@@ -44,7 +44,7 @@ The skill runs on both **Linux** (CI, WSL2) and **macOS** (operator dev box). Th
 
 **Security E2E prerequisite:** curl >= 7.68 (>= 7.84 for the Retry-After check; an older curl skips that one assertion, below 7.68 the gate fails with an explicit message).
 
-**macOS prerequisites:** GNU bash 5+ (`brew install bash` — stock /bin/bash 3.2 doesn't support `mapfile`/`declare -A`), kerl-installed Erlang, vcpkg with `VCPKG_ROOT` set, OrbStack or Docker Desktop installed (and launched once so its CLI symlinks populate `~/.orbstack/bin`), and Node 22.12+ (Phase 0b installs the puppeteer dependencies and Chrome itself; the gcovr install is Linux-only, so macOS needs no pipx).
+**macOS prerequisites:** GNU bash 5+ (`brew install bash` — stock /bin/bash 3.2 doesn't support `mapfile`/`declare -A`), kerl-installed Erlang, vcpkg with `VCPKG_ROOT` set, OrbStack or Docker Desktop installed (and launched once so its CLI symlinks populate `~/.orbstack/bin`), and Node 22.12+ (Phase 0b installs the puppeteer dependencies and Chrome itself; the gcovr install and the coverage gate are Linux-only, so macOS needs nothing more).
 
 **What skips on macOS without a running Docker daemon:**
 - Phase 1 docker-image-build → SKIP (operator can build locally only what they need)
@@ -159,9 +159,13 @@ The coverage gate (Phase 7b, report-only in default mode) needs `gcovr`. `ensure
 the way CI does: `pip install --require-hashes` from `requirements-ci.txt` into a private virtualenv
 (`~/.local/share/yuzu/gcovr-venv`), so gcovr and every dependency are hash-verified, and links the one
 `gcovr` into `~/.local/bin`. (`pip3 install --user` fails on a distro Python that is externally managed,
-and a bare `pipx install gcovr==X` would leave the dependencies unpinned.) It passes only when the
-`gcovr` your `PATH` resolves to is that one, the lookup `coverage-gate.sh` itself does. It does nothing
-off Linux, where the coverage gate does not measure.
+and a bare `pipx install gcovr==X` would leave the dependencies unpinned.) It passes when the `gcovr`
+your `PATH` resolves to (the lookup `coverage-gate.sh` itself does) reports the version `requirements-ci.in`
+pins; a gcovr you already have at that version is used as it is, and only a missing or different one is
+installed. It needs python3 3.10+ with `ensurepip` to install, and `~/.local/bin` on `PATH`: on a fresh
+account the directory may not exist at login, so the first run can install the tool and still report it
+is not on `PATH` until you re-login or add it. It does nothing off Linux, where the coverage gate does
+not measure.
 
 First run side effects: a Chrome for Testing download into `~/.cache/puppeteer` (a few hundred MB), npm's
 cache in `~/.npm`, and the gcovr virtualenv under `~/.local/share/yuzu/`. Later runs only verify.
@@ -181,8 +185,10 @@ if [[ "$MODE" == "default" || "$MODE" == "full" ]]; then
         exit 1
     fi
 
-    # gcovr only matters to the coverage gate (Phase 7b), which measures on Linux alone.
-    if [[ "$(host_os)" != "linux" ]]; then
+    # gcovr only matters to the coverage gate (Phase 7b), which measures on Linux alone. (`uname`, not
+    # host_os: the runbook blocks may run in separate shells, and nothing here may depend on a function.)
+    GCOVR_UNAVAILABLE=""
+    if [[ "$(uname -s)" != "Linux" ]]; then
         bash scripts/test/test-db-write.sh gate \
             --run-id "$RUN_ID" --phase 0 --gate "gcovr install" \
             --status SKIP --duration 0 --notes "the coverage gate measures on Linux only"
@@ -208,7 +214,10 @@ if [[ "$MODE" == "default" || "$MODE" == "full" ]]; then
                 bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED
                 exit 1
             fi
-            echo "gcovr unavailable: the coverage gate will record WARN (default mode is report-only)"
+            # Remember it for Phase 7b: with no usable pinned gcovr the coverage gate must not run at
+            # all, or it would measure with whatever other gcovr is on PATH and record that as a figure.
+            GCOVR_UNAVAILABLE=1
+            echo "gcovr unavailable: Phase 7b will not measure coverage (default mode is report-only)"
         fi
     fi
 fi
@@ -747,7 +756,16 @@ elif [[ "$MODE" == "default" ]]; then
     # Default mode: coverage in report-only (metric recorded, no enforce);
     # perf skipped (default-mode budget is too tight for the ~3-5 min
     # CT suite plus registry churn).
-    bash scripts/test/coverage-gate.sh --run-id "$RUN_ID" --report-only || true
+    if [[ -n "${GCOVR_UNAVAILABLE:-}" ]]; then
+        # Phase 0b could not provide the pinned gcovr. Measuring with some other gcovr on PATH would
+        # record a number that is not comparable to the baseline, so record WARN and measure nothing.
+        bash scripts/test/test-db-write.sh gate \
+            --run-id "$RUN_ID" --phase 7 --gate "Coverage" \
+            --status WARN --duration 0 \
+            --notes "not measured: Phase 0b could not provide the pinned gcovr (see the gcovr install row)"
+    else
+        bash scripts/test/coverage-gate.sh --run-id "$RUN_ID" --report-only || true
+    fi
     bash scripts/test/test-db-write.sh gate \
         --run-id "$RUN_ID" --phase 7 --gate "Perf" \
         --status SKIP --duration 0 --notes "perf measurement runs in --full only"
@@ -866,7 +884,7 @@ Meson logs remain Actions artifacts rather than runner-local history.
 The skill is designed so a single gate failure does NOT short-circuit the run. Goals:
 
 1. **Always finalize the run row.** Even on a hard error or interrupt, `teardown.sh --run-id "$RUN_ID"` should be called so the DB has `finished_at` set and `overall_status` is something other than `RUNNING`. Wrap the body of the run in a `trap 'bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED' ERR INT TERM` near the top.
-2. **Phase 1 (build) is the only hard short-circuit.** Build failures mean nothing else can run.
+2. **Phases 0, 0b and 1 are the hard short-circuits.** A failed preflight, a failed Puppeteer install (or, in `--full`, gcovr install) or a build failure means nothing else can run.
 3. **All other phases run to completion.** The operator gets a prioritized fix list in one pass instead of a fix-rerun loop.
 4. **Print failure summaries inline.** When a gate fails, the skill should `tail -50 "$LOG_DIR/<gate>.log"` so the operator sees the actual error without having to find the log path themselves.
 

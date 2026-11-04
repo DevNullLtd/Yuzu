@@ -69,6 +69,7 @@ Initialize each manual orchestration with a `RUN_ID`, `TEST_DIR=/tmp/yuzu-test-$
 Wall-clock order is fixed:
 
 1. Phase 0 preflight: `bash scripts/test/preflight.sh` or `--force-cleanup`.
+1b. Phase 0b tooling (default and full modes only): `bash scripts/test/ensure-puppeteer.sh` (a failure aborts the run) and `bash scripts/test/ensure-gcovr.sh` (a failure aborts a full run; in default mode it is a WARN and Phase 7b measures nothing).
 2. Phase 1 build HEAD: Meson compile, Erlang `rebar3 as prod release`, and docker images except in quick mode.
 3. Phase 2 upgrade test: `bash scripts/test/test-upgrade-stack.sh ...`; skipped in quick mode.
 4. Phase 3 OTA: full mode only; may record SKIP if still stubbed.
@@ -79,7 +80,7 @@ Wall-clock order is fixed:
 9. Phase 7b coverage: full mode only, enforces `tests/coverage-baseline.json`.
 10. Phase 8 teardown and summary.
 
-Phase 1 is mandatory-blocking. Other phases should normally continue so the operator gets one prioritized report.
+Phases 0, 0b and 1 are mandatory-blocking. Other phases should normally continue so the operator gets one prioritized report.
 
 ## UAT Lifetime Rule
 
