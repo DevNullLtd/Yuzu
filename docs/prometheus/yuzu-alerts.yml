@@ -5178,30 +5178,44 @@ groups:
         # per section (`installed_software:<facet>`), and the other sections of the call
         # still apply. outcome=rejected is a GRAMMAR refusal: the agent resends the same
         # bytes and never self-heals, so it is its own alert rather than a rise in
-        # YuzuInventoryHighNeedFullRatio. outcome=delta_unsupported is the expected
-        # honest placeholder until the delta apply is built (the agent falls back to a
-        # full section), kept here so the rate is visible and this rule is the reminder
-        # to retire the case when the delta apply lands.
+        # YuzuInventoryHighNeedFullRatio. outcome=delta_unsupported is NOT here: it is the
+        # expected placeholder until the delta apply is built, so it has its own
+        # non-paging rule (YuzuInventorySectionDeltaUnsupported) below.
         expr: |
-          sum by (facet) (rate(yuzu_inventory_section_ingest_total{outcome=~"rejected|delta_unsupported"}[15m])) > 0
+          sum by (facet) (rate(yuzu_inventory_section_ingest_total{outcome="rejected"}[15m])) > 0
         for: 15m
         labels:
           severity: warning
         annotations:
-          summary: "Installed-software v3 sections being refused or not applied"
+          summary: "Installed-software v3 sections being refused"
           description: >-
-            yuzu_inventory_section_ingest_total{outcome="rejected"} or
-            {outcome="delta_unsupported"} has been non-zero for 15m for the facet
-            label. rejected = the section broke the blob v3 grammar (an unknown
-            status, rows in a status-only section, a record whose source is not the
-            facet, a cap) - it NEVER self-heals, the agent resends the same bytes and
-            the server keeps the facet's previously held rows and section hash, so fix
-            the agent (grep the warn-level "v3 section(s) ... refused" server log
-            line for the agent_id and the refusal reason). delta_unsupported = a
-            delta section whose base matched; the server cannot apply deltas yet,
-            answers need_full, and the agent falls back to a full section - expected
-            while v3 agents ship ahead of the delta apply, a runbook item only if it
-            persists once the delta apply has shipped.
+            yuzu_inventory_section_ingest_total{outcome="rejected"} has been non-zero
+            for 15m for the facet label. rejected = the section broke the blob v3
+            grammar (an unknown status, rows in a status-only section, a record whose
+            source is not the facet, a record holding a NUL byte or missing its
+            terminator, a cap) - it NEVER self-heals, the agent resends the same bytes
+            and the server keeps the facet's previously held rows and section hash, so
+            fix the agent (grep the warn-level "v3 section(s) ... refused" server log
+            line for the agent_id and the refusal reason).
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventorySectionDeltaUnsupported
+        # The expected honest placeholder until the delta apply is built (the agent falls
+        # back to a full section, nothing is lost). Info severity, so it never pages: it keeps
+        # the rate visible and is the reminder to retire this rule when the delta apply lands.
+        expr: |
+          sum by (facet) (rate(yuzu_inventory_section_ingest_total{outcome="delta_unsupported"}[15m])) > 0
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "Installed-software v3 deltas answered with a full-section request"
+          description: >-
+            yuzu_inventory_section_ingest_total{outcome="delta_unsupported"} has been
+            non-zero for 1h for the facet label. A delta section whose base matched was
+            answered need_full because this server cannot apply deltas yet; the agent
+            falls back to a full section. Expected while v3 agents ship ahead of the delta
+            apply, so no action is needed; it is a runbook item only if it persists once
+            the delta apply has shipped.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryDroppedBlobs
         # outcome=dropped = a blob over the 3 MiB cap was rejected + nacked. UNLIKE
