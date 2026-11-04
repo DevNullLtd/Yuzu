@@ -8,7 +8,8 @@
   and `Infrastructure:Delete` respectively). If the grant has been withdrawn, the request is
   refused by the permission gate (normally `403`) and nothing is sent, created or purged. The audit
   log records `failure` with `permission_revoked`: as
-  `reason=permission_revoked <plugin>:<action>` for `command.dispatch`, `permission_revoked device=<id> source=<src>` for the Echo rows, and
-  `permission_revoked name=<group>` for `group.create_from_results`. The Echo refusals are counted as
-  `yuzu_echo_source_{reenable,purge}_total{result="denied"}`. A group's `created_by` now names the
+  `reason=permission_revoked <plugin>:<action>` for `command.dispatch`,
+  `permission_revoked device=<id> source=<src>` for the Echo rows, and
+  `permission_revoked name=<group>` for `group.create_from_results`. The Echo refusals are counted
+  as `yuzu_echo_source_{reenable,purge}_total{result="denied"}`. A group's `created_by` now names the
   principal as re-authenticated after the wait.
