@@ -349,6 +349,7 @@ agent_test_exe = executable(
     'unit/test_antivirus_parsers.cpp',
     'unit/test_firewall_parsers.cpp',
     'unit/test_disk_actions_local_dispatcher.cpp', # Wave 6 PR6.1-a-1: real disk_actions dylib/.so/.dll
+    'unit/test_disk_actions_partitions.cpp', # H.5b: pure layer of the Windows partitions leg (runs on every host)
     'unit/test_firewall_local_dispatcher.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_tls_policy.cpp', # #4722: shared TLS cipher policy (common/include/yuzu/tls_policy.hpp), pure
