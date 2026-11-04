@@ -673,3 +673,64 @@ TEST_CASE("NAT64 discovery: a thrown flight is counted ONCE and opens a logged e
     CHECK(log.count(kEndedLine) == 1);
     drain(pool);
 }
+
+// Moved from the CRL-source registry's tests (#6583 review): the cache's own decode, never-shrink
+// and overflow contract, exercised through the shared wiring rather than a consumer.
+TEST_CASE("RFC 7050 discovery: answers become prefixes; a no-DNS64 network is an answered empty set",
+          "[bounded_resolver][nat64_discovery]") {
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    DiscoveryRig rig;
+    const auto d = discover(kFullBudget, answering({"192.0.0.170", kPref1, "2001:db8:122:344::c000:ab"}),
+                            rig.cache, pool);
+    REQUIRE(d.ever_answered);
+    REQUIRE(d.prefixes.size() == 1);
+    CHECK(d.prefixes[0].length == 96);
+    CHECK(d.learned_new);
+
+    DiscoveryRig plain;
+    const auto none = discover(kFullBudget, answering({"192.0.0.170", "192.0.0.171"}), plain.cache, pool);
+    CHECK(none.ever_answered);
+    CHECK(none.prefixes.empty());
+    // A resolver "not found" for .arpa is still an ANSWER (an air-gapped resolver).
+    DiscoveryRig nf;
+    CHECK(discover(kFullBudget, failing(net::ResolveStatus::kNotFound), nf.cache, pool).ever_answered);
+}
+
+TEST_CASE("RFC 7050 discovery: the cache NEVER shrinks, a failure keeps everything learned",
+          "[bounded_resolver][nat64_discovery]") {
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    DiscoveryRig rig;
+    REQUIRE(discover(kFullBudget, answering({kPref1}), rig.cache, pool).prefixes.size() == 1);
+    // A different answer ADDS; it does not replace.
+    rig.expire();
+    auto d = discover(kFullBudget, answering({"3fff:0:0:1::c000:aa"}), rig.cache, pool);
+    CHECK(d.prefixes.size() == 2);
+    // An empty answer removes nothing.
+    rig.expire();
+    CHECK(discover(kFullBudget, answering({"192.0.0.170"}), rig.cache, pool).prefixes.size() == 2);
+    // A FAILED lookup removes nothing, and says so.
+    rig.expire();
+    d = discover(kFullBudget, failing(), rig.cache, pool);
+    CHECK(d.looked_up);
+    CHECK_FALSE(d.answered_now);
+    CHECK(d.ever_answered);
+    CHECK(d.prefixes.size() == 2);
+    // The failure is cached for the negative TTL: the next call does not look up again.
+    CHECK_FALSE(discover(kFullBudget, failing(), rig.cache, pool).looked_up);
+}
+
+TEST_CASE("RFC 7050 discovery: overflow past the bound is never a partial set",
+          "[bounded_resolver][nat64_discovery]") {
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    DiscoveryRig rig;
+    // 65 distinct /96 prefixes in one answer.
+    std::vector<std::string> many;
+    for (int i = 0; i < 65; ++i) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "2001:db8:%x:1::c000:aa", i + 1);
+        many.emplace_back(buf);
+    }
+    const auto d = discover(kFullBudget, answering(many), rig.cache, pool);
+    CHECK(d.overflowed);
+    CHECK(d.prefixes.empty());
+}
