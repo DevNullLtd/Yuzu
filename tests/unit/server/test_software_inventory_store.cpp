@@ -5206,6 +5206,16 @@ TEST_CASE("v3: a component_inventory section records its state, holds no hash, a
     CHECK(store.apply_installed_software("agent-cp", agg, std::nullopt, 0) ==
           InventoryIngestOutcome::kTouched);
 
+    // The nack is keyed on the status, not on whether records came: a `full` component section
+    // with NO records is answered need-full too (the store has no component storage to confirm
+    // it into), and it changes no rows.
+    res = store.apply_installed_software_v3(
+        "agent-cp", v3_report({v3_status(kV3Comp, V3Status::kFull, "tok2")}));
+    REQUIRE(res.size() == 1);
+    CHECK(res[0].outcome == V3SectionOutcome::kNeedFull);
+    CHECK(names_of(pool, "agent-cp", kV3Apps) == std::vector<std::string>{"Alpha"});
+    CHECK(stored_hash(pool, "agent-cp") == agg);
+
     // A status-only component section is a complete report, not a request for a resend.
     res = store.apply_installed_software_v3("agent-cp",
                                             v3_report({v3_status(kV3Comp, V3Status::kDisabled)}));
@@ -5447,6 +5457,32 @@ TEST_CASE("ingest_inventory_report v3: a refused section nacks only its facet; t
                          {{"source", "installed_software"}, {"phase", "v3"}})
               .snapshot()
               .count == 1);
+}
+
+TEST_CASE("ingest_inventory_report v3: a full component_inventory section with no records is "
+          "nacked",
+          "[pg][software_inventory][seam][v3]") {
+    SWINV_SHARED(store, pool);
+    yuzu::MetricsRegistry metrics;
+
+    // A syntactically complete, honest-empty component section: header line only, no records.
+    const std::string blob = w_hdr() + w_sec(kV3Comp, "full");
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = "claimed-and-ignored";
+    (*rep.mutable_plugin_data())["installed_software"] = blob;
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-seam-cz", rep, ack, &metrics);
+
+    CHECK(std::vector<std::string>(ack.need_full().begin(), ack.need_full().end()) ==
+          std::vector<std::string>{"installed_software:component_inventory"});
+    CHECK(metrics
+              .counter("yuzu_inventory_section_ingest_total",
+                       {{"facet", kV3Comp}, {"outcome", "need_full"}})
+              .value() == 1.0);
+    CHECK(metrics
+              .counter("yuzu_inventory_ingest_total",
+                       {{"source", "installed_software"}, {"outcome", "need_full"}})
+              .value() == 1.0);
 }
 
 TEST_CASE("ingest_inventory_report v3: a section holding a NUL byte is refused, nothing of it is "
