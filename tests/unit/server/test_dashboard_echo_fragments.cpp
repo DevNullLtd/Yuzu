@@ -736,7 +736,7 @@ TEST_CASE("dashboard execute still broadcasts when scope is OMITTED entirely (CD
 }
 
 TEST_CASE("dashboard execute FAILS CLOSED when the exec-visible derivation is unwired (CDX-R7-02)",
-          "[server][dashboard][execute][scope]") {
+          "[pg][server][dashboard][execute][scope]") {
     // Genuinely UNWIRED CallerFn: the production handler must hand dispatch
     // a PRESENT EMPTY visible set (deny all), never nullopt (unfiltered).
     FragmentHarness h(/*with_dispatch=*/true, /*wire_exec_visible=*/false);
@@ -754,7 +754,7 @@ TEST_CASE("dashboard execute FAILS CLOSED when the exec-visible derivation is un
 // exec_visible.
 TEST_CASE("dashboard execute hands dispatch an EMPTY principal when the CallerFn is unwired "
           "(PLAN-006)",
-          "[server][dashboard][execute][scope]") {
+          "[pg][server][dashboard][execute][scope]") {
     FragmentHarness h(/*with_dispatch=*/true, /*wire_exec_visible=*/false);
     h.resolve_to = {"os_info", "version"};
     h.dispatch_sent = 0;

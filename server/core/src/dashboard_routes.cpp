@@ -970,10 +970,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                       kGroupAuditRefusal))
                      return;
 
-                 // UP-5 (#3619): the attempted row can wait on the audit pool, so visibility is
-                 // resolved again and the set narrowed to what the caller may see NOW; a
-                 // revocation during the wait drops those agents from the group.
-                 agent_scope = resolve_visible_scope(*session);
+                 // UP-5 (#3619): the attempted row can wait on the audit pool, so the session is
+                 // authenticated again (a revoked elevation or an invalidated session must not
+                 // survive in the copy taken before the wait) and visibility is resolved from
+                 // it, narrowing the set to what the caller may see NOW.
+                 const auto fresh_session = auth_fn_(req, res); // writes its own 401 when gone
+                 if (!fresh_session) {
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "", "session_revoked");
+                     return;
+                 }
+                 agent_scope = resolve_visible_scope(*fresh_session);
                  if (const auto dropped = keep_visible(agent_ids, agent_scope); dropped > 0) {
                      audit_or_flag(req, res, "response.read", "denied", "Execution", command_id,
                                    "scope_dropped=" + std::to_string(dropped) +

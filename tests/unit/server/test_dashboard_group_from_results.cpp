@@ -248,6 +248,10 @@ struct GroupFromResultsHarness {
     /// whenever this is true, at the moment each request is authenticated.
     bool elevated_session{false};
 
+    /// #3619 UP-5: read live by `auth_fn`; false = the session is gone (revoked/invalidated),
+    /// so the next authentication answers 401. Lets a case revoke the session mid-request.
+    bool session_valid{true};
+
     /// Counts invocations of `visible_set_fn` regardless of what it
     /// returns (CDX-FV-04) -- lets a degrade-path test prove the scope
     /// resolver was never even CALLED, not merely that its result was
@@ -301,7 +305,11 @@ struct GroupFromResultsHarness {
         }
 
         auto auth_fn = [this](const httplib::Request&,
-                             httplib::Response&) -> std::optional<auth::Session> {
+                             httplib::Response& res) -> std::optional<auth::Session> {
+            if (!session_valid) {
+                res.status = 401;
+                return std::nullopt;
+            }
             auth::Session s;
             s.username = kUser;
             s.role = auth::Role::admin;
@@ -1798,6 +1806,8 @@ TEST_CASE("group-from-results audit (UP-5): visibility revoked while the attempt
     auto group = h.mg.find_group_by_name("revoked-mid-write");
     REQUIRE(group.has_value());
     CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
+    // The post-wait narrowing is itself audited (Gate 8 QE F1).
+    CHECK(contains(h.audit_detail("response.read", "denied"), "phase=post_attempted"));
 }
 
 TEST_CASE("group-from-results audit (UP-5): every agent revoked while the attempted row is written "
@@ -1823,4 +1833,49 @@ TEST_CASE("group-from-results audit (UP-5): every agent revoked while the attemp
     REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
     CHECK(h.audit_detail("group.create_from_results", "failure") == "scope_revoked");
     CHECK(toast_message(*res) == "No agents match the current filters. Nothing was created.");
+    CHECK(contains(h.audit_detail("response.read", "denied"), "phase=post_attempted"));
+}
+
+TEST_CASE("group-from-results audit (UP-5): JIT elevation revoked while the attempted row is "
+          "written no longer widens the group to the fleet",
+          "[pg][server][dashboard][group_from_results][audit][security][3619]") {
+    // An elevated session sees the whole fleet (resolve_visible_scope -> nullopt). If the
+    // elevation is revoked during the attempted-row wait, the group must be built from the
+    // caller's CURRENT (confined) visibility, not from the session copy taken before the wait.
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
+    h.elevated_session = true;
+    h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{"agent-A"}; // the confined view once not elevated
+    };
+    h.audit_persists = [&h](const AuditRow& r) {
+        if (r.action == "group.create_from_results" && r.result == "attempted")
+            h.elevated_session = false; // revoked mid-write
+        return true;
+    };
+
+    auto res = h.post(GroupFromResultsHarness::form_body("elevation-revoked"));
+    CHECK(res->status == 200);
+    auto group = h.mg.find_group_by_name("elevation-revoked");
+    REQUIRE(group.has_value());
+    CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
+}
+
+TEST_CASE("group-from-results audit (UP-5): a session invalidated while the attempted row is "
+          "written creates no group and records the outcome",
+          "[pg][server][dashboard][group_from_results][audit][security][3619]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    h.audit_persists = [&h](const AuditRow& r) {
+        if (r.action == "group.create_from_results" && r.result == "attempted")
+            h.session_valid = false; // session invalidated mid-write
+        return true;
+    };
+
+    auto res = h.post(GroupFromResultsHarness::form_body("session-gone"));
+    CHECK(res->status == 401);
+    CHECK_FALSE(h.mg.find_group_by_name("session-gone").has_value());
+    CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
+    REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
+    CHECK(h.audit_detail("group.create_from_results", "failure") == "session_revoked");
 }
