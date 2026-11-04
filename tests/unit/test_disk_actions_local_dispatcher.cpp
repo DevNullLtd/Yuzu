@@ -30,6 +30,7 @@
 #include "disk_actions_legs.hpp"
 #include "disk_actions_parsers.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdlib>
@@ -416,7 +417,8 @@ constexpr const char* kPlannedToken = "macos:planned";
 constexpr const char* kPlannedToken = "linux:planned";
 #endif
 
-TEST_CASE("disk_actions plugin: partitions and topology are declared PLANNED on every leg",
+TEST_CASE("disk_actions plugin: partitions is read on Windows, otherwise partitions and topology "
+          "are declared PLANNED",
           "[disk_actions][descriptors]") {
     auto plugin = load_disk_actions_plugin();
     if (!plugin) {
@@ -430,10 +432,15 @@ TEST_CASE("disk_actions plugin: partitions and topology are declared PLANNED on 
         const std::string_view name{a.action};
         INFO("action: " << name);
         if (name == "partitions" || name == "topology") {
-            for (const auto* leg : {&a.linux_leg, &a.macos_leg, &a.windows_leg}) {
+            for (const auto* leg : {&a.linux_leg, &a.macos_leg}) {
                 CHECK(leg->support == YUZU_SUPPORT_PLANNED);
                 CHECK(leg->rung == 1);
             }
+            // H.5b: the Windows partitions leg is read (constrained: it cannot see the Microsoft
+            // Reserved partition or a folder mount point); Windows topology has no source ruled.
+            CHECK(a.windows_leg.rung == 1);
+            CHECK(a.windows_leg.support ==
+                  (name == "partitions" ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_PLANNED));
         } else if (name == "smart") {
             CHECK(a.linux_leg.support == YUZU_SUPPORT_UNSUPPORTED);
             CHECK(a.macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
@@ -457,6 +464,10 @@ TEST_CASE("disk_actions plugin: partitions and topology answer one typed planned
     yuzu::agent::LocalDispatcher dispatcher;
     for (const char* name : {"partitions", "topology"}) {
         INFO("action: " << name);
+#if defined(_WIN32)
+        if (std::string_view{name} == "partitions")
+            continue; // read on Windows: covered by the live test below
+#endif
         auto result = dispatcher.run(plugin->descriptor, name);
         CHECK(result.rc == 0);
         const auto rows = captured_rows(result.captured);
@@ -467,6 +478,45 @@ TEST_CASE("disk_actions plugin: partitions and topology answer one typed planned
         CHECK(result.result_provenance == kPlannedToken);
     }
 }
+
+#if defined(_WIN32)
+// H.5b: the real leg, against this host's WMI. Shapes only -- the values are the machine's.
+TEST_CASE("disk_actions plugin: Windows partitions answers a status row then 7-column partition rows",
+          "[disk_actions][actions][windows_partitions]") {
+    auto plugin = load_disk_actions_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "partitions");
+    CHECK(result.rc == 0);
+    const auto rows = captured_rows(result.captured);
+    REQUIRE_FALSE(rows.empty());
+    // Exactly one status row, and it is first.
+    CHECK(rows[0].starts_with("status|partitions|"));
+    CHECK(std::count_if(rows.begin(), rows.end(),
+                        [](const std::string& r) { return r.starts_with("status|"); }) == 1);
+    CHECK((result.result_status == YUZU_RESULT_STATUS_OK ||
+           result.result_status == YUZU_RESULT_STATUS_CONSTRAINED));
+    // A Windows host that booted from a disk has a system partition.
+    REQUIRE(rows.size() >= 2);
+    bool saw_physical_drive = false;
+    for (std::size_t i = 1; i < rows.size(); ++i) {
+        INFO("row: " << rows[i]);
+        const auto f = split_fields_escape_aware(rows[i]);
+        REQUIRE(f.size() == 7);
+        CHECK(f[0] == "partition");
+        if (f[1].starts_with("PhysicalDrive"))
+            saw_physical_drive = true;
+        CHECK(f[3] != "0"); // an unread size is "-", never a fabricated zero
+    }
+    CHECK(saw_physical_drive);
+    // Deterministic: a second read is byte-identical (the daily-sync blob is hashed).
+    auto again = dispatcher.run(plugin->descriptor, "partitions");
+    CHECK(captured_rows(again.captured) == rows);
+}
+#endif // _WIN32
 
 TEST_CASE("disk_actions plugin: an unknown action is refused, not silently ignored",
           "[disk_actions][actions]") {

@@ -114,8 +114,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_PLANNED, 1, "diskutil list + getmntinfo",
          "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "Win32_DiskPartition + Win32_LogicalDisk",
-         "not read yet: one unsupported status row, windows:planned"},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "Win32_DiskPartition + Win32_LogicalDiskToPartition",
+         "one row per partition Windows exposes through Win32_DiskPartition, with its drive "
+         "letters; the 16 MiB Microsoft Reserved partition is not listed by that class, and a "
+         "volume mounted on a folder rather than a drive letter shows no mount point"},
     },
     {
         /* .action      = */ "topology",

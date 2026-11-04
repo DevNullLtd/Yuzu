@@ -85,9 +85,11 @@
 #endif
 
 #include <win_str.hpp>
+#include <wmi_bounded.hpp>
 
 #include "disk_actions_legs.hpp"
 #include "disk_actions_parsers.hpp"
+#include "disk_actions_partitions.hpp"
 #include <planned_leg.hpp>
 
 #include <array>
@@ -867,11 +869,77 @@ int emit_volumes(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-// PLANNED (partitions/topology): one `status|<action>|unsupported|windows:planned` row until
-// H.5 (partitions; topology stays planned until a Windows source is ruled) lands. The shared
-// reporter owns the grammar (agents/shared/planned_leg.hpp).
+// partitions: Win32_DiskPartition (rows) + Win32_LogicalDiskToPartition (drive letters), both
+// through the bounded WMI helper, so neither call can wedge the daily-sync thread (roadmap
+// Principle 14). The pure layer (disk_actions_partitions.hpp) owns the row grammar and the whole
+// outcome contract; this function owns the two queries, the typed result status, and the rule
+// that no exception crosses the plugin ABI (the SDK trampoline has no catch).
+//
+// Both classes live in root\cimv2, which grants Authenticated Users local access; the leg was
+// measured under a non-admin NT SERVICE virtual account (README: "Windows partitions").
+//
+// `topology` stays planned: no Windows source has been ruled for it.
+namespace {
+
+partitions::QueryOutcome run_partition_query(const wchar_t* wql, std::size_t row_cap) {
+    yuzu::shared::wmi::BoundedQueryOptions opts;
+    opts.row_cap = row_cap;
+    auto r = yuzu::shared::wmi::run_bounded_wmi_query(L"ROOT\\CIMV2", wql, opts);
+    partitions::QueryOutcome out;
+    out.rows = std::move(r.rows);
+    out.truncated = r.truncated;
+    if (r.error)
+        out.error = *r.error;
+    return out;
+}
+
+// Larger than the device-record ceiling for the kind (192 partition rows, device_ci_kinds.hpp):
+// the writer trims to its own cap, and a host past this many partitions reports row_cap.
+constexpr std::size_t kPartitionRowCap = 256;
+
+void report_partitions(yuzu::CommandContext& ctx, const partitions::Report& rep) {
+    ctx.write_output(rep.status_row);
+    for (const std::string& row : rep.data_rows)
+        ctx.write_output(row);
+    switch (rep.level) {
+    case partitions::Level::Ok:
+        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "windows:partitions");
+        break;
+    case partitions::Level::Constrained:
+        mark_result_partial(ctx, rep.reason.empty() ? "windows:partitions" : rep.reason);
+        break;
+    case partitions::Level::Denied:
+        mark_result_denied(ctx, rep.reason, "the partition query was refused");
+        break;
+    case partitions::Level::Unavailable:
+        mark_result_unavailable(ctx, rep.reason, "the partition class is not present on this host");
+        break;
+    }
+}
+
+} // namespace
+
 int emit_partitions(yuzu::CommandContext& ctx) {
-    return yuzu::shared::report_planned(ctx, "partitions");
+    try {
+        const auto parts = run_partition_query(
+            L"SELECT DeviceID, DiskIndex, Index, Size, Type FROM Win32_DiskPartition", kPartitionRowCap);
+        // Skip the association query when the partitions themselves could not be read: its
+        // answer would not be used, and a second failing call just spends the sync thread's time.
+        partitions::QueryOutcome links;
+        if (parts.error.empty())
+            links = run_partition_query(L"SELECT Antecedent, Dependent FROM Win32_LogicalDiskToPartition",
+                                        kPartitionRowCap);
+        report_partitions(ctx, partitions::build_report(parts, links));
+    } catch (...) {
+        // Reached only by an allocation failure or a bug. The section must still say it failed:
+        // an exception here would unwind through the plugin trampoline, which does not catch.
+        try {
+            ctx.write_output("status|partitions|constrained|windows:partitions:internal_error");
+            mark_result_partial(ctx, "windows:partitions:internal_error");
+        } catch (...) {
+        }
+    }
+    return 0;
 }
 
 int emit_topology(yuzu::CommandContext& ctx) {

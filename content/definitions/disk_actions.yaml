@@ -11,7 +11,9 @@
 ##            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS +
 ##            GetVolumePathNamesForVolumeNameW for `volumes`. The device handle
 ##            is opened with ZERO access rights, which an unprivileged service
-##            account may do.
+##            account may do. `partitions` reads Win32_DiskPartition and
+##            Win32_LogicalDiskToPartition through the bounded WMI helper (no
+##            device handle; measured under a non-admin service account).
 ##   macOS:   IOKit IOBlockStorageDevice device characteristics (identity,
 ##            medium type, NVMe-SMART capability) for `smart`; IOKit IOMedia
 ##            provider walk + getmntinfo_r_np(3) MNT_NOWAIT for `volumes`.
@@ -236,10 +238,13 @@ metadata:
   version: 1.0.0
   description: >
     Reports the partitions of each physical disk with size, partition type and
-    mount points. Not read yet on any OS: every dispatch answers one unsupported
-    status row (windows:planned, linux:planned or macos:planned) until its leg
-    lands. It is dispatched by the daily device-record sync, so its status (including
-    the planned one) is recorded as the partition section of the record.
+    mount points. Read on Windows (Win32_DiskPartition with the drive letters from
+    Win32_LogicalDiskToPartition; the 16 MiB Microsoft Reserved partition is not
+    listed by that class, and a folder mount point shows no mount point). Not read
+    yet on Linux or macOS: a dispatch there answers one unsupported status row
+    (linux:planned or macos:planned) until its leg lands. It is dispatched by the
+    daily device-record sync, so its status is recorded as the partition section
+    of the record.
   tags: [storage, disk, partitions]
 
 spec:
@@ -256,7 +261,7 @@ spec:
     properties: {}
 
   result:
-    # status|partitions|<level>|<reason>   (always first; the only row until a leg lands)
+    # status|partitions|<level>|<reason>   (always first; the only row where the leg is planned)
     # partition|<disk>|<partition>|<size_bytes>|<type>|<mount_points>|<detail>
     columns:
       - name: row_kind
@@ -270,37 +275,44 @@ spec:
       - name: disk
         type: string
         description: >-
-          Physical disk the partition belongs to. Status rows: the action name.
+          Physical disk the partition belongs to (Windows: PhysicalDrive<N>, the spelling
+          smart and volumes use). Status rows: the action name.
         example: "disk0"
         platforms: [windows, linux, darwin]
       - name: partition
         type: string
         description: >-
-          Partition identifier. Status rows: the level (unsupported).
+          Partition identifier (Windows: the provider's DeviceID, e.g. "Disk #0, Partition
+          #1", 0-based). Status rows: the level (supported, constrained or unsupported).
         example: "disk0s2"
         platforms: [windows, linux, darwin]
       - name: size_bytes
         type: string
         description: >-
-          Partition size in bytes, or "-" when unread. Status rows: the reason token (<os>:planned).
+          Partition size in bytes, or "-" when unread. Status rows: the reason token(s),
+          comma-separated (windows:partitions:..., or <os>:planned), or "-" when clean.
         example: "494384795648"
         platforms: [windows, linux, darwin]
       - name: type
         type: string
         description: >-
-          Partition type or filesystem hint, or "-". Absent on status rows.
+          Partition type or filesystem hint, or "-" (Windows: the Win32_DiskPartition.Type
+          string, e.g. "GPT: Basic Data"). Absent on status rows.
         example: "apfs"
         platforms: [windows, linux, darwin]
       - name: mount_points
         type: string
         description: >-
-          Comma-separated mount points or drive letters, or "-". Absent on status rows.
+          Comma-separated mount points or drive letters, or "-". On Windows "-" means no
+          drive letter was mapped, unless detail says mount_points_unread, in which case the
+          mapping could not be read. Absent on status rows.
         example: "/"
         platforms: [windows, linux, darwin]
       - name: detail
         type: string
         description: >-
-          Free text, or "-". Absent on status rows.
+          Free text, or "-" (Windows: the fixed token wmi, or wmi,mount_points_unread).
+          Absent on status rows.
         example: "-"
         platforms: [windows, linux, darwin]
 

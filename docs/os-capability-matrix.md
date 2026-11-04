@@ -334,7 +334,7 @@ implementation is.
 | disk_actions | volumes | windows | constrained | 1 | FindFirstVolumeW + IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS + GetVolumePathNamesForVolumeNameW | maps volumes to the physical drives backing them; a volume spanning several drives (a spanned or striped dynamic volume) reports every drive it touches, and a volume with no assigned drive letter or mount point reports '-' for mount points rather than being omitted |
 | disk_actions | partitions | linux | planned | 1 | /proc/self/mountinfo + /sys/block/*/<part> | not read yet: one unsupported status row, linux:planned |
 | disk_actions | partitions | macos | planned | 1 | diskutil list + getmntinfo | not read yet: one unsupported status row, macos:planned |
-| disk_actions | partitions | windows | planned | 1 | Win32_DiskPartition + Win32_LogicalDisk | not read yet: one unsupported status row, windows:planned |
+| disk_actions | partitions | windows | constrained | 1 | Win32_DiskPartition + Win32_LogicalDiskToPartition | one row per partition Windows exposes through Win32_DiskPartition, with its drive letters; the 16 MiB Microsoft Reserved partition is not listed by that class, and a volume mounted on a folder rather than a drive letter shows no mount point |
 | disk_actions | topology | linux | planned | 1 | /sys/block/dm-*/dm/{name,uuid}, md*/md, slaves | not read yet: one unsupported status row, linux:planned |
 | disk_actions | topology | macos | planned | 1 | diskutil apfs list | not read yet: one unsupported status row, macos:planned |
 | disk_actions | topology | windows | planned | 1 | no source ruled; stays planned | not read yet: one unsupported status row, windows:planned |
