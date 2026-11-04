@@ -980,6 +980,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                    "ManagementGroup", "", "session_revoked");
                      return;
                  }
+                 // The flat ManagementGroup:Write admission above ran before the wait too, so it
+                 // is decided again for the re-authenticated session: a grant revoked during the
+                 // wait creates nothing (#3619 review). The gate writes its own 403.
+                 if (!perm_fn_(req, res, "ManagementGroup", "Write")) {
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "", "permission_revoked");
+                     return;
+                 }
                  agent_scope = resolve_visible_scope(*fresh_session);
                  if (const auto dropped = keep_visible(agent_ids, agent_scope); dropped > 0) {
                      audit_or_flag(req, res, "response.read", "denied", "Execution", command_id,
@@ -1005,7 +1013,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  mg.description = "Created from filtered results (command " +
                                   command_id + ")";
                  mg.membership_type = "static";
-                 mg.created_by = session->username;
+                 mg.created_by = fresh_session->username;
                  auto group_result = mgmt_group_store_->create_group(mg);
                  if (!group_result) {
                      // The attempted row above is stored, so it gets an outcome (#3619). It

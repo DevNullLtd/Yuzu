@@ -264,6 +264,11 @@ struct GroupFromResultsHarness {
     /// per request; `fleet_read_calls` proves whether the gate ran at all.
     bool fleet_read_admit{true};
     int fleet_read_calls{0};
+
+    /// The flat ManagementGroup:Write admission (`perm_fn`). Admits by default; read live per
+    /// call so a case can revoke it while the attempted row is written (#3619 review).
+    bool perm_allow{true};
+    int perm_calls{0};
     std::string fleet_read_securable;
     std::string fleet_read_operation;
 
@@ -330,8 +335,17 @@ struct GroupFromResultsHarness {
             }
             return s;
         };
-        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) -> bool { return true; };
+        // Read live per call, so a case can revoke ManagementGroup:Write mid-request (#3619).
+        // A denial answers 403 itself, as the production gate does.
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                              const std::string&) -> bool {
+            ++perm_calls;
+            if (perm_allow)
+                return true;
+            res.status = 403;
+            res.set_content(R"({"error":"permission denied"})", "application/json");
+            return false;
+        };
         // ONE recording sink behind both callbacks, as production wires ONE `audit_log` behind
         // both (server.cpp): the persist-reporting `set_persist_audit_fn` sink the `attempted`
         // row goes through, and `audit_fn` for the outcome, refusal and scope-drop rows. Each
@@ -1878,4 +1892,25 @@ TEST_CASE("group-from-results audit (UP-5): a session invalidated while the atte
     CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
     REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
     CHECK(h.audit_detail("group.create_from_results", "failure") == "session_revoked");
+}
+
+TEST_CASE("group-from-results audit (UP-5): ManagementGroup:Write revoked while the attempted row "
+          "is written creates no group and records the outcome",
+          "[pg][server][dashboard][group_from_results][audit][security][3619]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    h.audit_persists = [&h](const AuditRow& r) {
+        if (r.action == "group.create_from_results" && r.result == "attempted")
+            h.perm_allow = false; // ManagementGroup:Write revoked mid-write
+        return true;
+    };
+
+    auto res = h.post(GroupFromResultsHarness::form_body("perm-revoked"));
+    CHECK(res->status == 403);
+    CHECK_FALSE(h.mg.find_group_by_name("perm-revoked").has_value());
+    CHECK(h.perm_calls == 2); // admission, then the recheck after the attempted row
+    CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
+    REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
+    CHECK(h.audit_detail("group.create_from_results", "failure") == "permission_revoked");
+    CHECK(h.audits_for("group.create_from_results", "success") == 0);
 }
