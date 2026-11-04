@@ -37,9 +37,9 @@
  * reparse point is refused: a link is never followed. The no-follow is leaf-only, a disclosed
  * residual for a junctioned ancestor of the home.
  *
- * BOUNDED. One kMaxTagsVisited counter per walk across both views (every enumerated name and value
- * counts, an over-long one too) and ONE RowByteBudget of kMaxTagsVisited rows and kMaxRowBytes
- * bytes; exhausting either records the walk's `row_cap` token and stops. A value is read up to
+ * BOUNDED. One kMaxEntriesVisited counter per walk across both views (every enumerated name and
+ * value counts, an over-long one too) and ONE RowByteBudget of kMaxEntriesVisited rows and
+ * kMaxRowBytes bytes; exhausting either records the walk's `row_cap` token and stops. A value is read up to
  * kMaxValueBytes, longer reads as absent.
  */
 #pragma once
@@ -62,7 +62,7 @@
 namespace yuzu::runtimes::win {
 
 inline constexpr std::size_t kMaxRowBytes = 1024 * 1024;
-inline constexpr std::size_t kMaxTagsVisited = 512;
+inline constexpr std::size_t kMaxEntriesVisited = 512;
 /// The JVM `release` file read cap (a real one is ~1.3 KB; the shared parser's own contract is 64 KiB).
 inline constexpr std::size_t kMaxReleaseBytes = 64 * 1024;
 
@@ -200,7 +200,7 @@ inline void add_jvm_home(std::vector<JvmHome>& homes, std::string home, std::str
                                                           std::string_view row_cap_token) {
     std::sort(rows.begin(), rows.end());
     rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
-    yuzu::shared::RowByteBudget budget{kMaxTagsVisited, kMaxRowBytes};
+    yuzu::shared::RowByteBudget budget{kMaxEntriesVisited, kMaxRowBytes};
     std::size_t kept = 0;
     while (kept < rows.size() && budget.charge(rows[kept].size())) ++kept;
     if (kept < rows.size()) {
@@ -302,13 +302,14 @@ struct RealRegOps {
     }
     /// One bounded read of a local-drive file, opened as itself and never followed through a link.
     /// engaged-and-empty: the file does not exist. nullopt: it exists (or may) but is not read -- not
-    /// a plain `X:\...` path, on a remote drive, a reparse point, a directory, not a disk file, over
-    /// `cap` bytes, or an open / read failure.
+    /// a plain `X:\...` path, not on a fixed local drive (remote, removable, optical, RAM or
+    /// unknown), a reparse point, a directory, not a disk file, over `cap` bytes, or an open / read
+    /// failure.
     std::optional<std::string> read_file_bounded(const std::wstring& path, std::size_t cap) const {
         if (path.size() < 3 || path[1] != L':' || (path[2] != L'\\' && path[2] != L'/'))
             return std::nullopt;
         const wchar_t root[] = {path[0], L':', L'\\', L'\0'};
-        if (GetDriveTypeW(root) == DRIVE_REMOTE) return std::nullopt;
+        if (GetDriveTypeW(root) != DRIVE_FIXED) return std::nullopt;
         struct Handle {
             HANDLE h;
             ~Handle() {
@@ -425,7 +426,7 @@ class RegWalk {
             acc_.add_failure(tok_.enum_failed);
             return false;
         }
-        if (++visited_ > kMaxTagsVisited) {
+        if (++visited_ > kMaxEntriesVisited) {
             acc_.add_failure(tok_.row_cap);
             capped_ = true;
             return false;
@@ -476,7 +477,7 @@ template <class Ops>
             }
             // Every enumerated name counts, an over-long one too, so a key stuffed with them ends
             // at the cap instead of looping to its last subkey.
-            if (++tags_seen > kMaxTagsVisited) {
+            if (++tags_seen > kMaxEntriesVisited) {
                 acc.add_failure(kTokRowCap);
                 capped = true;
                 break;
@@ -513,7 +514,7 @@ template <class Ops>
     }
     dedupe_python_rows(recs);
     sort_python_rows(recs); // registry enumeration order is unspecified: emit a stable order
-    yuzu::shared::RowByteBudget budget{kMaxTagsVisited, kMaxRowBytes};
+    yuzu::shared::RowByteBudget budget{kMaxEntriesVisited, kMaxRowBytes};
     std::vector<std::string> rows;
     for (const auto& r : recs) {
         auto row = python_row(r);

@@ -431,26 +431,26 @@ TEST_CASE("runtimes win: a tag that vanishes between enumerate and open is skipp
 TEST_CASE("runtimes win: the tag cap spans both views and reports row_cap, keeping rows already read",
           "[runtimes][python][windows]") {
     FakeOps ops;
-    // kMaxTagsVisited + 1 tags across the two views: half in each.
-    const std::size_t total = rwin::kMaxTagsVisited + 1;
+    // kMaxEntriesVisited + 1 tags across the two views: half in each.
+    const std::size_t total = rwin::kMaxEntriesVisited + 1;
     for (std::size_t i = 0; i < total; ++i)
         ops.add_tag(i < total / 2 ? L"64" : L"32", L"3." + std::to_wstring(i), "3." + std::to_string(i) + ".0",
                     "", "C:\\Py" + std::to_string(i) + "\\");
     ConstraintAccumulator acc;
     const auto rows = rwin::python_rows(ops, acc);
     CHECK(acc.reason() == std::string{rwin::kTokRowCap});
-    CHECK(rows.size() == rwin::kMaxTagsVisited); // the last tag was never visited
+    CHECK(rows.size() == rwin::kMaxEntriesVisited); // the last tag was never visited
     CHECK(ops.opened == ops.closed);
 }
 
 TEST_CASE("runtimes win: over-long tag names count against the tag cap too",
           "[runtimes][python][windows]") {
-    // kMaxTagsVisited + 1 names of 300 WCHARs: every enumeration answers ERROR_MORE_DATA. MUTATION:
+    // kMaxEntriesVisited + 1 names of 300 WCHARs: every enumeration answers ERROR_MORE_DATA. MUTATION:
     // taking the MORE_DATA `continue` before the counter lets a key stuffed with over-long names loop
     // to its last subkey with no cap, so row_cap is never recorded.
     FakeOps ops;
     auto& core = ops.node(L"64", kCore);
-    for (std::size_t i = 0; i < rwin::kMaxTagsVisited + 1; ++i)
+    for (std::size_t i = 0; i < rwin::kMaxEntriesVisited + 1; ++i)
         core.children.push_back(std::wstring(300, L'x'));
     ConstraintAccumulator acc;
     CHECK(rwin::python_rows(ops, acc).empty());
@@ -697,16 +697,16 @@ TEST_CASE("runtimes win: an over-long dotnet value name is name_too_long and the
 
 TEST_CASE("runtimes win: dotnet visits are capped across values and report row_cap",
           "[runtimes][dotnet][windows]") {
-    // kMaxTagsVisited + 1 distinct sdk values: the cap counts the arch key's own visit too, so one
+    // kMaxEntriesVisited + 1 distinct sdk values: the cap counts the arch key's own visit too, so one
     // fewer than the cap is read and the rest never is. MUTATION: dropping the counter lets a
     // stuffed key loop to its last value with no cap.
     FakeOps ops;
-    for (std::size_t i = 0; i < rwin::kMaxTagsVisited + 1; ++i)
+    for (std::size_t i = 0; i < rwin::kMaxEntriesVisited + 1; ++i)
         ops.setd(L"64", kIv + L"\\x64\\sdk", L"8.0." + std::to_wstring(i), 1);
     ConstraintAccumulator acc;
     const auto rows = rwin::dotnet_rows(ops, acc);
     CHECK(acc.reason() == std::string{rwin::kDotnetTokens.row_cap});
-    CHECK(rows.size() == rwin::kMaxTagsVisited - 1);
+    CHECK(rows.size() == rwin::kMaxEntriesVisited - 1);
     CHECK(ops.opened == ops.closed);
 }
 
@@ -860,14 +860,14 @@ TEST_CASE("runtimes win: JVM open_failed, enum_failed and name_too_long are toke
 TEST_CASE("runtimes win: JVM visits are capped and report row_cap, keeping the homes already read",
           "[runtimes][jvm][windows]") {
     FakeOps ops;
-    for (std::size_t i = 0; i < rwin::kMaxTagsVisited + 1; ++i)
+    for (std::size_t i = 0; i < rwin::kMaxEntriesVisited + 1; ++i)
         plant_jvm(ops, L"64", kJsJdk, L"21." + std::to_wstring(i), L"", L"JavaHome",
                   "C:\\Java\\jdk" + std::to_string(i));
     ConstraintAccumulator acc;
     const auto rows = rwin::jvm_rows(ops, acc);
     CHECK(acc.reason() == std::string{rwin::kJvmTokens.row_cap});
-    CHECK(rows.size() == rwin::kMaxTagsVisited);
-    CHECK(ops.file_reads.size() == rwin::kMaxTagsVisited);
+    CHECK(rows.size() == rwin::kMaxEntriesVisited);
+    CHECK(ops.file_reads.size() == rwin::kMaxEntriesVisited);
     CHECK(ops.opened == ops.closed);
 }
 
