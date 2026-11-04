@@ -27,7 +27,9 @@
 # Exit status: 0 = clean (or selftest passed); 1 = at least one illegal path
 # was found, or the scan could not run (`git ls-files` failed: not a checkout,
 # safe.directory refusal, git missing -- reported as a named ::error::), or
-# the selftest failed; 2 = usage error, or no working python interpreter.
+# the selftest failed; 2 = usage error, or no working python interpreter. An
+# uncaught Python exception (a traceback) also exits 1, so a red run with a
+# traceback is a bug in the lint, not a finding.
 
 set -euo pipefail
 

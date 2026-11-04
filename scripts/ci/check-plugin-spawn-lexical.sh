@@ -77,8 +77,10 @@
 # raw spawn token outside the allowlist, or a scan error reported in the same
 # findings list (`<unreadable: ...>` for a file that could not be read,
 # `<unterminated-literal>` for a lexer desync; both fail closed) -- or the
-# selftest failed; 2 = usage error, no working python interpreter, or a
-# requested --base / LEXICAL_GATE_BASE ref that cannot be resolved.
+# selftest failed; 2 = usage error, no working python interpreter, or the base
+# ref (--base / LEXICAL_GATE_BASE, default origin/dev) cannot be resolved. An
+# uncaught Python exception (a traceback) also exits 1, so a red run with a
+# traceback is a bug in the lint, not a finding.
 
 set -euo pipefail
 
