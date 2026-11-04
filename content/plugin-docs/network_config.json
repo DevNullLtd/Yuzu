@@ -1421,9 +1421,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
     ],
-    "changelog": [
-      "changelog.d/2026-10-04-network_config-routes.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/network_config.yaml"
     ],
@@ -1451,9 +1449,9 @@
     "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`.",
     "**Device page \"Get live info\".** `ip_addresses`, `arp` and `dns_cache` back three of the device page's live-snapshot cards (`device.live.netconfig` \"Adapters & IP\", `device.live.arp` \"ARP\", `device.live.dns_cache` \"DNS cache\"), dispatched through the shared \"Get live info\" chokepoint. This dispatch is deliberately untracked (no ExecutionTracker row, not in the executions drawer) because it fires one query per card on every click.",
     "**Daily-sync device_ci source (ADR-0016).** `adapters` is one of the four plugin reads (`hardware`, `device_identity`, `os_info`, `network_config`) the `device_ci` daily-sync source invokes in process to build the device's configuration-item record; its MAC addresses are deduped and sorted, and the first becomes the record's primary MAC. A MAC address is device-identifying data, so this source is in the GDPR personal-data and behavioural-PII tier of the daily-sync routed concern. A failed `adapters` read aborts the whole sync cycle rather than syncing a partial record.",
-    "**Not consumed by** TAR, DEX or Prometheus metrics.",
+    "**Not consumed by** Echo, DEX or Prometheus metrics.",
     "**Sensitivity.** `adapters` rows carry the host's own MAC addresses, and `arp` rows carry the MAC and IP address of every other device currently seen on the local subnet: device-identifying data by another route. `routes` rows carry the host's routing topology (internal networks, and the next-hop addresses and interface names of VPN and internal gateways), which is infrastructure detail rather than personal data. `ip_addresses` and `dns_servers` rows carry only this host's own address and resolver configuration. `dns_cache` entries can include hostnames of other devices the host has contacted (for example the names of phones or workstations on the LAN), which is potentially device-identifying. `proxy` rows carry network configuration only.",
-    "**Siblings:** `tar` has its own ARP collector that enumerates Windows ARP independently for the TAR capture surface; it is not a consumer of this plugin's `arp` action. `network_diag` covers listening ports and active connections, a distinct surface from this plugin's adapter, address, DNS and ARP inventory.",
+    "**Siblings:** `echo` has its own ARP collector that enumerates Windows ARP independently for the Echo capture surface; it is not a consumer of this plugin's `arp` action. `network_diag` covers listening ports and active connections, a distinct surface from this plugin's adapter, address, DNS and ARP inventory.",
     "**MCP / REST.** Discover: `discover_plugins` (summary), then `yuzu://plugin-docs` (this page as data), then `discover_instructions` or `get_definition(\"device.network_config.arp\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`, or the device page's \"Get live info\" snapshot for `ip_addresses`, `arp` and `dns_cache`."
   ]
 }

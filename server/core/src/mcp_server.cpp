@@ -3,6 +3,7 @@
 #include "http_route_sink.hpp" // HttpRouteSink / HttplibRouteSink — #2542 PR-6 seam migration
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "approver_assurance.hpp" // #6061: approve/reject are human-session acts (typed refusal)
+#include "checked_pending_count.hpp" // approval mint: throw-folding pending-count wrapper
 #include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
 #include "dispatch_denial_text.hpp" // shared describe_dispatch_denial (#6065 PR-Q; was an anonymous-namespace local here)
 #include "engine_no_admin_audit.hpp"      // the shared no-admin auditor (REST + MCP)
@@ -10,6 +11,7 @@
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
 #include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
 #include "mcp_input_schema.hpp" // input-schema subset compiler (#2405 C8 pre-approval gate)
+#include "mcp_instruction_execute.hpp" // execute_instruction_definition: bounds + rendering over instruction_execute (#2146)
 #include "mcp_jsonrpc.hpp"
 #include "discovered_devices_model.hpp" // list_discovered_devices shared builders
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
@@ -34,7 +36,7 @@
 #include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
 #include "app_perf_daily_store.hpp" // AppPerfDailyStore::kRetentionDays -- the VERIFY compare window clamp
 #include "compliance_model.hpp"         // shared REST/MCP/fragment builders (#4034)
-#include "dashboard_routes.hpp"         // DashboardRoutes::gather_tar_retention_paused (#4027)
+#include "dashboard_routes.hpp"         // DashboardRoutes::gather_echo_retention_paused (#4027)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
 #include "product_pack_model.hpp" // #4029: ProductPackStore (fwd-declared only in mcp_server.hpp) + shared builders
@@ -50,8 +52,7 @@
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_catalogue_model.hpp" // M.9: shared REST+MCP software catalogue model
 #include "software_catalog_rules.hpp"   // M.10b: kEcosystemFamilies + expand_ecosystem_tokens (ecosystem enums/pipe list)
-#include "crypto_cbom.hpp"          // export_crypto_cbom (CycloneDX 1.7 shaper)
-#include "crypto_library_model.hpp" // get_crypto_libraries / list_crypto_library_devices (shared model)
+#include "crypto_library_model.hpp" // crypto_library::dump_safe (list_issued_certs)
 #include "crypto_widget_catalogue.hpp" // the /crypto widget, layout and Yuzu-issued twins (shared model)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
@@ -75,6 +76,7 @@
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
+#include "rest_a4_envelope_http.hpp"    // detail::ensure_correlation_id (the call-wide id, #2146)
 #include "forensics_read_audit.hpp"     // #4990: response.forensics.read
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
 #include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
@@ -83,6 +85,7 @@
 #include "dispatch_destructive_gate.hpp" // #3685: evaluate_destructive_targeting — shared with /api/command
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
+#include "execution_mutation.hpp" // cancel_execution / record_execution_rerun: the shared admit-audit-effect sequence
 #include "execution_scope_rules.hpp" // #2146 A2-R1: execution_visible, shared with rest_api_v1.cpp/execution_routes.cpp
 #include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
 #include "workflow_execution_list_model.hpp" // shared REST+MCP parser/row builder for the run list
@@ -121,7 +124,6 @@
 #include "license_model.hpp"
 #include "software_deployment_model.hpp"
 
-#include <yuzu/version.hpp> // kVersionString - the CBOM metadata tool version
 #include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
 #include <spdlog/spdlog.h>
@@ -336,8 +338,9 @@ int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0
 /// Builds the catalogue model's `Params` from the named MCP arguments (strings and integers
 /// only; any other JSON type is left out, and an integer is stringified for every key). Every
 /// caller refuses a wrongly typed argument first, through `strict_args_error` (the two
-/// catalogue twins), `installed_software_args_error` (query_installed_software) or
-/// `crypto_library::strict_{summary,devices}_args_error` (the two /crypto twins), so nothing
+/// catalogue twins), `installed_software_args_error` (query_installed_software) or the
+/// `list_issued_certs` filter check (the /crypto twins that used
+/// `crypto_library::strict_{summary,devices}_args_error` live in mcp_tools_crypto.cpp), so nothing
 /// is silently dropped or stringified here. MCP and REST parse through the one model.
 software_catalogue::Params catalogue_params(const nlohmann::json& args,
                                             std::initializer_list<const char*> keys) {
@@ -454,6 +457,68 @@ std::string audit_caller_id(std::string_view id) {
     return audit_token(id.substr(0, 128));
 }
 
+// ── cancel_execution / record_execution_rerun: outcome -> MCP error ──────────
+// Maps a non-kDone ExecutionMutationOutcome onto the JSON-RPC error the two tools return, so
+// the two handler branches (kept separate on purpose: check-api-parity derives a tool's gate
+// calls from its own `if (tool_name == ...)` branch) cannot word the same outcome differently.
+// A `retry_after_ms >= 0` error is a retryable store/audit fault (a4_error with a hint); a
+// negative one is a terminal business answer (error_response, no hint) unless `envelope` is set,
+// which sends the A4 data object with `retry_after_ms: null` and the remediation (an error that
+// is permanent for this caller and must say so rather than stay silent).
+struct ExecMutationMcpError {
+    int code{kInternalError};
+    std::string message;
+    std::string remediation;
+    long retry_after_ms{-1};
+    bool envelope{false};
+};
+
+ExecMutationMcpError exec_mutation_mcp_error(ExecutionMutation what,
+                                             const ExecutionMutationOutcome& outcome,
+                                             const std::string& execution_id) {
+    using S = ExecutionMutationStatus;
+    const bool cancel = what == ExecutionMutation::kCancel;
+    switch (outcome.status) {
+    case S::kNoPrincipal:
+        // Permanent for this credential: no retry hint, and the prose says so.
+        return {kInternalError, "unable to resolve caller identity",
+                "this credential does not resolve to a principal and retrying with it will not "
+                "help; use a credential that names a user or engine principal",
+                -1, /*envelope=*/true};
+    case S::kStoreDegraded:
+        return {kInternalError, "execution tracker degraded", "retry once the server reports ready",
+                mcp::kMcpStoreFaultRetryMs};
+    case S::kNotFound:
+        // Identical for a nonexistent id and one hidden from this caller.
+        return {kInvalidParams, "Execution not found: " + execution_id, {}, -1};
+    case S::kAuditFailed:
+        return {kInternalError,
+                cancel ? "the audit record could not be persisted; the execution was NOT cancelled"
+                       : "the audit record could not be persisted; no rerun record was created",
+                "retry once the audit store recovers", mcp::kMcpStoreFaultRetryMs};
+    case S::kAlreadyFinished:
+        return {kInvalidParams, "execution already finished (nothing was changed)", {}, -1};
+    case S::kStoreFailed:
+        return {kInternalError,
+                cancel ? "cancel failed; execution store degraded"
+                       : "rerun record could not be created; execution store degraded",
+                "retry once the server reports ready", mcp::kMcpStoreFaultRetryMs};
+    case S::kEffectThrew:
+        // The effect threw: whether it landed is unknown, so no retry hint on the wire and none
+        // in the prose (a blind retry could repeat a write that already happened).
+        return {kInternalError,
+                cancel ? "cancel failed unexpectedly; the execution may or may not have been "
+                         "cancelled"
+                       : "rerun failed unexpectedly; a rerun record may or may not have been "
+                         "created",
+                "read the execution to see its current state before issuing another call", -1,
+                /*envelope=*/true};
+    case S::kDone:
+        break;
+    }
+    return {};
+}
+
 // B5 (api-parity #2146) — mirrors rest_api_v1.cpp's file-local
 // `sw_deploy_error_status`/`sw_deploy_client_message` (both `static` there, so
 // TU-invisible here — duplicated rather than shared, same constraint the
@@ -554,11 +619,6 @@ struct ToolDef {
 
 // kObjectOutputSchema lives in mcp_tool_registry.hpp (shared with registry handlers).
 
-// The remediation of a /crypto read refused because the Postgres pool is too small to spare it
-// (CryptoReadError::unavailable_until_restart): no retry hint, a retry fails identically.
-constexpr std::string_view kCryptoPoolTooSmallRemedy =
-    "restart the server with a larger --postgres-pool-size; a retry fails identically until then";
-
 std::string tool_result(std::string_view payload, const char* output_schema_json = nullptr) {
     JObj result;
     result.raw("content", JArr().add(JObj().add("type", "text").add("text", payload)).str());
@@ -641,53 +701,66 @@ std::string lower_copy(std::string v) {
 static_assert(kMaxFacetValueBytes == 2048,
               "update the preview tool text, the OpenAPI text and the docs");
 static const ToolDef kTools[] = {
-    {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
+    {"list_agents",
+     "List the connected agents the caller may read, with hostname, OS, architecture, and "
+     "version. Read-only. Requires Infrastructure:Read. A live snapshot of the agents connected "
+     "to this server: an enrolled device that is offline is not listed, so use list_hardware_ci "
+     "for enrolled devices. Use get_agent_details for one device's tags and detail; each row's "
+     "agent_id feeds the per-agent tools. Confined: when the read is scoped to the devices the "
+     "caller may read, the result carries scope_basis authority_scoped, and the text content is "
+     "the object {agents, scope_basis} instead of the bare array of an unscoped read. It is a "
+     "status, set whether or not anything was hidden; the number of hidden devices is never "
+     "disclosed. Every row and count then describes only the devices you may read and is never "
+     "a statement about the fleet: an empty list means no connected agent you may read, not "
+     "that none exists. Without that field the list is every agent connected to this server. A "
+     "permission denial is terminal; an authorization-store failure is a retryable 503 with "
+     "retry_after_ms, never an empty list; an unwired server is a non-retryable internal error.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
+     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the list holds only devices within that scope. A status, set whether or not any device was hidden; never a count."}},"required":["agents"]})j"},
 
-    // ── #4027 API-parity read twins: TAR process-tree / capture-sources device
+    // ── #4027 API-parity read twins: Echo process-tree / capture-sources device
     // pickers + retention-paused source list. Requires Infrastructure:Read,
     // enforced via fleet_read_fn_ (#4027 fix round, CDX-P1-01/K4 — the ADR-0017
     // admit-then-filter chokepoint; SAME gate their REST twins use, NOT the two
     // pre-existing HTML fragment siblings, which stay on the legacy bare
-    // require_permission gate this round — see tar_tree_routes.cpp's
+    // require_permission gate this round — see echo_tree_routes.cpp's
     // recorded-exception comments at their registration). #4143 review fix:
     // all three now read from an UNFILTERED source (all_devices_fn_ /
-    // DashboardRoutes::gather_tar_retention_paused with
+    // DashboardRoutes::gather_echo_retention_paused with
     // extra_scope_is_authoritative=true) exactly like list_agents' own
-    // agents_fn, with fleet_read_fn_'s gate.scope as the SOLE filter — no
+    // DeviceApi read, with fleet_read_fn_'s gate.scope as the SOLE filter — no
     // longer intersected with a separate per-operator-scoped provider. See
     // set_all_devices_fn's doc comment (mcp_server.hpp) for the full
     // rationale.
-    // GET /fragments/tar/process-tree/result and .../detail are DELIBERATELY NOT
-    // twinned by #4027 (see tar_tree_routes.hpp's file comment) — no REST/MCP-only
+    // GET /fragments/echo/process-tree/result and .../detail are DELIBERATELY NOT
+    // twinned by #4027 (see echo_tree_routes.hpp's file comment) — no REST/MCP-only
     // path exists to mint their required pcmd/tcmd/token inputs today.
-    {"list_tar_process_tree_devices",
-     "List the operator-scoped device picker for the TAR process-tree viewer. "
+    {"list_echo_process_tree_devices",
+     "List the operator-scoped device picker for the Echo process-tree viewer. "
      "Each row carries `online`, which is always true today — the sole wired "
      "provider sources this list from the live-session registry, so a "
      "disconnected enrolled device is not included (#4027 fix round, "
      "CDX-P1-02/K1). Requires Infrastructure:Read. Read-only twin of GET "
-     "/fragments/tar/process-tree's device picker / GET /api/v1/tar/process-tree.",
+     "/fragments/echo/process-tree's device picker / GET /api/v1/echo/process-tree.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"online":{"type":"boolean"}},"required":["agent_id","hostname","os","arch","agent_version","online"]}}},"required":["devices"]})j"},
 
-    {"list_tar_capture_sources_devices",
-     "List the operator-scoped device picker for the TAR capture-sources (ADR-0015 "
-     "enable/disable) frame. Same row shape as list_tar_process_tree_devices — "
+    {"list_echo_capture_sources_devices",
+     "List the operator-scoped device picker for the Echo capture-sources (ADR-0015 "
+     "enable/disable) frame. Same row shape as list_echo_process_tree_devices — "
      "`online` is always true today, same reason. Requires Infrastructure:Read. "
-     "Read-only twin of GET /fragments/tar/capture-sources's device picker / "
-     "GET /api/v1/tar/capture-sources.",
+     "Read-only twin of GET /fragments/echo/capture-sources's device picker / "
+     "GET /api/v1/echo/capture-sources.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"online":{"type":"boolean"}},"required":["agent_id","hostname","os","arch","agent_version","online"]}}},"required":["devices"]})j"},
 
-    {"list_tar_retention_paused",
-     "List the calling operator's most recent TAR retention-paused source scan "
+    {"list_echo_retention_paused",
+     "List the calling operator's most recent Echo retention-paused source scan "
      "(per-username state; filtered to the operator's visible agents), one row per "
      "(agent, paused source). Requires Infrastructure:Read. Read-only twin of GET "
-     "/fragments/tar/retention-paused / GET /api/v1/tar/retention-paused. Returns "
+     "/fragments/echo/retention-paused / GET /api/v1/echo/retention-paused. Returns "
      "scan_id=\"\" when the operator has not dispatched a scan yet (call "
-     "POST /fragments/tar/retention-paused/scan first, dashboard-only today). "
+     "POST /fragments/echo/retention-paused/scan first, dashboard-only today). "
      "result_truncated_by_cap=true means the scan's response read reached its "
      "10,000-row / 50 MiB cap, so rows and the counters are PARTIAL (a dropped "
      "response reads as an agent that never answered); store_degraded is then "
@@ -1132,6 +1205,50 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1,"description":"Parent execution ID"}},"required":["execution_id"]})",
      R"j({"type":"object","properties":{"children":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"}},"required":["id","status","dispatched_at"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["children"]})j"},
 
+    // Cancel/rerun twins (#2146 batch B). Both run execution_mutation.hpp's
+    // apply_execution_mutation, the same sequence POST /api/v1/executions/{id}/cancel and
+    // .../rerun run. NEITHER sends anything to a device; the names and descriptions say so.
+    {"cancel_execution",
+     "Mark ONE execution as cancelled in the server's execution tracker. This updates the "
+     "tracker record only: it sends NOTHING to any device and does not stop or recall a command "
+     "a device has already received, so a cancelled execution can still have running work on "
+     "devices. Use it to stop the server counting an execution as in progress (for example one "
+     "that is stuck); it is not a way to halt work on endpoints. Valid only while the execution "
+     "is not finished: one that already succeeded, completed or was cancelled answers the "
+     "business error 'execution already finished' and nothing changes (retrying will not help). "
+     "Irreversible: a cancelled execution cannot be resumed. A caller confined to management "
+     "groups may cancel only an execution they dispatched that no device has reported on yet, or "
+     "one whose COMPLETE targeted device list is visible to them; any other case, including an id "
+     "that does not exist, returns the SAME not-found error (the two cannot be told apart). "
+     "Mirrors POST /api/v1/executions/{id}/cancel. Not approval-gated at the supervised tier "
+     "because it only updates the tracker record and starts no work (owner ruling 2026-10-30); "
+     "the REST twin is still refused for a supervised-tier token. Writes an 'attempted' audit row (execution.cancel) BEFORE the "
+     "change and refuses with a retryable error, changing nothing, if that row cannot be saved. "
+     "Requires Execution:Execute and Execution:Read.",
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,128}$","maxLength":128,"description":"Execution id from list_executions or get_execution_status"}},"required":["execution_id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"execution_id":{"type":"string"},"status":{"const":"cancelled"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the outcome audit row failed to persist after the cancel had been applied"}},"required":["execution_id","status"]})j"},
+
+    {"record_execution_rerun",
+     "Create a PENDING rerun record for an existing execution in the server's execution tracker, "
+     "linked to the original through rerun_of. This sends NOTHING to any device: no agent runs "
+     "anything because of this call, and the new record stays 'pending'. Do NOT read a success "
+     "result as 'the devices were re-run'; the result carries dispatched_to_devices:false. To run "
+     "the work again on devices, dispatch it with execute_instruction. failed_only (default "
+     "false) sizes the new record to the original's failed, timed-out and rejected devices "
+     "instead of its whole targeted list; it is a boolean (the legacy REST scope=\"failed_only\" "
+     "string is not accepted here). Each call creates another record (not idempotent). A caller "
+     "confined to management groups may use it only on an execution they dispatched that no "
+     "device has reported on yet, or one whose COMPLETE targeted device list is visible to them; "
+     "any other case, including an id that does not exist, returns the SAME not-found error. "
+     "Mirrors POST /api/v1/executions/{id}/rerun. Approval-gated at the supervised tier: the "
+     "first call returns kApprovalRequired with an approval_id, and the call is repeated with "
+     "that approval_id after an administrator approves. Writes an 'attempted' audit row "
+     "(execution.rerun) BEFORE the record is created and refuses with a retryable error, "
+     "creating nothing, if that row cannot be saved. Requires Execution:Execute and "
+     "Execution:Read.",
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,128}$","maxLength":128,"description":"Id of the execution to record a rerun of, from list_executions or get_execution_status"},"failed_only":{"type":"boolean","description":"Default false. True sizes the new record to the original's failed, timed-out and rejected devices"},"approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after administrator approval"}},"required":["execution_id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Id of the NEW pending record"},"rerun_of":{"type":"string"},"status":{"const":"pending"},"failed_only":{"type":"boolean"},"dispatched_to_devices":{"const":false},"audit_persisted":{"type":"boolean","description":"Present (false) only when the outcome audit row failed to persist after the record had been created"}},"required":["execution_id","rerun_of","status","failed_only","dispatched_to_devices"]})j"},
+
     {"list_executions", "List recent command executions. Confined by management group: a "
      "caller admitted through a management-group grant (rather than a global permission) "
      "sees only executions they themselves dispatched — a narrower interim mechanism than "
@@ -1294,8 +1411,8 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
-    {"create_result_set_from_tar_query",
-     "Create a result set by DISPATCHING a read-only TAR SQL query to the fleet. ASYNC: "
+    {"create_result_set_from_echo_query",
+     "Create a result set by DISPATCHING a read-only Echo SQL query to the fleet. ASYNC: "
      "returns immediately with status=\"pending\" — poll get_result_set by the returned id, "
      "or subscribe to /api/v1/events on source_execution_id, until status flips to "
      "\"materialized\" (or \"failed\"). Requires Execution:Execute, confined to the caller's "
@@ -1306,7 +1423,7 @@ static const ToolDef kTools[] = {
      "parent_id's CURRENT members when supplied, else broadcasts to every connected agent — "
      "omitting parent_id is the only way to broadcast; a supplied parent_id that resolves to "
      "nothing is refused (400), never silently widened. REST v1 twin: POST "
-     "/api/v1/result-sets/from-tar-query. NEVER re-send this call on a timeout or an "
+     "/api/v1/result-sets/from-echo-query. NEVER re-send this call on a timeout or an "
      "ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
      "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
      "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
@@ -1320,18 +1437,34 @@ static const ToolDef kTools[] = {
 
     {"create_result_set_from_instruction_result",
      "Create a result set by DISPATCHING an existing InstructionDefinition to the fleet. "
-     "ASYNC — same pending->materialize contract as create_result_set_from_tar_query: poll "
+     "ASYNC — same pending->materialize contract as create_result_set_from_echo_query: poll "
      "get_result_set by id, or subscribe to /api/v1/events on source_execution_id. Requires "
      "Execution:Execute, confined to the caller's derived visible device set — the ONLY "
      "per-device authorization on this dispatch surface. Membership is the responders whose "
      "output row satisfies the operator-supplied matcher (column/op/value); omitting matcher "
      "accepts every responder. Dispatches to parent_id's CURRENT members when supplied, else "
      "broadcasts — same omit-to-broadcast / refuse-if-resolves-to-nothing contract as "
-     "create_result_set_from_tar_query. Find valid instruction_id values via list_definitions "
+     "create_result_set_from_echo_query. Find valid instruction_id values via list_definitions "
      "or discover_instructions — do not guess. If the definition runs a Forensics-tier "
      "plugin (an action on the Forensics securable) the set materializes with no members "
      "for every creator, because the materializer never reads Forensics-tier output; an "
-     "empty set from such a definition says nothing about the fleet. REST v1 twin: POST "
+     "empty set from such a definition says nothing about the fleet. A definition whose "
+     "plugin.action is gated (admin or approval) is refused for a non-admin caller with a "
+     "permission-denied error whose error.data.reason is approval_required (permanent, "
+     "retry_after_ms null): an approval ticket never lifts that gate for this tool, so a "
+     "supervised-tier token cannot run a gated action through it; an administrator can. "
+     "SUPERVISED-TIER TICKET: the -32006 ticket binds the plugin.action the instruction "
+     "resolves to, so a repoint before the approved re-call is refused -32003 with "
+     "error.data.reason definition_changed (retry_after_ms null; ticket unspent, repointing "
+     "back restores it; request a fresh approval), and a repoint landing later still runs "
+     "nothing and answers -32003 RESULT_SET_DEFINITION_CHANGED (same reason; ticket SPENT, "
+     "request a fresh approval). Execution:Execute is checked before any ticket is minted "
+     "(403 without it). If the definition cannot be read the call is refused -32603 and nothing "
+     "is minted or spent: error.data.reason effect_unresolvable_store_fault is retryable "
+     "(retry_after_ms 5000), effect_unresolvable_store_unwired is a server defect (null). "
+     "A missing instruction still mints a ticket bound to effect=unresolved, which the "
+     "approved recall then refuses and spends. "
+     "REST v1 twin: POST "
      "/api/v1/result-sets/from-instruction-result. NEVER re-send this call on a timeout or "
      "an ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
      "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
@@ -1340,13 +1473,13 @@ static const ToolDef kTools[] = {
      "RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store faulted after a real command "
      "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
      "poll executions for the outcome instead.",
-     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:tar_rows_ge,n} needs n to be an integer from 1 to 2147483647"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
+     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:echo_rows_ge,n} needs n to be an integer from 1 to 2147483647"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
     {"reevaluate_result_set",
      "Re-run an existing result set's OWN source query, creating a NEW SIBLING set (same "
-     "parent_id as the original, NOT a child of it) — a fresh snapshot of a tar_query or "
+     "parent_id as the original, NOT a child of it) — a fresh snapshot of an echo_query or "
      "instruction_result set's original question against today's fleet. Requires "
      "Execution:Execute (re-dispatches to the fleet, ASYNC, same pending->materialize "
      "contract as the create_result_set_from_* producers) — confined to the caller's derived "
@@ -1359,6 +1492,20 @@ static const ToolDef kTools[] = {
      "narrowed to a parent set at creation time and that parent has since been deleted, this "
      "REFUSES (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than silently broadcasting "
      "to every visible device (#4306) — create a new set from the intended parent instead. "
+     "An instruction_result source whose definition's plugin.action is gated (admin or "
+     "approval) is refused for a non-admin caller (permission denied, "
+     "error.data.reason=approval_required, retry_after_ms null): an approval ticket never "
+     "lifts that gate here. "
+     "SUPERVISED-TIER TICKET: the -32006 ticket binds the plugin.action the set's stored "
+     "source resolves to (an echo set is the fixed echo.sql), so a repoint before the approved "
+     "re-call is refused -32003 with error.data.reason definition_changed (retry_after_ms "
+     "null; ticket unspent; request a fresh approval), and a repoint landing later still runs "
+     "nothing and answers -32003 RESULT_SET_DEFINITION_CHANGED (ticket SPENT). "
+     "Execution:Execute is checked before any ticket is minted (403 without it); an unreadable "
+     "definition or set is -32603 with nothing minted or spent (effect_unresolvable_store_fault "
+     "retry_after_ms 5000; effect_unresolvable_store_unwired null). A missing instruction, or "
+     "an absent or not-owned set, still mints a ticket bound to effect=unresolved, which the "
+     "approved recall then refuses and spends. "
      "REST v1 twin: POST "
      "/api/v1/result-sets/{id}/re-eval. "
      "NEVER re-send this call on a timeout or an ambiguous/post-dispatch error - it "
@@ -1538,8 +1685,8 @@ static const ToolDef kTools[] = {
      "Guard. Use get_guardian_schemas to discover the spark/assertion/remediation type "
      "catalogue before authoring. Fleet-wide (a Guard has no single owning device/service); "
      "requires GuaranteedState:Write, denied outright to a service-scoped API token. REST's "
-     "twin applies an MFA step-up check; MCP applies none for a cookie-session caller "
-     "(architecture-wide gap, not specific to this tool - tracked in #4309).",
+     "twin applies an MFA step-up check; MCP applies none. Requires a tiered bearer token (a "
+     "tierless credential is refused at /mcp/v1/ admission).",
      R"j({"type":"object","properties":{)j"
      R"j("rule_id":{"type":"string","minLength":1,"maxLength":256,"pattern":"^[A-Za-z0-9._-]+$","description":"Unique Guard identifier"},)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique human-authored Guard name"},)j"
@@ -1577,8 +1724,8 @@ static const ToolDef kTools[] = {
      "Marked Destructive but NOT currently approval-gated despite that (tracked #4305) — "
      "do not assume a confirmation step exists. Fleet-wide; requires GuaranteedState:Write, "
      "denied outright to a service-scoped API token. REST's twin applies an MFA step-up "
-     "check; MCP applies none for a cookie-session caller (architecture-wide gap, not "
-     "specific to this tool - tracked in #4309).",
+     "check; MCP applies none. Requires a tiered bearer token (a tierless credential is "
+     "refused at /mcp/v1/ admission).",
      R"j({"type":"object","properties":{)j"
      R"j("rule_id":{"type":"string","minLength":1,"maxLength":256},)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256},)j"
@@ -1602,12 +1749,8 @@ static const ToolDef kTools[] = {
      "Destructive (GuaranteedState:Delete): approval-gated at the supervised MCP tier — the "
      "first call returns an approval ticket (kApprovalRequired), re-call with the returned "
      "approval_id to consume it. Fleet-wide; denied outright to a service-scoped API token. "
-     "An MCP-tier-less caller (empty mcp_tier - a cookie session, a plain non-MCP-tiered "
-     "API token, or an engine token) is DENIED outright rather than falling through to "
-     "RBAC-only enforcement, closing the #4309 gap for this tool specifically. The "
-     "architecture-wide gap remains open for create_guardian_rule/update_guardian_rule/ "
-     "push_guardian_rules (not approval-gated at any tier, so there is no approval to "
-     "bypass on those three) and every other approval-gated MCP tool not yet migrated.",
+     "Requires a tiered bearer token (supervised); a tierless credential is refused at "
+     "/mcp/v1/ admission.",
      R"({"type":"object","properties":{"rule_id":{"type":"string","minLength":1,"maxLength":256}},"required":["rule_id"]})",
      R"j({"type":"object","properties":{"deleted":{"const":true},"rule_id":{"type":"string"}},"required":["deleted","rule_id"]})j"},
 
@@ -1627,8 +1770,8 @@ static const ToolDef kTools[] = {
      "does not bump the policy generation, so a delta at the generation an agent already "
      "holds is not followed by an automatic full push. Fleet-wide; requires the distinct GuaranteedState:Push "
      "verb (not Write), denied outright to a service-scoped API token. REST's twin applies "
-     "an MFA step-up check; MCP applies none for a cookie-session caller (architecture-wide "
-     "gap, not specific to this tool - tracked in #4309).",
+     "an MFA step-up check; MCP applies none. Requires a tiered bearer token (a tierless "
+     "credential is refused at /mcp/v1/ admission).",
      R"j({"type":"object","properties":{)j"
      R"j("scope":{"type":"string","maxLength":2048,"default":"","description":"Scope DSL expression selecting target agents; empty = fleet-wide"},)j"
      R"j("full_sync":{"type":"boolean","default":false,"description":"Force a full re-sync of the enabled rule set to in-scope agents. When false the push is a merge that does not retry a still-unresolved rule it omits"})j"
@@ -1667,8 +1810,8 @@ static const ToolDef kTools[] = {
      "dedicated gate as assign_rbac_role, not a plain permission check) and the supervised MCP "
      "tier (Security:Write, approval-gated: the first call returns an approval ticket, re-call "
      "with the returned approval_id to consume it). Denied outright to a service-scoped API "
-     "token. An MCP-tier-less caller (empty mcp_tier) is denied outright; use the REST twin, "
-     "which applies an MFA step-up to an enrolled local account whose proof is stale, and to a "
+     "token. A tierless credential is refused at /mcp/v1/ admission; for a human session use "
+     "the REST twin, which applies an MFA step-up to an enrolled local account whose proof is stale, and to a "
      "single-sign-on session without an identity-provider MFA assertion only when --mfa-enforcement "
      "protects the role; an unenrolled local administrator and API-token sessions are not stepped "
      "up (see the MFA documentation). Every call is audited: an 'attempted' row is written before "
@@ -1809,22 +1952,28 @@ static const ToolDef kTools[] = {
      R"j("audit_persisted":{"type":"boolean"}},"required":["process_name","window","crashes","hangs","signals","distinct_devices","first_seen","last_seen","modules","exceptions","devices"]})j"},
 
     {"list_dex_apps",
-     "Application and per-version stability list: every application with a Windows crash/hang "
-     "signal in the window - the 100 applications affecting the most Windows devices (then "
+     "Application and per-version stability list: every application with a crash/hang "
+     "signal in the window on the chosen platform scope - the 100 applications affecting the most devices (then "
      "crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then "
-     "name in byte order); apps_total counts every application with a Windows crash or hang signal in the "
-     "window and apps_truncated flags the cut; up to 20 versions each, versions_truncated flags "
+     "name in byte order); apps_total counts every application with a crash or hang signal in the "
+     "window on that scope and apps_truncated flags the cut; up to 20 versions each, versions_truncated flags "
      "that cut. Each row carries crashes, hangs and devices affected over the window "
-     "(distinct_devices), then the figures over one population, the Windows devices online now: "
+     "(distinct_devices), then the figures over one population, the online devices of the chosen scope: "
      "distinct_devices_online (those of the affected devices that are online now; null when no fleet source is wired), the share of "
      "that population affected (Wilson interval at the score policy's confidence level, 95 percent "
      "unless the policy sets model.interval_confidence), the online devices' events per "
      "1,000 online devices (exact interval at the same level) and the stability score with its decomposition, so a "
      "device that crashed and went offline is in the counts but not in the share, and the score is "
      "withheld as offline_affected while any affected device is offline. "
-     "Counts are Windows-scoped (the Apps tab, the Overview top apps and get_dex_app still count "
-     "every platform) and the population is Windows devices online now (population: null = no "
-     "fleet source wired, 0 = no Windows device online now; population_basis). No device floor is applied. "
+     "platform selects the scope: all (default; one row per application across operating systems, "
+     "including agents whose operating system is not recognised, so not the sum of the per-platform "
+     "results), windows, macos or linux. The population is that scope's devices online now "
+     "(population: null = no fleet source wired, 0 = no device of the scope online now; "
+     "population_basis names it, e.g. all_online or windows_online). crash_source_coverage says "
+     "per platform whether its crash sources are complete (windows) or partial (linux, macos), so "
+     "a short list for linux or macos is not proof of a healthy fleet. An empty apps list means no "
+     "crash or hang signal in the window on that scope, not a failure. "
+     "Pass platform=windows for the Windows scope only; get_dex_app is the per-application drill-down and counts every platform. An invalid platform or window is invalid params (-32602, terminal: do not retry it unchanged). No device floor is applied. "
      "The policy object names the score policy every figure was scored under (source default or custom, "
      "revision, fault - a reason string when a stored policy document was refused and the shipped "
      "defaults are in force, otherwise null - and the four tier edges and display names); each "
@@ -1832,14 +1981,18 @@ static const ToolDef kTools[] = {
      "else default. No per-agent identity (a distinct-device "
      "COUNT, never an agent_id) - not audited. A degraded read, including a stored policy that cannot be "
      "read within its staleness bound, is an error, never an empty list. "
-     "Mirrors GET /api/v1/dex/apps. Requires GuaranteedState:Read.",
-     R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
-     R"j({"type":"object","properties":{"window":{"type":"string"},"population":{"type":["integer","null"]},"population_basis":{"type":"string"},"apps_total":{"type":"integer"},"apps_truncated":{"type":"boolean"},)j"
+     "Mirrors GET /api/v1/dex/apps. Not audited beyond the generic tool-call row. A degraded read "
+     "is a retryable error (retry_after_ms). Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("platform":{"type":"string","enum":["all","windows","macos","linux"],"default":"all","description":"Platform scope of the counts and the online population."},)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Look-back window for crash and hang signals."})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{"window":{"type":"string"},"population":{"type":["integer","null"]},"population_basis":{"type":"string"},"crash_source_coverage":{"type":"object","additionalProperties":{"type":"string","enum":["complete","partial"]}},"apps_total":{"type":"integer"},"apps_truncated":{"type":"boolean"},)j"
      R"j("policy":{"type":"object","properties":{"source":{"type":"string","enum":["default","custom"]},"revision":{"type":"string"},"fault":{"type":["string","null"]},"tiers":{"type":"object","properties":{"excellent":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"good":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"fair":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"poor":{"type":"object","properties":{"edge":{"type":"number","description":"The fixed 0, not a stored value."},"name":{"type":"string"}},"required":["edge","name"]}},"required":["excellent","good","fair","poor"]}},"required":["source","revision","fault","tiers"]},)j"
      R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"profile":{"type":"string","enum":["default","override"]},)j"
      R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},)j"
      R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]}},"required":["version","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score"]}},"version_count":{"type":"integer"},"versions_truncated":{"type":"boolean"}},"required":["subject","profile","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score","versions","version_count","versions_truncated"]}}},)j"
-     R"j("required":["window","apps","policy","population","population_basis","apps_total","apps_truncated"]})j"},
+     R"j("required":["window","apps","policy","population","population_basis","crash_source_coverage","apps_total","apps_truncated"]})j"},
 
     {"get_dex_catalogue",
      "Signal catalogue family cards (Catalogue View 1): every catalogued signal family's "
@@ -2355,7 +2508,9 @@ static const ToolDef kTools[] = {
      "subscribe to live JSON events via GET /api/v1/events?execution_id=<id>. Find valid "
      "plugin/action names AND their parameters via discover_plugins (parameter_schema is inline "
      "for actions with a published definition) or discover_instructions - do not guess action "
-     "names. "
+     "names. To run a STORED definition (its approval_mode and parameter_schema enforced) use "
+     "execute_instruction_definition: this tool looks up no definition and validates no stored "
+     "schema. "
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents. EXCEPTION (#3685): a Destructive-classified plugin.action pair requires explicit, "
      "non-empty agent_ids - broadcast and scope fan-out (including __all__) are refused before a "
@@ -2449,6 +2604,95 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"status":{"const":"kill_switched_os"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"os_gate_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false})j"
+     R"j(]})j"},
+
+    // #2146 (ledger row post.api-instructions-param-execute): the MCP twin of POST
+    // /api/instructions/{id}/execute and POST /api/v1/instructions/{id}/execute. Distinct from
+    // execute_instruction, which is a RAW plugin/action call. The input bounds below are the
+    // MCP schema contract AND are re-enforced server-side on every tier by
+    // mcp_instruction_execute.cpp's check_args (the literals and kExecInstr* are one contract).
+    {"execute_instruction_definition",
+     "Execute a STORED instruction definition by id on one or more agents. ASYNC: returns "
+     "immediately with command_id + execution_id + agents_reached; the agents run it and report "
+     "back separately, so poll query_responses or get_execution_status with execution_id, and "
+     "NEVER re-send this call to check on it, which would run the action a second time. Use "
+     "discover_instructions to find a definition id and its parameter schema. This is NOT "
+     "execute_instruction: that tool runs a raw plugin.action with no definition, no "
+     "approval_mode and no parameter schema; this one enforces the definition's own rules. "
+     "ORDER OF CHECKS, none of which dispatches, mints or consumes anything before it passes: "
+     "the arguments are well formed and bounded, before the store is read (definition_id non-empty "
+     "and at most 128 bytes, params, scope and agent_ids within their size bounds, agent_ids and "
+     "scope not empty and not both given); the definition_id holds no control byte (below 0x20 or 0x7F) and is "
+     "valid UTF-8 (else -32602 invalid_definition_id); the definition exists; the caller may run "
+     "its plugin.action; params match "
+     "the definition's stored parameter_schema (a violation is -32602 and nothing is queued for "
+     "approval); a Destructive or Forensics action names explicit agent_ids; then the "
+     "definition's approval_mode. "
+     "APPROVAL: the definition's approval_mode is evaluated FIRST and independently of your MCP "
+     "tier. auto dispatches. always, any unknown value, and role-gated for a caller who is not an "
+     "administrator return a SUCCESS result with status pending_approval and dispatch NOTHING. "
+     "That ticket cannot be redeemed through this tool: do NOT pass its approval_id back as the "
+     "approval_id argument (the recall refuses it), and do not poll it for a dispatch; an "
+     "operator approves it out of band, and approving it records the decision but never "
+     "dispatches this call (#6064: an instruction-origin ticket has no redemption path). An "
+     "operator-tier token's auto-approval and a supervised "
+     "token's consumed ticket never satisfy a definition's approval_mode. SUPERVISED tier: a "
+     "call whose definition is auto and whose plugin.action is not gated first returns the usual "
+     "approval_required (-32006) tier ticket; after an admin approves it re-call with that "
+     "approval_id. A tier ticket NEVER lifts the gate of a plugin.action that requires admin or "
+     "approval: a non-admin caller on such a definition is refused with a permission-denied "
+     "error whose error.data.reason is approval_required (permanent, retry_after_ms null, no "
+     "ticket minted); run it as an administrator instead. A call whose definition needs "
+     "approval returns pending_approval at once and mints no tier ticket. The -32006 tier "
+     "ticket also binds the plugin.action, approval_mode and concurrency_mode the definition "
+     "resolves to: if it is repointed before the approved re-call, the re-call is refused "
+     "-32003 with error.data.reason definition_changed (retry_after_ms null; ticket "
+     "unspent, repointing back restores it; request a fresh approval), and a repoint landing "
+     "after that check runs nothing and answers -32602 definition_changed with the ticket "
+     "SPENT (request a fresh approval). "
+     "TARGETING: omit BOTH agent_ids and scope to target every connected agent; supplying either "
+     "empty, or both, is rejected rather than widened. A Destructive-classified action requires "
+     "explicit non-empty agent_ids (broadcast and scope are refused) and a Forensics-classified "
+     "one exactly one, both confined to the agents you may see. "
+     "ZERO AGENTS: a SUCCESS result with agents_reached 0 carries a status to branch on, not "
+     "message text: invalid_scope, quarantined, plugin_not_found and kill_switched_os are "
+     "PERMANENT (retry_after_ms is null; retrying the same request cannot help); "
+     "containment_unreadable, route_unreadable, os_gate_unreadable and no_agents_reached are "
+     "transient (retry_after_ms 5000). A dispatch-authorization denial is a JSON-RPC error whose "
+     "error.data.reason is one of unclassified, ambiguous, anonymous_operator, forbidden, "
+     "approval_required, kill_switched. A per-device definition takes the ADR-1007 concurrency "
+     "claim, so a device already running it may be skipped (no_agents_reached). "
+     "A 'requested' audit row (mcp.execute_instruction_definition) is written BEFORE dispatch; "
+     "if it cannot be stored nothing is dispatched (-32603, retryable). A refusal earlier than "
+     "that row does not always write an audit row: a definition-store fault and an unwired "
+     "definition lookup, authorizer, validator cache, classifier or dispatch write none, while an unknown "
+     "definition, an out-of-bounds argument and the later validation refusals write a 'denied' "
+     "row (a 'failure' row for an unusable stored schema, an approval that could not be queued, "
+     "an unwired approval manager or an unreadable pending-approval count). Every row the "
+     "execute core writes ends with correlation_id=<id>, the id in error.data.correlation_id. "
+     "APPROVAL AND DISPATCH REFUSALS, branch on error.data.reason: definition_changed "
+     "(-32003 or -32602, above); approval_cap_reached (-32004; "
+     "too many of your approvals are pending, retry_after_ms null, wait for a reviewer); "
+     "approval_queue_full (-32603; the global approval queue is full, retry_after_ms null, "
+     "retrying will not help); approval_unavailable (-32603; retry_after_ms 5000 when the "
+     "pending-approval count could not be read, null for a server wiring defect); "
+     "dispatch_exception (-32603; the dispatch failed part-way, retry_after_ms is null on "
+     "purpose because some agents may already hold the command, so do NOT re-send: "
+     "error.data.execution_id names the execution left running and error.data.agents_sent the "
+     "lower-bound count of agents already sent the command when known (a gateway-routed agent counts once queued for forwarding, which can still fail); inspect that execution "
+     "and close it with cancel_execution if it should not wait). "
+     "Service-scoped API tokens are refused. Mirrors POST /api/v1/instructions/{id}/execute. Requires Execution:Execute.",
+     R"j({"type":"object","properties":{)j"
+     R"j("definition_id":{"type":"string","minLength":1,"maxLength":128,"description":"Id of the stored instruction definition (discover_instructions lists them)"},)j"
+     R"j("params":{"type":"object","description":"Parameters, validated against the definition's stored parameter_schema BEFORE anything else happens. Typed values are sent as JSON types (a number as a number); at most 32 keys, each key at most 256 bytes, each value at most 65536 bytes once serialised."},)j"
+     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. Omit BOTH this and agent_ids to target all agents; supplying either one empty is rejected rather than widened. A Destructive or Forensics action refuses scope outright."},)j"
+     R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs. EXCLUSIVE with scope. Omit entirely to target all agents; an EMPTY array is rejected. A Destructive action requires this field, non-empty; a Forensics action exactly one."},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier only: the tier ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. NOT the approval_id of a pending_approval result, which is never redeemable here."})j"
+     R"j(},"required":["definition_id"]})j",
+     R"j({"oneOf":[)j"
+     R"j({"type":"object","properties":{"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":1},"definition_id":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"audit_persisted":{"const":false}},"required":["command_id","execution_id","agents_reached","definition_id","plugin","action"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"pending_approval"},"approval_id":{"type":"string"},"approval_mode":{"type":"string"},"definition_id":{"type":"string"},"audit_persisted":{"const":false}},"required":["status","approval_id","approval_mode","definition_id"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"enum":["invalid_scope","containment_unreadable","route_unreadable","os_gate_unreadable","quarantined","plugin_not_found","kill_switched_os","no_agents_reached"]},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"definition_id":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"type":["integer","null"]},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0},"audit_persisted":{"const":false}},"required":["status","command_id","execution_id","agents_reached","definition_id","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false})j"
      R"j(]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
@@ -2642,6 +2886,15 @@ static const ToolDef kTools[] = {
      "revoked identity with a still-valid credential). TERMINAL and irreversible — never "
      "un-revocable; a false-positive response mints a successor principal instead (pass "
      "superseded_by on the successor's own creation, then reference this principal here). "
+     "Order matters: the credentials die first, then the identity. A retryable error "
+     "(retry_after_ms 5000) after the credentials died means the principal may still be active "
+     "with zero credentials; repeating the call finishes the revoke. Repeating is safe (a "
+     "revoke by a concurrent request that wins is reported as success; the repeat reports "
+     "credentials_revoked 0), but the supervised tier consumes the approval ticket before the "
+     "handler runs, so a retry after a retryable error needs a NEW approval ticket. Cap your "
+     "retries at a few attempts, then read the principal "
+     "with get_engine_principal and report its state to an administrator. The failure audit "
+     "row carries the number of credentials the failed call revoked. "
      "Mirrors DELETE /api/v1/engine-principals/{id}. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
@@ -2674,16 +2927,19 @@ static const ToolDef kTools[] = {
 
     {"rotate_engine_credential",
      "Rotate an engine principal's credential via the overlap-pair workflow (design doc §7): "
-     "mints a successor (both credentials valid during the overlap window, default+minimum 7 "
-     "days, floor 24h), auto-revokes the predecessor at window end. BOUNDED-IDEMPOTENT, not "
+     "mints a successor (both credentials valid during the overlap window, default 7 days, "
+     "minimum 1 day = 24h), auto-revokes the predecessor at window end. BOUNDED-IDEMPOTENT, not "
      "generally idempotent: a re-call within a short grace window after the original mint "
      "re-serves the SAME successor secret (each reveal — original or replay — is independently "
-     "audited as engine_principal.credential.reveal); once the grace window lapses, a re-call "
-     "errors and the caller must recover over REST (find the stuck successor with GET "
-     "/api/v1/engine-principals/{id}, revoke it with DELETE /api/v1/tokens/{token_id} as an "
-     "administrator, then rotate again), never an indefinite retry, and never revoke the "
-     "principal, which is terminal. If the read-back answers but finds no linked successor, the "
-     "secret is withheld with NO retry hint: inspect the principal's credentials first. Mirrors POST "
+     "audited as engine_principal.credential.reveal; a re-call is a new tool call, so under the "
+     "supervised tier it needs a NEW approval ticket, the one before it having been consumed "
+     "before the handler ran); once the grace window lapses, a re-call "
+     "errors and the caller must recover (find the stuck successor with GET "
+     "/api/v1/engine-principals/{id}, revoke it with DELETE /api/v1/tokens/{token_id} or the "
+     "revoke_api_token tool as an administrator, then rotate again), never an indefinite retry, "
+     "and never revoke the principal, which is terminal. If the read-back answers but finds "
+     "no linked successor, the secret is withheld with NO retry hint: inspect the principal's "
+     "credentials first. Mirrors POST "
      "/api/v1/engine-principals/{id}/credentials/rotate. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
@@ -2703,13 +2959,16 @@ static const ToolDef kTools[] = {
      "successor secret (#3015 proof of possession, SOC 2 CC6.3) — this call revokes the "
      "predecessor on success, so it must not proceed on token_id alone; a wrong secret is refused "
      "with a distinct error, checked only after every other admission gate has already passed. "
-     "Replaying a confirm after this rotation already resolved (a network-dropped success, a double-submit) returns a "
+     "Replaying a confirm after this rotation already resolved (a network-dropped success, a "
+     "double-submit) returns a "
      "TERMINAL already-confirmed/already-resolved error (not a retryable one) - do not retry; "
      "re-rotate if a fresh rotation is needed. If confirm instead reports 'rotation confirmation "
      "unavailable' (the initiator binding is lost or in dispute), do NOT call "
      "revoke_engine_principal - that is TERMINAL and destroys BOTH credentials plus the "
-     "principal itself; there is no MCP twin for per-credential revoke, so resolve this case via "
-     "REST: DELETE /api/v1/tokens/{token_id} on the SPECIFIC credential you no longer trust. "
+     "principal itself. Revoke the SPECIFIC credential you no longer trust instead, with "
+     "DELETE /api/v1/tokens/{token_id} or the revoke_api_token tool (approval-gated at the "
+     "supervised tier, ApiToken:Delete; only an effective administrator or the token's owner "
+     "can revoke it, anyone else gets 'token not found'). "
      "Note: the approval gate applies two independent "
      "checks before this logic runs. (1) An exact replay carrying an already-consumed "
      "approval_id is denied ('approval already used'; submit a new request for a fresh ticket). "
@@ -2742,9 +3001,9 @@ static const ToolDef kTools[] = {
 
     {"rotate_api_token",
      "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3): mints "
-     "a successor token alongside the still-valid predecessor for the overlap window (default+"
-     "minimum 7 days, floor 24h). BOUNDED-IDEMPOTENT, not generally idempotent: a re-call within "
-     "a short grace window after the original mint re-serves the SAME successor secret (each "
+     "a successor token alongside the still-valid predecessor for the overlap window (default "
+     "7 days, minimum 1 day = 24h). BOUNDED-IDEMPOTENT, not generally idempotent: a re-call "
+     "within a short grace window after the original mint re-serves the SAME successor secret (each "
      "reveal — original or replay — is independently audited as api_token.reveal); once the "
      "grace window lapses, a re-call errors and the caller must fall back to an explicit new "
      "token or the compromise runbook — never an indefinite retry. Self-service ONLY: the "
@@ -2755,18 +3014,17 @@ static const ToolDef kTools[] = {
      "never accepted as a caller argument. Requires ApiToken:Rotate (self-service, not an admin "
      "operation — unlike the engine credential arm's Security:Write, and deliberately distinct "
      "from the create/list/revoke ApiToken:Write axis; deliberately NOT approval-gated - "
-     "rotation is lifetime-neutral and cannot move authority). An MCP-tier-less caller "
-     "(empty mcp_tier - a cookie session, a plain non-MCP-tiered API token, or an engine "
-     "token) is DENIED outright rather than falling through unenforced, matching REST's "
-     "mandatory step-up on every rotate call including a re-serve; closes the #4309 gap "
-     "for this tool specifically. #2963: the shared ApiToken:Rotate permission gate is "
+     "rotation is lifetime-neutral and cannot move authority). Requires a tiered bearer "
+     "token; a tierless credential is refused at /mcp/v1/ admission (REST's twin applies a "
+     "mandatory step-up on every rotate call including a re-serve). "
+     "#2963: the shared ApiToken:Rotate permission gate is "
      "reachable by any non-admin owner under the default RBAC-off config (same legacy "
      "self-service allowlist REST uses); separately, the store's authority-inheritance "
      "guard now also admits a caller holding NO standing mcp_tier/scope_service to rotate "
-     "ANY of its own tokens regardless of that token's own tier/scope (moot for THIS tool, "
-     "since the #4309 gate above already requires a non-empty mcp_tier to invoke it at all — "
-     "the exception is reachable via the REST route's plain-cookie-session callers). A token "
-     "within 24h of its own expiry cannot be rotated (400/kInvalidParams) — mint a new one "
+     "ANY of its own tokens regardless of that token's own tier/scope (moot for THIS tool: "
+     "a non-empty mcp_tier is required here, so the exception applies only to the REST "
+     "route's plain-cookie-session callers). A token "
+     "within 24h of its own expiry cannot be rotated (400/kInvalidParams) - mint a new one "
      "instead. The returned token_id is "
      "the SUCCESSOR's (scoped exactly to the predecessor rotated, never any other in-flight "
      "rotation of the caller's — a caller may have several at once); overlap_expires_at is the "
@@ -2797,8 +3055,7 @@ static const ToolDef kTools[] = {
      "DELETE /api/v1/tokens/{token_id} — there is no engine-principal terminal route in play on "
      "this human-token arm, but the same per-credential (never per-principal) revoke discipline "
      "applies. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Same "
-     "MCP-tier-less deny-outright as rotate_api_token above - closed for this tool "
-     "specifically (#4309). Same #2963 self-service allowlist + empty-tier/scope "
+     "tiered-bearer-token requirement as rotate_api_token above. Same #2963 self-service allowlist + empty-tier/scope "
      "exception as rotate_api_token above. Ownership + the raw successor secret "
      "(proof of possession) are the actual gates on who may confirm - NOT necessarily "
      "the same session that called rotate. The re-check is that the CALLER'S CURRENT "
@@ -2838,12 +3095,9 @@ static const ToolDef kTools[] = {
      "permission) — the SAME multi-store check (rbac_store + mgmt_store) the REST route runs; "
      "RBAC must be enabled for a scope_service token at all. The raw token is returned exactly "
      "once - store it now. Mirrors POST /api/v1/tokens. Requires ApiToken:Write (approval-gated "
-     "at the supervised MCP tier - maker-checker for self-service credential minting). A caller "
-     "with an empty mcp_tier (a cookie session, a plain non-MCP-tiered API token, or an engine "
-     "token - not exclusively an interactive session) is DENIED outright rather than falling "
-     "through to RBAC-only enforcement (kPermissionDenied, 'requires an MCP-tier bearer token'); "
-     "closes the #4309 interactive-session gap for this tool specifically, still open for other "
-     "approval-gated MCP tools. "
+     "at the supervised MCP tier - maker-checker for self-service credential minting). Requires "
+     "a tiered bearer token; a tierless credential is refused at /mcp/v1/ admission "
+     "(kPermissionDenied, 'requires an MCP-tier bearer token'). "
      "Additive: mints a new credential, overwrites nothing (not idempotent - each call mints a "
      "distinct token).",
      R"j({"type":"object","properties":{)j"
@@ -2860,8 +3114,7 @@ static const ToolDef kTools[] = {
      "not-owned token_id and a nonexistent one are INDISTINGUISHABLE (both report 'token not "
      "found') — not an enumeration oracle. Mirrors DELETE /api/v1/tokens/{id}. Requires "
      "ApiToken:Delete — approval-gated (supervised MCP tier maker-checker; Delete is always "
-     "destructive). Same interactive-session denial as create_api_token - closed for this tool "
-     "specifically (#4309). Destructive, idempotent per the store's own already-revoked handling.",
+     "destructive). Same tiered-bearer-token requirement as create_api_token. Destructive, idempotent per the store's own already-revoked handling.",
      R"j({"type":"object","properties":{)j"
      R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"Token id to revoke (from list_api_tokens/create_api_token)"})j"
      R"j(},"required":["token_id"]})j",
@@ -3281,8 +3534,8 @@ static const ToolDef kTools[] = {
      "clearing your own lockout is recoverable. Requires the Postgres auth store (AuthDB) — "
      "answers 'lockout subsystem unavailable' if it is not wired, same as the REST route. "
      "Mirrors POST /api/v1/users/{username}/unlock. Requires UserManagement:Write — approval-"
-     "gated (supervised MCP tier maker-checker). Same interactive-session denial as "
-     "create_api_token - closed for this tool specifically (#4309). Destructive: overwrites the "
+     "gated (supervised MCP tier maker-checker). Same tiered-bearer-token "
+     "requirement as create_api_token. Destructive: overwrites the "
      "account's existing lockout/failed-login state.",
      R"j({"type":"object","properties":{)j"
      R"j("username":{"type":"string","minLength":1,"maxLength":64,"description":"Local account username to unlock"})j"
@@ -3302,11 +3555,14 @@ static const ToolDef kTools[] = {
      "depends on catalogue order (name, then id) and sizes, so retrying does not cure it; "
      "parameter_schema is still present). A non-null input_schema can still be refused at "
      "execute, for any reason its validator rejects that canonicalisation does not check (e.g. "
-     "a regex that does not compile). CHAIN: call execute_instruction with the entry's plugin and "
-     "action, params shaped by input_schema but sent as strings (\"24\", \"true\": "
-     "execute_instruction params are string-valued), and agent_ids or scope. The schema is "
-     "enforced only by POST /api/instructions/{id}/execute; execute_instruction looks up no "
-     "definition. There are no filter arguments: the whole catalogue comes back (truncated=true "
+     "a regex that does not compile). CHAIN: call execute_instruction_definition with "
+     "definition_id set to the entry's id, params shaped by input_schema (typed values go as "
+     "JSON types), and agent_ids or scope: the stored schema is enforced there, as it is by "
+     "POST /api/v1/instructions/{id}/execute and POST /api/instructions/{id}/execute. To run the "
+     "entry's plugin and action directly instead, call execute_instruction with them, params "
+     "shaped by input_schema but sent as strings (\"24\", \"true\": execute_instruction params "
+     "are string-valued); that tool looks up no definition and enforces no stored schema. "
+     "There are no filter arguments: the whole catalogue comes back (truncated=true "
      "at 5000 entries), so filter on plugin/action yourself. count 0 with an empty list means "
      "no enabled definition is published; it is not an error. Requires "
      "InstructionDefinition:Read. Read-only and safe to repeat. REST twin: GET "
@@ -3361,7 +3617,7 @@ static const ToolDef kTools[] = {
     {"get_agent_app_usage",
      "Query a single agent's per-executable app-usage projection (wave 7 PR7.2) — the "
      "MCP twin of GET /api/v1/forensics/agents/{id}/app-usage. One row per executable: "
-     "first_seen/last_seen (agent-observed, within TAR's retained usage window — 31 days "
+     "first_seen/last_seen (agent-observed, within Echo's retained usage window — 31 days "
      "default, operator-tunable) and a trailing-30-day run_count/total_seconds window. "
      "collected_at is the agent's batch collection time. No user names or pids — the "
      "store carries none. Requires Forensics:Read.",
@@ -3564,8 +3820,10 @@ static const ToolDef kTools[] = {
      "refused to an MCP-tier token with a permission error and an audit row: "
      "plugin_signing_required, audit_retention_days, dex_alert_routing, dex_blast_min_devices, "
      "dex_blast_window_seconds, dex_blast_cooldown_seconds, dex_cohort_export_key and the oidc_* "
-     "keys need an administrator account (an untiered administrator token is admitted, as on "
-     "REST); dex_score_policy has its own route and answers invalid params. Values are sent as "
+     "keys need an administrator account over REST: /mcp/v1/ requires a token that carries an "
+     "MCP tier, and even an administrator token with a tier cannot write them over MCP, so use "
+     "PUT /api/v1/config/{key} or the Settings pages; dex_score_policy has its own route and "
+     "answers invalid params. Values are sent as "
      "strings, e.g. \"90\"; key is 1 to 64 characters from a-z and _, value at most 256 bytes "
      "(a longer value, such as a long dex_alert_routing, goes through PUT /api/v1/config/{key}); "
      "extra arguments are refused. "
@@ -4155,234 +4413,6 @@ static const ToolDef kTools[] = {
      R"j("command_id":{"type":"string"},"source":{"type":"string"},"requested_at":{"type":"integer"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"})j"
      R"j(},"required":["requested","agents_reached","skipped_offline","skipped_version","command_id","source","requested_at"]})j"},
-    // ── /crypto slice 1 twins - MCP mirrors of GET /api/v1/crypto/libraries[/devices], shaped
-    // by the SAME pure model (crypto_library_model.hpp) and read through the SAME CryptoApi seam
-    // as the REST routes and the /crypto page. Appended at the VERY END of kTools[] per the
-    // standing governance note above. The `family` enum is the model's families() ids; a test
-    // pins the two together.
-    {"get_crypto_libraries",
-     "Fleet view of which cryptographic libraries are installed: one row per library family "
-     "(OpenSSL, GnuTLS, NSS, Mbed TLS, wolfSSL, libsodium, Bouncy Castle and others), each with "
-     "the number of DISTINCT devices carrying any package of the family and a per-(version, "
-     "ecosystem) breakdown with the matching package names. Use it to answer 'where is library X "
-     "installed and at which versions'; chain it with list_crypto_library_devices to name the "
-     "devices behind a family or one version bucket. Evidence is the daily-synced "
-     "installed-software inventory matched by package NAME against a curated table "
-     "(table_version says which mapping answered; names_source says where the package NAMES "
-     "came from - 'catalogue' (the hourly software catalogue, fresh: a name first reported "
-     "after names_as_of appears after the next refresh) or 'live' (read from the inventory at "
-     "call time because the catalogue is not built, is stale or was refreshed over zero "
-     "titles; names_as_of null); counts and versions for listed names are live either "
-     "way). It reports presence and versions only and "
-     "never judges a library or version: interpreting a version is the caller's job. Families "
-     "with no matching device are omitted, and an empty families list means 'no matching package "
-     "rows in the caller's visible inventory' - NOT proof the library is absent: statically "
-     "linked, vendored and OS-bundled copies are invisible here, and Windows installer builds of "
-     "OpenSSL are not matched. coverage gives the denominator: "
-     "devices_reporting_inventory (visible devices with an installed-software report) and "
-     "devices_with_crypto_library (distinct devices matching any family). versions_truncated / "
-     "result_truncated true mean version rows were capped, never that devices are missing from "
-     "the counts; when the 2,000-row store ceiling fires (result_truncated) every family is "
-     "flagged versions_truncated, because which families lost rows is not known. Each version "
-     "bucket lists at most 8 package names; package_names_truncated is true when it has more. "
-     "Requires Inventory:Read; a management-group-confined caller sees only its visible devices "
-     "(counts, coverage and versions are all computed over that scope). A service-scoped token "
-     "is refused (403) while RBAC enforcement is off, the default; with RBAC enforcement on it "
-     "is admitted within the ITServiceOwner ceiling and sees only the devices tagged with its IT "
-     "service. Input is strict: a non-object arguments value, an unknown family, an ecosystem "
-     "outside the published set, a wrong JSON type or an over-long string is rejected (the REST "
-     "twin clamps). A degraded inventory store, or crypto read capacity in "
-     "use, is a retryable error, never an "
-     "empty result. Package names are cut to 256 bytes (a cut name ends in an ellipsis) and the "
-     "whole payload is byte-budgeted: a cut version list sets versions_truncated and "
-     "result_truncated. ecosystem is matched EXACTLY (empty string = rows with no ecosystem; "
-     "omit for any). Audited as mcp.get_crypto_libraries. Mirrors GET /api/v1/crypto/libraries.",
-     R"j({"type":"object","properties":{)j"
-     R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict to one library family id; omit for every family"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
-     R"j(}})j",
-     R"j({"type":"object","properties":{)j"
-     R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this answer"},)j"
-     R"j("names_source":{"type":"string","enum":["catalogue","live"],"description":"Where the package names came from: the fresh hourly catalogue, or a live read of the inventory (catalogue not built, stale or refreshed over zero titles)"},)j"
-     R"j("names_as_of":{"type":["integer","null"],"description":"Refresh time (epoch seconds) of the catalogue when names_source is catalogue; null when live. Counts and versions for listed names are live either way"},)j"
-     R"j("families":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"display":{"type":"string"},"device_count":{"type":"integer"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"ecosystem":{"type":"string"},"device_count":{"type":"integer"},"package_names":{"type":"array","items":{"type":"string"}},"package_names_truncated":{"type":"boolean","description":"True when the bucket has more matching package names than the 8 listed"}},"required":["version","ecosystem","device_count","package_names","package_names_truncated"]}},"versions_truncated":{"type":"boolean","description":"True when this family's version list is cut (per-family cap of 50, the byte budget, or the 2,000-row store ceiling, which flags every family)"}},"required":["id","display","device_count","versions","versions_truncated"]}},)j"
-     R"j("coverage":{"type":"object","properties":{"devices_reporting_inventory":{"type":"integer"},"devices_with_crypto_library":{"type":"integer"}},"required":["devices_reporting_inventory","devices_with_crypto_library"]},)j"
-     R"j("result_truncated":{"type":"boolean"},)j"
-     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
-     R"j(},"required":["table_version","names_source","names_as_of","families","coverage","result_truncated"]})j"},
-
-    {"list_crypto_library_devices",
-     "List the devices (and the matching package rows) behind one cryptographic library family, "
-     "optionally narrowed to one exact version and ecosystem - the drill-down after "
-     "get_crypto_libraries. Each row carries agent_id, hostname (null when the registry does not "
-     "know the device), package_name, version, release, ecosystem and kind. A device with several "
-     "matching packages appears once per package. Ordered by agent_id, package name; page with "
-     "next_cursor (non-null when more rows exist) passed back as cursor: a cursor reused with a "
-     "different family/version/ecosystem, one issued under a different table_version, a "
-     "malformed one, or a page whose cursor was issued on live package names when the next page "
-     "finds the shared catalogue in use (names_source live to catalogue; this recurs if the "
-     "catalogue goes stale and recovers mid-walk), is rejected and the walk must restart "
-     "without a cursor. A newer catalogue or a switch to live continues; a name new in the "
-     "newer source is listed for devices after the cursor, and its rows on devices already "
-     "passed are missed until you restart. version and ecosystem are matched "
-     "EXACTLY; pass an empty string for the rows that carry none, omit either for every value. An empty devices list means 'no matching package rows "
-     "in the caller's visible inventory' - NOT proof the library is absent: statically linked, "
-     "vendored and OS-bundled copies are invisible here. Presence and versions only; nothing is "
-     "judged. Requires Inventory:Read; a management-group-confined caller sees only its visible "
-     "devices. A service-scoped token is refused (403) while RBAC enforcement is off, the "
-     "default; with RBAC enforcement on it is admitted within the ITServiceOwner ceiling and "
-     "sees only the devices tagged with its IT service. Input is "
-     "strict: a non-object arguments value, an unknown family, an ecosystem outside the "
-     "published set, a wrong JSON type, an over-long string or a limit outside 1..1000 is "
-     "rejected rather than clamped. A degraded "
-     "inventory store, or crypto read capacity in use, is a retryable error, never an empty result. Every page served is audited "
-     "as mcp.list_crypto_library_devices (continuation pages tagged page=continuation). Mirrors "
-     "GET /api/v1/crypto/libraries/devices.",
-     R"j({"type":"object","properties":{)j"
-     R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Library family id (from get_crypto_libraries)"},)j"
-     R"j("version":{"type":"string","maxLength":1024,"description":"Exact version bucket; empty string selects rows with no version; omit for every version"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"},)j"
-     R"j("cursor":{"type":"string","maxLength":2048,"description":"Opaque next_cursor from the previous page; bound to the family/version/ecosystem filter and the table_version; refused if the previous page was read on live names and the catalogue is now in use; restart without a cursor"},)j"
-     R"j("limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Page size"})j"
-     R"j(},"required":["family"]})j",
-     R"j({"type":"object","properties":{)j"
-     R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this page; a cursor is bound to it"},)j"
-     R"j("names_source":{"type":"string","enum":["catalogue","live"],"description":"Where the package names came from: the fresh hourly catalogue, or a live read of the inventory (catalogue not built, stale or refreshed over zero titles)"},)j"
-     R"j("names_as_of":{"type":["integer","null"],"description":"Refresh time (epoch seconds) of the catalogue when names_source is catalogue; null when live. Counts and versions for listed names are live either way"},)j"
-     R"j("family":{"type":"string"},"version":{"type":["string","null"]},"ecosystem":{"type":["string","null"],"description":"The exact-ecosystem filter echoed; null when absent"},)j"
-     R"j("devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":["string","null"]},"package_name":{"type":"string"},"version":{"type":"string"},"release":{"type":"string"},"ecosystem":{"type":"string"},"kind":{"type":"string"}},"required":["agent_id","hostname","package_name","version","release","ecosystem","kind"]}},)j"
-     R"j("next_cursor":{"type":["string","null"]},"count":{"type":"integer"},)j"
-     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
-     R"j(},"required":["table_version","names_source","names_as_of","family","version","ecosystem","devices","next_cursor","count"]})j"},
-
-    {"export_crypto_cbom",
-     "A CycloneDX 1.7 inventory of the fleet's cryptographic LIBRARY packages (library "
-     "components only: no algorithms, certificates, keys or protocols yet), exported as a CBOM "
-     "(JSON): the same data and the same Inventory:Read gate as get_crypto_libraries, re-shaped "
-     "into a standard bill of materials a CBOM/SBOM tool can ingest. A large fleet can produce a "
-     "multi-MiB result (about 2.3 MiB worst case); prefer REST GET /api/v1/crypto/cbom for a "
-     "full export. The BOM is returned as a JSON string in "
-     "the 'bom' field (media type application/vnd.cyclonedx+json; version=1.7). One component "
-     "per (family, version, ecosystem) bucket, always type 'library' (an installed package "
-     "matched by NAME against a curated table), never 'cryptographic-asset': the export carries "
-     "NO cryptoProperties, strength, quantum-security-level or good/bad field - interpreting a "
-     "library or version is the consumer's job. Yuzu-specific facts ride in 'yuzu:crypto:*' "
-     "properties: metadata carries table_version, names_source, names_as_of (absent when names "
-     "are live), result_truncated, truncated_families, devices_reporting, the filters "
-     "applied and scope (fleet, or confined for a confined caller); the document carries "
-     "compositions aggregate=incomplete because a name match cannot see statically linked, "
-     "vendored or OS-bundled copies; each component carries family_id, ecosystem, device_count and package_name "
-     "entries. TRUNCATION IS NEVER SILENT: a family whose version list was cut (50 buckets per "
-     "family, 256 KiB byte budget, store row cap) sets yuzu:crypto:versions_truncated=true on "
-     "its components and is listed in yuzu:crypto:truncated_families (a family with every bucket "
-     "dropped has no component and appears only there); a truncated BOM is incomplete, not "
-     "wrong. An empty components list means 'no matching package rows in the caller's visible "
-     "inventory' - NOT proof the library is absent (statically linked, vendored and OS-bundled "
-     "copies are invisible). Each call mints a fresh random serialNumber and timestamp. "
-     "Requires Inventory:Read; a management-group-confined or service-scoped caller exports "
-     "only its visible devices. Input is strict: arguments must be a JSON object, only family "
-     "and ecosystem are accepted; an unknown family, an ecosystem outside the published set, a "
-     "wrong JSON type or an over-long string is rejected rather than clamped. A degraded "
-     "inventory store, or crypto read capacity in use, is a retryable error, never an empty "
-     "BOM. Audited as mcp.export_crypto_cbom. Mirrors GET /api/v1/crypto/cbom.",
-     R"j({"type":"object","additionalProperties":false,"properties":{)j"
-     R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict the BOM to one library family id; omit for every family"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
-     R"j(}})j",
-     R"j({"type":"object","properties":{)j"
-     R"j("bom":{"type":"string","description":"The CycloneDX 1.7 JSON document, serialised (media type application/vnd.cyclonedx+json; version=1.7)"},)j"
-     R"j("content_type":{"type":"string","enum":["application/vnd.cyclonedx+json; version=1.7"]},)j"
-     R"j("components":{"type":"integer","description":"Number of components in the BOM"},)j"
-     R"j("result_truncated":{"type":"boolean","description":"True when the store row cap or response byte budget cut the summary; per-family version cuts are flagged in yuzu:crypto:truncated_families and each component's versions_truncated"},)j"
-     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
-     R"j(},"required":["bom","content_type","components","result_truncated"]})j"},
-    // ── /crypto dashboard widgets (ADR-0070 D13) - MCP twins of GET /api/v1/crypto/widgets,
-    // GET/PUT /api/v1/crypto/dashboard/layout and GET /api/v1/crypto/ca/{stats,certificates},
-    // shaped by the SAME pure catalogue (crypto_widget_catalogue.hpp) and read through the SAME
-    // CryptoApi seam as the REST routes. Appended at the VERY END of kTools[] per the standing
-    // governance note above. The days enum below is the union of the closed window set; the
-    // per-kind check is strict_cert_args_error's.
-    {"list_crypto_widgets",
-     "List the /crypto dashboard widget catalogue: every widget's id, title, kind (number, bar, "
-     "line or table), group ('Crypto libraries' or 'Yuzu-issued certificates'), gate class, the "
-     "permission its data needs (securable + operation), its criterion in words (exactly what the "
-     "number counts), where a click drills to, and available / availability - whether YOU may "
-     "read it (available, not_available, confined, access_check_unavailable). Library widgets "
-     "need Inventory:Read and a confined caller gets a narrowed answer; the Yuzu-issued counts "
-     "need Inventory:Read and are WITHHELD from a confined caller (availability confined, never a "
-     "narrowed count). Yuzu-issued widgets also carry drill_available: the certificate rows behind "
-     "a count need Security:Read (list_issued_certs with kind/days/week/bucket). Facts only; the "
-     "only built-in checks are the D13 named windows, each shown with its criterion. available "
-     "decides what to draw only; each data tool keeps its own gate. Also returns the default "
-     "layout, the window set version (window_set) and the Yuzu-issued scope note. Takes no "
-     "arguments. Mirrors GET /api/v1/crypto/widgets.",
-     R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{)j"
-     R"j("window_set":{"type":"string","description":"Version of the closed window set"},"scope_note":{"type":"string"},)j"
-     R"j("widgets":{"type":"array","items":)j" R"j({"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"kind":{"type":"string","enum":["number","bar","line","table"]},"group":{"type":"string"},"gate":{"type":"string","enum":["fleet_read","fleet_wide_only","global"]},"securable":{"type":"string"},"operation":{"type":"string"},"criterion":{"type":"string","description":"What the widget counts, in words"},"drill":{"type":"string","enum":["library_families","library_family_devices","ca_certificates","ca_week"]},"available":{"type":"boolean","description":"Whether the caller may read the widget's data (drawing only, never a grant)"},"availability":{"type":"string","enum":["available","not_available","confined","access_check_unavailable"]},"ca_kind":{"type":"string"},"days":{"type":["integer","null"]},"drill_securable":{"type":"string"},"drill_operation":{"type":"string"},"drill_available":{"type":"boolean"}},"required":["id","title","kind","group","gate","securable","operation","criterion","drill","available","availability"]})j" R"j(},)j"
-     R"j("default_layout":{"type":"array","items":{"type":"string"}},"max_layout_widgets":{"type":"integer"})j"
-     R"j(},"required":["window_set","widgets","default_layout","max_layout_widgets","scope_note"]})j"},
-
-    {"get_crypto_dashboard_layout",
-     "Get YOUR OWN /crypto dashboard layout: the catalogue widget ids you placed, in display "
-     "order, and its version (pass it as expected_version to set_crypto_dashboard_layout). Ids "
-     "this server version does not know (a widget another version added) are counted in "
-     "preserved_unknown - not listed, but kept on every save. is_default is true when the layout "
-     "is the catalogue default (nothing saved, version 0, or a saved copy of it). Keyed by your "
-     "session; there is no way to read another operator's layout. A degraded layout store is a "
-     "retryable error, never the default served as if nothing were stored; a stored layout that "
-     "cannot be read is a non-retryable error whose remediation names the version to overwrite. "
-     "Takes no arguments. Mirrors GET /api/v1/crypto/dashboard/layout.",
-     R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"widgets":{"type":"array","items":{"type":"string"},"description":"Catalogue widget ids in display order"},"is_default":{"type":"boolean"},"version":{"type":"integer","description":"Stored version; 0 when nothing is stored"},"preserved_unknown":{"type":"integer","description":"Stored ids this server version does not know: kept, not listed"},"max_layout_widgets":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["widgets","is_default","version","preserved_unknown","max_layout_widgets"]})j"},
-
-    {"set_crypto_dashboard_layout",
-     "Replace YOUR OWN /crypto dashboard layout with the given widget ids, in display order "
-     "(add a widget by including its id, remove one by leaving it out; an empty list is a valid, "
-     "empty dashboard). It overwrites the previous layout (destructive to that layout only; no "
-     "data, no permission and no other operator is touched). Every id must come from "
-     "list_crypto_widgets, without repeats, at most 64. Ids another server version stored are "
-     "kept after yours. Pass expected_version (the version get_crypto_dashboard_layout returned; "
-     "0 = only if nothing is saved) to refuse the save when the layout changed meanwhile - a "
-     "conflict is a non-retryable error: read it again, then save. Omit only for a first save: "
-     "without it the save succeeds only when nothing is stored, and a stored layout is the same "
-     "non-retryable conflict naming the stored version. Idempotent: the same list twice stores the same layout. Keyed by your session. "
-     "Input is strict: an unknown or repeated id, more than 64 ids, a non-string id or any other "
-     "argument is rejected. Audited as crypto.dashboard.layout.update (an attempted row first: if "
-     "it cannot be written the layout is not changed). A degraded layout store is a retryable "
-     "error; a save whose commit outcome is unknown is a retryable error that says so (read the "
-     "layout to check). Mirrors PUT /api/v1/crypto/dashboard/layout.",
-     R"j({"type":"object","properties":{)j"
-     R"j("widgets":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":64},"description":"Catalogue widget ids in display order"},)j"
-     R"j("expected_version":{"type":"integer","minimum":0,"description":"The version you last read; 0 = only when nothing is saved. Omit only for a first save (a stored layout is then a conflict)"})j"
-     R"j(},"required":["widgets"],"additionalProperties":false})j",
-     R"j({"type":"object","properties":{"widgets":{"type":"array","items":{"type":"string"},"description":"Catalogue widget ids in display order"},"is_default":{"type":"boolean"},"version":{"type":"integer","description":"The new stored version"},"preserved_unknown":{"type":"integer"},"max_layout_widgets":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["widgets","is_default","version","preserved_unknown","max_layout_widgets"]})j"},
-
-    {"get_crypto_ca_stats",
-     "Counts of certificates issued by Yuzu's OWN internal CA (the agent, server, gateway, "
-     "HTTPS and code-signing certificates Yuzu minted - never the certificates on your devices), "
-     "each against as_of, the database clock at read time (epoch seconds and ISO 8601). Facts "
-     "only; the only built-in checks are the D13 named windows, each with its criterion: active; "
-     "expiring within 3, 7, 14, 21, 30 and 60 days and expired in the last 7, 30, 60 and 90 days, "
-     "status active only (a certificate is valid through its notAfter, inclusive; a revoked one "
-     "counts only in the revoked windows); revoked in the last 7, 30, 60 and "
-     "90 days, reported in three buckets by recorded reason - superseded, unpublished (recorded, "
-     "never delivered) and other - never summed or labelled; issued in the last 7 days excluding "
-     "unpublished; and issued and revoked per ISO week for the last 52 ISO weeks (UTC, Monday "
-     "start; the current week is partial and flagged). Every count carries rule_id, "
-     "threshold (or week), criterion, rule_set_version and as_of. Nothing is stored or "
-     "graded: recompute any count from list_issued_certs with the same kind/days/week/bucket and "
-     "as_of (needs Security:Read). Requires Inventory:Read; a caller whose view is confined is "
-     "refused (these are fleet-wide figures), never given a narrowed count. A degraded CA store, "
-     "or crypto read capacity in use, is a retryable error, never zeros. Takes no arguments. "
-     "Audited as crypto.ca.stats.view. Mirrors GET /api/v1/crypto/ca/stats.",
-     R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{)j"
-     R"j("scope":{"const":"yuzu_issued"},"scope_note":{"type":"string"},"window_edge_note":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer","description":"Database time (epoch seconds) every window was computed against"},"as_of_iso":{"type":"string"},)j"
-     R"j("active":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]},"expiring_within_days":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]}},"expired_within_days":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]}},"revoked_within_days":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]},"description":"Three entries per window: buckets superseded, unpublished, other"},"issued_within_days":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]},)j"
-     R"j("week_basis":{"type":"string"},"weeks":{"type":"array","items":{"type":"object","properties":{"week":{"type":"string","description":"ISO 8601 week, e.g. 2026-W40"},"week_start":{"type":"integer"},"partial":{"type":"boolean"},"issued":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]},"revoked":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]}}},"required":["week","week_start","partial","issued","revoked"]}},)j"
-     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
-     R"j(},"required":["scope","scope_note","rule_set_version","as_of","as_of_iso","active","expiring_within_days","expired_within_days","revoked_within_days","issued_within_days","week_basis","weeks"]})j"},
     // Twin of REST GET /api/v1/me (and legacy GET /api/me): the caller's own session
     // self-description, built by the ONE shared me_response::build_me_json. Legacy
     // (non-registry) tool, mirroring check_permission: the generic tier gate only,
@@ -4421,7 +4451,7 @@ static const ToolDef kTools[] = {
      R"j("role":{"type":"string","description":"Persisted legacy role (admin or user)"},)j"
      R"j("principal_kind":{"type":"string","description":"human (the default for every non-engine session) or engine"},)j"
      R"j("auth_source":{"type":"string","description":"How the caller authenticated: local, oidc, saml, api_token, mcp_token or engine_token"},)j"
-     R"j("mcp_tier":{"type":"string","description":"readonly, operator or supervised; empty for a non-MCP session"},)j"
+     R"j("mcp_tier":{"type":"string","description":"readonly, operator or supervised; always present over MCP, which refuses a credential with no tier"},)j"
      R"j("scope_service":{"type":"string","description":"Service the token is scoped to; empty when unscoped. Always empty over MCP because a service-scoped token is refused"},)j"
      R"j("rbac_enabled":{"type":"boolean","description":"The server's cached view of the RBAC switch; can lag and does not report the degraded fail-closed state (#6033)"},)j"
      R"j("rbac_role":{"type":"string","description":"Deprecated display field: the first DIRECT role by role_name order, or for a human with none a legacy Administrator/Viewer label that is not a grant. Omitted for an engine principal with RBAC off or no engine grant, and when rbac_roles_resolved is false. Not an authority summary: call check_permission"},)j"
@@ -4434,25 +4464,6 @@ static const ToolDef kTools[] = {
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
      R"j(},"required":["username","display_name","role","principal_kind","auth_source","mcp_tier","scope_service","rbac_enabled","rbac_roles_resolved","effective_role","elevated","can_access_settings"],"additionalProperties":false})j"},
 };
-
-// The audit-detail tag of a /crypto layout failure (never the username), shared by the two
-// MCP layout twins; the REST twin's crypto_routes.cpp layout_failure_detail is its mirror.
-static std::string layout_failure_tag(const yuzu::server::CryptoReadError& e) {
-    using K = yuzu::server::CryptoReadError::Kind;
-    switch (e.kind) {
-    case K::kOutcomeUnknown:
-        return "outcome=unknown";
-    case K::kConflict:
-        return "outcome=conflict";
-    case K::kCorrupt:
-        return "outcome=corrupt";
-    case K::kInvalid:
-        return "outcome=invalid";
-    case K::kDegraded:
-        break;
-    }
-    return e.cause == yuzu::server::CryptoReadCause::kCapacity ? "outcome=busy" : "outcome=degraded";
-}
 
 static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
               "the catalogue cursor bound must equal the MCP cursor input bound");
@@ -4471,7 +4482,7 @@ static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
 // an offence — not a silent first-wins collapse at static init.
 static const char* const kWriteToolsRaw[] = {
     "sync_hardware_software",
-    "set_tag",         "delete_tag",     "execute_instruction",
+    "set_tag",         "delete_tag",     "execute_instruction", "execute_instruction_definition",
     "approve_request", "reject_request", "quarantine_device",
     "revoke_certificate", "execute_bundle", "issue_code_signing_cert", "import_ca_chain",
     // Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3).
@@ -4518,7 +4529,7 @@ static const char* const kWriteToolsRaw[] = {
     // operation is "Read"; operation is the ONLY thing that decides
     // membership here, not whether a handler mutates state.
     "create_result_set", "create_result_set_from_inventory_query",
-    "create_result_set_from_tar_query",
+    "create_result_set_from_echo_query",
     "create_result_set_from_instruction_result", "reevaluate_result_set",
     "pin_result_set", "unpin_result_set", "delete_result_set",
     // #2146 Batch B1 — Guardian rule CRUD + push. create/update: Write;
@@ -4548,8 +4559,9 @@ static const char* const kWriteToolsRaw[] = {
     "create_offload_target", "delete_offload_target", "activate_platform_license",
     "create_software_deployment", "rollback_software_deployment",
     "cancel_software_deployment",
-    // /crypto widgets — Infrastructure:Write (the caller's own layout).
-    "set_crypto_dashboard_layout",
+    // #2146 batch B - execution cancel/rerun records (Execution:Execute). Neither sends anything
+    // to a device.
+    "cancel_execution", "record_execution_rerun",
 };
 
 // The lookup set is DERIVED by catalogue() (merged with the registry records'
@@ -4596,9 +4608,9 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // (dashboard_routes.cpp) — none of the six #4027 surfaces admits a
     // service-scoped caller; this fix round closes the management-group gap
     // only, never widens the service-scope one.
-    {"list_tar_process_tree_devices", {"Infrastructure", "Read"}},
-    {"list_tar_capture_sources_devices", {"Infrastructure", "Read"}},
-    {"list_tar_retention_paused", {"Infrastructure", "Read"}},
+    {"list_echo_process_tree_devices", {"Infrastructure", "Read"}},
+    {"list_echo_capture_sources_devices", {"Infrastructure", "Read"}},
+    {"list_echo_retention_paused", {"Infrastructure", "Read"}},
     // #1700 / #3290 Phase 2: migrated onto require_fleet_read, which gives
     // this tool a REAL confinement mechanism (meet(management-group,
     // service-scope)) — reclassified from the default `denied` to
@@ -4624,23 +4636,6 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_inventory_tables", {"Infrastructure", "Read"}},
     {"get_agent_inventory", {"Infrastructure", "Read"}},
     {"query_installed_software", {"Inventory", "Read", ServiceScopeClass::confined}},
-    // /crypto slice 1: gated on fleet_read_fn_ (Inventory:Read), whose composed
-    // meet(management-group, service-scope) VisibleSet is pushed into the SQL by the CryptoApi
-    // seam - a REAL confinement mechanism, so `confined`, same as query_installed_software.
-    {"get_crypto_libraries", {"Inventory", "Read", ServiceScopeClass::confined}},
-    {"list_crypto_library_devices", {"Inventory", "Read", ServiceScopeClass::confined}},
-    {"export_crypto_cbom", {"Inventory", "Read", ServiceScopeClass::confined}},
-    // /crypto dashboard widgets. The catalogue and the caller's OWN layout are owner-scoped
-    // (session username, the result-set precedent: Infrastructure Read/Write for the tier, no
-    // RBAC gate in the handler) and touch no fleet data, so a service-scoped token stays
-    // `denied` (default). The Yuzu-issued counts (get_crypto_ca_stats) gate on the fleet-read
-    // Inventory:Read in the handler and the certificates behind them (list_issued_certs) on
-    // Security:Read, as GET /api/v1/ca/issued does; Yuzu's own PKI has no service scope, so
-    // both are `denied`.
-    {"list_crypto_widgets", {"Infrastructure", "Read"}},
-    {"get_crypto_dashboard_layout", {"Infrastructure", "Read"}},
-    {"set_crypto_dashboard_layout", {"Infrastructure", "Write"}},
-    {"get_crypto_ca_stats", {"Inventory", "Read"}},
     // M.9: the catalogue twins read a FLEET-WIDE rollup that cannot be scoped to a service tag,
     // so they keep the default-deny class (C8 refuses a service-scoped token before the handler).
     {"query_software_catalogue", {"Inventory", "Read"}},
@@ -4687,6 +4682,16 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // #2146 A2-R1 - same fleet_read_fn_-gated confinement mechanism as
     // get_execution_status/list_executions above.
     {"get_execution_children", {"Execution", "Read", ServiceScopeClass::confined}},
+    // Cancel/rerun twins (#2146 batch B). ServiceScopeClass is the `denied` default for BOTH:
+    // the REST twins' perm_fn(Execution:Execute) refuses a service-scoped token (the pair is not
+    // on kServiceScopeGlobalSafe, which is empty), and the only confinement these handlers have
+    // is admit_confined_mutation, which is a management-group mechanism, not a service-scope
+    // one. Calling it `confined` would claim a downstream service-scope mechanism that does not
+    // exist (the lie this classification exists to prevent). cancel_execution is exempt from the
+    // supervised approval ticket via mcp_policy.hpp's kApprovalExemptTools (same pair); rerun is
+    // gated like every other Execution:Execute tool.
+    {"cancel_execution", {"Execution", "Execute"}},
+    {"record_execution_rerun", {"Execution", "Execute"}},
     {"list_executions", {"Execution", "Read", ServiceScopeClass::confined}},
     {"list_schedules", {"Schedule", "Read", ServiceScopeClass::confined}},
     // #4030: Workflow (multi-step orchestration) — RBAC seeding prerequisite
@@ -4758,7 +4763,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // is the #1788/ADR-0017 confinement class -- get it right: the derived
     // VisibleSet is the ONLY per-device authorization on this surface, not
     // defense-in-depth.
-    {"create_result_set_from_tar_query", {"Execution", "Execute", ServiceScopeClass::confined}},
+    {"create_result_set_from_echo_query", {"Execution", "Execute", ServiceScopeClass::confined}},
     {"create_result_set_from_instruction_result",
      {"Execution", "Execute", ServiceScopeClass::confined}},
     {"reevaluate_result_set", {"Execution", "Execute", ServiceScopeClass::confined}},
@@ -4866,6 +4871,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"set_tag", {"Tag", "Write", ServiceScopeClass::confined}},
     {"delete_tag", {"Tag", "Delete", ServiceScopeClass::confined}},
     {"execute_instruction", {"Execution", "Execute", ServiceScopeClass::confined}},
+    // #2146: the REST twin gates on the plain, global Execution:Execute pair, which a
+    // service-scoped token cannot clear (kServiceScopeGlobalSafe is seeded empty), so this is
+    // `denied`: `confined` would claim a per-agent mechanism that gate does not have.
+    {"execute_instruction_definition", {"Execution", "Execute", ServiceScopeClass::denied}},
     // Live-query bundle (ADR-0011) — same securable as the underlying ops:
     // dispatch is Execution:Execute, collate is Response:Read.
     {"execute_bundle", {"Execution", "Execute", ServiceScopeClass::confined}},
@@ -5288,8 +5297,9 @@ void validate_tool_security_registration(
                                           [&](const auto& r) { return r.name == s.name; });
             if (row == security_rows.end())
                 continue;  // parity offence already reported above
-            const bool gated = requires_approval("operator", row->securable, row->operation) ||
-                               requires_approval("supervised", row->securable, row->operation);
+            const bool gated =
+                requires_approval_for_tool("operator", s.name, row->securable, row->operation) ||
+                requires_approval_for_tool("supervised", s.name, row->securable, row->operation);
             if (!gated)
                 continue;
             const auto parsed =
@@ -5454,12 +5464,12 @@ struct ToolAnnotation {
 static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // ── Read-only tools (effect ReadOnly, idempotent) ─────────────────────────
     {"list_agents", {ToolEffect::ReadOnly, true, "List agents"}},
-    {"list_tar_process_tree_devices",
-     {ToolEffect::ReadOnly, true, "List TAR process-tree device picker"}},
-    {"list_tar_capture_sources_devices",
-     {ToolEffect::ReadOnly, true, "List TAR capture-sources device picker"}},
-    {"list_tar_retention_paused",
-     {ToolEffect::ReadOnly, true, "List TAR retention-paused sources"}},
+    {"list_echo_process_tree_devices",
+     {ToolEffect::ReadOnly, true, "List Echo process-tree device picker"}},
+    {"list_echo_capture_sources_devices",
+     {ToolEffect::ReadOnly, true, "List Echo capture-sources device picker"}},
+    {"list_echo_retention_paused",
+     {ToolEffect::ReadOnly, true, "List Echo retention-paused sources"}},
     {"get_agent_details", {ToolEffect::ReadOnly, true, "Get agent details"}},
     {"query_audit_log", {ToolEffect::ReadOnly, true, "Query audit log"}},
     {"list_definitions", {ToolEffect::ReadOnly, true, "List instruction definitions"}},
@@ -5473,15 +5483,6 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_inventory_tables", {ToolEffect::ReadOnly, true, "List inventory tables"}},
     {"get_agent_inventory", {ToolEffect::ReadOnly, true, "Get agent inventory"}},
     {"query_installed_software", {ToolEffect::ReadOnly, true, "Query installed software"}},
-    {"get_crypto_libraries", {ToolEffect::ReadOnly, true, "Get installed crypto libraries"}},
-    {"list_crypto_library_devices",
-     {ToolEffect::ReadOnly, true, "List devices carrying a crypto library"}},
-    {"export_crypto_cbom", {ToolEffect::ReadOnly, true, "Export crypto libraries as a CycloneDX CBOM"}},
-    {"list_crypto_widgets", {ToolEffect::ReadOnly, true, "List crypto dashboard widgets"}},
-    {"get_crypto_dashboard_layout", {ToolEffect::ReadOnly, true, "Get my crypto dashboard layout"}},
-    {"set_crypto_dashboard_layout",
-     {ToolEffect::Destructive, true, "Replace my crypto dashboard layout"}},
-    {"get_crypto_ca_stats", {ToolEffect::ReadOnly, true, "Get Yuzu-issued certificate counts"}},
     {"query_software_catalogue", {ToolEffect::ReadOnly, true, "Query the software catalogue"}},
     {"get_software_versions", {ToolEffect::ReadOnly, true, "Get a title's versions"}},
     {"list_dex_app_perf_devices",
@@ -5543,8 +5544,8 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"create_result_set", {ToolEffect::Additive, false, "Create result set"}},
     {"create_result_set_from_inventory_query",
      {ToolEffect::Additive, false, "Create result set from inventory query"}},
-    {"create_result_set_from_tar_query",
-     {ToolEffect::Destructive, false, "Create result set from TAR query"}},
+    {"create_result_set_from_echo_query",
+     {ToolEffect::Destructive, false, "Create result set from Echo query"}},
     {"create_result_set_from_instruction_result",
      {ToolEffect::Destructive, false, "Create result set from instruction result"}},
     {"reevaluate_result_set", {ToolEffect::Destructive, false, "Re-evaluate result set"}},
@@ -5646,6 +5647,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // execute_*: dispatch caller-selected plugin actions → worst-case destructive,
     // and each call is a fresh async run (new command/execution ids) → not idempotent.
     {"execute_instruction", {ToolEffect::Destructive, false, "Execute instruction"}},
+    {"execute_instruction_definition", {ToolEffect::Destructive, false, "Execute stored instruction definition"}},
     {"execute_bundle", {ToolEffect::Destructive, false, "Execute live-query bundle"}},
     // approve/reject: one-way pending→decided transition (approve also arms a live
     // one-time execution ticket) → destructive + non-idempotent.
@@ -5853,6 +5855,15 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
      {ToolEffect::Destructive, false, "Roll back software deployment"}},
     {"cancel_software_deployment",
      {ToolEffect::Destructive, false, "Cancel software deployment"}},
+    // cancel_execution is a one-way tracker transition (a repeat answers 'already finished', not
+    // a clean no-op) -> Destructive, not idempotent. record_execution_rerun only INSERTS a
+    // pending record, but its kToolSecurityRows operation is Execute, and the 2g PR2
+    // safe-direction floor (test_mcp_server.cpp) mandates destructiveHint:true for every
+    // Delete/Execute-gated tool (same reasoning as create_software_deployment above); each call
+    // creates another record, so it is not idempotent either.
+    {"cancel_execution", {ToolEffect::Destructive, false, "Cancel execution record"}},
+    {"record_execution_rerun",
+     {ToolEffect::Destructive, false, "Record execution rerun (sends nothing to devices)"}},
 };
 
 // The registry header spells the PermFn signature out (it must not include the
@@ -5877,6 +5888,8 @@ static_assert(std::is_same_v<ToolDeps::CiDetailFn, HardwareRoutes::CiDetailFn>,
               "ToolDeps::CiDetailFn drifted from HardwareRoutes::CiDetailFn");
 static_assert(std::is_same_v<ToolDeps::DexScoreFn, HardwareRoutes::DexScoreFn>,
               "ToolDeps::DexScoreFn drifted from HardwareRoutes::DexScoreFn");
+static_assert(std::is_same_v<ToolDeps::CryptoAccessFn, McpServer::CryptoAccessFn>,
+              "ToolDeps::CryptoAccessFn drifted from McpServer::CryptoAccessFn (mcp_server.hpp)");
 
 // ── Merged tool catalogue (registry seam) ────────────────────────────────
 //
@@ -5888,7 +5901,8 @@ static_assert(std::is_same_v<ToolDeps::DexScoreFn, HardwareRoutes::DexScoreFn>,
 std::span<const ToolRecord> registered_tool_records() {
     static const std::vector<ToolRecord> records = [] {
         std::vector<ToolRecord> all;
-        for (const auto span : {discovery_tool_records(), hardware_tool_records(), containment_tool_records()})
+        for (const auto span : {discovery_tool_records(), hardware_tool_records(),
+                                containment_tool_records(), crypto_tool_records()})
             all.insert(all.end(), span.begin(), span.end());
         return all;
     }();
@@ -6611,7 +6625,7 @@ std::vector<std::string> approval_gated_tool_names() {
     std::vector<std::string> out;
     for (const auto& r : catalogue().raw_security)
         for (const char* tier : {"operator", "supervised"})
-            if (requires_approval(tier, r.securable, r.operation)) {
+            if (requires_approval_for_tool(tier, r.name, r.securable, r.operation)) {
                 out.emplace_back(r.name);
                 break;
             }
@@ -6655,6 +6669,38 @@ bool reject_unsupported_protocol_version(const httplib::Request& req, httplib::R
                                "header to accept the 2025-03-26 default)"),
         "application/json");
     return true;
+}
+
+// The one predicate for the stream-channel deny: "this caller holds a service-scoped API
+// token" (service-scoped confinement clause 4: extend, never fork). Other raw
+// token_scope_service.empty() checks belong to the C8 table and the scoped-gate layer, not
+// to this deny. A service-scoped token must never reach a fleet-wide surface unfiltered.
+// The usual gate does not fit the stream channel: require_permission's service branch is
+// only a role ceiling plus a seeded-empty global-safe allow-list, so it carries no
+// information about WHICH service the token is scoped to, and it needs a (securable,
+// operation) pair, which this handler has no securable to supply. The deny therefore
+// keys on the session's service scope directly.
+[[nodiscard]] bool is_service_scoped_caller(const auth::Session& session) {
+    return !session.token_scope_service.empty();
+}
+
+// The ONE audit-and-write sink for a service-scoped denial. Callers test
+// is_service_scoped_caller() first and hand over their own envelope body: the POST tool
+// path echoes the JSON-RPC id (its a4_error), the bodyless GET carries a null id.
+// `http_status` empty = leave res.status untouched (the POST tool path answers its
+// JSON-RPC error inside the HTTP status already on the response).
+template <typename AuditFn>
+void write_service_scoped_denial(const AuditFn& audit_fn, const httplib::Request& req,
+                                 httplib::Response& res, const std::string& action,
+                                 const std::string& result, const std::string& target_type,
+                                 const std::string& target_id, const std::string& audit_detail,
+                                 std::optional<int> http_status, const std::string& body) {
+    (void)yuzu::server::detail::try_persist_audit(audit_fn, req, action, result, target_type,
+                                                  target_id, audit_detail);
+    if (http_status.has_value()) {
+        res.status = *http_status;
+    }
+    res.set_content(body, "application/json");
 }
 
 // #3893 fix round (Doomgoose review, blocking findings 1+2): the ONE place
@@ -6881,7 +6927,10 @@ McpServer::HandlerFn McpServer::build_handler(
         // Auth check — reuses the server's existing auth middleware pipeline
         auto session = auth_fn(req, res);
         if (!session)
-            return; // auth_fn already set 401
+            return; // auth_fn already set 401/403
+        // Derived once per request: the presented-session check, the initialize mint, the
+        // bridge reserve and the streamed-POST liveness check all use this one value.
+        auto binding = binding_for(*session);
 
         // Parse JSON-RPC envelope
         auto parsed = parse_request(req.body);
@@ -6894,14 +6943,16 @@ McpServer::HandlerFn McpServer::build_handler(
 
         // ── Presented session validation (Streamable HTTP) ──────────────────
         // Any method other than initialize that carries an Mcp-Session-Id must
-        // present a live, principal-bound one; unknown / expired / foreign → 404
-        // and the client re-initializes (no cross-principal oracle — the wrong
-        // principal is indistinguishable from a never-existed id, 15(a)/CH-8).
+        // present a live one bound to this principal AND credential class; unknown /
+        // expired / foreign / other-class → 404 and the client re-initializes (no
+        // cross-principal oracle: the wrong principal is indistinguishable from a
+        // never-existed id, 15(a)/CH-8; a same-principal class mismatch answers
+        // identically on the wire and differs only in the audit reason).
         if (streaming_on) {
             const auto sid = req.get_header_value("Mcp-Session-Id");
             if (!sid.empty() && rpc.method != "initialize") {
-                if (mcp_sessions->validate_and_touch(sid, session->username) !=
-                    McpSessionRegistry::ValidateResult::kValid) {
+                const auto presented = mcp_sessions->validate_and_touch(sid, binding);
+                if (presented != McpSessionRegistry::ValidateResult::kValid) {
                     const auto cid = yuzu::server::detail::make_correlation_id();
                     // #2917: the session id is an attacker-controlled HEADER until
                     // it validates, so the prefix that reaches an audit row is
@@ -6912,7 +6963,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     // through raw.
                     session_audit("mcp.session.reject", "failure",
                                   yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8)),
-                                  "reason=unknown_session cid=" + cid);
+                                  std::string("reason=") + session_reject_reason(presented) +
+                                      " cid=" + cid);
                     res.status = 404;
                     // Echo the request id — this is a post-parse error with a known
                     // id, and JSON-RPC 2.0 SHOULD echo it (governance CONS-S3).
@@ -7027,7 +7079,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // A client-supplied Mcp-Session-Id is never adopted here (no
             // fixation, 15(a)/CH-8).
             if (streaming_on) {
-                auto mint = mcp_sessions->mint(session->username);
+                auto mint = mcp_sessions->mint(binding);
                 if (!mint.ok) {
                     const auto cid = yuzu::server::detail::make_correlation_id();
                     session_audit("mcp.session.reject", "failure", "",
@@ -7170,7 +7222,9 @@ McpServer::HandlerFn McpServer::build_handler(
             if (prompt_name == "fleet_overview") {
                 prompt_text = "Give me a summary of the fleet: how many agents are connected, "
                               "OS breakdown (Windows/Linux/macOS), and overall compliance status. "
-                              "Use the list_agents and get_fleet_compliance tools.";
+                              "Use the list_agents and get_fleet_compliance tools. If "
+                              "list_agents returns scope_basis, report its counts as the agents "
+                              "in your scope, not as the fleet.";
             } else if (prompt_name == "investigate_agent") {
                 auto agent_id = param_str(params, "agent_id", "UNKNOWN");
                 prompt_text =
@@ -7644,6 +7698,14 @@ McpServer::HandlerFn McpServer::build_handler(
             // by the BurnGuard below (NOT by mcp_audit — see its comment for why
             // hooking mcp_audit directly under-counts).
             bool approval_ticket_just_consumed = false;
+            // L1 (#2146, ADR-0033 section 10): the effect a supervised-tier C8 ticket was
+            // bound to, for the three tools whose (plugin, action) is read from a STORED
+            // definition at dispatch time (execute_instruction_definition and the two
+            // definition-resolved result-set producers). Set by the C8 block below on the
+            // call that mints or recalls a ticket; read by those handlers, which hand it to
+            // the dispatch stage so the definition that RUNS is the one the human approved.
+            // Unset on the operator tier (no ticket, nothing to hold the lookup to).
+            std::optional<std::string> ticket_bound_effect;
 
             // Audit helper. Returns true when the audit row persisted, false when it was
             // dropped, so SOC 2 read/write surfaces can
@@ -7684,7 +7746,7 @@ McpServer::HandlerFn McpServer::build_handler(
             //
             // CH-1 (recorded here per the issue's request): this counter does NOT
             // interact with the kMcpSubmitterPendingCap 25-slot cap —
-            // pending_count_for() counts only status='pending' rows, and
+            // pending_count_for_checked() counts only unexpired status='pending' rows, and
             // consume_ticket() never touches `status` (only consumed_at/
             // consumed_by); a ticket already left the pending bucket at
             // ADMIN-APPROVAL time, before it could ever reach this burn class. So a
@@ -7800,7 +7862,8 @@ McpServer::HandlerFn McpServer::build_handler(
             // 503 store-degrade of the sibling /sle/agents/{id} drill.
             auto a4_error = [&id](int code, std::string_view message,
                                   std::string_view remediation = {}, long retry_after_ms = -1,
-                                  std::string_view cid_override = {}, bool audit_ok = true) {
+                                  std::string_view cid_override = {}, bool audit_ok = true,
+                                  std::string_view reason = {}) {
                 // cid_override lets a caller mint the correlation id FIRST and
                 // stamp it into its log/audit records before building the
                 // envelope (#2423 review F4); default preserves mint-here.
@@ -7832,6 +7895,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // its own error.data, and the same fact `audit_persisted:false`
                 // already surfaces on every SUCCESS result in this file — passes
                 // its own audit_fn/mcp_audit return here instead.
+                // `reason` is an optional closed machine token (a server literal, never
+                // caller bytes), the same `error.data.reason` the shared execute core and
+                // the mint refusals carry, so a worker branches on it, not on prose.
+                if (!reason.empty())
+                    data += R"(,"reason":)" + json_quoted_string(reason);
                 if (!audit_ok)
                     data += R"(,"audit_persisted":false)";
                 data += "}";
@@ -7896,7 +7964,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // why that stays a dedicated shape rather than widening a4_error.
             auto deny_dispatch_authorization =
                 [&](const std::string& plugin, const std::string& action,
-                    const yuzu::server::detail::DispatchDenial& denial) {
+                    const yuzu::server::detail::DispatchDenial& denial,
+                    const std::optional<std::pair<std::string, std::string>>& text_override =
+                        std::nullopt) {
                     const std::string_view reason_label =
                         yuzu::server::detail::to_string(denial.reason);
                     if (metrics != nullptr) {
@@ -7931,8 +8001,14 @@ McpServer::HandlerFn McpServer::build_handler(
                                       yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
                                       yuzu::server::detail::sanitize_detail_value(action) +
                                       " correlation_id=" + cid);
-                    const auto text = describe_dispatch_denial(denial.reason, plugin, action,
-                                                               denial, DenialSurface::kMcp);
+                    auto text = describe_dispatch_denial(denial.reason, plugin, action, denial,
+                                                         DenialSurface::kMcp);
+                    // A caller whose surface cannot honour the shared wording (it advises a
+                    // supervised token's ticket flow) supplies its own message and remediation.
+                    if (text_override) {
+                        text.message = text_override->first;
+                        text.remediation = text_override->second;
+                    }
                     int text_code = kInternalError;
                     switch (text.cls) {
                     case DispatchDenialClass::kInvalidParams:
@@ -7973,7 +8049,11 @@ McpServer::HandlerFn McpServer::build_handler(
             // securable to perm_fn right after this deny — this helper's
             // deny decision itself is securable-agnostic, keyed only on
             // token_scope_service. `session` is already resolved once for
-            // the whole request above — no auth_fn call needed here.
+            // the whole request above, so no auth_fn call is needed here. The
+            // predicate and the audit-and-write sink are file-scope
+            // (is_service_scoped_caller, write_service_scoped_denial), shared
+            // with build_get_handler; this lambda only supplies the POST
+            // id-echoing envelope.
             // Routed through a4_error (defined just above) rather than a bare
             // error_response, so this denial carries the same correlation_id
             // /retry_after_ms/remediation envelope as every sibling MCP
@@ -7983,11 +8063,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 [&](const std::string& action, const std::string& target_type,
                     const std::string& audit_detail, const std::string& message,
                     const std::string& target_id = "") -> bool {
-                if (session->token_scope_service.empty())
+                if (!is_service_scoped_caller(*session))
                     return false;
-                (void)yuzu::server::detail::try_persist_audit(
-                    audit_fn, req, action, "denied", target_type, target_id, audit_detail);
-                res.set_content(a4_error(kPermissionDenied, message), "application/json");
+                write_service_scoped_denial(audit_fn, req, res, action, "denied", target_type,
+                                            target_id, audit_detail, std::nullopt,
+                                            a4_error(kPermissionDenied, message));
                 return true;
             };
 
@@ -8142,9 +8222,10 @@ McpServer::HandlerFn McpServer::build_handler(
             };
 
             // Canonical JSON of the tool arguments for approval-ticket binding
-            // (#289): a submitted ticket stores this string in scope_expression,
-            // and a recall recomputes it to prove the same tool+args are being
-            // executed. Default nlohmann::json is std::map-backed → object keys
+            // (#289): a submitted ticket stores this string in scope_expression
+            // (for the three L1 tools, after an `effect=` line, see `canon`), and a
+            // recall recomputes it to prove the same tool+args are being executed.
+            // Default nlohmann::json is std::map-backed → object keys
             // dump in sorted order, so client key order does not matter. The
             // `approval_id` argument is stripped on BOTH submit and recall so the
             // ticket-carrying re-call hashes identically to the original mint.
@@ -8288,7 +8369,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
 
-                if (requires_approval(tier, sec_type, sec_op)) {
+                // requires_approval_for_tool: false for the closed mcp_policy.hpp
+                // kApprovalExemptTools list (cancel_execution - tracker-only, starts no work, owner ruling
+                // 2026-10-30); every other tool is unchanged.
+                if (requires_approval_for_tool(tier, tool_name, sec_type, sec_op)) {
                     // ── Approval ticket flow (#289 / Issue 13.5, design D1) ──
                     // ticket-then-recall: the first call MINTS a pollable
                     // approval and returns kApprovalRequired (-32006) with
@@ -8317,7 +8401,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
 
                     const std::string definition_id = std::string(kMcpDefinitionPrefix) + tool_name;
-                    const std::string canon = canonical_args(args);
+                    // The ticket's bound subject. For every tool but the three L1 tools below it
+                    // is exactly the canonical arguments (byte-identical to before); for those
+                    // three an `effect_binding()` line is PREPENDED once the effect is resolved.
+                    const std::string args_canon = canonical_args(args);
+                    std::string canon = args_canon;
                     const std::string supplied_id = param_str(args, "approval_id");
                     // M2 (PR #1796): device-targeted tools prefix the pending
                     // audit detail with the endpoint so SIEM can filter
@@ -8422,6 +8510,186 @@ McpServer::HandlerFn McpServer::build_handler(
                     // deny-without-consume shape as the schema violation above;
                     // the handler keeps its own copy as defense in depth for
                     // the ungated tiers.
+                    // #2146 execute_instruction_definition: the definition's OWN approval_mode
+                    // is evaluated FIRST, before the tier ticket below is minted or consumed
+                    // (owner ruling 2026-10-30; see mcp_instruction_execute.hpp for the whole
+                    // composition). The probe runs the shared pipeline's steps 0-6, so a call
+                    // that is going to be refused, or that needs the definition's approval
+                    // anyway, mints no tier ticket and burns none. It tolerates NOTHING: this
+                    // tool never stamps Ticket provenance (sec-F1, #2146), so a pair gated by
+                    // the ExecuteGate (AdminOrApproval/AlwaysApproval) is refused here for a
+                    // non-admin caller BEFORE a ticket is minted, rather than being lifted by a
+                    // ticket. A Plan falls through to mint/recall, with its resolved pair folded
+                    // into the ticket's subject (L1, below) so a later repoint is refused too.
+                    if (tool_name == "execute_instruction_definition") {
+                        namespace idef = yuzu::server::mcp::instruction_definition;
+                        // RBAC BEFORE the probe (Gate 8 pass 2, sg-b1). The probe reads the
+                        // stored definition and writes rows (a pre-RBAC `denied` row, and a
+                        // pending approval for a definition that needs one), so running it ahead
+                        // of the handler's own Execution:Execute check let a supervised token
+                        // whose principal lacks that permission learn whether a definition
+                        // exists and what its schema says, and create approval rows. This is the
+                        // SAME gate, refusal shape and audit (perm_fn writes its own
+                        // auth.permission_required row) as the handler below; the tier ladder
+                        // already ran above, so the order is tier -> RBAC -> probe -> mint.
+                        if (!perm_fn(req, res, "Execution", "Execute"))
+                            return;
+                        // ONE correlation id per call: the response header, this probe's rows,
+                        // the handler's rows below and every error body carry the same value.
+                        const std::string call_cid =
+                            yuzu::server::detail::ensure_correlation_id(res);
+                        if (auto bv = idef::check_args(args)) {
+                            count_denial("yuzu_mcp_tool_args_too_large_total", bv->reason);
+                            const bool audit_ok =
+                                mcp_audit("denied", std::string("input bound exceeded: ") +
+                                                        bv->reason + " correlation_id=" + call_cid);
+                            res.set_content(a4_error(kInvalidParams, bv->message,
+                                                     "correct the argument and re-call; no "
+                                                     "approval ticket was created or consumed",
+                                                     -1, call_cid, audit_ok),
+                                            "application/json");
+                            return;
+                        }
+                        yuzu::server::instruction_execute::Request probe;
+                        probe.surface = yuzu::server::instruction_execute::Surface::kMcp;
+                        probe.definition_id = args["definition_id"].get<std::string>();
+                        probe.body = idef::core_body(args);
+                        probe.caller = caller_fn
+                                           ? caller_fn(*session)
+                                           : DispatchCaller{.exec_visible =
+                                                                yuzu::server::authz::deny_all()};
+                        probe.submitter_pending_cap = idef::kSubmitterPendingCap;
+                        probe.correlation_id = call_cid;
+                        const auto prepared = yuzu::server::instruction_execute::prepare(
+                            probe, instr_exec_ports_,
+                            [&](std::string_view result_status, const std::string& detail_text) {
+                                return mcp_audit(std::string(result_status), detail_text);
+                            },
+                            bind_event_emit(emit_event_fn_, req, metrics));
+                        if (const auto early = idef::render_unless_plan(prepared, prepared.correlation_id)) {
+                            res.set_content(
+                                early->is_error
+                                    ? error_response(id, early->code, early->message,
+                                                     early->data_json)
+                                    : success_response(id, tool_result(early->payload_json,
+                                                                       kObjectOutputSchema)),
+                                "application/json");
+                            return;
+                        }
+                        // L1: the probe's Plan names the pair this call WOULD dispatch. Bind it
+                        // into the ticket's subject so the approver sees the resolved
+                        // plugin.action and a repoint between approval and recall fails the
+                        // ordinary match below (no consume, nothing dispatched). The mint and
+                        // the recall both reach this line, so both compute the same string.
+                        const auto& bound_plan =
+                            std::get<yuzu::server::instruction_execute::Plan>(prepared.result);
+                        ticket_bound_effect = yuzu::server::instruction_execute::effect_binding(
+                            bound_plan.def.plugin, bound_plan.def.action,
+                            bound_plan.def.approval_mode, bound_plan.def.concurrency_mode);
+                        canon = *ticket_bound_effect + args_canon;
+                    }
+                    if (tool_name == "create_result_set_from_instruction_result" ||
+                        tool_name == "reevaluate_result_set") {
+                        // L1 (the definition-resolved result-set producers; the same window as
+                        // execute_instruction_definition). Their (plugin, action) is read from a
+                        // STORED definition when the handler runs: create_* from the named
+                        // instruction, reevaluate_* from the instruction the stored set was
+                        // minted from (an echo-query set is the fixed echo.sql). Resolve it here,
+                        // on the mint AND the recall, with the same read the handler makes, and
+                        // bind it exactly as above. RBAC FIRST (the sg-b1 order): this reads
+                        // stored rows, so a token without Execution:Execute learns nothing.
+                        // Read-only and side-effect free: no audit of its own, no heal. Anything
+                        // the handler will itself refuse (empty or oversize id, absent or
+                        // not-owned set, unsupported source_kind, missing instruction) binds
+                        // `unresolved`, which can never equal a real pair, so a state that later
+                        // becomes resolvable is refused rather than run. A store FAULT is not an
+                        // absence: it refuses here, retryable, with no ticket minted or spent.
+                        if (!perm_fn(req, res, "Execution", "Execute"))
+                            return;
+                        std::optional<std::pair<std::string, std::string>> rs_pair;
+                        // A store that is wired but cannot answer is TRANSIENT (retryable); a
+                        // store pointer that was never wired is a permanent wiring defect (no
+                        // hint: retrying cannot help), exactly as rs_load_owned answers it.
+                        bool rs_store_fault = false;
+                        bool rs_store_unwired = false;
+                        const auto rs_lookup_pair = [&](const std::string& instruction_id) {
+                            if (instruction_id.empty() ||
+                                instruction_id.size() > kInstructionIdMaxLen)
+                                return;
+                            if (!instruction_store) {
+                                rs_store_unwired = true;
+                                return;
+                            }
+                            if (!instruction_store->is_open()) {
+                                rs_store_fault = true;
+                                return;
+                            }
+                            auto def_read = instruction_store->get_definition(instruction_id);
+                            if (!def_read) {
+                                rs_store_fault = true;
+                                return;
+                            }
+                            if (*def_read)
+                                rs_pair.emplace((*def_read)->plugin, (*def_read)->action);
+                        };
+                        if (tool_name == "create_result_set_from_instruction_result") {
+                            rs_lookup_pair(param_str(args, "instruction_id"));
+                        } else {
+                            const auto rs_id = param_str(args, "id");
+                            if (!rs_id.empty() && rs_id.size() <= kResultSetIdMaxLen) {
+                                if (!result_set_store_) {
+                                    rs_store_unwired = true;
+                                } else if (auto row_read = result_set_store_->get(rs_id);
+                                           !row_read) {
+                                    rs_store_fault = true;
+                                } else if (const auto& row = *row_read;
+                                           row && row->owner_principal == session->username &&
+                                           !json_exceeds_depth(row->source_payload,
+                                                               kMcpMaxJsonDepth)) {
+                                    if (row->source_kind == source_kind::kEchoQuery) {
+                                        rs_pair.emplace("echo", "sql");
+                                    } else if (row->source_kind ==
+                                               source_kind::kInstructionResult) {
+                                        const auto sp = nlohmann::json::parse(row->source_payload,
+                                                                              nullptr, false);
+                                        if (sp.is_object() && sp.contains("instruction_id") &&
+                                            sp["instruction_id"].is_string())
+                                            rs_lookup_pair(sp["instruction_id"].get<std::string>());
+                                    }
+                                }
+                            }
+                        }
+                        if (rs_store_fault || rs_store_unwired) {
+                            const std::string fault_cid =
+                                yuzu::server::detail::make_correlation_id();
+                            const std::string_view fault_reason =
+                                rs_store_unwired ? "effect_unresolvable_store_unwired"
+                                                 : "effect_unresolvable_store_fault";
+                            const bool audit_ok = mcp_audit(
+                                "failure", "reason=" + std::string(fault_reason) +
+                                               " correlation_id=" + fault_cid);
+                            res.set_content(
+                                a4_error(kInternalError,
+                                         "the definition this call would run could not be read; "
+                                         "the store is unavailable",
+                                         rs_store_unwired
+                                             ? "this is a server wiring fault, not a caller "
+                                               "error; no approval ticket was created or "
+                                               "consumed; contact an administrator"
+                                             : "retry once the server reports ready; no approval "
+                                               "ticket was created or consumed",
+                                         rs_store_unwired ? -1 : mcp::kMcpStoreFaultRetryMs,
+                                         fault_cid, audit_ok, fault_reason),
+                                "application/json");
+                            return;
+                        }
+                        ticket_bound_effect =
+                            rs_pair ? yuzu::server::instruction_execute::effect_binding(
+                                          rs_pair->first, rs_pair->second, "", "")
+                                    : std::string(yuzu::server::instruction_execute::
+                                                      kUnresolvedEffect);
+                        canon = *ticket_bound_effect + args_canon;
+                    }
                     if (tool_name == "execute_instruction") {
                         if (auto bv = check_exec_instruction_shape(args)) {
                             const std::string cid =
@@ -8751,36 +9019,171 @@ McpServer::HandlerFn McpServer::build_handler(
                         // key defeats the args-hash) would still fill the GLOBAL
                         // pending cap shared with the REST approval workflow. Bound
                         // any single principal's share far below that global cap.
-                        constexpr int kMcpSubmitterPendingCap = 25;
-                        if (approval_manager->pending_count_for(session->username) >=
-                            kMcpSubmitterPendingCap) {
-                            mcp_audit("denied", "per-submitter pending-approval cap reached");
+                        constexpr int kMcpSubmitterPendingCap =
+                            yuzu::server::instruction_execute::kSubmitterPendingCap;
+                        // Every refusal of this ticket mint answers like the shared execute core's
+                        // (instruction_execute.cpp): the row detail is `reason=<token> ...
+                        // correlation_id=<id>` and error.data carries the SAME `reason` token and
+                        // the SAME id, plus `audit_persisted:false` when the row was lost, so an
+                        // agentic caller branches on a closed token and a SIEM pairs the row with
+                        // the body. `retry_ms` < 0 is a null `retry_after_ms` (not retryable).
+                        const auto mint_refusal = [&](int code, std::string_view message,
+                                                      std::string_view remediation,
+                                                      std::int64_t retry_ms,
+                                                      std::string_view reason,
+                                                      const std::string& refusal_cid,
+                                                      bool audit_ok) {
+                            nlohmann::json data{
+                                {"correlation_id", refusal_cid},
+                                {"retry_after_ms",
+                                 retry_ms >= 0 ? nlohmann::json(retry_ms) : nlohmann::json(nullptr)},
+                                {"remediation", std::string(remediation)},
+                                {"reason", std::string(reason)}};
+                            if (!audit_ok)
+                                data["audit_persisted"] = false;
+                            return error_response(id, code, message, data.dump());
+                        };
+                        // up8-1 / sre-2: an unreadable count refuses (a store fault, retryable);
+                        // it must never read as zero, which would admit every principal exactly
+                        // when the approval store is struggling. Nothing has been minted.
+                        // A count that THROWS (a bad_alloc building its SQL, a driver fault)
+                        // is the same unreadable count: folded into the branch below so it can
+                        // not unwind this handler before the refusal row is written.
+                        // The try/catch lives in checked_pending_count (checked_pending_count.hpp).
+                        const auto pending_now = yuzu::server::checked_pending_count([&] {
+                            return approval_manager->pending_count_for_checked(session->username);
+                        });
+                        if (!pending_now) {
+                            if (metrics != nullptr) {
+                                try {
+                                    metrics
+                                        ->counter(yuzu::server::instruction_execute::
+                                                      kApprovalRefusedMetric,
+                                                  {{"reason",
+                                                    yuzu::server::instruction_execute::
+                                                        kReasonApprovalUnavailable}})
+                                        .increment();
+                                } catch (...) { // NOLINT(bugprone-empty-catch)
+                                }
+                            }
+                            const std::string unreadable_cid =
+                                yuzu::server::detail::ensure_correlation_id(res);
+                            const bool audit_ok = mcp_audit(
+                                "failure",
+                                std::string("reason=") +
+                                    yuzu::server::instruction_execute::kReasonApprovalUnavailable +
+                                    " cause=pending_count_unreadable correlation_id=" +
+                                    unreadable_cid);
                             res.set_content(
-                                a4_error(kTierDenied,
-                                         "too many pending approvals for this principal; approve or "
-                                         "let existing requests expire before creating more",
-                                         "wait for your pending approvals to be reviewed"),
+                                mint_refusal(
+                                    kInternalError,
+                                    "approval system unavailable: the pending-approval count "
+                                    "could not be read; no approval ticket was created",
+                                    "retry shortly; the approval store could not be read",
+                                    mcp::kMcpStoreFaultRetryMs,
+                                    yuzu::server::instruction_execute::kReasonApprovalUnavailable,
+                                    unreadable_cid, audit_ok),
                                 "application/json");
                             return;
                         }
-                        auto submitted = approval_manager->submit(
+                        if (*pending_now >= kMcpSubmitterPendingCap) {
+                            if (metrics != nullptr) {
+                                try {
+                                    metrics
+                                        ->counter(yuzu::server::instruction_execute::
+                                                      kApprovalRefusedMetric,
+                                                  {{"reason",
+                                                    yuzu::server::instruction_execute::
+                                                        kReasonApprovalCapReached}})
+                                        .increment();
+                                } catch (...) { // NOLINT(bugprone-empty-catch)
+                                }
+                            }
+                            // The same closed token the metric label, the shared core's rows
+                            // and mcp_instruction_execute.cpp's error data carry: the row
+                            // detail names the reason and the error data repeats it, so an
+                            // agentic caller branches on a token, not on prose.
+                            const std::string cap_cid =
+                                yuzu::server::detail::ensure_correlation_id(res);
+                            const bool audit_ok = mcp_audit(
+                                "denied",
+                                std::string("reason=") +
+                                    yuzu::server::instruction_execute::kReasonApprovalCapReached +
+                                    " correlation_id=" + cap_cid);
+                            res.set_content(
+                                mint_refusal(
+                                    kTierDenied,
+                                    "too many pending approvals for this principal; approve or "
+                                    "let existing requests expire before creating more",
+                                    "wait for your pending approvals to be reviewed", -1,
+                                    yuzu::server::instruction_execute::kReasonApprovalCapReached,
+                                    cap_cid, audit_ok),
+                                "application/json");
+                            return;
+                        }
+                        auto submitted = approval_manager->submit_typed(
                             definition_id, session->username, canon,
                             /*schedule_id=*/"", ApprovalOrigin::kMcp);
                         if (!submitted) {
-                            mcp_audit("failure", "approval submit failed: " + submitted.error());
+                            const bool queue_full =
+                                submitted.error().kind == SubmitFailure::kQueueFull;
+                            if (metrics != nullptr) {
+                                try {
+                                    metrics
+                                        ->counter(yuzu::server::instruction_execute::
+                                                      kApprovalRefusedMetric,
+                                                  {{"reason",
+                                                    queue_full
+                                                        ? yuzu::server::instruction_execute::
+                                                              kReasonApprovalQueueFull
+                                                        : yuzu::server::instruction_execute::
+                                                              kReasonApprovalSubmitFailed}})
+                                        .increment();
+                                } catch (...) { // NOLINT(bugprone-empty-catch)
+                                }
+                            }
+                            // The row mirrors the core's: a full global queue is `denied`
+                            // (a capacity refusal, not a fault), anything else is `failure`.
+                            const std::string submit_cid =
+                                yuzu::server::detail::ensure_correlation_id(res);
+                            const char* const submit_reason =
+                                queue_full
+                                    ? yuzu::server::instruction_execute::kReasonApprovalQueueFull
+                                    : yuzu::server::instruction_execute::kReasonApprovalSubmitFailed;
+                            spdlog::error("MCP approval ticket mint for {} failed ({}): {}",
+                                          tool_name, submit_reason, submitted.error().message);
+                            const bool audit_ok = mcp_audit(
+                                queue_full ? "denied" : "failure",
+                                std::string("reason=") + submit_reason +
+                                    " correlation_id=" + submit_cid);
+                            if (queue_full) {
+                                // The GLOBAL pending queue is full: only a human reviewer
+                                // deciding a pending approval, or the 7-day expiry, frees a
+                                // slot, so no retry hint (a retry loop cannot succeed).
+                                res.set_content(
+                                    mint_refusal(kInternalError,
+                                                 "the approval queue is full: no approval ticket "
+                                                 "could be created",
+                                                 "a human reviewer must decide pending approvals "
+                                                 "(or the oldest expire) before a new approval "
+                                                 "request can be created; retrying will not help",
+                                                 -1, submit_reason, submit_cid, audit_ok),
+                                    "application/json");
+                                return;
+                            }
                             // #3344: was a bare -1/null despite the remediation
                             // already saying "retry later" — an oversight, not a
                             // deliberate non-retryable classification.
-                            // ApprovalManager::submit()'s only reachable failures
-                            // at this call site (definition_id and
-                            // session->username are both non-empty here) are
-                            // store-not-open, queue-full, or a SQLite
-                            // prepare/insert fault — the same transient-store-fault
-                            // class as the rest of this handler family.
+                            // The remaining reachable failures at this call site
+                            // (definition_id and session->username are both
+                            // non-empty here) are store-not-open or a Postgres
+                            // fault — the same transient-store-fault class as the
+                            // rest of this handler family.
                             res.set_content(
-                                a4_error(kInternalError, "failed to create approval request",
-                                         "retry later, or use the REST API / dashboard",
-                                         mcp::kMcpStoreFaultRetryMs),
+                                mint_refusal(kInternalError, "failed to create approval request",
+                                             "retry later, or use the REST API / dashboard",
+                                             mcp::kMcpStoreFaultRetryMs, submit_reason, submit_cid,
+                                             audit_ok),
                                 "application/json");
                             return;
                         }
@@ -8822,15 +9225,70 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     auto appr = std::move(*appr_read);
+                    // L1: the same tool and arguments, bound to a DIFFERENT effect (the stored
+                    // definition was repointed since the approval was requested). The ticket
+                    // text is `<effect line>` + the canonical arguments, and a canonical-JSON
+                    // dump never contains a raw newline, so the arguments are recognised as
+                    // the text after the first newline. Told apart from an ordinary mismatch
+                    // ONLY for the principal who requested the ticket (they already hold the
+                    // arguments and the id, and the answer is about their own request), and
+                    // ONLY while the ticket is still UNSPENT (pending or approved with
+                    // consumed_at == 0): "not consumed" is untrue for a ticket already
+                    // consumed, and a rejected or expired one is dead, so those fall through
+                    // to the ordinary mismatch answer below.
+                    const auto effect_moved_from = [&](const std::string& stored) {
+                        return ticket_bound_effect.has_value() && stored != canon &&
+                               stored.starts_with("effect=") &&
+                               stored.size() > args_canon.size() &&
+                               stored.ends_with("\n" + args_canon);
+                    };
+                    if (appr && appr->definition_id == definition_id &&
+                        appr->submitted_by == session->username && appr->consumed_at == 0 &&
+                        (appr->status == "pending" || appr->status == "approved") &&
+                        effect_moved_from(appr->scope_expression)) {
+                        // The call-wide id (idempotent): header, body and audit row agree.
+                        const std::string moved_cid =
+                            yuzu::server::detail::ensure_correlation_id(res);
+                        const bool audit_ok = mcp_audit(
+                            "denied", "reason=definition_changed approval_id=" + supplied_id +
+                                          " refused: the definition changed since the approval "
+                                          "was requested (ticket not consumed) correlation_id=" +
+                                          moved_cid);
+                        res.set_content(
+                            a4_error(kPermissionDenied,
+                                     "the definition changed since this approval was requested",
+                                     "the approval ticket was not consumed but no longer matches; "
+                                     "call again without approval_id to request approval for "
+                                     "the definition as it is now",
+                                     -1, moved_cid, audit_ok, "definition_changed"),
+                            "application/json");
+                        return;
+                    }
                     if (!appr || appr->definition_id != definition_id ||
                         appr->scope_expression != canon) {
-                        // Absent, or for a different tool / different arguments.
-                        mcp_audit("denied", "approval_id does not match this request");
+                        // Absent, or for a different tool / different arguments, or a
+                        // consumed / rejected / expired ticket whose effect has moved.
+                        // The row names the ticket ONLY when the store returned one (the id
+                        // is then the store's server-minted value, never raw caller bytes;
+                        // an unknown id is deliberately not echoed) and carries the call's
+                        // correlation id, so the refusal is traceable to its approval row.
+                        // No refused counter moves here, as for every other mismatch: that
+                        // family counts consume-rung refusals and its anti-oracle contract
+                        // (no reason label) is not widened by this change.
+                        const std::string mismatch_cid =
+                            yuzu::server::detail::ensure_correlation_id(res);
+                        mcp_audit("denied",
+                                  (appr ? "approval_id=" + appr->id + " status=" + appr->status +
+                                              " refused: "
+                                        : std::string()) +
+                                      "approval_id does not match this request correlation_id=" +
+                                      mismatch_cid);
                         res.set_content(
                             a4_error(kPermissionDenied,
                                      "approval_id does not match this tool and arguments",
                                      "submit this exact call without approval_id to obtain a "
-                                     "matching approval ticket"),
+                                     "matching approval ticket",
+                                     -1, mismatch_cid),
                             "application/json");
                         return;
                     }
@@ -9332,23 +9790,36 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── list_agents ───────────────────────────────────────────────
             if (tool_name == "list_agents") {
-                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                // #4041: a fan-out read of per-agent data — fleet_read_fn_
+                // (require_fleet_read, the ADR-0017 admit-then-filter chokepoint)
+                // is the SOLE gate in this handler, no separate tier_allows/perm_fn
+                // call: the C8 gate above has already tier-checked this tool's pair,
+                // for every principal class. Mirrors the Echo device pickers below.
+                // Unwired fails closed.
+                if (!fleet_read_fn_) {
+                    spdlog::error("list_agents: fleet_read_fn_ unwired — misconfigured "
+                                  "call site; failing closed");
+                    mcp_audit("failure");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                if (!device_api) {
+                    // Wiring fault: never an empty list, which reads as an empty fleet
+                    // (mirrors get_agent_details and REST's 503).
+                    mcp_audit("failure");
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        error_response(id, kInternalError, "device registry unavailable"),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
-                // ADR-0031 WS-A4 wave 2: sourced from the DeviceApi seam instead of
-                // the raw registry snapshot — BYTE-IDENTICAL gate/scope posture:
-                // still tier_allows + perm_fn ONLY, no scope filter at all (the
-                // known World-A confinement gap, #4041 — unconfined by design,
-                // tracked separately; do not "fix" it here).
-                std::vector<DeviceListRow> devices =
-                    device_api ? device_api->list_devices() : std::vector<DeviceListRow>{};
                 JArr arr;
-                for (const auto& d : devices) {
+                for (const auto& d : device_api->list_devices()) {
+                    if (!authz::in_scope(gate.scope, d.agent_id))
+                        continue;
                     arr.add(JObj()
                                 .add("agent_id", d.agent_id)
                                 .add("hostname", d.hostname)
@@ -9356,17 +9827,25 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("arch", d.arch)
                                 .add("agent_version", d.agent_version));
                 }
+                // Confinement is reported as a STATUS, never a count of hidden devices
+                // (mcp_tools_hardware.cpp), in both channels so a client reading only
+                // the text sees it. A scoped caller was refused before #4041, so no
+                // text consumer changes shape; gate.scope == nullopt keeps the bare
+                // array of a global read, where nothing was dropped.
+                JObj structured;
+                structured.raw("agents", arr.str());
+                if (gate.scope)
+                    structured.add("scope_basis", "authority_scoped");
+                const std::string body = structured.str();
                 mcp_audit("success");
                 res.set_content(
-                    success_response(id,
-                                      tool_result_split(arr.str(),
-                                                         JObj().raw("agents", arr.str()).str(),
-                                                         kObjectOutputSchema)),
+                    success_response(id, tool_result_split(gate.scope ? body : arr.str(), body,
+                                                           kObjectOutputSchema)),
                     "application/json");
                 return;
             }
 
-            // ── #4027 read twins: TAR process-tree / capture-sources device
+            // ── #4027 read twins: Echo process-tree / capture-sources device
             // pickers + retention-paused source list. #4027 fix round
             // (CDX-P1-01/K4): all three now gate SOLELY on fleet_read_fn_
             // (require_fleet_read, the ADR-0017 admit-then-filter chokepoint),
@@ -9393,22 +9872,22 @@ McpServer::HandlerFn McpServer::build_handler(
             // both confirmed by direct source inspection): the two device pickers
             // now read the SAME shared builder their REST twin calls
             // (api-twin-recipe.md Rule 1) from an UNFILTERED registry snapshot
-            // (all_devices_fn_ — same source list_agents' agents_fn and
+            // (all_devices_fn_ — same registry source list_agents and
             // GET /api/v1/devices (#4033) use), with gate.scope as the SOLE
-            // filter — not an intersection with tar_devices_fn_'s direct-
+            // filter — not an intersection with echo_devices_fn_'s direct-
             // membership-only pre-filter (see set_all_devices_fn's doc comment
             // above for why the old intersection design was an ADR-0017
             // INV-4/INV-7 violation). And both now fail LOUD (503-equivalent
             // kInternalError) when their provider is unwired, matching
-            // list_tar_retention_paused's existing posture below — the previous
+            // list_echo_retention_paused's existing posture below — the previous
             // code silently answered "0 devices in your scope" on a misconfigured
             // call site for these two tools only, indistinguishable from a
             // genuinely-empty-scope caller (a false "closed" that reads as data,
             // not an outage; the same class of bug the loud unwired-fleet_read_fn_
             // branch just above already guards against). ──
-            if (tool_name == "list_tar_process_tree_devices") {
+            if (tool_name == "list_echo_process_tree_devices") {
                 if (!fleet_read_fn_ || !all_devices_fn_) {
-                    spdlog::error("list_tar_process_tree_devices: fleet_read_fn_/"
+                    spdlog::error("list_echo_process_tree_devices: fleet_read_fn_/"
                                   "all_devices_fn_ unwired — misconfigured call site; "
                                   "failing closed");
                     res.set_content(error_response(id, kInternalError, "service unavailable"),
@@ -9427,7 +9906,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             visible.push_back(std::move(d));
                     devices.swap(visible);
                 }
-                const std::string devices_json = tar_process_tree_frame_json(devices);
+                const std::string devices_json = echo_process_tree_frame_json(devices);
                 mcp_audit("success");
                 res.set_content(
                     success_response(id,
@@ -9438,9 +9917,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            if (tool_name == "list_tar_capture_sources_devices") {
+            if (tool_name == "list_echo_capture_sources_devices") {
                 if (!fleet_read_fn_ || !all_devices_fn_) {
-                    spdlog::error("list_tar_capture_sources_devices: fleet_read_fn_/"
+                    spdlog::error("list_echo_capture_sources_devices: fleet_read_fn_/"
                                   "all_devices_fn_ unwired — misconfigured call site; "
                                   "failing closed");
                     res.set_content(error_response(id, kInternalError, "service unavailable"),
@@ -9459,7 +9938,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             visible.push_back(std::move(d));
                     devices.swap(visible);
                 }
-                const std::string devices_json = tar_capture_sources_devices_json(devices);
+                const std::string devices_json = echo_capture_sources_devices_json(devices);
                 mcp_audit("success");
                 res.set_content(
                     success_response(id,
@@ -9470,9 +9949,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            if (tool_name == "list_tar_retention_paused") {
+            if (tool_name == "list_echo_retention_paused") {
                 if (!fleet_read_fn_) {
-                    spdlog::error("list_tar_retention_paused: fleet_read_fn_ unwired — "
+                    spdlog::error("list_echo_retention_paused: fleet_read_fn_ unwired — "
                                   "misconfigured call site; failing closed");
                     res.set_content(error_response(id, kInternalError, "service unavailable"),
                                     "application/json");
@@ -9483,16 +9962,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     return; // gate already wrote the A4 error body + status
                 if (!dashboard_routes_) {
                     res.set_content(
-                        a4_error(kInternalError, "TAR retention-paused surface unavailable",
+                        a4_error(kInternalError, "Echo retention-paused surface unavailable",
                                  "this is a server configuration/wiring fault, not a caller "
                                  "error; contact an administrator"),
                         "application/json");
                     return;
                 }
                 // #4143 review fix: gate.scope is authoritative here — see
-                // gather_tar_retention_paused's doc comment.
+                // gather_echo_retention_paused's doc comment.
                 const std::string payload =
-                    tar_retention_paused_json(dashboard_routes_->gather_tar_retention_paused(
+                    echo_retention_paused_json(dashboard_routes_->gather_echo_retention_paused(
                         session->username, gate.scope, /*extra_scope_is_authoritative=*/true));
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
@@ -10569,480 +11048,6 @@ McpServer::HandlerFn McpServer::build_handler(
                 reply(swc::catalogue_response_json(page.rows, page.totals, page.kpis, page.next_cursor,
                                                    omit_newest, 0),
                       audit_ok);
-                return;
-            }
-
-            // ── get_crypto_libraries / list_crypto_library_devices (/crypto slice 1 twins) ──
-            // Shaped by crypto_library_model.hpp and read through the CryptoApi seam: the same
-            // model and instance the /crypto page and the REST twins use. fleet_read_fn_ is the
-            // SOLE gate (Inventory:Read); its composed meet(management-group, service-scope)
-            // VisibleSet is pushed into the SQL by the seam, so a confined caller gets a real,
-            // filtered answer (a service-scoped token is refused 403 by the gate while RBAC
-            // enforcement is off, and confined to its IT service's devices when it is on).
-            // ONE dispatch branch per tool, never a shared `||` branch: the A5 retry-hint gate
-            // (scripts/ci/check-mcp-retry-hints.py) scans each tool's own `if (tool_name ==`
-            // block, so a shared branch is invisible to it.
-            if (tool_name == "get_crypto_libraries") {
-                namespace cl = crypto_library;
-                if (!fleet_read_fn_) {
-                    spdlog::error("{}: fleet_read_fn_ unwired — misconfigured call site; failing "
-                                  "closed",
-                                  tool_name);
-                    res.set_content(error_response(id, kInternalError, "service unavailable"),
-                                    "application/json");
-                    return;
-                }
-                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
-                if (!gate.admitted)
-                    return; // gate already wrote the A4 error body + status
-                // Strict input (REST clamps, MCP refuses), judged before any parse or read.
-                if (const auto bad = cl::strict_summary_args_error(args)) {
-                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                if (!crypto_api_) {
-                    res.set_content(error_response(id, kInternalError,
-                                                   "Crypto library data unavailable"),
-                                    "application/json");
-                    return;
-                }
-                const auto parsed =
-                    cl::parse_summary_params(catalogue_params(args, {"family", "ecosystem"}));
-                if (!parsed) {
-                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                const std::string target = cl::audit_target(*parsed);
-                // The seam's caller-input refusal (a bad cursor) is answered through this
-                // helper so the `if (!read)` block below holds ONLY the retryable store-fault
-                // answer: the retry-hint gate then judges that branch on its own hint, and an
-                // exempt comment for the refusal cannot mask a missing retry_after_ms.
-                auto refuse_input = [&](const std::string& message) {
-                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
-                };
-                auto read = crypto_api_->library_summary(*parsed, gate.scope);
-                if (!read) {
-                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
-                        refuse_input(read.error().message);
-                        return;
-                    }
-                    mcp_audit("failure", cl::audit_detail_degraded("", read.error().cause,
-                                                                   gate.scope.has_value()) +
-                                             " target=" + target);
-                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
-                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
-                        return;
-                    }
-                    res.set_content(a4_error(kInternalError,
-                                             std::string(cl::degraded_message(read.error().cause)),
-                                             "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                // Same key set as the REST/page rows; the MCP path mints no cid, and the
-                // tool name is the audit target so the filters ride in the detail.
-                const bool audit_ok = mcp_audit(
-                    "success", cl::audit_detail("", parsed->family.value_or("all"),
-                                                read->families.size(), read->names_from_catalogue,
-                                                false, gate.scope.has_value()) +
-                                   " target=" + target);
-                auto payload = cl::summary_json(*read);
-                if (!audit_ok)
-                    payload["audit_persisted"] = false;
-                res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
-                                                                 kObjectOutputSchema)),
-                                "application/json");
-                return;
-            }
-
-            if (tool_name == "list_crypto_library_devices") {
-                namespace cl = crypto_library;
-                if (!fleet_read_fn_) {
-                    spdlog::error("{}: fleet_read_fn_ unwired — misconfigured call site; failing "
-                                  "closed",
-                                  tool_name);
-                    res.set_content(error_response(id, kInternalError, "service unavailable"),
-                                    "application/json");
-                    return;
-                }
-                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
-                if (!gate.admitted)
-                    return; // gate already wrote the A4 error body + status
-                if (const auto bad = cl::strict_devices_args_error(args)) {
-                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                if (!crypto_api_) {
-                    res.set_content(error_response(id, kInternalError,
-                                                   "Crypto library data unavailable"),
-                                    "application/json");
-                    return;
-                }
-                const auto parsed = cl::parse_devices_params(
-                    catalogue_params(args, {"family", "version", "ecosystem", "cursor", "limit"}));
-                if (!parsed) {
-                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                const std::string target = cl::audit_target(*parsed);
-                const bool continuation = !parsed->cursor.empty();
-                // The seam's caller-input refusal (a bad cursor) is answered through this
-                // helper so the `if (!read)` block below holds ONLY the retryable store-fault
-                // answer: the retry-hint gate then judges that branch on its own hint, and an
-                // exempt comment for the refusal cannot mask a missing retry_after_ms.
-                auto refuse_input = [&](const std::string& message) {
-                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
-                };
-                auto read = crypto_api_->library_devices(*parsed, gate.scope);
-                if (!read) {
-                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
-                        refuse_input(read.error().message);
-                        return;
-                    }
-                    mcp_audit("failure", cl::audit_detail_degraded("", read.error().cause,
-                                                                   gate.scope.has_value()) +
-                                             " target=" + target);
-                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
-                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
-                        return;
-                    }
-                    res.set_content(a4_error(kInternalError,
-                                             std::string(cl::degraded_message(read.error().cause)),
-                                             "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                const bool audit_ok = mcp_audit(
-                    "success", cl::audit_detail("", parsed->family, read->devices.size(),
-                                                read->names_from_catalogue, continuation,
-                                                gate.scope.has_value()) +
-                                   " target=" + target);
-                auto payload = cl::devices_json(*read);
-                if (!audit_ok)
-                    payload["audit_persisted"] = false;
-                res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
-                                                                 kObjectOutputSchema)),
-                                "application/json");
-                return;
-            }
-
-            // ── /crypto dashboard widget twins (ADR-0070 D13, R2) ─────────────────────────
-            // Shaped by crypto_widget_catalogue.hpp and read through the SAME CryptoApi seam
-            // instance as REST /api/v1/crypto/{widgets,dashboard/layout,ca/stats}. The catalogue
-            // and the layout are the caller's OWN (session username), tier-gated by the generic
-            // C8 check (Infrastructure Read/Write, the result-set precedent); the Yuzu-issued
-            // counts gate on fleet_read_fn_ Inventory:Read and are WITHHELD from a confined
-            // caller (R2). ONE dispatch branch per tool (the retry-hint gate scans each tool's
-            // own block).
-            if (tool_name == "list_crypto_widgets") {
-                namespace cw = crypto_widgets;
-                if (!args.is_object() || !args.empty()) {
-                    res.set_content(error_response(id, kInvalidParams, "list_crypto_widgets takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                if (!crypto_access_fn_) {
-                    spdlog::error("{}: crypto_access_fn_ unwired — misconfigured call site; "
-                                  "failing closed",
-                                  tool_name);
-                    res.set_content(error_response(id, kInternalError, "service unavailable"),
-                                    "application/json");
-                    return;
-                }
-                cw::AccessMemo access([&](cw::WidgetGate g, std::string_view s, std::string_view o) {
-                    return crypto_access_fn_(req, g, std::string(s), std::string(o));
-                });
-                auto payload = cw::widgets_json(access);
-                mcp_audit("success");
-                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
-                                                                 kObjectOutputSchema)),
-                                "application/json");
-                return;
-            }
-
-            if (tool_name == "get_crypto_dashboard_layout") {
-                namespace cw = crypto_widgets;
-                if (!args.is_object() || !args.empty()) {
-                    res.set_content(error_response(id, kInvalidParams, "get_crypto_dashboard_layout takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                if (!crypto_api_) {
-                    res.set_content(error_response(id, kInternalError,
-                                                   "Crypto dashboard layout unavailable"),
-                                    "application/json");
-                    return;
-                }
-                // Non-retryable answers (caller input, a corrupt stored layout) go through this
-                // helper so the `if (!read)` block below holds ONLY the retryable store fault.
-                auto refuse = [&](const CryptoReadError& e) {
-                    if (e.kind == CryptoReadError::Kind::kCorrupt)
-                        res.set_content(a4_error(kInternalError, e.message, "call set_crypto_dashboard_layout with expected_version=" + std::to_string(e.version) + " to replace it"), "application/json"); // retry-hint-exempt: stored-state defect, retrying reads it again
-                    else
-                        res.set_content(error_response(id, kInvalidParams, e.message), "application/json"); // retry-hint-exempt: caller-input rejection
-                };
-                auto read = crypto_api_->dashboard_layout(session->username);
-                if (!read) {
-                    if (read.error().kind != CryptoReadError::Kind::kDegraded) {
-                        mcp_audit("failure", layout_failure_tag(read.error()));
-                        refuse(read.error());
-                        return;
-                    }
-                    if (read.error().unavailable_until_restart) {
-                        mcp_audit("failure", read.error().message);
-                        res.set_content(a4_error(kInternalError, read.error().message, "the layout store did not open at server start; the default layout applies until the server is restarted with the store fixed"), "application/json"); // retry-hint-exempt: lasts until a restart, a retry fails identically
-                        return;
-                    }
-                    mcp_audit("failure", read.error().message);
-                    res.set_content(a4_error(kInternalError, read.error().message,
-                                             "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                mcp_audit("success");
-                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(
-                                                                     cw::layout_json(*read)),
-                                                                 kObjectOutputSchema)),
-                                "application/json");
-                return;
-            }
-
-            if (tool_name == "set_crypto_dashboard_layout") {
-                namespace cw = crypto_widgets;
-                if (const auto bad = cw::strict_layout_args_error(args)) {
-                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                const auto lr = cw::layout_request_from_args(args);
-                if (const auto bad = cw::layout_error(lr.widgets)) {
-                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                if (!crypto_api_) {
-                    res.set_content(error_response(id, kInternalError,
-                                                   "Crypto dashboard layout unavailable"),
-                                    "application/json");
-                    return;
-                }
-                const std::string& user = session->username;
-                const std::string detail_base =
-                    cw::audit_detail_layout("", lr.widgets.size(), lr.expected_version);
-                // "No audit row, no mutation" (ADR-0033 section 9), as the REST twin.
-                if (!audit_fn(req, "crypto.dashboard.layout.update", "attempted",
-                              "CryptoDashboard", user, detail_base)) {
-                    mcp_audit("failure", "audit unavailable; layout not changed");
-                    res.set_content(a4_error(kInternalError,
-                                             "audit log unavailable; the change was not made",
-                                             "retry once the audit log is available",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                // Non-retryable answers (caller input, a stale expected_version, a corrupt
-                // stored layout) go through this helper so the `if (!wrote)` block below holds
-                // ONLY the retryable answers (store fault, unknown commit outcome).
-                auto refuse = [&](const CryptoReadError& e) {
-                    if (e.kind == CryptoReadError::Kind::kConflict)
-                        res.set_content(a4_error(kInvalidParams, e.message, "read the layout with get_crypto_dashboard_layout (stored version " + std::to_string(e.version) + ") and save again with that expected_version"), "application/json"); // retry-hint-exempt: stale expected_version, resending it fails identically
-                    else if (e.kind == CryptoReadError::Kind::kCorrupt)
-                        res.set_content(a4_error(kInternalError, e.message, "save again with expected_version=" + std::to_string(e.version) + " to replace it"), "application/json"); // retry-hint-exempt: stored-state defect, the same call fails identically
-                    else
-                        res.set_content(error_response(id, kInvalidParams, e.message), "application/json"); // retry-hint-exempt: caller-input rejection
-                };
-                auto wrote = crypto_api_->set_dashboard_layout(user, lr.widgets, lr.expected_version);
-                if (!wrote) {
-                    (void)audit_fn(req, "crypto.dashboard.layout.update", "failure",
-                                   "CryptoDashboard", user,
-                                   detail_base + " " + layout_failure_tag(wrote.error()));
-                    mcp_audit("failure", layout_failure_tag(wrote.error()));
-                    if (wrote.error().kind != CryptoReadError::Kind::kDegraded &&
-                        wrote.error().kind != CryptoReadError::Kind::kOutcomeUnknown) {
-                        refuse(wrote.error());
-                        return;
-                    }
-                    if (wrote.error().unavailable_until_restart) {
-                        res.set_content(a4_error(kInternalError, wrote.error().message, "the layout store did not open at server start; layouts cannot be saved until the server is restarted with the store fixed"), "application/json"); // retry-hint-exempt: lasts until a restart, a retry fails identically
-                        return;
-                    }
-                    res.set_content(a4_error(kInternalError, wrote.error().message,
-                                             wrote.error().kind == CryptoReadError::Kind::kOutcomeUnknown
-                                                 ? "read the layout with get_crypto_dashboard_layout to see whether it was saved"
-                                                 : "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                const bool audit_ok =
-                    audit_fn(req, "crypto.dashboard.layout.update", "success", "CryptoDashboard",
-                             user,
-                             cw::audit_detail_layout("", wrote->widgets.size(), lr.expected_version) +
-                                 " version=" + std::to_string(wrote->version));
-                mcp_audit("success");
-                auto payload = cw::layout_json(*wrote);
-                if (!audit_ok)
-                    payload["audit_persisted"] = false;
-                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
-                                                                 kObjectOutputSchema)),
-                                "application/json");
-                return;
-            }
-
-            if (tool_name == "get_crypto_ca_stats") {
-                namespace cw = crypto_widgets;
-                if (!fleet_read_fn_) {
-                    spdlog::error("{}: fleet_read_fn_ unwired — misconfigured call site; failing "
-                                  "closed",
-                                  tool_name);
-                    res.set_content(error_response(id, kInternalError, "service unavailable"),
-                                    "application/json");
-                    return;
-                }
-                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
-                if (!gate.admitted)
-                    return; // gate already wrote the A4 error body + status
-                if (gate.scope.has_value()) {
-                    // ADR-0070 R2: a confined view never gets a fleet-wide count, nor a narrowed
-                    // one. No permission named: none would admit the caller.
-                    (void)audit_fn(req, "crypto.ca.stats.view", "denied", "Inventory", "yuzu_ca",
-                                   cw::audit_detail_ca_withheld("", cw::Access::kConfined));
-                    mcp_audit("denied", "withheld=confined");
-                    res.set_content(a4_error(kPermissionDenied, cw::kConfinedWithheldMessage), "application/json"); // retry-hint-exempt: authorization outcome, retrying cannot change it
-                    return;
-                }
-                if (!args.is_object() || !args.empty()) {
-                    res.set_content(error_response(id, kInvalidParams, "get_crypto_ca_stats takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                if (!crypto_api_) {
-                    res.set_content(error_response(id, kInternalError,
-                                                   "Yuzu-issued certificate data unavailable"),
-                                    "application/json");
-                    return;
-                }
-                auto read = crypto_api_->ca_stats(std::nullopt);
-                if (!read) {
-                    (void)audit_fn(req, "crypto.ca.stats.view", "failure", "Inventory", "yuzu_ca",
-                                   cw::audit_detail_ca_degraded("", std::nullopt, read.error().cause));
-                    mcp_audit("failure", cw::audit_detail_ca_degraded("", std::nullopt, read.error().cause));
-                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
-                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
-                        return;
-                    }
-                    res.set_content(a4_error(kInternalError, read.error().message,
-                                             "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                const bool audit_ok = audit_fn(req, "crypto.ca.stats.view", "success", "Inventory",
-                                               "yuzu_ca", cw::audit_detail_stats("", read->as_of));
-                mcp_audit("success", cw::audit_detail_stats("", read->as_of));
-                auto payload = cw::ca_stats_json(*read);
-                if (!audit_ok)
-                    payload["audit_persisted"] = false;
-                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
-                                                                 kObjectOutputSchema)),
-                                "application/json");
-                return;
-            }
-
-            // ── export_crypto_cbom (CycloneDX 1.7 export of the /crypto summary) ──────────
-            // Same gate (fleet_read_fn_, Inventory:Read), seam and admission bound as
-            // get_crypto_libraries; the BOM is shaped by crypto_cbom.hpp, the REST twin's shaper.
-            // Own branch (not folded into the pair above) so the retry-hint CI gate inspects it.
-            if (tool_name == "export_crypto_cbom") {
-                namespace cl = crypto_library;
-                if (!fleet_read_fn_) {
-                    spdlog::error("export_crypto_cbom: fleet_read_fn_ unwired - misconfigured call "
-                                  "site; failing closed");
-                    res.set_content(error_response(id, kInternalError, "service unavailable"),
-                                    "application/json");
-                    return;
-                }
-                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
-                if (!gate.admitted)
-                    return; // gate already wrote the A4 error body + status
-                // STRICT: a non-object `arguments` (null, array, string) is refused, judged
-                // before any parse or read.
-                if (const auto bad = crypto_cbom::strict_cbom_args_error(args)) {
-                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                if (!crypto_api_) {
-                    res.set_content(error_response(id, kInternalError,
-                                                   "Crypto library data unavailable"),
-                                    "application/json");
-                    return;
-                }
-                const auto parsed =
-                    cl::parse_summary_params(catalogue_params(args, {"family", "ecosystem"}));
-                if (!parsed) {
-                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                // No BOM without a unique serial. Minted BEFORE the store read so a CSPRNG
-                // failure costs no read slot and no scan; no audit row on this path (no
-                // inventory read has happened, so there is nothing to account for).
-                const auto identity = crypto_cbom::make_identity(yuzu::kVersionString);
-                if (!identity) {
-                    spdlog::error("export_crypto_cbom: CSPRNG failure minting the BOM serial number");
-                    res.set_content(a4_error(kInternalError, "service unavailable",
-                                             "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                const std::string target = cl::audit_target(*parsed);
-                // The seam's caller-input refusal is answered through this helper so the
-                // `if (!read)` block below holds ONLY the retryable store-fault answer (same
-                // pattern as get_crypto_libraries): the retry-hint gate judges that branch on
-                // its own hint, and an exempt comment for the refusal cannot mask a missing one.
-                auto refuse_input = [&](const std::string& message) {
-                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
-                };
-                const auto read = crypto_api_->library_summary(*parsed, gate.scope);
-                if (!read) {
-                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
-                        refuse_input(read.error().message);
-                        return;
-                    }
-                    mcp_audit("failure",
-                              cl::audit_detail_degraded("", read.error().cause,
-                                                        gate.scope.has_value()) +
-                                  " target=" + target);
-                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
-                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
-                        return;
-                    }
-                    res.set_content(a4_error(kInternalError,
-                                             std::string(cl::degraded_message(read.error().cause)),
-                                             "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                const auto bom_options = crypto_cbom::CbomOptions{
-                    .filters = *parsed, .confined = gate.scope.has_value()};
-                auto bom = crypto_cbom::cbom_json(*read, *identity, bom_options);
-                const std::size_t components = bom.at("components").size();
-                const bool audit_ok = mcp_audit(
-                    "success", cl::audit_detail("", parsed->family.value_or("all"),
-                                                read->families.size(), read->names_from_catalogue,
-                                                false, gate.scope.has_value()) +
-                                   crypto_cbom::audit_evidence(*identity, *parsed, components) +
-                                   " target=" + target);
-                if (!audit_ok)
-                    crypto_cbom::mark_audit_not_persisted(bom);
-                nlohmann::json payload{{"bom", cl::dump_safe(bom)},
-                                       {"content_type", std::string(crypto_cbom::kContentType)},
-                                       {"components", components},
-                                       {"result_truncated", read->result_truncated}};
-                if (!audit_ok)
-                    payload["audit_persisted"] = false;
-                res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
-                                                                 kObjectOutputSchema)),
-                                "application/json");
                 return;
             }
 
@@ -12140,9 +12145,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #4353 follow-up (Gate 2 finding on #4364): ManagementGroup:Write
                 // IS approval-gated at supervised tier, but requires_approval()
                 // returns false for an EMPTY mcp_tier - and /mcp/v1/'s auth_fn
-                // (require_auth) admits a plain RBAC session or non-MCP-tiered
+                // (require_auth) admitted a plain RBAC session or non-MCP-tiered
                 // API token same as any REST route, so C8's validate() never
-                // runs for that caller class either. Checked ahead of the
+                // ran for that caller class either (refused at /mcp/v1/
+                // admission since #4309, mcp_admission.hpp; the guard is
+                // retained as defence in depth). Checked ahead of the
                 // store-availability gate below - a malformed request is a
                 // client error regardless of backend availability.
                 if (name.size() > kMgmtGroupNameMaxLen ||
@@ -12339,7 +12346,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #4353 follow-up (Gate 2 finding on #4364): see
                 // create_management_group's identical comment above -
                 // requires_approval() never fires for an EMPTY mcp_tier, and
-                // /mcp/v1/'s auth_fn admits that caller class same as REST.
+                // /mcp/v1/'s auth_fn admitted that caller class same as REST
+                // (refused at /mcp/v1/ admission since #4309, mcp_admission.hpp;
+                // guard retained as defence in depth).
                 if (group_id.size() > kMgmtGroupIdMaxLen) {
                     reject_field_too_large(
                         std::format("group_id must be at most {} bytes", kMgmtGroupIdMaxLen));
@@ -13696,7 +13705,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // see every connected agent, not just their own visible set.
                 // `fleet_read_fn_` REPLACES the permission check (it already
                 // performs the RBAC check internally) rather than being
-                // paired with it — same pattern as list_tar_process_tree_devices.
+                // paired with it — same pattern as list_echo_process_tree_devices.
                 if (!fleet_read_fn_) {
                     spdlog::error("preview_scope_targets: fleet_read_fn_ unwired — "
                                   "misconfigured call site; failing closed");
@@ -13856,7 +13865,7 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // `rs_run_async`: MCP twin of rest_api_v1.cpp's `run_async` — the
             // shared dispatch engine for the 3 async result-set producers
-            // (create_result_set_from_tar_query, create_result_set_from_
+            // (create_result_set_from_echo_query, create_result_set_from_
             // instruction_result, reevaluate_result_set). `args_for_parent` is
             // read ONLY for `parent_id` (everything else is passed explicitly
             // so reevaluate_result_set can synthesise it) — mirrors REST's
@@ -13911,10 +13920,84 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // L1: the pair this call is about to dispatch must be the pair the consumed
+                // ticket was bound to (the C8 block resolved it with the same reads). Checked
+                // before the authorizer, any execution row or any send: the ticket is already
+                // spent, so a change since the recall's check runs nothing.
+                if (ticket_bound_effect &&
+                    *ticket_bound_effect !=
+                        yuzu::server::instruction_execute::effect_binding(plugin, action, "", "")) {
+                    const std::string changed_cid =
+                        yuzu::server::detail::make_correlation_id();
+                    const bool audit_ok = audit_fn(
+                        req, "result_set.create", "denied", "ResultSet", "",
+                        "reason=definition_changed source_kind=" +
+                            audit_token(std::string(src_kind)) +
+                            " correlation_id=" + changed_cid);
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "RESULT_SET_DEFINITION_CHANGED: the definition changed after "
+                                 "this call's approval ticket was checked; nothing was dispatched",
+                                 "the approval ticket is spent; call again without approval_id to "
+                                 "request approval for the definition as it is now",
+                                 -1, changed_cid, audit_ok, "definition_changed"),
+                        "application/json");
+                    return;
+                }
                 auto caller = caller_fn(*session);
-                caller.approval_provenance = approval_ticket_just_consumed
-                                                 ? yuzu::server::ApprovalProvenance::Ticket
-                                                 : yuzu::server::ApprovalProvenance::None;
+                // sg-1 (#2146), the sec-F1 class: the (plugin, action) pair of a
+                // kInstructionResult producer (create_result_set_from_instruction_result and
+                // reevaluate_result_set) comes from a STORED definition that an editor can
+                // repoint between ticket approval and recall. Since L1 the C8 ticket binds that
+                // resolved pair (`ticket_bound_effect`, checked just above), so a repoint
+                // between approval and recall is refused; the Ticket stamp is STILL withheld, as
+                // a policy line (dispatch_caller.hpp): the pair is resolved from a store, not
+                // named in the call's arguments, so the pair's own ExecuteGate still decides
+                // for a caller who is not an administrator.
+                // A definition-resolved producer therefore NEVER carries Ticket.
+                // Only the echo-query source keeps the stamp: its pair is the fixed
+                // echo.sql, not read from anything an editor can change.
+                const bool definition_resolved = src_kind != source_kind::kEchoQuery;
+                caller.approval_provenance =
+                    (approval_ticket_just_consumed && !definition_resolved)
+                        ? yuzu::server::ApprovalProvenance::Ticket
+                        : yuzu::server::ApprovalProvenance::None;
+                if (definition_resolved) {
+                    // Refuse a gated pair up front with text that is true for this tool, and
+                    // BEFORE any execution row exists (nothing to cancel). dispatch_fn would
+                    // refuse the same pair at the chokepoint but only as a bare "no agents
+                    // reached", which hides the cause.
+                    if (!authorize_dispatch_fn_) {
+                        const std::string cid = yuzu::server::detail::make_correlation_id();
+                        mcp_audit("denied", std::string("dispatch authorizer unavailable "
+                                                        "correlation_id=") +
+                                                cid);
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "dispatch authorization is unavailable; " + tool_name +
+                                         " is refused until it is restored",
+                                     kClassifierUnavailableRemediation, -1, cid),
+                            "application/json");
+                        return;
+                    }
+                    if (auto authz_decision = authorize_dispatch_fn_(caller, plugin, action);
+                        !authz_decision) {
+                        std::optional<std::pair<std::string, std::string>> text;
+                        if (authz_decision.error().reason ==
+                            yuzu::server::detail::DispatchDenialReason::ApprovalRequired) {
+                            text.emplace(
+                                "approval required for " + plugin + "." + action +
+                                    ": this definition's action is gated (admin or approval) "
+                                    "and " + tool_name +
+                                    " does not accept an approval ticket for a gated action",
+                                "this call cannot succeed for this caller and retrying will not "
+                                "help; dispatch as an administrator, or ask an administrator to "
+                                "run it or to change the definition to a non-gated action");
+                        }
+                        deny_dispatch_authorization(plugin, action, authz_decision.error(), text);
+                        return;
+                    }
+                }
 
                 // Same rule as REST's run_async: OMIT parent_id to broadcast
                 // deliberately. A SUPPLIED parent_id must name a parent —
@@ -14249,15 +14332,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #5047 AC2 (mirrored verbatim at pin_result_set/
                 // unpin_result_set/delete_result_set below):
                 // (a) the EMPTY-tier gap -- a plain RBAC session or a
-                //     non-MCP-tiered API token skips C8's tier/approval belt
-                //     here too, same as it always has -- is a SEPARATE,
-                //     already-tracked, OPEN design question (#4309), not
-                //     attempted by this fix.
+                //     non-MCP-tiered API token skipping C8's tier/approval
+                //     belt -- was a SEPARATE question when this was written;
+                //     /mcp/v1/ admission (mcp_admission.hpp, #4309) now
+                //     refuses every empty-tier caller before any tool runs.
                 // (b) Infrastructure:Write is never approval-gated at ANY
                 //     tier (see the #4353 comment just below: it is absent
                 //     from requires_approval()'s Delete/Execution:Execute/
                 //     Policy:Write/Security:Write|Execute/UserManagement:
-                //     Write/ManagementGroup:Write/ApiToken:Write list), and
+                //     Write/ManagementGroup:Write/Workflow:Execute/ApiToken:Write list), and
                 //     tier_allows() already confines operator tier out of
                 //     Infrastructure:Write entirely -- so a supervised-tier
                 //     caller of THIS tool never needed a ticket in the first
@@ -14289,7 +14372,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // from a genuinely parentless original once its parent is
                 // deleted (ON DELETE SET NULL) -- the same #4306/#2500
                 // target-erasure shape the dedicated
-                // create_result_set_from_tar_query/_instruction_result tools
+                // create_result_set_from_echo_query/_instruction_result tools
                 // are already protected against. Parse into a mutable object
                 // so scope_input_id can be merged in below, once pid's
                 // ownership check (rs_load_owned) succeeds -- mirrors those
@@ -14910,7 +14993,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            if (tool_name == "create_result_set_from_tar_query") {
+            if (tool_name == "create_result_set_from_echo_query") {
                 if (!perm_fn(req, res, "Execution", "Execute"))
                     return;
                 std::string sql = param_str(args, "sql");
@@ -14962,15 +15045,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool include_empty = args.value("include_empty", false);
                 nlohmann::json matcher = include_empty
                                              ? nlohmann::json{{"kind", "any_response"}}
-                                             : nlohmann::json{{"kind", "tar_rows_ge"}, {"n", 1}};
-                // source_payload — design §3.2 tar_query shape (re-eval reads it).
+                                             : nlohmann::json{{"kind", "echo_rows_ge"}, {"n", 1}};
+                // source_payload — design §3.2 echo_query shape (re-eval reads it).
                 nlohmann::json payload;
                 payload["sql"] = sql;
                 payload["include_empty"] = include_empty;
                 if (args.contains("parent_id") && args["parent_id"].is_string())
                     payload["scope_input_id"] = args["parent_id"];
                 std::unordered_map<std::string, std::string> params{{"sql", sql}};
-                rs_run_async("tar", "sql", params, source_kind::kTarQuery, payload.dump(),
+                rs_run_async("echo", "sql", params, source_kind::kEchoQuery, payload.dump(),
                             matcher.dump(), args, param_str(args, "name"));
                 return;
             }
@@ -15029,7 +15112,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             return;
                         }
                     }
-                    // #4644: a malformed tar_rows_ge threshold (`n`) is refused here, before
+                    // #4644: a malformed echo_rows_ge threshold (`n`) is refused here, before
                     // anything is dispatched or stored, like the REST twin.
                     // A PRESENT matcher that is not a JSON object used to be dropped silently
                     // ("accept every responder"); it is refused now. Absent stays the default.
@@ -15211,7 +15294,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // no reeval_name), so hoist it to an early return right after
                 // sp is parsed. Mirrors REST's identical reorder on this
                 // route (rest_api_v1.cpp).
-                if (orig->source_kind != source_kind::kTarQuery &&
+                if (orig->source_kind != source_kind::kEchoQuery &&
                     orig->source_kind != source_kind::kInstructionResult) {
                     res.set_content(
                         error_response(id, kInvalidParams,
@@ -15231,7 +15314,7 @@ McpServer::HandlerFn McpServer::build_handler(
                            !sp["scope_input_id"].get_ref<const std::string&>().empty()) {
                     // #4306 / #2500-class target erasure: the original was
                     // NARROWED at creation (scope_input_id persisted into
-                    // source_payload by create_result_set_from_tar_query /
+                    // source_payload by create_result_set_from_echo_query /
                     // create_result_set_from_instruction_result, OR by the
                     // generic create_result_set -- #4306 follow-up, all three
                     // mirror the same payload["scope_input_id"] = ... pattern),
@@ -15282,10 +15365,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     orig->name.empty()                  ? std::string()
                     : orig->name.ends_with(" (re-eval)") ? orig->name
                                                          : (orig->name + " (re-eval)");
-                if (orig->source_kind == source_kind::kTarQuery) {
+                if (orig->source_kind == source_kind::kEchoQuery) {
                     // Adversarial review (PR #4330): sp.value("sql", "") throws
                     // nlohmann::json::type_error on a type mismatch rather than
-                    // coercing - unlike create_result_set_from_tar_query's own
+                    // coercing - unlike create_result_set_from_echo_query's own
                     // caller-facing "sql" arg, which gets an explicit type check.
                     // orig->source_payload isn't caller-supplied on THIS call,
                     // but a row minted via the generic (uncapped) create_result_set
@@ -15306,9 +15389,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     // Gate 4 unhappy-path BLOCKING fix: re-apply the SAME cap
-                    // create_result_set_from_tar_query enforces before dispatch.
+                    // create_result_set_from_echo_query enforces before dispatch.
                     // `orig` may have been minted via the uncapped create_result_set
-                    // (source_kind labeled tar_query with no create-time SQL-length
+                    // (source_kind labeled echo_query with no create-time SQL-length
                     // check of its own) - without this, re-eval would smuggle an
                     // oversized SQL payload past the 200 KiB pre-routing body cap
                     // that exists specifically for this SQL size, then dispatch it
@@ -15321,7 +15404,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     std::unordered_map<std::string, std::string> params{{"sql", sql}};
-                    rs_run_async("tar", "sql", params, source_kind::kTarQuery, orig->source_payload,
+                    rs_run_async("echo", "sql", params, source_kind::kEchoQuery, orig->source_payload,
                                 orig->matcher, synth, reeval_name);
                 } else if (orig->source_kind == source_kind::kInstructionResult) {
                     // Same type-confusion guard as the sql field above.
@@ -15344,7 +15427,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // oversized instruction_id would reach instruction_store's
                     // lookup unbounded, and an over-keyed or oversized params
                     // object would dispatch fleet-wide. Mirrors the sql-size
-                    // recheck in the kTarQuery branch above. chaos-injector's
+                    // recheck in the kEchoQuery branch above. chaos-injector's
                     // Finding 1 caught the instruction_id gap: the fix's own
                     // "re-apply the SAME caps" note originally covered only
                     // params, not this sibling field.
@@ -15419,7 +15502,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                 orig->source_payload, orig->matcher, synth, reeval_name);
                 }
                 // else: unreachable -- the early return above already refused
-                // every source_kind other than kTarQuery/kInstructionResult
+                // every source_kind other than kEchoQuery/kInstructionResult
                 // before we got here.
                 return;
             }
@@ -15587,7 +15670,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "pin_result_set") {
                 // #5047 AC2 — see create_result_set's identical comment
                 // above for the full (a)-(d) rationale: (a) the empty-tier
-                // gap is #4309's, not this fix's; (b) Infrastructure:Write
+                // gap is closed at /mcp/v1/ admission (#4309); (b) Infrastructure:Write
                 // is never approval-gated at any tier (confirmed by the
                 // #4353 comment just below); (c) no step_up_fn exists on
                 // this route family, so the deny-and-redirect-to-REST
@@ -15647,7 +15730,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "unpin_result_set") {
                 // #5047 AC2 — see create_result_set's identical comment
                 // above for the full (a)-(d) rationale: (a) the empty-tier
-                // gap is #4309's, not this fix's; (b) Infrastructure:Write
+                // gap is closed at /mcp/v1/ admission (#4309); (b) Infrastructure:Write
                 // is never approval-gated at any tier (confirmed by the
                 // #4353 comment just below); (c) no step_up_fn exists on
                 // this route family, so the deny-and-redirect-to-REST
@@ -15727,10 +15810,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 //     `mcp_tier`, and `/mcp/v1/`'s `auth_fn` (`require_auth`)
                 //     admits a plain RBAC session or non-MCP-tiered API
                 //     token the same as any REST route, so C8's `validate()`
-                //     never runs for that caller class on ANY transport — is
-                //     a SEPARATE, already-tracked, OPEN design question
-                //     (#4309), not attempted by this fix. This tool is one
-                //     more instance of it, no different from the rest.
+                //     never ran for that caller class on ANY transport - was
+                //     a SEPARATE question when this was written; /mcp/v1/
+                //     admission (mcp_admission.hpp, #4309) now refuses that
+                //     caller class before any tool runs.
                 // (b) N/A here — unlike create/pin/unpin, Infrastructure:
                 //     Delete DOES require approval at supervised tier (the
                 //     paragraph above).
@@ -16841,10 +16924,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "delete_guardian_rule requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has neither the MFA step-up "
-                                 "REST's route applies nor a maker-checker approval ticket; "
+                                 "delete_guardian_rule requires an MCP-tier bearer token; "
                                  "use DELETE /api/v1/guaranteed-state/rules/{rule_id} instead",
                                  "use the equivalent REST v1 route from an authenticated browser "
                                  "session, or mint an MCP bearer token with an appropriate tier"),
@@ -17183,10 +17263,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(
                         a4_error(kPermissionDenied,
                                  "raise_guardian_policy_generation requires an MCP-tier bearer "
-                                 "token - an MCP-tier-less caller (a cookie session, a plain "
-                                 "non-MCP-tiered API token, or an engine token) has neither the "
-                                 "MFA step-up REST's route applies nor a maker-checker approval "
-                                 "ticket; use POST "
+                                 "token; use POST "
                                  "/api/v1/guaranteed-state/policy-generation/raise instead",
                                  "use the equivalent REST v1 route from an authenticated browser "
                                  "session, or mint an MCP bearer token with an appropriate tier"),
@@ -18056,7 +18133,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
                     return;
                 }
-                const auto model = dex_api_->apps(window);
+                // Present-but-non-string is invalid, never the default (`param_str` would
+                // turn `5` or `null` into the all-platform scope; same defect as #4644).
+                const auto platform = param_string_strict(args, "platform", kDexAppsScopeAll);
+                const std::string scope = platform ? dex_normalize_apps_scope(*platform) : "";
+                if (scope.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid platform (expected all|windows|macos|linux)"),
+                        "application/json");
+                    return;
+                }
+                const auto model = dex_api_->apps(window, scope);
                 // A failed read or an invalid score policy is an error, never
                 // an empty or perfect list (matches the REST 503, reason included).
                 if (model.degraded) {
@@ -19083,7 +19171,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // `version` is REQUIRED-PRESENT (distinct from get_dex_app_perf's ""
                 // = all-versions convention above): this drill is always scoped to
                 // ONE exact version, and Linux procperf emits "" for every app
-                // (tar_proc_perf.cpp) — an omitted `version` would otherwise
+                // (echo_proc_perf.cpp) — an omitted `version` would otherwise
                 // silently collapse to that single bucket instead of surfacing a
                 // genuine parameter error.
                 if (!args.contains("version") || !args["version"].is_string()) {
@@ -19501,6 +19589,82 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── execute_instruction ───────────────────────────────────────
             // Tier check handled by generic C8 block above (catalogue().security).
+            // #2146: the MCP twin of POST /api/instructions/{id}/execute (ledger row
+            // post.api-instructions-param-execute). The pipeline is instruction_execute.hpp's,
+            // shared with POST /api/v1/instructions/{id}/execute. TIER x APPROVAL, as
+            // implemented here: the tier ladder ran in C8 (and the pre-mint probe above ran the
+            // definition gate FIRST for supervised callers); this branch re-runs the whole
+            // pipeline, so an operator-tier call (no ticket, so C8 never ran) reaches the same
+            // definition gate. `approval_provenance` is NEVER stamped Ticket here (sec-F1): a
+            // consumed supervised ticket is a fact about the token and its arguments, not about
+            // the stored definition's (plugin, action), so it can neither skip a non-auto
+            // definition nor lift the pair's ExecuteGate.
+            if (tool_name == "execute_instruction_definition") {
+                namespace idef = yuzu::server::mcp::instruction_definition;
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    return;
+                // The same id the supervised pre-mint probe used (the response header is the
+                // call-wide carrier), so one call is one id across every row and body.
+                const std::string call_cid = yuzu::server::detail::ensure_correlation_id(res);
+                if (auto bv = idef::check_args(args)) {
+                    if (metrics != nullptr) {
+                        try {
+                            metrics
+                                ->counter("yuzu_mcp_tool_args_too_large_total",
+                                          {{"tool", tool_name}, {"reason", bv->reason}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                        }
+                    }
+                    const bool audit_ok =
+                        mcp_audit("denied", std::string("input bound exceeded: ") + bv->reason +
+                                                " correlation_id=" + call_cid);
+                    res.set_content(a4_error(kInvalidParams, bv->message,
+                                             "correct the argument and re-call", -1, call_cid,
+                                             audit_ok),
+                                    "application/json");
+                    return;
+                }
+                yuzu::server::instruction_execute::Request rq;
+                rq.surface = yuzu::server::instruction_execute::Surface::kMcp;
+                rq.definition_id = args["definition_id"].get<std::string>();
+                rq.body = idef::core_body(args);
+                rq.caller = caller_fn ? caller_fn(*session)
+                                      : DispatchCaller{.exec_visible =
+                                                           yuzu::server::authz::deny_all()};
+                // sec-F1 (#2146): this tool is NOT an approval_provenance stamping site
+                // (dispatch_caller.hpp). Since L1 the C8 tier ticket binds the resolved
+                // (plugin, action) as well as the call's arguments, so a repoint between
+                // approval and recall is refused (see `ticket_bound_effect` and
+                // `Request::expected_effect`). It is still not a stamping site, as a policy
+                // line: the pair is resolved from a store, not named in the call's arguments,
+                // and a pair gated by the ExecuteGate stays decided by the pair's own gate
+                // (an approval of one definition state is not taken to lift
+                // AdminOrApproval/AlwaysApproval). The value is
+                // forced to None (not left to caller_fn) so no upstream stamp survives, and the
+                // pair's own gate decides: a non-admin caller on a gated pair is refused.
+                rq.caller.approval_provenance = yuzu::server::ApprovalProvenance::None;
+                rq.submitter_pending_cap = idef::kSubmitterPendingCap;
+                rq.correlation_id = call_cid;
+                // L1: on the supervised tier, the effect the consumed ticket was bound to. The
+                // core re-reads the definition, and holds that read to it (definition_changed).
+                rq.expected_effect = ticket_bound_effect;
+                const auto out = yuzu::server::instruction_execute::run(
+                    rq, instr_exec_ports_,
+                    [&](std::string_view result_status, const std::string& detail_text) {
+                        return mcp_audit(std::string(result_status), detail_text);
+                    },
+                    bind_event_emit(emit_event_fn_, req, metrics));
+                const auto rendered = idef::render_outcome(out, out.correlation_id);
+                res.set_content(
+                    rendered.is_error
+                        ? error_response(id, rendered.code, rendered.message, rendered.data_json)
+                        : success_response(id, tool_result(rendered.payload_json,
+                                                           kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
             if (tool_name == "execute_instruction") {
                 if (!perm_fn(req, res, "Execution", "Execute"))
                     return;
@@ -19841,10 +20005,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #1398: a supervised-tier call reaches here only after C8
                 // consumed a real ticket for THIS request
                 // (approval_ticket_just_consumed); an operator-tier call
-                // (auto-approved, no ticket ever minted) or a non-MCP-tiered
-                // caller relies solely on caller.principal_is_admin (already
-                // stamped by caller_fn/derive_dispatch_caller above) at the
-                // chokepoint's ExecuteGate::AdminOrApproval arm.
+                // (auto-approved, no ticket ever minted) relies solely on
+                // caller.principal_is_admin (already stamped by
+                // caller_fn/derive_dispatch_caller above) at the chokepoint's
+                // ExecuteGate::AdminOrApproval arm. A non-MCP-tiered caller
+                // used to rely on it too (refused at /mcp/v1/ admission since
+                // #4309, mcp_admission.hpp; the arm is retained as defence in
+                // depth).
                 caller.approval_provenance = approval_ticket_just_consumed
                                                  ? yuzu::server::ApprovalProvenance::Ticket
                                                  : yuzu::server::ApprovalProvenance::None;
@@ -19982,7 +20149,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_sessions != nullptr &&
                     mcp::transport::accept_wants_sse(req.get_header_value("Accept"));
                 if (bridge_eligible) {
-                    // The session id was validated (principal-bound) at handler
+                    // The session id was validated (principal- and class-bound) at handler
                     // entry; reserve re-checks it against the registry anyway
                     // (no TOCTOU widening - a dead session just degrades).
                     // GUARD: reserve allocates (make_shared + map insert); a
@@ -20023,7 +20190,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             }
                             stream_lease.emplace(std::move(acquired.lease));
                         }
-                        auto rr = bridge->reserve(bridge_sid, session->username, id,
+                        auto rr = bridge->reserve(bridge_sid, binding, id,
                                                   std::move(bridge_token),
                                                   /*streamed_intent=*/streamed_mode);
                         if (rr.ok) {
@@ -20709,7 +20876,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                 mcp::StreamAuditPrincipal audit_principal{
                                     .id = session->username,
                                     .role = auth::role_to_string(auth::effective_role(*session)),
-                                    .cls = session->principal_kind == "engine"
+                                    .cls = session->is_engine()
                                                ? std::string("engine")
                                                : std::string{}};
                                 auto req_copy = std::make_shared<httplib::Request>(req);
@@ -20733,8 +20900,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                 // Also the TTL slide: a live streamed POST keeps its
                                 // session alive exactly as a GET tick does.
                                 auto session_alive = [mcp_sessions, bridge_sid,
-                                                      principal = session->username] {
-                                    return mcp_sessions->validate_and_touch(bridge_sid, principal) ==
+                                                      binding = std::move(binding)] {
+                                    return mcp_sessions->validate_and_touch(bridge_sid, binding) ==
                                            McpSessionRegistry::ValidateResult::kValid;
                                 };
                                 auto take_batch = [bridge, record_key](bool cap_expired) {
@@ -21341,8 +21508,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     // consumed a real ticket for THIS request
                     // (approval_ticket_just_consumed); a non-MCP-tiered
                     // caller (requires_approval short-circuits false for an
-                    // empty tier, so no ticket is ever minted) relies solely
-                    // on principal_is_admin above. The background
+                    // empty tier, so no ticket was ever minted) relied solely
+                    // on principal_is_admin above (refused at /mcp/v1/
+                    // admission since #4309, mcp_admission.hpp; retained as
+                    // defence in depth). The background
                     // QuarantineContainmentReconciler's OWN redispatch calls
                     // through a SEPARATE `.system = true` closure
                     // (CommandDispatchFn, quarantine_containment_reconciler.hpp)
@@ -21841,6 +22010,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // quarantine_caller does, so an already-ticket-consumed
                 // supervised-tier bundle call doesn't get denied ApprovalRequired
                 // again by the pre-check below.
+                //
+                // sg-1 (#2146) analysis, why this IS a legitimate stamp and the result-set
+                // producers are not: the bundle's (plugin, action) pairs are the call's own
+                // `steps` argument, not read from a stored definition. The C8 ticket canon is
+                // canonical_args(args) (steps, agent_id and every param included) and the
+                // recall's consume precondition rejects any row whose canon differs
+                // (`row.scope_expression != canon`), so the pair set a ticket approved is the
+                // pair set that dispatches; there is nothing an editor can repoint in between.
                 if (approval_ticket_just_consumed)
                     caller.approval_provenance = yuzu::server::ApprovalProvenance::Ticket;
                 if (!yuzu::server::authz::in_scope(caller.exec_visible, agent_id)) {
@@ -25764,6 +25941,196 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── cancel_execution (#2146 batch B) ───────────────────────────
+            // REST v1 twin: POST /api/v1/executions/{id}/cancel (rest_api_v1.cpp); legacy:
+            // POST /api/executions/{id}/cancel (execution_routes.cpp, untouched). All paths of
+            // the REST and MCP twins run execution_mutation.hpp's apply_execution_mutation.
+            // Tracker-only: nothing is sent to any device. Exempt from the supervised approval
+            // ticket (mcp_policy.hpp kApprovalExemptTools, owner ruling 2026-10-30); the REST
+            // twin keeps its approval mirror, so a supervised-tier token is refused there.
+            if (tool_name == "cancel_execution") {
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    return;
+                if (!fleet_read_fn_) {
+                    spdlog::error("cancel_execution: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Execution", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
+                const ExecutionMutationPorts ports =
+                    execution_mutation_ports_for_test_.wired()
+                        ? execution_mutation_ports_for_test_
+                        : make_tracker_mutation_ports(execution_tracker);
+                if (!ports.wired()) {
+                    res.set_content(
+                        a4_error(kInternalError, "Execution tracker unavailable", {},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                // Strict arguments (this tool is not approval-gated, so the C8 schema check does
+                // not run for it): one execution_id of the shared id charset, nothing else.
+                for (auto it = args.begin(); it != args.end(); ++it) {
+                    if (it.key() != "execution_id") {
+                        res.set_content(error_response(id, kInvalidParams,
+                                                       "unknown argument '" +
+                                                           it.key().substr(0, 64) +
+                                                           "'; cancel_execution takes only "
+                                                           "execution_id"),
+                                        "application/json");
+                        return;
+                    }
+                }
+                const auto exec_id = param_string_strict(args, "execution_id");
+                if (!exec_id || !is_valid_execution_id(*exec_id)) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "execution_id must be 1-128 characters from "
+                                                   "A-Z a-z 0-9 _ -"),
+                                    "application/json");
+                    return;
+                }
+                ExecutionMutationRequest mreq;
+                mreq.what = ExecutionMutation::kCancel;
+                mreq.execution_id = *exec_id;
+                mreq.username = session->username;
+                mreq.scope = gate.scope;
+                mreq.audit_context = "surface=mcp";
+                const auto outcome = apply_execution_mutation(
+                    ports, mreq,
+                    [&](const std::string& action, const std::string& result,
+                        const std::string& target, const std::string& audit_detail) {
+                        return yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, action, result, "execution", target, audit_detail);
+                    },
+                    bind_event_emit(emit_event_fn_, req, metrics));
+                if (outcome.status != ExecutionMutationStatus::kDone) {
+                    const bool tool_audit_ok = mcp_audit(
+                        outcome.status == ExecutionMutationStatus::kNotFound ||
+                                outcome.status == ExecutionMutationStatus::kAlreadyFinished
+                            ? "denied"
+                            : "error",
+                        audit_caller_id(*exec_id));
+                    const auto err = exec_mutation_mcp_error(mreq.what, outcome, *exec_id);
+                    // ca8-2: a lost denial/failure row (the sequence's or this tool's own) is
+                    // signalled on EVERY refusal as error.data.audit_persisted:false, the
+                    // instruction twin's convention; a refusal with intact rows is byte-unchanged.
+                    const bool audit_ok = tool_audit_ok && outcome.audit_persisted;
+                    res.set_content(!audit_ok || err.retry_after_ms >= 0 || err.envelope
+                                        ? a4_error(err.code, err.message, err.remediation,
+                                                   err.retry_after_ms, {}, audit_ok)
+                                        : error_response(id, err.code, err.message),
+                                    "application/json");
+                    return;
+                }
+                nlohmann::json payload_j = {{"execution_id", *exec_id}, {"status", "cancelled"}};
+                if (!outcome.audit_persisted)
+                    payload_j["audit_persisted"] = false;
+                mcp_audit("success", audit_caller_id(*exec_id));
+                res.set_content(
+                    success_response(id, tool_result(payload_j.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── record_execution_rerun (#2146 batch B) ─────────────────────
+            // REST v1 twin: POST /api/v1/executions/{id}/rerun. Creates a PENDING tracker
+            // record only; NOTHING is sent to any device. Approval-gated at the supervised tier
+            // like every other Execution:Execute tool (generic C8 gate, before this branch).
+            if (tool_name == "record_execution_rerun") {
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    return;
+                if (!fleet_read_fn_) {
+                    spdlog::error("record_execution_rerun: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Execution", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
+                const ExecutionMutationPorts ports =
+                    execution_mutation_ports_for_test_.wired()
+                        ? execution_mutation_ports_for_test_
+                        : make_tracker_mutation_ports(execution_tracker);
+                if (!ports.wired()) {
+                    res.set_content(
+                        a4_error(kInternalError, "Execution tracker unavailable", {},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                for (auto it = args.begin(); it != args.end(); ++it) {
+                    if (it.key() != "execution_id" && it.key() != "failed_only" &&
+                        it.key() != "approval_id") {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "unknown argument '" + it.key().substr(0, 64) +
+                                               "'; record_execution_rerun takes execution_id and "
+                                               "the boolean failed_only"),
+                            "application/json");
+                        return;
+                    }
+                }
+                const auto exec_id = param_string_strict(args, "execution_id");
+                if (!exec_id || !is_valid_execution_id(*exec_id)) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "execution_id must be 1-128 characters from "
+                                                   "A-Z a-z 0-9 _ -"),
+                                    "application/json");
+                    return;
+                }
+                const auto failed_only = param_bool_strict(args, "failed_only", false);
+                if (!failed_only) {
+                    res.set_content(error_response(id, kInvalidParams, "failed_only must be a boolean"), // retry-hint-exempt: input-parse failure, not a store fault
+                                    "application/json");
+                    return;
+                }
+                ExecutionMutationRequest mreq;
+                mreq.what = ExecutionMutation::kRerun;
+                mreq.execution_id = *exec_id;
+                mreq.username = session->username;
+                mreq.scope = gate.scope;
+                mreq.failed_only = *failed_only;
+                mreq.audit_context = "surface=mcp";
+                const auto outcome = apply_execution_mutation(
+                    ports, mreq,
+                    [&](const std::string& action, const std::string& result,
+                        const std::string& target, const std::string& audit_detail) {
+                        return yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, action, result, "execution", target, audit_detail);
+                    },
+                    bind_event_emit(emit_event_fn_, req, metrics));
+                if (outcome.status != ExecutionMutationStatus::kDone) {
+                    const bool tool_audit_ok = mcp_audit(
+                        outcome.status == ExecutionMutationStatus::kNotFound ? "denied" : "error",
+                        audit_caller_id(*exec_id));
+                    const auto err = exec_mutation_mcp_error(mreq.what, outcome, *exec_id);
+                    // ca8-2: see cancel_execution above.
+                    const bool audit_ok = tool_audit_ok && outcome.audit_persisted;
+                    res.set_content(!audit_ok || err.retry_after_ms >= 0 || err.envelope
+                                        ? a4_error(err.code, err.message, err.remediation,
+                                                   err.retry_after_ms, {}, audit_ok)
+                                        : error_response(id, err.code, err.message),
+                                    "application/json");
+                    return;
+                }
+                nlohmann::json payload_j = {{"execution_id", outcome.new_execution_id},
+                                            {"rerun_of", *exec_id},
+                                            {"status", "pending"},
+                                            {"failed_only", *failed_only},
+                                            {"dispatched_to_devices", false}};
+                if (!outcome.audit_persisted)
+                    payload_j["audit_persisted"] = false;
+                mcp_audit("success", audit_caller_id(outcome.new_execution_id));
+                res.set_content(
+                    success_response(id, tool_result(payload_j.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
             if (tool_name == "cancel_software_deployment") {
                 if (!tier_allows(tier, "SoftwareDeployment", "Execute")) {
                     res.set_content(
@@ -26205,10 +26572,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                        session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "assign_rbac_role requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has neither the MFA step-up "
-                                 "REST's route applies nor a maker-checker approval ticket; use "
+                                 "assign_rbac_role requires an MCP-tier bearer token; use "
                                  "POST /api/v1/rbac/roles/{name}/assignments instead",
                                  "use the equivalent REST v1 route from an authenticated browser "
                                  "session, or mint an MCP bearer token with an appropriate tier"),
@@ -26478,10 +26842,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                        session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "unassign_rbac_role requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has neither the MFA step-up "
-                                 "REST's route applies nor a maker-checker approval ticket; use "
+                                 "unassign_rbac_role requires an MCP-tier bearer token; use "
                                  "DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id} "
                                  "instead",
                                  "use the equivalent REST v1 route from an authenticated browser "
@@ -26641,10 +27002,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                        session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "set_rbac_enforcement requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has neither the MFA step-up "
-                                 "REST's route applies nor a maker-checker approval ticket; use "
+                                 "set_rbac_enforcement requires an MCP-tier bearer token; use "
                                  "PUT /api/v1/rbac/enforcement instead",
                                  "use the equivalent REST v1 route from an authenticated browser "
                                  "session, or mint an MCP bearer token with an appropriate tier"),
@@ -26839,7 +27197,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // though it cannot mutate it. Declared once here, used by every
             // handler below.
             auto deny_if_engine_session = [&]() -> bool {
-                if (session->principal_kind != "engine" && session->auth_source != "engine_token")
+                if (!session->is_engine())
                     return false;
                 mcp_audit("denied", "engine-classed session on lifecycle surface");
                 res.set_content(
@@ -27196,42 +27554,83 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::size_t credentials_revoked = *credentials_revoked_res;
+                // #6716: from here on the credentials ARE revoked. A failure row below
+                // carries that count, because the repeat call (which the retry hint
+                // invites) revokes 0 and records no count, so it would otherwise
+                // appear in no audit row at all. Same detail as the REST route.
+                const std::string revoked_count_detail =
+                    "credentials_revoked=" + std::to_string(credentials_revoked);
+                const auto fail_after_credentials = [&](const std::string& why) {
+                    // `why` may be a multi-line store error: one line, so the count stays
+                    // on the same physical line as the rest of the detail.
+                    const std::string detail =
+                        flatten_audit_text(why) + "; " + revoked_count_detail;
+                    mcp_audit("failure", detail);
+                    (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
+                                   principal_id, detail);
+                };
                 auto revoked_res = engine_principal_store_->revoke(principal_id, superseded_by);
                 if (!revoked_res) {
-                    mcp_audit("failure", revoked_res.error());
-                    (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
-                                   principal_id, revoked_res.error());
+                    fail_after_credentials(revoked_res.error());
                     res.set_content(a4_error(kInternalError, revoked_res.error(),
                                              "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
                 const bool revoked = *revoked_res;
-                if (!revoked && already_revoked) {
-                    // Idempotent no-op: the principal was already terminal before
-                    // this call, so `revoke()` returning false here is expected,
-                    // not an error — proceed to the success response below (same
-                    // as the REST route falling through this case).
-                } else if (!revoked) {
-                    // Genuine store failure (authoritative posture, EnginePrincipalStore
-                    // doc comment): a lease/query failure returns false, never a
-                    // silent success. Distinct from "already revoked" above — this is
-                    // retryable/partial-revoke state, not a permanent client-input
-                    // error, so map it to a 503-class retryable error rather than
-                    // kInvalidParams (which would misleadingly read as "bad request,
-                    // don't retry").
-                    mcp_audit("failure", "engine principal store failed to revoke");
-                    (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
-                                   principal_id, "store_unavailable");
-                    res.set_content(a4_error(kInternalError,
-                                             "failed to revoke engine principal — try again",
-                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
+                bool revoked_by_concurrent_request = false;
+                if (!revoked && !already_revoked) {
+                    // EnginePrincipalStore::revoke returns false ONLY when its UPDATE
+                    // matched no active row (a lease or query failure is the error arm
+                    // above). With `already_revoked` false at the read above, the
+                    // reachable cause is a concurrent revoke that landed between that
+                    // read and this write. Re-read to tell that apart from an identity
+                    // that is still active (mirrors the REST DELETE route).
+                    auto reread = engine_principal_store_->get(principal_id);
+                    if (reread && *reread && (*reread)->lifecycle_state != "active") {
+                        // The winner did the work and this call killed the credentials:
+                        // idempotent success, not a failure.
+                        revoked_by_concurrent_request = true;
+                    } else {
+                        // Still active (or gone, or unreadable): the identity is not
+                        // confirmed revoked and its credentials are already dead, the
+                        // same state as the revoke-error arm above, so the same hint.
+                        std::string why;
+                        if (!reread)
+                            why = "revoke matched no active row and the re-read failed: " +
+                                  reread.error();
+                        else if (!*reread)
+                            why = "revoke matched no active row and the principal is no longer "
+                                  "found";
+                        else
+                            why = "revoke matched no active row but the principal is still "
+                                  "active";
+                        fail_after_credentials(why);
+                        res.set_content(a4_error(kInternalError,
+                                                 "failed to revoke engine principal — try again",
+                                                 "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                        return;
+                    }
                 }
+                // `!revoked && already_revoked` is the idempotent no-op: the principal
+                // was already terminal before this call, so `false` is expected, not an
+                // error. The REST route falls through it the same way.
+                // The race row carries the same detail the REST route writes. A
+                // caller-supplied superseded_by was NOT persisted (the winner's value
+                // stands), so the row does not claim it was.
+                const std::string success_detail =
+                    revoked_by_concurrent_request
+                        ? revoked_count_detail + "; revoked_by_concurrent_request" +
+                              (superseded_by.empty() ? "" : "; superseded_by_not_persisted") +
+                              (reason.empty() ? "" : "; reason=" + audit_token(reason))
+                        // The caller's reason is sanitised here too: a raw one could carry
+                        // `credentials_revoked=0; revoked_by_concurrent_request` and read as
+                        // the race row of a revoke that did not race.
+                        : audit_token(reason);
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "engine_principal.revoke", "success", "EnginePrincipal",
-                    principal_id, reason);
+                    principal_id, success_detail);
                 if (!audit_ok) {
                     // #3937: fail closed (parity with REST #2466 + plugin-config MCP
                     // precedent). The principal + its credentials were revoked but the
@@ -27705,11 +28104,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     const bool denied_audit_ok =
                         audit_fn(req, "engine_principal.credential.confirm", "failure",
                                 "EnginePrincipal", principal_id, confirmed.error());
+                    // #6716: retry_after_ms only for the retryable (Transient ->
+                    // kInternalError) class, never for conflict / secret mismatch /
+                    // client validation. Mirrors rotate_engine_credential above and
+                    // the human-token confirm twin below.
+                    const int code = mcp_error_for_store_msg(confirmed.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_store_msg(confirmed.error()),
-                                       confirmed.error(),
-                                       denied_audit_ok ? std::string_view{}
-                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, confirmed.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     return;
                 }
@@ -27793,10 +28198,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "rotate_api_token requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has no MFA step-up REST's route "
-                                 "requires on every rotate call, including a re-serve; "
+                                 "rotate_api_token requires an MCP-tier bearer token; "
                                  "use POST /api/v1/tokens/{id}/rotate instead",
                                  kInteractiveSessionRemediation),
                         "application/json");
@@ -28059,10 +28461,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "confirm_api_token_rotation requires an MCP-tier bearer token - "
-                                 "an MCP-tier-less caller (a cookie session, a plain "
-                                 "non-MCP-tiered API token, or an engine token) has no MFA "
-                                 "step-up REST's route requires; "
+                                 "confirm_api_token_rotation requires an MCP-tier bearer token; "
                                  "use POST /api/v1/tokens/{id}/confirm instead",
                                  kInteractiveSessionRemediation),
                         "application/json");
@@ -28248,8 +28647,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // approval() itself no-ops on an empty tier) - mcp_policy.hpp's
                 // documented "not an MCP token -> allow everything, defer to
                 // RBAC" premise assumed that caller class is non-interactive,
-                // which #4309 disproves (an ordinary cookie session reaches
-                // this same MCP endpoint). Denying here restores that premise
+                // which #4309 disproved (an ordinary cookie session reached
+                // this same MCP endpoint; /mcp/v1/ admission now refuses it,
+                // and this guard stays as defence in depth). Denying here restores that premise
                 // for exactly the two operations (self-mint a persistent
                 // credential; the sibling revoke_api_token/unlock_account
                 // below) where REST has a control this transport otherwise
@@ -28265,10 +28665,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "create_api_token requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has neither the MFA step-up "
-                                 "REST's route applies nor a maker-checker approval ticket; "
+                                 "create_api_token requires an MCP-tier bearer token; "
                                  "use POST /api/v1/tokens instead",
                                  kInteractiveSessionRemediation),
                         "application/json");
@@ -28485,10 +28882,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "revoke_api_token requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has neither the MFA step-up "
-                                 "REST's route applies nor a maker-checker approval ticket; "
+                                 "revoke_api_token requires an MCP-tier bearer token; "
                                  "use DELETE /api/v1/tokens/{id} instead",
                                  kInteractiveSessionRemediation),
                         "application/json");
@@ -29374,10 +29768,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "unlock_account requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has neither the MFA step-up "
-                                 "REST's route applies nor a maker-checker approval ticket; "
+                                 "unlock_account requires an MCP-tier bearer token; "
                                  "use POST /api/v1/users/{username}/unlock instead",
                                  kInteractiveSessionRemediation),
                         "application/json");
@@ -29592,8 +29983,8 @@ McpServer::HandlerFn McpServer::build_handler(
 // mirroring build_handler's kill-switch treatment. GET is the session's live
 // server->client SSE channel - attach, replay, heartbeat, per-tick credential
 // revalidation (it was a 405 placeholder in PR 1 only; the 405 now survives just
-// under --mcp-no-streaming). DELETE terminates a principal-bound session (200)
-// or 404s an unknown/foreign one (no cross-principal oracle).
+// under --mcp-no-streaming). DELETE terminates a session bound to the caller's principal and
+// credential class (200) or 404s an unknown/foreign/other-class one (no cross-principal oracle).
 
 McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_fn,
                                                   const bool* mcp_disabled,
@@ -29655,20 +30046,45 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
         }
         auto session = auth_fn(req, res);
         if (!session)
-            return; // auth_fn already set 401
+            return; // auth_fn already set 401/403
+        // A service-scoped token never opens the stream channel (service-scoped
+        // confinement clause 4): the ring can hold another service's execution frames and
+        // this handler has no per-target parameter to scope them against. Decided before
+        // any session lookup, Accept negotiation or StreamBudget lease, so a refused
+        // caller reads and holds nothing. No `permission` field in the body (clause 5:
+        // no permission would, by itself, admit this caller). This precedes the
+        // missing-Mcp-Session-Id check, so a service-scoped GET without a session id
+        // answers 403 rather than the 400 it answered before.
+        if (is_service_scoped_caller(*session)) {
+            const auto cid = yuzu::server::detail::make_correlation_id();
+            if (metrics != nullptr) {
+                metrics->counter("yuzu_mcp_stream_rejects_total", {{"reason", "service_scoped"}})
+                    .increment();
+            }
+            write_service_scoped_denial(
+                audit_fn, req, res, "mcp.session.reject", "failure", "McpSession", std::string{},
+                "reason=service_scoped cid=" + cid, 403,
+                error_response_null_a4(kPermissionDenied,
+                                       "service-scoped tokens may not open the MCP stream channel",
+                                       cid,
+                                       "use a token without scope_service; durable results "
+                                       "remain fetchable by execution_id"));
+            return;
+        }
         // The SSE channel itself (session gate, Accept negotiation, replay, caps,
         // provider) lives in mcp_stream.cpp — this file stays wiring.
         // The actor is captured HERE, while the credential is still valid — the close
         // audit runs at teardown, when it may not resolve at all. All three fields must
         // come from the same live session, or the close row will disagree with the attach
         // row about who acted: principal_class in particular is re-stamped from
-        // principal_kind at request time, so an engine principal reads "engine" there and
-        // would read "agent" from bare credential presentation here.
+        // the session's engine classification at request time, so an engine
+        // principal reads "engine" there and would read "agent" from bare
+        // credential presentation here.
         mcp::StreamAuditPrincipal actor{
             .id = session->username,
             .role = auth::role_to_string(auth::effective_role(*session)),
-            .cls = session->principal_kind == "engine" ? std::string("engine") : std::string{}};
-        handle_get_tail(req, res, session->username, *sessions, stream_budget, revalidate_fn,
+            .cls = session->is_engine() ? std::string("engine") : std::string{}};
+        handle_get_tail(req, res, binding_for(*session), *sessions, stream_budget, revalidate_fn,
                         metrics, audit_fn, per_principal_cap, std::move(actor),
                         principal_audit_fn);
     };
@@ -29720,7 +30136,7 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
         }
         auto session = auth_fn(req, res);
         if (!session)
-            return; // auth_fn already set 401
+            return; // auth_fn already set 401/403
         const auto sid = req.get_header_value("Mcp-Session-Id");
         if (sid.empty()) {
             // Audit the malformed-request denial too so a SIEM watching DELETE
@@ -29742,18 +30158,23 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
         // mcp_stream.cpp already does this; DELETE takes the same untrusted input into
         // the same verbs and was passing it through raw.
         const auto audit_sid = yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8));
-        if (sessions->terminate(sid, session->username)) {
+        const auto terminated = sessions->terminate(sid, binding_for(*session));
+        if (terminated == McpSessionRegistry::ValidateResult::kValid) {
             session_audit("mcp.session.close", "success", audit_sid, "");
             res.status = 200;
         } else {
+            // Same 404 body for a never-existed id, a foreign principal and a
+            // same-principal different credential class; only the audit reason differs
+            // for the last, and the owner's session is left standing.
             const auto cid = yuzu::server::detail::make_correlation_id();
             session_audit("mcp.session.reject", "failure", audit_sid,
-                          "reason=unknown_session cid=" + cid);
+                          std::string("reason=") + session_reject_reason(terminated) +
+                              " cid=" + cid);
             res.status = 404;
             res.set_content(
                 error_response_null_a4(kMcpUnknownSession, "Unknown or expired session", cid,
-                                       "the session does not exist or is already terminated; no "
-                                       "action needed"),
+                                       "the session is unknown, expired or terminated; call "
+                                       "initialize to start a new session"),
                 "application/json");
         }
     };

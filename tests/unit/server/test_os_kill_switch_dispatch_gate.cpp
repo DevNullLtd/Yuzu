@@ -318,7 +318,7 @@ namespace {
 
 yuzu::server::detail::ClassifiedCommand classified_with_os_off(IdSet os_off) {
     constexpr yuzu::server::CommandCapability kCap{
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "sql",
         .dispatch_class = yuzu::server::DispatchClass::ReadOnly,
         .mutability = yuzu::server::Mutability::None,
@@ -331,7 +331,7 @@ yuzu::server::detail::ClassifiedCommand classified_with_os_off(IdSet os_off) {
         return std::optional<IdSet>{os_off};
     };
     auto r = yuzu::server::detail::finalize_classified_command(
-        kCap, fn, "tar", "sql", "os-cmd", {}, {}, 0, 0, {}, {});
+        kCap, fn, "echo", "sql", "os-cmd", {}, {}, 0, 0, {}, {});
     REQUIRE(r.has_value());
     return std::move(*r);
 }

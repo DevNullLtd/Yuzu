@@ -39,7 +39,7 @@ Every mutating operation on this surface requires:
   exist as a real Yuzu user — creation and transfer both fail closed
   (`400`) against an unknown username.
 
-**An engine-classed session is refused on the lifecycle and credential surface.** A caller whose *own* session is engine-classed is refused, even to read, on every engine-principal lifecycle and credential route on REST (create, list, get, revoke, mint, rotate, confirm, transfer and the no-admin audit) and on the engine lifecycle MCP tools; for the MCP tools, see the [MCP tool list](mcp.md#available-tools). `GET /api/v1/engine-principals/{id}/roles` (list) is the one REST exception: it carries no engine-session check and relies on its `EnginePrincipal:Read` gate alone. `POST` and `DELETE` on the roles routes (assign, unassign) are step-up gated like every other mutating route, so they refuse an engine-classed session before the handler runs.
+**An engine-classed session is refused on the lifecycle and credential surface.** A caller whose *own* session is engine-classed is refused, even to read, on every engine-principal lifecycle and credential route on REST (create, list, get, revoke, mint, rotate, confirm, transfer and the no-admin audit) and on the engine lifecycle MCP tools, and also on every access-review route, MCP tool and dashboard fragment (the grant population is evidence only a person reads); for the MCP tools, see the [MCP tool list](mcp.md#available-tools). `GET /api/v1/engine-principals/{id}/roles` (list) is the one REST exception: it carries no engine-session check and relies on its `EnginePrincipal:Read` gate alone. `POST` and `DELETE` on the roles routes (assign, unassign) are step-up gated like every other mutating route, so they refuse an engine-classed session before the handler runs.
 
 **What an engine principal can never be given.** Assignment refuses the roles named `admin` and `Administrator`, and refuses every built-in (system) role. Assignment does not inspect the permissions of a custom role, so a custom role that grants broad permissions can still be assigned. `GET /api/v1/engine-principals/audit/no-admin` reports an admin grant, a system role, or an effective grant that covers every securable and operation, so run it after assigning a custom role.
 
@@ -49,6 +49,56 @@ Every mutating operation on this surface requires:
 
 Dashboard: Settings → **Engine Principals** → fill in Slug, Display Name,
 Owner, Classification, Justification → Create.
+
+The panel needs `EnginePrincipal:Read`, the same permission as
+`GET /api/v1/engine-principals`. With RBAC disabled that means an effective
+administrator; with RBAC enabled it means the grant (the built-in `Administrator`
+and `Viewer` roles hold it), so an account administrator who has been given a
+role without it sees "You do not have permission to view this panel" instead of
+the list. The same note appears when the permission check itself could not be
+completed (a degraded RBAC read is answered `403`, not `503`): reload once (copy any
+credential secret shown first) before changing any grant, and if it persists check the
+role store's health and the `YuzuRbacReadDegraded` alert. The Settings page itself
+still opens for effective administrators only. The panel differs from the REST route in the ways
+listed once in [upgrading](upgrading.md) (the "Breaking: the Settings Engine
+Principals panel" section); none admits a caller the route refuses.
+
+A revoked row's **Detail (earliest retained record)** cell is the audit trail's text
+for that principal, shown to a caller who also holds `AuditLog:Read`. It is
+best-effort: the oldest committed revoke record the panel's read of the newest 200
+revoke events still holds, which is not the revocation's own record when audit
+retention has pruned it while a later retry survives, when the revoke committed but
+its audit row failed to persist (so a later retry of the same revoke is the first
+success row), when the credentials were revoked but the identity step then failed (the
+credential count is only in that call's failure row, and the repeat that completes the
+revoke writes `credentials_revoked=0` through the route, or its own typed reason through
+the MCP tool, which is what the cell shows), when two revokes
+raced (the row the loser wrote, which carries `revoked_by_concurrent_request`, can be the
+older of the two), or when an MCP revoke was given no reason (its committed row has an
+empty detail, so the cell shows no text and reads "(not recorded)"). Its states:
+
+- The recorded text, as above.
+- "(not recorded)": no committed revoke record is retained. There was no committed
+  revoke, or a committed MCP revoke was given no reason (an empty detail), or the
+  record is older than audit retention (365 days by default).
+- "(unavailable)": not looked up, or the lookup failed. The audit store could not
+  answer, or an earlier credential read in the same load failed (or no token store
+  is wired) and the lookup was skipped; the remaining revoked rows are then not
+  looked up. Retry when the panel shows a Retry control (a Retry cannot fix a server
+  with no token store wired), otherwise reload the page (copy any credential secret
+  shown first); if it persists, check the `YuzuAuditReadDegraded` alert and the audit
+  store ([Audit log](audit-log.md), Storage).
+- "(withheld: needs AuditLog:Read, or it could not be confirmed)": the caller does
+  not hold `AuditLog:Read`, or that check could not be completed. Grant it (the
+  built-in `Administrator` and `Viewer` roles hold it) or reload (copy any credential
+  secret shown first).
+
+Past 200 revoke events for one principal the cell adds "(more than 200 revoke events:
+this is the oldest success among the newest 200, not necessarily the original)" after
+the text, or "(more than 200 revoke events and none of the newest 200 succeeded)" after
+"(not recorded)"; the second can be wrong when the oldest success in the window has an
+empty detail (an MCP revoke given no reason). The full list of what the cell can
+and cannot say is in [upgrading](upgrading.md) ("The Detail cell").
 
 If the list or an engine principal's credentials cannot be read (for example
 while the database connection pool is exhausted), the panel says so: an
@@ -162,7 +212,8 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
      caller's own tokens, and an engine credential is owned by the engine
      principal.)
   2. Revoke the successor with `DELETE /api/v1/tokens/{token_id}`. This is a
-     REST call only (the MCP tools have no per-credential revoke). It needs
+     REST call. (An MCP worker has `revoke_api_token`; see "Revoking one
+     credential over MCP" below.) The REST route needs
      `ApiToken:Delete`, a fresh MFA step-up, and an **effective administrator**,
      because only the token's owner or an administrator may revoke it and the
      owner here is the engine principal, not a person. Any other caller gets
@@ -307,6 +358,65 @@ genuinely need a fresh credential. (The one case that stays `503`-retryable is
 a genuine store hiccup — an empty read, lock contention, or a persist failure —
 where retrying is the right move.)
 
+Two other confirm answers are terminal, not retryable. Two active credentials
+that are not a linked rotation pair answer `409` (it used to be a retryable
+`503`): the stored rows are malformed, which no retry can repair, so `GET` the
+principal, inspect both credentials, and revoke the unwanted one with
+`DELETE /api/v1/tokens/{token_id}` (or `revoke_api_token` over MCP, see
+below). The MCP `confirm_engine_rotation` answers this case as a terminal
+invalid-params error with no `retry_after_ms`, and the REST confirm also writes a
+warning log line naming it. And a `rotate` that finds one active credential
+still carrying unresolved rotation metadata (for example after its predecessor
+was revoked out of band) answers `409` instead of minting (over MCP,
+`rotate_engine_credential` answers invalid-params with no `retry_after_ms`);
+the message starts `one active credential with unresolved rotation metadata`.
+Before this refusal existed, such a rotate answered `200` with a new secret and
+left the malformed pair behind.
+
+**The way out of either `409`.**
+
+1. `GET /api/v1/engine-principals/{id}` and inspect `active_credentials`. In the
+   one-credential case, if a consumer is still using that credential it is the
+   good survivor: leave it alone.
+2. Only if the credential is confirmed stale (or, in the two-credential case,
+   once you know which one to drop), revoke it with
+   `DELETE /api/v1/tokens/{token_id}`. That route needs `ApiToken:Delete`, a
+   fresh MFA step-up and an **effective administrator**; any other caller gets
+   `404 token not found`. The reason is the one given under "If the secret is
+   lost" in section 3 above: the credential's owner is the engine principal, not
+   a person.
+3. If no credential remains afterwards, mint a fresh one with
+   `POST /api/v1/engine-principals/{id}/credentials`. Never use
+   `DELETE /api/v1/engine-principals/{id}` for this: it is terminal.
+
+A sole credential whose predecessor has simply expired is refused by the
+one-credential `rotate` (`409`) until the rotation sweep (it runs every 60
+seconds) clears the leftover rotation linkage. `rotate` never accepts an overlap
+window that would outlive the predecessor's own expiry, so by the time a
+predecessor has expired its overlap window has already ended and the next sweep
+tick that runs clears the linkage; `rotate` then works again. A tick can skip the
+work (the clock guard can decline it, the sweep lock can be held elsewhere, a
+tick can fail, and at most 200 pairs are handled per tick), and the pair is
+picked up on a later tick. The sweep only does this for a successor that has been
+presented at least once. A successor that was never used is not cleared: it keeps
+its linkage, and `rotate` keeps refusing it, until it is used, revoked or
+expires.
+
+**Revoking one credential over MCP.** The tool `revoke_api_token` (token id from
+`GET /api/v1/engine-principals/{id}`) revokes a single credential. It needs the
+`ApiToken:Delete` permission, a supervised-tier MCP bearer token (approval-gated,
+like the other destructive tools), and a caller that is an effective
+administrator (an administrator, or a user with an active elevation); for any
+other caller an engine credential is reported as `token not found`. Use it the
+same way as the REST call above.
+
+**Cap your retries.** `rotate` and `confirm` answer a `503` with `Retry-After: 2`
+when they find no active credential or no in-flight rotation, because that empty
+read cannot be told apart from a failed read. A revoked principal gives this
+answer every time, so a client that retries forever never stops. Retry a few
+times with growing delays; if the `503` persists, `GET` the principal and look
+at its credentials.
+
 ### 5. Transfer ownership
 
 Ownership transfer is **admin-forced** — it does not require the outgoing
@@ -337,6 +447,15 @@ Every active credential is revoked **first**, then the identity itself flips
 to `revoked` — a caller can never observe a revoked identity with a
 still-valid credential. Calling this again on an already-revoked principal is
 a no-op success, not an error.
+
+If a `503` interrupts the revoke after the credentials were revoked but before
+the identity was, the principal may stay `active` with **zero credentials** until a
+repeat call completes. The repeat answers `200` with `credentials_revoked: 0`;
+the count from the interrupted call is only in that call's failure audit row
+(`credentials_revoked=<N>` in its detail). Every `503` from the revoke steps carries
+`Retry-After: 2` except the one for an audit row that could not be saved after
+the revoke committed. Cap your retries, and `GET` the principal if the `503`
+persists.
 
 ## The owner-delete interlock (two-mode enforcement)
 
@@ -500,13 +619,18 @@ fix — an earlier revision of this doc, and of the primitive itself, treated
 streaming as rate-capped-only and concurrency-exempt, which left an engine
 principal able to open an unbounded number of concurrent streams).
 
-**Forward guard (track 2f).** When MCP Streamable-HTTP `GET`/`POST` gains a
-live SSE stream (today `GET /mcp/v1/` is a `405` placeholder — see
-[MCP — Streamable HTTP sessions](mcp.md#streamable-http-sessions)), that
-handler MUST adopt the pending concurrency slot into the stream exactly like
-the three routes already covered by this cap, or it silently reintroduces
-the UP-1 gap for MCP engine principals specifically — the surface this cap
-exists to protect.
+**Streaming guard (track 2f).** The MCP Streamable-HTTP `GET /mcp/v1/` stream
+(see [MCP — Streamable HTTP sessions](mcp.md#streamable-http-sessions); it
+answers `405` only when the server runs with `--mcp-no-streaming`) adopts the
+pending concurrency slot into the stream, exactly like the three routes already
+covered by this cap. Any further MCP streaming surface MUST do the same, or it
+silently reintroduces the UP-1 gap for MCP engine principals specifically — the
+surface this cap exists to protect.
+
+**MCP tier.** An engine principal's API token is always minted with
+`mcp_tier` `readonly`, and `/mcp/v1/` refuses any credential with no MCP tier
+for every principal, engines included, so an engine credential is always
+admitted by that check (a tier-less engine row would be refused, not exempted).
 
 **Tuning guidance:** the defaults (16 concurrent, 20/s) are conservative
 starting points for a single autonomous module; raise

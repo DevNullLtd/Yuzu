@@ -585,7 +585,7 @@ This is the closest Yuzu can get to the category leader's proprietary scripting 
 | **12: Agent Caps** | MEDIUM | Medium | LOW-MEDIUM | Completes capability map to 184/184 |
 | **13: Polish** | MEDIUM | Medium | MEDIUM | Security + operational maturity |
 | **14: Scale** | LOW | Large | HIGH (at scale) | Only needed for 100K+ deployments |
-| **15: TAR Dashboard & Scope Walking** | HIGH | Medium | HIGH | Composable scope is Yuzu's product differentiator; commercial peers have no equivalent — TAR page also unifies retention awareness and process-tree forensics |
+| **15: Echo Dashboard & Scope Walking** | HIGH | Medium | HIGH | Composable scope is Yuzu's product differentiator; commercial peers have no equivalent — Echo page also unifies retention awareness and process-tree forensics |
 | **16: System Guardian** | **CRITICAL** | Large | **CRITICAL** | **The headline parity feature** — real-time agent-side guaranteed state. Without this, "policy engine equivalent" is an overclaim. PR ladder defined; first 2 PRs shipped. |
 
 ### Recommended Execution Order
@@ -605,7 +605,7 @@ Phase 13 (Polish) ──────────── 1 sprint ──── Sec
     │
 Phase 14 (Scale) ───────────── 2 sprints ─── Large deployment readiness
     │
-Phase 15 (TAR + Scope Walking) ─ 2 sprints ─ Product differentiator (composable scope)
+Phase 15 (Echo + Scope Walking) ─ 2 sprints ─ Product differentiator (composable scope)
     │
 Phase 16 (System Guardian) ──── 4-6 sprints ─ THE headline parity feature; PRs 1-2 done, PRs 3-17 in ladder
 ```
@@ -623,7 +623,7 @@ After all phases complete, the capability map would grow from 184 to ~225 capabi
 | 25. Connector Framework | Connector CRUD, Sync Engine, Connection Testing, Sync Scheduling, Sync Logging |
 | 26. Inventory Repositories | Repository CRUD, Consolidation, Deduplication, Normalization, Multi-Source Merge |
 | 27. Software Catalog | Catalog Store, Software Normalization, AI Curation (stub), Usage Tracking, License Entitlements |
-| 28. Response Visualization | Chart Rendering, Built-in Processors, Custom Processors, Template Management, **TAR Dashboard Page** (Phase 15.A — Partial), **TAR Process Tree Viewer** (Phase 15.H), **Retention Awareness Surface** (Phase 15.A) |
+| 28. Response Visualization | Chart Rendering, Built-in Processors, Custom Processors, Template Management, **Echo Dashboard Page** (Phase 15.A — Partial), **Echo Process Tree Viewer** (Phase 15.H), **Retention Awareness Surface** (Phase 15.A) |
 | 29. Consumer Applications | Consumer Registration, Rate Limiting, Data Offloading, Custom Data |
 | **30. Scope Walking & Result Sets** | Result Set Persistence and Lineage (15.B), Composable Scope from Previous Query (15.C), YAML DSL `fromResultSet:` (15.E), Operational Hardening (15.G) |
 | **31. System Guardian — Real-Time Agent-Side Guaranteed State** | Kernel-event-driven enforcement primitives, event guards (Registry / SCM / WFP / ETW / inotify / netlink / D-Bus / Endpoint Security), condition guards (process / software / compliance / WMI), pre-login activation, offline-capable cached policy, audit journal, dashboard, push protocol, signing, quarantine integration |

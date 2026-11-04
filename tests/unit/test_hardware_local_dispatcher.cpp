@@ -1,0 +1,359 @@
+/**
+ * test_hardware_local_dispatcher.cpp -- loads the ACTUAL built hardware plugin via
+ * PluginHandle::load and drives it through yuzu::agent::LocalDispatcher.
+ *
+ * RUNS ON ALL THREE PLATFORMS, unconditionally (the sibling posix-actions test is
+ * `#if defined(__APPLE__)`). Assertions are row FAMILIES that hold on ANY host of the OS
+ * (a CI VM without DMI or per-DIMM data is legitimate), never host values.
+ */
+#include <catch2/catch_test_macros.hpp>
+
+#include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/plugin.h>
+#include <yuzu/plugin.hpp>
+
+#include "local_dispatcher.hpp"
+
+#include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+#if defined(_WIN32)
+constexpr const char* kPluginExt = ".dll";
+constexpr const char* kPlanned = "windows:planned";
+#elif defined(__APPLE__)
+constexpr const char* kPluginExt = ".dylib";
+constexpr const char* kPlanned = "macos:planned";
+#else
+constexpr const char* kPluginExt = ".so";
+constexpr const char* kPlanned = "linux:planned";
+#endif
+
+constexpr const char* kPlannedActions[] = {"chassis", "baseboard", "swap", "machine_id"};
+
+std::vector<std::string> captured_rows(const std::string& captured) {
+    std::vector<std::string> out;
+    std::istringstream ss(captured);
+    for (std::string line; std::getline(ss, line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) out.push_back(line);
+    }
+    return out;
+}
+
+/// Splits on '|'. The rows asserted on here carry only fixed tokens, so no escape handling.
+std::vector<std::string> split_pipes(const std::string& row) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : row) {
+        if (c == '|') {
+            out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    out.push_back(cur);
+    return out;
+}
+
+// Under `meson test` a missing plugin means the build is broken -- never "All tests passed".
+void require_plugin_or_skip() {
+    if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+        FAIL("hardware plugin library not found under meson test -- the plugin did not build, or "
+             "link_depends does not order it before this test");
+    WARN("hardware plugin library not found -- skipping (run from the build root)");
+}
+
+struct LoadedPlugin {
+    yuzu::agent::PluginHandle handle;
+    const YuzuPluginDescriptor* descriptor;
+};
+
+std::optional<LoadedPlugin> load_plugin() {
+    const fs::path rel =
+        fs::path{"agents"} / "plugins" / "hardware" / (std::string{"hardware"} + kPluginExt);
+    std::vector<fs::path> candidates;
+    if (auto* root = std::getenv("MESON_BUILD_ROOT")) candidates.push_back(fs::path{root} / rel);
+    for (const char* dir : {".", "..", "build-macos", "build-windows", "build-linux"})
+        candidates.push_back(fs::path{dir} / rel);
+    for (const auto& p : candidates) {
+        std::error_code ec;
+        if (!fs::exists(p, ec) || ec) continue;
+        auto handle = yuzu::agent::PluginHandle::load(fs::absolute(p, ec));
+        if (!handle.has_value() || !handle->descriptor()) return std::nullopt;
+        const auto* descriptor = handle->descriptor();
+        return LoadedPlugin{std::move(*handle), descriptor};
+    }
+    return std::nullopt;
+}
+
+const YuzuActionDescriptor* find_descriptor(const YuzuPluginDescriptor* d, std::string_view name) {
+    for (std::size_t i = 0; i < d->action_descriptor_count; ++i)
+        if (std::string_view{d->action_descriptors[i].action} == name)
+            return &d->action_descriptors[i];
+    return nullptr;
+}
+
+} // namespace
+
+TEST_CASE("hardware plugin: the four estate actions are SUPPORTED on Windows, PLANNED elsewhere",
+          "[hardware][descriptors]") {
+    auto plugin = load_plugin();
+    if (!plugin) return require_plugin_or_skip();
+
+    CHECK(plugin->descriptor->action_descriptor_count == 12);
+    for (const char* name : kPlannedActions) {
+        INFO("action: " << name);
+        const auto* d = find_descriptor(plugin->descriptor, name);
+        REQUIRE(d != nullptr);
+        // Linux (H.11) and macOS (H.13) legs have not landed: still the planned answer.
+        for (const auto* leg : {&d->linux_leg, &d->macos_leg}) {
+            CHECK(leg->support == YUZU_SUPPORT_PLANNED);
+            CHECK(leg->rung == 1);
+            CHECK(leg->mechanism != nullptr);
+            CHECK(leg->fallback != nullptr);
+        }
+        // Windows (H.5) reads them in-process (rung 1); a supported leg declares no fallback.
+        CHECK(d->windows_leg.support == YUZU_SUPPORT_SUPPORTED);
+        CHECK(d->windows_leg.rung == 1);
+        CHECK(d->windows_leg.mechanism != nullptr);
+        CHECK(d->windows_leg.fallback == nullptr);
+    }
+    // The pre-existing reads keep their declared support.
+    const auto* proc = find_descriptor(plugin->descriptor, "processors");
+    REQUIRE(proc != nullptr);
+    CHECK(proc->linux_leg.support == YUZU_SUPPORT_SUPPORTED);
+    const auto* mem = find_descriptor(plugin->descriptor, "memory");
+    REQUIRE(mem != nullptr);
+    CHECK(mem->linux_leg.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK(mem->macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
+}
+
+TEST_CASE("hardware plugin: the actions list names exactly the twelve actions",
+          "[hardware][descriptors]") {
+    auto plugin = load_plugin();
+    if (!plugin) return require_plugin_or_skip();
+
+    std::set<std::string> got;
+    for (const char* const* a = plugin->descriptor->actions; a && *a; ++a) got.insert(*a);
+    const std::set<std::string> want{"manufacturer", "model",   "bios",      "processors",
+                                     "memory",       "disks",   "drivers",   "system",
+                                     "chassis",      "baseboard", "swap",    "machine_id"};
+    CHECK(got == want);
+}
+
+#if !defined(_WIN32)
+TEST_CASE("hardware plugin: each estate action answers one typed planned status row",
+          "[hardware][actions]") {
+    auto plugin = load_plugin();
+    if (!plugin) return require_plugin_or_skip();
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    for (const char* name : kPlannedActions) {
+        INFO("action: " << name);
+        auto result = dispatcher.run(plugin->descriptor, name);
+        CHECK(result.rc == 0);
+        const auto rows = captured_rows(result.captured);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == std::string{"status|"} + name + "|unsupported|" + kPlanned);
+        CHECK(rows[0].find("unknown") == std::string::npos);
+        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+        CHECK(result.result_provenance == kPlanned);
+    }
+}
+
+TEST_CASE("hardware plugin: cpu and dimm rows carry the appended columns as '-'",
+          "[hardware][actions]") {
+    auto plugin = load_plugin();
+    if (!plugin) return require_plugin_or_skip();
+
+    yuzu::agent::LocalDispatcher dispatcher;
+
+    auto cpu = dispatcher.run(plugin->descriptor, "processors");
+    CHECK(cpu.rc == 0);
+    const auto cpu_rows = captured_rows(cpu.captured);
+    REQUIRE_FALSE(cpu_rows.empty());
+    for (const auto& r : cpu_rows) {
+        INFO("cpu row: " << r);
+        const auto f = split_pipes(r);
+        REQUIRE(f.size() == 8);
+        CHECK(f[0] == "cpu");
+        CHECK(f[6] == "-");
+        CHECK(f[7] == "-");
+    }
+
+    auto mem = dispatcher.run(plugin->descriptor, "memory");
+    CHECK(mem.rc == 0);
+    const auto mem_rows = captured_rows(mem.captured);
+    REQUIRE_FALSE(mem_rows.empty());
+    for (const auto& r : mem_rows) {
+        INFO("dimm row: " << r);
+        const auto f = split_pipes(r);
+        REQUIRE(f.size() == 8);
+        CHECK(f[0] == "dimm");
+        CHECK(f[5] == "-");
+        CHECK(f[6] == "-");
+        CHECK(f[7] == "-");
+    }
+}
+#endif // !_WIN32
+
+#if defined(_WIN32)
+namespace {
+
+// What ANY Windows host must satisfy for an estate action (a CI VM without DMI is legitimate):
+// rc 0, exactly one leading typed status row, and every data row the documented width. Host values
+// are never asserted.
+struct EstateRun {
+    int rc = -1;
+    std::vector<std::string> rows;
+    std::vector<std::string> data;
+    std::string status_level;
+    int result_status = 0;
+};
+
+EstateRun run_estate(const YuzuPluginDescriptor* d, const char* action, std::size_t data_fields) {
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(d, action);
+    EstateRun out;
+    out.rc = result.rc;
+    out.result_status = result.result_status;
+    out.rows = captured_rows(result.captured);
+    REQUIRE_FALSE(out.rows.empty());
+    const auto st = split_pipes(out.rows[0]);
+    REQUIRE(st.size() == 4);
+    CHECK(st[0] == "status");
+    CHECK(st[1] == action);
+    out.status_level = st[2];
+    for (std::size_t i = 1; i < out.rows.size(); ++i) {
+        const auto f = split_pipes(out.rows[i]);
+        INFO("data row: " << out.rows[i]);
+        REQUIRE(f.size() == data_fields); // fatal: callers index into the row
+        CHECK(f[0] == action);
+        out.data.push_back(out.rows[i]);
+    }
+    return out;
+}
+
+bool is_lower_hex64(const std::string& s) {
+    return s.size() == 64 && std::all_of(s.begin(), s.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+}
+
+} // namespace
+
+TEST_CASE("hardware plugin (windows): estate actions answer a real typed section, never the planned row",
+          "[hardware][actions]") {
+    auto plugin = load_plugin();
+    if (!plugin) return require_plugin_or_skip();
+
+    struct Case { const char* name; std::size_t fields; };
+    for (const Case c : {Case{"chassis", 5}, Case{"baseboard", 5}, Case{"swap", 5},
+                         Case{"machine_id", 4}}) {
+        INFO("action: " << c.name);
+        const auto r = run_estate(plugin->descriptor, c.name, c.fields);
+        CHECK(r.rc == 0);
+        for (const auto& row : r.rows)
+            CHECK(row.find("windows:planned") == std::string::npos);
+        // a typed status was declared (never the UNDECLARED default) ...
+        CHECK(r.result_status != YUZU_RESULT_STATUS_UNDECLARED);
+        // ... and it AGREES with the status row's level: a swapped mapping in emit_report must not
+        // stay green just because both are "something".
+        if (r.status_level == "supported")
+            CHECK(r.result_status == YUZU_RESULT_STATUS_OK);
+        else if (r.status_level == "constrained")
+            CHECK((r.result_status == YUZU_RESULT_STATUS_CONSTRAINED ||
+                   r.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED));
+        else if (r.status_level == "unsupported")
+            CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        else
+            FAIL("unexpected status level: " << r.status_level);
+        // rows only accompany a readable section
+        if (r.status_level == "unsupported")
+            CHECK(r.data.empty());
+    }
+}
+
+TEST_CASE("hardware plugin (windows): machine_id ships a keyed hash, never the raw id",
+          "[hardware][actions]") {
+    auto plugin = load_plugin();
+    if (!plugin) return require_plugin_or_skip();
+
+    const auto r = run_estate(plugin->descriptor, "machine_id", 4);
+    CHECK(r.rc == 0);
+    // Every Windows install has a MachineGuid and an unprivileged account can read it, so this must be
+    // a real, supported row. (An early return on "no data" would let a broken read pass green.)
+    CHECK(r.status_level == "supported");
+    REQUIRE(r.data.size() == 1);
+    const auto f = split_pipes(r.data[0]);
+    CHECK(is_lower_hex64(f[1]));
+    CHECK(f[2] == "hmac-sha256-app-v1");
+    CHECK(f[3] == "registry");
+}
+
+TEST_CASE("hardware plugin (windows): cpu and dimm rows carry the appended columns",
+          "[hardware][actions]") {
+    auto plugin = load_plugin();
+    if (!plugin) return require_plugin_or_skip();
+
+    yuzu::agent::LocalDispatcher dispatcher;
+
+    auto cpu = dispatcher.run(plugin->descriptor, "processors");
+    CHECK(cpu.rc == 0);
+    const auto cpu_rows = captured_rows(cpu.captured);
+    REQUIRE_FALSE(cpu_rows.empty());
+    // Every Windows host has at least one CPU, so the `unknown` sentinel row means the WMI query FAILED.
+    // That failure must be declared (a typed status), or the device record reads the section as `ok`.
+    // Without this a regression that drops the typed-status plumbing stays green on a healthy host.
+    if (split_pipes(cpu_rows[0]).size() > 2 && split_pipes(cpu_rows[0])[2] == "unknown")
+        CHECK(cpu.result_status != YUZU_RESULT_STATUS_UNDECLARED);
+    for (const auto& r : cpu_rows) {
+        INFO("cpu row: " << r);
+        const auto f = split_pipes(r);
+        REQUIRE(f.size() == 8);
+        CHECK(f[0] == "cpu");
+        CHECK_FALSE(f[6].empty()); // socket designation or "-"
+        CHECK_FALSE(f[7].empty()); // stepping (decimal) or "-"
+        if (f[7] != "-")
+            CHECK(std::all_of(f[7].begin(), f[7].end(), [](char c) { return c >= '0' && c <= '9'; }));
+    }
+
+    auto mem = dispatcher.run(plugin->descriptor, "memory");
+    CHECK(mem.rc == 0);
+    const auto mem_rows = captured_rows(mem.captured);
+    REQUIRE_FALSE(mem_rows.empty());
+    for (const auto& r : mem_rows) {
+        INFO("dimm row: " << r);
+        const auto f = split_pipes(r);
+        REQUIRE(f.size() == 8);
+        CHECK(f[0] == "dimm");
+        CHECK_FALSE(f[5].empty());
+        CHECK_FALSE(f[6].empty());
+        CHECK_FALSE(f[7].empty());
+    }
+}
+#endif // _WIN32
+
+TEST_CASE("hardware plugin: an unknown action is refused with rc 1 and no status row",
+          "[hardware][actions]") {
+    auto plugin = load_plugin();
+    if (!plugin) return require_plugin_or_skip();
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "no|such\naction");
+    CHECK(result.rc == 1);
+    CHECK(result.captured.find("status|") == std::string::npos);
+}

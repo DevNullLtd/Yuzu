@@ -998,12 +998,22 @@ int main(int argc, char* argv[]) {
     // Data infrastructure options. Bound to plain ints (CLI11 cannot fill a LiveInt) and copied into
     // the config right after the parse.
     int response_retention_days = cfg.response_retention_days;
+    int response_max_rows_per_agent = cfg.response_max_rows_per_agent;
     int audit_retention_days = cfg.audit_retention_days;
     int guardian_event_retention_days = cfg.guardian_event_retention_days;
     app.add_option("--response-retention-days", response_retention_days,
                    "Response retention period in days (default: 90)")
         ->default_val(90)
         ->envname("YUZU_RESPONSE_RETENTION_DAYS");
+    app.add_option("--response-max-rows-per-agent", response_max_rows_per_agent,
+                   "Most stored response rows per (command, agent) pair; frames past it are "
+                   "dropped at the store and counted on "
+                   "yuzu_server_response_ingest_dropped_total{reason=per_agent_cap}. One "
+                   "terminal-status frame is still kept past the cap. 1-65536 (default: 256, "
+                   "roughly 16 MiB of streamed output at the agent's ~64 KiB flush size)")
+        ->default_val(256)
+        ->check(CLI::Range(1, 65536))
+        ->envname("YUZU_RESPONSE_MAX_ROWS_PER_AGENT");
     app.add_option("--audit-retention-days", audit_retention_days,
                    "Audit log retention period in days (default: 365)")
         ->default_val(365)
@@ -1054,6 +1064,10 @@ int main(int argc, char* argv[]) {
 
     CLI11_PARSE(app, argc, argv);
     cfg.response_retention_days = response_retention_days;
+    // An out-of-range YUZU_RESPONSE_MAX_ROWS_PER_AGENT is dropped by CLI11 (env values that
+    // fail ->check() are skipped, App::_process_env) and the 256 default applies; only the
+    // flag form refuses. The cap therefore never reaches ResponseStore as 0 from the env.
+    cfg.response_max_rows_per_agent = response_max_rows_per_agent;
     cfg.audit_retention_days = audit_retention_days;
     cfg.guardian_event_retention_days = guardian_event_retention_days;
 
@@ -2316,7 +2330,9 @@ int main(int argc, char* argv[]) {
         }
         // Name the active SSO path(s) so this CC6.3 evidence line is accurate
         // under an OIDC-only, SAML-only, or dual deployment (the boot guard above
-        // has already proven at least one is present).
+        // has already proven at least one is CONFIGURED; whether wiring then left
+        // it usable is re-checked in ServerImpl (#4160), which refuses to start
+        // if none is).
         std::string sso_providers;
         if (yuzu::server::oidc_config_complete(cfg))
             sso_providers = "OIDC";
@@ -2325,7 +2341,7 @@ int main(int argc, char* argv[]) {
             sso_providers += sso_providers.empty() ? "SAML" : " + SAML";
 #endif
         spdlog::warn("Hardened auth mode ACTIVE (--auth-mode=sso-only): local-password login is "
-                     "DISABLED fleet-wide; only SSO ({}) can mint a session.{}",
+                     "DISABLED fleet-wide; only SSO (configured: {}) can mint a session.{}",
                      sso_providers,
                      cfg.break_glass_user.empty()
                          ? std::string(" No break-glass account is configured.")

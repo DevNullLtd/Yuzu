@@ -121,7 +121,7 @@
     <tr><td><span class="cause cause-B">B</span></td><td>9</td><td>Test runner</td><td>Honour YAML <code>platforms:</code> &mdash; host-not-in-list maps to <em>SKIP</em>, not FAIL</td><td><span class="pill pill-all">all</span></td></tr>
     <tr><td><span class="cause cause-C">C</span></td><td>5</td><td>Plugins</td><td>Stale or missing macOS / Linux branch &mdash; this is the parity work</td><td><span class="pill pill-mac">mac</span> <span class="pill pill-lin">lin</span></td></tr>
     <tr><td><span class="cause cause-D">D</span></td><td>2</td><td>YAML or importer</td><td><code>type: query</code> rejected by importer &mdash; rename to <code>question</code> or add alias</td><td><span class="pill pill-all">all</span></td></tr>
-    <tr><td><span class="cause cause-E">E</span></td><td>1</td><td>tar plugin</td><td>Real bug &mdash; <code>UNION ALL</code> column-count mismatch in <code>tar.export</code> SQL</td><td><span class="pill pill-all">all</span></td></tr>
+    <tr><td><span class="cause cause-E">E</span></td><td>1</td><td>echo plugin</td><td>Real bug &mdash; <code>UNION ALL</code> column-count mismatch in <code>echo.export</code> SQL</td><td><span class="pill pill-all">all</span></td></tr>
     <tr><td><span class="cause cause-F">F</span></td><td>2</td><td>Plugins or runner</td><td>Empty-result conditions returning <code>error|...</code> instead of rc=0</td><td><span class="pill pill-all">all</span></td></tr>
   </tbody>
 </table>
@@ -197,8 +197,8 @@
 <tr><td class="num">1</td><td><code>agent.content_dist.stage</code></td><td>action</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Download a file to agent's staging dir, verify SHA256</td><td class="resp">error|missing required parameters: url, filename, sha256</td><td><span class="cause cause-A">A</span></td></tr>
 <tr><td class="num">2</td><td><code>agent.content_dist.upload_file</code></td><td>action</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Upload a local file from agent &rarr; server via multipart POST</td><td class="resp">error|missing required parameter: path</td><td><span class="cause cause-A">A</span></td></tr>
 <tr><td class="num">3</td><td><code>crossplatform.process.fetch</code></td><td>question</td><td><span class="pill pill-win">win</span> <span class="pill pill-lin">lin</span></td><td>Deep process enumeration with SHA-1 hash of each exe</td><td class="resp">error: process enumeration not supported on this platform</td><td><span class="cause cause-B">B</span> <span class="cause cause-C">C</span></td></tr>
-<tr><td class="num">4</td><td><code>crossplatform.tar.export</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Export TAR events as JSON for Splunk/ELK</td><td class="resp">error|query failed: SELECTs to the left and right of UNION ALL do not have the same number ...</td><td><span class="cause cause-E">E</span></td></tr>
-<tr><td class="num">5</td><td><code>crossplatform.tar.sql</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Execute arbitrary SELECT against TAR warehouse</td><td class="resp">error|missing required 'sql' parameter</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">4</td><td><code>crossplatform.echo.export</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Export Echo events as JSON for Splunk/ELK</td><td class="resp">error|query failed: SELECTs to the left and right of UNION ALL do not have the same number ...</td><td><span class="cause cause-E">E</span></td></tr>
+<tr><td class="num">5</td><td><code>crossplatform.echo.sql</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Execute arbitrary SELECT against Echo warehouse</td><td class="resp">error|missing required 'sql' parameter</td><td><span class="cause cause-A">A</span></td></tr>
 <tr><td class="num">6</td><td><code>device.agent_logging.get_log</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Tail last N lines of the agent log</td><td class="resp">status|error|agent log file not found</td><td><span class="cause cause-F">F</span> <span class="cause cause-A">A</span></td></tr>
 <tr><td class="num">7</td><td><code>device.discovery.scan_subnet</code></td><td><strong>query</strong></td><td><span class="pill pill-all">win/lin/mac</span></td><td>ARP-table + ICMP-sweep subnet scan</td><td class="resp">DISPATCH_ERR: instruction definition not found
 (server log: bundled definition import failed: type must be 'question' or 'action')</td><td><span class="cause cause-D">D</span></td></tr>
@@ -269,7 +269,7 @@ if defn.platforms and host not in defn.platforms:
 <ul class="tight">
   <li><code>crossplatform.process.fetch</code> &mdash; add macOS branch (<code>proc_listpids</code>, <code>proc_pidpath</code>, <code>sysctl</code>). Linux branch already exists.</li>
   <li><code>device.wifi.list_networks</code> &mdash; replace <code>airport</code> (removed in macOS 14+). Try <code>system_profiler SPAirPortDataType</code> first (no privilege); fall back to <code>wdutil info</code> with sudoers entry. Linux: <code>nmcli -t -f SSID,BSSID,SIGNAL device wifi list</code>.</li>
-  <li>If you discover <code>tar.export</code>, <code>agent_logging.get_log</code>, or <code>event_logs.errors</code> have stale macOS branches once buckets A/F clear, file an issue per plugin.</li>
+  <li>If you discover <code>echo.export</code>, <code>agent_logging.get_log</code>, or <code>event_logs.errors</code> have stale macOS branches once buckets A/F clear, file an issue per plugin.</li>
 </ul>
 
 <h3>D &mdash; <code>type: query</code> (2)</h3>
@@ -280,8 +280,8 @@ if defn.platforms and host not in defn.platforms:
       print('list_jobs:',   'server.deployment.list_jobs' in ids)"</code></pre>
 <p class="meta">Orthogonally, consider patching <code>server/core/src/instruction_store.cpp</code> to accept <code>query</code> as an alias for <code>question</code> &mdash; fixes the class, not just these two instances.</p>
 
-<h3>E &mdash; <code>tar.export</code> UNION ALL (1)</h3>
-<p>Real plugin bug. In <code>agents/plugins/tar/src/tar_plugin.cpp</code> (or sibling), the export action composes a <code>UNION ALL</code> across TAR tables; one branch's column count diverges. Align columns; SQLite emits the error pre-exec so success is verified just by dispatch returning rc=0.</p>
+<h3>E &mdash; <code>echo.export</code> UNION ALL (1)</h3>
+<p>Real plugin bug. In <code>agents/plugins/echo/src/echo_plugin.cpp</code> (or sibling), the export action composes a <code>UNION ALL</code> across Echo tables; one branch's column count diverges. Align columns; SQLite emits the error pre-exec so success is verified just by dispatch returning rc=0.</p>
 
 <h3>F &mdash; empty-result rc=1 (2)</h3>
 <ul class="tight">
@@ -324,7 +324,7 @@ if defn.platforms and host not in defn.platforms:
 <tr><td>C process.fetch</td><td>PASS</td><td>FAIL until macOS branch lands</td><td>PASS</td></tr>
 <tr><td>C wifi</td><td>PASS once nmcli wired</td><td>FAIL until <code>airport</code> replaced</td><td>PASS</td></tr>
 <tr><td>D (2)</td><td>PASS</td><td>PASS</td><td>PASS</td></tr>
-<tr><td>E tar.export</td><td>PASS once SQL fix lands</td><td>same</td><td>same</td></tr>
+<tr><td>E echo.export</td><td>PASS once SQL fix lands</td><td>same</td><td>same</td></tr>
 <tr><td>F (2)</td><td>PASS once rc semantics fixed</td><td>same</td><td>same</td></tr>
 </tbody>
 </table>

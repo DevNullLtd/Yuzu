@@ -17,8 +17,8 @@
   },
   {
     "method": "POST",
-    "path": "/api/dashboard/tar-execute",
-    "capability_id": "post.api-dashboard-tar-execute",
+    "path": "/api/dashboard/echo-execute",
+    "capability_id": "post.api-dashboard-echo-execute",
     "rest_v1_twin": null,
     "mcp_twin": null,
     "status": "composed-of:post.api-command"

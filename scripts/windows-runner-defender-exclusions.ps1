@@ -159,7 +159,7 @@ $processes = @(
     # unit_test_guardian_engine.cpp.obj for >30 min).
     'yuzu_agent_tests.exe',
     'yuzu_server_tests.exe',
-    'yuzu_tar_tests.exe',
+    'yuzu_echo_tests.exe',
 
     # Yuzu release binaries — for any native UAT or runtime test that
     # launches them directly on the runner (rare, but the zombie

@@ -154,6 +154,11 @@ const std::vector<pg::PgMigration>& migrations() {
          // index — no separate idx_device_token_hash (the pre-migration SQLite schema had one,
          // but it was always redundant with the UNIQUE index; not reproduced here).
          "CREATE INDEX idx_device_token_device ON device_auth_tokens(device_id);"},
+        // v2 (Echo rename, upgrade window): a device token scoped to a definition follows the
+        // renamed definition id.
+        {2,
+         "UPDATE device_auth_tokens SET definition_id = replace(definition_id, "
+         "'crossplatform.tar.', 'crossplatform.echo.') WHERE definition_id LIKE 'crossplatform.tar.%';"},
     };
     return kMigrations;
 }

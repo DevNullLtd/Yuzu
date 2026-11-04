@@ -44,10 +44,10 @@ related: >-
   fork_lock.hpp / BR-001 (the macOS pipe()+fork() race whose residual gap is the
   uncovered popen sites). .github/codeql/queries/cpp/plugin-command-exec-non-literal.ql
   and plugin-windows-process-spawn-non-literal.ql (existing detection — see Decision 10
-  on making them a failing gate). agents/plugins/tar/src/tar_mapdrive_collector.cpp
+  on making them a failing gate). agents/plugins/echo/src/echo_mapdrive_collector.cpp
   (the documented shell exception this ADR re-homes onto the runner).
   docs/yuzu-guardian-design-v1.1.md §restart-process (posix_spawn mandate — Decision 9's
-  evolution path; note the long-lived-launch scope split in Non-goals). docs/tar-implementer.md
+  evolution path; note the long-lived-launch scope split in Non-goals). docs/echo-implementer.md
   (capture sources — already built at rung 1: Endpoint Security, ETW).
   docs/agent-spawn-sink-manifest.md (the sink manifest — stub ships with this ADR).
   docs/adr/0028-agent-component-inventory-collection.md (component_inventory — the first
@@ -103,7 +103,7 @@ API offers a bounded call mode (WMI semisynchronous with timeouts,
 broker call can wedge on a stuck service at a rung that has no runner
 deadline, recreating the hang-forever mode this ADR exists to remove.
 Already ours in places: Windows plugins live here
-(`hardware`/`bitlocker`/`license_scan` via WMI), the TAR capture sources were
+(`hardware`/`bitlocker`/`license_scan` via WMI), the Echo capture sources were
 built here from day one (ES on macOS, ETW on Windows — `ProcStreamCollector`
 implementations, never spawned tools), `network_diag` reads `/proc/net/tcp`
 directly, and the netqual nstat spike replaced a would-be `nettop` spawn with
@@ -172,11 +172,11 @@ recognised categories:
 ## Context
 
 - **The fleet is split by platform and by history.** Windows plugins largely
-  live at rung 1 already (WMI/Win32, registry via `Reg*W`); TAR capture
+  live at rung 1 already (WMI/Win32, registry via `Reg*W`); Echo capture
   sources were built at rung 1 (ES/ETW). But 27 of 49 plugins — heavily
   concentrated on macOS and Linux — sit at an *ungoverned* rung 3: per-plugin
   shell helpers of varying shapes (`run_command`, `run_command_rc`,
-  `run_command_lines`, bare `system()` probes, bespoke `tar`/`interaction`
+  `run_command_lines`, bare `system()` probes, bespoke `echo`/`interaction`
   helpers) wrapping `popen()`/`system()`. Exactly three plugins exec directly
   today (`script_exec`, `content_dist`, `filesystem`), each with a private
   helper. The divergence is itself the disease: timeouts, exit-code handling,
@@ -196,7 +196,7 @@ recognised categories:
   Windows.
 - **The `popen` helpers are operationally weak**: no timeout (a hung
   `system_profiler` blocks a plugin thread forever — flagged in-code in
-  `windows_updates`; the one exception is `tar`, whose literal commands wrap
+  `windows_updates`; the one exception is `echo`, whose literal commands wrap
   coreutils `timeout 10`/`15` — bounds the migration carries into runner
   deadlines), exit codes mostly dropped, stderr lost.
 - **macOS fork-safety (BR-001).** macOS has no `pipe2()`. On `dev` today the
@@ -434,7 +434,7 @@ removes its spawn from the picture entirely.
    only compile-time constant or allowlist-validated strings, carries an
    in-code comment stating why the shell capability is unavoidable, and
    **executes via the runner's Decision-5 shape — never raw `popen()`**. The
-   `tar` collectors' `popen` calls migrate onto that shape (commands stay
+   `echo` collectors' `popen` calls migrate onto that shape (commands stay
    shell strings; the spawn becomes runner-owned) — which is what actually
    closes the BR-001 residual; a retained raw `popen` would sit outside the
    fork lock and keep the race alive.
@@ -621,7 +621,7 @@ schedule; ordering is owned by the roadmap:
   and the enforcement gates.
 - This ADR covers `agents/plugins/*` and the agent-core spawn sites
   (collectors, trigger engine); existing rung-1 paths (Windows WMI/Win32,
-  TAR ES/ETW capture sources, `/proc`//`sys` reads) are untouched — they are
+  Echo ES/ETW capture sources, `/proc`//`sys` reads) are untouched — they are
   already the target state. Plugins designed after the runner lands are
   **born on the ladder** — no migration applies to them; ADR-0028's
   `component_inventory` (not yet built) is the first such plugin, and its

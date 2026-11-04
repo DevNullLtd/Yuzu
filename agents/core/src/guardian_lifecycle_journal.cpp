@@ -522,18 +522,18 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     }
     const bool would_wipe = datable > 0 && expired == datable;
     // KNOWN part-7 nonconformance (routed-concerns.md "Clock-guarded retention", #3208): this
-    // threshold is the retention window itself, not a separate ABSOLUTE constant like TAR's
-    // kTarMinBigStepSec or audit_store's kAuditMinBigStepSec (#2360/#2361's max(window, floor)
+    // threshold is the retention window itself, not a separate ABSOLUTE constant like Echo's
+    // kEchoMinBigStepSec or audit_store's kAuditMinBigStepSec (#2360/#2361's max(window, floor)
     // class). Inert today only because retention_days_ is fixed at kJournalRetentionDays in
     // production (set_retention_limits_for_test is test-only) - deliberately NOT fixed here,
     // see #3208 for the fix shape and why it's out of scope for #2573's latch->fact-set change.
     const bool big_step = last_prune_now_ms_ != 0 && now_ms - last_prune_now_ms_ > window_ms;
 
     // Adopt the shared decision core (#2573 GJ half; rung 1 #2549 extracted it, rung 2 PR #3101
-    // adopted it in TAR). Field mapping, deliberate:
+    // adopted it in Echo). Field mapping, deliberate:
     //  - prev_unusable = false: the comparison reading (last_prune_now_ms_) is in-process only,
     //    never read back from an untrusted store, so there is nothing to sanitise.
-    //  - no_anchor = false: GJ persists no anchor across restarts BY DESIGN (unlike TAR /
+    //  - no_anchor = false: GJ persists no anchor across restarts BY DESIGN (unlike Echo /
     //    audit_store, which both need one because they DO persist) - last_prune_now_ms_ == 0 on
     //    every process start is the ordinary case, not an anomaly. Feeding that in would decline
     //    once per restart, a behavior change this refactor deliberately does not make.

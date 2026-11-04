@@ -202,7 +202,7 @@ std::string format_conflict(std::string_view detail) {
 // detection backend produces it, so it is dormant until the agent's prefer_spark
 // default flips. guard.armed, guard.disarmed and guard.healthy are deliberately NOT
 // mapped: they are lifecycle or recovery markers, not verdicts.
-// Ordering: upsert_rule_status keeps a row when the new updated_at is >= the stored
+// Ordering: project_rule_status keeps a row when the new updated_at is >= the stored
 // one. Event timestamps have one-second resolution, so two distinct events in the same
 // second tie and the later arrival wins; an exact redelivery of one event_id exits at
 // insert_event_classified (Redelivered/Conflict) before the census write is reached.
@@ -425,8 +425,76 @@ const std::vector<pg::PgMigration>& migrations() {
         // no longer has a writer. Version-bumped (not edited into v1) because v1
         // has actually run against real dev/UAT databases — see ADR-0038's Update.
         {2, "DROP TABLE IF EXISTS sqlite_backfill;"},
+        // v3 (#5674): the census table gets a foreign key to the rule table, so a deleted
+        // rule's census rows go with it in the same statement (ON DELETE CASCADE) and an
+        // upsert for a rule that is gone is refused by the database (SQLSTATE 23503). Rows
+        // already orphaned are deleted first, or the constraint could not be added.
+        // The ADD CONSTRAINT is guarded so a re-run of this text adds nothing twice.
+        // The LOCK TABLE comes first, with its own 3 s SET LOCAL lock_timeout (the SessionStore
+        // v2 and CaStore v4 precedent): ADD CONSTRAINT takes SHARE ROW EXCLUSIVE anyway, so
+        // taking it before the DELETE adds no wait of its own, and a census row committed by a
+        // binary that has not been upgraded cannot slip in between the DELETE and the
+        // validation and refuse boot. The whole migration rolls back and retries on the next
+        // boot if the lock is not granted in time.
+        {3, R"SQL(
+            SET LOCAL lock_timeout = '3s';
+            LOCK TABLE guardian_agent_rule_status IN SHARE ROW EXCLUSIVE MODE;
+            DELETE FROM guardian_agent_rule_status s
+             WHERE NOT EXISTS (SELECT 1 FROM guaranteed_state_rules r WHERE r.rule_id = s.rule_id);
+            DO $do$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                                WHERE conname = 'guardian_agent_rule_status_rule_fk'
+                                  AND conrelid = 'guardian_agent_rule_status'::regclass) THEN
+                    ALTER TABLE guardian_agent_rule_status
+                        ADD CONSTRAINT guardian_agent_rule_status_rule_fk
+                        FOREIGN KEY (rule_id) REFERENCES guaranteed_state_rules(rule_id)
+                        ON DELETE CASCADE;
+                END IF;
+            END
+            $do$;
+        )SQL"},
     };
     return kMigrations;
+}
+
+// A database whose `guaranteed_state_store` version row reads 3 is skipped by the runner, so
+// the runner cannot tell this schema's v3 from another branch's v3 (#5674 hard cutover: a
+// database stamped by the discarded census-order design has no foreign key on the census
+// table). The cascade key is the one structural fact this schema's v3 adds, so it is the
+// only key checked, by its shape: cascade, not deferrable, on rule_id in both tables. A check
+// of the other columns would refuse a later schema version that adds columns to the same
+// tables. Returns an empty string when the key is present, else the cause, for the boot
+// error. Any query failure is a cause too. The refusal's remedy resets the version row to 2 so
+// that migration v3 runs again; a later migration must therefore be safe to run again, or the
+// remedy must be revisited with it.
+std::string census_schema_defect(PGconn* conn) {
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "SELECT count(*) FROM pg_constraint c "
+        "WHERE conrelid = 'guaranteed_state_store.guardian_agent_rule_status'::regclass "
+        "  AND confrelid = 'guaranteed_state_store.guaranteed_state_rules'::regclass "
+        "  AND contype = 'f' AND confdeltype = 'c' AND NOT condeferrable "
+        "  AND conkey = ARRAY[(SELECT attnum FROM pg_attribute "
+        "                       WHERE attrelid = c.conrelid AND attname = 'rule_id')] "
+        "  AND confkey = ARRAY[(SELECT attnum FROM pg_attribute "
+        "                        WHERE attrelid = c.confrelid AND attname = 'rule_id')]",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+        return std::string("census schema probe failed: ") +
+               ::yuzu::log_key_token(PQerrorMessage(conn));
+    if (to_i64(PQgetvalue(res.get(), 0, 0)) < 1)
+        return "guardian_agent_rule_status has no ON DELETE CASCADE foreign key on rule_id to "
+               "guaranteed_state_rules (a deferrable key, or one on other columns, does not "
+               "count). Back up the database first. A database stamped by a different "
+               "branch's schema v3 is not supported: recreating the guaranteed_state_store "
+               "schema DELETES every Guardian rule, event and observation. If only the key is "
+               "missing or has the wrong shape, run \"ALTER TABLE "
+               "guaranteed_state_store.guardian_agent_rule_status DROP CONSTRAINT IF EXISTS "
+               "guardian_agent_rule_status_rule_fk\" and then \"UPDATE public.schema_meta SET "
+               "version = 2 WHERE store = 'guaranteed_state_store'\" and restart, which re-runs "
+               "the idempotent v3 migration";
+    return {};
 }
 
 } // namespace
@@ -446,6 +514,12 @@ GuaranteedStateStore::GuaranteedStateStore(pg::PgPool& pool, int retention_days,
     if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
         spdlog::error("GuaranteedStateStore: schema migration failed — Guardian persistence "
                       "disabled");
+        return;
+    }
+    if (const std::string defect = census_schema_defect(lease.get()); !defect.empty()) {
+        // `defect` is fixed text, or the probe failure with its libpq message already
+        // sanitised; log_key_token here would cut the remedy off at its 256-byte cap.
+        spdlog::error("GuaranteedStateStore: unsupported schema, refusing to start: {}", defect);
         return;
     }
     open_ = true;
@@ -590,16 +664,12 @@ std::expected<void, std::string> GuaranteedStateStore::delete_rule(const std::st
     if (PQntuples(res.get()) == 0)
         return std::unexpected("not found: rule_id '" + rule_id + "'");
 
-    // Drop the rule's CURRENT compliance states — unlike the event log (an
-    // immutable audit stream kept past rule deletion), this table holds live
-    // state. Best-effort, matching the original (no changes-count check).
-    pg::PgResult del_status = pg::exec_params(
-        conn, "DELETE FROM guaranteed_state_store.guardian_agent_rule_status WHERE rule_id = $1",
-        std::vector<std::string>{rule_id});
-    if (del_status.status() != PGRES_COMMAND_OK)
-        spdlog::warn("GuaranteedStateStore::delete_rule: status cleanup for rule_id={} failed: {}",
-                     log_id_token(rule_id), PQerrorMessage(conn));
-
+    // The rule's CURRENT compliance states (unlike the event log, an immutable audit stream
+    // kept past rule deletion, the census table holds live state) go with it: the
+    // guardian_agent_rule_status foreign key is ON DELETE CASCADE (migration v3), so the one
+    // DELETE above removes both in a single statement. The generation bump below stays outside
+    // that statement on purpose: it is best-effort (see bump_policy_generation_on) and a failed
+    // bump must not undo the delete.
     bump_policy_generation_on(conn); // rule set changed → new generation
     lease.reset();                   // no pool lease held while the hook runs
     notify_rule_mutation();
@@ -962,13 +1032,38 @@ std::expected<void, std::string> project_observation(PGconn* conn,
     return {};
 }
 
-// Upsert one (agent, rule) compliance state. Best-effort — logs on a genuine
-// SQL error; the ON CONFLICT ... WHERE guard makes a stale-event no-op a
-// normal zero-rows-affected outcome, not an error.
-void upsert_rule_status(PGconn* conn, const std::string& agent_id, const std::string& rule_id,
-                        const char* state, const std::string& updated_at) {
-    if (agent_id.empty() || rule_id.empty())
-        return;
+enum class CensusOutcome {
+    Applied,   // upserted (or a stale event matched the ON CONFLICT guard: zero rows, not an error)
+    Rejected,  // SQLSTATE 23503: the rule is gone; definitive, not a fault
+    Failed,    // any other statement error; the savepoint was rolled back and released, the
+               // transaction is usable
+    Abandoned, // a savepoint control statement failed; the transaction must be abandoned
+};
+
+// Write one (agent, rule) compliance state inside the caller's open transaction, under
+// SAVEPOINT census_upsert, so a failed upsert never aborts the transaction holding the
+// event. Rejected and Failed leave the transaction usable (the savepoint was rolled back and
+// released); neither failure discards the event, which is stored when the caller commits.
+// Abandoned means a SAVEPOINT, ROLLBACK TO or RELEASE statement itself failed, so the
+// transaction may be aborted and the caller must return an error without committing (a
+// COMMIT of an aborted transaction reports success to libpq).
+// An Abandoned outcome after a failed census statement is logged at error with that
+// statement's error (it is not counted on `failures`; the caller's error is counted as an
+// ingest error). A Failed outcome is counted on `failures` and logged at error. A Rejected outcome is not
+// counted and is logged at debug only; the database server still records the refused
+// statement in its own log. The count moves before the caller's COMMIT, so a COMMIT that
+// then fails leaves it one ahead of the events actually stored.
+[[nodiscard]] CensusOutcome project_rule_status(PGconn* conn, std::atomic<uint64_t>& failures,
+                                                const GuaranteedStateEventRow& row,
+                                                const char* state) {
+    if (row.agent_id.empty() || row.rule_id.empty())
+        return CensusOutcome::Applied; // nothing to write
+    const auto control = [conn](const char* sql) {
+        return pg::exec_params(conn, sql, std::vector<std::string>{}).status() ==
+               PGRES_COMMAND_OK;
+    };
+    if (!control("SAVEPOINT census_upsert"))
+        return CensusOutcome::Abandoned;
     pg::PgResult res = pg::exec_params(
         conn,
         "INSERT INTO guaranteed_state_store.guardian_agent_rule_status "
@@ -976,10 +1071,38 @@ void upsert_rule_status(PGconn* conn, const std::string& agent_id, const std::st
         "ON CONFLICT (agent_id, rule_id) DO UPDATE SET state = EXCLUDED.state, "
         "updated_at = EXCLUDED.updated_at "
         "WHERE EXCLUDED.updated_at >= guardian_agent_rule_status.updated_at",
-        std::vector<std::string>{agent_id, rule_id, std::string(state), updated_at});
-    if (res.status() != PGRES_COMMAND_OK)
-        spdlog::warn("GuaranteedStateStore: status upsert failed for agent_id={} rule_id={}: {}",
-                     log_id_token(agent_id), log_id_token(rule_id), PQerrorMessage(conn));
+        std::vector<std::string>{row.agent_id, row.rule_id, std::string(state), row.timestamp});
+    if (res.status() == PGRES_COMMAND_OK)
+        return control("RELEASE SAVEPOINT census_upsert") ? CensusOutcome::Applied
+                                                          : CensusOutcome::Abandoned;
+    const char* sqlstate_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+    const bool rejected = sqlstate_p && std::string_view(sqlstate_p) == "23503";
+    const std::string err = PQresultErrorMessage(res.get());
+    // ROLLBACK TO keeps the savepoint defined, so release it too: a batch otherwise stacks
+    // one live savepoint per failed row until the transaction ends.
+    if (!control("ROLLBACK TO SAVEPOINT census_upsert") ||
+        !control("RELEASE SAVEPOINT census_upsert")) {
+        // The caller reports only the control statement's own libpq text, so record the census
+        // error that started this here or it is lost.
+        spdlog::error("GuaranteedStateStore: census write abandoned, the census statement failed "
+                      "and its savepoint could not be rolled back and released, the event is "
+                      "not stored event_id={} agent_id={} rule_id={}: {}",
+                      log_id_token(row.event_id), log_id_token(row.agent_id),
+                      log_id_token(row.rule_id), ::yuzu::log_key_token(err));
+        return CensusOutcome::Abandoned;
+    }
+    if (rejected) {
+        spdlog::debug("GuaranteedStateStore: census write refused, rule not defined on this "
+                      "server (event not discarded) agent_id={} rule_id={}",
+                      log_id_token(row.agent_id), log_id_token(row.rule_id));
+        return CensusOutcome::Rejected;
+    }
+    failures.fetch_add(1, std::memory_order_relaxed);
+    spdlog::error("GuaranteedStateStore: census upsert failed (status row not updated, event "
+                  "not discarded by this failure) event_id={} agent_id={} rule_id={}: {}",
+                  log_id_token(row.event_id), log_id_token(row.agent_id),
+                  log_id_token(row.rule_id), ::yuzu::log_key_token(err));
+    return CensusOutcome::Failed;
 }
 
 } // namespace
@@ -1095,6 +1218,16 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
         }
     }
 
+    // Census upsert in the SAME transaction as the event, so the two commit or roll back
+    // together; a refused or failed census write is rolled back to its own savepoint and
+    // never takes the event with it (see project_rule_status).
+    if (!is_reserved_rule_id(row.rule_id))
+        if (const char* state = event_state_from_type(row.event_type))
+            if (project_rule_status(conn, census_proj_failures_, row, state) ==
+                CensusOutcome::Abandoned)
+                return op_error(std::string("census savepoint failed: ") + PQerrorMessage(conn),
+                                kReasonQueryError);
+
     if (!txn.commit())
         return op_error(std::string("commit failed: ") + PQerrorMessage(conn), kReasonQueryError);
     const std::int64_t committed_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1102,13 +1235,6 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
                                                 .count();
 
     events_written_.fetch_add(1, std::memory_order_relaxed);
-    // Census upsert AFTER commit, as a separate best-effort autocommit
-    // statement on the same connection (mirrors the original SQLite ordering
-    // — a status-upsert failure here must never take the already-committed
-    // event with it).
-    if (!is_reserved_rule_id(row.rule_id))
-        if (const char* state = event_state_from_type(row.event_type))
-            upsert_rule_status(conn, row.agent_id, row.rule_id, state, row.timestamp);
     return {EventInsertOutcome::Inserted, {}, committed_wall_ns};
 }
 
@@ -1174,12 +1300,15 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
                     format_conflict("event_id '" + row.event_id + "' already exists"));
             return std::unexpected("insert failed: " + std::string(PQresultErrorMessage(ins.get())));
         }
-        // Census upsert INSIDE the transaction here (unlike the single-event path):
-        // rolled back with the batch on any later failure, so events and status
-        // never diverge (matches the original's explicit intent for this path).
+        // Census upsert inside the batch transaction, rolled back with the batch on any later
+        // failure; a refused or failed census write is isolated by its own savepoint, as in
+        // insert_event_classified.
         if (!is_reserved_rule_id(row.rule_id))
             if (const char* state = event_state_from_type(row.event_type))
-                upsert_rule_status(conn, row.agent_id, row.rule_id, state, row.timestamp);
+                if (project_rule_status(conn, census_proj_failures_, row, state) ==
+                    CensusOutcome::Abandoned)
+                    return std::unexpected(std::string("census savepoint failed: ") +
+                                           PQerrorMessage(conn));
         // DEX projection — same degrade-don't-destroy contract as insert_event,
         // under its own SAVEPOINT (Postgres aborts on any failed statement).
         if (is_reserved_rule_id(row.rule_id)) {

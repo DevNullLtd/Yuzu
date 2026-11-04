@@ -6,10 +6,13 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "response_cap_rules.hpp"
 #include "result_parsing.hpp"
 #include "utf8_sanitize.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
+#include <yuzu/server/auth.hpp>
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
@@ -26,6 +29,11 @@
 
 namespace yuzu::server {
 
+// The cap-refusal warning budget keys on a whole agent id (the budget treats keys that share its
+// key bound as one agent, bounded_audit_budget.hpp).
+static_assert(kCapLogBudgetKeyBytes >= auth::kMaxAgentIdLength,
+              "the cap-refusal warning budget must key on a whole agent id");
+
 namespace {
 
 constexpr const char* kStoreName = "response_store";
@@ -41,23 +49,30 @@ constexpr std::chrono::milliseconds kIngestTimeout{500};
 // Ingest bounds (#2691, Doomgoose finding #4): this store shares the same PG
 // pool the auth/RBAC substrate leases from — an enrolled agent streaming
 // large or high-cardinality output can pressure that shared pool, degrading
-// auth reads, not just this store's own. `kMaxIngestBytes` matches the
-// agent's own per-dispatch cap (agent.cpp's `kCaptureMaxBytes`, 2 MiB) —
-// generous enough that a well-behaved agent never truncates, a backstop
-// against a compromised agent binary that bypasses its own cap (the same
-// premise finding #8's resolution already accepted for the NUL-density
-// question). `kMaxFacetsPerResponse` bounds facet cardinality independent of
-// output size — a highly-repetitive tabular output can carry many distinct
-// values without approaching the byte cap.
+// auth reads, not just this store's own. `kMaxIngestBytes` bounds ONE ROW's
+// output/error_detail and matches the agent's own per-dispatch cap
+// (agent.cpp's `kCaptureMaxBytes`, 2 MiB) — generous enough that a
+// well-behaved agent never truncates, a backstop against a compromised agent
+// binary that bypasses its own cap (the same premise finding #8's resolution
+// already accepted for the NUL-density question). It does NOT bound how many
+// rows one (instruction_id, agent_id) pair can accumulate: that is
+// `max_rows_per_agent_` (#561). `kMaxFacetsPerResponse` bounds facet
+// cardinality independent of output size — a highly-repetitive tabular output
+// can carry many distinct values without approaching the byte cap.
 constexpr std::size_t kMaxIngestBytes = 2ull * 1024 * 1024;
 constexpr std::size_t kMaxFacetsPerResponse = 5'000;
 constexpr const char* kTruncationMarker = "\n...[truncated by server ingest cap]";
+// Appended to a capped pair's newest retained row (#561) so a reader can tell a stream whose
+// tail was dropped by the per-pair row cap from a complete one; the sibling of kTruncationMarker
+// (which marks the per-ROW byte cap).
+constexpr const char* kRowCapMarker = "\n...[rows past per-agent cap dropped]";
 
 // Ingest-drop / read-degrade reason labels (ADR-0037 label convention).
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
 constexpr const char* kReasonMalformedIdentity = "malformed_identity_field";
+constexpr const char* kReasonPerAgentCap = "per_agent_cap";
 constexpr const char* kDegradeSource = "response_store";
 // Sample the per-site degrade WARN so a sustained PG outage cannot flood the
 // log — the counter is the continuous signal, the log a sampled breadcrumb.
@@ -397,6 +412,39 @@ const std::vector<pg::PgMigration>& migrations() {
         {2, R"(
             ALTER TABLE responses ADD COLUMN plugin_result_status INTEGER NOT NULL DEFAULT 0;
         )"},
+        // v3 (Echo rename, upgrade window): stored responses and their facets follow the renamed
+        // definition ids so the per-instruction response views keep pre-rename rows, and the
+        // stored plugin label follows the renamed plugin. Three sequential passes over the
+        // retained history (a default-collation btree cannot serve a prefix LIKE), idempotent.
+        // SET LOCAL lifts the pool's per-lease statement_timeout for this step's transaction only
+        // (precedent: approval_manager.cpp v2): a multi-million-row store runs past the 30 s cap,
+        // which would cancel the statement, roll the version back and leave the store reporting
+        // "persistence disabled" on every boot.
+        {3, R"(
+            SET LOCAL statement_timeout = 0;
+            UPDATE responses SET instruction_id = replace(instruction_id,
+                'crossplatform.tar.', 'crossplatform.echo.')
+                WHERE instruction_id LIKE 'crossplatform.tar.%';
+            UPDATE response_facets SET instruction_id = replace(instruction_id,
+                'crossplatform.tar.', 'crossplatform.echo.')
+                WHERE instruction_id LIKE 'crossplatform.tar.%';
+            UPDATE responses SET plugin = 'echo' WHERE plugin = 'tar';
+        )"},
+        // v4 (#561): serves store()'s per-pair row count and its terminal probe (`status <> 0`,
+        // carried by the third column): both are bounded by the (instruction_id, agent_id)
+        // prefix, so neither touches more than the pair's own rows. SET LOCAL for the same
+        // reason v3 states: a multi-million row build past the 30 s pool statement_timeout would
+        // cancel, roll the version back and refuse boot. (The pool's 10 s lock_timeout is not
+        // lifted: a build that cannot take its SHARE lock in that time rolls back and refuses
+        // boot too; docs/postgres-store-playbook.md has the recovery.) IF NOT EXISTS: a re-run
+        // against a database whose version stamp was rewound (the
+        // Echo rename upgrade-window tests do exactly that) must not fail on the index it
+        // already built.
+        {4, R"(
+            SET LOCAL statement_timeout = 0;
+            CREATE INDEX IF NOT EXISTS idx_resp_instr_agent_status
+                ON responses(instruction_id, agent_id, status);
+        )"},
     };
     return kMigrations;
 }
@@ -406,8 +454,9 @@ const std::vector<pg::PgMigration>& migrations() {
 // ── Construction ─────────────────────────────────────────────────────────────
 
 ResponseStore::ResponseStore(pg::PgPool& pool, int retention_days,
-                             std::function<int64_t()> now_fn)
-    : pool_(pool), retention_days_(retention_days), now_fn_(std::move(now_fn)) {
+                             std::function<int64_t()> now_fn, int max_rows_per_agent)
+    : pool_(pool), retention_days_(retention_days), now_fn_(std::move(now_fn)),
+      max_rows_per_agent_(max_rows_per_agent) {
     auto lease = pool_.acquire();
     if (!lease) {
         spdlog::error("ResponseStore: no database connection at construction ({}) — response "
@@ -420,8 +469,8 @@ ResponseStore::ResponseStore(pg::PgPool& pool, int retention_days,
         return;
     }
     open_ = true;
-    spdlog::info("ResponseStore initialized (schema {}, retention={}d)", kStoreName,
-                retention_days_);
+    spdlog::info("ResponseStore initialized (schema {}, retention={}d, max_rows_per_agent={})",
+                 kStoreName, retention_days_, max_rows_per_agent_);
 }
 
 int64_t ResponseStore::compute_ttl_epoch() const {
@@ -471,7 +520,7 @@ void ResponseStore::store(const StoredResponse& resp) {
         has_embedded_nul(resp.plugin) || has_embedded_nul(resp.agent_id)) {
         spdlog::warn("ResponseStore: dropping response with an embedded NUL byte in "
                      "instruction_id/execution_id/plugin/agent_id (agent={})",
-                     resp.agent_id);
+                     ::yuzu::log_id_token(resp.agent_id));
         note_ingest_dropped(metrics_, kReasonMalformedIdentity);
         return;
     }
@@ -516,6 +565,7 @@ void ResponseStore::store(const StoredResponse& resp) {
     // from "began, but something inside failed" (kReasonQueryError) — the
     // pool/BEGIN failure classes with_txn_for's own bool return collapses.
     bool reached_txn = false;
+    bool capped = false;
     // Facet-drop deltas are accumulated here and published only once the response
     // transaction has committed: a facet counter counts facets of a STORED response.
     // If the SAVEPOINT machinery itself fails, the transaction is aborted and the
@@ -526,6 +576,68 @@ void ResponseStore::store(const StoredResponse& resp) {
     std::size_t facets_batch_failed = 0;
     const bool ok = pool_.with_txn_for(kIngestTimeout, [&](PGconn* conn) -> bool {
         reached_txn = true;
+        // Per-pair row cap (#561; the bound: response_cap_rules.hpp). One round trip, both
+        // halves bounded by the pair's prefix on idx_resp_instr_agent_status (at most cap +
+        // overshoot entries, whatever the status values): the pair's row count and, for a
+        // terminal frame only (the CASE skips the probe for RUNNING), whether the pair already
+        // holds a terminal row. "Terminal" is `status <> 0` in BOTH places (the admit predicate
+        // and the probe): CommandResponse.Status is an open proto3 enum, so an agent can put a
+        // value outside 0..4 on the wire (the callers cast it unchecked), and two different
+        // definitions would let such a frame be admitted past the cap forever. A probe that
+        // cannot run refuses the row (query_error) rather than admit it unbounded. No advisory
+        // lock; bound under concurrency: response_cap_rules.hpp.
+        const bool is_terminal = resp.status != 0;
+        pg::PgResult probe = pg::exec_params(
+            conn,
+            "SELECT (SELECT count(*) FROM (SELECT 1 FROM response_store.responses "
+            "WHERE instruction_id=$1 AND agent_id=$2 LIMIT $3::bigint) s), "
+            "CASE WHEN $4::boolean THEN EXISTS(SELECT 1 FROM response_store.responses "
+            "WHERE instruction_id=$1 AND agent_id=$2 AND status <> 0) ELSE false END",
+            std::vector<std::string>{resp.instruction_id, resp.agent_id,
+                                     std::to_string(max_rows_per_agent_),
+                                     is_terminal ? "true" : "false"});
+        if (probe.status() != PGRES_TUPLES_OK || PQntuples(probe.get()) != 1) {
+            spdlog::warn("ResponseStore: per-agent cap probe failed for instruction={} "
+                         "agent={}: {}",
+                         ::yuzu::log_id_token(resp.instruction_id),
+                         ::yuzu::log_id_token(resp.agent_id), PQerrorMessage(conn));
+            return false;
+        }
+        if (!per_agent_cap_admits(to_i64(PQgetvalue(probe.get(), 0, 0)), max_rows_per_agent_,
+                                  is_terminal, to_bool(PQgetvalue(probe.get(), 0, 1)))) {
+            // Mark the pair's newest retained row so a reader can tell a capped stream from a
+            // complete one (the sibling of kTruncationMarker). One idempotent UPDATE in this
+            // transaction: the suffix compare makes every refusal after the first a no-op.
+            // `timestamp + 0` is deliberate: a bare `ORDER BY timestamp DESC LIMIT 1` lets the
+            // planner walk idx_resp_instr_ts backwards filtering on agent_id, which reads every
+            // row of the instruction newer than this pair (measured: 10,000 entries filtered on a
+            // 2,000-agent command whose capped pair was its oldest). The expression forces the
+            // access path to be the pair's prefix on idx_resp_instr_agent_status (at most cap +
+            // overshoot entries) and a top-1 sort over them. Fail-closed like the probe: a marker
+            // that cannot be written rolls back (query_error).
+            pg::PgResult mark = pg::exec_params(
+                conn,
+                "UPDATE response_store.responses SET output = output || $3::text "
+                "WHERE id = (SELECT id FROM response_store.responses "
+                "WHERE instruction_id=$1 AND agent_id=$2 "
+                "ORDER BY timestamp + 0 DESC, id DESC LIMIT 1) "
+                "AND right(output, length($3::text)) <> $3::text",
+                std::vector<std::string>{resp.instruction_id, resp.agent_id, kRowCapMarker});
+            if (mark.status() != PGRES_COMMAND_OK) {
+                spdlog::warn("ResponseStore: per-agent cap marker failed for instruction={} "
+                             "agent={}: {}",
+                             ::yuzu::log_id_token(resp.instruction_id),
+                             ::yuzu::log_id_token(resp.agent_id), PQerrorMessage(conn));
+                return false;
+            }
+            capped = true;
+            return true; // commits the marker; not a query_error
+        }
+        // The overflow terminal row admitted at rows == cap is deliberately NOT marked here: that
+        // state is reachable with zero drops (the probe is LIMIT-bounded and reads no output), so
+        // a marker would label a complete stream as capped. The marker stays on the row before the
+        // gap; a terminal row admitted after a refusal is marked itself only if frames are
+        // refused after it.
         pg::PgResult ins = pg::exec_params(
         conn,
         "INSERT INTO response_store.responses (instruction_id, agent_id, timestamp, status, "
@@ -540,7 +652,8 @@ void ResponseStore::store(const StoredResponse& resp) {
                                  std::to_string(resp.plugin_result_status)});
         if (ins.status() != PGRES_TUPLES_OK || PQntuples(ins.get()) != 1) {
             spdlog::warn("ResponseStore: insert failed for instruction={} agent={}: {}",
-                         resp.instruction_id, resp.agent_id, PQerrorMessage(conn));
+                         ::yuzu::log_id_token(resp.instruction_id),
+                         ::yuzu::log_id_token(resp.agent_id), PQerrorMessage(conn));
             return false; // with_txn_for rolls back
         }
         const int64_t response_id = to_i64(PQgetvalue(ins.get(), 0, 0));
@@ -696,8 +809,25 @@ void ResponseStore::store(const StoredResponse& resp) {
 
     if (!ok) {
         spdlog::warn("ResponseStore: store failed for instruction={} agent={}: {}",
-                     resp.instruction_id, resp.agent_id, pool_.last_error());
+                     ::yuzu::log_id_token(resp.instruction_id),
+                     ::yuzu::log_id_token(resp.agent_id), pool_.last_error());
         note_ingest_dropped(metrics_, reached_txn ? kReasonQueryError : kReasonPoolTimeout);
+        return;
+    }
+    if (capped) {
+        // The counter is unsampled; only the log line is budgeted (bounded_audit_budget.hpp), so
+        // an agent cannot turn its refusals into unbounded log volume.
+        note_ingest_dropped(metrics_, kReasonPerAgentCap);
+        const auto admit = cap_log_budget_.try_admit(resp.agent_id);
+        if (admit.closed_window_suppressed > 0)
+            spdlog::warn("ResponseStore: per-agent cap-refusal warnings suppressed in the last "
+                         "window: {} (the counter is exact)",
+                         admit.closed_window_suppressed);
+        if (admit.admitted)
+            spdlog::warn("ResponseStore: per-agent row cap ({}) reached for instruction={} "
+                         "agent={}; frame dropped",
+                         max_rows_per_agent_, ::yuzu::log_id_token(resp.instruction_id),
+                         ::yuzu::log_id_token(resp.agent_id));
         return;
     }
     note_facets_dropped(metrics_, kFacetDropValueTooLong, facets_too_long);
@@ -727,7 +857,10 @@ ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
     //
     // Bound it BEFORE sanitizing, exactly as store() does for error_detail
     // (#2691): a terminal frame's message must not exceed the documented
-    // per-row worst case (kMaxIngestBytes plus the marker).
+    // per-row worst case: kMaxIngestBytes bounds the agent-supplied bytes of
+    // each field; output may additionally carry the two server-authored
+    // markers (kTruncationMarker, kRowCapMarker), error_detail at most
+    // kTruncationMarker.
     const std::string sanitized_error =
         sanitize_pg_text(truncate_ingest(error_detail, kMaxIngestBytes));
     pg::PgResult res = pg::exec_params(
@@ -1602,7 +1735,7 @@ void ResponseStore::reap_expired() {
             // "Clock-guarded retention" part 6): decline — AuditStore's/
             // GuaranteedStateStore's answer, not ResultSetStore's. A
             // mis-timed pass here would destroy agent command/instruction
-            // results powering the executions drawer + `/tar` dashboard,
+            // results powering the executions drawer + `/echo` dashboard,
             // some of which carry usage-class behavioral PII (device.live.*,
             // per-app panels) — not ResultSetStore's reproducible
             // one-TTL-window scratch result sets.

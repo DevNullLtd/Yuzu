@@ -2295,9 +2295,9 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
         // definition-less dispatch). Skipping it here avoids a wasted
         // write-pool lease + UPDATE on every guard push/reconcile response
         // (routine, high-frequency) for a claim that can structurally never
-        // exist. Deliberately NOT extended to `tar-` (Fable's other
-        // candidate): `tar` is also a REAL agent plugin name
-        // (agents/plugins/tar) that a per-device-gated definition could in
+        // exist. Deliberately NOT extended to `echo-` (Fable's other
+        // candidate): `echo` is also a REAL agent plugin name
+        // (agents/plugins/echo) that a per-device-gated definition could in
         // principle target — a string-prefix skip there would risk
         // silently skipping a legitimate release if that ever happens, and
         // nothing in the code (only today's content library) guarantees it
@@ -2424,17 +2424,17 @@ void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const st
     auto& col_names = yuzu::server::columns_for_plugin(plugin);
     auto lines = yuzu::server::split_output_lines(raw_output);
     for (const auto& line : lines) {
-        // TAR warehouse protocol lines: __schema__ and __total__
-        if (plugin == "tar" && yuzu::server::is_tar_protocol_line(line)) {
+        // Echo warehouse protocol lines: __schema__ and __total__
+        if (plugin == "echo" && yuzu::server::is_echo_protocol_line(line)) {
             if (line.starts_with("__schema__|")) {
-                auto cols = yuzu::server::parse_tar_schema_line(line);
+                auto cols = yuzu::server::parse_echo_schema_line(line);
                 // M16: Validate schema line has non-empty columns
                 if (cols.empty())
                     continue;
                 // H14: Thread-safe per-instance cache with mutex
                 {
                     std::lock_guard lock(cmd_times_mu_);
-                    tar_dynamic_columns_ = cols;
+                    echo_dynamic_columns_ = cols;
                 }
                 // C1: HTML-escape column names to prevent XSS via AS aliases
                 std::string thead = "<thead id=\"results-thead\" hx-swap-oob=\"true\"><tr>"
@@ -2472,14 +2472,14 @@ void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const st
             continue;
         }
 
-        // Use dynamic columns for TAR SQL results if available (H14: lock)
-        std::vector<std::string> tar_cols_copy;
+        // Use dynamic columns for Echo SQL results if available (H14: lock)
+        std::vector<std::string> echo_cols_copy;
         {
             std::lock_guard lock(cmd_times_mu_);
-            tar_cols_copy = tar_dynamic_columns_;
+            echo_cols_copy = echo_dynamic_columns_;
         }
         auto& effective_cols =
-            (!tar_cols_copy.empty() && plugin == "tar") ? tar_cols_copy : col_names;
+            (!echo_cols_copy.empty() && plugin == "echo") ? echo_cols_copy : col_names;
 
         auto count = output_row_count_.fetch_add(1, std::memory_order_relaxed) + 1;
         auto row_html = render_row(agent_name, plugin, line, effective_cols);

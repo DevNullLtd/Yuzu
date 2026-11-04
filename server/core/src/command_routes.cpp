@@ -374,9 +374,9 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         // base-gates only Execution:Execute and applies NO per-device visibility to
         // explicit agent_ids — a systemic property of this escape hatch tracked
         // separately (Tr3kkR/Yuzu#1788). An irreversible action (e.g.
-        // tar.purge_source) must NOT inherit that: require its real securable AND
+        // echo.purge_source) must NOT inherit that: require its real securable AND
         // confine the targets to the operator's visible agents, refusing untargeted
-        // broadcast/scope fan-out. The dedicated POST /api/v1/tar/retention-paused/
+        // broadcast/scope fan-out. The dedicated POST /api/v1/echo/retention-paused/
         // purge is the first-class structured surface; this keeps the generic path
         // from being a weaker one on AUTHZ.
         //
@@ -723,7 +723,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         // local — `classify()` is case-insensitive and
         // `finalize_classified_command` builds the wire command from the
         // catalogue-resolved spelling, so a caller who dispatches with
-        // valid-but-non-canonical casing (e.g. "TAR") must be checked
+        // valid-but-non-canonical casing (e.g. "Echo") must be checked
         // against the SAME spelling every agent's self-reported inventory
         // uses, or every agent that genuinely has the plugin is spuriously
         // flagged absent.

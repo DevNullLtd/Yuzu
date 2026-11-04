@@ -2,7 +2,7 @@
 
 // test_mgmt_group_pg_helper.hpp — shared PG-backed ManagementGroupStore
 // construction helper for the fixtures that used to open it against a per-test
-// SQLite temp file (test_list_read_confinement.cpp, test_dashboard_tar_*.cpp,
+// SQLite temp file (test_list_read_confinement.cpp, test_dashboard_echo_*.cpp,
 // test_policy_evaluator.cpp, test_rbac_store.cpp scoped tests).
 //
 // ManagementGroupStore ported to Postgres (ADR-0042, schema

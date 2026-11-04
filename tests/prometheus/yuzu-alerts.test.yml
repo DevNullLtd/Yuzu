@@ -1617,6 +1617,29 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuResponseIngestDrops", alertstate="firing", reason="pool_acquire_timeout", severity="warning"}'
             value: 1
+      # Negative control for the per_agent_cap companion (#561): a store-health reason
+      # must not fire it.
+      - expr: 'ALERTS{alertname="YuzuResponsePerAgentCapDrops", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE 24b -- an agent hitting the per-command row cap (#561) must not page
+  # YuzuResponseIngestDrops (store health), but must page the informational
+  # companion.
+  - interval: 1m
+    name: response ingest drops - per_agent_cap alone does not page store health
+    input_series:
+      - series: 'yuzu_server_response_ingest_dropped_total{job="yuzu",instance="s1",reason="per_agent_cap"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuResponseIngestDrops", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuResponsePerAgentCapDrops", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuResponsePerAgentCapDrops", alertstate="firing", instance="s1", job="yuzu", reason="per_agent_cap", severity="info"}'
+            value: 1
 
   # ── YuzuRbacReadDegraded ────────────────────────────────────────────────
   #
@@ -2277,6 +2300,35 @@ tests:
         eval_time: 45m
         exp_samples: []
 
+  # ── YuzuScimGuardStoreUnavailable (#6836) ────────────────────────────────
+
+  # CASE 54a -- a SCIM guard could not read the auth store (retryable 503); the
+  # bounded `guard` label survives onto the alert.
+  - interval: 1m
+    name: scim guard store unavailable - a guard read fault fires and keeps its guard label
+    input_series:
+      - series: 'yuzu_scim_guard_store_unavailable_total{job="yuzu",instance="s1",guard="role"}'
+        values: "0x30 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimGuardStoreUnavailable", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuScimGuardStoreUnavailable", alertstate="firing", guard="role", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 54b -- a flat (pre-seeded) counter stays quiet.
+  - interval: 1m
+    name: scim guard store unavailable - a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_scim_guard_store_unavailable_total{job="yuzu",instance="s1",guard="provenance"}'
+        values: "0x60"
+      - series: 'yuzu_scim_guard_store_unavailable_total{job="yuzu",instance="s1",guard="role"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimGuardStoreUnavailable"}'
+        eval_time: 45m
+        exp_samples: []
+
   # ── YuzuScimAuditWriteFailures ────────────────────────────────────────────
 
   # CASE 55 -- a committed SCIM mutation lost its audit evidence write. The
@@ -2615,7 +2667,7 @@ tests:
   # There is no rule for yuzu_server_system_reserved_push_total. That was
   # tried and withdrawn: `send_to` returns false whenever an agent's stream is
   # null, which is what an ordinary suspended laptop looks like, and
-  # tar.fleet_snapshot fans out over the whole fleet on every viz fetch. A
+  # echo.fleet_snapshot fans out over the whole fleet on every viz fetch. A
   # `> 0` rule on that family is permanently firing on any real fleet, and a
   # permanently-firing rule gets silenced — taking the genuine
   # "__guard__.push_rules never landed" signal with it. Same self-defeating
@@ -4911,6 +4963,148 @@ tests:
         eval_time: 8m
         exp_samples: []
 
+  # CASE D3 -- YuzuGatewayMgmtIdentityOutage (#6016, release N+1): the server's
+  # certificate is refused for want of the identity (no_uri_san) and the gateway
+  # admitted NOTHING in the same five minutes (both admitted-method series sit at
+  # their seeded 0): a total command outage, so it is critical, after a minute.
+  - interval: 1m
+    name: gateway mgmt identity outage - no_uri_san with no admissions pages
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="no_uri_san"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g1",method="identity"}'
+        values: "0x40"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g1",method="pin"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing", instance="g1", job="yuzu-gateway", reason="no_uri_san", severity="critical"}'
+            value: 1
+      # the warning rule fires for the same cause, as documented
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected", alertstate="firing", instance="g1", job="yuzu-gateway", reason="no_uri_san", severity="warning"}'
+            value: 1
+
+  # CASE D3b -- identity_mismatch pages the same way.
+  - interval: 1m
+    name: gateway mgmt identity outage - identity_mismatch with no admissions pages
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="identity_mismatch"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g1",method="identity"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing", instance="g1", job="yuzu-gateway", reason="identity_mismatch", severity="critical"}'
+            value: 1
+
+  # CASE D4 -- the same rejections while the gateway keeps ADMITTING (the server
+  # works for most commands; a probe or the gateway's own leaf is refused): no
+  # page. The warning rule still fires. Checked across the window.
+  - interval: 1m
+    name: gateway mgmt identity outage - rejections amid admissions do not page
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="no_uri_san"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g1",method="identity"}'
+        values: "0+1x40"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g1",method="pin"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE D5 -- no rejections, or a reason that is not an identity refusal
+  # (revoked, missing_server_auth_eku, pin_mismatch), never raises this alert
+  # even with no admissions: those have their own rules and actions.
+  - interval: 1m
+    name: gateway mgmt identity outage - other reasons and quiet gateways do not page
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="no_uri_san"}'
+        values: "0x40"
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g2",reason="revoked"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g3",reason="missing_server_auth_eku"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g4",reason="pin_mismatch"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g1",method="identity"}'
+        values: "0x40"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g2",method="identity"}'
+        values: "0x40"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g3",method="identity"}'
+        values: "0x40"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g4",method="identity"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CASE D6 -- per gateway: g1 refuses and admits nothing (pages), g2 refuses
+  # the same reason but admits (quiet). A fleet-wide sum would hide g1.
+  - interval: 1m
+    name: gateway mgmt identity outage - judged per gateway
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="no_uri_san"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g2",reason="no_uri_san"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g1",method="identity"}'
+        values: "0x40"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g2",method="identity"}'
+        values: "0+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing", instance="g1", job="yuzu-gateway", reason="no_uri_san", severity="critical"}'
+            value: 1
+
+  # CASE D7 -- it resolves once the refusals stop (the server re-issued, or the
+  # gateway was moved to pin and restarted: the counters restart from 0).
+  - interval: 1m
+    name: gateway mgmt identity outage - resolves when the refusals stop
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="no_uri_san"}'
+        values: "0x5 1+1x5 6x40"
+      - series: 'yuzu_gw_mgmt_auth_admitted_total{job="yuzu-gateway",instance="g1",method="identity"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing", instance="g1", job="yuzu-gateway", reason="no_uri_san", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtIdentityOutage", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+
   # -- The built-in server certificate lacks the server identity URI (#6016) -----
   #
   # Gauge 0 = the in-place re-issue was skipped or failed. Pending for 15m so a
@@ -6604,4 +6798,401 @@ tests:
         exp_samples: []
       - expr: 'ALERTS{alertname="YuzuLeaderCoordinationStale", alertstate="firing"}'
         eval_time: 8m
+        exp_samples: []
+
+  # ── YuzuSoftwareNormalizationStale / YuzuSoftwareNormalizationFailing (SAM.4) ──
+  #
+  # The job ticks HOURLY and adds one outcome counter increment per tick. The Failing
+  # rule is increase(...[3h]) >= 2 with `for: 10m`, sized to that cadence (a 15m window
+  # cannot observe an hourly increment, and in a sustained outage the period is a little
+  # OVER an hour because the wait starts when a tick ends). 1m samples; the counter steps
+  # at the hour.
+
+  # Healthy: the stamp tracks wall-clock (promtool's time() is the sample time, so a
+  # value of 60*minute IS "now"), and no tick has failed. Both rules stay quiet.
+  - interval: 1m
+    name: software normalization - a healthy hourly job is quiet
+    input_series:
+      - series: 'yuzu_software_normalization_last_success_timestamp{job="yuzu",instance="s1"}'
+        values: "0+60x240"
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuSoftwareNormalization.*", alertstate="firing"}'
+        eval_time: 3h50m
+        exp_samples: []
+
+  # Stale: s2's stamp tracks wall-clock for 60m and then freezes at 3600. It is quiet
+  # while the age is under two cadences (7200 s), pending once the age passes it
+  # (3h00m), and firing after the 10m hold. s1 sits at the seeded 0 forever (building,
+  # or never succeeded): the `> 0` guard keeps the Stale rule quiet (the Failing rule
+  # owns that case). RED against dropping the guard.
+  - interval: 1m
+    name: software normalization - stale fires after two cadences and not while building
+    input_series:
+      - series: 'yuzu_software_normalization_last_success_timestamp{job="yuzu",instance="s1"}'
+        values: "0x300"
+      - series: 'yuzu_software_normalization_last_success_timestamp{job="yuzu",instance="s2"}'
+        values: "0+60x60 3600x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s1"}'
+        eval_time: 4h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s2"}'
+        eval_time: 2h50m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s2"}'
+        eval_time: 3h5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s2"}'
+        eval_time: 3h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationStale", alertstate="firing", instance="s2", job="yuzu", severity="warning"}'
+            value: 1
+
+  # Failing: two failed hourly ticks inside one 3h window. The error counter steps at
+  # t=60m (1) and t=120m (2). Quiet after the first failure; the second brings
+  # increase([3h]) to 2, and after the 10m hold it fires and is still firing at 2h20m.
+  # The leading zeros model the job's construction-time seed (the server creates the
+  # series at 0 before the first tick), so this series is the state the server produces.
+  - interval: 1m
+    name: software normalization - two failed hourly ticks fire
+    input_series:
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x59 1x60 2x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 2h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # Failing, sustained outage: the period is 61 m (3600 s wait + a one-minute tick), the
+  # real shape of an outage. The counter steps at 61, 122, 183, 244, 305 and 366 m. A 2h
+  # window holds only ONE increment for 2 minutes of every period (181-182, 242-243 and
+  # 303-304 m here), the expression drops below 2 and `for` resets, so [2h] went quiet once
+  # an hour; [3h] always holds two. Evaluated INSIDE each of those would-be gaps and at 5h30
+  # the alert must be continuously firing from its first firing (132 m).
+  - interval: 1m
+    name: software normalization - a sustained outage at a 61 minute period fires continuously
+    input_series:
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x60 1x60 2x60 3x60 4x60 5x60 6x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 100m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 140m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 182m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 243m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 304m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 330m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # Failing: ONE isolated failure followed by successes never fires, however long we wait.
+  - interval: 1m
+    name: software normalization - one isolated hourly failure stays quiet
+    input_series:
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x59 1x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing"}'
+        eval_time: 80m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing"}'
+        eval_time: 4h
+        exp_samples: []
+
+  # Failing, positive baseline: the counter already sits at 1 (an earlier failure that has
+  # aged out of the window) and ONE new failure steps it to 2. The first in-window sample
+  # is then non-zero, so increase() extrapolates the single increment to the window edge
+  # and reads a little above 1 for the whole hour it stays in the window; `> 1` fired on
+  # it. The rule is `>= 2`: only two increments in the window reach 2.
+  - interval: 1m
+    name: software normalization - one failure after an aged-out earlier failure stays quiet
+    input_series:
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "1x59 2x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing"}'
+        eval_time: 80m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing"}'
+        eval_time: 4h
+        exp_samples: []
+
+  # Failing, positive baseline: two failures on top of an aged-out earlier one (1 -> 2 -> 3)
+  # still fire after the hold.
+  - interval: 1m
+    name: software normalization - two failures after an aged-out earlier failure fire
+    input_series:
+      - series: 'yuzu_software_normalization_pass_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "1x59 2x60 3x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing"}'
+        eval_time: 2h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # ── YuzuDedupStoreDegraded (#3663) ───────────────────────────────────────
+  #
+  # yuzu_fleet_agents_dedup_store_degraded counts agents whose durable command-dedup store never
+  # opened (they run commands WITHOUT replay protection). It is an unlabelled server-owned gauge
+  # recomputed every sweep and exported PER core replica, so these cases feed it directly. The
+  # rule is `sum by (job) (max_over_time(<gauge>[5m])) > 0`, `for: 15m`, severity=warning.
+  #
+  # The expression exists because of cases F, G and H below: on the bare gauge each one resets the
+  # 15 m `for:` clock and a persistently degraded agent never alerts. Cases I and J pin the
+  # window's width: a degradation spanning 10 minutes (11 samples at a 1m scrape) must NOT fire and
+  # one spanning 11 minutes (12 samples) must. Mutation-checked
+  # (each case run alone against each mutant): removing the window, or shrinking it to 1m or 2m,
+  # reddens F and G; a bare gauge without `sum by (job)` additionally reddens H; a wider or
+  # narrower window than 5m reddens I or J; `>= 0` reddens C, C-1, D and E; `== 1` reddens B and
+  # H; `for: 12m`, `16m` or `20m` reddens A.
+  #
+  # The sibling yuzu_fleet_agents_dedup_* counters deliberately have NO alert and so no case:
+  # they count agents whose per-process counter is > 0 "since its last restart", which latches
+  # until that restart and cannot back a sustained-condition alert. Case C-1 pins that a store
+  # that opened and then failed writes (claim_erroring = 1, degraded = 0) does NOT alert: that
+  # is the documented coverage limit, not an accident.
+
+  # CASE A -- fires once the condition has held for the full 15m, and not before. RED if `for:`
+  # is dropped (fires at 14m) or lengthened to 16m or more (the 15m eval is the only one that
+  # catches 16m exactly).
+  - interval: 1m
+    name: dedup store degraded - sustained for 15m fires, and not before
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 50m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE B -- several degraded agents fire the same single alert (the gauge is a COUNT, so the
+  # threshold is `> 0`, not `== 1`). RED if the rule were written as `== 1`.
+  - interval: 1m
+    name: dedup store degraded - more than one degraded agent still fires
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "3x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE C -- the healthy fleet stays quiet: a flat 0 is the published "nobody degraded" reading.
+  # RED if the rule were `>= 0`, which would page a healthy fleet forever.
+  - interval: 1m
+    name: dedup store degraded - zero degraded agents stays quiet
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded"}'
+        eval_time: 50m
+        exp_samples: []
+
+  # CASE C-1 -- the documented coverage limit: a store that OPENED and then failed writes
+  # reports degraded = 0 and only the latched claim_erroring gauge moves, so this alert stays
+  # silent. If someone later adds claim_erroring to the rule this case goes red and forces the
+  # docs (metrics.md, security-hardening.md) to be rewritten in the same change.
+  - interval: 1m
+    name: dedup store degraded - a store that opened then failed writes does not alert
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "0x60"
+      - series: 'yuzu_fleet_agents_dedup_claim_erroring{job="yuzu",instance="s1"}'
+        values: "1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded"}'
+        eval_time: 50m
+        exp_samples: []
+
+  # CASE D -- a short transient (a restart, a brief disk-full that clears) never fires: 5 samples
+  # of 1 then 0 is shorter than the effective window. RED if `for:` is removed, or the
+  # max_over_time window is widened past about 10m.
+  - interval: 1m
+    name: dedup store degraded - a 5 minute blip stays quiet
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "1x5 0x55"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE E -- it clears after the agent recovers (restarts with a working store), about 5
+  # minutes after the gauge drops because of the max_over_time window. RED if the alert latches.
+  - interval: 1m
+    name: dedup store degraded - resolves after recovery
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "1x30 0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # CASE F -- a heartbeat interval of 120 s (> the 90 s staleness window): the server counts the
+  # degraded agent for about 90 s of every 120 s, so at the 1m evaluation interval the gauge
+  # alternates 1, 0, 1, 0. On the bare gauge `for:` restarts on every 0 and the alert NEVER
+  # fires. RED if the max_over_time window is removed or shortened to 1m.
+  - interval: 1m
+    name: dedup store degraded - heartbeat slower than the staleness window still fires
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE G -- a core replica restarts mid-condition: the series is absent for a minute, then the
+  # replica reports 0 for one sweep before its agents have re-heartbeated, then 1 again. On the
+  # bare gauge that gap resets `for:`. RED if the window is removed or shortened to 1m.
+  - interval: 1m
+    name: dedup store degraded - a replica restart mid-condition does not reset for
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "1x20 _x1 0x1 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE H -- the degraded agent fails over from replica s1 to replica s2: the `instance` label
+  # changes, so on the bare gauge a NEW alert instance starts its own 15 m clock while s1's series
+  # goes stale. `sum by (job)` drops `instance` from the alert identity. RED against the bare
+  # gauge (not against max_over_time alone: the join across instances is the discriminator).
+  - interval: 1m
+    name: dedup store degraded - an agent moving replicas does not reset for
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "1x20 stale"
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s2"}'
+        values: "0x20 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE I -- the measured lower bound of the firing window. The 5m window carries the condition
+  # 5 minutes past the LAST degraded sample, so a degradation SPANNING 10 minutes (11 samples at a
+  # 1m scrape, first to last) is NOT enough to fire: a fixed agent is not paged for it. RED if the
+  # window is widened (the same condition then fires). Measured with promtool 3.x: 11 samples
+  # never fire (3.0 made range selectors left-open; the 2.x boundary likely differs by a sample).
+  - interval: 1m
+    name: dedup store degraded - a 10 minute span of degradation does not fire
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "1x10 0x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded"}'
+        eval_time: 16m
+        exp_samples: []
+
+  # CASE J -- a degradation SPANNING 11 minutes (12 samples at a 1m scrape) DOES fire, at exactly
+  # the 15 minute mark, and the alert is already gone a minute later (it can fire for an agent
+  # that was fixed at minute 11). RED if the window is narrowed (the same condition then never
+  # fires).
+  - interval: 1m
+    name: dedup store degraded - an 11 minute span of degradation fires at the 15 minute mark
+    input_series:
+      - series: 'yuzu_fleet_agents_dedup_store_degraded{job="yuzu",instance="s1"}'
+        values: "1x11 0x49"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDedupStoreDegraded", alertstate="firing"}'
+        eval_time: 16m
         exp_samples: []

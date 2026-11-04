@@ -25,16 +25,26 @@
 #include "dashboard_routes.hpp"
 #include "test_route_sink.hpp"
 
+#include "agent_registry.hpp"
 #include "dispatch_destructive_gate.hpp"
 #include "dispatch_target_shape.hpp"
+#include "event_bus.hpp"
+#include "instruction_store.hpp"
 #include "mcp_input_bounds.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_real_capability_registry.hpp"
 
-#include <catch2/catch_test_macros.hpp>
+#include "../test_helpers.hpp"
 
+#include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
+
+#include <iterator>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -45,7 +55,7 @@ namespace {
 
 constexpr const char* kPath = "/api/dashboard/execute";
 constexpr std::pair<const char*, const char*> kReadOnly{"os_info", "os_version"};
-constexpr std::pair<const char*, const char*> kDestructive{"tar", "purge_source"};
+constexpr std::pair<const char*, const char*> kDestructive{"echo", "purge_source"};
 
 struct DispatchCall {
     std::string plugin, action, scope_expr;
@@ -58,6 +68,10 @@ struct AuditRow {
 // Member order is load-bearing: `sink` last so it is destroyed first.
 struct Harness {
     yuzu::MetricsRegistry metrics;
+    // Only the built-in `help` command needs a registry (it renders the registry's help table);
+    // every other case runs with none, exactly as before.
+    detail::EventBus bus;
+    std::unique_ptr<detail::AgentRegistry> registry;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
     std::vector<DispatchCall> calls;
@@ -69,7 +83,9 @@ struct Harness {
     int sent = 3;
     std::pair<std::string, std::string> resolve_to{kReadOnly.first, kReadOnly.second};
 
-    Harness() {
+    explicit Harness(bool with_registry = false, InstructionStore* instruction_store = nullptr) {
+        if (with_registry)
+            registry = std::make_unique<detail::AgentRegistry>(bus, metrics);
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -95,14 +111,13 @@ struct Harness {
         };
         routes.register_routes(
             sink, auth_fn, perm_fn, audit_fn, /*response_store=*/nullptr, /*mg=*/nullptr,
-            /*registry=*/nullptr, /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+            registry.get(), /*tag_store=*/nullptr, /*event_bus=*/nullptr,
             [] { return std::string{"[]"}; }, dispatch,
             [](const httplib::Request&) -> yuzu::server::DispatchCaller {
                 return yuzu::server::DispatchCaller{.principal = "expr-op",
                                                     .exec_visible = std::nullopt};
             },
-            [this](const std::string&) { return resolve_to; }, &metrics,
-            /*instruction_store=*/nullptr);
+            [this](const std::string&) { return resolve_to; }, &metrics, instruction_store);
         routes.set_capability_classify_fn(yuzu::test::real_classify_fn());
         routes.set_persist_audit_fn([this](const httplib::Request&, const std::string& a,
                                            const std::string& r, const std::string&,
@@ -165,6 +180,16 @@ std::string enc(const std::string& s) {
 bool contains(const std::string& hay, std::string_view needle) {
     return hay.find(needle) != std::string::npos;
 }
+
+// Same key as test_dashboard_results_fragment.cpp's instruction-store template (one migration run
+// across the suite; shared keys are verified by structural replay).
+yuzu::test::PgTestTemplate dashboard_exec_instr_tpl{
+    "dashfraginstr", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        InstructionStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("dashboard_exec_instr template: store failed to migrate");
+    }};
 
 } // namespace
 
@@ -448,6 +473,87 @@ TEST_CASE("dashboard execute: only a dispatched send carries X-Yuzu-Dispatched, 
         CHECK_FALSE(h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"))
                         ->has_header("X-Yuzu-Dispatched"));
     }
+}
+
+// ── #5677 / #6075: a Send (or help) replaces the results, so it aborts the old request ─────
+
+TEST_CASE("dashboard execute: a dispatch aborts an in-flight results request and replaces the "
+          "pager",
+          "[server][dashboard][execute][sync]") {
+    Harness h;
+    auto res = h.post("instruction=version&scope=__all__");
+    REQUIRE(res->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    const std::string cmd = "cmd-1";
+
+    // HX-Trigger is JSON: the toast first, the abort LAST (htmx keeps a key's target for the keys
+    // after it, so an earlier target:#filter-bar would retarget the toast too).
+    const auto trigger = nlohmann::ordered_json::parse(res->get_header_value("HX-Trigger"));
+    REQUIRE(trigger.is_object());
+    REQUIRE(trigger.size() == 2);
+    CHECK(trigger.begin().key() == "showToast");
+    CHECK(std::prev(trigger.end()).key() == "htmx:abort");
+    CHECK(trigger.at("htmx:abort").at("target") == "#filter-bar");
+
+    CHECK(contains(res->body, "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>"));
+    // The initializer exists for every dispatch, with or without a definition.
+    CHECK(contains(res->body, "<div id=\"chart-deck-host\" hx-swap-oob=\"true\" "
+                              "hx-get=\"/fragments/results?command_id=" + cmd +
+                                  "&amp;plugin=os_info\" hx-trigger=\"load delay:2s\" "
+                                  "hx-swap=\"none\"></div>"));
+    // Residual tripwire: there is no sort/page control in the placeholder window, so nothing in
+    // the dispatch body may re-read the filter bar (it would race the abort above).
+    CHECK_FALSE(contains(res->body, "hx-include=\"#filter-bar\""));
+}
+
+// The chart-deck initializer is how the first results fetch learns the definition the dispatch
+// resolved; with one, its request carries the id so the deck and the template columns follow.
+TEST_CASE("dashboard execute: the chart-deck initializer carries the definition the dispatch "
+          "resolved",
+          "[pg][server][dashboard][execute][sync]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashboard_exec_instr_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore is{pool};
+    REQUIRE(is.is_open());
+    is.set_require_signed_definitions(false);
+    InstructionDefinition def;
+    def.name = "os-version-deck";
+    def.version = "1.0";
+    def.plugin = kReadOnly.first;
+    def.action = kReadOnly.second;
+    def.type = "question";
+    def.description = "definition resolved by the dispatch";
+    def.enabled = true;
+    def.platforms = "windows,linux,darwin";
+    def.approval_mode = "auto";
+    def.result_schema = R"([{"name":"hostname","type":"string"}])";
+    const auto id = is.create_definition(def);
+    REQUIRE(id.has_value());
+
+    Harness h(/*with_registry=*/false, &is);
+    auto res = h.post("instruction=version&scope=__all__");
+    REQUIRE(res->status == 200);
+    CHECK(contains(res->body, "hx-get=\"/fragments/results?command_id=cmd-1&amp;plugin=os_info"
+                              "&amp;definition_id=" + *id +
+                                  "\" hx-trigger=\"load delay:2s\" hx-swap=\"none\""));
+}
+
+TEST_CASE("dashboard execute: help aborts an in-flight results request and replaces the "
+          "previous command's chrome",
+          "[server][dashboard][execute][sync]") {
+    Harness h(/*with_registry=*/true);
+    auto res = h.post("instruction=help&scope=__all__");
+    REQUIRE(res->status == 200);
+    CHECK(res->get_header_value("HX-Trigger") == R"({"htmx:abort":{"target":"#filter-bar"}})");
+    // outerHTML (not innerHTML): replacing the element drops the previous command's pending
+    // hx-get / hx-trigger load (filter bar, chart-deck host) and clears the pager's view stamp.
+    CHECK(contains(res->body, "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>"));
+    CHECK(contains(res->body, "<div id=\"chart-deck-host\" hx-swap-oob=\"true\"></div>"));
+    CHECK(contains(res->body, "<div id=\"filter-bar\" hx-swap-oob=\"true\"></div>"));
+    CHECK_FALSE(contains(res->body, "<nav id=\"result-pagination\" hx-swap-oob=\"innerHTML\""));
+    CHECK_FALSE(contains(res->body, "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\""));
+    CHECK_FALSE(contains(res->body, "<div id=\"filter-bar\" hx-swap-oob=\"innerHTML\""));
+    CHECK(h.calls.empty());
 }
 
 // Same-site gate (browser_write_is_cross_site): a cookie session needs an Origin or Referer naming

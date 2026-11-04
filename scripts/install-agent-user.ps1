@@ -62,7 +62,7 @@ WHAT THIS SCRIPT DOES
                                    filesystem.read with system paths)
         SeRestorePrivilege      — paired with SeBackupPrivilege; restore
                                   semantics for the same paths, and required by
-                                  RegLoadKeyA/RegUnLoadKeyA (TAR `software`
+                                  RegLoadKeyA/RegUnLoadKeyA (Echo `software`
                                   per-user scope mounts logged-off NTUSER.DAT)
         SeSecurityPrivilege     — read Security event log, manage SACLs
         SeIncreaseQuotaPrivilege — adjust process quotas (some WMI
@@ -191,7 +191,7 @@ param(
     [string]$BinaryPath  = "C:\Program Files\Yuzu\yuzu-agent.exe",
     # The agent's data directory — MUST equal the value passed to the agent's
     # `--data-dir`, because the boot AutoLogger writes `procboot.etl` here and the
-    # agent reads it from the same directory it writes `tar.db` to. Defaults to
+    # agent reads it from the same directory it writes `echo.db` to. Defaults to
     # the production service data dir (C:\ProgramData\Yuzu); override when the
     # agent runs with a different --data-dir (e.g. a UAT data dir) so the
     # boot-window backfill actually finds the trace.
@@ -845,7 +845,7 @@ function Test-Install {
 # the boot window its live session missed. **Takes effect on the NEXT boot.**
 #
 # The .etl path MUST match the agent's --data-dir: the agent reads `procboot.etl`
-# from the SAME directory it writes `tar.db` to (NOT a `state` subdirectory).
+# from the SAME directory it writes `echo.db` to (NOT a `state` subdirectory).
 # Driven by the -DataDir parameter (default C:\ProgramData\Yuzu = the production
 # service data dir). Override -DataDir when the agent runs with a different
 # --data-dir, or the backfill silently finds no file. The production InnoSetup

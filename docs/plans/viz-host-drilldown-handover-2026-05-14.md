@@ -12,7 +12,7 @@ are deployed to it.
 | sha | commit |
 |---|---|
 | `9640688` | `fix(agent)`: wire the trigger engine so interval triggers actually fire |
-| `a6b808c` | `feat(tar)`: widen fleet_snapshot to connections seen within a window |
+| `a6b808c` | `feat(echo)`: widen fleet_snapshot to connections seen within a window |
 | `ad1fc5c` | `fix(gateway)`: replay agent registrations on upstream reconnect |
 | `dcd10d7` | `feat(server,viz)`: per-host IPC-graph drill-down + tier & cache fixes |
 | `6076d77` | `chore(uat)`: start-viz-uat.sh cedar-vale mode for the 3-VM rig |
@@ -30,19 +30,19 @@ operator's call.
 
 `yuzu_register_trigger` was a no-op stub; no `TriggerEngine` was instantiated;
 `start()` was never called — so `collect_fast` / `collect_slow` / `rollup` never
-ran for **any** plugin agent-wide, and the TAR warehouse (`*_live` tables) sat
+ran for **any** plugin agent-wide, and the Echo warehouse (`*_live` tables) sat
 permanently empty in the field. Fixed: `parse_trigger_config()` (new, 5 tests),
 `yuzu_register_trigger`/`yuzu_unregister_trigger` rewired, `TriggerEngine`
 instantiated + dispatch + start/stop. **All 384 agent tests pass.** Verified
 live: `collect_fast` fires every 60 s, `*_live` tables populate.
 
-### `a6b808c` — TAR `last_seen_seconds_ago` connection-memory
+### `a6b808c` — Echo `last_seen_seconds_ago` connection-memory
 
-`tar.fleet_snapshot` now merges live `/proc` connections with recently-seen ones
+`echo.fleet_snapshot` now merges live `/proc` connections with recently-seen ones
 from the `tcp_live` warehouse. `query_recent_tcp_connections`,
 `merge_live_and_recent_connections`, `NetConnection.last_seen_seconds_ago`,
 `fleet_snapshot.v1` `schema_minor` 1→2, operator-tunable
-`fleet_snapshot_window_seconds`. Tests in `test_tar_store.cpp` +
+`fleet_snapshot_window_seconds`. Tests in `test_echo_store.cpp` +
 `test_fleet_snapshot.cpp`. **Issue #1019** filed: the 60 s sampler still can't
 see sub-interval connections — that needs kernel eventing.
 
@@ -66,7 +66,7 @@ breaker. **Caveat:** a future hot upgrade from a pre-change build needs a real
 ### `dcd10d7` — Per-host IPC-graph drill-down + tier & cache fixes
 
 Double-clicking a cube in `/viz/fleet` opens `/viz/host/<agent_id>` in a new
-tab: a 2D bipartite IPC graph (Cytoscape, built-in `cose` layout) over the TAR
+tab: a 2D bipartite IPC graph (Cytoscape, built-in `cose` layout) over the Echo
 process tree. Slices 1–4 (server endpoints + `HostTopologySnapshot` wire type;
 `yuzu-viz-host.js` renderer + vendored `cytoscape.min.js`; 3D dblclick +
 heartbeat flash + new-tab; cross-pane sync + resizable splitter). **24 viz-host
@@ -103,7 +103,7 @@ agent, waits for registration.
   (app / database / frontend). `no-cache` headers confirmed on both renderer
   bundles. Gateway shows 3 agents registered; `yuzu_fleet_agents_healthy = 3`.
 - All 3 VM agents restarted onto the committed-source builds
-  (`libyuzu_agent_core.so` = trigger-engine fix, `tar.so` = last_seen merge),
+  (`libyuzu_agent_core.so` = trigger-engine fix, `echo.so` = last_seen merge),
   re-registered through the rebuilt gateway.
 - **`yuzu-db`**: PostgreSQL fixed earlier this session — `/etc/conf.d/postgresql`
   points `data_dir` + `conf_dir` at `/var/lib/postgresql/data` (the real
@@ -147,14 +147,14 @@ fix that makes `collect_fast` actually run).
    longer needed for *future* changes (the `no-cache` fix), but the browser still
    has the pre-fix cached `yuzu-viz.js` — do **one** `Cmd+Option+R` on `/viz/fleet`
    first. Then confirm: three correctly-tiered cubes; double-click a cube → host
-   page → IPC graph renders with `cose`, TAR tree below, splitter drags,
+   page → IPC graph renders with `cose`, Echo tree below, splitter drags,
    cross-pane highlight works. **For the blue cross-VM tubes specifically, run the
    ~90 s traffic loop first** (see "Blue tubes" under Demo environment) — they are
    not automatic and will be absent on a freshly-restarted rig. (The host page
    already had its renderer verified served as `cose`; the visual itself is
    unconfirmed.)
 3. **Governance.** None of the 5 commits has been through `/governance`. Slices
-   1–4 want docs-writer gate work; the trigger fix, TAR `last_seen`, and gateway
+   1–4 want docs-writer gate work; the trigger fix, Echo `last_seen`, and gateway
    replay each warrant a review pass.
 4. **Gateway hot-upgrade `code_change/3`** — see the `ad1fc5c` caveat; needed
    before the next release that hot-upgrades a pre-change gateway.
@@ -197,7 +197,7 @@ curl -fsS http://localhost:8080/login -d 'username=admin&password=adminpassword1
 curl -fsS -b /tmp/ck.txt http://localhost:8080/api/v1/viz/fleet/topology | python3 -m json.tool | head -40
 curl -sI http://localhost:8080/static/yuzu-viz.js | grep -i cache-control   # expect: no-cache
 for vm in yuzu-frontend yuzu-app yuzu-db; do
-  orb -u root -m "$vm" sh -c 'grep -c "Trigger .tar.fast. fired" /var/log/yuzu-agent.log'
+  orb -u root -m "$vm" sh -c 'grep -c "Trigger .echo.fast. fired" /var/log/yuzu-agent.log'
 done
 ```
 
@@ -205,5 +205,5 @@ done
 
 - **#1018** — viz: function-aware tier classification (port heuristics
   misrepresent real three-tier topologies)
-- **#1019** — tar: short-lived connections need kernel eventing (sampled-diff
+- **#1019** — echo: short-lived connections need kernel eventing (sampled-diff
   can't capture them)

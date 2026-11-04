@@ -476,8 +476,8 @@ TEST_CASE("ResultSetStore: async create -> materialize", "[pg][result_set][async
     REQUIRE(pool.valid());
     ResultSetStore store(pool);
 
-    CreateRequest r = req("alice", "tar-suspects");
-    r.source_kind = std::string(source_kind::kTarQuery);
+    CreateRequest r = req("alice", "echo-suspects");
+    r.source_kind = std::string(source_kind::kEchoQuery);
     r.source_payload = R"({"sql":"SELECT 1"})";
     auto rs = store.create_pending(r, "exec-123");
     REQUIRE(rs.has_value());
@@ -487,7 +487,7 @@ TEST_CASE("ResultSetStore: async create -> materialize", "[pg][result_set][async
     auto pending = store.list_pending();
     REQUIRE(pending.size() == 1);
     CHECK(pending[0].source_execution_id == "exec-123");
-    CHECK(pending[0].source_kind == source_kind::kTarQuery);
+    CHECK(pending[0].source_kind == source_kind::kEchoQuery);
 
     auto m = store.materialize(rs->id, {"dev-1", "dev-2"});
     REQUIRE(m.has_value());
@@ -512,7 +512,7 @@ TEST_CASE("ResultSetStore: materialize dedups members and drops empty ids",
     ResultSetStore store(pool);
 
     CreateRequest r = req("alice", "dedup-check");
-    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_kind = std::string(source_kind::kEchoQuery);
     r.source_payload = R"({"sql":"SELECT 1"})";
     auto rs = store.create_pending(r, "exec-dedup");
     REQUIRE(rs.has_value());
@@ -1249,7 +1249,7 @@ TEST_CASE("ResultSetStore: mark_failed merges a failure reason into a healthy "
     ResultSetStore store(pool);
 
     CreateRequest r = req("alice", "healthy-pending");
-    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_kind = std::string(source_kind::kEchoQuery);
     r.source_payload = R"({"sql":"SELECT 1"})";
     auto rs = store.create_pending(r, "exec-ok");
     REQUIRE(rs.has_value());
@@ -1277,7 +1277,7 @@ TEST_CASE("ResultSetStore: mark_failed heals a source_payload nested past the "
     ResultSetStore store(pool);
 
     CreateRequest r = req("alice", "poisoned-pending");
-    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_kind = std::string(source_kind::kEchoQuery);
     // A raw string, never materialised as a live nlohmann::json object at
     // this depth. kMcpMaxJsonDepth is 32; 40 is comfortably past it and still
     // trivially safe to construct/dump directly in this test process,
@@ -1344,7 +1344,7 @@ TEST_CASE("ResultSetStore: heal_poisoned_payload heals a materialized row's "
     ResultSetStore store(pool);
 
     CreateRequest r = req("alice", "poisoned-materialized");
-    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_kind = std::string(source_kind::kEchoQuery);
     // Same idiom as the poisoned-pending test above: 40 levels, comfortably
     // past kMcpMaxJsonDepth (32) and orders of magnitude short of the real
     // attack depth, safe to construct/dump directly in this test process.
@@ -1384,7 +1384,7 @@ TEST_CASE("ResultSetStore: heal_poisoned_payload is a no-op on a healthy payload
     ResultSetStore store(pool);
 
     CreateRequest r = req("alice", "healthy-materialized");
-    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_kind = std::string(source_kind::kEchoQuery);
     r.source_payload = R"({"sql":"SELECT 1"})";
     auto rs = store.create_materialized(r, {"dev-a"});
     REQUIRE(rs.has_value());
@@ -1410,7 +1410,7 @@ TEST_CASE("ResultSetStore: heal_poisoned_payload also heals an already-failed ro
     ResultSetStore store(pool);
 
     CreateRequest r = req("alice", "poisoned-failed");
-    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_kind = std::string(source_kind::kEchoQuery);
     r.source_payload = R"({"sql":"SELECT 1"})";
     auto rs = store.create_pending(r, "exec-poisoned-failed");
     REQUIRE(rs.has_value());
@@ -1453,7 +1453,7 @@ TEST_CASE("ResultSetStore: heal_poisoned_payload reports failure (not success) "
     ResultSetStore store(pool);
 
     CreateRequest r = req("alice", "vanishes-mid-heal");
-    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_kind = std::string(source_kind::kEchoQuery);
     r.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + std::string(40, '[') +
                         std::string(40, ']') + "}";
     auto rs = store.create_materialized(r, {"dev-a"});

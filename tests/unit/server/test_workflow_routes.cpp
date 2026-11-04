@@ -79,7 +79,7 @@ namespace {
 // kFixture: one Forensics row (byte-identical to the real
 // app_usage.summary row, capability_decls/plugin_action_catalogue_app_usage.hpp)
 // for the single-target gate, one Destructive row (byte-identical to
-// test_command_routes.cpp's tar.purge_source row) proving the same gate also
+// test_command_routes.cpp's echo.purge_source row) proving the same gate also
 // covers Destructive rows reached through this route, and the pre-existing
 // "test"/"list" pair used by every other test in this file deliberately stays
 // OUT of this fixture so it keeps classifying as Unclassified (ClassifyMiss),
@@ -97,7 +97,7 @@ inline constexpr std::array<CommandCapability, 2> kBr001Fixture{{
         .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "purge_source",
         .dispatch_class = DispatchClass::Destructive,
         .mutability = Mutability::Irreversible,
@@ -4316,7 +4316,7 @@ TEST_CASE("#2500 — an explicit agent_ids list wins over a broadcast request",
 // console are the other three) that never called
 // `dispatch_destructive_gate.hpp`'s Forensics single-target rule /
 // Destructive broadcast refusal. `kBr001Fixture` classifies "app_usage"/
-// "summary" as Forensics and "tar"/"purge_source" as Destructive; the
+// "summary" as Forensics and "echo"/"purge_source" as Destructive; the
 // pre-existing "test"/"list" default stays unclassified so every test above
 // this section is unaffected.
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4417,7 +4417,7 @@ TEST_CASE("BR-001 — a Destructive action with 0 agent_ids is refused (same gat
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ExecHarness h(pool);
-    h.make_def("def-BR5", "Purge source", "tar", "purge_source");
+    h.make_def("def-BR5", "Purge source", "echo", "purge_source");
 
     auto res = h.sink.Post("/api/instructions/def-BR5/execute", R"({"params":{}})");
     REQUIRE(res);
@@ -4555,7 +4555,7 @@ TEST_CASE("BR2-001 — a workflow step naming a Destructive instruction with 0 a
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
                   /*with_workflow_engine=*/true);
-    h.make_def("def-BR2-3", "Destructive purge", "tar", "purge_source");
+    h.make_def("def-BR2-3", "Destructive purge", "echo", "purge_source");
     auto wf_id = h.make_workflow("wf-br2-3", "def-BR2-3");
     h.dispatch_cmd_override = "cmd-br2-3";
     h.dispatch_sent_override = 5;

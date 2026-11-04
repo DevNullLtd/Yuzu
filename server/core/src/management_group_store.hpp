@@ -31,12 +31,15 @@
 /// over `management_groups`/`management_group_members`/`management_group_roles` instead —
 /// silent unless real rows are found, never blocks boot.
 
+#include "management_group_types.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <expected>
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu {
@@ -48,25 +51,6 @@ class PgPool;
 }
 
 namespace yuzu::server {
-
-struct ManagementGroup {
-    std::string id;
-    std::string name;
-    std::string description;
-    std::string parent_id;        // empty for root groups
-    std::string membership_type;  // "static" or "dynamic"
-    std::string scope_expression; // for dynamic groups (evaluated by scope engine)
-    std::string created_by;
-    int64_t created_at{0};
-    int64_t updated_at{0};
-};
-
-struct ManagementGroupMember {
-    std::string group_id;
-    std::string agent_id;
-    std::string source; // "static" or "dynamic"
-    int64_t added_at{0};
-};
 
 struct GroupRoleAssignment {
     std::string group_id;
@@ -130,7 +114,16 @@ public:
     [[nodiscard]] std::expected<std::optional<ManagementGroup>, std::string>
     get_group_checked(const std::string& id) const;
     std::optional<ManagementGroup> find_group_by_name(const std::string& name) const;
+    /// LEGACY fail-soft: `list_groups_checked().value_or({})` — a degrade renders as an empty
+    /// vector, indistinguishable from "no groups". Prefer `list_groups_checked` for any read that
+    /// must tell the two apart.
     std::vector<ManagementGroup> list_groups() const;
+    /// Degrade-distinguishable twin of `list_groups()`: `nullopt` on store-not-open /
+    /// pool-acquire-timeout / query-error (each bumps
+    /// `yuzu_server_mgmt_group_read_degrade_total{reason=...}`), a value is authoritative.
+    /// No LIMIT: it materialises the whole group table like the REST twin, bounded by the pool
+    /// lease timeout (`kReadTimeout`).
+    [[nodiscard]] std::optional<std::vector<ManagementGroup>> list_groups_checked() const;
     std::vector<ManagementGroup> get_children(const std::string& parent_id) const;
     std::expected<void, std::string> update_group(const ManagementGroup& group);
     std::expected<void, std::string> delete_group(const std::string& id);
@@ -267,6 +260,12 @@ public:
     size_t count_groups() const;
     size_t count_all_members() const;
     size_t count_members(const std::string& group_id) const;
+    /// Member count per group in ONE `GROUP BY` read (replaces N `count_members` round trips).
+    /// `nullopt` on store-not-open / pool timeout / query error (counted on the read-degrade
+    /// metric); a value is authoritative and a group absent from the map has zero members.
+    /// Materialising and unlimited like `list_groups_checked`, bounded by the lease timeout.
+    [[nodiscard]] std::optional<std::unordered_map<std::string, std::size_t>>
+    count_members_by_group_checked() const;
 
     /// Well-known root group ID.
     static constexpr const char* kRootGroupId = "000000000000";

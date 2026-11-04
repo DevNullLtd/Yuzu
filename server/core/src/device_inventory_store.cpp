@@ -1,24 +1,32 @@
 #include "device_inventory_store.hpp"
 
+#include "device_ci_kinds.hpp"
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "sha256_hex.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
-#include <openssl/evp.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
+#include <iterator>
 #include <optional>
+#include <ranges>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -98,19 +106,53 @@ std::string bigint_param(const std::string& s) {
     return std::to_string(v);
 }
 
-std::string sha256_hex(const std::string& in) {
-    unsigned char md[EVP_MAX_MD_SIZE];
-    unsigned int len = 0;
-    if (EVP_Digest(in.data(), in.size(), md, &len, EVP_sha256(), nullptr) != 1)
-        return {};
-    static const char* kHex = "0123456789abcdef";
-    std::string out;
-    out.reserve(static_cast<std::size_t>(len) * 2);
-    for (unsigned int i = 0; i < len; ++i) {
-        out.push_back(kHex[md[i] >> 4]);
-        out.push_back(kHex[md[i] & 0x0f]);
-    }
+// The 11 scalars appended to device_ci at wire positions 22-32 (device_ci_kinds.hpp).
+constexpr const char* kV2ScalarCols[] = {
+    "chassis_type",   "chassis_serial", "chassis_asset_tag", "chassis_source",
+    "board_vendor",   "board_product",  "board_serial",      "board_source",
+    "machine_id_hash", "machine_id_algorithm", "machine_id_source",
+};
+// Ties the migration DDL to the wire: positions 0-21 are the frozen v1 fields, the rest are
+// the appended scalars named here.
+static_assert(std::size(kV2ScalarCols) == kDeviceCiScalarFields - 22,
+              "kV2ScalarCols must name every appended scalar position (22..kDeviceCiScalarFields-1)");
+
+// Split a kDeviceCiSections column list ("a,b,c") into names.
+std::vector<std::string> split_columns(std::string_view columns) {
+    std::vector<std::string> out;
+    for (const auto part : std::views::split(columns, ','))
+        out.emplace_back(part.begin(), part.end());
     return out;
+}
+
+// Migration v2 (additive, online-safe: constant defaults make the ALTER metadata-only,
+// ADR-0008): the v2 blob's identity scalars on device_ci, a per-section status table, and
+// one child table per list kind (typed TEXT columns, driven by kDeviceCiSections so a kind
+// costs one registry entry). Children cascade from device_ci so delete_agent stays one
+// statement. Unqualified DDL — the runner sets search_path to the store schema.
+std::string migration_v2_sql() {
+    std::string sql =
+        "ALTER TABLE device_ci ADD COLUMN blob_version SMALLINT NOT NULL DEFAULT 1";
+    for (const char* c : kV2ScalarCols)
+        sql += std::string(", ADD COLUMN ") + c + " TEXT NOT NULL DEFAULT ''";
+    sql += ";";
+    sql += "CREATE TABLE device_ci_section ("
+           "  agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+           "  kind     TEXT NOT NULL,"
+           "  level    TEXT NOT NULL DEFAULT '',"
+           "  reason   TEXT NOT NULL DEFAULT '',"
+           "  PRIMARY KEY (agent_id, kind));";
+    for (const auto& d : kDeviceCiSections) {
+        if (d.table == nullptr)
+            continue;
+        sql += std::string("CREATE TABLE ") + d.table +
+               " (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+               " ord INTEGER NOT NULL";
+        for (const auto& col : split_columns(d.columns))
+            sql += ", " + col + " TEXT NOT NULL DEFAULT ''";
+        sql += ", PRIMARY KEY (agent_id, ord));";
+    }
+    return sql;
 }
 
 const std::vector<pg::PgMigration>& migrations() {
@@ -152,6 +194,7 @@ const std::vector<pg::PgMigration>& migrations() {
          "  last_seen     BIGINT NOT NULL);"
          // Roster reads order by hostname; the index keeps the LIMIT scan ordered.
          "CREATE INDEX device_ci_hostname_idx ON device_ci (hostname);"},
+        {2, migration_v2_sql()},
     };
     return kMigrations;
 }
@@ -161,7 +204,9 @@ constexpr const char* kSelectCols =
     "agent_id, manufacturer, model, serial, system_uuid, hostname, domain, ou, "
     "bios_vendor, bios_version, bios_date, cpu_model, cpu_cores, cpu_threads, ram_bytes, "
     "disks_summary, primary_mac, macs_summary, nic_count, os_name, os_version, os_build, "
-    "arch, first_seen, last_seen";
+    "arch, first_seen, last_seen, blob_version, chassis_type, chassis_serial, "
+    "chassis_asset_tag, chassis_source, board_vendor, board_product, board_serial, "
+    "board_source, machine_id_hash, machine_id_algorithm, machine_id_source";
 
 void fill_record(PGresult* res, int row, DeviceCiRecord& out) {
     int c = 0;
@@ -191,11 +236,28 @@ void fill_record(PGresult* res, int row, DeviceCiRecord& out) {
     out.arch = col();
     out.first_seen = to_i64(col());
     out.last_seen = to_i64(col());
+    out.blob_version = static_cast<int>(to_i64(col()));
+    out.chassis_type = col();
+    out.chassis_serial = col();
+    out.chassis_asset_tag = col();
+    out.chassis_source = col();
+    out.board_vendor = col();
+    out.board_product = col();
+    out.board_serial = col();
+    out.board_source = col();
+    out.machine_id_hash = col();
+    out.machine_id_algorithm = col();
+    out.machine_id_source = col();
 }
 
 } // namespace
 
 std::string DeviceInventoryStore::canonical_hash(const DeviceCiRecord& rec) {
+    // v2: the agent's canonical bytes ARE the blob; the parser pinned its sha256 into
+    // content_hash (empty on a digest failure -> the store nacks). v1 keeps the positional
+    // 22-field join below, byte-identical, so old agents never loop on need_full.
+    if (rec.blob_version >= 2)
+        return rec.content_hash;
     // POSITIONAL — field order is the contract; MUST match the agent's
     // device_ci_canonical_blob (sync_source_device_ci.cpp) byte-for-byte. The
     // fields are already scrub+clamp'd by the ingest seam's parse (like
@@ -218,7 +280,7 @@ std::string DeviceInventoryStore::canonical_hash(const DeviceCiRecord& rec) {
         first = false;
     }
     canon += '\x1e';
-    return sha256_hex(canon);
+    return sha256_hex(canon).value_or("");
 }
 
 DeviceInventoryStore::DeviceInventoryStore(pg::PgPool& pool) : pool_(pool) {
@@ -285,50 +347,180 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
         return InventoryIngestOutcome::kTouched;
     }
 
-    // ── Full payload: recompute the hash from the record, upsert the single row ──
+    // ── Full payload: recompute the hash, replace the parent row AND every child row ──
     const DeviceCiRecord r = std::move(*rec);
     const std::string server_hash = canonical_hash(r);
-    auto lease = pool_.try_acquire_for(kIngestAcquireTimeout);
-    if (!lease) {
-        spdlog::warn("DeviceInventoryStore: full ingest skipped for agent={}, no connection ({})",
-                     agent_id, pool_.last_error());
+    if (server_hash.empty()) {
+        // v2 record without a pinned hash (digest failure): never store it under a
+        // placeholder hash — nack so the agent resends rather than loop on a bad compare.
+        spdlog::warn("DeviceInventoryStore: no canonical hash for agent={} (blob_version={}) — "
+                     "not stored",
+                     agent_id, r.blob_version);
         return InventoryIngestOutcome::kError;
     }
-    // Single-row ON CONFLICT upsert is atomic — no advisory lock needed (unlike the
-    // multi-row software replace). first_seen is preserved on conflict; last_seen is
-    // the server receipt time. RETURNING carries the result (no sqlite3_changes race).
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "INSERT INTO device_inventory_store.device_ci ("
-        "agent_id, content_hash, manufacturer, model, serial, system_uuid, hostname, domain, ou, "
-        "bios_vendor, bios_version, bios_date, cpu_model, cpu_cores, cpu_threads, ram_bytes, "
-        "disks_summary, primary_mac, macs_summary, nic_count, os_name, os_version, os_build, arch, "
-        "first_seen, last_seen) VALUES ("
-        "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::bigint, $15::bigint, "
-        "$16::bigint, $17, $18, $19, $20::bigint, $21, $22, $23, $24, $25::bigint, $26::bigint) "
-        "ON CONFLICT (agent_id) DO UPDATE SET "
-        "content_hash = EXCLUDED.content_hash, manufacturer = EXCLUDED.manufacturer, "
-        "model = EXCLUDED.model, serial = EXCLUDED.serial, system_uuid = EXCLUDED.system_uuid, "
-        "hostname = EXCLUDED.hostname, domain = EXCLUDED.domain, ou = EXCLUDED.ou, "
-        "bios_vendor = EXCLUDED.bios_vendor, bios_version = EXCLUDED.bios_version, "
-        "bios_date = EXCLUDED.bios_date, cpu_model = EXCLUDED.cpu_model, "
-        "cpu_cores = EXCLUDED.cpu_cores, cpu_threads = EXCLUDED.cpu_threads, "
-        "ram_bytes = EXCLUDED.ram_bytes, disks_summary = EXCLUDED.disks_summary, "
-        "primary_mac = EXCLUDED.primary_mac, macs_summary = EXCLUDED.macs_summary, "
-        "nic_count = EXCLUDED.nic_count, os_name = EXCLUDED.os_name, "
-        "os_version = EXCLUDED.os_version, os_build = EXCLUDED.os_build, arch = EXCLUDED.arch, "
-        "last_seen = EXCLUDED.last_seen "
-        "RETURNING agent_id",
-        std::vector<std::string>{std::string(agent_id), server_hash, r.manufacturer, r.model,
-                                 r.serial, r.system_uuid, r.hostname, r.domain, r.ou, r.bios_vendor,
-                                 r.bios_version, r.bios_date, r.cpu_model, bigint_param(r.cpu_cores),
-                                 bigint_param(r.cpu_threads), bigint_param(r.ram_bytes),
-                                 r.disks_summary, r.primary_mac, r.macs_summary,
-                                 bigint_param(r.nic_count), r.os_name, r.os_version, r.os_build,
-                                 r.arch, std::to_string(ts), std::to_string(ts)});
-    if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::warn("DeviceInventoryStore: upsert failed for agent={}: {}", agent_id,
-                     PQerrorMessage(lease.get()));
+    const std::string agent_id_s{agent_id};
+    const std::string ts_s = std::to_string(ts);
+
+    // Which statement failed and Postgres's primary error line, for the warn below.
+    const char* fail_stage = "";
+    std::string fail_err;
+    const bool ok = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
+        // First line only: later lines (DETAIL) can echo row values.
+        const auto fail = [&](const char* stage) {
+            fail_stage = stage;
+            fail_err = PQerrorMessage(c);
+            fail_err.resize(std::min(fail_err.find('\n'), fail_err.size()));
+            return false;
+        };
+        // Serialise concurrent full replaces for THIS agent (two fulls under READ COMMITTED
+        // would interleave their child DELETE+INSERT and leave a mixed set under a hash that
+        // matches neither). Transaction-scoped and blocking on purpose — same rationale as
+        // SoftwareInventoryStore. The key is PREFIXED so it never collides with that store's
+        // unprefixed per-agent key on the same report thread.
+        pg::PgResult lk = pg::exec_params(
+            c, "SELECT pg_advisory_xact_lock(hashtextextended('device_ci:' || $1::text, 0))",
+            std::vector<std::string>{agent_id_s});
+        if (lk.status() != PGRES_TUPLES_OK)
+            return fail("lock");
+
+        // Parent upsert. first_seen is preserved on conflict; last_seen is the server
+        // receipt time. blob_version + the 11 appended scalars are replaced wholesale, so a
+        // v2 -> v1 downgrade blanks them.
+        pg::PgResult up = pg::exec_params(
+            c,
+            "INSERT INTO device_inventory_store.device_ci ("
+            "agent_id, content_hash, manufacturer, model, serial, system_uuid, hostname, domain, "
+            "ou, bios_vendor, bios_version, bios_date, cpu_model, cpu_cores, cpu_threads, "
+            "ram_bytes, disks_summary, primary_mac, macs_summary, nic_count, os_name, os_version, "
+            "os_build, arch, first_seen, last_seen, blob_version, chassis_type, chassis_serial, "
+            "chassis_asset_tag, chassis_source, board_vendor, board_product, board_serial, "
+            "board_source, machine_id_hash, machine_id_algorithm, machine_id_source) VALUES ("
+            "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::bigint, $15::bigint, "
+            "$16::bigint, $17, $18, $19, $20::bigint, $21, $22, $23, $24, $25::bigint, "
+            "$26::bigint, $27::smallint, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38) "
+            "ON CONFLICT (agent_id) DO UPDATE SET "
+            "content_hash = EXCLUDED.content_hash, manufacturer = EXCLUDED.manufacturer, "
+            "model = EXCLUDED.model, serial = EXCLUDED.serial, system_uuid = EXCLUDED.system_uuid, "
+            "hostname = EXCLUDED.hostname, domain = EXCLUDED.domain, ou = EXCLUDED.ou, "
+            "bios_vendor = EXCLUDED.bios_vendor, bios_version = EXCLUDED.bios_version, "
+            "bios_date = EXCLUDED.bios_date, cpu_model = EXCLUDED.cpu_model, "
+            "cpu_cores = EXCLUDED.cpu_cores, cpu_threads = EXCLUDED.cpu_threads, "
+            "ram_bytes = EXCLUDED.ram_bytes, disks_summary = EXCLUDED.disks_summary, "
+            "primary_mac = EXCLUDED.primary_mac, macs_summary = EXCLUDED.macs_summary, "
+            "nic_count = EXCLUDED.nic_count, os_name = EXCLUDED.os_name, "
+            "os_version = EXCLUDED.os_version, os_build = EXCLUDED.os_build, arch = EXCLUDED.arch, "
+            "last_seen = EXCLUDED.last_seen, blob_version = EXCLUDED.blob_version, "
+            "chassis_type = EXCLUDED.chassis_type, chassis_serial = EXCLUDED.chassis_serial, "
+            "chassis_asset_tag = EXCLUDED.chassis_asset_tag, "
+            "chassis_source = EXCLUDED.chassis_source, board_vendor = EXCLUDED.board_vendor, "
+            "board_product = EXCLUDED.board_product, board_serial = EXCLUDED.board_serial, "
+            "board_source = EXCLUDED.board_source, machine_id_hash = EXCLUDED.machine_id_hash, "
+            "machine_id_algorithm = EXCLUDED.machine_id_algorithm, "
+            "machine_id_source = EXCLUDED.machine_id_source "
+            "RETURNING agent_id",
+            std::vector<std::string>{
+                agent_id_s, server_hash, r.manufacturer, r.model, r.serial, r.system_uuid,
+                r.hostname, r.domain, r.ou, r.bios_vendor, r.bios_version, r.bios_date,
+                r.cpu_model, bigint_param(r.cpu_cores), bigint_param(r.cpu_threads),
+                bigint_param(r.ram_bytes), r.disks_summary, r.primary_mac, r.macs_summary,
+                bigint_param(r.nic_count), r.os_name, r.os_version, r.os_build, r.arch, ts_s, ts_s,
+                std::to_string(r.blob_version), r.chassis_type, r.chassis_serial,
+                r.chassis_asset_tag, r.chassis_source, r.board_vendor, r.board_product,
+                r.board_serial, r.board_source, r.machine_id_hash, r.machine_id_algorithm,
+                r.machine_id_source});
+        if (up.status() != PGRES_TUPLES_OK)
+            return fail("upsert");
+
+        // Child replace: the full payload IS the new set, so a v1 full (no sections) or a
+        // shrunk v2 leaves no stale rows. Driven by the registry so a kind costs no code.
+        for (const auto& d : kDeviceCiSections) {
+            if (d.table == nullptr)
+                continue;
+            const std::string del =
+                std::string("DELETE FROM device_inventory_store.") + d.table + " WHERE agent_id = $1";
+            pg::PgResult dr = pg::exec_params(c, del.c_str(), std::vector<std::string>{agent_id_s});
+            if (dr.status() != PGRES_COMMAND_OK)
+                return fail("child_delete");
+        }
+        pg::PgResult ds = pg::exec_params(
+            c, "DELETE FROM device_inventory_store.device_ci_section WHERE agent_id = $1",
+            std::vector<std::string>{agent_id_s});
+        if (ds.status() != PGRES_COMMAND_OK)
+            return fail("section_delete");
+
+        // Only registered kinds persist (a hand-built record cannot smuggle a stray kind).
+        // One pass: each kept section's row INSERT runs inline while its status columns are
+        // collected for the single device_ci_section INSERT after the loop.
+        std::vector<std::string_view> kinds, levels, reasons;
+        for (const auto& sec : r.sections) {
+            const auto si = device_ci_section_index(sec.kind);
+            if (!si)
+                continue;
+            const auto& def = kDeviceCiSections[*si];
+            kinds.emplace_back(sec.kind);
+            levels.emplace_back(sec.level);
+            reasons.emplace_back(sec.reason);
+            if (def.table == nullptr || sec.rows.empty())
+                continue;
+            const auto cols = split_columns(def.columns);
+            const std::size_t ncol = cols.size();
+            std::vector<std::string> ords;
+            ords.reserve(sec.rows.size());
+            std::vector<std::vector<std::string_view>> arrays(ncol);
+            for (auto& a : arrays)
+                a.reserve(sec.rows.size());
+            const std::string blank;
+            for (std::size_t i = 0; i < sec.rows.size(); ++i) {
+                ords.push_back(std::to_string(i));
+                for (std::size_t k = 0; k < ncol; ++k)
+                    arrays[k].emplace_back(k < sec.rows[i].size() ? sec.rows[i][k] : blank);
+            }
+            std::vector<std::string_view> ord_views(ords.begin(), ords.end());
+            std::string sql = std::string("INSERT INTO device_inventory_store.") + def.table +
+                              " (agent_id, ord";
+            for (const auto& col : cols)
+                sql += ", " + col;
+            sql += ") SELECT $1, o";
+            for (std::size_t k = 0; k < ncol; ++k)
+                sql += ", c" + std::to_string(k);
+            sql += " FROM unnest($2::int[]";
+            for (std::size_t k = 0; k < ncol; ++k)
+                sql += ", $" + std::to_string(k + 3) + "::text[]";
+            sql += ") AS t(o";
+            for (std::size_t k = 0; k < ncol; ++k)
+                sql += ", c" + std::to_string(k);
+            sql += ")";
+            std::vector<std::string> params;
+            params.reserve(ncol + 2);
+            params.push_back(agent_id_s);
+            params.push_back(pg::to_text_array(ord_views));
+            for (const auto& a : arrays)
+                params.push_back(pg::to_text_array(a));
+            pg::PgResult ins = pg::exec_params(c, sql.c_str(), params);
+            if (ins.status() != PGRES_COMMAND_OK)
+                return fail("row_insert");
+        }
+        if (!kinds.empty()) {
+            pg::PgResult si = pg::exec_params(
+                c,
+                "INSERT INTO device_inventory_store.device_ci_section (agent_id, kind, level, "
+                "reason) SELECT $1, k, l, r FROM unnest($2::text[], $3::text[], $4::text[]) "
+                "AS t(k, l, r)",
+                std::vector<std::string>{agent_id_s, pg::to_text_array(kinds),
+                                         pg::to_text_array(levels), pg::to_text_array(reasons)});
+            if (si.status() != PGRES_COMMAND_OK)
+                return fail("section_insert");
+        }
+        return true;
+    });
+    if (!ok) {
+        // Rolled back (or never began): the previous set survives intact; the caller nacks
+        // need_full and the agent resends. Never a half-replaced set. An empty stage means
+        // no statement ran (no connection in time, or BEGIN failed): the pool error says why.
+        spdlog::warn("DeviceInventoryStore: full ingest failed for agent={} stage={} err='{}' "
+                     "pool='{}'",
+                     agent_id, *fail_stage != '\0' ? fail_stage : "acquire_or_begin", ::yuzu::log_key_token(fail_err),
+                     pool_.last_error());
         return InventoryIngestOutcome::kError;
     }
     return InventoryIngestOutcome::kStored;
@@ -404,6 +596,101 @@ std::optional<std::vector<DeviceCiRecord>> DeviceInventoryStore::list_device_ci(
         DeviceCiRecord r;
         fill_record(res.get(), i, r);
         out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::expected<std::vector<DeviceCiSection>, CiReadError>
+DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
+    if (!open_) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, s).should_log)
+            spdlog::warn("DeviceInventoryStore: sections get on a closed store");
+        return std::unexpected(CiReadError::kDegraded);
+    }
+    if (agent_id.empty())
+        return std::vector<DeviceCiSection>{}; // precondition miss -> empty, not a degrade
+    const std::string agent_id_s{agent_id};
+
+    // One REPEATABLE READ transaction so the section SELECT and every per-kind SELECT share
+    // ONE snapshot: a concurrent full replace committing between them can never mix
+    // generations (a plain with_txn_for is READ COMMITTED — each statement re-snapshots).
+    // `sections` is indexed by registry position; a non-empty `kind` marks a section seen
+    // (a status row, or rows without one). with_txn_on runs the lambda exactly once, so the
+    // registry-order result is assembled inside it.
+    //
+    // The lease is acquired here (bounded, nothing in between) rather than inside
+    // with_txn_for so "no connection in time" and "the transaction failed" are told apart:
+    // with_txn_for answers both with one false. A read has no compensating step, so the
+    // lost-COMMIT ambiguity documented on with_txn_on does not apply.
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, s).should_log)
+            spdlog::warn("DeviceInventoryStore: sections get skipped for agent={}, no connection "
+                         "in time ({})",
+                         agent_id, pool_.last_error());
+        return std::unexpected(CiReadError::kDegraded);
+    }
+    std::array<DeviceCiSection, kDeviceCiSectionCount> sections;
+    std::vector<DeviceCiSection> out;
+    const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* c) -> bool {
+        pg::PgResult iso{PQexec(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")};
+        if (iso.status() != PGRES_COMMAND_OK)
+            return false;
+        pg::PgResult sres = pg::exec_params(
+            c,
+            "SELECT kind, level, reason FROM device_inventory_store.device_ci_section "
+            "WHERE agent_id = $1",
+            std::vector<std::string>{agent_id_s});
+        if (sres.status() != PGRES_TUPLES_OK)
+            return false;
+        for (int i = 0; i < PQntuples(sres.get()); ++i) {
+            const auto si = device_ci_section_index(PQgetvalue(sres.get(), i, 0));
+            if (!si)
+                continue; // unregistered kind: never surfaced
+            sections[*si].kind = kDeviceCiSections[*si].section;
+            sections[*si].level = PQgetvalue(sres.get(), i, 1);
+            sections[*si].reason = PQgetvalue(sres.get(), i, 2);
+        }
+        // Registry order (deterministic). A kind with rows but no status row still surfaces,
+        // with a blank level.
+        for (std::size_t si = 0; si < kDeviceCiSectionCount; ++si) {
+            const auto& d = kDeviceCiSections[si];
+            auto& sec = sections[si];
+            if (d.table != nullptr) {
+                const std::string sql = std::string("SELECT ") + d.columns +
+                                        " FROM device_inventory_store." + d.table +
+                                        " WHERE agent_id = $1 ORDER BY ord";
+                pg::PgResult rres =
+                    pg::exec_params(c, sql.c_str(), std::vector<std::string>{agent_id_s});
+                if (rres.status() != PGRES_TUPLES_OK)
+                    return false;
+                const int nrow = PQntuples(rres.get());
+                const int ncol = PQnfields(rres.get());
+                sec.rows.reserve(static_cast<std::size_t>(nrow));
+                for (int i = 0; i < nrow; ++i) {
+                    std::vector<std::string> row;
+                    row.reserve(static_cast<std::size_t>(ncol));
+                    for (int k = 0; k < ncol; ++k)
+                        row.emplace_back(PQgetvalue(rres.get(), i, k));
+                    sec.rows.push_back(std::move(row));
+                }
+            }
+            if (sec.kind.empty() && sec.rows.empty())
+                continue;
+            sec.kind = d.section;
+            out.push_back(std::move(sec));
+        }
+        return true;
+    });
+    if (!ok) {
+        // Never an empty success on a failed read: a degrade the caller can surface.
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+            spdlog::warn("DeviceInventoryStore: sections get failed for agent={} ({})", agent_id,
+                         pool_.last_error());
+        return std::unexpected(CiReadError::kDegraded);
     }
     return out;
 }

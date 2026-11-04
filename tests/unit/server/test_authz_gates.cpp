@@ -15,6 +15,7 @@
 #include "service_scope_policy.hpp"
 
 #include "management_group_store.hpp"
+#include "mcp_policy.hpp"
 #include "oidc_provider.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -452,6 +453,42 @@ TEST_CASE("require_fleet_read: mcp_tier='readonly' token, Read op ⇒ tier "
     auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
     REQUIRE(result.has_value());
     CHECK(result->unfiltered());
+}
+
+// #4041: list_agents dropped its own tier_allows. The C8 gate checks the tool's pair first;
+// this branch is the backstop behind it. No real tier denies Infrastructure:Read (every
+// tier allows Read there), so the branch is exercised on a securable whose Read every tier
+// refuses (TlsConfig, mcp_policy.hpp's always-denied set) with a real, mintable readonly
+// token. The tier branch precedes the RBAC axis, so a global grant does not rescue the call.
+TEST_CASE("require_fleet_read: an MCP tier that does not allow the pair is denied 403 by the "
+          "tier branch, ahead of RBAC",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.set_permission({"RespReader", "TlsConfig", "Read", "allow"}).has_value());
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value()); // GLOBAL allow
+    auto raw = r.api_tokens->create_token("gates-test-tier-deny", "minter", now_epoch() + 3600,
+                                          /*scope_service=*/"", /*mcp_tier=*/"readonly");
+    REQUIRE(raw.has_value());
+    auto req = bearer_request(*raw);
+    httplib::Response res;
+
+    REQUIRE_FALSE(yuzu::server::mcp::tier_allows("readonly", "TlsConfig", "Read"));
+    auto result = r.ar->require_fleet_read(req, res, "TlsConfig", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Forbidden);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("MCP token tier") != std::string::npos);
+}
+
+// An unknown tier is admitted by /mcp/v1/ admission (mcp_admission.hpp:33) and the token
+// store refuses to mint one, so the only layer that decides it is tier_allows' final deny.
+TEST_CASE("tier_allows: an unknown tier is denied for the list_agents pair",
+          "[mcp][security]") {
+    CHECK_FALSE(yuzu::server::mcp::tier_allows("bogus", "Infrastructure", "Read"));
+    CHECK(yuzu::server::mcp::tier_allows("readonly", "Infrastructure", "Read"));
+    CHECK(yuzu::server::mcp::tier_allows("operator", "Infrastructure", "Read"));
+    CHECK(yuzu::server::mcp::tier_allows("supervised", "Infrastructure", "Read"));
 }
 
 // ── Degradation and store-unavailable failure modes ─────────────────────────

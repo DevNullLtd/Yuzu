@@ -610,6 +610,18 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
                                                          std::string{plugin_name} + "'"});
                 continue;
             }
+            if (is_retired_plugin_name(plugin_name)) {
+                // Upgrade-window guard (removed with the other legacy-name shims): a stale
+                // pre-rename plugin beside the renamed one must not load. The handle destructs
+                // here and dlcloses the library.
+                spdlog::error("Plugin {} declares the retired pre-rename name '{}' - rejecting; "
+                              "install the renamed plugin and remove this file",
+                              entry.path().string(), plugin_name);
+                result.errors.push_back(
+                    LoadError{entry.path().string(), std::string{kRetiredNameReason} + ": '" +
+                                                         std::string{plugin_name} + "'"});
+                continue;
+            }
             if (!seen_names.insert(std::string{plugin_name}).second) {
                 // The handle destructs here and dlcloses the library (first file wins).
                 spdlog::warn("Plugin {} declares name '{}' already loaded from another file in "
