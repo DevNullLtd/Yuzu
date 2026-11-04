@@ -3405,6 +3405,17 @@ test('compose certs volume',
   timeout: 30,
 )
 
+# Compose default credentials (#4817): no tracked compose may run Grafana with a
+# known admin password - GF_SECURITY_ADMIN_PASSWORD must be the required
+# ${YUZU_GRAFANA_ADMIN_PASSWORD:?...} - and the UAT launchers must load the
+# password before every `docker compose` call. Stdlib + bash, no Docker.
+test('compose default credentials',
+  _python3_test,
+  args: [files('test_compose_default_credentials.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Gateway scrape (#5695): every Prometheus config under deploy/prometheus/ and
 # every compose stack that runs a Prometheus next to a gateway scrapes the
 # gateway's metrics port. Stdlib only, no Docker.

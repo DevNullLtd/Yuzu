@@ -6153,10 +6153,26 @@ The default Docker deployment runs the server and agent standalone -- no gateway
 
 ```bash
 cd deploy/docker
+export YUZU_GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"   # required, see below
 docker compose up -d          # start all services
 docker compose logs -f        # follow logs
 docker compose down           # stop all services
 ```
+
+**Grafana admin password.** The composes that run Grafana (`deploy/docker/docker-compose.yml`, `deploy/docker/docker-compose.uat.yml`, `deploy/docker/docker-compose.full-uat.yml` and `docker-compose.uat.yml`) have no default Grafana password (#4817). They set `GF_SECURITY_ADMIN_PASSWORD=${YUZU_GRAFANA_ADMIN_PASSWORD:?set YUZU_GRAFANA_ADMIN_PASSWORD ...}`, so Compose refuses every command that reads the file, `down`, `ps`, `logs` and `exec` included, until `YUZU_GRAFANA_ADMIN_PASSWORD` is set to a non-empty value. Grafana's own default when no password is configured is `admin`/`admin`, and Grafana is published on port 3000 on every interface, so without this anyone who could reach the host had full Grafana admin, including adding data sources that make Grafana fetch arbitrary internal URLs.
+
+- **Setting it.** In bash or zsh: `export YUZU_GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"`. In PowerShell: `$env:YUZU_GRAFANA_ADMIN_PASSWORD = [guid]::NewGuid().ToString('N')`. Or put a `YUZU_GRAFANA_ADMIN_PASSWORD=<value>` line in a `.env` file next to the compose file, which works from any shell; keep it out of git. A value exported in the shell wins over `.env`. Keep the same value across shells: a different one makes the next `up` recreate the Grafana container. Grafana also accepts the password from a file (`GF_SECURITY_ADMIN_PASSWORD__FILE`, for example a Docker secret mounted at `/run/secrets/...`), but using it means editing your copy of the compose file: the shipped files require `YUZU_GRAFANA_ADMIN_PASSWORD` either way.
+- **Existing installs keep `admin`/`admin`.** Grafana reads the setting only when it first creates its database. On a Grafana volume that already exists (`grafana-data` for `deploy/docker/docker-compose.yml` and the root `docker-compose.uat.yml`, `grafana-uat-data` for the two `deploy/docker/` UAT composes), a new value does nothing, and an install started from an earlier version of these files still accepts `admin`/`admin` on port 3000 until you change it. With the variable set, run:
+
+  ```bash
+  docker compose exec grafana grafana cli admin reset-admin-password '<new password>'
+  ```
+
+  Without the compose environment, use the container directly: `docker exec <container> grafana cli admin reset-admin-password '<new password>'`, where the container is `yuzu-uat-grafana` (`docker-compose.full-uat.yml`), `yuzu-grafana` (root `docker-compose.uat.yml`), or the name `docker ps --filter name=grafana` shows for the other two. The command line, and so your shell history, holds the password. The reset is stored in Grafana's database and survives container recreation.
+- **Stopping or inspecting a stack whose password you no longer have.** `down`, `ps` and `logs` do not use the value, so any non-empty value works: `YUZU_GRAFANA_ADMIN_PASSWORD=x docker compose -f <file> down`. The root `docker-compose.uat.yml` also needs `YUZU_GW_COOKIE` (any non-empty value), and `docker-compose.full-uat.yml` also needs `UAT_CONFIG` (any absolute or `./`-prefixed path) when run outside its launcher. Plain `docker ps`, `docker logs` and `docker stop` need nothing. A throwaway value does not change the password of a Grafana that already has a database.
+- **The UAT launchers set it for you.** `scripts/docker-start-UAT.sh` (`docker-compose.full-uat.yml`) and `scripts/win-start-UAT.sh` (`deploy/docker/docker-compose.uat.yml`): `start` uses an exported `YUZU_GRAFANA_ADMIN_PASSWORD` if there is one, otherwise the password the previous `start` saved, otherwise a new random one; saves it to `.uat/grafana-admin-password` (mode 0600 where the filesystem honours it) and prints it. It refuses `admin`, an empty value and leading or trailing whitespace, and checks an exported value before it stops anything. `stop` and `status` only read that file and never change it; `status` prints the saved password, an exported one with a caveat when no usable password is saved, or says the login is unknown (a stack started before this change or outside the launcher). The launchers un-export the password and pass it only to each `docker compose` command, so the native server, gateway and agent they start do not inherit it, even one you exported. To change it, export a different value, or delete the file, before the next `start` (which also runs `down -v`, so Grafana starts with an empty database). UAT only: the file and the launcher output hold the password in plaintext, so do not keep launcher output in shared logs or CI artifacts. Under MSYS2 on Windows, an exported value that looks like a path or a path list (it starts with `/` or contains `:/`) can be rewritten before Docker sees it; `export MSYS2_ENV_CONV_EXCL=YUZU_GRAFANA_ADMIN_PASSWORD` before running the launcher to prevent that. The generated values are hex and unaffected.
+- **Elsewhere.** The reference composes (`docker-compose.reference.yml`, `docker-compose.reference-gateway.yml`, `docker-compose.reference-gateway-cluster.yml`) run no Grafana. The Compose Wizard writes the password only to the `.env` it generates and accepts only printable ASCII without spaces, `$` or quotes, which Compose's `.env` parser leaves unchanged. `tests/test_compose_default_credentials.py` fails if a tracked compose runs Grafana without a required password.
+- **What this does not change.** The development and UAT composes still carry other default credentials and exposures, tracked separately: ClickHouse's default user and all-interface ports (#420), the fixed dashboard password in `docker-compose.uat.yml` (#417, #4790), the Postgres `${...:-yuzu}` defaults (not published on a host port), and Grafana served over plain HTTP on every interface (#4818). `scripts/start-stack.sh` starts a natively installed Grafana with its own `admin`/`admin` (#7053). Do not run these stacks where untrusted hosts can reach them.
 
 **What must persist.** Every shipped compose that keeps Postgres on a volume also keeps these two server directories on named volumes, and a compose you write needs the same two. (The sanitizer rig, `docker-compose.sanitizer-uat.yml`, keeps no state at all and is the one exception.)
 
@@ -6172,6 +6188,7 @@ The second is easy to miss, because the image never passes `--ca-dir` and the se
 The top-level UAT compose file parameterises its `ghcr.io/.../yuzu-server` and `yuzu-gateway` tags through `${YUZU_VERSION:-<default>}`. The default tracks the latest published release, but operators testing an earlier or newer image can override at the command line:
 
 ```bash
+export YUZU_GW_COOKIE="$(openssl rand -hex 32)" YUZU_GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"
 YUZU_VERSION=0.9.0 docker compose -f docker-compose.uat.yml up -d
 ```
 
@@ -6190,7 +6207,7 @@ A GitHub Actions check (`scripts/check-compose-versions.sh`) runs as the first s
 | 8081 | Gateway health/readiness | Gateway deployments only |
 | 9568 | Gateway Prometheus metrics | Gateway deployments only |
 | 9090 | Prometheus | Monitoring stack |
-| 3000 | Grafana (default login: admin/admin) | Monitoring stack |
+| 3000 | Grafana (user `admin`, password `YUZU_GRAFANA_ADMIN_PASSWORD`; no default, see "Grafana admin password" above) | Monitoring stack |
 
 **Volumes:** `server-data`, `server-certs` (`certs` in the reference composes), `postgres-data`, `agent-data`, `prometheus-data`, `grafana-data` are persisted across container restarts.
 
