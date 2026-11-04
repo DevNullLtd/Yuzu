@@ -191,6 +191,7 @@ EOF
 
 # ramp N : bring the agent count up in batches of 50, recording footprint per step
 ramp() {
+    case "${1:-}" in ''|*[!0-9]*|0) die "ramp: the agent count must be a positive integer (got '${1:-}')";; esac
     local n="$1" k step=20; k="$(compose ps -q agent | wc -l)"; [ "$k" -gt 0 ] && step=50
     while [ "$k" -lt "$n" ]; do
         k=$(( k + step )); [ "$k" -gt "$n" ] && k="$n"; step=50
@@ -204,7 +205,7 @@ ramp() {
         note "$k agents registered in $(( $(date +%s) - s ))s; per node: $(node_counts | tr '\n' ' ')"
         footprint "$k"
     done
-    setenv SPIKE_AGENTS "$n"   # the INTENDED fleet size: a retry must not size the fleet from whatever happens to be running
+    setenv SPIKE_AGENTS "$k"   # the INTENDED fleet size (ramp never scales down, so this is max(requested, running))
 }
 footprint() { # footprint K : RSS/threads/CPU of the agents, appended to $STATE/footprint.tsv
     local first pid; first="$(compose ps -q agent | head -1)"
@@ -478,8 +479,9 @@ if record:   # validate first: an abort must leave every output untouched
     for name in ("failover", "faults-f3-f2p", "probes"):
         nb = len(re.findall(r"^<!-- BEGIN GENERATED: %s -->$" % re.escape(name), doc0, re.M))
         ne = len(re.findall(r"^<!-- END GENERATED: %s -->$" % re.escape(name), doc0, re.M))
-        if nb != 1 or ne != 1:
-            sys.exit(f"ERROR: the record must hold exactly one whole-line BEGIN and one END marker for '{name}' (found {nb} and {ne}); nothing was written")
+        ordered = re.search(r"^<!-- BEGIN GENERATED: %s -->\n(.*?)^<!-- END GENERATED: %s -->$" % (re.escape(name), re.escape(name)), doc0, re.S | re.M)
+        if nb != 1 or ne != 1 or not ordered:
+            sys.exit(f"ERROR: the record must hold exactly one whole-line BEGIN marker followed by one END marker for '{name}' (found {nb} and {ne}, in order: {bool(ordered)}); nothing was written")
 def atomic_write(path, writer):
     tmp = path + ".tmp"
     with open(tmp, "w", newline="") as fh: writer(fh)

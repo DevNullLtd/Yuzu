@@ -109,8 +109,13 @@ clustered gateways, a real server and Postgres, and 20 / 100 / 300 agents.
   read back from the fleet (the harness now records the observed mode and marks a mismatch INVALID). Derived columns in the CSV (peer FIN/RST timing, route and `/readyz` timelines, breaker timing,
   probe classes) were recomputed from the raw run data with the final code, so they are consistent across
   the early and late runs.
-- **Raw data is not committed, and no copy exists outside the measuring host.** The per-run logs, route
-  samples and packet captures (about 1.1 GB, almost all of it the route samples) are on that host only.
+- **Raw data is not committed (two series excepted), and no copy exists outside the measuring host.** The
+  per-run logs, route samples and packet captures (about 1.1 GB, almost all of it the route samples) are on
+  that host only. The exception is the two per-second gateway series under `ws13-0/raw/`, committed because
+  the alerting paragraph cites them: columns are epoch milliseconds, gateway, the `/readyz` HTTP status (or
+  `down`), and `yuzu_gw_agents_current`; there is no header line, and the fault is at epoch millisecond
+  1793751229989 in the 300-agent run (`run-F2p-vip-001328`) and 1793743803557 in the 100-agent DNS run
+  (`run-F2p-dns-220945`).
   The CSVs are the only retained record, so the numbers are not independently reproducible from this
   repository; the rig is, which reproduces the measurements, not the figures. Archiving the subset needed to
   recompute the CSVs is left to the maintainers.
@@ -301,7 +306,7 @@ could not resolve, so both of its probes failed); they were not used for any cla
     re-attached to another node (4 with the management plane behind the VIP, 1 with it on a single node). 3 of
     the 5 were accepted by the server and are in no agent, gateway or server log. One candidate explanation,
     not verified: the victim node keeps a local session for the agent while it is partitioned (its
-    `yuzu_gw_agents_current` gauge stayed at its pre-fault value for the first 155 s of a full partition and
+    `yuzu_gw_agents_current` gauge stayed at its pre-fault value until about +160 s of a full partition and
     only then fell) and the gateway looks at its local table before the cluster, so a command routed through
     the victim goes nowhere. If that is right it is a product defect, not a rig artefact. A confirming
     experiment would point the management address at a node other than the victim and expect every probe to be
@@ -346,7 +351,8 @@ could not resolve, so both of its probes failed); they were not used for any cla
 - **Packet capture** was missing for the first 20-agent kill (a container name clash, fixed).
 - The HAProxy variant, the management address and the DNS order are operator-supplied for every run (see
   "Run configurations"); the run metadata did not record them.
-- Raw logs and secrets are not committed. The summary CSVs are the artefact.
+- Raw logs and secrets are not committed (the two gateway series under `ws13-0/raw/` excepted). The summary
+  CSVs are the artefact.
 
 ## What this means for the open decisions (inputs, not decisions)
 
@@ -391,8 +397,11 @@ could not resolve, so both of its probes failed); they were not used for any cla
   one run, and the 100-agent runs' 150 s windows ended before the fall). The `/readyz` flip in the same run
   was at +157 s, which is a different quantity. The shipped `YuzuGatewayConnectionDrops` alert needs that
   gauge to fall below 70 % of its value five minutes earlier for two minutes, and needs a positive connection
-  rate in the last five minutes. By derivation, not measurement, it would fire late if at all (the earliest
-  about +295 to +320 s), and the rate condition may lapse before the two minutes are met. Two qualifiers: this
+  rate in the last five minutes. By derivation, not measurement: the victim takes no new connection after the
+  fault, so unless agents had connected to it in the preceding five minutes the rate term is zero and the
+  alert cannot fire; if it can, the earliest is about +300 s. `YuzuGatewayUpstreamCircuitOpened` (a breaker
+  that opened and has not closed, held three minutes) would fire at about +340 s, since the breaker opened at
+  +157 s. Two qualifiers: this
   harness read the gauge over the node's loopback, whereas a networked Prometheus would see the node
   unreachable in a full partition, which `YuzuGatewayDown` covers; and in the agent-port-only shape (the one
   with the lost commands, finding 10) only the drop alert could act. The alert rule itself was not exercised.
