@@ -301,7 +301,7 @@ std::string echo_rename_definitions_sql() {
         "  AND t2.id = replace(deleted_seed_content.id, 'crossplatform.tar.', 'crossplatform.echo.'));";
     // Fail closed on a collision, after BOTH id updates. The NOT EXISTS guards above leave a legacy
     //    id in place when an Echo-named definition already exists, while the dependent stores
-    //    (schedules, approvals, policies, device tokens, workflows) rewrite their references to
+    //    (schedules, approvals, policies, workflows) rewrite their references to
     //    the Echo id unconditionally and would silently re-point at the other definition. The raise
     //    aborts this migration's transaction, the store does not open, and server startup refuses
     //    (server.cpp: a store that is not open sets startup_failed_, which the construction of
