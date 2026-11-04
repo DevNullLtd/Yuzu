@@ -76,7 +76,7 @@ spec:
         platforms: [windows, darwin, linux]
       - name: version
         type: string
-        description: 'Version taken from the install directory name (e.g. 8.0.31, or a preview build such as 9.0.100-preview.1.24101.2). Status rows: the level (supported, constrained or unsupported).'
+        description: 'Version taken from the install directory name on Linux and macOS, or the registry value name on Windows (e.g. 8.0.31, or a preview build such as 9.0.100-preview.1.24101.2). Status rows: the level (supported, constrained or unsupported).'
         example: 8.0.31
         platforms: [windows, darwin, linux]
       - name: install_path
@@ -124,7 +124,8 @@ metadata:
     jre, unmodelled), version, install path and vendor (the build's self-reported
     `IMPLEMENTOR` value, e.g. Eclipse Adoptium vs Debian; it is not verified). A
     home with a java binary but no `release` file (some distro OpenJDK 8 packages)
-    is a row with version `-` and a `release_missing` constraint. No `java` process is
+    is, on Linux, a row with version `-` and a `release_missing` constraint (on Windows the row has
+    no version token and the source stays supported). No `java` process is
     started. A `supported` status with no rows means none was found at those
     roots (an Oracle-RPM /usr/java or a tarball install elsewhere is not looked
     for); a `constrained` status means a read failed or was skipped and the list
@@ -162,7 +163,7 @@ spec:
         platforms: [windows, darwin, linux]
       - name: version
         type: string
-        description: 'JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION. A release file with neither key yields no row and a release_unparsable constraint; a home with a java binary but no release file yields - and a release_missing constraint. Status rows: the level (supported, constrained or unsupported).'
+        description: 'JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION. A release file with neither key yields no row and a release_unparsable constraint; on Linux a home with a java binary but no release file yields - and a release_missing constraint; on Windows such a home keeps its row with no version and no constraint. Status rows: the level (supported, constrained or unsupported).'
         example: 17.0.20
         platforms: [windows, darwin, linux]
       - name: install_path

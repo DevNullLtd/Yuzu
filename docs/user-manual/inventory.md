@@ -184,8 +184,7 @@ cadences.
   `dotnet`, `publisher` `Microsoft`, `version` the install's version, and `name` `.NET Runtime`,
   `.NET SDK` or `.NET Framework` (any other shared framework reads `.NET`). No process is started.
   Windows reads the .NET installer registry keys in both registry views (the shared frameworks are
-  registered in the 32-bit view) and the .NET Framework release key, and cross-checks the install
-  directory; Linux and macOS list the `shared/<framework>/<version>` and `sdk/<version>` directory names
+  registered in the 32-bit view) and the .NET Framework release key (no directory is read); Linux and macOS list the `shared/<framework>/<version>` and `sdk/<version>` directory names
   under the standard machine roots (`/usr/share/dotnet`, `/usr/lib/dotnet`, `/usr/lib64/dotnet`; macOS
   `/usr/local/share/dotnet`). Homebrew, `dotnet-install` and per-user installs are not walked.
   A constrained read withholds only the `dotnet` rows, as for Python.
@@ -922,8 +921,9 @@ alone: the stored rows of that source are removed until a read succeeds again. T
 cause, for example `windows:runtimes:dotnet_reg:access_denied`,
 `windows:runtimes:jvm_reg:access_denied`, `windows:runtimes:jvm:release_unreadable`,
 `linux:runtimes:release_missing` or `macos:runtimes:release_unparsable`, and any `row_cap`; the
-`runtimes` README lists them all. A Java home with no `release` file keeps the source constrained
-for as long as it is installed. Fix the named cause; the next daily sync restores the rows.
+`runtimes` README lists them all. On Linux and macOS a Java home with no `release` file keeps the source constrained
+for as long as it is installed; on Windows such a home keeps its row with no version and the source
+stays supported. Fix the named cause; the next daily sync restores the rows.
 
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`
