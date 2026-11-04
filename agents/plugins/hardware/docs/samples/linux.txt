@@ -1,52 +1,173 @@
-captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-04 · euid 0 · leg-hash 93cbaf4434ef
+captured: linux Ubuntu 26.04.1 LTS x86_64 · bare-metal · 2026-11-03 · euid 1000; the drivers_inventory block was captured 2026-11-04 on a vm as euid 0 · leg-hash f7b5dcc7d853
 == action=manufacturer
-manufacturer|unknown
+manufacturer|CORSAIR
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=model
-model|unknown
+model|CORSAIR AI WORKSTATION 300
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=bios
-bios_vendor|unknown
-bios_version|unknown
-bios_date|unknown
+bios_vendor|American Megatrends International, LLC.
+bios_version|AXB35-02 3.07
+bios_date|10/16/2025
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=processors
-cpu|0|AMD Ryzen 9 PRO 8945HS w/ Radeon 780M Graphics|8|16|3993|-|-
+cpu|0|AMD RYZEN AI MAX+ 395 w/ Radeon 8060S|16|32|2000|-|-
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=memory
-dimm|total|15993|unknown|0|-|-|-
+dimm|total|125125|unknown|0|-|-|-
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=disks
-disk|0|Virtual Disk|1024|HDD|unknown
-disk|1|Virtual Disk|0|HDD|unknown
-disk|2|Virtual Disk|8|HDD|unknown
-disk|3|Virtual Disk|0|HDD|unknown
+disk|0|PCIe SSD|1907|SSD|nvme
+disk|1|PCIe SSD|1907|SSD|nvme
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=drivers
-driver|0|xt_nat|||kernel|module
-driver|1|nf_conntrack_netlink|||kernel|module
-driver|2|xt_conntrack|||kernel|module
-driver|3|xt_MASQUERADE|||kernel|module
-driver|4|xfrm_user|||kernel|module
-driver|5|xfrm_algo|||kernel|module
-driver|6|xt_set|||kernel|module
-driver|7|ip_set|||kernel|module
-driver|8|xt_addrtype|||kernel|module
-driver|9|nft_compat|||kernel|module
-driver|10|sch_fq_codel|||kernel|module
-driver|11|autofs4|||kernel|module
-driver|12|br_netfilter|||kernel|module
-driver|13|bridge|||kernel|module
-driver|14|stp|||kernel|module
-driver|15|llc|||kernel|module
-driver|16|ip_tables|||kernel|module
-driver|17|tun|||kernel|module
+driver|0|tcp_diag|||kernel|module
+driver|1|inet_diag|||kernel|module
+driver|2|xt_connmark|||kernel|module
+driver|3|xt_mark|||kernel|module
+driver|4|xt_nat|||kernel|module
+driver|5|xt_tcpudp|||kernel|module
+driver|6|nf_conntrack_netlink|||kernel|module
+driver|7|veth|||kernel|module
+driver|8|xt_conntrack|||kernel|module
+driver|9|xt_MASQUERADE|||kernel|module
+driver|10|bridge|||kernel|module
+driver|11|stp|||kernel|module
+driver|12|llc|||kernel|module
+driver|13|xfrm_user|||kernel|module
+driver|14|xfrm_algo|||kernel|module
+driver|15|xt_set|||kernel|module
+driver|16|ip_set|||kernel|module
+driver|17|nft_chain_nat|||kernel|module
+driver|18|nf_nat|||kernel|module
+driver|19|nf_conntrack|||kernel|module
+driver|20|nf_defrag_ipv6|||kernel|module
+driver|21|nf_defrag_ipv4|||kernel|module
+driver|22|xt_addrtype|||kernel|module
+driver|23|nft_compat|||kernel|module
+driver|24|x_tables|||kernel|module
+driver|25|rpcsec_gss_krb5|||kernel|module
+driver|26|auth_rpcgss|||kernel|module
+driver|27|nfsv4|||kernel|module
+driver|28|nfs|||kernel|module
+driver|29|lockd|||kernel|module
+driver|30|vxlan|||kernel|module
+driver|31|grace|||kernel|module
+driver|32|ip6_udp_tunnel|||kernel|module
+driver|33|udp_tunnel|||kernel|module
+driver|34|netfs|||kernel|module
+driver|35|rfcomm|||kernel|module
+driver|36|snd_seq_dummy|||kernel|module
+driver|37|snd_hrtimer|||kernel|module
+driver|38|nf_tables|||kernel|module
+driver|39|nfnetlink|||kernel|module
+driver|40|overlay|||kernel|module
+driver|41|qrtr|||kernel|module
+driver|42|cmac|||kernel|module
+driver|43|algif_hash|||kernel|module
+driver|44|algif_skcipher|||kernel|module
+driver|45|af_alg|||kernel|module
+driver|46|bnep|||kernel|module
+driver|47|sunrpc|||kernel|module
+driver|48|binfmt_misc|||kernel|module
+driver|49|amd_atl|||kernel|module
+driver|50|intel_rapl_msr|||kernel|module
+driver|51|nls_iso8859_1|||kernel|module
+driver|52|intel_rapl_common|||kernel|module
+driver|53|amdgpu|||kernel|module
+driver|54|edac_mce_amd|||kernel|module
+driver|55|kvm_amd|||kernel|module
+driver|56|snd_hda_codec_atihdmi|||kernel|module
+driver|57|snd_hda_codec_senarytech|||kernel|module
+driver|58|snd_hda_codec_generic|||kernel|module
+driver|59|snd_hda_codec_hdmi|||kernel|module
+driver|60|kvm|||kernel|module
+driver|61|btusb|||kernel|module
+driver|62|snd_hda_intel|||kernel|module
+driver|63|btmtk|||kernel|module
+driver|64|snd_hda_codec|||kernel|module
+driver|65|btrtl|||kernel|module
+driver|66|btbcm|||kernel|module
+driver|67|btintel|||kernel|module
+driver|68|snd_hda_core|||kernel|module
+driver|69|irqbypass|||kernel|module
+driver|70|snd_intel_dspcfg|||kernel|module
+driver|71|amdxcp|||kernel|module
+driver|72|ghash_clmulni_intel|||kernel|module
+driver|73|snd_intel_sdw_acpi|||kernel|module
+driver|74|drm_panel_backlight_quirks|||kernel|module
+driver|75|aesni_intel|||kernel|module
+driver|76|snd_hwdep|||kernel|module
+driver|77|drm_buddy|||kernel|module
+driver|78|rapl|||kernel|module
+driver|79|drm_ttm_helper|||kernel|module
+driver|80|bluetooth|||kernel|module
+driver|81|snd_pcm|||kernel|module
+driver|82|ttm|||kernel|module
+driver|83|snd_seq_midi|||kernel|module
+driver|84|amdxdna|||kernel|module
+driver|85|drm_exec|||kernel|module
+driver|86|drm_suballoc_helper|||kernel|module
+driver|87|snd_seq_midi_event|||kernel|module
+driver|88|joydev|||kernel|module
+driver|89|snd_rawmidi|||kernel|module
+driver|90|spd5118|||kernel|module
+driver|91|drm_display_helper|||kernel|module
+driver|92|amd_pmf|||kernel|module
+driver|93|amdtee|||kernel|module
+driver|94|snd_seq|||kernel|module
+driver|95|cec|||kernel|module
+driver|96|amd_sfh|||kernel|module
+driver|97|snd_seq_device|||kernel|module
+driver|98|tee|||kernel|module
+driver|99|snd_timer|||kernel|module
+driver|100|rc_core|||kernel|module
+driver|101|gpu_sched|||kernel|module
+driver|102|wmi_bmof|||kernel|module
+driver|103|snd|||kernel|module
+driver|104|i2c_algo_bit|||kernel|module
+driver|105|platform_profile|||kernel|module
+driver|106|i2c_piix4|||kernel|module
+driver|107|soundcore|||kernel|module
+driver|108|ccp|||kernel|module
+driver|109|k10temp|||kernel|module
+driver|110|i2c_smbus|||kernel|module
+driver|111|input_leds|||kernel|module
+driver|112|amd_pmc|||kernel|module
+driver|113|mac_hid|||kernel|module
+driver|114|sch_fq_codel|||kernel|module
+driver|115|lp|||kernel|module
+driver|116|ppdev|||kernel|module
+driver|117|parport|||kernel|module
+driver|118|msr|||kernel|module
+driver|119|efi_pstore|||kernel|module
+driver|120|dmi_sysfs|||kernel|module
+driver|121|autofs4|||kernel|module
+driver|122|nvme|||kernel|module
+driver|123|thunderbolt|||kernel|module
+driver|124|nvme_core|||kernel|module
+driver|125|video|||kernel|module
+driver|126|sdhci_pci|||kernel|module
+driver|127|psmouse|||kernel|module
+driver|128|r8169|||kernel|module
+driver|129|sdhci_uhs2|||kernel|module
+driver|130|nvme_keyring|||kernel|module
+driver|131|sdhci|||kernel|module
+driver|132|nvme_auth|||kernel|module
+driver|133|serio_raw|||kernel|module
+driver|134|cqhci|||kernel|module
+driver|135|hkdf|||kernel|module
+driver|136|wmi|||kernel|module
+driver|137|realtek|||kernel|module
+driver|138|hid_generic|||kernel|module
+driver|139|usbhid|||kernel|module
+driver|140|hid|||kernel|module
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=system

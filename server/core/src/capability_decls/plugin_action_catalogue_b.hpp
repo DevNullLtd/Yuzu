@@ -57,8 +57,8 @@ inline constexpr std::array<CommandCapability, 60> kPluginActionCatalogueB{{
     // ── hardware (agents/plugins/hardware/src/hardware_plugin.cpp) ────────
     // 13 actions, all pure fact-collection (manufacturer/model/BIOS/CPU/
     // memory/disks/drivers/drivers_inventory/serial+UUID, plus chassis/baseboard/swap/machine_id,
-    // which are planned placeholders that read nothing yet) — no host-state
-    // write anywhere.
+    // which Windows reads and Linux/macOS still answer as planned placeholders)
+    // — no host-state write anywhere.
     {
         .plugin = "hardware",
         .action = "manufacturer",

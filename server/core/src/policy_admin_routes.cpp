@@ -9,6 +9,7 @@
 #include "dispatch_target_shape.hpp" // check_targeting_shape (#2500)
 #include "policy_evaluator.hpp"
 #include "store_errors.hpp"
+#include "web_utils.hpp" // audit_token
 
 #include <nlohmann/json.hpp>
 
@@ -16,6 +17,43 @@
 #include <vector>
 
 namespace yuzu::server {
+
+namespace {
+
+// Detail for the policy.create audit row: the targeting AS STORED, so what a
+// policy actually acts on can be reconstructed after the fact (CC6.1/CC6.3;
+// #2123 governance G6-CO-1 — an empty detail is why silently-broadened scopes
+// left no trace). Read back from the store, not re-derived from the request, so
+// it records what evaluation will use. Every caller-influenced value goes
+// through audit_token (CWE-117). The row is bounded: at most 32 ids, each id
+// and the scope cut to a fixed byte budget with a trailing `~`.
+std::string policy_targeting_audit_detail(const PolicyStore& store, const std::string& policy_id) {
+    auto pol = store.get_policy(policy_id);
+    if (!pol || !pol->has_value())
+        return "scope=unreadable groups=unreadable";
+    const auto& p = **pol;
+    constexpr std::size_t kMaxScopeBytes = 1024;
+    constexpr std::size_t kMaxIdBytes = 64;
+    constexpr std::size_t kMaxListedGroups = 32;
+    auto capped = [](std::string v, std::size_t max) {
+        if (v.size() > max) {
+            v.resize(max);
+            v += '~';
+        }
+        return v;
+    };
+    std::string out = "scope=";
+    out += p.scope_expression.empty() ? std::string{"-"}
+                                      : capped(audit_token(p.scope_expression), kMaxScopeBytes);
+    out += " groups=" + std::to_string(p.management_groups.size());
+    for (std::size_t i = 0; i < p.management_groups.size() && i < kMaxListedGroups; ++i)
+        out += (i == 0 ? ":" : ",") + capped(audit_token(p.management_groups[i]), kMaxIdBytes);
+    if (p.management_groups.size() > kMaxListedGroups)
+        out += ",~";
+    return out;
+}
+
+} // namespace
 
 void PolicyAdminRoutes::register_routes(httplib::Server& svr,
                                         AuthFn auth_fn,
@@ -177,7 +215,8 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
                 }
                 return;
             }
-            audit_fn_(req, "policy.create", "success", "policy", *result, "");
+            audit_fn_(req, "policy.create", "success", "policy", *result,
+                      policy_targeting_audit_detail(*policy_store_, *result));
             emit_event_fn_("policy.created", req, {}, {{"policy_id", *result}});
             res.set_header("HX-Trigger",
                 R"({"showToast":{"message":"Policy created","level":"success"}})");
