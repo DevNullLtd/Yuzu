@@ -189,13 +189,20 @@ Policy and fragment YAML is read by the server's own line scanner (#2123):
   at or shallower than `scope:` itself, a `- item` written after another key
   (such as `platform:` under `selector:`, or any key after
   `managementGroups:`), tab characters in indentation, a `scope:` or
-  `managementGroups:` line inside a multi-line `description: |` block, and a
-  null list item (a bare `- `, `tags: [,]`, or the empty entry in `[a,,b]`).
-  Each can still drop or replace an entry without an error, leaving the
-  policy targeting a broader, narrower or different device set than its YAML
-  says. Keep a list's `- item` lines together, directly under their key,
-  indent with spaces only, and keep those key names out of multi-line
-  descriptions.
+  `managementGroups:` line inside a multi-line `description: |` block, a
+  null list item (a bare `- `, `tags: [,]`, or the empty entry in `[a,,b]`),
+  a quoted key (`"tags":`) or a space before the colon (`tags :`), neither
+  of which is read as the key, a block-scalar value (`platform: >`), a
+  duplicate key (the server reads the first, a YAML parser the last), a
+  flow-mapped selector (`selector: {tags: [prod]}`), and a compact
+  `triggers:` list. Each can still drop or replace an entry without an
+  error, leaving the policy targeting a broader, narrower or different
+  device set than its YAML says. A lone CR is also a line break to the
+  server, but terminals and diffs render it as nothing, so a key after one
+  is read without showing on its own line. Keep a list's `- item` lines
+  together, directly under their key, write keys unquoted with the colon
+  straight after the name, each key once, in block style, indent with spaces
+  only, and keep those key names out of multi-line descriptions.
 
 ### Example Policy YAML
 

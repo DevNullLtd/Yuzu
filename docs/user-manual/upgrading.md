@@ -12,7 +12,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
   - a list line missing its `- `, or a `- item` line indented to `selector:`'s own column;
   - a single value where a list is expected (`tags: prod` or `managementGroups: abc123def456`; write `tags: [prod]`), and list lines written after a value on the key line (`tags: null` or `tags: [a]` followed by `- prod`). `tags: null` and `managementGroups: null` on their own still mean none;
   - a `managementGroups` entry outside letters, digits and `_ . : * -`. Group ids are server-assigned, so no working reference is affected. A display name inside that charset (e.g. `web-servers`) is still accepted and, as before, matches no group (tracked in #3182).
-- **Not yet refused** (tracked on #2123): a list line indented at or shallower than `scope:` itself, a `- item` written after another key (such as `platform:` under `selector:`, or any key after `managementGroups:`), tab characters in indentation, a `scope:` or `managementGroups:` line inside a multi-line `description: |` block, and a null list item (a bare `- `, `tags: [,]`, or the empty entry in `[a,,b]`) can still drop or replace an entry without an error, leaving the policy targeting a broader, narrower or different device set than its YAML says. For example, this keeps only `tag:a`:
+- **Not yet refused** (tracked on #2123): a list line indented at or shallower than `scope:` itself, a `- item` written after another key (such as `platform:` under `selector:`, or any key after `managementGroups:`), tab characters in indentation, a `scope:` or `managementGroups:` line inside a multi-line `description: |` block, a null list item (a bare `- `, `tags: [,]`, or the empty entry in `[a,,b]`), a quoted key (`"tags":`) or a space before the colon (`tags :`), neither of which is read as the key, a block-scalar value (`platform: >`), a duplicate key (the server reads the first, a YAML parser the last), a flow-mapped selector (`selector: {tags: [prod]}`), and a compact `triggers:` list can still drop or replace an entry without an error, leaving the policy targeting a broader, narrower or different device set than its YAML says. A lone CR is also a line break to the server, but terminals and diffs render it as nothing, so a key after one is read without showing on its own line. For example, this keeps only `tag:a`:
 
   ```yaml
   scope:
@@ -22,7 +22,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
   - b          # at scope:'s column: not read
   ```
 
-  Keep a list's `- item` lines together directly under their key, indent with spaces only, and keep those key names out of multi-line descriptions.
+  Keep a list's `- item` lines together directly under their key, write keys unquoted with the colon straight after the name, each key once, in block style, indent with spaces only, and keep those key names out of multi-line descriptions.
 - **Existing policies are not re-read.** A policy's scope, management groups and triggers are derived once, when it is created. A policy created before this release from CRLF YAML, from YAML with a comment line inside a block, or with a single-value `tags: prod`, may still be evaluating against a **broader** device set than its YAML says (`tags: prod` was stored with no tag filter at all). Re-deriving and flagging these automatically is tracked in #7004.
 - **To find candidates without changing anything:** list each policy's stored targeting next to its source and compare them by eye:
 
