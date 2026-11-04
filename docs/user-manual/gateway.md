@@ -439,6 +439,7 @@ from those two settings, not an observed figure. Plan for these requirements:
   containment). Use addresses that stay the same (a virtual IP or fixed node addresses) for
   gateway-fronted fleets; if the addresses behind the name change, a quarantined agent
   cannot reach any node and cannot be released remotely.
+- **Management address.** The server reaches a gateway cluster's management plane (`:50063`) through one address, `--gateway-command-addr`. With several gateway nodes and that address naming one node, killing that node left the whole fleet undispatchable in two HA WS-13 spike runs although every agent had re-attached (a control run is still owed, #7051; what to configure instead is tracked in #7062). Until then, plan for an address that survives the loss of a node, such as a virtual IP or a name that reaches every node, and check the certificate pin or identity the gateway's management listener requires for whatever address you choose; this is reasoned from the code and was not tried in the spike.
 - **A node that is up but has lost its server.** Failover does not cover this case. From
   the sources, the gateway acknowledges proxied heartbeats from its own node-local state
   whatever the state of its upstream (an unknown session gets `NOT_FOUND`), and the agent
@@ -447,10 +448,12 @@ from those two settings, not an observed figure. Plan for these requirements:
   the server's 90 s route lease expires, and the agent may stop being dispatchable. Failover does not
   repair this and the usual signals do not show it: in the HA WS-13 spike, on a quiet single-host
   fleet, `/readyz` stayed 200 and the circuit breaker never opened in 400 s, and on one server replica
-  every dispatch probe was still delivered, so a probe does not rule it out either. By reading the code
-  (not measured in the spike), the signal is `yuzu_gw_upstream_rpc_errors_total{rpc_name="batch_heartbeat"}`
-  rising about once a second and the gateway log line `BatchHeartbeat failed`; the same counter rises when
-  the server itself is down, so compare gateways. The agent log will not show it. Whether a quarantine or
+  every dispatch probe was still delivered, so a probe does not rule it out either. Expected from
+  the code, not yet measured: `yuzu_gw_upstream_rpc_errors_total{rpc_name="batch_heartbeat"}` rising (about once
+  a second if the server refuses connections, about once every 6 s if the path silently drops them) and the
+  gateway log line `BatchHeartbeat failed`; the same counter rises when the server itself is down, so
+  compare gateways. The agent log will not show it. The action reasoned from the code is to stop the
+  gateway node so that its agents re-register through the surviving nodes; this was not tried in the spike. Whether a quarantine or
   other protective action issued in this state reaches the endpoint, and the consequence for dispatch on
   two server replicas, have not been measured.
 - **Agents older than 0.15.0** may wedge in their reconnect path and need a restart (see
