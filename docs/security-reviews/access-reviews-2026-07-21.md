@@ -13,10 +13,10 @@ listed **MISSING**; Priority-2 item **13** — item 12 at the time this record
 was written, renumbered on 2026-07-25 when a duplicate `10` in that section
 was corrected).
 
-> **Addendum (2026-11-03, #4752).** The statements below that `record_attestation` is an UPSERT
+> **Addendum (2026-11-03, amended 2026-11-04).** The statements below that `record_attestation` is an UPSERT
 > that overwrites a prior decision (under "What shipped", and the `destructiveHint` rationale) are
 > superseded: every decision is now kept and the reviewer must differ from the subject of the
-> grant. See "Addendum (2026-11-03, #4752)" at the end of this document.
+> grant. See "Addendum (2026-11-03, amended 2026-11-04)" at the end of this document.
 
 ## What shipped
 
@@ -464,7 +464,7 @@ reference.
   or an external scheduler (e.g. a cron'd `open_access_review` MCP call)
   must drive the cadence today.
 
-## Addendum (2026-11-03, #4752): reviewer differs from the subject of the grant; every decision kept
+## Addendum (2026-11-03, amended 2026-11-04): reviewer differs from the subject of the grant; every decision kept
 
 **What changed.** The original design let a reviewer record a decision on a grant that named
 them, and a later decision on the same grant overwrote the earlier one. Now:
@@ -488,17 +488,30 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
   only in a new campaign, which freezes a fresh population; the history and audit rows identify who
   wrote the entries) and a history read returns at most the latest 100 entries
   of a grant (for rows written through the application path; rows added by other means, such as
-  owner-level SQL with the guard triggers disabled, are outside that guarantee). Every entry except the latest also returns at most the first 512 characters of its
-  justification (cut in SQL, counted in characters), flagged by `justification_truncated`: the
+  owner-level SQL with the guard triggers disabled, are outside that guarantee). Every entry except the latest also returns at most the first 64 characters of its
+  justification (cut in SQL, counted in characters, so on a UTF8 database a multibyte character is never split; see
+  "Database encoding" in `docs/auth-architecture.md`), flagged by `justification_truncated`: the
   per-grant limit alone does not bound a campaign with many grants (100 x 4096 bytes x grants, about
-  410 MB per copy at 1000 grants, held in several copies by the REST, MCP and page paths). With the
+  410 MB of text per copy at 1000 grants, held in several copies by the REST, MCP and page paths). With the
   preview the response is bounded by the per-grant ceiling x the number of frozen grants; there is
-  no per-campaign budget (an accepted limit). At 1000 grants, each grant at its 100-decision
-  limit, one copy is at most about 76 MB with ASCII text, about 228 MB with 4-byte characters and
-  about 371 MB when every character is a control character that JSON escapes to six bytes
-  (measured through the REST route on 2026-11-04), plus about 50 MB when the reviewer ids are
-  about 520 bytes long (an estimate, not measured). The server's peak memory while building the
-  response was about 14 times its size in that measurement (about 3.9 GB for the 371 MB case). The full
+  no per-campaign budget and the frozen grant count is not capped (an accepted limit).
+
+  Measured 2026-11-04 on Linux (glibc), with a FRESH server process per case (baseline server RSS about 107 MB),
+  one `GET /api/v1/access-reviews/{id}` on a campaign of 1000 frozen grants with 100 decisions each (built by
+  inserting rows directly into a throwaway database), with the 64-character preview: 4096-character ASCII text,
+  a 32.3 MB response and a server peak (`VmHWM`) of about 331 MB; 1024 four-byte (emoji) characters, 51.3 MB and
+  about 464 MB; 4096 control characters, each escaped by JSON to six bytes, 105.0 MB and about 779 MB. With 200
+  grants of ASCII text: 6.47 MB and about 154 MB. The same measurement with the former 512-character preview gave
+  76.7 MB and about 716 MB (ASCII) and 371.1 MB and about 2.4 GB (control characters). The peak was roughly 7 to 10
+  times the response in these runs, allocator dependent. The 64-character cases were run three times each, in fresh
+  processes, with peaks within about 1 percent of each other; the 512-character comparison is one run per case.
+  They are measurements on one host, not a guarantee. About 50 MB more would be added by reviewer ids of about
+  520 bytes (an estimate, not measured). The response is built whole in memory (the store result, the view
+  structures, the JSON builders and the serialised body are live together), the route has no concurrency limit
+  of its own, so each request in flight holds its own copies, and the MCP twin puts its payload in the result twice
+  (about 2.2 times the REST body by code reading, not measured). The Access page's memory use was not measured. No
+  shipped deployment configuration sets a memory limit and the only shipped server-restart alert is
+  `YuzuServerRestartLoop`; the sizing advice is in `docs/auth-architecture.md`, "The decision history". The full
   text of a superseded entry stays in the database and is not returned; an assessor exports it with
   a database read of `access_review_attestation_history`. A success answers `{recorded, decision_seq, previous_decision}`.
 - Audit shape: `target_id` is the campaign id alone and the grant is in `detail`, for every
@@ -535,8 +548,15 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
 2. The history is append-only against the application path and ordinary SQL (triggers, `RESTRICT`
    keys and a deferred consistency check), not against the application's database credential, a
    role granted TRUNCATE, or a database administrator. A data-only restore into a migrated schema
-   is refused; restore schema and data together. The audit store and its export are the
-   independent evidence. The guard triggers protect the frozen grants, the decisions and the
+   is refused; restore schema and data together. On these tables the owner can also run `DISABLE TRIGGER USER`
+   (`DISABLE TRIGGER ALL` is refused to a non-superuser) and `DROP TABLE`; nothing in Yuzu records either, or a
+   `TRUNCATE`, so detection is database statement logging or `pgaudit` plus reconciling each grant's `decision_seq`
+   with its history row count and the audit rows' `seq`. The audit rows are evidence independent of these tables,
+   not of the database credential: the audit store is in the same database and has no guard triggers, so they are
+   independent of it only to the extent audit rows are exported off the database. A closed campaign and its history
+   persist indefinitely while audit rows are kept for the audit retention period (365 days by default), so after
+   that period the campaign tables are the only on-database record unless the audit rows were exported. The authorised
+   redaction procedure below also disables the triggers, and Yuzu does not audit it. The guard triggers protect the frozen grants, the decisions and the
    history; the campaign row (status, `closed_at_ms`, `closed_by`, title) is protected by the
    application only, which refuses further decisions on a closed campaign, so a database
    credential holder can reopen a closed campaign. Personal-data redaction has no application
@@ -559,7 +579,7 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
    it. After a dropped connection the outcome of an attestation can be unknown: read the campaign
    and compare `decision_seq` before retrying; a retry appends an identical decision until the
    grant reaches its limit of 100 decisions, after which the request is refused. A
-   superseded entry is returned truncated (and an earlier history entry shows at most its first 512
+   superseded entry is returned truncated (and an earlier history entry shows at most its first 64
    characters), so match an earlier entry on those.
 6. Under a continuous stream of attestations a `close` can wait up to the pool's lock timeout and
    answer `503`; retry it.

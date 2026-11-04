@@ -4314,25 +4314,29 @@ id, or one carrying a NUL byte) is refused with `400` and the message
 store is read, and writes no audit row. The check runs after the permission
 gate, so a caller without the permission still gets the `403`.
 
-**Responses:** `200` —
+**Responses:** `200` — the body is wrapped like every other `/api/v1` read: `data` holds the
+object below and `meta` is `{"api_version": "v1"}`.
 
 ```json
 {
-  "campaign": {
-    "campaign_id": "...", "title": "...", "status": "open",
-    "created_by": "alice", "created_at_ms": 0,
-    "closed_by": "", "closed_at_ms": 0,
-    "rbac_enforcement": "enabled"
+  "data": {
+    "campaign": {
+      "campaign_id": "...", "title": "...", "status": "open",
+      "created_by": "alice", "created_at_ms": 0,
+      "closed_by": "", "closed_at_ms": 0,
+      "rbac_enforcement": "enabled"
+    },
+    "attestations": [
+      {
+        "principal_type": "user", "principal_id": "bob", "role_name": "Operator",
+        "decision": "pending", "reviewer": "", "decided_at_ms": 0,
+        "justification": "", "grant_snapshot": { "display_name": "bob", "...": "..." },
+        "decision_seq": 0, "history": []
+      }
+    ],
+    "pending_count": 1
   },
-  "attestations": [
-    {
-      "principal_type": "user", "principal_id": "bob", "role_name": "Operator",
-      "decision": "pending", "reviewer": "", "decided_at_ms": 0,
-      "justification": "", "grant_snapshot": { "display_name": "bob", "...": "..." },
-      "decision_seq": 0, "history": []
-    }
-  ],
-  "pending_count": 1
+  "meta": { "api_version": "v1" }
 }
 ```
 
@@ -4347,21 +4351,25 @@ that predates the history table, and never means pending), `reviewer`,
 the server replica that recorded it). The grant's own `decision`, `reviewer`,
 `justification` and `decided_at_ms` are the latest entry. Only the latest entry
 carries its whole `justification`. Every earlier entry carries at most the first
-512 characters of the text it was recorded with (counted in characters, so a
-multibyte character is never split), and `justification_truncated` is `true`
+64 characters of the text it was recorded with (counted in characters, so on a
+UTF8 database a multibyte character is never split; see "Database encoding" in
+`docs/auth-architecture.md`), and `justification_truncated` is `true`
 exactly when text was cut (always `false` for the latest entry and for a short
 one). The full text of an earlier entry stays in the database and is not
 returned by this call, which keeps the response bounded for a campaign with many
-grants: at most 100 entries per grant, and at most 512 characters of
+grants: at most 100 entries per grant, and at most 64 characters of
 justification on all but the latest. To match your own earlier entry after a lost
 answer (see `POST .../attestations` below), compare its `justification` with the
-first 512 characters of what you sent. The response grows with every recorded
+first 64 characters of what you sent. The response grows with every recorded
 decision, up to 100 per grant: `history[]` lists at most the latest 100 entries of
 a grant, and `decision_seq` stays the total, so `decision_seq` greater than the
 number of entries means earlier ones are not shown (the write cap keeps a grant at
 or under 100 for rows written through the application path, so this appears only if
 rows were added or removed by other means, such as owner-level SQL with the guard
-triggers disabled, which is outside the guarantee).
+triggers disabled, which is outside the guarantee). The server builds the whole response in
+memory, and a campaign of 1000 grants at the limits measured 32 MB to 105 MB on the wire with a server
+peak several times that; the figures and the sizing advice are in `docs/auth-architecture.md`,
+"The decision history".
 The Settings campaign fragment shows the latest decision only and has
 no marker for earlier ones; that difference is intended. The Access page shows the
 latest decision with a marker and the earlier ones behind a disclosure; when the
@@ -4498,7 +4506,7 @@ history and the audit rows identify who wrote the entries. To review the grant
 again, close the campaign and open a new one, which freezes a fresh population. `record_attestation`'s MCP `destructiveHint` stays
 `true` because the current decision is replaced with no route back to pending; the
 earlier one is kept in the history (a read returns the latest 100 entries per grant,
-an earlier justification cut to its first 512 characters).
+an earlier justification cut to its first 64 characters).
 
 **If the answer is lost, read before retrying.** A decision is recorded when its
 transaction commits. If the connection drops after the commit was sent, the server
@@ -4506,7 +4514,7 @@ cannot tell whether it was recorded and answers a write failure (`503`). Before
 retrying, `GET /api/v1/access-reviews/{id}`, compare `decision_seq` with the value
 you last saw and look for your own entry (match `reviewer`, `justification` and
 `decided_at_ms`; once a later decision exists, an earlier entry's `justification`
-is at most its first 512 characters). A blind retry after an unacknowledged commit appends an identical
+is at most its first 64 characters). A blind retry after an unacknowledged commit appends an identical
 decision at the next `seq`; it is kept and visible, not an error, until the
 grant reaches its limit of 100 decisions, after which the request is refused (read
 the campaign first if your earlier attempt may have been recorded). The first

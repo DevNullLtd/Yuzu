@@ -68,11 +68,15 @@
 /// version window (it fails, SQLSTATE class 23, it does not bypass the
 /// reviewer rule). It does NOT hold against the application credential: the
 /// migration runner creates the schema under that role, so the owner can
-/// DISABLE TRIGGER, forge a matching history row, or TRUNCATE, and a role
-/// granted TRUNCATE can truncate. A data-only restore into a migrated schema
-/// is refused by the guard, so restore schema and data together. A future
-/// migration that touches attestation rows must DISABLE TRIGGER inside its own
-/// transaction. The independent evidence is the audit store.
+/// DISABLE TRIGGER USER (DISABLE TRIGGER ALL is refused to a non-superuser,
+/// because of the foreign keys' system triggers), forge a matching history
+/// row, TRUNCATE or DROP TABLE, and a role granted TRUNCATE can truncate. A
+/// data-only restore into a migrated schema is refused by the guard, so restore
+/// schema and data together. A future migration that touches attestation rows
+/// must DISABLE TRIGGER USER inside its own transaction. The audit store is
+/// evidence independent of these tables but not of the database credential: it
+/// is in the same database with no guard triggers, so it is independent only to
+/// the extent audit rows are exported.
 ///
 /// A decision event is ONE COMMITTED decision transaction. When the
 /// connection drops after COMMIT was sent, the caller cannot tell whether the

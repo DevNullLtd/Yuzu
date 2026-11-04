@@ -3851,16 +3851,31 @@ The store writes the history row in the same transaction as the state change; th
 A bare UPDATE from an earlier binary against a migrated schema fails (SQLSTATE class 23) and does not bypass
 the reviewer rule; the deployment contract excludes earlier binaries, so this is a backstop, not a supported
 configuration. That is the claim, and its limits are part of it: append-only against the application path and
-ordinary SQL. It is NOT held against the application credential:
-the migration runner creates the schema under that role, so the owner can disable a trigger (`ALTER TABLE ... DISABLE
-TRIGGER USER` succeeds for a non-superuser owner; `DISABLE TRIGGER ALL` is refused to a non-superuser because it
-includes system triggers), drop a trigger, replace the guard function, forge a matching history row or truncate. A role granted TRUNCATE can truncate, and a database administrator can do anything. A
+ordinary SQL. It is NOT held against the application credential: the migration runner creates the schema under that
+role, so the owner can disable a trigger, drop a trigger, replace the guard function, forge a matching history row,
+truncate or drop the table. On these tables, which have foreign keys (whose system triggers a non-superuser cannot
+disable), `ALTER TABLE ... DISABLE TRIGGER ALL` is refused to a non-superuser while `DISABLE TRIGGER USER`
+succeeds, after which updates and deletes go through; `DROP TABLE` also succeeds. This is stated as a limit of the
+claim, not as a procedure. A role granted TRUNCATE can truncate, and a database administrator can do anything. A
 data-only restore into a migrated schema is refused by the guard; restore schema and data together. A future
-migration that touches attestation rows must disable the triggers inside its own transaction. The guard
-triggers protect the frozen grants, the decisions and the history. The campaign row (`status`, `closed_at_ms`,
-`closed_by`, `title`) is protected by the application only, which refuses further decisions on a closed
-campaign, so a database credential holder can reopen one. The independent evidence is the audit store and its
-export, not this table.
+migration that touches attestation rows must run `DISABLE TRIGGER USER` on the table inside its own transaction.
+The guard triggers protect the frozen grants, the decisions and the history. The campaign row (`status`,
+`closed_at_ms`, `closed_by`, `title`) is protected by the application only, which refuses further decisions on a
+closed campaign, so a database credential holder can reopen one.
+
+**Evidence outside these tables, and detection.** The audit rows are evidence independent of THESE tables, not of the
+database credential: the audit store is in the same database and has no guard triggers (`audit_store.cpp` defines
+none), so a holder of the application or owner credential can edit audit rows as well. They are independent of that
+credential only to the extent audit rows are exported off the database (the audit export, or a log shipper). For a
+recorded decision the audit trail holds the `access_review.attested` / `access_review.flagged` row: the actor, the
+campaign, the grant, the decision, the previous decision and `seq` (and `sod=pass`); the justification text is not in
+it. Retention differs between the two records: a closed campaign and its history persist indefinitely, while audit
+rows are kept for the audit retention period (365 days by default), so after that period the campaign tables are
+the only on-database record of a decision unless the audit rows were exported. Nothing in Yuzu records a `DISABLE
+TRIGGER` or a `TRUNCATE`. Detection is outside the product: database statement logging or `pgaudit` (class `ddl`),
+and reconciling each grant's `decision_seq` against its history row count and against the `seq` values in the audit
+rows. The authorised data-redaction procedure (see the erasure statement under "Deliberate no-prune" above) also
+disables the triggers, and Yuzu does not audit it.
 
 **Bounds.** `principal_type`, `principal_id` and `role_name` are 1 to 1024 bytes without a NUL byte (the
 longest ids the identity stores produce are about 520 bytes: `oidc:<iss>#<sub>` with each part capped at 255,
@@ -3880,29 +3895,60 @@ new campaign freezes a fresh population). A history read returns at most the lat
 100 entries of a grant; `decision_seq` stays the total, so `decision_seq` greater than the number of entries
 means earlier ones are not shown. That bound holds for rows written through the application path; rows added by
 other means (owner-level SQL with the guard triggers disabled, for example a forged pending state row with more than
-100 history rows) are outside the guarantee and are returned as they stand. The entry count alone does not bound the response of a campaign with many
-grants (100 entries of 4096 bytes each, per grant), so every entry except the grant's latest also returns at
-most its first 512 characters of justification, cut in SQL (`left()` counts characters, so a multibyte
-sequence is never split) and flagged by `justification_truncated`; the latest entry is whole and equals the
-state row. The full text of a superseded entry stays in the database and is not returned, so an export of it
-is a database read of `access_review_attestation_history`. A grant adds at most 99 entries of 512 characters
-plus one whole entry to a response, so a response is bounded by the per-grant ceiling times the number of frozen
-grants; there is no per-campaign budget (an accepted limit). At 1000 grants at the limit one copy is at
-most about 76 MB with ASCII text, about 228 MB with 4-byte characters and about 371 MB when every character is
-a control character that JSON escapes to six bytes (measured through `GET /api/v1/access-reviews/{id}` on a
-database holding 1000 grants of 100 entries each; the grant's top-level `justification` repeats its latest entry, so
-each grant carries one more copy of that text than its history shows), plus about 50 MB when reviewer ids are about
-520 bytes (an estimate, not measured). REST, MCP and the page each hold a copy, and the server's peak memory while
-building the REST response was about 14 times its size in that measurement (about 1.5 GB for the 76 MB case and
-about 3.9 GB for the 371 MB case), so size the server for the response, not only for the bytes on the wire. The Access page marks a cut entry "(truncated)" and never labels a pair
+100 history rows) are outside the guarantee and are returned as they stand. The entry count alone does not bound the
+response of a campaign with many grants (100 entries of 4096 bytes each, per grant), so every entry except the
+grant's latest also returns at most its first 64 characters of justification, cut in SQL (`left()` counts
+characters, so on a UTF8 database a multibyte sequence is never split; see "Database encoding" below) and flagged by
+`justification_truncated`; the latest entry is whole and equals the state row. The full text of a superseded entry
+stays in the database and is not returned, so an export of it is a database read of
+`access_review_attestation_history`. A grant adds at most 99 entries of 64 characters plus one whole entry to a
+response, so a response is bounded by the per-grant ceiling times the number of frozen grants; there is no
+per-campaign budget and the number of frozen grants is not capped (an accepted limit).
+
+*Measured response sizes.* On 2026-11-04, on Linux (glibc), with a FRESH server process for each case (baseline
+server RSS about 107 MB), one `GET /api/v1/access-reviews/{id}` against a campaign of 1000 frozen grants with 100
+decisions each (built by inserting rows directly into a throwaway database, not by 100,000 attest calls), with the
+64-character preview: 4096-character ASCII text gave a 32.3 MB response and a server peak (`VmHWM`) of about 331 MB;
+1024 four-byte (emoji) characters gave 51.3 MB and about 464 MB; 4096 control characters, each of which JSON escapes
+to six bytes, gave 105.0 MB and about 779 MB. 200 grants of ASCII text gave 6.47 MB and about 154 MB. For comparison,
+the same measurement with the former 512-character preview gave 76.7 MB and about 716 MB (ASCII) and 371.1 MB and
+about 2.4 GB (control characters). In these runs the server peak was roughly 7 to 10 times the response, which
+depends on the allocator. (A response is in units of 10^6 bytes and a peak is `VmHWM` divided by 1024, so the ratio is
+approximate.) The 64-character cases were run three times each, in fresh processes, and their peaks agreed within about
+1 percent; the 512-character comparison is one run per case. These are measurements on one host, not a guarantee.
+Reviewer ids of about 520 bytes would add about 50 MB (100,000 history entries of about 520 bytes each; an estimate,
+not measured, because the measured campaigns used short reviewer names).
+
+The response is built whole in memory: the REST handler holds the store result, the view structures, the JSON
+builders and the serialised body at once, and there is no per-campaign budget, no cap on the frozen grant count and
+no concurrency limit on the route itself, so each request in flight holds its own copies. The grant's top-level
+`justification` repeats its latest history entry, so the latest entry's text is in the response twice. The MCP twin
+puts its payload in the tool result twice (the `content` text and `structuredContent`), so its response is larger than
+the REST body (about 2.2 times by code reading, not measured). The Access page's own memory use was not measured. No
+shipped deployment configuration (the `deploy/docker` compose files, the `deploy/systemd` unit, the HA compose file)
+sets a memory limit, and the only shipped server-restart alert is `YuzuServerRestartLoop` (more than 3 resets in 3
+hours, `docs/prometheus/yuzu-alerts.yml`). Size the server's memory for several times the response per concurrent
+request, set an explicit memory limit above that, and alert on server memory and restarts yourself.
+
+The Access page marks a cut entry "(truncated)" and never labels a pair
 in which either entry was cut as a re-recording, because a cut text cannot be shown equal to the next one. A successful attest answers `{recorded, decision_seq, previous_decision}`.
 
 **Database encoding.** The truncation counts characters and assumes a UTF8-encoded database. The server neither
-checks nor sets the encoding. Measured on 2026-11-04: the image the compose files build from `Dockerfile.postgres`, the
-CI `postgres:18.4-bookworm` image and the `postgres:18` image the playbook names all create UTF8 databases
-(`en_US.utf8`), and the HA entrypoint sets UTF8 explicitly. `install-server-postgres.sh` and `setup-rhel9.sh` set no
-encoding, so a cluster they create follows the host's locale at `initdb`; a host in the `C` locale yields `SQL_ASCII`.
-On a database with a single-byte encoding `left()` counts bytes, so a cut can fall inside a multibyte sequence.
+checks nor sets the encoding. Measured on 2026-11-04: the image the compose files build from `Dockerfile.postgres`
+(`docker-compose.yml`, `docker-compose.full-uat.yml`, `docker-compose.sanitizer-uat.yml`, `docker-compose.viz-uat.yml`;
+the reference, reference-gateway and demo compose files and the root `docker-compose.uat.yml` pull the published
+`yuzu-postgres` image instead), the `postgres:18.4-bookworm` image that `scripts/ci/ensure-postgres.sh` pins for the
+Linux Docker CI leg and the `postgres:18` image the playbook names all create UTF8 databases (`en_US.utf8`), and the HA
+entrypoint (`deploy/docker/ha-postgres/patroni-entrypoint.sh`) sets `encoding: UTF8` explicitly.
+`install-server-postgres.sh` creates a DATABASE in an existing cluster (`CREATE DATABASE`, which inherits the
+encoding of `template1`) and creates no cluster; only `setup-rhel9.sh` runs `initdb` (`postgresql-setup --initdb`),
+and it sets no encoding, so that cluster follows the host's locale, and a host in the `C` locale yields `SQL_ASCII`.
+To check, run `SHOW server_encoding;` in the Yuzu database: it must answer `UTF8`. A database in another encoding
+cannot be converted in place (`ALTER DATABASE` has no encoding option); create it correctly with
+`CREATE DATABASE yuzu OWNER yuzu ENCODING 'UTF8' TEMPLATE template0;` (verified on a `postgres:18` cluster initialised
+with the `C` locale; a cluster whose locale is not compatible with UTF8 may need locale options as well, not tested)
+and move the data across. On a database with a single-byte encoding `left()` counts bytes, so a cut can fall inside
+a multibyte sequence; what that does to the validity of the JSON response was not verified.
 
 **Frozen grants whose ids exceed 1024 bytes.** No known creation path produces an id longer than the limit, but a
 frozen grant whose `principal_id` or `role_name` exceeds 1024 bytes cannot be attested (`400`); it stays pending
@@ -3917,9 +3963,9 @@ may have been recorded). The first attempt writes a
 `result=failure` audit row whose fixed text says the decision store is unavailable or the decision may not have
 been committed (`kStoreFailureMessage`), so an auditor sees a failure row next to a committed decision. To tell
 whether a decision landed, read the campaign, compare `decision_seq` with the value you last saw and match your
-entry on reviewer, justification (an earlier entry shows at most its first 512 characters) and `decided_at_ms`. A store failure that is not the caller's is answered with
-that fixed message and `retry_after_ms` 5000 (`503` on REST, an internal error on MCP), never database text,
-which goes to the server log. There is no idempotency key yet.
+entry on reviewer, justification (an earlier entry shows at most its first 64 characters) and `decided_at_ms`. A
+store failure that is not the caller's is answered with that fixed message and `retry_after_ms` 5000 (`503` on REST,
+an internal error on MCP), never database text, which goes to the server log. There is no idempotency key yet.
 
 **Close starvation.** A queued `close_campaign` does not block a new attestation's lock on the campaign row, so
 under a continuous stream of attestations a close can wait up to the pool's 10 s `lock_timeout` and answer 503.

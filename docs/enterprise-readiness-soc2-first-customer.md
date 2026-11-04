@@ -174,15 +174,17 @@ grant in that campaign. The history and the audit rows identify who wrote the en
 remedy is to close the campaign and open a new one, which freezes a fresh population. A blind retry
 of an unacknowledged attempt appends an identical decision until that limit, after which the request
 is refused. **Superseded justifications are shown truncated:** a history read returns, for every entry
-except a grant's latest, at most the first 512 characters of its justification, flagged by
+except a grant's latest, at most the first 64 characters of its justification, flagged by
 `justification_truncated`, so a campaign with many grants cannot make one response grow without bound
 (100 entries per grant alone would not bound it). The full text stays in the database; an assessor who
 needs it exports it with a database read of `access_review_attestation_history`, not through the API.
 **The history table is
 append-only against the application path and ordinary SQL, not against the application's database
 credential** (it owns the schema and could disable the guard, forge a matching row or truncate), a
-role granted TRUNCATE, or a database administrator; the independent evidence is the audit store
-and its export. The guard triggers protect the frozen grants, the decisions and the history; the
+role granted TRUNCATE, or a database administrator; the audit rows are evidence independent of
+these tables but not of the database credential (the audit store is in the same database and has
+no guard triggers), so they are independent of it only to the extent they are exported off the
+database. The guard triggers protect the frozen grants, the decisions and the history; the
 campaign row (status, `closed_at_ms`, `closed_by`, title) is protected by the application only, which
 refuses further decisions on a closed campaign, so a database credential holder can reopen one. **One person with two identities (a local account and an SSO identity, or two SSO
 identities) counts as two reviewers**; this is the maintainer-accepted exception recorded in the

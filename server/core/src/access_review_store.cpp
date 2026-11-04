@@ -79,12 +79,13 @@ const std::vector<pg::PgMigration>& migrations() {
         //
         // Honest limits: append-only against the application path and ordinary SQL, NOT
         // against the application credential. The runner creates the schema under that role, so
-        // it owns the tables and can DISABLE TRIGGER, forge a history row that matches, or
+        // it owns the tables and can DISABLE TRIGGER USER (DISABLE TRIGGER ALL is refused to a
+        // non-superuser: the foreign keys' system triggers), forge a history row that matches,
         // TRUNCATE (row triggers do not fire on TRUNCATE, which is why a test fixture's
-        // TRUNCATE ... CASCADE still works); a role granted TRUNCATE can too. A data-only
-        // restore into a migrated schema is refused by the guard: restore schema and data
-        // together. A future migration that touches attestation rows must DISABLE TRIGGER
-        // inside its own transaction (the ca_store v4 rule).
+        // TRUNCATE ... CASCADE still works) or DROP TABLE; a role granted TRUNCATE can too. A
+        // data-only restore into a migrated schema is refused by the guard: restore schema and
+        // data together. A future migration that touches attestation rows must DISABLE TRIGGER
+        // USER inside its own transaction (the ca_store v4 rule).
         //
         // Statement order matters. The refusal runs first so a legacy self-recorded decision
         // surfaces the readable message below rather than the history CHECK's. Every guard is
@@ -285,8 +286,9 @@ AttestationHistoryRow read_history(PGresult* res, int i) {
 
 // The grant's latest entry (h.seq = the state row's decision_seq, $3 below is the preview length)
 // keeps its whole justification; every other entry is cut to its first $3 CHARACTERS by the
-// database (`left` counts characters, so a multibyte sequence is never split), and the flag says
-// whether anything was cut. Done in SQL so the discarded text is never read into this process.
+// database (`left` counts characters, so on a UTF8 database a multibyte sequence is never split;
+// on a single-byte encoding it counts bytes), and the flag says whether anything was cut. Done in
+// SQL so the discarded text is never read into this process.
 // `a` is the state row (LEFT JOINed: a history row whose state row is missing still reaches the
 // merge below, which reports it, and is treated as superseded here).
 constexpr const char* kHistoryCols =
