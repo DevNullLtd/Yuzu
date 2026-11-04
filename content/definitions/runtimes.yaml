@@ -2,8 +2,8 @@
 ## Reports installed .NET (Core/5+), JVM and Python runtimes. Read-only, zero subprocess.
 ## Plugin: runtimes | Actions: dotnet, jvm, python
 ##
-## SHIPPED LEGS: Linux (dotnet, jvm, python) and, for python only, macOS and Windows. Rung 1
-## (directory names and metadata-file reads; no `java`, `dotnet` or `python` process is ever
+## SHIPPED LEGS: dotnet, jvm and python on Linux, macOS and Windows. Rung 1 (directory names,
+## registry values and metadata-file reads; no `java`, `dotnet` or `python` process is ever
 ## started).
 ##   Linux:   /usr/share/dotnet, /usr/lib/dotnet, /usr/lib64/dotnet shared/<framework>/<version>
 ##            and sdk/<version> directory walk (dotnet);
@@ -12,18 +12,14 @@
 ##            python3.<minor> regular files in /usr/bin and /usr/local/bin (python; the version
 ##            is major.minor from the file name, the patch level is not available).
 ##            Network mounts are skipped (read from /proc/self/mountinfo).
-##   macOS:   /Library/Frameworks/Python.framework/Versions/<x.y>/Resources/Info.plist (python).
-##   Windows: HKLM\SOFTWARE\Python\PythonCore\<tag> in both registry views, PEP 514 (python);
-##            per-user hives are never read.
-##
-## macOS AND WINDOWS dotnet / jvm: planned; the action answers a single unsupported status row on
-## this OS. Until then it answers `status|<action>|unsupported|<macos|windows>:planned`. The
-## planned mechanisms are declared in the plugin descriptor (runtimes_plugin.cpp):
-##   macOS:   /usr/local/share/dotnet/shared walk (dotnet);
-##            /Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict +
-##            Contents/Home/release (jvm).
-##   Windows: NDP release-key table + dotnet InstalledVersions + Program Files walk (dotnet);
-##            JavaSoft keys + Program Files\Java walk (jvm).
+##   macOS:   /usr/local/share/dotnet (and x64/) shared and sdk directory walk (dotnet);
+##            /Library/Java/JavaVirtualMachines/*/Contents/Home/release, Info.plist fallback
+##            (jvm); /Library/Frameworks/Python.framework/Versions/<x.y>/Resources/Info.plist
+##            (python). Network mounts are skipped (getmntinfo_r_np).
+##   Windows: HKLM\SOFTWARE\dotnet\Setup\InstalledVersions and the NDP release keys (dotnet);
+##            HKLM JavaSoft, Eclipse Adoptium and Azul Zulu keys plus one <home>\release read
+##            (jvm); HKLM\SOFTWARE\Python\PythonCore (python). All in both registry views,
+##            PEP 514 for python; per-user hives are never read.
 ##
 ## Every action's output is: one `status|<action>|<level>|<reason>` row FIRST, then zero or
 ## more `<action>|<flavour>|<version>|<install_path>|<vendor>` rows. A `supported` status
@@ -39,20 +35,19 @@ metadata:
   displayName: .NET Runtime Inventory
   version: 1.0.0
   description: >
-    Reports installed .NET (Core/5+) shared frameworks and SDKs on Linux: one
-    row per framework version or SDK version found under the standard install
-    roots (flavour, version, install path), from directory names only — no
-    `dotnet` process is started. A `supported` status with no rows means none
+    Reports installed .NET: one row per framework version or SDK version
+    (flavour, version, install path). Linux and macOS: directory names under the
+    standard install roots. Windows: the HKLM dotnet Setup InstalledVersions
+    keys and the .NET Framework NDP release keys in both registry views, with no
+    filesystem walk. No `dotnet` process is started. A `supported` status with no rows means none
     was found at the standard roots (a runtime installed elsewhere is not
     looked for); a `constrained` status means a read failed or was skipped and
-    the list may be incomplete. macOS and Windows: planned; the action answers a single
-    unsupported status row on this OS
-    (`status|dotnet|unsupported|<macos|windows>:planned`).
+    the list may be incomplete.
   tags: [runtimes, dotnet, inventory]
 
 spec:
   type: question
-  platforms: [linux]
+  platforms: [windows, darwin, linux]
 
   execution:
     plugin: runtimes
@@ -72,28 +67,28 @@ spec:
         description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), dotnet (one per runtime found).'
         values: [status, dotnet]
         example: dotnet
-        platforms: [linux]
+        platforms: [windows, darwin, linux]
       - name: flavour
         type: string
-        description: 'Runtime kind. Values: core (a Microsoft.NETCore.App, Microsoft.AspNetCore.App or Microsoft.WindowsDesktop.App shared framework), sdk (an SDK install), unmodelled (any other shared-framework name — reported, never dropped). The three core frameworks all read core at the same version; the install path tells them apart. Status rows: the action name.'
-        values: [core, sdk, unmodelled]
+        description: 'Runtime kind. Values: core (Linux and macOS: a Microsoft.NETCore.App, Microsoft.AspNetCore.App or Microsoft.WindowsDesktop.App shared framework), runtime (Windows: a shared framework from the registry), sdk (an SDK install), netfx (Windows: .NET Framework), unmodelled (any other shared-framework name — reported, never dropped). On Linux and macOS the three core frameworks all read core at the same version; the install path tells them apart. Status rows: the action name.'
+        values: [core, runtime, sdk, netfx, unmodelled]
         example: core
-        platforms: [linux]
+        platforms: [windows, darwin, linux]
       - name: version
         type: string
         description: 'Version taken from the install directory name (e.g. 8.0.31, or a preview build such as 9.0.100-preview.1.24101.2). Status rows: the level (supported, constrained or unsupported).'
         example: 8.0.31
-        platforms: [linux]
+        platforms: [windows, darwin, linux]
       - name: install_path
         type: string
         description: 'Absolute path of the framework or SDK version directory the version was read from. Status rows: the comma-joined failure tokens, or -.'
         example: /usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.31
-        platforms: [linux]
+        platforms: [windows, darwin, linux]
       - name: vendor
         type: string
-        description: 'Always "-" for dotnet: the install tree carries no vendor field.'
+        description: '"-" on Linux and macOS: the install tree carries no vendor field. Windows rows read "Microsoft".'
         example: "-"
-        platforms: [linux]
+        platforms: [windows, darwin, linux]
 
   readablePayload: "List installed .NET runtimes"
 
@@ -122,8 +117,10 @@ metadata:
   displayName: JVM Inventory
   version: 1.0.0
   description: >
-    Reports installed Java runtimes on Linux: one row per JDK/JRE home under
-    /usr/lib/jvm, /opt/java, /usr/lib64/jvm and /var/opt/java — flavour (jdk,
+    Reports installed Java runtimes: one row per JDK/JRE home. Linux: under
+    /usr/lib/jvm, /opt/java, /usr/lib64/jvm and /var/opt/java. macOS: under
+    /Library/Java/JavaVirtualMachines. Windows: homes registered under the HKLM JavaSoft,
+    Eclipse Adoptium and Azul Zulu keys in both registry views — flavour (jdk,
     jre, unmodelled), version, install path and vendor (the build's self-reported
     `IMPLEMENTOR` value, e.g. Eclipse Adoptium vs Debian; it is not verified). A
     home with a java binary but no `release` file (some distro OpenJDK 8 packages)
@@ -131,13 +128,12 @@ metadata:
     started. A `supported` status with no rows means none was found at those
     roots (an Oracle-RPM /usr/java or a tarball install elsewhere is not looked
     for); a `constrained` status means a read failed or was skipped and the list
-    may be incomplete. macOS and Windows: planned; the action answers a single
-    unsupported status row on this OS (`status|jvm|unsupported|<macos|windows>:planned`).
+    may be incomplete.
   tags: [runtimes, jvm, inventory]
 
 spec:
   type: question
-  platforms: [linux]
+  platforms: [windows, darwin, linux]
 
   execution:
     plugin: runtimes
@@ -157,28 +153,28 @@ spec:
         description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), jvm (one per runtime found).'
         values: [status, jvm]
         example: jvm
-        platforms: [linux]
+        platforms: [windows, darwin, linux]
       - name: flavour
         type: string
         description: 'Image kind from the IMAGE_TYPE key of the release file. Values: jdk, jre, unmodelled (the file does not say — Debian and SUSE OpenJDK release files have no IMAGE_TYPE, and a release-less home has no file at all; never guessed from the path). Status rows: the action name.'
         values: [jdk, jre, unmodelled]
         example: jdk
-        platforms: [linux]
+        platforms: [windows, darwin, linux]
       - name: version
         type: string
         description: 'JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION. A release file with neither key yields no row and a release_unparsable constraint; a home with a java binary but no release file yields - and a release_missing constraint. Status rows: the level (supported, constrained or unsupported).'
         example: 17.0.20
-        platforms: [linux]
+        platforms: [windows, darwin, linux]
       - name: install_path
         type: string
         description: 'Absolute path of the JVM home directory. Status rows: the comma-joined failure tokens, or -.'
         example: /opt/java/openjdk
-        platforms: [linux]
+        platforms: [windows, darwin, linux]
       - name: vendor
         type: string
         description: 'IMPLEMENTOR from the release file (e.g. Eclipse Adoptium, Debian), self-reported by the build and not verified, or "-" when the key is absent (or the home has no release file).'
         example: Eclipse Adoptium
-        platforms: [linux]
+        platforms: [windows, darwin, linux]
 
   readablePayload: "List installed JVMs"
 
