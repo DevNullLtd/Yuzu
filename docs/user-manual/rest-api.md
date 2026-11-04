@@ -309,7 +309,7 @@ Every request is checked against a per-route body-size cap **before authenticati
 | Status | Meaning |
 |---|---|
 | `413` | The body's **declared `Content-Length`** exceeds the resolved cap for this route's class. |
-| `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Four classes refuse an unmeasurable body today: `/mcp/`, `upload_session` (`PUT /api/v1/uploads/{id}/chunk` and its sibling agent-facing upload routes), `hardware` and `dex_score_policy`** — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule. `upload_session` opts in for the same reason `/mcp/` does: its session gate lives in the route HANDLER, after httplib would otherwise buffer the body, so the pre-routing bound is what actually stops an unauthenticated caller forcing a ~100 MiB buffer per connection — the agent uploader always sends an identity-encoded body with a `Content-Length` (the protocol's `Content-Range` header requires knowing it), so this costs a conforming client nothing. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
+| `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Five classes refuse an unmeasurable body today: `/mcp/`, `upload_session` (`PUT /api/v1/uploads/{id}/chunk` and its sibling agent-facing upload routes), `hardware`, `dex_score_policy` and `commands`** — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule. `upload_session` opts in for the same reason `/mcp/` does: its session gate lives in the route HANDLER, after httplib would otherwise buffer the body, so the pre-routing bound is what actually stops an unauthenticated caller forcing a ~100 MiB buffer per connection — the agent uploader always sends an identity-encoded body with a `Content-Length` (the protocol's `Content-Range` header requires knowing it), so this costs a conforming client nothing. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
 | `415` | The request carries a `Content-Encoding` header set to anything other than `identity` (case-insensitive). Refused **unconditionally, on every route class, regardless of `requires_measurable`** — unlike the framing rule above, this does not depend on a per-class opt-in. Why: this build compiles `CPPHTTPLIB_BROTLI_SUPPORT`, httplib decompresses transparently and enforces only its 100 MiB global limit against the **decompressed** size, so `Content-Length` on a compressed body measures the wrong thing and a sub-cap compressed body can expand to ~100 MiB before anything downstream sees it. No Yuzu route accepts a compressed request body today, so this costs a conforming client nothing — send the body identity-encoded by **omitting `Content-Encoding` entirely**. Do **not** send `Content-Encoding: identity` explicitly: `has_non_identity_content_encoding` correctly admits it past this gate (it isn't a compressed encoding), but httplib's own body reader then calls `create_decompressor("identity")` — which matches none of gzip/deflate/br/zstd, returns null, and httplib answers a bare `415` itself (`httplib.h`'s `prepare_content_receiver`), before this gate, any route handler, or the A4/SCIM envelope code ever runs. That response carries none of the structure this section promises — no A4 envelope, no `correlation_id`, no `yuzu_body_cap_rejected_total` increment. Until that gap is closed at the code level, the only conforming way to send an identity-encoded body is to omit the header. |
 
 All three responses use the standard [A4 error envelope](#json-envelope) with a `remediation` hint (no `permission` field — the request is rejected before any principal is resolved) — **except the `scim` class**, which publishes SCIM's own RFC 7644 §3.12 error shape (`schemas`/`status`/`detail`) on `application/scim+json` instead of the generic envelope (`scim::error()`, `scim_json.hpp:192`; wired into all three status codes above in `server.cpp`'s pre-routing handler). This gate is separate from, and runs *before*, any route-local body check a handler may also carry (e.g. the SCIM/response-template 64 KiB checks below) — those still exist for defense-in-depth if a future edit widens this table's entry, but on the current table this pre-routing gate rejects first. **This is not purely a timing change for every affected class.** For most (response templates, CA import), an earlier rejection at the same byte count is the entire effect. SCIM is **no longer** an exception to that either (fixed as part of this change, D7): the pre-routing rejection's SCIM shape matches the wording of the handler's own (now-superseded, and unreachable — the pre-routing cap and the handler check the identical 64 KiB threshold, so the pre-routing gate always wins first) `413` check exactly, and extends the same shape to the `411`/`415` cases the handler-level check never covered.
@@ -337,7 +337,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 
 | Method | Path prefix | Cap | `path_class` | Notes |
 |---|---|---|---|---|
-| any | `/mcp/` | 4 MiB | `mcp` | One of four classes with `requires_measurable=true` — see the 411 row above. |
+| any | `/mcp/` | 4 MiB | `mcp` | One of five classes with `requires_measurable=true` — see the 411 row above. |
 | POST | `/api/v1/bundles` | 70 MiB | `bundles` | Sized to the live-query bundle route's own computed 64 MiB parameter-byte floor plus JSON overhead headroom. |
 | any | `/api/v1/uploads` | 8 MiB | `upload_session` | The second `requires_measurable=true` class. Exact mirror of the PR1.6a chunked-receive protocol's own `kDefaultChunkMaxBytes` (`upload_grant_parsers.hpp`), bound to it by a `static_assert` in `file_retrieval_routes.cpp` so the two cannot drift. Any method — the session-open POST, chunk PUT, status GET, commit POST, and cancel DELETE all share this class; only the chunk PUT carries a large body, but scoping to PUT alone would silently drop the sibling verbs to the 4 MiB catch-all. |
 | any | `/api/v1/plugin-config` | 256 KiB | `plugin_config` | † The store's own grammar caps a config value at 8 KiB and a secret plaintext at 64 KiB (`plugin_config_parsers.hpp`); 256 KiB covers the larger of the two plus JSON framing/escaping headroom, while keeping an unauthenticated flood against this surface two orders of magnitude under the 4 MiB catch-all. Any method — PUT config/secret writes, DELETE carries no body, GET/list are bodyless. |
@@ -372,6 +372,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/dex/score-policy` | 320 KiB | `dex_score_policy` | The fourth `requires_measurable=true` class. `PUT`'s body IS the score policy document, which the handler caps at 256 KiB (`kDexScorePolicyMaxBytes`); 320 KiB leaves framing headroom, so a legitimate document is never refused here. `GET` and `DELETE` are bodyless siblings sharing the class. The permission gate runs in the handler, after the body is buffered (a cookie session's same-site gate runs earlier, pre-routing), so an unmeasurable (chunked) body is refused up front with `411`. |
 | any | `/api/v1/crypto` | 16 KiB | `crypto` | The `/crypto` REST v1 subtree. The only body-bearing route is `PUT /api/v1/crypto/dashboard/layout` (at most 64 catalogue ids, about 4.4 KiB even fully escaped); 16 KiB mirrors the handler's own `kLayoutBodyMaxBytes` exactly. Any method, because every sibling is a bodyless GET and shares the prefix. |
 | any | `/api/v1/config` | 16 KiB | `config` | The runtime-configuration REST v1 subtree. The only body-bearing route is `PUT /api/v1/config/{key}` (`{"value": ...}`, one scalar: an integer, a flag, a log level, a tag key, an OIDC client secret or a string holding a short JSON array); 16 KiB is far above any legal value. Any method, because the sibling `GET /api/v1/config` is bodyless and shares the prefix. The legacy `PUT /api/config/{key}` stays on the catch-all. |
+| any | `/api/v1/commands` | 4 MiB | `commands` | The fifth `requires_measurable=true` class. The REST v1 twin of MCP `execute_instruction` (`POST /api/v1/commands`). The same 4 MiB as the `/mcp/` class, because the same worst case rides it: 10000 agent ids, 32 parameters of 64 KiB and an 8 KiB scope come to about 3.3 MiB. `requires_measurable=true`, like `/mcp/`: a chunked (unmeasurable) body is refused here rather than read unbounded. Any method, so a sibling under the prefix is capped too. |
 | any | `/api/v1/inventory/software/normalization/` | 64 KiB | `software_curation` | The software-title curation subtree. The body-bearing routes are `POST .../aliases` (one JSON object of at most eight strings, each at most 256 bytes) and `POST .../queue/{key}/reject` (bodyless); the status and queue GETs are bodyless siblings sharing the prefix, so any method. |
 | any | `/api/v1/inventory/software/normalization/pack` | 1 MiB | `software_alias_pack` | The alias-pack CSV upload. The raw body is the CSV, which `parse_normalization_pack` refuses over 1 MiB, so the cap mirrors that bound exactly. A longer prefix than the row above, so it wins for this path. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
@@ -3697,6 +3698,71 @@ List all instruction definitions.
 
 **404** if no definition has that id. **503** if the instruction store is unavailable or the read fails (A4 envelope, `retry_after_ms: 5000`).
 
+#### `POST /api/v1/instructions/{id}/execute`
+
+(#2146) Execute a stored instruction definition. Twin of the legacy `POST /api/instructions/{id}/execute` and of the MCP `execute_instruction_definition` tool (the existing MCP `execute_instruction` is a raw `plugin.action` call and is not its twin); both v1 surfaces run one shared pipeline. Dispatch is **asynchronous**: the response names the command and execution, and the agents report separately (poll `GET /api/v1/executions/{execution_id}` or subscribe to `GET /api/v1/events`).
+
+**Permission:** `Execution:Execute`, a plain global grant. A service-scoped token is refused (the service-scope allow-list is empty), an engine principal needs an explicit grant, and a supervised-tier MCP token is refused on this REST path (the ticket flow exists only on `/mcp/v1/`). The gate admits the call; who is **reached** is decided at dispatch from the caller's own `Execution:Execute` visible set, and an agent outside it is silently left out.
+
+**Body:** a JSON object. All keys are optional.
+
+| Key | Meaning |
+|---|---|
+| `agent_ids` | Non-empty array of agent ids. Exclusive with `scope`. |
+| `scope` | Non-empty scope expression (`__all__`, `group:<id>`, or the scope DSL). Exclusive with `agent_ids`. |
+| `params` | Object of parameters. Validated against the definition's stored `parameter_schema`; typed values are sent as JSON types. A value that is not an object (or `null`) is `400` even when the definition declares no schema (`params_type`), rather than being dropped. |
+
+The request body is required: send `{}` when you have no `agent_ids`, `scope` or `params`. An empty body (no bytes at all) is `400` `invalid_json`, as on the legacy `POST /api/instructions/{id}/execute`. Omitting **both** `agent_ids` and `scope` targets every connected agent. Supplying either one empty, of the wrong type, or both together is `400` (`reason` = `agent_ids_empty`, `agent_ids_type`, `agent_id_type`, `scope_empty`, `scope_type`, `target_conflict`) and is never widened to the fleet. A body that is not an object is `400` (`body_type`). A **Destructive** action requires explicit non-empty `agent_ids` (broadcast and `scope` are `400` `destructive_untargeted`) and its ids are confined to the agents the caller may see (`404` `destructive_no_visible_target` when none are); a **Forensics** action requires exactly one (`forensic_untargeted`).
+
+**Order of checks.** The first refusal wins, and nothing before the audit row dispatches, creates an execution row, or queues an approval: the gate, the depth guard (`400` `body_depth`) and JSON parse (`400` `invalid_json`), the definition id (`400` `invalid_definition_id` when the id in the path holds a control character (any byte below `0x20` or equal to `0x7F`, NUL included) or is not valid UTF-8 (for example the overlong `%C0%80` or a lone `%FF`, which the HTTP layer decodes to raw bytes); it is refused before the definition is looked up, with no retry hint: the store binds the id as a C string, so `foo\0xyz` would otherwise resolve the definition `foo` while the audit row recorded a different string, and invalid UTF-8 would otherwise reach Postgres and read as a retryable `503` for an input that can never succeed), the definition lookup (`404` `not_found`; `503` `store_unavailable`, `retry_after_ms: 5000` when the store read fails, or `retry_after_ms: null` with a remediation saying retrying will not help when the store was never wired, a server defect), the dispatch chokepoint's dry run for the definition's `plugin.action` (`403` `forbidden` / `approval_required` / `kill_switched`, `400` `unclassified` / `ambiguous`, `403` `anonymous_operator`), the body shape, the stored `parameter_schema` (`400` `param_schema`; a stored schema that cannot be prepared is `500` `param_schema_invalid`, fail closed), the destructive targeting rules above, the definition's `approval_mode`, the audit row, then dispatch. A required server component that was never wired (`reason` `misconfigured`, `authorizer_unconfigured`, `validators_unconfigured` or `dispatch_unconfigured`) is a `500` with `retry_after_ms: null` and a remediation saying it is a server configuration defect: retrying will not help; an unwired capability classifier is the same kind of defect but answers `503` `classifier_unavailable` (also `retry_after_ms: null`). The definition-id check is specific to the v1 route and the MCP twin; the legacy `POST /api/instructions/{id}/execute` does not apply it.
+
+**`approval_mode`.** `auto` dispatches. `always`, any unrecognised value, and `role-gated` for a caller who is not an effective administrator answer **`202`** and dispatch nothing. `role-gated` lets an administrator (including an active JIT elevation) through. A non-auto definition with no approval manager is `503` `approval_unavailable` with `retry_after_ms: null`: an unwired approval manager is a server defect that does not clear by itself, so the `remediation` says retrying will not help and to report it to the server operator. **Per-principal cap.** A caller who already holds about 25 pending approvals (a per-principal soft bound over unexpired rows of every approval origin; the MCP `execute_instruction_definition` tool and the MCP approval-ticket mint apply the same bound from one shared constant) is refused with **`429`** `approval_cap_reached` before any approval is created; `retry_after_ms` is `null` because only a reviewer handling the pending requests, or their 7-day expiry, frees a slot, so a blind retry loop cannot succeed. If the shared approval queue is full (1000 pending across every principal) the call is refused **`503`** `approval_queue_full` with `retry_after_ms: null` and a `remediation` saying a human reviewer must decide pending approvals: only a reviewer, or the 7-day expiry, frees a slot, so a retry loop cannot succeed. A store fault while creating the approval stays `500` `approval_submit_failed` with `retry_after_ms: 5000`. If the approval store cannot be read to count the caller's pending approvals (a pool timeout or query failure), the call is refused **`503`** `approval_unavailable` with `retry_after_ms: 5000` and no approval is created: the cap fails closed and never treats an unreadable count as zero. The check reads the count and then submits, so concurrent requests from one caller can briefly exceed the bound (the shared 1000-row queue bounds the total on one server replica (submissions are serialised inside a replica, but replicas do not coordinate, so a multi-replica deployment can briefly exceed it)), and the legacy `POST /api/instructions/{id}/execute` does not apply it. Other principals are unaffected by one caller's count, and the refusal is audited (`instruction.execute` `denied`, detail `reason=approval_cap_reached`) and counted on `yuzu_server_approval_submit_refused_total{reason="approval_cap_reached"}`. The `202` ticket cannot be redeemed through the API: it is a request for an operator to review, not a token that releases this call, so re-send the request after the definition is changed or the approval is handled out of band. The pending approval records the definition, the scope expression and the definition's resolved `target_plugin` / `target_action` (for the reviewer's context only), and nothing else: it does NOT approve the `agent_ids` or the `params` of the request that created it, so a reviewer is not approving those, and any future redemption path must bind them (a bound request) before it ships.
+
+**Audit.** Action `instruction.execute`, target `instruction`/`{id}`. The `requested` row is written **before** dispatch, and it is the only row guaranteed to exist before the effect. Every row this route writes ends with `correlation_id=<id>`, the value of the response's `X-Correlation-Id` header and of the error body's `correlation_id`, so a `requested` row with no outcome row pairs with the error the caller saw (the legacy route's rows carry no such token). Refusals that come earlier than `requested` write a `denied` row too: the body depth guard (`body_depth`), JSON parse (`invalid_json`), a definition id with a control byte (below `0x20` or `0x7F`) or invalid UTF-8 (`invalid_definition_id`, detail `reason=invalid_definition_id definition=<cleaned id>`), an unknown definition (`not_found`) and every refusal the dispatch dry run and the validation steps make (`failure` for a stored schema that cannot be used or an approval that could not be queued), and `pending` marks a `202`. For an id refused as malformed (a control byte or invalid UTF-8), or one holding a C1 control, U+2028 or U+2029 (valid, so looked up as usual), `target_id` and the `definition=` token carry the same FOLDED string (each unsafe byte of a malformed id, and each C1 control, U+2028 or U+2029 code point, becomes one `_`; space, `=` and `,` also become `_`, and only an ordinary unfolded id keeps them). The fold is lossy: a malformed id's row carries `reason=invalid_definition_id`, but a VALID id holding a C1 control, U+2028 or U+2029 follows the normal path, so its `target_id`, `definition=` and `reason` (for example `not_found`) are identical to those of the legitimate name it folds to and no field separates them; a pre-core refusal (`invalid_json`, `body_depth`) of any such id likewise cannot be told by `target_id` from a refusal of that name. A `denied` row that cannot be stored sets `Sec-Audit-Failed: true` on the refusal, which stays as it was. These refusals write **no** `instruction.execute` row: the permission gate (its own denials are `auth.permission_required` rows), a definition-store fault, and a server that is missing a required component of the definition lookup, authorizer, validator cache, classifier or dispatch. A definition that needs approval is different when the approval manager or the pending-approval counter is not wired, or the caller's pending count cannot be read: that writes a `failure` row with `reason=approval_unavailable` before the `503`, and a caller at the per-principal bound or a full approval queue leaves a `denied` row (`approval_cap_reached`, `approval_queue_full`). After the dispatch comes `success` or `failure`. If the `requested` row cannot be stored the call is `503` `audit_unavailable` with `Sec-Audit-Failed: true` and **nothing is dispatched**. A server with no audit sink wired answers the same `503` `audit_unavailable` (with `retry_after_ms: null`, a configuration defect) right after the permission check. A later best-effort row that fails to store sets `Sec-Audit-Failed: true` on the response; the command already ran.
+
+**Events.** As the legacy route does, a dispatch that reached at least one agent publishes the platform event `instruction.executed`, and a call that creates a pending approval (the `202`) publishes `approval.created`, once each, after the audit row (no attributes or payload; see [analytics-events.md](../analytics-events.md)). A refusal, a zero-reach and a dispatch that threw publish nothing, and a failed publish never changes the answer.
+
+**Concurrency.** A definition whose `concurrency_mode` is `per-device` takes the per-device claim (ADR-1007) inside the dispatch, so a device already running it can be skipped.
+
+**`200` response** (dispatched):
+
+```json
+{
+  "data": {
+    "command_id": "echo-3f2a...",
+    "execution_id": "ex-91c0...",
+    "agents_reached": 3,
+    "definition_id": "filesystem.exists"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**`202` response** (approval required, nothing dispatched):
+
+```json
+{
+  "data": {
+    "status": "pending_approval",
+    "approval_id": "a1b2c3...",
+    "approval_mode": "role-gated",
+    "definition_id": "filesystem.exists"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Zero agents reached** is an error, discriminated by `error.reason`: `invalid_scope` is `400`; `containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `quarantined`, `plugin_not_found`, `kill_switched_os` and `no_agents_reached` are `503`. `retry_after_ms` is `5000` for `containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached`, and `null` for the permanent causes (`invalid_scope`, `quarantined`, `plugin_not_found`, `kill_switched_os`), where retrying the same request cannot succeed. The error object also carries `command_id`, `execution_id` (the cancelled execution row) and the counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_switched_os`. `no_agents_reached` includes the case where a per-device claim excluded every target.
+
+Other errors use the A4 envelope with a `reason`: `500` `dispatch_exception` (the dispatch threw; a `failure` audit row with `reason=dispatch_exception` is written). The execution row is **not** cancelled: whether any agent already received the command is unknown, so the row is left `running` and results from any agent that did receive it are still recorded against it. The error carries two typed fields, so nothing has to be parsed out of the remediation text: `error.execution_id` (always present for this refusal; an empty string when no execution row exists) and `error.agents_sent` (present only when the send path had accepted the command for at least one agent before the failure; a lower bound, because a send in flight when the dispatch threw is not counted; a gateway-routed agent counts once its command is queued for forwarding, which can still fail). The `failure` audit row carries `agents_sent=<n>` (before `correlation_id=`) whenever at least one send was accepted by the send path, whether or not the count could be stored, and it is written before the count is stored. The remediation depends on what happened:
+
+- At least one send accepted by the send path and the count stored as the row's targeted count: those agents' results complete the row on their own; the remediation says so and names `POST /api/v1/executions/{id}/cancel` as the way to close it early.
+- At least one send accepted by the send path, the row exists, but the count could NOT be stored (counted on `yuzu_exec_tracker_bookkeeping_failed_total{op="set_agents_targeted"}`): the server closes the record by itself ONLY if no agent ever responds, a record an agent has answered will NOT close by itself, and `POST /api/v1/executions/{id}/cancel` closes it.
+- At least one send accepted by the send path but no execution row exists: there is no execution record to attach per-agent results to; the remediation says to confirm on the devices before running the definition again.
+- No send accepted (or none known) and a row exists: the targeted count stays 0 and the row stays `running` until the stuck-execution sweep cancels it, which it does only for a row that is still `running` with a targeted count of 0, no per-agent response at all and no pending command-outbox delivery, dispatched more than about 30 minutes ago (the same closes-by-itself-only-if-no-agent-answers wording is in the remediation); `POST /api/v1/executions/{id}/cancel` closes it at once.
+
+`agents_sent` is a lower bound (a gateway-routed agent counts once its command is queued for forwarding, which can still fail), so the row can complete early: a count that is too low lets the row complete through the ordinary count refresh as soon as that many agents have answered, before an uncounted agent has (this is not the stuck-execution sweep, which never closes a row an agent has answered), and a swept row means "no agent answered", not "no agent received the command". The error carries **no retry hint** (`retry_after_ms` is `null`, and the text does not suggest a retry), because a dispatch that threw may already have reached some agents and sending it again could run it twice; check that execution's per-agent results before running the definition again. If the execution row cannot be created (the store throws), nothing is dispatched: the answer is `503` `execution_record_unavailable` with `retry_after_ms: 5000` and a `failure` audit row with `reason=execution_record_exception`.
+
 ---
 
 ### Product Packs
@@ -6504,6 +6570,8 @@ does not exist or was soft-deleted; a genuine store degrade returns `503` (ADR-0
 | `scope` | string | Yes | Scope expression selecting target agents |
 | `parameters` | object | No | Override parameters for workflow steps |
 
+**Approval:** `Workflow:Execute` requires an approval ticket at the `supervised` MCP token tier, so a supervised-tier MCP token that calls this route is refused (`403`, approval required on this transport, audit action `auth.approval_required`). No MCP tool maps to `Workflow:Execute` yet, so such a token has no ticket path to run a workflow until the `execute_workflow` tool ships; use a session or a non-MCP API token. Treat that as temporary and do not remove the tier from a token that does other work only to run workflows: the tier constrains every other operation the token performs. Running the steps one at a time through `execute_instruction` stays approval-gated per step. The `operator` tier is refused by the tier check, and an untiered token is unaffected.
+
 #### `GET /api/workflow-executions/{id}`
 
 Get the status of a running or completed workflow execution, including per-step and per-agent
@@ -6763,6 +6831,82 @@ When the 100-row (scoped) cap drops rows, `data.result_truncated_by_cap` is adde
   "meta": { "api_version": "v1" }
 }
 ```
+
+#### `POST /api/v1/executions/{id}/cancel` and `POST /api/v1/executions/{id}/rerun` (#2146 batch B)
+
+REST v1 twins of the legacy `POST /api/executions/{id}/cancel` and `.../rerun` documented above;
+MCP twins `cancel_execution` and `record_execution_rerun`. The four v1 and MCP twins run the same
+admit, audit, change, audit sequence (`execution_mutation.hpp`); the legacy routes are untouched and
+keep their own handlers (the legacy cancel and rerun write no `attempted` row).
+
+**Neither route sends anything to any device.** Cancel only marks the execution's tracker record
+cancelled: a command a device has already received is not stopped or recalled. Rerun only creates a
+**pending** tracker record linked to the original through `rerun_of`; no agent runs anything because
+of it, and a `201` does not mean devices were re-run (the body says `dispatched_to_devices: false`).
+To run the work again on devices, dispatch it.
+
+**Permission:** `Execution:Execute` and `Execution:Read` (the target-visibility check runs through
+the fleet-read gate), in that order. A service-scoped API token is refused (`403`). A supervised-tier
+MCP token that calls these REST routes is refused (`403`, approval required on this transport); the
+MCP `cancel_execution` tool is the one that is exempt from the approval ticket (see `docs/mcp-server.md`).
+Step-up: cancel is classified "cancels a pending record" and the v1 rerun "creates a pending rerun record" (each sends nothing
+to any device; the legacy rerun route keeps the class "execution dispatch"); none asks for a fresh MFA proof.
+
+**Confinement.** A caller confined to management groups may use these only on an execution they
+dispatched that no device has reported on yet, or one whose complete targeted device list is visible
+to them. Every other case, including an id that does not exist, answers the same `404` body and
+writes the same `denied` audit row (when that row is lost the `404` carries `Sec-Audit-Failed: true`), so a hidden execution cannot be told from a missing one.
+An unconfined caller naming an unknown id gets the `404` and no audit row. This differs from the legacy `POST /api/executions/{id}/rerun`, which answers an unknown id with `400` ("original execution not found") for an unconfined caller: a client moving from the legacy rerun route to the v1 twin must treat `404` as the unknown-id answer. The legacy cancel route answers `404`, like both v1 routes. A caller whose identity
+cannot be resolved is refused with a `503` and no `retry_after_ms` (the credential names no principal, so retrying with it cannot succeed; use a different credential); there is no fallback user.
+
+**Audit (fail closed).** Both write `execution.cancel` / `execution.rerun` rows. An `attempted` row
+is written **before** the change; if it cannot be saved the call answers `503` with
+`Sec-Audit-Failed: true` and changes nothing. Every refusal that writes its own `denied` or `failure` row (the confined `404`, a rerun whose original vanished or whose store went unreadable) carries `Sec-Audit-Failed: true` when that row is lost, without changing the status or body. A server with no audit sink wired is treated the same
+way (`503`, `Sec-Audit-Failed: true`, no `retry_after_ms`: a configuration defect, not a transient
+fault), never as "audit off". The outcome then writes `success` (for rerun the target
+is the new record), `denied` (cancel `409`) or `failure` (`503`, or `500` when the change itself threw). If only the outcome row fails after
+the change was applied, the success response carries `Sec-Audit-Failed: true`.
+
+**`POST /api/v1/executions/{id}/cancel`** takes no body. `200`:
+
+```json
+{ "data": { "execution_id": "exec-1", "status": "cancelled" }, "meta": { "api_version": "v1" } }
+```
+
+`409`: the execution already finished (`succeeded`, `completed` or `cancelled`); nothing changed.
+`503` (with `retry_after_ms`): the tracker or audit store is degraded; nothing changed. A `503` without `retry_after_ms` means the credential resolves to no principal and retrying with it will not help. The same two `503` forms apply to rerun.
+`500` (no `retry_after_ms`): the change itself threw, so whether the cancel landed is unknown; a `failure` row is written. Read the execution before issuing another request. The same `500` applies to rerun.
+
+**`POST /api/v1/executions/{id}/rerun`** takes an optional JSON object with one field,
+`failed_only` (boolean, default `false`; an empty body means `false`). `failed_only: true` sizes the
+new record to the original's failed, timed-out and rejected devices. The legacy
+`{"scope": "failed_only"}` string is **not** accepted: any other field, a non-object body or a
+non-boolean `failed_only` is a `400`. Each call creates another record. `201`:
+
+```json
+{
+  "data": {
+    "execution_id": "exec-9", "rerun_of": "exec-1", "status": "pending",
+    "failed_only": true, "dispatched_to_devices": false
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+An original that exists but cannot be read (store degraded, pool exhausted) answers `503` with
+`retry_after_ms`, a `failure` audit row and no new record; it is never reported as `404`. (The
+legacy `POST /api/executions/{id}/rerun` still reads without that check and reports an unreadable
+original as `400 original execution not found`.)
+
+Like the legacy routes, a successful cancel publishes the platform event `execution.completed`
+(attributes `{status:"cancelled"}`, payload `{execution_id}`) and a successful rerun publishes
+`execution.created` (payload `{execution_id, parent_id, trigger:"rerun"}`), once each, after the
+`success` audit row. A refusal, a denial, a store failure and an effect that threw publish nothing,
+and a failure to publish never changes the answer (it is counted on
+`yuzu_server_event_emit_failed_total`). These are the analytics events documented in
+[analytics-events.md](../analytics-events.md); they are not the per-agent `execution.completed`
+webhook of the Webhooks section above, which fires from the agent response path for every
+execution regardless of route.
 
 #### `GET /api/v1/schedules`
 
@@ -11625,6 +11769,109 @@ approval workflow this route deliberately does not — `/api/command` mints no a
 its own (one core-owned approval primitive, ADR-1005). An admin caller, or a caller redispatching
 with a redeemed approval ticket via the governed path, is not subject to this denial.
 
+#### `POST /api/v1/commands`
+
+The REST v1 twin of `POST /api/command` and of the MCP tool `execute_instruction`. It sends one
+plugin action to connected agents through the same confined dispatch seam, creates an execution row
+and returns its `execution_id`, so the result is collected with the execution routes. It has no UI
+fields (no `thead_html`, no `HX-Trigger`). A dispatch that reaches an agent does publish the
+platform event `command.dispatched` (see **Event** below), as `POST /api/command` does.
+
+Requires `Execution:Execute`. A service-scoped API token is refused at that gate (`403`); the
+service-scope allow-list is empty. Every agent the command reaches is also intersected with the
+caller's own visible set, so a caller confined by management group or by tag never reaches an agent
+outside it. An engine principal holds no authority here unless an RBAC grant gives it one.
+
+**Body size.** The route has its own `commands` body-cap class (4 MiB, `requires_measurable`, see the body
+cap table): a body that cannot be measured in advance (chunked `Transfer-Encoding`, or no `Content-Length`) is
+refused `411`, which the legacy `POST /api/command` (default class, no measurability requirement) does not do.
+
+**Request body** (a JSON object; any field not listed is refused with `reason: "unknown_field"`,
+so a legacy `stagger` or `delay` is never silently dropped):
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `plugin` | string | Yes | Plugin name, at most 128 bytes. Lowercased before dispatch. |
+| `action` | string | Yes | Action name, at most 128 bytes. Lowercased before dispatch. |
+| `params` | object | No | At most 32 keys; a key at most 256 bytes; a value at most 64 KiB (a non-string value is sent as its JSON text). Anything but an object is refused (`params_type`). |
+| `agent_ids` | array of strings | No | At most 10000 entries of at most 128 bytes. Present means non-empty. |
+| `scope` | string | No | A scope expression, at most 8192 bytes, or `__all__`. Present means non-empty. |
+
+Targeting: omit both `agent_ids` and `scope` to target the whole fleet. A targeting argument that
+is supplied but names nothing (`"agent_ids": []`, `"scope": ""`) is refused (`agent_ids_empty`,
+`scope_empty`), never widened to the fleet. `agent_ids` together with a real `scope` is refused
+(`target_conflict`); `agent_ids` together with `__all__` dispatches to the listed agents only.
+
+A `Destructive` pair (and a `Forensics` read) must name explicit `agent_ids`: broadcast and scope
+fan-out are refused with `400` and `reason: "destructive_untargeted"` (`forensic_untargeted` for a
+Forensics pair, which needs exactly one id). The pair's own securable is checked first (`403`
+before `400`). Listed agents outside the caller's management-group-visible set are dropped silently;
+when none is left the answer is `404` with `reason: "destructive_no_visible_target"`.
+
+**Success** is `202 Accepted`:
+
+```json
+{
+  "data": {
+    "command_id": "echo-0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+    "execution_id": "exec-...",
+    "agents_reached": 2,
+    "plugin": "echo",
+    "action": "status",
+    "withheld_quarantined": 0,
+    "withheld_unknown_plugin": 0,
+    "withheld_kill_switched_os": 0
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
+`agents_reached` is at least 1. `execution_id` is an empty string when the execution row could not
+be created (the command is still sent). The `withheld_*` counts are agents the command was not sent
+to by the quarantine gate, an absent plugin, or a per-OS kill switch.
+
+**Audit.** The route writes `command.dispatch` rows stamped from the session it resolved. A
+`requested` row is written before anything is sent; if it cannot be stored the answer is `503`
+with `Sec-Audit-Failed: true` and nothing is dispatched. An outcome row follows (`success`, or
+`failure` with the reason, among them `dispatch_exception` with `agents_sent=<n>` (before `correlation_id=`) after a partial send (the sends accepted by the send path), and `execution_record_exception` when the execution row could not be created and nothing was dispatched); that row cannot undo a dispatch, so when it is lost the response
+carries `Sec-Audit-Failed: true` and the `requested` row remains the evidence. A refusal writes a
+`denied` row with `reason=`.
+
+**Event.** As `POST /api/command` does, a dispatch that reached at least one agent publishes the platform event `command.dispatched` (attributes `{target_count}`, payload `{plugin, action, command_id, scope}`; see [analytics-events.md](../analytics-events.md)) once, after the outcome row. A refusal, a zero-reach and a dispatch that threw publish nothing, and a failed publish never changes the answer (it is counted on `yuzu_server_event_emit_failed_total`).
+
+**Errors.** Every error is the A4 envelope with a machine-readable `error.reason`.
+
+| Status | `reason` | Meaning |
+|---|---|---|
+| `400` | `body_depth`, `body_type`, `unknown_field`, `params_type`, `ident_empty`, `ident_len`, `scope_len`, `param_count`, `param_key_len`, `param_value_len`, `agent_ids_count`, `agent_id_len`, `agent_ids_type`, `agent_id_type`, `agent_ids_empty`, `scope_type`, `scope_empty`, `target_conflict` | The request is malformed or over a bound; fix it and re-send. |
+| `400` | `destructive_untargeted`, `forensic_untargeted` | See above. |
+| `400` | `unclassified`, `ambiguous` | The `plugin`/`action` pair is not in the capability catalogue. |
+| `401` | `principal_changed` | The request's credentials resolved to two different principals; retry. |
+| `403` | `forbidden`, `approval_required`, `kill_switched`, `anonymous_operator` | The dispatch check refused the caller; `approval_required` means this route creates no approval ticket and accepts none, so dispatch as an administrator; `POST /api/instructions/{id}/execute` dispatches through the same gate, and an approval created there cannot be redeemed yet (#6064). No `permission` field is returned. |
+| `404` | `destructive_no_visible_target` | See above. |
+| `503` | `audit_unavailable` | The `requested` row could not be stored; nothing was sent. Carries `retry_after_ms`. |
+| `500` | `dispatch_exception` | The dispatch threw. No retry hint: whether an agent received the command is unknown, so the execution row is left `running` (not cancelled) and `error.execution_id` names it (a typed field, an empty string when no row exists); results from any agent that did receive the command are still recorded against it. `error.agents_sent` is present only when the send path had accepted a send to at least one agent before the failure (a lower bound; a gateway-routed agent counts once its command is queued for forwarding, which can still fail); the `failure` audit row then carries `agents_sent=<n>` (before `correlation_id=`), whether or not the count could be stored. When it is stored as the row's targeted count, their results complete the row. When it could not be stored, the remediation says the server closes the record by itself ONLY if no agent ever responds, a record an agent has answered will NOT close by itself, and `POST /api/v1/executions/{id}/cancel` closes it. When a send was accepted but no row exists, there is no execution record to attach per-agent results to and the remediation says to confirm on the devices. With none accepted the row stays `running` until the stuck-execution sweep cancels it (only for a row with a targeted count of 0, no per-agent response and no pending command-outbox delivery, dispatched more than about 30 minutes ago), and `POST /api/v1/executions/{id}/cancel` closes it at once. |
+| `503` | `execution_record_unavailable` | The execution row could not be created (the store threw); nothing was dispatched. Carries `retry_after_ms`. |
+
+When the command reaches no agent (`sent == 0`) the answer is the first row of this table that
+applies (a fixed priority order, one answer per request) and carries `command_id`, `execution_id` (the row is
+marked cancelled), `agents_reached: 0` and the withheld counts in the `error` object:
+
+| Order | `reason` | Status | `retry_after_ms` | Meaning |
+|---|---|---|---|---|
+| 1 | `invalid_scope` | `400` | `null` | The scope expression did not parse; fix it. |
+| 2 | `containment_unreadable` | `503` | `5000` | The quarantine state is unreadable; dispatch fails closed. |
+| 3 | `route_unreadable` | `503` | `5000` | The gateway routing directory could not be read for some targets. |
+| 4 | `os_gate_unreadable` | `503` | `5000` | Presence could not be read while a per-OS kill switch is set. |
+| 5 | `quarantined` | `409` | `null` | Every target is quarantined. |
+| 6 | `plugin_not_found` | `422` | `null` | The plugin is in no target agent's inventory. |
+| 7 | `kill_switched_os` | `403` | `null` | Every target runs an OS for which the action is switched off. |
+| 8 | `no_agents_reached` | `503` | `5000` | Every target was unreachable. |
+
+A protective action (the quarantine control actions and `__guard__.push_rules`) never yields
+`os_gate_unreadable`, `plugin_not_found` or `kill_switched_os`. Refusals in the targeting family
+increment `yuzu_server_dispatch_target_rejected_total{route="command_v1"}`.
+
 ---
 
 ### Agents
@@ -12928,7 +13175,7 @@ curl -X POST https://yuzu.example.com/api/dashboard/echo-execute \
 
 **Safety controls:**
 - Server-side: validates SELECT-only queries and applies a keyword blocklist (no INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, DETACH, PRAGMA, VACUUM, REINDEX).
-- Agent-side: untrusted queries run on a dedicated **read-only** SQLite connection through a `sqlite3` authorizer that permits only `SELECT`/`READ` of registry-known warehouse tables (`$Process_Live`, `$TCP_Hourly`, …) and scalar/aggregate functions. Writes, `ATTACH`, `PRAGMA`, schema-table reads (`sqlite_master`), recursive CTEs, and multi-statement input are denied at prepare time — the read-only connection makes writes structurally impossible regardless of the query text. `$`-prefixed table names are translated only outside string literals and comments, so the executed query always matches the validated form. Queries exceeding 4KB are rejected. A blocked query returns `query rejected: operation or table not permitted`.
+- Agent-side: untrusted queries run on a dedicated **read-only** SQLite connection through a `sqlite3` authorizer that permits only `SELECT`/`READ` of registry-known warehouse tables (`$Process_Live`, `$TCP_Hourly`, …) and scalar/aggregate functions. Writes, `ATTACH`, `PRAGMA`, schema-table reads (`sqlite_master`) and multi-statement input are denied at prepare time, and common table expressions (`WITH`), `NATURAL` and `USING` joins and bound-parameter markers are refused before the query is prepared (a query that starts with `WITH` gets `only SELECT queries are allowed`) — the read-only connection makes writes structurally impossible regardless of the query text. `$`-prefixed table names are translated in code and inside quoted identifiers, never inside a string literal or a comment, so the executed query always matches the validated form. Queries exceeding 4KB are rejected. A blocked query returns `query rejected: operation or table not permitted`.
 
 #### `GET /echo`
 

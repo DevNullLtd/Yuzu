@@ -1361,6 +1361,8 @@ echo_test_exe = executable(
     'unit/test_echo_power.cpp',                   # Wave 6 PR6.2-b: pmset parser + exact-tail cursor/gap decisions, REAL-CAPTURE fixtures, RunFn-injected
     'unit/test_echo_removable.cpp',               # Wave 6 PR6.3: event-log channel parsers + identity + per-channel cursors, REAL-CAPTURE fixtures
     'unit/test_echo_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
+    'unit/test_echo_fold.cpp',                    # roll-up substrate: bucket math, deltas, merge ops, DDL/view parity, fold writer, replay ring, GC, authorizer
+    'unit/test_echo_fold_sizing.cpp',             # roll-up substrate: bytes-per-row ceilings ([fold_sizing], split into its own test() below)
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/echo/src/echo_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -1372,6 +1374,8 @@ echo_test_exe = executable(
     '../agents/plugins/echo/src/echo_diff.cpp',
     '../agents/plugins/echo/src/echo_software_core.cpp',
     '../agents/plugins/echo/src/echo_schema_registry.cpp',
+    '../agents/plugins/echo/src/echo_fold_schema.cpp',
+    '../agents/plugins/echo/src/echo_fold.cpp',
     '../agents/plugins/echo/src/echo_aggregator.cpp',
     '../agents/plugins/echo/src/echo_usage.cpp',
     '../agents/plugins/echo/src/echo_perf.cpp',
@@ -1406,7 +1410,10 @@ echo_test_exe = executable(
   link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   dependencies: echo_test_deps,
 )
-test('echo unit tests', echo_test_exe, args: ['--durations=yes'], suite: 'echo', timeout: 90)
+# The sizing cases fold 20,000 distinct keys per source, so they run as their own test() with a
+# longer timeout; the main run excludes them (the same filter-split shape as the server shards below).
+test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 90)
+test('echo fold sizing', echo_test_exe, args: ['[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 
 # ── Server unit tests ─────────────────────────────────────────────────────────
 if build_server
@@ -1478,6 +1485,7 @@ if build_server
       'unit/server/test_pg_retention_guard.cpp',
       'unit/server/test_audit_retention_rules.cpp',
       'unit/server/test_log_token.cpp',
+      'unit/server/test_audit_token_hostile_bytes.cpp',
       'unit/server/test_sqlite_raii.cpp',
       'unit/server/test_rest_audit_sample.cpp',
       'unit/server/test_rest_audit_query.cpp',
@@ -1566,6 +1574,8 @@ if build_server
       'unit/server/test_gateway_route_reap_rules.cpp', # HA WS-4 4.2a: PURE decide_reap decision set (PR #4299 round-3 decide/apply split)
       'unit/server/test_gateway_route_wiring.cpp', # HA WS-4 4.1: GatewayUpstreamServiceImpl wiring onto GatewayRouteStore (re-announce-vs-fresh, connect/disconnect/heartbeat, fail-open)
       'unit/server/test_gateway_mgmt_stub_pool.cpp', # HA WS-4 4.3: parse_gateway_cluster_addrs + GatewayMgmtStubPool resolution (cross-cluster fan-out)
+      'unit/server/test_gateway_forward_guard.cpp', # #2146 D7: forward_gateway_pending spawn/setup guard seam (resolve-once, flag ordering, loop continues)
+      'unit/server/test_checked_pending_count.cpp', # #2146 D7: MCP approval mint pending-count throw-folding wrapper
 
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
@@ -1827,6 +1837,9 @@ if build_server
       'unit/server/test_shutdown_join_order.cpp', # #3495: agent_server_->Shutdown(deadline) runs before the policy-eval/pre-flight/quarantine/schedule joins + the heartbeat fn-null wait, mechanically scanned from server.cpp at test run time
       'unit/server/test_store_worker_pool.cpp', # #3261: StoreWorkerPool submit/quiesce/backpressure/exception-firewall, no HTTP (avoids the unrelated TSan/glibc crash #2504)
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
+      'unit/server/test_command_v1_routes.cpp', # POST /api/v1/commands (#2146): exact send sets over a real AgentRegistry, destructive gate, zero-reach table, audit fail-closed
+      'unit/server/test_instruction_execute.cpp', # #2146: the shared instruction-definition execute core + the v1 REST twin; every store is a Ports seam (the [pg]-tagged wedge cases alone use a real ExecutionTracker + reaper)
+      'unit/server/test_dispatch_zero_reach.cpp', # classify_zero_reach: pure cause priority, protective suppression, tokens, retryable (new v1 routes / MCP tools)
       'unit/server/test_dispatch_destructive_gate.cpp', # #3685: Destructive targeting gate — pure verdict + confinement + refusal-string pins
       'unit/server/test_plugin_result_audit.cpp', # registry.write audit extraction from mutating-action output frames (pure) + live ingest on both frame paths
       'unit/server/test_rundown_gate.cpp', # the shutdown rundown behind the registry.write hook (pure): enter/close/drain, the wake-up, a latch race against one close
@@ -1932,6 +1945,7 @@ if build_server
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
       'unit/server/test_rest_executions_v1_twins.cpp',
+      'unit/server/test_execution_cancel_rerun_twins.cpp', # #2146 batch B: cancel/rerun REST v1 + shared sequence, no Postgres
       'unit/server/test_rest_responses_v1_twins.cpp', # #2146 A2-R2: GET /api/v1/responses{,/aggregate,/export}
       'unit/server/test_response_templates_engine.cpp',
       'unit/server/test_rest_response_templates.cpp',

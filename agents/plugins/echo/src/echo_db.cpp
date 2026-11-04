@@ -14,6 +14,7 @@
  */
 
 #include "echo_db.hpp"
+#include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp"
 
 #include <sqlite3.h>
@@ -121,7 +122,7 @@ bool ascii_iequals(const char* a, const char* b) noexcept {
 // is_queryable_table's allocation) must never unwind through them — that would be
 // UB. Any exception fails closed (SQLITE_DENY).
 int echo_query_authorizer(void* /*ctx*/, int action, const char* arg1, const char* arg2,
-                         const char* /*db_name*/, const char* /*inner_trigger_or_view*/) noexcept {
+                         const char* /*db_name*/, const char* inner_trigger_or_view) noexcept {
     try {
         switch (action) {
         case SQLITE_SELECT:
@@ -133,7 +134,28 @@ int echo_query_authorizer(void* /*ctx*/, int action, const char* arg1, const cha
                 return SQLITE_DENY;
             return SQLITE_OK;
         case SQLITE_READ:
-            return (arg1 && is_queryable_table(arg1)) ? SQLITE_OK : SQLITE_DENY;
+            if (!arg1)
+                return SQLITE_DENY;
+            if (is_queryable_table(arg1) || is_fold_view(arg1))
+                return SQLITE_OK;
+            // The roll-up views read echo_dict and their `_r` tables; operator SQL may
+            // reach those ONLY through a roll-up view, never by name. The inner-most
+            // view argument names a SQL context, not a persisted view: a CTE of that
+            // name is reported the same way. This rule is sound ONLY because
+            // validate_and_translate_sql rejects WITH, so no CTE can shadow a view
+            // name. It is defence in depth behind that validator, not the closure.
+            if (inner_trigger_or_view && is_fold_internal_table(arg1) &&
+                is_fold_view(inner_trigger_or_view))
+                return SQLITE_OK;
+            // `SELECT COUNT(*) FROM <view>` is reported as a column-less read of the table
+            // behind the view with no view context. Allow that for the row tables only: it
+            // exposes a row count the view already exposes, never a column. The dictionary
+            // and the replay ring stay denied outright. Sound only while every roll-up view
+            // is a WHERE-less single-table projection (generate_fold_ddl, pinned by test);
+            // a filter or JOIN in a view turns this count into an oracle.
+            if (is_fold_row_table(arg1) && (!arg2 || *arg2 == '\0'))
+                return SQLITE_OK;
+            return SQLITE_DENY;
         default:
             return SQLITE_DENY;
         }
@@ -1295,6 +1317,7 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
             // on a normal C++ stack — never lazily inside the authorizer callback
             // while it runs in SQLite's C prepare frames.
             (void)is_queryable_table("");
+            (void)is_fold_view(""); // the view set; the fold-internal checks derive from it
             db.query_db_ = ro;
         } else {
             spdlog::warn("EchoDatabase: read-only query connection unavailable ({}); "
