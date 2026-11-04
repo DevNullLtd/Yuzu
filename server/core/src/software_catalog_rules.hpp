@@ -48,7 +48,7 @@ struct EcosystemFamily {
 
 /// Row order is the published order of the OpenAPI and MCP ecosystem enums; a mid-table insert
 /// shifts positions, so say so in the changelog.
-inline constexpr std::array<EcosystemFamily, 14> kEcosystemFamilies{{
+inline constexpr std::array<EcosystemFamily, 17> kEcosystemFamilies{{
     {"windows", "windows"},
     {"optional_feature", "windows"},
     {"msi", "windows"},
@@ -63,6 +63,9 @@ inline constexpr std::array<EcosystemFamily, 14> kEcosystemFamilies{{
     {"flatpak", "linux"},
     {"python", "other"},
     {"ibm_mq", "other"},  // middleware (SAM.2): no OS family -- the product runs on several
+    {"chocolatey", "windows"}, // pkg_inventory Windows legs (SAM-31)
+    {"winget", "windows"},
+    {"appx", "windows"},
 }};
 
 /// The table is non-empty, every ecosystem is `[a-z_]+` and every family `[a-z]+` (so none is

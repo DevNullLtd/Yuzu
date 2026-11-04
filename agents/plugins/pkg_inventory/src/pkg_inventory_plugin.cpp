@@ -4,14 +4,17 @@
  * Actions:
  *   "managers"       — which package managers are present on this host and their
  *                      manager-level configuration facts (row PR10.1-c). macOS
- *                      Homebrew and the Linux tool-presence leg (dpkg, apt, rpm,
- *                      dnf, pacman, apk, snap, flatpak) ship; Windows is PLANNED.
+ *                      Homebrew, the Linux tool-presence leg (dpkg, apt, rpm,
+ *                      dnf, pacman, apk, snap, flatpak) and Windows (Chocolatey
+ *                      and winget presence) ship.
  *   "packages"       — macOS Homebrew formulae and casks (Cellar/Caskroom
- *                      directory names). Linux is UNSUPPORTED by construction
- *                      (see below); Windows is a PLANNED placeholder.
+ *                      directory names) and Windows Chocolatey packages (lib\<id>
+ *                      nuspec versions). Linux is UNSUPPORTED by construction
+ *                      (see below).
  *   "store_packages" — Linux snaps and flatpak apps/runtimes from the system
- *                      stores. macOS is UNSUPPORTED by design (installed_apps owns
- *                      the application list); the Windows Appx leg is PLANNED.
+ *                      stores, and the Windows Appx roster registered for all
+ *                      users. macOS is UNSUPPORTED by design (installed_apps owns
+ *                      the application list).
  *
  * SCOPE. MACHINE-SCOPE ONLY: per-user package stores (npm global-vs-user, pip
  * user installs, cargo, per-user Homebrew) are out of scope and deferred to
@@ -23,17 +26,19 @@
  * apk package: installed_apps.list_inventory already covers those, so `packages`
  * is UNSUPPORTED on Linux by design rather than a second, drifting roster.
  *
- * ZERO SUBPROCESSES. Every read is a filesystem read (open/openat/readdir/
- * readlinkat with O_NOFOLLOW); no dpkg-query / rpm / pacman / apk / snap /
- * flatpak / brew / winget is spawned.
+ * ZERO SUBPROCESSES. Every read is a filesystem or registry read (open/openat/
+ * readdir/readlinkat with O_NOFOLLOW; Reg*W and FindFirstFileExW on Windows); no
+ * dpkg-query / rpm / pacman / apk / snap / flatpak / brew / choco / winget is
+ * spawned.
  *
  * Every walk takes an injected root (production passes "/") so the unit suite
  * can drive it over a fixture tree; the per-OS leg TUs are one-line wrappers.
  *
  * All nine per-OS legs are declared unconditionally so the capability-matrix
  * generator (#2204) sees a complete, stable shape whichever OS built the
- * plugin. The Windows legs are PLANNED placeholders: the Chocolatey walk, winget
- * presence and the Appx store roster each follow as their own PR.
+ * plugin. WINDOWS SCOPE: see pkg_inventory_win_parsers.hpp (machine-scope Appx
+ * roster from the registry, Chocolatey lib nuspecs, winget presence through the
+ * App Installer package; the WindowsApps folder is not listed).
  *
  * Read-only: no action here mutates host state.
  */
@@ -67,10 +72,13 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "cask rows, non-zero tap counts and the Intel prefix are exercised by synthetic in-code "
          "layouts only, never a real capture"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "ProgramData\\chocolatey lib/ walk + Program Files\\WindowsApps DesktopAppInstaller "
-         "folder presence for winget; follows as its own PR",
-         nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "C:\\ProgramData\\chocolatey\\lib directory listing (presence + directory count); winget "
+         "presence and version from the HKLM Appx roster "
+         "(AppxAllUserStore\\Applications\\Microsoft.DesktopAppInstaller_* key name)",
+         "measured as the interactive admin user, NT SERVICE\\YuzuAgent unverified; chocolatey's "
+         "own version is not read (the bootstrap package has no loose nuspec and bin\\choco.exe is "
+         "a shim), so its version column is empty"},
     },
     {
         /* .action      = */ "packages",
@@ -82,8 +90,12 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "cask rows and the Intel prefix are exercised by synthetic in-code layouts only, never a "
          "real capture"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "chocolatey lib/<id>/<id>.nuspec via libxml2; follows as its own PR", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "chocolatey lib\\<id>\\<id>.nuspec, one bounded read per package, <version> by a bounded "
+         "tag scan (no libxml2)",
+         "measured as the interactive admin user, NT SERVICE\\YuzuAgent unverified; a directory "
+         "without a loose nuspec (the chocolatey bootstrap package) is not listed; an unreadable "
+         "nuspec gives a row with an empty version"},
     },
     {
         /* .action      = */ "store_packages",
@@ -96,10 +108,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .macos_leg   = */
         {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "installed_apps owns the macOS application list"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "HKLM AppxAllUserStore + WindowsApps single-level + one AppxManifest.xml read; follows as "
-         "its own PR",
-         nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "HKLM Appx\\AppxAllUserStore {Applications, InboxApplications, Deprovisioned} subkey names "
+         "(one per PackageFullName); the WindowsApps folder is not listed and no manifest is read",
+         "measured as the interactive admin user, NT SERVICE\\YuzuAgent unverified; per-user "
+         "packages are not enumerated and Deprovisioned rows are not collected as software"},
     },
 };
 

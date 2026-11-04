@@ -1,0 +1,54 @@
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-04 · interactive admin user, not the agent service account · leg-hash 1b03567381e2
+# PROVENANCE (read before relying on this file). Host: the build host kingsley (Windows 11 Pro 10.0.26200), 2026-11-04.
+# REAL: the Chocolatey lib listing (19 directories, `choco list --local-only -r`, loose-nuspec presence per directory),
+#   the first six Applications and InboxApplications roster key names, the absent Deprovisioned key, and the
+#   Microsoft.DesktopAppInstaller 1.29.379.0 package (Get-AppxPackage).
+# NOT A PLUGIN RUN: these rows are what the shipped walk produces over that captured data (the walk is driven through its
+#   test seam by test_pkg_inventory_win_parsers.cpp, which asserts this file equals that output), not a plugin-capture on
+#   the host. The Applications roster is an excerpt (7 of 69 keys, 6 of 50 for InboxApplications). The Path value of the
+#   DesktopAppInstaller key is derived from its captured InstallLocation, not read from the registry.
+# NOT MEASURED: the NT SERVICE\YuzuAgent service account. Every read above ran as the interactive admin user.
+== action=managers
+status|managers|supported|-
+manager|chocolatey|present|-|C:/ProgramData/chocolatey|lib_dirs=19|-
+manager|winget|present|1.29.379.0|C:/Program Files/WindowsApps/Microsoft.DesktopAppInstaller_1.29.379.0_x64__8wekyb3d8bbwe|-|-
+[result_status] OK / FULL / 
+
+== action=packages
+status|packages|supported|-
+package|chocolatey|7zip|26.5.0|pkg
+package|chocolatey|7zip.install|26.5.0|pkg
+package|chocolatey|KB2919355|1.0.20160915|pkg
+package|chocolatey|KB2919442|1.0.20160915|pkg
+package|chocolatey|KB2999226|1.0.20181019|pkg
+package|chocolatey|KB3033929|1.0.5|pkg
+package|chocolatey|KB3035131|1.0.3|pkg
+package|chocolatey|Temurin21|21.0.13|pkg
+package|chocolatey|chocolatey-compatibility.extension|1.0.0|pkg
+package|chocolatey|chocolatey-core.extension|1.4.0|pkg
+package|chocolatey|chocolatey-windowsupdate.extension|1.0.5|pkg
+package|chocolatey|dotnet-8.0-runtime|8.0.33|pkg
+package|chocolatey|dotnet-9.0-runtime|9.0.22|pkg
+package|chocolatey|jq|1.8.2|pkg
+package|chocolatey|microsoft-openjdk-21|21.0.12.1|pkg
+package|chocolatey|notepadplusplus|8.9.8.1|pkg
+package|chocolatey|notepadplusplus.install|8.9.8.1|pkg
+package|chocolatey|vcredist140|14.51.36247|pkg
+[result_status] OK / FULL / 
+
+== action=store_packages
+status|store_packages|supported|-
+package|appx|AdvancedMicroDevicesInc-RSXCM_22.10.0.0_x64__v2es6h43hjn86|22.10.0.0|app|-|x64|-|active
+package|appx|Clipchamp.Clipchamp_4.7.10220.0_neutral_~_yxz26nhyzhsrt|4.7.10220.0|app|-|neutral|-|active
+package|appx|Microsoft.AV1VideoExtension_2.0.35.0_neutral_~_8wekyb3d8bbwe|2.0.35.0|app|-|neutral|-|active
+package|appx|Microsoft.AVCEncoderVideoExtension_1.1.47.0_neutral_~_8wekyb3d8bbwe|1.1.47.0|app|-|neutral|-|active
+package|appx|Microsoft.ApplicationCompatibilityEnhancements_1.2511.9.0_neutral_~_8wekyb3d8bbwe|1.2511.9.0|app|-|neutral|-|active
+package|appx|Microsoft.BingNews_4.1.24002.0_neutral_~_8wekyb3d8bbwe|4.1.24002.0|app|-|neutral|-|active
+package|appx|Microsoft.DesktopAppInstaller_1.29.379.0_x64__8wekyb3d8bbwe|1.29.379.0|app|-|x64|-|active
+package|appx|1527c705-839a-4832-9118-54d4Bd6a0c89_10.0.19640.1000_neutral_neutral_cw5n1h2txyewy|10.0.19640.1000|app|-|neutral|-|active
+package|appx|E2A4F912-2574-4A75-9BB0-0D023378592B_10.0.19640.1000_neutral_neutral_cw5n1h2txyewy|10.0.19640.1000|app|-|neutral|-|active
+package|appx|F46D4000-FD22-4DB4-AC8E-4E1DDDE828FE_10.0.26100.1_neutral_neutral_cw5n1h2txyewy|10.0.26100.1|app|-|neutral|-|active
+package|appx|Microsoft.AAD.BrokerPlugin_1000.19580.1000.2_neutral_neutral_cw5n1h2txyewy|1000.19580.1000.2|app|-|neutral|-|active
+package|appx|Microsoft.AccountsControl_10.0.26100.1_neutral__cw5n1h2txyewy|10.0.26100.1|app|-|neutral|-|active
+package|appx|c5e2524a-ea46-4f67-841f-6a9465d9d515_10.0.26100.1_neutral_neutral_cw5n1h2txyewy|10.0.26100.1|app|-|neutral|-|active
+[result_status] OK / FULL / 

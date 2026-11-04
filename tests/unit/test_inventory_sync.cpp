@@ -3607,3 +3607,152 @@ TEST_CASE("collector: one drop_source source withheld does not touch the other",
         CHECK(count_source(got->first, "middleware.ibm_mq") == 0);
     }
 }
+
+// ============================================================================
+// pkg_inventory Windows legs (SAM-31): chocolatey / winget / appx adapter arms
+// ============================================================================
+
+namespace {
+std::string constrained_status(std::string_view action, std::string_view token) {
+    return yuzu::shared::format_status_row(action, yuzu::shared::StatusLevel::constrained, token);
+}
+// The shapes the Windows leg emits (pkg_inventory_win_parsers.hpp), via the real row emitters.
+std::string appx_row(std::string_view full_name, std::string_view version, std::string_view arch,
+                     pkg::StoreState state = pkg::StoreState::active) {
+    return pkg::format_store_row(pkg::Store::appx, full_name, version, "app", "", arch, "", state);
+}
+} // namespace
+
+TEST_CASE("pkg_inventory store_packages adapter: appx rows map to {appx, app, name, version, arch}",
+          "[sync][parse][adapter][windows]") {
+    const auto r = parse_pkg_inventory_store_packages_output(
+        nl({supported_status("store_packages"),
+            appx_row("Microsoft.BingNews_4.1.24002.0_neutral_~_8wekyb3d8bbwe", "4.1.24002.0",
+                     "neutral"),
+            appx_row("Microsoft.DesktopAppInstaller_1.29.379.0_x64__8wekyb3d8bbwe", "1.29.379.0",
+                     "x64"),
+            // Removed from the set new profiles receive: seen, never collected.
+            appx_row("Microsoft.Gone_1.0.0.0_x64__8wekyb3d8bbwe", "1.0.0.0", "x64",
+                     pkg::StoreState::deprovisioned),
+            // An unparsable key name: the row degrades to `-`, the entry keeps the whole key.
+            appx_row("not-a-package-name", "", ""),
+            // A snap row beside it still maps through its own arm.
+            snap_store_row("btop", "1.4.7", "app", "1073")}),
+        kFailPolicy);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 4);
+    CHECK(r.entries[0].name == "Microsoft.BingNews");
+    CHECK(r.entries[0].ecosystem == "appx");
+    CHECK(r.entries[0].kind == "app");
+    CHECK(r.entries[0].version == "4.1.24002.0");
+    CHECK(r.entries[0].arch == "neutral");
+    CHECK(r.entries[0].release.empty());
+    CHECK(r.entries[0].publisher.empty());
+    CHECK(r.entries[1].name == "Microsoft.DesktopAppInstaller");
+    CHECK(r.entries[1].arch == "x64");
+    CHECK(r.entries[2].name == "not-a-package-name");
+    CHECK(r.entries[2].version.empty());
+    CHECK(r.entries[2].arch.empty());
+    CHECK(r.entries[3].ecosystem == "snap");
+    // A partial Appx roster would delete stored rows: a constrained answer fails the cycle.
+    CHECK(parse_pkg_inventory_store_packages_output(
+              nl({constrained_status("store_packages",
+                                     "windows:pkg_inventory:appx_applications:access_denied"),
+                  appx_row("Microsoft.BingNews_4.1.24002.0_neutral_~_8wekyb3d8bbwe", "4.1.24002.0",
+                           "neutral")}),
+              kFailPolicy)
+              .status == Status::failed);
+}
+
+TEST_CASE("pkg_inventory packages adapter: chocolatey pkg rows map to {chocolatey, pkg}",
+          "[sync][parse][adapter][windows]") {
+    const auto r = parse_pkg_inventory_packages_output(
+        nl({supported_status("packages"), "package|chocolatey|7zip|26.5.0|pkg",
+            // nuspec unreadable: the version column is `-`, the entry's version stays empty
+            "package|chocolatey|jq|-|pkg",
+            pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula),
+            // an appx row has no business in `packages`: not counted, not mapped
+            appx_row("X.Y_1.0.0.0_x64__8wekyb3d8bbwe", "1.0.0.0", "x64")}),
+        kFailPolicy);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 3);
+    CHECK(r.entries[0].name == "7zip");
+    CHECK(r.entries[0].ecosystem == "chocolatey");
+    CHECK(r.entries[0].kind == "pkg");
+    CHECK(r.entries[0].version == "26.5.0");
+    CHECK(r.entries[1].name == "jq");
+    CHECK(r.entries[1].version.empty());
+    CHECK(r.entries[2].ecosystem == "brew");       // Homebrew is unchanged
+    CHECK(r.entries[2].version == "1.24");
+    // constrained packages answers still fail the cycle (policy unchanged)
+    CHECK(parse_pkg_inventory_packages_output(
+              nl({constrained_status("packages", "windows:pkg_inventory:chocolatey_lib:entry_cap"),
+                  "package|chocolatey|7zip|26.5.0|pkg"}),
+              kFailPolicy)
+              .status == Status::failed);
+}
+
+TEST_CASE("pkg_inventory managers adapter: chocolatey and winget presence rows map",
+          "[sync][parse][adapter][windows]") {
+    const std::string choco =
+        pkg::format_manager_row(pkg::Manager::chocolatey, pkg::Presence::present, "",
+                                "C:\\ProgramData\\chocolatey", "lib_dirs=19", "");
+    const std::string winget = pkg::format_manager_row(
+        pkg::Manager::winget, pkg::Presence::present, "1.29.379.0",
+        "C:\\Program Files\\WindowsApps\\Microsoft.DesktopAppInstaller_1.29.379.0_x64__8wekyb3d8bbwe",
+        "", "");
+    const std::string unavailable = pkg::format_manager_row(
+        pkg::Manager::chocolatey, pkg::Presence::unavailable, "", "C:\\ProgramData\\chocolatey", "",
+        "windows:pkg_inventory:chocolatey_lib:access_denied");
+    const auto r = parse_pkg_inventory_managers_output(
+        nl({supported_status("managers"), choco, winget, unavailable}), kKeepPolicy);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 2); // an unavailable row is not a presence row
+    CHECK(r.entries[0].name == "chocolatey");
+    CHECK(r.entries[0].ecosystem == "chocolatey");
+    CHECK(r.entries[0].kind == "app");
+    CHECK(r.entries[0].version.empty());
+    CHECK(r.entries[1].name == "winget");
+    CHECK(r.entries[1].ecosystem == "winget");
+    CHECK(r.entries[1].version == "1.29.379.0");
+    // Constrained with a present row seen: the rows are kept (managers policy unchanged).
+    const auto c = parse_pkg_inventory_managers_output(
+        nl({constrained_status("managers", "windows:pkg_inventory:appx_applications:access_denied"),
+            choco}),
+        kKeepPolicy);
+    CHECK(c.status == Status::ok);
+    CHECK_FALSE(c.reason.empty());
+    CHECK(c.entries.size() == 1);
+}
+
+TEST_CASE("pkg_inventory adapters: the committed windows.txt sample round-trips through all three",
+          "[sync][parse][adapter][windows]") {
+    const auto m = parse_pkg_inventory_managers_output(
+        capture_section("pkg_inventory", "windows.txt", "managers"), kKeepPolicy);
+    REQUIRE(m.status == Status::ok);
+    REQUIRE(m.entries.size() == 2);
+    CHECK(m.entries[0].ecosystem == "chocolatey");
+    CHECK(m.entries[1].ecosystem == "winget");
+    CHECK(m.entries[1].version == "1.29.379.0");
+
+    const auto p = parse_pkg_inventory_packages_output(
+        capture_section("pkg_inventory", "windows.txt", "packages"), kFailPolicy);
+    REQUIRE(p.status == Status::ok);
+    CHECK(p.entries.size() == 18); // 19 lib directories, `chocolatey` has no loose nuspec
+    for (const auto& e : p.entries) {
+        CHECK(e.ecosystem == "chocolatey");
+        CHECK(e.kind == "pkg");
+        CHECK_FALSE(e.version.empty());
+    }
+
+    const auto s = parse_pkg_inventory_store_packages_output(
+        capture_section("pkg_inventory", "windows.txt", "store_packages"), kFailPolicy);
+    REQUIRE(s.status == Status::ok);
+    CHECK(s.entries.size() == 13); // 7 Applications + 6 InboxApplications captured keys
+    for (const auto& e : s.entries) {
+        CHECK(e.ecosystem == "appx");
+        CHECK(e.kind == "app");
+        CHECK_FALSE(e.version.empty());
+        CHECK(e.name.find('_') == std::string::npos);
+    }
+}
