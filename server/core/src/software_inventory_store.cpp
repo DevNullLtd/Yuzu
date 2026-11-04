@@ -4,7 +4,9 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
+#include "install_type_rules.hpp"
 #include "pg/pg_raii.hpp"
+#include "product_normalize.hpp"
 #include "software_catalog_rules.hpp"
 #include "utf8_sanitize.hpp"
 
@@ -331,6 +333,60 @@ const std::vector<pg::PgMigration>& migrations() {
          "  ecosystem    TEXT   NOT NULL DEFAULT '',"
          "  device_count BIGINT NOT NULL,"
          "  PRIMARY KEY (name, publisher, ecosystem));"},
+        {10,
+         // SAM-13: blob contract v3 (ADR-0016 Update 2026-11-04). Five server-derived/stored
+         // columns on installed_software and a per-(agent, facet) state table.
+         // COLUMNS: constant defaults are metadata-only (the v5 precedent), no rewrite. A row
+         // that predates v10 reads install_type '' ("not derived"), install_scope 'machine' (the
+         // only scope ever collected) and '' keys until its agent's next full replace, bounded by
+         // the weekly floor (kFullFloor, sync_scheduler.hpp).
+         // CHECKs are NOT VALID: new and updated rows are checked, existing rows are not scanned.
+         // '' is admitted for exactly the not-yet-derived rows above, so a later VALIDATE can
+         // never fail. DROP IF EXISTS + ADD keeps a white-box schema_meta rewind idempotent.
+         // The install_type list is FROZEN here: a new type needs its own migration (the
+         // kInstallTypes test pins this list against the vocabulary).
+         // UNIQUENESS is (agent_id, instance_key), NOT the spec row's identity-keyed UNIQUE: an
+         // MSI product is listed by BOTH msi_packages and installed_apps and the two are not
+         // de-duplicated (ADR-0016 Update 2026-10-17), so an identity key would reject a Windows
+         // host's first v10 ingest. instance_key (SHA-256 of the whole canonical row) is unique
+         // after normalize() by construction. Partial: pre-v10 rows (instance_key '') are
+         // excluded, so there is no backfill and no rewrite.
+         // The index build holds ACCESS EXCLUSIVE for its duration, like v7: accepted under the
+         // hard-cutover posture docs/postgres-migration-ladder.md records for v7 (a deviation
+         // from v7's "must be online" rule, with the build measured at 1.8M rows in the ladder
+         // row); statement_timeout is lifted for this txn as in v7, lock_timeout still bounds
+         // lock acquisition.
+         // software_facet_state: one row per (agent, facet), the per-section status the v3 blob
+         // reports plus the section hash the report hash is built from. A new empty table with a
+         // plain primary key: online.
+         "SET LOCAL statement_timeout = 0;"
+         "ALTER TABLE installed_software "
+         "ADD COLUMN IF NOT EXISTS install_type     TEXT NOT NULL DEFAULT '', "
+         "ADD COLUMN IF NOT EXISTS install_scope    TEXT NOT NULL DEFAULT 'machine', "
+         "ADD COLUMN IF NOT EXISTS install_location TEXT NOT NULL DEFAULT '', "
+         "ADD COLUMN IF NOT EXISTS identity_key     TEXT NOT NULL DEFAULT '', "
+         "ADD COLUMN IF NOT EXISTS instance_key     TEXT NOT NULL DEFAULT '';"
+         "ALTER TABLE installed_software DROP CONSTRAINT IF EXISTS installed_software_install_type_chk;"
+         "ALTER TABLE installed_software ADD CONSTRAINT installed_software_install_type_chk "
+         "CHECK (install_type IN ('', 'msi', 'installer', 'store', 'package_manager', "
+         "'optional_feature', 'runtime', 'middleware', 'component', 'driver')) NOT VALID;"
+         "ALTER TABLE installed_software DROP CONSTRAINT IF EXISTS installed_software_install_scope_chk;"
+         "ALTER TABLE installed_software ADD CONSTRAINT installed_software_install_scope_chk "
+         "CHECK (install_scope IN ('machine', 'user')) NOT VALID;"
+         "CREATE UNIQUE INDEX IF NOT EXISTS installed_software_instance_idx "
+         "ON installed_software (agent_id, instance_key) WHERE instance_key <> '';"
+         "CREATE TABLE IF NOT EXISTS software_facet_state ("
+         "  agent_id          TEXT    NOT NULL,"
+         "  facet             TEXT    NOT NULL,"
+         "  status            TEXT    NOT NULL DEFAULT '',"
+         "  token             TEXT    NOT NULL DEFAULT '',"
+         "  section_hash      TEXT    NOT NULL DEFAULT '',"
+         "  enabled           BOOLEAN NOT NULL DEFAULT TRUE,"
+         "  last_confirmed_at BIGINT  NOT NULL DEFAULT 0,"
+         "  duration_ms       BIGINT  NOT NULL DEFAULT 0,"
+         "  bytes_read        BIGINT  NOT NULL DEFAULT 0,"
+         "  updated_at        BIGINT  NOT NULL DEFAULT 0,"
+         "  PRIMARY KEY (agent_id, facet));"},
     };
     return kMigrations;
 }
@@ -359,13 +415,13 @@ std::string sha256_hex(const std::string& in) {
     return out;
 }
 
-// Sort/dedup key walks every STORED field in blob order (name..source; wire slots 13-14
-// are reserved and not stored) so two entries differing only in one field are distinct
-// rows, not duplicates.
+// Sort/dedup key walks every STORED field in blob order (name..source; wire slot 14 is
+// reserved and not stored; slot 13, install_location, is '' on the v2 path) so two entries
+// differing only in one field are distinct rows, not duplicates.
 // The agent (sync_source_installed_software.cpp) sorts and dedups on the same fields in
 // the same order, package_id and source last; the two must stay identical or the canonical
-// hashes diverge → permanent always-full. Records differing only in the reserved slots
-// 13-14 collapse to one row here.
+// hashes diverge → permanent always-full. Records differing only in the reserved slot
+// 14 collapse to one row here.
 bool entry_less(const SoftwareEntry& a, const SoftwareEntry& b) {
     if (a.name != b.name)
         return a.name < b.name;
@@ -391,6 +447,8 @@ bool entry_less(const SoftwareEntry& a, const SoftwareEntry& b) {
         return a.distro_id < b.distro_id;
     if (a.distro_version != b.distro_version)
         return a.distro_version < b.distro_version;
+    if (a.install_location != b.install_location)
+        return a.install_location < b.install_location;
     if (a.package_id != b.package_id)
         return a.package_id < b.package_id;
     return a.source < b.source;
@@ -401,8 +459,8 @@ bool entry_equal(const SoftwareEntry& a, const SoftwareEntry& b) {
            a.install_date == b.install_date && a.kind == b.kind && a.ecosystem == b.ecosystem &&
            a.epoch == b.epoch && a.release == b.release && a.arch == b.arch &&
            a.signature_status == b.signature_status && a.distro_id == b.distro_id &&
-           a.distro_version == b.distro_version && a.package_id == b.package_id &&
-           a.source == b.source;
+           a.distro_version == b.distro_version && a.install_location == b.install_location &&
+           a.package_id == b.package_id && a.source == b.source;
 }
 
 // Sort + dedup in place so both the canonical hash and the persisted rows are
@@ -411,6 +469,98 @@ bool entry_equal(const SoftwareEntry& a, const SoftwareEntry& b) {
 void normalize(std::vector<SoftwareEntry>& entries) {
     std::sort(entries.begin(), entries.end(), entry_less);
     entries.erase(std::unique(entries.begin(), entries.end(), entry_equal), entries.end());
+}
+
+// One row in the blob-v3 canonical form: ALL 16 wire slots (slot 14, uninstall_string, is
+// reserved and always empty), 0x1F-joined, 0x1E-terminated. No conditional tail. This is the
+// byte form the section hash is taken over, and the form `instance_key` hashes for one row.
+void append_section_record(std::string& out, const SoftwareEntry& e) {
+    const std::string_view slots[16] = {e.name,
+                                        e.version,
+                                        e.publisher,
+                                        e.install_date,
+                                        e.kind,
+                                        e.ecosystem,
+                                        e.epoch,
+                                        e.release,
+                                        e.arch,
+                                        e.signature_status,
+                                        e.distro_id,
+                                        e.distro_version,
+                                        e.install_location,
+                                        std::string_view{},
+                                        e.package_id,
+                                        e.source};
+    for (std::size_t i = 0; i < 16; ++i) {
+        if (i)
+            out += '\x1f';
+        out += slots[i];
+    }
+    out += '\x1e';
+}
+
+// Postgres bind form of an entry set: one text[] per inserted column, in the order of the
+// INSERT below. The column list, the SELECT list, the unnest() alias list and this array order
+// are one contract; kInsertColumnCount is checked against it.
+constexpr std::size_t kInsertColumnCount = 19;
+
+// Batched insert (#1664): one statement carrying the per-row columns as parallel text[]
+// arrays — agent_id is the scalar $1, so the param count is a constant 20 regardless of row
+// count. A multi-row VALUES would hit libpq's 65535-parameter ceiling at ~3.2k rows (20
+// params/row); up to kMaxEntries (20k) rows arrive here. unnest() pairs the arrays
+// positionally and they are equal-length by construction. Collapsing up to 20k single-row
+// INSERTs into one statement shrinks the transaction's connection-hold + statement_timeout
+// exposure, which is the UP-IN4/5 pool-saturation blast (a need_full herd flipping healthy
+// agents touched→full) this shape targets. Callers skip it for an empty set.
+// push_back (not a braced init-list) so each large to_text_array prvalue is MOVED into the
+// params, not copied — an init_list's backing array is `const std::string[]`, forcing copies
+// of these up-to-MB literals on the hot path (cpp-expert). Rows must already carry their
+// derived keys (SoftwareInventoryStore::derive_install_keys).
+bool insert_entries(PGconn* c, const std::string& agent_id_s,
+                    const std::vector<SoftwareEntry>& entries) {
+    std::vector<std::string_view> cols[kInsertColumnCount];
+    for (auto& col : cols)
+        col.reserve(entries.size());
+    for (const auto& e : entries) {
+        cols[0].emplace_back(e.name);
+        cols[1].emplace_back(e.version);
+        cols[2].emplace_back(e.publisher);
+        cols[3].emplace_back(e.install_date);
+        cols[4].emplace_back(e.kind);
+        cols[5].emplace_back(e.ecosystem);
+        cols[6].emplace_back(e.epoch);
+        cols[7].emplace_back(e.release);
+        cols[8].emplace_back(e.arch);
+        cols[9].emplace_back(e.signature_status);
+        cols[10].emplace_back(e.distro_id);
+        cols[11].emplace_back(e.distro_version);
+        cols[12].emplace_back(e.install_location);
+        cols[13].emplace_back(e.package_id);
+        cols[14].emplace_back(e.source);
+        cols[15].emplace_back(e.install_type);
+        cols[16].emplace_back(e.install_scope);
+        cols[17].emplace_back(e.identity_key);
+        cols[18].emplace_back(e.instance_key);
+    }
+    std::vector<std::string> params;
+    params.reserve(kInsertColumnCount + 1);
+    params.push_back(agent_id_s);
+    for (const auto& col : cols)
+        params.push_back(pg::to_text_array(col));
+    pg::PgResult ins = pg::exec_params(
+        c,
+        "INSERT INTO software_inventory_store.installed_software "
+        "(agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, "
+        "release, arch, signature_status, distro_id, distro_version, install_location, "
+        "package_id, source, install_type, install_scope, identity_key, instance_key) "
+        "SELECT $1, n, v, p, d, k, e, ep, r, a, s, di, dv, il, pk, so, it, sc, ik, ink "
+        "FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], "
+        "$7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], "
+        "$13::text[], $14::text[], $15::text[], $16::text[], $17::text[], $18::text[], "
+        "$19::text[], $20::text[]) "
+        "AS t(n, v, p, d, k, e, ep, r, a, s, di, dv, il, pk, so, it, sc, ik, ink)",
+        params);
+    return ins.status() == PGRES_COMMAND_OK;
 }
 
 // ── Read-degrade observability (#1675) ───────────────────────────────────────
@@ -609,6 +759,67 @@ std::string SoftwareInventoryStore::canonical_hash(std::vector<SoftwareEntry> en
     return sha256_hex(canon);
 }
 
+namespace {
+
+// Section hash over an ALREADY normalised row set (see canonical_section_hash).
+std::string section_hash_of_normalised(const std::vector<SoftwareEntry>& rows) {
+    std::string canon;
+    canon.reserve(rows.size() * 112);
+    for (const auto& e : rows)
+        append_section_record(canon, e);
+    return sha256_hex(canon);
+}
+
+} // namespace
+
+std::string SoftwareInventoryStore::canonical_section_hash(std::vector<SoftwareEntry> rows) {
+    normalize(rows);
+    return section_hash_of_normalised(rows);
+}
+
+std::string SoftwareInventoryStore::v3_report_hash(
+    std::vector<std::pair<std::string, std::string>> facet_section_hashes) {
+    // Byte-order sort by facet (std::string operator<): independent of any database collation,
+    // which is why the held sections are read unsorted and ordered here.
+    std::sort(facet_section_hashes.begin(), facet_section_hashes.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::string canon;
+    for (const auto& [facet, hash] : facet_section_hashes) {
+        canon += facet;
+        canon += '\x1f';
+        canon += hash;
+        canon += '\x1e';
+    }
+    return "v3:" + sha256_hex(canon);
+}
+
+void SoftwareInventoryStore::derive_install_keys(SoftwareEntry& e) {
+    e.install_type = std::string(install_type_for(e.source, e.ecosystem));
+    e.install_scope = "machine"; // the collection is machine-scope only (ADR-0016 §8)
+
+    // location_norm: ASCII-lower-cased, trailing path separators stripped ('' stays '').
+    std::string loc = e.install_location;
+    for (char& ch : loc) {
+        if (ch >= 'A' && ch <= 'Z')
+            ch = static_cast<char>(ch - 'A' + 'a');
+    }
+    while (!loc.empty() && (loc.back() == '/' || loc.back() == '\\'))
+        loc.pop_back();
+
+    e.identity_key = norm_key(e.name, e.publisher);
+    e.identity_key += '\x1f';
+    e.identity_key += e.version;
+    e.identity_key += '\x1f';
+    e.identity_key += e.arch;
+    e.identity_key += '\x1f';
+    e.identity_key += loc;
+
+    std::string rec;
+    rec.reserve(160);
+    append_section_record(rec, e);
+    e.instance_key = sha256_hex(rec);
+}
+
 void SoftwareInventoryStore::note_read_shed() const noexcept {
     if (!metrics_)
         return;
@@ -651,8 +862,12 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
     static constexpr Projection kProjections[] = {
         {"installed_software",
          "agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, release, "
-         "arch, signature_status, distro_id, distro_version, package_id, source, install_id"},
+         "arch, signature_status, distro_id, distro_version, package_id, source, install_id, "
+         "install_type, install_scope, install_location, identity_key, instance_key"},
         {"inventory_state", "agent_id, source, content_hash, first_seen, last_seen"},
+        {"software_facet_state",
+         "agent_id, facet, status, token, section_hash, enabled, last_confirmed_at, duration_ms, "
+         "bytes_read, updated_at"},
         {"catalog_rollup",
          "name, grain, kind, ecosystem, source, publisher, device_count, version_count, "
          "unsigned_count, ecosystems, kinds, sources, newest_version"},
@@ -739,6 +954,8 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
     std::vector<SoftwareEntry> entries = std::move(*rows);
     normalize(entries);
     const std::string server_hash = SoftwareInventoryStore::canonical_hash(entries);
+    for (auto& e : entries)
+        derive_install_keys(e); // outside the txn: pure CPU, no connection held
     const std::string agent_id_s{agent_id};
 
     const bool ok = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
@@ -778,63 +995,17 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
             std::vector<std::string>{agent_id_s});
         if (del.status() != PGRES_COMMAND_OK)
             return false;
-        // Batched insert (#1664): one statement carrying the per-row columns as
-        // fourteen parallel text[] arrays — agent_id is the scalar $1, so the param
-        // count is a constant 15 regardless of row count. A multi-row VALUES would
-        // hit libpq's 65535-parameter ceiling at ~4.3k rows (15 params/row); up to
-        // kMaxEntries (20k) rows arrive here. unnest() pairs the arrays
-        // positionally and they are equal-length by construction. Collapsing up
-        // to 20k single-row INSERTs into one statement shrinks the transaction's
-        // connection-hold + statement_timeout exposure, which is the UP-IN4/5
-        // pool-saturation blast (a need_full herd flipping healthy agents
-        // touched→full) this change targets. Skip entirely when empty (a
-        // legitimate empty inventory): the DELETE above already cleared the rows.
-        if (!entries.empty()) {
-            // One parallel text[] per stored column (blob-order, 14 columns).
-            std::vector<std::string_view> cols[14];
-            for (auto& col : cols)
-                col.reserve(entries.size());
-            for (const auto& e : entries) {
-                cols[0].emplace_back(e.name);
-                cols[1].emplace_back(e.version);
-                cols[2].emplace_back(e.publisher);
-                cols[3].emplace_back(e.install_date);
-                cols[4].emplace_back(e.kind);
-                cols[5].emplace_back(e.ecosystem);
-                cols[6].emplace_back(e.epoch);
-                cols[7].emplace_back(e.release);
-                cols[8].emplace_back(e.arch);
-                cols[9].emplace_back(e.signature_status);
-                cols[10].emplace_back(e.distro_id);
-                cols[11].emplace_back(e.distro_version);
-                cols[12].emplace_back(e.package_id);
-                cols[13].emplace_back(e.source);
-            }
-            // push_back (not a braced init-list) so each large to_text_array
-            // prvalue is MOVED into params, not copied — an init_list's backing
-            // array is `const std::string[]`, forcing copies of these up-to-MB
-            // literals on the hot path (cpp-expert). Param count is a constant
-            // 15 ($1 scalar agent_id + 14 arrays) regardless of row count.
-            std::vector<std::string> params;
-            params.reserve(15);
-            params.push_back(agent_id_s);
-            for (const auto& col : cols)
-                params.push_back(pg::to_text_array(col));
-            pg::PgResult ins = pg::exec_params(
-                c,
-                "INSERT INTO software_inventory_store.installed_software "
-                "(agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, "
-                "release, arch, signature_status, distro_id, distro_version, "
-                "package_id, source) "
-                "SELECT $1, n, v, p, d, k, e, ep, r, a, s, di, dv, pk, so "
-                "FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], "
-                "$7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], "
-                "$13::text[], $14::text[], $15::text[]) "
-                "AS t(n, v, p, d, k, e, ep, r, a, s, di, dv, pk, so)",
-                params);
-            if (ins.status() != PGRES_COMMAND_OK)
-                return false;
-        }
+        // Batched insert (#1664), shared with the v3 path: see insert_entries. Skipped for a
+        // legitimate empty inventory: the DELETE above already cleared the rows.
+        if (!entries.empty() && !insert_entries(c, agent_id_s, entries))
+            return false;
+        // A v2 full report supersedes any v3 state: drop the agent's facet rows so a downgraded
+        // agent leaves no stale facets (and a later v3 contact starts from the v2 transition).
+        pg::PgResult fs = pg::exec_params(
+            c, "DELETE FROM software_inventory_store.software_facet_state WHERE agent_id = $1",
+            std::vector<std::string>{agent_id_s});
+        if (fs.status() != PGRES_COMMAND_OK)
+            return false;
         // Upsert parent: $4 seeds first_seen on insert; on conflict keep
         // first_seen, refresh content_hash + last_seen.
         pg::PgResult par = pg::exec_params(
@@ -855,6 +1026,254 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         return InventoryIngestOutcome::kError;
     }
     return InventoryIngestOutcome::kStored;
+}
+
+std::vector<V3SectionResult>
+SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id,
+                                                    [[maybe_unused]] std::string_view claimed_hash,
+                                                    V3Report report) {
+    using O = V3SectionOutcome;
+    const std::size_t n = report.sections.size();
+    std::vector<V3SectionResult> results(n); // outcome defaults to kError
+    for (std::size_t i = 0; i < n; ++i)
+        results[i].facet = report.sections[i].facet;
+
+    // What each section needs, decided without the database. A refused section is answered
+    // here; the rest are prepared (normalised, hashed, keys derived) OUTSIDE the transaction so
+    // no pooled connection is held for pure CPU.
+    struct Prepared {
+        std::vector<SoftwareEntry> rows; // normalised, keys derived (full sections)
+        std::string section_hash;
+        bool write{false};     // this section writes facet state (and maybe rows)
+        bool is_delta{false};  // a non-component delta: answered need-full, needs the base compare
+    };
+    std::vector<Prepared> prep(n);
+    bool any_write = false;
+    bool any_delta = false;
+    for (std::size_t i = 0; i < n; ++i) {
+        auto& sec = report.sections[i];
+        if (sec.refusal != V3Refusal::kNone) {
+            results[i].outcome = O::kRejected;
+            continue;
+        }
+        const bool component = sec.facet == kComponentInventoryFacet;
+        if (!v3_status_carries_rows(sec.status) || component) {
+            prep[i].write = true; // status-only, or a component section's state
+        } else if (sec.status == V3Status::kFull) {
+            prep[i].rows = std::move(sec.rows);
+            normalize(prep[i].rows);
+            prep[i].section_hash = section_hash_of_normalised(prep[i].rows);
+            for (auto& e : prep[i].rows)
+                derive_install_keys(e);
+            prep[i].write = true;
+        } else {
+            prep[i].is_delta = true;
+            any_delta = true;
+        }
+        any_write = any_write || prep[i].write;
+    }
+
+    const auto all_unrefused_error = [&] {
+        for (std::size_t i = 0; i < n; ++i) {
+            if (report.sections[i].refusal == V3Refusal::kNone)
+                results[i].outcome = O::kError;
+        }
+    };
+    if (!open_ || agent_id.empty()) {
+        all_unrefused_error();
+        return results;
+    }
+    if (!any_write && !any_delta)
+        return results; // every section was refused: nothing to apply, the nacks say so
+
+    const std::string agent_id_s{agent_id};
+    const std::int64_t ts = now_secs();
+    std::vector<O> done(n, O::kError);
+
+    const bool ok = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
+        const auto fail = [&](const char* what) {
+            spdlog::warn("SoftwareInventoryStore: v3 ingest {} failed for agent={}: {}", what,
+                         agent_id, PQerrorMessage(c));
+            return false;
+        };
+        // The SAME per-agent advisory lock as the v2 replace (key namespace and rationale at
+        // that site): a v2 full and a v3 call for one agent serialise.
+        pg::PgResult lk = pg::exec_params(
+            c,
+            "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || $1, 0))",
+            std::vector<std::string>{agent_id_s});
+        if (lk.status() != PGRES_TUPLES_OK)
+            return fail("lock");
+
+        pg::PgResult st = pg::exec_params(
+            c,
+            "SELECT content_hash FROM software_inventory_store.inventory_state "
+            "WHERE agent_id = $1 AND source = $2",
+            std::vector<std::string>{agent_id_s, kSourceInstalledSoftware});
+        if (st.status() != PGRES_TUPLES_OK)
+            return fail("state read");
+        const bool was_v3 =
+            PQntuples(st.get()) > 0 && std::string_view(PQgetvalue(st.get(), 0, 0)).starts_with("v3:");
+
+        // A delta is judged against the section hash the server holds. Both answers ask for a
+        // full section (delta apply is not built); the outcome records which one it was.
+        if (any_delta) {
+            pg::PgResult held = pg::exec_params(
+                c,
+                "SELECT facet, section_hash FROM software_inventory_store.software_facet_state "
+                "WHERE agent_id = $1",
+                std::vector<std::string>{agent_id_s});
+            if (held.status() != PGRES_TUPLES_OK)
+                return fail("facet read");
+            for (std::size_t i = 0; i < n; ++i) {
+                if (!prep[i].is_delta)
+                    continue;
+                std::string_view stored;
+                for (int r = 0; r < PQntuples(held.get()); ++r) {
+                    if (report.sections[i].facet == PQgetvalue(held.get(), r, 0))
+                        stored = PQgetvalue(held.get(), r, 1);
+                }
+                const auto& base = report.sections[i].base;
+                done[i] = (!base.empty() && base == stored) ? O::kDeltaUnsupported : O::kNeedFull;
+            }
+        }
+
+        if (any_write) {
+            // First v3 contact (or a return from v2): no pre-existing row may outlive the
+            // switch, because from here on a section replaces only its own facet's rows. The
+            // facet state goes with them: the v2 path clears it, so a row here can only be a
+            // leftover of an older binary's v2 replace (which does not know the table), and a
+            // stale held facet would otherwise stay in the report hash for ever.
+            if (!was_v3) {
+                pg::PgResult del = pg::exec_params(
+                    c, "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
+                    std::vector<std::string>{agent_id_s});
+                if (del.status() != PGRES_COMMAND_OK)
+                    return fail("transition delete");
+                pg::PgResult stale = pg::exec_params(
+                    c,
+                    "DELETE FROM software_inventory_store.software_facet_state "
+                    "WHERE agent_id = $1",
+                    std::vector<std::string>{agent_id_s});
+                if (stale.status() != PGRES_COMMAND_OK)
+                    return fail("transition facet delete");
+            }
+            const std::string ts_s = std::to_string(ts);
+            for (std::size_t i = 0; i < n; ++i) {
+                if (!prep[i].write)
+                    continue;
+                const auto& sec = report.sections[i];
+                const std::string dur = std::to_string(sec.duration_ms);
+                const std::string bytes = std::to_string(sec.bytes_read);
+                const std::string status{v3_status_name(sec.status)};
+                if (sec.status == V3Status::kFull && sec.facet != kComponentInventoryFacet) {
+                    pg::PgResult del = pg::exec_params(
+                        c,
+                        "DELETE FROM software_inventory_store.installed_software "
+                        "WHERE agent_id = $1 AND source = $2",
+                        std::vector<std::string>{agent_id_s, sec.facet});
+                    if (del.status() != PGRES_COMMAND_OK)
+                        return fail("section delete");
+                    if (!prep[i].rows.empty() && !insert_entries(c, agent_id_s, prep[i].rows))
+                        return fail("section insert");
+                    pg::PgResult up = pg::exec_params(
+                        c,
+                        "INSERT INTO software_inventory_store.software_facet_state "
+                        "(agent_id, facet, status, token, section_hash, enabled, "
+                        " last_confirmed_at, duration_ms, bytes_read, updated_at) "
+                        "VALUES ($1, $2, $3, $4, $5, TRUE, $6::bigint, $7::bigint, $8::bigint, "
+                        "$6::bigint) "
+                        "ON CONFLICT (agent_id, facet) DO UPDATE SET "
+                        " status = EXCLUDED.status, token = EXCLUDED.token, "
+                        " section_hash = EXCLUDED.section_hash, enabled = TRUE, "
+                        " last_confirmed_at = EXCLUDED.last_confirmed_at, "
+                        " duration_ms = EXCLUDED.duration_ms, bytes_read = EXCLUDED.bytes_read, "
+                        " updated_at = EXCLUDED.updated_at",
+                        std::vector<std::string>{agent_id_s, sec.facet, status, sec.token,
+                                                 prep[i].section_hash, ts_s, dur, bytes});
+                    if (up.status() != PGRES_COMMAND_OK)
+                        return fail("facet upsert");
+                    done[i] = O::kStored;
+                } else {
+                    // Status-only (and a component section's state): rows, section_hash and
+                    // last_confirmed_at are left alone. Nothing was confirmed this cycle.
+                    const bool component = sec.facet == kComponentInventoryFacet;
+                    pg::PgResult up = pg::exec_params(
+                        c,
+                        "INSERT INTO software_inventory_store.software_facet_state "
+                        "(agent_id, facet, status, token, enabled, duration_ms, bytes_read, "
+                        " updated_at) "
+                        "VALUES ($1, $2, $3, $4, $5::boolean, $6::bigint, $7::bigint, $8::bigint) "
+                        "ON CONFLICT (agent_id, facet) DO UPDATE SET "
+                        " status = EXCLUDED.status, token = EXCLUDED.token, "
+                        " enabled = EXCLUDED.enabled, duration_ms = EXCLUDED.duration_ms, "
+                        " bytes_read = EXCLUDED.bytes_read, updated_at = EXCLUDED.updated_at",
+                        std::vector<std::string>{agent_id_s, sec.facet, status, sec.token,
+                                                 sec.status == V3Status::kDisabled ? "false" : "true",
+                                                 dur, bytes, ts_s});
+                    if (up.status() != PGRES_COMMAND_OK)
+                        return fail("facet upsert");
+                    // A component section that carries records is asked for again (no component
+                    // store yet); a status-only one is a complete report like any other.
+                    done[i] = (component && v3_status_carries_rows(sec.status)) ? O::kNeedFull
+                                                                                : O::kStatusOnly;
+                }
+            }
+
+            // The report hash is recomputed from the table, never from this call's sections, so
+            // a first contact split over several calls converges after the last of them. Only
+            // held sections count: a full/delta status with a section hash (a component facet,
+            // whose rows this store does not hold, carries none).
+            pg::PgResult held = pg::exec_params(
+                c,
+                "SELECT facet, section_hash FROM software_inventory_store.software_facet_state "
+                "WHERE agent_id = $1 AND status IN ('full', 'delta') AND section_hash <> ''",
+                std::vector<std::string>{agent_id_s});
+            if (held.status() != PGRES_TUPLES_OK)
+                return fail("report hash read");
+            std::vector<std::pair<std::string, std::string>> pairs;
+            for (int r = 0; r < PQntuples(held.get()); ++r)
+                pairs.emplace_back(PQgetvalue(held.get(), r, 0), PQgetvalue(held.get(), r, 1));
+            const std::string report_hash = v3_report_hash(std::move(pairs));
+            pg::PgResult par = pg::exec_params(
+                c,
+                "INSERT INTO software_inventory_store.inventory_state "
+                "(agent_id, source, content_hash, first_seen, last_seen) "
+                "VALUES ($1, $2, $3, $4::bigint, $4::bigint) "
+                "ON CONFLICT (agent_id, source) DO UPDATE SET "
+                "  content_hash = EXCLUDED.content_hash, last_seen = EXCLUDED.last_seen "
+                "RETURNING agent_id",
+                std::vector<std::string>{agent_id_s, kSourceInstalledSoftware, report_hash,
+                                         ts_s});
+            if (par.status() != PGRES_TUPLES_OK)
+                return fail("state upsert");
+        }
+        return true;
+    });
+
+    if (!ok) {
+        all_unrefused_error(); // nothing of this call was applied; every section is re-asked
+        return results;
+    }
+    // Sampled: an agent that keeps sending a component section or a delta before their apply
+    // paths exist would otherwise log every cycle.
+    static std::atomic<std::uint64_t> unsupported_seen{0};
+    for (std::size_t i = 0; i < n; ++i) {
+        if (report.sections[i].refusal != V3Refusal::kNone)
+            continue;
+        results[i].outcome = done[i];
+        const bool component_with_records = report.sections[i].facet == kComponentInventoryFacet &&
+                                            v3_status_carries_rows(report.sections[i].status);
+        if ((done[i] == O::kDeltaUnsupported || component_with_records) &&
+            unsupported_seen.fetch_add(1, std::memory_order_relaxed) % kReadDegradeLogSample == 0) {
+            spdlog::warn("SoftwareInventoryStore: agent={} sent a '{}' {} section this server "
+                         "cannot apply yet (delta apply and the component store are SAM-14): "
+                         "asking for a full section",
+                         agent_id, results[i].facet,
+                         std::string(v3_status_name(report.sections[i].status)));
+        }
+    }
+    return results;
 }
 
 std::optional<std::int64_t> SoftwareInventoryStore::source_last_seen(std::string_view agent_id,
@@ -2117,8 +2536,9 @@ bool SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
     if (!open_ || agent_id.empty())
         return false;
     const std::string id{agent_id};
-    // Both deletes in one transaction so an agent removal can't leave a parent
-    // inventory_state row without its child rows, or vice versa (Gate 2 INFO).
+    // All three deletes in one transaction so an agent removal can't leave a parent
+    // inventory_state row without its child rows (installed_software, software_facet_state), or
+    // vice versa (Gate 2 INFO).
     const bool committed = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
         pg::PgResult d1 = pg::exec_params(
             c, "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
@@ -2126,7 +2546,11 @@ bool SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
         pg::PgResult d2 = pg::exec_params(
             c, "DELETE FROM software_inventory_store.inventory_state WHERE agent_id = $1",
             std::vector<std::string>{id});
-        return d1.status() == PGRES_COMMAND_OK && d2.status() == PGRES_COMMAND_OK;
+        pg::PgResult d3 = pg::exec_params(
+            c, "DELETE FROM software_inventory_store.software_facet_state WHERE agent_id = $1",
+            std::vector<std::string>{id});
+        return d1.status() == PGRES_COMMAND_OK && d2.status() == PGRES_COMMAND_OK &&
+               d3.status() == PGRES_COMMAND_OK;
     });
     if (!committed)
         spdlog::debug("SoftwareInventoryStore: delete_agent did not commit for agent={} ({})",

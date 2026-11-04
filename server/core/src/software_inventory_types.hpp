@@ -14,13 +14,14 @@ namespace yuzu::server {
 
 /// One installed-software entry. **Machine-scope collection only** (see
 /// ADR-0016 §8): no per-user rows and no username/SID fields. The wire tail's
-/// `install_location` and `uninstall_string` slots (13-14) are reserved: the server
-/// neither stores nor hashes them until §8 is re-opened for them (#5186).
+/// `uninstall_string` slot (14) stays reserved: the server neither stores nor hashes it
+/// (#5186). Slot 13 (`install_location`) is stored from the blob-v3 `+` record only; the v2
+/// path still parses and discards it, so a v2 row's `install_location` is always empty.
 ///
 /// Blob contract v2 + extended tail: member order == the wire/hash field order (append-only —
-/// the canonical hash walks this exact sequence, except that wire slots 13-14 have no member
-/// and are hashed as empty; the agent's blob builder walks the first 12 today, the tail rule
-/// is the agent's to mirror).
+/// the canonical hash walks this exact sequence, except that wire slot 14 has no member and
+/// is hashed as empty, and `install_location` (slot 13) is hashed as empty on the v2 path;
+/// the agent's blob builder walks the first 12 today, the tail rule is the agent's to mirror).
 /// Fields an ecosystem does not store are EMPTY, never synthesised: NEVRA +
 /// signature populate on Linux package managers per their capability (rpm =
 /// full; deb = no signature; apk/pacman = name/EVR only); Windows/macOS rows
@@ -40,11 +41,19 @@ struct SoftwareEntry {
     std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
     std::string distro_id;        // /etc/os-release ID
     std::string distro_version;   // /etc/os-release VERSION_ID
-    // Extended tail (wire slots 15-16; 13-14 are reserved and have no member): enters the
-    // canonical hash ONLY when package_id or source is non-empty — a v2 agent's 12-field
-    // bytes are unchanged.
+    // Wire slot 13 (blob v3 only; always empty on the v2 path, which discards it). Sits here so
+    // member order == wire order; slot 14 has no member.
+    std::string install_location;
+    // Extended tail (wire slots 15-16): enters the canonical v2 hash ONLY when package_id or
+    // source is non-empty — a v2 agent's 12-field bytes are unchanged.
     std::string package_id;
     std::string source; // <plugin>.<action> that produced the row
+    // SERVER-DERIVED, never on the wire and never in either hash. Filled by the store's
+    // `derive_install_keys` on every insert path.
+    std::string install_type;  // install_type_rules.hpp vocabulary; '' = not derived
+    std::string install_scope; // "machine" | "user" (machine-scope collection: always "machine")
+    std::string identity_key;  // norm_key(name, publisher) US version US arch US location
+    std::string instance_key;  // SHA-256 hex of the row's 16 canonical slots; unique per agent
 };
 
 } // namespace yuzu::server

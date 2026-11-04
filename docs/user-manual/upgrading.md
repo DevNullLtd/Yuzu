@@ -2,6 +2,14 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: installed-software schema v10 (the first start builds a unique index; the server accepts the sectioned report)
+
+- **What changed:** the installed-software store migrates to schema v10 at first start. `installed_software` gains five columns (`install_type`, `install_scope`, `install_location`, `identity_key`, `instance_key`), two `NOT VALID` checks and a partial unique index on `(agent_id, instance_key)`, and a new per-device `software_facet_state` table. The ingest seam also accepts the sectioned report (blob v3) beside the unchanged v2 report. No shipped agent sends v3 yet, so a fleet upgraded to this build behaves as before until agents that do are deployed.
+- **The first start holds a table lock while the index is built.** The migration takes `ACCESS EXCLUSIVE` on `installed_software` for its whole transaction, with the per-statement timeout lifted, the same posture as the v7 migration (see the SoftwareInventoryStore row of `docs/postgres-migration-ladder.md`). Measured on one development host with 1.8M rows (4,000 endpoints at 450 rows each), the whole migration took about 0.2 s, because the rows stored before the upgrade have no instance key and the partial index starts empty. The hold grows with the table; treat the figure as a floor. As for v7, start one server replica first and let it finish before starting the rest; a replica that starts while the migration holds the lock waits up to the pool's 10 s lock timeout and then refuses to start.
+- **Rows stored before the upgrade** read an empty `install_type` (and empty keys) until their device's next full report, at most a week later. Nothing in the dashboard, the REST API or MCP returns these columns yet, so there is nothing to act on.
+- **Rolling back to the previous server build** against a v10 database is clean for this store: the old build writes none of the new columns, and their defaults satisfy the checks. Rows the old build writes carry empty keys until a v10 build replaces them.
+- **Metric:** `yuzu_inventory_section_ingest_total{facet,outcome}` counts the outcome of each section of a v3 report; see "Install type, scope and location, and the sectioned report" in the installed-software inventory manual.
+
 ## ⚠️ Breaking: stored response rows are capped per command and device (256 by default) (#561)
 
 - **What changed:** the response store keeps at most 256 rows for one command on one device (`--response-max-rows-per-agent`, env `YUZU_RESPONSE_MAX_ROWS_PER_AGENT`, range 1-65536). Rows past the cap are dropped, newest first, and the row just before the dropped frames ends with a `...[rows past per-agent cap dropped]` marker. One terminal-status row is still recorded past the cap when none exists, so the command's outcome shows.

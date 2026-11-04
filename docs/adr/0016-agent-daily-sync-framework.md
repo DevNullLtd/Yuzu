@@ -788,3 +788,162 @@ absorb any realistic overflow first, so `swap` is a defensive tail.
 the same build enroll, and every replica is on that build. The deployment contract (a fresh
 database, every writer on this build; `docs/user-manual/upgrading.md`, "Deployment contract (hard
 cutover)") excludes an earlier server, so this entry states no behaviour of an agent against one.
+
+### 2026-11-04 — `installed_software` blob v3 (sections) and schema v10: store and ingest
+
+This entry records the server half: the v3 wire grammar the ingest seam accepts, the store
+columns and tables it fills, and the rules the agent writer (a later change) must reproduce
+byte for byte. The v2 path is unchanged and still owns every blob that does not start with the
+v3 header. No shipped agent sends v3 yet.
+
+**Wire (same `plugin_data` and `content_hashes` key, `installed_software`).** Record 0 is the
+header `0x1F "v3" 0x1E`: an empty first field, which the v2 parser drops (it ignores a record
+with an empty name), so no v2 record can collide with it. A blob that does not start with exactly
+those four bytes is v2, including a v2 blob whose first product is named `v3`. After the header
+every record is `0x1E`-terminated with `0x1F`-separated fields, and the first field is the record
+kind:
+
+| Record | Fields after the kind | Meaning |
+|---|---|---|
+| `S` | `facet`, `status`, `base`, `token`, `duration_ms`, `bytes_read` | opens a section |
+| `+` | `name`, `version`, `publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`, `install_location`, *slot 14 (reserved, empty)*, `package_id`, `source` | an install row |
+| `-` | `row_hash` | a deletion by row hash (64 lowercase hex); parsed and validated, applied by a later change |
+| `comp` | `kind`, `name`, `version`, `version_source`, `path`, `size`, `mtime`, `anchor_app` | a component row; `version_source` is one of `filename`, `pom`, `manifest`, `metadata`, `package_json`, `pe`, `elf`, `macho`, `unreadable`; parsed and validated, stored by a later change |
+
+`facet` is a `kSoftwareSources` value (the collector source) or `component_inventory`, 1 to 64
+characters of `[a-z0-9_.]`. `status` is `full`, `delta`, `constrained`, `timeout`, `oversize`,
+`not_collected` or `disabled`; only `full` and `delta` sections carry records. `duration_ms` and
+`bytes_read` are agent-reported diagnostics: anything that is not plain digits reads as 0. Every
+field passes the v2 field step: scrub to valid UTF-8 first (U+FFFD for each invalid byte), then
+clamp to 1,024 bytes on a codepoint boundary. A `+` row's `source` must equal its section's
+`facet`. Caps per call: 3 MiB of blob (unchanged), 32 sections, 20,000 `+` rows, 20,000 `-`
+records, 20,000 `comp` records.
+
+**Containment.** A grammar violation inside a section refuses that section only: a `+`, `-` or
+`comp` record in a status-only section; a `-` record in a `full` section; a `+` source other
+than the facet; `+` in `component_inventory` or `comp` anywhere else; an unknown status, facet or
+record kind; a malformed row hash; an unknown `version_source`; a repeated facet; a row over the
+per-call cap. The rest of a refused section is skipped to the next `S`, and the other sections
+still apply. A defect that cannot be attributed to a facet fails the whole blob (a record before
+any section, an `S` record whose facet is empty or outside the charset, more than 32 sections,
+over 3 MiB): the ingest seam answers the whole-source `installed_software` nack and counts
+`dropped`, like an over-cap v2 blob.
+
+**Nack form.** `InventoryAck.need_full` is a `repeated string`, so the per-section nack is
+`installed_software:<facet>` with no proto change. The whole-source `installed_software` stays
+the nack for a hash-only claim the server cannot match and for an unattributable v3 blob.
+
+**Section hash.** `canonical_section_hash(rows)` is the SHA-256 hex of the section's rows,
+sorted and de-duplicated, each written as all 16 wire slots (slot 14 empty, and no conditional
+tail: unlike the v2 hash, `package_id` and `source` are always written), `0x1F`-joined and
+`0x1E`-terminated. The sort walks the stored fields in wire order: `name`, `version`,
+`publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`,
+`signature_status`, `distro_id`, `distro_version`, `install_location`, `package_id`, `source`,
+byte-wise. An honest-empty `full` section hashes the empty string.
+
+**Report hash.** The value stored in `inventory_state.content_hash` for a v3 agent, and the value
+a v3 agent claims in a hash-only report, is `v3:` followed by the SHA-256 hex of
+`facet 0x1F section_hash 0x1E` for every facet the server holds, sorted by facet in byte order.
+A facet is held when its `software_facet_state` row has status `full` or `delta` and a
+non-empty section hash. It is recomputed from that table after every v3 call, never from the
+call's own sections, so a first contact split over several calls converges to the hash a single
+call produces. A facet reporting a status-only status (`constrained`, `timeout`, `oversize`,
+`not_collected`, `disabled`) is not in the hash until a `full` section confirms it again, though
+its rows are kept. The `v3:` prefix means a v2 hash-only claim (plain hex) can never match a v3
+state, and the other way round; each side asks for a full report.
+
+**Apply rules** (`apply_installed_software_v3`, one transaction under the same per-agent
+advisory lock as the v2 replace):
+
+- *First v3 contact.* If the stored report hash does not start with `v3:` (or there is none),
+  every `installed_software` row and every facet state row of the agent is deleted first, so no
+  v2 leftover survives. A call that applies nothing (every section refused, or only `delta`
+  sections) does not do this.
+- *`full`.* Deletes the agent's rows of that facet, inserts the section's rows with their
+  derived keys, and upserts the facet state (status, token, recomputed section hash,
+  `last_confirmed_at`, duration, bytes). An honest-empty section deletes the facet's rows.
+- *Status-only.* Upserts status, token, duration, bytes and `enabled` (false only for
+  `disabled`). Rows, the stored section hash and `last_confirmed_at` are left alone.
+- *`delta`.* Not applied. Answered with a per-section nack whatever its base: a base that is
+  not the stored section hash is a plain `need_full`, a matching base is counted as
+  `delta_unsupported` and logged (sampled), because delta apply is not built. The agent falls
+  back to a full section, so nothing is lost. The `-` records are parsed and validated here and
+  applied with the delta apply path.
+- *`component_inventory`.* Grammar-validated; its facet state is recorded with an empty section
+  hash (this store holds no component rows), so it never enters the report hash; a section that
+  carries records is nacked, a status-only one is a complete report.
+- *Failure.* A SQL failure rolls the whole call back and every section in it that was not
+  refused is answered `error` and nacked. A v2 full report additionally deletes the agent's
+  `software_facet_state` rows, and `delete_agent` deletes them too.
+
+**Slot 13 is stored on v3 only.** `install_location` (wire slot 13) is stored from the v3 `+`
+record. The v2 path still parses and discards it, so a v2 row's location is always empty and the
+v2 canonical hash is unchanged. Slot 14 (`uninstall_string`) stays reserved on both paths, so
+#5186 is closed for slot 13 only. The server stores the value as sent after the field step: a
+location under a user's profile would name an account, and the agent-side change that starts
+sending the slot owns what a machine-scope collector may put in it (§8).
+
+**`install_type` and `install_scope`.** Both are derived by the server at insert time and are
+never on the wire or in either hash. `install_type` is one of `msi`, `installer`, `store`,
+`package_manager`, `optional_feature`, `runtime`, `middleware`, `component`, `driver`, or `''`
+for a row not yet derived. The source decides it: `installed_apps.list_inventory` → `installer`;
+`pkg_inventory.managers` and `pkg_inventory.packages` → `package_manager`;
+`pkg_inventory.store_packages` → `store`; `windows_optional_features.list` →
+`optional_feature`; `msi_packages.list_inventory` → `msi`; `runtimes.python` → `runtime`;
+`middleware.ibm_mq` → `middleware`. A row with an empty source (a pre-tail agent) falls back by
+ecosystem: `msi`, `optional_feature`, `python` → `runtime`, `ibm_mq` → `middleware`, `snap` and
+`flatpak` → `store`, `brew`, `rpm`, `deb`, `apk`, `pacman` → `package_manager`, `windows`, `macos`,
+`macos_pkgutil` → `installer`, anything else `''`. `component` and `driver` are reserved for the
+component and drivers facets; no source maps to them yet. The table has a compile-time
+totality check over `kSoftwareSources`, so a new collector cannot ship without an install type.
+The `pkg_inventory.managers` presence row is stored in `installed_software` today, so it is typed
+`package_manager` like the packages it manages; it is not exempted by name. `install_scope` is
+`machine` or `user`; collection is machine-scope only, so the server writes `machine`.
+
+**Keys, and why the uniqueness is not the identity.** Two keys are derived in one place (the
+store's `derive_install_keys`) on both insert paths:
+
+- `instance_key` is the SHA-256 hex of the row's single canonical record (the section-hash
+  serialisation of that one row). Rows are sorted and de-duplicated before insert, so it is
+  unique per agent by construction. It is the value a `-` record names. A partial unique index on
+  `(agent_id, instance_key) WHERE instance_key <> ''` enforces it.
+- `identity_key` is `norm_key(name, publisher)`, `0x1F`, `version`, `0x1F`, `arch`, `0x1F`, the
+  install location lower-cased with trailing path separators stripped (empty on v2 rows). It is
+  stored and **not** unique and not indexed; it is the key a later consolidation step will use.
+
+This deviates from the spec row, which asked for a `UNIQUE (agent_id, identity_key, removed_at)`.
+The Update of 2026-10-17 above records that one MSI product is listed by both
+`msi_packages.list_inventory` and `installed_apps.list_inventory` and that the two rows are not
+de-duplicated. They share an identity, so an identity-keyed unique constraint would reject the
+first v10 ingest of every Windows host that has an MSI product. `removed_at` belongs to the
+deletion-tracking change and is not added here.
+
+**Migration v10** (`docs/postgres-migration-ladder.md`, `SoftwareInventoryStore` row): five
+columns on `installed_software` (`install_type`, `install_scope` default `machine`,
+`install_location`, `identity_key`, `instance_key`; constant defaults, no rewrite); two CHECK
+constraints (`install_type` in the vocabulary above or `''`, `install_scope` in `machine`,
+`user`) added `NOT VALID`, so existing rows are not scanned and `''` is admitted for the rows
+that predate v10 until their agent's next full report (at most a week); the partial unique index
+above; and the new `software_facet_state (agent_id, facet, status, token, section_hash, enabled,
+last_confirmed_at, duration_ms, bytes_read, updated_at)` table, primary key `(agent_id, facet)`.
+The index build is not online: it holds `ACCESS EXCLUSIVE` for its duration, under the same
+hard-cutover posture the ladder records for v7. The ladder row carries the measured build time.
+
+**Partitioning decision: `installed_software` stays a plain table.** No measurement exists (the
+partitioning spike was skipped). Hash-partitioning by `agent_id` needs the non-transactional
+migration kind that is not built (`app_perf_daily_store.hpp`, the ladder), would rewrite the
+table under `ACCESS EXCLUSIVE` at a size past the v7 ceiling of 2-4M rows, and would turn the one
+measured query, the `installed_software_name_idx` seek, into a scan of every partition. The
+decision is reversible and is revisited when a measurement exists.
+
+**Observability.** Each section bumps `yuzu_inventory_section_ingest_total{facet,outcome}`
+(`outcome`: `stored`, `status_only`, `need_full`, `delta_unsupported`, `rejected`, `error`; `facet`
+is a collector source, `component_inventory`, or `unknown`, never the agent's raw string). The
+apply is timed under `yuzu_inventory_ingest_duration_seconds{phase="v3"}`, and the source-level
+`yuzu_inventory_ingest_total` outcome is `stored`, `need_full`, `error` or `dropped`. The
+agent-reported per-section duration and bytes live in the facet state row, not in Prometheus
+labels.
+
+**Not in this change.** Delta apply and the `-` deletions; storage of component rows; the agent
+writer; any read surface returning the new columns (the existing reads select the old columns
+only).

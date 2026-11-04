@@ -274,10 +274,14 @@ cadences.
   `C:/Users/<name>/...` on Windows) and is stored as an ordinary Response (90-day
   default retention, no per-subject erasure), outside this sync and outside
   `--inventory-disable`. The sync blob also has `install_location` and
-  `uninstall_string` slots, but they are reserved: the server ignores them and
-  stores neither, until ADR-0016 §8 is re-classified for them with the
-  agent-side change, #5186. No shipped agent fills them; a build that does gets a
-  full-resend request every cycle until the server accepts them. (The only `HKCU`
+  `uninstall_string` slots. In the v2 blob they are reserved: the server ignores
+  them and stores neither, and an agent that fills them gets a full-resend request
+  every cycle. The sectioned v3 blob stores `install_location` and keeps
+  `uninstall_string` reserved (see "Install type, scope and location, and the
+  sectioned report" below). No shipped agent sends either slot, and the agent-side
+  change that starts sending `install_location` decides what a machine-scope
+  collector may put in it, since a path under a user's profile names an account
+  (ADR-0016 §8, #5186). (The only `HKCU`
   read is the agent's own service-account hive, which is benign: the agent runs outside any
   interactive login session, so `HKCU` is that service account's profile. Note
   the account is **LocalSystem** today, not the intended `NT SERVICE\YuzuAgent`
@@ -293,6 +297,49 @@ cadences.
   `YUZU_AGENT_INVENTORY_DISABLE`) on the agent to collect and push **no**
   installed-software inventory. Deploy-time opt-out; not a server-side runtime
   toggle. It does not gate the operator `list`/`query`/`list_per_user` actions.
+
+### Install type, scope and location, and the sectioned report
+
+Each stored software row carries three more attributes. They are read-side facts today: the
+fleet query, catalogue and device pages do not return them yet, so they are visible only in the
+database.
+
+- **`install_type`** says how the software got onto the machine. The server derives it from the
+  producing collector (the row's `source`), and from the ecosystem when a row has no source:
+  `installer` (`installed_apps.list_inventory`), `msi` (`msi_packages.list_inventory`),
+  `package_manager` (`pkg_inventory.packages` and `pkg_inventory.managers`, which is the
+  Homebrew presence row), `store` (`pkg_inventory.store_packages`), `optional_feature`
+  (`windows_optional_features.list`), `runtime` (`runtimes.python`) and `middleware`
+  (`middleware.ibm_mq`). `component` and `driver` are reserved. A row stored before the
+  upgrade reads an empty `install_type` until its device's next full report, at most a week
+  later.
+- **`install_scope`** is `machine` or `user`. The sync collects machine scope only, so every row
+  reads `machine`.
+- **`install_location`** is the folder the software was installed into, when the collector reports
+  one. It is stored only from the v3 blob; the v2 blob's slot is ignored, so it is empty for every
+  device until an agent that sends v3 is deployed.
+
+**The per-source report (blob v3).** A v3 report is a list of sections, one per collector source,
+each with a status (`full`, `delta`, `constrained`, `timeout`, `oversize`, `not_collected` or
+`disabled`). The server applies each section on its own: a `full` section replaces only that
+collector's rows, so one collector's failure no longer holds back the rest of the report, and a
+status-only section records why a collector did not report and keeps its previous rows. The
+latest status of each collector, with the section's content hash, when it last reported in full,
+how long the collector took and how many bytes it read, is kept per device. Nothing in the
+dashboard or the API shows that record yet.
+
+A section the server cannot accept is asked for again by name (`installed_software:<source>` in
+the acknowledgement's `need_full`), while the other sections of the same report are stored. The
+first v3 report from a device removes the rows its earlier v2 reports left, so a device never
+shows the same software from two report formats. A `delta` section, and the
+`component_inventory` section, are checked but not applied by this server version: each is
+answered with a request for a full section, so nothing is lost. No shipped agent sends v3 yet;
+the agent side arrives in a later release. Operators can see the outcome of each section in
+`yuzu_inventory_section_ingest_total{facet,outcome}`, where `outcome` is `stored`, `status_only`,
+`need_full`, `delta_unsupported`, `rejected` or `error`, and `facet` is the collector source
+(`unknown` for a name the server does not recognise). The existing
+`yuzu_inventory_ingest_total` keeps one outcome per report; a v3 report with any section asked for
+again counts as `need_full`.
 
 ## How the sync behaves (and why it's quiet on the network)
 

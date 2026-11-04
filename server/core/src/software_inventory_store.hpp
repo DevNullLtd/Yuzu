@@ -31,6 +31,7 @@
 ///     result. Staleness is acceptable (return the last projection); failure-as-empty
 ///     is not.
 
+#include "inventory_blob_v3.hpp"       // V3Report (pure blob-v3 grammar types)
 #include "inventory_ingest_outcome.hpp" // InventoryIngestOutcome
 #include "software_inventory_types.hpp"
 
@@ -320,6 +321,45 @@ struct NamePatternDevicesPage {
     std::int64_t names_as_of{0};
 };
 
+/// What one blob-v3 section became (`apply_installed_software_v3`). The ingest seam maps it to
+/// the `yuzu_inventory_section_ingest_total{facet,outcome}` label and to the per-section nack.
+enum class V3SectionOutcome {
+    kStored,           ///< full section: the facet's rows were replaced
+    kStatusOnly,       ///< status-only section: facet state recorded, rows untouched
+    kNeedFull,         ///< not applied (delta on a base we do not hold, or a facet we cannot store)
+    kDeltaUnsupported, ///< a delta whose base matches: delta apply is not built, a full is asked for
+    kRejected,         ///< the section broke the grammar and was refused
+    kError,            ///< the transaction failed; nothing of this call was applied
+};
+
+[[nodiscard]] constexpr std::string_view v3_section_outcome_name(V3SectionOutcome o) noexcept {
+    switch (o) {
+    case V3SectionOutcome::kStored:
+        return "stored";
+    case V3SectionOutcome::kStatusOnly:
+        return "status_only";
+    case V3SectionOutcome::kNeedFull:
+        return "need_full";
+    case V3SectionOutcome::kDeltaUnsupported:
+        return "delta_unsupported";
+    case V3SectionOutcome::kRejected:
+        return "rejected";
+    case V3SectionOutcome::kError:
+        return "error";
+    }
+    return "error";
+}
+
+/// True when the agent must resend the section in full (every outcome except an applied one).
+[[nodiscard]] constexpr bool v3_section_needs_full(V3SectionOutcome o) noexcept {
+    return o != V3SectionOutcome::kStored && o != V3SectionOutcome::kStatusOnly;
+}
+
+struct V3SectionResult {
+    std::string facet;
+    V3SectionOutcome outcome{V3SectionOutcome::kError};
+};
+
 class SoftwareInventoryStore {
 public:
     /// Borrows the shared pool and runs the `software_inventory_store` schema
@@ -374,10 +414,62 @@ public:
     /// `rows` is taken BY VALUE so the full-payload path can `std::move` the
     /// entries into normalization instead of copying up to kMaxEntries structs on
     /// the ingest hot path (UP-8); pass `std::move` at the call site.
+    /// Blob v2 vs v3: this is the v2 path and is unchanged by v3 except that it stamps the
+    /// server-derived key columns on each row and deletes the agent's `software_facet_state`
+    /// rows in the same transaction (a downgraded agent leaves no stale facets). A hash-only
+    /// report works for both: a v3 agent claims its `v3:` report hash, which only a v3 state
+    /// can match, and a v2 claim (plain hex) never matches a v3 state.
     InventoryIngestOutcome apply_installed_software(std::string_view agent_id,
                                                     std::string_view claimed_hash,
                                                     std::optional<std::vector<SoftwareEntry>> rows,
                                                     std::int64_t collected_at);
+
+    /// Blob v3 ingest (ADR-0016 Update 2026-11-04). ONE transaction under the SAME per-agent
+    /// advisory lock as the v2 replace; one DELETE/INSERT pair per `full` section, so a section
+    /// replaces only its own facet's rows. The agent's first v3 call (its stored hash does not
+    /// start with `v3:`) first deletes every pre-existing row of the agent, so no v2 leftover
+    /// outlives the switch. A call may carry only some of the agent's sections (a first contact
+    /// split over several calls): after each call the stored report hash is recomputed from the
+    /// `software_facet_state` table, so the split converges to the same hash as one call.
+    ///  - `full`: replace the facet's rows (an honest-empty full deletes them) and record
+    ///    {status, token, recomputed section_hash, last_confirmed_at, duration, bytes}.
+    ///  - status-only (constrained|timeout|oversize|not_collected|disabled): record the status
+    ///    only; rows, section_hash and last_confirmed_at are left alone.
+    ///  - `delta`: NOT applied here (delta apply and `-` deletions belong to the next change).
+    ///    Always answered need-full: kNeedFull when its base is not the stored section hash,
+    ///    kDeltaUnsupported when it is (a WARN names the gap). Nothing is lost: the agent falls
+    ///    back to a full section.
+    ///  - `component_inventory`: grammar-validated, its facet state recorded with an EMPTY
+    ///    section_hash (this store holds no component rows), and answered kNeedFull.
+    ///  - a refused section (V3Section::refusal) is kRejected; the others still apply.
+    /// A SQL failure rolls the whole call back and answers kError for EVERY section in it.
+    /// Returns one result per `report.sections` entry, in order. `claimed_hash` is accepted for
+    /// parity with the v2 call and never trusted (the stored hash is always recomputed).
+    [[nodiscard]] std::vector<V3SectionResult>
+    apply_installed_software_v3(std::string_view agent_id, std::string_view claimed_hash,
+                                V3Report report);
+
+    /// Hash of one section's rows: SHA-256 hex over the sorted, de-duplicated rows, each written
+    /// as ALL 16 wire slots (slot 14 empty; no conditional tail), 0x1F-joined and
+    /// 0x1E-terminated. Pure; the agent's builder mirrors it byte for byte. NOT the v2
+    /// `canonical_hash` (whose tail is conditional and whose slot 13 is always empty).
+    [[nodiscard]] static std::string canonical_section_hash(std::vector<SoftwareEntry> rows);
+
+    /// The v3 report hash stored in `inventory_state.content_hash`: `v3:` + SHA-256 hex over
+    /// `facet 0x1F section_hash 0x1E` for each (facet, section_hash) pair, byte-order sorted by
+    /// facet. Callers pass the held sections only (status full or delta, non-empty hash). The
+    /// `v3:` prefix keeps a v2 hash-only claim from ever matching a v3 state. Pure.
+    [[nodiscard]] static std::string
+    v3_report_hash(std::vector<std::pair<std::string, std::string>> facet_section_hashes);
+
+    /// Fill the server-derived columns of `e` (install_type, install_scope, identity_key,
+    /// instance_key) from its wire fields. The ONE place they are computed: both insert paths
+    /// call it. `instance_key` is the SHA-256 hex of the row's single canonical record (the
+    /// section-hash serialisation of that one row), unique per agent after normalisation, and
+    /// the value a `-` record names. `identity_key` is `norm_key(name, publisher)` US version
+    /// US arch US install_location (lower-cased, trailing separators stripped); it is stored
+    /// and not indexed, and deliberately NOT unique.
+    static void derive_install_keys(SoftwareEntry& e);
 
     /// All installed software for one agent (per-device drill-down), name-sorted.
     /// AUTHORITATIVE read: `std::nullopt` on a store/pool/query failure (degraded —
