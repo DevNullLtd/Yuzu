@@ -1129,3 +1129,53 @@ TEST_CASE("dashboard execute audit (#3619 UP-5): authority revoked while the att
     CHECK(h.calls[0].exec_visible->count("dev-A") == 1);
     CHECK(h.calls[0].exec_visible->count("dev-B") == 0); // the revocation reached the send
 }
+
+TEST_CASE("fragment purge/reenable audit (#3619 UP-5): the route permission revoked while the "
+          "attempted row is written dispatches nothing and records the outcome",
+          "[pg][server][echo][purge][reenable][fragment][audit][security][3619]") {
+    // The route gate (Infrastructure:Delete for purge, Execution:Execute for re-enable) ran
+    // before the wait. With RBAC off the dispatch seam admits every human principal, so a JIT
+    // elevation that lapses during the wait is caught only by deciding the permission again.
+    for (const auto& [path, action] : kEchoMutations) {
+        DYNAMIC_SECTION(action) {
+            FragmentHarness h;
+            const std::string act = action;
+            h.audit_persists = [&h, act](const AuditRow& r) {
+                if (r.action == act && r.result == "attempted")
+                    h.perm_allow = false; // revoked mid-write
+                return true;
+            };
+            auto res = h.post(path, "device_id=dev-A&source=process");
+            CHECK(res->status == 403);
+            CHECK(h.calls.empty());
+            CHECK(h.perms.size() == 2); // admission, then the recheck after the attempted row
+            CHECK(h.audits_for(action, "attempted") == 1);
+            REQUIRE(h.audits_for(action, "failure") == 1);
+            CHECK(h.audit_detail(action, "failure") == "permission_revoked source=process");
+            CHECK(h.audits_for(action, "success") == 0);
+            const std::string metric = act == "echo.source.purge"
+                                           ? "yuzu_echo_source_purge_total"
+                                           : "yuzu_echo_source_reenable_total";
+            CHECK(h.metric(metric, "denied") == 1.0);
+        }
+    }
+}
+
+TEST_CASE("dashboard execute audit (#3619 UP-5): Execution:Execute revoked while the attempted "
+          "row is written sends nothing and records the outcome",
+          "[pg][server][dashboard][execute][audit][security][3619]") {
+    FragmentHarness h;
+    h.resolve_to = {"os_info", "version"};
+    h.audit_persists = [&h](const AuditRow& r) {
+        if (r.action == "command.dispatch" && r.result == "attempted")
+            h.perm_allow = false; // revoked mid-write
+        return true;
+    };
+    auto res = h.post("/api/dashboard/execute", "instruction=run&scope=dev-B");
+    CHECK(res->status == 403);
+    CHECK(h.calls.empty());
+    CHECK(h.audits_for("command.dispatch", "attempted") == 1);
+    REQUIRE(h.audits_for("command.dispatch", "failure") == 1);
+    CHECK(h.audit_detail("command.dispatch", "failure") == "reason=permission_revoked");
+    CHECK(h.audits_for("command.dispatch", "success") == 0);
+}

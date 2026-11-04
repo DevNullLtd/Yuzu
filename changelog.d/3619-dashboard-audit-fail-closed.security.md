@@ -13,12 +13,14 @@
   `attempted` and then a `failure` row. Every console send that reaches no agent now writes a
   `command.dispatch` `failure` row (`reason=no_agents_reached`), where before only an
   expression-targeted send did, and a group whose creation fails writes `failure`
-  (`create_failed`). Create Group decides the session, `ManagementGroup:Write` and visibility again
-  after its `attempted` row and creates nothing, writing `failure` (`session_revoked`,
-  `permission_revoked`, `scope_revoked`), when any was withdrawn meanwhile. Every other audit row
-  these four routes write themselves (refusals, scope narrowing, outcomes) and the Echo SQL and status-scan sends keep the request's own answer but now mark the
-  response `Sec-Audit-Failed: true` when the row does not persist, instead of answering exactly as
-  if it had been recorded. The permission-denial row (`auth.permission_required`) is written by
+  (`create_failed`). Each of the four decides its own permission again after its `attempted` row
+  and acts on nothing, writing `failure` (`permission_revoked`), when the grant was withdrawn
+  meanwhile; Create Group also re-checks the session and visibility (`session_revoked`,
+  `scope_revoked`). Every other audit row these four routes write themselves (refusals, scope
+  narrowing, outcomes) and the Echo SQL and status-scan sends keep the request's own answer but
+  now mark the response `Sec-Audit-Failed: true` when the row does not persist, instead of
+  answering exactly as if it had been recorded. The permission-denial row
+  (`auth.permission_required`) is written by
   the shared permission gate, not these routes, and a lost one still answers a plain `403`
   (tracked in #7096). Expect an `attempted` row ahead of the outcome row of every console send
   that was not expression-targeted (those already wrote one), every group creation, and every Echo
