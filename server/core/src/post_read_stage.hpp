@@ -23,8 +23,9 @@
 /// `httplib::Server` (the plaintext redirect listener, in-process test servers). The key is an
 /// opaque address used for identity only, never dereferenced. A server with no stage installed is
 /// REFUSED by `HttplibRouteSink` (it throws at registration) unless the sink was built with the
-/// explicit `StageRequirement::ExemptNoStage`: the plaintext redirect listener (it only answers
-/// 301) is the one production exemption, and tests opt out the same way. The in-process
+/// explicit `StageRequirement::ExemptNoStage`: the plaintext redirect listener (a 301 plus four
+/// bodyless GET health probes) is the one production exemption, and tests opt out the same way.
+/// A body-bearing or mutating route added to that sink would run with no cap and no step-up. The in-process
 /// `TestRouteSink` never consults this registry.
 ///
 /// ORDERING GUARD: the stage is looked up when a route is REGISTERED, so a stage installed after

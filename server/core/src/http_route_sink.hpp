@@ -82,7 +82,7 @@ enum class StageRequirement {
 /// stage installed throw `std::logic_error` BEFORE anything is recorded or registered, so a route
 /// owner built on a server that forgot the install cannot serve an uncapped, ungated route. The one
 /// way out is the explicit, greppable `StageRequirement::ExemptNoStage`, used by the plaintext
-/// redirect listener (it only answers 301) and by tests that do not exercise the stage.
+/// redirect listener (a 301 plus four bodyless GET health probes) and by tests that do not exercise the stage.
 class HttplibRouteSink : public HttpRouteSink {
 public:
     explicit HttplibRouteSink(httplib::Server& svr,

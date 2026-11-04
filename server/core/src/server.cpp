@@ -16235,7 +16235,7 @@ private:
         // turning that mistake into a boot failure. Every registration on
         // `*web_server_` follows this call (the first is
         // `auth_routes_->register_routes(*web_server_)` below). The plaintext
-        // redirect listener (`redirect_server_`, which only answers 301) has
+        // redirect listener (`redirect_server_`, which answers 301 and four bodyless GET health probes) has
         // its own server key and NO stage, so its handlers register unwrapped;
         // `TestRouteSink` never consults the registry.
         //
@@ -16479,7 +16479,7 @@ private:
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
         if (cfg_.https_enabled && cfg_.https_redirect) {
             redirect_server_ = std::make_unique<httplib::Server>();
-            // This listener runs no post-read stage (it only answers 301): drop any stage a
+            // This listener runs no post-read stage (301s and four bodyless GET probes): drop any stage a
             // destroyed server left under a reused address so the sink registers unwrapped.
             RouteInventory::instance().forget(redirect_server_.get());
             PostReadStageRegistry::instance().forget(redirect_server_.get());
@@ -16507,9 +16507,10 @@ private:
                 count_http_request);
         }
 #endif
-        // The plaintext redirect listener only answers 301 and has no post-read stage by design;
-        // this is the ONLY production sink that opts out of the stage (pinned by
-        // test_step_up_route_inventory.cpp's source scan).
+        // The plaintext redirect listener answers 301 and four bodyless GET health probes and has no
+        // post-read stage by design; this is the ONLY production sink that opts out of the stage
+        // (pinned by test_step_up_route_inventory.cpp's source scan). A body-bearing or mutating
+        // route added to it would run with no cap and no step-up.
         if (redirect_server_)
             redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_,
                                                                 StageRequirement::ExemptNoStage);
