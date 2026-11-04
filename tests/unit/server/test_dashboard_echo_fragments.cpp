@@ -1189,3 +1189,30 @@ TEST_CASE("dashboard execute audit (#3619 UP-5): Execution:Execute revoked while
     CHECK(h.audit_detail("command.dispatch", "failure") == "reason=permission_revoked");
     CHECK(h.audits_for("command.dispatch", "success") == 0);
 }
+
+TEST_CASE("fragment purge audit (#3619 UP-5, Gate 5 CH-1): a recheck refusal whose failure row is "
+          "not stored still purges nothing and flags the response",
+          "[pg][server][echo][purge][fragment][audit][security][3619]") {
+    // Compound fault: the attempted row is stored, the grant is withdrawn during that write, and
+    // every later row fails to persist. Only the attempted row survives; nothing is dispatched;
+    // the route's own (unstored) failure row marks the response.
+    FragmentHarness h;
+    bool attempted_seen = false;
+    h.audit_persists = [&h, &attempted_seen](const AuditRow& r) {
+        if (attempted_seen)
+            return false; // the audit store fails after the attempted row
+        if (r.action == "echo.source.purge" && r.result == "attempted") {
+            attempted_seen = true;
+            h.perm_allow = false; // revoked mid-write
+        }
+        return true;
+    };
+    auto res = h.post(kPurgePath, "device_id=dev-A&source=process");
+    CHECK(res->status == 403);
+    CHECK(h.calls.empty());
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.audits_for("echo.source.purge", "attempted") == 1);
+    CHECK(h.audit_detail("echo.source.purge", "failure") ==
+          "permission_revoked device=dev-A source=process"); // attempted, not stored
+    CHECK(h.metric("yuzu_echo_source_purge_total", "denied") == 1.0);
+}

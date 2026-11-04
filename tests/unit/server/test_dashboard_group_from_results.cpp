@@ -1918,3 +1918,27 @@ TEST_CASE("group-from-results audit (UP-5): ManagementGroup:Write revoked while 
     CHECK(h.audit_detail("group.create_from_results", "failure") == "permission_revoked");
     CHECK(h.audits_for("group.create_from_results", "success") == 0);
 }
+
+TEST_CASE("group-from-results audit (UP-5, Gate 5 CH-1): a recheck refusal whose failure row is not "
+          "stored still creates no group and flags the response",
+          "[pg][server][dashboard][group_from_results][audit][security][3619]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    bool attempted_seen = false;
+    h.audit_persists = [&h, &attempted_seen](const AuditRow& r) {
+        if (attempted_seen)
+            return false; // the audit store fails after the attempted row
+        if (r.action == "group.create_from_results" && r.result == "attempted") {
+            attempted_seen = true;
+            h.perm_allow = false; // revoked mid-write
+        }
+        return true;
+    };
+
+    auto res = h.post(GroupFromResultsHarness::form_body("perm-revoked-audit-down"));
+    CHECK(res->status == 403);
+    CHECK_FALSE(h.mg.find_group_by_name("perm-revoked-audit-down").has_value());
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
+    CHECK(h.audit_detail("group.create_from_results", "failure") == "permission_revoked");
+}
