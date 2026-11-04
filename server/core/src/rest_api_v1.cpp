@@ -2998,72 +2998,10 @@ const std::string& openapi_spec_with_guides_etag() {
 
 namespace detail {
 
-// W5.1 — definitions for the agentic JSON SSE shape contract. Declared
-// in `rest_a4_envelope.hpp`; defined here so they retain access to the
-// anonymous-namespace JObj/JArr builders (any move into a separate TU
-// would either duplicate the builders or promote them to a public
-// header — both bigger diffs than this PR warrants).
-
-std::string make_correlation_id() {
-    static std::atomic<std::uint64_t> seq{0};
-    auto n = seq.fetch_add(1, std::memory_order_relaxed);
-    auto t = std::chrono::duration_cast<std::chrono::milliseconds>(
-                 std::chrono::system_clock::now().time_since_epoch())
-                 .count();
-    // std::format keeps the buffer-size reasoning out of the call site;
-    // the surrounding file already uses std::format for the JObj double
-    // path. governance round cpp-expert L-1.
-    return std::format("req-{:x}-{:x}", static_cast<std::uint64_t>(t), n);
-}
-
-std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
-                          const A4ErrorOpts& opts) {
-    // The ONE unified A4 envelope builder (folds the old auth_routes.cpp
-    // a4_denial into a single wire shape). A4 (docs/agentic-first-principle.md)
-    // lists retry_after_ms as a REQUIRED, nullable field, so it is ALWAYS a
-    // key: `null` unless opts.retry_after_ms is set. remediation is omitted
-    // when empty (absence == "no recovery hint" per §A4). permission is the
-    // kPermissionDenied specialisation ("<securable_type>:<operation>");
-    // approval_id + status_url are the kApprovalRequired specialisation. #1470.
-    auto err = JObj()
-                   .add("code", code)
-                   .add("message", message)
-                   .add("correlation_id", correlation_id);
-    if (opts.retry_after_ms.has_value()) {
-        err.add("retry_after_ms", *opts.retry_after_ms);
-    } else {
-        err.raw("retry_after_ms", "null");
-    }
-    if (!opts.remediation.empty()) {
-        err.add("remediation", opts.remediation);
-    }
-    if (!opts.permission.empty()) {
-        err.add("permission", opts.permission);
-    }
-    if (!opts.approval_id.empty()) {
-        err.add("approval_id", opts.approval_id);
-    }
-    if (!opts.status_url.empty()) {
-        err.add("status_url", opts.status_url);
-    }
-    return JObj().raw("error", err.str()).raw("meta", R"({"api_version":"v1"})").str();
-}
-
-std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
-                          std::string_view remediation) {
-    // Backward-compatible no-retry overload — delegates to the unified builder
-    // so the wire shape stays byte-identical (retry_after_ms:null, remediation
-    // omitted when empty).
-    return error_json_a4(code, message, correlation_id, A4ErrorOpts{.remediation = remediation});
-}
-
-std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
-                          std::int64_t retry_after_ms, std::string_view remediation) {
-    // Backward-compatible concrete-retry overload. Passes the value through
-    // even when 0 — this overload's contract is "always a concrete number".
-    return error_json_a4(code, message, correlation_id,
-                         A4ErrorOpts{.retry_after_ms = retry_after_ms, .remediation = remediation});
-}
+// W5.1 — `make_correlation_id` and `error_json_a4` are declared in
+// `rest_a4_envelope.hpp` and defined in `rest_a4_envelope.cpp` (they moved out so
+// yuzu_server_core_lib can call them without a back edge into this file; see
+// server/core/meson.build). `make_event_envelope` below stays here.
 
 /// REST-shaped counterpart of `mcp::approval_store_read_error_body`
 /// (mcp_approval_error.hpp): same permanent-vs-transient classification
