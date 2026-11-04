@@ -3156,7 +3156,7 @@ if build_server
       args: [files('../scripts/ci/check_core_presentation_link.py'),
              '--build-dir', meson.project_build_root(), '--verbose'],
       suite: ['server', 'server-checks'],
-      depends: [yuzu_server_core_lib],
+      depends: [yuzu_server_core_lib, yuzu_server_routes_lib],
       timeout: 60,
     )
   endif
