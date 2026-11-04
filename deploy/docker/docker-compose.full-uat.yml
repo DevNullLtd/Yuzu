@@ -11,6 +11,19 @@
 #   Prometheus --> Server(:8080) + Gateway(:9568)  (metrics)
 #   Grafana --> Prometheus + ClickHouse   (dashboards)
 #
+# Started by scripts/docker-start-UAT.sh, which generates the Grafana admin
+# password, keeps it in .uat/grafana-admin-password (0600 where the filesystem
+# honours it) and prints it. Run by hand, every `docker compose` command (`down`
+# included) needs (#4817):
+#   export YUZU_GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+# and UAT_CONFIG (the server config path the launcher normally sets). Keep the
+# same value across shells (or use a .env); for `down`, `ps` and `logs` any
+# non-empty password and any absolute or ./-prefixed UAT_CONFIG path work. An
+# existing grafana-uat-data volume keeps its old password (admin/admin if it
+# predates #4817) until `down -v` or
+#   docker compose exec grafana grafana cli admin reset-admin-password '<new>'
+# UAT ONLY - Grafana and ClickHouse are published on every interface.
+#
 # Gateway image: yuzu-gateway:latest must be built from this checkout (or be from
 # the first release containing the yuzu_gw grpc_listeners shape): the mounted
 # gateway-sys.config uses that shape. An older image ignores it, binds no listener
@@ -193,7 +206,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      # Required, no default (#4817): Grafana's built-in default is admin/admin.
+      - GF_SECURITY_ADMIN_PASSWORD=${YUZU_GRAFANA_ADMIN_PASSWORD:?set YUZU_GRAFANA_ADMIN_PASSWORD to a strong random value, e.g. openssl rand -hex 16}
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/yuzu-dashboard.json
       - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
     volumes:
