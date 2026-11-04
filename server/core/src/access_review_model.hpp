@@ -287,8 +287,8 @@ decision_cap_wire_message(std::string_view store_error) noexcept {
     if (id.empty() || id.size() > kCampaignIdMaxLen)
         return false;
     for (const unsigned char c : id) {
-        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-                        c == '_' || c == '-';
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-';
         if (!ok)
             return false;
     }

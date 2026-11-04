@@ -152,21 +152,22 @@ std::string history_block(const AccessReviewAttestationRow& a) {
     bool all_rerecorded = a.history.size() == total;
     for (std::size_t i = 1; all_rerecorded && i < a.history.size(); ++i)
         all_rerecorded = is_rerecord(a.history[i - 1], a.history[i]);
-    const std::string marker =
-        all_rerecorded ? "re-recorded " + std::to_string(earlier) + (earlier == 1 ? " time" : " times")
-                       : "superseded " + std::to_string(earlier) + " earlier decision" +
-                             (earlier == 1 ? "" : "s");
+    const std::string marker = all_rerecorded ? "re-recorded " + std::to_string(earlier) +
+                                                    (earlier == 1 ? " time" : " times")
+                                              : "superseded " + std::to_string(earlier) +
+                                                    " earlier decision" + (earlier == 1 ? "" : "s");
     if (a.history.empty())
         return "<span class=\"sub\">" + marker + "</span>";
-    std::string out = "<details class=\"ar-history\"><summary class=\"sub\">" + marker + "</summary>";
+    std::string out =
+        "<details class=\"ar-history\"><summary class=\"sub\">" + marker + "</summary>";
     // The read returns only a grant's latest entries (kMaxDecisionsPerGrant): say so when the
     // count recorded is larger than what is listed.
     if (recorded > a.history.size()) {
         const std::size_t hidden = recorded - a.history.size();
-        out += "<span class=\"sub\">" + std::to_string(hidden) +
-               (hidden == 1 ? " earlier decision is not shown"
-                            : " earlier decisions are not shown") +
-               "</span>";
+        out +=
+            "<span class=\"sub\">" + std::to_string(hidden) +
+            (hidden == 1 ? " earlier decision is not shown" : " earlier decisions are not shown") +
+            "</span>";
     }
     for (std::size_t i = 0; i < a.history.size(); ++i)
         out += history_entry(a, i);
@@ -174,7 +175,8 @@ std::string history_block(const AccessReviewAttestationRow& a) {
 }
 
 // `viewer` is the signed-in reviewer. The server refuses a reviewer who is the subject of the
-// grant, so a user row naming the viewer shows no Attest or Flag; that is a courtesy, not the control.
+// grant, so a user row naming the viewer shows no Attest or Flag; that is a courtesy, not the
+// control.
 std::string attestation_row(const AccessReviewAttestationRow& a, bool controls,
                             std::string_view viewer) {
     const bool pending = is_pending(a);
@@ -322,8 +324,9 @@ std::string render_campaigns(
     return out + "</tbody></table></div>";
 }
 
-std::string render_campaign(const std::variant<CampaignView, access::NotFound, access::Unavailable>& state,
-                            bool can_attest, std::string_view id, std::string_view viewer) {
+std::string
+render_campaign(const std::variant<CampaignView, access::NotFound, access::Unavailable>& state,
+                bool can_attest, std::string_view id, std::string_view viewer) {
     if (const auto* v = std::get_if<CampaignView>(&state))
         return campaign_panel(*v, can_attest, viewer) +
                side_card(*v, derive_campaign_counts(*v), can_attest);

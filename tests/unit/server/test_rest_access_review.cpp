@@ -215,8 +215,8 @@ struct AccessReviewHarness {
 
     /// What the MCP audit callback does. `fail` returns false (a persist failure), `throws` throws
     /// std::runtime_error (a bad_alloc-class fault), both only for `mcp_audit_mode_action` (empty =
-    /// every action, the domain row AND the `mcp.<tool>` wrapper row). The REST callback has its own
-    /// knob above; the MCP one defaulted to always-true before the attestation refusal tests.
+    /// every action, the domain row AND the `mcp.<tool>` wrapper row). The REST callback has its
+    /// own knob above; the MCP one defaulted to always-true before the attestation refusal tests.
     enum class McpAuditMode { ok, fail, throws };
     McpAuditMode mcp_audit_mode{McpAuditMode::ok};
     std::string mcp_audit_mode_action;
@@ -1842,9 +1842,9 @@ TEST_CASE("REST get/attest/close refuse a malformed campaign id with 400 and tou
     }
 
     const nlohmann::json attest_body = {{"principal_type", "user"},
-                                       {"principal_id", "csrfuser"},
-                                       {"role_name", "CsrfRole"},
-                                       {"decision", "attested"}};
+                                        {"principal_id", "csrfuser"},
+                                        {"role_name", "CsrfRole"},
+                                        {"decision", "attested"}};
 
     for (const auto& [label, bad] : bad_campaign_ids(cid)) {
         INFO("case: " << label << " (size " << bad.size() << ")");
@@ -1920,16 +1920,17 @@ TEST_CASE("MCP get/record/close refuse a malformed campaign id with invalid-para
         INFO("case: " << label << " (size " << bad.size() << ")");
         h.audit_log.clear();
 
-        const auto [c1, m1] = code_and_message(h.mcp_call_tool("get_access_review", {{"campaign_id", bad}}));
+        const auto [c1, m1] =
+            code_and_message(h.mcp_call_tool("get_access_review", {{"campaign_id", bad}}));
         CHECK(c1 == yuzu::server::mcp::kInvalidParams);
         CHECK(m1 == kCampaignIdMessage);
 
-        const auto [c2, m2] = code_and_message(
-            h.mcp_call_tool("record_attestation", {{"campaign_id", bad},
-                                                   {"principal_type", "user"},
-                                                   {"principal_id", "csrfuser"},
-                                                   {"role_name", "CsrfRole"},
-                                                   {"decision", "attested"}}));
+        const auto [c2, m2] =
+            code_and_message(h.mcp_call_tool("record_attestation", {{"campaign_id", bad},
+                                                                    {"principal_type", "user"},
+                                                                    {"principal_id", "csrfuser"},
+                                                                    {"role_name", "CsrfRole"},
+                                                                    {"decision", "attested"}}));
         CHECK(c2 == yuzu::server::mcp::kInvalidParams);
         CHECK(m2 == kCampaignIdMessage);
 
@@ -2905,8 +2906,8 @@ TEST_CASE("attestation bounds: a frozen grant with the longest ids the identity 
     // shorten, so a row is bounded by the three field caps plus its fixed labels: a few KiB.
     const auto rows = audit_rows(h, "access_review.attested");
     REQUIRE(rows.size() == 3);
-    const std::size_t bound = 2 * yuzu::server::kPrincipalIdMaxLen +
-                              yuzu::server::kRoleNameMaxLen + 256;
+    const std::size_t bound =
+        2 * yuzu::server::kPrincipalIdMaxLen + yuzu::server::kRoleNameMaxLen + 256;
     for (const auto& r : rows) {
         CHECK(r.detail.size() > 600); // the long ids really are in the row
         CHECK(r.detail.size() <= bound);
@@ -3064,8 +3065,8 @@ TEST_CASE("access review store errors: every string the store returns maps to on
     CHECK(sod::store_error_http_status(cap_cls) == 400);
     CHECK(sod::store_error_jsonrpc_code(cap_cls) == kInvalidParams);
     CHECK(yuzu::server::decision_cap_wire_message(cap_err) == yuzu::server::kDecisionCapMessage);
-    CHECK_FALSE(yuzu::server::decision_cap_wire_message(
-                    std::string(yuzu::server::kDecisionCapMessage)));
+    CHECK_FALSE(
+        yuzu::server::decision_cap_wire_message(std::string(yuzu::server::kDecisionCapMessage)));
     CHECK_FALSE(yuzu::server::decision_cap_wire_message(cap_err + " "));
     CHECK_FALSE(yuzu::server::decision_cap_wire_message("bad_request: reviewer cannot be empty"));
     CHECK_FALSE(yuzu::server::decision_cap_wire_message(""));
@@ -3076,7 +3077,8 @@ TEST_CASE("access review store errors: every string the store returns maps to on
 // GET /{id}, MCP get_access_review and the Access page show the same decisions: the latest, its
 // decision_seq and every earlier one. The page case drives the real fragment route over a callback
 // that reads the real store with include_history=true, which is what server.cpp wires; the Settings
-// fragment keeps reading without history and shows the latest decision only (an intended difference).
+// fragment keeps reading without history and shows the latest decision only (an intended
+// difference).
 
 namespace {
 
@@ -3093,9 +3095,10 @@ std::set<std::string> property_names(const nlohmann::json& schema) {
 
 } // namespace
 
-TEST_CASE("decision history: REST, MCP and the Access page agree, and the OpenAPI schema names exactly "
-          "what is emitted",
-          "[pg][access_review][rest][mcp][access-reviews][4752]") {
+TEST_CASE(
+    "decision history: REST, MCP and the Access page agree, and the OpenAPI schema names exactly "
+    "what is emitted",
+    "[pg][access_review][rest][mcp][access-reviews][4752]") {
     AccessReviewHarness h;
     seed_user_grant(h, "bob");
     seed_user_grant(h, "alice");
@@ -3106,23 +3109,21 @@ TEST_CASE("decision history: REST, MCP and the Access page agree, and the OpenAP
     const std::string long_note(600, 'x');
     h.session_user = "carol";
     REQUIRE(h.sink
-                .Post(attest_url(cid),
-                      nlohmann::json{{"principal_type", "user"},
-                                     {"principal_id", "bob"},
-                                     {"role_name", "Operator"},
-                                     {"decision", "attested"},
-                                     {"justification", long_note}}
-                          .dump())
+                .Post(attest_url(cid), nlohmann::json{{"principal_type", "user"},
+                                                      {"principal_id", "bob"},
+                                                      {"role_name", "Operator"},
+                                                      {"decision", "attested"},
+                                                      {"justification", long_note}}
+                                           .dump())
                 ->status == 200);
     h.session_user = "dave";
     REQUIRE(h.sink
-                .Post(attest_url(cid),
-                      nlohmann::json{{"principal_type", "user"},
-                                     {"principal_id", "bob"},
-                                     {"role_name", "Operator"},
-                                     {"decision", "flagged_revoke"},
-                                     {"justification", "left <the> team"}}
-                          .dump())
+                .Post(attest_url(cid), nlohmann::json{{"principal_type", "user"},
+                                                      {"principal_id", "bob"},
+                                                      {"role_name", "Operator"},
+                                                      {"decision", "flagged_revoke"},
+                                                      {"justification", "left <the> team"}}
+                                           .dump())
                 ->status == 200);
 
     const auto find_att = [](const nlohmann::json& atts, const std::string& id) {
@@ -3214,12 +3215,10 @@ TEST_CASE("decision history: REST, MCP and the Access page agree, and the OpenAP
             if (t["name"] != "get_access_review")
                 continue;
             schema_found = true;
-            const auto& mcp_hist =
-                t["outputSchema"]["properties"]["attestations"]["items"]["properties"]["history"]
-                 ["items"];
+            const auto& mcp_hist = t["outputSchema"]["properties"]["attestations"]["items"]
+                                    ["properties"]["history"]["items"];
             CHECK(property_names(mcp_hist) == keys_of(find_att(mcp_atts, "bob")["history"][0]));
-            CHECK(std::set<std::string>(mcp_hist["required"].begin(),
-                                        mcp_hist["required"].end()) ==
+            CHECK(std::set<std::string>(mcp_hist["required"].begin(), mcp_hist["required"].end()) ==
                   keys_of(find_att(mcp_atts, "bob")["history"][0]));
         }
         CHECK(schema_found);
@@ -3235,13 +3234,17 @@ TEST_CASE("decision history: REST, MCP and the Access page agree, and the OpenAP
         return s;
     };
     d.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                   const std::string&) { return true; };
+                   const std::string&) {
+        return true;
+    };
     d.quiet_perm_fn = d.perm_fn;
     d.probe_perm_fn = [](const httplib::Request&, const std::string&, const std::string&) {
         return true;
     };
     d.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                    const std::string&, const std::string&, const std::string&) { return true; };
+                    const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
     d.list_campaigns_fn = []() -> std::expected<std::vector<AccessReviewCampaignRow>, std::string> {
         return std::vector<AccessReviewCampaignRow>{};
     };
@@ -3534,8 +3537,7 @@ TEST_CASE("attestation limits: the MCP input schema and description and the Open
 
     const auto spec = nlohmann::json::parse(yuzu::server::openapi_spec_json());
     const auto& post = spec["paths"]["/access-reviews/{id}/attestations"]["post"];
-    const auto& body =
-        post["requestBody"]["content"]["application/json"]["schema"]["properties"];
+    const auto& body = post["requestBody"]["content"]["application/json"]["schema"]["properties"];
     CHECK(body["principal_id"]["maxLength"] == yuzu::server::kPrincipalIdMaxLen);
     CHECK(body["role_name"]["maxLength"] == yuzu::server::kRoleNameMaxLen);
     CHECK(body["justification"]["maxLength"] == yuzu::server::kMaxJustificationBytes);
@@ -3584,7 +3586,9 @@ TEST_CASE("bounded history read: a grant carrying 105 history rows returns its l
               "INSERT INTO " + hist +
                   " (campaign_id, principal_type, principal_id, role_name, seq, decision, "
                   "previous_decision, reviewer, justification, decided_at_ms) "
-                  "SELECT '" + cid + "','user','bob','Operator', g, 'attested', 'attested', "
+                  "SELECT '" +
+                  cid +
+                  "','user','bob','Operator', g, 'attested', 'attested', "
                   "'carol', '', g FROM generate_series(2,105) g",
               "UPDATE " + att + " SET decision_seq=105 WHERE campaign_id='" + cid +
                   "' AND principal_id='bob'"}) {
@@ -3633,13 +3637,17 @@ TEST_CASE("bounded history read: a grant carrying 105 history rows returns its l
         return s;
     };
     d.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                   const std::string&) { return true; };
+                   const std::string&) {
+        return true;
+    };
     d.quiet_perm_fn = d.perm_fn;
     d.probe_perm_fn = [](const httplib::Request&, const std::string&, const std::string&) {
         return true;
     };
     d.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                    const std::string&, const std::string&, const std::string&) { return true; };
+                    const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
     d.list_campaigns_fn = []() -> std::expected<std::vector<AccessReviewCampaignRow>, std::string> {
         return std::vector<AccessReviewCampaignRow>{};
     };

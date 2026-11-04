@@ -647,8 +647,8 @@ public:
     /// collapses a failed read into an empty vector, a failure is an `unexpected` the caller MUST
     /// fail closed on, never read as "not a member". Breaker-gated, `kAuthzAcquireTimeout` budget:
     /// every call feeds the replica's RBAC breaker and a failure bumps
-    /// `yuzu_server_rbac_read_degrade_total` (the ADR-0017 admit-then-filter chokepoint's read, also
-    /// used by the attestation separation-of-duties gate). Errors: `kRbacErrStoreNotOpen`,
+    /// `yuzu_server_rbac_read_degrade_total` (the ADR-0017 admit-then-filter chokepoint's read,
+    /// also used by the attestation separation-of-duties gate). Errors: `kRbacErrStoreNotOpen`,
     /// `kRbacErrCircuitBreakerOpen`, `kRbacErrPoolAcquireTimeout`, `"query failed: ..."`.
     [[nodiscard]] std::expected<std::vector<std::string>, std::string>
     user_rbac_group_names_checked(const std::string& username) const;

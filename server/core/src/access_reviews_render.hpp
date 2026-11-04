@@ -77,8 +77,9 @@ std::string render_campaigns(
 /// that names them. The server refuses that decision anyway; this only spares a dead button.
 /// A grant that carries more than one decision shows a marker and, when the history was loaded,
 /// the history behind a `<details>`.
-std::string render_campaign(const std::variant<CampaignView, access::NotFound, access::Unavailable>& state,
-                            bool can_attest, std::string_view id = {}, std::string_view viewer = {});
+std::string
+render_campaign(const std::variant<CampaignView, access::NotFound, access::Unavailable>& state,
+                bool can_attest, std::string_view id = {}, std::string_view viewer = {});
 
 /// Nothing selected: both targets show their placeholder.
 std::string render_campaign_unselected();

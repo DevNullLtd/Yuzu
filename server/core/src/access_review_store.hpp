@@ -284,11 +284,11 @@ public:
     /// a grant at or under it, so `decision_seq > history.size()` means rows were
     /// added by other means). The cap holds for rows written through the application path;
     /// rows added by other means (owner-level SQL with the guard triggers disabled, which can
-    /// forge a state row) are outside the guarantee. Every entry except the grant's latest (`seq == decision_seq`)
-    /// carries at most its first `kHistoryJustificationPreviewChars` characters of justification,
-    /// cut in SQL on a character boundary, with `justification_truncated` set when the stored
-    /// text was longer; the latest entry is whole. The two bounds together cap what one grant
-    /// adds to a response; a superseded entry's full text is in the database only. It
+    /// forge a state row) are outside the guarantee. Every entry except the grant's latest (`seq ==
+    /// decision_seq`) carries at most its first `kHistoryJustificationPreviewChars` characters of
+    /// justification, cut in SQL on a character boundary, with `justification_truncated` set when
+    /// the stored text was longer; the latest entry is whole. The two bounds together cap what one
+    /// grant adds to a response; a superseded entry's full text is in the database only. It
     /// defaults to false so a caller that shows only the latest decision stays one cheap read.
     /// `unexpected("bad_request: ...")`
     /// when `campaign_id` fails `valid_campaign_id` (empty included), checked

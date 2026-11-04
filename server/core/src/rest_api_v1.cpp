@@ -10608,7 +10608,8 @@ void RestApiV1::register_routes(
 
             // The history is opt-in on the store read: this evidence surface carries every
             // decision, not only the latest (the Settings fragment keeps the latest only).
-            auto view_res = access_review_store->get_campaign(campaign_id, /*include_history=*/true);
+            auto view_res =
+                access_review_store->get_campaign(campaign_id, /*include_history=*/true);
             if (!view_res) {
                 res.status = access_review_error_status(view_res.error());
                 res.set_content(detail::a4_error(res, view_res.error()), "application/json");

@@ -33,29 +33,28 @@ const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
     // the migration txn. Runtime statements below schema-qualify explicitly.
     static const std::vector<pg::PgMigration> kMigrations = {
-        {1,
-         "CREATE TABLE access_review_campaign ("
-         "  campaign_id    TEXT PRIMARY KEY,"
-         "  title          TEXT NOT NULL,"
-         "  status         TEXT NOT NULL CHECK (status IN ('open','closed')),"
-         "  created_by     TEXT NOT NULL,"
-         "  created_at_ms  BIGINT NOT NULL,"
-         "  closed_by      TEXT NOT NULL DEFAULT '',"
-         "  closed_at_ms   BIGINT NOT NULL DEFAULT 0);"
-         "CREATE INDEX access_review_campaign_status_idx ON access_review_campaign (status);"
-         "CREATE TABLE access_review_attestation ("
-         "  campaign_id     TEXT NOT NULL REFERENCES access_review_campaign(campaign_id) "
-         "                  ON DELETE CASCADE,"
-         "  principal_type  TEXT NOT NULL CHECK (principal_type IN ('user','group','engine')),"
-         "  principal_id    TEXT NOT NULL,"
-         "  role_name       TEXT NOT NULL,"
-         "  decision        TEXT NOT NULL CHECK (decision IN ('pending','attested',"
-         "                  'flagged_revoke')),"
-         "  reviewer        TEXT NOT NULL DEFAULT '',"
-         "  decided_at_ms   BIGINT NOT NULL DEFAULT 0,"
-         "  justification   TEXT NOT NULL DEFAULT '',"
-         "  grant_snapshot  TEXT NOT NULL DEFAULT '',"
-         "  PRIMARY KEY (campaign_id, principal_type, principal_id, role_name));"},
+        {1, "CREATE TABLE access_review_campaign ("
+            "  campaign_id    TEXT PRIMARY KEY,"
+            "  title          TEXT NOT NULL,"
+            "  status         TEXT NOT NULL CHECK (status IN ('open','closed')),"
+            "  created_by     TEXT NOT NULL,"
+            "  created_at_ms  BIGINT NOT NULL,"
+            "  closed_by      TEXT NOT NULL DEFAULT '',"
+            "  closed_at_ms   BIGINT NOT NULL DEFAULT 0);"
+            "CREATE INDEX access_review_campaign_status_idx ON access_review_campaign (status);"
+            "CREATE TABLE access_review_attestation ("
+            "  campaign_id     TEXT NOT NULL REFERENCES access_review_campaign(campaign_id) "
+            "                  ON DELETE CASCADE,"
+            "  principal_type  TEXT NOT NULL CHECK (principal_type IN ('user','group','engine')),"
+            "  principal_id    TEXT NOT NULL,"
+            "  role_name       TEXT NOT NULL,"
+            "  decision        TEXT NOT NULL CHECK (decision IN ('pending','attested',"
+            "                  'flagged_revoke')),"
+            "  reviewer        TEXT NOT NULL DEFAULT '',"
+            "  decided_at_ms   BIGINT NOT NULL DEFAULT 0,"
+            "  justification   TEXT NOT NULL DEFAULT '',"
+            "  grant_snapshot  TEXT NOT NULL DEFAULT '',"
+            "  PRIMARY KEY (campaign_id, principal_type, principal_id, role_name));"},
         // A3 (RBAC delivery plan): stamp each campaign with the fleet's RBAC
         // enforcement state at open. DEFAULT '' is honest-empty for every row
         // that predates this column — never '' -> 'degraded' backfill, and
@@ -102,10 +101,9 @@ const std::vector<pg::PgMigration>& migrations() {
         // EXCLUSIVE), so the pool's 10 s lock_timeout is raised to 30 s as in ca_store v3/v4.
         // The backfill is expected to be empty under the deployment contract; the
         // statement_timeout bounds a carried-forward one.
-        {3,
-         "SET LOCAL lock_timeout = '30s'; "
-         "SET LOCAL statement_timeout = '300s'; "
-         R"sql(
+        {3, "SET LOCAL lock_timeout = '30s'; "
+            "SET LOCAL statement_timeout = '300s'; "
+            R"sql(
 DO $do$
 DECLARE n bigint;
 BEGIN
@@ -392,12 +390,10 @@ AccessReviewStore::open_campaign(std::string title, std::string created_by,
     return campaign_id;
 }
 
-std::expected<AttestationOutcome, std::string>
-AccessReviewStore::record_attestation(const std::string& campaign_id,
-                                      const std::string& principal_type,
-                                      const std::string& principal_id,
-                                      const std::string& role_name, std::string decision,
-                                      std::string reviewer, std::string justification) {
+std::expected<AttestationOutcome, std::string> AccessReviewStore::record_attestation(
+    const std::string& campaign_id, const std::string& principal_type,
+    const std::string& principal_id, const std::string& role_name, std::string decision,
+    std::string reviewer, std::string justification) {
     if (!open_)
         return std::unexpected("database not open");
     if (decision != "attested" && decision != "flagged_revoke")
@@ -413,7 +409,9 @@ AccessReviewStore::record_attestation(const std::string& campaign_id,
         return std::unexpected("bad_request: reviewer cannot be empty");
     // libpq binds c_str() (pg/pg_exec.hpp): an embedded NUL would truncate the value, so the
     // row written or matched would not be the one named. Refuse before the pool is touched.
-    const auto has_nul = [](const std::string& s) { return s.find('\0') != std::string::npos; };
+    const auto has_nul = [](const std::string& s) {
+        return s.find('\0') != std::string::npos;
+    };
     if (has_nul(principal_type))
         return std::unexpected("bad_request: principal_type contains a NUL byte");
     if (has_nul(principal_id))
@@ -484,11 +482,10 @@ AccessReviewStore::record_attestation(const std::string& campaign_id,
             " previous_decision, reviewer, justification, decided_at_ms) "
             "VALUES ($1,$2,$3,$4,$5::integer,$6,$7,$8,$9,$10::bigint)",
             std::vector<std::string>{campaign_id, principal_type, principal_id, role_name, new_seq,
-                                     decision, old_decision, reviewer, justification,
-                                     decided_at});
+                                     decision, old_decision, reviewer, justification, decided_at});
         if (hist.status() != PGRES_COMMAND_OK) {
-            error_msg = std::string("record_attestation history write failed: ") +
-                        PQerrorMessage(conn);
+            error_msg =
+                std::string("record_attestation history write failed: ") + PQerrorMessage(conn);
             return false;
         }
 
@@ -629,8 +626,8 @@ AccessReviewStore::get_campaign(const std::string& campaign_id, bool include_his
                 std::vector<std::string>{campaign_id, std::to_string(kMaxDecisionsPerGrant),
                                          std::to_string(kHistoryJustificationPreviewChars)});
             if (hres.status() != PGRES_TUPLES_OK) {
-                error_msg = std::string("get_campaign history read failed: ") +
-                            PQerrorMessage(conn);
+                error_msg =
+                    std::string("get_campaign history read failed: ") + PQerrorMessage(conn);
                 return false;
             }
             const int hrows = PQntuples(hres.get());

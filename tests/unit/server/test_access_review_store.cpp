@@ -320,8 +320,8 @@ TEST_CASE("get_campaign: a genuine read failure mid-enumeration is a plain error
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
         // CASCADE: the history table's foreign key (schema v3) makes a plain DROP fail.
-        PgResult d{PQexec(conn.get(),
-                          "DROP TABLE access_review_store.access_review_attestation CASCADE")};
+        PgResult d{
+            PQexec(conn.get(), "DROP TABLE access_review_store.access_review_attestation CASCADE")};
         REQUIRE(d.ok());
     }
 
@@ -335,9 +335,9 @@ TEST_CASE("get_campaign: a genuine read failure mid-enumeration is a plain error
 
 namespace {
 
-const yuzu::server::AccessReviewAttestationRow*
-find_row(const yuzu::server::CampaignView& v, std::string_view type, std::string_view id,
-         std::string_view role) {
+const yuzu::server::AccessReviewAttestationRow* find_row(const yuzu::server::CampaignView& v,
+                                                         std::string_view type, std::string_view id,
+                                                         std::string_view role) {
     for (const auto& a : v.attestations)
         if (a.principal_type == type && a.principal_id == id && a.role_name == role)
             return &a;
@@ -465,8 +465,7 @@ TEST_CASE("record_attestation: a grant keeps at most kMaxDecisionsPerGrant decis
               (i == 1 ? "pending" : (i % 2 ? "flagged_revoke" : "attested")));
     }
 
-    const std::string expected =
-        "bad_request: " + std::string(yuzu::server::kDecisionCapMessage);
+    const std::string expected = "bad_request: " + std::string(yuzu::server::kDecisionCapMessage);
     for (int attempt = 0; attempt < 2; ++attempt) { // refused again, never a different answer
         auto over =
             store.record_attestation(cid, "group", "eng", "Reader", "attested", "dave", "x");
@@ -523,7 +522,9 @@ TEST_CASE("get_campaign(include_history) returns each grant's latest kMaxDecisio
               "INSERT INTO " + hist +
                   " (campaign_id, principal_type, principal_id, role_name, seq, decision, "
                   "previous_decision, reviewer, justification, decided_at_ms) "
-                  "SELECT '" + cid + "','group','eng','Reader', g, 'attested', 'attested', "
+                  "SELECT '" +
+                  cid +
+                  "','group','eng','Reader', g, 'attested', 'attested', "
                   "'carol', 'row ' || g, g FROM generate_series(2,105) g",
               "UPDATE " + att + " SET decision_seq=105 WHERE campaign_id='" + cid +
                   "' AND principal_id='eng'"}) {
@@ -636,8 +637,8 @@ TEST_CASE("record_attestation: a self-subject user decision is forbidden even in
     REQUIRE_FALSE(self_unknown.has_value());
     CHECK(self_unknown.error().starts_with("forbidden:"));
     // A malformed campaign id is still a bad_request, ahead of the reviewer rule.
-    auto bad_id = store.record_attestation("bad id", "user", "alice", "Admin", "attested", "alice",
-                                           "");
+    auto bad_id =
+        store.record_attestation("bad id", "user", "alice", "Admin", "attested", "alice", "");
     REQUIRE_FALSE(bad_id.has_value());
     CHECK(bad_id.error().starts_with("bad_request:"));
 
@@ -721,8 +722,8 @@ TEST_CASE("record_attestation into a closed campaign after a decision leaves his
                 .has_value());
     REQUIRE(store.close_campaign(cid, "admin").has_value());
 
-    auto late = store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "dave",
-                                         "late");
+    auto late =
+        store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "dave", "late");
     REQUIRE_FALSE(late.has_value());
     CHECK(late.error().starts_with("not_found:"));
 
@@ -1017,8 +1018,7 @@ TEST_CASE("record_attestation: a frozen grant with the longest ids the identity 
     CHECK(row->history.size() == 1);
 }
 
-TEST_CASE("record_attestation caps justification at 4096 bytes",
-          "[access_review][store][pg]") {
+TEST_CASE("record_attestation caps justification at 4096 bytes", "[access_review][store][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AccessReviewStore store{pool};
@@ -1272,55 +1272,66 @@ TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation
     const std::string key = "campaign_id='" + cid + "' AND principal_type='";
 
     // An older binary's bare UPDATE (no history row, no seq advance).
-    CHECK(integrity_violation(sqlstate_of(
-        c, "UPDATE " + att + " SET decision='flagged_revoke', reviewer='dave', "
-           "decided_at_ms=1, justification='x' WHERE " + key + "user' AND principal_id='alice'")));
+    CHECK(integrity_violation(sqlstate_of(c, "UPDATE " + att +
+                                                 " SET decision='flagged_revoke', reviewer='dave', "
+                                                 "decided_at_ms=1, justification='x' WHERE " +
+                                                 key + "user' AND principal_id='alice'")));
     // Resetting the sequence to forge a later primary-key collision.
-    CHECK(integrity_violation(sqlstate_of(
-        c, "UPDATE " + att + " SET decision_seq=0 WHERE " + key + "user' AND principal_id='alice'")));
+    CHECK(integrity_violation(sqlstate_of(c, "UPDATE " + att + " SET decision_seq=0 WHERE " + key +
+                                                 "user' AND principal_id='alice'")));
     // A decided row inserted directly.
-    CHECK(integrity_violation(sqlstate_of(
-        c, "INSERT INTO " + att + " (campaign_id, principal_type, principal_id, role_name, decision, "
-           "reviewer, decided_at_ms, justification, grant_snapshot) VALUES ('" + cid +
-           "','user','mallory','Admin','attested','carol',1,'','{}')")));
+    CHECK(integrity_violation(
+        sqlstate_of(c, "INSERT INTO " + att +
+                           " (campaign_id, principal_type, principal_id, role_name, decision, "
+                           "reviewer, decided_at_ms, justification, grant_snapshot) VALUES ('" +
+                           cid + "','user','mallory','Admin','attested','carol',1,'','{}')")));
     // A justification-only edit of a pending row.
-    CHECK(integrity_violation(sqlstate_of(
-        c, "UPDATE " + att + " SET justification='x' WHERE " + key + "group' AND principal_id='eng'")));
+    CHECK(integrity_violation(sqlstate_of(c, "UPDATE " + att + " SET justification='x' WHERE " +
+                                                 key + "group' AND principal_id='eng'")));
     // History is append-only.
     CHECK(integrity_violation(sqlstate_of(c, "UPDATE " + hist + " SET reviewer='eve'")));
     CHECK(integrity_violation(sqlstate_of(c, "DELETE FROM " + hist)));
     // Evidence rows are never deleted, so neither is a campaign that has any.
-    CHECK(integrity_violation(sqlstate_of(c, "DELETE FROM " + att + " WHERE campaign_id='" + cid + "'")));
+    CHECK(integrity_violation(
+        sqlstate_of(c, "DELETE FROM " + att + " WHERE campaign_id='" + cid + "'")));
     CHECK(integrity_violation(sqlstate_of(
-        c, "DELETE FROM access_review_store.access_review_campaign WHERE campaign_id='" + cid + "'")));
+        c,
+        "DELETE FROM access_review_store.access_review_campaign WHERE campaign_id='" + cid + "'")));
     // A history row naming the subject as reviewer fails the table CHECK.
-    CHECK(sqlstate_of(c, "INSERT INTO " + hist + " (campaign_id, principal_type, principal_id, "
-                         "role_name, seq, decision, previous_decision, reviewer, justification, "
-                         "decided_at_ms) VALUES ('" + cid +
-                         "','user','alice','Admin',2,'attested','attested','alice','',9)") ==
+    CHECK(sqlstate_of(c,
+                      "INSERT INTO " + hist +
+                          " (campaign_id, principal_type, principal_id, "
+                          "role_name, seq, decision, previous_decision, reviewer, justification, "
+                          "decided_at_ms) VALUES ('" +
+                          cid + "','user','alice','Admin',2,'attested','attested','alice','',9)") ==
           "23514");
 
     // A history row committed with no state change is refused AT COMMIT (deferred consistency
     // guard), so it cannot poison the next decision's primary key.
     REQUIRE(sqlstate_of(c, "BEGIN").empty());
-    CHECK(sqlstate_of(c, "INSERT INTO " + hist + " (campaign_id, principal_type, principal_id, "
-                         "role_name, seq, decision, previous_decision, reviewer, justification, "
-                         "decided_at_ms) VALUES ('" + cid +
-                         "','group','eng','Reader',1,'attested','pending','carol','',5)")
-              .empty());
+    CHECK(
+        sqlstate_of(c, "INSERT INTO " + hist +
+                           " (campaign_id, principal_type, principal_id, "
+                           "role_name, seq, decision, previous_decision, reviewer, justification, "
+                           "decided_at_ms) VALUES ('" +
+                           cid + "','group','eng','Reader',1,'attested','pending','carol','',5)")
+            .empty());
     CHECK(integrity_violation(sqlstate_of(c, "COMMIT")));
 
     // The zero-row UPDATE emulation (the shape a callback that wrongly returned true would
     // commit): history inserted, the state UPDATE matched nothing, COMMIT.
     REQUIRE(sqlstate_of(c, "BEGIN").empty());
-    CHECK(sqlstate_of(c, "INSERT INTO " + hist + " (campaign_id, principal_type, principal_id, "
-                         "role_name, seq, decision, previous_decision, reviewer, justification, "
-                         "decided_at_ms) VALUES ('" + cid +
-                         "','group','eng','Reader',1,'attested','pending','carol','',5)")
-              .empty());
-    CHECK(sqlstate_of(c, "UPDATE " + att + " SET decision='attested', reviewer='carol', "
-                         "decided_at_ms=5, justification='', decision_seq=1 WHERE " + key +
-                         "group' AND principal_id='eng' AND decision_seq=99")
+    CHECK(
+        sqlstate_of(c, "INSERT INTO " + hist +
+                           " (campaign_id, principal_type, principal_id, "
+                           "role_name, seq, decision, previous_decision, reviewer, justification, "
+                           "decided_at_ms) VALUES ('" +
+                           cid + "','group','eng','Reader',1,'attested','pending','carol','',5)")
+            .empty());
+    CHECK(sqlstate_of(c, "UPDATE " + att +
+                             " SET decision='attested', reviewer='carol', "
+                             "decided_at_ms=5, justification='', decision_seq=1 WHERE " +
+                             key + "group' AND principal_id='eng' AND decision_seq=99")
               .empty());
     CHECK(integrity_violation(sqlstate_of(c, "COMMIT")));
 
@@ -1506,7 +1517,9 @@ std::string grant_lock_sql(const std::string& cid) {
     // The same locks the attest pre-read takes, on the alice/Admin grant.
     return "SELECT 1 FROM access_review_store.access_review_attestation a "
            "JOIN access_review_store.access_review_campaign c ON c.campaign_id = a.campaign_id "
-           "WHERE a.campaign_id='" + cid + "' AND a.principal_type='user' AND "
+           "WHERE a.campaign_id='" +
+           cid +
+           "' AND a.principal_type='user' AND "
            "a.principal_id='alice' AND a.role_name='Admin' FOR UPDATE OF a FOR SHARE OF c";
 }
 
@@ -1569,8 +1582,9 @@ TEST_CASE("get_campaign history: a superseded justification is cut to 512 charac
     }
 
     // A grant decided once has only its latest entry: never cut, never flagged.
-    REQUIRE(store.record_attestation(cid, "group", "eng", "Reader", "attested", "carol",
-                                     std::string(4096, 'z'))
+    REQUIRE(store
+                .record_attestation(cid, "group", "eng", "Reader", "attested", "carol",
+                                    std::string(4096, 'z'))
                 .has_value());
     auto again = store.get_campaign(cid, true);
     REQUIRE(again.has_value());
@@ -1724,7 +1738,8 @@ TEST_CASE("an attest issued while a close is in flight waits, then is not_found 
     std::expected<yuzu::server::AttestationOutcome, std::string> attested;
     yuzu::test::HeldLocks held(pool);
     held.run("UPDATE access_review_store.access_review_campaign SET status='closed', "
-             "closed_by='held', closed_at_ms=1 WHERE campaign_id='" + cid + "'");
+             "closed_by='held', closed_at_ms=1 WHERE campaign_id='" +
+             cid + "'");
     yuzu::test::Workers workers([&] { held.rollback(); });
     workers.add([&] {
         attested = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "");
@@ -1828,7 +1843,8 @@ void seed_v2_database(const std::string& dsn) {
         "  principal_type  TEXT NOT NULL CHECK (principal_type IN ('user','group','engine')),"
         "  principal_id    TEXT NOT NULL,"
         "  role_name       TEXT NOT NULL,"
-        "  decision        TEXT NOT NULL CHECK (decision IN ('pending','attested','flagged_revoke')),"
+        "  decision        TEXT NOT NULL CHECK (decision IN "
+        "('pending','attested','flagged_revoke')),"
         "  reviewer        TEXT NOT NULL DEFAULT '',"
         "  decided_at_ms   BIGINT NOT NULL DEFAULT 0,"
         "  justification   TEXT NOT NULL DEFAULT '',"
@@ -1923,12 +1939,12 @@ TEST_CASE("AccessReviewStore: a v2 database holding a self-recorded decision is 
         // What the earlier build allowed: the subject of the grant recorded its own decision.
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
-        PgResult r{PQexec(
-            conn.get(),
-            "INSERT INTO access_review_store.access_review_attestation (campaign_id, "
-            "principal_type, principal_id, role_name, decision, reviewer, decided_at_ms, "
-            "justification, grant_snapshot) VALUES "
-            "('c1','user','mallory','Admin','attested','mallory',1236,'me','{}')")};
+        PgResult r{
+            PQexec(conn.get(),
+                   "INSERT INTO access_review_store.access_review_attestation (campaign_id, "
+                   "principal_type, principal_id, role_name, decision, reviewer, decided_at_ms, "
+                   "justification, grant_snapshot) VALUES "
+                   "('c1','user','mallory','Admin','attested','mallory',1236,'me','{}')")};
         REQUIRE(r.ok());
     }
 

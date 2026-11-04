@@ -476,9 +476,10 @@ AccessReviewAttestationRow twice_decided() {
 
 } // namespace
 
-TEST_CASE("reviews render: a grant decided twice shows the latest decision, a superseded marker and "
-          "the history",
-          "[access-reviews][render][4752]") {
+TEST_CASE(
+    "reviews render: a grant decided twice shows the latest decision, a superseded marker and "
+    "the history",
+    "[access-reviews][render][4752]") {
     const auto out = campaign_html(view(camp("c1", "T"), {twice_decided()}), true);
     CHECK_THAT(out, ContainsSubstring("<span class=\"pill warn\">flagged_revoke</span>"));
     CHECK_THAT(out, ContainsSubstring("superseded 1 earlier decision<"));
@@ -571,8 +572,8 @@ TEST_CASE("reviews render: a cut entry is never a re-record of its successor, on
     CHECK_THAT(whole, ContainsSubstring("(re-recorded)"));
     // A cut text is a prefix, so equal text proves nothing: the pair reads as a superseding
     // decision whichever side was cut, and when both were.
-    for (const auto [prev_cut, cur_cut] : {std::pair{true, false}, std::pair{false, true},
-                                           std::pair{true, true}}) {
+    for (const auto [prev_cut, cur_cut] :
+         {std::pair{true, false}, std::pair{false, true}, std::pair{true, true}}) {
         INFO("prev_cut=" << prev_cut << " cur_cut=" << cur_cut);
         const auto out = repeat(prev_cut, cur_cut);
         CHECK_THAT(out, ContainsSubstring("superseded 1 earlier decision<"));
@@ -601,7 +602,8 @@ TEST_CASE("reviews render: a view read without history still shows the marker, a
     CHECK_THAT(out, !ContainsSubstring("<details"));
 }
 
-TEST_CASE("reviews render: hostile strings in the history are escaped", "[access-reviews][render][4752]") {
+TEST_CASE("reviews render: hostile strings in the history are escaped",
+          "[access-reviews][render][4752]") {
     auto a = twice_decided();
     a.history[0].reviewer = "<script>alert(1)</script>";
     a.history[0].justification = "\"><img src=x onerror=alert(2)>";
@@ -617,7 +619,8 @@ TEST_CASE("reviews render: hostile strings in the history are escaped", "[access
 
 TEST_CASE("reviews render: distinct reviewers count the current rows plus the history",
           "[access-reviews][render][4752]") {
-    // carol's decision was replaced by dave's, so she is only in the history; erin decided another grant.
+    // carol's decision was replaced by dave's, so she is only in the history; erin decided another
+    // grant.
     auto other = att("user", "al", "Viewer", "attested", "erin");
     other.decision_seq = 1;
     other.history = {hist(1, "attested", "pending", "erin")};
@@ -635,12 +638,13 @@ TEST_CASE("reviews render: distinct reviewers count the current rows plus the hi
 
 TEST_CASE("reviews render: no Attest or Flag on a user grant that names the viewer",
           "[access-reviews][render][4752]") {
-    const std::vector<AccessReviewAttestationRow> rows = {att("user", "carol", "Operator", "pending"),
-                                                          att("user", "bob", "Operator", "pending"),
-                                                          att("group", "carol", "Operator", "pending")};
+    const std::vector<AccessReviewAttestationRow> rows = {
+        att("user", "carol", "Operator", "pending"), att("user", "bob", "Operator", "pending"),
+        att("group", "carol", "Operator", "pending")};
     const auto v = view(camp("c1", "T"), rows);
     const auto out = render_campaign(v, true, {}, "carol");
-    // bob's user row and the group named "carol" keep their controls; carol's own user row does not.
+    // bob's user row and the group named "carol" keep their controls; carol's own user row does
+    // not.
     CHECK(count_of(out, "data-act=\"ar-attest\"") == 2);
     CHECK(count_of(out, "data-act=\"ar-flag\"") == 2);
     CHECK(count_of(out, "data-ar-justification") == 2);
