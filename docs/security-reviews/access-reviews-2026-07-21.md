@@ -495,7 +495,7 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
   410 MB of text per copy at 1000 grants, held in several copies by the REST, MCP and page paths). With the
   preview the response grows linearly with the number of frozen grants (the per-grant ceiling bounds one grant, not the
   response, because there is no cap on the factor); there is no per-campaign budget and the frozen grant count is not
-  capped (an accepted limit).
+  capped (a recorded residual; its acceptance is a separate decision that is not yet recorded).
 
   Measured 2026-11-04 on Linux (glibc), with a FRESH server process per case (baseline server peak RSS about 104 to 105 MB),
   one `GET /api/v1/access-reviews/{id}` on a campaign of 1000 frozen grants with 100 decisions each (built by
@@ -553,7 +553,7 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
    keys and a deferred consistency check), not against the application's database credential, a
    role granted TRUNCATE, or a database administrator. A data-only restore into a migrated schema
    is refused; restore schema and data together. On these tables the owner can also run `DISABLE TRIGGER USER`
-   (`DISABLE TRIGGER ALL` is refused to a non-superuser) and `DROP TABLE`; nothing in Yuzu records either, or a
+   (`DISABLE TRIGGER ALL` is refused to a non-superuser), drop a trigger, replace the guard function and `DROP TABLE`; nothing in Yuzu records either, or a
    `TRUNCATE`, so detection is database statement logging (`pgaudit` classes `ddl` and `write`, or `log_statement = mod`;
    `ddl` alone does not log a `TRUNCATE`) plus reconciling each grant's `decision_seq` with its history row count and
    the audit rows' `seq`; the reconciliation does not depend on logging. The audit rows are evidence independent of these tables,
@@ -588,7 +588,7 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
    characters), so match an earlier entry on those.
 6. Under a continuous stream of attestations a `close` can wait up to the pool's lock timeout and
    answer `503`; retry it.
-7. **Deliberate residual and intended direction (memory use of the history read).** The project owner
+7. **Recorded residual and options under consideration (memory use of the history read).** The project owner
    ruled on 2026-11-04 to cut the preview of a superseded entry to 64 characters as the immediate response to the
    measured memory use of the history read (about 2.4 GB for the worst measured case with the former 512-character
    preview). The remaining exposure is a recorded residual: there is no per-campaign budget, no cap on the number of

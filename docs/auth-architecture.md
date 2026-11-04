@@ -3875,7 +3875,9 @@ the only on-database record of a decision unless the audit rows were exported. N
 TRIGGER` or a `TRUNCATE`. Detection is outside the product: database statement logging (`pgaudit` classes `ddl` and `write`, or
 `log_statement = mod`; `log_statement = ddl` and the `ddl` class alone do not log a `TRUNCATE` or the INSERT of a forged
 history row), and reconciling each grant's `decision_seq` against its history row count and against the `seq` values in
-the audit rows. The reconciliation is the check that does not depend on any logging having been enabled; the queries
+the audit rows. The reconciliation is the check that does not depend on database logging having been enabled, but it compares only
+counts and `seq` values: it cannot see an in-place edit of a history row's decision, reviewer or justification, or a
+forged matching row, and its audit half needs audit rows that are still within retention or were exported. The queries
 are under "Obtaining the full justification of a superseded decision" below. The authorised data-redaction procedure
 (see the erasure statement under "Deliberate no-prune" above) also disables the triggers, and Yuzu does not audit it.
 
@@ -3951,7 +3953,7 @@ adds at most 99 entries of 64 characters plus one whole entry to a response, and
 in the grant's own `justification`, which is the state-row copy, and once as the latest `history` entry). The
 response therefore grows linearly with the number of frozen grants: the per-grant ceiling is a bound on one grant, not
 on the response, because there is no cap on the factor. There is no per-campaign budget and the number of frozen grants
-is not capped (an accepted limit).
+is not capped (a recorded residual; its acceptance is a separate decision that is not yet recorded).
 
 *Measured response sizes.* On 2026-11-04, on Linux (glibc), with a FRESH server process for each case (baseline
 server peak RSS about 104 to 105 MB), one `GET /api/v1/access-reviews/{id}` against a campaign of 1000 frozen grants with 100
@@ -3961,7 +3963,7 @@ decisions each (built by inserting rows directly into a throwaway database, not 
 to six bytes, gave 105.0 MB and about 779 MB. 200 grants of ASCII text gave 6.47 MB and about 154 MB. For comparison,
 the same measurement with the former 512-character preview gave 76.7 MB and about 716 MB (ASCII) and 371.1 MB and
 about 2.4 GB (control characters). For the three 1000-grant cases the server peak was about 7 to 10 times the response,
-baseline included (7.4, 9.0 and 10.2 times); the 200-grant case, which is mostly baseline, was about 24 times. The
+baseline included (10.2 times for ASCII, 9.0 for emoji, 7.4 for control characters); the 200-grant case, which is mostly baseline, was about 24 times. The
 ratio depends on the allocator. (A response is in units of 10^6 bytes and a peak is `VmHWM` divided by 1024, so the
 ratios are approximate.) The 64-character cases were run three times each, in fresh processes, and their peaks agreed
 within about 1 percent; the 512-character comparison is one run per case. These are measurements on one host, not a
@@ -3986,7 +3988,7 @@ one read.
 
 *Scaling (scaled from the 1000-grant measurement, not measured).* The measured net cost (peak minus the baseline) was
 about 690 kB per grant for the control-character text and about 233 kB per grant for the ASCII text (about 368 kB for
-the four-byte characters); the 200-grant ASCII case gave about 257 kB per grant, so the cost is roughly linear in the
+the four-byte characters); the 200-grant ASCII case gave about 255 kB per grant (251 to 257 over three runs), so the cost is roughly linear in the
 number of grants over that range. On that scaling one request alone would reach 1 GiB of server memory at about 1,400
 frozen grants of control-character text or about 4,000 of ASCII text, and with several requests in flight the per-request
 costs are assumed to add: two concurrent reads at 1000 control-character grants would exceed 1 GiB. The assumption that
