@@ -4084,7 +4084,7 @@ public:
         // is the DEX/observation family (dex_read<>/dex_observation, fail-soft:
         // the caller gets an empty/degraded result and keeps serving); "guardian_rules"
         // is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
-        // agent_rule_statuses*/rule_names*/errored_rule_count, fail-hard: the
+        // agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count, fail-hard: the
         // caller gets a std::expected error and aborts the push/reconcile
         // rather than fan out empty/stale data). Pre-seeded below (same closed
         // {reason x source} cross-product pre-seed pattern as

@@ -2861,8 +2861,9 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   mutex to a younger errored send released after H, so the errored reaches the wire first.
   UP-14: `enqueued_ns` is `system_clock`; a backward wall-clock step between an older compliant
   and a newer errored gives the errored an earlier timestamp, so the server keeps the compliant
-  whatever the wire order (the pair is now flagged `order_uncertain`), and the hold cannot
-  touch it (server side). Note on #5690's
+  whatever the wire order (the pair is flagged `order_uncertain` when the errored arrives
+  second; in the other order the compliant applies unflagged), and the hold cannot touch it
+  (server side). Note on #5690's
   acceptance options (factual, not a ruling): a tie policy closes UP-13 but not UP-14 (the
   server now flags a tied or mis-ordered pair rather than keeping it silently);
   receipt-sequence ordering closes UP-14 but worsens UP-13; only terminal precedence

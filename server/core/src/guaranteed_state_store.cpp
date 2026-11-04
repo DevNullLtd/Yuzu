@@ -1470,8 +1470,8 @@ constexpr const char* kCensusFold =
 // Stale-mark recovery R: a usable key below the mark, a later arrival than the applied verdict, and
 // a mark that last rose more than YUZU_CENSUS_STALE_NS_ (1 hour of database time) ago, or whose
 // recorded time is more than YUZU_CENSUS_FUTURE_SLACK_NS_ in the database's future (a stepped-back
-// clock: treated as stale, never as an indefinite hold; a step of D back lengthens every
-// un-released hold by D). A row with no recorded time (hwm_recv_ns NULL) never recovers.
+// clock: treated as stale, never as an indefinite hold; a step of D back lengthens a hold by at
+// most D). A row with no recorded time (hwm_recv_ns NULL) never recovers.
 #define YUZU_CENSUS_STALE_NS_ "3600000000000"
 #define YUZU_CENSUS_RECOVER_                                                                       \
     "(EXCLUDED.key_ns > 0 AND EXCLUDED.key_ns < COALESCE(c.ts_hwm, 0) "                            \

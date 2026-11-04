@@ -4206,7 +4206,7 @@ groups:
             leaves it absent before the first successful read).
             source="guardian_rules" means an AUTHORITATIVE rule/status read
             (get_rule/list_rules/agent_rule_statuses/rule_names/
-            errored_rule_count) is degrading: the read itself returns a typed
+            errored_rule_count/uncertain_rule_count) is degrading: the read itself returns a typed
             error, not a silent empty/stale result — but "returns a typed
             error" does not mean every caller aborts. Most callers DO fail
             closed (abort push/reconcile/status on the typed error), but this
