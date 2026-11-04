@@ -937,7 +937,7 @@ TEST_CASE("device_ci collect(): the volumes action is dispatched off Windows and
     CHECK(p.status.at("volume") == Rec{"ok", ""});
     CHECK(p.rows.at("volume").size() == 1);
 #endif
-    // partitions and topology are status-only on Windows and always run.
+    // partitions (bounded WMI on Windows) and topology (status-only on Windows) always run.
     CHECK(dispatched("partitions"));
     CHECK(dispatched("topology"));
 }

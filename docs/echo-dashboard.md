@@ -459,8 +459,11 @@ Per `docs/observability-conventions.md`:
 > fragment and the REST twin write the same series with different `result` tokens:
 > the fragment distinguishes `scope_violation` from `denied`, while REST folds
 > per-device scope denial, missing wiring, and audit failure all into `denied` and
-> otherwise only ever writes `requested`. `success` and `agent_not_connected` are
-> comparable; nothing else is, and there is no `surface` label to split them.
+> otherwise only ever writes `requested`. The fragment counts an audit-store refusal
+> (the `attempted` row could not be stored, `503`, #3619) as `audit_unavailable`, a
+> value REST never writes; `yuzu_echo_source_reenable_total`
+> uses the same value. `success` and `agent_not_connected` are comparable; nothing else
+> is, and there is no `surface` label to split them.
 
 > The PR-H viewer ships with **no process-tree metrics yet** (a dashboard read surface); the render-duration histogram + a dispatch counter + a node-count histogram are a tracked SRE follow-up. The seed-age gauge from the original design is removed (there is no seed).
 
