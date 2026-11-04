@@ -1121,7 +1121,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      authoring session; like the entries above it is a session statement, not a
      signed decision.** Four parts.
      First, `get.fragments-access-enforcement` flips from `twinned-rest-only`
-     to `twinned` (untwinned 210 to 209, after the 2026-11-02 #4041 entry; the live pin is in
+     to `twinned` (untwinned 210 to 209, counting dev's #4041 step already in the baseline; the live pin is in
      `scripts/ci/check-api-parity.py`). Both twins return
      `{enabled, unconfirmed, administrator}` (the MCP tool adds
      `audit_persisted`): `enabled` and `unconfirmed` are this replica's cached
