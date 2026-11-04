@@ -1915,7 +1915,8 @@ TEST_CASE("group-from-results audit (UP-5): ManagementGroup:Write revoked while 
     CHECK(h.perm_asked == std::vector<std::string>{"ManagementGroup:Write", "ManagementGroup:Write"});
     CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
     REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
-    CHECK(h.audit_detail("group.create_from_results", "failure") == "permission_revoked");
+    CHECK(h.audit_detail("group.create_from_results", "failure") ==
+          "permission_revoked name=perm-revoked");
     CHECK(h.audits_for("group.create_from_results", "success") == 0);
 }
 
@@ -1940,5 +1941,6 @@ TEST_CASE("group-from-results audit (UP-5, Gate 5 CH-1): a recheck refusal whose
     CHECK_FALSE(h.mg.find_group_by_name("perm-revoked-audit-down").has_value());
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
-    CHECK(h.audit_detail("group.create_from_results", "failure") == "permission_revoked");
+    CHECK(h.audit_detail("group.create_from_results", "failure") ==
+          "permission_revoked name=perm-revoked-audit-down");
 }

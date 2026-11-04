@@ -1186,7 +1186,7 @@ TEST_CASE("dashboard execute audit (#3619 UP-5): Execution:Execute revoked while
     CHECK(h.perms.back().op == "Execute");
     CHECK(h.audits_for("command.dispatch", "attempted") == 1);
     REQUIRE(h.audits_for("command.dispatch", "failure") == 1);
-    CHECK(h.audit_detail("command.dispatch", "failure") == "reason=permission_revoked");
+    CHECK(h.audit_detail("command.dispatch", "failure") == "reason=permission_revoked os_info:version");
     CHECK(h.audits_for("command.dispatch", "success") == 0);
 }
 

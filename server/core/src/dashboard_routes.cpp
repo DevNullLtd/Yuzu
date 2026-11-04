@@ -985,7 +985,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // wait creates nothing (#3619 review). The gate writes its own 403.
                  if (!perm_fn_(req, res, "ManagementGroup", "Write")) {
                      audit_or_flag(req, res, "group.create_from_results", "failure",
-                                   "ManagementGroup", "", "permission_revoked");
+                                   "ManagementGroup", "", "permission_revoked name=" + group_name);
                      return;
                  }
                  agent_scope = resolve_visible_scope(*fresh_session);
@@ -1605,7 +1605,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // its own refusal.
                  if (!perm_fn_(req, res, "Execution", "Execute")) {
                      audit_or_flag(req, res, "command.dispatch", "failure", "command", "",
-                                   "reason=permission_revoked");
+                                   "reason=permission_revoked " +
+                                       onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                       onbehalf::sanitize_for_log(action, 128));
                      return;
                  }
                  // UP-5 (#3619): the attempted row can wait on the audit pool, so the caller's

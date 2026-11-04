@@ -27,4 +27,5 @@
   re-enable and purge. Not covered, among others: `POST /api/command`, MCP
   `execute_instruction`, the legacy command forwarder, management-group creation through REST, MCP
   and Settings, and the Echo **Capture sources** push still audit after acting (tracked in #7073,
-  #7074 and #7075). See [Upgrading](docs/user-manual/upgrading.md).
+  #7074 and #7075), and the REST twins that audit first do not yet re-check the permission after
+  their audit row (#7110). See [Upgrading](docs/user-manual/upgrading.md).
