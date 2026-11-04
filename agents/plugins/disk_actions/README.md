@@ -88,14 +88,14 @@ On Windows the physical drive comes from the volume's disk extents, so a spanned
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `partitions` | 🟡 planned · rung 1 · Win32_DiskPartition + Win32_LogicalDisk | 🟡 planned · rung 1 · diskutil list + getmntinfo | 🟡 planned · rung 1 · /proc/self/mountinfo + /sys/block/*/<part> |
+| `partitions` | 🟡 constrained · rung 1 · WMI Win32_DiskPartition + Win32_LogicalDiskToPartition + Win32_LogicalDisk (bounded) | 🟡 planned · rung 1 · diskutil list + getmntinfo | 🟡 planned · rung 1 · /proc/self/mountinfo + /sys/block/*/<part> |
 | `smart` | ✅ supported · rung 1 · IOCTL_STORAGE_QUERY_PROPERTY (StorageDeviceProperty + StorageDeviceSeekPenaltyProperty + StorageDeviceProtocolSpecificProperty, NVMe log page 0x02) | 🟡 constrained · rung 1 · IOKit IOBlockStorageDevice device characteristics | ⛔ unsupported |
 | `topology` | 🟡 planned · rung 1 · no source ruled; stays planned | 🟡 planned · rung 1 · diskutil apfs list | 🟡 planned · rung 1 · /sys/block/dm-*/dm/{name,uuid}, md*/md, slaves |
 | `volumes` | 🟡 constrained · rung 1 · FindFirstVolumeW + IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS + GetVolumePathNamesForVolumeNameW | 🟡 constrained · rung 1 · IOKit IOMedia provider walk + getmntinfo_r_np(3) MNT_NOWAIT | ⛔ unsupported |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`partitions` / Windows** — not read yet: one unsupported status row, windows:planned
+- **`partitions` / Windows** — one row per partition Windows exposes through Win32_DiskPartition, with its drive letters; the 16 MiB Microsoft Reserved partition is not listed by that class, and a volume mounted on a folder rather than a drive letter shows no mount point
 - **`partitions` / macOS** — not read yet: one unsupported status row, macos:planned
 - **`partitions` / Linux** — not read yet: one unsupported status row, linux:planned
 - **`smart` / Windows** — the device handle is opened with zero access rights, which an unprivileged service account may do; wear and spare figures come from the NVMe SMART/Health log and are therefore reported only for NVMe devices, with SATA and USB drives reporting identity and media type but 'unknown' health
@@ -137,12 +137,12 @@ Pipe-delimited rows, one per drive, volume or partition. Field 0 is a literal di
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `row_kind` | string | `status` `partition` | Windows, Linux, macOS | `status` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), partition (one per record read). |
-| `disk` | string | - | Windows, Linux, macOS | `disk0` | Physical disk the partition belongs to. Status rows: the action name. |
-| `partition` | string | - | Windows, Linux, macOS | `disk0s2` | Partition identifier. Status rows: the level (unsupported). |
-| `size_bytes` | string | - | Windows, Linux, macOS | `494384795648` | Partition size in bytes, or "-" when unread. Status rows: the reason token (<os>:planned). |
-| `type` | string | - | Windows, Linux, macOS | `apfs` | Partition type or filesystem hint, or "-". Absent on status rows. |
-| `mount_points` | string | - | Windows, Linux, macOS | `/` | Comma-separated mount points or drive letters, or "-". Absent on status rows. |
-| `detail` | string | - | Windows, Linux, macOS | `-` | Free text, or "-". Absent on status rows. |
+| `disk` | string | - | Windows, Linux, macOS | `disk0` | Physical disk the partition belongs to (Windows: PhysicalDrive<N>, the spelling smart and volumes use). Status rows: the action name. |
+| `partition` | string | - | Windows, Linux, macOS | `disk0s2` | Partition identifier (Windows: the provider's DeviceID, e.g. "Disk #0, Partition #1", 0-based). Status rows: the level (supported, constrained or unsupported). |
+| `size_bytes` | string | - | Windows, Linux, macOS | `494384795648` | Partition size in bytes, or "-" when unread. Status rows: the reason token(s), comma-separated (windows:partitions:..., or <os>:planned), or "-" when clean. |
+| `type` | string | - | Windows, Linux, macOS | `apfs` | Partition type or filesystem hint, or "-" (Windows: the Win32_DiskPartition.Type string, e.g. "GPT: Basic Data"). Absent on status rows. |
+| `mount_points` | string | - | Windows, Linux, macOS | `/` | Comma-separated mount points or drive letters, or "-". On Windows "-" means no drive letter was mapped, unless detail says mount_points_unread or mount_points_partial, in which case the mapping could not be fully read or trusted (including a local fixed drive letter no partition was associated with). Windows shows drive letters only (a folder mount shows "-"). Absent on status rows. |
+| `detail` | string | - | Windows, Linux, macOS | `-` | Free text, or "-" (Windows: the fixed token wmi, wmi,mount_points_unread or wmi,mount_points_partial). Absent on status rows. |
 
 **`crossplatform.storage.smart` — `device|model|bus|media|health|pct_used|spare_pct|detail`**
 
@@ -204,48 +204,66 @@ Surfaced as `plugin_result_status` on the command response.
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · interactive user (elevated) · leg-hash 3abb2323b0be
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-04 · NT SERVICE virtual service account (not an administrator) · leg-hash a036c570424f
 
 ```
 == action=smart
-smart|PhysicalDrive0|Samsung SSD 970 EVO Plus 250GB|nvme|ssd|ok|5|100|-
-smart|PhysicalDrive1|Samsung SSD 970 EVO Plus 1TB|nvme|ssd|ok|1|100|-
+smart|PhysicalDrive0|KINGSTON OM8TAP41024K1-A00|nvme|ssd|ok|0|100|-
 [result_status] UNDECLARED / UNKNOWN
 
 == action=volumes
-volume|//?/Volume{0a35801e-3f40-4114-a073-3d7ea1dd7664}/|-|PhysicalDrive0|NTFS|524288000|-
-volume|//?/Volume{c9a5f911-4689-41b2-b774-5b0e25b60e10}/|C:/|PhysicalDrive0|NTFS|248158093312|-
-volume|//?/Volume{daa59534-884a-4ce4-8fc8-4244f7bbe7ae}/|-|PhysicalDrive0|NTFS|967835648|-
-volume|//?/Volume{785383ef-b682-41d9-9b28-27c4b8882d65}/|D:/|PhysicalDrive1|NTFS|1000187363328|-
-volume|//?/Volume{b188886e-39bb-4915-a893-d61a3ca3c707}/|-|PhysicalDrive0|FAT32|272629760|-
+volume|//?/Volume{f0d50cbb-4686-4831-8413-6819dc7636e6}/|C:/|PhysicalDrive0|NTFS|1021818437632|-
+volume|//?/Volume{65a27b4e-fa40-42ef-9a10-e7a2e3d6ad7e}/|-|PhysicalDrive0|NTFS|1299185664|-
+volume|//?/Volume{b084ef68-3082-4402-9bd7-ec218bbe28a5}/|-|PhysicalDrive0|FAT32|1073741824|-
 [result_status] UNDECLARED / UNKNOWN
+
+== action=partitions
+status|partitions|supported|-
+partition|PhysicalDrive0|Disk #0, Partition #0|1073741824|GPT: System|-|wmi
+partition|PhysicalDrive0|Disk #0, Partition #1|1021818437632|GPT: Basic Data|C:/|wmi
+partition|PhysicalDrive0|Disk #0, Partition #2|1299185664|GPT: Unknown|-|wmi
+[result_status] UNDECLARED / UNKNOWN
+
+== action=topology
+status|topology|unsupported|windows:planned
+[result_status] UNAVAILABLE / UNKNOWN / windows:planned
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 · leg-hash 3abb2323b0be
+**macOS** — captured: macos macOS 27.0.1 arm64 · bare-metal · 2026-11-04 · euid 501 · leg-hash a036c570424f
 
 ```
 == action=smart
-smart|disk0|APPLE SSD AP0512Z|nvme|ssd|unknown|-|-|device advertises SMART; health attributes are not read on macOS (they require Apple's private IONVMeSMARTUserClient interface)
-[result_status] CONSTRAINED / PARTIAL / macos:iokit:health_unread
+smart|disk0|APPLE SSD AP1024Z|nvme|ssd|unknown|-|-|device advertises SMART; health attributes are not read on macOS (they require Apple's private IONVMeSMARTUserClient interface)
+smart|-|Built In SDXC Reader|unknown|unknown|unknown|-|-|device does not advertise SMART capability
+smart|disk4|Disk Image|virtual|unknown|unknown|-|-|device does not advertise SMART capability
+[result_status] CONSTRAINED / PARTIAL / macos:iokit:no_bsd_name
 
 == action=volumes
-volume|disk0s1|-|disk0|-|524288000|-
+volume|disk0s1|-|disk0|-|576716800|-
+volume|disk0s2|-|disk0|-|994610155520|-
 volume|disk0s3|-|disk0|-|5368664064|-
-volume|disk0s2|-|disk0|-|494384795648|-
-volume|disk1|-|disk0|-|524288000|-
+volume|disk1|-|disk0|-|576716800|-
+volume|disk3|-|disk0|-|994610155520|-
 volume|disk2|-|disk0|-|5368664064|-
-volume|disk3|-|disk0|-|494384795648|-
-volume|disk1s1|/System/Volumes/iSCPreboot|disk0|apfs|524288000|-
-volume|disk1s4|-|disk0|-|524288000|-
-volume|disk1s2|/System/Volumes/xarts|disk0|apfs|524288000|-
-volume|disk1s3|/System/Volumes/Hardware|disk0|apfs|524288000|-
+volume|disk5|-|disk4|-|16000000000000|-
+volume|disk1s1|/System/Volumes/iSCPreboot|disk0|apfs|576716800|-
+volume|disk1s2|/System/Volumes/xarts|disk0|apfs|576716800|-
+volume|disk1s3|/System/Volumes/Hardware|disk0|apfs|576716800|-
+volume|disk1s4|-|disk0|-|576716800|-
 volume|disk2s1|-|disk0|-|5368664064|-
-volume|disk2s2|-|disk0|-|5368664064|-
-… 12 of 19 rows shown
+… 12 of 21 rows shown
 [result_status] UNDECLARED / UNKNOWN
+
+== action=partitions
+status|partitions|unsupported|macos:planned
+[result_status] UNAVAILABLE / UNKNOWN / macos:planned
+
+== action=topology
+status|topology|unsupported|macos:planned
+[result_status] UNAVAILABLE / UNKNOWN / macos:planned
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 3abb2323b0be
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · bare-metal · 2026-11-04 · euid 1000 (unprivileged) · leg-hash a036c570424f
 
 ```
 == action=smart
@@ -255,6 +273,14 @@ smart|-|-|unknown|unknown|unsupported|-|-|drive health is not implemented on Lin
 == action=volumes
 volume|-|-|-|-|-|physical-to-logical volume mapping is not implemented on Linux in this release; it ships with the smart leg it exists to support
 [result_status] UNAVAILABLE / PARTIAL / linux:volumes
+
+== action=partitions
+status|partitions|unsupported|linux:planned
+[result_status] UNAVAILABLE / UNKNOWN / linux:planned
+
+== action=topology
+status|topology|unsupported|linux:planned
+[result_status] UNAVAILABLE / UNKNOWN / linux:planned
 ```
 <!-- END GENERATED -->
 
@@ -269,9 +295,9 @@ volume|-|-|-|-|-|physical-to-logical volume mapping is not implemented on Linux 
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/disk_actions/src/disk_actions_legs.hpp` · `agents/plugins/disk_actions/src/disk_actions_linux.cpp` · `agents/plugins/disk_actions/src/disk_actions_macos.cpp` · `agents/plugins/disk_actions/src/disk_actions_parsers.hpp` · `agents/plugins/disk_actions/src/disk_actions_plugin.cpp` · `agents/plugins/disk_actions/src/disk_actions_win.cpp`
+- Plugin: `agents/plugins/disk_actions/src/disk_actions_legs.hpp` · `agents/plugins/disk_actions/src/disk_actions_linux.cpp` · `agents/plugins/disk_actions/src/disk_actions_macos.cpp` · `agents/plugins/disk_actions/src/disk_actions_parsers.hpp` · `agents/plugins/disk_actions/src/disk_actions_partitions.hpp` · `agents/plugins/disk_actions/src/disk_actions_plugin.cpp` · `agents/plugins/disk_actions/src/disk_actions_win.cpp`
 - Definitions: `content/definitions/disk_actions.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_disk_actions.hpp`
-- Tests: `tests/test_disk_actions_definition.py` · `tests/unit/test_disk_actions_local_dispatcher.cpp`
+- Tests: `tests/test_disk_actions_definition.py` · `tests/unit/test_disk_actions_local_dispatcher.cpp` · `tests/unit/test_disk_actions_partitions.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->
