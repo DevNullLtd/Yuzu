@@ -177,8 +177,9 @@ under `~/.local/share/yuzu/`. Later runs only verify. A first run takes minutes 
 steps run under timeouts (npm 600 s, browser 900 s, launch 60 s, pip 600 s; `YUZU_ENSURE_NPM_TIMEOUT`,
 `_BROWSER_TIMEOUT`, `_LAUNCH_TIMEOUT`, `YUZU_ENSURE_PIP_TIMEOUT` and `_LOCK_TIMEOUT` override), and a stalled
 connection that burns every timeout, with the retries, can hold Phase 0b for well over an hour (about 70
-minutes for the Puppeteer step alone; up to about two hours if another run holds the lock). An interrupted
-install repairs itself on the next run.
+minutes for the Puppeteer step alone; up to about two hours if another run holds the lock; Phase 0b as a
+whole up to about two and a half hours in that worst case). An interrupted install repairs itself on the
+next run (on Linux; a truncated macOS browser needs the manual step in `tests/puppeteer/README.md`).
 
 ```bash
 if [[ "$MODE" == "default" || "$MODE" == "full" ]]; then

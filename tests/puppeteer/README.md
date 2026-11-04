@@ -31,10 +31,11 @@ variable only skips the browser download: `npm ci` still runs unless `node_modul
 
 ### Recovery
 
-An interrupted install repairs itself on the next run: a partial Chrome download, or a binary that is
-demonstrably incomplete (a truncated extract), inside puppeteer's own cache is removed and fetched again
-once. A browser that is structurally complete but fails to run or to start is never deleted. If it still
-fails:
+An interrupted install repairs itself on the next run: a partial Chrome download, or a Linux (ELF) binary
+that is demonstrably incomplete (a truncated extract), inside puppeteer's own cache is removed and fetched
+again once. A browser that is structurally complete but fails to run or to start is never deleted, and
+neither is a macOS (Mach-O) or Windows (PE) one: there is no completeness check for those, so a truncated
+macOS browser needs the manual step below. If it still fails:
 
 - `cd tests/puppeteer && npx puppeteer browsers clear` removes ALL cached browsers (shared by every
   project that uses puppeteer), then re-run the script.
@@ -44,6 +45,8 @@ fails:
   the usual cause); on Linux missing shared libraries are listed by name.
 - Timeouts can be raised with `YUZU_ENSURE_NPM_TIMEOUT`, `YUZU_ENSURE_BROWSER_TIMEOUT` and
   `YUZU_ENSURE_LAUNCH_TIMEOUT` (seconds).
+- Run by hand from a terminal, Ctrl-C waits for the current step to finish or time out (the timeout
+  kills the whole step so nothing is left running); `kill -TERM -<pgid>` stops it sooner.
 
 ## Run
 
