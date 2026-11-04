@@ -1207,6 +1207,9 @@ sync, defeating the hash-skip protocol.
   chassis (type, serial, asset tag), baseboard (vendor, product, serial) and a hashed
   machine-id, each with its source, plus typed per-device rows for CPUs, DIMMs, disks,
   swap, volumes, partitions and storage topology, each section with its own status.
+  Partitions are read on Windows only so far (Linux and macOS report `<os>:planned`, meaning
+  not read; storage topology is planned everywhere), and the stored sections are not yet
+  shown in the Hardware pages or API.
   `blob_version` says which format an agent last sent. A device whose agent is still on
   the original format has **no** section rows stored — read that as "not stored", not
   "the device has none". A section reported `constrained` with reason `server_cap:<n>`
@@ -1239,6 +1242,8 @@ sync, defeating the hash-skip protocol.
   record would be too large); `server_cap:<n>` is the server's own cap. Sections fail
   independently: one section being unavailable never stops the others, or the base device
   fields, from being reported.
+
+On Windows the `chassis`, `baseboard`, `swap` and `machine_id` sections now report data (and the `cpu` and `dimm` rows carry the socket, stepping and DIMM identity columns); Linux and macOS still report `<os>:planned` for the four. A Windows section that could not be read reports `constrained`, `permission_denied` or `unavailable` with a reason token such as `smbios:win32_5`, `windows:machine_guid:absent` or `wmi:<class>:<cause>` (where `<class>` is `processors`, `memory`, `pagefile_usage` or `pagefile_setting`); the full token list is in the Result status table of the hardware plugin README (`agents/plugins/hardware/README.md`). On Windows the `cpu` and `dimm` sections also carry a non-`ok` status (with the reason token) when their WMI query fails, instead of reading as an empty `ok` section. Those values are stored in the device record and are not yet shown on the Hardware pages or returned by the REST or MCP device-record endpoints.
 
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its
