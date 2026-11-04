@@ -22,7 +22,7 @@ metadata:
     reply is then just an error| line followed by storage_state|offline (a
     wedged rollback closed the Echo database) or
     storage_state|offline|free_space (the roll-up migration was refused at
-    start because the volume held less than twice the database file free, or
+    start because the volume held less than twice the database file plus its write-ahead log free, or
     its free space could not be read; the file is untouched and Echo loads
     without its database until a restart with the space freed), and the
     action exits non-zero. The order is REVERSED on that path: error| comes

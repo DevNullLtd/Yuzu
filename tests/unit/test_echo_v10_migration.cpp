@@ -1363,6 +1363,53 @@ TEST_CASE("v10 migration: lagged process rows below the roll-up mark still reach
     CHECK(n(db, "SELECT COALESCE(SUM(start_count), 0) FROM process_hourly") == 0); // below the mark: not re-folded
 }
 
+TEST_CASE("v10 migration: a lagged run that straddles the roll-up mark closes in id order",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // The start (id 1) is below the mark and the stop (id 2) is above it. Usage pairs a stop with
+    // its start, so it must see them in id order: a stop fed first finds no open run and the
+    // later start leaves one open for the 7-day expiry, crediting nothing.
+    seed(seeded, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(kH0 + 3500), I(1), T("started"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+        insert_raw(db, "process", {I(kH0 + 3700), I(1), T("stopped"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+        exec(db, std::format("INSERT INTO echo_config VALUES ('usage_hwm_id', '0'), "
+                             "('usage_active_generation', '0'), ('rollup_process_hourly_at', '{}')",
+                             kH0 + 3600));
+    });
+    auto db = open_ok(seeded.tmp.path);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live") == 0);
+    CHECK(n(db, "SELECT run_count FROM usage_daily WHERE exe_key = 'alpha.exe'") == 1);
+    CHECK(n(db, "SELECT total_seconds FROM usage_daily WHERE exe_key = 'alpha.exe'") == 200);
+}
+
+TEST_CASE("v10 migration: rows below the roll-up mark are not fed to a usage source that would not credit them",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    std::string cfg;
+    SECTION("usage disabled") {
+        cfg = "('usage_enabled', 'false'), ('usage_active_generation', '0')";
+    }
+    SECTION("usage awaiting its baseline") {
+        cfg = "('usage_generation', '1'), ('usage_active_generation', '0')";
+    }
+    seed(seeded, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(kH0 + 10), I(1), T("started"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+        insert_raw(db, "process", {I(kH0 + 70), I(1), T("stopped"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+        exec(db, std::format("INSERT INTO echo_config VALUES ('usage_hwm_id', '0'), "
+                             "('rollup_process_hourly_at', '{}'), {}",
+                             kH0 + 3600, cfg));
+    });
+    yuzu::test::LogCapture logs;
+    auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    INFO(logs.text());
+    CHECK(logs.text().find("2 raw process rows past usage_hwm_id (usage_lag_events was 0), 0 of them folded "
+                           "into usage") != std::string::npos);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live") == 0);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_daily") == 0);
+    CHECK(db.get_config("usage_active_generation", "absent") == "0"); // nothing stamped
+}
+
 TEST_CASE("v10 migration: the below-mark usage pass starts past the usage cursor",
           "[echo][v10][migration][usage]") {
     Seeded seeded;
@@ -1429,6 +1476,10 @@ TEST_CASE("v10 migration: the free-space demand counts the write-ahead log alrea
     const auto short_by_one = EchoDatabase::open(seeded.tmp.path, edge);
     REQUIRE(!short_by_one.has_value());
     CHECK(is_free_space_refusal(short_by_one.error()));
+    // The demand did not drift between opens (a per-open log write would move it).
+    std::smatch again;
+    REQUIRE(std::regex_search(short_by_one.error(), again, std::regex{R"((\d+) are needed)"}));
+    CHECK(std::stoull(again[1]) == need);
     edge.free_bytes = [need](const fs::path&) -> std::optional<std::uintmax_t> { return need; };
     CHECK(EchoDatabase::open(seeded.tmp.path, edge).has_value());
 }

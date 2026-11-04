@@ -36,8 +36,8 @@
  *        process rows past `usage_hwm_id` (the usage fold's own cursor, deleted in step 5) are
  *        also fed to the usage fold in this transaction when usage is enabled and Active (the
  *        fold's own predicate, whether or not the process source is enabled), so a lagging
- *        usage fold loses nothing it would have credited (the rows below the mark reach usage
- *        only, through a second pass: the tiers already hold them); a usage source that is
+ *        usage fold loses nothing it would have credited (one id-ordered walk over every row past
+ *        the cursor, whatever its ts, since the tiers already hold the rows below the mark); a usage source that is
  *        disabled or awaiting its baseline would not have credited them either, and gets nothing;
  *     5. drop the 16 raw tables and every `_legacy` table, create the `$X_Live` shim views (empty,
  *        with the old columns), delete the rollup marks and the usage cursor from echo_config, and
@@ -254,23 +254,22 @@ std::optional<Columns> raw_columns(TransactionHandle& h, std::string_view source
 }
 
 // Streams `<source>_live` rows with ts >= min_ts in id order, kChunkRows at a time, to `on_chunk`.
-// `below_ts` flips that to ts < min_ts, and `after_id` starts the id walk past that id: together
-// they select the rows under the roll-up mark that are still past a cursor.
+// `after_id` starts the id walk past that id (a cursor).
 // Id order, not (ts, id): every merge the fold applies (sum, max, min, last-by-guard with ties to
 // the later arrival) gives the same result for either order, and the id walk needs no sort.
 // Returns the number of rows read. The SELECT is finalised before this returns, so a later DROP
 // TABLE finds the table unlocked.
 std::optional<int64_t> for_each_chunk(
     TransactionHandle& h, std::string_view source, const Columns& c, int64_t min_ts,
-    const std::function<bool(const std::vector<RawRow>&)>& on_chunk, bool below_ts = false,
+    const std::function<bool(const std::vector<RawRow>&)>& on_chunk,
     int64_t after_id = std::numeric_limits<int64_t>::min()) {
     std::string select = "SELECT id";
     for (std::size_t i = 0; i < c.cols.size(); ++i)
         select += c.present[i] ? std::format(", {}", c.cols[i].name)
                                : std::format(", {} AS {}", c.cols[i].sql_type == "TEXT" ? "''" : "0",
                                              c.cols[i].name);
-    select += std::format(" FROM {}_live WHERE id > ?1 AND ts {} ?2 ORDER BY id LIMIT {}", source,
-                          below_ts ? "<" : ">=", kChunkRows);
+    select += std::format(" FROM {}_live WHERE id > ?1 AND ts >= ?2 ORDER BY id LIMIT {}", source,
+                          kChunkRows);
     auto st = prep(h, select);
     if (!st)
         return std::nullopt;
@@ -567,7 +566,7 @@ struct Report {
     int64_t ring_keys{0};
     int64_t untrusted_marks{0};   // marks ahead of the clock, replaced by the converted tier's edge
     int64_t usage_lag_rows{0};    // raw process rows past usage_hwm_id (the stored lag)
-    int64_t usage_lag_folded{0};  // of those, the ones fed to usage (usage Active), above or below the floor
+    int64_t usage_lag_folded{0};  // of those, the ones fed to usage (usage Active)
     int64_t usage_lag_events{0};  // the counter the old fold kept, read before it is deleted
 };
 
@@ -997,14 +996,9 @@ private:
         std::optional<std::string> failure;
         const auto chunk = [&](const std::vector<RawRow>& rows) -> bool {
             TierAccumulator acc(def);
-            std::vector<ProcessEvent> lagged; // process rows the usage fold had not yet read
             try {
                 if (def.name == "process") {
-                    const auto events = decode<ProcessEvent>(rows, decode_process);
-                    process_delta(events, acc);
-                    for (std::size_t i = 0; i < rows.size(); ++i)
-                        if (rows[i].id() > usage_hwm)
-                            lagged.push_back(events[i]);
+                    process_delta(decode<ProcessEvent>(rows, decode_process), acc);
                 } else if (def.name == "tcp")
                     tcp_delta(decode<NetworkEvent>(rows, decode_tcp), acc);
                 else if (def.name == "service")
@@ -1054,13 +1048,6 @@ private:
                 failure = n.error();
                 return false;
             }
-            if (!lagged.empty()) {
-                if (const auto u = usage::usage_fold_in(h_, now_, lagged); !u) {
-                    failure = "usage fold of the lagged process rows: " + u.error();
-                    return false;
-                }
-                report_.usage_lag_folded += static_cast<int64_t>(lagged.size());
-            }
             return true;
         };
         const auto read = for_each_chunk(h_, def.name, *cols, min_ts, chunk);
@@ -1070,14 +1057,13 @@ private:
             return std::unexpected(h_.error());
         report_.raw_rows += *read;
 
-        // The chunk walk above reads only rows at or past the mark, so a process row past the
-        // usage cursor but below the mark (the old roll-up summarised it into the tiers, but the
-        // usage fold never read it) reached neither. Feed those to usage only, never to the tiers
-        // (the mark means the tiers already hold them), and count them with the other lagged rows.
-        if (def.name == "process" && usage_hwm != std::numeric_limits<int64_t>::max() &&
-            min_ts != std::numeric_limits<int64_t>::min()) {
-            const auto below = for_each_chunk(
-                h_, def.name, *cols, min_ts,
+        // Usage is fed here, apart from the tiers, in ONE id-ordered walk over every row past the
+        // usage cursor whatever its ts: usage pairs a stop with its start, so a run that
+        // straddles the roll-up mark must arrive start first, and the tier walk above reads only
+        // rows at or past the mark (the old roll-up already summarised the rest into the tiers).
+        if (def.name == "process" && usage_hwm != std::numeric_limits<int64_t>::max()) {
+            const auto fed = for_each_chunk(
+                h_, def.name, *cols, std::numeric_limits<int64_t>::min(),
                 [&](const std::vector<RawRow>& rows) -> bool {
                     std::vector<ProcessEvent> lagged;
                     try {
@@ -1087,16 +1073,16 @@ private:
                         return false;
                     }
                     if (const auto u = usage::usage_fold_in(h_, now_, lagged); !u) {
-                        failure = "usage fold of the lagged process rows below the mark: " + u.error();
+                        failure = "usage fold of the lagged process rows: " + u.error();
                         return false;
                     }
                     report_.usage_lag_folded += static_cast<int64_t>(lagged.size());
                     return true;
                 },
-                /*below_ts=*/true, /*after_id=*/usage_hwm);
+                /*after_id=*/usage_hwm);
             if (failure)
                 return std::unexpected(*failure);
-            if (!below)
+            if (!fed)
                 return std::unexpected(h_.error());
         }
         return {};

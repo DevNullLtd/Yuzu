@@ -321,7 +321,8 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    so a lagging usage fold loses nothing it would have credited when the cursor is deleted; the
    log line carries the rows past the cursor, the stored counter and how many of them were folded
    (a row past the cursor but below the roll-up floor is not folded into the tiers, and is in the
-   "older than the mark" figure, but a second usage-only pass still feeds it to usage). They are fed only when the usage fold would have credited them, through the
+   "older than the mark" figure, but usage still gets it: usage is fed in one id-ordered walk over
+   every row past the cursor, whatever its ts, so a run that straddles the floor pairs start first). They are fed only when the usage fold would have credited them, through the
    fold's own predicate (`usage_active_in`): usage enabled and the lifecycle Active, with the
    active generation parsed as `usage_lifecycle_state` parses it (an empty or malformed
    `usage_active_generation` is 0 and reads Active against an absent or 0 `usage_generation`,
@@ -363,8 +364,8 @@ Three operational facts about the migration. (1) Plugin `init()` blocks for the 
 Register RPC and before the heartbeat thread starts (about :2005 and :2582), so the agent registers
 after the migration, and the Windows SCM and systemd (`Type=simple`) have no readiness deadline it can
 trip. Agent-level start-to-registered time is not measured. (2) The transaction's WAL is not bounded by
-the file's size: 325.7 MB on a 241.8 MB file (1.35 times) in the one measurement. The twice-the-file
-free-space pre-check covers that case (WAL plus new file about 404 MB under the 483 MB demanded); no
+the file's size: 325.7 MB on a 241.8 MB file (1.35 times) in the one measurement. The free-space
+pre-check (twice the file plus the log on disk) covers that case (WAL plus new file about 404 MB under the 483 MB demanded); no
 general bound is proven. (3) A failed earlier step (v8) makes `open()` refuse before the roll-up step
 runs; the plugin's init fails (`init_failed` in the heartbeat's `yuzu.plugins_failed`) until a start
 succeeds.

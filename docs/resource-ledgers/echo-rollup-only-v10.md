@@ -71,7 +71,7 @@ releases exactly the resource listed.
   would not have credited them and gets nothing (the rows are counted, not fed). An Active
   lifecycle with no cursor refuses the migration; the rows past the cursor, the stored counter
   and the rows folded are in the log line (a row past the cursor but below the roll-up floor is
-  not folded into the tiers and is in the "older than the mark" count, but a second usage-only pass still feeds it to usage).
+  not folded into the tiers and is in the "older than the mark" count, but usage still gets it, fed in one id-ordered walk over every row past the cursor).
 - **After COMMIT:** the connection must be in autocommit (`sqlite3_get_autocommit`); a wedged one is
   returned as an error and `open()` closes it, never publishes it.
 
