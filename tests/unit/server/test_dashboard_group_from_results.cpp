@@ -1683,6 +1683,7 @@ TEST_CASE("group-from-results audit: a create_group failure records a failure ou
     // The form is hx-swap="none": the toast is the only thing the operator sees (Gate 8 UP-1).
     CHECK(toast_message(*res) ==
           "The group could not be created. Nothing was created. Retry shortly.");
+    CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
     CHECK(h.audits_for("group.create_from_results", "success") == 0);
 }
 
