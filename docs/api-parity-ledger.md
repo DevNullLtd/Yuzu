@@ -143,7 +143,10 @@ fresh render; a twinned row whose REST route and MCP tool disagree on securable,
 operation or confinement kind (check 6, gate parity: the REST gate is compared with the tool's
 declared pair, and for a compared row a derived MCP handler's own gate calls are held to that
 pair too, a label-and-call-site tripwire
-with a size-pinned, shrink-only allowlist, `GATE_PARITY_KNOWN_MISMATCHES`, plus
+with a size-pinned allowlist, `GATE_PARITY_KNOWN_MISMATCHES` (its cap, `GATE_PARITY_KNOWN_MISMATCHES_MAX`,
+is a pin that the script holds equal to the entry count: an entry that goes stale must be removed with the cap
+lowered, and a new entry needs the cap raised in the same change with a stated reviewed reason; it went from 6 to
+7 for `POST /api/v1/commands` / `execute_instruction` by owner ruling of 2026-10-31), plus
 `GATE_PARITY_NO_GATE_ALLOWED` for routes whose gate it cannot read); a registry
 tool whose test file does not name it, assert a schema refusal and an audit row, or
 appear in `tests/meson.build` (check 7); a registry file count that is not
@@ -214,7 +217,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | viz | 2 | 2 | 0 |
 | executions | 6 | 0 | 6 |
 | scope-result-sets | 1 | 0 | 1 |
-| instructions | 27 | 14 | 13 |
+| instructions | 27 | 15 | 12 |
 | compliance-policy | 22 | 5 | 17 |
 | settings | 30 | 11 | 19 |
 | rbac | 17 | 6 | 11 |
@@ -225,12 +228,12 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | ota | 15 | 1 | 14 |
 | enrollment | 21 | 4 | 17 |
 | crypto | 5 | 5 | 0 |
-| other | 82 | 28 | 54 |
-| **Total** | **347** | **138** | **209** |
+| other | 82 | 31 | 51 |
+| **Total** | **347** | **142** | **205** |
 
-Registered `/api/vN/*` routes: 266. OpenAPI `paths` entries: 265. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 207.
+Registered `/api/vN/*` routes: 270. OpenAPI `paths` entries: 269. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 210.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 209. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 83.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 205. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 79.
 
 <!-- END GENERATED -->
 
