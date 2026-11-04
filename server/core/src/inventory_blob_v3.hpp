@@ -22,6 +22,11 @@
 ///    is full | delta | constrained | timeout | oversize | not_collected | disabled; only full
 ///    and delta sections carry records.
 ///
+/// One framing rule every record obeys: it holds no NUL byte. NUL is valid UTF-8, so the field
+/// scrub keeps it, but the text bound to Postgres cannot carry one, so a NUL would be hashed and
+/// then stored without it (two rows reading the same with different keys). The section is
+/// refused instead; the agent writer must never emit NUL.
+///
 /// Containment: a grammar violation INSIDE a section refuses that section only (the other
 /// sections of the call still apply and the refused facet is nacked). A defect that cannot be
 /// attributed to a facet (header, an unreadable section header, a record before any section,
@@ -123,6 +128,7 @@ enum class V3Refusal {
     kBadRowHash,       ///< a - record that is not 64 lowercase hex
     kBadVersionSource, ///< a comp record with a version_source outside the closed set
     kRowCap,           ///< kV3MaxRows / kV3MaxDeletions / kV3MaxComponents exceeded
+    kNulByte,          ///< a record holding a NUL byte (it could not be stored as it was hashed)
 };
 
 [[nodiscard]] constexpr std::string_view v3_refusal_name(V3Refusal r) noexcept {
@@ -153,6 +159,8 @@ enum class V3Refusal {
         return "bad_version_source";
     case V3Refusal::kRowCap:
         return "row_cap";
+    case V3Refusal::kNulByte:
+        return "nul_byte";
     }
     return "none";
 }
@@ -342,6 +350,8 @@ parse_v3_blob(std::string_view blob) {
             p = f_end + 1;
         }
 
+        const bool has_nul = rec.find('\0') != std::string_view::npos;
+
         if (f[0] == "S") {
             if (rep.sections.size() >= kV3MaxSections)
                 return std::unexpected(K::kTooManySections);
@@ -358,6 +368,8 @@ parse_v3_blob(std::string_view blob) {
             sec.bytes_read = v3_detail::parse_nonneg(f[6]);
             if (!is_known_v3_facet(sec.facet)) {
                 v3_detail::refuse(sec, V3Refusal::kUnknownFacet);
+            } else if (has_nul) {
+                v3_detail::refuse(sec, V3Refusal::kNulByte);
             } else if (!st) {
                 v3_detail::refuse(sec, V3Refusal::kUnknownStatus);
             } else {
@@ -378,6 +390,10 @@ parse_v3_blob(std::string_view blob) {
         if (sec.refusal != V3Refusal::kNone)
             continue; // the rest of a refused section is skipped to the next S
 
+        if (has_nul) {
+            v3_detail::refuse(sec, V3Refusal::kNulByte);
+            continue;
+        }
         const bool is_component_facet = sec.facet == kComponentInventoryFacet;
         if (f[0] == "+") {
             if (!v3_status_carries_rows(sec.status)) {

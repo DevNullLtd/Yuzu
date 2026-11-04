@@ -209,6 +209,18 @@ TEST_CASE("v3 grammar refusals isolate to the section", "[server][inventory_blob
         {"a comp record with no name",
          sec(kComponentInventoryFacet, "full") + rec({"comp", "jar", "", "1", "pom"}),
          V3Refusal::kBadRecord},
+        {"a NUL inside a row field", sec(kApps, "full") + plus(std::string("A\0B", 3), kApps),
+         V3Refusal::kNulByte},
+        {"a NUL in a row's install location",
+         sec(kApps, "full") + plus("A", kApps, std::string("C:\\x\0y", 6)), V3Refusal::kNulByte},
+        {"a NUL in the section header token", sec(kApps, "full", "", std::string("t\0k", 3)),
+         V3Refusal::kNulByte},
+        {"a NUL in a comp record",
+         sec(kComponentInventoryFacet, "full") +
+             rec({"comp", "jar", "x", "1", "pom", std::string("/p\0q", 4), "1", "1", ""}),
+         V3Refusal::kNulByte},
+        {"a NUL in a record of a status-only section",
+         sec(kApps, "constrained") + plus(std::string("A\0", 2), kApps), V3Refusal::kNulByte},
         {"a duplicate facet",
          sec(kApps, "full") + plus("A", kApps) + sec(kApps, "full") + plus("B", kApps),
          V3Refusal::kDuplicateFacet},
@@ -383,14 +395,17 @@ TEST_CASE("v3 numeric diagnostics read as zero when they are not plain digits",
     // std::string, not const char*: a char pointer cannot carry an embedded NUL, and a NUL is the
     // one byte the digit loop and from_chars could both stop at.
     const std::vector<std::string> junk = {
-        "",
-        "-5",
-        "+5",
-        "1.5",
-        "12x",
-        "abc",
-        " 7",
-        "99999999999999999999",
+        "", "-5", "+5", "1.5", "12x", "abc", " 7", "99999999999999999999",
+    };
+    for (const std::string& j : junk) {
+        CAPTURE(j.size(), j);
+        const V3Report r = parse_ok(header() + sec(kApps, "constrained", "", "", j, j));
+        CHECK(r.sections[0].duration_ms == 0);
+        CHECK(r.sections[0].bytes_read == 0);
+        CHECK(r.sections[0].refusal == V3Refusal::kNone);
+    }
+    // A NUL anywhere in the header record refuses the section (the numerics read as zero).
+    const std::vector<std::string> nul_junk = {
         std::string("12\0"
                     "3",
                     4),        // a NUL between digits
@@ -400,16 +415,16 @@ TEST_CASE("v3 numeric diagnostics read as zero when they are not plain digits",
                     "5",
                     2), // a leading NUL
     };
-    for (const std::string& j : junk) {
+    for (const std::string& j : nul_junk) {
         CAPTURE(j.size(), j);
         const V3Report r = parse_ok(header() + sec(kApps, "constrained", "", "", j, j));
         CHECK(r.sections[0].duration_ms == 0);
         CHECK(r.sections[0].bytes_read == 0);
-        CHECK(r.sections[0].refusal == V3Refusal::kNone);
+        CHECK(r.sections[0].refusal == V3Refusal::kNulByte);
     }
 }
 
-TEST_CASE("v3 embedded NUL: a facet name fails the blob, a + field passes the scrub unchanged",
+TEST_CASE("v3 embedded NUL: a facet name fails the blob, a field of a record refuses its section",
           "[server][inventory_blob_v3]") {
     // A NUL inside a facet is outside the facet charset, so it is an unattributable defect (the
     // whole blob is refused) before the known-facet check could name it: it never reaches a
@@ -421,18 +436,16 @@ TEST_CASE("v3 embedded NUL: a facet name fails the blob, a + field passes the sc
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == V3ParseErrorKind::kBadSectionHeader);
     }
-    // A NUL inside a `+` field is a valid byte for the scrub step (it is valid UTF-8), exactly as
-    // for the v2 field step the two must stay identical to. The parser keeps it; the store's
-    // handling of such a row is a separate, deferred decision (a lockstep agent + server change),
-    // so this pins the CURRENT parity rather than endorsing the byte.
+    // A NUL inside a `+` field is valid UTF-8 and survives the scrub, but the store cannot keep
+    // it (the text bound to Postgres has no NUL) while the hashes were taken over it, so the
+    // section is refused (V3Refusal::kNulByte); the agent writer must never emit one.
     const std::string with_nul("A\0"
                                "B",
                                3);
     const V3Report r = parse_ok(header() + sec(kApps, "full") + plus(with_nul, kApps));
-    REQUIRE(r.sections[0].rows.size() == 1);
-    CHECK(r.sections[0].refusal == V3Refusal::kNone);
-    CHECK(r.sections[0].rows[0].name == with_nul);
-    CHECK(r.sections[0].rows[0].name.size() == 3);
+    REQUIRE(r.sections.size() == 1);
+    CHECK(r.sections[0].refusal == V3Refusal::kNulByte);
+    CHECK(r.sections[0].rows.empty());
 }
 
 TEST_CASE("v3 drops a 17th token and a nameless row", "[server][inventory_blob_v3]") {
@@ -465,6 +478,21 @@ TEST_CASE("v3 empty records are skipped and a trailing record needs no terminato
     const V3Report r = parse_ok(blob + last);
     REQUIRE(r.sections.size() == 1);
     CHECK(r.sections[0].rows.size() == 1);
+}
+
+TEST_CASE("v3 NUL: the refused section is cleared and later sections still apply",
+          "[server][inventory_blob_v3]") {
+    // Two names that differ only by a NUL would hash apart and store alike once the NUL is
+    // dropped on the way to Postgres, so the whole section is refused instead.
+    const V3Report r = parse_ok(header() + sec(kApps, "full") + plus("AB", kApps) +
+                                plus(std::string("A\0B", 3), kApps) + sec("pkg_inventory.packages", "full") +
+                                plus("Good", "pkg_inventory.packages"));
+    REQUIRE(r.sections.size() == 2);
+    CHECK(r.sections[0].refusal == V3Refusal::kNulByte);
+    CHECK(r.sections[0].rows.empty()); // the clean row of the same section goes with it
+    CHECK(v3_refusal_name(V3Refusal::kNulByte) == "nul_byte");
+    CHECK(r.sections[1].refusal == V3Refusal::kNone);
+    REQUIRE(r.sections[1].rows.size() == 1);
 }
 
 TEST_CASE("install_type_for: the source table is total over kSoftwareSources",

@@ -5449,6 +5449,47 @@ TEST_CASE("ingest_inventory_report v3: a refused section nacks only its facet; t
               .count == 1);
 }
 
+TEST_CASE("ingest_inventory_report v3: a section holding a NUL byte is refused, nothing of it is "
+          "stored, and the other sections still apply",
+          "[pg][software_inventory][seam][v3]") {
+    SWINV_SHARED(store, pool);
+    yuzu::MetricsRegistry metrics;
+    const auto ingest = [&](const std::string& blob) {
+        agentpb::InventoryReport rep;
+        (*rep.mutable_content_hashes())["installed_software"] = "claimed-and-ignored";
+        (*rep.mutable_plugin_data())["installed_software"] = blob;
+        agentpb::InventoryAck ack;
+        yuzu::server::ingest_inventory_report(store, "agent-nul", rep, ack, &metrics);
+        return std::set<std::string>(ack.need_full().begin(), ack.need_full().end());
+    };
+
+    // "AB" and "A\0B" differ on the wire; stored as bound text they would both read "AB" while
+    // hashing apart. The whole section is refused instead, and the clean row beside them goes too.
+    const std::string nul_name("A\0B", 3);
+    const auto nacks = ingest(w_hdr() + w_sec(kV3Apps, "full") + w_plus("AB", kV3Apps) +
+                              w_plus(nul_name, kV3Apps) + w_sec(kV3Pkgs, "full") +
+                              w_plus("libfoo", kV3Pkgs));
+    CHECK(nacks == std::set<std::string>{"installed_software:installed_apps.list_inventory"});
+    CHECK(names_of(pool, "agent-nul", kV3Apps).empty());
+    CHECK(names_of(pool, "agent-nul", kV3Pkgs) == std::vector<std::string>{"libfoo"});
+    // The refused facet has no state row: nothing about it was recorded.
+    CHECK(sql_rows(pool,
+                   "SELECT count(*) FROM software_inventory_store.software_facet_state "
+                   "WHERE agent_id = 'agent-nul' AND facet = $1",
+                   {kV3Apps})[0][0] == "0");
+    CHECK(metrics
+              .counter("yuzu_inventory_section_ingest_total",
+                       {{"facet", kV3Apps}, {"outcome", "rejected"}})
+              .value() == 1.0);
+
+    // Rows the agent already held for the facet survive a later NUL section untouched.
+    CHECK(ingest(w_hdr() + w_sec(kV3Apps, "full") + w_plus("Alpha", kV3Apps)).empty());
+    CHECK(names_of(pool, "agent-nul", kV3Apps) == std::vector<std::string>{"Alpha"});
+    const auto again = ingest(w_hdr() + w_sec(kV3Apps, "full") + w_plus(nul_name, kV3Apps));
+    CHECK(again == std::set<std::string>{"installed_software:installed_apps.list_inventory"});
+    CHECK(names_of(pool, "agent-nul", kV3Apps) == std::vector<std::string>{"Alpha"});
+}
+
 TEST_CASE("ingest_inventory_report v3: a clean report is stored, then hash-only claims match",
           "[pg][software_inventory][seam][v3]") {
     SWINV_SHARED(store, pool);

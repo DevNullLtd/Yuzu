@@ -5143,9 +5143,10 @@ groups:
             uncorrelated it is likely one or more devices whose payload the store
             keeps rejecting — grep the warn-level SoftwareInventoryStore logs for
             the agent_id. A blob-v3 call applies all of its sections in ONE
-            transaction, so a single row Postgres refuses (for example an embedded
-            NUL) answers error for every section of that call, on every resend, until
-            the agent is fixed; the warn line to grep for names "v3 ingest ... failed".
+            transaction, so any one failing statement (a statement timeout or a lost
+            connection under load, for example) answers error for every section of that
+            call and rolls the whole call back; the next sync resends it. The warn line
+            to grep for names "v3 ingest ... failed".
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryHighNeedFullRatio
         expr: |

@@ -819,11 +819,20 @@ clamp to 1,024 bytes on a codepoint boundary. A `+` row's `source` must equal it
 `facet`. Caps per call: 3 MiB of blob (unchanged), 32 sections, 20,000 `+` rows, 20,000 `-`
 records, 20,000 `comp` records.
 
+**No NUL byte in any record.** A record that holds a `0x00` byte refuses the section it is in
+(`nul_byte`). NUL is valid UTF-8, so the field scrub would keep it, and both hashes (the section
+hash and `instance_key`) would be taken over it; but the text bound to Postgres cannot carry a
+NUL, so the stored row would read without it while its keys were computed with it. Two rows
+(`AB` and `A\0B`) would then be stored identically under different keys, and the stored section
+hash could not be reproduced from the stored rows. The refusal is a v3 grammar rule, and the
+writer contract: **the agent writer must never emit a NUL byte in any field of any record.** The
+v2 parser is unchanged.
+
 **Containment.** A grammar violation inside a section refuses that section only: a `+`, `-` or
 `comp` record in a status-only section; a `-` record in a `full` section; a `+` source other
 than the facet; `+` in `component_inventory` or `comp` anywhere else; an unknown status, facet or
 record kind; a malformed row hash; an unknown `version_source`; a repeated facet; a row over the
-per-call cap. The rest of a refused section is skipped to the next `S`, and the other sections
+per-call cap; a record holding a NUL byte. The rest of a refused section is skipped to the next `S`, and the other sections
 still apply. A defect that cannot be attributed to a facet fails the whole blob (a record before
 any section, a header with no section after it, an `S` record whose facet is empty or outside
 the charset, more than 32 sections, over 3 MiB): the ingest seam answers the whole-source `installed_software` nack and counts
