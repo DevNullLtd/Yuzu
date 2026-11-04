@@ -17,9 +17,10 @@
  * the difference from the synchronous DeviceIoControl volume reads (tracked in #3925, and withheld
  * by the device-record writer as `agent:windows_volumes_unbounded`), which can block indefinitely
  * on a stalled VSS or storage provider. This is the documented behaviour of the provider and the
- * precedent firmware_posture has shipped on; it has NOT been measured under a stalled provider. The size is capped (kMaxRsmbBytes) and the probe/fill retry is bounded
- * (kMaxRsmbAttempts), so the call count and the allocation are bounded too. If a measurement ever
- * shows this call blocking, the fix is bounded_wait.hpp here, in one place.
+ * precedent firmware_posture has shipped on; it has NOT been measured under a stalled provider.
+ * The size is capped (kMaxRsmbBytes) and the probe/fill retry is bounded (kMaxRsmbAttempts), so
+ * the call count and the allocation are bounded too. If a measurement ever shows this call
+ * blocking, the fix is bounded_wait.hpp here, in one place.
  */
 #pragma once
 

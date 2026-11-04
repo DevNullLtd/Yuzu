@@ -573,7 +573,8 @@ metadata:
   description: >
     Reports the chassis type, serial number and asset tag. Windows reads them
     from the SMBIOS System Enclosure structure; a value the firmware leaves as
-    OEM filler is reported as "-". Linux and macOS do not read it yet: every
+    OEM filler is reported as "-"; a text field is capped at 256 bytes. Linux and
+    macOS do not read it yet: every
     dispatch answers one unsupported status row (linux:planned or macos:planned)
     until its leg lands, and macOS has no public source and will move to a typed
     unsupported. It is dispatched by the daily device-record sync: its status is
@@ -651,7 +652,8 @@ metadata:
   description: >
     Reports the baseboard (motherboard) vendor, product and serial number.
     Windows reads them from the SMBIOS Baseboard structure; a value the firmware
-    leaves as OEM filler is reported as "-". Linux and macOS do not read it yet:
+    leaves as OEM filler is reported as "-"; a text field is capped at 256 bytes.
+    Linux and macOS do not read it yet:
     every dispatch answers one unsupported status row (linux:planned or
     macos:planned) until its leg lands, and macOS has no public source and will
     move to a typed unsupported. It is dispatched by the daily device-record
@@ -806,7 +808,7 @@ metadata:
   displayName: Machine Identifier (Keyed Hash)
   version: 1.0.0
   description: >
-    Reports a keyed hash of the operating system machine identifier. The raw
+    Reports an HMAC-SHA256 hash of the operating system machine identifier. The raw
     identifier never leaves the host. The hash is an HMAC-SHA256 under a fixed,
     public, versioned label, so it is stable across reinstalls of the agent and
     is not secret from a party that already holds the raw identifier. Windows

@@ -122,11 +122,13 @@ inline constexpr std::size_t kMaxIdentityBytes = 256;
         raw.remove_prefix(1);
     if (yuzu::shared::smbios::is_placeholder(raw))
         return "-";
-    // A string that was ONLY bytes the scrub had to replace (a 0xFF-filled serial) is now "????": the
-    // same pseudo-value on every such device. It is garbage, not data.
-    if (!raw.empty() && std::ranges::all_of(raw, [](char c) { return c == '?'; }))
+    const std::string trimmed = yuzu::shared::smbios::rtrim(raw);
+    // A string that was ONLY bytes the scrub had to replace (a 0xFF-filled serial, even one padded with
+    // trailing blanks) is now "????": the same pseudo-value on every such device. It is garbage, not
+    // data. A genuine serial that is literally "?" or "???" is treated the same way.
+    if (!trimmed.empty() && std::ranges::all_of(trimmed, [](char c) { return c == '?'; }))
         return "-";
-    return yuzu::util::safe_output_field(yuzu::shared::smbios::rtrim(raw));
+    return yuzu::util::safe_output_field(trimmed);
 }
 
 /// As above for a string the SMBIOS walker may not have found at all (nullopt -> "-").

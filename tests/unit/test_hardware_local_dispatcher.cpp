@@ -315,6 +315,11 @@ TEST_CASE("hardware plugin (windows): cpu and dimm rows carry the appended colum
     CHECK(cpu.rc == 0);
     const auto cpu_rows = captured_rows(cpu.captured);
     REQUIRE_FALSE(cpu_rows.empty());
+    // Every Windows host has at least one CPU, so the `unknown` sentinel row means the WMI query FAILED.
+    // That failure must be declared (a typed status), or the device record reads the section as `ok`.
+    // Without this a regression that drops the typed-status plumbing stays green on a healthy host.
+    if (split_pipes(cpu_rows[0]).size() > 2 && split_pipes(cpu_rows[0])[2] == "unknown")
+        CHECK(cpu.result_status != YUZU_RESULT_STATUS_UNDECLARED);
     for (const auto& r : cpu_rows) {
         INFO("cpu row: " << r);
         const auto f = split_pipes(r);

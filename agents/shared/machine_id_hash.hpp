@@ -26,6 +26,9 @@
  * read the same id. The label and algorithm token are pinned by the [machine_id_hash] cases in
  * tests/unit/test_hmac_sha256.cpp; changing either is a coordinated change of every stored value.
  *
+ * RAW ID. The raw identifier lives only in function-local strings and is not zeroised before they are
+ * destroyed: it is readable by any local user on the host, so it is not secret material.
+ *
  * NORMALISATION. The input is trimmed of ASCII whitespace, stripped of one pair of surrounding
  * braces and lowercased, so `{ABCD-...}` and `abcd-...` hash identically. Windows stores
  * MachineGuid as lowercase without braces; the normalisation exists so a future reader that

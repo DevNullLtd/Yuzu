@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <new>
+#include <stdexcept>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -88,6 +90,10 @@ TEST_CASE("estate: firmware bytes that are not UTF-8 are scrubbed before they re
     CHECK(est::clean_identity(std::string_view{"\xFF"}) == "-");
     CHECK(est::clean_identity(std::string_view{"\xFF\xFF\xFF\xFF"}) == "-");
     CHECK(est::clean_identity(std::string_view{"AB\xFF"}) == "AB?"); // partly readable stays
+    // trailing blanks must not hide the garbage: "\xFF\xFF  " scrubs to "??  " and is trimmed first
+    CHECK(est::clean_identity(std::string_view{"\xFF\xFF  "}) == "-");
+    CHECK(est::clean_identity(std::string_view{"  \xFF\xFF\t "}) == "-");
+    CHECK(est::clean_identity("???") == "-"); // a literal all-'?' value is treated the same way
     CHECK(est::clean_identity_opt(std::optional<std::string>{"X\x80Y"}) == "X?Y");
 }
 
@@ -498,4 +504,17 @@ TEST_CASE("estate: every outcome maps to the typed result its status-row level p
     CHECK(est::result_code_for(Outcome::unavailable).completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
     for (Outcome o : {Outcome::constrained, Outcome::denied, Outcome::unavailable})
         CHECK(est::result_code_for(o).carries_token); // a degraded read always names why
+}
+
+// -- the exception guard the plugin's execute() runs every action under ----------------------------------
+
+TEST_CASE("estate: guarded_rc contains anything an action throws and returns 1", "[hardware_estate]") {
+    // The SDK's exported trampoline has no try/catch; an exception escaping execute() would cross the
+    // C ABI and terminate the agent. guarded_rc is what keeps that from happening, so pin it.
+    CHECK(est::guarded_rc("t", [] { return 0; }) == 0); // a normal rc passes through untouched
+    CHECK(est::guarded_rc("t", [] { return 7; }) == 7);
+    CHECK(est::guarded_rc("t", []() -> int { throw std::runtime_error("boom"); }) == 1);
+    CHECK(est::guarded_rc("t", []() -> int { throw std::bad_alloc(); }) == 1);
+    CHECK(est::guarded_rc("t", []() -> int { throw 42; }) == 1); // non-standard exception type
+    static_assert(noexcept(est::guarded_rc("t", [] { return 0; })), "guarded_rc must be noexcept");
 }

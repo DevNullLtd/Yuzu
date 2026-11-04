@@ -12,7 +12,7 @@
  *   "chassis", "baseboard", "swap", "machine_id" — the hardware-estate actions. Windows reads
  *                    them (hardware_estate_win.cpp); Linux and macOS still answer one
  *                    `status|<action>|unsupported|<os>:planned` row until their legs land (the
- *                    dispatch line in execute()).
+ *                    dispatch line in dispatch()).
  *
  * Output is pipe-delimited, one field per line via write_output():
  *   key|value   (for scalar actions)
@@ -197,11 +197,20 @@ using yuzu::hardware::wmi_rows::wmi_row_uint64;
 // do_disks/do_system) still discards it exactly as before; only do_drivers
 // below reads it, because it is the one action whose result set can
 // realistically exceed the row cap on a host with many installed drivers.
-template <typename Fn> bool wmi_query(const wchar_t* wql, Fn&& fn, std::string* error_out = nullptr) {
+// What a FAILED query left behind, so a caller can tell it from a genuinely empty result and classify
+// it with the stage-aware WMI classifier (which needs the real rows_before_error, not 0).
+struct WmiFailure {
+    std::string error;                 // empty = the query did not fail
+    std::size_t rows_before_error = 0; // rows the helper had yielded when it failed
+};
+
+template <typename Fn> bool wmi_query(const wchar_t* wql, Fn&& fn, WmiFailure* failure_out = nullptr) {
     auto result = wmi::run_bounded_wmi_query(L"ROOT\\CIMV2", wql);
     if (result.error) {
-        if (error_out)
-            *error_out = *result.error; // lets a caller tell a FAILED query from a genuinely empty one
+        if (failure_out) {
+            failure_out->error = *result.error;
+            failure_out->rows_before_error = result.rows_before_error;
+        }
         // gate-6 sre remediation: a connect/query/deadline failure was
         // previously indistinguishable from a genuinely-absent WMI class --
         // every caller emits the same "unknown" sentinel either way, with no
@@ -210,8 +219,9 @@ template <typename Fn> bool wmi_query(const wchar_t* wql, Fn&& fn, std::string* 
         // an ordinary "no such provider" outcome. wmi_plugin.cpp's own
         // actions surface result.error directly in their output; this
         // helper is a fire-and-forget accumulator instead (its callers embed
-        // an "unknown" row, not an error token), so a log line is the only
-        // place this can be observed.
+        // an "unknown" row, not an error token), so a log line is the place
+        // this is observed -- EXCEPT do_processors / do_memory, which pass a
+        // WmiFailure out-parameter and declare a typed result status from it.
         spdlog::warn("hardware: WMI query failed: {}", *result.error);
         return false;
     }
@@ -226,10 +236,11 @@ template <typename Fn> bool wmi_query(const wchar_t* wql, Fn&& fn, std::string* 
 // query itself failed, declare it (unavailable / permission_denied / constrained, with the cause),
 // through the same host-tested mapping the estate actions use. A genuinely empty result stays
 // undeclared, exactly as before.
-void report_wmi_failure(yuzu::CommandContext& ctx, std::string_view wmi_class, const std::string& error) {
-    if (error.empty())
+void report_wmi_failure(yuzu::CommandContext& ctx, std::string_view wmi_class, const WmiFailure& failure) {
+    if (failure.error.empty())
         return;
-    const auto rep = yuzu::hardware::estate::wmi_failure_report(wmi_class, error, 0);
+    const auto rep = yuzu::hardware::estate::wmi_failure_report(wmi_class, failure.error,
+                                                                failure.rows_before_error);
     const auto rc = yuzu::hardware::estate::result_code_for(rep.outcome);
     ctx.set_result_status(rc.status, rc.completeness,
                           rc.carries_token ? std::string_view{rep.token} : std::string_view{});
@@ -478,7 +489,7 @@ int do_processors(yuzu::CommandContext& ctx) {
 
 #elif defined(_WIN32)
     int idx = 0;
-    std::string wmi_error;
+    WmiFailure wmi_failure;
     wmi_query(L"SELECT Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed, "
               L"SocketDesignation, ProcessorId, Architecture, Stepping FROM Win32_Processor",
               [&](const wmi::WmiRow& row) {
@@ -505,12 +516,12 @@ int do_processors(yuzu::CommandContext& ctx) {
                   ctx.write_output(yuzu::hardware::estate::format_cpu_row(
                       idx++, name, cores, threads, mhz, socket, stepping));
               },
-              &wmi_error);
+              &wmi_failure);
     // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
     // doc comment above.
     if (idx == 0) {
         ctx.write_output("cpu|0|unknown|0|0|0|-|-");
-        report_wmi_failure(ctx, "processors", wmi_error);
+        report_wmi_failure(ctx, "processors", wmi_failure);
     }
 
 #else
@@ -579,7 +590,7 @@ int do_memory(yuzu::CommandContext& ctx) {
 
 #elif defined(_WIN32)
     bool found = false;
-    std::string wmi_error;
+    WmiFailure wmi_failure;
     wmi_query(L"SELECT DeviceLocator, Capacity, MemoryType, SMBIOSMemoryType, Speed, "
               L"Manufacturer, PartNumber, SerialNumber FROM Win32_PhysicalMemory",
               [&](const wmi::WmiRow& row) {
@@ -605,7 +616,6 @@ int do_memory(yuzu::CommandContext& ctx) {
                       break;
                   }
                   auto size_mb = capacity / (1024 * 1024);
-                  // The module's own identity strings; OEM filler and empty -> "-".
                   // The module's own identity strings; OEM filler and empty -> "-". The pure
                   // formatter escapes `slot` (WMI text) like the appended identity columns.
                   ctx.write_output(yuzu::hardware::estate::format_dimm_row(
@@ -614,12 +624,12 @@ int do_memory(yuzu::CommandContext& ctx) {
                       yuzu::hardware::estate::dimm_identity_field(wmi_row_string(row, "PartNumber")),
                       yuzu::hardware::estate::dimm_identity_field(wmi_row_string(row, "SerialNumber"))));
               },
-              &wmi_error);
+              &wmi_failure);
     // Deliberate #3404 divergence from silent-gap-on-empty -- see wmi_query()'s
     // doc comment above.
     if (!found) {
         ctx.write_output("dimm|unknown|0|unknown|0|-|-|-");
-        report_wmi_failure(ctx, "memory", wmi_error);
+        report_wmi_failure(ctx, "memory", wmi_failure);
     }
 
 #else
@@ -993,14 +1003,8 @@ public:
     // exception escaping here would cross the C ABI and terminate the agent. Every action below
     // allocates (std::format, std::string), so contain it: report failure, never throw.
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
-        try {
-            return dispatch(ctx, action, params);
-        } catch (const std::exception& e) {
-            spdlog::error("hardware: action '{}' threw: {}", action, e.what());
-        } catch (...) {
-            spdlog::error("hardware: action '{}' threw a non-standard exception", action);
-        }
-        return 1;
+        return yuzu::hardware::estate::guarded_rc(action,
+                                                  [&] { return dispatch(ctx, action, params); });
     }
 
 private:

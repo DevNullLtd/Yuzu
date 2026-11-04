@@ -21,6 +21,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include <exception>
+
 #include <string_view>
 
 namespace yuzu::hardware::estate {
@@ -47,6 +49,27 @@ struct ResultCode {
         return {YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN, true};
     }
     return {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL, true};
+}
+
+/// Runs `fn` (returning the action's rc) and contains anything it throws: logs and returns 1. The SDK's
+/// exported trampoline has no try/catch, so an exception escaping a plugin's execute() would cross the C
+/// ABI and terminate the agent. Logging itself is wrapped, so this is genuinely noexcept. Pure of any
+/// CommandContext so a host test can drive it with a throwing lambda.
+template <class Fn> [[nodiscard]] int guarded_rc(std::string_view action, Fn&& fn) noexcept {
+    try {
+        return fn();
+    } catch (const std::exception& e) {
+        try {
+            spdlog::error("hardware: action '{}' threw: {}", action, e.what());
+        } catch (...) {
+        }
+    } catch (...) {
+        try {
+            spdlog::error("hardware: action '{}' threw a non-standard exception", action);
+        } catch (...) {
+        }
+    }
+    return 1;
 }
 
 inline int emit_report(yuzu::CommandContext& ctx, std::string_view action, const Report& r) {
