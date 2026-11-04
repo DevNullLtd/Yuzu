@@ -80,7 +80,7 @@
 /// with a write failure. GET the campaign and compare `decision_seq` before
 /// retrying: a retry after an unacknowledged commit appends an identical
 /// decision at seq+1, which is kept and visible (an earlier entry shows at most
-/// its first 512 characters, so match on the rest), not an error, until the
+/// its first 64 characters, so match on the rest), not an error, until the
 /// grant's 100th decision.
 ///
 /// Close starvation: a queued `close_campaign` does not block a NEW
@@ -114,7 +114,7 @@ inline constexpr std::size_t kMaxJustificationBytes = 4096;
 /// full text stays in the database. Together with `kMaxDecisionsPerGrant` this bounds what one
 /// grant adds to a response, so a campaign with many grants cannot make it grow by
 /// 4 KiB x 100 x grants.
-inline constexpr std::int32_t kHistoryJustificationPreviewChars = 512;
+inline constexpr std::int32_t kHistoryJustificationPreviewChars = 64;
 
 /// One grant to freeze into a campaign at `open_campaign` time — the shape
 /// `access_review_model::AccessReviewRow` is expanded into (one `GrantRef`

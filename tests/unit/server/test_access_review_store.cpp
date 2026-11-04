@@ -1527,22 +1527,28 @@ std::string grant_lock_sql(const std::string& cid) {
 
 // #4752 read ceiling: the per-grant limit of 100 decisions does not bound a campaign with many
 // grants, so a superseded entry returns a justification preview and only the latest is whole.
-TEST_CASE("get_campaign history: a superseded justification is cut to 512 characters and flagged, "
-          "the latest entry and short entries are whole",
-          "[access_review][store][pg][4752]") {
+TEST_CASE(
+    "get_campaign history: a superseded justification is cut to the preview length and flagged, "
+    "the latest entry and short entries are whole",
+    "[access_review][store][pg][4752]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AccessReviewStore store{pool};
     REQUIRE(store.is_open());
-    REQUIRE(yuzu::server::kHistoryJustificationPreviewChars == 512);
+    constexpr auto kPreview =
+        static_cast<std::size_t>(yuzu::server::kHistoryJustificationPreviewChars);
+    // The boundary cases below are built from the constant; this pins that it is a real preview
+    // (below the 4096 byte limit, so a long justification is cut) and not zero.
+    static_assert(kPreview > 0 && kPreview < yuzu::server::kMaxJustificationBytes);
     auto open_res = store.open_campaign("Read ceiling", "admin", three_grants(), "enabled");
     REQUIRE(open_res.has_value());
     const auto cid = *open_res;
 
-    // 1: 4096 chars (cut); 2: short (whole); 3: exactly 512 (whole, the boundary); 4: 513 (cut by
-    // one); 5: 4096 chars and the latest (whole).
-    const std::vector<std::string> texts = {std::string(4096, 'a'), "short", std::string(512, 'e'),
-                                            std::string(513, 'f'), std::string(4096, 'g')};
+    // 1: 4096 chars (cut); 2: short (whole); 3: exactly the preview length (whole, the boundary);
+    // 4: one more (cut by one); 5: 4096 chars and the latest (whole).
+    const std::vector<std::string> texts = {std::string(4096, 'a'), "short",
+                                            std::string(kPreview, 'e'),
+                                            std::string(kPreview + 1, 'f'), std::string(4096, 'g')};
     for (const auto& t : texts)
         REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", t)
                     .has_value());
@@ -1553,13 +1559,13 @@ TEST_CASE("get_campaign history: a superseded justification is cut to 512 charac
     REQUIRE(row != nullptr);
     REQUIRE(row->decision_seq == 5);
     REQUIRE(row->history.size() == 5);
-    CHECK(row->history[0].justification == std::string(512, 'a'));
+    CHECK(row->history[0].justification == std::string(kPreview, 'a'));
     CHECK(row->history[0].justification_truncated);
     CHECK(row->history[1].justification == "short");
     CHECK_FALSE(row->history[1].justification_truncated);
-    CHECK(row->history[2].justification == std::string(512, 'e'));
+    CHECK(row->history[2].justification == std::string(kPreview, 'e'));
     CHECK_FALSE(row->history[2].justification_truncated);
-    CHECK(row->history[3].justification == std::string(512, 'f'));
+    CHECK(row->history[3].justification == std::string(kPreview, 'f'));
     CHECK(row->history[3].justification_truncated);
     // The latest entry is whole and equals the state row's justification.
     CHECK(row->history[4].justification == std::string(4096, 'g'));
@@ -1578,7 +1584,7 @@ TEST_CASE("get_campaign history: a superseded justification is cut to 512 charac
         REQUIRE(r.status() == PGRES_TUPLES_OK);
         REQUIRE(PQntuples(r.get()) == 5);
         CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "4096");
-        CHECK(std::string(PQgetvalue(r.get(), 3, 0)) == "513");
+        CHECK(std::string(PQgetvalue(r.get(), 3, 0)) == std::to_string(kPreview + 1));
     }
 
     // A grant decided once has only its latest entry: never cut, never flagged.
@@ -1612,10 +1618,15 @@ TEST_CASE("get_campaign history: the cut counts characters, so a multibyte justi
             s += unit;
         return s;
     };
-    // 600 two-byte and 600 three-byte characters (1200 and 1800 bytes, under the 4096 byte cap).
-    const std::string two = repeat("\xC3\xA9", 600);       // U+00E9
-    const std::string three = repeat("\xE2\x82\xAC", 600); // U+20AC
-    const std::string last = repeat("\xC3\xA9", 600);
+    constexpr auto kPreview =
+        static_cast<std::size_t>(yuzu::server::kHistoryJustificationPreviewChars);
+    // Well over the preview length in characters, so the cut falls mid-text: two-byte and
+    // three-byte characters (a byte cut at the preview length would split a sequence; the
+    // character cut must not), each under the 4096 byte cap.
+    constexpr std::size_t kLong = kPreview + 88;
+    const std::string two = repeat("\xC3\xA9", kLong);       // U+00E9
+    const std::string three = repeat("\xE2\x82\xAC", kLong); // U+20AC
+    const std::string last = repeat("\xC3\xA9", kLong);
     for (const auto& t : {two, three, last})
         REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", t)
                     .has_value());
@@ -1625,13 +1636,13 @@ TEST_CASE("get_campaign history: the cut counts characters, so a multibyte justi
     const auto* row = find_row(*view, "user", "alice", "Admin");
     REQUIRE(row != nullptr);
     REQUIRE(row->history.size() == 3);
-    CHECK(row->history[0].justification == repeat("\xC3\xA9", 512));
-    CHECK(row->history[0].justification.size() == 1024);
+    CHECK(row->history[0].justification == repeat("\xC3\xA9", kPreview));
+    CHECK(row->history[0].justification.size() == 2 * kPreview);
     CHECK(row->history[0].justification_truncated);
-    CHECK(row->history[1].justification == repeat("\xE2\x82\xAC", 512));
-    CHECK(row->history[1].justification.size() == 1536);
+    CHECK(row->history[1].justification == repeat("\xE2\x82\xAC", kPreview));
+    CHECK(row->history[1].justification.size() == 3 * kPreview);
     CHECK(row->history[1].justification_truncated);
-    // The latest entry is whole, 600 characters.
+    // The latest entry is whole, past the preview length.
     CHECK(row->history[2].justification == last);
     CHECK_FALSE(row->history[2].justification_truncated);
 
@@ -1649,7 +1660,7 @@ TEST_CASE("get_campaign history: the cut counts characters, so a multibyte justi
             i += len;
             ++chars;
         }
-        CHECK(chars == 512);
+        CHECK(chars == kPreview);
     }
 }
 

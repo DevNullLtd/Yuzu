@@ -3155,7 +3155,9 @@ TEST_CASE(
     CHECK(bob["history"][1]["justification"] == "left <the> team");
     CHECK(bob["history"][1]["decided_at_ms"].get<std::int64_t>() > 0);
     // The superseded entry is cut to the preview and flagged; the latest entry is whole.
-    CHECK(bob["history"][0]["justification"] == std::string(512, 'x'));
+    CHECK(bob["history"][0]["justification"] ==
+          std::string(static_cast<std::size_t>(yuzu::server::kHistoryJustificationPreviewChars),
+                      'x'));
     CHECK(bob["history"][0]["justification_truncated"] == true);
     CHECK(bob["history"][1]["justification_truncated"] == false);
     CHECK(bob["justification"] == "left <the> team");
@@ -3266,8 +3268,10 @@ TEST_CASE(
     CHECK(frag->body.find("left &lt;the&gt; team") != std::string::npos);
     CHECK(frag->body.find("left <the> team") == std::string::npos);
     // The cut entry shows the preview and the marker; the whole one shows none.
-    CHECK(frag->body.find(std::string(512, 'x') + " (truncated)") != std::string::npos);
-    CHECK(frag->body.find(std::string(513, 'x')) == std::string::npos);
+    const auto preview_len =
+        static_cast<std::size_t>(yuzu::server::kHistoryJustificationPreviewChars);
+    CHECK(frag->body.find(std::string(preview_len, 'x') + " (truncated)") != std::string::npos);
+    CHECK(frag->body.find(std::string(preview_len + 1, 'x')) == std::string::npos);
     std::size_t markers = 0;
     for (auto at = frag->body.find("(truncated)"); at != std::string::npos;
          at = frag->body.find("(truncated)", at + 1))
@@ -3306,7 +3310,8 @@ TEST_CASE("decision history: a grant at the decision limit serialises under the 
     const auto& history = atts[0]["history"];
     REQUIRE(history.size() == 100);
     for (std::size_t i = 0; i < 99; ++i) {
-        CHECK(history[i]["justification"].get<std::string>().size() == 512);
+        CHECK(history[i]["justification"].get<std::string>().size() ==
+              static_cast<std::size_t>(yuzu::server::kHistoryJustificationPreviewChars));
         CHECK(history[i]["justification_truncated"] == true);
     }
     CHECK(history[99]["justification"].get<std::string>().size() == 4096);

@@ -556,7 +556,9 @@ TEST_CASE("reviews render: only a truncated history entry carries the (truncated
 TEST_CASE("reviews render: a cut entry is never a re-record of its successor, only whole texts are "
           "compared",
           "[access-reviews][render][4752]") {
-    const std::string prefix(512, 'p');
+    // A preview-length text: what a cut entry actually carries.
+    const std::string prefix(
+        static_cast<std::size_t>(yuzu::server::kHistoryJustificationPreviewChars), 'p');
     const auto repeat = [&](bool prev_cut, bool cur_cut) {
         auto a = att("user", "bob", "Operator", "attested", "carol", prefix);
         a.decision_seq = 2;

@@ -10,6 +10,7 @@
  * CRITICAL C6: "No integration test through HTTP dispatch."
  */
 
+#include "access_review_store.hpp" // kHistoryJustificationPreviewChars (description drift pin)
 #include "mcp_input_schema.hpp" // #2405: input-schema subset compiler
 #include "mcp_jsonrpc.hpp"
 #include "secure_random.hpp" // test_hooks: force the next CSPRNG failure
@@ -2483,19 +2484,23 @@ TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the app
 
     CHECK((*record)["annotations"]["destructiveHint"] == true);
     const auto rdesc = (*record)["description"].get<std::string>();
-    for (const char* needle :
-         {"destructiveHint:true", "every decision is kept", "decision_seq",
-          "must differ from the subject of the grant",
-          "the reviewer must differ from the subject of this grant; ask another "
-          "reviewer to record this decision",
-          "at most 1024 bytes each and justification at most 4096 bytes", "the 100th is final",
-          "until the grant reaches its limit of 100 decisions", "at most 100 recorded decisions",
-          "refused with invalid params and records nothing", "returns decision_seq",
-          "previous_decision", "retry_after_ms can mean the decision was recorded anyway",
-          "before retrying, call get_access_review, compare decision_seq",
-          "match reviewer, justification and decided_at_ms",
-          "an earlier entry shows at most its first 512 characters",
-          "a blind retry appends another identical decision"})
+    // The descriptions state the preview length from the constant, so a change to one that
+    // leaves the other behind fails.
+    const std::string first_n =
+        "first " + std::to_string(yuzu::server::kHistoryJustificationPreviewChars) + " characters";
+    for (const std::string& needle : std::vector<std::string>{
+             "destructiveHint:true", "every decision is kept", "decision_seq",
+             "must differ from the subject of the grant",
+             "the reviewer must differ from the subject of this grant; ask another "
+             "reviewer to record this decision",
+             "at most 1024 bytes each and justification at most 4096 bytes", "the 100th is final",
+             "until the grant reaches its limit of 100 decisions", "at most 100 recorded decisions",
+             "refused with invalid params and records nothing", "returns decision_seq",
+             "previous_decision", "retry_after_ms can mean the decision was recorded anyway",
+             "before retrying, call get_access_review, compare decision_seq",
+             "match reviewer, justification and decided_at_ms",
+             "an earlier entry shows at most its " + first_n,
+             "a blind retry appends another identical decision"})
         CHECK(rdesc.find(needle) != std::string::npos);
     for (const char* stale : {"UPSERT", "OVERWRITES", "not retained"})
         CHECK(rdesc.find(stale) == std::string::npos);
@@ -2504,7 +2509,7 @@ TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the app
     CHECK(gdesc.find("decision_seq") != std::string::npos);
     CHECK(gdesc.find("history") != std::string::npos);
     CHECK(gdesc.find("justification_truncated") != std::string::npos);
-    CHECK(gdesc.find("at most its first 512 characters") != std::string::npos);
+    CHECK(gdesc.find("at most its " + first_n) != std::string::npos);
 
     const auto& items = (*get)["outputSchema"]["properties"]["attestations"]["items"];
     REQUIRE(items.is_object());
