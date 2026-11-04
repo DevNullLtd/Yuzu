@@ -1422,6 +1422,15 @@ TEST_CASE("v10 migration: the free-space demand counts the write-ahead log alrea
     const auto logged = std::stoull(m[3]);
     CHECK(logged > 0);
     CHECK(need == 2 * file + logged);
+
+    // The boundary: one byte short of that demand refuses, exactly that demand migrates.
+    OpenSeams edge;
+    edge.free_bytes = [need](const fs::path&) -> std::optional<std::uintmax_t> { return need - 1; };
+    const auto short_by_one = EchoDatabase::open(seeded.tmp.path, edge);
+    REQUIRE(!short_by_one.has_value());
+    CHECK(is_free_space_refusal(short_by_one.error()));
+    edge.free_bytes = [need](const fs::path&) -> std::optional<std::uintmax_t> { return need; };
+    CHECK(EchoDatabase::open(seeded.tmp.path, edge).has_value());
 }
 
 TEST_CASE("v10 migration: a mark over a source with nothing to fold migrates whether or not it is trusted",
