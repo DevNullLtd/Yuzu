@@ -444,13 +444,15 @@ from those two settings, not an observed figure. Plan for these requirements:
   whatever the state of its upstream (an unknown session gets `NOT_FOUND`), and the agent
   re-registers only on `NOT_FOUND` or `UNAUTHENTICATED`, so the agent sees every heartbeat
   succeed and its keepalives to the gateway stay healthy. It would stay on that node while
-  the server's 90 s route lease expires and the agent stops being dispatchable; look at the
-  gateway's `yuzu_gw_upstream_rpc_errors_total` and probe a sample agent with a dispatch,
-  rather than for `UNAVAILABLE` lines in the agent log. In the HA WS-13 spike, on a quiet
-  single-host fleet, the circuit breaker and `/readyz` did not change in this state, so
-  neither is a reliable signal of it; `rpc_errors_total` was not read in the spike, and
-  whether it rises is unmeasured. The consequence for dispatch on two replicas has not been
-  measured.
+  the server's 90 s route lease expires, and the agent may stop being dispatchable. Failover does not
+  repair this and the usual signals do not show it: in the HA WS-13 spike, on a quiet single-host
+  fleet, `/readyz` stayed 200 and the circuit breaker never opened in 400 s, and on one server replica
+  every dispatch probe was still delivered, so a probe does not rule it out either. By reading the code
+  (not measured in the spike), the signal is `yuzu_gw_upstream_rpc_errors_total{rpc_name="batch_heartbeat"}`
+  rising about once a second and the gateway log line `BatchHeartbeat failed`; the same counter rises when
+  the server itself is down, so compare gateways. The agent log will not show it. Whether a quarantine or
+  other protective action issued in this state reaches the endpoint, and the consequence for dispatch on
+  two server replicas, have not been measured.
 - **Agents older than 0.15.0** may wedge in their reconnect path and need a restart (see
   [Heartbeat admission](#heartbeat-admission)).
 
