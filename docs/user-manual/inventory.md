@@ -301,6 +301,17 @@ cadences.
   so a fleet does not all report at once. A freshly enrolled (or long-offline)
   agent does its first sync shortly after connecting, jittered to avoid a
   mass-enrollment thundering herd.
+- **Nightly window for installed software.** Installed software syncs once a
+  night, at a stable per-agent moment between 01:00 and 05:00 in the endpoint's
+  local time, so the load lands outside working hours. The window is built into
+  the agent for now and is not configurable.
+- **Gentle catch-up.** An agent that was switched off, or a laptop that slept
+  through its sync, does not report the moment it wakes. It spreads the missed
+  sync over the next 30 minutes, by a stable per-agent offset.
+- **Sync now can be spread too.** The agent's `__sync__.now` command takes a
+  list of sources and an optional `delay_max_s` (0 to 86400 seconds); with it
+  the agent reports at a stable offset within that many seconds instead of
+  immediately. Nothing in the console sends `delay_max_s` yet.
 - **Hash-skip.** If a device's installed software hasn't changed since its last
   successful sync, the agent sends only a small **content hash** instead of the
   full list. The server replies asking for the full list only when it can't match

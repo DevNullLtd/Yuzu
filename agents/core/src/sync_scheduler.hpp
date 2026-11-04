@@ -15,6 +15,7 @@
 #include <yuzu/plugin.h> // YUZU_EXPORT (agent-core DLL export macro)
 
 #include "plugin_heartbeat_tags.hpp" // kPluginHeartbeatMaxValueBytes (heartbeat tag value bound)
+#include "sync_window.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -54,6 +55,13 @@ struct SyncSource {
     /// it can skip (sync_source_device_ci.cpp, sync_source_software_licensing.cpp),
     /// so they stay off.
     bool skip_backoff{false};
+
+    /// Maintenance window in machine-local time. When set, every successful sync
+    /// and every skip-ladder cap lands at the agent's stable moment inside the
+    /// window (next_window_fire) instead of the next phase slot of `interval`.
+    /// Unset (the default) keeps the interval/phase-slot cadence unchanged. A
+    /// compile-time default per source: no settings channel pushes it yet.
+    std::optional<SyncWindow> window;
 };
 
 /// Sanitise a skip reason for the KV / heartbeat tag: keep [A-Za-z0-9_.:=,-],
@@ -75,7 +83,10 @@ public:
     using KvGetFn = std::function<std::string(const std::string& key)>;
     using KvSetFn = std::function<void(const std::string& key, const std::string& value)>;
 
-    SyncScheduler(std::string agent_id, KvGetFn kv_get, KvSetFn kv_set, SenderFn sender);
+    /// `clock` converts epoch seconds to and from local civil time for windowed
+    /// sources; tests inject a fake zone, production uses the C library's.
+    SyncScheduler(std::string agent_id, KvGetFn kv_get, KvSetFn kv_set, SenderFn sender,
+                  LocalClock clock = system_local_clock());
 
     void add_source(SyncSource src);
 
@@ -86,16 +97,23 @@ public:
     std::chrono::seconds tick(std::int64_t now_secs);
 
     /// Operator-triggered sync-on-demand (the `__sync__.now` reserved command).
-    /// `source_or_all` is one source name or `kAllSources`. Thread-safe: it only
-    /// touches the mutex-guarded pending list — never sources_/states_/kv/sender —
-    /// so it may be called from a thread other than the one that ticks (the
-    /// command read loop). Returns the source names that will be forced (empty =
-    /// unknown name). Drained at the top of the next tick(): next_fire = now,
-    /// force_full = true, needfull_streak = 0, persisted; that same tick then
-    /// fires them. `add_source` must not be called after the ticking thread
-    /// starts (sources_ is read here without the mutex — append-only before
-    /// publication, as agent.cpp does).
-    [[nodiscard]] std::vector<std::string> request_now(std::string_view source_or_all);
+    /// `sources_csv_or_all` is `kAllSources`, one source name, or a comma-separated
+    /// list of names; all-or-nothing — any unknown name arms nothing and returns
+    /// empty. Thread-safe: it only touches the mutex-guarded pending list — never
+    /// sources_/states_/kv/sender — so it may be called from a thread other than
+    /// the one that ticks (the command read loop). Returns the source names that
+    /// will be forced, in registration order. Drained at the top of the next
+    /// tick(). With `delay_max` zero: next_fire = now, force_full = true,
+    /// needfull_streak = 0, persisted, and that same tick fires them. With
+    /// `delay_max` > 0 the same state is armed but next_fire = now + a stable
+    /// per-(agent,source) offset in [0, delay_max), and the batch pass fires the
+    /// source once that is due, so a fleet-wide click does not stampede the server.
+    /// A source requested twice keeps the smaller delay. `add_source` must not be
+    /// called after the ticking thread starts (sources_ is read here without the
+    /// mutex — append-only before publication, as agent.cpp does).
+    [[nodiscard]] std::vector<std::string>
+    request_now(std::string_view sources_csv_or_all,
+                std::chrono::seconds delay_max = std::chrono::seconds{0});
 
     /// Registered source names, in registration order (for the agent's error text, and
     /// the heartbeat thread's emit_sync_skip_tags). Like request_now(), safe from another
@@ -108,9 +126,15 @@ public:
     /// Hard floor: even with hash-skip, send a full payload at least this often
     /// (defense-in-depth against server cold-cache / agent hash bugs — ADR-0016 §4).
     static constexpr std::chrono::seconds kFullFloor{7 * 24 * 60 * 60};
-    /// First-run / overdue catch-up is delayed by a stable per-(agent,source)
-    /// offset in [0, this) so a mass-enroll / site power-on does not herd.
+    /// First-run catch-up is delayed by a stable per-(agent,source) offset in
+    /// [0, this) so a mass-enroll / site power-on does not herd.
     static constexpr std::chrono::seconds kStartupJitterWindow{10 * 60};
+    /// Overdue catch-up (a persisted next_fire more than kMaxTickSeconds in the past:
+    /// the agent was off, the machine slept, or the server was unreachable for longer
+    /// than that and the failed send left the state unadvanced) is spread over
+    /// [0, this) from now by a stable per-(agent,source) offset, so a Monday-morning
+    /// power-on, or the server coming back after an outage, is gentle.
+    static constexpr std::chrono::seconds kCatchUpWindow{30 * 60};
     /// A server `need_full` resend is delayed by `kMinTickSeconds` + a stable
     /// per-(agent,source) offset in [0, this), so a mass cold-cache event (e.g. a
     /// server DB restore that nacks the whole fleet at once) does not stampede
@@ -149,7 +173,7 @@ private:
     };
 
     /// Apply every pending request_now() arm to its State (on the ticking thread).
-    /// Returns the (validated, in-bounds) indices just armed — round-3 item 4:
+    /// Returns the (validated, in-bounds) indices armed for an IMMEDIATE fire — round-3 item 4:
     /// tick() sends each of these in its OWN immediate RPC (see apply_ack) so an
     /// operator-forced source is never queued behind an unrelated cadence-due
     /// source's collect() in the same tick.
@@ -167,6 +191,13 @@ private:
     void note_collected(std::size_t idx);
     /// Stable per-(agent,source) phase offset in [0, interval).
     std::int64_t phase_offset(const std::string& source, std::int64_t interval) const;
+    /// The next regular fire after `now_secs`: the source's window placement when it
+    /// has one, else the next phase-aligned slot of its interval.
+    std::int64_t next_due(std::size_t idx, std::int64_t now_secs) const;
+    /// Re-arm a LOADED source whose next_fire is more than kMaxTickSeconds in the
+    /// past (a live agent never is: it wakes at least every clamped sleep) to
+    /// now + a stable offset in [0, kCatchUpWindow), and persist it.
+    void catch_up_if_overdue(std::size_t idx, std::int64_t now_secs);
     /// Hash-skip decision for one source at `now_secs`, given its freshly
     /// collected `hash` — factored out of tick() so the forced-source (pass 1)
     /// and batched (pass 2) paths make the identical decision.
@@ -187,13 +218,15 @@ private:
     KvGetFn kv_get_;
     KvSetFn kv_set_;
     SenderFn sender_;
+    LocalClock clock_;
     std::vector<SyncSource> sources_;
     std::vector<State> states_; // parallel to sources_
 
-    // request_now() (any thread) -> drain_pending() (ticking thread). Indices into
-    // sources_; deduplicated on insert. The ONLY cross-thread state in this class.
+    // request_now() (any thread) -> drain_pending() (ticking thread). {index into
+    // sources_, delay_max seconds}; deduplicated on index on insert, keeping the
+    // smaller delay. The ONLY cross-thread state in this class.
     std::mutex pending_mu_;
-    std::vector<std::size_t> pending_;
+    std::vector<std::pair<std::size_t, std::int64_t>> pending_;
 };
 
 /// Publish the persisted skip state of each source as heartbeat tags

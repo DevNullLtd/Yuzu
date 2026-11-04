@@ -788,3 +788,31 @@ absorb any realistic overflow first, so `swap` is a defensive tail.
 the same build enroll, and every replica is on that build. The deployment contract (a fresh
 database, every writer on this build; `docs/user-manual/upgrading.md`, "Deployment contract (hard
 cutover)") excludes an earlier server, so this entry states no behaviour of an agent against one.
+
+### 2026-11-04 — sync-now parameters, the installed-software window, and overdue catch-up
+
+This amends the trigger text of section 3 and the `__sync__.now` reserved-command contract. No
+proto field is added: both new inputs are entries in the command's existing string `parameters`
+map, and the wire, the KV keys and the heartbeat tags are unchanged.
+
+- **`__sync__.now` parameters.** `source` accepts `all`, one name, or a comma-separated list. The
+  list is all-or-nothing: any unknown name fails the command (exit 2, naming the valid set) and
+  arms nothing. `delay_max_s` is an integer from 0 to 86400; absent or 0 is the immediate path.
+  When it is above 0 the agent still forces a full report, but fires it at a stable per-agent
+  offset in `[0, delay_max_s)` from the request instead of at once. A malformed or out-of-range
+  value fails the command (exit 2). The existing `stagger_seconds` field stays ignored for
+  `__sync__`. Nothing in the server sends `delay_max_s` yet; that is a separate change.
+- **Installed-software window.** `installed_software` is scheduled inside a nightly window of
+  01:00 to 05:00 in the machine's local time, at a stable per-agent moment (`fnv1a(agent:window:source)`
+  over the window length, to the second) instead of at a phase offset of the 24 h interval. The
+  skip backoff of #5327 is capped at that moment rather than at the next phase slot. The window is
+  a compile-time default carried by the source; there is no channel to change it per fleet yet. A
+  local time that does not exist (a spring-forward gap) resolves forward, an ambiguous one
+  (fall-back) resolves to the earlier instant, both by the C library. Sources without a window
+  are unchanged.
+- **Overdue catch-up.** A persisted `next_fire` more than `kMaxTickSeconds` (15 minutes) in the
+  past, which a live agent never has, is re-armed to now plus a stable offset in `[0, 30 min)`,
+  both when the agent restarts and when a tick runs long after the previous one (sleep and
+  resume). This replaces "fire at once" for an overdue source and is what section 3's startup
+  policy described. First-run jitter (10 minutes) is unchanged, and an operator-forced sync is not
+  subject to it.

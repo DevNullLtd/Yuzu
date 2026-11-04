@@ -357,6 +357,7 @@ agent_test_exe = executable(
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
+    'unit/test_sync_window.cpp', # SAM-19: sync_window.hpp placement + overdue catch-up, fake zone
     'unit/test_inventory_sync_action_table.cpp',
     'unit/test_agent_sync_command.cpp', # round-3 remediation: decide_sync_now pure-core extraction
                                           # from agent.cpp's __sync__.now reserved-command branch

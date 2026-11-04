@@ -26,6 +26,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -146,6 +147,25 @@ TEST_CASE("parse_installed_apps_output tolerates short and over-long inv rows",
     }
 }
 
+namespace {
+
+// A live agent wakes at least every kMaxTickSeconds. A single tick() far past a source's
+// next_fire is a resume from sleep (SAM-19: re-armed with a spread, not fired at once), so a
+// test that means "one interval later" walks the clock the way the agent's own loop does.
+std::int64_t live_advance(SyncScheduler& sched, std::int64_t from, std::int64_t to,
+                          const std::function<bool()>& done = {}) {
+    std::int64_t t = from;
+    while (t < to) {
+        t = std::min(t + SyncScheduler::kMaxTickSeconds.count(), to);
+        sched.tick(t);
+        if (done && done())
+            break;
+    }
+    return t;
+}
+
+} // namespace
+
 TEST_CASE("SyncScheduler: first-run jitter, hash-skip, change, need_full", "[sync][scheduler]") {
     std::map<std::string, std::string> kv;
     auto kv_get = [&](const std::string& k) {
@@ -189,7 +209,7 @@ TEST_CASE("SyncScheduler: first-run jitter, hash-skip, change, need_full", "[syn
 
     // Unchanged content one interval later → hash-only (no blob).
     std::int64_t t2 = 1000 + 700 + 86400 + 1;
-    sched.tick(t2);
+    live_advance(sched, 1700, t2);
     REQUIRE(calls == 2);
     CHECK_FALSE(last_had_blob);
 
@@ -197,7 +217,7 @@ TEST_CASE("SyncScheduler: first-run jitter, hash-skip, change, need_full", "[syn
     cur_hash = "h2";
     cur_blob = "b2";
     std::int64_t t3 = t2 + 86400 + 1;
-    sched.tick(t3);
+    live_advance(sched, t2, t3);
     REQUIRE(calls == 3);
     CHECK(last_had_blob);
 
@@ -205,7 +225,7 @@ TEST_CASE("SyncScheduler: first-run jitter, hash-skip, change, need_full", "[syn
     // but the scheduler then force-fulls on the next pass.
     next_need = {"installed_software"};
     std::int64_t t4 = t3 + 86400 + 1;
-    sched.tick(t4);
+    t4 = live_advance(sched, t3, t4, [&] { return calls == 4; }); // stop at the nacked send
     REQUIRE(calls == 4);
     CHECK_FALSE(last_had_blob); // hash-only send that the server nacked
 
@@ -512,13 +532,24 @@ TEST_CASE("SyncScheduler: weekly full-floor resends a full payload even when unc
     REQUIRE(calls == 1);
     REQUIRE(last_had_blob);
 
-    sched.tick(1700 + 86400 + 1); // unchanged, within the floor → hash-only
+    live_advance(sched, 1700, 1700 + 86400 + 1); // unchanged, within the floor → hash-only
     REQUIRE(calls == 2);
     REQUIRE_FALSE(last_had_blob);
 
-    // Past last_full + kFullFloor, still unchanged → forced FULL.
-    sched.tick(1700 + SyncScheduler::kFullFloor.count() + 1);
-    REQUIRE(calls == 3);
+    // Daily hash-only syncs through the week, never a blob while inside the floor.
+    bool any_blob = false;
+    std::int64_t t = 1700 + 86400 + 1;
+    const std::int64_t floor_at = 1700 + SyncScheduler::kFullFloor.count();
+    while (t < floor_at) {
+        const int before = calls;
+        t = std::min(t + SyncScheduler::kMaxTickSeconds.count(), floor_at);
+        sched.tick(t);
+        any_blob = any_blob || (calls != before && last_had_blob);
+    }
+    CHECK_FALSE(any_blob);
+
+    // Past last_full + kFullFloor, still unchanged → the next sync is a forced FULL.
+    live_advance(sched, floor_at, floor_at + 86400 + 1, [&] { return last_had_blob; });
     CHECK(last_had_blob);
 }
 
@@ -3605,5 +3636,264 @@ TEST_CASE("collector: one drop_source source withheld does not touch the other",
         REQUIRE(got.has_value());
         CHECK(count_source(got->first, "runtimes.python") == 1);
         CHECK(count_source(got->first, "middleware.ibm_mq") == 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SAM-19: delay_max on request_now, source lists, maintenance windows, catch-up.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// UTC as the "local" zone: deterministic and DST-free (the DST edges are pinned in
+// test_sync_window.cpp). from_local normalises an out-of-range day like mktime does.
+yuzu::agent::LocalClock utc_clock() {
+    namespace c = std::chrono;
+    yuzu::agent::LocalClock clock;
+    clock.to_local = [](std::int64_t t) {
+        const c::sys_seconds tp{c::seconds{t}};
+        const c::sys_days d = c::floor<c::days>(tp);
+        const c::year_month_day ymd{d};
+        const c::hh_mm_ss<c::seconds> hms{tp - d};
+        return yuzu::agent::LocalTm{static_cast<int>(ymd.year()),
+                                    static_cast<int>(static_cast<unsigned>(ymd.month())),
+                                    static_cast<int>(static_cast<unsigned>(ymd.day())),
+                                    static_cast<int>(hms.hours().count()),
+                                    static_cast<int>(hms.minutes().count()),
+                                    static_cast<int>(hms.seconds().count())};
+    };
+    clock.from_local = [](const yuzu::agent::LocalTm& l) {
+        const c::sys_days d =
+            c::sys_days{c::year{l.year} / c::month{static_cast<unsigned>(l.month)} / 1} +
+            c::days{l.day - 1};
+        return static_cast<std::int64_t>(
+            c::duration_cast<c::seconds>(d.time_since_epoch() + c::hours{l.hour} +
+                                         c::minutes{l.minute} + c::seconds{l.second})
+                .count());
+    };
+    return clock;
+}
+
+struct Sam19Rig {
+    std::map<std::string, std::string> kv;
+    int calls{0};
+    bool last_had_blob{false};
+    std::map<std::string, int> collects; // per source
+    std::unique_ptr<SyncScheduler> sched;
+
+    Sam19Rig() { reset_scheduler(); }
+
+    void reset_scheduler() { // a "restart": new scheduler over the same persisted KV
+        sched = std::make_unique<SyncScheduler>(
+            "agent-sam19",
+            [this](const std::string& k) {
+                auto it = kv.find(k);
+                return it == kv.end() ? std::string{} : it->second;
+            },
+            [this](const std::string& k, const std::string& v) { kv[k] = v; },
+            [this](const std::vector<std::pair<std::string, std::string>>&,
+                   const std::vector<std::pair<std::string, std::string>>& blobs)
+                -> std::optional<std::vector<std::string>> {
+                ++calls;
+                last_had_blob = !blobs.empty();
+                return std::vector<std::string>{};
+            },
+            utc_clock());
+    }
+
+    void add(const std::string& name, std::optional<yuzu::agent::SyncWindow> window = {},
+             bool skips = false) {
+        SyncSource src;
+        src.name = name;
+        src.interval = std::chrono::seconds{86400};
+        src.window = window;
+        src.skip_backoff = skips;
+        src.collect = [this, name, skips]() -> std::optional<std::pair<std::string, std::string>> {
+            ++collects[name];
+            if (skips)
+                return std::nullopt;
+            return std::make_pair(std::string{"blob"}, std::string{"hash"});
+        };
+        sched->add_source(src);
+    }
+
+    std::int64_t next_fire(const std::string& name) const {
+        return std::stoll(kv.at("sync." + name + ".next_fire"));
+    }
+};
+
+constexpr std::int64_t kNoon = 1'781'092'800; // 2026-06-10 12:00:00Z
+int utc_minutes(std::int64_t t) {
+    const auto l = utc_clock().to_local(t);
+    return l.hour * 60 + l.minute;
+}
+
+} // namespace
+
+TEST_CASE("SAM-19: request_now(delay_max) arms a stable spread and fires in a later tick",
+          "[sync][scheduler][sam19]") {
+    Sam19Rig r;
+    r.add("a");
+    r.sched->tick(kNoon);
+    r.sched->tick(kNoon + 700); // first send
+    REQUIRE(r.calls == 1);
+
+    const std::int64_t t0 = kNoon + 5000;
+    auto armed = r.sched->request_now("a", std::chrono::seconds{600});
+    REQUIRE(armed == std::vector<std::string>{"a"});
+    r.sched->tick(t0);
+    const std::int64_t due = r.next_fire("a");
+    REQUIRE(due > t0); // this agent's offset is non-zero, so it does not fire in the same tick
+    REQUIRE(due < t0 + 600);
+    CHECK(r.calls == 1);
+    CHECK(r.kv.at("sync.a.force_full") == "1");
+
+    r.sched->tick(due);
+    CHECK(r.calls == 2);
+    CHECK(r.last_had_blob); // force_full carried through the delayed path
+
+    // Stable: the same request a day later spreads by the same offset.
+    const std::int64_t t1 = due + 86400;
+    (void)r.sched->request_now("a", std::chrono::seconds{600});
+    r.sched->tick(t1);
+    CHECK(r.next_fire("a") - t1 == due - t0);
+}
+
+TEST_CASE("SAM-19: a source requested twice keeps the smaller delay", "[sync][scheduler][sam19]") {
+    for (bool delayed_first : {true, false}) {
+        Sam19Rig r;
+        r.add("a");
+        r.sched->tick(kNoon);
+        r.sched->tick(kNoon + 700);
+        REQUIRE(r.calls == 1);
+        if (delayed_first) {
+            (void)r.sched->request_now("a", std::chrono::seconds{600});
+            (void)r.sched->request_now("a");
+        } else {
+            (void)r.sched->request_now("a");
+            (void)r.sched->request_now("a", std::chrono::seconds{600});
+        }
+        r.sched->tick(kNoon + 5000);
+        INFO("delayed_first=" << delayed_first);
+        CHECK(r.calls == 2); // immediate wins in both orders
+    }
+}
+
+TEST_CASE("SAM-19: request_now takes a source list, all-or-nothing", "[sync][scheduler][sam19]") {
+    Sam19Rig r;
+    r.add("a");
+    r.add("b");
+    r.add("c");
+    r.sched->tick(kNoon);
+    r.sched->tick(kNoon + 700); // all three first-sent in one batch
+    REQUIRE(r.calls == 1);
+    const auto before = r.collects;
+
+    SECTION("a list arms each name, reported in registration order") {
+        auto armed = r.sched->request_now("c,a");
+        CHECK(armed == std::vector<std::string>{"a", "c"});
+        r.sched->tick(kNoon + 5000);
+        CHECK(r.collects["a"] == before.at("a") + 1);
+        CHECK(r.collects["c"] == before.at("c") + 1);
+        CHECK(r.collects["b"] == before.at("b"));
+    }
+    SECTION("one unknown name arms nothing and returns empty") {
+        CHECK(r.sched->request_now("a,zzz").empty());
+        CHECK(r.sched->request_now("zzz,a").empty());
+        CHECK(r.sched->request_now("a,").empty());
+        CHECK(r.sched->request_now(",a").empty());
+        CHECK(r.sched->request_now("").empty());
+        r.sched->tick(kNoon + 5000);
+        CHECK(r.collects == before);
+    }
+    SECTION("a duplicated name is armed once") {
+        CHECK(r.sched->request_now("a,a") == std::vector<std::string>{"a"});
+    }
+}
+
+TEST_CASE("SAM-19: a windowed source lands every sync inside its window",
+          "[sync][scheduler][sam19]") {
+    Sam19Rig r;
+    r.add("w", yuzu::agent::SyncWindow{60, 300});
+    r.sched->tick(kNoon);
+    r.sched->tick(kNoon + 700); // first send at 12:11
+    REQUIRE(r.calls == 1);
+    const std::int64_t first = r.next_fire("w");
+    CHECK(first > kNoon + 700);
+    CHECK(first <= kNoon + 700 + 86400);
+    CHECK(utc_minutes(first) >= 60);
+    CHECK(utc_minutes(first) < 300);
+
+    r.sched->tick(first - 1); // not before the window moment
+    CHECK(r.calls == 1);
+    r.sched->tick(first);
+    CHECK(r.calls == 2);
+    const std::int64_t second = r.next_fire("w");
+    CHECK(second - first == 86400); // the same moment tomorrow
+}
+
+TEST_CASE("SAM-19: a windowed source's skip ladder is capped at the window fire",
+          "[sync][scheduler][sam19]") {
+    Sam19Rig r;
+    const std::int64_t now = kNoon + 10 * 3600; // 22:00Z
+    r.kv["sync.w.next_fire"] = std::to_string(now);
+    r.kv["sync.w.skip_streak"] = "3"; // the next skip is streak 4: a plain 8 h delay = 06:00
+    r.kv["sync.w.last_skip"] = "x";
+    r.add("w", yuzu::agent::SyncWindow{60, 300}, /*skips=*/true);
+    r.sched->tick(now);
+    REQUIRE(r.collects["w"] == 1);
+    const std::int64_t nf = r.next_fire("w");
+    CHECK(nf >= now + 3 * 3600); // not before 01:00
+    CHECK(nf < now + 7 * 3600);  // capped under the 06:00 an 8 h backoff would give
+    CHECK(utc_minutes(nf) >= 60);
+    CHECK(utc_minutes(nf) < 300);
+}
+
+TEST_CASE("SAM-19: a source without a window keeps its phase-slot cadence",
+          "[sync][scheduler][sam19]") {
+    Sam19Rig r;
+    r.add("p");
+    r.sched->tick(kNoon);
+    r.sched->tick(kNoon + 700);
+    REQUIRE(r.calls == 1);
+    const std::int64_t first = r.next_fire("p");
+    CHECK(first > kNoon + 700);
+    CHECK(first <= kNoon + 700 + 86400);
+    r.sched->tick(first);
+    CHECK(r.next_fire("p") - first == 86400); // slot-aligned: exactly one interval on
+}
+
+TEST_CASE("SAM-19: an overdue source is spread on restart and on resume, not fired at once",
+          "[sync][scheduler][sam19]") {
+    const std::int64_t later = kNoon + 3 * 86400;
+    SECTION("restart: a fresh scheduler over state persisted days ago") {
+        Sam19Rig r;
+        r.add("a");
+        r.sched->tick(kNoon);
+        r.sched->tick(kNoon + 700);
+        REQUIRE(r.calls == 1);
+
+        r.reset_scheduler();
+        r.add("a");
+        r.sched->tick(later);
+        CHECK(r.calls == 1);
+        CHECK(r.next_fire("a") >= later);
+        CHECK(r.next_fire("a") < later + SyncScheduler::kCatchUpWindow.count());
+        r.sched->tick(r.next_fire("a"));
+        CHECK(r.calls == 2);
+    }
+    SECTION("resume: the same scheduler ticked far past next_fire") {
+        Sam19Rig r;
+        r.add("a");
+        r.sched->tick(kNoon);
+        r.sched->tick(kNoon + 700);
+        REQUIRE(r.calls == 1);
+
+        r.sched->tick(later);
+        CHECK(r.calls == 1);
+        CHECK(r.next_fire("a") >= later);
+        CHECK(r.next_fire("a") < later + SyncScheduler::kCatchUpWindow.count());
+        r.sched->tick(r.next_fire("a"));
+        CHECK(r.calls == 2);
     }
 }
