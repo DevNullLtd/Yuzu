@@ -970,6 +970,28 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                       kGroupAuditRefusal))
                      return;
 
+                 // UP-5 (#3619): the attempted row can wait on the audit pool, so visibility is
+                 // resolved again and the set narrowed to what the caller may see NOW; a
+                 // revocation during the wait drops those agents from the group.
+                 agent_scope = resolve_visible_scope(*session);
+                 if (const auto dropped = keep_visible(agent_ids, agent_scope); dropped > 0) {
+                     audit_or_flag(req, res, "response.read", "denied", "Execution", command_id,
+                                   "scope_dropped=" + std::to_string(dropped) +
+                                       " surface=group_from_results phase=post_attempted");
+                 }
+                 if (agent_ids.empty()) {
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "", "scope_revoked");
+                     res.status = 422;
+                     res.set_header("HX-Retarget", "#group-form-slot");
+                     res.set_header("HX-Trigger", refusal_toast_header(
+                         "No agents match the current filters. Nothing was created."));
+                     res.set_content("<span class=\"feedback-error\">"
+                                     "No agents match the current filters.</span>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+
                  // Create the static group
                  ManagementGroup mg;
                  mg.name = group_name;
@@ -1561,6 +1583,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                              "be stored, so nothing was sent. Retry once the audit store "
                              "recovers.</span>"))
                          return;
+                 }
+                 // UP-5 (#3619): the attempted row can wait on the audit pool, so the caller's
+                 // authority is resolved again here and the dispatch confines to what the
+                 // caller may reach NOW; a revocation during the wait narrows the send. The
+                 // gates above used the earlier resolution and only ever refuse.
+                 if (caller_fn_) {
+                     caller = caller_fn_(req);
+                 } else {
+                     caller = yuzu::server::DispatchCaller{};
+                     caller.exec_visible = yuzu::server::authz::deny_all(); // unwired: fail CLOSED
                  }
 
                  auto dispatch_outcome =

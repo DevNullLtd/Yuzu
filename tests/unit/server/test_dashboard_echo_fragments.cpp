@@ -1102,3 +1102,30 @@ TEST_CASE("fragment purge/reenable audit: an unwired or throwing persist sink re
         }
     }
 }
+
+TEST_CASE("dashboard execute audit (#3619 UP-5): authority revoked while the attempted row is "
+          "written narrows the send",
+          "[pg][server][dashboard][execute][audit][security][3619]") {
+    // The attempted row can wait on the audit pool (up to AuditStore's write timeout); the
+    // dispatch must use the caller's authority as it stands AFTER that wait, not before it.
+    FragmentHarness h;
+    h.resolve_to = {"os_info", "version"};
+    h.dispatch_sent = 0; // stop before the result-render path (registry_ is null here)
+    h.caller_fn = [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{
+                                                std::unordered_set<std::string>{"dev-A", "dev-B"}}};
+    };
+    h.audit_persists = [&h](const AuditRow& r) {
+        if (r.action == "command.dispatch" && r.result == "attempted") // revoked mid-write
+            h.caller_fn = [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+                return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{
+                                                        std::unordered_set<std::string>{"dev-A"}}};
+            };
+        return true;
+    };
+    auto res = h.post("/api/dashboard/execute", "instruction=run&scope=dev-B");
+    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.calls[0].exec_visible.has_value());
+    CHECK(h.calls[0].exec_visible->count("dev-A") == 1);
+    CHECK(h.calls[0].exec_visible->count("dev-B") == 0); // the revocation reached the send
+}

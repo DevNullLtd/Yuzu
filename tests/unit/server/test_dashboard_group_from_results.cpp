@@ -1776,3 +1776,51 @@ TEST_CASE("group-from-results audit: a REAL audit-store rejection of the attempt
     CHECK(store.emit_failed_count() - before == 1);
     CHECK_FALSE(h.mg.find_group_by_name("store-rejects-attempted").has_value());
 }
+
+TEST_CASE("group-from-results audit (UP-5): visibility revoked while the attempted row is written "
+          "narrows the group",
+          "[pg][server][dashboard][group_from_results][audit][security][3619]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
+    h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{"agent-A", "agent-B"};
+    };
+    h.audit_persists = [&h](const AuditRow& r) {
+        if (r.action == "group.create_from_results" && r.result == "attempted")
+            h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+                return std::set<std::string>{"agent-A"}; // agent-B revoked mid-write
+            };
+        return true;
+    };
+
+    auto res = h.post(GroupFromResultsHarness::form_body("revoked-mid-write"));
+    CHECK(res->status == 200);
+    auto group = h.mg.find_group_by_name("revoked-mid-write");
+    REQUIRE(group.has_value());
+    CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
+}
+
+TEST_CASE("group-from-results audit (UP-5): every agent revoked while the attempted row is written "
+          "creates no group and records the outcome",
+          "[pg][server][dashboard][group_from_results][audit][security][3619]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{"agent-A"};
+    };
+    h.audit_persists = [&h](const AuditRow& r) {
+        if (r.action == "group.create_from_results" && r.result == "attempted")
+            h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+                return std::set<std::string>{}; // everything revoked mid-write
+            };
+        return true;
+    };
+
+    auto res = h.post(GroupFromResultsHarness::form_body("all-revoked"));
+    CHECK(res->status == 422);
+    CHECK_FALSE(h.mg.find_group_by_name("all-revoked").has_value());
+    CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
+    REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
+    CHECK(h.audit_detail("group.create_from_results", "failure") == "scope_revoked");
+    CHECK(toast_message(*res) == "No agents match the current filters. Nothing was created.");
+}
