@@ -4530,6 +4530,15 @@ test('forensics tier wiring lexical selftest',
   timeout: 30,
 )
 
+# #3619: every audit row DashboardRoutes writes has its persist outcome checked (ADR-0033 §9).
+# Pins the bool AuditFn and the absence of direct sink calls; the script self-checks its detector.
+test('dashboard audit checked lexical',
+  _python3_test,
+  args: [files('test_dashboard_audit_checked_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Personal-data commit guard (scripts/ci/check-personal-data.py) and its
 # self-test. Both also run in .github/workflows/docs-lint.yml on every PR.
 test('personal data guard',
