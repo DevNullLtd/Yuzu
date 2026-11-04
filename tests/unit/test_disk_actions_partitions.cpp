@@ -125,12 +125,18 @@ TEST_CASE("partitions: several drive letters are sorted and de-duplicated",
     CHECK(rep.level == dp::Level::Ok);
 }
 
-TEST_CASE("partitions: a link to a partition that is not listed is ignored, not an error",
+TEST_CASE("partitions: a link to a partition that is not listed means the layout moved between the queries",
           "[disk_actions_partitions]") {
+    // The two queries are not a snapshot: an association naming a partition the first query did
+    // not return is direct evidence a disk was attached or removed in between (or a layout this
+    // class reports differently). The join is not trusted.
     const auto rep = dp::build_report(ok({part("0", "1", "9", "t", "Disk #0, Partition #1")}),
                                       ok({assoc("Disk #7, Partition #3", "Z:")}));
-    CHECK(rep.level == dp::Level::Ok);
+    CHECK(rep.level == dp::Level::Constrained);
+    CHECK(rep.reason == "windows:partitions:mount_points:unmatched_link");
+    REQUIRE(rep.data_rows.size() == 1);
     CHECK(cols(rep.data_rows[0])[5] == "-");
+    CHECK(cols(rep.data_rows[0])[6] == "wmi,mount_points_partial");
 }
 
 TEST_CASE("partitions: the association query failing keeps the rows and says mount points are unknown",
@@ -242,11 +248,11 @@ TEST_CASE("partitions: a truncated association query is constrained", "[disk_act
     CHECK(rep.level == dp::Level::Constrained);
     CHECK(rep.reason == "windows:partitions:mount_points:row_cap");
     REQUIRE(rep.data_rows.size() == 3);
-    // The matched partition keeps its letter and a plain `wmi`; the unmatched ones are PARTIAL.
+    // The matched partition keeps its letter; EVERY row says the join is incomplete (a second
+    // letter on a matched partition could be in the part that was cut off).
     CHECK(cols(rep.data_rows[1])[5] == "C:/");
-    CHECK(cols(rep.data_rows[1])[6] == "wmi");
-    CHECK(cols(rep.data_rows[0])[6] == "wmi,mount_points_partial");
-    CHECK(cols(rep.data_rows[2])[6] == "wmi,mount_points_partial");
+    for (const auto& row : rep.data_rows)
+        CHECK(cols(row)[6] == "wmi,mount_points_partial");
 }
 
 TEST_CASE("partitions: a clean read with zero partitions is constrained, never an empty success",
@@ -424,4 +430,82 @@ TEST_CASE("partitions: a non-ASCII byte is never a drive letter", "[disk_actions
     CHECK_FALSE(drive_letter_mount(std::string{"\xE9:"}).has_value());
     CHECK_FALSE(drive_letter_mount(std::string{"\xC3:"}).has_value());
     CHECK(drive_letter_mount("z:") == "Z:\\");
+}
+
+namespace {
+
+dp::Row ldisk(const char* id, const char* drive_type) {
+    return {{"DeviceID", id}, {"DriveType", drive_type}};
+}
+
+} // namespace
+
+TEST_CASE("partitions: every local fixed drive letter placed by the association is a clean join",
+          "[disk_actions_partitions]") {
+    const auto rep = dp::build_report(ok(bigsenga_partitions()),
+                                      ok({assoc("Disk #0, Partition #1", "C:")}),
+                                      ok({ldisk("C:", "3")}));
+    CHECK(rep.level == dp::Level::Ok);
+    CHECK(cols(rep.data_rows[1])[6] == "wmi");
+}
+
+TEST_CASE("partitions: a local fixed volume no partition was associated with is not 'no mount point'",
+          "[disk_actions_partitions]") {
+    // A dynamic disk or Storage Space (unmeasured) would look like this: Windows lists D: as a
+    // local fixed disk, but Win32_LogicalDiskToPartition places it on no partition.
+    const auto rep = dp::build_report(ok(bigsenga_partitions()),
+                                      ok({assoc("Disk #0, Partition #1", "C:")}),
+                                      ok({ldisk("C:", "3"), ldisk("D:", "3")}));
+    CHECK(rep.level == dp::Level::Constrained);
+    CHECK(rep.reason == "windows:partitions:mount_points:unplaced_volume");
+    REQUIRE(rep.data_rows.size() == 3);
+    for (const auto& row : rep.data_rows)
+        CHECK(cols(row)[6] == "wmi,mount_points_partial");
+}
+
+TEST_CASE("partitions: letters that are not local fixed disks never trip the cross-check",
+          "[disk_actions_partitions]") {
+    // 2 removable (an empty card reader), 4 network, 5 optical, 6 RAM disk: none has a partition
+    // on a physical disk, so none may turn a healthy host constrained.
+    const auto rep = dp::build_report(
+        ok(bigsenga_partitions()), ok({assoc("Disk #0, Partition #1", "C:")}),
+        ok({ldisk("C:", "3"), ldisk("E:", "2"), ldisk("Z:", "4"), ldisk("D:", "5"), ldisk("R:", "6")}));
+    CHECK(rep.level == dp::Level::Ok);
+}
+
+TEST_CASE("partitions: the logical-disk cross-check failing or truncating is constrained, not skipped",
+          "[disk_actions_partitions]") {
+    SECTION("failed query") {
+        const auto rep = dp::build_report(ok(bigsenga_partitions()), ok({}),
+                                          failed("wmi_query_failed_0x80041001"));
+        CHECK(rep.level == dp::Level::Constrained);
+        CHECK(rep.reason == "windows:partitions:mount_points:logical_disks:wmi_query_failed_0x80041001");
+        for (const auto& row : rep.data_rows)
+            CHECK(cols(row)[6] == "wmi,mount_points_partial");
+    }
+    SECTION("truncated query") {
+        auto d = ok({ldisk("C:", "3")});
+        d.truncated = true;
+        const auto rep = dp::build_report(ok(bigsenga_partitions()),
+                                          ok({assoc("Disk #0, Partition #1", "C:")}), d);
+        CHECK(rep.level == dp::Level::Constrained);
+        CHECK(rep.reason == "windows:partitions:mount_points:logical_disks:row_cap");
+    }
+}
+
+TEST_CASE("partitions: the cross-check is not consulted when the association already failed",
+          "[disk_actions_partitions]") {
+    const auto rep = dp::build_report(ok(bigsenga_partitions()), failed("wmi_deadline_exceeded"),
+                                      ok({ldisk("D:", "3")}));
+    CHECK(rep.reason == "windows:partitions:mount_points:wmi_deadline_exceeded");
+    for (const auto& row : rep.data_rows)
+        CHECK(cols(row)[6] == "wmi,mount_points_unread");
+}
+
+TEST_CASE("partitions: an unparsable DriveType or DeviceID in the cross-check is ignored",
+          "[disk_actions_partitions]") {
+    const auto rep = dp::build_report(
+        ok(bigsenga_partitions()), ok({assoc("Disk #0, Partition #1", "C:")}),
+        ok({ldisk("C:", "3"), ldisk("??", "3"), ldisk("D:", "three"), ldisk("E:", "")}));
+    CHECK(rep.level == dp::Level::Ok);
 }

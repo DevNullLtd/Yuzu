@@ -26,9 +26,12 @@
  *                 is NOT visible through this class (README caveat).
  *   detail        a fixed token, never free text: "wmi"; "wmi,mount_points_unread" when the
  *                 association query failed (every "-" means UNKNOWN, not none); or
- *                 "wmi,mount_points_partial" on a row left unmatched by an association query
- *                 that returned a row it could not use, or hit its row cap (that "-" is UNKNOWN
- *                 too).
+ *                 "wmi,mount_points_partial" on EVERY row when the join is incomplete or
+ *                 untrusted: an association row it could not use or that names an unlisted
+ *                 partition (the layout changed between the queries), a truncated query, a
+ *                 failed Win32_LogicalDisk cross-check, or a local fixed drive letter no
+ *                 partition was associated with (a dynamic disk or Storage Space, unmeasured).
+ *                 A "-" on such a row is UNKNOWN, not none.
  *
  * KNOWN GAP, MEASURED: Win32_DiskPartition does not list the 16 MiB Microsoft Reserved
  * partition (a GPT disk shows one fewer partition than MSFT_Partition). The section is therefore
@@ -237,8 +240,13 @@ inline void finalize(Report& rep, const yuzu::shared::ConstraintAccumulator& acc
 } // namespace impl
 
 /// Build the status row and the sorted data rows. `links` is consulted only when `parts`
-/// succeeded; the Windows TU skips running it otherwise.
-[[nodiscard]] inline Report build_report(const QueryOutcome& parts, const QueryOutcome& links) {
+/// succeeded, and `disks` (Win32_LogicalDisk, DriveType 3) only when `links` did; the Windows TU
+/// skips running the later queries otherwise. `disks` is the cross-check that turns "a lettered
+/// local volume the association cannot place" (a dynamic disk, a Storage Space, anything this
+/// class does not map) into a constrained section instead of a silent "no mount point". The
+/// default (no disks supplied) performs no cross-check.
+[[nodiscard]] inline Report build_report(const QueryOutcome& parts, const QueryOutcome& links,
+                                         const QueryOutcome& disks = QueryOutcome{}) {
     Report rep;
     yuzu::shared::ConstraintAccumulator acc;
 
@@ -283,12 +291,17 @@ inline void finalize(Report& rep, const yuzu::shared::ConstraintAccumulator& acc
 
     // ── drive letters ───────────────────────────────────────────────────────
     const bool links_ok = links.error.empty();
-    bool mounts_partial = false; // some association rows were unusable, or the query hit its cap
+    bool mounts_partial = false; // the join may be missing letters it could not see or read
     std::map<std::string, std::set<std::string>> mounts; // partition DeviceID -> sorted letters
     if (!links_ok) {
         acc.add_failure("windows:partitions:mount_points:" + links.error);
     } else {
+        std::set<std::string> listed; // DeviceIDs of the partitions we are about to report
+        for (const impl::Partition& p : list)
+            listed.insert(p.device_id);
+        std::set<std::string> placed; // every drive letter the association placed on a partition
         bool link_unparsed = false;
+        bool unmatched_link = false;
         for (const Row& r : links.rows) {
             const auto part = impl::path_key_value(impl::field(r, "Antecedent"), "DeviceID");
             const auto disk = impl::path_key_value(impl::field(r, "Dependent"), "DeviceID");
@@ -297,16 +310,52 @@ inline void finalize(Report& rep, const yuzu::shared::ConstraintAccumulator& acc
                 link_unparsed = true;
                 continue;
             }
+            placed.insert(*mount);
+            if (listed.find(*part) == listed.end())
+                unmatched_link = true; // names a partition the first query did not list
             mounts[*part].insert(*mount);
         }
         if (link_unparsed) {
             acc.add_failure("windows:partitions:mount_points:link_unparsed");
             mounts_partial = true;
         }
+        // The two queries are not a snapshot. An association naming a partition the first query
+        // did not return is direct evidence the layout changed between them (a disk attached or
+        // removed), or of a layout this class reports differently; either way a letter may be
+        // attached to the wrong partition or missing, so the join is not trusted.
+        if (unmatched_link) {
+            acc.add_failure("windows:partitions:mount_points:unmatched_link");
+            mounts_partial = true;
+        }
         if (links.truncated) {
             acc.add_failure("windows:partitions:mount_points:row_cap");
             acc.mark_incomplete();
             mounts_partial = true;
+        }
+
+        // Cross-check against the drive letters Windows itself says exist on local fixed disks:
+        // one the association did not place anywhere is invisible to this class (dynamic disks,
+        // Storage Spaces, ... -- unmeasured), and its volume must not read as "no mount point".
+        if (!disks.error.empty()) {
+            acc.add_failure("windows:partitions:mount_points:logical_disks:" + disks.error);
+            mounts_partial = true;
+        } else {
+            bool unplaced = false;
+            for (const Row& r : disks.rows) {
+                const auto type = impl::parse_u64(impl::field(r, "DriveType"));
+                const auto letter = impl::drive_letter_mount(impl::field(r, "DeviceID"));
+                if (type && *type == 3 && letter && placed.find(*letter) == placed.end())
+                    unplaced = true;
+            }
+            if (unplaced) {
+                acc.add_failure("windows:partitions:mount_points:unplaced_volume");
+                mounts_partial = true;
+            }
+            if (disks.truncated) {
+                acc.add_failure("windows:partitions:mount_points:logical_disks:row_cap");
+                acc.mark_incomplete();
+                mounts_partial = true;
+            }
         }
     }
 
@@ -317,10 +366,8 @@ inline void finalize(Report& rep, const yuzu::shared::ConstraintAccumulator& acc
 
     for (const impl::Partition& p : list) {
         std::string mount_points = "-";
-        bool matched = false;
         if (links_ok) {
             if (const auto it = mounts.find(p.device_id); it != mounts.end()) {
-                matched = true;
                 mount_points.clear();
                 for (const std::string& m : it->second) {
                     if (!mount_points.empty())
@@ -342,8 +389,8 @@ inline void finalize(Report& rep, const yuzu::shared::ConstraintAccumulator& acc
         row += '|';
         if (!links_ok)
             row += "wmi,mount_points_unread";
-        else if (mounts_partial && !matched)
-            row += "wmi,mount_points_partial"; // this "-" may be a row we could not read
+        else if (mounts_partial)
+            row += "wmi,mount_points_partial"; // the join is incomplete or untrusted
         else
             row += "wmi";
         rep.data_rows.push_back(std::move(row));

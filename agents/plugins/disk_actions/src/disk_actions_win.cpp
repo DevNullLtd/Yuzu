@@ -873,7 +873,7 @@ int emit_volumes(yuzu::CommandContext& ctx) {
 
 // partitions: Win32_DiskPartition (rows) + Win32_LogicalDiskToPartition (drive letters), both
 // through the bounded WMI helper (agents/shared/wmi_bounded.hpp), so neither query can wedge the
-// daily-sync thread (the sync-thread boundedness rule in docs/adr/0016-agent-daily-sync-framework.md;
+// daily-sync thread longer than their own deadlines (the sync-thread boundedness rule in docs/adr/0016-agent-daily-sync-framework.md;
 // the DeviceIoControl-based `volumes` leg is the one still withheld there, #3925). The pure layer
 // (disk_actions_partitions.hpp) owns the row grammar, the outcome contract and the Level ->
 // typed-status mapping; this function owns the two queries, applying that status, and the rule
@@ -902,7 +902,8 @@ constexpr std::size_t kPartitionRowCap = 256;
 
 // A handful of rows is expected, so the enumeration stage is bounded at 15 s rather than the
 // helper's 60 s (the connect stage keeps the helper's own max-wait bound; it has no millisecond
-// knob). Two queries run back to back on the sync thread, so this halves the worst case twice over.
+// knob), so this is bounded, not instantaneous. Three queries run back to back on the sync thread
+// (the later two only when the earlier answered).
 constexpr std::uint64_t kPartitionEnumerationDeadlineMs = 15000;
 
 partitions::QueryOutcome run_partition_query(const wchar_t* wql) {
@@ -954,19 +955,30 @@ int emit_partitions(yuzu::CommandContext& ctx) {
     try {
         const auto parts =
             run_partition_query(L"SELECT DeviceID, DiskIndex, Index, Size, Type FROM Win32_DiskPartition");
-        // Skip the association query when the partitions themselves could not be read: its
-        // answer would not be used, and a second failing call just spends the sync thread's time.
+        // Each later query runs only if the one before it answered: its result would not be used
+        // otherwise, and a second failing call just spends the sync thread's time. The local
+        // fixed-disk drive letters are the cross-check on the association (see build_report).
         partitions::QueryOutcome links;
+        partitions::QueryOutcome disks;
         if (parts.error.empty())
             links = run_partition_query(L"SELECT Antecedent, Dependent FROM Win32_LogicalDiskToPartition");
-        report_partitions(ctx, partitions::build_report(parts, links), wrote_any);
+        if (parts.error.empty() && links.error.empty())
+            disks = run_partition_query(L"SELECT DeviceID, DriveType FROM Win32_LogicalDisk WHERE DriveType = 3");
+        report_partitions(ctx, partitions::build_report(parts, links, disks), wrote_any);
     } catch (...) {
         // Reached only by an allocation failure or a bug. The section must still say it failed:
         // an exception here would unwind through the plugin trampoline, which does not catch.
-        // The typed status first (its own guard), then -- only if no line is out yet, so a
-        // section never carries two status rows -- the row.
+        // The typed status FIRST and straight through the SDK (no logging before it: a formatting
+        // allocation that throws would skip it, and an UNDECLARED result with rc 0 is derived as a
+        // clean success), then the log line, then -- only if no line is out yet, so a section never
+        // carries two status rows -- the row. Each step has its own guard.
         try {
-            mark_result_partial(ctx, "windows:partitions:internal_error");
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "windows:partitions:internal_error");
+        } catch (...) {
+        }
+        try {
+            spdlog::warn("disk_actions: degraded read (windows:partitions:internal_error)");
         } catch (...) {
         }
         if (!wrote_any) {

@@ -7,8 +7,11 @@
  *               where the OS exposes it, wear indicators.
  *   "volumes" — The mapping between physical drives and the logical volumes
  *               they back.
- *   "partitions", "topology" — PLANNED on every OS: each answers one
- *               `status|<action>|unsupported|<os>:planned` row until its leg lands.
+ *   "partitions" — read on Windows (Win32_DiskPartition + Win32_LogicalDiskToPartition
+ *               through bounded WMI); PLANNED on Linux and macOS.
+ *   "topology"   — PLANNED on every OS.
+ *               A planned action answers one `status|<action>|unsupported|<os>:planned` row
+ *               until its leg lands.
  *
  * SCOPE, decided deliberately (Alex ruling, Wave 6 planning). `volumes` is NOT
  * a third volume inventory. `hardware.disks` already enumerates physical

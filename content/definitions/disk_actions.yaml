@@ -305,7 +305,8 @@ spec:
         description: >-
           Comma-separated mount points or drive letters, or "-". On Windows "-" means no
           drive letter was mapped, unless detail says mount_points_unread or
-          mount_points_partial, in which case the mapping could not be fully read. Windows
+          mount_points_partial, in which case the mapping could not be fully read or trusted
+          (including a local fixed drive letter no partition was associated with). Windows
           shows drive letters only (a folder mount shows "-"). Absent on status rows.
         example: "/"
         platforms: [windows, linux, darwin]
