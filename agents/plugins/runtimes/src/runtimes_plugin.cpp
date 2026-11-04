@@ -77,8 +77,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "rests on trees built from the documented bundle layout"},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
-         "HKLM JavaSoft, Eclipse Adoptium and Azul Zulu keys (both views) + one <home>\\release "
-         "read; no Program Files walk",
+         "HKLM JavaSoft, Eclipse Adoptium, Microsoft JDK and Azul Zulu keys (both views) + one "
+         "<home>\\release read; no Program Files walk",
          nullptr},
     },
     {

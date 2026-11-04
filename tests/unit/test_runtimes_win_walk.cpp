@@ -228,6 +228,12 @@ struct FakeOps {
         const auto it = n.values.find(value_name ? value_name : L"");
         return it == n.values.end() ? std::string{} : it->second;
     }
+    // A value of that name exists, whatever its type or size (an empty string, a DWORD): what the real
+    // RegQueryValueExW probe answers, so a registered-but-unusable value differs from an absent one.
+    bool has_value(HKEY key, const wchar_t* value_name) const {
+        const Node& n = nodes.at(paths[reinterpret_cast<std::size_t>(key) - 1]);
+        return n.values.count(value_name) != 0 || n.dwords.count(value_name) != 0;
+    }
     std::optional<DWORD> read_dword(HKEY key, const wchar_t* value_name) const {
         const Node& n = nodes.at(paths[reinterpret_cast<std::size_t>(key) - 1]);
         const auto it = n.dwords.find(value_name);
@@ -269,6 +275,7 @@ const std::wstring kNdp35 = L"SOFTWARE\\Microsoft\\NET Framework Setup\\NDP\\v3.
 const std::wstring kJsJdk = L"SOFTWARE\\JavaSoft\\JDK";
 const std::wstring kAdoptJdk = L"SOFTWARE\\Eclipse Adoptium\\JDK";
 const std::wstring kZulu = L"SOFTWARE\\Azul Systems\\Zulu";
+const std::wstring kMsJdk = L"SOFTWARE\\Microsoft\\JDK";
 
 const std::string kDotnetDir = "C:\\Program Files\\dotnet\\";
 const std::string kMsHome = "C:\\Program Files\\Microsoft\\jdk-21.0.12.101-hotspot\\";
@@ -802,6 +809,61 @@ TEST_CASE("runtimes win: a non-local home is never opened, and reads as an unrea
     CHECK(acc.reason() == std::string{rwin::kTokJvmReleaseUnreadable});
 }
 
+TEST_CASE("runtimes win: Microsoft's own JDK key (HKLM\\SOFTWARE\\Microsoft\\JDK\\<ver>\\hotspot\\MSI Path) is a source",
+          "[runtimes][jvm][windows]") {
+    // Registered ONLY under the Microsoft key (no JavaSoft twin): the home must still be found.
+    FakeOps ops;
+    plant_jvm(ops, L"64", kMsJdk, L"21.0.12.101", L"hotspot\\MSI", L"Path", kMsHome);
+    ops.files[kMsReleasePath] = kMsRelease;
+    ConstraintAccumulator acc;
+    CHECK(rwin::jvm_rows(ops, acc) ==
+          std::vector<std::string>{
+              "jvm|unmodelled|21.0.12.1|C:/Program Files/Microsoft/jdk-21.0.12.101-hotspot/|Microsoft"});
+    CHECK_FALSE(acc.any_failure());
+    CHECK(ops.opened == ops.closed);
+}
+
+TEST_CASE("runtimes win: a registered JVM key with an empty or mistyped home raises home_unusable",
+          "[runtimes][jvm][windows]") {
+    // read_str folds absent, empty, mistyped and oversized into ""; only the PRESENT ones are a token.
+    const auto run = [](const FakeOps& ops) {
+        ConstraintAccumulator acc;
+        const auto rows = rwin::jvm_rows(ops, acc);
+        return std::make_pair(rows, acc.reason());
+    };
+    const std::string token{rwin::kTokJvmHomeUnusable};
+    {
+        FakeOps ops; // an empty string value
+        plant_jvm(ops, L"64", kJsJdk, L"21", L"", L"JavaHome", "");
+        const auto [rows, reason] = run(ops);
+        CHECK(rows.empty());
+        CHECK(reason == token);
+        CHECK(ops.opened == ops.closed);
+    }
+    {
+        FakeOps ops; // a DWORD where the home string belongs, under the hotspot\MSI tail
+        ops.setd(L"64", kAdoptJdk + L"\\21.0.13.9\\hotspot\\MSI", L"Path", 1);
+        const auto [rows, reason] = run(ops);
+        CHECK(rows.empty());
+        CHECK(reason == token);
+    }
+    {
+        FakeOps ops; // a usable sibling is still a row beside the unusable one
+        plant_three_vendors(ops);
+        plant_jvm(ops, L"64", kJsJdk, L"11", L"", L"JavaHome", "");
+        const auto [rows, reason] = run(ops);
+        CHECK(rows == kThreeVendorRows);
+        CHECK(reason == token);
+    }
+    {
+        FakeOps ops; // absent value: silent
+        ops.mk(L"64", kJsJdk + L"\\21");
+        const auto [rows, reason] = run(ops);
+        CHECK(rows.empty());
+        CHECK(reason.empty());
+    }
+}
+
 TEST_CASE("runtimes win: a version key without a home value is not an install",
           "[runtimes][jvm][windows]") {
     FakeOps ops;
@@ -1119,14 +1181,10 @@ TEST_CASE("runtimes win: RealRegOps::read_file_bounded reads a plain file and re
           "[runtimes][jvm][windows]") {
     // The real CreateFileW path, once. engaged-and-empty = no such file; nullopt = not read.
     namespace fs = std::filesystem;
-    const fs::path dir = fs::temp_directory_path() /
-                         ("yuzu_test_runtimes_release_" + std::to_string(GetCurrentProcessId()));
+    const yuzu::test::TempDir tmp{"yuzu_test_runtimes_release_"};
+    const fs::path& dir = tmp.path;
     std::error_code ec;
     fs::create_directories(dir, ec);
-    struct Cleanup {
-        const fs::path& dir;
-        ~Cleanup() { std::error_code e; fs::remove_all(dir, e); }
-    } cleanup{dir};
     const fs::path file = dir / "release";
     const std::string body = "JAVA_VERSION=\"21.0.1\"\n";
     { std::ofstream(file, std::ios::binary) << body; }
@@ -1150,6 +1208,19 @@ TEST_CASE("runtimes win: RealRegOps::read_file_bounded reads a plain file and re
     } else {
         WARN("symlink creation not permitted here: reparse-point refusal not exercised live");
     }
+    // A reparse point in an ANCESTOR directory is refused too (the leaf flag does not cover it):
+    // <dir>\\via\\release reaches the real file through the directory link <dir>\\via.
+    const fs::path via = dir / "via";
+    std::error_code dir_ec;
+    fs::create_directory_symlink(dir, via, dir_ec);
+    if (!dir_ec) {
+        CHECK_FALSE((ops.read_file_bounded((via / "release").wstring(), kCap)).has_value());
+    } else {
+        WARN("directory symlink creation not permitted here: ancestor refusal not exercised live");
+    }
+    // A missing ancestor is a missing file, not a refusal.
+    CHECK(ops.read_file_bounded((dir / "nodir" / "release").wstring(), kCap) ==
+          std::optional<std::string>{std::string{}});
 }
 
 #endif // _WIN32

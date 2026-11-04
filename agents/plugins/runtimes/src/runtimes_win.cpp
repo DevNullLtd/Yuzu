@@ -6,8 +6,8 @@
  *   python  HKLM\SOFTWARE\Python\PythonCore (PEP 514), `win::python_rows`.
  *   dotnet  HKLM\SOFTWARE\dotnet\Setup\InstalledVersions (shared frameworks and SDKs) plus the
  *           .NET Framework NDP\v4\Full release table and NDP\v3.5, `win::dotnet_rows`.
- *   jvm     the JavaSoft, Eclipse Adoptium and Azul Zulu home registrations, then one bounded read of
- *           each home's `release` file (never through a reparse point), `win::jvm_rows`.
+ *   jvm     the JavaSoft, Eclipse Adoptium, Microsoft and Azul Zulu home registrations, then one bounded
+ *           read of each home's `release` file (never through a reparse point, leaf or ancestor), `win::jvm_rows`.
  */
 #include "runtimes_legs.hpp"
 #include "runtimes_win_parsers.hpp"

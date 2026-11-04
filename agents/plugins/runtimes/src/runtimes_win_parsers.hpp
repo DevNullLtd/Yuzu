@@ -21,7 +21,7 @@
  *           NDP\v3.5 `Version`. The .NET shared frameworks sit in the WOW6432Node view on a real
  *           host, so reading one view only would miss them. Vendor is `Microsoft`.
  *   jvm     the home directories registered by JavaSoft (JDK, Java Development Kit, Java Runtime
- *           Environment, JRE), Eclipse Adoptium (JDK, JRE) and Azul Zulu, deduplicated by home path,
+ *           Environment, JRE), Eclipse Adoptium (JDK, JRE), Microsoft (JDK) and Azul Zulu, deduplicated by home path,
  *           then ONE bounded read (64 KiB) of `<home>\release` through the shared release parser.
  *           Vendor and flavour come from that file, NEVER from the registry vendor key: a non-Oracle
  *           JDK (Microsoft's) also writes the Oracle JavaSoft key.
@@ -29,13 +29,16 @@
  * FAILURE NEVER READS AS ABSENT. An absent root is silent (`supported` + zero rows). Any other failed
  * open, an enumeration error, a name too long for the buffer and a denied open record
  * `windows:runtimes:<python|dotnet|jvm>_reg:<cause>`. A missing or unparsable VALUE is a per-item
- * metadata shortfall: the row reports what was found and raises no token. A JVM home whose `release`
+ * metadata shortfall: the row reports what was found and raises no token (a JVM home value is the exception, below). A JVM home whose `release`
  * file exists but cannot be read (denied, a reparse point, over the cap, a non-local path) is still
  * a row (version = the registry's version tag, flavour `unmodelled`) and records
  * `windows:runtimes:jvm:release_unreadable`; a home with no `release` file at all is the same row
  * without a token. The release file is opened as itself (FILE_FLAG_OPEN_REPARSE_POINT) and a
- * reparse point is refused: a link is never followed. The no-follow is leaf-only, a disclosed
- * residual for a junctioned ancestor of the home.
+ * reparse point is refused: a link is never followed, and each ancestor directory of the
+ * file below the drive root is checked not to be a reparse point first (refused as unreadable). A
+ * JVM key whose home value is present but empty, mistyped or oversized records
+ * `windows:runtimes:jvm:home_unusable` (an absent value stays silent). The read has no deadline,
+ * a disclosed residual on a dead FIXED volume.
  *
  * BOUNDED. One kMaxEntriesVisited counter per walk across both views (every enumerated name and
  * value counts, an over-long one too) and ONE RowByteBudget of kMaxEntriesVisited rows and
@@ -87,6 +90,10 @@ inline constexpr RegTokens kJvmTokens{
 /// A home's `release` file exists but could not be read (denied, a reparse point, over the cap, a
 /// non-local path). Absent file: no token.
 inline constexpr std::string_view kTokJvmReleaseUnreadable = "windows:runtimes:jvm:release_unreadable";
+/// A registered JVM key whose home value (JavaHome / Path / InstallationPath) exists but is empty,
+/// mistyped or oversized: a registered install with no usable home, never a silent drop. An ABSENT
+/// value stays silent (the key is not a home registration).
+inline constexpr std::string_view kTokJvmHomeUnusable = "windows:runtimes:jvm:home_unusable";
 
 // -- .NET -----------------------------------------------------------------------------------------
 
@@ -264,6 +271,13 @@ struct RealRegOps {
             return {}; // grew between the two reads (ERROR_MORE_DATA) or vanished: absent
         return yuzu::win::reg_sz_to_utf8(buf.c_str(), got);
     }
+    /// True when the value exists whatever its type or size (read_str folds absent, mistyped and
+    /// oversized into ""; this tells a registered-but-unusable value from an absent one).
+    bool has_value(HKEY key, const wchar_t* value_name) const {
+        DWORD size = 0;
+        const LSTATUS rc = RegQueryValueExW(key, value_name, nullptr, nullptr, nullptr, &size);
+        return rc != ERROR_FILE_NOT_FOUND && rc != ERROR_PATH_NOT_FOUND;
+    }
     /// nullopt for an absent or non-DWORD value.
     std::optional<DWORD> read_dword(HKEY key, const wchar_t* value_name) const {
         DWORD type = 0;
@@ -300,7 +314,10 @@ struct RealRegOps {
         *data = yuzu::win::reg_sz_to_utf8(buf.c_str(), got);
         return ERROR_SUCCESS;
     }
-    /// One bounded read of a local-drive file, opened as itself and never followed through a link.
+    /// One bounded read of a local-drive file, opened as itself and never followed through a link
+    /// (the leaf by FILE_FLAG_OPEN_REPARSE_POINT, every ancestor below the drive root by an attribute
+    /// check). It has no deadline: CreateFileW / ReadFile on a dead FIXED volume (iSCSI, USB, VHD)
+    /// can block the sync thread, a disclosed residual shared with the other Windows readers.
     /// engaged-and-empty: the file does not exist. nullopt: it exists (or may) but is not read -- not
     /// a plain `X:\...` path, not on a fixed local drive (remote, removable, optical, RAM or
     /// unknown), a reparse point, a directory, not a disk file, over `cap` bytes, or an open / read
@@ -310,6 +327,20 @@ struct RealRegOps {
             return std::nullopt;
         const wchar_t root[] = {path[0], L':', L'\\', L'\0'};
         if (GetDriveTypeW(root) != DRIVE_FIXED) return std::nullopt;
+        // CreateFileW follows a reparse point in any ANCESTOR directory (the flag below covers only
+        // the leaf), and a directory link to a UNC path would make it connect outbound with the
+        // service identity. So each directory between the drive root and the leaf must itself not be
+        // a reparse point. A missing ancestor is a missing file, as CreateFileW would answer.
+        for (std::size_t sep = path.find_first_of(L"\\/", 3); sep != std::wstring::npos;
+             sep = path.find_first_of(L"\\/", sep + 1)) {
+            const DWORD attrs = GetFileAttributesW(path.substr(0, sep).c_str());
+            if (attrs == INVALID_FILE_ATTRIBUTES) {
+                const DWORD e = GetLastError();
+                if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return std::string{};
+                return std::nullopt;
+            }
+            if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) return std::nullopt;
+        }
         struct Handle {
             HANDLE h;
             ~Handle() {
@@ -627,6 +658,8 @@ inline constexpr JvmSource kJvmSources[] = {
     {L"SOFTWARE\\Eclipse Adoptium\\JDK", L"hotspot\\MSI", L"Path"},
     {L"SOFTWARE\\Eclipse Adoptium\\JRE", L"hotspot\\MSI", L"Path"},
     {L"SOFTWARE\\Azul Systems\\Zulu", L"", L"InstallationPath"},
+    // Microsoft Build of OpenJDK registers HKLM\SOFTWARE\Microsoft\JDK\<ver>\hotspot\MSI `Path`.
+    {L"SOFTWARE\\Microsoft\\JDK", L"hotspot\\MSI", L"Path"},
 };
 
 /// The jvm rows of this host: every registered home (both views, one per home path), each with one
@@ -653,8 +686,11 @@ template <class Ops>
                 if (*src.tail && !walk.open(version_key, src.tail, KEY_READ | view, &tail_key))
                     return;
                 Guard tail_guard{ops, tail_key};
-                add_jvm_home(homes, ops.read_str(tail_key ? tail_key : version_key, src.value),
-                             yuzu::win::from_wide(version, version_len));
+                const HKEY home_key = tail_key ? tail_key : version_key;
+                std::string home = ops.read_str(home_key, src.value);
+                if (home.empty() && ops.has_value(home_key, src.value))
+                    acc.add_failure(kTokJvmHomeUnusable);
+                add_jvm_home(homes, std::move(home), yuzu::win::from_wide(version, version_len));
             });
         }
     }
