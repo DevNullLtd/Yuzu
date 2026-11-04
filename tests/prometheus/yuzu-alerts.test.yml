@@ -3248,7 +3248,7 @@ tests:
           - labels: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing", facet="installed_apps.list_inventory", severity="warning"}'
             value: 1
 
-  # CASE - delta_unsupported (a delta whose base matched, no delta apply until SAM-14) does NOT
+  # CASE - delta_unsupported (a delta whose base matched, the server has no delta apply yet) does NOT
   # fire the warning: it is the expected placeholder and has its own info rule below.
   - interval: 1m
     name: inventory section ingest refused - delta_unsupported does not fire the warning

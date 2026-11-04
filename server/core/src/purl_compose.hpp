@@ -12,7 +12,7 @@
 /// `tests/types/<type>-test.json` vectors (test_purl_compose.cpp carries the build vectors).
 ///
 /// Shape: `pkg:<type>/<namespace>/<name>@<version>?<qualifiers>`.
-///   - type: lowercase, from `purl_type_for` (the SAM.4 ecosystem -> type table, the one source).
+///   - type: lowercase, from `purl_type_for` (the ecosystem -> type table, the one source).
 ///     An ecosystem with no registered type (windows, macos, macos_pkgutil, msi, snap, flatpak,
 ///     optional_feature, python, ibm_mq) yields ''. A type is never invented: `python` rows are
 ///     interpreter installs (`runtimes.python`), not PyPI distributions, so they stay ''.

@@ -1013,7 +1013,7 @@ labels.
 
 **Hand-off to the delta apply and the agent writer.** Two facts the next changes must carry.
 `instance_key` hashes the row's whole 16-slot record, so adding a slot to that record re-keys
-every stored row once; the weekly full floor bounds how long old and new keys coexist. Until the
+every stored row once, so the agent writer and the server move together on it. Until the
 delta apply and the component store exist, every `delta` section and every `full` or `delta`
 `component_inventory` section (even one with no records) is answered `need_full`; the agent writer's golden-vector parity
 test must reproduce the section hash, the report hash and the hash membership rule above

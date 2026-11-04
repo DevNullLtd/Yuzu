@@ -4324,7 +4324,7 @@ TEST_CASE("name-pattern reads: a deny-all scope is an empty value with no SQL; a
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Blob v3 + migration v10 (SAM-13, ADR-0016 Update 2026-11-04)
+// Blob v3 + migration v10 (ADR-0016 Update 2026-11-04)
 // ═════════════════════════════════════════════════════════════════════════════
 
 namespace {

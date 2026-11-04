@@ -416,7 +416,7 @@ public:
     /// the ingest hot path (UP-8); pass `std::move` at the call site.
     /// Blob v2 vs v3: this is the v2 path and is unchanged by v3 except that it stamps the
     /// server-derived key columns on each row and deletes the agent's `software_facet_state`
-    /// rows in the same transaction (a downgraded agent leaves no stale facets). A hash-only
+    /// rows in the same transaction (v2 rows and facet state never describe one agent at once). A hash-only
     /// report works for both: a v3 agent claims its `v3:` report hash, which only a v3 state
     /// can match, and a v2 claim (plain hex) never matches a v3 state.
     InventoryIngestOutcome apply_installed_software(std::string_view agent_id,
