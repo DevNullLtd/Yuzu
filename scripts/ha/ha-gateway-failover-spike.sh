@@ -204,6 +204,7 @@ ramp() {
         note "$k agents registered in $(( $(date +%s) - s ))s; per node: $(node_counts | tr '\n' ' ')"
         footprint "$k"
     done
+    setenv SPIKE_AGENTS "$n"   # the INTENDED fleet size: a retry must not size the fleet from whatever happens to be running
 }
 footprint() { # footprint K : RSS/threads/CPU of the agents, appended to $STATE/footprint.tsv
     local first pid; first="$(compose ps -q agent | head -1)"
@@ -472,6 +473,13 @@ for f in sorted(glob.glob(state + "/run-*/summary.json")):
         "probes": "".join(pcl), "victim_readyz_200_s_after_undo": rec.get("victim_readyz_200_s", ""), "all_routable_s_after_undo": rec.get("all_routable_s", ""),
         "invalid": "yes" if os.path.exists(rd + "/INVALID") else "", "note": notes.get(run, ""),
     })
+if record:   # validate first: an abort must leave every output untouched
+    doc0 = open(record).read()
+    for name in ("failover", "faults-f3-f2p", "probes"):
+        nb = len(re.findall(r"^<!-- BEGIN GENERATED: %s -->$" % re.escape(name), doc0, re.M))
+        ne = len(re.findall(r"^<!-- END GENERATED: %s -->$" % re.escape(name), doc0, re.M))
+        if nb != 1 or ne != 1:
+            sys.exit(f"ERROR: the record must hold exactly one whole-line BEGIN and one END marker for '{name}' (found {nb} and {ne}); nothing was written")
 def atomic_write(path, writer):
     tmp = path + ".tmp"
     with open(tmp, "w", newline="") as fh: writer(fh)
@@ -540,7 +548,7 @@ if record:
     print("tables spliced into", record)
 PY
     local rc=$?
-    [ "$rc" -eq 0 ] || { fail "export failed (python exit $rc); the outputs were not updated"; return 1; }
+    [ "$rc" -eq 0 ] || { fail "export failed (python exit $rc); a marker error writes nothing, but any other failure may leave some outputs updated"; return 1; }
 }
 
 # report : one markdown table over every summary.json under the state dir
@@ -592,7 +600,7 @@ cmd_scenario() {
         local old_addr="$SPIKE_SERVER_ADDR"
         : > "$STATE/DIRTY" || die "cannot write $STATE/DIRTY"   # FIRST: any interruption from here on leaves the rig flagged
         setenv SPIKE_SERVER_ADDR "$addr"; load_state
-        local n; n="$(compose ps -q agent | wc -l)"
+        local n="${SPIKE_AGENTS:-$(compose ps -q agent | wc -l)}"
         if ! compose up -d --scale agent="$n" --force-recreate agent >/dev/null 2>&1; then
             # The containers may be half-recreated: restoring the variable does not restore them.
             setenv SPIKE_SERVER_ADDR "$old_addr"

@@ -105,7 +105,8 @@ clustered gateways, a real server and Postgres, and 20 / 100 / 300 agents.
   its configuration in its `meta.txt`** (the DNS order, the management address, the HAProxy variant and the
   script hash were added to the metadata afterwards). The "Mgmt addr" and HAProxy columns, and which runs are
   the H7 and redispatch runs, therefore come from the operator's own notes, listed under "Run configurations"
-  below. Derived columns in the CSV (peer FIN/RST timing, route and `/readyz` timelines, breaker timing,
+  below. The addressing label (DNS or VIP) of those runs is likewise the mode that was requested, not one
+  read back from the fleet (the harness now records the observed mode and marks a mismatch INVALID). Derived columns in the CSV (peer FIN/RST timing, route and `/readyz` timelines, breaker timing,
   probe classes) were recomputed from the raw run data with the final code, so they are consistent across
   the early and late runs.
 - **Raw data is not committed, and no copy exists outside the measuring host.** The per-run logs, route
@@ -331,7 +332,9 @@ could not resolve, so both of its probes failed); they were not used for any cla
   3. a positive control for refusals: lower the gateway's register queue limit (`upstream_register_queue_max`)
      until "the gateway is busy" is produced and appears in an agent log, then repeat a kill (finding 9);
   4. an H7 control that proves the management address was the only difference;
-  5. a re-run of the early-harness runs on the corrected clock, to replace the corrections described above.
+  5. a re-run of the early-harness runs on the corrected clock, to replace the corrections described above;
+  6. the finding 10 experiment, with the management address on a node other than the victim, repeated
+     several times (a verification, since the loss is intermittent).
 - **Not run:** H6, H9, fixed-order DNS, a static endpoint list with no DNS (13.2's case), a real
   resolver with TTLs, a multi-replica server, PROXY-protocol / client-address attribution behind a VIP, and
   TLS session resumption across nodes.
@@ -359,7 +362,8 @@ could not resolve, so both of its probes failed); they were not used for any cla
   agent client certificates; mutual TLS applies only between server and gateways). Behind a VIP in
   `mode tcp` every agent's peer address is the proxy.
 - **WS-15:** finding 6.
-- **A new candidate issue:** finding 7 (agent teardown latency after a clean reset).
+- **Candidate issues (not filed):** finding 7 (agent teardown latency after a clean reset), and finding 10
+  (commands lost after the agent-port-only fault: a verification first, then a defect if confirmed).
 
 ## Run configurations (operator-supplied)
 
@@ -381,12 +385,17 @@ could not resolve, so both of its probes failed); they were not used for any cla
   The DNS measurements sit inside that; the VIP "health check stays green" case did not (finding 3).
 - `docs/user-manual/server-admin.md` documents `--gateway-command-addr` as one address without warning that
   killing that node loses command dispatch to the whole fleet (finding 5).
-- **Alerting:** during a full partition the victim gateway's `yuzu_gw_agents_current` stayed at its
-  pre-fault value for about 155 s and then fell (in the 300-agent, 200 s run: 100, then 96 at +160 s, 71 at
-  +170 s, 13 at +190 s; the 100-agent runs' 150 s windows ended before the fall). The shipped
-  `YuzuGatewayConnectionDrops` alert needs that gauge to fall below 70 % of its value five minutes earlier
-  for two minutes, and needs a positive connection rate in the last five minutes, so for these faults it would
-  fire late if at all; a killed node is covered by a different alert. The alert rule itself was not exercised.
+- **Alerting:** during a full partition the victim gateway's `yuzu_gw_agents_current` held its pre-fault
+  value until about +160 s and then fell (in the 300-agent, 200 s run: 100 until +159.8 s, 96 at +160 s,
+  71 at +171 s, 41 at +182 s, 13 at +190 s; the series is `ws13-0/raw/run-F2p-vip-001328-gw.csv`; this is
+  one run, and the 100-agent runs' 150 s windows ended before the fall). The `/readyz` flip in the same run
+  was at +157 s, which is a different quantity. The shipped `YuzuGatewayConnectionDrops` alert needs that
+  gauge to fall below 70 % of its value five minutes earlier for two minutes, and needs a positive connection
+  rate in the last five minutes. By derivation, not measurement, it would fire late if at all (the earliest
+  about +295 to +320 s), and the rate condition may lapse before the two minutes are met. Two qualifiers: this
+  harness read the gauge over the node's loopback, whereas a networked Prometheus would see the node
+  unreachable in a full partition, which `YuzuGatewayDown` covers; and in the agent-port-only shape (the one
+  with the lost commands, finding 10) only the drop alert could act. The alert rule itself was not exercised.
 
 None of these pages was edited by this slice.
 
