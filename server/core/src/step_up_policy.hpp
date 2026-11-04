@@ -97,7 +97,9 @@ inline constexpr std::string_view kMcpTransport =
 inline constexpr std::string_view kContentAuthoring =
     "content authoring: running the content is gated separately";
 inline constexpr std::string_view kReferenceDataReplace =
-    "fleet-wide reference data replace: not credentials, identity or authority; audited before the write";
+    "fleet-wide software reference data (pack replace, curated aliases): not credentials, "
+    "identity or authority, but it steers cpe_product and CVE matching and fleet-wide title "
+    "resolution; audited before the write; whether it needs MFA step-up awaits an owner ruling";
 inline constexpr std::string_view kPolicyLifecycle =
     "policy lifecycle: governed by the Policy securable and approval";
 inline constexpr std::string_view kEvidenceCapture = "evidence capture under its own securable";
@@ -248,7 +250,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/v1/hardware/([^/]+)/sync)",                                           step_up_detail::kSyncTrigger),
     step_up_detail::exempt("POST",  R"(/api/v1/hardware/sync)",                                                   step_up_detail::kSyncTrigger),
     // software_curation_routes.cpp
-    step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/aliases)",                        step_up_detail::kOperationalData),
+    step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/aliases)",                        step_up_detail::kReferenceDataReplace),
     step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/queue/([A-Za-z0-9_-]+)/reject)",  step_up_detail::kOperationalData),
     step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/pack)",                           step_up_detail::kReferenceDataReplace),
     // instruction_fragment_routes.cpp

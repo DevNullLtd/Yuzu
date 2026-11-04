@@ -7,6 +7,7 @@
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, a4_denial, ensure_correlation_id
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit, try_persist_audit
 #include "software_normalization_pack.hpp"
+#include "web_utils.hpp" // audit_token
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -45,6 +46,12 @@ std::optional<std::vector<std::string>> split_exact(std::string_view s, std::siz
 bool has_sep(std::string_view s) {
     return s.find(kSep) != std::string_view::npos;
 }
+
+// Bytes a decoded field must not carry: exec_params binds c_str() (a NUL truncates the value,
+// so the key would act on a different row) and Postgres refuses invalid UTF-8 (22021).
+bool bindable(std::string_view s) {
+    return s.find('\0') == std::string_view::npos && valid_utf8(s);
+}
 } // namespace
 
 std::optional<std::string> encode_key(const Triple& t) {
@@ -55,7 +62,8 @@ std::optional<std::string> encode_key(const Triple& t) {
 
 std::optional<Triple> decode_key(std::string_view key) {
     auto raw = keyset::b64url_decode(key);
-    if (!raw || raw->size() > kMaxKeyBytes || keyset::b64url_encode(*raw) != key)
+    if (!raw || raw->size() > kMaxKeyBytes || keyset::b64url_encode(*raw) != key ||
+        !bindable(*raw))
         return std::nullopt;
     auto f = split_exact(*raw, 3);
     if (!f || (*f)[0].empty() || (*f)[2].empty())
@@ -72,7 +80,8 @@ std::optional<std::string> encode_cursor(const CurationCursor& c) {
 
 std::optional<CurationCursor> decode_cursor(std::string_view token) {
     auto raw = keyset::b64url_decode(token);
-    if (!raw || raw->size() > kMaxKeyBytes + 24 || keyset::b64url_encode(*raw) != token)
+    if (!raw || raw->size() > kMaxKeyBytes + 24 || keyset::b64url_encode(*raw) != token ||
+        !bindable(*raw))
         return std::nullopt;
     const auto p = raw->find(kSep);
     if (p == std::string::npos)
@@ -314,9 +323,10 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             deny_400(req, res, kVerb, "unknown ecosystem");
             return;
         }
-        if (category.empty())
-            category = "other";
-        if (std::find(kCategories.begin(), kCategories.end(), category) == kCategories.end()) {
+        // An omitted category is passed through empty: the store keeps an existing product's
+        // category and gives a new product "other".
+        if (!category.empty() &&
+            std::find(kCategories.begin(), kCategories.end(), category) == kCategories.end()) {
             deny_400(req, res, kVerb, "unknown category");
             return;
         }
@@ -330,8 +340,8 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         if (!audit_first(req, res, kVerb, keys->norm_key,
-                         "ecosystem=" + eco + " alias=" + keys->alias_key +
-                             " publisher=" + keys->alias_publisher))
+                         "ecosystem=" + audit_token(eco) + " alias=" + audit_token(keys->alias_key) +
+                             " publisher=" + audit_token(keys->alias_publisher)))
             return;
         const auto pid = deps.registry->curate_alias(eco, *keys, category, cpe);
         if (!pid) {
@@ -360,9 +370,10 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                       deny_400(req, res, kVerb, "invalid queue key");
                       return;
                   }
-                  if (!audit_first(req, res, kVerb, t->ecosystem,
-                                   "ecosystem=" + t->ecosystem + " raw_name=" + t->raw_name +
-                                       " raw_publisher=" + t->raw_publisher))
+                  if (!audit_first(req, res, kVerb, audit_token(t->ecosystem),
+                                   "ecosystem=" + audit_token(t->ecosystem) +
+                                       " raw_name=" + audit_token(t->raw_name) +
+                                       " raw_publisher=" + audit_token(t->raw_publisher)))
                       return;
                   const auto done =
                       deps.registry->reject_curation(t->raw_name, t->raw_publisher, t->ecosystem);
@@ -406,8 +417,9 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             deny_400(req, res, kVerb, pack.error());
             return;
         }
-        if (!audit_first(req, res, kVerb, pack->pack_version,
-                         "pack_version=" + pack->pack_version + " sha256=" + pack->sha256 +
+        if (!audit_first(req, res, kVerb, audit_token(pack->pack_version),
+                         "pack_version=" + audit_token(pack->pack_version) +
+                             " sha256=" + audit_token(pack->sha256) +
                              " rows=" + std::to_string(pack->rows.size())))
             return;
         const auto out = deps.registry->replace_pack(*pack, session->username);

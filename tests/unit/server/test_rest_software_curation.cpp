@@ -143,6 +143,50 @@ TEST_CASE("curation key round-trips and refuses anything encode_key could not pr
                     .has_value());
 }
 
+TEST_CASE("a maximal listed queue key (2400-byte triple) still decodes", "[software_curation][rest]") {
+    // The queue admits triples whose fields sum to 2400 bytes; the key adds two separators.
+    const std::string name(1000, 'n'), pub(1000, 'p'), eco(400, 'e');
+    const auto k = curation_keys::encode_key({name, pub, eco});
+    REQUIRE(k.has_value());
+    const auto back = curation_keys::decode_key(*k);
+    REQUIRE(back.has_value());
+    CHECK(back->raw_name == name);
+    CHECK(back->ecosystem == eco);
+    // One byte more is refused.
+    CHECK_FALSE(curation_keys::decode_key(key_for(name + "x", pub, eco)).has_value());
+
+    ClosedStore cs;
+    Harness h{&cs.store};
+    const auto res = h.sink.Post(kBase + "/queue/" + *k + "/reject", "");
+    CHECK(res->status == 503); // past the codec, to the (closed) store; not a 400
+    CHECK(h.audits.size() == 1);
+}
+
+TEST_CASE("keys and cursors carrying a NUL byte or invalid UTF-8 are refused",
+          "[software_curation][rest]") {
+    using keyset::b64url_encode;
+    const std::string nul("a\0b", 3);
+    CHECK_FALSE(curation_keys::decode_key(b64url_encode(nul + "\x1F" "p\x1F" "rpm")).has_value());
+    CHECK_FALSE(curation_keys::decode_key(b64url_encode("n\x1F" + nul + "\x1F" "rpm")).has_value());
+    CHECK_FALSE(curation_keys::decode_key(b64url_encode("\xC3\x28\x1F" "p\x1F" "rpm")).has_value());
+    CHECK_FALSE(curation_keys::decode_key(b64url_encode("\xED\xA0\x80\x1F" "p\x1F" "rpm")).has_value());
+    CHECK_FALSE(curation_keys::decode_cursor(b64url_encode("3\x1F" + nul + "\x1F\x1F" "rpm")).has_value());
+    CHECK_FALSE(curation_keys::decode_cursor(b64url_encode("3\x1F\xFF\x1F\x1F" "rpm")).has_value());
+    CHECK(curation_keys::decode_key(b64url_encode("caf\xC3\xA9\x1F" "p\x1F" "rpm")).has_value());
+
+    CHECK(valid_utf8("plain \xE2\x82\xAC \xF0\x9F\x98\x80"));
+    CHECK_FALSE(valid_utf8("\xC0\x80"));     // overlong
+    CHECK_FALSE(valid_utf8("\xE2\x82"));     // truncated
+    CHECK_FALSE(valid_utf8("\xF4\x90\x80\x80")); // above U+10FFFF
+
+    ClosedStore cs;
+    Harness h{&cs.store};
+    const auto bad = h.sink.Post(
+        kBase + "/queue/" + b64url_encode(nul + "\x1F" "p\x1F" "rpm") + "/reject", "");
+    CHECK(bad->status == 400);
+    CHECK(h.sink.Post(kBase + "/pack", "#pack_version: 2026.11.1\n\xFF\n", "text/csv")->status == 400);
+}
+
 TEST_CASE("curation cursor round-trips and refuses a forged token", "[software_curation][rest]") {
     const CurationCursor c{true, 42, "name", "pub", "deb"};
     const auto tok = curation_keys::encode_cursor(c);
@@ -332,9 +376,35 @@ TEST_CASE("POST aliases audits BEFORE the write and fails closed when the audit 
         const auto res = h.sink.Post(kBase + "/aliases", alias_body());
         REQUIRE(res->status == 503);
         CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
-        CHECK(json::parse(res->body)["error"]["message"].get<std::string>().find("audit") !=
-              std::string::npos);
+        const auto msg = json::parse(res->body)["error"]["message"].get<std::string>();
+        CHECK(msg.find("audit") != std::string::npos);
+        // The store's own failure message never appears: its write was not attempted.
+        CHECK(msg.find("curation write failed") == std::string::npos);
     }
+}
+
+TEST_CASE("POST aliases accepts an omitted category and neutralises the audit detail",
+          "[software_curation][rest]") {
+    ClosedStore cs;
+    Harness h{&cs.store};
+    json b = json::parse(alias_body());
+    b.erase("category");
+    // No category is valid: it reaches the audit row and the (closed) store, never a 400.
+    const auto ok = h.sink.Post(kBase + "/aliases", b.dump());
+    CHECK(ok->status == 503);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "requested");
+
+    h.audits.clear();
+    json evil = json::parse(alias_body());
+    evil["raw_publisher"] = "Contoso\nresult=success cid=FORGED";
+    evil["raw_name"] = "Contoso Studio\ncid=FORGED Standard";
+    h.sink.Post(kBase + "/aliases", evil.dump());
+    REQUIRE(h.audits.size() == 1);
+    const auto& d = h.audits[0].detail;
+    CHECK(d.find('\n') == std::string::npos);
+    CHECK(d.find("cid=FORGED") == std::string::npos);
+    CHECK(d.find("cid=") == d.rfind("cid=")); // only the server's own cid=
 }
 
 // ── reject ────────────────────────────────────────────────────────────────────────────────
@@ -359,6 +429,21 @@ TEST_CASE("POST reject: a malformed key is a 400; a valid key audits then meets 
     const auto failed = h.sink.Post(kBase + "/queue/" + key_for("n", "", "rpm") + "/reject", "");
     CHECK(failed->status == 503);
     CHECK(failed->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("POST reject neutralises caller-controlled key fields in the audit row",
+          "[software_curation][rest]") {
+    ClosedStore cs;
+    Harness h{&cs.store};
+    const auto k = key_for("evil\nname cid=FORGED", "pub\r\nresult=success", "rpm\ncid=FORGED2");
+    h.sink.Post(kBase + "/queue/" + k + "/reject", "");
+    REQUIRE(h.audits.size() == 1);
+    for (const auto& s : {h.audits[0].detail, h.audits[0].target_id}) {
+        CHECK(s.find('\n') == std::string::npos);
+        CHECK(s.find('\r') == std::string::npos);
+    }
+    CHECK(h.audits[0].detail.find("cid=") == h.audits[0].detail.rfind("cid="));
+    CHECK(h.audits[0].detail.find("cid=FORGED") == std::string::npos);
 }
 
 // ── pack ──────────────────────────────────────────────────────────────────────────────────
@@ -449,8 +534,7 @@ yuzu::test::PgTestTemplate curation_tpl{"prodreg", [](const std::string& dsn) {
 } // namespace
 
 TEST_CASE("curation routes end to end over a live store", "[pg][software_curation][rest]") {
-    yuzu::test::PostgresTestDb db{curation_tpl};
-    REQUIRE(db.available());
+    YUZU_REQUIRE_PG_DB_TPL(db, curation_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     ProductRegistryStore store{pool};
@@ -516,4 +600,38 @@ TEST_CASE("curation routes end to end over a live store", "[pg][software_curatio
     CHECK(open["count"] == 1);
     const auto rej = json::parse(h.sink.Get(kBase + "/queue?status=rejected")->body)["data"];
     CHECK(rej["count"] == 1);
+}
+
+TEST_CASE("an audit failure leaves a live store untouched, and an omitted category keeps the "
+          "product's category", "[pg][software_curation][rest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, curation_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ProductRegistryStore store{pool};
+    REQUIRE(store.is_open());
+    Harness h{&store};
+    const auto count = [&](const char* sql) {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto r = pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return std::string{PQgetvalue(r.get(), 0, 0)};
+    };
+
+    h.audit_ok = false;
+    CHECK(h.sink.Post(kBase + "/aliases", alias_body({{"category", "database"}}))->status == 503);
+    CHECK(h.sink.Post(kBase + "/pack", std::string{kSoftwareNormalizationSeed}, "text/csv")->status ==
+          503);
+    CHECK(count("SELECT count(*) FROM product_registry_store.products") == "0");
+    CHECK(count("SELECT count(*) FROM product_registry_store.product_aliases") == "0");
+
+    h.audit_ok = true;
+    REQUIRE(h.sink.Post(kBase + "/aliases", alias_body({{"category", "database"}}))->status == 201);
+    // A second raw name onto the same product, category omitted: the category is kept.
+    json second = json::parse(alias_body({{"raw_name", "Contoso Studio 2 Standard"},
+                                          {"edition", "standard"}}));
+    second.erase("category");
+    REQUIRE(h.sink.Post(kBase + "/aliases", second.dump())->status == 201);
+    CHECK(count("SELECT category FROM product_registry_store.products WHERE "
+                "norm_key = 'contoso:studio:standard'") == "database");
 }

@@ -708,6 +708,10 @@ TEST_CASE("reject_curation transitions an open entry once and a later reconcile 
           "[pg][product_registry][normalization]") {
     PROD_SHARED(store, pool);
     queue_row(pool, "x", "p", "rpm", 3);
+    // The queue is not a resolution input: a dimension row present BEFORE the reject is untouched.
+    curation_exec(pool, "INSERT INTO product_registry_store.title_dimension (raw_name, "
+                        "raw_publisher, ecosystem, norm_status, pack_version, first_seen_at, "
+                        "updated_at) VALUES ('q', '', 'rpm', 'unnormalized', '2026.11.1', 1, 1)");
 
     auto first = store.reject_curation("x", "p", "rpm");
     REQUIRE(first.has_value());
@@ -720,10 +724,6 @@ TEST_CASE("reject_curation transitions an open entry once and a later reconcile 
     CHECK_FALSE(*absent);
     CHECK(curation_scalar(pool, "SELECT status FROM product_registry_store.curation_queue") ==
           "rejected");
-    // The queue is not a resolution input: the dimension is not touched.
-    curation_exec(pool, "INSERT INTO product_registry_store.title_dimension (raw_name, "
-                        "raw_publisher, ecosystem, norm_status, pack_version, first_seen_at, "
-                        "updated_at) VALUES ('q', '', 'rpm', 'unnormalized', '2026.11.1', 1, 1)");
     CHECK(store.reject_curation("x", "p", "rpm").has_value());
     CHECK(curation_scalar(pool, "SELECT pack_version FROM "
                                 "product_registry_store.title_dimension") == "2026.11.1");
@@ -843,4 +843,62 @@ TEST_CASE("derive_curated_alias applies the pack parser's edition rules", "[norm
     CHECK(k->edition == "standard");
     CHECK(k->source == "curated:rpm");
     CHECK(k->norm_key == "acme:thing:standard");
+}
+
+TEST_CASE("curate_alias with no category keeps an existing product's category; a new one gets other",
+          "[pg][product_registry][normalization]") {
+    PROD_SHARED(store, pool);
+    const auto a1 = yuzu::server::derive_curated_alias("windows", "SQL Server 2019 Standard",
+                                                       "Microsoft Corporation", "Microsoft",
+                                                       "SQL Server", "");
+    REQUIRE(a1.has_value());
+    REQUIRE(store.curate_alias("windows", *a1, "database", "sql_server").has_value());
+    const auto a2 = yuzu::server::derive_curated_alias("windows", "SQL Server 2022 Standard",
+                                                       "Microsoft Corporation", "Microsoft",
+                                                       "SQL Server", "");
+    REQUIRE(a2.has_value());
+    REQUIRE(store.curate_alias("windows", *a2, "", "").has_value());
+    auto prod = store.get_product("microsoft:sql server:standard");
+    REQUIRE(prod.has_value());
+    REQUIRE(prod->has_value());
+    CHECK((*prod)->category == "database"); // not reset to other
+    CHECK((*prod)->cpe_product == "sql_server");
+
+    const auto b = yuzu::server::derive_curated_alias("windows", "Widget Pro", "", "Acme",
+                                                      "Widget", "");
+    REQUIRE(b.has_value());
+    REQUIRE(store.curate_alias("windows", *b, "", "").has_value());
+    auto fresh = store.get_product(b->norm_key);
+    REQUIRE(fresh.has_value());
+    REQUIRE(fresh->has_value());
+    CHECK((*fresh)->category == "other");
+}
+
+TEST_CASE("replace_pack leaves curated aliases active and a curated product's category alone",
+          "[pg][product_registry][normalization]") {
+    PROD_SHARED(store, pool);
+    const auto old_pack = seed_pack();
+    REQUIRE(store.load_pack_if_empty(old_pack, "seed").has_value());
+
+    const auto alias = yuzu::server::derive_curated_alias("windows", "Contoso Studio Standard",
+                                                          "Contoso Ltd", "Contoso", "Studio", "");
+    REQUIRE(alias.has_value());
+    REQUIRE(store.curate_alias("windows", *alias, "runtime", "").has_value());
+
+    // A pack product a curator now owns: its category must survive the replace.
+    const auto kept = old_pack.rows.front();
+    const std::string want = kept.category == "runtime" ? "database" : "runtime";
+    curation_exec(pool, "UPDATE product_registry_store.products SET origin = 'curated', "
+                        "category = '" + want + "' WHERE norm_key = '" + kept.norm_key + "'");
+
+    auto out = store.replace_pack(next_pack("2099.12.2"), "tester");
+    REQUIRE(out.has_value());
+    CHECK(*out == yuzu::server::PackReplaceOutcome::replaced);
+
+    CHECK(curation_scalar(pool, "SELECT status FROM product_registry_store.product_aliases "
+                                "WHERE source = 'curated:windows'") == "active");
+    CHECK(curation_scalar(pool, "SELECT category FROM product_registry_store.products WHERE "
+                                "norm_key = '" + kept.norm_key + "'") == want);
+    CHECK(curation_scalar(pool, "SELECT origin FROM product_registry_store.products WHERE "
+                                "norm_key = '" + kept.norm_key + "'") == "curated");
 }

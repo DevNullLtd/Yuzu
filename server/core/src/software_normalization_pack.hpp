@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <string>
 #include <string_view>
@@ -98,6 +99,46 @@ struct ParsedPack {
         return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' ||
                c == '-' || c == '+';
     });
+}
+
+/// Strict UTF-8 (no overlong form, no surrogate, nothing above U+10FFFF). Postgres refuses
+/// anything else in a text parameter (22021), so a trust boundary turns it into a 400 first.
+[[nodiscard]] inline bool valid_utf8(std::string_view s) {
+    std::size_t i = 0;
+    while (i < s.size()) {
+        const auto b0 = static_cast<unsigned char>(s[i]);
+        std::size_t n = 0;
+        std::uint32_t cp = 0;
+        if (b0 < 0x80) {
+            ++i;
+            continue;
+        }
+        if (b0 >= 0xC2 && b0 <= 0xDF) {
+            n = 1;
+            cp = b0 & 0x1FU;
+        } else if (b0 >= 0xE0 && b0 <= 0xEF) {
+            n = 2;
+            cp = b0 & 0x0FU;
+        } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+            n = 3;
+            cp = b0 & 0x07U;
+        } else {
+            return false;
+        }
+        if (i + n >= s.size())
+            return false;
+        for (std::size_t k = 1; k <= n; ++k) {
+            const auto b = static_cast<unsigned char>(s[i + k]);
+            if ((b & 0xC0U) != 0x80U)
+                return false;
+            cp = (cp << 6) | (b & 0x3FU);
+        }
+        if ((n == 2 && cp < 0x800) || (n == 3 && cp < 0x10000) || cp > 0x10FFFF ||
+            (cp >= 0xD800 && cp <= 0xDFFF))
+            return false;
+        i += n + 1;
+    }
+    return true;
 }
 
 /// "-" and "." are CPE logical values (not applicable / any), never a product token.

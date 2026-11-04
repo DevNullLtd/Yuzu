@@ -33,8 +33,9 @@ namespace yuzu::server {
 /// Pure codecs for the opaque tokens the queue hands out (unit-tested without a store).
 namespace curation_keys {
 
-/// Decoded-size bound of a queue key: three fields of at most the title-triple bound.
-inline constexpr std::size_t kMaxKeyBytes = 2400;
+/// Decoded-size bound of a queue key: the title triple the queue admits sums to at most 2400
+/// bytes, plus the two 0x1F separators.
+inline constexpr std::size_t kMaxKeyBytes = 2402;
 
 struct Triple {
     std::string raw_name;
@@ -46,7 +47,8 @@ struct Triple {
 /// the 0x1F separator (the key could not be decoded back unambiguously).
 [[nodiscard]] std::optional<std::string> encode_key(const Triple& t);
 /// nullopt for anything `encode_key` could not have produced: non-canonical base64url, over
-/// `kMaxKeyBytes`, not exactly three fields, an empty raw_name or ecosystem.
+/// `kMaxKeyBytes`, not exactly three fields, an empty raw_name or ecosystem, a NUL byte, or
+/// invalid UTF-8 (Postgres cannot bind either).
 [[nodiscard]] std::optional<Triple> decode_key(std::string_view key);
 
 /// The keyset position as an opaque token: `base64url(device_count 0x1F <key fields>)`.

@@ -334,8 +334,9 @@ public:
     /// edition, no wildcard; the publisher key is the normalised publisher); `ecosystem` is the
     /// one `keys` was derived for (it selects the purl type). ONE transaction behind the blocking
     /// normalisation lock (the dimension invalidation contract), marking every title-dimension
-    /// row stale (`pack_version = ''`) in that same transaction. Returns the product id;
-    /// `unexpected(reason)` on any failure (nothing written).
+    /// row stale (`pack_version = ''`) in that same transaction. An empty `category` means "not
+    /// given": an existing product keeps its category, a new one gets `other`. Returns the product
+    /// id; `unexpected(reason)` on any failure (nothing written).
     [[nodiscard]] std::expected<std::int64_t, std::string>
     curate_alias(std::string_view ecosystem, const CuratedAliasKeys& keys,
                  std::string_view category, std::string_view cpe_product);
@@ -344,7 +345,9 @@ public:
     /// One transaction behind the pack lock AND the blocking normalisation lock: the singleton
     /// pack row is rewritten, every `pack:` alias is retired and its `pack_version` cleared, then
     /// the new pack's products and aliases are upserted (re-activating the ones it still carries),
-    /// and every title-dimension row is marked stale. `same_version` when the stored version
+    /// and every title-dimension row is marked stale. A product a curator owns
+    /// (`origin = 'curated'`) keeps its category and cpe_product; curated aliases are untouched.
+    /// `same_version` when the stored version
     /// already equals `pack.pack_version`. `unexpected(reason)` on any failure.
     [[nodiscard]] std::expected<PackReplaceOutcome, std::string>
     replace_pack(const ParsedPack& pack, std::string_view loaded_by);

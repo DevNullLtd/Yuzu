@@ -52,6 +52,8 @@ std::expected<ParsedPack, std::string> parse_normalization_pack(std::string_view
         return std::unexpected("pack exceeds kMaxPackBytes (" + std::to_string(kMaxPackBytes) + ")");
     if (csv.find('\0') != std::string_view::npos)
         return std::unexpected("pack contains a NUL byte");
+    if (!valid_utf8(csv))
+        return std::unexpected("pack is not valid UTF-8");
 
     ParsedPack out;
     std::set<std::tuple<std::string, std::string, std::string>> seen;
