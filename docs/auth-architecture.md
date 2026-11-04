@@ -3872,10 +3872,55 @@ campaign, the grant, the decision, the previous decision and `seq` (and `sod=pas
 it. Retention differs between the two records: a closed campaign and its history persist indefinitely, while audit
 rows are kept for the audit retention period (365 days by default), so after that period the campaign tables are
 the only on-database record of a decision unless the audit rows were exported. Nothing in Yuzu records a `DISABLE
-TRIGGER` or a `TRUNCATE`. Detection is outside the product: database statement logging or `pgaudit` (class `ddl`),
-and reconciling each grant's `decision_seq` against its history row count and against the `seq` values in the audit
-rows. The authorised data-redaction procedure (see the erasure statement under "Deliberate no-prune" above) also
-disables the triggers, and Yuzu does not audit it.
+TRIGGER` or a `TRUNCATE`. Detection is outside the product: database statement logging (`pgaudit` classes `ddl` and `write`, or
+`log_statement = mod`; `log_statement = ddl` and the `ddl` class alone do not log a `TRUNCATE` or the INSERT of a forged
+history row), and reconciling each grant's `decision_seq` against its history row count and against the `seq` values in
+the audit rows. The reconciliation is the check that does not depend on any logging having been enabled; the queries
+are under "Obtaining the full justification of a superseded decision" below. The authorised data-redaction procedure
+(see the erasure statement under "Deliberate no-prune" above) also disables the triggers, and Yuzu does not audit it.
+
+**Obtaining the full justification of a superseded decision.** The API and the Access page return a 64-character
+preview of a superseded entry, never the full record. The full text is in the table
+`access_review_store.access_review_attestation_history` (schema-qualified), one row per decision, with the key columns
+`campaign_id`, `principal_type`, `principal_id`, `role_name` and `seq`, and the columns `decision`,
+`previous_decision`, `reviewer`, `justification` and `decided_at_ms`. For one grant, in decision order:
+
+```sql
+SELECT seq, decision, previous_decision, reviewer, decided_at_ms, justification
+  FROM access_review_store.access_review_attestation_history
+ WHERE campaign_id = '<campaign id>' AND principal_type = 'user'
+   AND principal_id = '<principal id>' AND role_name = '<role name>'
+ ORDER BY seq;
+```
+
+To reconcile a campaign, list every grant whose `decision_seq` does not equal its number of history rows (or whose
+highest `seq` is not its `decision_seq`); an empty result is the expected answer:
+
+```sql
+SELECT a.principal_type, a.principal_id, a.role_name, a.decision_seq,
+       count(h.seq) AS history_rows, coalesce(max(h.seq), 0) AS highest_seq
+  FROM access_review_store.access_review_attestation a
+  LEFT JOIN access_review_store.access_review_attestation_history h
+    ON h.campaign_id = a.campaign_id AND h.principal_type = a.principal_type
+   AND h.principal_id = a.principal_id AND h.role_name = a.role_name
+ WHERE a.campaign_id = '<campaign id>'
+ GROUP BY a.principal_type, a.principal_id, a.role_name, a.decision_seq
+HAVING count(h.seq) <> a.decision_seq OR coalesce(max(h.seq), 0) <> a.decision_seq;
+```
+
+The audit side of the comparison is the `access_review.attested` and `access_review.flagged` rows, read with
+`GET /api/v1/audit` (`AuditLog:Read`) once per verb: `action=access_review.attested`, then
+`action=access_review.flagged`, each with `target_type=AccessReview` and `target_id=<campaign id>` (a result of up to
+1000 rows per request; page with `offset` or narrow with `since`/`until`). The `detail` of a success row carries
+`seq=<n>` and the grant, so a grant's `seq` values can be matched against its history rows; rows written before the
+build that introduced the history carry the earlier `target_id` shape and are not matched by that filter. Both
+queries were run for syntax and result against a throwaway PostgreSQL 18 database built from the schema DDL of
+migrations v1 to v3 (they returned the expected rows, and the reconciliation returned the grant after a history row was
+deleted with the guard trigger disabled); they were not run against a populated production database. Three caveats.
+This read is outside the product, and Yuzu does not audit it. It needs a database credential, the same trust class that
+could edit these rows, so it shows what the tables hold, not that they were never altered; the audit rows exported off
+the database and the reconciliation are the independent comparison. And the API and the Access page do not return the
+full text of a superseded decision at all: only this database read does.
 
 **Bounds.** `principal_type`, `principal_id` and `role_name` are 1 to 1024 bytes without a NUL byte (the
 longest ids the identity stores produce are about 520 bytes: `oidc:<iss>#<sub>` with each part capped at 255,
@@ -3901,21 +3946,26 @@ grant's latest also returns at most its first 64 characters of justification, cu
 characters, so on a UTF8 database a multibyte sequence is never split; see "Database encoding" below) and flagged by
 `justification_truncated`; the latest entry is whole and equals the state row. The full text of a superseded entry
 stays in the database and is not returned, so an export of it is a database read of
-`access_review_attestation_history`. A grant adds at most 99 entries of 64 characters plus one whole entry to a
-response, so a response is bounded by the per-grant ceiling times the number of frozen grants; there is no
-per-campaign budget and the number of frozen grants is not capped (an accepted limit).
+`access_review_attestation_history` (see "Obtaining the full justification of a superseded decision" above). A grant
+adds at most 99 entries of 64 characters plus one whole entry to a response, and the latest text appears twice (once
+in the grant's own `justification`, which is the state-row copy, and once as the latest `history` entry). The
+response therefore grows linearly with the number of frozen grants: the per-grant ceiling is a bound on one grant, not
+on the response, because there is no cap on the factor. There is no per-campaign budget and the number of frozen grants
+is not capped (an accepted limit).
 
 *Measured response sizes.* On 2026-11-04, on Linux (glibc), with a FRESH server process for each case (baseline
-server RSS about 107 MB), one `GET /api/v1/access-reviews/{id}` against a campaign of 1000 frozen grants with 100
+server peak RSS about 104 to 105 MB), one `GET /api/v1/access-reviews/{id}` against a campaign of 1000 frozen grants with 100
 decisions each (built by inserting rows directly into a throwaway database, not by 100,000 attest calls), with the
 64-character preview: 4096-character ASCII text gave a 32.3 MB response and a server peak (`VmHWM`) of about 331 MB;
 1024 four-byte (emoji) characters gave 51.3 MB and about 464 MB; 4096 control characters, each of which JSON escapes
 to six bytes, gave 105.0 MB and about 779 MB. 200 grants of ASCII text gave 6.47 MB and about 154 MB. For comparison,
 the same measurement with the former 512-character preview gave 76.7 MB and about 716 MB (ASCII) and 371.1 MB and
-about 2.4 GB (control characters). In these runs the server peak was roughly 7 to 10 times the response, which
-depends on the allocator. (A response is in units of 10^6 bytes and a peak is `VmHWM` divided by 1024, so the ratio is
-approximate.) The 64-character cases were run three times each, in fresh processes, and their peaks agreed within about
-1 percent; the 512-character comparison is one run per case. These are measurements on one host, not a guarantee.
+about 2.4 GB (control characters). For the three 1000-grant cases the server peak was about 7 to 10 times the response,
+baseline included (7.4, 9.0 and 10.2 times); the 200-grant case, which is mostly baseline, was about 24 times. The
+ratio depends on the allocator. (A response is in units of 10^6 bytes and a peak is `VmHWM` divided by 1024, so the
+ratios are approximate.) The 64-character cases were run three times each, in fresh processes, and their peaks agreed
+within about 1 percent; the 512-character comparison is one run per case. These are measurements on one host, not a
+guarantee.
 Reviewer ids of about 520 bytes would add about 50 MB (100,000 history entries of about 520 bytes each; an estimate,
 not measured, because the measured campaigns used short reviewer names).
 
@@ -3926,12 +3976,30 @@ no concurrency limit on the route itself, so each request in flight holds its ow
 puts its payload in the tool result twice (the `content` text and `structuredContent`), so its response is larger than
 the REST body (about 2.2 times by code reading, not measured). The Access page's own memory use was not measured. No
 shipped deployment configuration (the `deploy/docker` compose files, the `deploy/systemd` unit, the HA compose file)
-sets a memory limit, and the only shipped server-restart alert is `YuzuServerRestartLoop` (more than 3 resets in 3
-hours, `docs/prometheus/yuzu-alerts.yml`). Size the server's memory for several times the response per concurrent
-request, set an explicit memory limit above that, and alert on server memory and restarts yourself.
+sets a memory limit, and the only shipped server-restart alert is `YuzuServerRestartLoop` (more than 3 resets of
+`yuzu_server_uptime_seconds` in 3 hours, sustained for 15 minutes, `docs/prometheus/yuzu-alerts.yml`). One out-of-memory
+kill is one uptime reset, below that threshold, so that alert will not fire on a single kill. Size the server's memory
+for several times the response per concurrent request, set an explicit memory limit above that, and alert on server
+memory and restarts yourself. The server already exports its resident memory as `yuzu_server_memory_bytes{type="rss"}`
+on `/metrics`; it is a sampled gauge and the measured reads took about 2 to 3 seconds, so a scrape can miss the peak of
+one read.
 
-The Access page marks a cut entry "(truncated)" and never labels a pair
-in which either entry was cut as a re-recording, because a cut text cannot be shown equal to the next one. A successful attest answers `{recorded, decision_seq, previous_decision}`.
+*Scaling (scaled from the 1000-grant measurement, not measured).* The measured net cost (peak minus the baseline) was
+about 690 kB per grant for the control-character text and about 233 kB per grant for the ASCII text (about 368 kB for
+the four-byte characters); the 200-grant ASCII case gave about 257 kB per grant, so the cost is roughly linear in the
+number of grants over that range. On that scaling one request alone would reach 1 GiB of server memory at about 1,400
+frozen grants of control-character text or about 4,000 of ASCII text, and with several requests in flight the per-request
+costs are assumed to add: two concurrent reads at 1000 control-character grants would exceed 1 GiB. The assumption that
+concurrent peaks add, and the extrapolation beyond 1000 grants, were not measured. The only limit on how many such
+requests run at once is the server's shared HTTP worker pool; the route has no limit of its own, and the pool is not a
+memory bound.
+
+The Access page marks a cut entry "(truncated)" and never labels a pair in which either entry was cut as a
+re-recording, because a cut text cannot be shown equal to the next one. With a 64-character preview an earlier entry is
+cut whenever its justification is longer than 64 characters, so a lost-answer retry that appended an identical decision
+is labelled "superseded" rather than "re-recorded" on the Access page for any such justification; compare
+`decided_at_ms` and the full text with the database read above. A successful attest answers
+`{recorded, decision_seq, previous_decision}`.
 
 **Database encoding.** The truncation counts characters and assumes a UTF8-encoded database. The server neither
 checks nor sets the encoding. Measured on 2026-11-04: the image the compose files build from `Dockerfile.postgres`
@@ -3944,11 +4012,15 @@ entrypoint (`deploy/docker/ha-postgres/patroni-entrypoint.sh`) sets `encoding: U
 encoding of `template1`) and creates no cluster; only `setup-rhel9.sh` runs `initdb` (`postgresql-setup --initdb`),
 and it sets no encoding, so that cluster follows the host's locale, and a host in the `C` locale yields `SQL_ASCII`.
 To check, run `SHOW server_encoding;` in the Yuzu database: it must answer `UTF8`. A database in another encoding
-cannot be converted in place (`ALTER DATABASE` has no encoding option); create it correctly with
-`CREATE DATABASE yuzu OWNER yuzu ENCODING 'UTF8' TEMPLATE template0;` (verified on a `postgres:18` cluster initialised
-with the `C` locale; a cluster whose locale is not compatible with UTF8 may need locale options as well, not tested)
-and move the data across. On a database with a single-byte encoding `left()` counts bytes, so a cut can fall inside
-a multibyte sequence; what that does to the validity of the JSON response was not verified.
+cannot be converted in place (`ALTER DATABASE` has no encoding option). Back up first, then create a NEW database
+under a different name, for example
+`CREATE DATABASE yuzu_utf8 OWNER yuzu ENCODING 'UTF8' TEMPLATE template0;` (the same command against the existing
+name fails with "already exists"; the command was verified on a `postgres:18` cluster initialised with the `C` locale,
+and a cluster whose locale is not compatible with UTF8 may need locale options as well, not tested), move the data
+across, and repoint the server's DSN at the new database. A dump taken from a single-byte database can contain bytes
+that are not valid UTF8 and may need cleaning before it loads; that step was not verified in detail. On a database
+with a single-byte encoding `left()` counts bytes, so a cut can fall inside a multibyte sequence; what that does to
+the validity of the JSON response was not verified.
 
 **Frozen grants whose ids exceed 1024 bytes.** No known creation path produces an id longer than the limit, but a
 frozen grant whose `principal_id` or `role_name` exceeds 1024 bytes cannot be attested (`400`); it stays pending

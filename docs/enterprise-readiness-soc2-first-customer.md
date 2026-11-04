@@ -177,10 +177,15 @@ is refused. **Superseded justifications are shown truncated:** a history read re
 except a grant's latest, at most the first 64 characters of its justification, flagged by
 `justification_truncated`, so a campaign with many grants cannot make one response grow without bound
 (100 entries per grant alone would not bound it). The full text stays in the database; an assessor who
-needs it exports it with a database read of `access_review_attestation_history`, not through the API.
+needs it reads it from `access_review_store.access_review_attestation_history` in the database, not through the API;
+the API and the Access page show only the 64-character preview, the read is outside the product and Yuzu does not audit
+it, and it needs a database credential, the same trust class that could edit these rows (queries and caveats:
+`docs/auth-architecture.md`, "Obtaining the full justification of a superseded decision").
 **The history table is
 append-only against the application path and ordinary SQL, not against the application's database
-credential** (it owns the schema and could disable the guard, forge a matching row or truncate), a
+credential** (it owns the schema and could disable the guard, drop a trigger, replace the guard function, forge a matching row,
+truncate or drop the table; detection is outside the product, see `docs/auth-architecture.md`, Periodic access
+reviews, "Evidence outside these tables, and detection"), a
 role granted TRUNCATE, or a database administrator; the audit rows are evidence independent of
 these tables but not of the database credential (the audit store is in the same database and has
 no guard triggers), so they are independent of it only to the extent they are exported off the

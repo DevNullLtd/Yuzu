@@ -4134,6 +4134,11 @@ flag it for revocation. Covers all three RBAC principal types: **user**,
 > corresponding audit verb is recorded with `result=denied` and
 > `detail="engine_session_denied"`.
 
+**Response envelope.** Every successful JSON response of the access-review routes below is wrapped as
+`{"data": ..., "meta": {"api_version": "v1"}}`, and a body written in shorthand below is the content of `data` (where a
+shorthand names `data` and `meta` itself it is shown as written). The JSON export adds `pagination` and
+`rbac_enforcement` beside them; the CSV export (`?format=csv`) is not wrapped.
+
 **Grant-table-driven completeness.** The export and every campaign freeze
 are driven by the grant table, not a roster walk — a principal with **zero**
 role grants produces no row (the export answers "who currently has access",
@@ -4314,8 +4319,7 @@ id, or one carrying a NUL byte) is refused with `400` and the message
 store is read, and writes no audit row. The check runs after the permission
 gate, so a caller without the permission still gets the `403`.
 
-**Responses:** `200` — the body is wrapped like every other `/api/v1` read: `data` holds the
-object below and `meta` is `{"api_version": "v1"}`.
+**Responses:** `200`, the object below, in `data`, with `meta` as shown.
 
 ```json
 {
@@ -4356,9 +4360,14 @@ UTF8 database a multibyte character is never split; see "Database encoding" in
 `docs/auth-architecture.md`), and `justification_truncated` is `true`
 exactly when text was cut (always `false` for the latest entry and for a short
 one). The full text of an earlier entry stays in the database and is not
-returned by this call, which keeps the response bounded for a campaign with many
+returned by this call, which limits the response for a campaign with many
 grants: at most 100 entries per grant, and at most 64 characters of
-justification on all but the latest. To match your own earlier entry after a lost
+justification on all but the latest. The API and the Access page show only that
+preview of a superseded decision, never the full record; the full text is a
+database read of `access_review_store.access_review_attestation_history`
+(queries and caveats: "Obtaining the full justification of a superseded
+decision" in `docs/auth-architecture.md`; the read is outside the product and
+Yuzu does not audit it). To match your own earlier entry after a lost
 answer (see `POST .../attestations` below), compare its `justification` with the
 first 64 characters of what you sent. The response grows with every recorded
 decision, up to 100 per grant: `history[]` lists at most the latest 100 entries of

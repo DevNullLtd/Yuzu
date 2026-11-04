@@ -13,10 +13,10 @@ listed **MISSING**; Priority-2 item **13** — item 12 at the time this record
 was written, renumbered on 2026-07-25 when a duplicate `10` in that section
 was corrected).
 
-> **Addendum (2026-11-03, amended 2026-11-04).** The statements below that `record_attestation` is an UPSERT
+> **Addendum (2026-11-03, #4752, amended 2026-11-04).** The statements below that `record_attestation` is an UPSERT
 > that overwrites a prior decision (under "What shipped", and the `destructiveHint` rationale) are
 > superseded: every decision is now kept and the reviewer must differ from the subject of the
-> grant. See "Addendum (2026-11-03, amended 2026-11-04)" at the end of this document.
+> grant. See "Addendum (2026-11-03, #4752, amended 2026-11-04)" at the end of this document.
 
 ## What shipped
 
@@ -464,7 +464,7 @@ reference.
   or an external scheduler (e.g. a cron'd `open_access_review` MCP call)
   must drive the cadence today.
 
-## Addendum (2026-11-03, amended 2026-11-04): reviewer differs from the subject of the grant; every decision kept
+## Addendum (2026-11-03, #4752, amended 2026-11-04): reviewer differs from the subject of the grant; every decision kept
 
 **What changed.** The original design let a reviewer record a decision on a grant that named
 them, and a later decision on the same grant overwrote the earlier one. Now:
@@ -493,17 +493,19 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
   "Database encoding" in `docs/auth-architecture.md`), flagged by `justification_truncated`: the
   per-grant limit alone does not bound a campaign with many grants (100 x 4096 bytes x grants, about
   410 MB of text per copy at 1000 grants, held in several copies by the REST, MCP and page paths). With the
-  preview the response is bounded by the per-grant ceiling x the number of frozen grants; there is
-  no per-campaign budget and the frozen grant count is not capped (an accepted limit).
+  preview the response grows linearly with the number of frozen grants (the per-grant ceiling bounds one grant, not the
+  response, because there is no cap on the factor); there is no per-campaign budget and the frozen grant count is not
+  capped (an accepted limit).
 
-  Measured 2026-11-04 on Linux (glibc), with a FRESH server process per case (baseline server RSS about 107 MB),
+  Measured 2026-11-04 on Linux (glibc), with a FRESH server process per case (baseline server peak RSS about 104 to 105 MB),
   one `GET /api/v1/access-reviews/{id}` on a campaign of 1000 frozen grants with 100 decisions each (built by
   inserting rows directly into a throwaway database), with the 64-character preview: 4096-character ASCII text,
   a 32.3 MB response and a server peak (`VmHWM`) of about 331 MB; 1024 four-byte (emoji) characters, 51.3 MB and
   about 464 MB; 4096 control characters, each escaped by JSON to six bytes, 105.0 MB and about 779 MB. With 200
   grants of ASCII text: 6.47 MB and about 154 MB. The same measurement with the former 512-character preview gave
-  76.7 MB and about 716 MB (ASCII) and 371.1 MB and about 2.4 GB (control characters). The peak was roughly 7 to 10
-  times the response in these runs, allocator dependent. The 64-character cases were run three times each, in fresh
+  76.7 MB and about 716 MB (ASCII) and 371.1 MB and about 2.4 GB (control characters). For the three 1000-grant
+  cases the peak was about 7 to 10 times the response, baseline included (the 200-grant case, which is mostly
+  baseline, was about 24 times), allocator dependent. The 64-character cases were run three times each, in fresh
   processes, with peaks within about 1 percent of each other; the 512-character comparison is one run per case.
   They are measurements on one host, not a guarantee. About 50 MB more would be added by reviewer ids of about
   520 bytes (an estimate, not measured). The response is built whole in memory (the store result, the view
@@ -511,9 +513,11 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
   of its own, so each request in flight holds its own copies, and the MCP twin puts its payload in the result twice
   (about 2.2 times the REST body by code reading, not measured). The Access page's memory use was not measured. No
   shipped deployment configuration sets a memory limit and the only shipped server-restart alert is
-  `YuzuServerRestartLoop`; the sizing advice is in `docs/auth-architecture.md`, "The decision history". The full
-  text of a superseded entry stays in the database and is not returned; an assessor exports it with
-  a database read of `access_review_attestation_history`. A success answers `{recorded, decision_seq, previous_decision}`.
+  `YuzuServerRestartLoop`; the sizing advice, the scaled break-even and the existing `yuzu_server_memory_bytes{type="rss"}` metric are in
+  `docs/auth-architecture.md`, "The decision history". The full
+  text of a superseded entry stays in the database and is not returned; an assessor obtains it with
+  a database read of `access_review_store.access_review_attestation_history` (queries and caveats: "Obtaining the full
+  justification of a superseded decision" in `docs/auth-architecture.md`). A success answers `{recorded, decision_seq, previous_decision}`.
 - Audit shape: `target_id` is the campaign id alone and the grant is in `detail`, for every
   outcome that reaches the gate or the store (the refusal of an engine session and the
   unsupported-media-type refusal carry an empty `target_id`). Audit rows written before this
@@ -550,8 +554,9 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
    role granted TRUNCATE, or a database administrator. A data-only restore into a migrated schema
    is refused; restore schema and data together. On these tables the owner can also run `DISABLE TRIGGER USER`
    (`DISABLE TRIGGER ALL` is refused to a non-superuser) and `DROP TABLE`; nothing in Yuzu records either, or a
-   `TRUNCATE`, so detection is database statement logging or `pgaudit` plus reconciling each grant's `decision_seq`
-   with its history row count and the audit rows' `seq`. The audit rows are evidence independent of these tables,
+   `TRUNCATE`, so detection is database statement logging (`pgaudit` classes `ddl` and `write`, or `log_statement = mod`;
+   `ddl` alone does not log a `TRUNCATE`) plus reconciling each grant's `decision_seq` with its history row count and
+   the audit rows' `seq`; the reconciliation does not depend on logging. The audit rows are evidence independent of these tables,
    not of the database credential: the audit store is in the same database and has no guard triggers, so they are
    independent of it only to the extent audit rows are exported off the database. A closed campaign and its history
    persist indefinitely while audit rows are kept for the audit retention period (365 days by default), so after
@@ -583,6 +588,16 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
    characters), so match an earlier entry on those.
 6. Under a continuous stream of attestations a `close` can wait up to the pool's lock timeout and
    answer `503`; retry it.
+7. **Deliberate residual and intended direction (memory use of the history read).** The project owner
+   ruled on 2026-11-04 to cut the preview of a superseded entry to 64 characters as the immediate response to the
+   measured memory use of the history read (about 2.4 GB for the worst measured case with the former 512-character
+   preview). The remaining exposure is a recorded residual: there is no per-campaign budget, no cap on the number of
+   frozen grants, no concurrency limit on the route and no shipped memory limit, so the response and its memory still
+   grow linearly with the number of frozen grants and with the number of requests in flight (the scaled break-even is
+   in `docs/auth-architecture.md`, "The decision history", and is not measured). The structural options under
+   consideration are a per-grant history read (the campaign `GET` returning only each grant's latest decision), a
+   streamed or paged response, a per-campaign budget and a concurrency cap on heavy reads. None is decided and none is
+   scheduled by this record.
 
 **Deployment.** A database that holds a `user` grant decided by the account it names makes the
 server refuse to start (the schema v3 migration fails and the store does not open), on every boot,
