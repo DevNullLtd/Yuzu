@@ -63,9 +63,10 @@ static_assert(kMaxBlobBytes == kV3MaxBlobBytes && kMaxEntries == kV3MaxRows &&
 // source) — the same byte form the agent hashes (ADR-0016 §4), so the server
 // re-hash matches. Slots 13-14 (install_location, uninstall_string) are RESERVED on THIS
 // (v2) path: they are consumed to keep the positions but never stored or hashed, because
-// ADR-0016 §8 has not been re-opened for them (#5186). An agent that hashes real values there
-// gets need_full until the server accepts them. The blob-v3 `+` record (inventory_blob_v3.hpp)
-// is the path that stores slot 13; slot 14 stays reserved there too. A shorter record (v1
+// the v2 grammar was never re-classified for them (#5186). An agent that hashes real values
+// there gets need_full until the server accepts them. The blob-v3 `+` record
+// (inventory_blob_v3.hpp) is the path that stores slot 13, after ADR-0016 §8 was re-opened for
+// it in the v10 Update; slot 14 stays reserved there too. A shorter record (v1
 // 4-field, v2 12-field) parses fine: the token walk stops at the record's end, leaving the
 // remaining fields default-empty
 // (the documented mixed-version behaviour — an old agent's rows store with empty

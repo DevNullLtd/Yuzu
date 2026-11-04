@@ -235,7 +235,8 @@ const std::vector<pg::PgMigration>& migrations() {
         {7,
          // Extended row: package_id / source, plus install_id for keyset paging. The
          // install_location / uninstall_string wire slots (13-14) are reserved and not
-         // stored until ADR-0016 §8 is re-opened (#5186). The two TEXT columns follow the
+         // stored on the v2 path (#5186); the v3 path stores slot 13 under the §8 outcome
+         // recorded in the ADR-0016 v10 Update. The two TEXT columns follow the
          // v5 precedent (constant '' defaults are metadata-only, no rewrite). install_id BIGSERIAL
          // backfills existing rows via a table REWRITE under ACCESS EXCLUSIVE — one
          // sequential pass at server start over a table bounded at agents x kMaxEntries
