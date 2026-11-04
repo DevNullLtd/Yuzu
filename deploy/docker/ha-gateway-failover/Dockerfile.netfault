@@ -1,0 +1,9 @@
+# WS-13 13.0 spike - fault-injection sidecar. Joined to a gateway's network
+# namespace (`docker run --net container:<gw> --cap-add NET_ADMIN`) to apply
+# iptables DROP/REJECT rules inside that node's own namespace, and to capture
+# packets there, with no host root. Rig tooling only; never shipped.
+#
+#   docker build -t yuzu-spike-netfault:1 -f Dockerfile.netfault .
+FROM alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f
+RUN apk add --no-cache iptables tcpdump bash curl
+ENTRYPOINT ["/bin/bash"]
