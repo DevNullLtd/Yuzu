@@ -13,10 +13,14 @@
 #include "resolver_errors.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <sstream>
+#include <string_view>
 #include <cstdio>
 #include <cstdint>
 #include <functional>
@@ -568,8 +572,47 @@ TEST_CASE("NAT64 discovery: a failed or inconclusive refresh removes nothing; a 
         std::this_thread::sleep_for(10ms);
 }
 
-TEST_CASE("NAT64 discovery: a busy episode is reported once and ends at the next completed lookup",
+namespace {
+// Captures spdlog's default logger for one case (restored in the destructor). Every resolver worker
+// a case starts is drained before the capture ends, so no worker can log into a dead sink.
+class LogCapture {
+public:
+    LogCapture() : saved_(spdlog::default_logger()) {
+        auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(stream_);
+        auto logger = std::make_shared<spdlog::logger>("nat64_busy_capture", sink);
+        logger->set_level(spdlog::level::trace);
+        logger->set_pattern("%v");
+        spdlog::set_default_logger(logger);
+    }
+    ~LogCapture() { spdlog::set_default_logger(saved_); }
+    LogCapture(const LogCapture&) = delete;
+    LogCapture& operator=(const LogCapture&) = delete;
+    [[nodiscard]] std::size_t count(std::string_view needle) const {
+        const std::string text = stream_.str();
+        std::size_t n = 0;
+        for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1))
+            ++n;
+        return n;
+    }
+
+private:
+    std::ostringstream stream_;
+    std::shared_ptr<spdlog::logger> saved_;
+};
+
+constexpr std::string_view kBusyLine = "ipv4only.arpa lookup could not run or did not finish in time";
+constexpr std::string_view kEndedLine = "the busy episode ended";
+
+void drain(const std::shared_ptr<net::ResolverPool>& pool) {
+    for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i)
+        std::this_thread::sleep_for(10ms);
+    REQUIRE(pool->in_flight.load() == 0);
+}
+} // namespace
+
+TEST_CASE("NAT64 discovery: a busy episode logs ONE line, and a failed lookup ends it",
           "[bounded_resolver][nat64_discovery]") {
+    LogCapture log;
     DiscoveryRig rig;
     auto pool = std::make_shared<net::ResolverPool>(1);
     auto latch = std::make_shared<Latch>();
@@ -582,16 +625,51 @@ TEST_CASE("NAT64 discovery: a busy episode is reported once and ends at the next
     for (int i = 0; i < 3; ++i)
         CHECK(discover(kFullBudget, answering({kPref1}), rig.cache, pool).inconclusive);
     CHECK(rig.cache.stats.inconclusive.load() == before + 3); // every call is counted ...
+    CHECK(log.count(kBusyLine) == 1);                          // ... the episode is logged once
+    CHECK(log.count(kEndedLine) == 0);
+    latch->release();
+    drain(pool);
+    // A real FAILURE is a completed lookup: it ends the episode (and is not itself inconclusive).
+    const auto failed = discover(kFullBudget, failing(), rig.cache, pool);
+    CHECK_FALSE(failed.inconclusive);
+    CHECK(log.count(kEndedLine) == 1);
     {
         std::lock_guard lk(rig.cache.mu);
-        CHECK(rig.cache.busy_logged); // ... but the episode is logged once (the flag gates the line)
+        CHECK_FALSE(rig.cache.busy_logged);
     }
-    latch->release();
-    for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i)
-        std::this_thread::sleep_for(10ms);
-    REQUIRE(pool->in_flight.load() == 0);
+    // A second episode is logged again, once.
+    rig.expire();
+    auto latch2 = std::make_shared<Latch>();
+    const net::LookupFn blocked2 = [latch2](const std::string&) -> net::ResolveResult {
+        latch2->wait();
+        return {net::ResolveStatus::kOk, {}};
+    };
+    (void)net::bounded_resolve("blocker.example", 1ms, blocked2, pool);
+    CHECK(discover(kFullBudget, answering({kPref1}), rig.cache, pool).inconclusive);
+    CHECK(discover(kFullBudget, answering({kPref1}), rig.cache, pool).inconclusive);
+    CHECK(log.count(kBusyLine) == 2);
+    latch2->release();
+    drain(pool);
+}
+
+TEST_CASE("NAT64 discovery: a thrown flight is counted ONCE and opens a logged episode",
+          "[bounded_resolver][nat64_discovery]") {
+    LogCapture log;
+    DiscoveryRig rig;
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    // The throw lands after the lookup and BEFORE run_flight counts: the catch counts it.
+    rig.cache.test_fault_after_lookup = [] { throw std::bad_alloc(); };
+    const auto before_inc = rig.cache.stats.inconclusive.load();
+    const auto before_ans = rig.cache.stats.answered.load();
+    const auto thrown = discover(kFullBudget, answering({kPref1}), rig.cache, pool);
+    CHECK(thrown.inconclusive);
+    CHECK(rig.cache.stats.inconclusive.load() == before_inc + 1);
+    CHECK(rig.cache.stats.answered.load() == before_ans);
+    CHECK(log.count(kBusyLine) == 1);
+    drain(pool);
+    rig.cache.test_fault_after_lookup = nullptr;
     const auto fair = discover(kFullBudget, answering({kPref1}), rig.cache, pool);
     CHECK_FALSE(fair.inconclusive);
-    std::lock_guard lk(rig.cache.mu);
-    CHECK_FALSE(rig.cache.busy_logged); // a completed lookup ends the episode (recovery logged once)
+    CHECK(log.count(kEndedLine) == 1);
+    drain(pool);
 }

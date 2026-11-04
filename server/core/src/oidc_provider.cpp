@@ -1209,7 +1209,7 @@ discovered_nat64_prefixes(int dns_timeout_ms) {
         nat64_discovery_cache(), std::chrono::milliseconds{std::max(1, dns_timeout_ms)});
     // Only a real resolver failure is warned about here, and it is cached for the negative TTL, so
     // this is at most one line a minute. An INCONCLUSIVE call (busy pool, a waiter whose flight gave
-    // no answer) is not a failure and is recorded nowhere; the shared cache logs one warning per
+    // no answer) is not a failure and nothing is cached for it; the shared cache logs one warning per
     // busy episode and one line when it ends, so nothing is repeated per IPv6 vet.
     if (d.looked_up && !d.answered_now && !d.inconclusive)
         spdlog::warn("OIDC egress: the NAT64 prefix lookup (ipv4only.arpa) failed; IPv6 "

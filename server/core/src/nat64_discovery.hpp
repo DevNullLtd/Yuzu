@@ -143,7 +143,7 @@ inline void note_inconclusive(Nat64DiscoveryCache& cache) {
         return;
     cache.busy_logged = true;
     spdlog::warn("NAT64 discovery: the ipv4only.arpa lookup could not run or did not finish in "
-                 "time (busy resolver); IPv6 destinations are classified with the prefixes already "
+                 "time (busy resolver or internal error); IPv6 destinations are classified with the prefixes already "
                  "learned until a lookup completes. Logged once per episode.");
 }
 
@@ -156,7 +156,10 @@ inline void end_busy_episode(Nat64DiscoveryCache& cache) {
 }
 
 /// The leader's work: one lookup, then the merge into the cache. Runs under a FlightGuard.
-inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCache& cache) {
+/// `counted` is set once this call's outcome is in the stats, so a throw AFTER that point is not
+/// counted a second time by the caller's catch.
+inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCache& cache,
+                                 bool& counted) {
     namespace egress = ::yuzu::server::oidc::egress;
     std::vector<egress::Ipv6> answers;
     Nat64LookupOutcome outcome = Nat64LookupOutcome::kFailed;
@@ -193,6 +196,7 @@ inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCach
         note_inconclusive(cache);
         break;
     }
+    counted = true;
     if (outcome != Nat64LookupOutcome::kInconclusive)
         end_busy_episode(cache);
     if (outcome == Nat64LookupOutcome::kInconclusive) {
@@ -314,8 +318,9 @@ inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCach
         }
     }
     detail::FlightGuard flight(cache); // released on every exit below, including an exception
+    bool counted = false;
     try {
-        return detail::run_flight(lookup, cache);
+        return detail::run_flight(lookup, cache, counted);
     } catch (...) {
         // An allocation failure (or anything else) while parsing/merging: this call is
         // inconclusive; the guard clears the flight, so the next caller can look again. It must
@@ -327,7 +332,8 @@ inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCach
         d.inconclusive = true;
         try {
             std::lock_guard lock(cache.mu);
-            detail::note_inconclusive(cache);
+            if (!counted)
+                detail::note_inconclusive(cache);
             d.ever_answered = cache.ever_answered;
             d.overflowed = cache.overflowed;
             if (!cache.overflowed)
