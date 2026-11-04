@@ -892,8 +892,12 @@ advisory lock as the v2 replace):
   back to a full section, so nothing is lost. The `-` records are parsed and validated here and
   applied with the delta apply path.
 - *`component_inventory`.* Grammar-validated; its facet state is recorded with an empty section
-  hash (this store holds no component rows), so it never enters the report hash; a section that
-  carries records is nacked, a status-only one is a complete report.
+  hash (this store holds no component rows), so it never enters the report hash. The nack is keyed
+  on the section's STATUS, not on its record count: every `full` or `delta` component section is
+  answered `need_full`, including an honest-empty `full` one, and only a status-only one is a
+  complete report. An agent that reports the facet `full` therefore resends it on every cycle until
+  the component store lands. That is safe by the delivery order: the server's component apply ships
+  before any agent sends the section, so no fleet is left in the permanent resend.
 - *Refused sections.* A refused section is skipped before any write, so its previously held
   rows, facet state and section hash stay as they were, and the report hash still includes that
   held section hash. A facet the agent refuses permanently therefore keeps its old rows and is
@@ -1009,8 +1013,8 @@ labels.
 **Hand-off to the delta apply and the agent writer.** Two facts the next changes must carry.
 `instance_key` hashes the row's whole 16-slot record, so adding a slot to that record re-keys
 every stored row once; the weekly full floor bounds how long old and new keys coexist. Until the
-delta apply and the component store exist, every `delta` section and every `component_inventory`
-section that carries records is answered `need_full`; the agent writer's golden-vector parity
+delta apply and the component store exist, every `delta` section and every `full` or `delta`
+`component_inventory` section (even one with no records) is answered `need_full`; the agent writer's golden-vector parity
 test must reproduce the section hash, the report hash and the hash membership rule above
 byte for byte, including that a facet whose status moves from `full` to a status-only status
 (for example `disabled`) leaves the report hash while its rows are kept.

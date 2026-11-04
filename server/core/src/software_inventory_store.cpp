@@ -1228,8 +1228,9 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                                                  dur, bytes, ts_s});
                     if (up.status() != PGRES_COMMAND_OK)
                         return fail("facet upsert");
-                    // A component section that carries records is asked for again (no component
-                    // store yet); a status-only one is a complete report like any other.
+                    // A full or delta component section is asked for again whether or not it holds
+                    // records (the nack is keyed on status; no component store yet); a status-only
+                    // one is a complete report like any other.
                     done[i] = (component && v3_status_carries_rows(sec.status)) ? O::kNeedFull
                                                                                 : O::kStatusOnly;
                 }

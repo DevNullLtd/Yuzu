@@ -5168,9 +5168,10 @@ groups:
             treating this as an incident. A sustained ratio with no such change
             suggests hash drift or agents stuck in a resend cycle. Blob-v3 agents
             add one more source of need_full until the server can apply deltas and
-            store component rows: every delta section and every component_inventory
-            section that carries records is answered need_full, so a fleet of v3
-            agents reporting deltas raises this ratio without any hash drift.
+            store component rows: every delta section and every full or delta
+            component_inventory section (even one with no records) is answered
+            need_full, so a fleet of v3 agents reporting deltas or the component
+            facet raises this ratio without any hash drift.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventorySectionIngestRefused
         # Blob v3 (ADR-0016 Update 2026-11-04): a section the server refuses is nacked
