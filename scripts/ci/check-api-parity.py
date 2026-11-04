@@ -478,7 +478,7 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # 227 (origin/dev) -> 228 (Users and roles page): GET /fragments/access/enforcement has only the REST twin
 # GET /api/v1/me, which omits the unconfirmed (degraded) bit (`twinned-rest-only`). The MCP tool
 # get_me is the twin of the raw flag only, so this row needed the degraded-bit read tracked in
-# #6033 (since delivered: see the 212 -> 211 line below).
+# #6033 (since delivered: see the 210 -> 209 line below).
 #
 # 228 -> 225 (Seam PR2): the three hardware rows (get.fragments-hardware-list, -hardware-ci,
 # -hardware-quarantine) gained MCP twins (list_hardware_ci, get_hardware_ci, list_quarantined_devices).

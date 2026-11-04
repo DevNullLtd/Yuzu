@@ -234,7 +234,6 @@ Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only w
 
 <!-- END GENERATED -->
 
-
 ## See also
 
 - `docs/adr/0031-presentation-core-engine-decomposition.md` - INV-31-4, the
