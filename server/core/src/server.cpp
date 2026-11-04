@@ -19771,6 +19771,15 @@ private:
                             ? device_inventory_store_->get_device_ci(agent_id)
                             : std::expected<std::optional<DeviceCiRecord>, CiReadError>(
                                   std::unexpected(CiReadError::kDegraded));
+            // The v2 per-section statuses and rows (H.7): only for a FOUND v2 record - a v1 record,
+            // an absent one and a degraded read carry none, and the sections read is a second
+            // REPEATABLE READ transaction best not spent on them. A failure is KEPT as the error
+            // (the REST route 503s on it); it is never flattened to an empty list. Honest limit:
+            // this and `get_device_ci` above are two transactions, so a full replace landing
+            // between them can pair one generation's scalars with the next generation's sections
+            // (both are complete, valid records; the daily cadence makes it rare).
+            if (detail.ci && *detail.ci && (*detail.ci)->blob_version >= 2)
+                detail.ci_sections = device_inventory_store_->get_device_ci_sections(agent_id);
             if (software_inventory_store_) {
                 auto sw = software_inventory_store_->get_agent_software(agent_id);
                 if (sw) {

@@ -293,6 +293,37 @@ TEST_CASE("hw_row_matches: search finds a row by a key=value tag pair", "[hardwa
     CHECK(hw_row_matches(r, hw_search_tokens("team=platform"), "all", "all", ""));
 }
 
+TEST_CASE("hw_row_matches: search finds a row by asset tag, chassis serial or board serial",
+          "[hardware][model][search]") {
+    InventoryDeviceRow r = make_row("a1");
+    r.ci_chassis_asset_tag = "AT-0042-Z";
+    r.ci_chassis_serial = "CHS9X77";
+    r.ci_board_serial = "BRD-SN-5150";
+    CHECK(hw_row_matches(r, hw_search_tokens("at-0042-z"), "all", "all", "")); // case folded
+    CHECK(hw_row_matches(r, hw_search_tokens("CHS9X77"), "all", "all", ""));
+    CHECK(hw_row_matches(r, hw_search_tokens("brd-sn-5150"), "all", "all", ""));
+    CHECK(hw_row_matches(r, hw_search_tokens("chs9x"), "all", "all", "")); // substring, as the other fields
+    CHECK_FALSE(hw_row_matches(r, hw_search_tokens("no-such-tag"), "all", "all", ""));
+}
+
+// The agent writes `-` for "no value": it must never be a search term, so `q=-` finds nothing on a
+// row whose only hyphens are those placeholders. Kills: dropping the placeholder filter.
+TEST_CASE("hw_row_matches: the - placeholder in a v2 identifier is never searchable",
+          "[hardware][model][search]") {
+    InventoryDeviceRow r = make_row("a1");
+    r.ci_chassis_asset_tag = "-";
+    r.ci_chassis_serial = "-";
+    r.ci_board_serial = "-";
+    CHECK_FALSE(hw_row_matches(r, hw_search_tokens("-"), "all", "all", ""));
+    // the older sentinels stay filtered too
+    r.ci_chassis_asset_tag = "unknown";
+    r.ci_chassis_serial = "";
+    CHECK_FALSE(hw_row_matches(r, hw_search_tokens("unknown"), "all", "all", ""));
+    // and a real value next to a placeholder still matches
+    r.ci_board_serial = "REAL-1";
+    CHECK(hw_row_matches(r, hw_search_tokens("real-1"), "all", "all", ""));
+}
+
 // ── hardware_kpis ────────────────────────────────────────────────────────────
 
 TEST_CASE("hardware_kpis: total/online/offline/stale/with_ci over the full roster",
@@ -634,6 +665,204 @@ TEST_CASE("hardware_ci_json: software_last_seen distinguishes nullopt (degraded)
 
     d.software_last_seen = 1234567;
     CHECK(hardware_ci_json(d, 0)["software_last_seen"] == 1234567);
+}
+
+// ── hardware_ci_json: the v2 scalars and sections (H.7) ──────────────────────
+
+namespace {
+
+DeviceCiSection make_section(std::string kind, std::string level, std::string reason = "",
+                             std::vector<std::vector<std::string>> rows = {}) {
+    DeviceCiSection s;
+    s.kind = std::move(kind);
+    s.level = std::move(level);
+    s.reason = std::move(reason);
+    s.rows = std::move(rows);
+    return s;
+}
+
+HardwareCiDetail v2_detail(std::vector<DeviceCiSection> sections) {
+    HardwareCiDetail d;
+    DeviceCiRecord rec;
+    rec.blob_version = 2;
+    rec.chassis_type = "Laptop";
+    rec.chassis_serial = "CHS1";
+    rec.chassis_asset_tag = "AT1";
+    rec.chassis_source = "smbios";
+    rec.board_vendor = "Acme";
+    rec.board_product = "B450";
+    rec.board_serial = "BSN1";
+    rec.board_source = "smbios";
+    rec.machine_id_hash = "abcdef01";
+    rec.machine_id_algorithm = "sha256";
+    rec.machine_id_source = "etc_machine_id";
+    d.ci = std::optional<DeviceCiRecord>(rec);
+    d.ci_sections = std::move(sections);
+    return d;
+}
+
+const nlohmann::json& section_of(const nlohmann::json& j, std::string_view kind) {
+    static const nlohmann::json none;
+    for (const auto& s : j["ci"]["sections"])
+        if (s["kind"] == kind)
+            return s;
+    return none;
+}
+
+} // namespace
+
+TEST_CASE("hardware_ci_json: the v2 identity scalars are served and the - placeholder is null",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({});
+    const auto j = hardware_ci_json(d, 0);
+    CHECK(j["ci"]["chassis_type"] == "Laptop");
+    CHECK(j["ci"]["chassis_serial"] == "CHS1");
+    CHECK(j["ci"]["chassis_asset_tag"] == "AT1");
+    CHECK(j["ci"]["chassis_source"] == "smbios");
+    CHECK(j["ci"]["board_vendor"] == "Acme");
+    CHECK(j["ci"]["board_product"] == "B450");
+    CHECK(j["ci"]["board_serial"] == "BSN1");
+    CHECK(j["ci"]["board_source"] == "smbios");
+    CHECK(j["ci"]["machine_id_hash"] == "abcdef01");
+    CHECK(j["ci"]["machine_id_algorithm"] == "sha256");
+    CHECK(j["ci"]["machine_id_source"] == "etc_machine_id");
+
+    // A v1 record (every v2 scalar blank), an agent that sent `-`, and an `unknown` all read null.
+    HardwareCiDetail v1;
+    DeviceCiRecord rec;
+    rec.chassis_asset_tag = "-";
+    rec.chassis_serial = "unknown";
+    rec.machine_id_hash = "-";
+    v1.ci = std::optional<DeviceCiRecord>(rec);
+    const auto vj = hardware_ci_json(v1, 0);
+    for (const char* k : {"chassis_type", "chassis_serial", "chassis_asset_tag", "chassis_source", "board_vendor",
+                          "board_product", "board_serial", "board_source", "machine_id_hash",
+                          "machine_id_algorithm", "machine_id_source"}) {
+        INFO(k);
+        REQUIRE(vj["ci"].contains(k));
+        CHECK(vj["ci"][k].is_null());
+    }
+}
+
+TEST_CASE("hardware_ci_json: a clean ok list section serves its rows keyed by the declared columns",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({make_section("cpu", "ok", "", {{"0", "Xeon", "8", "16", "2400", "CPU0", "-"}}),
+                        make_section("disk", "ok", "", {{"0", "NVMe", "512", "ssd", "nvme"}})});
+    const auto j = hardware_ci_json(d, 0);
+    CHECK(j["sections_state"] == "found");
+    const auto& cpu = section_of(j, "cpu");
+    REQUIRE(cpu.is_object());
+    CHECK(cpu["status"] == "ok");
+    CHECK(cpu["complete"] == true);
+    CHECK(cpu["reason"].is_null());
+    CHECK(cpu["source"].is_null());
+    REQUIRE(cpu["rows"].size() == 1);
+    CHECK(cpu["rows"][0]["idx"] == "0");
+    CHECK(cpu["rows"][0]["model"] == "Xeon");
+    CHECK(cpu["rows"][0]["clock_mhz"] == "2400");
+    CHECK(cpu["rows"][0]["socket_designation"] == "CPU0");
+    CHECK(cpu["rows"][0]["stepping"].is_null()); // the `-` placeholder
+    CHECK(cpu["rows"][0].size() == 7);
+    CHECK(section_of(j, "disk")["rows"][0]["interface"] == "nvme");
+}
+
+// Kills: serving a constrained section as complete, or dropping its rows.
+TEST_CASE("hardware_ci_json: a constrained section is incomplete and keeps its rows",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({make_section("dimm", "constrained", "agent:partial;server_cap:64",
+                                     {{"A1", "8192", "DDR4", "3200", "Acme", "P1", "S1"}})});
+    const auto j = hardware_ci_json(d, 0);
+    const auto& dimm = section_of(j, "dimm");
+    CHECK(dimm["status"] == "constrained");
+    CHECK(dimm["complete"] == false);
+    CHECK(dimm["reason"] == "agent:partial;server_cap:64");
+    REQUIRE(dimm["rows"].size() == 1);
+    CHECK(dimm["rows"][0]["slot"] == "A1");
+    CHECK(dimm["rows"][0]["serial"] == "S1");
+}
+
+// Kills: rendering rows for a failed section.
+TEST_CASE("hardware_ci_json: unavailable and permission_denied sections carry the reason and no rows",
+          "[hardware][model][json][sections]") {
+    // Rows are stored here on purpose: the serialiser must withhold them regardless of what the
+    // store holds.
+    auto d = v2_detail({make_section("swap", "unavailable", "linux:planned", {{"/swap", "1024", "file"}}),
+                        make_section("volume", "permission_denied", "agent:denied", {{"C:", "C:\\", "d", "ntfs", "1", ""}}),
+                        make_section("topology", "mystery", "", {{"lvm", "vg0", "u", "m", ""}})});
+    const auto j = hardware_ci_json(d, 0);
+    const auto& swap = section_of(j, "swap");
+    CHECK(swap["status"] == "unavailable");
+    CHECK(swap["reason"] == "linux:planned");
+    CHECK(swap["complete"] == false);
+    CHECK(swap["rows"].is_array());
+    CHECK(swap["rows"].empty());
+    const auto& vol = section_of(j, "volume");
+    CHECK(vol["status"] == "permission_denied");
+    CHECK(vol["reason"] == "agent:denied");
+    CHECK(vol["complete"] == false);
+    CHECK(vol["rows"].empty());
+    // a level this server does not know is neither complete nor row-bearing
+    const auto& topo = section_of(j, "topology");
+    CHECK(topo["status"] == "mystery");
+    CHECK(topo["complete"] == false);
+    CHECK(topo["rows"].empty());
+}
+
+TEST_CASE("hardware_ci_json: status-only sections carry their *_source and never rows",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({make_section("chassis", "ok"), make_section("baseboard", "ok", "-"),
+                        make_section("machine_id", "constrained", "server:machine_id_shape")});
+    const auto j = hardware_ci_json(d, 0);
+    CHECK(section_of(j, "chassis")["source"] == "smbios");
+    CHECK(section_of(j, "baseboard")["source"] == "smbios");
+    CHECK(section_of(j, "baseboard")["reason"].is_null()); // `-` is "no reason"
+    CHECK(section_of(j, "machine_id")["source"] == "etc_machine_id");
+    CHECK(section_of(j, "machine_id")["complete"] == false);
+    for (const char* k : {"chassis", "baseboard", "machine_id"})
+        CHECK(section_of(j, k)["rows"].empty());
+}
+
+TEST_CASE("hardware_ci_json: sections are served in registry order whatever order they arrive in, "
+          "and an unregistered kind is never surfaced",
+          "[hardware][model][json][sections]") {
+    auto d = v2_detail({make_section("topology", "ok"), make_section("bogus", "ok"),
+                        make_section("cpu", "ok"), make_section("machine_id", "ok"),
+                        make_section("disk", "ok")});
+    const auto j = hardware_ci_json(d, 0);
+    std::vector<std::string> kinds;
+    for (const auto& s : j["ci"]["sections"])
+        kinds.push_back(s["kind"].get<std::string>());
+    CHECK(kinds == std::vector<std::string>{"machine_id", "cpu", "disk", "topology"});
+}
+
+// "Not reported" is not "has none": a v1 record reads absent with an empty list, a failed read
+// reads degraded with a null list, and the three states never collapse.
+TEST_CASE("hardware_ci_json: sections_state tells found, absent and degraded apart",
+          "[hardware][model][json][sections]") {
+    // v1 / nothing stored
+    const auto absent = hardware_ci_json(v2_detail({}), 0);
+    CHECK(absent["sections_state"] == "absent");
+    REQUIRE(absent["ci"]["sections"].is_array());
+    CHECK(absent["ci"]["sections"].empty());
+
+    // the sections read failed
+    auto failed = v2_detail({});
+    failed.ci_sections = std::unexpected(CiReadError::kDegraded);
+    CHECK(hardware_ci_sections_unreadable(failed));
+    const auto fj = hardware_ci_json(failed, 0);
+    CHECK(fj["sections_state"] == "degraded");
+    CHECK(fj["ci"]["sections"].is_null());
+
+    // the struct default (ci degraded, sections never read) reads degraded, not absent, and is not
+    // a sections-read failure (the record route keeps its per-part 200 for a degraded ci)
+    const HardwareCiDetail untouched;
+    CHECK_FALSE(hardware_ci_sections_unreadable(untouched));
+    CHECK(hardware_ci_json(untouched, 0)["sections_state"] == "degraded");
+
+    // ci readable but no record yet: nothing stored
+    HardwareCiDetail none;
+    none.ci = std::optional<DeviceCiRecord>{};
+    CHECK(hardware_ci_json(none, 0)["sections_state"] == "absent");
 }
 
 // ── #5531: the pure store-to-bit mappings server.cpp's closures delegate to ───

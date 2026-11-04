@@ -1772,6 +1772,122 @@ TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with a readabl
     }
 }
 
+// ───────────────────────── GET /api/v1/hardware/{id} — the v2 sections (H.7) ─────────────
+
+namespace {
+HardwareCiDetail v2_record_detail() {
+    HardwareCiDetail d;
+    d.identity = make_row("agent-x", "HOST-X", "linux", true);
+    DeviceCiRecord rec;
+    rec.blob_version = 2;
+    rec.chassis_serial = "CHS1";
+    rec.chassis_source = "smbios";
+    rec.machine_id_hash = "abcdef01";
+    d.ci = std::optional<DeviceCiRecord>(rec);
+    DeviceCiSection cpu;
+    cpu.kind = "cpu";
+    cpu.level = "constrained";
+    cpu.reason = "agent:partial";
+    cpu.rows = {{"0", "Xeon", "8", "16", "2400", "CPU0", ""}};
+    DeviceCiSection chassis;
+    chassis.kind = "chassis";
+    chassis.level = "ok";
+    d.ci_sections = std::vector<DeviceCiSection>{chassis, cpu};
+    d.software = std::vector<SoftwareEntry>{};
+    d.tags = std::vector<DeviceTag>{};
+    return d;
+}
+} // namespace
+
+TEST_CASE("route: GET /api/v1/hardware/{id} — serves the v2 scalars and sections, audited as a success",
+          "[hardware][route][rest][sections]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    auto res = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    const auto& data = body["data"];
+    CHECK(data["sections_state"] == "found");
+    CHECK(data["ci"]["chassis_serial"] == "CHS1");
+    CHECK(data["ci"]["machine_id_hash"] == "abcdef01");
+    CHECK(data["ci"]["board_serial"].is_null());
+    REQUIRE(data["ci"]["sections"].size() == 2);
+    CHECK(data["ci"]["sections"][0]["kind"] == "chassis");
+    CHECK(data["ci"]["sections"][0]["source"] == "smbios");
+    CHECK(data["ci"]["sections"][1]["kind"] == "cpu");
+    CHECK(data["ci"]["sections"][1]["complete"] == false); // constrained = incomplete
+    CHECK(data["ci"]["sections"][1]["rows"][0]["model"] == "Xeon");
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back() == "inventory.device.ci|success");
+}
+
+// Kills: flattening a failed sections read to an empty list (a 200 that reads "reports none").
+TEST_CASE("route: GET /api/v1/hardware/{id} — a failed sections read is 503 with a retry hint, never "
+          "an empty 200",
+          "[hardware][route][rest][sections]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    h.ci_detail.ci_sections = std::unexpected(CiReadError::kDegraded);
+    auto res = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["retry_after_ms"].get<int>() == 5000);
+    CHECK(body["error"]["message"].get<std::string>() == "hardware sections unavailable");
+    CHECK_FALSE(body.contains("data")); // nothing of the record leaks beside the 503
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back() == "inventory.device.ci|failure");
+    CHECK(contains(h.audit_details.back(), "state=sections unreadable"));
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed")); // control: the failure row persisted
+}
+
+// The new 503 composes with, and does not replace, the per-part degrade the schema documents: a
+// degraded ci (sections never read) and a v1 record (none stored) both stay a 200.
+TEST_CASE("route: GET /api/v1/hardware/{id} — a degraded ci or a v1 record with no sections stays a 200",
+          "[hardware][route][rest][sections]") {
+    {
+        HwHarness h;
+        h.ci_detail = v2_record_detail();
+        h.ci_detail.ci = std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+            std::unexpected(CiReadError::kDegraded));
+        h.ci_detail.ci_sections = std::vector<DeviceCiSection>{};
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body["data"]["ci_state"] == "degraded");
+        CHECK(body["data"]["sections_state"] == "degraded");
+    }
+    {
+        HwHarness h;
+        h.ci_detail = v2_record_detail();
+        h.ci_detail.ci_sections = std::vector<DeviceCiSection>{};
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body["data"]["sections_state"] == "absent");
+        REQUIRE(body["data"]["ci"]["sections"].is_array());
+        CHECK(body["data"]["ci"]["sections"].empty());
+    }
+}
+
+// The existence-oracle closure is unchanged: an out-of-scope id never reaches the sections arm.
+TEST_CASE("route: GET /api/v1/hardware/{id} — scope 404 precedes the sections 503",
+          "[hardware][route][rest][sections][security]") {
+    HwHarness h;
+    h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+    h.ci_detail = v2_record_detail();
+    h.ci_detail.ci_sections = std::unexpected(CiReadError::kDegraded);
+    auto res = h.sink.Get("/api/v1/hardware/agent-out");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(h.audits.empty());
+}
+
 // ───────────────────────── Containment UI hidden (kContainmentUi == false) ───────────
 // The quarantine surfaces are hidden on /hardware until the approval workflow lands; the
 // renderers, fragment routes, REST and MCP are untouched. These pin the hidden state.

@@ -36,6 +36,7 @@
 #include "audit_store.hpp"
 #include "auth_routes.hpp"
 #include "authz_gates.hpp"
+#include "device_ci_kinds.hpp"
 #include "hardware_list_model.hpp"
 #include "openapi_spec_access.hpp"
 #include "management_group_store.hpp"
@@ -404,6 +405,69 @@ TEST_CASE("REST hardware: the 200/202 bodies are typed in the OpenAPI spec and m
     REQUIRE(schemas.contains("HardwareCiRecord"));
     CHECK(keys_of(schemas["HardwareCiRecord"]["properties"]) == keys_of(rec["ci"]));
     CHECK(required_of(schemas["HardwareCiRecord"]) == keys_of(rec["ci"]));
+
+    // The v2 sections (H.7): the section element's schema keys are exactly the keys a served
+    // section carries, for every registered kind (status-only and list alike) and every level.
+    REQUIRE(schemas.contains("HardwareCiSection"));
+    HardwareCiDetail v2;
+    v2.identity = InventoryDeviceRow{};
+    v2.ci = std::optional<DeviceCiRecord>(DeviceCiRecord{});
+    std::vector<std::string> kinds;
+    for (const auto& def : kDeviceCiSections)
+        kinds.emplace_back(def.section);
+    std::vector<DeviceCiSection> all;
+    for (const auto& k : kinds) {
+        DeviceCiSection sec;
+        sec.kind = k;
+        sec.level = "constrained";
+        sec.reason = "r";
+        all.push_back(sec);
+    }
+    v2.ci_sections = all;
+    const auto v2j = hardware_ci_json(v2, 0);
+    REQUIRE(v2j["ci"]["sections"].size() == kDeviceCiSectionCount);
+    for (const auto& served : v2j["ci"]["sections"]) {
+        INFO(served["kind"].get<std::string>());
+        CHECK(keys_of(schemas["HardwareCiSection"]["properties"]) == keys_of(served));
+        CHECK(required_of(schemas["HardwareCiSection"]) == keys_of(served));
+    }
+    // The schema's kind enum is the registry, in registry order.
+    std::vector<std::string> enum_kinds;
+    for (const auto& k : schemas["HardwareCiSection"]["properties"]["kind"]["enum"])
+        enum_kinds.push_back(k.get<std::string>());
+    CHECK(enum_kinds == kinds);
+    // Every declared column of every list kind is named in the rows description, so a column
+    // added to the registry without the schema following fails here.
+    const auto rows_desc =
+        schemas["HardwareCiSection"]["properties"]["rows"]["items"]["description"].get<std::string>();
+    for (const auto& def : kDeviceCiSections) {
+        if (def.table == nullptr)
+            continue;
+        std::string_view cols = def.columns;
+        std::string_view col;
+        while (!cols.empty()) {
+            const auto comma = cols.find(',');
+            col = cols.substr(0, comma);
+            const std::string needle = std::string(def.section) + " ";
+            const auto at = rows_desc.find(needle);
+            INFO(def.section << "." << col);
+            REQUIRE(at != std::string::npos);
+            // the kind's own clause runs to the next ';'
+            const auto clause = rows_desc.substr(at, rows_desc.find(';', at) - at);
+            CHECK(clause.find(col) != std::string::npos);
+            if (comma == std::string_view::npos)
+                break;
+            cols.remove_prefix(comma + 1);
+        }
+    }
+    // sections and its state are the nullable / enumerated members the description promises.
+    CHECK(schemas["HardwareCiRecord"]["properties"]["sections"]["nullable"] == true);
+    CHECK(schemas["HardwareRecord"]["properties"]["sections_state"]["enum"] ==
+          nlohmann::json::array({"found", "absent", "degraded"}));
+
+    // The route documents the sections 503.
+    const auto& r503 = spec["paths"]["/hardware/{id}"]["get"]["responses"]["503"]["description"];
+    CHECK(r503.get<std::string>().find("sections could not be read") != std::string::npos);
 }
 
 // The per-group guides are for people reading /swagger. The default document, and so the MCP resource

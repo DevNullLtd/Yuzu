@@ -851,6 +851,24 @@ TEST_CASE("mcp hardware twins: every answer conforms to the published output sch
     sparse.software_last_seen.reset();
     t.ci_by_id["s"] = sparse;
     t.ci_by_id["d"] = HardwareCiDetail{};
+    // a v2 record with a populated, a constrained and a failed section, and one whose sections read failed
+    HardwareCiDetail v2 = full_detail("v2");
+    {
+        DeviceCiSection cpu;
+        cpu.kind = "cpu";
+        cpu.level = "constrained";
+        cpu.reason = "agent:partial";
+        cpu.rows = {{"0", "Xeon", "8", "16", "2400", "CPU0", ""}};
+        DeviceCiSection swap;
+        swap.kind = "swap";
+        swap.level = "unavailable";
+        swap.reason = "linux:planned";
+        v2.ci_sections = std::vector<DeviceCiSection>{cpu, swap};
+    }
+    t.ci_by_id["v2"] = v2;
+    HardwareCiDetail v2_failed = full_detail("v2f");
+    v2_failed.ci_sections = std::unexpected(CiReadError::kDegraded);
+    t.ci_by_id["v2f"] = v2_failed;
 
     auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
@@ -866,12 +884,20 @@ TEST_CASE("mcp hardware twins: every answer conforms to the published output sch
     }
     CHECK(schema_violation(list_schema, t.call("list_hardware_ci", {{"limit", 1}})
                                             ["result"]["structuredContent"]) == "");
-    for (const char* id : {"a", "s", "d"}) {
+    for (const char* id : {"a", "s", "d", "v2", "v2f"}) {
         INFO("device " << id);
         const json r = t.call("get_hardware_ci", {{"agent_id", id}});
         REQUIRE_FALSE(r.contains("error"));
         CHECK(schema_violation(get_schema, r["result"]["structuredContent"]) == "");
     }
+    // The twin serves a failed sections read as an explicit degraded state (REST answers 503
+    // there), never as an empty list.
+    const json failed = t.call("get_hardware_ci", {{"agent_id", "v2f"}})["result"]["structuredContent"];
+    CHECK(failed["sections_state"] == "degraded");
+    CHECK(failed["ci"]["sections"].is_null());
+    const json ok = t.call("get_hardware_ci", {{"agent_id", "v2"}})["result"]["structuredContent"];
+    CHECK(ok["sections_state"] == "found");
+    CHECK(ok["ci"]["sections"].size() == 2);
 }
 
 // ───────────────────────── audit row contents ──────────────────────────────────

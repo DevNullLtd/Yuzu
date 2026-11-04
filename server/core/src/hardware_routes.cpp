@@ -757,6 +757,21 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
+        if (hardware_ci_sections_unreadable(detail)) {
+            // The record's v2 sections (the REPEATABLE READ sections reader) could not be read:
+            // a store error is never an empty 200 (H.7). Unlike `ci` / `software` / `tags`, which
+            // degrade one part at a time, an unreadable sections read withholds the whole record -
+            // a body with `sections` blank would read as "this device reports none".
+            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.device.ci", "failure",
+                                                "Agent", agent_id,
+                                                "hardware CI record (REST) state=sections unreadable");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "hardware sections unavailable",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
+
         std::string state = !detail.ci.has_value() ? "store degraded"
                             : !detail.ci->has_value() ? "absent" : "found";
         if (detail.identity_degraded)

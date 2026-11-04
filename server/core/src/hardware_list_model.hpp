@@ -194,6 +194,13 @@ struct HardwareCiDetail {
     /// but the device may exist.
     bool identity_degraded{false};
     std::expected<std::optional<DeviceCiRecord>, CiReadError> ci{std::unexpected(CiReadError::kDegraded)};
+    /// The v2 per-section statuses and list rows (`DeviceInventoryStore::get_device_ci_sections`,
+    /// one REPEATABLE READ read), in registry order. An EMPTY value means "no section stored" (a v1
+    /// agent, a record that carries none, or `ci` itself not found/degraded so the read was not
+    /// made) - never "the device has none". An ERROR means the sections read itself failed: the
+    /// REST route answers 503 (`hardware_ci_sections_unreadable`) and a twin that still serves the
+    /// body reports `sections_state:"degraded"`, never an empty list. Default-constructed = empty.
+    std::expected<std::vector<DeviceCiSection>, CiReadError> ci_sections{};
     std::optional<std::vector<SoftwareEntry>> software; // nullopt = store degraded/unwired
     bool software_truncated{false};                     // capped at kHwSoftwareCap
     std::optional<std::vector<DeviceTag>> tags;          // nullopt = tag store degraded/unwired
@@ -270,8 +277,19 @@ enum class HardwareCiRead {
 /// record into `RosterUnreadable`.
 [[nodiscard]] HardwareCiRead classify_hardware_ci_read(const HardwareCiDetail& detail);
 
-/// `ci_state` and `identity_state` in the output are each one of "found" |
-/// "absent" | "degraded" — never inferred by the reader from a blank field.
+/// True iff the v2 sections read FAILED (not merely "nothing stored"). The REST record route maps
+/// it to a 503 with no body (a store error is never an empty 200, H.7); see `ci_sections`.
+[[nodiscard]] inline bool hardware_ci_sections_unreadable(const HardwareCiDetail& detail) noexcept {
+    return !detail.ci_sections.has_value();
+}
+
+/// `ci_state`, `sections_state` and `identity_state` in the output are each one of "found" |
+/// "absent" | "degraded" — never inferred by the reader from a blank field. `sections_state` is
+/// "degraded" when the sections read failed OR `ci` could not be read (so none was attempted),
+/// "absent" when nothing is stored (a v1 agent: NOT "the device has none"), else "found".
+/// Inside `ci`, `sections` is an array in registry order of `{kind, status, reason, source,
+/// complete, rows}`; `complete` is true only for status `ok`, and a section whose status is
+/// anything but `ok`/`constrained` carries its reason and NO rows.
 [[nodiscard]] nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t now_secs);
 
 } // namespace yuzu::server
