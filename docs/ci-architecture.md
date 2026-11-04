@@ -191,7 +191,7 @@ layout check fails when it should; a selftest failure fails the gate. A failure 
 older `Puppeteer` gate is warn-only). `/test` Phase 0b runs `scripts/test/ensure-puppeteer.sh`,
 which installs the Node dependencies and Chrome for Testing when absent and proves the browser
 launches headless; if it cannot, the run aborts before the build. A missing
-`tests/puppeteer/node_modules/puppeteer` at Phase 5 records FAIL, never SKIP. Shared mechanics are in `tests/puppeteer/lib/harness.mjs`;
+`tests/puppeteer/node_modules/puppeteer` at Phase 5 records FAIL, never SKIP. The same phase runs `scripts/test/ensure-gcovr.sh`, which installs the `gcovr` version `requirements-ci.in` pins (with `pipx`, Linux only) so the local coverage gate measures instead of recording WARN. Shared mechanics are in `tests/puppeteer/lib/harness.mjs`;
 `tests/puppeteer/README.md` covers running it by hand.
 
 ### Release re-publish guard (`release-guard`, #5282)

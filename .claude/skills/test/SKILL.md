@@ -57,7 +57,7 @@ Everything else (Phase 0 preflight, Phase 1 C++ + Erlang build, Phase 4 native s
 
 ```
 Phase 0 — Preflight             (toolchains, ports, disk, docker, init DB)
-Phase 0b — Browser tooling      (default/--full: npm ci + Chrome for Testing, proven to launch)
+Phase 0b — Test tooling         (default/--full: puppeteer + Chrome proven to launch; gcovr pinned as CI)
 Phase 1 — Build HEAD            (meson + rebar3 + docker build local :test images)
 Phase 2 — Upgrade Test          (latest release → HEAD: fixtures, migrate, verify)
 Phase 3 — OTA Agent Test        (--full only — Linux + Windows self-exec)
@@ -148,12 +148,16 @@ bash scripts/test/test-db-write.sh gate \
 [[ "$PRE_STATUS" == "FAIL" ]] && { bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED; exit 1; }
 ```
 
-### Phase 0b — Browser tooling (default and `--full`; skipped in `--quick`, which has no live stack)
+### Phase 0b — Test tooling (default and `--full`; skipped in `--quick`, which has no live stack)
 
 The two headless-browser gates in Phase 5 need Node dependencies and a Chrome for Testing binary
 that are not committed. `/test` installs them rather than skipping the gates: a gate that skips for
 want of a one-line install silently stops protecting the dashboard. The script is idempotent (a
 ready box only verifies), and it proves the browser LAUNCHES headless, not merely that a file exists.
+
+The coverage gate (Phase 7b, report-only in default mode) needs `gcovr`. `ensure-gcovr.sh` installs the
+version CI pins (`requirements-ci.in`) with `pipx`, because `pip3 install --user` fails on a distro
+Python that is externally managed. It does nothing off Linux, where the coverage gate does not measure.
 
 ```bash
 if [[ "$MODE" != "quick" ]]; then
@@ -166,6 +170,19 @@ if [[ "$MODE" != "quick" ]]; then
         --log "ensure-puppeteer.log"
     if [[ "$PPTR_STATUS" == "FAIL" ]]; then
         cat "$LOG_DIR/ensure-puppeteer.log"
+        bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED
+        exit 1
+    fi
+
+    GCOVR_START=$(date +%s)
+    bash scripts/test/ensure-gcovr.sh > "$LOG_DIR/ensure-gcovr.log" 2>&1 \
+        && GCOVR_STATUS=PASS || GCOVR_STATUS=FAIL
+    bash scripts/test/test-db-write.sh gate \
+        --run-id "$RUN_ID" --phase 0 --gate "gcovr install" \
+        --status "$GCOVR_STATUS" --duration $(( $(date +%s) - GCOVR_START )) \
+        --log "ensure-gcovr.log"
+    if [[ "$GCOVR_STATUS" == "FAIL" ]]; then
+        cat "$LOG_DIR/ensure-gcovr.log"
         bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED
         exit 1
     fi
