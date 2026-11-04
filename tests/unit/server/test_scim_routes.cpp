@@ -7074,10 +7074,13 @@ TEST_CASE("ScimRoutes: classify_role_read maps every AuthDB role-read outcome (#
 
     // Every AuthDBError value is either a store fault (is_store_unavailable) or Refused:
     // the classifier is exactly is_store_unavailable plus the role comparison.
-    static_assert(static_cast<unsigned>(AuthDBError::MfaEnrollmentCancelled) == 10,
+    static_assert(static_cast<unsigned>(AuthDBError::EntropyUnavailable) == 11,
                   "AuthDBError grew: extend the classify_role_read coverage loop and revisit "
                   "is_store_unavailable");
-    for (std::uint8_t v = 0; v <= static_cast<std::uint8_t>(AuthDBError::MfaEnrollmentCancelled);
+    // #6995: the loop now reaches EntropyUnavailable (11), which is_store_unavailable() accepts, so
+    // classify_role_read keeps failing it CLOSED (Unavailable). No role read can actually return it
+    // (only the MFA mint paths draw entropy); this pins the classifier for a future caller.
+    for (std::uint8_t v = 0; v <= static_cast<std::uint8_t>(AuthDBError::EntropyUnavailable);
          ++v) {
         const auto e = static_cast<AuthDBError>(v);
         const auto verdict = classify_role_read(Read{std::unexpected(e)});
