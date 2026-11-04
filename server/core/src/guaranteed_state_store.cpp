@@ -68,7 +68,7 @@ constexpr const char* kReasonConcurrencyBudget = "concurrency_budget";
 // family (dex_read<>/dex_observation, fail-soft — an empty/degraded result
 // is returned to the caller), "guardian_rules" for the AUTHORITATIVE
 // rule/status reads (get_rule/list_rules/agent_rule_statuses*/rule_names*/
-// errored_rule_count, fail-hard — a std::expected error is returned and the
+// errored_rule_count/uncertain_rule_count, fail-hard — a std::expected error is returned and the
 // caller decides how to fail) (#4856), and "guardian_census" (below). All
 // bump the SAME counter, yuzu_server_guardian_read_degrade_total{reason,source},
 // so an alert can aggregate `by (reason, source)` without missing any family.
