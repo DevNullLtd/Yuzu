@@ -64,7 +64,7 @@ constexpr const char* kReasonConcurrencyBudget = "concurrency_budget";
 // yuzu_inventory_read_degrade_total{reason, source} family — a constant
 // "source" so a future second Guardian-adjacent read-degrade emitter stays
 // distinguishable on the same dashboards without a metric rename. Two
-// sources exist today (#4856): "guardian_state" for the DEX/observation
+// sources exist today (#4856, plus "guardian_census" below): "guardian_state" for the DEX/observation
 // family (dex_read<>/dex_observation, fail-soft — an empty/degraded result
 // is returned to the caller) and "guardian_rules" for the AUTHORITATIVE
 // rule/status reads (get_rule/list_rules/agent_rule_statuses*/rule_names*/
@@ -74,6 +74,11 @@ constexpr const char* kReasonConcurrencyBudget = "concurrency_budget";
 // aggregate `by (reason, source)` without missing either family.
 constexpr const char* kDegradeSource = "guardian_state";
 constexpr const char* kDegradeSourceRules = "guardian_rules";
+// The census pending-evidence count read (pending_projection_count_checked,
+// #5690) is a third source on the same counter: it is neither a DEX read nor
+// an authoritative rule/status read, and a failure leaves the published gauge
+// at its previous value, so it gets its own label to be told apart.
+constexpr const char* kDegradeSourceCensus = "guardian_census";
 // Sample the per-site degrade WARN so a sustained PG outage cannot flood the
 // log — the counter is the continuous signal, the log a sampled breadcrumb.
 // Mirrors InventoryStore's constants.
@@ -3510,7 +3515,7 @@ std::expected<std::size_t, std::string> GuaranteedStateStore::rule_count_checked
 std::expected<std::int64_t, std::string> GuaranteedStateStore::pending_projection_count_checked() const {
     static DegradeSampler sampler;
     if (!open_) {
-        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSource,
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSourceCensus,
                                               sampler);
             d.should_log)
             spdlog::warn("GuaranteedStateStore::pending_projection_count_checked: store not open");
@@ -3518,7 +3523,7 @@ std::expected<std::int64_t, std::string> GuaranteedStateStore::pending_projectio
     }
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
-        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSource,
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSourceCensus,
                                               sampler);
             d.should_log)
             spdlog::warn("GuaranteedStateStore::pending_projection_count_checked: pool acquire "
@@ -3530,7 +3535,8 @@ std::expected<std::int64_t, std::string> GuaranteedStateStore::pending_projectio
     if (begin.status() != PGRES_COMMAND_OK) {
         // Counted like every other failed read here: the gauge keeps its previous value on a
         // failure, so this counter is how a stale reading is told from a quiet one.
-        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSource, sampler);
+        if (const auto d =
+                note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceCensus, sampler);
             d.should_log)
             spdlog::warn("GuaranteedStateStore::pending_projection_count_checked: BEGIN failed: {}",
                          ::yuzu::log_key_token(PQerrorMessage(conn)));
@@ -3547,7 +3553,8 @@ std::expected<std::int64_t, std::string> GuaranteedStateStore::pending_projectio
                               std::vector<std::string>{})
             : std::move(timeout);
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
-        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSource, sampler);
+        if (const auto d =
+                note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceCensus, sampler);
             d.should_log)
             spdlog::warn("GuaranteedStateStore::pending_projection_count_checked: query failed: {}",
                          ::yuzu::log_key_token(PQresultErrorMessage(res.get())));

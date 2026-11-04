@@ -4168,7 +4168,9 @@ groups:
       # with no alert referencing it, so a sustained read degrade silently
       # turned device compliance scores "healthy" (the DEX-score fail-open
       # this counter's guardian_state source also covers) and paged nobody.
-      # Two sources on the SAME counter, both keyed by reason
+      # Three sources on the SAME counter (guardian_census, #5690, is the census
+      # pending-evidence count read: it serves no empty result, its gauge keeps
+      # its last value), each keyed by reason
       # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
       # on guardian_state for the Apps list's in-flight budget): "guardian_state"
       # is the DEX/observation family (dex_read<>/dex_observation) - these
@@ -4198,8 +4200,8 @@ groups:
             - callers keep serving an empty/partial result, so this counter and the sampled
             warn log are the only external tell; do not read a "healthy"
             device compliance score as authoritative while this fires (#4855).
-            source="guardian_state" also counts a failed census pending-evidence
-            count read (#5690), which only freezes the
+            source="guardian_census" means the census pending-evidence count
+            read (#5690) failed, which only freezes the
             yuzu_server_guardian_census_pending_events gauge at its last value.
             source="guardian_rules" means an AUTHORITATIVE rule/status read
             (get_rule/list_rules/agent_rule_statuses/rule_names/

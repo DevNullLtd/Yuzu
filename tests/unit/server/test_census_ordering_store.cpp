@@ -897,13 +897,21 @@ TEST_CASE("census ordering: the pending gauge counts stored evidence and reports
     closed.set_metrics(&metrics);
     CHECK_FALSE(closed.pending_projection_count_checked().has_value());
     // A failed read is counted as a read degrade; only the reason depends on how the pool fails.
-    double degrades = 0;
-    for (const char* reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
-        degrades += metrics
-                        .counter("yuzu_server_guardian_read_degrade_total",
-                                 {{"reason", reason}, {"source", "guardian_state"}})
-                        .value();
-    CHECK(degrades >= 1);
+    // It is attributed to its own source, not to the DEX family.
+    double census = 0;
+    double dex = 0;
+    for (const char* reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
+        census += metrics
+                      .counter("yuzu_server_guardian_read_degrade_total",
+                               {{"reason", reason}, {"source", "guardian_census"}})
+                      .value();
+        dex += metrics
+                   .counter("yuzu_server_guardian_read_degrade_total",
+                            {{"reason", reason}, {"source", "guardian_state"}})
+                   .value();
+    }
+    CHECK(census >= 1);
+    CHECK(dex == 0);
 }
 
 TEST_CASE("census ordering: the reaper keeps an expired event that still carries pending evidence",
@@ -1246,6 +1254,54 @@ TEST_CASE("census ordering: a repair projects from the stored inputs and keeps a
                                      ".guaranteed_state_events WHERE event_id = 'h'") == "t");
     CHECK(query_scalar(db.dsn(), std::string("SELECT projection_pending FROM ") + kSchema +
                                      ".guaranteed_state_events WHERE event_id = 'l'") == "f");
+}
+
+TEST_CASE("census ordering: a recovery repair that lowers the key leaves a higher-key pending peer pending",
+          "[pg][guaranteed_state_store][db][census][ordering][stale][k]") {
+    // Ruled (architect, 2026-11-04): a repair retires only the evidence the verdict it applied
+    // dominates, and recovery lowers the key. The peer S sits between the repaired event I and the
+    // mark, so it stays pending: retiring it would drop the only record that its verdict was never
+    // applied. Redelivering S later then orders by key again, still flagged.
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase + 1000)).outcome ==
+            EventInsertOutcome::Inserted);
+    install_census_fail(db.dsn(), "true");
+    const auto s_ev = ev("s", "r1", "a", kErrored, kBase + 700);     // seq 2, key 700: below the mark
+    const auto i_ev = ev("i", "r1", "a", kCompliant, kBase + 500);   // seq 3, key 500: lower still
+    REQUIRE(store.insert_event_classified(s_ev).outcome == EventInsertOutcome::Inserted);
+    REQUIRE(store.insert_event_classified(i_ev).outcome == EventInsertOutcome::Inserted);
+    remove_census_fail(db.dsn());
+    CHECK(pending_count(db.dsn()) == "2");
+    // Age the mark past the hour so recovery lets the later arrival apply by arrival.
+    exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
+                           ".guardian_agent_rule_status SET hwm_recv_ns = hwm_recv_ns - "
+                           "3700000000000 WHERE agent_id = 'a' AND rule_id = 'r1'");
+
+    auto redelivered = i_ev;
+    redelivered.agent_ns = 0;
+    redelivered.received_ns = 1;
+    REQUIRE(store.insert_event_classified(redelivered).outcome == EventInsertOutcome::Redelivered);
+    CHECK(census(db.dsn(), "a", "r1") ==
+          "compliant|" + key_str(kBase + 500) + "|" + key_str(kBase + 1000) + "|true");
+    const auto pending_of = [&](const char* id) {
+        return query_scalar(db.dsn(), std::string("SELECT projection_pending FROM ") + kSchema +
+                                          ".guaranteed_state_events WHERE event_id = '" + id + "'");
+    };
+    CHECK(pending_of("i") == "f");
+    CHECK(pending_of("s") == "t");
+
+    // S's own redelivery orders by key above the recovered verdict and stays flagged.
+    auto s_again = s_ev;
+    s_again.agent_ns = 0;
+    s_again.received_ns = 1;
+    REQUIRE(store.insert_event_classified(s_again).outcome == EventInsertOutcome::Redelivered);
+    CHECK(census(db.dsn(), "a", "r1") ==
+          "errored|" + key_str(kBase + 700) + "|" + key_str(kBase + 1000) + "|true");
+    CHECK(pending_of("s") == "f");
 }
 
 TEST_CASE("census ordering: two failed projections with no census row at all keep the disagreement",

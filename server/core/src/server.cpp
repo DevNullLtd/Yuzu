@@ -4077,7 +4077,8 @@ public:
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
-        // #4856: two sources share this counter, both by reason
+        // #4856: sources share this counter ("guardian_census" added for the census
+        // pending-evidence count read, #5690), each by reason
         // (store_not_open/pool_acquire_timeout/query_error) — "guardian_state"
         // is the DEX/observation family (dex_read<>/dex_observation, fail-soft:
         // the caller gets an empty/degraded result and keeps serving); "guardian_rules"
@@ -4095,12 +4096,13 @@ public:
                           "concurrency_budget for a guardian_state read refused over its "
                           "in-flight budget) and source "
                           "(guardian_state = DEX/observation reads, fail-soft, empty result "
-                          "served, plus the census pending-evidence count read, whose gauge "
-                          "keeps its last value; guardian_rules = authoritative rule/status reads, fail-hard, "
-                          "push/reconcile aborts rather than fans out empty). A sampled warn "
+                          "served; guardian_rules = authoritative rule/status reads, fail-hard, "
+                          "push/reconcile aborts rather than fans out empty; guardian_census = "
+                          "the census pending-evidence count read, whose gauge keeps its last "
+                          "value). A sampled warn "
                           "accompanies each new degrade episode.",
                           "counter");
-        for (const auto source : {"guardian_state", "guardian_rules"})
+        for (const auto source : {"guardian_state", "guardian_rules", "guardian_census"})
             for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
                 metrics_.counter("yuzu_server_guardian_read_degrade_total",
                                  {{"reason", reason}, {"source", source}});
