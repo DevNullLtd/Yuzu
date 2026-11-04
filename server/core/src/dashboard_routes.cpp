@@ -7,7 +7,7 @@
 #include "mcp_input_bounds.hpp"    // kExecInstrScopeMaxLen
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500), kReasonDestructiveUntargeted
 #include "forensics_read_audit.hpp" // #4990: response.forensics.read
-#include "rest_audit.hpp" // detail::try_persist_audit (E-1: audit-before-dispatch)
+#include "rest_audit.hpp" // detail::try_persist_audit / emit_behavioral_audit (#3619)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, make_correlation_id (#4027 REST twin)
 #include "echo_tree_routes.hpp" // EchoRetentionPausedScan/EchoPausedSourceRow/echo_retention_paused_json (#4027)
 
@@ -136,6 +136,13 @@ static std::string refusal_toast_header(const char* message) {
     return trigger.dump(-1, ' ', true, nlohmann::ordered_json::error_handler_t::replace);
 }
 
+/// The Echo re-enable/purge refusal when the `attempted` audit row cannot be stored (#3619): the
+/// body text and the toast (htmx does not swap a 5xx body on the Echo page, so the toast is what
+/// the operator sees).
+static constexpr const char* kEchoAuditRefusal =
+    "The audit record could not be stored, so nothing was sent. Retry once the audit store "
+    "recovers.";
+
 /// The refusal sentence for a group set cut by the read cap (toast and body say the same thing).
 static constexpr const char* kGroupPartialRefusal =
     "The result set was cut by the read cap, so the agent list is partial. "
@@ -246,7 +253,8 @@ bool DashboardRoutes::audit_attempted(const httplib::Request& req, httplib::Resp
                                                        target_type, target_id, detail_text))
         return true;
     res.status = 503;
-    res.set_header("Sec-Audit-Failed", "true");
+    if (!res.has_header("Sec-Audit-Failed")) // a set-and-proceed row may already have set it
+        res.set_header("Sec-Audit-Failed", "true");
     if (toast)
         res.set_header("HX-Trigger", refusal_toast_header(toast));
     res.set_content(refusal_html, "text/html; charset=utf-8");
@@ -359,12 +367,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
         metrics_->describe(
             "yuzu_echo_source_reenable_total",
             "Operator-triggered Echo source re-enable attempts by result "
-            "(success / scope_violation / agent_not_connected / denied / invalid_input).",
+            "(success / scope_violation / agent_not_connected / denied / invalid_input / "
+            "audit_unavailable).",
             "counter");
         metrics_->describe(
             "yuzu_echo_source_purge_total",
             "Operator-triggered Echo retention-paused source purge (destructive) attempts by "
-            "result (success / scope_violation / agent_not_connected / denied / invalid_input). "
+            "result (success / scope_violation / agent_not_connected / denied / invalid_input / "
+            "audit_unavailable). "
             "Counts DISPATCH outcomes; the agent's rows_deleted / source_not_paused outcome is in "
             "the command response record.",
             "counter");
@@ -964,6 +974,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  mg.created_by = session->username;
                  auto group_result = mgmt_group_store_->create_group(mg);
                  if (!group_result) {
+                     // The attempted row above is stored, so it gets an outcome (#3619).
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "", "create_failed");
                      res.status = 500;
                      res.set_content(
                          "<span class=\"feedback-error\">"
@@ -1526,8 +1539,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                       onbehalf::sanitize_for_log(target_expression, 256);
                      else if (!agent_ids.empty())
                          attempted += " agents=" + std::to_string(agent_ids.size());
-                     else
+                     else if (!scope_expr.empty())
                          attempted += " scope=" + onbehalf::sanitize_for_log(scope_expr, 256);
+                     else // no `scope` field at all: the fleet by omission
+                         attempted += " scope=" + std::string(yuzu::server::kBroadcastScope);
                      if (!audit_attempted(
                              req, res, "command.dispatch", "command", "", attempted,
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -2312,10 +2327,18 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // the dispatch; every refusal above returned first (none burns a row).
                  if (!audit_attempted(req, res, "echo.source.reenable", "command", "",
                                       std::format("device={} source={}", device_id, source),
-                                      "<span class=\"echo-row-error\""
-                                      " data-reason=\"audit_unavailable\">The audit record "
-                                      "could not be stored, so nothing was sent.</span>"))
+                                      std::string("<span class=\"echo-row-error\""
+                                                  " data-reason=\"audit_unavailable\">") +
+                                          kEchoAuditRefusal + "</span>",
+                                      kEchoAuditRefusal)) {
+                     // A counted exit like every other one here, under its own value: this
+                     // is an audit outage, not an RBAC refusal (`denied`).
+                     if (metrics_) {
+                         metrics_->counter("yuzu_echo_source_reenable_total",
+                                           {{"result", "audit_unavailable"}}).increment();
+                     }
                      return;
+                 }
 
                  std::unordered_map<std::string, std::string> params;
                  params[std::format("{}_enabled", source)] = "true";
@@ -2493,10 +2516,18 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // a row).
                  if (!audit_attempted(req, res, "echo.source.purge", "command", "",
                                       std::format("device={} source={}", device_id, source),
-                                      "<span class=\"echo-row-error\""
-                                      " data-reason=\"audit_unavailable\">The audit record "
-                                      "could not be stored, so nothing was sent.</span>"))
+                                      std::string("<span class=\"echo-row-error\""
+                                                  " data-reason=\"audit_unavailable\">") +
+                                          kEchoAuditRefusal + "</span>",
+                                      kEchoAuditRefusal)) {
+                     // A counted exit like every other one here, under its own value: this
+                     // is an audit outage, not an RBAC refusal (`denied`).
+                     if (metrics_) {
+                         metrics_->counter("yuzu_echo_source_purge_total",
+                                           {{"result", "audit_unavailable"}}).increment();
+                     }
                      return;
+                 }
 
                  std::unordered_map<std::string, std::string> params;
                  params["source"] = source;

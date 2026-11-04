@@ -675,3 +675,25 @@ TEST_CASE("dashboard execute: a same-site cookie-session write passes the gate",
     CHECK(h.calls.size() == 1);
     CHECK(h.rows("csrf.denied", "denied") == 0);
 }
+
+TEST_CASE("dashboard execute audit (#3619): a plain send that reaches no agent records an "
+          "attempted row and a failure outcome",
+          "[server][dashboard][execute][audit][3619]") {
+    // qe-1 / CH-7: before #3619 only an expression send wrote the zero-reach failure row.
+    // Restoring that expression-only guard must turn this case red. hp-1: a send with NO
+    // `scope` field is the fleet by omission, and its attempted row says so.
+    Harness h;
+    h.sent = 0;
+    h.post("instruction=version");
+    REQUIRE(h.persisted.size() == 1);
+    CHECK(h.persisted[0].result == "attempted");
+    CHECK(h.persisted[0].detail == "os_info:os_version scope=__all__");
+    CHECK(h.order == std::vector<std::string>{"audit:attempted", "dispatch"});
+    int failures = 0;
+    for (const auto& a : h.audits)
+        if (a.action == "command.dispatch" && a.result == "failure") {
+            ++failures;
+            CHECK(a.detail == "reason=no_agents_reached");
+        }
+    CHECK(failures == 1);
+}

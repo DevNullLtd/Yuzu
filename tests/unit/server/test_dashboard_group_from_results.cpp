@@ -79,6 +79,7 @@
 
 #include "agent.pb.h"
 
+#include <cstdint>
 #include <ctime>
 #include <functional>
 #include <initializer_list>
@@ -1455,6 +1456,22 @@ TEST_CASE("group-from-results: a Search term needs the results table's Response:
 // audited answer from an unaudited one.
 
 namespace {
+/// The group route's audit refusal, verbatim (dashboard_routes.cpp kGroupAuditRefusal).
+constexpr const char* kGroupAuditRefusalText =
+    "The audit record could not be stored. Nothing was created. Retry once the audit store "
+    "recovers.";
+
+/// The showToast message carried in a response's HX-Trigger header ("" if absent/unparsable).
+std::string toast_message(const httplib::Response& res) {
+    const auto j = nlohmann::json::parse(res.get_header_value("HX-Trigger"), nullptr,
+                                         /*allow_exceptions=*/false);
+    if (j.is_discarded() || !j.is_object() || !j.contains("showToast") ||
+        !j["showToast"].is_object() || !j["showToast"].contains("message") ||
+        !j["showToast"]["message"].is_string())
+        return {};
+    return j["showToast"]["message"].get<std::string>();
+}
+
 /// Fails exactly the rows matching (action, result); every other row persists.
 std::function<bool(const AuditRow&)> fail_only(std::string action, std::string result) {
     return [action = std::move(action), result = std::move(result)](const AuditRow& r) {
@@ -1487,8 +1504,10 @@ TEST_CASE("group-from-results audit: an attempted row the store does not persist
     auto res = h.post(GroupFromResultsHarness::form_body("unaudited-group"));
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
-    // The form is hx-swap="none": the toast is the operator's only signal.
-    CHECK(contains(res->get_header_value("HX-Trigger"), "Nothing was created"));
+    // The form is hx-swap="none": the toast is the operator's only signal. Pinned exactly:
+    // five sibling refusals on this route also say "Nothing was created" (#3619 C-4).
+    CHECK(toast_message(*res) == kGroupAuditRefusalText);
+    CHECK(contains(res->body, "data-reason=\"audit_unavailable\""));
     CHECK_FALSE(h.mg.find_group_by_name("unaudited-group").has_value());
     CHECK(h.audits_for("group.create_from_results", "success") == 0);
     CHECK(h.audits_for("group.create_from_results", "failure") == 0);
@@ -1617,8 +1636,10 @@ TEST_CASE("group-from-results audit: a REAL audit-store failure on the scope-dro
     REQUIRE(rows.has_value());
     int n_attempted = 0, n_failure = 0;
     for (const auto& r : *rows) {
-        n_attempted += r.result == "attempted";
-        n_failure += r.result == "failure";
+        if (r.result == "attempted")
+            ++n_attempted;
+        if (r.result == "failure")
+            ++n_failure;
     }
     CHECK(n_attempted == 1);
     CHECK(n_failure == 0);
@@ -1627,4 +1648,126 @@ TEST_CASE("group-from-results audit: a REAL audit-store failure on the scope-dro
     const auto drop_rows = store.query(dropped);
     REQUIRE(drop_rows.has_value());
     CHECK(drop_rows->empty());
+}
+
+TEST_CASE("group-from-results audit: a create_group failure records a failure outcome for its "
+          "attempted row",
+          "[pg][server][dashboard][group_from_results][audit][3619]") {
+    // sec-3: a store error inside create_group must not leave the attempted row without an
+    // outcome. A BEFORE INSERT trigger on this test's own cloned database forces the failure.
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    {
+        PgConn conn{PQconnectdb(h.mg_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult fn_res{PQexec(
+            conn.get(),
+            "CREATE OR REPLACE FUNCTION management_group_store.block_group_3619() RETURNS "
+            "trigger AS $$ BEGIN RAISE EXCEPTION 'test: forced create_group failure'; END; $$ "
+            "LANGUAGE plpgsql;")};
+        REQUIRE(fn_res.ok());
+        PgResult trig_res{PQexec(conn.get(),
+                                 "CREATE TRIGGER block_group_3619 BEFORE INSERT ON "
+                                 "management_group_store.management_groups FOR EACH ROW "
+                                 "EXECUTE FUNCTION management_group_store.block_group_3619();")};
+        REQUIRE(trig_res.ok());
+    }
+
+    auto res = h.post(GroupFromResultsHarness::form_body("create-fails"));
+    CHECK(res->status == 500);
+    CHECK_FALSE(h.mg.find_group_by_name("create-fails").has_value());
+    REQUIRE(h.audits_for("group.create_from_results", "attempted") == 1);
+    REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
+    CHECK(contains(h.audit_detail("group.create_from_results", "failure"), "create_failed"));
+    CHECK(h.audits_for("group.create_from_results", "success") == 0);
+}
+
+TEST_CASE("group-from-results audit: two unstored rows in one request yield exactly ONE "
+          "Sec-Audit-Failed header",
+          "[pg][server][dashboard][group_from_results][audit][3619]") {
+    // sec-4 / CH-6: the scope-drop row and the attempted row both fail to persist.
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
+    h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{"agent-A"};
+    };
+    h.audit_persists = [](const AuditRow& r) {
+        return !((r.action == "response.read" && r.result == "denied") ||
+                 (r.action == "group.create_from_results" && r.result == "attempted"));
+    };
+
+    auto res = h.post(GroupFromResultsHarness::form_body("double-fault"));
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value_count("Sec-Audit-Failed") == 1);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(h.mg.find_group_by_name("double-fault").has_value());
+}
+
+TEST_CASE("group-from-results audit: an unwired or throwing persist sink refuses, never acts",
+          "[pg][server][dashboard][group_from_results][audit][security][3619]") {
+    // CH-4: unwired = fail CLOSED (never "audit-off, proceed"); a throwing sink is caught by
+    // the shared kernel and refuses the same way, with no exception escaping the handler.
+    SECTION("unwired") {
+        GroupFromResultsHarness h;
+        seed_matching_responses(h.rs(), {"agent-A"});
+        h.routes.set_persist_audit_fn({});
+        auto res = h.post(GroupFromResultsHarness::form_body("unwired-sink"));
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK_FALSE(h.mg.find_group_by_name("unwired-sink").has_value());
+    }
+    SECTION("throwing") {
+        GroupFromResultsHarness h;
+        seed_matching_responses(h.rs(), {"agent-A"});
+        h.routes.set_persist_audit_fn(
+            [](const httplib::Request&, const std::string&, const std::string&,
+               const std::string&, const std::string&, const std::string&) -> bool {
+                throw std::runtime_error("test: audit sink threw");
+            });
+        auto res = h.post(GroupFromResultsHarness::form_body("throwing-sink"));
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK_FALSE(h.mg.find_group_by_name("throwing-sink").has_value());
+    }
+}
+
+TEST_CASE("group-from-results audit: a REAL audit-store rejection of the attempted row creates "
+          "no group and shows the exact refusal",
+          "[pg][server][dashboard][group_from_results][audit][security][3619]") {
+    // CH-8: the failure is in the store (a trigger rejects every `attempted` row), not in a
+    // test predicate, and the refusal text is pinned exactly rather than by substring.
+    YUZU_REQUIRE_PG_DB_TPL(adb, group_audit_tpl);
+    PgPool apool{{.conninfo = adb.dsn(), .size = 2}};
+    AuditStore store{apool};
+    REQUIRE(store.is_open());
+    {
+        PgConn conn{PQconnectdb(adb.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult fn_res{PQexec(
+            conn.get(),
+            "CREATE OR REPLACE FUNCTION audit_store.reject_attempted_3619() RETURNS trigger AS "
+            "$$ BEGIN IF NEW.result = 'attempted' THEN RAISE EXCEPTION 'test: forced'; END IF; "
+            "RETURN NEW; END; $$ LANGUAGE plpgsql;")};
+        REQUIRE(fn_res.ok());
+        PgResult trig_res{PQexec(conn.get(),
+                                 "CREATE TRIGGER reject_attempted_3619 BEFORE INSERT ON "
+                                 "audit_store.audit_events FOR EACH ROW EXECUTE FUNCTION "
+                                 "audit_store.reject_attempted_3619();")};
+        REQUIRE(trig_res.ok());
+    }
+
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    h.real_audit = &store;
+    const auto before = store.emit_failed_count();
+
+    auto res = h.post(GroupFromResultsHarness::form_body("store-rejects-attempted"));
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(toast_message(*res) == kGroupAuditRefusalText);
+    CHECK(res->body == std::string("<span class=\"feedback-error\" "
+                                   "data-reason=\"audit_unavailable\">") +
+                           kGroupAuditRefusalText + "</span>");
+    CHECK(store.emit_failed_count() - before == 1);
+    CHECK_FALSE(h.mg.find_group_by_name("store-rejects-attempted").has_value());
 }

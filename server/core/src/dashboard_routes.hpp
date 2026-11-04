@@ -74,8 +74,10 @@ public:
                                       const std::string&, const std::string&)>;
     /// Writes one audit row; returns the persist outcome (true == stored, or audit-off).
     /// #3619: `bool`, never `void` -- a void sink cannot tell a stored row from a lost one.
-    /// Handlers never call it directly: every row goes through `audit_attempted` or
-    /// `audit_or_flag` (pinned by tests/test_dashboard_audit_checked_lexical.py).
+    /// Handlers never call it (or `persist_audit_fn_`) directly: each row goes through
+    /// `audit_attempted`, `audit_or_flag`, or the shared `emit_forensics_read_audit` (#4990), all
+    /// of which pass the sink to the `rest_audit.hpp` kernel (pinned by
+    /// tests/test_dashboard_audit_checked_lexical.py).
     using AuditFn = std::function<bool(const httplib::Request&, const std::string&,
                                        const std::string&, const std::string&,
                                        const std::string&, const std::string&)>;
@@ -175,13 +177,15 @@ public:
         csrf_trusted_origins_ = std::move(origins);
     }
 
-    /// ADR-0033 section 9 ("no audit row, no mutation"): the SAME audit sink as `AuditFn`, used
-    /// only for the `attempted` row a mutation writes BEFORE it acts (`audit_attempted`): every
+    /// ADR-0033 section 9 ("no audit row, no mutation"): the SAME audit sink as `AuditFn`. Two
+    /// uses. (1) The `attempted` row a mutation writes BEFORE it acts (`audit_attempted`): every
     /// console send on POST /api/dashboard/execute, POST /api/dashboard/group-from-results, and
     /// the Echo re-enable and purge fragments (#3619; the expression-targeted send was first).
-    /// A separate setter because its UNSET contract differs from `AuditFn`'s: unset here means
-    /// those mutations fail CLOSED (503), never "act without evidence", whereas an empty
-    /// `AuditFn` is an audit-off deployment. Set before `register_routes`.
+    /// Unset here, those mutations fail CLOSED (503), never "act without evidence". (2) The
+    /// #4990 `response.forensics.read` row on /fragments/results (`emit_forensics_read_audit`),
+    /// a read that is set-and-proceed: unset, that row is skipped as audit-off. Set before
+    /// `register_routes`: handlers read the member on every request, so a later set would race
+    /// the request threads.
     using PersistAuditFn = std::function<bool(const httplib::Request&, const std::string&,
                                               const std::string&, const std::string&,
                                               const std::string&, const std::string&)>;

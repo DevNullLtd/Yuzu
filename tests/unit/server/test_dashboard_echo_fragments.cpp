@@ -48,11 +48,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <cstddef>
 #include <functional>
 #include <initializer_list>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -825,7 +828,7 @@ TEST_CASE("dashboard execute REFUSES a BARE supplied-but-empty scope (no '=') "
 // ═══════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("echo-execute REFUSES a supplied-but-empty scope (CDX-R8-01)",
-          "[server][dashboard][echo-execute][scope][security]") {
+          "[pg][server][dashboard][echo-execute][scope][security]") {
     FragmentHarness h;
     auto res = h.post("/api/dashboard/echo-execute", "sql=SELECT+1&scope=");
     REQUIRE(res->status == 200); // HTMX fragment, not a status-code surface
@@ -835,7 +838,7 @@ TEST_CASE("echo-execute REFUSES a supplied-but-empty scope (CDX-R8-01)",
 
 // Same-site gate (browser_write_is_cross_site) on the "Run on Echo history" form post.
 TEST_CASE("echo-execute: a cookie-session write without a same-site Origin is refused",
-          "[server][dashboard][echo-execute][csrf][security]") {
+          "[pg][server][dashboard][echo-execute][csrf][security]") {
     FragmentHarness h;
     SECTION("no Origin and no Referer") {
         auto res = h.post("/api/dashboard/echo-execute", "sql=SELECT+1", {{"Host", kHost}});
@@ -851,7 +854,7 @@ TEST_CASE("echo-execute: a cookie-session write without a same-site Origin is re
 }
 
 TEST_CASE("echo-execute: a token session is not gated by Origin",
-          "[server][dashboard][echo-execute][csrf]") {
+          "[pg][server][dashboard][echo-execute][csrf]") {
     FragmentHarness h;
     h.auth_source = "mcp_token";
     auto res = h.post("/api/dashboard/echo-execute", "sql=SELECT+1", {{"Host", kHost}});
@@ -861,7 +864,7 @@ TEST_CASE("echo-execute: a token session is not gated by Origin",
 }
 
 TEST_CASE("echo-execute still broadcasts when scope is OMITTED entirely (CDX-R8-01)",
-          "[server][dashboard][echo-execute][scope]") {
+          "[pg][server][dashboard][echo-execute][scope]") {
     FragmentHarness h;
     auto res = h.post("/api/dashboard/echo-execute", "sql=SELECT+1");
     REQUIRE(res->status == 200);
@@ -872,7 +875,7 @@ TEST_CASE("echo-execute still broadcasts when scope is OMITTED entirely (CDX-R8-
 
 TEST_CASE("echo-execute REFUSES a supplied-but-empty scope even under a non-form "
           "Content-Type (UP-10)",
-          "[server][dashboard][echo-execute][scope][security]") {
+          "[pg][server][dashboard][echo-execute][scope][security]") {
     // `sql` rides the QUERY string — parsed into req.params regardless of
     // Content-Type — purely so the handler's earlier "Missing SQL query" 400
     // doesn't short-circuit before the scope logic under test is reached.
@@ -996,11 +999,101 @@ TEST_CASE("fragment purge/reenable audit: refusal rows that are not persisted ke
 }
 
 TEST_CASE("echo-execute audit: a success row that is not persisted keeps the 200 and is flagged",
-          "[server][dashboard][echo-execute][audit][3619]") {
+          "[pg][server][dashboard][echo-execute][audit][3619]") {
     FragmentHarness h;
     h.audit_persists = fail_only("echo.sql", "success");
     auto res = h.post("/api/dashboard/echo-execute", "sql=SELECT+1");
     CHECK(res->status == 200);
     CHECK(h.calls.size() == 1);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+namespace {
+/// The Echo fragments' audit refusal, verbatim (body span text and toast message).
+constexpr const char* kEchoAuditRefusalText =
+    "The audit record could not be stored, so nothing was sent. Retry once the audit store "
+    "recovers.";
+} // namespace
+
+TEST_CASE("fragment purge/reenable audit: a refusal is visible and counted, and the body is exact",
+          "[pg][server][echo][purge][reenable][fragment][audit][3619]") {
+    // arch-4 / sre-1: htmx does not swap a 5xx body on the Echo page, so the refusal also rides
+    // the page's toast channel, and the exit is counted under its own bounded result value.
+    for (const auto& [path, action] : kEchoMutations) {
+        DYNAMIC_SECTION(action) {
+            FragmentHarness h;
+            h.audit_persists = fail_only(action, "attempted");
+            auto res = h.post(path, "device_id=dev-A&source=process");
+            CHECK(res->status == 503);
+            CHECK(res->body == std::string("<span class=\"echo-row-error\" "
+                                           "data-reason=\"audit_unavailable\">") +
+                                   kEchoAuditRefusalText + "</span>");
+            const auto trigger = nlohmann::json::parse(res->get_header_value("HX-Trigger"),
+                                                       nullptr, /*allow_exceptions=*/false);
+            REQUIRE_FALSE(trigger.is_discarded());
+            CHECK(trigger["showToast"]["message"] == kEchoAuditRefusalText);
+            CHECK(trigger["showToast"]["level"] == "error");
+            const std::string metric = std::string(action) == "echo.source.purge"
+                                           ? "yuzu_echo_source_purge_total"
+                                           : "yuzu_echo_source_reenable_total";
+            CHECK(h.metric(metric, "audit_unavailable") == 1.0);
+            CHECK(h.metric(metric, "denied") == 0.0); // not an RBAC refusal
+        }
+    }
+}
+
+TEST_CASE("fragment purge audit: a flapping audit store dispatches exactly once per stored "
+          "attempted row",
+          "[pg][server][echo][purge][fragment][audit][security][3619]") {
+    // CH-3: four clicks against a store that refuses every other attempted row.
+    FragmentHarness h;
+    int attempted_calls = 0;
+    h.audit_persists = [&attempted_calls](const AuditRow& r) {
+        if (r.action == "echo.source.purge" && r.result == "attempted")
+            return (++attempted_calls % 2) == 0; // fail, ok, fail, ok
+        return true;
+    };
+    int refused = 0;
+    for (int i = 0; i < 4; ++i) {
+        auto res = h.post(kPurgePath, "device_id=dev-A&source=process");
+        if (res->status == 503) {
+            ++refused;
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        } else {
+            CHECK(res->status == 200);
+            CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+        }
+    }
+    CHECK(refused == 2);
+    CHECK(h.calls.size() == 2);
+    CHECK(h.audits_for("echo.source.purge", "success") == 2);
+    CHECK(h.metric("yuzu_echo_source_purge_total", "audit_unavailable") == 2.0);
+}
+
+TEST_CASE("fragment purge/reenable audit: an unwired or throwing persist sink refuses, never "
+          "dispatches",
+          "[pg][server][echo][purge][reenable][fragment][audit][security][3619]") {
+    // CH-4.
+    for (const auto& [path, action] : kEchoMutations) {
+        DYNAMIC_SECTION(action << " unwired") {
+            FragmentHarness h;
+            h.routes.set_persist_audit_fn({});
+            auto res = h.post(path, "device_id=dev-A&source=process");
+            CHECK(res->status == 503);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            CHECK(h.calls.empty());
+        }
+        DYNAMIC_SECTION(action << " throwing") {
+            FragmentHarness h;
+            h.routes.set_persist_audit_fn(
+                [](const httplib::Request&, const std::string&, const std::string&,
+                   const std::string&, const std::string&, const std::string&) -> bool {
+                    throw std::runtime_error("test: audit sink threw");
+                });
+            auto res = h.post(path, "device_id=dev-A&source=process");
+            CHECK(res->status == 503);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            CHECK(h.calls.empty());
+        }
+    }
 }
