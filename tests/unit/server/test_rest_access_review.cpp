@@ -2711,6 +2711,8 @@ TEST_CASE("attestation SoD: a refusal stands and a recorded decision stands when
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("result"));
         const auto& sc = body["result"]["structuredContent"];
+        REQUIRE(sc.contains("campaign_id"));
+        REQUIRE(sc.contains("audit_persisted"));
         CHECK_FALSE(sc["campaign_id"].get<std::string>().empty());
         CHECK(sc["audit_persisted"] == false);
     }
