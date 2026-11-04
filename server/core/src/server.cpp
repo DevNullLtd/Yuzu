@@ -4095,7 +4095,8 @@ public:
                           "concurrency_budget for a guardian_state read refused over its "
                           "in-flight budget) and source "
                           "(guardian_state = DEX/observation reads, fail-soft, empty result "
-                          "served; guardian_rules = authoritative rule/status reads, fail-hard, "
+                          "served, plus the census pending-evidence count read, whose gauge "
+                          "keeps its last value; guardian_rules = authoritative rule/status reads, fail-hard, "
                           "push/reconcile aborts rather than fans out empty). A sampled warn "
                           "accompanies each new degrade episode.",
                           "counter");

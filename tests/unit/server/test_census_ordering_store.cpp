@@ -354,6 +354,7 @@ TEST_CASE("census ordering: an adopted v4 object not as this version creates it 
     CHECK_FALSE(store.is_open());
     CHECK(cap.text().find("unsupported schema, refusing to start") != std::string::npos);
     CHECK(cap.text().find("v4: object not as this version creates it") != std::string::npos);
+    REQUIRE_FALSE(expect.empty()); // a section that forgets its token would pass vacuously
     CHECK(cap.text().find(expect) != std::string::npos);
 }
 
@@ -686,7 +687,7 @@ TEST_CASE("census ordering: a transaction aborted before commit is refused and s
     // Aborts the open transaction right before the health check, as a failed DEX savepoint
     // release would; without the check COMMIT of an aborted transaction reports success.
     const auto abort_txn = [](void* conn) {
-        PQclear(PQexec(static_cast<PGconn*>(conn), "SELECT 1/0"));
+        const pg::PgResult aborted{PQexec(static_cast<PGconn*>(conn), "SELECT 1/0")};
     };
 
     SECTION("a plain census-bearing event") {
@@ -731,7 +732,8 @@ TEST_CASE("census ordering: a transaction aborted before commit is refused and s
         store.set_pre_commit_hook_for_test(abort_txn);
         const auto n = store.insert_events({ev("b1", "r1", "a", kDrifted, kBase),
                                             ev("b2", "r1", "a", kCompliant, kBase + 1)});
-        CHECK_FALSE(n.has_value());
+        REQUIRE_FALSE(n.has_value());
+        CHECK(n.error().find("transaction aborted before commit") != std::string::npos);
         store.set_pre_commit_hook_for_test(nullptr);
         CHECK(query_scalar(db.dsn(), events) == "0");
     }
@@ -891,7 +893,17 @@ TEST_CASE("census ordering: the pending gauge counts stored evidence and reports
 
     PgPool dead{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
     GuaranteedStateStore closed(dead);
+    yuzu::MetricsRegistry metrics;
+    closed.set_metrics(&metrics);
     CHECK_FALSE(closed.pending_projection_count_checked().has_value());
+    // A failed read is counted as a read degrade; only the reason depends on how the pool fails.
+    double degrades = 0;
+    for (const char* reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+        degrades += metrics
+                        .counter("yuzu_server_guardian_read_degrade_total",
+                                 {{"reason", reason}, {"source", "guardian_state"}})
+                        .value();
+    CHECK(degrades >= 1);
 }
 
 TEST_CASE("census ordering: the reaper keeps an expired event that still carries pending evidence",

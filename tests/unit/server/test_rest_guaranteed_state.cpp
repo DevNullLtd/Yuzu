@@ -6100,6 +6100,12 @@ TEST_CASE("REST guaranteed-state: order_uncertain and projection_pending on the 
     const auto fleet = get("/api/v1/guaranteed-state/status", true);
     CHECK(fleet["data"]["total_rules"].get<int>() == 3);
     CHECK(fleet["data"]["uncertain_rules"].get<int>() == 2); // r1 (flag) and r2 (pending); r3 clean
+    // The notes say what uncertain_rules counts (reverting the wording must turn this red).
+    CHECK(fleet["data"]["note"].get<std::string>().find("uncertain_rules counts live rules") !=
+          std::string::npos);
+    CHECK(get("/api/v1/guaranteed-state/status/WS-1", false)["data"]["note"]
+              .get<std::string>()
+              .find("uncertain_rules counts this device's rules") != std::string::npos);
     CHECK(get("/api/v1/guaranteed-state/status/WS-1", false)["data"]["uncertain_rules"].get<int>() == 1);
     CHECK(get("/api/v1/guaranteed-state/status/WS-2", false)["data"]["uncertain_rules"].get<int>() == 1);
 

@@ -17,6 +17,7 @@
 
 #include "dex_view_types.hpp"    // dex_signal_label for the DEX lens (store-free)
 #include "echo_process_tree.hpp"  // echo_is_suspicious_spawn — shared LOLBin/shell denylist
+#include "guardian_runbook_pointer.hpp"
 #include "web_utils.hpp"
 
 #include <algorithm>
@@ -1040,7 +1041,9 @@ std::string render_device_guardian_lens(const std::string& agent_id,
         h += "<tr><td class=\"name\">" + esc(g.name) + "</td><td>" + guard_state_badge(g.state) +
              (g.order_uncertain || g.projection_pending
                   ? " <span class=\"gp-mute\" title=\"The ordering of this verdict cannot be proven, "
-                    "or a retained event is not yet reflected\">&middot; ordering uncertain</span>"
+                    "or a retained event is not yet reflected. " +
+                        std::string(kUncertainRunbookPointer) +
+                        "\">&middot; ordering uncertain</span>"
                   : std::string{}) +
              "</td><td class=\"gp-mute\">" + esc(g.updated_at) + "</td></tr>";
     h += "</tbody></table>";

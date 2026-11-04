@@ -44016,6 +44016,8 @@ TEST_CASE("MCP Guardian: the twins carry order_uncertain and projection_pending 
 
     const auto agent = call(R"({"jsonrpc":"2.0","method":"tools/call","id":73,"params":{"name":"get_guardian_agent_status","arguments":{"agent_id":"WS-2"}}})");
     CHECK(agent["uncertain_rules"].get<int>() == 1);
+    CHECK(agent["note"].get<std::string>().find("uncertain_rules counts this device's rules") !=
+          std::string::npos);
 
     // The advertised output schemas list the new keys as required.
     auto list = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":74})");

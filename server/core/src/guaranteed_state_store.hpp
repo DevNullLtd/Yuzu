@@ -267,8 +267,9 @@ public:
     /// `void*`, this header does not include libpq) immediately before each of the three
     /// `txn_healthy` checks (the repair of a redelivered pending event, a single-event insert, a
     /// batch insert), so a test can put the transaction into the aborted state and prove the commit
-    /// is refused instead of reporting success for a transaction that stored nothing. Production
-    /// leaves it empty (a no-op). Set it before the store is used concurrently and clear it with an
+    /// is refused instead of reporting success for a transaction that stored nothing. The handle is
+    /// borrowed for the call only: do not retain it, and do not COMMIT or ROLLBACK through it.
+    /// Production leaves it empty (a no-op). Set it before the store is used concurrently and clear it with an
     /// empty function.
     void set_pre_commit_hook_for_test(std::function<void(void*)> fn) {
         pre_commit_hook_ = std::move(fn);

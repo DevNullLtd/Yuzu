@@ -5,6 +5,7 @@
 #include "guardian_routes.hpp"
 
 #include "guaranteed_state_store.hpp"
+#include "guardian_runbook_pointer.hpp"
 #include "baseline_store.hpp"
 #include "http_route_sink.hpp"
 #include "guardian_form_render.hpp"
@@ -246,10 +247,6 @@ rollup_by_rule(const std::vector<yuzu::server::GuardianAgentRuleStatus>& rows,
 }
 
 // Wording shared by every surface that shows the uncertain count beside a compliance figure.
-// Where an operator reads what to do about a flagged pair (docs/user-manual/guaranteed-state.md).
-constexpr const char* kUncertainRunbookPointer =
-    "See the Guaranteed State guide, section 'When a verdict is flagged or does not move'.";
-
 std::string uncertain_phrase(int64_t n) {
     return std::to_string(n) + (n == 1 ? " pair" : " pairs") +
            " with uncertain ordering or an unreflected verdict";
