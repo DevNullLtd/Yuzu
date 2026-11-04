@@ -136,7 +136,7 @@ WHAT IT CHECKS
      triple -> number of calls); and the refusal / confinement evidence above.
      A route with no recognisable gate (auth_fn
      only, a helper closure, a member-function gate) fails CLOSED unless named in the
-     size-pinned, shrink-only GATE_PARITY_NO_GATE_ALLOWED; a mismatch is an error unless
+     size-pinned GATE_PARITY_NO_GATE_ALLOWED (its table size must equal GATE_PARITY_NO_GATE_MAX, raised only by a dated ADR-1005 ruling); a mismatch is an error unless
      named, with its exact gates and a reason, in GATE_PARITY_KNOWN_MISMATCHES (the table size
      must EQUAL its pin, GATE_PARITY_KNOWN_MISMATCHES_MAX: it is a pin, not a shrink-only cap.
      It was raised 6 -> 7 by owner ruling 2026-10-31; raising it again needs a ruling recorded
@@ -481,7 +481,7 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # 227 (origin/dev) -> 228 (Users and roles page): GET /fragments/access/enforcement has only the REST twin
 # GET /api/v1/me, which omits the unconfirmed (degraded) bit (`twinned-rest-only`). The MCP tool
 # get_me is the twin of the raw flag only, so this row needed the degraded-bit read tracked in
-# #6033 (since delivered: see the 210 -> 209 line below).
+# #6033 (since delivered: see the 206 -> 205 line below).
 #
 # 228 -> 225 (Seam PR2): the three hardware rows (get.fragments-hardware-list, -hardware-ci,
 # -hardware-quarantine) gained MCP twins (list_hardware_ci, get_hardware_ci, list_quarantined_devices).
