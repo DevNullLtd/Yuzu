@@ -808,7 +808,7 @@ map, and the wire, the KV keys and the heartbeat tags are unchanged.
   skip backoff of #5327 is capped at that moment rather than at the next phase slot. The window is
   a compile-time default carried by the source; there is no channel to change it per fleet yet. A
   local time that does not exist (a spring-forward gap) resolves forward, an ambiguous one
-  (fall-back) resolves to the earlier instant, both by the C library. Sources without a window
+  (fall-back) resolves to whichever instant the C library chooses. Sources without a window
   are unchanged.
 - **Overdue catch-up.** A persisted `next_fire` more than `kMaxTickSeconds` (15 minutes) in the
   past, which a live agent never has, is re-armed to now plus a stable offset in `[0, 30 min)`,

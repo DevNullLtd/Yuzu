@@ -17,7 +17,7 @@ caller-owned `std::tm` values on the stack and hand back nothing to release.
 | `SyncSource::window` | `std::optional<SyncWindow>` (two ints) | `SyncSource` | per source, fixed at registration | Set only by `make_installed_software_source`. |
 | `SyncScheduler::clock_` | `LocalClock` (two `std::function`) | `SyncScheduler` | scheduler lifetime | Defaults to `system_local_clock()`, whose lambdas capture nothing; tests inject a fake zone. |
 | `pending_` entries | `std::pair<size_t, int64_t>` (was `size_t`) | `SyncScheduler` | guarded by the existing `pending_mu_` | Same single cross-thread container; drained under the same lock by `drain_pending`. |
-| `tm` / `LocalTm` | stack structs | `system_local_clock` lambdas, `next_window_fire` | function-local | Value types; `mktime` normalises in place. |
+| `std::tm` | stack structs | `system_local_clock` lambdas, `next_window_fire` | function-local | Value types; `mktime` normalises in place. |
 
 ## Table 2 — pre-existing resources this diff touches without changing ownership
 

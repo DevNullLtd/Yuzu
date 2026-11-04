@@ -66,7 +66,7 @@ struct SyncNowDecision {
 ///   delay_max_s       - the "delay_max_s" command parameter, "" when absent:
 ///                        a plain base-10 integer in [0, 86400]; 0 or absent is
 ///                        the immediate path. Anything else is a FAILURE (exit
-///                        2) before the scheduler is touched. The agent spreads
+///                        2) before request_now is called. The agent spreads
 ///                        the fire over [0, delay_max_s) by a stable per-agent
 ///                        offset.
 ///   inventory_disable - cfg_.inventory_disable; used only to pick between the

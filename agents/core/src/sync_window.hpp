@@ -34,6 +34,9 @@ inline LocalClock system_local_clock() {
     c.to_local = [](std::int64_t t) {
         const std::time_t tt = static_cast<std::time_t>(t);
         std::tm tmv{};
+        // The conversion's return value is deliberately unchecked: on failure tmv stays
+        // zeroed (year 1900), so next_window_fire's mktime yields -1, both candidates fail
+        // `cand <= now`, and it returns its now + 24 h fallback.
 #ifdef _WIN32
         localtime_s(&tmv, &tt);
 #else

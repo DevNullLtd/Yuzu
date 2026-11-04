@@ -4056,6 +4056,17 @@ test('agent command-dedup wiring lexical gate (#3668)',
   timeout: 30,
 )
 
+# __sync__.now parameter wiring: decide_sync_now is a pure function with its own unit tests; this
+# pins that agent.cpp's Subscribe loop still reads the `source` and `delay_max_s` keys and passes
+# both in (no gRPC seam to test the loop, #1492). Carries its own in-memory mutation self-test.
+# No build required.
+test('agent __sync__.now wiring lexical gate',
+  _python3_test,
+  args: [files('test_agent_sync_now_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # Command-dedup fleet telemetry (#3663): the agent's `yuzu.dedup_*` heartbeat tags and the
 # server's yuzu_fleet_agents_dedup_* table share no header (no upward server -> agent edge), so
 # nothing in the compiler binds them. This pins that every emitted tag has a server row and vice

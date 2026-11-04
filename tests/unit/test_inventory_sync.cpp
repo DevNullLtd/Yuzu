@@ -2462,6 +2462,16 @@ TEST_CASE("collector: typed completeness - FULL collected; an opted-in PARTIAL a
     }
 }
 
+TEST_CASE("collector: installed_software carries the 01:00-05:00 local nightly window",
+          "[sync][collector][window]") {
+    // The only place the window is set: every other source keeps a plain 24 h phase slot.
+    fake_mac();
+    const auto src = make_installed_software_source(all_plugins());
+    REQUIRE(src.window);
+    CHECK(src.window->start_min == 60);
+    CHECK(src.window->end_min == 300);
+}
+
 TEST_CASE("collector: skip_reason names the cause of each skip and clears on success",
           "[sync][collector]") {
     fake_mac();
