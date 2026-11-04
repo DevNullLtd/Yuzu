@@ -1029,9 +1029,7 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
 }
 
 std::vector<V3SectionResult>
-SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id,
-                                                    [[maybe_unused]] std::string_view claimed_hash,
-                                                    V3Report report) {
+SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V3Report report) {
     using O = V3SectionOutcome;
     const std::size_t n = report.sections.size();
     std::vector<V3SectionResult> results(n); // outcome defaults to kError

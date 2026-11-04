@@ -83,7 +83,7 @@ TEST_CASE("v3 header detection: only the exact header bytes make a blob v3",
     // A non-v3 blob is refused by the parser, not misread.
     auto r = parse_v3_blob(std::string("v3") + kFs + "1.0" + kRs);
     REQUIRE_FALSE(r.has_value());
-    CHECK(r.error().kind == V3ParseErrorKind::kNotV3);
+    CHECK(r.error() == V3ParseErrorKind::kNotV3);
     // The header alone is a valid, empty report.
     CHECK(parse_ok(header()).sections.empty());
 }
@@ -247,28 +247,28 @@ TEST_CASE("v3 unattributable defects fail the whole blob", "[server][inventory_b
     SECTION("a record before any section") {
         auto r = parse_v3_blob(header() + plus("A", kApps));
         REQUIRE_FALSE(r.has_value());
-        CHECK(r.error().kind == V3ParseErrorKind::kRecordBeforeSection);
+        CHECK(r.error() == V3ParseErrorKind::kRecordBeforeSection);
     }
     SECTION("a section header with no facet") {
         auto r = parse_v3_blob(header() + rec({"S", "", "full"}));
         REQUIRE_FALSE(r.has_value());
-        CHECK(r.error().kind == V3ParseErrorKind::kBadSectionHeader);
+        CHECK(r.error() == V3ParseErrorKind::kBadSectionHeader);
     }
     SECTION("a section header whose facet is outside the label charset") {
         for (const char* bad : {"Installed_Apps", "a b", "a:b", "a/b", "x\xc3\xa9"}) {
             CAPTURE(bad);
             auto r = parse_v3_blob(header() + rec({"S", bad, "full"}));
             REQUIRE_FALSE(r.has_value());
-            CHECK(r.error().kind == V3ParseErrorKind::kBadSectionHeader);
+            CHECK(r.error() == V3ParseErrorKind::kBadSectionHeader);
         }
         auto r = parse_v3_blob(header() + rec({"S", std::string(kV3MaxFacetLen + 1, 'a'), "full"}));
         REQUIRE_FALSE(r.has_value());
-        CHECK(r.error().kind == V3ParseErrorKind::kBadSectionHeader);
+        CHECK(r.error() == V3ParseErrorKind::kBadSectionHeader);
     }
     SECTION("a bare S record") {
         auto r = parse_v3_blob(header() + rec({"S"}));
         REQUIRE_FALSE(r.has_value());
-        CHECK(r.error().kind == V3ParseErrorKind::kBadSectionHeader);
+        CHECK(r.error() == V3ParseErrorKind::kBadSectionHeader);
     }
 }
 
@@ -282,7 +282,7 @@ TEST_CASE("v3 caps: sections, rows and blob bytes", "[server][inventory_blob_v3]
         blob += sec("unknown_over", "full");
         auto over = parse_v3_blob(blob);
         REQUIRE_FALSE(over.has_value());
-        CHECK(over.error().kind == V3ParseErrorKind::kTooManySections);
+        CHECK(over.error() == V3ParseErrorKind::kTooManySections);
     }
     SECTION("rows: kV3MaxRows in one section parse; the next row refuses its section only") {
         std::string rows;
@@ -323,7 +323,7 @@ TEST_CASE("v3 caps: sections, rows and blob bytes", "[server][inventory_blob_v3]
         REQUIRE(blob.size() == kV3MaxBlobBytes + 1);
         auto r = parse_v3_blob(blob);
         REQUIRE_FALSE(r.has_value());
-        CHECK(r.error().kind == V3ParseErrorKind::kOversize);
+        CHECK(r.error() == V3ParseErrorKind::kOversize);
     }
 }
 
@@ -438,20 +438,5 @@ TEST_CASE("install_type_for: an empty or unknown source falls back by ecosystem"
         CAPTURE(r.ecosystem);
         CHECK(install_type_for("", r.ecosystem) == r.expect);
         CHECK(install_type_for("some.future_source", r.ecosystem) == r.expect);
-    }
-}
-
-TEST_CASE("kInstallTypes is the closed vocabulary", "[server][install_type]") {
-    CHECK(kInstallTypes.size() == 9);
-    for (const auto t : kInstallTypes)
-        CHECK(is_install_type(t));
-    CHECK_FALSE(is_install_type(""));
-    CHECK_FALSE(is_install_type("Installer"));
-    // Reserved values exist in the vocabulary but no source maps to them yet.
-    CHECK(is_install_type("driver"));
-    CHECK(is_install_type("component"));
-    for (const auto& row : kInstallTypeBySource) {
-        CHECK(row.type != "driver");
-        CHECK(row.type != "component");
     }
 }

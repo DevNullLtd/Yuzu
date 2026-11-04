@@ -443,11 +443,10 @@ public:
     ///    section_hash (this store holds no component rows), and answered kNeedFull.
     ///  - a refused section (V3Section::refusal) is kRejected; the others still apply.
     /// A SQL failure rolls the whole call back and answers kError for EVERY section in it.
-    /// Returns one result per `report.sections` entry, in order. `claimed_hash` is accepted for
-    /// parity with the v2 call and never trusted (the stored hash is always recomputed).
+    /// Returns one result per `report.sections` entry, in order. The stored section hash is
+    /// always recomputed from the applied rows, never taken from the wire.
     [[nodiscard]] std::vector<V3SectionResult>
-    apply_installed_software_v3(std::string_view agent_id, std::string_view claimed_hash,
-                                V3Report report);
+    apply_installed_software_v3(std::string_view agent_id, V3Report report);
 
     /// Hash of one section's rows: SHA-256 hex over the sorted, de-duplicated rows, each written
     /// as ALL 16 wire slots (slot 14 empty; no conditional tail), 0x1F-joined and

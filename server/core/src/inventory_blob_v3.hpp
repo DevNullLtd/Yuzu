@@ -206,10 +206,6 @@ enum class V3ParseErrorKind {
     kRecordBeforeSection,
 };
 
-struct V3ParseError {
-    V3ParseErrorKind kind{V3ParseErrorKind::kNotV3};
-};
-
 [[nodiscard]] constexpr std::string_view v3_parse_error_name(V3ParseErrorKind k) noexcept {
     switch (k) {
     case V3ParseErrorKind::kNotV3:
@@ -300,7 +296,6 @@ namespace v3_detail {
 inline void refuse(V3Section& sec, V3Refusal why) {
     sec.refusal = why;
     sec.rows.clear();
-    sec.rows.shrink_to_fit();
     sec.deletions.clear();
     sec.components.clear();
 }
@@ -309,18 +304,18 @@ inline void refuse(V3Section& sec, V3Refusal why) {
 
 /// Parse a v3 blob. `std::unexpected` = the whole blob is unusable (see the file comment);
 /// otherwise every section the blob named is present, accepted or refused.
-[[nodiscard]] inline std::expected<V3Report, V3ParseError> parse_v3_blob(std::string_view blob) {
+[[nodiscard]] inline std::expected<V3Report, V3ParseErrorKind>
+parse_v3_blob(std::string_view blob) {
     using K = V3ParseErrorKind;
     if (blob.size() > kV3MaxBlobBytes)
-        return std::unexpected(V3ParseError{K::kOversize});
+        return std::unexpected(K::kOversize);
     if (!is_v3_blob(blob))
-        return std::unexpected(V3ParseError{K::kNotV3});
+        return std::unexpected(K::kNotV3);
 
     V3Report rep;
     std::size_t total_rows = 0;
     std::size_t total_deletions = 0;
     std::size_t total_components = 0;
-    bool have_section = false;
 
     std::size_t pos = kV3Header.size();
     while (pos < blob.size()) {
@@ -348,12 +343,13 @@ inline void refuse(V3Section& sec, V3Refusal why) {
 
         if (f[0] == "S") {
             if (rep.sections.size() >= kV3MaxSections)
-                return std::unexpected(V3ParseError{K::kTooManySections});
+                return std::unexpected(K::kTooManySections);
             if (!v3_detail::facet_name_ok(f[1]))
-                return std::unexpected(V3ParseError{K::kBadSectionHeader});
+                return std::unexpected(K::kBadSectionHeader);
             V3Section sec;
             sec.facet = f[1];
-            if (const auto st = v3_status_parse(f[2]))
+            const auto st = v3_status_parse(f[2]);
+            if (st)
                 sec.status = *st;
             sec.base = std::move(f[3]);
             sec.token = std::move(f[4]);
@@ -361,7 +357,7 @@ inline void refuse(V3Section& sec, V3Refusal why) {
             sec.bytes_read = v3_detail::parse_nonneg(f[6]);
             if (!is_known_v3_facet(sec.facet)) {
                 v3_detail::refuse(sec, V3Refusal::kUnknownFacet);
-            } else if (!v3_status_parse(f[2]).has_value()) {
+            } else if (!st) {
                 v3_detail::refuse(sec, V3Refusal::kUnknownStatus);
             } else {
                 for (const auto& prev : rep.sections) {
@@ -372,12 +368,11 @@ inline void refuse(V3Section& sec, V3Refusal why) {
                 }
             }
             rep.sections.push_back(std::move(sec));
-            have_section = true;
             continue;
         }
 
-        if (!have_section)
-            return std::unexpected(V3ParseError{K::kRecordBeforeSection});
+        if (rep.sections.empty())
+            return std::unexpected(K::kRecordBeforeSection);
         V3Section& sec = rep.sections.back();
         if (sec.refusal != V3Refusal::kNone)
             continue; // the rest of a refused section is skipped to the next S

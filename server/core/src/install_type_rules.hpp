@@ -17,6 +17,7 @@
 
 #include "software_catalog_rules.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <string_view>
@@ -99,27 +100,18 @@ namespace install_type_detail {
 
 /// Every collector source has a row, and every row names a real source and a real type.
 [[nodiscard]] consteval bool table_total_and_well_formed() {
-    for (const auto& src : software_catalog::kSoftwareSources) {
-        bool found = false;
-        for (const auto& row : kInstallTypeBySource) {
-            if (row.source == src.value)
-                found = true;
-        }
-        if (!found)
-            return false;
-    }
-    for (const auto& row : kInstallTypeBySource) {
-        if (!is_install_type(row.type))
-            return false;
-        bool known = false;
-        for (const auto& src : software_catalog::kSoftwareSources) {
-            if (src.value == row.source)
-                known = true;
-        }
-        if (!known)
-            return false;
-    }
-    return true;
+    namespace sc = software_catalog;
+    return std::ranges::all_of(sc::kSoftwareSources,
+                               [](const auto& src) {
+                                   return std::ranges::any_of(
+                                       kInstallTypeBySource,
+                                       [&](const auto& row) { return row.source == src.value; });
+                               }) &&
+           std::ranges::all_of(kInstallTypeBySource, [](const auto& row) {
+               return is_install_type(row.type) &&
+                      std::ranges::any_of(sc::kSoftwareSources,
+                                          [&](const auto& src) { return src.value == row.source; });
+           });
 }
 
 } // namespace install_type_detail

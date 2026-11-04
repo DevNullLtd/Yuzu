@@ -138,15 +138,14 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
 // and the section counter. Returns the source-level `yuzu_inventory_ingest_total` outcome.
 // A refused section never stops the others: the store applies every section that parsed.
 const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& agent_id,
-                           const std::string& claimed_hash, const std::string& blob,
-                           pb::InventoryAck& ack, ::yuzu::MetricsRegistry* metrics) {
+                           const std::string& blob, pb::InventoryAck& ack,
+                           ::yuzu::MetricsRegistry* metrics) {
     auto parsed = parse_v3_blob(blob);
     if (!parsed) {
         // Same class as an over-cap v2 blob: nacked, and the agent resends the same bytes, so
         // it is `dropped` (the never-self-heals alert), not `need_full`.
         spdlog::warn("inventory: unusable v3 '{}' blob from agent={} ({}), dropping + nacking",
-                     kSourceInstalledSoftware, agent_id,
-                     v3_parse_error_name(parsed.error().kind));
+                     kSourceInstalledSoftware, agent_id, v3_parse_error_name(parsed.error()));
         ack.add_need_full(kSourceInstalledSoftware);
         return "dropped";
     }
@@ -158,7 +157,7 @@ const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& age
 
     const auto t0 = std::chrono::steady_clock::now();
     const std::vector<V3SectionResult> results =
-        store.apply_installed_software_v3(agent_id, claimed_hash, std::move(*parsed));
+        store.apply_installed_software_v3(agent_id, std::move(*parsed));
     if (metrics) {
         const double secs =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -250,7 +249,7 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
         // Blob v3 is recognised by its exact header bytes and takes its own path; every other
         // blob is v2 and falls through to the unchanged code below.
         if (it != report.plugin_data().end() && is_v3_blob(it->second)) {
-            emit(source, ingest_v3_blob(store, agent_id, claimed_hash, it->second, ack, metrics));
+            emit(source, ingest_v3_blob(store, agent_id, it->second, ack, metrics));
             continue;
         }
 
