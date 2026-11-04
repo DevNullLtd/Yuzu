@@ -14,6 +14,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "product_normalize.hpp"
+#include "purl_compose.hpp"
 #include "software_catalog_rules.hpp"
 #include "software_inventory_store.hpp"
 
@@ -4620,7 +4621,7 @@ TEST_CASE("migration v10 adds the v3 columns, checks, partial unique index and f
     REQUIRE(sql_ok(pool, "ALTER TABLE software_inventory_store.installed_software "
                          "DROP COLUMN install_type, DROP COLUMN install_scope, "
                          "DROP COLUMN install_location, DROP COLUMN identity_key, "
-                         "DROP COLUMN instance_key"));
+                         "DROP COLUMN instance_key, DROP COLUMN purl"));
     for (const char* v : {"1.0", "2.0"}) {
         REQUIRE(sql_ok(pool,
                        "INSERT INTO software_inventory_store.installed_software "
@@ -4643,6 +4644,11 @@ TEST_CASE("migration v10 adds the v3 columns, checks, partial unique index and f
         CHECK(row[3] == "");
         CHECK(row[4] == "");
     }
+    for (const auto& row : sql_rows(pool, "SELECT purl FROM "
+                                          "software_inventory_store.installed_software "
+                                          "WHERE agent_id = 'agent-legacy'")) {
+        CHECK(row[0] == "");
+    }
 
     const auto verify_shape = [&] {
         // Both CHECKs exist and are NOT VALID (no scan of existing rows).
@@ -4663,6 +4669,14 @@ TEST_CASE("migration v10 adds the v3 columns, checks, partial unique index and f
         CHECK(idx[0][0].find("UNIQUE") != std::string::npos);
         CHECK(idx[0][0].find("(agent_id, instance_key)") != std::string::npos);
         CHECK(idx[0][0].find("WHERE") != std::string::npos);
+        // The purl index is a partial btree: rows without a purl hold no entry.
+        const auto pidx = sql_rows(
+            pool, "SELECT indexdef FROM pg_indexes WHERE schemaname = 'software_inventory_store' "
+                  "AND indexname = 'installed_software_purl_idx'");
+        REQUIRE(pidx.size() == 1);
+        CHECK(pidx[0][0].find("UNIQUE") == std::string::npos);
+        CHECK(pidx[0][0].find("(purl)") != std::string::npos);
+        CHECK(pidx[0][0].find("WHERE") != std::string::npos);
         // The facet table has the contracted columns.
         const auto cols = sql_rows(pool, "SELECT column_name FROM information_schema.columns "
                                          "WHERE table_schema = 'software_inventory_store' AND "
@@ -4865,6 +4879,147 @@ TEST_CASE("v3: a full section replaces only its own facet and records its facet 
                    "SELECT section_hash FROM software_inventory_store.software_facet_state "
                    "WHERE agent_id = 'agent-v3' AND facet = $1",
                    {kV3Apps})[0][0] == h_apps);
+}
+
+namespace {
+
+SoftwareEntry v3_linux(const std::string& name, const std::string& ecosystem,
+                       const std::string& version, const std::string& release,
+                       const std::string& source = kV3Apps) {
+    SoftwareEntry e;
+    e.name = name;
+    e.version = version;
+    e.release = release;
+    e.kind = "package";
+    e.ecosystem = ecosystem;
+    e.arch = "amd64";
+    e.distro_id = "debian";
+    e.distro_version = "12";
+    e.source = source;
+    return e;
+}
+
+std::string purl_of(PgPool& pool, const std::string& agent, const std::string& name) {
+    const auto t = sql_rows(pool,
+                            "SELECT purl FROM software_inventory_store.installed_software "
+                            "WHERE agent_id = $1 AND name = $2",
+                            {agent, name});
+    return t.size() == 1 ? t[0][0] : std::string("<" + std::to_string(t.size()) + " rows>");
+}
+
+} // namespace
+
+TEST_CASE("v3: a full section stores the composed purl; no-type ecosystems and v2 rows store ''",
+          "[pg][software_inventory][v3][purl]") {
+    SWINV_SHARED(store, pool);
+    const auto deb = v3_linux("Curl", "deb", "7.88.1", "10");
+    const auto win = v3_entry("Alpha", kV3Apps); // ecosystem windows: no registered purl type
+    auto brew = v3_entry("sqlite", kV3Pkgs, "3.43.2");
+    brew.ecosystem = "brew";
+    brew.kind = "pkg";
+
+    const auto res = store.apply_installed_software_v3(
+        "agent-purl", v3_report({v3_full(kV3Apps, {deb, win}), v3_full(kV3Pkgs, {brew})}));
+    REQUIRE(res.size() == 2);
+    CHECK(res[0].outcome == V3SectionOutcome::kStored);
+    CHECK(purl_of(pool, "agent-purl", "Curl") ==
+          "pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12");
+    CHECK(purl_of(pool, "agent-purl", "Alpha") == "");
+    CHECK(purl_of(pool, "agent-purl", "sqlite") == "pkg:brew/sqlite@3.43.2");
+
+    // The stored purl is exactly what the pure composer returns for the stored row, and it is
+    // in neither hash: the section hash is the same with the purl field cleared or set.
+    CHECK(purl_of(pool, "agent-purl", "Curl") == compose_purl(deb));
+    auto with_purl = deb;
+    with_purl.purl = "pkg:deb/other/other@0";
+    CHECK(section_hash_of({with_purl}) == section_hash_of({deb}));
+
+    // A v2 report leaves the purl empty (the same coexistence rule as install_location).
+    const std::vector<SoftwareEntry> v2rows = {deb};
+    REQUIRE(store.apply_installed_software("agent-v2purl",
+                                           SoftwareInventoryStore::canonical_hash(v2rows), v2rows,
+                                           0) == InventoryIngestOutcome::kStored);
+    CHECK(purl_of(pool, "agent-v2purl", "Curl") == "");
+
+    // The device's first v3 report fills it in.
+    REQUIRE(store.apply_installed_software_v3("agent-v2purl",
+                                              v3_report({v3_full(kV3Apps, {deb})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    CHECK(purl_of(pool, "agent-v2purl", "Curl") ==
+          "pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12");
+}
+
+TEST_CASE("v3: a re-report with a changed version replaces the purl", "[pg][software_inventory][v3][purl]") {
+    SWINV_SHARED(store, pool);
+    REQUIRE(store.apply_installed_software_v3(
+                "agent-purl-up", v3_report({v3_full(kV3Apps, {v3_linux("curl", "deb", "7.88.1", "10")})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    CHECK(purl_of(pool, "agent-purl-up", "curl") ==
+          "pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12");
+    REQUIRE(store.apply_installed_software_v3(
+                "agent-purl-up", v3_report({v3_full(kV3Apps, {v3_linux("curl", "deb", "7.88.1", "11")})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    CHECK(purl_of(pool, "agent-purl-up", "curl") ==
+          "pkg:deb/debian/curl@7.88.1-11?arch=amd64&distro=debian-12");
+    CHECK(row_count(pool, "agent-purl-up") == "1");
+    // An honest-empty section removes the purl with its row.
+    REQUIRE(store.apply_installed_software_v3("agent-purl-up", v3_report({v3_full(kV3Apps, {})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    CHECK(store.find_by_purl("pkg:deb/debian/curl@7.88.1-11?arch=amd64&distro=debian-12")
+              .value()
+              .empty());
+}
+
+TEST_CASE("find_by_purl: exact match across agents, ordered, bounded, and served by the index",
+          "[pg][software_inventory][v3][purl]") {
+    SWINV_SHARED(store, pool);
+    const auto curl = v3_linux("curl", "deb", "7.88.1", "10");
+    for (const char* agent : {"agent-pb", "agent-pa"}) {
+        REQUIRE(store.apply_installed_software_v3(
+                    agent, v3_report({v3_full(kV3Apps, {curl, v3_linux("git", "deb", "2.39.2", "1")})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+    }
+    REQUIRE(store.apply_installed_software_v3(
+                "agent-pc", v3_report({v3_full(kV3Apps, {v3_linux("curl", "deb", "7.88.1", "9")})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+
+    const std::string target = "pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12";
+    auto hit = store.find_by_purl(target);
+    REQUIRE(hit.has_value());
+    REQUIRE(hit->size() == 2); // exact: -9 and git do not match
+    CHECK((*hit)[0].agent_id == "agent-pa"); // ordered by agent_id
+    CHECK((*hit)[1].agent_id == "agent-pb");
+    CHECK((*hit)[0].entry.name == "curl");
+    CHECK((*hit)[0].entry.version == "7.88.1");
+    CHECK((*hit)[0].entry.ecosystem == "deb");
+    CHECK((*hit)[0].entry.purl == target);
+    CHECK((*hit)[0].install_id > 0);
+
+    CHECK(store.find_by_purl(target, 1).value().size() == 1);                 // limit honoured
+    CHECK(store.find_by_purl(target + "x").value().empty());                  // no prefix matching
+    CHECK(store.find_by_purl("PKG:DEB/DEBIAN/CURL@7.88.1-10").value().empty()); // case sensitive
+    CHECK(store.find_by_purl("").value().empty()); // '' names "no purl": a precondition miss
+
+    // The statement reaches the partial index (seq scan priced out: the table is tiny).
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    const std::vector<std::string> none;
+    struct RollbackGuard {
+        PGconn* conn;
+        ~RollbackGuard() { pg::exec_params(conn, "ROLLBACK", std::vector<std::string>{}); }
+    };
+    REQUIRE(pg::exec_params(lease.get(), "BEGIN", none).status() == PGRES_COMMAND_OK);
+    const RollbackGuard rollback{lease.get()};
+    REQUIRE(pg::exec_params(lease.get(), "SET LOCAL enable_seqscan = off", none).status() ==
+            PGRES_COMMAND_OK);
+    pg::PgResult plan = pg::exec_params(
+        lease.get(), ("EXPLAIN (COSTS OFF) " + SoftwareInventoryStore::find_by_purl_sql()).c_str(),
+        std::vector<std::string>{target, "100"});
+    REQUIRE(plan.status() == PGRES_TUPLES_OK);
+    std::string text;
+    for (int i = 0; i < PQntuples(plan.get()); ++i)
+        text += std::string(PQgetvalue(plan.get(), i, 0)) + "\n";
+    CHECK(text.find("installed_software_purl_idx") != std::string::npos);
 }
 
 TEST_CASE("v3: the first v3 call deletes every row the v2 path left, and only that call",

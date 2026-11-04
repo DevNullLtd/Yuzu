@@ -1960,6 +1960,7 @@ if build_server
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_inventory_blob_v3.cpp',          # SAM-13: pure blob-v3 grammar + install-type table
+      'unit/server/test_purl_compose.cpp',               # SAM-13: pure purl composer (purl-spec vectors)
       'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
       'unit/server/test_crypto_cbom.cpp',                # /crypto CBOM export: CycloneDX 1.7 shaper + goldens

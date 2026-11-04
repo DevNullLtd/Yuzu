@@ -54,6 +54,11 @@ struct SoftwareEntry {
     std::string install_scope; // "machine" | "user" (machine-scope collection: always "machine")
     std::string identity_key;  // norm_key(name, publisher) US version US arch US location
     std::string instance_key;  // SHA-256 hex of the row's 16 canonical slots; unique per agent
+    // Package URL (purl_compose.hpp), composed server-side from fields already on the wire and
+    // set by the blob-v3 apply path ONLY: a row from a v2 report carries '' until its device's
+    // first v3 report (the install_location coexistence rule). '' also where the ecosystem has
+    // no registered purl type. Never hashed.
+    std::string purl;
 };
 
 } // namespace yuzu::server

@@ -463,7 +463,8 @@ public:
 
     /// Fill the server-derived columns of `e` (install_type, install_scope, identity_key,
     /// instance_key) from its wire fields. The ONE place they are computed: both insert paths
-    /// call it. `instance_key` is the SHA-256 hex of the row's single canonical record (the
+    /// call it. `purl` is NOT among them: only the v3 apply path composes it (`compose_purl`),
+    /// so a v2-reported row stays ''. `instance_key` is the SHA-256 hex of the row's single canonical record (the
     /// section-hash serialisation of that one row), unique per agent after normalisation, and
     /// the value a `-` record names. `identity_key` is `norm_key(name, publisher)` US version
     /// US arch US install_location (lower-cased, trailing separators stripped); it is stored
@@ -478,6 +479,23 @@ public:
     /// that re-opens the fail-open A4 violation this contract closes (gov UP-5).
     [[nodiscard]] std::optional<std::vector<SoftwareEntry>>
     get_agent_software(std::string_view agent_id);
+
+    /// Fleet-wide exact lookup of a Package URL ("which agents carry exactly this package"),
+    /// served by the partial index `installed_software_purl_idx`. Matching is by byte equality
+    /// with the purl `compose_purl` stored, so callers pass the canonical form (percent-encoded,
+    /// qualifiers sorted); only blob-v3 rows carry a purl. Rows are ordered (agent_id,
+    /// install_id); `limit` defaults to 100 when <= 0 and is clamped to kFleetQueryRowCap, so a
+    /// short page is not proof of exhaustion. Returns agent_id, name, version, ecosystem, purl
+    /// and install_id per row. FLEET-WIDE and unscoped like `software_catalog`: a caller that
+    /// exposes it MUST gate it (global `Inventory:Read`, ADR-0017). AUTHORITATIVE read:
+    /// `std::nullopt` on a store/pool/query degrade; an empty `purl` is a precondition miss ->
+    /// empty value. No route, tool or page calls this yet.
+    [[nodiscard]] std::optional<std::vector<SoftwareFleetRow>> find_by_purl(std::string_view purl,
+                                                                            int limit = 100);
+
+    /// The `find_by_purl` statement (`$1` = purl, `$2` = limit). Exposed so a test can EXPLAIN it
+    /// and pin that it reaches `installed_software_purl_idx`.
+    [[nodiscard]] static std::string find_by_purl_sql();
 
     /// `inventory_state.last_seen` for one (agent, source) — the SERVER receipt
     /// epoch-seconds of the last ACCEPTED report (full or hash-only touch).

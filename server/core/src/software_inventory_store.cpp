@@ -5,6 +5,7 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "install_type_rules.hpp"
+#include "purl_compose.hpp"
 #include "pg/pg_raii.hpp"
 #include "product_normalize.hpp"
 #include "software_catalog_rules.hpp"
@@ -346,7 +347,7 @@ const std::vector<pg::PgMigration>& migrations() {
          "  device_count BIGINT NOT NULL,"
          "  PRIMARY KEY (name, publisher, ecosystem));"},
         {10,
-         // SAM-13: blob contract v3 (ADR-0016 Update 2026-11-04). Five server-derived/stored
+         // SAM-13: blob contract v3 (ADR-0016 Update 2026-11-04). Six server-derived/stored
          // columns on installed_software and a per-(agent, facet) state table.
          // COLUMNS: constant defaults are metadata-only (the v5 precedent), no rewrite. A row
          // that predates v10 reads install_type '' ("not derived"), install_scope 'machine' (the
@@ -363,6 +364,11 @@ const std::vector<pg::PgMigration>& migrations() {
          // host's first v10 ingest. instance_key (SHA-256 of the whole canonical row) is unique
          // after normalize() by construction. Partial: pre-v10 rows (instance_key '') are
          // excluded, so there is no backfill and no rewrite.
+         // PURL: the Package URL composed server-side for a v3 row (purl_compose.hpp), '' for a
+         // v2-reported row and for an ecosystem with no registered purl type. Indexed by a
+         // partial btree WHERE purl <> '' (the same partial shape as the instance index), so a
+         // row without a purl costs no index entry and the lookup-by-exact-purl read is one seek.
+         // Both indexes are built in this transaction, each by its own heap scan.
          // The index build holds ACCESS EXCLUSIVE for its duration, like v7: accepted under the
          // hard-cutover posture docs/postgres-migration-ladder.md records for v7 (a deviation
          // from v7's "must be online" rule, with the build measured at 1.8M rows in the ladder
@@ -377,7 +383,8 @@ const std::vector<pg::PgMigration>& migrations() {
          "ADD COLUMN IF NOT EXISTS install_scope    TEXT NOT NULL DEFAULT 'machine', "
          "ADD COLUMN IF NOT EXISTS install_location TEXT NOT NULL DEFAULT '', "
          "ADD COLUMN IF NOT EXISTS identity_key     TEXT NOT NULL DEFAULT '', "
-         "ADD COLUMN IF NOT EXISTS instance_key     TEXT NOT NULL DEFAULT '';"
+         "ADD COLUMN IF NOT EXISTS instance_key     TEXT NOT NULL DEFAULT '', "
+         "ADD COLUMN IF NOT EXISTS purl             TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE installed_software DROP CONSTRAINT IF EXISTS "
          "installed_software_install_type_chk;"
          "ALTER TABLE installed_software ADD CONSTRAINT installed_software_install_type_chk "
@@ -389,6 +396,8 @@ const std::vector<pg::PgMigration>& migrations() {
          "CHECK (install_scope IN ('machine', 'user')) NOT VALID;"
          "CREATE UNIQUE INDEX IF NOT EXISTS installed_software_instance_idx "
          "ON installed_software (agent_id, instance_key) WHERE instance_key <> '';"
+         "CREATE INDEX IF NOT EXISTS installed_software_purl_idx "
+         "ON installed_software (purl) WHERE purl <> '';"
          "CREATE TABLE IF NOT EXISTS software_facet_state ("
          "  agent_id          TEXT    NOT NULL,"
          "  facet             TEXT    NOT NULL,"
@@ -516,11 +525,11 @@ void append_section_record(std::string& out, const SoftwareEntry& e) {
 // Postgres bind form of an entry set: one text[] per inserted column, in the order of the
 // INSERT below. The column list, the SELECT list, the unnest() alias list and this array order
 // are one contract; kInsertColumnCount is checked against it.
-constexpr std::size_t kInsertColumnCount = 19;
+constexpr std::size_t kInsertColumnCount = 20;
 
 // Batched insert (#1664): one statement carrying the per-row columns as parallel text[]
-// arrays — agent_id is the scalar $1, so the param count is a constant 20 regardless of row
-// count. A multi-row VALUES would hit libpq's 65535-parameter ceiling at ~3.2k rows (20
+// arrays — agent_id is the scalar $1, so the param count is a constant 21 regardless of row
+// count. A multi-row VALUES would hit libpq's 65535-parameter ceiling at ~3.1k rows (21
 // params/row); up to kMaxEntries (20k) rows arrive here. unnest() pairs the arrays
 // positionally and they are equal-length by construction. Collapsing up to 20k single-row
 // INSERTs into one statement shrinks the transaction's connection-hold + statement_timeout
@@ -555,6 +564,7 @@ bool insert_entries(PGconn* c, const std::string& agent_id_s,
         cols[16].emplace_back(e.install_scope);
         cols[17].emplace_back(e.identity_key);
         cols[18].emplace_back(e.instance_key);
+        cols[19].emplace_back(e.purl);
     }
     std::vector<std::string> params;
     params.reserve(kInsertColumnCount + 1);
@@ -566,13 +576,13 @@ bool insert_entries(PGconn* c, const std::string& agent_id_s,
         "INSERT INTO software_inventory_store.installed_software "
         "(agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, "
         "release, arch, signature_status, distro_id, distro_version, install_location, "
-        "package_id, source, install_type, install_scope, identity_key, instance_key) "
-        "SELECT $1, n, v, p, d, k, e, ep, r, a, s, di, dv, il, pk, so, it, sc, ik, ink "
+        "package_id, source, install_type, install_scope, identity_key, instance_key, purl) "
+        "SELECT $1, n, v, p, d, k, e, ep, r, a, s, di, dv, il, pk, so, it, sc, ik, ink, pu "
         "FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], "
         "$7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], "
         "$13::text[], $14::text[], $15::text[], $16::text[], $17::text[], $18::text[], "
-        "$19::text[], $20::text[]) "
-        "AS t(n, v, p, d, k, e, ep, r, a, s, di, dv, il, pk, so, it, sc, ik, ink)",
+        "$19::text[], $20::text[], $21::text[]) "
+        "AS t(n, v, p, d, k, e, ep, r, a, s, di, dv, il, pk, so, it, sc, ik, ink, pu)",
         params);
     return ins.status() == PGRES_COMMAND_OK;
 }
@@ -877,7 +887,7 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
         {"installed_software",
          "agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, release, "
          "arch, signature_status, distro_id, distro_version, package_id, source, install_id, "
-         "install_type, install_scope, install_location, identity_key, instance_key"},
+         "install_type, install_scope, install_location, identity_key, instance_key, purl"},
         {"inventory_state", "agent_id, source, content_hash, first_seen, last_seen"},
         {"software_facet_state",
          "agent_id, facet, status, token, section_hash, enabled, last_confirmed_at, duration_ms, "
@@ -1067,8 +1077,10 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
             prep[i].rows = std::move(sec.rows);
             normalize(prep[i].rows);
             prep[i].section_hash = section_hash_of_normalised(prep[i].rows);
-            for (auto& e : prep[i].rows)
+            for (auto& e : prep[i].rows) {
                 derive_install_keys(e);
+                e.purl = compose_purl(e); // v3 path only: a v2 row keeps '' (see SoftwareEntry)
+            }
             prep[i].write = true;
         } else {
             prep[i].is_delta = true;
@@ -1421,6 +1433,66 @@ SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
         e.package_id = PQgetvalue(res.get(), i, 12);
         e.source = PQgetvalue(res.get(), i, 13);
         out.push_back(std::move(e));
+    }
+    return out;
+}
+
+std::string SoftwareInventoryStore::find_by_purl_sql() {
+    // `purl <> ''` is stated so the partial index qualifies for every plan, generic ones too.
+    return "SELECT agent_id, name, version, ecosystem, purl, install_id "
+           "FROM software_inventory_store.installed_software "
+           "WHERE purl = $1 AND purl <> '' ORDER BY agent_id, install_id LIMIT $2::bigint";
+}
+
+std::optional<std::vector<SoftwareFleetRow>>
+SoftwareInventoryStore::find_by_purl(std::string_view purl, int limit) {
+    // AUTHORITATIVE read (ADR-0016 §7): nullopt on a degrade, never a silent empty. An empty
+    // purl is a precondition miss (rows with no purl all store ''), not a degrade: empty value.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: find_by_purl degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    std::vector<SoftwareFleetRow> out;
+    if (purl.empty())
+        return out;
+    if (limit <= 0)
+        limit = 100;
+    limit = std::min(limit, kFleetQueryRowCap);
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: find_by_purl degraded — no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(), find_by_purl_sql().c_str(),
+        std::vector<std::string>{std::string(purl), std::to_string(limit)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: find_by_purl degraded — query failed: {} "
+                         "(occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::nullopt;
+    }
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        SoftwareFleetRow row;
+        row.agent_id = PQgetvalue(res.get(), i, 0);
+        row.entry.name = PQgetvalue(res.get(), i, 1);
+        row.entry.version = PQgetvalue(res.get(), i, 2);
+        row.entry.ecosystem = PQgetvalue(res.get(), i, 3);
+        row.entry.purl = PQgetvalue(res.get(), i, 4);
+        row.install_id = std::strtoll(PQgetvalue(res.get(), i, 5), nullptr, 10);
+        out.push_back(std::move(row));
     }
     return out;
 }

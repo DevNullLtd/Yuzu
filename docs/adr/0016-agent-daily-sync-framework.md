@@ -917,6 +917,35 @@ The `pkg_inventory.managers` presence row is stored in `installed_software` toda
 `package_manager` like the packages it manages; it is not exempted by name. `install_scope` is
 `machine` or `user`; collection is machine-scope only, so the server writes `machine`.
 
+**`purl`.** A Package URL per row, composed by the server (`purl_compose.hpp`, `compose_purl`)
+from fields already on the `+` record and stored in `installed_software.purl`. It is not on the
+wire and in neither hash, so the agent and the v2 path are untouched. Only the v3 apply path
+sets it: a row from a v2 report carries an empty `purl` until its device's first v3 report (the
+`install_location` coexistence rule). It is built to the Package-URL specification (ECMA-427,
+Clause 5 and the `alpm`, `apk`, `brew`, `deb`, `rpm` type definitions of the purl-spec
+repository) and is `''` wherever the specification registers no type for the ecosystem: a type
+is never invented. `purl_type_for` (the title normalisation pack's ecosystem table) is the one
+source of the type. Rules common to all types: UTF-8 bytes percent-encoded except
+`A-Z a-z 0-9 . - _ ~ :`; qualifier keys sorted, empty values dropped; `''` when the name or the
+version is empty, when a required namespace has no source, and when the result would exceed 2048
+bytes (never truncated).
+
+| Ecosystem | Result | Notes |
+|---|---|---|
+| `deb` | `pkg:deb/<distro_id>/<name>@[<epoch>:]<version>[-<revision>]?arch=&distro=` | name lowercased |
+| `rpm` | `pkg:rpm/<distro_id>/<name>@<version>[-<release>]?arch=&distro=&epoch=` | name keeps its case; epoch is a qualifier |
+| `apk` | `pkg:apk/<distro_id>/<name>@<version>[-r<pkgrel>]?arch=&distro=` | the agent stores pkgrel without apk's `r` |
+| `pacman` | `pkg:alpm/<distro_id>/<name>@[<epoch>:]<pkgver>[-<pkgrel>]?arch=` | rolling: no distro qualifier |
+| `brew` formula | `pkg:brew/<name>@<version>` | default tap; `@` in a name is `%40` |
+| `brew` cask | `pkg:brew/homebrew/cask/<name>@<version>` | the Homebrew presence row gets no purl |
+| `windows`, `macos`, `macos_pkgutil`, `msi`, `snap`, `flatpak`, `optional_feature`, `python`, `ibm_mq` | `''` | no registered type; `python` rows are interpreter installs, not PyPI distributions |
+
+The namespace is the lower-cased `/etc/os-release` ID (`distro_id`). `distro` is
+`<distro_id>-<distro_version>` and only when both are known. `arch` is the stored architecture
+when non-empty. An index (`installed_software_purl_idx`, a partial btree `WHERE purl <> ''`) and
+`SoftwareInventoryStore::find_by_purl` serve exact lookups; no route, tool or page reads the
+column yet.
+
 **Keys, and why the uniqueness is not the identity.** Two keys are derived in one place (the
 store's `derive_install_keys`) on both insert paths:
 
@@ -935,15 +964,15 @@ de-duplicated. They share an identity, so an identity-keyed unique constraint wo
 first v10 ingest of every Windows host that has an MSI product. `removed_at` belongs to the
 deletion-tracking change and is not added here.
 
-**Migration v10** (`docs/postgres-migration-ladder.md`, `SoftwareInventoryStore` row): five
+**Migration v10** (`docs/postgres-migration-ladder.md`, `SoftwareInventoryStore` row): six
 columns on `installed_software` (`install_type`, `install_scope` default `machine`,
-`install_location`, `identity_key`, `instance_key`; constant defaults, no rewrite); two CHECK
+`install_location`, `identity_key`, `instance_key`, `purl`; constant defaults, no rewrite); two CHECK
 constraints (`install_type` in the vocabulary above or `''`, `install_scope` in `machine`,
 `user`) added `NOT VALID`, so existing rows are not scanned and `''` is admitted for the rows
 that predate v10 until their agent's next full report (at most a week); the partial unique index
-above; and the new `software_facet_state (agent_id, facet, status, token, section_hash, enabled,
+above and the partial btree `installed_software_purl_idx` on `(purl) WHERE purl <> ''`; and the new `software_facet_state (agent_id, facet, status, token, section_hash, enabled,
 last_confirmed_at, duration_ms, bytes_read, updated_at)` table, primary key `(agent_id, facet)`.
-The index build is not online: it holds `ACCESS EXCLUSIVE` for its duration, under the same
+The index builds are not online: they hold `ACCESS EXCLUSIVE` for their duration, under the same
 hard-cutover posture the ladder records for v7. The ladder row carries the measured build time.
 
 **Partitioning decision: `installed_software` stays a plain table.** No measurement exists (the
@@ -973,4 +1002,4 @@ byte for byte, including that a facet whose status moves from `full` to a status
 
 **Not in this change.** Delta apply and the `-` deletions; storage of component rows; the agent
 writer; any read surface returning the new columns (the existing reads select the old columns
-only).
+only; `find_by_purl` is a store method with no caller).

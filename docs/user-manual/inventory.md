@@ -300,7 +300,7 @@ cadences.
 
 ### Install type, scope and location, and the sectioned report
 
-Each stored software row carries three more attributes. They are read-side facts today: the
+Each stored software row carries four more attributes. They are read-side facts today: the
 fleet query, catalogue and device pages do not return them yet, so they are visible only in the
 database.
 
@@ -318,6 +318,15 @@ database.
 - **`install_location`** is the folder the software was installed into, when the collector reports
   one. It is stored only from the v3 blob; the v2 blob's slot is ignored, so it is empty for every
   device until an agent that sends v3 is deployed.
+- **`purl`** is the row's Package URL (for example
+  `pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12`), composed by the server from the
+  row's name, version, release, epoch, architecture and distribution. Linux package rows
+  (`deb`, `rpm`, `apk`, `pacman`, which the Package-URL specification calls `alpm`) and Homebrew
+  formulae and casks carry one; the other ecosystems have no registered Package-URL type, so
+  their `purl` is empty, and so is the Homebrew presence row. The server stores it only from the
+  v3 blob: a row from a v2 report has an empty `purl` until its device's first v3 report. The
+  value is indexed, and the store can look up the devices carrying exactly one `purl`; the
+  dashboard and the API do not return it yet.
 
 **The per-source report (blob v3).** A v3 report is a list of sections, one per collector source,
 each with a status (`full`, `delta`, `constrained`, `timeout`, `oversize`, `not_collected` or
