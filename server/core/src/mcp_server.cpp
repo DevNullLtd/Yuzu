@@ -90,6 +90,7 @@
 #include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
 #include "workflow_execution_list_model.hpp" // shared REST+MCP parser/row builder for the run list
 #include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution row builders
+#include "workflow_execute.hpp" // #2146 batch B: execute_workflow shares this sequence with POST /api/v1/workflows/{id}/execute
 #include "response_export_metrics.hpp" // #4644/#4703: param-rejected counter (shared with REST)
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
                                      // response query/aggregate row builders
@@ -1332,6 +1333,65 @@ static const ToolDef kTools[] = {
      R"j("next_cursor":{"type":["string","null"],"description":"Pass back as cursor for the next page; null when no more rows exist"},)j"
      R"j("result_truncated_by_cap":{"type":"boolean","description":"Present (true) only under latest_per_workflow when more workflows matched than limit"})j"
      R"j(},"required":["executions","next_cursor"]})j"},
+
+    // Workflow execute twin (#2146 batch B). Shares workflow_execute.hpp's sequence with
+    // POST /api/v1/workflows/{id}/execute.
+    {"execute_workflow",
+     "Run a multi-step workflow (see list_workflows / get_workflow) against the named devices. "
+     "SYNCHRONOUS DISPATCH, ASYNC DEVICE WORK: the call returns once every step's command has "
+     "been SENT (it can take as long as the workflow's step retries and delays), not when devices "
+     "finish; read the outcome with get_workflow_execution on the returned execution_id, and the "
+     "devices' own results with query_responses by each step's command_id. NEVER re-send this "
+     "call to 'retry': a second call sends every step to the devices a second time. "
+     "agent_ids is REQUIRED (1 to 10000 ids): a workflow run names its devices; there is no scope "
+     "and no fleet-wide default. Each step is sent only to the agents you can see; ids outside "
+     "your visibility are silently dropped, and a step that then reaches nobody is reported in "
+     "steps with its reason. "
+     "ALL-OR-NOTHING PRECHECK, before anything is sent: every step's instruction must exist and "
+     "have approval_mode auto (a role-gated step runs only for an administrator; an always-"
+     "approval step, or an unknown mode, refuses the whole call with 403 and a message naming the "
+     "step - run that instruction through its own approval instead). An approval ticket for this "
+     "call does NOT lift a step's own approval mode. A Destructive-classified step needs the "
+     "explicit agent_ids (always true here) and at least one of them visible to you, else the "
+     "call is refused; a Forensics step needs exactly one agent id. A step whose plugin.action is "
+     "not in the capability catalogue refuses the call. If the instruction store or the approval "
+     "gate is not available the call is refused with a 503 and NOTHING is sent (it does not skip "
+     "the check). "
+     "TIER AND TICKET: the operator tier is denied. At the supervised tier the first call returns "
+     "kApprovalRequired with an approval_id; repeat the SAME arguments plus that approval_id "
+     "after an administrator approves. The ticket binds workflow_id and agent_ids, not the "
+     "workflow's step list: a definition edited between approval and the repeat call runs as "
+     "edited, with every precheck re-run at send time. "
+     "AUDIT: an 'requested' audit row (workflow.execute) is written BEFORE anything is sent; if "
+     "it cannot be saved the call fails with a retryable error and nothing was sent. A step "
+     "refused at send time because its definition changed is audited at that moment. A closing "
+     "row records the outcome (audit_persisted:false if that one was lost). "
+     "RESULT: a success envelope with execution_id, workflow_id, status (the engine's recorded "
+     "dispatch-level status, completed or failed; it means sent, not finished) and steps (one "
+     "entry per send attempt: instruction_id, command_id, agents_reached; when 0, a reason). If "
+     "NO step reached any agent the envelope instead carries status set to the cause with "
+     "agents_reached 0 on every step: \"quarantined\", "
+     "\"plugin_not_found\", \"kill_switched_os\" and \"late_denied\" are PERMANENT "
+     "(retry_after_ms null); \"containment_unreadable\", \"route_unreadable\", "
+     "\"os_gate_unreadable\" and \"no_agents_reached\" (offline devices, or a concurrency "
+     "claim) are retryable (retry_after_ms 5000). The execution still exists and is readable. "
+     "Mirrors REST POST /api/v1/workflows/{id}/execute. Requires Workflow:Execute; a "
+     "service-scoped token is denied.",
+     R"j({"type":"object","properties":{)j"
+     R"j("workflow_id":{"type":"string","minLength":1,"maxLength":128,"description":"Workflow id from list_workflows"},)j"
+     R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","minLength":1,"maxLength":128},"description":"Agent ids to run the workflow against. Required: there is no scope and no fleet-wide default"},)j"
+     R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after administrator approval"})j"
+     R"j(},"required":["workflow_id","agent_ids"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("execution_id":{"type":"string","description":"Read the run with get_workflow_execution"},)j"
+     R"j("workflow_id":{"type":"string"},)j"
+     R"j("status":{"type":"string","description":"The engine's recorded status (completed, failed, ...), or the zero-reach cause token when no step reached any agent"},)j"
+     R"j("late_denied":{"type":"boolean","description":"True when a step was refused at send time because its definition changed after the precheck"},)j"
+     R"j("steps":{"type":"array","items":{"type":"object","properties":{"instruction_id":{"type":"string"},"command_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":0},"reason":{"type":"string","description":"Present when agents_reached is 0"},"retryable":{"type":"boolean"},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["instruction_id","command_id","agents_reached"]}},)j"
+     R"j("message":{"type":"string","description":"Present only when no step reached any agent"},)j"
+     R"j("retry_after_ms":{"type":["integer","null"],"description":"Present only when no step reached any agent: 5000 for a retryable cause, null for a permanent one"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the closing audit row failed to persist after the run had started"})j"
+     R"j(},"required":["execution_id","workflow_id","status","steps"]})j"},
 
     {"validate_scope",
      "Validate a scope expression without executing it. Returns parse errors if invalid.",
@@ -4483,6 +4543,7 @@ static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
 static const char* const kWriteToolsRaw[] = {
     "sync_hardware_software",
     "set_tag",         "delete_tag",     "execute_instruction", "execute_instruction_definition",
+    "execute_workflow",
     "approve_request", "reject_request", "quarantine_device",
     "revoke_certificate", "execute_bundle", "issue_code_signing_cert", "import_ca_chain",
     // Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3).
@@ -4701,6 +4762,13 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // get_definition above, not a per-agent read.
     {"list_workflows", {"Workflow", "Read"}},
     {"get_workflow", {"Workflow", "Read"}},
+    // #2146 batch B. ServiceScopeClass is the `denied` default: the REST twin's perm_fn refuses a
+    // service-scoped token (Workflow:Execute is not on kServiceScopeGlobalSafe, which is empty),
+    // and the only confinement the steps have is the caller's exec_visible at the dispatch
+    // chokepoint, a management-group mechanism, not a service-scope one. `confined` would claim
+    // a downstream service-scope mechanism that does not exist. Approval: requires_approval()
+    // gates the supervised tier on this pair (mcp_policy.hpp); the operator tier is denied.
+    {"execute_workflow", {"Workflow", "Execute"}},
     // get_workflow_execution DOES carry per-agent data (agent_ids) and is
     // gated on fleet_read_fn — a real confinement mechanism, so it earns the
     // `confined` tag (same precedent as query_responses/get_agent_details).
@@ -5649,6 +5717,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"execute_instruction", {ToolEffect::Destructive, false, "Execute instruction"}},
     {"execute_instruction_definition", {ToolEffect::Destructive, false, "Execute stored instruction definition"}},
     {"execute_bundle", {ToolEffect::Destructive, false, "Execute live-query bundle"}},
+    // A workflow's steps are caller-chosen instructions, so the worst case is whatever those
+    // instructions can do (Destructive); each call sends every step again (not idempotent).
+    {"execute_workflow", {ToolEffect::Destructive, false, "Execute workflow"}},
     // approve/reject: one-way pending→decided transition (approve also arms a live
     // one-time execution ticket) → destructive + non-idempotent.
     {"approve_request", {ToolEffect::Destructive, false, "Approve request"}},
@@ -21950,6 +22021,166 @@ McpServer::HandlerFn McpServer::build_handler(
             // still gets denied below by `in_scope` (compose_exec_visible resolves
             // to a present-empty set when the caller holds no Execution:Execute
             // grant at all, scoped or global — see authz_model.hpp).
+            // ── execute_workflow (#2146 batch B) ──────────────────────────
+            // REST v1 twin: POST /api/v1/workflows/{id}/execute (workflow_execute_routes.cpp).
+            // Both run workflow_execute.hpp's apply_workflow_execute, so the precheck, the
+            // fail-closed wiring, the requested-before-effect audit and the per-step confinement
+            // are one copy. The tier and ticket are decided BEFORE this branch by the generic C8
+            // gate (tier_allows denies operator; requires_approval gates supervised on
+            // Workflow:Execute). A consumed ticket does NOT change what the steps may do:
+            // approval_provenance is left None, so an AdminOrApproval step still needs an
+            // administrator, exactly as on REST.
+            if (tool_name == "execute_workflow") {
+                if (!perm_fn(req, res, "Workflow", "Execute"))
+                    return;
+                // Strict arguments: the C8 schema check only runs for approval-gated callers.
+                for (auto it = args.begin(); it != args.end(); ++it) {
+                    if (it.key() != "workflow_id" && it.key() != "agent_ids" &&
+                        it.key() != "approval_id") {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "unknown argument '" + it.key().substr(0, 64) +
+                                               "'; execute_workflow takes workflow_id, agent_ids "
+                                               "and approval_id"),
+                            "application/json");
+                        return;
+                    }
+                }
+                const auto wf_id = param_string_strict(args, "workflow_id");
+                if (!wf_id || wf_id->empty() || wf_id->size() > mcp::kExecInstrIdentMaxLen) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "workflow_id must be a non-empty string of at "
+                                                   "most 128 characters"),
+                                    "application/json");
+                    return;
+                }
+                auto agent_ids = parse_workflow_execute_body(args);
+                if (!agent_ids) {
+                    if (metrics) {
+                        try {
+                            metrics
+                                ->counter("yuzu_server_dispatch_target_rejected_total",
+                                          {{"route", "workflow"},
+                                           {"reason", agent_ids.error().reason}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
+                        }
+                    }
+                    mcp_audit("denied", "reason=" + agent_ids.error().reason);
+                    res.set_content(error_response(id, kInvalidParams, agent_ids.error().message), // retry-hint-exempt: input-parse failure, not a store fault
+                                    "application/json");
+                    return;
+                }
+                // The caller's REAL DispatchCaller; an unwired derivation fails CLOSED on
+                // visibility (present-EMPTY set, never nullopt - ADR-0033 section 1).
+                const auto caller =
+                    caller_fn ? caller_fn(*session)
+                              : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+
+                WorkflowExecutePorts ports;
+                ports.api = workflow_api_.get();
+                ports.instruction_store_open = instruction_store && instruction_store->is_open();
+                ports.approval_gate_available = approval_manager != nullptr;
+                ports.lookup = make_instruction_lookup(instruction_store);
+                ports.classify = classify_fn_;
+                if (dispatch_fn) {
+                    ports.dispatch = [&](const WorkflowStepInstruction& def,
+                                         const std::vector<std::string>& ids,
+                                         const std::unordered_map<std::string, std::string>& params,
+                                         const DispatchCaller& c) {
+                        return workflow_concurrency_dispatch_fn_
+                                   ? workflow_concurrency_dispatch_fn_(
+                                         def.plugin, def.action, ids, "", params,
+                                         /*execution_id=*/"", c, def.id, def.concurrency_mode)
+                                   : dispatch_fn(def.plugin, def.action, ids, "", params,
+                                                 /*execution_id=*/"", c);
+                    };
+                }
+                ports.audit = [&](const std::string& action, const std::string& result_status,
+                                  const std::string& target_id, const std::string& detail_text) {
+                    return yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, action, result_status, "workflow", target_id, detail_text);
+                };
+                ports.count_target_rejected = [&](std::string_view reason) {
+                    if (!metrics)
+                        return;
+                    try {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "workflow"}, {"reason", std::string(reason)}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
+                    }
+                };
+
+                WorkflowExecuteRequest wreq;
+                wreq.workflow_id = *wf_id;
+                wreq.agent_ids = std::move(*agent_ids);
+                wreq.caller = caller;
+                wreq.audit_context = "surface=mcp";
+
+                WorkflowExecuteOutcome out;
+                try {
+                    out = apply_workflow_execute(ports, wreq);
+                } catch (const std::exception& e) {
+                    spdlog::error("MCP execute_workflow: threw: {}", e.what());
+                    mcp_audit("failure", "exception");
+                    res.set_content(a4_error(kInternalError, "workflow execution failed", {},
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                using WES = WorkflowExecuteStatus;
+                if (out.status == WES::kOk || out.status == WES::kNoAgentsReached) {
+                    auto payload = workflow_execute_result_json(out, *wf_id);
+                    if (out.status == WES::kNoAgentsReached) {
+                        // Same envelope shape as execute_instruction's zero-agents branch: a
+                        // success result carrying the cause, never a bare "reached 0".
+                        payload["status"] = out.reason;
+                        payload["message"] = out.message;
+                        payload["retry_after_ms"] =
+                            out.retryable ? nlohmann::json(mcp::kMcpStoreFaultRetryMs)
+                                          : nlohmann::json(nullptr);
+                    }
+                    mcp_audit(out.status == WES::kOk ? "success" : "failure",
+                              "execution_id=" + audit_caller_id(out.execution_id));
+                    res.set_content(
+                        success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                        "application/json");
+                    return;
+                }
+                mcp_audit(out.status == WES::kStoreFailed || out.status == WES::kAuditFailed ||
+                                  out.status == WES::kUnavailable
+                              ? "error"
+                              : "denied",
+                          "reason=" + out.reason);
+                switch (out.status) {
+                case WES::kStoreFailed:
+                case WES::kAuditFailed:
+                    res.set_content(a4_error(kInternalError, out.message, {},
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                case WES::kUnavailable:
+                case WES::kNoPrincipal:
+                    res.set_content(error_response(id, kInternalError, out.message),
+                                    "application/json");
+                    return;
+                case WES::kApprovalRequired:
+                    res.set_content(
+                        a4_error(kPermissionDenied, out.message,
+                                 "run each instruction through its own approval; a workflow only "
+                                 "runs steps this caller may run without one. An approval ticket "
+                                 "for this call does not lift a step's own approval mode"),
+                        "application/json");
+                    return;
+                default:
+                    res.set_content(error_response(id, kInvalidParams, out.message),
+                                    "application/json");
+                    return;
+                }
+            }
+
             if (tool_name == "execute_bundle") {
                 if (!bundle_orch) {
                     res.set_content(

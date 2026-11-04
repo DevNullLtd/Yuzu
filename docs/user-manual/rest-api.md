@@ -6552,22 +6552,30 @@ pre-migration `{"deleted": false}`.
 
 #### `POST /api/workflows/{id}/execute`
 
-Execute a workflow against targeted agents. Fails (workflow-not-found, `400`) if the workflow
-does not exist or was soft-deleted; a genuine store degrade returns `503` (ADR-0064).
+Execute a workflow against named agents. Fails (workflow-not-found, `400`) if the workflow
+does not exist or was soft-deleted; a genuine store degrade returns `503` (ADR-0064). The
+versioned twin with a fail-closed precheck and a pre-dispatch audit row is
+[`POST /api/v1/workflows/{id}/execute`](#post-apiv1workflowsidexecute); prefer it.
+
+**Permission:** `Workflow:Execute`. A supervised-tier MCP token is refused (`403`, use the MCP
+ticket flow); this route never accepted an operator-tier one.
 
 **Request body:**
 
 ```json
 {
-  "scope": "os = 'windows' AND tag:environment = 'production'",
-  "parameters": {}
+  "agent_ids": ["agent-1", "agent-2"]
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `scope` | string | Yes | Scope expression selecting target agents |
-| `parameters` | object | No | Override parameters for workflow steps |
+| `agent_ids` | array of strings | Yes | The agents to run the workflow against (`400` if missing or empty). There is no `scope` field. |
+
+The per-step approval check (a step whose instruction is not `auto` is refused with `403`) and the
+unknown-instruction `400` run only when the approval manager and the instruction store are both
+wired and open; if either is not, this legacy route skips them and goes on to dispatch. The v1 twin
+refuses with `503` instead. The route replies `202` after the steps have been dispatched.
 
 **Approval:** `Workflow:Execute` requires an approval ticket at the `supervised` MCP token tier, so a supervised-tier MCP token that calls this route is refused (`403`, approval required on this transport, audit action `auth.approval_required`). No MCP tool maps to `Workflow:Execute` yet, so such a token has no ticket path to run a workflow until the `execute_workflow` tool ships; use a session or a non-MCP API token. Treat that as temporary and do not remove the tier from a token that does other work only to run workflows: the tier constrains every other operation the token performs. Running the steps one at a time through `execute_instruction` stays approval-gated per step. The `operator` tier is refused by the tier check, and an untiered token is unaffected.
 
@@ -6641,6 +6649,59 @@ you've already narrowed them.
 **Permission:** `Workflow:Read`. Fetch one workflow's full detail, including `yaml_source`. The v1
 twin of `GET /api/workflows/{id}` above, MCP twin `get_workflow`. `404` for an unknown or
 soft-deleted id.
+
+#### `POST /api/v1/workflows/{id}/execute`
+
+**Permission:** `Workflow:Execute` (global). Run a workflow against named agents. The v1 twin of
+`POST /api/workflows/{id}/execute`, MCP twin `execute_workflow` (#2146); both run one shared
+sequence, so they cannot disagree about what a run may do. A service-scoped token and an
+operator-tier MCP token are refused; a supervised-tier MCP token is refused with `403` here and
+must use `execute_workflow`'s ticket flow (`docs/user-manual/mcp.md`).
+
+**Request body:** `{"agent_ids": ["agent-1", "agent-2"]}`. `agent_ids` is required: 1 to 10000 ids
+of at most 128 bytes each. `scope` is not accepted (`400`, `reason: scope_unsupported`); there is no
+fleet-wide default. A body nested deeper than 32 levels is `400`.
+
+**Everything is checked before anything is sent.** For every step of the workflow: its instruction
+must exist (`400 unknown_instruction`) and its approval mode must admit the caller (`auto` always;
+`role-gated` only for an administrator, JIT elevation included; `always` or an unknown mode never,
+`403 approval_required` naming the step). A step whose `plugin.action` is not in the capability
+catalogue is refused (`400 step_unclassified`). A Destructive step needs `agent_ids` with at least
+one agent visible to the caller (`404 destructive_no_visible_target` otherwise); a Forensics step
+needs exactly one id (`400 forensic_untargeted`). One refused step refuses the whole run. Unlike the
+legacy route, if the instruction store or the approval gate is not available the answer is `503`
+(`reason: instruction_store_unavailable` / `approval_gate_unavailable`) and nothing is sent.
+
+**Audit.** A `workflow.execute` row with `result=requested` is written before anything is sent; if
+it cannot be saved the answer is `503` with `Sec-Audit-Failed: true` and nothing was sent. A step
+refused at send time because its definition changed after the precheck is audited as `denied` at
+that moment (detail ends `(late)`). A closing row (`success`, `failure` or `denied`) records the
+outcome; if that one is lost the `202` carries `data.audit_persisted: false` and
+`Sec-Audit-Failed: true`. An approval or targeting refusal (before the `requested` row) is audited as `denied` with the
+`reason`. Audit details are neutralised (CWE-117).
+
+**Dispatch is synchronous, device work is not.** The call returns after every step's command has
+been sent, including step retries and delays, so it can be slow. Each step is sent only to the
+agents the caller can see (the same confinement as every other dispatch); a named agent outside the
+caller's view is dropped silently. Read the run with `GET /api/v1/workflow-executions/{execution_id}`
+and each device's output with the step's `command_id`. Do not repeat the call to retry: every step is
+sent again.
+
+**Success `202`:** `data.execution_id`, `data.workflow_id`, `data.status` (the engine's recorded
+dispatch-level status, `completed` or `failed`: commands were sent, devices have not necessarily
+finished), `data.late_denied` and `data.steps`, one entry per send attempt (retries and `foreach`
+add entries): `instruction_id`, `command_id`, `agents_reached`, and, when `agents_reached` is `0`,
+`reason`, `retryable` and the withheld counts `agents_quarantined`, `agents_unknown_plugin`,
+`agents_kill_switched_os`.
+
+**Nothing reached `503`:** if the run started but no step reached any agent, the answer is `503`
+with `error.reason` and `error.execution_id` (the run exists and is readable). `quarantined`,
+`plugin_not_found`, `kill_switched_os` and `late_denied` are permanent (`retry_after_ms: null`);
+`containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached` (offline
+devices, or a per-device concurrency claim) are retryable (`retry_after_ms: 5000`).
+
+Other statuses: `404` unknown or deleted workflow; `403` missing permission; `500` a session with no
+principal; `503` with `retry_after_ms: 5000` for a store read failure.
 
 #### `GET /api/v1/workflow-executions`
 

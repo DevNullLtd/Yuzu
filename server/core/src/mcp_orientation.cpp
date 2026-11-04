@@ -211,8 +211,11 @@ constexpr std::string_view kPreflightDeploy[] = {"list_preflight_runs", "get_dep
 // "Executions & audit" (ExecutionTracker's single-instruction fan-out): a
 // Workflow composes multiple steps, and its execution record is a different
 // data model from an Execution (see get_workflow_execution's tool doc).
+// #2146 batch B: execute_workflow joins the family - same securable (Workflow), the run side of
+// the read tools beside it.
 constexpr std::string_view kWorkflows[] = {"list_workflows", "get_workflow",
-                                           "list_workflow_executions", "get_workflow_execution"};
+                                           "list_workflow_executions", "get_workflow_execution",
+                                           "execute_workflow"};
 // #4027 — Echo (Timeline / Activity Recorder) had zero MCP presence before this
 // read-twin batch; its own family rather than folding into an unrelated one.
 constexpr std::string_view kEcho[] = {"list_echo_process_tree_devices",

@@ -505,7 +505,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # get.api-agents and get.fragments-devices-list left their dated exception and are twinned to it.
 # The two 212-origin steps above ran on separate branches. Merged: 4 rows flipped by twin batch B and
 # 2 by #4041, the sets are disjoint, so 212 - 4 - 2 = 206.
-BASELINE_UNTWINNED = 206
+# 206 -> 205 (workflow execute twins, #2146 batch B): post.api-workflows-param-execute flipped from
+# planned to twinned (POST /api/v1/workflows/{id}/execute + the execute_workflow MCP tool).
+BASELINE_UNTWINNED = 205
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -518,7 +520,8 @@ GENERIC_PLANNED_ISSUE = 2146
 # 84 -> 83 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me became twinned.
 # 83 -> 80 (twin batch B: commands, execution cancel/rerun): three rows became twinned.
 # 80 -> 79 (instruction-definition execute twins): post.api-instructions-param-execute became twinned.
-BASELINE_GENERIC_PLANNED = 79
+# 79 -> 78 (workflow execute twins, #2146 batch B): post.api-workflows-param-execute became twinned.
+BASELINE_GENERIC_PLANNED = 78
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.

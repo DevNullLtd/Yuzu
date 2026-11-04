@@ -1762,6 +1762,7 @@ if build_server
       'unit/server/test_list_keyset.cpp', # pure keyset cursor/int primitives (workflow-execution list)
       'unit/server/test_workflow_execution_list_model.cpp', # pure shared REST+MCP list model (parse/rows/cursor)
       'unit/server/test_workflow_execution_list_routes.cpp', # GET /api/v1/workflow-executions via TestRouteSink (no PG)
+      'unit/server/test_workflow_execute_twins.cpp', # #2146 batch B: POST /api/v1/workflows/{id}/execute + the shared sequence (no PG)
       'unit/server/test_guardian_api.cpp', # ADR-0031 WS-A4: the ninth per-family in-process API seam (Guardian read)
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
