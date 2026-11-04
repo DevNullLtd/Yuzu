@@ -5174,7 +5174,7 @@ groups:
             the agent_id. A blob-v3 call applies all of its sections in ONE
             transaction, so any one failing statement (a statement timeout or a lost
             connection under load, for example) answers error for every section of that
-            call and rolls the whole call back; the next sync resends it. The warn line
+            call that was not refused and rolls the whole call back; the next sync resends it. The warn line
             to grep for names "v3 ingest ... failed".
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryHighNeedFullRatio
@@ -5210,16 +5210,19 @@ groups:
         # YuzuInventoryHighNeedFullRatio. outcome=delta_unsupported is NOT here: it is the
         # expected placeholder until the delta apply is built, so it has its own
         # non-paging rule (YuzuInventorySectionDeltaUnsupported) below.
+        # increase over a day with NO hold (the YuzuCertInventoryReportsRejected shape): one
+        # refused section per sync cycle is enough, and a rate()-with-for would never fire for a
+        # low-cadence refusal. The series are pre-seeded at 0 (seed_section_ingest_series), so the
+        # first refusal is a real increase.
         expr: |
-          sum by (facet) (rate(yuzu_inventory_section_ingest_total{outcome="rejected"}[15m])) > 0
-        for: 15m
+          sum by (facet) (increase(yuzu_inventory_section_ingest_total{outcome="rejected"}[1d])) > 0
         labels:
           severity: warning
         annotations:
           summary: "Installed-software v3 sections being refused"
           description: >-
-            yuzu_inventory_section_ingest_total{outcome="rejected"} has been non-zero
-            for 15m for the facet label. rejected = the section broke the blob v3
+            yuzu_inventory_section_ingest_total{outcome="rejected"} increased in the
+            last day for the facet label. rejected = the section broke the blob v3
             grammar (an unknown status, rows in a status-only section, a record whose
             source is not the facet, a record holding a NUL byte or missing its
             terminator, a cap) - it NEVER self-heals, the agent resends the same bytes
@@ -5247,8 +5250,10 @@ groups:
             the delta apply has shipped.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryDroppedBlobs
-        # outcome=dropped = a blob over the 3 MiB cap was rejected + nacked. UNLIKE
-        # outcome=error this NEVER self-heals: the agent resends the same over-cap
+        # outcome=dropped = a blob over the 3 MiB cap, or a blob-v3 blob that cannot be
+        # attributed to sections (a record before any section, no section after the header,
+        # an unusable S record, over 32 sections), was rejected + nacked. UNLIKE
+        # outcome=error this NEVER self-heals: the agent resends the same
         # payload and backs off forever (the agent's own cap should prevent reaching
         # here, so a non-zero rate signals agent/server cap drift after a version
         # skew, or a non-conforming agent). Deliberately a SEPARATE alert — folding
@@ -5263,14 +5268,15 @@ groups:
           summary: "Installed-software ingest dropping over-cap blobs"
           description: >-
             yuzu_inventory_ingest_total{outcome="dropped"} is non-zero: one or more
-            agents are sending an installed-software blob over the 3 MiB cap (the label
-            source says which; source="certificate_inventory" also counts an unknown
+            agents are sending an installed-software blob over the 3 MiB cap, or a blob-v3
+            blob the server cannot split into sections (the warn-level "unusable v3 ...
+            blob" line names the reason) (the label source says which; source="certificate_inventory" also counts an unknown
             major version or an unparseable header, which are NOT resent - see
             YuzuCertInventoryReportsRejected for those), which
             is dropped + nacked and will NOT self-heal (the agent resends the same
             payload). Likely an agent/server cap-constant drift after a version skew,
             or a non-conforming agent — check the agent version and the warn-level
-            "oversized ... blob" server logs for the agent_id.
+            "oversized ... blob" or "unusable v3 ... blob" server logs for the agent_id.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryReportRejected
         # outcome=rejected = a whole report carrying too many sources (content_hashes /
