@@ -62,10 +62,11 @@ inline constexpr std::string_view kReadOnlyOperation =
 
 /// The closed list of reasons a kExempt MCP row may carry. A new reason is a new constant in
 /// `step_up_policy.hpp` (or above) AND an entry here: the class name is the review record.
-inline constexpr std::array<std::string_view, 6> kMcpExemptReasons = {
+inline constexpr std::array<std::string_view, 7> kMcpExemptReasons = {
     step_up_detail::kExecutionDispatch, step_up_detail::kOperationalData,
     step_up_detail::kSyncTrigger,       step_up_detail::kEvidenceCapture,
-    step_up_detail::kStopsEffect,       kReadOnlyOperation,
+    step_up_detail::kCancelsRecord,     step_up_detail::kCreatesRerunRecord,
+    kReadOnlyOperation,
 };
 
 [[nodiscard]] constexpr McpStepUpPolicyEntry exempt(std::string_view tool, std::string_view reason,
@@ -97,10 +98,13 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("approve_request",                      "POST",   R"(/api/approvals/([^/]+)/approve)"),
     step_up_mcp_detail::pending("reject_request",                       "POST",   R"(/api/approvals/([^/]+)/reject)"),
     // Execution:Execute
-    step_up_mcp_detail::exempt ("create_result_set_from_tar_query",     step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/from-tar-query)"),
+    step_up_mcp_detail::exempt ("cancel_execution",                     step_up_detail::kCancelsRecord,      "POST",   R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/cancel)"),
+    step_up_mcp_detail::exempt ("create_result_set_from_echo_query",     step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/from-echo-query)"),
     step_up_mcp_detail::exempt ("create_result_set_from_instruction_result", step_up_detail::kOperationalData, "POST", R"(/api/v1/result-sets/from-instruction-result)"),
     step_up_mcp_detail::exempt ("execute_bundle",                       step_up_detail::kExecutionDispatch, "POST",   R"(/api/v1/bundles)"),
-    step_up_mcp_detail::exempt ("execute_instruction",                  step_up_detail::kExecutionDispatch),
+    step_up_mcp_detail::exempt ("execute_instruction",                  step_up_detail::kExecutionDispatch, "POST",   R"(/api/v1/commands)"),
+    step_up_mcp_detail::exempt ("record_execution_rerun",               step_up_detail::kCreatesRerunRecord, "POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/rerun)"),
+    step_up_mcp_detail::exempt ("execute_instruction_definition",       step_up_detail::kExecutionDispatch, "POST",   R"(/api/v1/instructions/([^/]+)/execute)"),
     step_up_mcp_detail::exempt ("reevaluate_result_set",                step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/(rs_[0-9a-f]+)/re-eval)"),
     step_up_mcp_detail::exempt ("sync_hardware_software",               step_up_detail::kSyncTrigger,       "POST",   R"(/api/v1/hardware/sync)"),
     // GuaranteedState:Delete / Push / Write
@@ -161,7 +165,7 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("unassign_engine_role",                 "DELETE", R"(/api/v1/engine-principals/([a-z0-9._-]+)/roles/([^/]+))"),
     step_up_mcp_detail::pending("unassign_rbac_role",                   "DELETE", R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments/([A-Za-z0-9._-]+))"),
     // SoftwareDeployment:Execute
-    step_up_mcp_detail::exempt ("cancel_software_deployment",           step_up_detail::kStopsEffect,       "POST",   R"(/api/v1/software-deployments/([a-f0-9]+)/cancel)"),
+    step_up_mcp_detail::exempt ("cancel_software_deployment",           step_up_detail::kCancelsRecord,      "POST",   R"(/api/v1/software-deployments/([a-f0-9]+)/cancel)"),
     step_up_mcp_detail::pending("create_software_deployment",           "POST",   R"(/api/v1/software-deployments)"),
     step_up_mcp_detail::pending("rollback_software_deployment",         "POST",   R"(/api/v1/software-deployments/([a-f0-9]+)/rollback)"),
     // Tag:Delete / Write

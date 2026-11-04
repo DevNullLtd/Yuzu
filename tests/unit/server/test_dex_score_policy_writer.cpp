@@ -332,6 +332,7 @@ TEST_CASE("writer: the Apps projection is refused with a remediation naming tier
     CHECK(r.status == St::Invalid);
     CHECK(r.message == "unparseable at tiers.excellent: unknown key");
     CHECK(r.remediation.find("tiers.edges") != std::string::npos);
+    CHECK(r.remediation.find("model") != std::string::npos);
     REQUIRE(w.rows.size() == 1);
     CHECK(w.rows[0].detail["field"] == "tiers.excellent");
     CHECK(w.cas_calls == 0);
@@ -383,6 +384,40 @@ TEST_CASE("writer: a validator refusal names its token and group", "[dex][score_
     const auto r = w.put("default", R"({"tiers":{"edges":{"excellent":50,"good":60,"fair":40}}})");
     CHECK(r.status == St::Invalid);
     CHECK(r.message == "edges_not_descending at tiers.edges");
+}
+
+TEST_CASE("writer: model refusals name the model group and the override index",
+          "[dex][score_policy_writer]") {
+    struct Case {
+        const char* body;
+        const char* message;
+        const char* field;
+    };
+    const Case cases[] = {
+        {R"({"version":2,"model":{"per_device_event_cap":0}})", "event_cap_out_of_range at model",
+         "model"},
+        {R"({"version":2,"model":{"interval_confidence":0.3}})",
+         "interval_confidence_out_of_range at model", "model"},
+        // The inherited global full ratio (3.0) is below this override's start: the write path
+        // validates the override as merged onto the global policy.
+        {R"({"version":2,"overrides":[{"image":"a.exe","model":{"regression_start_ratio":5}}]})",
+         "regression_ratios_not_ascending at overrides[0].model", "overrides[0].model"},
+        {R"({"version":2,"overrides":[{"image":"a.exe","model":{"interval_confidence":0.9}}]})",
+         "unparseable at overrides[0].model.interval_confidence: unknown key",
+         "overrides[0].model.interval_confidence"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.body);
+        World w;
+        const auto r = w.put("default", c.body);
+        CHECK(r.status == St::Invalid);
+        CHECK(r.message == c.message);
+        CHECK(r.remediation.empty());
+        REQUIRE(w.rows.size() == 1);
+        CHECK(w.rows[0].result == "denied");
+        CHECK(w.rows[0].detail["field"] == c.field);
+        CHECK(w.cas_calls == 0);
+    }
 }
 
 TEST_CASE("writer: a read failure is 503 with no audit row and no store write",

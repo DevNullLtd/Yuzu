@@ -237,7 +237,7 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   work-root exclusions (`D:\ci\work-0` … `work-3`), which cover each runner's
   `_temp` directory and checkout/build outputs. PostgreSQL's executable and
   disposable data paths are also excluded, as are the Catch2 test binaries
-  (`yuzu_{server,agent,tar}_tests.exe`) via process exclusions — a process
+  (`yuzu_{server,agent,echo}_tests.exe`) via process exclusions — a process
   exclusion skips scanning that binary's file I/O wherever it lands, which covers
   the SQLite temp churn even in the LOCAL SYSTEM `%TEMP%` the routing can't reach.
   Provisioning verifies every `_temp`

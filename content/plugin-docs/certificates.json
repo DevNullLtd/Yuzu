@@ -786,7 +786,7 @@
   "version": "1.0.0",
   "where_the_data_goes": [
     "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention), queryable at `/api/responses/{id}`; `list` also aggregates by `store` and `issuer` through its definition's `aggregation` block.",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no reference to the `certificates` plugin or its definition ids exists outside `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`.",
+    "**Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics — no reference to the `certificates` plugin or its definition ids exists outside `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`.",
     "**Sensitivity.** `list`/`details` rows carry every certificate's `subject` and `issuer` — for code-signing certs (the Windows sample) this is effectively an installed-software-publisher inventory (e.g. `Logitech Inc`, `Microsoft Corporation`) by another route, and on macOS a successful login-keychain read can surface the signed-in user's own personal certificates; `thumbprint`/`serial` uniquely identify a specific certificate but not a device or person directly.",
     "**Siblings:** none in this plugin group; the `diagnostics.certificates` action (a different plugin, TLS cert/key diagnostics) is unrelated despite the similar name.",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"security.certificates.list\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."

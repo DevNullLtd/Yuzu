@@ -8,7 +8,7 @@
 
 /// @file plugin_action_catalogue_a.hpp
 /// PR1.10 group A + PR1.9 data A (#2204): the command-capability-catalogue
-/// fragment for five plugins — filesystem (16 actions), tar (13 of its 14
+/// fragment for five plugins — filesystem (16 actions), echo (13 of its 14
 /// actions — see the NOTE below), registry (12), license_scan (2), vuln_scan
 /// (5) — 48 rows total. Every `dispatch_class`/`mutability` pair and every
 /// `securable`/`operation` choice was made by reading the implementation,
@@ -20,13 +20,13 @@
 /// its row's operation. `system_reserved` is false on every row — none of
 /// these forty-eight dispatches is one the server issues to itself.
 ///
-/// NOTE — `tar.fleet_snapshot` is DELIBERATELY ABSENT from this fragment.
+/// NOTE — `echo.fleet_snapshot` is DELIBERATELY ABSENT from this fragment.
 /// `capability_decls/core_dispatch_capabilities.hpp` (a different package's
-/// file, already landed) declares `tar.fleet_snapshot` itself
+/// file, already landed) declares `echo.fleet_snapshot` itself
 /// (`system_reserved = true`, the periodic fleet-wide snapshot pull
 /// `server.cpp:2427` issues to itself). `CommandCapabilityRegistry::classify`
 /// keys purely on the case-insensitive `(plugin, action)` pair — it has no
-/// notion of "caller context" — so a second `tar.fleet_snapshot` row here
+/// notion of "caller context" — so a second `echo.fleet_snapshot` row here
 /// would make every future classification of that pair `Ambiguous`
 /// (`command_capability.hpp`'s own contract: "two fragments declaring the
 /// same plugin.action is Ambiguous, never first-wins"), exactly the
@@ -50,7 +50,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
     // supplied replacement. append only adds bytes, never destroys existing
     // content — Mutating/Reversible. delete_lines is named-explicit
     // deletion of existing file content with no undo — Destructive/
-    // Irreversible/Delete/High, the same treatment as tar.purge_source.
+    // Irreversible/Delete/High, the same treatment as echo.purge_source.
     {
         .plugin = "filesystem",
         .action = "exists",
@@ -226,7 +226,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
     {
         // Named-explicit deletion of existing file content with no undo —
         // Destructive/Irreversible/Delete, the same treatment given to
-        // tar.purge_source below.
+        // echo.purge_source below.
         .plugin = "filesystem",
         .action = "delete_lines",
         .dispatch_class = DispatchClass::Destructive,
@@ -238,7 +238,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
         .execute_gate = ExecuteGate::AdminOrApproval,
     },
 
-    // ── tar (agents/plugins/tar/src/tar_plugin.cpp) — 13 of 14 actions; ──
+    // ── echo (agents/plugins/echo/src/echo_plugin.cpp) — 13 of 14 actions; ──
     // ── fleet_snapshot is excluded, see the file-level NOTE above. ───────
     // Collector/report actions (status/query/snapshot/export/collect_*/
     // rollup/sql/compatibility) only observe the host and record/report —
@@ -254,7 +254,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
     // purge_source. purge_source's classification is PRESERVED verbatim
     // from server.cpp:9038-9042's `kDestructiveActionSecurable` map.
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "status",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -267,7 +267,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
     {
         // Medium, not the Read floor: a type filter can return PII
         // sources (arp/dns/mapdrive) alongside the default event union.
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "query",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -278,7 +278,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
         .execute_gate = ExecuteGate::None,
     },
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "snapshot",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -291,7 +291,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
     {
         // Medium, not the Read floor: same PII-surfacing type filter as
         // query, wrapped as a JSON export.
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "export",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -302,7 +302,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
         .execute_gate = ExecuteGate::None,
     },
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "configure",
         .dispatch_class = DispatchClass::Mutating,
         .mutability = Mutability::Reversible,
@@ -313,7 +313,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
         .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "collect_fast",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -324,7 +324,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
         .execute_gate = ExecuteGate::None,
     },
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "collect_slow",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -335,7 +335,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
         .execute_gate = ExecuteGate::None,
     },
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "collect_perf",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -346,7 +346,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
         .execute_gate = ExecuteGate::None,
     },
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "collect_software",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -362,7 +362,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
         // configured retention window — genuinely destroys data, so
         // Destructive/Irreversible/Delete like purge_source, not a plain
         // Mutating/Write for the aggregation half alone.
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "rollup",
         .dispatch_class = DispatchClass::Destructive,
         .mutability = Mutability::Irreversible,
@@ -377,7 +377,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
         // SELECT-only (rejects INSERT/UPDATE/DELETE/DROP/etc.) but an
         // operator-authored SELECT can reach the same PII tables
         // query/export gate behind a type filter.
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "sql",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -388,7 +388,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
         .execute_gate = ExecuteGate::None,
     },
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "compatibility",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -402,7 +402,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
         // PRESERVED verbatim from server.cpp:9038-9042's
         // kDestructiveActionSecurable map (the /api/command generic-dispatch
         // per-action elevation for this one action).
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "purge_source",
         .dispatch_class = DispatchClass::Destructive,
         .mutability = Mutability::Irreversible,
@@ -604,7 +604,7 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
     // ── vuln_scan (agents/plugins/vuln_scan/src/vuln_scan_plugin.cpp) ────
     // scan/cve_scan/config_scan/summary only detect and report vulnerability/
     // configuration findings — `Security` securable, Read. inventory returns
-    // the same raw software listing tar.query's software source and the
+    // the same raw software listing echo.query's software source and the
     // `/inventory` REST route serve — `Inventory` securable, matching
     // rbac_store.cpp's own note that "the /inventory software catalog
     // remains under Inventory:Read".

@@ -11,13 +11,15 @@ cadences.
 
 - **Machine-wide installed software** (blob contract v2): name, version,
   publisher, install date, plus the package-manager fields below. The daily
-  sync calls six inventory actions in-process and merges their rows:
+  sync calls seven inventory actions in-process and merges their rows:
   `installed_apps` `list_inventory` (Windows: `HKLM` + the agent service
   account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
   `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
   `store_packages` (Linux snaps and flatpaks), and
   `windows_optional_features` `list` and `msi_packages` `list_inventory`
-  (Windows machine-context MSI products). An action whose plugin is not loaded, or
+  (Windows machine-context MSI products), `runtimes` `python` (installed
+  Python interpreters), and `middleware` `ibm_mq` (IBM MQ
+  installations; Linux). An action whose plugin is not loaded, or
   that answers "unsupported on this OS", is skipped. A plugin that is not
   loaded is logged at warn (the rows its action produced are removed on the next
   report); without `installed_apps` the source stays idle and sends nothing,
@@ -29,10 +31,14 @@ cadences.
   skips that day's report and keeps the last good state — nothing is deleted. A
   `constrained` `managers` answer that still names at least one present manager
   is accepted: the constraint concerns manager facts the presence row never
-  carried. A skipped cycle is retried sooner on a phase-aligned backoff:
-  waits that double from 1 h after each consecutive skip (1 h, 2 h, 4 h, 8 h, …),
-  each retry capped so it never lands after the next daily slot — up to four
-  extra attempts — then one attempt per daily slot until a collection succeeds.
+  carried. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
+  exception: it withholds only that source's rows and the cycle continues, so the
+  stored rows of that source are removed until a later read succeeds (see
+  Troubleshooting). A skipped cycle
+  is retried sooner on a phase-aligned backoff: waits that double from 1 h after
+  each consecutive skip (1 h, 2 h, 4 h, 8 h, …), each retry capped so it never
+  lands after the next daily slot — up to four extra attempts — then one attempt
+  per daily slot until a collection succeeds.
   While it is skipping, the agent publishes the heartbeat tags
   `yuzu.sync.installed_software.skip_streak` (consecutive skips since the last
   success, uncapped) and `yuzu.sync.installed_software.last_skip` (the reason
@@ -41,7 +47,8 @@ cadences.
   `source` names the
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `pkg_inventory.store_packages`,
-  `windows_optional_features.list`, `msi_packages.list_inventory`); `package_id`
+  `windows_optional_features.list`, `msi_packages.list_inventory`,
+  `runtimes.python`, `middleware.ibm_mq`); `package_id`
   is empty for these producers except `msi_packages.list_inventory`, where it is
   the MSI product code. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
@@ -80,19 +87,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -149,6 +156,47 @@ cadences.
   and the machine-context guarantee. Install location and uninstall string are
   not collected (wire slots 13-14 stay reserved and empty, #5186). If the
   enumeration itself fails the cycle is skipped (see Troubleshooting).
+
+  **Python interpreters** are collected through `runtimes` `python` (all three OSes;
+  `source` `runtimes.python`) as one `app` row per interpreter, `name` `Python`,
+  `ecosystem` `python`, `version` the interpreter version; publisher and the other
+  package fields are empty. No process is started: each OS answers from install
+  metadata. Windows reads the PEP 514 `HKLM\SOFTWARE\Python\PythonCore` keys in both
+  registry views (python.org installs; per-user installs and other PEP 514
+  publishers are not listed) and reports the full `x.y.z`. macOS reads the
+  python.org framework under `/Library/Frameworks/Python.framework/Versions` and
+  reports the full `x.y.z` from each version's `Info.plist`. Linux lists
+  `python3.<minor>` files in `/usr/bin`, `/usr/local/bin` and `/var/usrlocal/bin` (the
+  last exists only on rpm-ostree hosts such as Fedora CoreOS and RHEL Edge, where
+  `/usr/local` links to `../var/usrlocal`) and reports **major.minor only** (for
+  example `3.11`): the patch level is not stored anywhere without running the
+  interpreter, so it is not guessed.
+  Homebrew, pyenv, conda, virtual environments and Xcode's Python are not walked. A
+  read that cannot be completed (an unreadable or network-mounted root, a cap, an
+  access-denied registry key) withholds only the `python` rows from that day's report
+  and every other source is still sent; the report replaces the device's stored
+  software rows, so the stored `python` rows are removed until a read succeeds again
+  (see Troubleshooting). A missing or unreadable version file never does this, the
+  row reports the version it could determine.
+
+  **IBM MQ** is collected through the `middleware` plugin's `ibm_mq` action (Linux; `source`
+  `middleware.ibm_mq`) with `kind` `app`, `ecosystem` `ibm_mq`, `name` `IBM MQ` and `publisher`
+  `IBM`, taken from the plugin's product table. `version` is VRM (version.release.modification,
+  for example `9.4.5`); the fix-pack level is not carried. The install path and edition
+  are shown by the `middleware` definition, not carried into installed software. This is a
+  metadata-only read with no subprocess: `mqinst.ini` and the
+  swidtag file names, readable by an unprivileged account (measured as a throwaway
+  unprivileged uid on one IBM MQ 9.4.5.0 Ubuntu-debs install; not measured as the packaged
+  `yuzu-agent` account or on another version or distribution). If the answer is `constrained`
+  (an access or walk fault such as a refused read or a cap; an unusable `mqinst.ini` stanza
+  beside a usable one is only logged) the collector withholds this source's rows for the
+  cycle, logs a warning, and carries on with every other source, rather than failing the
+  whole report. Because each cycle replaces the agent's stored inventory, the withheld IBM MQ
+  rows are REMOVED from the stored inventory until the source recovers, so they are absent
+  from the Software page. The server sees no signal for this and cannot tell a withheld
+  source from one with no IBM MQ installed; the state is visible only by running the
+  `ibm_mq` action on the device and reading its status row. This is the second such exception to the
+  skip-the-cycle rule above, with Python. Windows and macOS answer `unsupported` (planned).
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,
@@ -510,7 +558,7 @@ place, **Hardware** and **Software**, each its own page:
 
 - **`/hardware`** — a ServiceNow-style Configuration-Item list and record; the successor
   to the old **Devices** tab, extended with a generic action runner. The list shows
-  hostname, **IP** (new — read live from the TAR fleet-snapshot cache, so it is honestly
+  hostname, **IP** (new — read live from the Echo fleet-snapshot cache, so it is honestly
   blank once a device goes offline rather than a stale last-known address), OS,
   online/offline/**stale** status, per-page **DEX score**, agent version, last-seen,
   **Tags** (new — click a chip to filter by that exact `key` or `key=value`, or type
@@ -635,7 +683,10 @@ place, **Hardware** and **Software**, each its own page:
     as pills with a Clear all, the URL hash carries them (so a view can be bookmarked or shared), and the
     exact REST call the view corresponds to is shown with a copy button. The filter box on an
     expanded devices table filters only the rows already loaded; the catalogue search
-    and chips are server-side.
+    and chips are server-side. Rows and the **versions** and **devices** controls work from the
+    keyboard (Tab, then Enter or Space), and pressing an open control again closes its drill.
+    The chip rows are built from the server's vocabulary tables, so **Found by** lists every
+    collector source and each **Kind** and **Found by** chip's tooltip says what it covers.
   - **The table** lists titles most-installed first, 100 at a time with a keyset
     **Load more**. **Installs** is the exact number of distinct devices carrying the
     title under the active filters (a device carrying one title through two sources
@@ -697,10 +748,13 @@ place, **Hardware** and **Software**, each its own page:
   - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
     a management group, so the fleet view, the strip and the version counts need an
     unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused
-    (audited as denied); the notice points to Hardware and carries a
+    (audited as denied); the notice points to Hardware (open the device from
+    Hardware, **Installed software**, **Open in Software**) and carries a
     **Clear all filters and reload** link. A scoped account can still use the host view
-    and the devices tables for devices in its scope, but only through a hand-typed
-    `/software#host=<agent_id>` address, which has no host-name type-ahead; there the "newest in fleet" mark is
+    and the devices tables for devices in its scope, through that **Open in Software**
+    link on a device's Hardware **Installed software** lens (it opens
+    `/software#host=<agent_id>`) or a hand-typed address of the same form; the page has no
+    host-name type-ahead for them; there the "newest in fleet" mark is
     blanked, no fleet
     figures are read, and device counts omit "of M". A scope wider than 10,000 devices is
     applied after the read in at most four bounded reads, so a devices page can come back short or
@@ -820,6 +874,23 @@ read more than 20000 rows` (or a merged-entry or 3 MiB blob cap) is not an
 action failure: that host reports more software rows than one report can carry,
 so its report is skipped rather than sent truncated; review the host's
 inventory rather than removing a plugin.
+
+**A device's Python rows vanished, but the rest of its software is still reported; its
+log shows `sync: runtimes.python constrained (<tokens>) — rows withheld this cycle`.**
+The `runtimes` `python` read was constrained, so the agent withheld only the Python rows
+rather than send a partial list. The report replaces the device's stored software rows,
+so its stored `python` rows are removed until a read succeeds again; no other source is
+affected and the cycle is not skipped. The tokens name the cause:
+`linux:runtimes:network_fs_skipped` (`/usr/bin`, `/usr/local/bin`, `/var/usrlocal/bin` or
+a directory above one of them, such as `/usr/local`, is on a network mount, so it is
+never opened), `linux:runtimes:permission_denied`,
+`linux:runtimes:symlink_refused` (a symlink at a root that is not a same-action alias;
+the rpm-ostree `/usr/local -> ../var/usrlocal` link is covered and is not a cause),
+`linux:runtimes:mountinfo_unreadable` and `macos:runtimes:mountinfo_unreadable` (the
+mount table could not be read), `macos:runtimes:permission_denied`,
+`windows:runtimes:python_reg:access_denied` and any `<os>:runtimes:row_cap` or
+`windows:runtimes:python_reg:row_cap` (a walk cap was hit). Fix the named cause; the next
+daily sync restores the rows.
 
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`
@@ -942,6 +1013,16 @@ ingest is failing. Four further series sharpen the picture:
   `YuzuGenericInventoryPersistenceDropped` warns only after a non-`stale` reason's rate
   remains non-zero for 15 minutes, avoiding alerts for a single self-healing report or
   expected clock-step stale suppression.
+- `yuzu_inventory_typed_purge_rows_total` (counter) — stray typed-source rows removed from the
+  generic store by the background boot purge. Present at 0 on every boot; it rises only after
+  an upgrade or rollback that left such rows. The pass runs once per boot and then stops, so a
+  flat counter after the first minutes is normal.
+- `yuzu_inventory_typed_purge_failures_total` (counter) — background purge passes that gave up after a failed
+  batch (closed store, pool timeout, SQL error, 20 s statement timeout) through its retries with backoff
+  at smaller batch sizes, or because typed rows stayed locked by another session across the retries
+  (that path retries without halving). The pass is not retried until the next boot; **a restart re-runs it**, which is the remediation once the database is healthy;
+  stray rows stay unreadable meanwhile. Any non-zero value after a boot is worth a look at the
+  Postgres pool, not a page. Readiness does not depend on the pass.
 - `yuzu_inventory_query_truncated_total` (counter) — generic-store reads that hit their
   row cap or 8 MiB aggregate payload cap. A non-zero rate on the result-set
   producer path pairs with 503s from
@@ -1071,6 +1152,24 @@ the first `|` (`app` plus one merged cell) while the headers come from the defin
 seven tokens from `GET /api/v1/responses/{id}`, its `/export` or MCP `query_responses`, or search the merged cell
 with the results search box.
 
+### Software title normalisation (server job)
+
+The server turns every distinct installed-software title into a stable identity once an hour, so later software views can group by product instead of by whatever string each endpoint reported.
+
+- **What runs.** A background job reads the distinct (name, publisher, ecosystem) titles the catalogue rollup already computes, and writes one row per title to a permanent title dimension: the canonical publisher, product, edition, category (`web_server`, `database`, `message_broker`, `runtime` or `other`), the package-URL type for package ecosystems, and the version token embedded in the raw name. It works through the most widely installed titles first, in bounded passes of 2,000 titles, and each pass is a single transaction, so a restart never leaves half a batch. With several server replicas, one runs the job at a time.
+- **Cadence.** A quiet fleet is checked once an hour. A tick covers up to 200,000 titles or 60 seconds of work in total, whichever comes first. When it stops at either limit with more waiting (a new pack version, or the first run on a large fleet), the next tick starts after 60 seconds instead of an hour, so a backlog is worked off in back-to-back ticks rather than one tick an hour. The same 60 seconds applies right after a server start or upgrade when the catalogue rollup has not yet produced the title list: the job finds nothing to do and keeps checking every 60 seconds until the rollup has produced the title list, instead of waiting an hour. A tick that fails or times out is retried at the hourly interval, because an immediate retry would pick the same batch and fail the same way.
+- **The alias pack.** Resolution is driven by a versioned alias pack (`YYYY.MM.N`) stored in Postgres. A seed pack ships inside the server and is loaded on first boot only when no pack exists; a newer server build does not replace a pack that is already loaded (the boot log names both versions). If the pack cannot be loaded for any reason, including a transient database error, the server refuses to start and logs `[PG] Refusing to start`.
+- **Settled titles are not re-resolved in this release.** A title is resolved when it first appears and again when the pack version changes, its product is deleted, or a registry write marks it stale (editing a product, or adding or changing an alias, in the product registry store does that). Nothing in the server writes the registry yet: there is no route or screen to add a product or an alias by hand, so in this release a new pack version is what re-resolves settled titles.
+- **Unnormalized never means guessed.** A title resolves only through a curated or pack alias, or to the product whose key is exactly the title's cleaned-up publisher, product and edition; similar-looking products are never used, so a companion title such as a remote-desktop host does not resolve to the main product. A title that does not resolve this way is labelled `unnormalized`, keeps its cleaned-up publisher, product and edition, and has no product. A name that reduces to nothing once versions, architectures and edition words are removed (for example `2019` or `Pro`) is always `unnormalized`. The title is also added to the curation queue with its device count, so the most widely installed unknowns surface first. The queue follows the fleet: counts are refreshed every hour (only when a count changed, or at least daily) and a title that has left the fleet is dropped and comes back, still open, when the title does. A title a curator has rejected stays rejected, even after the title later resolves.
+- **Editions are distinct products.** An alias binds exactly one edition, and a title is never matched to a different edition of the same product, so SQL Server Standard and SQL Server Enterprise resolve separately and an edition the pack does not list lands in the queue rather than on its neighbour.
+- **Automatic product creation is off.** The job does not create products for unmatched titles; they wait in the queue.
+- **What is kept, and for how long.** The title dimension is permanent: it keeps one row for every distinct title the fleet has ever reported, and is never pruned. Titles that embed a version in their name (many do) therefore add rows over time, so the table grows with the number of distinct titles ever seen, not with the current fleet. `yuzu_software_titles` shows how many titles are in the current fleet; the table's size is visible in Postgres. A future retention policy would be a separate decision. The curation queue is different: its open rows always mirror the current fleet, and an empty title list (see below) empties it; only each row's first-queued time is lost, because the rows are rebuilt as titles return.
+- **Titles that are too long.** A title whose name, publisher and ecosystem together exceed 2,400 bytes is left out of the title list, and so is never normalised or queued; this is far beyond any real software name and exists so that one malformed report cannot stop the whole catalogue refresh. Each catalogue refresh that leaves such titles out writes one warning to the server log with their count.
+- **Where to look.** There is no REST route, MCP tool or page for this yet, and install-level normalisation status is not recorded. To inspect the results, query the Postgres tables `product_registry_store.title_dimension` (one row per title) and `product_registry_store.curation_queue`, and read the metrics below.
+- **Known limits of the seed pack.** The seed is a starting set, not a measured one. Its Windows rows bind to the `windows` ecosystem only, so the same product reported as an `msi`, `optional_feature` or `macos_pkgutil` title is queued rather than matched. Several raw names will not match what a collector really reports (a locale suffix, or an edition word the real title omits). The version token recorded for a title is its first version-like word, so `SQL Server 2019` records `2019`. A short generic name with no publisher (`git`, `curl`, `bash`) matches a pack row that carries a product token, so `normalized` does not mean the publisher was verified. And the pack names products with short canonical titles, so a deployment whose registry already holds a longer name for the same product may hold both.
+- **Metrics and alerts.** `yuzu_software_titles{norm_status}`, `yuzu_software_unnormalized_ratio` (install-weighted, the headline coverage figure), `yuzu_software_normalization_curation_queue_size`, `yuzu_software_normalization_pack_info{pack_version}` and the job's run, duration and last-success series. `YuzuSoftwareNormalizationStale` fires when no clean tick has completed for over two hours; `YuzuSoftwareNormalizationFailing` fires when two hourly ticks fail within three hours. The ratio is not exported until the title list has had a first non-empty read, and it keeps its last value if the list later becomes empty; an empty list is never reported as a perfect score.
+- **When the catalogue rollup stalls.** The job's title list is rebuilt by the hourly catalogue rollup, so it inherits that rollup's limits, including its scale ceiling of about 6,000 endpoints. When the rollup stops completing, the title list stops refreshing, the normalisation gauges freeze at their last values and no new title is picked up, while the job itself keeps ticking cleanly, so neither normalisation alert fires. The signal is the catalogue rollup's own alerts (`YuzuInventoryCatalogRollupStale` and `YuzuInventoryCatalogRollupFailing`): check them first.
+
 ## Device-identity inventory (`device_ci`)
 
 A second daily-sync source, **`device_ci`** (ADR-0016 source #3), is live on the
@@ -1091,7 +1190,11 @@ sync, defeating the hash-skip protocol.
 - **Scope / privacy.** Machine-scope only (no per-user data), but serial/UUID/MAC
   are device-persistent identifiers — treat as potentially personal data where a
   device is person-assigned. The same **`--inventory-disable`** flag suppresses
-  `device_ci` along with the other sources (it gates the whole daily-sync thread).
+  `device_ci` along with the other sources (it gates the whole daily-sync thread). A volume
+  or partition mount point under a user profile or under `/Volumes` is replaced with
+  `[redacted]` before it is sent. That removes one route to a personal name and is not a
+  consent mechanism; other folder mounts, free text in the other columns, and the device
+  name, domain and OU are sent as the machine reports them.
 - **Observability.** Ingest shares
   `yuzu_inventory_ingest_total{source="device_ci"}` +
   `yuzu_inventory_ingest_duration_seconds{source="device_ci"}`; read degrades use
@@ -1100,6 +1203,44 @@ sync, defeating the hash-skip protocol.
 - **VMs / serial-less hosts.** A device with no SMBIOS serial (many VMs) reports
   `serial`/`system_uuid` as the literal `"unknown"` — use `manufacturer`/`model`
   (e.g. "VMware, Inc."/"VMware7,1") to recognise it.
+- **Versioned record (v2).** The server also stores a versioned record that adds
+  chassis (type, serial, asset tag), baseboard (vendor, product, serial) and a hashed
+  machine-id, each with its source, plus typed per-device rows for CPUs, DIMMs, disks,
+  swap, volumes, partitions and storage topology, each section with its own status.
+  `blob_version` says which format an agent last sent. A device whose agent is still on
+  the original format has **no** section rows stored — read that as "not stored", not
+  "the device has none". A section reported `constrained` with reason `server_cap:<n>`
+  means the server kept only the first `n` rows; `server:machine_id_shape` on the
+  `machine_id` section means the reported machine ID was not a hash and was discarded.
+  Chassis, board and DIMM serial numbers are personal data on the same footing as the
+  device serial and system UUID. Agents keep working unchanged; upgrade the server
+  before the agents. No page or API reads the per-device rows yet: these values are stored
+  now and become visible when the device-CI read surface ships.
+- **What the agent sends.** An agent that carries this change always sends the versioned
+  record; there is no flag to fall back to the earlier format, and `--inventory-disable`
+  still stops the collection. Each section reports one of four levels:
+  `ok`, `constrained` (partial: read the reason), `unavailable` (the data could not be
+  read on this host) and `permission_denied` (the agent was refused). A section that is
+  `unavailable` or `permission_denied` carries **no rows**, so an empty list under those
+  levels means "not collected", not "the device has none". A reason of the form
+  `<os>:planned` means the collector for that OS is not shipped yet; `agent:action_absent`
+  means the installed plugin predates the section; `agent:plugin_not_loaded` means the
+  disk plugin is not loaded on that host; `agent:windows_volumes_unbounded` means the
+  Windows volume probe was not run, because it has no deadline and the daily sync must not
+  block on a wedged drive, so the Windows `volume` section is `unavailable` with no rows;
+  `agent:mount_points_redacted` means at least one mount point under a user profile or under
+  `/Volumes` was replaced with `[redacted]` and the rest of the row is unchanged. The Windows reason
+  is expected on every Windows host and needs no action; the operator-triggered `volumes` action
+  still works there. To see how many devices report each state, query
+  `SELECT kind, level, reason, count(*) FROM device_inventory_store.device_ci_section GROUP BY kind, level, reason ORDER BY kind, count(*) DESC;`.
+  A reason ending `agent_cap:<kept>/<total>`
+  means the agent kept only the first `kept` of `total` rows (it caps each list to
+  the same limits the server applies, and trims the least valuable lists first if the whole
+  record would be too large); `server_cap:<n>` is the server's own cap. Sections fail
+  independently: one section being unavailable never stops the others, or the base device
+  fields, from being reported.
+
+On Windows the `chassis`, `baseboard`, `swap` and `machine_id` sections now report data (and the `cpu` and `dimm` rows carry the socket, stepping and DIMM identity columns); Linux and macOS still report `<os>:planned` for the four. A Windows section that could not be read reports `constrained`, `permission_denied` or `unavailable` with a reason token such as `smbios:win32_5`, `windows:machine_guid:absent` or `wmi:<class>:<cause>` (where `<class>` is `processors`, `memory`, `pagefile_usage` or `pagefile_setting`); the full token list is in the Result status table of the hardware plugin README (`agents/plugins/hardware/README.md`). On Windows the `cpu` and `dimm` sections also carry a non-`ok` status (with the reason token) when their WMI query fails, instead of reading as an empty `ok` section. Those values are stored in the device record and are not yet shown on the Hardware pages or returned by the REST or MCP device-record endpoints.
 
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its
@@ -1108,8 +1249,8 @@ columns, fields, and audit/degrade posture.
 ## App usage inventory (`app_usage`)
 
 A further daily-sync source, **`app_usage`**, is live on the agent and server. It
-derives machine-scope executable usage evidence read-only from TAR's `usage` fold
-(`usage_daily`/`usage_daily_user`/`usage_live` inside `tar.db`) and persists it in
+derives machine-scope executable usage evidence read-only from Echo's `usage` fold
+(`usage_daily`/`usage_daily_user`/`usage_live` inside `echo.db`) and persists it in
 the typed Postgres schema **`app_usage_store`**: per-executable run counts, total
 seconds, first/last-seen, and a distinct-user count over a 30-day sliding window.
 

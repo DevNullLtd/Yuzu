@@ -398,7 +398,7 @@ ExecutionEventBus::Listener McpStreamBridge::make_listener(std::shared_ptr<Bridg
 // ── reserve / subscribe / arm / cancel / abandon / park ────────────────────
 
 McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& session_id,
-                                                        const std::string& principal,
+                                                        McpSessionBinding binding,
                                                         const nlohmann::json& jsonrpc_id,
                                                         std::optional<nlohmann::json> progress_token,
                                                         bool streamed_intent) {
@@ -423,7 +423,7 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     // last_seen, which is correct here: reserve runs on a client request that
     // already slid the TTL at session-validate. Nothing on the PARKED path
     // touches it again (retention honesty).
-    auto stream = sessions_ != nullptr ? sessions_->stream_for(session_id, principal) : nullptr;
+    auto stream = sessions_ != nullptr ? sessions_->stream_for(session_id, binding) : nullptr;
     if (!stream) {
         count_reject("unknown_session");
         return {false, "unknown_session"};
@@ -435,7 +435,7 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     // to discard on a reject and must not serialize against the map).
     auto rec = std::make_shared<BridgeRecord>();
     rec->session_id = session_id;
-    rec->principal = principal;
+    rec->binding = std::move(binding);
     rec->jsonrpc_id = jsonrpc_id;
     rec->key = make_key(session_id, jsonrpc_id);
     rec->streamed_intent = streamed_intent;
@@ -680,7 +680,8 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
                         displaced->orphan
                             ? "orphan pin released to admit a new streamed call on this session"
                             : "pin released to admit a new streamed call on this session",
-                        displaced_detail, AuditResult::kSuccess, principal);
+                        displaced_detail, AuditResult::kSuccess,
+                        rec->binding.principal);
         // Evidence floor, matching this file's teardown convention: the counter
         // and the audit row both route through swallowing guards, so a log line is
         // the one trace that survives an obs/audit sink failure. The release
@@ -941,7 +942,7 @@ McpStreamBridge::ArmOutcome McpStreamBridge::arm(const std::string& session_id,
         // The cancel this may consume came from an authenticated client too, so the
         // row it produces is attributable like the streamed detach is. The session
         // gate guarantees this equals the canceller.
-        rec_principal = rec->principal;
+        rec_principal = rec->binding.principal;
     }
     std::string fallback = build_fallback_final(jsonrpc_id, exec_id);
 
@@ -2201,7 +2202,7 @@ void McpStreamBridge::sweep() {
             // whose final reached the wire still settles kDone rather than
             // parking for a resume nobody needs.
             const bool session_alive =
-                sessions_ != nullptr && sessions_->exists(rec->session_id, rec->principal);
+                sessions_ != nullptr && sessions_->exists(rec->session_id, rec->binding);
             // `created` and `key` are write-once (immutable after reserve, before
             // the record is shared), so both are safe to read lock-free here.
             const bool stale = now() - rec->created > cfg_.streaming_park_after;
@@ -2212,7 +2213,7 @@ void McpStreamBridge::sweep() {
             // Registry leaf, no locks held. Non-touching: a parked record must
             // never extend session life.
             const bool session_alive =
-                sessions_ != nullptr && sessions_->exists(rec->session_id, rec->principal);
+                sessions_ != nullptr && sessions_->exists(rec->session_id, rec->binding);
             if (!session_alive) {
                 claim = true;
                 action = "mcp.bridge.session_dead";

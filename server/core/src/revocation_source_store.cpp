@@ -483,8 +483,12 @@ RevocationSourceStore::crl_past_next_update_count() {
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT count(DISTINCT source_id) FROM revocation_source_store.crl WHERE next_update IS NOT "
-        "NULL AND next_update < now()",
+        // Counts registered CRL SCOPES, not sources (design D13 and the gauge row: one per
+        // (CA, IDP, base or delta) scope; ADR-0070 R12): one source can hold several scoped CRLs,
+        // and each stale one counts, a delta scope included.
+        "SELECT count(*) FROM (SELECT DISTINCT source_id, scope_key, is_delta FROM "
+        "revocation_source_store.crl WHERE next_update IS NOT NULL AND next_update < now()) "
+        "AS past_scopes",
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
         return statement_error("crl_past_next_update_count", lease.get(), res, false);

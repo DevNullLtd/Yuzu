@@ -1,10 +1,10 @@
 #pragma once
 
 /// @file discover_catalog_types.hpp
-/// The `/discover/*` catalogue value type (`DiscoveryDoc`) and the one builder that
-/// needs no store (`build_routes_catalog`), split out of `discover_routes.hpp` so the
-/// MCP registry lane (`mcp_tools_discovery.cpp`) can name them without including
-/// `instruction_store.hpp` / `rbac_store.hpp` (ADR-0031 seam closure, #6558).
+/// The `/discover/*` catalogue value type (`DiscoveryDoc`) and `build_routes_catalog`, the one
+/// builder whose only input is the OpenAPI JSON (no store or registry argument), split out of
+/// `discover_routes.hpp` so the MCP registry lane (`mcp_tools_discovery.cpp`) can name them
+/// without including `instruction_store.hpp` / `rbac_store.hpp` (ADR-0031 seam closure, #6558).
 /// Not to be confused with `discovery_types.hpp`, which holds the network-discovery
 /// (discovered-hosts) row types. `discover_routes.hpp` re-includes this header, so
 /// existing includers are unaffected, and the definition of `build_routes_catalog`

@@ -412,22 +412,35 @@ TEST_CASE("RevocationSourceStore: reset_at later than the server clock, or unpar
     CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "0");
 }
 
-TEST_CASE("RevocationSourceStore: crl_past_next_update counts sources, not CRLs",
+TEST_CASE("RevocationSourceStore: crl_past_next_update counts CRL scopes past nextUpdate",
           "[revocation_source_store][pg]") {
     RS_STORE(store);
     const auto id = store.create(make_source("Corp CA", '1'), "alice");
     REQUIRE(id.has_value());
     CHECK(store.crl_past_next_update_count().value() == 0);
     const auto src = store.get(*id);
-    for (const char* scope : {"*", "idp:1"})
+    // One held CRL row per call: scope, nextUpdate SQL expression, base or delta.
+    const auto hold = [&](const char* scope, const char* next_update, bool delta) {
         RS_EXEC(rs_db_fx_, (std::string("INSERT INTO revocation_source_store.crl (source_id, scope_key, "
-                                        "url_id, this_update, next_update, verified_key_sha256, "
-                                        "der_sha256, entry_count) VALUES (") +
+                                        "url_id, this_update, next_update, is_delta, "
+                                        "verified_key_sha256, der_sha256, entry_count) VALUES (") +
                             std::to_string(*id) + ", '" + scope + "', " +
-                            std::to_string(src->urls[0].id) + ", now() - interval '2 days', "
-                            "now() - interval '1 day', '" + hex64('1') + "', '" + hex64('c') +
-                            scope + "', 0)").c_str());
-    CHECK(store.crl_past_next_update_count().value() == 1);
+                            std::to_string(src->urls[0].id) + ", now() - interval '2 days', " +
+                            next_update + ", " + (delta ? "TRUE" : "FALSE") + ", '" + hex64('1') +
+                            "', '" + hex64('c') + scope + (delta ? "d" : "") + "', 0)").c_str());
+    };
+    // Two stale scopes of ONE source count twice: the count is over scopes, not sources.
+    hold("*", "now() - interval '1 day'", false);
+    hold("idp:1", "now() - interval '1 day'", false);
+    CHECK(store.crl_past_next_update_count().value() == 2);
+    // A fresh scope and a scope with no nextUpdate add nothing.
+    hold("idp:2", "now() + interval '1 day'", false);
+    hold("idp:3", "NULL", false);
+    CHECK(store.crl_past_next_update_count().value() == 2);
+    // A stale DELTA is its own scope (design: one per (CA, IDP, base or delta)), so it counts, even
+    // when that scope's base CRL is fresh.
+    hold("idp:2", "now() - interval '1 day'", true);
+    CHECK(store.crl_past_next_update_count().value() == 3);
 }
 
 TEST_CASE("RevocationSourceStore: two registrations of one CA race to exactly one winner",

@@ -99,7 +99,17 @@ inline constexpr std::string_view kContentAuthoring =
 inline constexpr std::string_view kPolicyLifecycle =
     "policy lifecycle: governed by the Policy securable and approval";
 inline constexpr std::string_view kEvidenceCapture = "evidence capture under its own securable";
-inline constexpr std::string_view kStopsEffect = "stops an in-flight effect; reduces risk";
+/// A cancel that only closes a record. It marks a pending tracker or pipeline record cancelled and
+/// sends NOTHING to any device: it does not stop, recall or undo a command a device has already
+/// received. The class is exempt because it starts no new work, NOT because it halts a running
+/// effect; do not reword it into a claim that it does (#2146 CA-4).
+inline constexpr std::string_view kCancelsRecord =
+    "cancels a pending record; sends nothing to any device and starts no work";
+/// The v1 / MCP rerun twins only create a `pending` record linked through `rerun_of`; they send
+/// NOTHING to any device (the legacy `POST /api/executions/{id}/rerun` is a different route and
+/// keeps kExecutionDispatch). Exempt for the same reason as kCancelsRecord: no new work starts.
+inline constexpr std::string_view kCreatesRerunRecord =
+    "creates a pending rerun record; sends nothing to any device and starts no work";
 inline constexpr std::string_view kAlertingConfig = "alerting and notification configuration";
 inline constexpr std::string_view kMfaEnrolment =
     "MFA enrolment flow: cannot replace or remove an enabled factor";
@@ -211,10 +221,10 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     // dashboard_routes.cpp
     step_up_detail::pending("POST",  R"(/api/dashboard/group-from-results)"),
     step_up_detail::exempt("POST",  R"(/api/dashboard/execute)",                                                  step_up_detail::kExecutionDispatch),
-    step_up_detail::exempt("POST",  R"(/api/dashboard/tar-execute)",                                              step_up_detail::kReadShaped),
-    step_up_detail::exempt("POST",  R"(/fragments/tar/retention-paused/scan)",                                    step_up_detail::kReadShaped),
-    step_up_detail::pending("POST",  R"(/fragments/tar/retention-paused/reenable)"),
-    step_up_detail::pending("POST",  R"(/fragments/tar/retention-paused/purge)"),
+    step_up_detail::exempt("POST",  R"(/api/dashboard/echo-execute)",                                              step_up_detail::kReadShaped),
+    step_up_detail::exempt("POST",  R"(/fragments/echo/retention-paused/scan)",                                    step_up_detail::kReadShaped),
+    step_up_detail::pending("POST",  R"(/fragments/echo/retention-paused/reenable)"),
+    step_up_detail::pending("POST",  R"(/fragments/echo/retention-paused/purge)"),
     // data_inventory_routes.cpp
     step_up_detail::exempt("POST",  R"(/api/inventory/query)",                                                    step_up_detail::kReadShaped),
     // deployment_routes.cpp
@@ -300,7 +310,11 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/fragments/auto/run)",                                                     step_up_detail::kExecutionDispatch),
     // rest_api_v1.cpp
     step_up_detail::exempt("POST",  R"(/api/v1/bundles)",                                                         step_up_detail::kExecutionDispatch),
-    step_up_detail::pending("POST",  R"(/api/v1/tar/retention-paused/purge)"),
+    step_up_detail::exempt("POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/cancel)",                        step_up_detail::kCancelsRecord),
+    step_up_detail::exempt("POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/rerun)",                         step_up_detail::kCreatesRerunRecord),
+    // command_v1_routes.cpp: the REST v1 twin of /api/command and MCP execute_instruction (kExecutionDispatch, like both)
+    step_up_detail::exempt("POST",  R"(/api/v1/commands)",                                                        step_up_detail::kExecutionDispatch),
+    step_up_detail::pending("POST",  R"(/api/v1/echo/retention-paused/purge)"),
     step_up_detail::pending("POST",  R"(/api/v1/management-groups)"),
     step_up_detail::pending("PUT",   R"(/api/v1/management-groups/([a-f0-9]+))"),
     step_up_detail::pending("DELETE",R"(/api/v1/management-groups/([a-f0-9]+))"),
@@ -325,7 +339,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/v1/inventory/evaluate)",                                              step_up_detail::kReadShaped),
     step_up_detail::exempt("POST",  R"(/api/v1/result-sets)",                                                     step_up_detail::kOperationalData),
     step_up_detail::exempt("POST",  R"(/api/v1/result-sets/from-inventory-query)",                                step_up_detail::kOperationalData),
-    step_up_detail::exempt("POST",  R"(/api/v1/result-sets/from-tar-query)",                                      step_up_detail::kOperationalData),
+    step_up_detail::exempt("POST",  R"(/api/v1/result-sets/from-echo-query)",                                      step_up_detail::kOperationalData),
     step_up_detail::exempt("POST",  R"(/api/v1/result-sets/from-instruction-result)",                             step_up_detail::kOperationalData),
     step_up_detail::exempt("POST",  R"(/api/v1/result-sets/(rs_[0-9a-f]+)/re-eval)",                              step_up_detail::kOperationalData),
     step_up_detail::exempt("POST",  R"(/api/v1/result-sets/(rs_[0-9a-f]+)/pin)",                                  step_up_detail::kOperationalData),
@@ -337,7 +351,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::pending("DELETE",R"(/api/v1/device-tokens/([a-f0-9]+))"),
     step_up_detail::pending("POST",  R"(/api/v1/software-deployments)"),
     step_up_detail::pending("POST",  R"(/api/v1/software-deployments/([a-f0-9]+)/rollback)"),
-    step_up_detail::exempt("POST",  R"(/api/v1/software-deployments/([a-f0-9]+)/cancel)",                         step_up_detail::kStopsEffect),
+    step_up_detail::exempt("POST",  R"(/api/v1/software-deployments/([a-f0-9]+)/cancel)",                         step_up_detail::kCancelsRecord),
     step_up_detail::pending("POST",  R"(/api/v1/license)"),
     step_up_detail::pending("DELETE",R"(/api/v1/license/([a-f0-9]+))"),
     step_up_detail::exempt("POST",  R"(/api/v1/dex/devices/([^/]+)/live)",                                        step_up_detail::kReadShaped),
@@ -400,8 +414,8 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/tags/set)",                                                           step_up_detail::kOperationalData),
     step_up_detail::exempt("POST",  R"(/api/tags/delete)",                                                        step_up_detail::kOperationalData),
     step_up_detail::exempt("POST",  R"(/api/tags/query)",                                                         step_up_detail::kReadShaped),
-    // tar_tree_routes.cpp
-    step_up_detail::pending("POST",  R"(/fragments/tar/capture-sources/push)"),
+    // echo_tree_routes.cpp
+    step_up_detail::pending("POST",  R"(/fragments/echo/capture-sources/push)"),
     // webhook_routes.cpp
     step_up_detail::pending("POST",  R"(/api/webhooks)"),
     step_up_detail::pending("DELETE",R"(/api/webhooks/(\d+))"),
@@ -411,6 +425,8 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("DELETE",R"(/api/workflows/([^/]+))",                                                  step_up_detail::kContentAuthoring),
     step_up_detail::exempt("POST",  R"(/api/workflows/([^/]+)/execute)",                                          step_up_detail::kExecutionDispatch),
     step_up_detail::exempt("POST",  R"(/api/instructions/([^/]+)/execute)",                                       step_up_detail::kExecutionDispatch),
+    // instruction_execute_routes.cpp (#2146): the v1 twin of the row above, same class.
+    step_up_detail::exempt("POST",  R"(/api/v1/instructions/([^/]+)/execute)",                                    step_up_detail::kExecutionDispatch),
     step_up_detail::exempt("POST",  R"(/api/product-packs)",                                                      step_up_detail::kContentAuthoring),
     step_up_detail::exempt("DELETE",R"(/api/product-packs/([^/]+))",                                              step_up_detail::kContentAuthoring),
 };

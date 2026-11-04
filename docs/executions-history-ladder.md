@@ -282,7 +282,7 @@ until `action` is stored too. The exact set of read methods and the exact set of
 out through `unrestricted_internal_consumer()` are frozen by
 `tests/test_response_store_read_tripwire.py`: four sites, all reads of a command the server
 dispatched itself from a fixed non-Forensics plugin (the pre-flight check collation, the quarantine
-containment poll, the `tar.fleet_snapshot` topology poll and the deployment collect), none of which returns raw rows
+containment poll, the `echo.fleet_snapshot` topology poll and the deployment collect), none of which returns raw rows
 to an operator. The server-side consumers that used to read the store unfiltered now apply the tier
 through a real filter: the policy evaluator excludes the Forensics plugins outright (such a check
 scores `unknown`), the result-set materializer does the same (a set sourced from such a command

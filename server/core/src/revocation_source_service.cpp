@@ -349,6 +349,9 @@ std::expected<UrlParts, std::string> parse_url_syntax(const std::string& url) {
         }
         if (host.empty() || host.find('%') != std::string::npos || !eg::parse_ipv6(host))
             return std::unexpected("has an invalid IPv6 literal");
+        // UrlParts::host is lowercase for every form, an IPv6 literal's hex digits included.
+        std::ranges::transform(host, host.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         parts.bracketed = true;
     } else {
         const auto colon = authority.rfind(':');
@@ -385,6 +388,40 @@ std::expected<UrlParts, std::string> parse_url_syntax(const std::string& url) {
     }
     parts.host = std::move(host);
     return parts;
+}
+
+// The identity two registered URLs are compared by: the scheme and the authority lowercased (both
+// are case-insensitive, RFC 3986 section 6.2.2.1; userinfo is refused, so the authority is host and
+// port only), the scheme's default port dropped (`https://h:443/a` is `https://h/a`, section 6.2.3),
+// and a trailing root dot dropped from a name host (`h.` is `h`); the path and query are kept byte
+// for byte (they are case-sensitive). Only called on a URL parse_url_syntax accepted, so "://" is
+// present.
+std::string url_identity_key(std::string_view url) {
+    const auto sep = url.find("://");
+    const auto auth_end = url.find_first_of("/?", sep + 3);
+    const auto head_len = auth_end == std::string_view::npos ? url.size() : auth_end;
+    std::string head(url.substr(0, head_len));
+    std::transform(head.begin(), head.end(), head.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const std::string scheme = head.substr(0, sep);
+    std::string authority = head.substr(sep + 3);
+    // A port follows the last ':' unless that ':' is inside an IPv6 literal's brackets.
+    std::string host = authority;
+    std::string port;
+    if (const auto colon = authority.rfind(':');
+        colon != std::string::npos && authority.find(']', colon) == std::string::npos) {
+        host = authority.substr(0, colon);
+        port = authority.substr(colon + 1);
+    }
+    if ((scheme == "https" && port == "443") || (scheme == "http" && port == "80"))
+        port.clear();
+    if (!host.empty() && host.front() != '[' && host.back() == '.')
+        host.pop_back();
+    std::string key = scheme + "://" + host;
+    if (!port.empty())
+        key += ":" + port;
+    key.append(url.substr(head_len));
+    return key;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -449,9 +486,9 @@ struct Ctx {
     const EgressEnv& env;
     std::chrono::steady_clock::time_point deadline{std::chrono::steady_clock::now() + kRequestBudget};
     bool own_loaded{false};
-    std::set<Addr> own;
+    std::set<Addr> own{};
     bool discovery_loaded{false};
-    std::vector<eg::Nat64Prefix> discovered; ///< RFC 7050, shared never-shrink cache; kept apart from the declared ones
+    std::vector<eg::Nat64Prefix> discovered{}; ///< RFC 7050, shared never-shrink cache; kept apart from the declared ones
     bool classified_degraded{false};         ///< a stale (not fresh) discovery set was used: recorded in the audit row
 
     /// Load the RFC 7050 prefixes (once per request). The cache NEVER shrinks, so a failed refresh
@@ -1007,7 +1044,7 @@ RevocationSourceService::validate_registration(const nlohmann::json& body, BodyM
         auto u = validate_url_entry((*uit)[i], i, ctx);
         if (!u)
             return std::unexpected(u.error());
-        if (!seen_urls.insert(u->url).second)
+        if (!seen_urls.insert(url_identity_key(u->url)).second)
             return invalid("crl_urls[" + std::to_string(i) + "].url", "duplicate url");
         out.urls.push_back(std::move(*u));
     }
@@ -1106,7 +1143,11 @@ bool valid_rfc3339_utc(const std::string& s) {
     const int year = std::stoi(s.substr(0, 4)), mon = std::stoi(s.substr(5, 2)),
               day = std::stoi(s.substr(8, 2)), hour = std::stoi(s.substr(11, 2)),
               min = std::stoi(s.substr(14, 2)), sec = std::stoi(s.substr(17, 2));
-    if (year < 1970 || mon < 1 || mon > 12 || hour > 23 || min > 59 || sec > 59)
+    // RFC 3339 section 5.6 allows second 60 (a leap second). In UTC a leap second is only ever
+    // inserted as 23:59:60, so that is the one place it is accepted; Postgres reads it as the
+    // next minute's second 0.
+    const bool leap_second = sec == 60 && hour == 23 && min == 59;
+    if (year < 1970 || mon < 1 || mon > 12 || hour > 23 || min > 59 || (sec > 59 && !leap_second))
         return false;
     const bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
     static constexpr int kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};

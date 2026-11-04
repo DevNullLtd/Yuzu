@@ -64,6 +64,12 @@ constexpr int kFleetQueryRowCap = 100000;
 // the small precomputed tables, no bound.
 constexpr const char* kRollupStatementTimeout = "60s";
 
+/// Largest combined byte length of a (name, publisher, ecosystem) triple admitted to
+/// `title_triples`: its PK btree entry limit is ~2704 B (SQLSTATE 54000, which would roll
+/// back the whole refresh), so 2400 leaves margin. A longer triple is left out of
+/// title_triples, never the refresh; derivation in ADR-0012 "Input bound".
+constexpr int kTitleTripleMaxBytes = 2400;
+
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
     // migration transaction, so these tables land in `software_inventory_store`.
@@ -310,6 +316,21 @@ const std::vector<pg::PgMigration>& migrations() {
          "  rpm_unsigned     BIGINT NOT NULL DEFAULT 0);"
          "INSERT INTO catalog_rollup_meta (id, refreshed_at) VALUES (1, 0) "
          "ON CONFLICT (id) DO NOTHING;"},
+        {9,
+         // SAM.4: the distinct (name, publisher, ecosystem) triples with their exact
+         // device counts - the candidate source of the title normalisation job
+         // (product_registry_store.title_dimension). Rebuilt inside the existing hourly
+         // refresh_catalog_rollup transaction beside version_rollup (one more GROUP BY on
+         // the REPEATABLE READ snapshot that already scans the table), so normalisation
+         // adds no new per-pass scan of installed_software. A new empty table with a plain
+         // PK: online, nothing to rewrite. Empty until the first refresh. IF NOT EXISTS keeps the
+         // step re-runnable (the v7 backfill test rewinds schema_meta over a fully migrated schema).
+         "CREATE TABLE IF NOT EXISTS title_triples ("
+         "  name         TEXT   NOT NULL,"
+         "  publisher    TEXT   NOT NULL DEFAULT '',"
+         "  ecosystem    TEXT   NOT NULL DEFAULT '',"
+         "  device_count BIGINT NOT NULL,"
+         "  PRIMARY KEY (name, publisher, ecosystem));"},
     };
     return kMigrations;
 }
@@ -636,6 +657,7 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
          "name, grain, kind, ecosystem, source, publisher, device_count, version_count, "
          "unsigned_count, ecosystems, kinds, sources, newest_version"},
         {"version_rollup", "name, version, device_count"},
+        {"title_triples", "name, publisher, ecosystem, device_count"},
         {"catalog_rollup_meta",
          "id, refreshed_at, total_titles, total_devices, total_publishers, total_installs, "
          "installs_windows, installs_macos, installs_linux, installs_other, current_installs, "
@@ -739,8 +761,16 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         // taxonomy is sre's gate, out of scope for this round). The wait is
         // transaction-scoped + bounded by the pool's statement_timeout; a distinct
         // "contended" outcome label is the right pool-hygiene follow-up.
-        pg::PgResult lk = pg::exec_params(c, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                                          std::vector<std::string>{agent_id_s});
+        // CROSS-STORE NAMESPACE (do not remove the prefix): advisory-lock keys are ONE
+        // cluster-wide 64-bit space. A bare hashtextextended(agent_id, 0) is the same key as
+        // the fixed-string locks other jobs take (a valid agent id `software_normalization`
+        // IS the normalisation job's key), so a stream of full reports from such an agent
+        // could make that job's try-lock lose every tick. Every sibling store prefixes its
+        // key the same way (`vuln_finding_store:`, `device_ci:`, `app_usage:`, ...).
+        pg::PgResult lk = pg::exec_params(
+            c,
+            "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || $1, 0))",
+            std::vector<std::string>{agent_id_s});
         if (lk.status() != PGRES_TUPLES_OK)
             return false;
         pg::PgResult del = pg::exec_params(
@@ -1808,6 +1838,36 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
                  "device_count) SELECT name, version, count(DISTINCT agent_id) "
                  "FROM software_inventory_store.installed_software GROUP BY name, version"))
             return false;
+
+        // title_triples: the normalisation job's candidate source, same snapshot.
+        if (!cmd("DELETE FROM software_inventory_store.title_triples"))
+            return false;
+        if (!cmd("INSERT INTO software_inventory_store.title_triples (name, publisher, "
+                 "ecosystem, device_count) SELECT name, publisher, ecosystem, "
+                 "count(DISTINCT agent_id) FROM software_inventory_store.installed_software "
+                 "WHERE octet_length(name) + octet_length(publisher) + octet_length(ecosystem) <= " +
+                 std::to_string(kTitleTripleMaxBytes) + " GROUP BY name, publisher, ecosystem"))
+            return false;
+        // A triple over the cap is dropped (never truncated: a truncated key would resolve to
+        // the wrong title), so it is absent from the title, queue and ratio gauges while the
+        // rollup still reports success. Say so, with the count, once per refresh.
+        {
+            const std::string count_sql =
+                "SELECT count(*) FROM (SELECT 1 FROM software_inventory_store.installed_software "
+                "WHERE octet_length(name) + octet_length(publisher) + octet_length(ecosystem) > " +
+                std::to_string(kTitleTripleMaxBytes) +
+                " GROUP BY name, publisher, ecosystem) over_wide";
+            pg::PgResult dropped =
+                pg::exec_params(c, count_sql.c_str(), std::vector<std::string>{});
+            if (dropped.status() != PGRES_TUPLES_OK)
+                return failed("over-wide title count", dropped);
+            if (PQntuples(dropped.get()) == 1 &&
+                std::string_view(PQgetvalue(dropped.get(), 0, 0)) != "0")
+                spdlog::warn("SoftwareInventoryStore: {} installed-software title(s) exceed {} "
+                             "bytes (name + publisher + ecosystem) and are left out of "
+                             "title_triples, so they are never normalised",
+                             PQgetvalue(dropped.get(), 0, 0), kTitleTripleMaxBytes);
+        }
 
         // Fleet-newest version of EVERY title, bounded memory: stream version_rollup in
         // (name, version) order (a total order, served by version_rollup_nv_key) through a

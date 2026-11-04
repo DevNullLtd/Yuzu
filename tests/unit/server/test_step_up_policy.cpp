@@ -73,11 +73,13 @@ TEST_CASE("step-up policy: the gated set is exactly the 41 routes with an in-han
 
 TEST_CASE("step-up policy: the table's total and per-class row counts are pinned",
           "[stepup][policy]") {
-    // Executable pins for the table counts (239 mutating REST routes: 41 required, 3 own-gate,
-    // 122 exempt, 73 pending). A row added or reclassified without these numbers moving
+    // Executable pins for the table counts (243 mutating REST routes: 41 required, 3 own-gate,
+    // 126 exempt, 73 pending; #2146 batch B added the two v1 execution cancel/rerun rows, the v1
+    // commands row and the v1 instruction-definition execute row, and ADR-0070 R1 the four
+    // revocation-source rows). A row added or reclassified without these numbers moving
     // together fails here.
-    CHECK(kStepUpPolicyCount == 239);
-    CHECK(count_class(StepUpClass::kExempt) == 122);
+    CHECK(kStepUpPolicyCount == 243);
+    CHECK(count_class(StepUpClass::kExempt) == 126);
     CHECK(count_class(StepUpClass::kPendingRuling) == 73);
     CHECK(count_class(StepUpClass::kRequired) + count_class(StepUpClass::kOwnGate) +
               count_class(StepUpClass::kStrong) + count_class(StepUpClass::kExempt) +
@@ -217,6 +219,7 @@ constexpr PendingKey kGrandfatheredPending[] = {
     {"POST", R"(/api/v1/ca/revoke)"},
     {"POST", R"(/api/v1/device-tokens)"},
     {"DELETE", R"(/api/v1/device-tokens/([a-f0-9]+))"},
+    {"POST", R"(/api/v1/echo/retention-paused/purge)"},
     {"POST", R"(/api/v1/license)"},
     {"DELETE", R"(/api/v1/license/([a-f0-9]+))"},
     {"POST", R"(/api/v1/management-groups)"},
@@ -240,20 +243,19 @@ constexpr PendingKey kGrandfatheredPending[] = {
     {"DELETE", R"(/api/v1/sle/agents/([^/]+))"},
     {"POST", R"(/api/v1/software-deployments)"},
     {"POST", R"(/api/v1/software-deployments/([a-f0-9]+)/rollback)"},
-    {"POST", R"(/api/v1/tar/retention-paused/purge)"},
     {"POST", R"(/api/v1/upload-grants)"},
     {"DELETE", R"(/api/v1/upload-grants/([a-f0-9]+))"},
     {"POST", R"(/api/webhooks)"},
     {"DELETE", R"(/api/webhooks/(\d+))"},
+    {"POST", R"(/fragments/echo/capture-sources/push)"},
+    {"POST", R"(/fragments/echo/retention-paused/purge)"},
+    {"POST", R"(/fragments/echo/retention-paused/reenable)"},
     {"POST", R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+))"},
     {"POST", R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/delete)"},
     {"POST", R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/deploy)"},
     {"POST", R"(/fragments/guardian/baselines)"},
     {"POST", R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/enabled)"},
     {"POST", R"(/fragments/guardian/guards)"},
-    {"POST", R"(/fragments/tar/capture-sources/push)"},
-    {"POST", R"(/fragments/tar/retention-paused/purge)"},
-    {"POST", R"(/fragments/tar/retention-paused/reenable)"},
 };
 
 } // namespace
@@ -296,11 +298,12 @@ TEST_CASE("step-up policy: every kExempt reason is one of the named exempt class
           "[stepup][policy]") {
     using namespace step_up_detail;
     const std::set<std::string_view> classes = {
-        kPreSession,         kStepUpProofEndpoint,  kSelfSignOut,       kSelfPrivilegeReduction,
-        kExecutionDispatch,  kApprovalGatedElsewhere, kOperationalData, kReadShaped,
-        kSyncTrigger,        kAgentUploadProtocol,  kScimBearer,        kMcpTransport,
-        kContentAuthoring,   kPolicyLifecycle,      kEvidenceCapture,   kStopsEffect,
-        kAlertingConfig,     kMfaEnrolment,         kSchedulingGatedWork, kSelfNotificationState};
+        kPreSession,           kStepUpProofEndpoint,    kSelfSignOut,     kSelfPrivilegeReduction,
+        kExecutionDispatch,    kApprovalGatedElsewhere, kOperationalData, kReadShaped,
+        kSyncTrigger,          kAgentUploadProtocol,    kScimBearer,      kMcpTransport,
+        kContentAuthoring,     kPolicyLifecycle,        kEvidenceCapture, kCancelsRecord,
+        kCreatesRerunRecord,   kAlertingConfig,         kMfaEnrolment,    kSchedulingGatedWork,
+        kSelfNotificationState};
     std::set<std::string_view> used;
     for (const auto& e : kStepUpPolicy) {
         if (e.cls != StepUpClass::kExempt)

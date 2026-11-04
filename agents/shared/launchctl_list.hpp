@@ -6,18 +6,18 @@
  * Decodes the "PID\tStatus\tLabel" rows `launchctl list` emits into raw,
  * per-row facts (label, whether a pid was present, the raw status code) with
  * NO downstream interpretation baked in -- unlike the historical
- * tar_service_parsers.hpp copy this is lifted from (A0, macOS Spark/Reflex/
+ * echo_service_parsers.hpp copy this is lifted from (A0, macOS Spark/Reflex/
  * DEX programme), which additionally collapsed pid presence into a
  * "running"/"stopped" ServiceInfo status string and dropped the status-code
- * field entirely. Two independent consumers need the raw shape: TAR's
- * tar_service_collector.cpp (which still wants the collapsed ServiceInfo
- * view -- see tar_service_parsers.hpp's launchctl_rows_to_services(), a thin
+ * field entirely. Two independent consumers need the raw shape: Echo's
+ * echo_service_collector.cpp (which still wants the collapsed ServiceInfo
+ * view -- see echo_service_parsers.hpp's launchctl_rows_to_services(), a thin
  * mapper now built on top of this header) and the macOS Spark launchd
  * service mechanism (a later slice), which needs a per-label state lookup
  * driven by raw pid presence, not a pre-baked string.
  *
  * Header-only, pure decision code (no I/O, no platform API) -- compiled and
- * unit-tested on every host, exactly like tar_service_parsers.hpp's sibling
+ * unit-tested on every host, exactly like echo_service_parsers.hpp's sibling
  * parse_systemctl_list_units(), even though only a macOS collector/mechanism
  * ever calls it at runtime.
  *
@@ -40,7 +40,7 @@ namespace yuzu::shared {
 /// One decoded `launchctl list` row. `pid`: nullopt when the PID column is
 /// "-" or empty (not running); `status`: the raw exit/last-status column,
 /// parsed as an integer where numeric, 0 where it is "-"/empty/unparsable
-/// (no prior behaviour to preserve here -- the historical TAR parser never
+/// (no prior behaviour to preserve here -- the historical Echo parser never
 /// read this field at all). `label` empty means a malformed/truncated row
 /// (fewer than 3 tab-separated fields) -- this parser never drops or throws
 /// on that; malformed-row *policy* (BR-service-001) is the caller's job.
@@ -120,7 +120,7 @@ struct LaunchctlParseResult {
 /// (governance A0 fix round, UP2-2, HIGH): a real `launchctl list` exit-0
 /// capture always emits at least the header row, so zero lines at all is
 /// itself a sign of a corrupted/truncated capture, never a genuine
-/// zero-services answer -- treating it as valid-empty would make TAR's
+/// zero-services answer -- treating it as valid-empty would make Echo's
 /// diff read it as "every previously-known service just disappeared",
 /// overwrite the baseline with nothing, then storm every one back as
 /// freshly `added` on the next real capture. Otherwise line 0 MUST be

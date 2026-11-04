@@ -1361,7 +1361,7 @@ TEST_CASE("response tier SQL folds the plugin name as ASCII (observable on a loc
 TEST_CASE("the plugins behind the frozen internal-consumer reads are not Forensics-tier",
           "[server][forensics_tier][security]") {
     const auto& set = test::forensics_plugin_set();
-    for (const char* plugin : {"tar", "content_dist", "quarantine"}) {
+    for (const char* plugin : {"echo", "content_dist", "quarantine"}) {
         INFO(plugin);
         CHECK_FALSE(set.contains(plugin));
     }

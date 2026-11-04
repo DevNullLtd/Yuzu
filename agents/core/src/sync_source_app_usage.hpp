@@ -4,7 +4,7 @@
 /// The `app_usage` daily-sync source (ADR-0016; wave 7 PR7.2). Collects
 /// per-executable last-used state by invoking the `app_usage` plugin in-process
 /// (`LocalDispatcher`, action `last_used`) — the plugin is a thin, Forensics-
-/// gated read-only view over the TAR plugin's `usage_daily` sqlite fold
+/// gated read-only view over the Echo plugin's `usage_daily` sqlite fold
 /// (agents/plugins/app_usage/src/app_usage_plugin.cpp). The server persists the
 /// projection in `AppUsageStore` (server/core/src/app_usage_store.hpp).
 ///
@@ -16,7 +16,7 @@
 /// (sync_canonical clamp_field) still applies as defence-in-depth.
 ///
 /// CONSTRAINED OUTPUT (never an empty blob): the plugin reports
-/// `constrained|...` (usage source disabled, older TAR schema, tar.db
+/// `constrained|...` (usage source disabled, older Echo schema, echo.db
 /// unavailable) with rc==0 — a *legitimate* "nothing to say this cycle", not
 /// "zero usage". Treating it as a valid empty replace would wipe stored
 /// last-used state the next time the constraint lifts and a stale server view
@@ -45,10 +45,10 @@ namespace yuzu::agent {
 /// AppUsageStore row; kept agent-side so this module needs no server headers).
 struct AppUsageRow {
     std::string exe_key;
-    std::int64_t first_seen{0};       ///< first-seen epoch seconds, within TAR's retained usage
+    std::int64_t first_seen{0};       ///< first-seen epoch seconds, within Echo's retained usage
                                        ///< window (never all-time — see app_usage_parsers.hpp
                                        ///< RETENTION, adjudication P3)
-    std::int64_t last_seen{0};        ///< last-seen epoch seconds, within TAR's retained usage
+    std::int64_t last_seen{0};        ///< last-seen epoch seconds, within Echo's retained usage
                                        ///< window (never all-time — see app_usage_parsers.hpp
                                        ///< RETENTION, adjudication P3)
     std::int64_t run_count_30d{0};    ///< trailing-30-day run count
@@ -59,7 +59,7 @@ struct AppUsageRow {
 struct AppUsageParse {
     std::vector<AppUsageRow> rows; ///< `last_used|` rows only, fields clamped
     /// True iff the capture carried a `constrained|...` line (usage source
-    /// disabled, older TAR schema, tar.db unavailable). When true the caller
+    /// disabled, older Echo schema, echo.db unavailable). When true the caller
     /// MUST skip the cycle — never send an empty blob for a constrained
     /// source (see the file header).
     bool constrained{false};

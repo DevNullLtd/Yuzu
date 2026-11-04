@@ -6,26 +6,33 @@
  */
 
 #include "execution_tracker.hpp"
+#include "execution_mutation.hpp" // #2146: make_tracker_mutation_ports against a real tracker
 #include "command_outbox_store.hpp" // #4982 Part B: reap_stuck_running_executions' cross-schema tests
 #include "execution_event_bus.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "test_execution_tracker_pg_helper.hpp"
+#include "source_scan.hpp" // #3834: wiring pin for the server.cpp seed call
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
 
+#include <yuzu/metrics.hpp>
+
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <expected>
+#include <functional>
 #include <latch>
 #include <memory>
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -1473,10 +1480,10 @@ TEST_CASE("ExecutionTracker: the dispatch record carries the plugin; the plugin 
     ExecutionTracker& tracker = *tracker_bundle;
 
     SECTION("round trip: plugin and execution id") {
-        REQUIRE(tracker.record_command_dispatch("tar-0001", "tar", "exec-1"));
-        const auto rec = tracker.lookup_command_record("tar-0001");
+        REQUIRE(tracker.record_command_dispatch("echo-0001", "echo", "exec-1"));
+        const auto rec = tracker.lookup_command_record("echo-0001");
         REQUIRE(rec.has_value());
-        CHECK(rec->plugin == "tar");
+        CHECK(rec->plugin == "echo");
         CHECK(rec->execution_id == "exec-1");
     }
     SECTION("an untracked dispatch records the plugin with an empty execution id") {
@@ -2964,6 +2971,85 @@ TEST_CASE("ExecutionTracker: WS-2a mark_cancelled durably appends a terminal "
     CHECK(rows[0].data.find("cancelled") != std::string::npos);
 }
 
+// #3845: `mark_cancelled_checked` is the three-way form of `mark_cancelled`. The cancel route
+// maps the three outcomes to 200 / 409 / 503, so a regression that collapses kNoOp into kFailed
+// (the pre-#3845 shape) would turn "unknown or already finished" back into a false "store
+// degraded" 503. Pin each outcome and its side effects directly.
+TEST_CASE("ExecutionTracker: #3845 mark_cancelled_checked reports kCancelled for a running "
+          "execution and kNoOp (not kFailed) for an already-terminal one",
+          "[pg][execution_tracker][outbox]") {
+    using Outcome = ExecutionTracker::MarkCancelledOutcome;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution()); // status "running"
+    REQUIRE(id.has_value());
+
+    CHECK(tracker.mark_cancelled_checked(*id, "admin") == Outcome::kCancelled);
+    auto after_first = fetch_outbox(tracker_bundle.pool(), *id);
+    REQUIRE(after_first.size() == 1);
+
+    // Second cancel of the same (now terminal) execution: a clean no-op, not a store failure,
+    // and it must not append a second, contradictory terminal frame.
+    CHECK(tracker.mark_cancelled_checked(*id, "admin") == Outcome::kNoOp);
+    CHECK(fetch_outbox(tracker_bundle.pool(), *id).size() == 1);
+
+    auto exec = tracker.get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
+}
+
+TEST_CASE("ExecutionTracker: #3845 mark_cancelled_checked reports kNoOp for an unknown id and "
+          "writes nothing",
+          "[pg][execution_tracker][outbox]") {
+    using Outcome = ExecutionTracker::MarkCancelledOutcome;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    CHECK(tracker.mark_cancelled_checked("does-not-exist", "admin") == Outcome::kNoOp);
+    // No phantom event-without-state (ADR-2002 §5 pairing).
+    CHECK(fetch_outbox(tracker_bundle.pool(), "does-not-exist").empty());
+}
+
+// No [pg] tag: an unreachable port fails construction deterministically, so this needs no
+// database (same construction as "a store bound to an unreachable pool degrades every method").
+// It pins the `!open_` early return; it cannot tell that guard from a failing pool, which also
+// yields kFailed.
+TEST_CASE("ExecutionTracker: #3845 mark_cancelled_checked reports kFailed for a store that "
+          "never opened",
+          "[execution_tracker]") {
+    using Outcome = ExecutionTracker::MarkCancelledOutcome;
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid());
+    ExecutionTracker closed(unreachable);
+    REQUIRE(!closed.is_open());
+    CHECK(closed.mark_cancelled_checked("exec-1", "tester") == Outcome::kFailed);
+}
+
+TEST_CASE("ExecutionTracker: #3845 mark_cancelled_checked reports kFailed when the paired "
+          "outbox append fails, and rolls the cancel back",
+          "[pg][execution_tracker][outbox]") {
+    using Outcome = ExecutionTracker::MarkCancelledOutcome;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(lease.get(), "DROP TABLE execution_tracker.event_outbox",
+                                   std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+    CHECK(tracker.mark_cancelled_checked(*id, "admin") == Outcome::kFailed);
+    auto exec = tracker.get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running");
+}
+
 TEST_CASE("ExecutionTracker: WS-2a events appended on one instance are durable "
           "and readable from a SEPARATE instance (WS-9 failover scenario)",
           "[pg][execution_tracker][outbox]") {
@@ -3192,6 +3278,88 @@ TEST_CASE("ExecutionTracker: WS-2a refresh_counts terminal transition is atomic 
     auto exec = tracker.get_execution(*id);
     REQUIRE(exec.has_value());
     CHECK(exec->status == "running");
+}
+
+TEST_CASE("ExecutionTracker: WS-2a refresh_counts partial-append rollback — progress "
+          "append succeeds, terminal append fails, the WHOLE txn rolls back (#3846)",
+          "[pg][execution_tracker][outbox]") {
+    // The sibling case above drops event_outbox, so the FIRST append (progress)
+    // fails and the second is never attempted. This pins the partial sequence:
+    // refresh_counts_once's `execution-progress` INSERT succeeds, then its
+    // `execution-completed` INSERT fails. The already-succeeded progress row, the
+    // aggregate recompute and the terminal status flip must all roll back together.
+    // Injected with a CHECK constraint that rejects only the terminal event type.
+    // This relies on refresh_counts_once appending execution-progress BEFORE
+    // execution-completed. If that order ever changes, the test degrades to the
+    // sibling's first-append case (still green, but no longer proves that an
+    // earlier successful append rolls back) — revisit it then.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution()); // status "running"
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.set_agents_targeted(*id, 1));
+
+    // In-memory bus attached AFTER create_execution/set_agents_targeted so only
+    // refresh_counts's own publishes are counted. The durable append does not
+    // need a bus; this pins that a ROLLED-BACK refresh publishes nothing live.
+    ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+
+    auto run_sql = [&](const char* sql) {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    };
+
+    {
+        // A responded agent row inserted directly, so refresh_counts sees
+        // all-responded WITHOUT update_agent_status (whose own append would fire).
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO execution_tracker.agent_exec_status "
+            "(execution_id, agent_id, status, dispatched_at, first_response_at, completed_at, "
+            " exit_code, error_detail, plugin_result_status) "
+            "VALUES ($1, 'agent-1', 'success', 0, 0, 0, 0, '', 0)",
+            std::vector<std::string>{*id});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    }
+
+    run_sql("ALTER TABLE execution_tracker.event_outbox "
+            "ADD CONSTRAINT yuzu_test_no_terminal_append "
+            "CHECK (event_type <> 'execution-completed')");
+
+    tracker.refresh_counts(*id); // progress append OK -> terminal append fails -> rollback
+
+    {
+        auto exec = tracker.get_execution(*id);
+        REQUIRE(exec.has_value());
+        CHECK(exec->status == "running");     // terminal transition rolled back
+        CHECK(exec->agents_responded == 0);   // aggregate recompute rolled back too
+    }
+    // The progress row that DID insert must not survive the failed second append.
+    CHECK(fetch_outbox(tracker_bundle.pool(), *id).empty());
+    CHECK(bus.snapshot(*id).empty()); // nothing published for the rolled-back txn
+
+    // Positive control: lift the injected failure. The rolled-back state is
+    // retryable (not wedged) and the same call now commits both events.
+    run_sql("ALTER TABLE execution_tracker.event_outbox "
+            "DROP CONSTRAINT yuzu_test_no_terminal_append");
+    tracker.refresh_counts(*id);
+
+    auto exec = tracker.get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "succeeded");
+    CHECK(exec->agents_responded == 1); // contrast with the rolled-back 0 above
+    auto rows = fetch_outbox(tracker_bundle.pool(), *id);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].event_type == "execution-progress");
+    CHECK(rows[1].event_type == "execution-completed");
+    CHECK(rows[1].is_terminal);
+    CHECK(bus.snapshot(*id).size() == 2); // both events published, once, after commit
 }
 
 // ── #4982 Part B: reap_stuck_running_executions ──────────────────────────────
@@ -4194,4 +4362,594 @@ TEST_CASE("ExecutionTracker: reap_stuck_running_executions does NOT recover "
         REQUIRE(PQntuples(res.get()) == 1);
         CHECK(std::string(PQgetvalue(res.get(), 0, 0)) == std::to_string(anchor_a) + ":forward");
     }
+}
+
+// ── #3834: read-degrade counter ─────────────────────────────────────────────
+//
+// yuzu_server_execution_tracker_read_degrade_total{method,reason} is bumped at every degrade
+// branch of the five `_checked` readers. These tests pin: the closed label sets (5 x 3 = 15
+// series, all pre-seeded to 0, label VALUES included), that each reason is attributed to the
+// right (method, reason) pair and to NOTHING else, that the unchecked wrappers that delegate are
+// counted, that a healthy read - including an empty or not-found one - is not a degrade, and that
+// server.cpp still seeds the family once.
+//
+// The label values below are spelled here independently of production on purpose: a typo in a
+// production constant must fail a test, not be mirrored by it.
+
+static constexpr const char* kDegradeMetric = "yuzu_server_execution_tracker_read_degrade_total";
+static constexpr std::array<const char*, 5> kDegradeMethods{
+    "query_executions", "get_execution", "get_agent_statuses", "get_agent_statuses_for_executions",
+    "get_children"};
+static constexpr std::array<const char*, 3> kDegradeReasons{"store_not_open", "pool_acquire_timeout",
+                                                            "query_error"};
+
+static double degrade_count(yuzu::MetricsRegistry& m, const std::string& method,
+                            const std::string& reason) {
+    return m.counter(kDegradeMetric, {{"method", method}, {"reason", reason}}).value();
+}
+
+// Every series of the family must be 0 except (method, reason), which must be exactly `expected`.
+// Checking all 15 (not just the one) is what catches a branch attributed to the wrong label.
+// Pass method == "" to assert that NOTHING moved.
+static void check_only_degrade_series(yuzu::MetricsRegistry& m, const std::string& method,
+                                      const std::string& reason, double expected = 1.0) {
+    for (const char* mm : kDegradeMethods)
+        for (const char* rr : kDegradeReasons) {
+            INFO("series method=" << mm << " reason=" << rr << " (expected hit: " << method << "/"
+                                  << reason << ")");
+            CHECK(degrade_count(m, mm, rr) == ((method == mm && reason == rr) ? expected : 0.0));
+        }
+}
+
+namespace {
+
+// Wires `m` into the tracker for one scope and ALWAYS unwires it on exit, including when a
+// REQUIRE throws mid-scope, so the tracker can never be left holding a pointer to a registry that
+// has gone out of scope. Declare it AFTER the registry so it is destroyed (unwired) first.
+class MetricsWire {
+public:
+    MetricsWire(ExecutionTracker& tracker, yuzu::MetricsRegistry& m) : tracker_(tracker) {
+        tracker_.set_metrics(&m);
+    }
+    ~MetricsWire() { tracker_.set_metrics(nullptr); }
+    MetricsWire(const MetricsWire&) = delete;
+    MetricsWire& operator=(const MetricsWire&) = delete;
+
+private:
+    ExecutionTracker& tracker_;
+};
+
+struct DegradeReader {
+    const char* method;
+    std::function<void(ExecutionTracker&)> call;
+};
+
+// One call per `_checked` reader, on arguments that make each reach its pool/query path (a
+// non-empty execution-id list for the batch reader, which short-circuits success-empty otherwise).
+std::vector<DegradeReader> degrade_readers() {
+    return {
+        {"query_executions",
+         [](ExecutionTracker& t) { (void)t.query_executions_checked(ExecutionQuery{}); }},
+        {"get_execution", [](ExecutionTracker& t) { (void)t.get_execution_checked("exec-1"); }},
+        {"get_agent_statuses",
+         [](ExecutionTracker& t) { (void)t.get_agent_statuses_checked("exec-1"); }},
+        {"get_agent_statuses_for_executions",
+         [](ExecutionTracker& t) { (void)t.get_agent_statuses_for_executions_checked({"exec-1"}); }},
+        {"get_children",
+         [](ExecutionTracker& t) { (void)t.get_children_checked("exec-1", std::nullopt); }},
+    };
+}
+
+} // namespace
+
+TEST_CASE("ExecutionTracker: seed_read_degrade_metrics pre-seeds exactly the 15 closed series at 0",
+          "[execution_tracker]") {
+    yuzu::MetricsRegistry m;
+    ExecutionTracker::seed_read_degrade_metrics(m);
+
+    const std::string out = m.serialize();
+    // Count this family's sample lines: `<name>{...} 0`. HELP/TYPE lines also contain the name,
+    // so anchor on the sample shape (the name immediately followed by `{`).
+    const std::string prefix = std::string(kDegradeMetric) + "{";
+    std::size_t samples = 0;
+    for (std::size_t pos = out.find(prefix); pos != std::string::npos;
+         pos = out.find(prefix, pos + 1)) {
+        ++samples;
+        const auto eol = out.find('\n', pos);
+        REQUIRE(eol != std::string::npos);
+        const std::string line = out.substr(pos, eol - pos);
+        INFO("sample line: " << line);
+        CHECK(line.ends_with(" 0")); // pre-seeded, nothing has degraded
+    }
+    CHECK(samples == kDegradeMethods.size() * kDegradeReasons.size());
+    CHECK(out.find(std::string("# TYPE ") + kDegradeMetric + " counter") != std::string::npos);
+
+    // The label VALUES, from this test's own literals: a typo in a production constant would still
+    // give 15 samples, so counting alone is not evidence of what was seeded.
+    for (const char* method : kDegradeMethods)
+        for (const char* reason : kDegradeReasons) {
+            const std::string expected = std::string(kDegradeMetric) + "{method=\"" + method +
+                                         "\",reason=\"" + reason + "\"} 0\n";
+            INFO("expected sample: " << expected);
+            CHECK(out.find(expected) != std::string::npos);
+        }
+
+    // HELP must stay 7-bit ASCII (scripts/ci/check-metrics-help-ascii.sh).
+    CHECK(std::ranges::all_of(out, [](unsigned char ch) { return ch < 0x80; }));
+
+    // Seeding is idempotent: a second call neither duplicates series nor bumps a value.
+    ExecutionTracker::seed_read_degrade_metrics(m);
+    CHECK(m.serialize() == out);
+}
+
+TEST_CASE("ExecutionTracker: ServerImpl still seeds the read-degrade counter, exactly once",
+          "[execution_tracker]") {
+    // Wiring pin for the issue's "pre-seed to 0 at startup" criterion: the seed function is only
+    // useful while server.cpp still calls it. Counted in comment-free source so a commented-out
+    // call or a prose mention does not satisfy it. A count of 0 fails loudly, including if the
+    // comment stripper (it keeps string literals intact, see source_scan.hpp) ever swallows the
+    // call site. Limits: it does not see preprocessor exclusion (`#if 0`), and it proves the call
+    // EXISTS, not that it runs in the store-open branch - that placement is reviewed, not
+    // machine-checked.
+    const std::string& src = yuzu::test::source_scan::comment_free_source("server.cpp");
+    const std::string call = "ExecutionTracker::seed_read_degrade_metrics(metrics_)";
+    std::size_t live_calls = 0;
+    for (auto pos = src.find(call); pos != std::string::npos; pos = src.find(call, pos + 1))
+        ++live_calls;
+    INFO("expected exactly one live call to "
+         << call << " in server.cpp; 0 means it was removed, renamed (the member `metrics_`?) or "
+                    "moved out of server.cpp - the pre-seed at startup would be lost");
+    CHECK(live_calls == 1);
+}
+
+TEST_CASE("ExecutionTracker: a closed store counts store_not_open against the right method only",
+          "[execution_tracker]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid());
+    ExecutionTracker closed(unreachable);
+    REQUIRE(!closed.is_open());
+
+    for (const auto& reader : degrade_readers()) {
+        INFO("method " << reader.method);
+        yuzu::MetricsRegistry m;
+        ExecutionTracker::seed_read_degrade_metrics(m);
+        {
+            MetricsWire wire(closed, m);
+            reader.call(closed);
+        }
+        check_only_degrade_series(m, reader.method, "store_not_open");
+    }
+
+    SECTION("the unchecked wrappers that delegate to a _checked body are counted too") {
+        yuzu::MetricsRegistry m;
+        ExecutionTracker::seed_read_degrade_metrics(m);
+        {
+            MetricsWire wire(closed, m);
+            (void)closed.query_executions(ExecutionQuery{});
+            (void)closed.get_agent_statuses("exec-1");
+            (void)closed.get_agent_statuses_for_executions({"exec-1"});
+            (void)closed.get_children("exec-1");
+        }
+        for (const char* method : {"query_executions", "get_agent_statuses",
+                                   "get_agent_statuses_for_executions", "get_children"})
+            CHECK(degrade_count(m, method, "store_not_open") == 1.0);
+        // get_execution() (unchecked) has its own body and does NOT delegate to the _checked one.
+        CHECK(degrade_count(m, "get_execution", "store_not_open") == 0.0);
+    }
+
+    SECTION("a success-empty read (empty execution-id list) is not a degrade") {
+        yuzu::MetricsRegistry m;
+        ExecutionTracker::seed_read_degrade_metrics(m);
+        std::optional<std::unordered_map<std::string, std::vector<AgentExecStatus>>> empty_ids;
+        {
+            MetricsWire wire(closed, m);
+            empty_ids = closed.get_agent_statuses_for_executions_checked({});
+        }
+        REQUIRE(empty_ids.has_value());
+        check_only_degrade_series(m, "", "", 0.0); // nothing moved anywhere
+    }
+
+    SECTION("a tracker with no metrics wired degrades without crashing") {
+        closed.set_metrics(nullptr);
+        for (const auto& reader : degrade_readers())
+            reader.call(closed);
+    }
+}
+
+TEST_CASE("ExecutionTracker: pool exhaustion counts pool_acquire_timeout for every _checked reader",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg bundle;
+
+    // A second tracker over a size-1 pool whose only connection we hold: every reader's bounded
+    // acquire must fail and be attributed to pool_acquire_timeout. The tracker is constructed
+    // BEFORE the lease is taken (its constructor acquires unboundedly and would block on a held
+    // connection). The wait is clamped by the pool's saturated fast-fail, so no timing is asserted.
+    pg::PgPool tiny{{.conninfo = bundle.dsn(), .size = 1}};
+    REQUIRE(tiny.valid());
+    ExecutionTracker tracker(tiny);
+    REQUIRE(tracker.is_open());
+    auto held = tiny.acquire();
+    REQUIRE(held);
+
+    for (const auto& reader : degrade_readers()) {
+        INFO("method " << reader.method);
+        yuzu::MetricsRegistry m;
+        ExecutionTracker::seed_read_degrade_metrics(m);
+        {
+            MetricsWire wire(tracker, m);
+            reader.call(tracker);
+        }
+        check_only_degrade_series(m, reader.method, "pool_acquire_timeout");
+    }
+}
+
+TEST_CASE("ExecutionTracker: a failing statement counts query_error for every _checked reader",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg bundle;
+    ExecutionTracker& tracker = *bundle;
+
+    // Drop both tables out from under the open store (this fixture's database is ephemeral and
+    // private to the test): the store is still open_ and a lease is available, so the ONLY thing
+    // that can go wrong is the statement - exactly the query_error branch.
+    {
+        auto lease = bundle.pool().acquire();
+        REQUIRE(lease);
+        for (const char* ddl : {"DROP TABLE execution_tracker.agent_exec_status CASCADE",
+                                "DROP TABLE execution_tracker.executions CASCADE"}) {
+            pg::PgResult r = pg::exec_params(lease.get(), ddl, std::vector<std::string>{});
+            REQUIRE(r.status() == PGRES_COMMAND_OK);
+        }
+    }
+
+    for (const auto& reader : degrade_readers()) {
+        INFO("method " << reader.method);
+        yuzu::MetricsRegistry m;
+        ExecutionTracker::seed_read_degrade_metrics(m);
+        {
+            MetricsWire wire(tracker, m);
+            reader.call(tracker);
+        }
+        check_only_degrade_series(m, reader.method, "query_error");
+    }
+}
+
+TEST_CASE("ExecutionTracker: get_children_checked's statement timeout counts query_error, not "
+          "pool_acquire_timeout",
+          "[pg][execution_tracker]") {
+    // The real timeout path (a held ACCESS EXCLUSIVE lock, as in the statement_timeout test
+    // above), as opposed to the dropped-table path: a lease IS acquired and the SET LOCAL
+    // statement_timeout fires inside the transaction, so it must be attributed to query_error.
+    yuzu::test::ExecutionTrackerPg bundle;
+    ExecutionTracker& tracker = *bundle;
+
+    auto parent = tracker.create_execution(make_execution());
+    REQUIRE(parent.has_value());
+
+    pg::PgConn locker{PQconnectdb(bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE execution_tracker.executions IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    yuzu::MetricsRegistry m;
+    ExecutionTracker::seed_read_degrade_metrics(m);
+    std::optional<ExecutionChildrenResult> checked;
+    {
+        MetricsWire wire(tracker, m);
+        checked = tracker.get_children_checked(*parent, std::nullopt);
+    }
+
+    (void)pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{});
+
+    CHECK_FALSE(checked.has_value());
+    check_only_degrade_series(m, "get_children", "query_error");
+}
+
+TEST_CASE("ExecutionTracker: healthy reads, including empty and not-found ones, never move the "
+          "degrade counter",
+          "[pg][execution_tracker]") {
+    // The negative control the degraded-path tests above cannot give: an emit that drifted onto a
+    // SUCCESS path (a not-found get_execution, an empty list, a parent with no children) would pass
+    // every one of them. Success-empty is the documented non-degrade, so it is pinned here.
+    yuzu::test::ExecutionTrackerPg bundle;
+    ExecutionTracker& tracker = *bundle;
+
+    auto parent = tracker.create_execution(make_execution());
+    REQUIRE(parent.has_value());
+    AgentExecStatus status;
+    status.agent_id = "agent-1";
+    status.status = "success";
+    tracker.update_agent_status(*parent, status);
+
+    yuzu::MetricsRegistry m;
+    ExecutionTracker::seed_read_degrade_metrics(m);
+    {
+        MetricsWire wire(tracker, m);
+
+        // Populated.
+        CHECK(tracker.query_executions_checked(ExecutionQuery{}).has_value());
+        auto found = tracker.get_execution_checked(*parent);
+        REQUIRE(found.has_value());
+        CHECK(found->has_value());
+        auto statuses = tracker.get_agent_statuses_checked(*parent);
+        REQUIRE(statuses.has_value());
+        CHECK_FALSE(statuses->empty());
+        CHECK(tracker.get_agent_statuses_for_executions_checked({*parent}).has_value());
+
+        // Success-empty: absent id, a filter that matches nothing, an empty id list, no children.
+        auto missing = tracker.get_execution_checked("no-such-execution");
+        REQUIRE(missing.has_value());
+        CHECK_FALSE(missing->has_value());
+        ExecutionQuery matches_nothing;
+        matches_nothing.definition_id = "no-such-definition";
+        auto none = tracker.query_executions_checked(matches_nothing);
+        REQUIRE(none.has_value());
+        CHECK(none->empty());
+        auto no_statuses = tracker.get_agent_statuses_checked("no-such-execution");
+        REQUIRE(no_statuses.has_value());
+        CHECK(no_statuses->empty());
+        CHECK(tracker.get_agent_statuses_for_executions_checked({"no-such-execution"}).has_value());
+        CHECK(tracker.get_agent_statuses_for_executions_checked({}).has_value());
+        auto no_children = tracker.get_children_checked(*parent, std::nullopt);
+        REQUIRE(no_children.has_value());
+        CHECK(no_children->children.empty());
+
+        // The unchecked wrappers on the healthy path.
+        (void)tracker.query_executions(ExecutionQuery{});
+        (void)tracker.get_execution(*parent);
+        (void)tracker.get_agent_statuses(*parent);
+        (void)tracker.get_agent_statuses_for_executions({*parent});
+        (void)tracker.get_children(*parent);
+    }
+
+    check_only_degrade_series(m, "", "", 0.0); // nothing moved anywhere
+}
+
+// ── make_tracker_mutation_ports against a REAL tracker (#2146 batch B, CA-1/UP-11) ───────────
+// test_execution_cancel_rerun_twins.cpp drives the shared sequence against a fake store; these
+// cases pin the adapter itself, so a regression in how the ports bind the tracker (an unchecked
+// read, a string-matched error) is caught where it is made.
+
+namespace {
+
+struct MutationAudit {
+    std::vector<std::pair<std::string, std::string>> rows; // {result, target}
+    ExecutionMutationAuditFn fn() {
+        return [this](const std::string&, const std::string& result, const std::string& target,
+                      const std::string&) {
+            rows.emplace_back(result, target);
+            return true;
+        };
+    }
+};
+
+ExecutionMutationRequest mutation_req(ExecutionMutation what, const std::string& id,
+                                      bool failed_only = false) {
+    ExecutionMutationRequest r;
+    r.what = what;
+    r.execution_id = id;
+    r.username = "operator";
+    r.failed_only = failed_only;
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("make_tracker_mutation_ports: a null tracker yields unwired ports",
+          "[execution_tracker][mutation][2146]") {
+    CHECK_FALSE(make_tracker_mutation_ports(nullptr).wired());
+}
+
+TEST_CASE("make_tracker_mutation_ports: cancel of a live row, a finished row and a missing row",
+          "[pg][execution_tracker][mutation][2146]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    const auto ports = make_tracker_mutation_ports(&tracker);
+    REQUIRE(ports.wired());
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+
+    CHECK(ports.mark_cancelled(*id, "operator") == ExecutionTracker::MarkCancelledOutcome::kCancelled);
+    auto after = tracker.get_execution(*id);
+    REQUIRE(after.has_value());
+    CHECK(after->status == "cancelled");
+
+    // Already terminal: a no-op, not a failure.
+    CHECK(ports.mark_cancelled(*id, "operator") == ExecutionTracker::MarkCancelledOutcome::kNoOp);
+    // Missing: also a no-op at the port (the not-found decision is the sequence's, made on the
+    // checked read before the effect).
+    CHECK(ports.mark_cancelled("no-such-execution", "operator") ==
+          ExecutionTracker::MarkCancelledOutcome::kNoOp);
+
+    SECTION("end to end through apply_execution_mutation") {
+        auto live = tracker.create_execution(make_execution());
+        REQUIRE(live.has_value());
+        MutationAudit audit;
+        auto done = apply_execution_mutation(ports, mutation_req(ExecutionMutation::kCancel, *live),
+                                             audit.fn());
+        CHECK(done.status == ExecutionMutationStatus::kDone);
+        auto again = apply_execution_mutation(ports, mutation_req(ExecutionMutation::kCancel, *live),
+                                              audit.fn());
+        CHECK(again.status == ExecutionMutationStatus::kAlreadyFinished);
+        auto missing = apply_execution_mutation(
+            ports, mutation_req(ExecutionMutation::kCancel, "no-such-execution"), audit.fn());
+        CHECK(missing.status == ExecutionMutationStatus::kNotFound);
+    }
+}
+
+TEST_CASE("make_tracker_mutation_ports: rerun of an existing and a missing original",
+          "[pg][execution_tracker][mutation][2146]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    const auto ports = make_tracker_mutation_ports(&tracker);
+    REQUIRE(ports.wired());
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    for (const auto& [agent, status] : {std::pair{"a1", "success"}, std::pair{"a2", "failure"},
+                                        std::pair{"a3", "timeout"}}) {
+        AgentExecStatus s;
+        s.agent_id = agent;
+        s.status = status;
+        tracker.update_agent_status(*id, s);
+    }
+
+    SECTION("existing original, all devices") {
+        auto rerun = ports.create_rerun(*id, "operator", false);
+        REQUIRE(rerun.has_value());
+        auto row = tracker.get_execution(*rerun);
+        REQUIRE(row.has_value());
+        CHECK(row->rerun_of == *id);
+        CHECK(row->parent_id == *id);
+        CHECK(row->status == "pending");
+        CHECK(row->dispatched_by == "operator");
+    }
+    SECTION("existing original, failed_only counts the failed and timed-out devices") {
+        auto rerun = ports.create_rerun(*id, "operator", true);
+        REQUIRE(rerun.has_value());
+        auto row = tracker.get_execution(*rerun);
+        REQUIRE(row.has_value());
+        CHECK(row->agents_targeted == 2);
+    }
+    SECTION("missing original is kOriginalNotFound, not an unavailable store") {
+        auto rerun = ports.create_rerun("no-such-execution", "operator", false);
+        REQUIRE_FALSE(rerun.has_value());
+        CHECK(rerun.error() == ExecutionTracker::RerunError::kOriginalNotFound);
+    }
+    SECTION("end to end through apply_execution_mutation") {
+        MutationAudit audit;
+        auto done = apply_execution_mutation(
+            ports, mutation_req(ExecutionMutation::kRerun, *id, /*failed_only=*/true), audit.fn());
+        CHECK(done.status == ExecutionMutationStatus::kDone);
+        CHECK_FALSE(done.new_execution_id.empty());
+        auto missing = apply_execution_mutation(
+            ports, mutation_req(ExecutionMutation::kRerun, "no-such-execution"), audit.fn());
+        CHECK(missing.status == ExecutionMutationStatus::kNotFound);
+    }
+}
+
+TEST_CASE("make_tracker_mutation_ports: a rerun whose read DEGRADES is unavailable, never "
+          "not-found, and creates no record (CA-1/UP-11)",
+          "[pg][execution_tracker][mutation][2146]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    const auto ports = make_tracker_mutation_ports(&tracker);
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    const auto count_rows = [&] { return tracker.query_executions(ExecutionQuery{}).size(); };
+    const auto before = count_rows();
+    REQUIRE(before == 1);
+
+    {
+        // Exhaust the pool so the tracker's bounded acquire gives up: the original EXISTS, but
+        // it cannot be read. size == 4 in the fixture.
+        std::vector<pg::PgPool::Lease> held;
+        for (int i = 0; i < 4; ++i) {
+            auto lease = tracker_bundle.pool().acquire();
+            REQUIRE(lease);
+            held.push_back(std::move(lease));
+        }
+        for (const bool failed_only : {false, true}) {
+            auto rerun = ports.create_rerun(*id, "operator", failed_only);
+            REQUIRE_FALSE(rerun.has_value());
+            CHECK(rerun.error() == ExecutionTracker::RerunError::kStoreDegraded);
+        }
+        // The shared sequence's own admission read degrades first (also a fail-closed 503 path).
+        MutationAudit audit;
+        auto out = apply_execution_mutation(
+            ports, mutation_req(ExecutionMutation::kRerun, *id), audit.fn());
+        CHECK(out.status == ExecutionMutationStatus::kStoreDegraded);
+    }
+
+    // Released: nothing was created while degraded, and the same call now succeeds, proving the
+    // earlier failure was the read and not an absent original.
+    CHECK(count_rows() == before);
+    auto rerun = ports.create_rerun(*id, "operator", false);
+    CHECK(rerun.has_value());
+}
+
+TEST_CASE("make_tracker_mutation_ports: a failed_only rerun whose SECOND read (the per-device "
+          "statuses) fails after the original read succeeded is unavailable and creates no record",
+          "[pg][execution_tracker][mutation][2146]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    const auto ports = make_tracker_mutation_ports(&tracker);
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    AgentExecStatus failed;
+    failed.agent_id = "a1";
+    failed.status = "failure";
+    tracker.update_agent_status(*id, failed);
+    const auto count_rows = [&] { return tracker.query_executions(ExecutionQuery{}).size(); };
+    const auto before = count_rows();
+    REQUIRE(before == 1);
+
+    // Break ONLY what the per-device status read selects. The original-row read (get_execution_
+    // checked) subselects `error_detail` from the same table and does not touch this column, so it
+    // still succeeds and the failure lands on the second read in create_rerun_checked.
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto drop = pg::exec_params(
+            lease.get(),
+            "ALTER TABLE execution_tracker.agent_exec_status DROP COLUMN plugin_result_status",
+            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    // Control: the original reads, and a full (not failed_only) rerun does not need the status
+    // table, so this proves the first read is healthy. It is the one record created below.
+    auto full = ports.create_rerun(*id, "operator", false);
+    CHECK(full.has_value());
+    CHECK(count_rows() == before + 1);
+
+    // The failed_only rerun cannot size its record: unavailable, never "0 failed devices", and
+    // no record is created (an unchecked second read would create an empty one and succeed).
+    auto rerun = ports.create_rerun(*id, "operator", true);
+    REQUIRE_FALSE(rerun.has_value());
+    CHECK(rerun.error() == ExecutionTracker::RerunError::kStoreDegraded);
+    CHECK(count_rows() == before + 1);
+
+    // Through the shared sequence: a 503-class outcome, not a success and not a not-found.
+    MutationAudit audit;
+    auto out = apply_execution_mutation(
+        ports, mutation_req(ExecutionMutation::kRerun, *id, /*failed_only=*/true), audit.fn());
+    CHECK(out.status != ExecutionMutationStatus::kDone);
+    CHECK(out.status != ExecutionMutationStatus::kNotFound);
+    CHECK(count_rows() == before + 1);
+}
+
+TEST_CASE("make_tracker_mutation_ports: a CLOSED tracker degrades every port",
+          "[execution_tracker][mutation][2146]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid());
+    ExecutionTracker closed(unreachable);
+    REQUIRE_FALSE(closed.is_open());
+    const auto ports = make_tracker_mutation_ports(&closed);
+    REQUIRE(ports.wired());
+
+    CHECK_FALSE(ports.get_execution("exec-1").has_value());
+    CHECK_FALSE(ports.get_statuses("exec-1").has_value());
+    CHECK(ports.mark_cancelled("exec-1", "operator") ==
+          ExecutionTracker::MarkCancelledOutcome::kFailed);
+    for (const bool failed_only : {false, true}) {
+        auto rerun = ports.create_rerun("exec-1", "operator", failed_only);
+        REQUIRE_FALSE(rerun.has_value());
+        CHECK(rerun.error() == ExecutionTracker::RerunError::kStoreDegraded);
+    }
+    MutationAudit audit;
+    CHECK(apply_execution_mutation(ports, mutation_req(ExecutionMutation::kRerun, "exec-1"),
+                                   audit.fn())
+              .status == ExecutionMutationStatus::kStoreDegraded);
+    CHECK(audit.rows.empty()); // the admission read failed before any row
 }

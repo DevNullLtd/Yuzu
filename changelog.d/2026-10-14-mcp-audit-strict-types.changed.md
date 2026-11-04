@@ -1,1 +1,0 @@
-- **Breaking - MCP `query_audit_log` rejects wrong-typed filters.** `query_audit_log` callers that sent a non-string `principal`, `action` or `target_type`, or a non-integer or negative `since`/`until`, previously got an unfiltered read; they now get an invalid-params error (-32602).

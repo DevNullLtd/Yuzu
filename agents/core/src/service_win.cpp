@@ -217,7 +217,7 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
         // No checkpoint-bumping thread runs during this call because it's cheap
         // today (make_agent() in main.cpp: an in-process flag check, one small
         // SQLite open/write, and a trivial in-memory constructor -- the real
-        // startup cost, plugin load and KV/TAR store open, is deliberately deferred
+        // startup cost, plugin load and KV/Echo store open, is deliberately deferred
         // into agent->run() below, past the RUNNING report). If a future change
         // ever moves real work into the factory ahead of run(), this single
         // 30s-hint START_PENDING report stops being long enough and needs either a

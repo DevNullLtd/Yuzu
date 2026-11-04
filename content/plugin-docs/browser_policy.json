@@ -353,7 +353,7 @@
   "version": "1.0.0",
   "where_the_data_goes": [
     "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `policies` is also a gathered definition (`crossplatform.browser_policy.policies`, `gather.ttlSeconds` 300: informational, nothing re-dispatches on it).",
-    "**Not consumed by** daily-sync, TAR, DEX, or metrics.",
+    "**Not consumed by** daily-sync, Echo, DEX, or metrics.",
     "**Sensitivity.** Rows are operator/IT-authored configuration: policy names and values such as homepage URLs, allowed or blocked extension ids and proxy settings can disclose part of an organisation's browser-management posture and internal hostnames. They carry no browsing history, bookmarks, cookies or per-user data, and the Linux leg's `scope` column always reports `machine`, never a user. Values are reported verbatim and are not screened: a value an administrator wrote can itself hold a credential-bearing URL or an enrollment token, and the files are world-readable so the browser can load them, so treat the rows as sensitive. Stored responses are kept for the ResponseStore's retention period (90 days by default, `docs/user-manual/response-store.md`); with RBAC on, dispatch needs `Execution:Execute` plus `Inventory:Read` and reading needs `Response:Read`. The classification is deliberate: unlike `browser_inventory`'s per-user browsing data, this content is machine policy the organisation itself wrote, so the action is an ordinary `Inventory:Read` with no execute gate.",
     "**Sibling:** `installed_apps` (which browsers are installed, not how they are managed)."
   ]

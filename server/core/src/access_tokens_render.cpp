@@ -259,7 +259,7 @@ const std::string kRetryPrincipals = "data-tk=\"reload\" data-target=\"principal
 bool sees_all_owners(const auth::Session& s) {
     const bool cookie = s.auth_source != "api_token" && s.auth_source != "mcp_token" &&
                         s.auth_source != "engine_token";
-    return cookie && s.mcp_tier.empty() && s.token_scope_service.empty() && s.principal_kind != "engine" &&
+    return cookie && s.mcp_tier.empty() && s.token_scope_service.empty() && !s.is_engine() &&
            auth::effective_role(s) == auth::Role::admin;
 }
 
@@ -280,6 +280,12 @@ RevokeDetail revoke_detail_from(std::vector<AuditEvent> newest_first) {
         newest_first.erase(newest_first.begin() + static_cast<std::ptrdiff_t>(window), newest_first.end());
     out.text = committed_revoke_detail(newest_first);
     return out;
+}
+
+std::string revoke_truncation_hint(bool have_detail) {
+    const auto win = std::to_string(kRevokeHistoryWindow);
+    return have_detail ? " <span class=\"hint\">(more than " + win + " revoke events: this is the oldest success among the newest " + win + ", not necessarily the original)</span>"
+                       : " <span class=\"hint\">(more than " + win + " revoke events and none of the newest " + win + " succeeded)</span>";
 }
 
 bool safe_token_id(std::string_view id) {
@@ -469,11 +475,9 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
         else if (const auto& s = std::get<std::string>(d.revoke_detail); !s.empty())
             detail = esc(s);
         if (d.revoke_truncated) {
-            const auto win = std::to_string(kRevokeHistoryWindow);
             const bool have = std::holds_alternative<std::string>(d.revoke_detail) &&
                               !std::get<std::string>(d.revoke_detail).empty();
-            detail += have ? " <span class=\"hint\">(more than " + win + " revoke events: this is the oldest success among the newest " + win + ", not necessarily the original)</span>"
-                           : " <span class=\"hint\">(more than " + win + " revoke events and none of the newest " + win + " succeeded)</span>";
+            detail += revoke_truncation_hint(have);
         }
         out += kv("Revocation detail", detail);
     }

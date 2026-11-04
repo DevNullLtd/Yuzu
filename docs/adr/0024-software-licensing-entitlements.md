@@ -538,7 +538,7 @@ Decision numbers are stable, since other documents cite them.
     reclamation verdicts (categories, candidates, coverage) join usage with entitlement
     data for a purpose, so they are UCE interpretation. The **usage collection** half — an
     opt-in (`--usage-sync-enable`, default off) machine-scope daily-sync source reading
-    the agent's TAR warehouse locally through the plugin's sandboxed read-only `sql`
+    the agent's Echo warehouse locally through the plugin's sandboxed read-only `sql`
     action, user dimension dropped on-device — is agent-side fact collection and, if/when
     it ships, ships in-server as **mechanism only**; it is out of §27 v1. Recorded as
     module design input: usage **categories** (Used ≤30 d, Rarely 31–90 d, Unused >90 d,
@@ -547,7 +547,7 @@ Decision numbers are stable, since other documents cite them.
     lead with usage coverage and render zero coverage as explicit guidance, never as
     "nothing to reclaim". **Product tags on `ProductRegistryStore` stay core** (they drive
     tag-based views and time-boxed management-group rules). *Rejected: routing
-    licence/usage data through TAR as a transport — usage reads TAR locally and pushes via
+    licence/usage data through Echo as a transport — usage reads Echo locally and pushes via
     daily-sync.*
 
 16. **Out of scope.** Yuzu's own product-licence machinery (`LicenseStore`, the

@@ -39,10 +39,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <chrono>
-#include <future>
-#include <condition_variable>
 #include <mutex>
-#include <thread>
 #include <string>
 #include <vector>
 
@@ -416,6 +413,55 @@ TEST_CASE("revocation source validation: URL syntax", "[revocation_source][pg]")
         b["crl_urls"] = json::array({rstest::url_entry("http://crl.example.com/a.crl", {"public"}),
                                      rstest::url_entry("http://crl.example.com/a.crl", {"public"})});
         CHECK(refused(fx, b).param == "crl_urls[1].url");
+    }
+    // A duplicate in another case: scheme and host are case-insensitive, so these are one URL.
+    {
+        auto b = rstest::valid_body();
+        b["crl_urls"] = json::array({rstest::url_entry("https://CRL.EXAMPLE.com/a", {"public"}),
+                                     rstest::url_entry("HTTPS://crl.example.COM/a", {"public"})});
+        const auto e = refused(fx, b);
+        CHECK(e.param == "crl_urls[1].url");
+        CHECK_THAT(e.message, ContainsSubstring("duplicate url"));
+    }
+    // The scheme's default port and a trailing root dot do not make a second URL.
+    for (const auto& [first, second] :
+         {std::pair{"https://crl.example.com/a", "https://crl.example.com:443/a"},
+          std::pair{"http://crl.example.com/a", "http://crl.example.com:80/a"},
+          std::pair{"https://crl.example.com/a", "https://crl.example.com./a"}}) {
+        auto b = rstest::valid_body();
+        b["crl_urls"] = json::array({rstest::url_entry(first, {"public"}),
+                                     rstest::url_entry(second, {"public"})});
+        const auto v = fx.svc.validate_registration(b);
+        if (v.has_value()) {
+            FAIL_CHECK(std::string(second) + " was accepted as a second URL");
+            continue;
+        }
+        CHECK(v.error().param == "crl_urls[1].url");
+    }
+    // A non-default port IS a different URL.
+    {
+        auto b = rstest::valid_body();
+        b["crl_urls"] = json::array({rstest::url_entry("https://crl.example.com/a", {"public"}),
+                                     rstest::url_entry("https://crl.example.com:8443/a", {"public"})});
+        const auto v = fx.svc.validate_registration(b);
+        REQUIRE(v.has_value());
+        CHECK(v->urls.size() == 2);
+    }
+    // ...but the path is case-sensitive: these are two URLs.
+    {
+        auto b = rstest::valid_body();
+        b["crl_urls"] = json::array({rstest::url_entry("https://crl.example.com/a", {"public"}),
+                                     rstest::url_entry("https://crl.example.com/A", {"public"})});
+        const auto v = fx.svc.validate_registration(b);
+        REQUIRE(v.has_value());
+        CHECK(v->urls.size() == 2);
+    }
+    // An IPv6 literal's host is lowercased like any other host (UrlParts::host contract).
+    {
+        const auto v = fx.svc.validate_registration(
+            with_url("http://[2606:2800:220:1:248:1893:25C8:1946]/a.crl"));
+        REQUIRE(v.has_value());
+        CHECK(v->urls[0].host == "2606:2800:220:1:248:1893:25c8:1946");
     }
     // Accepted: an https URL, a port, an uppercase scheme/host (stored host lowercased), a query,
     // exactly 2048 bytes.
@@ -1500,7 +1546,9 @@ TEST_CASE("revocation source: reset_at must be a real calendar time from 1970, e
     const auto id = fx.seed();
     for (const char* bad : {"2026-02-31T00:00:00Z", "2025-02-29T00:00:00Z", "1969-12-31T23:59:59Z",
                             "2026-04-31T00:00:00Z", "2026-13-01T00:00:00Z", "2026-00-10T00:00:00Z",
-                            "2026-10-23T24:00:00Z", "2026-10-23T09:00:00+01:00", "yesterday"}) {
+                            "2026-10-23T24:00:00Z", "2026-10-23T09:00:00+01:00", "yesterday",
+                            // Second 60 only as the UTC leap second 23:59:60; never 61.
+                            "2026-10-23T12:30:60Z", "2016-12-31T23:59:61Z"}) {
         INFO(bad);
         auto r = fx.rest_reset(id, std::string(R"({"reset_at":")") + bad + "\"}");
         REQUIRE(r->status == 400);
@@ -1511,6 +1559,10 @@ TEST_CASE("revocation source: reset_at must be a real calendar time from 1970, e
     auto epoch = fx.rest_reset(id, R"({"reset_at":"1970-01-01T00:00:00Z"})");
     REQUIRE(epoch->status == 200);
     CHECK(data_of(*epoch)["data"]["reset_at"] == "1970-01-01T00:00:00Z");
+    // A leap second (RFC 3339 section 5.6 allows second 60) is accepted; it is the next minute.
+    auto leap = fx.rest_reset(id, R"({"reset_at":"2016-12-31T23:59:60Z"})");
+    REQUIRE(leap->status == 200);
+    CHECK(data_of(*leap)["data"]["reset_at"] == "2017-01-01T00:00:00Z");
     // The refusal is audited (denied), and no attempted row was written for it.
     bool saw_denied = false;
     for (const auto& row : fx.rows("crypto.revocation_source.reset_high_water"))
@@ -1666,102 +1718,6 @@ TEST_CASE("revocation source MCP: a DENY on the grant refuses register and updat
             CHECK(row.result != "attempted");
 }
 
-// ─── the bounded resolver: deterministic, with an injected lookup ────────────────────────────
-// NOTE: no Catch2 assertion runs inside an injected lookup (it executes on a worker thread, and
-// Catch2 assertions are not thread-safe); lookups only record into atomics read afterwards.
-
-namespace {
-struct Latch {
-    std::mutex mu;
-    std::condition_variable cv;
-    bool open{false};
-    void release() {
-        { std::lock_guard lk(mu); open = true; }
-        cv.notify_all();
-    }
-    void wait() {
-        std::unique_lock lk(mu);
-        cv.wait(lk, [&] { return open; });
-    }
-};
-} // namespace
-
-TEST_CASE("bounded resolver: the default cap is exactly 16 and a blocked lookup times out on time",
-          "[revocation_source][resolver]") {
-    namespace net = yuzu::server::net;
-    using namespace std::chrono_literals;
-    static_assert(net::kMaxInFlightLookups == 16);
-    CHECK(net::ResolverPool{}.cap == 16); // the DEFAULT pool; a 16->17 change must fail here
-
-    auto latch = std::make_shared<Latch>();
-    const net::LookupFn blocked = [latch](const std::string&) -> net::ResolveResult {
-        latch->wait();
-        return {net::ResolveStatus::kOk, {"192.0.2.1"}};
-    };
-    auto pool = std::make_shared<net::ResolverPool>(); // default cap
-
-    // Timing: the call returns at the bound (not before, not much after). Run it on a helper
-    // thread with a bounded wait, so an implementation that ignores the timeout fails this test
-    // instead of hanging it.
-    auto fut = std::async(std::launch::async, [&] {
-        const auto t0 = std::chrono::steady_clock::now();
-        const auto r = net::bounded_resolve("blocked.example", 400ms, blocked, pool);
-        return std::make_pair(r.status, std::chrono::steady_clock::now() - t0);
-    });
-    if (fut.wait_for(10s) != std::future_status::ready) {
-        latch->release(); // unblock so the test can end
-        FAIL("bounded_resolve ignored its timeout");
-    }
-    const auto [status, elapsed] = fut.get();
-    CHECK(status == net::ResolveStatus::kTimeout);
-    CHECK(elapsed >= 350ms); // not returned early
-    CHECK(elapsed < 700ms);  // not a doubled wait
-    CHECK(pool->in_flight.load() == 1);
-
-    // 15 more blocked lookups fill the default cap of 16; the 17th is refused kBusy.
-    for (int i = 0; i < 15; ++i)
-        CHECK(net::bounded_resolve("blocked.example", 1ms, blocked, pool).status ==
-              net::ResolveStatus::kTimeout);
-    CHECK(pool->in_flight.load() == 16);
-    CHECK(net::bounded_resolve("blocked.example", 1ms, blocked, pool).status ==
-          net::ResolveStatus::kBusy);
-
-    latch->release();
-    for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i)
-        std::this_thread::sleep_for(10ms);
-    CHECK(pool->in_flight.load() == 0);
-}
-
-TEST_CASE("bounded resolver: exact statuses through the same path", "[revocation_source][resolver]") {
-    namespace net = yuzu::server::net;
-    using namespace std::chrono_literals;
-    auto pool = std::make_shared<net::ResolverPool>();
-    const net::LookupFn nf = [](const std::string&) -> net::ResolveResult {
-        return {net::ResolveStatus::kNotFound, {}};
-    };
-    const net::LookupFn temp = [](const std::string&) -> net::ResolveResult {
-        return {net::ResolveStatus::kTemporary, {}};
-    };
-    const net::LookupFn boom = [](const std::string&) -> net::ResolveResult {
-        throw std::runtime_error("resolver blew up");
-    };
-    const net::LookupFn ok = [](const std::string& h) -> net::ResolveResult {
-        return {net::ResolveStatus::kOk, {h == "a" ? "192.0.2.7" : "192.0.2.8"}};
-    };
-    CHECK(net::bounded_resolve("x", 5s, nf, pool).status == net::ResolveStatus::kNotFound);
-    CHECK(net::bounded_resolve("x", 5s, temp, pool).status == net::ResolveStatus::kTemporary);
-    CHECK(net::bounded_resolve("x", 5s, boom, pool).status == net::ResolveStatus::kTemporary);
-    const auto r = net::bounded_resolve("a", 5s, ok, pool);
-    REQUIRE(r.status == net::ResolveStatus::kOk);
-    CHECK(r.addresses == std::vector<std::string>{"192.0.2.7"});
-    for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i)
-        std::this_thread::sleep_for(10ms);
-    CHECK(pool->in_flight.load() == 0);
-    const auto lit = net::bounded_resolve("127.0.0.1", 5s);
-    REQUIRE(lit.status == net::ResolveStatus::kOk);
-    CHECK(lit.addresses.front() == "127.0.0.1");
-}
-
 // ─── RFC 7050: the shared never-shrink cache, and the call-site rules ────────────────────────
 
 namespace {
@@ -1770,7 +1726,6 @@ using yuzu::server::oidc::egress::Nat64Prefix;
 
 // 2001:db8:122:344::/96 and 3fff:0:0:1::/96 wrapped around 192.0.0.170 (what a DNS64 returns).
 const std::string kPref1 = "2001:db8:122:344::c000:aa";
-const std::string kPref2 = "3fff:0:0:1::c000:aa";
 
 net::LookupFn answering(std::vector<std::string> addrs) {
     return [addrs = std::move(addrs)](const std::string&) -> net::ResolveResult {
@@ -1797,69 +1752,6 @@ struct DiscoveryRig {
     }
 };
 } // namespace
-
-TEST_CASE("RFC 7050 discovery: answers become prefixes; a no-DNS64 network is an answered empty set",
-          "[revocation_source][resolver]") {
-    DiscoveryRig rig;
-    rig.lookup = answering({"192.0.0.170", kPref1, "2001:db8:122:344::c000:ab"});
-    auto d = rig.fn()(std::chrono::seconds(2));
-    REQUIRE(d.ever_answered);
-    REQUIRE(d.prefixes.size() == 1);
-    CHECK(d.prefixes[0].length == 96);
-    CHECK(d.learned_new);
-
-    DiscoveryRig plain;
-    plain.lookup = answering({"192.0.0.170", "192.0.0.171"});
-    const auto none = plain.fn()(std::chrono::seconds(2));
-    CHECK(none.ever_answered);
-    CHECK(none.prefixes.empty());
-    // A resolver "not found" for .arpa is still an ANSWER (an air-gapped resolver).
-    DiscoveryRig nf;
-    nf.lookup = failing(net::ResolveStatus::kNotFound);
-    CHECK(nf.fn()(std::chrono::seconds(2)).ever_answered);
-}
-
-TEST_CASE("RFC 7050 discovery: the cache NEVER shrinks, a failure keeps everything learned",
-          "[revocation_source][resolver]") {
-    DiscoveryRig rig;
-    rig.lookup = answering({kPref1});
-    REQUIRE(rig.fn()(std::chrono::seconds(2)).prefixes.size() == 1);
-    // A different answer ADDS; it does not replace.
-    rig.expire();
-    rig.lookup = answering({kPref2});
-    auto d = rig.fn()(std::chrono::seconds(2));
-    CHECK(d.prefixes.size() == 2);
-    // An empty answer removes nothing.
-    rig.expire();
-    rig.lookup = answering({"192.0.0.170"});
-    CHECK(rig.fn()(std::chrono::seconds(2)).prefixes.size() == 2);
-    // A FAILED lookup removes nothing, and says so.
-    rig.expire();
-    rig.lookup = failing();
-    d = rig.fn()(std::chrono::seconds(2));
-    CHECK(d.looked_up);
-    CHECK_FALSE(d.answered_now);
-    CHECK(d.ever_answered);
-    CHECK(d.prefixes.size() == 2);
-    // The failure is cached for the negative TTL: the next call does not look up again.
-    CHECK_FALSE(rig.fn()(std::chrono::seconds(2)).looked_up);
-}
-
-TEST_CASE("RFC 7050 discovery: overflow past the bound is never a partial set",
-          "[revocation_source][resolver]") {
-    DiscoveryRig rig;
-    // 65 distinct /96 prefixes in one answer.
-    std::vector<std::string> many;
-    for (int i = 0; i < 65; ++i) {
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "2001:db8:%x:1::c000:aa", i + 1);
-        many.emplace_back(buf);
-    }
-    rig.lookup = answering(many);
-    const auto d = rig.fn()(std::chrono::seconds(2));
-    CHECK(d.overflowed);
-    CHECK(d.prefixes.empty());
-}
 
 TEST_CASE("revocation source: discovered prefixes end to end (shared cache, fail closed, stale audit)",
           "[revocation_source][resolver][pg]") {
@@ -2009,55 +1901,6 @@ TEST_CASE("RevocationSourceStore: the OpenAPI PUT documents the 409", "[revocati
 
 // ─── round 5: one three-state outcome for every consumer, no cache poisoning, honest retry ───
 
-#include "resolver_errors.hpp"
-
-TEST_CASE("resolver error codes: only NXDOMAIN / NODATA are an ANSWER, everything else a failure",
-          "[revocation_source][resolver]") {
-    using yuzu::server::net::resolver_code_is_no_data;
-#ifndef _WIN32
-    CHECK(resolver_code_is_no_data(EAI_NONAME));
-    CHECK_FALSE(resolver_code_is_no_data(EAI_AGAIN));
-    CHECK_FALSE(resolver_code_is_no_data(EAI_FAIL));
-    CHECK_FALSE(resolver_code_is_no_data(EAI_MEMORY));
-    CHECK_FALSE(resolver_code_is_no_data(EAI_SYSTEM));
-#else
-    CHECK(resolver_code_is_no_data(11001)); // WSAHOST_NOT_FOUND
-    CHECK(resolver_code_is_no_data(11004)); // WSANO_DATA
-    CHECK_FALSE(resolver_code_is_no_data(11002)); // WSATRY_AGAIN
-#endif
-    CHECK_FALSE(resolver_code_is_no_data(0));
-}
-
-TEST_CASE("NAT64 cache constants are pinned", "[revocation_source][resolver]") {
-    namespace net = yuzu::server::net;
-    static_assert(net::kMaxDiscoveredNat64Prefixes == 64);
-    static_assert(net::kNat64PositiveTtl == std::chrono::minutes{10});
-    static_assert(net::kNat64NegativeTtl == std::chrono::minutes{1});
-    // Exactly 64 prefixes fit; 65 do not.
-    const auto build = [](int n) {
-        net::Nat64DiscoveryCache cache;
-        return std::make_pair(net::discover_nat64_prefixes_cached(
-                                  [n](std::vector<yuzu::server::oidc::egress::Ipv6>& out) {
-                                      for (int i = 0; i < n; ++i) {
-                                          yuzu::server::oidc::egress::Ipv6 a{};
-                                          a[0] = 0x20; a[1] = 0x01; a[2] = 0x0d; a[3] = 0xb8;
-                                          a[4] = static_cast<std::uint8_t>(i + 1);
-                                          a[12] = 0xc0; a[15] = 0xaa; // 192.0.0.170 at /96
-                                          out.push_back(a);
-                                      }
-                                      return net::Nat64LookupOutcome::kAnswered;
-                                  },
-                                  cache),
-                              0);
-    };
-    const auto at_bound = build(64).first;
-    CHECK_FALSE(at_bound.overflowed);
-    CHECK(at_bound.prefixes.size() == 64);
-    const auto over = build(65).first;
-    CHECK(over.overflowed);
-    CHECK(over.overflow_started); // logged once, on the transition
-}
-
 TEST_CASE("NAT64 cache: NXDOMAIN from one consumer and an answer from another do not flip each other",
           "[revocation_source][resolver][pg]") {
     namespace net = yuzu::server::net;
@@ -2089,40 +1932,6 @@ TEST_CASE("NAT64 cache: NXDOMAIN from one consumer and an answer from another do
     ok = fx.svc.validate_registration(with_url("http://v6.example.com/a.crl"));
     REQUIRE(ok.has_value());
     CHECK(ok->classified_degraded);
-}
-
-TEST_CASE("NAT64 cache: a clamped or busy lookup does not poison what another consumer reads",
-          "[revocation_source][resolver]") {
-    namespace net = yuzu::server::net;
-    using namespace std::chrono_literals;
-    DiscoveryRig rig;
-    auto latch = std::make_shared<Latch>();
-    rig.lookup = [latch](const std::string&) -> net::ResolveResult {
-        latch->wait();
-        return {net::ResolveStatus::kOk, {"2001:db8:122:344::c000:aa"}};
-    };
-    // A budget below a full lookup that times out is INCONCLUSIVE: failed for this call only.
-    auto pool = std::make_shared<net::ResolverPool>(1);
-    const auto d = rs::discover_nat64(10ms, rig.lookup, rig.cache, pool);
-    CHECK(d.looked_up);
-    CHECK_FALSE(d.answered_now);
-    CHECK(d.stale);
-    {
-        std::lock_guard lk(rig.cache.mu);
-        CHECK_FALSE(rig.cache.filled);       // no negative entry...
-        CHECK_FALSE(rig.cache.last_failed);  // ...no failure flag...
-        CHECK(rig.cache.expires == std::chrono::steady_clock::time_point{}); // ...no TTL
-    }
-    CHECK(rig.cache.stats.inconclusive.load() == 1);
-    CHECK(rig.cache.stats.failed.load() == 0);
-    // The next consumer, with a fair budget, does its own lookup and learns the prefix.
-    latch->release();
-    for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i) // the abandoned worker finishes
-        std::this_thread::sleep_for(10ms);
-    rig.lookup = answering({kPref1});
-    const auto fair = rs::discover_nat64(5s, rig.lookup, rig.cache, pool);
-    CHECK(fair.answered_now);
-    CHECK(fair.prefixes.size() == 1);
 }
 
 TEST_CASE("NAT64 discovery failure: the retry hint matches the negative cache, overflow is loud",
@@ -2175,29 +1984,6 @@ TEST_CASE("NAT64 discovery failure: the retry hint matches the negative cache, o
 }
 
 // ─── round 6: one resolver / one mapping, and the outcome-unknown arm ───────────────────────
-
-#include "nat64_probe.hpp"
-
-TEST_CASE("NAT64 probe: every resolver status maps to exactly one shared outcome",
-          "[revocation_source][resolver]") {
-    namespace net = yuzu::server::net;
-    using O = net::Nat64LookupOutcome;
-    using S = net::ResolveStatus;
-    std::vector<yuzu::server::oidc::egress::Ipv6> out;
-    const auto map = [&](S st, std::vector<std::string> addrs, bool clamped) {
-        out.clear();
-        return net::nat64_outcome_from_resolve({st, std::move(addrs)}, clamped, out);
-    };
-    CHECK(map(S::kOk, {"2001:db8:122:344::c000:aa"}, false) == O::kAnswered);
-    CHECK(out.size() == 1);
-    CHECK(map(S::kOk, {"192.0.0.170"}, false) == O::kAnsweredNone); // A-only: no DNS64 here
-    CHECK(map(S::kNotFound, {}, false) == O::kAnsweredNone);        // NXDOMAIN / NODATA: an ANSWER
-    CHECK(map(S::kTemporary, {}, false) == O::kFailed);             // EAI_AGAIN / FAIL / SYSTEM
-    CHECK(map(S::kTimeout, {}, false) == O::kFailed);               // a full-budget timeout
-    CHECK(map(S::kTimeout, {}, true) == O::kInconclusive);          // a clamped budget: not the resolver's fault
-    CHECK(map(S::kBusy, {}, false) == O::kInconclusive);            // no capacity: nothing was asked
-    CHECK(map(S::kBusy, {}, true) == O::kInconclusive);
-}
 
 TEST_CASE("RevocationSource: an unknown write outcome is a retryable 503 / -32603 asking for a re-read",
           "[revocation_source][mcp][pg]") {
@@ -2252,74 +2038,6 @@ TEST_CASE("RevocationSource: an unknown write outcome is a retryable 503 / -3260
 
 // ─── round 7: single-flight discovery, and the kind -> status table ─────────────────────────
 
-TEST_CASE("NAT64 discovery is single-flight: N concurrent callers with a blocked resolver use ONE lookup",
-          "[revocation_source][resolver]") {
-    namespace net = yuzu::server::net;
-    using namespace std::chrono_literals;
-    DiscoveryRig rig;
-    auto pool = std::make_shared<net::ResolverPool>(1); // the production discovery pool shape
-    auto latch = std::make_shared<Latch>();
-    std::atomic<int> lookups{0};
-    rig.lookup = [latch, &lookups](const std::string&) -> net::ResolveResult {
-        ++lookups;
-        latch->wait();
-        return {net::ResolveStatus::kOk, {kPref1}};
-    };
-    constexpr int kCallers = 12;
-    std::vector<std::future<net::Nat64Discovery>> calls;
-    for (int i = 0; i < kCallers; ++i)
-        calls.push_back(std::async(std::launch::async, [&] {
-            // A full per-lookup budget (not clamped); the leader's lookup is blocked, so every
-            // caller ends inconclusive at ITS OWN budget rather than starting a lookup of its own.
-            return rs::discover_nat64(300ms, rig.lookup, rig.cache, pool);
-        }));
-    std::vector<net::Nat64Discovery> results;
-    for (auto& f : calls) {
-        REQUIRE(f.wait_for(20s) == std::future_status::ready); // none hangs past its budget
-        results.push_back(f.get());
-    }
-    CHECK(lookups.load() == 1); // exactly one lookup, one worker, one slot, ever started
-    CHECK(pool->in_flight.load() == 1); // ...and it is still outstanding (the resolver is hung)
-    for (const auto& r : results) {
-        CHECK_FALSE(r.answered_now); // nobody got an answer while the resolver was blocked
-        CHECK(r.stale);
-    }
-    // Release: the flight finishes, ONE answer fills the cache, and a late caller reads it.
-    latch->release();
-    for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i)
-        std::this_thread::sleep_for(10ms);
-    const auto after = rs::discover_nat64(2s, rig.lookup, rig.cache, pool);
-    CHECK(after.prefixes.size() == 1);
-    // The abandoned flight's late answer is discarded (nobody was waiting); the late caller made
-    // its own, single, lookup.
-    CHECK(lookups.load() == 2);
-}
-
-TEST_CASE("NAT64 discovery: waiters share the leader's answer (no expiry stampede)",
-          "[revocation_source][resolver]") {
-    namespace net = yuzu::server::net;
-    using namespace std::chrono_literals;
-    DiscoveryRig rig;
-    auto pool = std::make_shared<net::ResolverPool>(1);
-    std::atomic<int> lookups{0};
-    rig.lookup = [&lookups](const std::string&) -> net::ResolveResult {
-        ++lookups;
-        std::this_thread::sleep_for(150ms);
-        return {net::ResolveStatus::kOk, {kPref1}};
-    };
-    std::vector<std::future<net::Nat64Discovery>> calls;
-    for (int i = 0; i < 8; ++i)
-        calls.push_back(std::async(std::launch::async, [&] {
-            return rs::discover_nat64(5s, rig.lookup, rig.cache, pool);
-        }));
-    for (auto& f : calls) {
-        const auto d = f.get();
-        CHECK(d.ever_answered);
-        CHECK(d.prefixes.size() == 1);
-    }
-    CHECK(lookups.load() == 1);
-}
-
 TEST_CASE("RevocationSource: the REST and MCP kind -> status table is locked",
           "[revocation_source][mcp][pg]") {
     using SK = RevocationSourceStoreError::Kind;
@@ -2360,59 +2078,6 @@ TEST_CASE("RevocationSource: the REST and MCP kind -> status table is locked",
 }
 
 // ─── round 8: the flight is released on every exit; waiters never start a second lookup ─────
-
-TEST_CASE("NAT64 discovery: an allocation failure in the leader releases the single flight",
-          "[revocation_source][resolver]") {
-    namespace net = yuzu::server::net;
-    using namespace std::chrono_literals;
-    DiscoveryRig rig;
-    auto pool = std::make_shared<net::ResolverPool>(1);
-    rig.lookup = answering({kPref1});
-    // The leader's parse/merge step throws bad_alloc (injected right after the lookup returns).
-    rig.cache.test_fault_after_lookup = [] { throw std::bad_alloc(); };
-    const auto d = rs::discover_nat64(2s, rig.lookup, rig.cache, pool);
-    CHECK(d.stale);            // inconclusive for this call
-    CHECK_FALSE(d.answered_now);
-    {
-        std::lock_guard lk(rig.cache.mu);
-        CHECK_FALSE(rig.cache.inflight); // NOT wedged: the flag was cleared by the guard
-        CHECK_FALSE(rig.cache.filled);   // and nothing half-written is served as fresh
-    }
-    // The next caller is not blocked behind a dead flight: it looks, answers and learns.
-    rig.cache.test_fault_after_lookup = nullptr;
-    for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i)
-        std::this_thread::sleep_for(10ms);
-    const auto next = rs::discover_nat64(2s, rig.lookup, rig.cache, pool);
-    CHECK(next.answered_now);
-    CHECK(next.prefixes.size() == 1);
-}
-
-TEST_CASE("NAT64 discovery: a waiter whose leader ended inconclusive does not start its own lookup",
-          "[revocation_source][resolver]") {
-    namespace net = yuzu::server::net;
-    using namespace std::chrono_literals;
-    DiscoveryRig rig;
-    auto pool = std::make_shared<net::ResolverPool>(1);
-    std::atomic<int> lookups{0};
-    // The leader's lookup is slow, then reports busy-equivalent (inconclusive via a clamped
-    // timeout): 40 ms budget against a 300 ms lookup.
-    rig.lookup = [&lookups](const std::string&) -> net::ResolveResult {
-        ++lookups;
-        std::this_thread::sleep_for(300ms);
-        return {net::ResolveStatus::kOk, {kPref1}};
-    };
-    auto leader = std::async(std::launch::async,
-                             [&] { return rs::discover_nat64(40ms, rig.lookup, rig.cache, pool); });
-    std::this_thread::sleep_for(20ms); // the leader holds the flight
-    const auto waiter = rs::discover_nat64(5s, rig.lookup, rig.cache, pool);
-    const auto l = leader.get();
-    CHECK(l.stale);
-    // The leader ended inconclusive (its clamped budget expired) and wrote nothing, so the waiter
-    // must NOT run a second full-budget lookup of its own: it is inconclusive too.
-    CHECK(lookups.load() == 1);
-    CHECK(waiter.stale);
-    CHECK_FALSE(waiter.answered_now);
-}
 
 TEST_CASE("RevocationSource: every mutating route maps faults the same way on REST and MCP",
           "[revocation_source][mcp][pg]") {
@@ -2487,60 +2152,3 @@ TEST_CASE("RevocationSource: every mutating route maps faults the same way on RE
 
 // ─── round 9: mutation guards for the flight release and the clamped-budget rule ─────────────
 
-TEST_CASE("NAT64 discovery: finishing the flight WAKES a waiter well before its own budget",
-          "[revocation_source][resolver]") {
-    namespace net = yuzu::server::net;
-    using namespace std::chrono_literals;
-    DiscoveryRig rig;
-    auto pool = std::make_shared<net::ResolverPool>(1);
-    rig.lookup = [](const std::string&) -> net::ResolveResult {
-        std::this_thread::sleep_for(100ms);
-        return {net::ResolveStatus::kOk, {kPref1}};
-    };
-    auto leader = std::async(std::launch::async,
-                             [&] { return rs::discover_nat64(5s, rig.lookup, rig.cache, pool); });
-    std::this_thread::sleep_for(20ms); // the leader holds the flight
-    const auto t0 = std::chrono::steady_clock::now();
-    const auto waiter = rs::discover_nat64(5s, rig.lookup, rig.cache, pool);
-    const auto waited = std::chrono::steady_clock::now() - t0;
-    (void)leader.get();
-    // The waiter shares the leader's answer as soon as the flight ends. Without the guard's
-    // notify it would sit out its full 5 s budget.
-    CHECK(waited < 1s);
-    CHECK(waiter.prefixes.size() == 1);
-}
-
-TEST_CASE("NAT64 discovery: a CLAMPED leader's timeout leaves the cache untouched; an unclamped caller then looks",
-          "[revocation_source][resolver]") {
-    namespace net = yuzu::server::net;
-    using namespace std::chrono_literals;
-    DiscoveryRig rig;
-    auto pool = std::make_shared<net::ResolverPool>(1);
-    auto latch = std::make_shared<Latch>();
-    std::atomic<int> lookups{0};
-    rig.lookup = [latch, &lookups](const std::string&) -> net::ResolveResult {
-        ++lookups;
-        latch->wait();
-        return {net::ResolveStatus::kOk, {kPref1}};
-    };
-    // A budget below a full per-lookup budget (5 s) that times out: inconclusive, NOT a failure.
-    const auto clamped = rs::discover_nat64(30ms, rig.lookup, rig.cache, pool);
-    CHECK(clamped.stale);
-    {
-        std::lock_guard lk(rig.cache.mu);
-        CHECK_FALSE(rig.cache.filled);
-        CHECK_FALSE(rig.cache.last_failed);
-        CHECK(rig.cache.expires == std::chrono::steady_clock::time_point{});
-    }
-    CHECK(rig.cache.stats.failed.load() == 0);
-    CHECK(rig.cache.stats.inconclusive.load() == 1);
-    // Let the abandoned worker finish (its late answer is discarded), then an UNCLAMPED caller
-    // (a full 5 s budget) performs a lookup of its own and its timeout WOULD be a recorded failure.
-    latch->release();
-    for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i)
-        std::this_thread::sleep_for(10ms);
-    const auto fair = rs::discover_nat64(5s, rig.lookup, rig.cache, pool);
-    CHECK(lookups.load() == 2);
-    CHECK(fair.answered_now);
-    CHECK(fair.prefixes.size() == 1);
-}

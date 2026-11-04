@@ -964,13 +964,25 @@ struct ResolvedAddress {
     std::array<unsigned char, 16> bytes{};
 };
 
+// The OIDC host vet's resolver pool: PROCESS-WIDE (cap 8), shared by every OIDC fetch, live
+// sign-ins and Settings "Test Connection" alike, but never with the NAT64 probe's cap-1 pool. A
+// hung resolver can pin all 8 slots; further vets then fail at once as "did not resolve". Never destroyed: detached workers may still hold it at exit.
+// On Windows the vet uses GetAddrInfoExW (below) and the pool stays idle.
+constexpr int kOidcResolverCap = 8;
+std::shared_ptr<::yuzu::server::net::ResolverPool> oidc_resolver_pool() {
+    static const std::shared_ptr<::yuzu::server::net::ResolverPool>& p =
+        *new std::shared_ptr<::yuzu::server::net::ResolverPool>(
+            std::make_shared<::yuzu::server::net::ResolverPool>(kOidcResolverCap));
+    return p;
+}
+
 // Resolves `host` (a name, not a literal) to its IPv4 and IPv6 addresses within about
 // `timeout_sec` seconds. False when the name did not resolve or the lookup timed out. Own
-// function per platform because httplib's helper cannot be consumed generically: on Windows it
-// returns a GetAddrInfoExW result cast to `addrinfo`, whose layout differs after ai_addr (the
-// blob, blob length and provider fields precede ai_next) and which must be released with
-// FreeAddrInfoExW, so walking it as `addrinfo` misses addresses and freeing it with freeaddrinfo
-// is the wrong deleter.
+// function per platform: Windows keeps its GetAddrInfoExW request (overlapped, cancellable, with
+// the abandoned-request ledger below); everywhere else the bounded resolver runs the lookup.
+// httplib's helper is used on neither: on Windows it returns a GetAddrInfoExW result cast to
+// `addrinfo` (a different layout, freed with a different deleter), and on glibc its timeout path
+// leaves the resolver writing into the caller's dead stack frame.
 #ifdef _WIN32
 // One GetAddrInfoExW lookup. It owns a HANDLE and a resolver-allocated list, and the OS references
 // it while the lookup is pending, so it may be destroyed only once the lookup has completed.
@@ -1079,41 +1091,31 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
     return true;
 }
 #else
+// The host vet resolves through the bounded resolver (bounded_resolver.hpp), NOT httplib's
+// getaddrinfo_with_timeout: that one hands glibc's async resolver a request that lives on the
+// CALLER's stack and, on timeout, returns without waiting for the resolver, which later writes into
+// the dead frame. The bounded resolver's worker owns every byte it touches. The pool is the OIDC
+// host vet's own PROCESS-WIDE pool (cap 8, oidc_resolver_pool() above), shared by every provider,
+// so a stuck resolver here never takes a slot from the NAT64 probe's pool or from another
+// subsystem's lookups, but one stuck lookup does take a slot from every OIDC provider. A busy pool is "did not resolve" (the fetch is refused).
 bool resolve_host_addresses(const std::string& host, int timeout_sec,
                             std::vector<ResolvedAddress>& out) {
-    struct addrinfo hints;
-    std::memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo* result = nullptr;
-    if (::httplib::detail::getaddrinfo_with_timeout(host.c_str(), "0", &hints, &result,
-                                                    static_cast<time_t>(timeout_sec)) != 0 ||
-        result == nullptr)
+    const auto r = ::yuzu::server::net::bounded_resolve(
+        host, std::chrono::seconds(std::max(1, timeout_sec)), {}, oidc_resolver_pool());
+    if (r.status != ::yuzu::server::net::ResolveStatus::kOk)
         return false;
-    struct Freer {
-        struct addrinfo* p;
-        Freer(struct addrinfo* list) : p(list) {}
-        Freer(const Freer&) = delete;
-        Freer& operator=(const Freer&) = delete;
-        ~Freer() { ::freeaddrinfo(p); }
-    } freer{result};
-    for (const struct addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
+    for (const auto& text : r.addresses) {
         ResolvedAddress address;
-        // ai_family names the sockaddr type ai_addr points at (the documented BSD sockets
-        // contract), and ai_addrlen is checked before the address bytes are read.
-        if (ai->ai_family == AF_INET && ai->ai_addr != nullptr &&
-            ai->ai_addrlen >= sizeof(sockaddr_in)) {
-            address.family = AF_INET;
-            std::memcpy(address.bytes.data(),
-                        &reinterpret_cast<const sockaddr_in*>(ai->ai_addr)->sin_addr, 4);
-            out.push_back(address);
-        } else if (ai->ai_family == AF_INET6 && ai->ai_addr != nullptr &&
-                   ai->ai_addrlen >= sizeof(sockaddr_in6)) {
+        if (text.find(':') != std::string::npos) {
+            if (::inet_pton(AF_INET6, text.c_str(), address.bytes.data()) != 1)
+                continue;
             address.family = AF_INET6;
-            std::memcpy(address.bytes.data(),
-                        &reinterpret_cast<const sockaddr_in6*>(ai->ai_addr)->sin6_addr, 16);
-            out.push_back(address);
+        } else {
+            if (::inet_pton(AF_INET, text.c_str(), address.bytes.data()) != 1)
+                continue;
+            address.family = AF_INET;
         }
+        out.push_back(address);
     }
     return true;
 }
@@ -1140,8 +1142,8 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
 // attacker wants unclassified.
 constexpr const char* kEgressNat64OverflowReason = OidcProvider::kEgressNat64Overflow;
 
-// The NAT64 discovery cache is the shared one (nat64_discovery.hpp): the revocation-source
-// registration check reads and fills the SAME process-wide set, never a second copy.
+// The NAT64 discovery cache is the shared one (nat64_discovery.hpp): any later egress
+// check reads and fills the SAME process-wide set, never a second copy.
 using ::yuzu::server::net::kMaxDiscoveredNat64Prefixes;
 using ::yuzu::server::net::Nat64DiscoveryCache;
 Nat64DiscoveryCache& nat64_discovery_cache() { return ::yuzu::server::net::process_nat64_cache(); }
@@ -1150,9 +1152,9 @@ Nat64DiscoveryCache& nat64_discovery_cache() { return ::yuzu::server::net::proce
 // (some AAAA), kAnsweredNone (the resolver answered "no such name/data", or only A records: no
 // DNS64 here, a NORMAL network), kFailed (timeout, SERVFAIL, resolver unavailable), kInconclusive
 // (the resolver pool was busy: nothing was asked, nothing is remembered). NXDOMAIN is an ANSWER,
-// exactly as the CRL-source registration check treats it (resolver_errors.hpp). The shared cache
+// as the shared classifier defines it (resolver_errors.hpp). The shared cache
 // SINGLE-FLIGHTS this lookup process-wide and it runs in a cap-1 resolver pool (nat64_probe.hpp),
-// so a sign-in burst, or a hung resolver, holds at most one thread and no registration slot.
+// so a sign-in burst, or a hung resolver, holds at most one thread and no host-vet slot.
 ::yuzu::server::net::Nat64LookupOutcome
 lookup_ipv4only_answers(int dns_timeout_ms, std::vector<::yuzu::server::oidc::egress::Ipv6>& out) {
     namespace egress = ::yuzu::server::oidc::egress;
@@ -1185,20 +1187,19 @@ lookup_ipv4only_answers(int dns_timeout_ms, std::vector<::yuzu::server::oidc::eg
                     static_cast<::yuzu::server::net::ResolveStatus>(r.status), r.addresses};
             };
     }
-    // The probe resolves through the SAME bounded resolver (and error classifier) as the CRL-source
-    // registration check, NOT through this file's host resolver: that one reports only success or
+    // The probe resolves through the SAME bounded resolver (and error classifier) as every other discovery consumer, NOT through this file's host resolver: that one reports only success or
     // failure, and httplib's wrapper reports EAI_NODATA for every CFHost error on macOS, which
     // would turn any failure into an "answer". The budget is this provider's own DNS timeout.
     const auto r = ::yuzu::server::net::bounded_resolve(
         ::yuzu::server::net::kNat64ProbeName,
         std::chrono::milliseconds{std::max(1, dns_timeout_ms)}, std::move(probe_lookup),
-        ::yuzu::server::net::nat64_probe_pool()); // cap 1: discovery never takes a registration slot
+        ::yuzu::server::net::nat64_probe_pool()); // cap 1: discovery never takes a host-vet slot
     return ::yuzu::server::net::nat64_outcome_from_resolve(r, /*budget_clamped=*/false, out);
 }
 
 // The prefixes learned from `ipv4only.arpa`, from the shared cache while it is fresh. nullopt = the
 // learned set overflowed: the caller must refuse. A failed lookup is logged and classifies without
-// it until retried (this path's historical behaviour; the registration check refuses instead).
+// it until retried (this path's historical behaviour).
 std::optional<std::vector<::yuzu::server::oidc::egress::Nat64Prefix>>
 discovered_nat64_prefixes(int dns_timeout_ms) {
     const auto d = ::yuzu::server::net::discover_nat64_prefixes_cached(
@@ -1206,7 +1207,11 @@ discovered_nat64_prefixes(int dns_timeout_ms) {
             return lookup_ipv4only_answers(dns_timeout_ms, out);
         },
         nat64_discovery_cache(), std::chrono::milliseconds{std::max(1, dns_timeout_ms)});
-    if (d.looked_up && !d.answered_now)
+    // Only a real resolver failure is warned about here, and it is cached for the negative TTL, so
+    // this is at most one line a minute. An INCONCLUSIVE call (busy pool, a waiter whose flight gave
+    // no answer) is not a failure and nothing is cached for it; the shared cache logs one warning per
+    // busy episode and one line when it ends, so nothing is repeated per IPv6 vet.
+    if (d.looked_up && !d.answered_now && !d.inconclusive)
         spdlog::warn("OIDC egress: the NAT64 prefix lookup (ipv4only.arpa) failed; IPv6 "
                      "destinations are classified without it until the lookup is retried");
     if (d.overflowed) {
@@ -2537,6 +2542,8 @@ void OidcProvider::set_resolver_for_test(ResolverForTest resolver) {
     test_resolver_slot() = std::move(resolver);
 }
 
+int OidcProvider::resolver_in_flight() { return oidc_resolver_pool()->in_flight.load(); }
+
 void OidcProvider::set_nat64_probe_lookup_for_test(Nat64ProbeLookupForTest lookup) {
     std::lock_guard lock(test_resolver_mutex());
     nat64_probe_lookup_slot() = std::move(lookup);
@@ -2548,6 +2555,7 @@ void OidcProvider::clear_nat64_discovery_cache_for_test() {
     cache.filled = false;
     cache.overflowed = false;
     cache.overflow_logged = false;
+    cache.busy_logged = false;
     cache.last_failed = false;
     cache.ever_answered = false;
     cache.prefixes.clear();

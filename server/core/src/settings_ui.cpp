@@ -363,6 +363,7 @@ const char* const kSettingsPageTemplate =
           Generate tokens for programmatic REST API access.
           Pass via <code>Authorization: Bearer &lt;token&gt;</code> or
           <code>X-Yuzu-Token</code> header.
+          A token created with the "none" choice (REST API only) is refused on /mcp/v1/; choose a tier only if the token is for MCP.
           The raw token is shown <strong>once</strong> — copy it before closing.
         </p>
         <div id="api-token-section"
@@ -660,6 +661,40 @@ const char* const kSettingsPageTemplate =
           (d.xhr.getResponseHeader('Content-Type') || '').indexOf('text/html') !== -1) {
         d.shouldSwap = true;
         d.isError = false;
+      }
+    });
+
+    /* The Engine Principals panel is gated on EnginePrincipal:Read, which this page's own
+       administrator gate does not imply (an account administrator under RBAC enforcement needs
+       the grant). htmx drops 4xx/5xx bodies, so a refused panel would sit on "Loading..."
+       forever: say why instead. Plain body listener (textContent only), no hx-on: the CSP
+       blocks the new Function() that htmx compiles it with. */
+    document.body.addEventListener('htmx:responseError', function(e) {
+      var d = e.detail || {}, el = d.elt, x = d.xhr;
+      if (!el || !x || el.id !== 'engine-principals-section') return;
+      if (x.status === 403)
+        el.textContent = 'You do not have permission to view this panel. It needs the EnginePrincipal:Read permission.';
+      else if (x.status === 401)
+        el.textContent = 'Your session has expired. Sign in again to view this panel.';
+      else {
+        /* Not a reload: a freshly minted or rotated credential secret is shown outside this
+           section and a reload discards it. The Retry control and its wording mirror
+           settings_routes.cpp's kEngineRetryControl (a hand copy, pinned in
+           test_settings_page_ui.cpp), built as elements (textContent only) so the note stays
+           free of markup parsing. */
+        el.textContent = 'This panel could not be loaded (HTTP ' + x.status + '). ';
+        var retry = document.createElement('button');
+        retry.type = 'button';
+        retry.className = 'btn btn-secondary';
+        retry.textContent = 'Retry';
+        retry.addEventListener('click', function() {
+          htmx.trigger(document.body, 'refreshEnginePrincipals');
+        });
+        var hint = document.createElement('span');
+        hint.className = 'hint';
+        hint.textContent = ' Retry here instead of reloading the page, which would discard a credential secret shown above.';
+        el.appendChild(retry);
+        el.appendChild(hint);
       }
     });
 

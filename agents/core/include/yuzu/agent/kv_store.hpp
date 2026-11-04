@@ -229,6 +229,15 @@ public:
                                       std::string_view to_key) override;
 
     /**
+     * Re-key every row of plugin `from` to plugin `to` in ONE transaction: copy with
+     * INSERT OR IGNORE (a key already present under `to` keeps its value), then delete the
+     * `from` rows. All-or-nothing; true when the move committed (including "nothing to
+     * move"), false on error. Upgrade-window step for the tar -> echo rename, removed with
+     * the other legacy-name shims.
+     */
+    [[nodiscard]] bool rename_plugin(std::string_view from, std::string_view to);
+
+    /**
      * Delete a set of keys for a plugin in ONE transaction. Returns the number
      * actually removed (via RETURNING, not sqlite3_changes()). All-or-nothing: on
      * error the transaction rolls back and 0 is returned.

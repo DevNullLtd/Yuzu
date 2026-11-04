@@ -12,7 +12,7 @@
 # the container's (service exit => container exit). tini (PID 1) reaps the
 # backgrounded agent.
 #
-# DEMO ONLY: the agent runs as root here so its tar plugin can read every
+# DEMO ONLY: the agent runs as root here so its echo plugin can read every
 # process's /proc entry. Do not copy this pattern to production — see
 # docs/agent-privilege-model.md.
 set -euo pipefail

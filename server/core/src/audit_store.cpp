@@ -532,13 +532,25 @@ std::optional<std::vector<AuditEvent>> AuditStore::query(const AuditQuery& q,
         "WHERE 1=1";
     std::vector<std::string> binds;
     int idx = 1;
+    constexpr std::string_view kEchoPrefix = "echo."; // upgrade-window shim, see the action filters
     if (!q.principal.empty()) {
         sql += " AND principal = $" + std::to_string(idx++);
         binds.push_back(q.principal);
     }
     if (!q.action.empty()) {
-        sql += " AND action = $" + std::to_string(idx++);
-        binds.push_back(q.action);
+        // Upgrade-window shim (Echo rename; removed with the other legacy-name shims once old
+        // rows age out): audit rows written before the rename keep their `tar.` action spelling
+        // and are never rewritten. An `echo.`-prefixed exact action therefore also matches its
+        // `tar.` twin.
+        if (std::string_view{q.action}.starts_with(kEchoPrefix)) {
+            sql += " AND action IN ($" + std::to_string(idx) + ", $" + std::to_string(idx + 1) + ")";
+            idx += 2;
+            binds.push_back(q.action);
+            binds.push_back("tar." + q.action.substr(kEchoPrefix.size()));
+        } else {
+            sql += " AND action = $" + std::to_string(idx++);
+            binds.push_back(q.action);
+        }
     }
     if (!q.target_type.empty()) {
         sql += " AND target_type = $" + std::to_string(idx++);
@@ -572,6 +584,13 @@ std::optional<std::vector<AuditEvent>> AuditStore::query(const AuditQuery& q,
             binds.push_back(p + "%");
             ++idx;
             first = false;
+            // Same upgrade-window shim as the exact-action filter above: an `echo.` prefix also
+            // matches the pre-rename `tar.` spelling.
+            if (p.starts_with(kEchoPrefix)) {
+                sql += " OR action LIKE $" + std::to_string(idx);
+                binds.push_back("tar." + p.substr(kEchoPrefix.size()) + "%");
+                ++idx;
+            }
         }
         sql += first ? "1=0)" : ")";
     }

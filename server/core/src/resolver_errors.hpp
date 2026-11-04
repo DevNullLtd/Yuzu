@@ -3,7 +3,7 @@
 /// @file resolver_errors.hpp
 /// The ONE definition of "the resolver answered, and the answer is that there is no such data",
 /// as opposed to "the lookup failed". `bounded_resolver.hpp` - the resolver every NAT64 discovery
-/// consumer (the OIDC probe and CRL-source registration) goes through - maps its platform error
+/// consumer (the OIDC probe and any later consumer) goes through - maps its platform error
 /// code here, so there is ONE classifier and the consumers cannot disagree about NXDOMAIN (a
 /// disagreement once left the shared NAT64 discovery cache flipping between "answered" and "failed").
 ///

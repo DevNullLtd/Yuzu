@@ -1096,8 +1096,6 @@ TEST_CASE("OIDC egress: the token POST's pre-check - pinned where the connect is
     }
 }
 
-#endif // !YUZU_OIDC_MOCK_IDP_TSAN
-
 // The OIDC probe's WIRING: which host it asks for, how each resolver status becomes a cache state,
 // and that it never claims a clamped budget (an OIDC lookup uses its own configured timeout).
 TEST_CASE("OIDC egress NAT64: the ipv4only.arpa probe wiring - host, status mapping, caching",
@@ -1109,15 +1107,23 @@ TEST_CASE("OIDC egress NAT64: the ipv4only.arpa probe wiring - host, status mapp
         }
         ~ProbeGuard() { OidcProvider::set_nat64_probe_lookup_for_test({}); }
     };
-    std::atomic<int> probes{0};
-    std::mutex mu;
-    std::vector<std::string> hosts;
-    int status = 1;
-    const auto stub = [&](const std::string& host) {
-        std::lock_guard lk(mu);
-        ++probes;
-        hosts.push_back(host);
-        return Stub{status, {}};
+    // The stub runs on a detached resolver worker that may outlive this test body: its state is
+    // shared-owned, never a reference into this stack frame.
+    struct ProbeState {
+        std::atomic<int> probes{0};
+        std::mutex mu;
+        std::vector<std::string> hosts;
+        std::atomic<int> status{1};
+    };
+    const auto st_p = std::make_shared<ProbeState>();
+    auto& probes = st_p->probes;
+    auto& hosts = st_p->hosts;
+    auto& status = st_p->status;
+    const auto stub = [st_p](const std::string& host) {
+        std::lock_guard lk(st_p->mu);
+        ++st_p->probes;
+        st_p->hosts.push_back(host);
+        return Stub{st_p->status.load(), {}};
     };
     // The target resolves through the system path for a LITERAL, so only the probe is stubbed.
     // The TARGET resolves through the test resolver to an IPv6 address (permitted with the
@@ -1159,3 +1165,56 @@ TEST_CASE("OIDC egress NAT64: the ipv4only.arpa probe wiring - host, status mapp
         cached_second_call(2);
     }
 }
+
+// Review point: an INCONCLUSIVE probe (busy pool) must not warn "lookup failed" on every IPv6 vet;
+// only a real failure does, and that one is cached for the negative TTL (so it logs once, not per
+// vet).
+TEST_CASE("OIDC egress NAT64: only a real probe failure is warned about, an inconclusive one is silent",
+          "[oidc][oidc_egress][oidc_nat64]") {
+    using Stub = OidcProvider::Nat64ProbeStubForTest;
+    struct ProbeGuard {
+        explicit ProbeGuard(OidcProvider::Nat64ProbeLookupForTest f) {
+            OidcProvider::set_nat64_probe_lookup_for_test(std::move(f));
+        }
+        ~ProbeGuard() { OidcProvider::set_nat64_probe_lookup_for_test({}); }
+    };
+    ResolverGuard target_resolver([](const std::string&) -> std::vector<std::string> {
+        return {"2001:db8:ffff::1"};
+    });
+    const auto count_warnings = [](int status) {
+        Nat64CacheReset cache;
+        ProbeGuard g([status](const std::string&) { return Stub{status, {}}; });
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        for (int i = 0; i < 5; ++i)
+            (void)OidcProvider::vet_egress_target_for_test("t.test", true, false, 1500, {}, false);
+        cap.stop();
+        std::size_t n = 0;
+        const std::string text = cap.text();
+        for (auto pos = text.find("ipv4only.arpa) failed"); pos != std::string::npos;
+             pos = text.find("ipv4only.arpa) failed", pos + 1))
+            ++n;
+        return n;
+    };
+    CHECK(count_warnings(4) == 0); // busy: inconclusive, five vets, no warning at all
+    CHECK(count_warnings(1) == 0); // NXDOMAIN: an answer, no warning
+    CHECK(count_warnings(2) == 1); // a transient failure: warned once, then cached for the negative TTL
+    CHECK(count_warnings(3) == 1); // a full-budget timeout is a failure too
+}
+
+#ifndef _WIN32
+// The host-name check resolves through the bounded resolver (its own pool), not httplib: a real
+// system lookup of a loopback name still reaches the policy and is refused by policy, rather
+// than failing as "did not resolve".
+TEST_CASE("OIDC egress: the host vet resolves through the bounded resolver and drains its pool",
+          "[oidc][oidc_egress]") {
+    const auto r = OidcProvider::vet_egress_target_for_test("localhost", false, false, 3000, {},
+                                                            false);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find(kRefused) != std::string::npos);
+    for (int i = 0; i < 200 && OidcProvider::resolver_in_flight() > 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(OidcProvider::resolver_in_flight() == 0);
+}
+#endif
+
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN

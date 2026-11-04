@@ -4,7 +4,7 @@
 ///
 /// Membership is a function of the producing execution's stored responses through the pending
 /// row's matcher (`rs_matcher::response_matches`: status, and for the column/op/value and
-/// `tar_rows_ge` kinds the CONTENT of the output). A set is readable by its owner afterwards, so
+/// `echo_rows_ge` kinds the CONTENT of the output). A set is readable by its owner afterwards, so
 /// matching over a Forensics-tier plugin's rows would be a content-membership oracle over data the
 /// owner may not hold the Forensics tier for. The materializer is a background thread with no
 /// request, so the creating principal's Forensics visibility cannot be resolved here: the read

@@ -196,8 +196,9 @@ public:
     [[nodiscard]] std::expected<RevocationSourceRecord, RevocationSourceStoreError>
     get(std::int64_t id);
 
-    /// Sources whose held CRL is past its `nextUpdate` (the list's `crl_past_next_update`).
-    /// Always 0 until the fetcher stores a CRL.
+    /// Registered CRL scopes (source, scope key, base or delta) whose held CRL is past its
+    /// `nextUpdate` (the list's `crl_past_next_update`; design D13, ADR-0070 R12). A CRL with no
+    /// `nextUpdate` is never past. Always 0 until the fetcher stores a CRL.
     [[nodiscard]] std::expected<std::int64_t, RevocationSourceStoreError>
     crl_past_next_update_count();
 

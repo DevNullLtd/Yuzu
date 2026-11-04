@@ -158,7 +158,7 @@ TEST_CASE("kill switch panel: an unreadable layer is Unknown, never Enabled", "[
 TEST_CASE("kill switch panel: a blank action says action-level switches are not shown",
           "[plugin_page][plugins][ui]") {
     KillSwitchPanel p;
-    p.plugin = "tar";
+    p.plugin = "echo";
     p.layers = {layer("", SwitchState::Enabled)};
     CHECK_THAT(render_kill_switch_panel(p), ContainsSubstring("action-level switch is not shown"));
     p.action = "sql";

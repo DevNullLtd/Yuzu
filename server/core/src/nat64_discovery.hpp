@@ -3,7 +3,7 @@
 /// @file nat64_discovery.hpp
 /// ONE process-wide cache of the NAT64 prefixes the network advertises (RFC 7050: the AAAA answer
 /// for `ipv4only.arpa` carries the prefix wrapped around 192.0.0.170/171). Shared by every egress
-/// check - the OIDC client and the CRL-source registration check (and the later CRL fetcher) - so
+/// check - the OIDC client today, and any later egress check - so
 /// a prefix learned by one is known to all and there is no second, differently-behaved copy.
 ///
 /// NEVER SHRINKS. A prefix, once learned, is kept for the life of the process: an answered refresh
@@ -19,12 +19,12 @@
 ///
 /// An INCONCLUSIVE outcome is never remembered, so it cannot persist: the next call looks again (the
 /// resolver pool's cap bounds the cost). A resolver that is busy or too slow for every caller's
-/// budget therefore keeps registrations at 503 (`dns_busy` / `nat64_discovery_unavailable`) until
-/// it recovers, which is the intended fail-closed behaviour.
+/// budget therefore stays inconclusive (classified with the prefixes already learned and still
+/// refused while the set is in overflow, or refused by a consumer that fails closed) until it recovers, which is the intended behaviour.
 ///
 /// A caller must also treat "no lookup has EVER answered" (`ever_answered == false`) as unknown,
-/// not as "no translator": the OIDC path logs and proceeds (its historical behaviour), the
-/// revocation-source registration refuses with a retryable 503.
+/// not as "no translator": the OIDC path logs and proceeds (its historical behaviour), while a
+/// consumer that gates admission may refuse with a retryable error.
 
 #include "oidc_egress_policy.hpp"
 
@@ -77,6 +77,7 @@ struct Nat64DiscoveryCache {
     bool ever_answered{false}; ///< a lookup has ANSWERED since the last reset
     bool overflowed{false};
     bool overflow_logged{false}; ///< the overflow transition was reported once (log once, not per call)
+    bool busy_logged{false}; ///< an inconclusive (busy) episode was reported once; cleared by a fair lookup
     bool last_failed{false};  ///< the most recent lookup did not answer (cached for the negative TTL)
     std::chrono::steady_clock::time_point expires{};
     std::vector<::yuzu::server::oidc::egress::Nat64Prefix> prefixes;
@@ -105,6 +106,10 @@ struct Nat64Discovery {
     bool ever_answered{false}; ///< some lookup, now or earlier, answered
     bool stale{false};         ///< the most recent refresh FAILED: `prefixes` is everything learned earlier
     bool learned_new{false};   ///< this call added at least one prefix
+    /// This call could not get a fair answer (busy pool, clamped budget, waiter whose leader gave
+    /// none, or an internal error): NOT a resolver failure, recorded nowhere, so a caller must not
+    /// log it as "the lookup failed" (a stuck resolver would otherwise warn on every call).
+    bool inconclusive{false};
 };
 
 /// The lookup callback: fill `out` with the IPv6 answers for `kNat64ProbeName` and return the
@@ -129,8 +134,32 @@ struct FlightGuard {
     explicit FlightGuard(Nat64DiscoveryCache& c) : cache(c) {}
 };
 
+/// Records an inconclusive call (caller holds `cache.mu`). The FIRST one of a busy episode logs one
+/// warning, in the shared cache like the overflow line, so a stuck probe worker produces one line
+/// per episode, never one per IPv6 vet; `end_busy_episode` logs the recovery.
+inline void note_inconclusive(Nat64DiscoveryCache& cache) {
+    cache.stats.inconclusive.fetch_add(1, std::memory_order_relaxed);
+    if (cache.busy_logged)
+        return;
+    cache.busy_logged = true;
+    spdlog::warn("NAT64 discovery: the ipv4only.arpa lookup could not run or did not finish in "
+                 "time (busy resolver or internal error); IPv6 destinations are classified with the prefixes already "
+                 "learned until a lookup completes. Logged once per episode.");
+}
+
+/// A lookup completed (answered or failed) after an inconclusive episode: report the recovery once.
+inline void end_busy_episode(Nat64DiscoveryCache& cache) {
+    if (!cache.busy_logged)
+        return;
+    cache.busy_logged = false;
+    spdlog::info("NAT64 discovery: the ipv4only.arpa lookup completed again; the busy episode ended");
+}
+
 /// The leader's work: one lookup, then the merge into the cache. Runs under a FlightGuard.
-inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCache& cache) {
+/// `counted` is set once this call's outcome is in the stats, so a throw AFTER that point is not
+/// counted a second time by the caller's catch.
+inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCache& cache,
+                                 bool& counted) {
     namespace egress = ::yuzu::server::oidc::egress;
     std::vector<egress::Ipv6> answers;
     Nat64LookupOutcome outcome = Nat64LookupOutcome::kFailed;
@@ -164,13 +193,17 @@ inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCach
         cache.stats.failed.fetch_add(1, std::memory_order_relaxed);
         break;
     case Nat64LookupOutcome::kInconclusive:
-        cache.stats.inconclusive.fetch_add(1, std::memory_order_relaxed);
+        note_inconclusive(cache);
         break;
     }
+    counted = true;
+    if (outcome != Nat64LookupOutcome::kInconclusive)
+        end_busy_episode(cache);
     if (outcome == Nat64LookupOutcome::kInconclusive) {
         // Failed FOR THIS CALL only: nothing is written to the shared state (no negative entry, no
         // TTL change), so the next consumer does a fair lookup of its own.
         d.stale = true;
+        d.inconclusive = true;
         d.ever_answered = cache.ever_answered;
         d.overflowed = cache.overflowed;
         if (!cache.overflowed)
@@ -194,9 +227,9 @@ inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCach
                 // any future one) gets the same single line and none can forget or repeat it.
                 spdlog::error("NAT64 discovery: the NAT64 prefix answer for ipv4only.arpa would "
                               "exceed {} learned prefixes; the learned set is frozen in overflow "
-                              "and IPv6 destinations are refused (OIDC IdP fetches and CRL source "
-                              "registrations) until a later answer fits or the server is "
-                              "restarted. Declare the real prefix with --oidc-nat64-prefix.",
+                              "and IPv6 destinations are refused (OIDC IdP fetches) until a later "
+                              "answer fits or the server is restarted. --oidc-nat64-prefix does NOT "
+                              "clear this; a restart does.",
                               kMaxDiscoveredNat64Prefixes);
             }
         } else {
@@ -272,9 +305,10 @@ inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCach
             // The lookup in flight did not finish within THIS caller's budget, or it ended without
             // filling the cache: inconclusive for this call only, nothing recorded about the
             // resolver.
-            cache.stats.inconclusive.fetch_add(1, std::memory_order_relaxed);
+            detail::note_inconclusive(cache);
             Nat64Discovery d;
             d.stale = true;
+            d.inconclusive = true;
             d.ever_answered = cache.ever_answered;
             d.overflowed = cache.overflowed;
             if (!cache.overflowed)
@@ -284,14 +318,31 @@ inline Nat64Discovery run_flight(const Nat64LookupFn& lookup, Nat64DiscoveryCach
         }
     }
     detail::FlightGuard flight(cache); // released on every exit below, including an exception
+    bool counted = false;
     try {
-        return detail::run_flight(lookup, cache);
+        return detail::run_flight(lookup, cache, counted);
     } catch (...) {
         // An allocation failure (or anything else) while parsing/merging: this call is
-        // inconclusive; the guard clears the flight, so the next caller can look again.
+        // inconclusive; the guard clears the flight, so the next caller can look again. It must
+        // still carry the cache's CURRENT state: a fresh default would read as "not overflowed,
+        // nothing learned" and let the caller skip the overflow refusal and every learned prefix.
         Nat64Discovery d;
         d.looked_up = true;
         d.stale = true;
+        d.inconclusive = true;
+        try {
+            std::lock_guard lock(cache.mu);
+            if (!counted)
+                detail::note_inconclusive(cache);
+            d.ever_answered = cache.ever_answered;
+            d.overflowed = cache.overflowed;
+            if (!cache.overflowed)
+                d.prefixes = cache.prefixes; // may itself throw: handled below
+        } catch (...) {
+            // Cannot even copy the set: fail CLOSED (refuse), never open.
+            d.prefixes.clear();
+            d.overflowed = true;
+        }
         return d;
     }
 }

@@ -15,9 +15,9 @@ Five distinct root causes. Counts × cause:
 |---|---|---|---|
 | **A** Test runner does not synthesise required parameters from the YAML schema | 15 | `scripts/test/instructions_runner.py` | Teach `synthesise_params` to emit plausible defaults for `path`, `sql`, `url`, `directory`, `thumbprint`, `group`, `sha256`, `filename`, `pattern`, `root`, etc. |
 | **B** Plugin correctly reports "platform not supported"; host is macOS and the def declares Windows-only | 9 | `instructions_runner.py` classification | Honour the YAML `platforms:` field — map host-OS-not-in-list to **SKIP**, not FAIL |
-| **C** Plugin's macOS branch is stale or absent | 5 | Plugins (`wifi` airport, `procfetch` macOS, possibly `tar.export`, `agent_logging`, `event_logs`) | One-issue-per-plugin; track separately |
+| **C** Plugin's macOS branch is stale or absent | 5 | Plugins (`wifi` airport, `procfetch` macOS, possibly `echo.export`, `agent_logging`, `event_logs`) | One-issue-per-plugin; track separately |
 | **D** Server importer rejects `type: query`; the two defs that use it never reach the DB so dispatch is 404 | 2 | YAMLs OR `import_definition_json` validator | Either rename `type: query` → `type: question` in the 2 YAMLs (one-line each), or add `query` as a synonym in the validator |
-| **E** Real bug in plugin SQL | 1 | `tar` plugin | `tar.export` UNION ALL column-count mismatch |
+| **E** Real bug in plugin SQL | 1 | `echo` plugin | `echo.export` UNION ALL column-count mismatch |
 | **F** Plugin returns "error\|" for legitimate empty-result conditions | 2 | Plugins (`agent_logging.get_log`, `event_logs.errors`) | Plugin path returns `status\|empty` / rc=0 instead of `status\|error\|...` |
 
 ### Recommended order
@@ -27,7 +27,7 @@ The runner-side fixes (A + B) drop the FAIL count from 34 to **10** with one PR 
 1. **A** (15 disappear): edit `scripts/test/instructions_runner.py` `synthesise_params` (around line 200 in the existing file). Walk the YAML's `parameters:` block and emit synthesis defaults keyed on parameter name + type. Examples below.
 2. **B** (9 disappear): edit `instructions_runner.py` to read the YAML's `platforms:` (or pull from the loaded definition); compare to host OS (`platform.system().lower()` → `windows` / `linux` / `darwin`); if host is not in the list, classify the outcome as `skip`, not `fail`.
 3. **D** (2 disappear): rename `type: query` → `type: question` in `content/definitions/discovery.yaml` and `content/definitions/deployment.yaml` for the affected ids. Then verify the API returns them after rebuild. (Lower-risk than touching the validator.)
-4. **E** (1 disappears): real bug — fix the `UNION ALL` column count in the tar plugin's export SQL.
+4. **E** (1 disappears): real bug — fix the `UNION ALL` column count in the echo plugin's export SQL.
 5. **F** (2 disappear): plugin patches.
 6. **C** (5 disappear): separate plugin work; file issues, prioritise per release urgency.
 
@@ -40,8 +40,8 @@ This is the authoritative reproduction set. Each row records: id, type, declared
 | 1 | `agent.content_dist.stage` | action | win/lin/mac | Download a file to agent's staging dir, verify SHA256 | `error\|missing required parameters: url, filename, sha256` | A |
 | 2 | `agent.content_dist.upload_file` | action | win/lin/mac | Upload a local file from agent → server via multipart POST | `error\|missing required parameter: path` | A |
 | 3 | `crossplatform.process.fetch` | question | win/lin | Deep process enumeration with SHA-1 hash of each exe | `error: process enumeration not supported on this platform` | B (also C — needs macOS branch) |
-| 4 | `crossplatform.tar.export` | question | win/lin/mac | Export TAR events as JSON for Splunk/ELK | `error\|query failed: SELECTs to the left and right of UNION ALL do not have the same number ...` | E |
-| 5 | `crossplatform.tar.sql` | question | win/lin/mac | Execute arbitrary SELECT against TAR warehouse | `error\|missing required 'sql' parameter` | A |
+| 4 | `crossplatform.echo.export` | question | win/lin/mac | Export Echo events as JSON for Splunk/ELK | `error\|query failed: SELECTs to the left and right of UNION ALL do not have the same number ...` | E |
+| 5 | `crossplatform.echo.sql` | question | win/lin/mac | Execute arbitrary SELECT against Echo warehouse | `error\|missing required 'sql' parameter` | A |
 | 6 | `device.agent_logging.get_log` | question | win/lin/mac | Tail last N lines of the agent log | `status\|error\|agent log file not found` | F (also A — `lines` param) |
 | 7 | `device.discovery.scan_subnet` | **query** | win/lin/mac | ARP-table + ICMP-sweep subnet scan | `DISPATCH_ERR: instruction definition not found` (server log: `bundled definition import failed: id=device.discovery.scan_subnet error=type must be 'question' or 'action'`) | D |
 | 8 | `device.event_logs.errors` | question | win/lin/mac | Recent Level-2 (Error) event log entries | `error\|Timestamp\|\|...Ty Process[PID:TID] error\|2026-05-12 ...akd[951:...` (returned actual error log lines; runner heuristic sees `error\|` prefix and fails) | F |
@@ -115,8 +115,8 @@ A pre-built probe script lives at `/tmp/probe-fails.py` from the prior session �
 agent.content_dist.stage
 agent.content_dist.upload_file
 crossplatform.process.fetch
-crossplatform.tar.export
-crossplatform.tar.sql
+crossplatform.echo.export
+crossplatform.echo.sql
 device.agent_logging.get_log
 device.discovery.scan_subnet
 device.event_logs.errors
@@ -200,9 +200,9 @@ curl -s -b /tmp/cookies.txt 'http://localhost:8080/api/instructions?limit=500' \
 
 Optionally — and orthogonally — patch the importer at `server/core/src/instruction_store.cpp` (search for the `type must be 'question' or 'action'` literal) to accept `query` as an alias. That fixes the class of bug rather than the two instances.
 
-### E — `tar.export` UNION ALL bug (1 instruction)
+### E — `echo.export` UNION ALL bug (1 instruction)
 
-In the `tar` plugin (`agents/plugins/tar/src/tar_plugin.cpp` or sibling), the export action composes a SQL UNION ALL across multiple TAR tables; one branch's SELECT column count diverges from the others. Find the construction site and align. The error string `SELECTs to the left and right of UNION ALL do not have the same number of result columns` is unambiguous — SQLite emits it pre-exec, so the fix is verified by simply having `tar.export` dispatch return rc=0 with any body.
+In the `echo` plugin (`agents/plugins/echo/src/echo_plugin.cpp` or sibling), the export action composes a SQL UNION ALL across multiple Echo tables; one branch's SELECT column count diverges from the others. Find the construction site and align. The error string `SELECTs to the left and right of UNION ALL do not have the same number of result columns` is unambiguous — SQLite emits it pre-exec, so the fix is verified by simply having `echo.export` dispatch return rc=0 with any body.
 
 ### F — empty-result returns rc=1 (2 instructions)
 

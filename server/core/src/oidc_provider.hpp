@@ -221,6 +221,10 @@ public:
     /// Test seams.
     [[nodiscard]] std::size_t lease_count_for_test() const;
     [[nodiscard]] static std::size_t retired_count_for_test();
+    /// Name lookups outstanding in the host vet's own resolver pool (cap 8; a stuck resolver pins
+    /// its slots). Published as `yuzu_server_oidc_resolver_in_flight` from the health tick. Always
+    /// 0 on Windows, where the vet uses GetAddrInfoExW with its own abandoned-request ledger.
+    [[nodiscard]] static int resolver_in_flight();
 
     bool is_enabled() const;
 

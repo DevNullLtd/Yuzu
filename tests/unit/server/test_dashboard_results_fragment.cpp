@@ -22,8 +22,8 @@
  * directly, without an HTTP round-trip, in
  * test_dashboard_results_columns.cpp's "scope filter drops out-of-scope
  * agents" test; this file proves the ROUTE wires the gate correctly, same
- * division of labour as test_dashboard_tar_fragments.cpp (route wiring)
- * vs. test_dashboard_tar_retention.cpp (render-time logic) for the TAR
+ * division of labour as test_dashboard_echo_fragments.cpp (route wiring)
+ * vs. test_dashboard_echo_retention.cpp (render-time logic) for the Echo
  * fragments.
  */
 
@@ -77,7 +77,7 @@ bool contains(const std::string& hay, std::string_view needle) {
 }
 
 struct FragmentResultsHarness {
-    // MEMBER ORDER IS LOAD-BEARING (mirrors test_dashboard_tar_fragments.cpp):
+    // MEMBER ORDER IS LOAD-BEARING (mirrors test_dashboard_echo_fragments.cpp):
     // `sink` is declared LAST so it is destroyed FIRST, while the
     // `DashboardRoutes` whose `this` its handlers captured is still alive.
     yuzu::MetricsRegistry metrics;
@@ -212,19 +212,19 @@ TEST_CASE("/fragments/results: admitted + scoped gate hides out-of-scope rows "
     CHECK_FALSE(contains(res->body, "2 agents"));
 }
 
-// #4027 fix round 2 (adversarial review CDX-P2-08): GET /api/v1/tar/retention-paused's
+// #4027 fix round 2 (adversarial review CDX-P2-08): GET /api/v1/echo/retention-paused's
 // explicit service-scoped-token 403 (dashboard_routes.cpp, ahead of fleet_read_fn_)
 // must emit a durable audit row, not just a metric — this is the exact regression the
 // finding caught (the check replaced perm_fn_/require_permission's service-scope
 // default-deny branch, which DID audit via AuthRoutes::audit_log). Lives here rather
-// than test_dashboard_tar_fragments.cpp because the path under test returns before
-// gather_tar_retention_paused/response_store/mgmt_group_store are ever touched, so it
+// than test_dashboard_echo_fragments.cpp because the path under test returns before
+// gather_echo_retention_paused/response_store/mgmt_group_store are ever touched, so it
 // needs none of that file's real-Postgres ManagementGroupStorePg fixture — same
 // minimal-registration pattern as the /fragments/results tests above, self-contained
 // rather than reusing FragmentResultsHarness (whose auth_fn has no service-scope hook).
-TEST_CASE("GET /api/v1/tar/retention-paused: service-scoped token denial is audited, "
+TEST_CASE("GET /api/v1/echo/retention-paused: service-scoped token denial is audited, "
           "not just counted",
-          "[server][dashboard][tar][auth]") {
+          "[server][dashboard][echo][auth]") {
     yuzu::MetricsRegistry metrics;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
@@ -263,13 +263,13 @@ TEST_CASE("GET /api/v1/tar/retention-paused: service-scoped token denial is audi
     // deny (and audit) BEFORE the route ever reaches it; if this test somehow
     // needed a wired gate to pass, that would itself prove the ordering broke.
 
-    auto res = sink.Get("/api/v1/tar/retention-paused");
+    auto res = sink.Get("/api/v1/echo/retention-paused");
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(contains(res->body, "service-scoped"));
 
     REQUIRE(audits.size() == 1);
-    CHECK(audits[0].action == "tar.retention_paused.view");
+    CHECK(audits[0].action == "echo.retention_paused.view");
     CHECK(audits[0].result == "denied");
     CHECK(audits[0].target_type == "Infrastructure");
 }
@@ -536,8 +536,8 @@ constexpr std::string_view kTooLongMarker = "data-filter-too-long";
 std::string expected_hint_text() {
     return "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
            " bytes. Newly stored responses do not index values that long, so this filter may "
-           "match nothing. Clear the filter (or switch the View to Default) and use the Search "
-           "box.";
+           "match nothing. Clear the filter and use the Search box; if the filter comes from the "
+           "View, tick 'View without saved filters'.";
 }
 
 // The whole hint element, from its opening `<span` through `</span>`, so an echo check covers
@@ -940,6 +940,94 @@ TEST_CASE("/fragments/results: saved View defaults and the over-bound hint",
     }
 }
 
+// #5638: the View's authored equals filters are defaults; "View without saved filters" shows the
+// data without them for one request, and never drops a filter the operator set.
+TEST_CASE("/fragments/results: view_filters=off skips the View's equals defaults only",
+          "[pg][server][dashboard][fragment][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_frag_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+    is.set_require_signed_definitions(false);
+
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-view-off-1";
+    store_registry_output(rs, command_id, "short output");
+
+    InstructionDefinition def;
+    def.name = "view-off";
+    def.version = "1.0";
+    def.plugin = "registry";
+    def.action = "query";
+    def.type = "question";
+    def.description = "view_filters test";
+    def.enabled = true;
+    def.platforms = "windows,linux,darwin";
+    def.approval_mode = "auto";
+    // An AUTHORED DEFAULT whose equals filter matches nothing the agent returned.
+    def.response_templates_spec =
+        R"([{"id":"vw1","name":"v","default":true,"filters":[{"column":"Output","op":"equals","value":"nothing like it"}]}])";
+    auto id = is.create_definition(def);
+    REQUIRE(id.has_value());
+
+    FragmentResultsHarness h(&rs, &is);
+    wire_unfiltered_gate(h);
+    const std::string base = "/fragments/results?command_id=" + command_id +
+                             "&plugin=registry&definition_id=" + *id + "&template_id=vw1";
+
+    SECTION("without the switch the default applies and hides the row") {
+        auto res = h.get(base);
+        REQUIRE(res);
+        CHECK_FALSE(contains(res->body, "class=\"result-row\""));
+        CHECK(contains(res->body, "No results match your filters."));
+    }
+    SECTION("with the switch the row is shown") {
+        auto res = h.get(base + "&view_filters=off");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "class=\"result-row\""));
+        CHECK_FALSE(contains(res->body, "No results match your filters."));
+    }
+    SECTION("the switch never drops an operator filter") {
+        auto miss = h.get(base + "&view_filters=off&f_output=nothing+like+it");
+        REQUIRE(miss);
+        CHECK_FALSE(contains(miss->body, "class=\"result-row\""));
+        auto hit = h.get(base + "&view_filters=off&f_output=short+output");
+        REQUIRE(hit);
+        CHECK(contains(hit->body, "class=\"result-row\""));
+    }
+}
+
+// #5669: an operator-driven results response empties the Create Group slot (the form it holds was
+// built for the previous filters); the background refresh carries the same live filters and does not.
+TEST_CASE("/fragments/results: only an operator-driven response clears the Create Group slot",
+          "[pg][server][dashboard][fragment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-slot-1";
+    store_registry_output(rs, command_id, "some output");
+
+    FragmentResultsHarness h(&rs);
+    wire_unfiltered_gate(h);
+    const std::string url = "/fragments/results?command_id=" + command_id + "&plugin=registry";
+
+    auto operator_driven = h.get(url);
+    REQUIRE(operator_driven);
+    CHECK(contains(operator_driven->body, "<div id=\"group-form-slot\" hx-swap-oob=\"true\"></div>"));
+
+    auto refresh = h.get(url + "&refresh=1");
+    REQUIRE(refresh);
+    CHECK(refresh->status == 200);
+    CHECK_FALSE(contains(refresh->body, "group-form-slot"));
+    // The refresh still renders the summary it exists to update.
+    CHECK(contains(refresh->body, "id=\"result-summary\""));
+}
+
 // #4644: `page` / `per_page` are ONE base-10 integer or a 400: a malformed page used to
 // fall back to the default silently, so the operator read page 1 as the page they asked for.
 TEST_CASE("/fragments/results: a malformed page or per_page is a 400 and valid values are served",
@@ -1038,7 +1126,8 @@ TEST_CASE("/fragments/results: Forensics rows follow the caller's Forensics visi
         CHECK(contains(res->body, "TOKEN-FORENSICS-B"));
         CHECK(contains(res->body, "TOKEN-ORDINARY-A"));
         CHECK(contains(res->body, "TOKEN-ORDINARY-C"));
-        CHECK(contains(res->body, "4 agents"));
+        // Four rows, three distinct agents: the summary counts agents, not stored frames.
+        CHECK(contains(res->body, "3 agents"));
     }
     SECTION("a per-agent subset is unsupported and sees no Forensics row, named agent or not") {
         h.forensics.unsupported_subset({"agent-b"});
@@ -1130,6 +1219,33 @@ TEST_CASE("/fragments/results: response.forensics.read is written only when the 
         REQUIRE(rows.size() == 1);
         CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=dashboard");
     }
+    SECTION("the background refresh reads for its counts and leaves no verb row; its operator-"
+            "driven twin of the same page does") {
+        h.forensics.admin();
+        auto refresh = h.get(url + "&refresh=1");
+        REQUIRE(refresh);
+        CHECK(refresh->status == 200);
+        CHECK(contains(refresh->body, "id=\"result-summary\"")); // still renders what it is for
+        // `refresh=1` is a query parameter any caller can send: it must carry no stored rows, or
+        // skipping the audit row would let Forensics-tier output be read unaudited.
+        CHECK_FALSE(contains(refresh->body, "TOKEN-FORENSICS-A"));
+        CHECK_FALSE(contains(refresh->body, "TOKEN-ORDINARY-02"));
+        CHECK_FALSE(contains(refresh->body, "class=\"result-row\""));
+        CHECK(verb_rows().empty());
+        // Even a persist failure has nothing to report: no row was attempted.
+        h.persist_fail_action = "response.forensics.read";
+        auto failing = h.get(url + "&refresh=1");
+        REQUIRE(failing);
+        CHECK(failing->get_header_value("Sec-Audit-Failed").empty());
+        h.persist_fail_action.clear();
+        // The twin: the same page, operator-driven, is audited as before.
+        auto driven = h.get(url);
+        REQUIRE(driven);
+        CHECK(contains(driven->body, "TOKEN-FORENSICS-A"));
+        const auto rows = verb_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=dashboard");
+    }
     SECTION("a persist failure sets Sec-Audit-Failed and still renders the page") {
         h.forensics.admin();
         h.persist_fail_action = "response.forensics.read";
@@ -1200,6 +1316,15 @@ TEST_CASE("/fragments/results and filter-bar: an Unknown Forensics decision show
     CHECK_FALSE(contains(results->body, "TOKEN-FORENSICS-A"));
     // A Forensics-read row is for rows actually shown; none were.
     CHECK(h.persisted_audits.empty());
+    // The refusal closes a Create Group form built for the previous filters (#5669), like any
+    // operator-driven response; the background refresh does not.
+    CHECK(contains(results->body, "<div id=\"group-form-slot\" hx-swap-oob=\"true\"></div>"));
+    auto refresh = h.get("/fragments/results?command_id=" + command_id +
+                         "&plugin=vuln_scan&refresh=1");
+    REQUIRE(refresh);
+    CHECK(refresh->status == 200);
+    CHECK(contains(refresh->body, "data-forensics-tier-unknown=\"true\"")); // notice still shown
+    CHECK_FALSE(contains(refresh->body, "group-form-slot"));
 
     auto bar = h.get("/fragments/results/filter-bar?command_id=" + command_id + "&plugin=vuln_scan");
     REQUIRE(bar);

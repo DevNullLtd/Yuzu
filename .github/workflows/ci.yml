@@ -1177,7 +1177,7 @@ jobs:
       - name: Test (non-pg suites)
         # Split into 2 invocations, cheap-first (fail-fast — bash -e aborts
         # the remaining lines on the first non-zero exit): the cheap suites
-        # (agent/docs/proto/tar/gateway/platform) run first, then the 6
+        # (agent/docs/proto/echo/gateway/platform) run first, then the 6
         # non-pg server entries by name (4 shards — #3443 Windows
         # restructuring added shard C, a later measured-by-time follow-up
         # added shard D, carved from B's [body_cap] tests — + the mcp bridge
@@ -1264,7 +1264,7 @@ jobs:
           # stale log). On a red run bash -e stops before the summary; use the
           # uploaded meson-logs artifact locally (#4884).
           rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 --suite agent --suite docs --suite proto --suite tar --suite gateway --suite platform
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 --suite agent --suite docs --suite proto --suite echo --suite gateway --suite platform
           python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux non-pg (cheap suites)"
           rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
           python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "guardian cache allocation-failure sweep" "server pg shard partition invariant" "dex link no presentation symbols"
@@ -1345,7 +1345,7 @@ jobs:
         #
         # HISTORICAL (pre-#3443-Phase-2) — describes what was then a single
         # step's internal 3-invocation split: 21 tests across 5 cheap suites
-        # (agent/docs/proto/tar/gateway) run first, then the 4 non-pg server
+        # (agent/docs/proto/echo/gateway) run first, then the 4 non-pg server
         # entries by name (corrected count — this paragraph originally said
         # "3", found stale by adversarial review), both UNCAPPED (no
         # --num-processes at all) since neither touches Postgres. Only the pg
@@ -1627,7 +1627,7 @@ jobs:
       #
       # The OTHER hop, server -> gateway management listener (the privileged command plane, #5175), is
       # covered too, in the production posture: strict mutual TLS, auth_fun
-      # yuzu_gw_authz:check_mgmt_peer/1 and mgmt_peer_pins = the server's default leaf, the server
+      # yuzu_gw_authz:check_mgmt_peer/1 and the server admitted by its identity (mgmt_peer_auth_mode identity, no pin), the server
       # pointed at it with --gateway-command-addr. The script dispatches commands to the real agent
       # through the server's REST API (one round trip, then a 300-command burst over the server's one
       # management connection, each required to return the agent's SUCCESS), and
@@ -1666,7 +1666,7 @@ jobs:
       # without a status function an `if:` that reads only a step outcome is unsatisfiable.
       - name: Upload gateway real-wire logs on failure
         if: failure() && steps.gateway_real_wire.outcome == 'failure'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gateway-real-wire-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.run_attempt }}
           path: |
@@ -1689,6 +1689,21 @@ jobs:
           YUZU_AGENT_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/core/yuzu-agent
           YUZU_PLUGIN_DIR: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/plugins
         run: bash scripts/test/agent-shutdown-smoke.sh
+
+      # Installs the shipped agent unit under unique runtime names and reads the kernel's
+      # view of the capabilities a process under it holds (needs systemd as PID 1 and
+      # passwordless sudo; a missing precondition fails the step, it never skips). Covers the
+      # ambient CAP_DAC_READ_SEARCH grant, the agent clearing inheritable/ambient so exec'd
+      # children get nothing, and the DMI snapshot helper. Prints no firmware bytes. One leg
+      # is enough: the unit and the agent's capability handling do not vary by compiler or
+      # build type.
+      - name: Agent systemd unit capability check
+        if: matrix.compiler == 'gcc-15' && matrix.build_type == 'debug'
+        timeout-minutes: 5
+        env:
+          YUZU_AGENT_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/core/yuzu-agent
+          YUZU_PLUGIN_DIR: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/plugins
+        run: bash scripts/test/agent-unit-capcheck.sh
 
       # Mirror the windows job's upload step so a Linux test failure is
       # diagnosable. meson `--print-errorlogs` truncates per-test output to
@@ -2199,7 +2214,7 @@ jobs:
           # docs suite is OS-independent and runs on the Linux leg only; OS-contract
           # entries carry suite platform (tests/meson.build) and run on every leg, so
           # the selection swaps docs for platform and the guard excludes docs.
-          suites=(--suite agent --suite platform --suite proto --suite tar --suite gateway --suite server-nonpg --suite server-checks)
+          suites=(--suite agent --suite platform --suite proto --suite echo --suite gateway --suite server-nonpg --suite server-checks)
           python scripts/ci/assert-suite-cover.py --builddir build-windows-${{ matrix.build_type }} \
             "${suites[@]}" \
             --exclude-suite server-pg --exclude-suite server-pg-smoke --exclude-suite docs
@@ -2264,7 +2279,7 @@ jobs:
           suites=(--suite server-pg)
           python scripts/ci/assert-suite-cover.py --builddir build-windows-${{ matrix.build_type }} \
             "${suites[@]}" \
-            --exclude-suite agent --exclude-suite docs --exclude-suite proto --exclude-suite tar \
+            --exclude-suite agent --exclude-suite docs --exclude-suite proto --exclude-suite echo \
             --exclude-suite gateway --exclude-suite server-nonpg --exclude-suite server-checks \
             --exclude-suite server-pg-smoke --exclude-suite platform
           # Runs LAST (after the non-pg step above): flake-retry.py /

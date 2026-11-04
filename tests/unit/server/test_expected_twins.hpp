@@ -45,6 +45,9 @@ inline constexpr TwinRow kExpectedTwins[] = {
     {"list_discovered_devices", "Infrastructure", "Read", true},
     // The MCP twin of POST /api/v1/hardware/sync (same Execution:Execute gate).
     {"sync_hardware_software", "Execution", "Execute", false},
+    // #2146: the MCP twin of POST /api/v1/instructions/{id}/execute (and the legacy
+    // POST /api/instructions/{id}/execute): the same plain Execution:Execute gate.
+    {"execute_instruction_definition", "Execution", "Execute", false},
     // #4030: executions/workflows/schedules read-twin programme.
     {"list_workflows", "Workflow", "Read", true},
     {"get_workflow", "Workflow", "Read", true},
@@ -64,13 +67,13 @@ inline constexpr TwinRow kExpectedTwins[] = {
     // the new GET /api/v1/product-packs* routes.
     {"list_product_packs", "ProductPack", "Read", true},
     {"get_product_pack", "ProductPack", "Read", true},
-    // #4027 - TAR process-tree/capture-sources/retention-paused read twins.
-    // Same Infrastructure:Read gate as GET /fragments/tar/process-tree,
-    // .../capture-sources, .../retention-paused (tar_tree_routes.cpp /
+    // #4027 - Echo process-tree/capture-sources/retention-paused read twins.
+    // Same Infrastructure:Read gate as GET /fragments/echo/process-tree,
+    // .../capture-sources, .../retention-paused (echo_tree_routes.cpp /
     // dashboard_routes.cpp).
-    {"list_tar_process_tree_devices", "Infrastructure", "Read", true},
-    {"list_tar_capture_sources_devices", "Infrastructure", "Read", true},
-    {"list_tar_retention_paused", "Infrastructure", "Read", true},
+    {"list_echo_process_tree_devices", "Infrastructure", "Read", true},
+    {"list_echo_capture_sources_devices", "Infrastructure", "Read", true},
+    {"list_echo_retention_paused", "Infrastructure", "Read", true},
     // #4031: directory-sync (AD/Entra) read twin - parity with GET
     // /api/v1/directory/users. The OIDC-config, auto-approve-rules, and
     // pending-agents read twins are REST-only per #520 (see
@@ -146,7 +149,7 @@ inline constexpr TwinRow kExpectedTwins[] = {
     // assert something false in one direction or fail in the other.
     {"list_result_sets", "Infrastructure", "Read", true},
     {"create_result_set", "Infrastructure", "Write", false},
-    {"create_result_set_from_tar_query", "Execution", "Execute", false},
+    {"create_result_set_from_echo_query", "Execution", "Execute", false},
     {"create_result_set_from_instruction_result", "Execution", "Execute", false},
     {"reevaluate_result_set", "Execution", "Execute", false},
     {"get_result_set", "Infrastructure", "Read", true},

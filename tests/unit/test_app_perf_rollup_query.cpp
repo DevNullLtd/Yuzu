@@ -1,18 +1,18 @@
 // Integration: the agent's app_perf rollup query (sync_source_app_perf, DEX
-// app-perf-over-time B1) must survive the REAL TAR `sql` path end-to-end —
+// app-perf-over-time B1) must survive the REAL Echo `sql` path end-to-end —
 // `$ProcPerf_Hourly` translation, the SELECT validator, AND the read-only
 // authorizer — and return correctly-aggregated rows. The pure agent unit tests
 // only string-match `build_app_perf_query`; this is the one cross-module path
-// (agent query → tar validator/authorizer/SQLite) that would otherwise fail
+// (agent query → echo validator/authorizer/SQLite) that would otherwise fail
 // SILENTLY in production (B1 stays empty) with every unit test green. It lives in
-// the tar suite because only that exe compiles both agent-core (the query
-// builder) and the tar SQL executor + warehouse DB.
+// the echo suite because only that exe compiles both agent-core (the query
+// builder) and the echo SQL executor + warehouse DB.
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "sync_source_app_perf.hpp" // build_app_perf_query (agent-core)
-#include "tar_db.hpp"               // TarDatabase
-#include "tar_sql_executor.hpp"     // validate_and_translate_sql
+#include "echo_db.hpp"               // EchoDatabase
+#include "echo_sql_executor.hpp"     // validate_and_translate_sql
 #include "test_helpers.hpp"
 
 #include <cmath>
@@ -22,14 +22,14 @@
 
 namespace fs = std::filesystem;
 using yuzu::agent::build_app_perf_query;
-using yuzu::tar::TarDatabase;
+using yuzu::echo::EchoDatabase;
 
 namespace {
 struct TestDb {
-    TarDatabase db;
+    EchoDatabase db;
     fs::path path;
     ~TestDb() {
-        { TarDatabase discard = std::move(db); }
+        { EchoDatabase discard = std::move(db); }
         std::error_code ec;
         fs::remove(path, ec);
         fs::remove(fs::path{path.string() + "-wal"}, ec);
@@ -38,14 +38,14 @@ struct TestDb {
     }
 };
 TestDb make_db() {
-    auto tmp = yuzu::test::unique_temp_path("tar_appperf_");
-    auto r = TarDatabase::open(tmp);
+    auto tmp = yuzu::test::unique_temp_path("echo_appperf_");
+    auto r = EchoDatabase::open(tmp);
     REQUIRE(r.has_value());
     return TestDb{std::move(*r), tmp};
 }
 } // namespace
 
-TEST_CASE("app_perf rollup query survives the real TAR sql path", "[tar][app_perf]") {
+TEST_CASE("app_perf rollup query survives the real Echo sql path", "[echo][app_perf]") {
     auto t = make_db();
     // 2025-01-01 00:00:00 UTC — exactly divisible by 86400, so (hour_ts/86400)*86400
     // == day_start for both seed rows.
@@ -68,14 +68,14 @@ TEST_CASE("app_perf rollup query survives the real TAR sql path", "[tar][app_per
     const std::string sql = build_app_perf_query(window_start, today_start);
 
     SECTION("translates $ProcPerf_Hourly and passes the SELECT validator") {
-        auto validated = yuzu::tar::validate_and_translate_sql(sql);
+        auto validated = yuzu::echo::validate_and_translate_sql(sql);
         REQUIRE(validated.has_value()); // SELECT-start, no dangerous kw, single stmt, <=4KB
         CHECK(validated->find("procperf_hourly") != std::string::npos); // $-name translated
         CHECK(validated->find('$') == std::string::npos);               // nothing left untranslated
     }
 
     SECTION("passes the authorizer and returns the sample-weighted aggregate row") {
-        auto validated = yuzu::tar::validate_and_translate_sql(sql);
+        auto validated = yuzu::echo::validate_and_translate_sql(sql);
         REQUIRE(validated.has_value());
         auto res = t.db.execute_user_query(*validated);
         REQUIRE(res.has_value()); // authorizer accepts (day-bucket arithmetic, aggregates, version col)
@@ -95,10 +95,10 @@ TEST_CASE("app_perf rollup query survives the real TAR sql path", "[tar][app_per
 }
 
 TEST_CASE("app_perf rollup query excludes is_kthread rows, keeps normal processes",
-          "[tar][app_perf][procperf]") {
+          "[echo][app_perf][procperf]") {
     // Kernel threads (Linux PF_KTHREAD) and the Windows System process (pid 4)
-    // are recorded unfiltered into procperf_hourly (the live TAR tier keeps
-    // them — tar_proc_perf.hpp's "Kernel-thread marker" note); this rollup
+    // are recorded unfiltered into procperf_hourly (the live Echo tier keeps
+    // them — echo_proc_perf.hpp's "Kernel-thread marker" note); this rollup
     // query is the ONE place that excludes them from the daily app-perf
     // history sent to the server.
     auto t = make_db();
@@ -118,7 +118,7 @@ TEST_CASE("app_perf rollup query excludes is_kthread rows, keeps normal processe
         ", 'normal.exe', '1.0.0.0', 0, 10, 2, 12.5, 20.0, 1024, 2048)")); // normal — included
 
     const std::string sql = build_app_perf_query(window_start, today_start);
-    auto validated = yuzu::tar::validate_and_translate_sql(sql);
+    auto validated = yuzu::echo::validate_and_translate_sql(sql);
     REQUIRE(validated.has_value());
     CHECK(validated->find("is_kthread") != std::string::npos);
     auto res = t.db.execute_user_query(*validated);

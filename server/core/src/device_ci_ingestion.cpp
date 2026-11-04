@@ -1,20 +1,27 @@
 #include "device_ci_ingestion.hpp"
 
 #include "agent.pb.h"
+#include "device_ci_kinds.hpp"
 #include "device_inventory_store.hpp"
+#include "sha256_hex.hpp"
 #include "utf8_sanitize.hpp" // shared yuzu::server::sanitize_utf8_strict (server side of the pair)
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
+#include <bitset>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -24,11 +31,14 @@ namespace pb = ::yuzu::agent::v1;
 
 constexpr const char* kSourceDeviceCi = "device_ci";
 
-// Caps — MUST match the agent source (sync_source_device_ci.cpp), comment-
-// coordinated, and sit below the 4 MiB gRPC receive ceiling. The CI blob is a
-// single small record; 64 KiB is a generous abuse bound.
-constexpr std::size_t kMaxBlobBytes = 64u * 1024;
-constexpr std::size_t kMaxFieldLen = 1024;
+// Caps. The field cap is kDeviceCiMaxFieldLen (device_ci_kinds.hpp); the agent source
+// (sync_source_device_ci.cpp) holds an equal constant, pinned by the dirty-input cross-pin test.
+// The blob ceiling is kDeviceCiMaxBlobBytes (device_ci_kinds.hpp): 96 KiB,
+// derived from the section registry (a p99 large host is about 25 KiB; every kind at its row
+// cap with a p99.9-wide row is about 75 KiB) and proved against it by a static_assert there. It
+// must stay >= the agent's (sync_source_device_ci.hpp), equal by contract. A conforming sender
+// trims its own rows to fit (ADR-0016 update "device_ci blob v2"), so a blob over the ceiling is
+// a non-conforming sender: dropped and nacked below, never parsed.
 // The number of positional fields in the canonical record (see DeviceCiRecord /
 // the agent's CiRecord). Extra fields in a (forward-version) blob are ignored;
 // missing trailing fields stay empty.
@@ -49,8 +59,8 @@ constexpr int kMaxSources = 64;
 // (U+FFFD is 3 bytes; clamping first would budget differently on each side).
 std::string clamp_field(std::string_view raw) {
     std::string f = sanitize_utf8_strict(raw);
-    if (f.size() > kMaxFieldLen) {
-        std::size_t end = kMaxFieldLen;
+    if (f.size() > kDeviceCiMaxFieldLen) {
+        std::size_t end = kDeviceCiMaxFieldLen;
         while (end > 0 && (static_cast<unsigned char>(f[end]) & 0xC0) == 0x80)
             --end;
         f.resize(end);
@@ -65,32 +75,25 @@ std::string clamp_field(std::string_view raw) {
     return out;
 }
 
-} // namespace
-
-DeviceCiRecord parse_device_ci_blob(const std::string& blob) {
-    DeviceCiRecord rec;
-    if (blob.size() > kMaxBlobBytes)
-        return rec; // defence-in-depth; caller caps + nacks before reaching here
-    // One record, terminated by the first 0x1E (the agent emits exactly one).
-    std::size_t rec_end = blob.find('\x1e');
-    if (rec_end == std::string::npos)
-        rec_end = blob.size();
-    std::string_view record(blob.data(), rec_end);
-
-    std::array<std::string, kFieldCount> f; // value-initialised to empty
-    std::size_t fi = 0;
+// Split one record on 0x1F into at most `max_fields` clamped fields (the rest are
+// ignored). An empty record yields one empty field, matching the v1 loop.
+std::vector<std::string> split_fields(std::string_view record, std::size_t max_fields) {
+    std::vector<std::string> out;
     std::size_t p = 0;
-    while (fi < kFieldCount) {
+    while (out.size() < max_fields) {
         std::size_t fe = record.find('\x1f', p);
         if (fe == std::string_view::npos)
             fe = record.size();
-        f[fi] = clamp_field(record.substr(p, fe - p));
-        ++fi;
+        out.push_back(clamp_field(record.substr(p, fe - p)));
         if (fe >= record.size())
             break;
         p = fe + 1;
     }
-    // Positional assignment — MUST match the agent's CiRecord order.
+    return out;
+}
+
+// Positions 0-21 — frozen across v1 and v2. MUST match the agent's CiRecord order.
+void assign_base_fields(DeviceCiRecord& rec, std::string* f) {
     rec.manufacturer = std::move(f[0]);
     rec.model = std::move(f[1]);
     rec.serial = std::move(f[2]);
@@ -113,6 +116,203 @@ DeviceCiRecord parse_device_ci_blob(const std::string& blob) {
     rec.os_version = std::move(f[19]);
     rec.os_build = std::move(f[20]);
     rec.arch = std::move(f[21]);
+}
+
+// The machine ID ships only as a hash (hex), or "-" when absent; the algorithm is open, so
+// the server enforces the shape but no length. Honest limit: this rejects UUID/GUID shapes
+// (dashes, braces, upper case) so a raw platform identifier is never stored under the hash
+// column, but it cannot detect a raw hex id such as /etc/machine-id (32 hex is also a valid
+// raw id, so a length floor would be theatre).
+bool machine_id_hash_shape_ok(std::string_view h) {
+    if (h.empty() || h == "-")
+        return true;
+    return std::ranges::all_of(
+        h, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+}
+
+constexpr const char* kMachineIdShapeNote = "server:machine_id_shape";
+// At most this many distinct unregistered tokens appear in the once-per-blob debug line.
+constexpr std::size_t kMaxLoggedDropped = 8;
+
+// v2: 0x02 scalar_record list_record* (see device_ci_kinds.hpp for the layout).
+DeviceCiRecord parse_v2(const std::string& blob) {
+    DeviceCiRecord rec;
+    rec.blob_version = 2;
+    // The agent's canonical bytes ARE the blob, so the server hashes what it received
+    // (never a re-serialisation that a cap/clamp mismatch could silently drift). A digest
+    // failure leaves the hash empty: canonical_hash returns "" and the store answers
+    // kError (nack need_full) rather than storing under a v1-shaped default.
+    if (auto h = sha256_hex(blob))
+        rec.content_hash = std::move(*h);
+    else
+        spdlog::warn("device_ci: sha256 of a v2 blob failed — record will be nacked");
+
+    bool extra_scalar{false}; // the scalar record carried fields past its last position (see below)
+
+    std::string_view rest(blob.data() + 1, blob.size() - 1);
+    const auto next_record = [&rest]() -> std::optional<std::string_view> {
+        if (rest.empty())
+            return std::nullopt;
+        std::size_t e = rest.find('\x1e');
+        std::string_view r = rest.substr(0, e == std::string_view::npos ? rest.size() : e);
+        rest.remove_prefix(e == std::string_view::npos ? rest.size() : e + 1);
+        return r;
+    };
+
+    // Record 0: the 33 scalar positions (missing trailing stay blank, extras ignored).
+    // A blob that is only the version byte, or whose first record is empty, still yields
+    // an (all-blank) v2 record.
+    {
+        std::string_view r0;
+        if (auto r = next_record())
+            r0 = *r;
+        // One sentinel field past the last position makes an over-wide record visible.
+        auto f = split_fields(r0, kDeviceCiScalarFields + 1);
+        extra_scalar = f.size() > kDeviceCiScalarFields;
+        f.resize(kDeviceCiScalarFields);
+        assign_base_fields(rec, f.data());
+        rec.chassis_type = std::move(f[22]);
+        rec.chassis_serial = std::move(f[23]);
+        rec.chassis_asset_tag = std::move(f[24]);
+        rec.chassis_source = std::move(f[25]);
+        rec.board_vendor = std::move(f[26]);
+        rec.board_product = std::move(f[27]);
+        rec.board_serial = std::move(f[28]);
+        rec.board_source = std::move(f[29]);
+        rec.machine_id_hash = std::move(f[30]);
+        rec.machine_id_algorithm = std::move(f[31]);
+        rec.machine_id_source = std::move(f[32]);
+    }
+
+    struct Acc {
+        bool seen{false};
+        std::string note; ///< server-side disclosure (cap or shape), appended to the reason
+        DeviceCiSection sec;
+    };
+    std::array<Acc, kDeviceCiSectionCount> acc;
+    // Widest record: the biggest list kind's columns plus the kind token, plus one sentinel
+    // field so a row carrying columns past its kind's width is visible as such.
+    std::size_t max_rec_fields = 4; // "status" section level reason
+    for (const auto& d : kDeviceCiSections)
+        max_rec_fields = std::max(max_rec_fields, static_cast<std::size_t>(d.n_fields) + 2);
+
+    // What this parse ignores, kept so ONE debug line per blob makes version skew diagnosable
+    // (a newer agent's kind, an extra column or field). Bounded: a hostile blob cannot grow the
+    // line.
+    std::vector<std::string> dropped; // distinct unregistered section / kind tokens
+    std::bitset<kDeviceCiSectionCount> extra_status; // sections whose status record had extras
+    std::bitset<kDeviceCiSectionCount> extra_cols;   // kinds whose rows carried extra columns
+    const auto note_dropped = [&dropped](const std::string& token) {
+        if (dropped.size() < kMaxLoggedDropped &&
+            std::ranges::find(dropped, token) == dropped.end())
+            dropped.push_back(token);
+    };
+
+    // Trust boundary on the one hashed identifier: a machine ID that is not hex (or "-") is
+    // blanked and disclosed on the machine_id section through the same note path the row
+    // caps use, so a raw GUID/IOPlatformUUID is never stored as if it were a hash.
+    if (!machine_id_hash_shape_ok(rec.machine_id_hash)) {
+        rec.machine_id_hash.clear();
+        if (const auto mi = device_ci_section_index("machine_id")) {
+            acc[*mi].seen = true;
+            acc[*mi].note = kMachineIdShapeNote;
+        }
+    }
+
+    while (auto r = next_record()) {
+        if (r->empty())
+            continue;
+        auto f = split_fields(*r, max_rec_fields);
+        if (f[0] == "status") {
+            if (f.size() < 2)
+                continue;
+            const auto i = device_ci_section_index(f[1]);
+            if (!i) {
+                note_dropped(f[1]);
+                continue; // unregistered section
+            }
+            auto& a = acc[*i];
+            a.seen = true;
+            if (f.size() > 4) // "status" section level reason, plus a sentinel
+                extra_status.set(*i);
+            a.sec.level = f.size() > 2 ? std::move(f[2]) : std::string{};
+            a.sec.reason = f.size() > 3 ? std::move(f[3]) : std::string{};
+            continue;
+        }
+        const auto i = device_ci_section_index(f[0]);
+        if (!i || kDeviceCiSections[*i].table == nullptr) {
+            note_dropped(f[0]);
+            continue; // unknown kind, or a row for a status-only section
+        }
+        const auto& def = kDeviceCiSections[*i];
+        auto& a = acc[*i];
+        a.seen = true;
+        if (f.size() > static_cast<std::size_t>(def.n_fields) + 1)
+            extra_cols.set(*i);
+        if (static_cast<int>(a.sec.rows.size()) >= def.row_cap) {
+            if (a.note.empty())
+                a.note = "server_cap:" + std::to_string(def.row_cap);
+            continue;
+        }
+        std::vector<std::string> row(static_cast<std::size_t>(def.n_fields));
+        for (std::size_t c = 0; c < row.size() && c + 1 < f.size(); ++c)
+            row[c] = std::move(f[c + 1]);
+        a.sec.rows.push_back(std::move(row));
+    }
+
+    for (std::size_t i = 0; i < kDeviceCiSectionCount; ++i) {
+        auto& a = acc[i];
+        if (!a.seen)
+            continue;
+        a.sec.kind = kDeviceCiSections[i].section;
+        if (!a.note.empty()) {
+            // Disclose the server-side truncation / blanking on the persisted section so a
+            // hash-only ack of an unchanged blob never reads a bounded projection as complete.
+            // Applied after every incoming status record, so a trailing `ok` cannot hide it.
+            a.sec.level = "constrained";
+            a.sec.reason = a.sec.reason.empty() ? a.note : a.sec.reason + ";" + a.note;
+        }
+        rec.sections.push_back(std::move(a.sec));
+    }
+
+    if (!dropped.empty() || extra_scalar || extra_status.any() || extra_cols.any()) {
+        std::string tokens;
+        for (const auto& t : dropped)
+            tokens += (tokens.empty() ? "'" : ", '") + ::yuzu::log_key_token(t) + "'";
+        std::string kinds;
+        const auto add_kind = [&kinds](const std::string& name) {
+            kinds += (kinds.empty() ? "" : ", ") + name;
+        };
+        if (extra_scalar)
+            add_kind("scalar");
+        for (std::size_t i = 0; i < kDeviceCiSectionCount; ++i) {
+            if (extra_status.test(i))
+                add_kind(std::string("status:") + kDeviceCiSections[i].section);
+            if (extra_cols.test(i))
+                add_kind(kDeviceCiSections[i].section);
+        }
+        spdlog::debug("device_ci: v2 blob ignored unregistered tokens [{}] and extra columns on "
+                      "kinds [{}]",
+                      tokens, kinds);
+    }
+    return rec;
+}
+
+} // namespace
+
+DeviceCiRecord parse_device_ci_blob(const std::string& blob) {
+    DeviceCiRecord rec;
+    if (blob.size() > kDeviceCiMaxBlobBytes)
+        return rec; // defence-in-depth; caller caps + nacks before reaching here
+    if (!blob.empty() && blob[0] == kDeviceCiVersionByte)
+        return parse_v2(blob);
+    // v1: one record, terminated by the first 0x1E (the agent emits exactly one).
+    std::size_t rec_end = blob.find('\x1e');
+    if (rec_end == std::string::npos)
+        rec_end = blob.size();
+    auto f = split_fields(std::string_view(blob.data(), rec_end), kFieldCount);
+    f.resize(kFieldCount); // missing trailing fields stay empty
+    assign_base_fields(rec, f.data());
     return rec;
 }
 
@@ -151,12 +351,13 @@ void ingest_device_ci_report(DeviceInventoryStore& store, const std::string& age
     const auto bit = report.plugin_data().find(kSourceDeviceCi);
     std::optional<DeviceCiRecord> rec;
     if (bit != report.plugin_data().end()) {
-        if (bit->second.size() > kMaxBlobBytes) {
-            // Oversized: don't store, but nack so the agent resends rather than
-            // recording a false success. The agent's own cap should prevent this.
+        if (bit->second.size() > kDeviceCiMaxBlobBytes) {
+            // Oversized: a non-conforming sender (a conforming one trims its own rows to fit
+            // under the ceiling). Backstop: log once, count, don't store, and nack so the agent
+            // resends rather than recording a false success.
             spdlog::warn("device_ci: oversized blob from agent={} ({} B > {} B) — dropping + "
                          "nacking",
-                         agent_id, bit->second.size(), kMaxBlobBytes);
+                         agent_id, bit->second.size(), kDeviceCiMaxBlobBytes);
             ack.add_need_full(kSourceDeviceCi);
             emit("dropped");
             return;

@@ -340,12 +340,33 @@ public:
     void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
 
     /// ADR-1007 — optional observability sink for the per-device
-    /// concurrency-claim path (skip counts, force-releases). nullptr (the
-    /// default) means no metrics — matches every sibling store's `set_metrics`
-    /// idiom (a post-construction setter, not a constructor parameter, so
-    /// this costs zero changes to any existing `ExecutionTracker(pg::PgPool&)`
-    /// call site).
+    /// concurrency-claim path (skip counts, force-releases) and, since #3834,
+    /// the read-degrade counter of the five `_checked` readers
+    /// (`yuzu_server_execution_tracker_read_degrade_total{method,reason}`).
+    /// nullptr (the default) means no metrics — matches every sibling store's
+    /// `set_metrics` idiom (a post-construction setter, not a constructor
+    /// parameter, so this costs zero changes to any existing
+    /// `ExecutionTracker(pg::PgPool&)` call site).
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
+    /// #3834 — register (describe) and pre-seed to 0 every `(method, reason)` series of
+    /// `yuzu_server_execution_tracker_read_degrade_total` (5 methods x 3 reasons = 15), so a healthy
+    /// store reads "wired, nothing degraded" on a dashboard instead of "series absent" and
+    /// `increase()` has a baseline (docs/observability-conventions.md). The label sets live in
+    /// `execution_tracker.cpp`, and the constants the emit sites use are indexed out of the very
+    /// arrays this function reads, so an emitted label value is a seeded one as long as every emit
+    /// site uses those constants (a convention: `note_read_degrade` accepts any string). Call once
+    /// at boot, next to `set_metrics()`. Static: it needs no store.
+    ///
+    /// The five readers it covers: `query_executions_checked`, `get_execution_checked`,
+    /// `get_agent_statuses_checked`, `get_agent_statuses_for_executions_checked`,
+    /// `get_children_checked`. The counter is bumped INSIDE those bodies, so the unchecked wrappers
+    /// that delegate to them (`query_executions`, `get_agent_statuses`,
+    /// `get_agent_statuses_for_executions`, `get_children`) are counted too; the unchecked
+    /// `get_execution()` has its own body and is NOT counted. A success-empty read (including an
+    /// empty execution-id list) is not a degrade. `store_not_open` can only occur in a harness: a
+    /// running server refuses to boot when the tracker did not open.
+    static void seed_read_degrade_metrics(yuzu::MetricsRegistry& metrics);
 
     // Query
     std::vector<Execution> query_executions(const ExecutionQuery& q = {}) const;
@@ -497,8 +518,28 @@ public:
     /// return would reintroduce the exact bug this fix closes.
     [[nodiscard]] bool set_agents_targeted(const std::string& execution_id, int agents_targeted);
 
+    /// LEGACY rerun (`/api/executions/{id}/rerun`). Reads the original with the UNCHECKED
+    /// `get_execution` / `get_agent_statuses`, so a degraded store collapses into "original
+    /// execution not found" (and `failed_only` into a zero-device record). That behaviour is
+    /// kept for the legacy handler, whose text the source tripwires pin; every NEW caller uses
+    /// `create_rerun_checked`, which cannot mask a storage fault.
     std::expected<std::string, std::string> create_rerun(const std::string& original_id,
                                                          const std::string& user, bool failed_only);
+
+    /// Why `create_rerun_checked` produced no record. A closed enum, so a caller maps it with a
+    /// `switch` rather than by comparing error text.
+    enum class RerunError {
+        kOriginalNotFound, ///< the original was read successfully and does not exist.
+        kStoreDegraded,    ///< the original (or, for `failed_only`, its agent rows) could not be
+                           ///< READ: pool exhausted, tracker not open, query failed. Unknown
+                           ///< whether the original exists; nothing was written.
+        kWriteFailed,      ///< the reads succeeded but inserting the new record failed.
+    };
+    /// Same record `create_rerun` creates, but every read goes through the degrade-aware
+    /// `get_execution_checked` / `get_agent_statuses_checked`, so an unreadable store is
+    /// `kStoreDegraded`, never a not-found and never a silently zero-sized `failed_only` record.
+    [[nodiscard]] std::expected<std::string, RerunError>
+    create_rerun_checked(const std::string& original_id, const std::string& user, bool failed_only);
 
     /// Returns false on a pool/query failure (governance PR review,
     /// 2026-08-31) — the execution was NOT actually cancelled; callers must

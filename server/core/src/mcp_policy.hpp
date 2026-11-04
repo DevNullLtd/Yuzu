@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <string_view>
 
 namespace yuzu::server::mcp {
@@ -18,11 +19,13 @@ namespace yuzu::server::mcp {
 ///                set, which stays denied even at this tier
 
 /// Returns true if the MCP tier permits (securable_type, operation).
-/// An empty tier string means "not an MCP token" → allow everything (defer to RBAC).
+/// An empty tier string is refused for every principal at /mcp/v1/ admission
+/// (mcp_admission.hpp), so no tool handler is reached with one. This branch is retained
+/// for non-MCP transports and as defence in depth: it allows everything (defers to RBAC).
 inline bool tier_allows(std::string_view mcp_tier,
                         std::string_view securable_type,
                         std::string_view operation) {
-    if (mcp_tier.empty()) return true;  // Not an MCP token
+    if (mcp_tier.empty()) return true;  // non-MCP transport / defence in depth (see above)
 
     // ── #520/#4028/#4031: MCP tokens must never administer the server ────
     //
@@ -145,7 +148,9 @@ inline bool tier_allows(std::string_view mcp_tier,
 inline bool requires_approval(std::string_view mcp_tier,
                               std::string_view securable_type,
                               std::string_view operation) {
-    if (mcp_tier.empty()) return false;  // Not an MCP token
+    // An empty tier is refused at /mcp/v1/ admission (mcp_admission.hpp); this branch is
+    // retained for non-MCP transports and as defence in depth.
+    if (mcp_tier.empty()) return false;
 
     // readonly tokens can't do anything that needs approval
     if (mcp_tier == "readonly") return false;
@@ -168,6 +173,17 @@ inline bool requires_approval(std::string_view mcp_tier,
         if (securable_type == "Security" && operation == "Execute") return true;
         if (securable_type == "UserManagement" && operation == "Write") return true;
         if (securable_type == "ManagementGroup" && operation == "Write") return true;
+        // Workflow:Execute (POST /api/workflows/{id}/execute): a workflow fans several steps out
+        // to the fleet in one call with no per-step human look. Owner ruling 2026-10-30: a
+        // supervised token needs an approval ticket for it, like every other fleet execution at
+        // this tier. Before this line a supervised token passed Workflow:Execute with NO
+        // ticket. AuthRoutes::require_permission mirrors this rule on every non-MCP transport,
+        // so a supervised-tier token is refused (403) on the REST execute route. No MCP tool
+        // maps to Workflow:Execute yet (the execute_workflow tool is not implemented), so
+        // until that tool ships a supervised token has no ticket path to run a workflow. The operator
+        // tier stays DENIED by tier_allows() above, which admits only Execution:Execute among
+        // execute operations.
+        if (securable_type == "Workflow" && operation == "Execute") return true;
 
         // RevocationSource:Write (ADR-0070 R1, slice 2b-1a): register, replace, remove and reset
         // the anti-rollback marks of a registered CRL source. Registering a source adds an
@@ -235,6 +251,46 @@ inline bool requires_approval(std::string_view mcp_tier,
 /// Returns true if the given string is a valid MCP tier name.
 inline bool is_valid_tier(std::string_view tier) {
     return tier.empty() || tier == "readonly" || tier == "operator" || tier == "supervised";
+}
+
+/// MCP tools exempt from the supervised-tier approval ticket although their (securable,
+/// operation) pair is one `requires_approval()` gates. CLOSED LIST; adding a name is a security
+/// decision recorded where the tool is classified, never a convenience.
+///
+/// Why this is a tool-name list and not a distinct operation (the `ApiToken:Rotate` route):
+/// `requires_approval()` is keyed on the pair alone and `AuthRoutes::require_permission` mirrors
+/// it on every non-MCP transport, so a pair-level carve-out would also relax every REST route
+/// that shares the pair. The exemption is read ONLY by the generic C8 gate in mcp_server.cpp (and
+/// the boot-time and metric-seeding derivations that must agree with it) via
+/// `requires_approval_for_tool()`, so the REST mirror is untouched: a supervised-tier MCP token
+/// that calls the REST twin of an exempt tool is still refused there. That asymmetry (MCP looser
+/// than REST for this one tool) is deliberate and is documented in docs/mcp-server.md.
+///
+///   cancel_execution (Execution:Execute): owner ruling 2026-10-30 (Dave). It only marks a
+///     tracker row cancelled: it sends NOTHING to any device and does not stop or recall a
+///     command a device already received, so it is NOT a stop of a running effect. It is exempt
+///     because it starts no new work and so adds no device risk; it does not make anything
+///     safe on a device. The handler still gates on
+///     Execution:Execute then Execution:Read, admits a confined caller only with COMPLETE cohort
+///     visibility, and audits an `attempted` row before the effect.
+inline constexpr std::array<std::string_view, 1> kApprovalExemptTools = {"cancel_execution"};
+
+[[nodiscard]] constexpr bool tool_exempt_from_approval(std::string_view tool) {
+    for (const auto t : kApprovalExemptTools) {
+        if (t == tool)
+            return true;
+    }
+    return false;
+}
+
+/// `requires_approval()` for a named tool: false for the tools on `kApprovalExemptTools`.
+/// Every MCP-side consumer of the approval rule (the C8 gate, the boot validator, the metric
+/// pre-seeding list) goes through this one function so they cannot disagree about an exempt tool.
+[[nodiscard]] inline bool requires_approval_for_tool(std::string_view mcp_tier,
+                                                     std::string_view tool,
+                                                     std::string_view securable_type,
+                                                     std::string_view operation) {
+    return !tool_exempt_from_approval(tool) && requires_approval(mcp_tier, securable_type, operation);
 }
 
 } // namespace yuzu::server::mcp
