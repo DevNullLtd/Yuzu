@@ -395,7 +395,7 @@ TEST_CASE("process_gateway_response: a command left RUNNING then hit by a #4672 
          "[gateway_unavailable] Gateway unreachable after 3 attempts — command not delivered");
 }
 
-TEST_CASE("process_gateway_response: each of the five #4672 reason codes produces a distinct, "
+TEST_CASE("process_gateway_response: each of the six forward reason codes produces a distinct, "
           "resolved FAILURE row",
           "[pg][agent_service][executions][4672]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -410,13 +410,16 @@ TEST_CASE("process_gateway_response: each of the five #4672 reason codes produce
     // Gate 4 consistency-auditor SHOULD (2026-09-21): this list previously
     // omitted "gateway_forward_failed" (the generic non-UNAVAILABLE
     // grpc-status branch, the 5th of forward_gateway_pending's 5 terminal-
-    // failure call sites) — a typo/rename there would have gone uncaught.
+    // failure call sites) — a typo/rename there would have gone uncaught. The sixth code,
+    // "gateway_forward_spawn_failed" (#2146), is passed by the spawn/setup guard around the whole
+    // per-command body; six reason codes, seven call sites ("gateway_unavailable" is passed at two).
     const Case cases[] = {
         {"cmd-unauth", "gateway_unauthenticated"},
         {"cmd-unavail", "gateway_unavailable"},
         {"cmd-unknown-cluster", "gateway_unknown_cluster"},
         {"cmd-mismatch", "gateway_agent_mismatch"},
         {"cmd-forward-failed", "gateway_forward_failed"},
+        {"cmd-forward-spawn-failed", "gateway_forward_spawn_failed"},
     };
     for (const auto& c : cases) {
         INFO("reason=" << c.reason);
