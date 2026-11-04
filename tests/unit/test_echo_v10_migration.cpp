@@ -1362,6 +1362,60 @@ TEST_CASE("v10 migration: lagged process rows below the roll-up mark still reach
     CHECK(n(db, "SELECT COALESCE(SUM(start_count), 0) FROM process_hourly") == 0); // below the mark: not re-folded
 }
 
+TEST_CASE("v10 migration: the below-mark usage pass starts past the usage cursor",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // Row 1 (the start) is below the mark and already read by the usage fold: it is the open run
+    // in usage_live and the cursor sits on it. Only row 2 (the stop) is owed. A pass that ignored
+    // the cursor would feed the start again and the run would not close cleanly.
+    seed(seeded, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(kH0 + 10), I(1), T("started"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+        insert_raw(db, "process", {I(kH0 + 70), I(1), T("stopped"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+        exec(db, std::format("INSERT INTO usage_live (ts, snapshot_id, action, pid, exe_key, user, start_ts) "
+                             "VALUES ({0}, 0, 'open', 100, 'alpha.exe', 'jsmith', {0})",
+                             kH0 + 10));
+        exec(db, std::format("INSERT INTO echo_config VALUES ('usage_hwm_id', '1'), "
+                             "('usage_active_generation', '0'), ('rollup_process_hourly_at', '{}')",
+                             kH0 + 3600));
+    });
+    yuzu::test::LogCapture logs;
+    auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    INFO(logs.text());
+    CHECK(logs.text().find("usage lag: 1 raw process rows past usage_hwm_id (usage_lag_events was 0), 1 of "
+                           "them folded into usage") != std::string::npos);
+    CHECK(n(db, "SELECT COUNT(*) FROM usage_live") == 0);
+    CHECK(n(db, "SELECT run_count FROM usage_daily WHERE exe_key = 'alpha.exe'") == 1);
+    CHECK(n(db, "SELECT total_seconds FROM usage_daily WHERE exe_key = 'alpha.exe'") == 60);
+    CHECK(n(db, "SELECT superseded_runs FROM usage_daily WHERE exe_key = 'alpha.exe'") == 0);
+}
+
+TEST_CASE("v10 migration: the free-space demand counts the write-ahead log already on disk",
+          "[echo][v10][migration][free_space]") {
+    Seeded seeded;
+    // A second connection keeps a non-empty -wal file alive (no auto-checkpoint, never closed
+    // before the open), so the migration sees a known, non-zero log.
+    Db holder;
+    open_raw(holder, seeded.tmp.path);
+    exec(holder.db, "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0");
+    seed_schema(holder.db);
+    insert_raw(holder.db, "process", {I(kT0), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
+    std::error_code ec;
+    const auto wal = fs::file_size(fs::path{seeded.tmp.path.string() + "-wal"}, ec);
+    REQUIRE(!ec);
+    REQUIRE(wal > 0);
+
+    OpenSeams tight;
+    tight.free_bytes = [](const fs::path&) -> std::optional<std::uintmax_t> { return 1000; };
+    const auto refused = EchoDatabase::open(seeded.tmp.path, tight);
+    REQUIRE(!refused.has_value());
+    CHECK(is_free_space_refusal(refused.error()));
+    INFO(refused.error());
+    // The message names the log it counted; a demand of twice the file alone names a 0-byte log.
+    CHECK(refused.error().find("plus its 0-byte log") == std::string::npos);
+    CHECK(refused.error().find("-byte log)") != std::string::npos);
+}
+
 TEST_CASE("v10 migration: a mark over a source with nothing to fold migrates whether or not it is trusted",
           "[echo][v10][migration][marks]") {
     Seeded seeded;
