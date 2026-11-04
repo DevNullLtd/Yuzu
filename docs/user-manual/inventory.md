@@ -149,7 +149,16 @@ cadences.
   architecture-neutral package); a package in the `Deprovisioned` list and a
   package installed for one user only are not collected. A host where Chocolatey
   is absent has no Chocolatey rows, which means none was found at the standard
-  location, not that none exists elsewhere.
+  location, not that none exists elsewhere. Only winget's presence is collected,
+  not what winget installed; Scoop, portable apps and the contents of the
+  `WindowsApps` folder are not covered. These reads were measured as the
+  interactive administrator; whether `NT SERVICE\YuzuAgent` can read the roster
+  keys and the Chocolatey `lib` directory is unverified. A roster key or `lib`
+  directory that is denied (`constrained`, reason
+  `windows:pkg_inventory:<source>:access_denied`), over the row or byte cap or
+  cannot be listed makes that daily cycle skip for every source: the previously
+  stored roster is kept and the agent logs a warning (this policy is shared with
+  snaps and flatpaks and is tracked in #6093).
 
   **Windows optional features** are collected with `ecosystem`
   `optional_feature` and `kind` `feat`, every feature the host knows, enabled or

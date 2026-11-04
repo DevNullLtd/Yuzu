@@ -3662,6 +3662,24 @@ TEST_CASE("pkg_inventory store_packages adapter: appx rows map to {appx, app, na
                            "neutral")}),
               kFailPolicy)
               .status == Status::failed);
+    // Width guard (`!= 9`): this adapter splits on a bare `|` and never unescapes, so a key name
+    // carrying pipes (each written `\|`) and a short row are dropped, never shifted. MUTATION:
+    // without the guard the hostile name below (six pipes, the last segment `active`) puts
+    // `active` at the state column and maps a bogus appx entry named `a\`; a short row would
+    // read past its tokens. The well-formed sibling after them still maps.
+    {
+        const auto w = parse_pkg_inventory_store_packages_output(
+            nl({supported_status("store_packages"),
+                appx_row("We|ird_1.0.0.0_x64__8wekyb3d8bbwe", "1.0.0.0", "x64"),
+                appx_row("a|b|c|d|e|f|active", "", ""),
+                "package|appx|Short_1.0.0.0_x64__8wekyb3d8bbwe|1.0.0.0|app",
+                appx_row("Microsoft.BingNews_4.1.24002.0_neutral_~_8wekyb3d8bbwe", "4.1.24002.0",
+                         "neutral")}),
+            kFailPolicy);
+        REQUIRE(w.status == Status::ok);
+        REQUIRE(w.entries.size() == 1);
+        CHECK(w.entries[0].name == "Microsoft.BingNews");
+    }
 }
 
 TEST_CASE("pkg_inventory packages adapter: chocolatey pkg rows map to {chocolatey, pkg}",
@@ -3690,6 +3708,21 @@ TEST_CASE("pkg_inventory packages adapter: chocolatey pkg rows map to {chocolate
                   "package|chocolatey|7zip|26.5.0|pkg"}),
               kFailPolicy)
               .status == Status::failed);
+    // Width guard (`!= 5`): an id carrying pipes (each written `\|`) and a short row (four tokens)
+    // are dropped, never shifted. MUTATION: without the guard the second id below puts `pkg` at
+    // the kind column and maps a shifted entry named `a\` with version `b\`; a short row would
+    // read past its tokens. The well-formed sibling after them still maps.
+    {
+        const auto w = parse_pkg_inventory_packages_output(
+            nl({supported_status("packages"),
+                pkg::format_package_row("we|ird", "1.0", pkg::PackageKind::pkg, "chocolatey"),
+                pkg::format_package_row("a|b|pkg", "1.0", pkg::PackageKind::pkg, "chocolatey"),
+                "package|chocolatey|short|1.0", "package|chocolatey|7zip|26.5.0|pkg"}),
+            kFailPolicy);
+        REQUIRE(w.status == Status::ok);
+        REQUIRE(w.entries.size() == 1);
+        CHECK(w.entries[0].name == "7zip");
+    }
 }
 
 TEST_CASE("pkg_inventory managers adapter: chocolatey and winget presence rows map",

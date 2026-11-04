@@ -479,10 +479,24 @@ TEST_CASE("win store_packages: entry cap, enumeration failure and the row budget
     {
         auto ops = real_appx();
         pw::WinLimits lim;
-        lim.max_output_bytes = 300; // two rows of ~120 bytes
+        lim.max_output_bytes = 300;
+        // The exact expectation, by plain arithmetic over the unbounded rows: a row is admitted
+        // while the running total of (row bytes + its newline) stays within the budget, and the
+        // first refusal ends the walk. On this fixture the sorted rows cost 101, 104 and 106
+        // bytes, so two fit (205) and the third (311) is refused.
+        ConstraintAccumulator unbounded;
+        const auto all = pw::store_package_rows(ops, unbounded);
+        std::size_t used = 0;
+        std::size_t expected = 0;
+        for (const auto& r : all) {
+            if (used + r.size() + 1 > lim.max_output_bytes) break;
+            used += r.size() + 1;
+            ++expected;
+        }
+        CHECK(expected == 2);
         ConstraintAccumulator acc;
         const auto rows = pw::store_package_rows(ops, acc, lim);
-        CHECK(rows.size() < 12);
+        CHECK(rows.size() == expected);
         CHECK(acc.reason() == "windows:pkg_inventory:appx_applications:byte_cap");
     }
     {
@@ -582,6 +596,29 @@ TEST_CASE("win packages: absent lib is silent, denied or failing lib is a token"
     }
 }
 
+TEST_CASE("win packages: an `absent` nuspec the path could not have resolved still gets a `-` row",
+          "[pkg_inventory][windows][choco]") {
+    // SYNTHETIC. A lib directory name holding an unpaired surrogate crosses the seam as U+FFFD
+    // (EF BF BD), so the nuspec path built from it names nothing and reads `absent`; a path past
+    // MAX_PATH reads `absent` too. A listed directory must not vanish with no row and no token
+    // ("failure never reads as absent"). The bootstrap directory (ordinary path, no loose
+    // nuspec) stays silent. The nuspec path is 38 + 2 * len(id) characters.
+    FakeOps ops;
+    const std::string bad = std::string{"bad"} + "\xEF\xBF\xBD" "name";
+    const std::string fits(110, 'f'); // nuspec path of 258 characters: an ordinary absent
+    const std::string over(111, 'o'); // nuspec path of 260 characters: past MAX_PATH
+    ops.dir_lists[std::string{pw::kChocolateyLib}] = {
+        pw::OpStatus::ok, {bad, "chocolatey", fits, over}, false, false};
+    ConstraintAccumulator acc;
+    const auto rows = pw::chocolatey_package_rows(ops, acc);
+    CHECK_FALSE(acc.any_failure()); // row-level only, as for an unreadable nuspec
+    REQUIRE(ops.file_reads.size() == 4);
+    CHECK(ops.file_reads[2].size() == 258);
+    CHECK(ops.file_reads[3].size() == 260);
+    CHECK(rows == std::vector<std::string>{"package|chocolatey|" + bad + "|-|pkg",
+                                           "package|chocolatey|" + over + "|-|pkg"});
+}
+
 // -- managers ------------------------------------------------------------------------------------
 
 TEST_CASE("win managers: captured chocolatey lib and the winget App Installer package",
@@ -623,6 +660,27 @@ TEST_CASE("win managers: the highest registered App Installer version wins; a mi
     const auto rows = pw::manager_rows(ops, acc);
     REQUIRE(rows.size() == 1);
     CHECK(rows[0] == "manager|winget|present|1.29.379.0|-|-|-");
+}
+
+TEST_CASE("win managers: equal App Installer versions pick the lexically smaller key, whatever the listing order",
+          "[pkg_inventory][windows][managers]") {
+    // SYNTHETIC: x64 and arm64 builds registered side by side at one version. The hashed row must
+    // not flap with registry enumeration order, so the key that sorts first supplies the `Path`.
+    const std::string x64 = "Microsoft.DesktopAppInstaller_1.29.379.0_x64__8wekyb3d8bbwe";
+    const std::string arm64 = "Microsoft.DesktopAppInstaller_1.29.379.0_arm64__8wekyb3d8bbwe";
+    for (const bool smaller_first : {false, true}) {
+        FakeOps ops;
+        if (smaller_first) ops.set_apps("Applications", {arm64.c_str(), x64.c_str()});
+        else ops.set_apps("Applications", {x64.c_str(), arm64.c_str()}); // reverse lexical order
+        for (const auto* key : {&x64, &arm64})
+            ops.reg_values["Applications|" + *key + "|Path"] =
+                "C:\\Program Files\\WindowsApps\\" + *key + "\\AppxManifest.xml";
+        ConstraintAccumulator acc;
+        const auto rows = pw::manager_rows(ops, acc);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == "manager|winget|present|1.29.379.0|C:/Program Files/WindowsApps/" +
+                             arm64 + "|-|-");
+    }
 }
 
 TEST_CASE("win managers: an unreadable App Installer Path leaves the root `-` and raises no token",
@@ -835,6 +893,10 @@ TEST_CASE("win real ops: a planted Appx roster in an HKCU scratch key decodes th
             RegDeleteKeyW(HKEY_CURRENT_USER, base.c_str());
         }
     } cleanup{base};
+    // RegCreateKeyExW opens an existing key, so one left by a killed earlier run under a reused
+    // process id would carry its subkeys into the roster assertions; clear it first (the return
+    // value is ignored: the key normally does not exist).
+    RegDeleteTreeW(HKEY_CURRENT_USER, base.c_str());
     const auto create = [](const std::wstring& path) {
         HKEY k{};
         REQUIRE(RegCreateKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, nullptr, 0, KEY_READ | KEY_WRITE,

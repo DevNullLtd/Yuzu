@@ -38,7 +38,8 @@
  * FAILURE NEVER READS AS ABSENT. An absent root is silent (supported, zero rows /
  * no manager row). A denied or failing roster key, lib listing or manager probe is
  * a `windows:pkg_inventory:<source>:<cause>` token (CONSTRAINED). Per-item
- * shortfalls (an unreadable nuspec, an unparsable package name) degrade the ROW
+ * shortfalls (an unreadable nuspec, an unparsable package name, a lib directory whose
+ * nuspec path cannot be resolved: U+FFFD in the name or past MAX_PATH) degrade the ROW
  * (`-`), never the action, because the installed-software collector fails a
  * constrained `packages` / `store_packages` answer and a persistent per-item
  * anomaly must not wedge the sync (pkg_inventory_parsers.hpp "TWO TOKEN CLASSES").
@@ -386,6 +387,17 @@ inline bool note_listing(yuzu::shared::ConstraintAccumulator& acc, std::string_v
     return false;
 }
 
+/// True when an `absent` nuspec read cannot be trusted to mean "no loose nuspec". The ops seam
+/// hands names across as UTF-8: a directory name holding an unpaired surrogate arrives as U+FFFD
+/// (bytes EF BF BD), so the path built from it names a directory that does not exist, and a
+/// path past MAX_PATH (259 characters plus the terminator) is refused without a `\\?\` prefix;
+/// both read as "not found". Byte length over-counts non-ASCII paths, so the check errs toward
+/// emitting a visible `-` row rather than dropping a listed directory.
+[[nodiscard]] inline bool absent_nuspec_is_unreliable(std::string_view dir,
+                                                      std::string_view path) noexcept {
+    return path.size() > 259 || dir.find("\xEF\xBF\xBD") != std::string_view::npos;
+}
+
 struct RosterKey {
     std::string_view leaf;
     std::string_view source;
@@ -439,7 +451,10 @@ chocolatey_package_rows(const Ops& ops, yuzu::shared::ConstraintAccumulator& acc
         path += dir;
         path += ".nuspec";
         const auto file = ops.read_file(path, lim.max_nuspec_bytes);
-        if (file.status == OpStatus::absent) continue; // no loose nuspec: not a roster entry
+        // No loose nuspec (the bootstrap package) is not a roster entry; but a listed directory
+        // whose path the read could not have resolved still gets its row, version `-`.
+        if (file.status == OpStatus::absent && !detail::absent_nuspec_is_unreliable(dir, path))
+            continue;
         std::string version;
         if (file.status == OpStatus::ok) {
             if (auto v = extract_xml_text(file.bytes, "version"); v && plausible_version(*v))
@@ -487,7 +502,9 @@ manager_rows(const Ops& ops, yuzu::shared::ConstraintAccumulator& acc,
             const auto p = parse_package_full_name(name);
             if (!p || p->name != kWingetPackageName) continue;
             auto ver = appx_version_parts(p->version).value(); // validated by the parse above
-            if (!best || ver > best_ver) {
+            // Equal versions (x64 beside arm64): the lexically smaller key wins, so the hashed
+            // row does not flap with registry enumeration order.
+            if (!best || ver > best_ver || (ver == best_ver && name < *best_key)) {
                 best = p;
                 best_key = &name;
                 best_ver = std::move(ver);

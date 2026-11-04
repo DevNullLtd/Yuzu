@@ -2,6 +2,12 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: Windows software counts rise after upgrade (Store apps, Chocolatey packages and winget presence)
+
+- **What changed:** an upgraded Windows agent now reports the `pkg_inventory` Windows legs in its daily installed-software sync. Each Windows endpoint adds `appx` rows (every Store and inbox app registered for all users, roughly 100-300 rows per host, inbox apps included), `chocolatey` rows (one per Chocolatey package, plus a presence row) and a `winget` presence row. The rows appear on the agent's next daily sync; no re-enrolment is needed.
+- **Affected:** per-device software counts and the `/software` catalogue for Windows devices rise, and a saved filter on `ecosystem` or "Found by" now also matches the new rows. A client that validates `ecosystem` against a fixed list (the MCP `get_crypto_libraries` tool refuses an unknown value) must add `chocolatey`, `winget` and `appx`.
+- **Not affected:** per-user Store packages and anything winget itself installed are not collected. Servers need no setting; the server learns the three ecosystems from its own build, so upgrade the server before the agents, as for every release.
+
 ## ⚠️ Breaking: stored response rows are capped per command and device (256 by default) (#561)
 
 - **What changed:** the response store keeps at most 256 rows for one command on one device (`--response-max-rows-per-agent`, env `YUZU_RESPONSE_MAX_ROWS_PER_AGENT`, range 1-65536). Rows past the cap are dropped, newest first, and the row just before the dropped frames ends with a `...[rows past per-agent cap dropped]` marker. One terminal-status row is still recorded past the cap when none exists, so the command's outcome shows.
