@@ -306,7 +306,9 @@ database.
 
 - **`install_type`** says how the software got onto the machine. The server derives it from the
   producing collector (the row's `source`), and from the ecosystem when a row has no source:
-  `installer` (`installed_apps.list_inventory`), `msi` (`msi_packages.list_inventory`),
+  `installer` (`installed_apps.list_inventory`, except that its Linux packages, whose ecosystem is
+  `deb`, `rpm`, `apk` or `pacman`, read `package_manager`, as they do from an agent that sends no
+  source), `msi` (`msi_packages.list_inventory`),
   `package_manager` (`pkg_inventory.packages` and `pkg_inventory.managers`, which is the
   Homebrew presence row), `store` (`pkg_inventory.store_packages`), `optional_feature`
   (`windows_optional_features.list`), `runtime` (`runtimes.python`) and `middleware`

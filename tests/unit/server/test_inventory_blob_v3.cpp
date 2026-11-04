@@ -543,8 +543,10 @@ TEST_CASE("install_type_for: the source table is total over kSoftwareSources",
         const auto t = install_type_for(src.value, "");
         CHECK_FALSE(t.empty());
         CHECK(is_install_type(t));
-        // The source wins over a contradicting ecosystem.
-        CHECK(install_type_for(src.value, "rpm") == t);
+        // The source wins over a contradicting ecosystem, except the one ecosystem-refined
+        // source (next test case).
+        if (src.value != kEcosystemRefinedSource)
+            CHECK(install_type_for(src.value, "rpm") == t);
     }
     CHECK(install_type_for("installed_apps.list_inventory", "") == "installer");
     CHECK(install_type_for("pkg_inventory.managers", "") == "package_manager");
@@ -554,6 +556,25 @@ TEST_CASE("install_type_for: the source table is total over kSoftwareSources",
     CHECK(install_type_for("msi_packages.list_inventory", "") == "msi");
     CHECK(install_type_for("runtimes.python", "") == "runtime");
     CHECK(install_type_for("middleware.ibm_mq", "") == "middleware");
+}
+
+TEST_CASE("install_type_for: installed_apps rows read their Linux package ecosystem",
+          "[server][install_type]") {
+    // The same package is package_manager whether the agent stamped a source or not.
+    for (const char* eco : {"deb", "rpm", "apk", "pacman"}) {
+        CAPTURE(eco);
+        CHECK(install_type_for("installed_apps.list_inventory", eco) == "package_manager");
+        CHECK(install_type_for("installed_apps.list_inventory", eco) ==
+              install_type_for("", eco));
+    }
+    for (const char* eco : {"windows", "macos", "macos_pkgutil", "", "made_up"}) {
+        CAPTURE(eco);
+        CHECK(install_type_for("installed_apps.list_inventory", eco) == "installer");
+    }
+    // Source-first for every other source: a contradicting ecosystem changes nothing.
+    CHECK(install_type_for("pkg_inventory.store_packages", "rpm") == "store");
+    CHECK(install_type_for("msi_packages.list_inventory", "deb") == "msi");
+    CHECK(install_type_for("runtimes.python", "rpm") == "runtime");
 }
 
 TEST_CASE("install_type_for: an empty or unknown source falls back by ecosystem",

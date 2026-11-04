@@ -4515,7 +4515,9 @@ TEST_CASE("derive_install_keys: type, scope, identity key and instance key",
     CHECK(a2.instance_key == a.instance_key);
     SoftwareEntry ext = full_extended_entry();
     SoftwareInventoryStore::derive_install_keys(ext);
-    CHECK(ext.install_type == "installer");
+    // An rpm row stamped installed_apps.list_inventory is package_manager, like the same row
+    // from a pre-tail agent (empty source).
+    CHECK(ext.install_type == "package_manager");
     CHECK(SoftwareInventoryStore::canonical_hash({ext}) == kCrossPinHashExtended);
 
     // A pre-tail (v2, empty source) row falls back by ecosystem; an unknown one is not derived.

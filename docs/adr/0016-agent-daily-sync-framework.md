@@ -929,7 +929,9 @@ that starts sending slot 13, which must also test that no profile path is emitte
 **`install_type` and `install_scope`.** Both are derived by the server at insert time and are
 never on the wire or in either hash. `install_type` is one of `msi`, `installer`, `store`,
 `package_manager`, `optional_feature`, `runtime`, `middleware`, `component`, `driver`, or `''`
-for a row not yet derived. The source decides it: `installed_apps.list_inventory` → `installer`;
+for a row not yet derived. The source decides it: `installed_apps.list_inventory` → `installer`,
+except that a row of ecosystem `deb`, `rpm`, `apk` or `pacman` (the same collector lists the Linux
+packages) is `package_manager`, so the same package reads the same with or without a source;
 `pkg_inventory.managers` and `pkg_inventory.packages` → `package_manager`;
 `pkg_inventory.store_packages` → `store`; `windows_optional_features.list` →
 `optional_feature`; `msi_packages.list_inventory` → `msi`; `runtimes.python` → `runtime`;
