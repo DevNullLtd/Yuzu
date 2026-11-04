@@ -2612,13 +2612,19 @@ StorageBytes EchoDatabase::storage_bytes_locked() {
 }
 
 std::optional<int64_t> wal_file_bytes(const std::filesystem::path& main_file) {
+    const std::filesystem::path wal{main_file.string() + "-wal"};
     std::error_code ec;
-    const auto size = std::filesystem::file_size(main_file.string() + "-wal", ec);
-    if (!ec)
-        return static_cast<int64_t>(size);
-    if (ec == std::errc::no_such_file_or_directory)
+    // Only a regular file has a size: file_size() of a directory succeeds on Windows (it is an
+    // error on POSIX), and a log that is not a file must fail the measurement, never read as 0.
+    const auto type = std::filesystem::status(wal, ec).type();
+    if (type == std::filesystem::file_type::not_found)
         return 0;
-    return std::nullopt;
+    if (ec || type != std::filesystem::file_type::regular)
+        return std::nullopt;
+    const auto size = std::filesystem::file_size(wal, ec);
+    if (ec)
+        return std::nullopt;
+    return static_cast<int64_t>(size);
 }
 
 std::expected<int64_t, std::string> EchoDatabase::delete_counted(const std::string& sql,
