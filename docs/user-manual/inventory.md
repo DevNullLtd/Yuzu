@@ -1019,9 +1019,10 @@ ingest is failing. Four further series sharpen the picture:
   applying one source's report holds a pooled Postgres connection (advisory lock +
   the atomic replace, whose inserts are now batched into a single `unnest()`
   statement). `phase=full` is the full-payload replace; `phase=hash_only` is the
-  cheap hash-skip compare + `last_seen` bump — split so the steady-state
-  hash_only majority doesn't bury the `full` tail, the pool-pressure signal under
-  a cold-cache `need_full` herd.
+  cheap hash-skip compare + `last_seen` bump; `phase=v3` is a sectioned report's
+  apply (up to 32 sections in one transaction) — split so the steady-state
+  hash_only majority doesn't bury the `full` and `v3` tail, the pool-pressure
+  signal under a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
   `pool_acquire_timeout` / `query_error`, plus `admission_full` for `source="installed_software"` and `source="ca_issued"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
   `software_licensing` / `product_registry` / `app_usage` / `generic`, and the `/crypto` sources `ca_issued` (Yuzu-issued certificate reads) and `crypto_layout` (dashboard layouts), see [metrics.md](metrics.md#crypto-dashboard-metrics)) — an
@@ -1161,9 +1162,13 @@ payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob dropped + nacked),
 `YuzuInventoryGenericBlobRejectedDepth` (a generic source blob rejected for
 nesting past `kMcpMaxJsonDepth`, json-dump-depth-guard fix),
 `YuzuInventoryReadDegraded` (a read returned a degrade, by reason),
-`YuzuInventoryIngestSlow` (full-payload ingests holding a connection >10s — a
-leading pool-saturation indicator), and `YuzuInventoryStaleCountUnavailable` (the
-freshness gauge may be frozen).
+`YuzuInventoryIngestSlow` (full-payload and sectioned (`phase=~"full|v3"`) ingests
+holding a connection >10s — a leading pool-saturation indicator),
+`YuzuInventorySectionIngestRefused` (warning: a v3 section was refused, `outcome="rejected"`;
+the refusal is a grammar failure that never self-heals, so fix the agent),
+`YuzuInventorySectionDeltaUnsupported` (info, held 1h: a v3 delta was answered with a request
+for a full section because this server cannot apply deltas yet; expected, no action), and
+`YuzuInventoryStaleCountUnavailable` (the freshness gauge may be frozen).
 
 A **recording rule**, `yuzu:inventory_ingest_duration_seconds:p99{source,phase}`,
 ships in the same group: it precomputes the 99th-percentile ingest duration per
