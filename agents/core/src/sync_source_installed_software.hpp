@@ -152,14 +152,26 @@ YUZU_EXPORT AdaptedRows parse_pkg_inventory_store_packages_output(const std::str
 YUZU_EXPORT AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out,
                                                                  ConstrainedPolicy policy);
 
+/// Whether the `runtimes` `python` vendor column holds a vendor on this host's OS: true on
+/// Windows (PythonCore tag) and Linux, false on macOS where it is a CFBundleIdentifier id.
+#if defined(__APPLE__)
+inline constexpr bool kPythonVendorColumnIsVendor = false;
+#else
+inline constexpr bool kPythonVendorColumnIsVendor = true;
+#endif
+
 /// Adapt `runtimes` `python` output (`status|python|<level>|...` plus five-token
 /// `python|<flavour>|<version or ->|<install_path or ->|<vendor or ->`). Each row becomes
 /// {name=Python, kind=app, ecosystem=python}; `-` version -> empty, publisher = the vendor column
-/// (`-` -> empty, labelled `via:python` by the collector), flavour/path dropped.
+/// (`-` -> empty, labelled `via:python` by the collector), flavour/path dropped. With
+/// `vendor_column_is_vendor` false (macOS: the column is a reverse-domain bundle id, an identifier
+/// and not a vendor) the column is ignored and publisher is always empty (`via:python`).
 /// On Linux the version is major.minor only (the patch level needs the interpreter). The
 /// collector's table row uses ConstrainedPolicy::drop_source: a `constrained` answer withholds
 /// these rows (Status::withheld) and the cycle continues; `unsupported` is skipped.
-YUZU_EXPORT AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPolicy policy);
+YUZU_EXPORT AdaptedRows parse_runtimes_python_output(
+    const std::string& out, ConstrainedPolicy policy,
+    bool vendor_column_is_vendor = kPythonVendorColumnIsVendor);
 
 /// Adapt `windows_optional_features` `list` output (`feature|<name>|<state>|<0/1>`):
 /// EVERY feature becomes {kind=feat, ecosystem=optional_feature} with the DISM

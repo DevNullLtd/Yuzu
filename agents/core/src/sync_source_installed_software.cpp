@@ -309,6 +309,12 @@ AdaptedRows adapt_windows_optional_features(const std::string& captured,
     return parse_windows_optional_features_output(captured);
 }
 
+// runtimes.python is bound through a wrapper that supplies the host's vendor-column rule (the
+// collector runs on the agent's own OS), keeping the public adapter testable on any host.
+AdaptedRows adapt_runtimes_python(const std::string& captured, ConstrainedPolicy policy) {
+    return parse_runtimes_python_output(captured, policy, kPythonVendorColumnIsVendor);
+}
+
 const InventoryAction kInventoryActions[] = {
     {.plugin = "installed_apps", .action = "list_inventory", .adapt = adapt_installed_apps},
     {.plugin = "pkg_inventory",
@@ -332,7 +338,7 @@ const InventoryAction kInventoryActions[] = {
     // denied registry key): a constrained answer withholds just the python rows, not the cycle.
     {.plugin = "runtimes",
      .action = "python",
-     .adapt = parse_runtimes_python_output,
+     .adapt = adapt_runtimes_python,
      .constrained = ConstrainedPolicy::drop_source},
     // Metadata-only source whose steady-state constraint is a permission fact: a constrained
     // answer drops just that source (rows withheld) instead of failing the whole cycle.
@@ -508,22 +514,26 @@ AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out,
     }, policy);
 }
 
-AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPolicy policy) {
+AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPolicy policy,
+                                         bool vendor_column_is_vendor) {
     // python|<flavour>|<version or ->|<install_path or ->|<vendor or ->, one row per interpreter the
     // runtimes plugin found at the standard machine roots (agents/plugins/runtimes/src/
     // runtimes_python_parsers.hpp). The status row is the shared inventory grammar. Every row
     // becomes one {name Python, kind app, ecosystem python} entry whose version is the row's
     // (`-` = unknown -> empty; on Linux it is major.minor, the patch level is not available there).
-    // The vendor rides in `publisher` (`-` = unknown); the flavour and path have no
-    // installed_software slot and are dropped. A constrained
+    // The vendor rides in `publisher` (`-` = unknown) wherever the column holds a vendor
+    // (Windows PythonCore, Linux); on macOS it is a CFBundleIdentifier reverse-domain id, an
+    // identifier and not a vendor, so it is ignored there (`vendor_column_is_vendor` false) and
+    // the collector labels the row `via:python`, the same rule as macos_pkgutil. The flavour and
+    // path have no installed_software slot and are dropped. A constrained
     // status withholds these rows only: see the table row's ConstrainedPolicy::drop_source.
     // The producer escapes a literal pipe in the free-text fields (runtimes_parsers.hpp
     // field_or_dash -> safe_output_field gives `\|`), so the split is escape-aware: width stays
     // strict (five logical fields); the version is dotted digits by construction on every leg, and
     // the vendor is unescaped (`\|` -> `|`) before it is stored.
     return adapt_pkg_inventory(out, "python",
-                               [](const std::vector<std::string_view>& tok,
-                                  std::vector<SwEntry>& entries) {
+                               [vendor_column_is_vendor](const std::vector<std::string_view>& tok,
+                                            std::vector<SwEntry>& entries) {
         if (tok[0] != "python" || tok.size() != 5)
             return false;
         SwEntry e;
@@ -531,7 +541,7 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
         e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
         // The vendor column is free text (the producer escapes a literal pipe as `\|`), so it
         // is unescaped here; `-` = unknown, left empty for the collector's via:python label.
-        if (tok[4] != "-")
+        if (vendor_column_is_vendor && tok[4] != "-")
             e.publisher = clamp_field(unescape_pipes(tok[4]), kMaxFieldLen);
         e.kind = "app";
         e.ecosystem = "python";

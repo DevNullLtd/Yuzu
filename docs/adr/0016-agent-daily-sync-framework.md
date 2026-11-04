@@ -1053,7 +1053,8 @@ cross-pins (`kCrossPinHash` and the extended, tail-order and mixed-blob pins) di
 | `pkg_inventory.managers` (Homebrew presence row) | the constant `Homebrew` | n/a |
 | `windows_optional_features.list` | the constant `Microsoft` (DISM features are Windows components; the middleware table's `IBM` is the precedent) | n/a |
 | `msi_packages.list_inventory` | the product's `Publisher` | `via:msi` |
-| `runtimes.python` | the row's vendor column (it was previously dropped), unescaped | `via:python` when the column is `-` |
+| `runtimes.python`, Windows and Linux | the row's vendor column (it was previously dropped), unescaped | `via:python` when the column is `-` |
+| `runtimes.python`, macOS | none: the column is a `CFBundleIdentifier` reverse-domain id (`org.python.python`), an identifier and not a vendor, and no heuristic turns one into the other; the adapter ignores the column on macOS | `via:python` |
 | `middleware.ibm_mq` | `IBM`, from the product table (unchanged) | n/a |
 
 The rpm `list_inventory` query format gains a tenth column, `%{VENDOR}`, at the end; the pinned

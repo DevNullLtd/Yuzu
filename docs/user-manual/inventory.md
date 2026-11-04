@@ -96,7 +96,7 @@ cadences.
   | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — |
   | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — |
   | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — |
-  | `publisher` | VENDOR, else PACKAGER, else `via:rpm` | Maintainer, else `via:deb` | `via:apk` | `via:pacman` | Publisher, else `via:windows` | signing leaf CN, else `via:macos` | `via:macos_pkgutil` | `via:brew` | `via:brew` | `Microsoft` | `via:snap` | `via:flatpak` | `Publisher`, else `via:msi` | the interpreter's vendor, else `via:python` | `IBM` |
+  | `publisher` | VENDOR, else PACKAGER, else `via:rpm` | Maintainer, else `via:deb` | `via:apk` | `via:pacman` | Publisher, else `via:windows` | signing leaf CN, else `via:macos` | `via:macos_pkgutil` | `via:brew` | `via:brew` | `Microsoft` | `via:snap` | `via:flatpak` | `Publisher`, else `via:msi` | the interpreter's vendor (Windows, Linux), else `via:python` (always on macOS) | `IBM` |
   | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — |
   | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — |
   | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — |
@@ -175,7 +175,8 @@ cadences.
   **Python interpreters** are collected through `runtimes` `python` (all three OSes;
   `source` `runtimes.python`) as one `app` row per interpreter, `name` `Python`,
   `ecosystem` `python`, `version` the interpreter version, `publisher` the vendor the
-  interpreter's install metadata declares (`via:python` when it declares none); the other
+  interpreter's install metadata declares on Windows and Linux (`via:python` when it declares none,
+  and always on macOS, where the metadata names only a bundle identifier, not a vendor); the other
   package fields are empty. No process is started: each OS answers from install
   metadata. Windows reads the PEP 514 `HKLM\SOFTWARE\Python\PythonCore` keys in both
   registry views (python.org installs; per-user installs and other PEP 514

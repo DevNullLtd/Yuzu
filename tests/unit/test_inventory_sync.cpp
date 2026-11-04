@@ -3144,7 +3144,7 @@ TEST_CASE("runtimes python adapter: real-capture rows map to Python / app / pyth
             "python|unmodelled|3.11|/usr/bin/python3.11|-",
             "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python",
             "python|cpython|3.14.6|C:/Python314/|PythonCore"}),
-        kFailPolicy);
+        kFailPolicy, /*vendor_column_is_vendor=*/true);
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 3);
     const char* versions[] = {"3.11", "3.13.1", "3.14.6"};
@@ -3155,6 +3155,33 @@ TEST_CASE("runtimes python adapter: real-capture rows map to Python / app / pyth
         CHECK(r.entries[i].kind == "app");
         CHECK(r.entries[i].ecosystem == "python");
         CHECK(r.entries[i].publisher == publishers[i]);
+    }
+}
+
+TEST_CASE("runtimes python adapter: macOS ignores the vendor column (a bundle id, not a vendor)",
+          "[sync][parse][adapter][runtimes]") {
+    using Status = AdaptedRows::Status;
+    const auto out = nl({"status|python|supported|-",
+                         "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python",
+                         "python|cpython|3.12.4|/opt/py|Some Vendor"});
+    SECTION("vendor column is an identifier: publisher stays empty for the via:python label") {
+        const auto r = parse_runtimes_python_output(out, kFailPolicy, /*vendor_column_is_vendor=*/false);
+        REQUIRE(r.status == Status::ok);
+        REQUIRE(r.entries.size() == 2);
+        CHECK(r.entries[0].version == "3.13.1");
+        CHECK(r.entries[0].publisher.empty());
+        CHECK(r.entries[1].publisher.empty());
+    }
+    SECTION("vendor column is a vendor (Windows, Linux): kept") {
+        const auto r = parse_runtimes_python_output(out, kFailPolicy, /*vendor_column_is_vendor=*/true);
+        REQUIRE(r.entries.size() == 2);
+        CHECK(r.entries[0].publisher == "org.python.python");
+        CHECK(r.entries[1].publisher == "Some Vendor");
+    }
+    SECTION("the default follows the host OS") {
+        const auto r = parse_runtimes_python_output(out, kFailPolicy);
+        REQUIRE(r.entries.size() == 2);
+        CHECK(r.entries[0].publisher.empty() == !yuzu::agent::kPythonVendorColumnIsVendor);
     }
 }
 
@@ -3170,7 +3197,8 @@ TEST_CASE("runtimes python adapter: rows built by the producer round-trip throug
     // Pin the wire form the adapter has to read, so a producer change shows up here.
     REQUIRE(row == "python|cpython|3.13.1|C:/Python\\|313/|org.python\\|custom");
     SECTION("one piped vendor and path: one entry, version unchanged") {
-        const auto r = parse_runtimes_python_output(nl({"status|python|supported|-", row}), kFailPolicy);
+        const auto r = parse_runtimes_python_output(nl({"status|python|supported|-", row}), kFailPolicy,
+                                                    /*vendor_column_is_vendor=*/true);
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].version == "3.13.1");
@@ -3180,7 +3208,8 @@ TEST_CASE("runtimes python adapter: rows built by the producer round-trip throug
     SECTION("more escaped pipes than the split width still read as five logical fields") {
         rec.vendor = "a|b|c|d|e|f|g|h|i|j|k|l";
         const auto r = parse_runtimes_python_output(
-            nl({"status|python|supported|-", yuzu::runtimes::python_row(rec)}), kFailPolicy);
+            nl({"status|python|supported|-", yuzu::runtimes::python_row(rec)}), kFailPolicy,
+            /*vendor_column_is_vendor=*/true);
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].version == "3.13.1");
@@ -3703,7 +3732,10 @@ TEST_CASE("collector: every source's real-capture rows carry a publisher or a vi
         const auto by = publishers_by_source(got->first);
         CHECK(by.at("pkg_inventory.store_packages") ==
               std::set<std::string>{"via:snap", "via:flatpak"});
-        CHECK(by.at("runtimes.python") == std::set<std::string>{"PythonCore", "via:python"});
+        // The collector runs on the host OS: a vendor column is read only where it holds a vendor.
+        CHECK(by.at("runtimes.python") ==
+              (yuzu::agent::kPythonVendorColumnIsVendor ? std::set<std::string>{"PythonCore", "via:python"}
+                                                        : std::set<std::string>{"via:python"}));
         CHECK(by.at("middleware.ibm_mq") == std::set<std::string>{"IBM"});
         CHECK(by.count("installed_apps.list_inventory") == 1);
     }
