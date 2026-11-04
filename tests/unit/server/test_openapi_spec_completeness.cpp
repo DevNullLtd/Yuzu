@@ -62,6 +62,7 @@
 #include <cctype>
 #include <cstddef>
 #include <functional>
+#include <initializer_list>
 #include <iterator>
 #include <map>
 #include <optional>
@@ -2087,6 +2088,9 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
           "[openapi][structure][envelope]") {
     const std::set<std::string> kList = {"data", "pagination", "meta"};
     const std::set<std::string> kOne = {"data", "meta"};
+    // Not in this table: the plugin-config value, secret, kill-switch and DELETE responses (pinned
+    // by the plugin-config test case further down), GET /plugin-config (a list, not pinned by
+    // either), and the upload agent routes, whose 200 bodies are bare objects with no envelope.
     // Each key list was read from the named handler, not from the schema:
     //  inventory/tables: JObj of plugin, agent_count, last_collected, through list_json.
     //  rules list: rule_to_jobj (14 fields) through list_json.
@@ -2445,7 +2449,9 @@ TEST_CASE("openapi documents: the response status set of the hand-checked operat
         // (offset_mismatch, session_terminal); 410 (expired); 413 (chunk_too_large,
         // size_exceeded); 500 (open or write failed); 503 (store null or unavailable,
         // advance_offset error).
-        {"/uploads/{upload_id}/chunk", "put", {"200", "400", "401", "409", "410", "413", "500", "503"}},
+        {"/uploads/{upload_id}/chunk",
+         "put",
+         {"200", "400", "401", "409", "410", "413", "500", "503"}},
         // plugin_config_routes.cpp, sink.Get("/api/v1/plugin-config"): 200; 400 (list_config
         // InvalidInput for a plugin filter that is not a valid identifier); 403 (list_read_fn
         // admitted a management-group-confined grant, refused by design, so it is declared); 503
@@ -2474,7 +2480,9 @@ TEST_CASE("openapi documents: the response status set of the hand-checked operat
         // 409 (session_terminal); 410 (expired); 422 (hash_mismatch); 500 (blob cannot be read
         // back to verify); 503 (store null or unavailable, cancel_session or commit_session
         // error).
-        {"/uploads/{upload_id}/commit", "post", {"200", "400", "401", "409", "410", "422", "500", "503"}},
+        {"/uploads/{upload_id}/commit",
+         "post",
+         {"200", "400", "401", "409", "410", "422", "500", "503"}},
     };
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
