@@ -6,6 +6,7 @@
  */
 
 #include "execution_tracker.hpp"
+#include "execution_mutation.hpp" // #2146: make_tracker_mutation_ports against a real tracker
 #include "command_outbox_store.hpp" // #4982 Part B: reap_stuck_running_executions' cross-schema tests
 #include "execution_event_bus.hpp"
 #include "pg/pg_exec.hpp"
@@ -4707,4 +4708,248 @@ TEST_CASE("ExecutionTracker: healthy reads, including empty and not-found ones, 
     }
 
     check_only_degrade_series(m, "", "", 0.0); // nothing moved anywhere
+}
+
+// ── make_tracker_mutation_ports against a REAL tracker (#2146 batch B, CA-1/UP-11) ───────────
+// test_execution_cancel_rerun_twins.cpp drives the shared sequence against a fake store; these
+// cases pin the adapter itself, so a regression in how the ports bind the tracker (an unchecked
+// read, a string-matched error) is caught where it is made.
+
+namespace {
+
+struct MutationAudit {
+    std::vector<std::pair<std::string, std::string>> rows; // {result, target}
+    ExecutionMutationAuditFn fn() {
+        return [this](const std::string&, const std::string& result, const std::string& target,
+                      const std::string&) {
+            rows.emplace_back(result, target);
+            return true;
+        };
+    }
+};
+
+ExecutionMutationRequest mutation_req(ExecutionMutation what, const std::string& id,
+                                      bool failed_only = false) {
+    ExecutionMutationRequest r;
+    r.what = what;
+    r.execution_id = id;
+    r.username = "operator";
+    r.failed_only = failed_only;
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("make_tracker_mutation_ports: a null tracker yields unwired ports",
+          "[execution_tracker][mutation][2146]") {
+    CHECK_FALSE(make_tracker_mutation_ports(nullptr).wired());
+}
+
+TEST_CASE("make_tracker_mutation_ports: cancel of a live row, a finished row and a missing row",
+          "[pg][execution_tracker][mutation][2146]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    const auto ports = make_tracker_mutation_ports(&tracker);
+    REQUIRE(ports.wired());
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+
+    CHECK(ports.mark_cancelled(*id, "operator") == ExecutionTracker::MarkCancelledOutcome::kCancelled);
+    auto after = tracker.get_execution(*id);
+    REQUIRE(after.has_value());
+    CHECK(after->status == "cancelled");
+
+    // Already terminal: a no-op, not a failure.
+    CHECK(ports.mark_cancelled(*id, "operator") == ExecutionTracker::MarkCancelledOutcome::kNoOp);
+    // Missing: also a no-op at the port (the not-found decision is the sequence's, made on the
+    // checked read before the effect).
+    CHECK(ports.mark_cancelled("no-such-execution", "operator") ==
+          ExecutionTracker::MarkCancelledOutcome::kNoOp);
+
+    SECTION("end to end through apply_execution_mutation") {
+        auto live = tracker.create_execution(make_execution());
+        REQUIRE(live.has_value());
+        MutationAudit audit;
+        auto done = apply_execution_mutation(ports, mutation_req(ExecutionMutation::kCancel, *live),
+                                             audit.fn());
+        CHECK(done.status == ExecutionMutationStatus::kDone);
+        auto again = apply_execution_mutation(ports, mutation_req(ExecutionMutation::kCancel, *live),
+                                              audit.fn());
+        CHECK(again.status == ExecutionMutationStatus::kAlreadyFinished);
+        auto missing = apply_execution_mutation(
+            ports, mutation_req(ExecutionMutation::kCancel, "no-such-execution"), audit.fn());
+        CHECK(missing.status == ExecutionMutationStatus::kNotFound);
+    }
+}
+
+TEST_CASE("make_tracker_mutation_ports: rerun of an existing and a missing original",
+          "[pg][execution_tracker][mutation][2146]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    const auto ports = make_tracker_mutation_ports(&tracker);
+    REQUIRE(ports.wired());
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    for (const auto& [agent, status] : {std::pair{"a1", "success"}, std::pair{"a2", "failure"},
+                                        std::pair{"a3", "timeout"}}) {
+        AgentExecStatus s;
+        s.agent_id = agent;
+        s.status = status;
+        tracker.update_agent_status(*id, s);
+    }
+
+    SECTION("existing original, all devices") {
+        auto rerun = ports.create_rerun(*id, "operator", false);
+        REQUIRE(rerun.has_value());
+        auto row = tracker.get_execution(*rerun);
+        REQUIRE(row.has_value());
+        CHECK(row->rerun_of == *id);
+        CHECK(row->parent_id == *id);
+        CHECK(row->status == "pending");
+        CHECK(row->dispatched_by == "operator");
+    }
+    SECTION("existing original, failed_only counts the failed and timed-out devices") {
+        auto rerun = ports.create_rerun(*id, "operator", true);
+        REQUIRE(rerun.has_value());
+        auto row = tracker.get_execution(*rerun);
+        REQUIRE(row.has_value());
+        CHECK(row->agents_targeted == 2);
+    }
+    SECTION("missing original is kOriginalNotFound, not an unavailable store") {
+        auto rerun = ports.create_rerun("no-such-execution", "operator", false);
+        REQUIRE_FALSE(rerun.has_value());
+        CHECK(rerun.error() == ExecutionTracker::RerunError::kOriginalNotFound);
+    }
+    SECTION("end to end through apply_execution_mutation") {
+        MutationAudit audit;
+        auto done = apply_execution_mutation(
+            ports, mutation_req(ExecutionMutation::kRerun, *id, /*failed_only=*/true), audit.fn());
+        CHECK(done.status == ExecutionMutationStatus::kDone);
+        CHECK_FALSE(done.new_execution_id.empty());
+        auto missing = apply_execution_mutation(
+            ports, mutation_req(ExecutionMutation::kRerun, "no-such-execution"), audit.fn());
+        CHECK(missing.status == ExecutionMutationStatus::kNotFound);
+    }
+}
+
+TEST_CASE("make_tracker_mutation_ports: a rerun whose read DEGRADES is unavailable, never "
+          "not-found, and creates no record (CA-1/UP-11)",
+          "[pg][execution_tracker][mutation][2146]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    const auto ports = make_tracker_mutation_ports(&tracker);
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    const auto count_rows = [&] { return tracker.query_executions(ExecutionQuery{}).size(); };
+    const auto before = count_rows();
+    REQUIRE(before == 1);
+
+    {
+        // Exhaust the pool so the tracker's bounded acquire gives up: the original EXISTS, but
+        // it cannot be read. size == 4 in the fixture.
+        std::vector<pg::PgPool::Lease> held;
+        for (int i = 0; i < 4; ++i) {
+            auto lease = tracker_bundle.pool().acquire();
+            REQUIRE(lease);
+            held.push_back(std::move(lease));
+        }
+        for (const bool failed_only : {false, true}) {
+            auto rerun = ports.create_rerun(*id, "operator", failed_only);
+            REQUIRE_FALSE(rerun.has_value());
+            CHECK(rerun.error() == ExecutionTracker::RerunError::kStoreDegraded);
+        }
+        // The shared sequence's own admission read degrades first (also a fail-closed 503 path).
+        MutationAudit audit;
+        auto out = apply_execution_mutation(
+            ports, mutation_req(ExecutionMutation::kRerun, *id), audit.fn());
+        CHECK(out.status == ExecutionMutationStatus::kStoreDegraded);
+    }
+
+    // Released: nothing was created while degraded, and the same call now succeeds, proving the
+    // earlier failure was the read and not an absent original.
+    CHECK(count_rows() == before);
+    auto rerun = ports.create_rerun(*id, "operator", false);
+    CHECK(rerun.has_value());
+}
+
+TEST_CASE("make_tracker_mutation_ports: a failed_only rerun whose SECOND read (the per-device "
+          "statuses) fails after the original read succeeded is unavailable and creates no record",
+          "[pg][execution_tracker][mutation][2146]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    const auto ports = make_tracker_mutation_ports(&tracker);
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    AgentExecStatus failed;
+    failed.agent_id = "a1";
+    failed.status = "failure";
+    tracker.update_agent_status(*id, failed);
+    const auto count_rows = [&] { return tracker.query_executions(ExecutionQuery{}).size(); };
+    const auto before = count_rows();
+    REQUIRE(before == 1);
+
+    // Break ONLY what the per-device status read selects. The original-row read (get_execution_
+    // checked) subselects `error_detail` from the same table and does not touch this column, so it
+    // still succeeds and the failure lands on the second read in create_rerun_checked.
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto drop = pg::exec_params(
+            lease.get(),
+            "ALTER TABLE execution_tracker.agent_exec_status DROP COLUMN plugin_result_status",
+            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    // Control: the original reads, and a full (not failed_only) rerun does not need the status
+    // table, so this proves the first read is healthy. It is the one record created below.
+    auto full = ports.create_rerun(*id, "operator", false);
+    CHECK(full.has_value());
+    CHECK(count_rows() == before + 1);
+
+    // The failed_only rerun cannot size its record: unavailable, never "0 failed devices", and
+    // no record is created (an unchecked second read would create an empty one and succeed).
+    auto rerun = ports.create_rerun(*id, "operator", true);
+    REQUIRE_FALSE(rerun.has_value());
+    CHECK(rerun.error() == ExecutionTracker::RerunError::kStoreDegraded);
+    CHECK(count_rows() == before + 1);
+
+    // Through the shared sequence: a 503-class outcome, not a success and not a not-found.
+    MutationAudit audit;
+    auto out = apply_execution_mutation(
+        ports, mutation_req(ExecutionMutation::kRerun, *id, /*failed_only=*/true), audit.fn());
+    CHECK(out.status != ExecutionMutationStatus::kDone);
+    CHECK(out.status != ExecutionMutationStatus::kNotFound);
+    CHECK(count_rows() == before + 1);
+}
+
+TEST_CASE("make_tracker_mutation_ports: a CLOSED tracker degrades every port",
+          "[execution_tracker][mutation][2146]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid());
+    ExecutionTracker closed(unreachable);
+    REQUIRE_FALSE(closed.is_open());
+    const auto ports = make_tracker_mutation_ports(&closed);
+    REQUIRE(ports.wired());
+
+    CHECK_FALSE(ports.get_execution("exec-1").has_value());
+    CHECK_FALSE(ports.get_statuses("exec-1").has_value());
+    CHECK(ports.mark_cancelled("exec-1", "operator") ==
+          ExecutionTracker::MarkCancelledOutcome::kFailed);
+    for (const bool failed_only : {false, true}) {
+        auto rerun = ports.create_rerun("exec-1", "operator", failed_only);
+        REQUIRE_FALSE(rerun.has_value());
+        CHECK(rerun.error() == ExecutionTracker::RerunError::kStoreDegraded);
+    }
+    MutationAudit audit;
+    CHECK(apply_execution_mutation(ports, mutation_req(ExecutionMutation::kRerun, "exec-1"),
+                                   audit.fn())
+              .status == ExecutionMutationStatus::kStoreDegraded);
+    CHECK(audit.rows.empty()); // the admission read failed before any row
 }

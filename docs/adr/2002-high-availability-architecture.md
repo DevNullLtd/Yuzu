@@ -2033,6 +2033,23 @@ when the applied frame's `status()` is not `RUNNING` (`is_terminal_command_statu
 `gateway_mgmt_stub_pool.hpp`, unit-tested against the full status enum). The `not_connected`-repair site is
 unconditionally terminal by its classifier's own contract and needs no such check.
 
+**Third correction (2026-11-01, #2146 batch B Gate 8):** the four per-attempt synthesizing sites above sit INSIDE the
+per-command forward thread, so a command whose thread could never be started was outside every one of them. The
+other two (`unknown_cluster` and the null-pool branch) resolve in the dispatching thread, before that command's own forward thread exists
+(`server.cpp`'s `forward_gateway_pending`, ahead of the spawn).
+`forward_gateway_pending` drains the queue and spawns one detached `std::thread` per command, and `send_to` had
+already counted each queued command as sent (it returns true at the queue push), so a throwing spawn
+(`std::system_error` or `bad_alloc`) unwound the loop, destroyed every not-yet-spawned drained command with no
+terminal response, and left its execution row `running` with a targeted count it could never complete (the
+stuck-execution sweep skips a row whose targeted count is above 0). The whole per-command body, from the first
+allocating statement through the spawn, now runs as the `forward_one` lambda under `guarded_forward` (`server/core/src/gateway_forward_guard.hpp`, which also holds the reason constant and the stored detail text), so one try statement covers it: a failure resolves THAT command through
+`apply_gateway_forward_terminal_failure` with the reason code `gateway_forward_spawn_failed` and the loop continues.
+That resolution is best effort: the resolver allocates too, so under the same resource pressure it can fail as well;
+that is logged at error level (an operator `cancel_execution` is then the only way to close the row), and an
+unknown-cluster resolution that already ran is never repeated, so each later drained command gets its own spawn attempt and,
+failing that, its own terminal failure. The non-throwing path is unchanged, and no `yuzu_server_gateway_forward_total`
+status was added for it. The reason code is listed in `docs/user-manual/server-admin.md` beside the others.
+
 **Deliberately still fire-and-forget in the sense §7's original design note meant (no durable outbox
 re-drive), for two independent, load-bearing reasons — not silently, this time:**
 

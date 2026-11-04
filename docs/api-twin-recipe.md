@@ -434,16 +434,17 @@ by something broader, the fix is always a new operation string — never a tool-
 ### A fifth registration point: `requires_approval()`
 
 `tier_allows()` decides *whether* a supervised-tier token may call a tool at all; a separate
-function, `requires_approval(mcp_tier, securable_type, operation)` (`mcp_policy.hpp:97`), decides
+function, `requires_approval(mcp_tier, securable_type, operation)` (in `mcp_policy.hpp`), decides
 *whether that call must go through the maker-checker approval workflow first* — checked, per its
 own doc comment, "AFTER `tier_allows()` returns true." **It is not derived from anything else — it
 is its own hard-coded, exact-match `(securable_type, operation)` list** (supervised tier:
 `Execution:Execute`, any `Delete`, `Policy:Write`, `Security:Write`, `Security:Execute`,
-`UserManagement:Write`, `ManagementGroup:Write`; operator tier: `Tag:Delete` only —
-`mcp_policy.hpp:105-158`). A pair that is destructive in the everyday sense but **absent** from this
-list runs un-approved at supervised tier, full stop — there is no fallback heuristic ("Write implies
-approval" is not the rule; `ApiToken:Write` itself is not in the list, deliberately, per the comment
-at `mcp_policy.hpp:124-151`).
+`UserManagement:Write`, `ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`; operator
+tier: `Tag:Delete` only; read the supervised branch of `requires_approval()` in `mcp_policy.hpp`
+for the current list, which this paragraph can fall behind). A pair that is destructive in the
+everyday sense but **absent** from this list runs un-approved at supervised tier, full stop: there
+is no fallback heuristic ("Write implies approval" is not the rule; `ApiToken:Rotate` is
+deliberately absent from the list, with its rationale in the comment after the `ApiToken:Write` line in that branch).
 
 **This means a twin PR for a destructive action-twin must explicitly decide, and state in the tool
 description, whether its `(securable_type, operation)` pair belongs in `requires_approval()`** — not
@@ -759,7 +760,7 @@ see §5 for which chokepoints apply.
    handler makes, and in the other direction a gate call in a derived MCP handler for a pair other than
    the tool's declared one is a finding too (for rows with a REST object twin; an MCP-only tool or a
    handler that shares a dispatch branch is not held to it); a route whose gate the script cannot read
-   fails closed unless it is in `GATE_PARITY_NO_GATE_ALLOWED`; both tables are shrink-only) and `scripts/ci/check-mcp-retry-hints.py` (a new tool's handler
+   fails closed unless it is in `GATE_PARITY_NO_GATE_ALLOWED`; that table and `GATE_PARITY_KNOWN_MISMATCHES` are each pinned to an exact size, `GATE_PARITY_NO_GATE_MAX` and `GATE_PARITY_KNOWN_MISMATCHES_MAX`: a pin is lowered in the change that retires an entry and raised only under a ruling recorded in ADR-1005) and `scripts/ci/check-mcp-retry-hints.py` (a new tool's handler
    block, and a new or changed `mcp_tool*.hpp`: a store/query-fault branch needs a retry hint or a
    `// retry-hint-exempt:` comment).
    For a destructive action-twin, also decide `requires_approval()` (§3's "fifth registration
@@ -952,14 +953,15 @@ before any of the table edits below.
 
 Next, the decision §3's "fifth registration point"
 calls out explicitly: `SoftwareDeployment:Execute` is **not** in `requires_approval()`'s hard-coded
-supervised-tier list today (verified — the full list is `Execution:Execute`, any `Delete`,
-`Policy:Write`, `Security:Write`, `Security:Execute`, `UserManagement:Write`,
-`ManagementGroup:Write`; `mcp_policy.hpp:105-121`). Starting a deployment pushes a package to live
+supervised-tier list today (verified; the list at the time of writing is `Execution:Execute`,
+any `Delete`, `Policy:Write`, `Security:Write`, `Security:Execute`, `UserManagement:Write`,
+`ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`; read the supervised branch of
+`requires_approval()` in `mcp_policy.hpp` for the current one). Starting a deployment pushes a package to live
 endpoints — REST gates the equivalent action behind an MFA step-up (`step_up_fn`,
 `rest_api_v1.cpp:9053`) precisely because it is consequential. The twin PR's job is to make that
 call explicitly rather than silently ship an unapproved supervised-tier action: add
 `if (securable_type == "SoftwareDeployment" && operation == "Execute") return true;` to the
-supervised-tier block in `requires_approval()` (`mcp_policy.hpp:105`), with a short comment
+supervised-tier block in `requires_approval()` (`mcp_policy.hpp`), with a short comment
 recording the REST-parity rationale (matching the style of the existing entries there) — this is
 the MCP-native answer to a step-up gate MCP tokens cannot satisfy interactively (they're
 non-interactive; see the engine-principal tools' "platform-wide MCP step-up exemption" note,
@@ -967,7 +969,7 @@ non-interactive; see the engine-principal tools' "platform-wide MCP step-up exem
 leaving it implicit).
 
 ```cpp
-// mcp_policy.hpp:105 -- add to the supervised-tier block in requires_approval():
+// mcp_policy.hpp -- add to the supervised-tier block in requires_approval():
 if (securable_type == "SoftwareDeployment" && operation == "Execute") return true;
 // Deployment start pushes a package to live endpoints -- REST parity with its
 // step_up_fn MFA gate (rest_api_v1.cpp POST .../start); MCP tokens are non-interactive,
