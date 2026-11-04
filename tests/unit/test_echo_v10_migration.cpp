@@ -37,6 +37,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <regex>
 #include <string>
 #include <variant>
 #include <vector>
@@ -1411,9 +1412,16 @@ TEST_CASE("v10 migration: the free-space demand counts the write-ahead log alrea
     REQUIRE(!refused.has_value());
     CHECK(is_free_space_refusal(refused.error()));
     INFO(refused.error());
-    // The message names the log it counted; a demand of twice the file alone names a 0-byte log.
-    CHECK(refused.error().find("plus its 0-byte log") == std::string::npos);
-    CHECK(refused.error().find("-byte log)") != std::string::npos);
+    // "<need> are needed (twice the <file>-byte database file plus its <log>-byte log)": the
+    // demand is twice the file plus the log, and the log is the non-empty one on disk.
+    std::smatch m;
+    REQUIRE(std::regex_search(refused.error(), m,
+                              std::regex{R"((\d+) are needed \(twice the (\d+)-byte database file plus its (\d+)-byte log\))"}));
+    const auto need = std::stoull(m[1]);
+    const auto file = std::stoull(m[2]);
+    const auto logged = std::stoull(m[3]);
+    CHECK(logged > 0);
+    CHECK(need == 2 * file + logged);
 }
 
 TEST_CASE("v10 migration: a mark over a source with nothing to fold migrates whether or not it is trusted",
