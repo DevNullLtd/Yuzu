@@ -492,9 +492,10 @@ Mechanics:
   `list`: on macOS the shared `system_profiler` scan `list`/`list_inventory`
   both run CAN list entries under `/Users/<account>/Applications` (4 of the
   323 rows in the committed macOS sample), so `list` may name a home
-  directory. Any change that puts `install_location` into a hashed or synced
-  blob (the component-inventory collection's blob v3, ADR-0028) must re-open
-  §8's classification first. `list`/`list_inventory` keep their
+  directory. §8's classification was re-opened for the server store of blob v3
+  (the 2026-11-04 Update, "Slot 13 is stored on v3 only"); the change that
+  starts SENDING slot 13 (ADR-0028) must honour its outcome before an agent
+  emits it. `list`/`list_inventory` keep their
   `Inventory:Read`/`ExecuteGate::None` tier; `list_per_user`'s AdminOrApproval
   gate exists for profile enumeration, which `list` does not do (CC6.3
   decision recorded here).
@@ -915,9 +916,15 @@ advisory lock as the v2 replace):
 **Slot 13 is stored on v3 only.** `install_location` (wire slot 13) is stored from the v3 `+`
 record. The v2 path still parses and discards it, so a v2 row's location is always empty and the
 v2 canonical hash is unchanged. Slot 14 (`uninstall_string`) stays reserved on both paths, so
-#5186 is closed for slot 13 only. The server stores the value as sent after the field step: a
-location under a user's profile would name an account, and the agent-side change that starts
-sending the slot owns what a machine-scope collector may put in it (§8).
+#5186 is closed for slot 13 only.
+
+*§8 outcome for slot 13 (this change re-opens §8 for the server store).* `install_location` is
+operator-tier: machine-scope roots only (ADR-0028), but a root can still name an account's home
+directory, so it is classified like the `list` column above. It is erased on decommission
+(`delete_agent` deletes the rows), and nothing in this change reads it back (no route, tool, page
+or log line carries it). The server stores it as sent after the field step, without minimisation,
+so **the agent writer must not send per-user paths**: that precondition is owned by the change
+that starts sending slot 13, which must also test that no profile path is emitted.
 
 **`install_type` and `install_scope`.** Both are derived by the server at insert time and are
 never on the wire or in either hash. `install_type` is one of `msi`, `installer`, `store`,
