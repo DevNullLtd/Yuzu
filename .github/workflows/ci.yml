@@ -579,6 +579,7 @@ jobs:
           bash tests/shell/test_codegate_push.sh        # docs-only gate's push + PR arms (#5320)
           bash tests/shell/test_release_guard.sh        # release.yml re-publish guard (#5282)
           bash tests/shell/test_release_tag_sha.sh      # release.yml per-push tag recheck (#5282)
+          bash tests/shell/test_lint_exit_status.sh     # lint bash-side exit codes (#6470)
           python3 scripts/ci/test_runner_health_check.py
           bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
           bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
