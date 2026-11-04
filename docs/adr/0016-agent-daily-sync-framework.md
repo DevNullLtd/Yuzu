@@ -802,4 +802,20 @@ generation. A failed read of the sections is a `503` on REST and a retryable err
 (`retry_after_ms` 5000), with the record withheld and the audit detail `state=sections
 unreadable`; it is never a `200` with an empty sections list.
 
-Each table-backed section's status row also records `row_count` (migration v3, additive and nullable): the number of child rows the full replace actually inserted for it, taken from the insert in the same transaction and never from the agent. The read side compares it with the rows it reads in the same snapshot; if they differ (child rows lost outside the product, for example a partial single-table restore or a manual `DELETE`) an `ok` section is served `constrained` and `complete: false` with reason `server:row_count_mismatch` (appended after any existing reason, so `server_cap:<n>` is kept), and the rows that were read are still served. A status-only section (chassis, baseboard, machine_id) and a section written before v3 store NULL, are not verified, and read exactly as before; the next full replace records the count. The wire format and the agent are unchanged. Migration 3 is a single additive `ALTER TABLE device_ci_section ADD COLUMN row_count INTEGER NULL`; an older server that runs against the migrated database writes NULL there, so the rollback note above still holds.
+Each table-backed section's status row also records `row_count` (migration v3, additive and
+nullable): the number of child rows the full replace actually inserted for it, taken from the insert in
+the same transaction and never from the agent. The read side compares it with the rows it reads in the
+same snapshot; if they differ (child rows lost outside the product, for example a partial single-table
+restore or a manual `DELETE`) an `ok` section is served `constrained` and `complete: false` with reason
+`server:row_count_mismatch` (appended after any existing reason, so `server_cap:<n>` is kept), and the
+rows that were read are still served. The check detects lost rows only: rows replaced out of band by
+the same number of different rows are not detected. A status-only section (chassis, baseboard,
+machine_id) and a section written before v3 store NULL, are not verified, and read exactly as before.
+Only a full replace records the count and repairs a mismatched section: a device whose hash is
+unchanged sends only a hash, which leaves the rows alone, so this happens on a hardware change, an
+operator Sync now, or the weekly full floor (at most 7 days); the pre-v3 fleet is therefore unverified
+for up to a week after upgrade. The wire format and the agent are unchanged. Migration 3 is a single
+additive `ALTER TABLE device_ci_section ADD COLUMN row_count INTEGER NULL`. The rollback note above
+holds after migrations 2 and 3: an older server that runs against the migrated database writes NULL
+there, so the sections it writes are unverified until a v3 server next does a full replace for that
+device.

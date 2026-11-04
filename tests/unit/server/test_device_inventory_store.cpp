@@ -2138,7 +2138,7 @@ TEST_CASE("a full replace rewrites the persisted row count (never stale)", "[pg]
     CHECK(served_section(store, "agent-rp", "cpu")["rows"].size() == 5);
 }
 
-TEST_CASE("a v2 database upgrades to v3 in place: existing sections have no count and read as before",
+TEST_CASE("a v2 database upgrades to v3 in place and existing sections have no count and read as before",
           "[pg][device_ci][migration][v3][row_count]") {
     // A private database: a v3 store seeds a v2-shaped device, the test rolls the schema back to v2
     // (drops the additive column and rewinds schema_meta), and a new store runs migration 3.
@@ -2170,7 +2170,7 @@ TEST_CASE("a v2 database upgrades to v3 in place: existing sections have no coun
     CHECK(dimm["reason"].is_null());
     CHECK(served_section(store, "agent-up", "cpu")["rows"].size() == 2);
 
-    // The next full replace (the daily sync) arms the check for that device.
+    // The next full replace (hardware change, Sync now or the weekly floor) arms the check.
     REQUIRE(put_record(store, "agent-up", blob_with_rows(2, 2)) == InventoryIngestOutcome::kStored);
     CHECK(persisted_row_counts(pool, "agent-up").at("dimm") == "2");
     CHECK(served_section(store, "agent-up", "dimm")["complete"] == true);

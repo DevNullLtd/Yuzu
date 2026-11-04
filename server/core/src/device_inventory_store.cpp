@@ -462,8 +462,10 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
         // collected for the single device_ci_section INSERT after the loop.
         std::vector<std::string_view> kinds, levels, reasons;
         // Per kept section: the child-row count the INSERT below ACTUALLY stored (read from its
-        // command tag, never from the agent or from `sec.rows.size()`), or "" for a status-only
-        // kind (-> NULL: nothing to verify). The read side compares this to the rows it reads.
+        // command tag, never from the agent; it is expected to equal the parser-capped
+        // `sec.rows.size()`, and the tag is authoritative if a trigger ever diverges), or "" for
+        // a status-only kind (-> NULL: nothing to verify). The read side compares this to the
+        // rows it reads.
         std::vector<std::string> row_counts;
         for (const auto& sec : r.sections) {
             const auto si = device_ci_section_index(sec.kind);
@@ -518,8 +520,13 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
             pg::PgResult ins = pg::exec_params(c, sql.c_str(), params);
             if (ins.status() != PGRES_COMMAND_OK)
                 return fail("row_insert");
-            // The tag's row count is what Postgres stored under this transaction.
-            row_counts.emplace_back(PQcmdTuples(ins.get()));
+            // The tag's row count is what Postgres stored under this transaction. A successful
+            // INSERT always carries one; an empty tag would silently store NULL (= unverified),
+            // so refuse it rather than fail open.
+            const char* const tag = PQcmdTuples(ins.get());
+            if (tag == nullptr || *tag == '\0')
+                return fail("row_insert");
+            row_counts.emplace_back(tag);
         }
         if (!kinds.empty()) {
             pg::PgResult si = pg::exec_params(

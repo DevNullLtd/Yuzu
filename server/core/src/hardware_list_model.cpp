@@ -221,7 +221,8 @@ std::vector<std::string_view> ci_columns(const DeviceCiSectionDef& def) {
 }
 
 /// `ci.sections`: one entry per section the device reported, in registry order. `complete` is true
-/// only for level `ok` after the row-count check (`verify_section_row_count`). Rows are served only for `ok` and `constrained` (a constrained section is
+/// only for level `ok` after the row-count check (`verify_section_row_count`). Rows are served
+/// only for `ok` and `constrained` (a constrained section is
 /// a bounded or partial projection, so its `complete:false` is the whole point); every other level
 /// - `unavailable`, `permission_denied`, or a level this server does not know - renders its reason
 /// and no rows, even if rows were somehow stored.

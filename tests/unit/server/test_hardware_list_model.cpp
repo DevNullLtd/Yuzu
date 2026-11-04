@@ -1434,7 +1434,7 @@ TEST_CASE("verify_section_row_count: an already constrained section keeps its re
 }
 
 // Kills: upgrading or reasoning over a level that has no rows by contract.
-TEST_CASE("verify_section_row_count: unavailable, permission_denied, unknown and blank levels are never touched",
+TEST_CASE("verify_section_row_count: unavailable and permission_denied and unknown and blank levels are never touched",
           "[hardware][model][sections][row_count]") {
     for (const char* level : {"unavailable", "permission_denied", "novel", ""}) {
         INFO(level);

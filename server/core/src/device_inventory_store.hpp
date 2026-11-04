@@ -108,6 +108,9 @@ public:
     /// No production caller: any production use MUST sit behind the fail-closed
     /// `inventory.device.ci` audit and the Inventory:Read scope gate; reads DIMM serials. The
     /// record routes use `get_device_ci_with_sections` below (one snapshot with the record).
+    /// The levels returned here are RAW: they are NOT row-count verified. Anything that serves
+    /// them must pass each section through `verify_section_row_count` (hardware_list_model.hpp)
+    /// or it re-opens the lost-rows-read-as-complete defect.
     [[nodiscard]] std::expected<std::vector<DeviceCiSection>, CiReadError>
     get_device_ci_sections(std::string_view agent_id);
 

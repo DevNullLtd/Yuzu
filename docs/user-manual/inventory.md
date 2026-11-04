@@ -1219,8 +1219,13 @@ sync, defeating the hash-skip protocol.
   `server:row_count_mismatch` means the rows stored for the section no longer match the count
   recorded when the device last synced in full (rows were lost outside the product, for example
   a partial database restore), so the section is served `constrained` and incomplete with the
-  rows that remain, and the next daily full sync repairs it. A section stored before this check
-  existed has no recorded count and is not checked until that device's next full sync.
+  rows that remain. Only a full sync repairs it (a device whose hardware has not changed sends
+  only a hash on its daily sync, which leaves the rows alone): run **Sync now** on the device,
+  or wait for its next hardware change or the weekly full report (at most 7 days). A section
+  stored before this check existed has no recorded count and is not checked until that
+  device's next full sync, so a freshly upgraded server verifies a device only after that
+  sync. The check detects lost rows only: rows replaced out of band by the same number of
+  different rows are not detected.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
   device serial and system UUID. Agents keep working unchanged; upgrade the server
   before the agents.
