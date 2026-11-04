@@ -721,7 +721,9 @@ SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
         inputs.disk_actions_loaded = disk_actions != nullptr;
         if (disk_actions != nullptr) {
             // The Windows volumes leg has no deadline on its DeviceIoControl calls (see
-            // windows_volumes_deferred_result); partitions and topology there are status-only.
+            // windows_volumes_deferred_result). Windows partitions runs two bounded WMI queries
+            // (agents/shared/wmi_bounded.hpp) and is dispatched like every other OS; only
+            // Windows topology is still status-only.
             if constexpr (kWindowsHost)
                 inputs.volumes = windows_volumes_deferred_result();
             else

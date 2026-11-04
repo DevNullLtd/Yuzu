@@ -304,14 +304,16 @@ spec:
         type: string
         description: >-
           Comma-separated mount points or drive letters, or "-". On Windows "-" means no
-          drive letter was mapped, unless detail says mount_points_unread, in which case the
-          mapping could not be read. Absent on status rows.
+          drive letter was mapped, unless detail says mount_points_unread or
+          mount_points_partial, in which case the mapping could not be fully read. Windows
+          shows drive letters only (a folder mount shows "-"). Absent on status rows.
         example: "/"
         platforms: [windows, linux, darwin]
       - name: detail
         type: string
         description: >-
-          Free text, or "-" (Windows: the fixed token wmi, or wmi,mount_points_unread).
+          Free text, or "-" (Windows: the fixed token wmi, wmi,mount_points_unread or
+          wmi,mount_points_partial).
           Absent on status rows.
         example: "-"
         platforms: [windows, linux, darwin]

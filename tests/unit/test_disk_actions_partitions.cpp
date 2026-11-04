@@ -1,7 +1,9 @@
 // Pure layer of the Windows disk_actions `partitions` leg (disk_actions_partitions.hpp).
-// No OS call: the rows below are the shapes Win32_DiskPartition and Win32_LogicalDiskToPartition
-// returned on a real GPT host (bigsenga, Windows 11, one NVMe disk, 2026-11-04), plus hostile and
-// degraded variants of them.
+// No OS call. The EXPECTED output rows are the ones a real GPT host produced (bigsenga, Windows
+// 11, one NVMe disk, 2026-11-04; agents/plugins/disk_actions/docs/samples/windows.txt). The INPUT
+// WMI rows are reconstructed from that sample and the documented CIM object-path form, not a raw
+// dump; the Windows-only live test in test_disk_actions_local_dispatcher.cpp checks the real
+// provider's shapes on a Windows host. Hostile and degraded variants follow.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -150,7 +152,12 @@ TEST_CASE("partitions: an unparsable association is constrained, not a silent no
     const auto rep = dp::build_report(ok(bigsenga_partitions()), ok({bad}));
     CHECK(rep.level == dp::Level::Constrained);
     CHECK(rep.reason == "windows:partitions:mount_points:link_unparsed");
-    CHECK(rep.data_rows.size() == 3);
+    REQUIRE(rep.data_rows.size() == 3);
+    // Every "-" here may be a row we could not read, and each row says so.
+    for (const auto& row : rep.data_rows) {
+        CHECK(cols(row)[5] == "-");
+        CHECK(cols(row)[6] == "wmi,mount_points_partial");
+    }
 }
 
 TEST_CASE("partitions: a dependent that is not a drive letter is not a mount point",
@@ -188,6 +195,23 @@ TEST_CASE("partitions: a partition query that fails classifies by cause and keep
         CHECK(dp::build_report(failed("wmi_deadline_exceeded"), ok({})).level ==
               dp::Level::Constrained);
     }
+    // The classifier is the shared, stage-aware one (agents/shared/wmi_error_token.hpp, whose own
+    // matrix is pinned in test_wmi_error_token.cpp); these pin that this leg uses it.
+    SECTION("INVALID_CLASS at the connect stage is a fault, not an absence") {
+        CHECK(dp::build_report(failed("wmi_connect_failed_0x80041010"), ok({})).level ==
+              dp::Level::Constrained);
+    }
+    SECTION("INVALID_NAMESPACE at the query stage is a fault, not an absence") {
+        CHECK(dp::build_report(failed("wmi_query_failed_0x8004100e"), ok({})).level ==
+              dp::Level::Constrained);
+    }
+    SECTION("INVALID_CLASS at the first Next() is an absence, after data came back it is a fault") {
+        auto first = failed("wmi_next_failed_0x80041010");
+        CHECK(dp::build_report(first, ok({})).level == dp::Level::Unavailable);
+        auto later = failed("wmi_next_failed_0x80041010");
+        later.rows_before_error = 2;
+        CHECK(dp::build_report(later, ok({})).level == dp::Level::Constrained);
+    }
 }
 
 TEST_CASE("partitions: a row that cannot be named is skipped and the section is constrained",
@@ -217,13 +241,22 @@ TEST_CASE("partitions: a truncated association query is constrained", "[disk_act
     const auto rep = dp::build_report(ok(bigsenga_partitions()), links);
     CHECK(rep.level == dp::Level::Constrained);
     CHECK(rep.reason == "windows:partitions:mount_points:row_cap");
+    REQUIRE(rep.data_rows.size() == 3);
+    // The matched partition keeps its letter and a plain `wmi`; the unmatched ones are PARTIAL.
+    CHECK(cols(rep.data_rows[1])[5] == "C:/");
+    CHECK(cols(rep.data_rows[1])[6] == "wmi");
+    CHECK(cols(rep.data_rows[0])[6] == "wmi,mount_points_partial");
+    CHECK(cols(rep.data_rows[2])[6] == "wmi,mount_points_partial");
 }
 
-TEST_CASE("partitions: zero partitions with a clean read is a supported, empty section",
+TEST_CASE("partitions: a clean read with zero partitions is constrained, never an empty success",
           "[disk_actions_partitions]") {
+    // A booted Windows host always has a system partition, so S_OK with nothing is a provider
+    // fault. (volumes follows the same rule with a placeholder row; here the status row is the
+    // authoritative signal.)
     const auto rep = dp::build_report(ok({}), ok({}));
-    CHECK(rep.level == dp::Level::Ok);
-    CHECK(rep.status_row == "status|partitions|supported|-");
+    CHECK(rep.level == dp::Level::Constrained);
+    CHECK(rep.status_row == "status|partitions|constrained|windows:partitions:no_rows");
     CHECK(rep.data_rows.empty());
 }
 
@@ -249,7 +282,7 @@ TEST_CASE("partitions: a missing DeviceID is synthesised from the indexes",
 TEST_CASE("partitions: provider text cannot add a column or a row", "[disk_actions_partitions]") {
     auto rows = bigsenga_partitions();
     rows[1]["Type"] = "evil|extra\nnext|partition|PhysicalDrive9";
-    rows[1]["DeviceID"] = "Disk #0, Partition #1";
+    rows[1]["DeviceID"] = "Disk #0|x\r\npartition|PhysicalDrive9, Partition #1";
     const auto rep = dp::build_report(ok(rows), ok({}));
     for (const auto& row : rep.data_rows) {
         CHECK(cols(row).size() == 7);
@@ -266,7 +299,7 @@ TEST_CASE("partitions: a hostile reason cannot forge a status column", "[disk_ac
 }
 
 TEST_CASE("partitions: strict unsigned parsing", "[disk_actions_partitions]") {
-    using dp::detail::parse_u64;
+    using dp::impl::parse_u64;
     CHECK(parse_u64("0") == 0);
     CHECK(parse_u64("18446744073709551615") == 18446744073709551615ULL);
     CHECK_FALSE(parse_u64("18446744073709551616").has_value());
@@ -281,7 +314,7 @@ TEST_CASE("partitions: strict unsigned parsing", "[disk_actions_partitions]") {
 }
 
 TEST_CASE("partitions: CIM object-path key extraction", "[disk_actions_partitions]") {
-    using dp::detail::path_key_value;
+    using dp::impl::path_key_value;
     CHECK(path_key_value(R"(\\H\root\cimv2:Win32_LogicalDisk.DeviceID="C:")", "DeviceID") == "C:");
     CHECK(path_key_value(R"(x:Y.DeviceID="Disk #0, Partition #1")", "DeviceID") ==
           "Disk #0, Partition #1");
@@ -304,7 +337,7 @@ TEST_CASE("partitions: CIM object-path key extraction", "[disk_actions_partition
 }
 
 TEST_CASE("partitions: drive-letter validation", "[disk_actions_partitions]") {
-    using dp::detail::drive_letter_mount;
+    using dp::impl::drive_letter_mount;
     CHECK(drive_letter_mount("C:") == "C:\\");
     CHECK(drive_letter_mount("d:") == "D:\\");
     CHECK_FALSE(drive_letter_mount("C").has_value());
@@ -312,4 +345,83 @@ TEST_CASE("partitions: drive-letter validation", "[disk_actions_partitions]") {
     CHECK_FALSE(drive_letter_mount("1:").has_value());
     CHECK_FALSE(drive_letter_mount("").has_value());
     CHECK_FALSE(drive_letter_mount("CC:").has_value());
+}
+
+TEST_CASE("partitions: ties on (disk, index) sort the same whatever the enumeration order",
+          "[disk_actions_partitions]") {
+    auto a = part("0", "1", "100", "GPT: Basic Data", "Disk #0, Partition #1");
+    auto b = part("0", "1", "200", "GPT: Basic Data", "Disk #0, Partition #1 (dup)");
+    const auto fwd = dp::build_report(ok({a, b}), ok({}));
+    const auto rev = dp::build_report(ok({b, a}), ok({}));
+    CHECK(fwd.data_rows == rev.data_rows);
+}
+
+TEST_CASE("partitions: an unusable Size is '-' and a missing DiskIndex skips the row",
+          "[disk_actions_partitions]") {
+    SECTION("past uint64 and non-numeric sizes render '-', not a wrapped number") {
+        const auto rep = dp::build_report(
+            ok({part("0", "0", "18446744073709551616", "t", "Disk #0, Partition #0"),
+                part("0", "1", "12abc", "t", "Disk #0, Partition #1")}),
+            ok({}));
+        REQUIRE(rep.data_rows.size() == 2);
+        CHECK(cols(rep.data_rows[0])[3] == "-");
+        CHECK(cols(rep.data_rows[1])[3] == "-");
+    }
+    SECTION("Index without DiskIndex cannot be named") {
+        dp::Row r{{"Index", "0"}, {"Size", "5"}, {"DeviceID", "Disk #?, Partition #0"}};
+        const auto rep = dp::build_report(ok({r}), ok({}));
+        CHECK(rep.data_rows.empty());
+        CHECK(rep.level == dp::Level::Constrained);
+    }
+}
+
+TEST_CASE("partitions: one drive letter on two partitions is reported on both",
+          "[disk_actions_partitions]") {
+    // A spanned or mirrored volume can be associated with more than one partition.
+    const auto rep = dp::build_report(
+        ok({part("0", "0", "1", "t", "Disk #0, Partition #0"),
+            part("1", "0", "1", "t", "Disk #1, Partition #0")}),
+        ok({assoc("Disk #0, Partition #0", "D:"), assoc("Disk #1, Partition #0", "D:")}));
+    REQUIRE(rep.data_rows.size() == 2);
+    CHECK(cols(rep.data_rows[0])[5] == "D:/");
+    CHECK(cols(rep.data_rows[1])[5] == "D:/");
+}
+
+TEST_CASE("partitions: the Level -> typed result status mapping", "[disk_actions_partitions]") {
+    using dp::Level;
+    // A clean read declares NOTHING: the agent derives OK with an empty provenance (as smart and
+    // volumes do), so the stored section carries no reason and no FULL-completeness claim.
+    CHECK_FALSE(dp::typed_status(Level::Ok).declare);
+    CHECK(dp::typed_status(Level::Ok).status == YUZU_RESULT_STATUS_UNDECLARED);
+
+    const auto c = dp::typed_status(Level::Constrained);
+    CHECK(c.declare);
+    CHECK(c.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(c.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+
+    const auto d = dp::typed_status(Level::Denied);
+    CHECK(d.declare);
+    CHECK(d.status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+    CHECK(d.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+
+    const auto u = dp::typed_status(Level::Unavailable);
+    CHECK(u.declare);
+    CHECK(u.status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(u.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+}
+
+TEST_CASE("partitions: path_key_value only matches on a key boundary", "[disk_actions_partitions]") {
+    using dp::impl::path_key_value;
+    CHECK_FALSE(path_key_value(R"(x:Y.XDeviceID="C:")", "DeviceID").has_value());
+    CHECK(path_key_value(R"(x:Y.Name="n",DeviceID="C:")", "DeviceID") == "C:");
+    CHECK(path_key_value(R"(DeviceID="C:")", "DeviceID") == "C:");
+    // A later boundary match is still found after an earlier non-boundary one.
+    CHECK(path_key_value(R"(x:Y.XDeviceID="no",DeviceID="yes")", "DeviceID") == "yes");
+}
+
+TEST_CASE("partitions: a non-ASCII byte is never a drive letter", "[disk_actions_partitions]") {
+    using dp::impl::drive_letter_mount;
+    CHECK_FALSE(drive_letter_mount(std::string{"\xE9:"}).has_value());
+    CHECK_FALSE(drive_letter_mount(std::string{"\xC3:"}).has_value());
+    CHECK(drive_letter_mount("z:") == "Z:\\");
 }

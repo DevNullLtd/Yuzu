@@ -481,6 +481,9 @@ TEST_CASE("disk_actions plugin: partitions and topology answer one typed planned
 
 #if defined(_WIN32)
 // H.5b: the real leg, against this host's WMI. Shapes only -- the values are the machine's.
+// Host requirement: a Windows host that booted from a disk, so WMI answers with at least one
+// partition. A container runner with no storage WMI fails REQUIRE below, deliberately: the leg
+// reports `constrained` (windows:partitions:no_rows) there and this test is not meant to pass.
 TEST_CASE("disk_actions plugin: Windows partitions answers a status row then 7-column partition rows",
           "[disk_actions][actions][windows_partitions]") {
     auto plugin = load_disk_actions_plugin();
@@ -497,8 +500,12 @@ TEST_CASE("disk_actions plugin: Windows partitions answers a status row then 7-c
     CHECK(rows[0].starts_with("status|partitions|"));
     CHECK(std::count_if(rows.begin(), rows.end(),
                         [](const std::string& r) { return r.starts_with("status|"); }) == 1);
-    CHECK((result.result_status == YUZU_RESULT_STATUS_OK ||
-           result.result_status == YUZU_RESULT_STATUS_CONSTRAINED));
+    // A clean read declares nothing (derived OK, empty provenance); anything else is CONSTRAINED
+    // here. The status row's word and the typed status must agree.
+    const bool clean = result.result_status == YUZU_RESULT_STATUS_OK ||
+                       result.result_status == YUZU_RESULT_STATUS_UNDECLARED;
+    CHECK((clean || result.result_status == YUZU_RESULT_STATUS_CONSTRAINED));
+    CHECK(rows[0].starts_with("status|partitions|supported|") == clean);
     // A Windows host that booted from a disk has a system partition.
     REQUIRE(rows.size() >= 2);
     bool saw_physical_drive = false;
@@ -509,12 +516,27 @@ TEST_CASE("disk_actions plugin: Windows partitions answers a status row then 7-c
         CHECK(f[0] == "partition");
         if (f[1].starts_with("PhysicalDrive"))
             saw_physical_drive = true;
-        CHECK(f[3] != "0"); // an unread size is "-", never a fabricated zero
+        // An unread size is "-", never a fabricated zero; a read one is all digits.
+        const bool digits = !f[3].empty() &&
+                            std::all_of(f[3].begin(), f[3].end(), [](char c) { return c >= '0' && c <= '9'; });
+        CHECK((digits ? f[3] != "0" : f[3] == "-"));
     }
     CHECK(saw_physical_drive);
-    // Deterministic: a second read is byte-identical (the daily-sync blob is hashed).
+    // Deterministic: a second read gives the same disk / partition / size / type columns (the
+    // daily-sync blob is hashed). The mount-point and detail columns are left out on purpose: a
+    // drive letter or VHD attached by a concurrent job on a shared runner may legitimately change
+    // them between the two reads.
     auto again = dispatcher.run(plugin->descriptor, "partitions");
-    CHECK(captured_rows(again.captured) == rows);
+    const auto rows2 = captured_rows(again.captured);
+    REQUIRE(rows2.size() == rows.size());
+    for (std::size_t i = 1; i < rows.size(); ++i) {
+        const auto a = split_fields_escape_aware(rows[i]);
+        const auto b = split_fields_escape_aware(rows2[i]);
+        REQUIRE(a.size() == 7);
+        REQUIRE(b.size() == 7);
+        for (std::size_t c = 0; c < 5; ++c)
+            CHECK(a[c] == b[c]);
+    }
 }
 #endif // _WIN32
 

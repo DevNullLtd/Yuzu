@@ -24,25 +24,34 @@
  *                 comma-separated, in the spelling `volumes` uses ("C:/" after
  *                 safe_output_field folds the backslash), or "-" for none. A folder mount point
  *                 is NOT visible through this class (README caveat).
- *   detail        a fixed token, never free text: "wmi", or "wmi,mount_points_unread" when the
- *                 association query failed so a "-" in mount_points means UNKNOWN, not none.
+ *   detail        a fixed token, never free text: "wmi"; "wmi,mount_points_unread" when the
+ *                 association query failed (every "-" means UNKNOWN, not none); or
+ *                 "wmi,mount_points_partial" on a row left unmatched by an association query
+ *                 that returned a row it could not use, or hit its row cap (that "-" is UNKNOWN
+ *                 too).
  *
  * KNOWN GAP, MEASURED: Win32_DiskPartition does not list the 16 MiB Microsoft Reserved
  * partition (a GPT disk shows one fewer partition than MSFT_Partition). The section is therefore
  * the partitions Windows exposes through Win32_DiskPartition, not a byte-exact map of the disk.
  *
  * OUTCOME CONTRACT (the same four levels as the hardware estate legs; rc is 0 for every one)
- *   supported / OK      both queries answered cleanly; zero rows means WMI reported no partitions.
+ *   supported / OK      both queries answered cleanly and returned at least one partition.
  *   constrained         a partial read: a row or an association the parser could not use, a row
- *                       cap, or the association query failed (the partitions are kept, their
- *                       mount points are unknown and say so).
+ *                       cap, the association query failed (the partitions are kept, their mount
+ *                       points are unknown and say so), or a clean read that returned NO
+ *                       partitions (a booted Windows host always has one, so an empty answer is a
+ *                       provider fault, not "no partitions": `windows:partitions:no_rows`).
  *   denied              the partition query was refused; no rows.
- *   unavailable         the class or namespace does not exist; no rows.
+ *   unavailable         the class or namespace is reported missing; no rows. On a stock Windows
+ *                       host this means a damaged WMI repository, not an OS that cannot answer
+ *                       (the same limit firmware_posture documents, #4900).
  * A failed read is never rendered as an empty success, and a "-" mount point never stands for a
  * failed join.
  *
- * Determinism: rows are sorted by (disk, partition index), because the daily-sync blob is hashed
- * and an enumeration-order change must not read as a changed device.
+ * Determinism: rows are sorted by (disk, partition index, then DeviceID, size, type) so the
+ * output is a pure function of the data. The daily-sync writer re-sorts the wire rows itself
+ * (sync_source_device_ci.cpp), so this ordering is what makes the plugin's own output stable and
+ * testable, not what protects the hashed blob.
  */
 #pragma once
 
@@ -50,9 +59,10 @@
 
 #include <constraint_accumulator.hpp>
 #include <inventory_status_row.hpp>
+#include <wmi_error_token.hpp>
 
 #include <algorithm>
-#include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -60,6 +70,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace yuzu::disk_actions::partitions {
@@ -67,14 +78,41 @@ namespace yuzu::disk_actions::partitions {
 /// One WMI row: property name -> value rendered as text (the shape wmi_bounded.hpp returns).
 using Row = std::map<std::string, std::string>;
 
-/// What one bounded query produced. `error` is the helper's token (empty on success).
+/// What one bounded query produced. `error` is the helper's token (empty on success);
+/// `rows_before_error` is the helper's count of rows read before that failure (the shared
+/// classifier needs it to tell a missing class from a fault after data came back).
 struct QueryOutcome {
     std::vector<Row> rows;
     std::string error;
     bool truncated = false;
+    std::size_t rows_before_error = 0;
 };
 
 enum class Level { Ok, Constrained, Denied, Unavailable };
+
+/// The typed result status a Level maps to. `declare` is false for Ok: a clean read leaves the
+/// status UNDECLARED so the agent derives OK with an empty provenance, exactly as `smart` and
+/// `volumes` do -- an explicit OK/FULL would store a clean section with a reason, and FULL would
+/// assert a completeness the descriptor (CONSTRAINED) says this class cannot give.
+struct TypedStatus {
+    bool declare = false;
+    int status = YUZU_RESULT_STATUS_UNDECLARED;
+    int completeness = YUZU_RESULT_COMPLETENESS_UNKNOWN;
+};
+
+[[nodiscard]] constexpr TypedStatus typed_status(Level level) noexcept {
+    switch (level) {
+    case Level::Ok:
+        return {false, YUZU_RESULT_STATUS_UNDECLARED, YUZU_RESULT_COMPLETENESS_UNKNOWN};
+    case Level::Constrained:
+        return {true, YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL};
+    case Level::Denied:
+        return {true, YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_PARTIAL};
+    case Level::Unavailable:
+        return {true, YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL};
+    }
+    return {true, YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL};
+}
 
 struct Report {
     Level level = Level::Ok;
@@ -83,7 +121,7 @@ struct Report {
     std::vector<std::string> data_rows;  // `partition|...`, sorted
 };
 
-namespace detail {
+namespace impl {
 
 /// Strict unsigned decimal: digits only, no sign, no space, no overflow, non-empty.
 [[nodiscard]] inline std::optional<std::uint64_t> parse_u64(std::string_view s) noexcept {
@@ -101,65 +139,69 @@ namespace detail {
     return v;
 }
 
-[[nodiscard]] inline std::string lower(std::string_view s) {
-    std::string out(s);
-    std::transform(out.begin(), out.end(), out.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return out;
-}
-
-/// Classify a wmi_bounded.hpp error token. The HRESULT is rendered `0x........` by the helper.
-///   0x80041003 WBEM_E_ACCESS_DENIED, 0x80070005 E_ACCESSDENIED      -> Denied
-///   0x80041010 WBEM_E_INVALID_CLASS, 0x8004100e WBEM_E_INVALID_NAMESPACE -> Unavailable
-/// Everything else (timeout, transport, provider fault) is a failed read, never an absence.
-[[nodiscard]] inline Level classify_error(std::string_view token) {
-    const std::string t = lower(token);
-    const auto has = [&](std::string_view needle) { return t.find(needle) != std::string::npos; };
-    if (has("0x80041003") || has("0x80070005"))
+/// Classify a wmi_bounded.hpp error token with the SHARED stage-aware classifier
+/// (agents/shared/wmi_error_token.hpp, the one firmware_posture and app_control use), so there
+/// is a single WMI-token policy: a missing class counts as absent only at the stage and row
+/// count where that answer is believable, everything unrecognised is a failed read.
+[[nodiscard]] inline Level classify_error(std::string_view token, std::size_t rows_before_error) {
+    switch (yuzu::shared::wmi_token::classify_wmi_error_token(token, rows_before_error)) {
+    case yuzu::shared::wmi_token::WmiReadOutcome::denied:
         return Level::Denied;
-    if (has("0x80041010") || has("0x8004100e"))
+    case yuzu::shared::wmi_token::WmiReadOutcome::absent:
         return Level::Unavailable;
+    case yuzu::shared::wmi_token::WmiReadOutcome::ok:
+    case yuzu::shared::wmi_token::WmiReadOutcome::failed:
+        return Level::Constrained;
+    }
     return Level::Constrained;
 }
 
 /// Pull the quoted value of `key` out of a CIM object path:
 ///   \\HOST\root\cimv2:Win32_LogicalDisk.DeviceID="C:"      -> C:
 ///   \\HOST\root\cimv2:Win32_DiskPartition.DeviceID="Disk #0, Partition #1"
-/// CIM escapes `"` and `\` inside the quoted value with a backslash; both are undone here.
-/// nullopt for a missing key, an unterminated string or a dangling escape.
+/// The match is anchored to a key boundary (start of the string, or a preceding `.` or `,`), so
+/// `XDeviceID="..."` is not `DeviceID`. CIM escapes `"` and `\` inside the quoted value with a
+/// backslash; both are undone here. nullopt for a missing key, an unterminated string or a
+/// dangling escape.
 [[nodiscard]] inline std::optional<std::string> path_key_value(std::string_view path,
                                                                std::string_view key) {
     std::string needle(key);
     needle += "=\"";
-    const auto at = path.find(needle);
-    if (at == std::string_view::npos)
-        return std::nullopt;
-    std::string out;
-    for (std::size_t i = at + needle.size(); i < path.size(); ++i) {
-        const char c = path[i];
-        if (c == '"')
-            return out;
-        if (c == '\\') {
-            if (++i >= path.size())
-                return std::nullopt;
-            out += path[i];
+    for (std::size_t at = path.find(needle); at != std::string_view::npos;
+         at = path.find(needle, at + 1)) {
+        if (at != 0 && path[at - 1] != '.' && path[at - 1] != ',')
             continue;
+        std::string out;
+        for (std::size_t i = at + needle.size(); i < path.size(); ++i) {
+            const char c = path[i];
+            if (c == '"')
+                return out;
+            if (c == '\\') {
+                if (++i >= path.size())
+                    return std::nullopt;
+                out += path[i];
+                continue;
+            }
+            out += c;
         }
-        out += c;
+        return std::nullopt; // unterminated
     }
-    return std::nullopt; // unterminated
+    return std::nullopt;
 }
 
-/// "C:" (any case) -> "C:\" ; anything else nullopt. The trailing backslash is added so the
-/// spelling matches GetVolumePathNamesForVolumeNameW, which `volumes` emits.
+/// "C:" (ASCII letter, any case) -> "C:\" ; anything else nullopt. ASCII only, with no
+/// <cctype> call, so the answer cannot depend on the process locale. The trailing backslash is
+/// added so the spelling matches GetVolumePathNamesForVolumeNameW, which `volumes` emits.
 [[nodiscard]] inline std::optional<std::string> drive_letter_mount(std::string_view device_id) {
     if (device_id.size() != 2 || device_id[1] != ':')
         return std::nullopt;
-    const auto c = static_cast<unsigned char>(device_id[0]);
-    if (!std::isalpha(c))
+    const char c = device_id[0];
+    const bool upper = c >= 'A' && c <= 'Z';
+    const bool lower = c >= 'a' && c <= 'z';
+    if (!upper && !lower)
         return std::nullopt;
     std::string out;
-    out += static_cast<char>(std::toupper(c));
+    out += upper ? c : static_cast<char>(c - 'a' + 'A');
     out += ":\\";
     return out;
 }
@@ -177,51 +219,54 @@ struct Partition {
     std::string type;
 };
 
-} // namespace detail
+/// Fill `rep` from the accumulator and the level. Not a lambda: a captured-by-reference return
+/// would copy the Report.
+inline void finalize(Report& rep, const yuzu::shared::ConstraintAccumulator& acc, Level level) {
+    rep.level = level;
+    rep.reason = acc.reason();
+    // The three-word row vocabulary has no "refused": a denied read is `constrained` (the OS can
+    // answer, this account was not allowed to hear it) and only a source reported missing is
+    // `unsupported`. The typed result status carries the exact four-way answer.
+    const auto lv = level == Level::Ok
+                        ? yuzu::shared::StatusLevel::supported
+                        : (level == Level::Unavailable ? yuzu::shared::StatusLevel::unsupported
+                                                       : yuzu::shared::StatusLevel::constrained);
+    rep.status_row = yuzu::shared::format_status_row("partitions", lv, rep.reason);
+}
+
+} // namespace impl
 
 /// Build the status row and the sorted data rows. `links` is consulted only when `parts`
 /// succeeded; the Windows TU skips running it otherwise.
 [[nodiscard]] inline Report build_report(const QueryOutcome& parts, const QueryOutcome& links) {
     Report rep;
     yuzu::shared::ConstraintAccumulator acc;
-    const auto finish = [&](Level level) {
-        rep.level = level;
-        rep.reason = acc.reason();
-        // The three-word row vocabulary has no "refused": a denied read is `constrained` (the
-        // OS can answer, this account was not allowed to hear it) and only a source that does
-        // not exist is `unsupported`. The typed result status carries the exact four-way answer.
-        const auto lv = level == Level::Ok
-                            ? yuzu::shared::StatusLevel::supported
-                            : (level == Level::Unavailable ? yuzu::shared::StatusLevel::unsupported
-                                                           : yuzu::shared::StatusLevel::constrained);
-        rep.status_row = yuzu::shared::format_status_row("partitions", lv, rep.reason);
-        return rep;
-    };
 
     if (!parts.error.empty()) {
         // A failed query never keeps rows (wmi_bounded.hpp clears them); the level says why.
         acc.add_failure("windows:partitions:" + parts.error);
-        return finish(detail::classify_error(parts.error));
+        impl::finalize(rep, acc, impl::classify_error(parts.error, parts.rows_before_error));
+        return rep;
     }
 
     // ── partitions ──────────────────────────────────────────────────────────
-    std::vector<detail::Partition> list;
+    std::vector<impl::Partition> list;
     bool row_unparsed = false;
     for (const Row& r : parts.rows) {
-        const auto disk = detail::parse_u64(detail::field(r, "DiskIndex"));
-        const auto index = detail::parse_u64(detail::field(r, "Index"));
+        const auto disk = impl::parse_u64(impl::field(r, "DiskIndex"));
+        const auto index = impl::parse_u64(impl::field(r, "Index"));
         if (!disk || !index) {
             row_unparsed = true; // cannot name it, so it cannot be a row
             continue;
         }
-        detail::Partition p;
+        impl::Partition p;
         p.disk = *disk;
         p.index = *index;
-        p.device_id = detail::field(r, "DeviceID");
+        p.device_id = impl::field(r, "DeviceID");
         if (p.device_id.empty())
             p.device_id = "Disk #" + std::to_string(p.disk) + ", Partition #" + std::to_string(p.index);
-        p.size = detail::parse_u64(detail::field(r, "Size"));
-        p.type = detail::field(r, "Type");
+        p.size = impl::parse_u64(impl::field(r, "Size"));
+        p.type = impl::field(r, "Type");
         list.push_back(std::move(p));
     }
     if (row_unparsed)
@@ -230,40 +275,52 @@ struct Partition {
         acc.add_failure("windows:partitions:row_cap");
         acc.mark_incomplete();
     }
+    // A booted Windows host always has a system partition, so a clean answer with none is a
+    // provider fault (a damaged repository answering S_OK with nothing). An unparsable row is
+    // already reported above; this is the case where WMI returned nothing at all.
+    if (parts.rows.empty())
+        acc.add_failure("windows:partitions:no_rows");
 
     // ── drive letters ───────────────────────────────────────────────────────
     const bool links_ok = links.error.empty();
+    bool mounts_partial = false; // some association rows were unusable, or the query hit its cap
     std::map<std::string, std::set<std::string>> mounts; // partition DeviceID -> sorted letters
     if (!links_ok) {
         acc.add_failure("windows:partitions:mount_points:" + links.error);
     } else {
         bool link_unparsed = false;
         for (const Row& r : links.rows) {
-            const auto part = detail::path_key_value(detail::field(r, "Antecedent"), "DeviceID");
-            const auto disk = detail::path_key_value(detail::field(r, "Dependent"), "DeviceID");
-            const auto mount = disk ? detail::drive_letter_mount(*disk) : std::nullopt;
+            const auto part = impl::path_key_value(impl::field(r, "Antecedent"), "DeviceID");
+            const auto disk = impl::path_key_value(impl::field(r, "Dependent"), "DeviceID");
+            const auto mount = disk ? impl::drive_letter_mount(*disk) : std::nullopt;
             if (!part || !mount) {
                 link_unparsed = true;
                 continue;
             }
             mounts[*part].insert(*mount);
         }
-        if (link_unparsed)
+        if (link_unparsed) {
             acc.add_failure("windows:partitions:mount_points:link_unparsed");
+            mounts_partial = true;
+        }
         if (links.truncated) {
             acc.add_failure("windows:partitions:mount_points:row_cap");
             acc.mark_incomplete();
+            mounts_partial = true;
         }
     }
 
-    std::sort(list.begin(), list.end(), [](const detail::Partition& a, const detail::Partition& b) {
-        return a.disk != b.disk ? a.disk < b.disk : a.index < b.index;
+    std::sort(list.begin(), list.end(), [](const impl::Partition& a, const impl::Partition& b) {
+        return std::tie(a.disk, a.index, a.device_id, a.size, a.type) <
+               std::tie(b.disk, b.index, b.device_id, b.size, b.type);
     });
 
-    for (const detail::Partition& p : list) {
+    for (const impl::Partition& p : list) {
         std::string mount_points = "-";
+        bool matched = false;
         if (links_ok) {
             if (const auto it = mounts.find(p.device_id); it != mounts.end()) {
+                matched = true;
                 mount_points.clear();
                 for (const std::string& m : it->second) {
                     if (!mount_points.empty())
@@ -283,11 +340,17 @@ struct Partition {
         row += '|';
         row += yuzu::util::safe_output_field(mount_points);
         row += '|';
-        row += links_ok ? "wmi" : "wmi,mount_points_unread";
+        if (!links_ok)
+            row += "wmi,mount_points_unread";
+        else if (mounts_partial && !matched)
+            row += "wmi,mount_points_partial"; // this "-" may be a row we could not read
+        else
+            row += "wmi";
         rep.data_rows.push_back(std::move(row));
     }
 
-    return finish(acc.any_failure() || acc.incomplete() ? Level::Constrained : Level::Ok);
+    impl::finalize(rep, acc, acc.any_failure() || acc.incomplete() ? Level::Constrained : Level::Ok);
+    return rep;
 }
 
 } // namespace yuzu::disk_actions::partitions
