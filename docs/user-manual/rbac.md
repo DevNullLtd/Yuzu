@@ -150,7 +150,7 @@ Recommended order for a fresh install:
 > could not be stored. Nothing was created. Retry once the audit store recovers.", and creates
 > nothing. Because that write can wait on the audit store, the session, `ManagementGroup:Write`
 > and the visible agent set are decided again after it: a session that is gone answers `401`, a
-> withdrawn `ManagementGroup:Write` grant `403`, and a visible set that no longer holds any matched
+> withdrawn `ManagementGroup:Write` grant the permission gate's refusal (normally `403`), and a visible set that no longer holds any matched
 > agent the `422` above; each creates nothing and records `group.create_from_results` `failure`
 > (`session_revoked`, `permission_revoked`, `scope_revoked`).
 >

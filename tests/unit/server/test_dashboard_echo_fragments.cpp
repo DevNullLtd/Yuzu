@@ -1156,7 +1156,7 @@ TEST_CASE("fragment purge/reenable audit (#3619 UP-5): the route permission revo
             CHECK(h.perms[1].op == (purge ? "Delete" : "Execute"));
             CHECK(h.audits_for(action, "attempted") == 1);
             REQUIRE(h.audits_for(action, "failure") == 1);
-            CHECK(h.audit_detail(action, "failure") == "permission_revoked source=process");
+            CHECK(h.audit_detail(action, "failure") == "permission_revoked device=dev-A source=process");
             CHECK(h.audits_for(action, "success") == 0);
             const std::string metric =
                 purge ? "yuzu_echo_source_purge_total" : "yuzu_echo_source_reenable_total";
