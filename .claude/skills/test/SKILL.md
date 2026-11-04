@@ -57,6 +57,7 @@ Everything else (Phase 0 preflight, Phase 1 C++ + Erlang build, Phase 4 native s
 
 ```
 Phase 0 — Preflight             (toolchains, ports, disk, docker, init DB)
+Phase 0b — Browser tooling      (default/--full: npm ci + Chrome for Testing, proven to launch)
 Phase 1 — Build HEAD            (meson + rebar3 + docker build local :test images)
 Phase 2 — Upgrade Test          (latest release → HEAD: fixtures, migrate, verify)
 Phase 3 — OTA Agent Test        (--full only — Linux + Windows self-exec)
@@ -146,6 +147,34 @@ bash scripts/test/test-db-write.sh gate \
     --status "$PRE_STATUS" --duration "$PREFLIGHT_DUR"
 [[ "$PRE_STATUS" == "FAIL" ]] && { bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED; exit 1; }
 ```
+
+### Phase 0b — Browser tooling (default and `--full`; skipped in `--quick`, which has no live stack)
+
+The two headless-browser gates in Phase 5 need Node dependencies and a Chrome for Testing binary
+that are not committed. `/test` installs them rather than skipping the gates: a gate that skips for
+want of a one-line install silently stops protecting the dashboard. The script is idempotent (a
+ready box only verifies), and it proves the browser LAUNCHES headless, not merely that a file exists.
+
+```bash
+if [[ "$MODE" != "quick" ]]; then
+    PPTR_START=$(date +%s)
+    bash scripts/test/ensure-puppeteer.sh > "$LOG_DIR/ensure-puppeteer.log" 2>&1 \
+        && PPTR_STATUS=PASS || PPTR_STATUS=FAIL
+    bash scripts/test/test-db-write.sh gate \
+        --run-id "$RUN_ID" --phase 0 --gate "Puppeteer install" \
+        --status "$PPTR_STATUS" --duration $(( $(date +%s) - PPTR_START )) \
+        --log "ensure-puppeteer.log"
+    if [[ "$PPTR_STATUS" == "FAIL" ]]; then
+        cat "$LOG_DIR/ensure-puppeteer.log"
+        bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED
+        exit 1
+    fi
+fi
+```
+
+**On failure**: stop, like preflight. The log's last line says what to do (no Node, no network to the
+npm registry, a missing shared library for Chrome). An offline box can point
+`PUPPETEER_EXECUTABLE_PATH` at an existing Chrome for Testing binary.
 
 ## Phase 1 — Build HEAD
 
@@ -468,16 +497,16 @@ gate_run "Synthetic UAT" "synthetic-uat.log" \
         --gateway-metrics http://localhost:9568 \
         --run-id $RUN_ID --gate-name phase5-synthetic-uat"
 
-# Puppeteer is warn-only — flaky on first run. Its npm dependency is never installed by
-# the pipeline (tests/puppeteer/node_modules is gitignored), so a missing install is
-# recorded as SKIP with the fix, not as a permanent WARN; a WARN means it ran and failed.
+# Puppeteer is warn-only — flaky on first run. Phase 0b installs its dependencies and browser
+# (tests/puppeteer/node_modules is gitignored), so a missing install here means that step was
+# bypassed: record FAIL, never SKIP. A WARN means it ran and failed.
 (
     start=$(date +%s)
     if [[ ! -d tests/puppeteer/node_modules/puppeteer ]]; then
         bash scripts/test/test-db-write.sh gate \
             --run-id "$RUN_ID" --phase 5 --gate "Puppeteer" \
-            --status SKIP --duration 0 \
-            --notes "puppeteer not installed; run: (cd tests/puppeteer && npm ci)"
+            --status FAIL --duration 0 \
+            --notes "puppeteer not installed; Phase 0b should have run: bash scripts/test/ensure-puppeteer.sh"
     else
         if node tests/puppeteer/dashboard-help-test.mjs > "$LOG_DIR/puppeteer.log" 2>&1; then
             STATUS=PASS
@@ -495,13 +524,13 @@ gate_run "Synthetic UAT" "synthetic-uat.log" \
 # the script is deterministic (no sleeps; stubbed writes, nothing reaches the stack). It
 # first runs --selftest (a local fixture, no stack: proves each crawl/overflow check can
 # fail; a failing selftest fails the gate), then crawls the shell nav (200 + CSP + no page
-# errors), checks submit-control bounds and runs the stubbed write scenarios. Same SKIP
-# when puppeteer is not installed.
+# errors), checks submit-control bounds and runs the stubbed write scenarios. Phase 0b installs
+# puppeteer; if it is still absent here that step was bypassed, so FAIL rather than SKIP.
 if [[ ! -d tests/puppeteer/node_modules/puppeteer ]]; then
     bash scripts/test/test-db-write.sh gate \
         --run-id "$RUN_ID" --phase 5 --gate "Browser smoke" \
-        --status SKIP --duration 0 \
-        --notes "puppeteer not installed; run: (cd tests/puppeteer && npm ci)" &
+        --status FAIL --duration 0 \
+        --notes "puppeteer not installed; Phase 0b should have run: bash scripts/test/ensure-puppeteer.sh" &
 else
     gate_run "Browser smoke" "browser-smoke.log" \
         "node tests/puppeteer/ui-smoke.mjs --selftest && node tests/puppeteer/ui-smoke.mjs"

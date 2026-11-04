@@ -11,11 +11,15 @@ Headless-browser checks against a running Yuzu dashboard.
 ## Install
 
 ```bash
-(cd tests/puppeteer && npm ci)
+bash scripts/test/ensure-puppeteer.sh
 ```
 
-`node_modules` is not committed and `/test` never installs it: without it the gate records SKIP.
-If the browser download is skipped, point `PUPPETEER_EXECUTABLE_PATH` at a Chrome for Testing binary.
+`node_modules` and the browser are not committed. `/test` runs this script itself (Phase 0b, default
+and `--full` modes) and aborts the run if it cannot finish, so the gates never skip for a missing
+install. It is idempotent: on a ready machine it only verifies, including that Chrome launches
+headless. By hand it is the same as `(cd tests/puppeteer && npm ci)` plus
+`npx puppeteer browsers install chrome`. On a box with no route to the download, point
+`PUPPETEER_EXECUTABLE_PATH` at a Chrome for Testing binary.
 
 ## Run
 
@@ -58,8 +62,7 @@ runs it before the live run, and a selftest failure fails the gate. Add a case w
 It does not check: WebGL scenes (the Fleet and Host maps), non-administrator roles, a write that
 really reaches the server, or any route the shell does not link to. The nav list it compares
 against is hand-copied, so a new nav entry fails the smoke until `EXPECTED` is edited. Needs
-Node 22.12 or newer (the pinned `puppeteer` requires it); run `(cd tests/puppeteer && npm ci)`
-once.
+Node 22.12 or newer (the pinned `puppeteer` requires it); `scripts/test/ensure-puppeteer.sh` checks it.
 
 ## Writing a scenario
 

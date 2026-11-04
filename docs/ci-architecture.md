@@ -188,8 +188,10 @@ and runs four scenarios (stubbed where they write: those requests are answered i
 so nothing reaches the server). The gate first runs
 `ui-smoke.mjs --selftest`, which checks against a local fixture (no stack) that each crawl and
 layout check fails when it should; a selftest failure fails the gate. A failure records FAIL (the
-older `Puppeteer` gate is warn-only); a missing `tests/puppeteer/node_modules/puppeteer`
-records SKIP with the `npm ci` hint. Shared mechanics are in `tests/puppeteer/lib/harness.mjs`;
+older `Puppeteer` gate is warn-only). `/test` Phase 0b runs `scripts/test/ensure-puppeteer.sh`,
+which installs the Node dependencies and Chrome for Testing when absent and proves the browser
+launches headless; if it cannot, the run aborts before the build. A missing
+`tests/puppeteer/node_modules/puppeteer` at Phase 5 records FAIL, never SKIP. Shared mechanics are in `tests/puppeteer/lib/harness.mjs`;
 `tests/puppeteer/README.md` covers running it by hand.
 
 ### Release re-publish guard (`release-guard`, #5282)
