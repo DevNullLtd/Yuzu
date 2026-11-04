@@ -49,6 +49,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <optional>
@@ -124,6 +125,11 @@ struct FragmentHarness {
     std::vector<DispatchCall> calls;
     std::vector<AuditRow> audits;
     std::vector<PermCall> perms;
+    /// #3619: "audit:<action>/<result>" and "dispatch", in call order — proves an `attempted`
+    /// row precedes the dispatch it covers.
+    std::vector<std::string> order;
+    /// #3619: whether the audit store persists a given row (read live per row). Default: all do.
+    std::function<bool(const AuditRow&)> audit_persists{[](const AuditRow&) { return true; }};
     bool perm_allow{true}; ///< perm_fn verdict (false → handler's 403 path)
     bool auth_ok{true};    ///< auth_fn verdict (false → handler returns early)
     std::string auth_source{"local"}; ///< resolved session source; "local" = a cookie session
@@ -177,17 +183,25 @@ struct FragmentHarness {
                 res.status = 403;
             return perm_allow;
         };
+        // ONE recording sink behind both callbacks, as production wires ONE `audit_log` behind
+        // `audit_fn` and `set_persist_audit_fn` (server.cpp); each returns the store's verdict.
         auto audit_fn = [this](const httplib::Request&, const std::string& a,
                                const std::string& r, const std::string& tt,
                                const std::string& tid, const std::string& d) {
-            audits.push_back({a, r, tt, tid, d});
+            order.push_back("audit:" + a + "/" + r);
+            AuditRow row{a, r, tt, tid, d};
+            const bool ok = audit_persists(row);
+            audits.push_back(std::move(row));
+            return ok;
         };
+        routes.set_persist_audit_fn(audit_fn);
         DashboardRoutes::DispatchFn dispatch =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& ids, const std::string& scope,
                    const std::unordered_map<std::string, std::string>& params,
                    const yuzu::server::DispatchCaller& caller)
             -> yuzu::server::ConfinedDispatchOutcome {
+            order.push_back("dispatch");
             calls.push_back({plugin, action, scope, ids, params, caller.exec_visible, caller});
             return {.sent = dispatch_sent,
                     .command_id = "cmd-" + std::to_string(calls.size()),
@@ -873,4 +887,120 @@ TEST_CASE("echo-execute REFUSES a supplied-but-empty scope even under a non-form
     REQUIRE(res->status == 200);
     CHECK(h.calls.empty());
     CHECK(res->body.find("No target selected") != std::string::npos);
+}
+
+// ── (#3619) Audit-failure posture (ADR-0033 §9: no audit row, no mutation) ──
+//
+// Re-enable and purge change a device's capture state (purge is Destructive), so each writes an
+// `attempted` row BEFORE the dispatch and refuses with nothing sent when that row is not
+// persisted. Their outcome and refusal rows, and the read-class Echo SQL send, proceed and mark
+// the response `Sec-Audit-Failed: true` instead.
+
+namespace {
+/// The two Echo mutations, each with its fragment path and audit verb.
+constexpr std::pair<const char*, const char*> kEchoMutations[] = {
+    {kPurgePath, "echo.source.purge"}, {kReenablePath, "echo.source.reenable"}};
+
+std::function<bool(const AuditRow&)> fail_only(std::string action, std::string result) {
+    return [action = std::move(action), result = std::move(result)](const AuditRow& r) {
+        return !(r.action == action && r.result == result);
+    };
+}
+} // namespace
+
+TEST_CASE("fragment purge/reenable audit: the attempted row is stored BEFORE the dispatch",
+          "[pg][server][echo][purge][reenable][fragment][audit][3619]") {
+    for (const auto& [path, action] : kEchoMutations) {
+        DYNAMIC_SECTION(action) {
+            FragmentHarness h;
+            auto res = h.post(path, "device_id=dev-A&source=process");
+            CHECK(res->status == 200);
+            const std::vector<std::string> expected{std::string("audit:") + action + "/attempted",
+                                                    "dispatch",
+                                                    std::string("audit:") + action + "/success"};
+            CHECK(h.order == expected);
+            CHECK(contains(h.audit_detail(action, "attempted"), "source=process"));
+            CHECK(contains(h.audit_detail(action, "attempted"), "device=dev-A"));
+            CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+        }
+    }
+}
+
+TEST_CASE("fragment purge/reenable audit: an attempted row the store does not persist sends "
+          "NOTHING",
+          "[pg][server][echo][purge][reenable][fragment][audit][security][3619]") {
+    for (const auto& [path, action] : kEchoMutations) {
+        DYNAMIC_SECTION(action) {
+            FragmentHarness h;
+            h.audit_persists = fail_only(action, "attempted");
+            auto res = h.post(path, "device_id=dev-A&source=process");
+            CHECK(res->status == 503);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            CHECK(contains(res->body, "audit_unavailable"));
+            CHECK(h.calls.empty()); // the security property
+            CHECK(h.audits_for(action, "success") == 0);
+        }
+    }
+}
+
+TEST_CASE("fragment purge/reenable audit: a refused request writes no attempted row",
+          "[pg][server][echo][purge][reenable][fragment][audit][3619]") {
+    for (const auto& [path, action] : kEchoMutations) {
+        DYNAMIC_SECTION(action) {
+            FragmentHarness h;
+            CHECK(h.post(path, "device_id=dev-A&source=not-a-source")->status == 400);
+            CHECK(h.post(path, "device_id=dev-Z&source=process")->status == 404); // out of scope
+            h.perm_allow = false;
+            CHECK(h.post(path, "device_id=dev-A&source=process")->status == 403);
+            CHECK(h.audits_for(action, "attempted") == 0);
+            CHECK(h.calls.empty());
+        }
+    }
+}
+
+TEST_CASE("fragment purge/reenable audit: a success row that is not persisted keeps the 200 and "
+          "is flagged on the response",
+          "[pg][server][echo][purge][reenable][fragment][audit][3619]") {
+    for (const auto& [path, action] : kEchoMutations) {
+        DYNAMIC_SECTION(action) {
+            FragmentHarness h;
+            h.audit_persists = fail_only(action, "success");
+            auto res = h.post(path, "device_id=dev-A&source=process");
+            CHECK(res->status == 200);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            CHECK(h.calls.size() == 1);
+            CHECK(h.audits_for(action, "attempted") == 1);
+        }
+    }
+}
+
+TEST_CASE("fragment purge/reenable audit: refusal rows that are not persisted keep the refusal "
+          "and are flagged on the response",
+          "[pg][server][echo][purge][reenable][fragment][audit][3619]") {
+    for (const auto& [path, action] : kEchoMutations) {
+        DYNAMIC_SECTION(action) {
+            FragmentHarness h;
+            h.audit_persists = [](const AuditRow&) { return false; };
+            h.perm_allow = false;
+            auto denied = h.post(path, "device_id=dev-A&source=process");
+            CHECK(denied->status == 403);
+            CHECK(denied->get_header_value("Sec-Audit-Failed") == "true");
+
+            h.perm_allow = true;
+            auto out_of_scope = h.post(path, "device_id=dev-Z&source=process");
+            CHECK(out_of_scope->status == 404);
+            CHECK(out_of_scope->get_header_value("Sec-Audit-Failed") == "true");
+            CHECK(h.calls.empty());
+        }
+    }
+}
+
+TEST_CASE("echo-execute audit: a success row that is not persisted keeps the 200 and is flagged",
+          "[server][dashboard][echo-execute][audit][3619]") {
+    FragmentHarness h;
+    h.audit_persists = fail_only("echo.sql", "success");
+    auto res = h.post("/api/dashboard/echo-execute", "sql=SELECT+1");
+    CHECK(res->status == 200);
+    CHECK(h.calls.size() == 1);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
 }

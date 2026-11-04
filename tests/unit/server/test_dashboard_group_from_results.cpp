@@ -56,6 +56,7 @@
  */
 
 #include "agent_registry.hpp"
+#include "audit_store.hpp"
 #include "dashboard_routes.hpp"
 #include "event_bus.hpp"
 #include "management_group_store.hpp"
@@ -78,6 +79,8 @@
 
 #include "agent.pb.h"
 
+#include <ctime>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <optional>
@@ -161,6 +164,36 @@ std::string q_form_body(const std::string& group_name, const std::string& extra)
     return "group_name=" + group_name + "&command_id=" + kCommandId + "&plugin=" + kPlugin + extra;
 }
 
+/// Makes `add_member` fail for @p agent_id in this test's own cloned database.
+/// management_group_store.cpp's add_member INSERTs with `ON CONFLICT (group_id, agent_id) DO
+/// NOTHING`, so a duplicate row silently no-ops rather than erroring; a BEFORE INSERT trigger
+/// is the only store-level seam that produces a genuine add_member failure.
+void block_add_member_for(yuzu::test::ManagementGroupStorePg& bundle, const std::string& agent_id) {
+    PgConn conn{PQconnectdb(bundle.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    const std::string fn_sql =
+        "CREATE OR REPLACE FUNCTION management_group_store.block_agent_b() "
+        "RETURNS trigger AS $$ BEGIN IF NEW.agent_id = '" + agent_id + "' THEN "
+        "RAISE EXCEPTION 'test: forced add_member failure'; "
+        "END IF; RETURN NEW; END; $$ LANGUAGE plpgsql;";
+    PgResult fn_res{PQexec(conn.get(), fn_sql.c_str())};
+    REQUIRE(fn_res.ok());
+    PgResult trig_res{PQexec(
+        conn.get(),
+        "CREATE TRIGGER block_agent_b BEFORE INSERT ON "
+        "management_group_store.management_group_members "
+        "FOR EACH ROW EXECUTE FUNCTION management_group_store.block_agent_b();")};
+    REQUIRE(trig_res.ok());
+}
+
+// Same key and schema as test_plugin_result_audit.cpp's audit-only template (one migration run).
+yuzu::test::PgTestTemplate group_audit_tpl{"agentaudit", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("agentaudit template: store failed to migrate");
+}};
+
 struct GroupFromResultsHarness {
     // MEMBER ORDER IS LOAD-BEARING (mirrors FragmentHarness,
     // test_dashboard_echo_fragments.cpp:106-114): `sink` is declared AFTER
@@ -187,6 +220,19 @@ struct GroupFromResultsHarness {
     yuzu::server::test::TestRouteSink sink;
 
     std::vector<AuditRow> audits;
+
+    /// #3619: whether the audit store persists a given row. Read live per row, so a case can
+    /// fail exactly one (action, result) and leave the rest stored. Default: every row persists.
+    std::function<bool(const AuditRow&)> audit_persists{[](const AuditRow&) { return true; }};
+    /// #3619: when set, every row is written to this REAL AuditStore and its persist outcome is
+    /// the store's own (the last step of production's AuthRoutes::audit_log), instead of
+    /// `audit_persists`. Lets a case assert the store's emit-failure counter, the value
+    /// published as yuzu_server_audit_emit_failed_total.
+    AuditStore* real_audit{nullptr};
+    /// #3619: whether `group_name_probe` already existed when the `attempted` row was written.
+    /// Proves the row precedes the mutation, not merely that both happened.
+    std::string group_name_probe;
+    std::optional<bool> group_existed_at_attempted;
 
     /// Live-read via `this` (same pattern as FragmentHarness::caller_fn) so a
     /// test can reassign it AFTER construction, before issuing a request.
@@ -277,11 +323,38 @@ struct GroupFromResultsHarness {
         };
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                           const std::string&) -> bool { return true; };
-        auto audit_fn = [this](const httplib::Request&, const std::string& a,
-                               const std::string& r, const std::string& tt,
-                               const std::string& tid, const std::string& d) {
-            audits.push_back({a, r, tt, tid, d});
+        // ONE recording sink behind both callbacks, as production wires ONE `audit_log` behind
+        // both (server.cpp): the persist-reporting `set_persist_audit_fn` sink the `attempted`
+        // row goes through, and `audit_fn` for the outcome, refusal and scope-drop rows. Each
+        // returns the store's verdict for that row (#3619).
+        auto record = [this](const std::string& a, const std::string& r, const std::string& tt,
+                             const std::string& tid, const std::string& d) -> bool {
+            AuditRow row{a, r, tt, tid, d};
+            if (r == "attempted" && !group_name_probe.empty())
+                group_existed_at_attempted = mg.find_group_by_name(group_name_probe).has_value();
+            bool ok = false;
+            if (real_audit) {
+                AuditEvent ev;
+                ev.timestamp = static_cast<std::int64_t>(std::time(nullptr));
+                ev.principal = kUser;
+                ev.action = a;
+                ev.result = r;
+                ev.target_type = tt;
+                ev.target_id = tid;
+                ev.detail = d;
+                ok = real_audit->log(ev);
+            } else {
+                ok = audit_persists(row);
+            }
+            audits.push_back(std::move(row));
+            return ok;
         };
+        auto audit_fn = [record](const httplib::Request&, const std::string& a,
+                                 const std::string& r, const std::string& tt,
+                                 const std::string& tid, const std::string& d) {
+            return record(a, r, tt, tid, d);
+        };
+        routes.set_persist_audit_fn(audit_fn);
 
         if (!csrf_trusted_origins.empty())
             routes.set_csrf_trusted_origins(std::move(csrf_trusted_origins));
@@ -660,30 +733,8 @@ TEST_CASE("group-from-results: an add_member partial failure is reported "
     // Default visible_set_fn (nullopt/unfiltered) — both agents match scope;
     // the failure under test is at add_member, not at confinement.
 
-    // management_group_store.cpp's add_member INSERTs with `ON CONFLICT
-    // (group_id, agent_id) DO NOTHING` — a duplicate-row precondition would
-    // silently no-op (PGRES_COMMAND_OK, 0 rows touched), not error. The only
-    // store-level seam that produces a genuine add_member failure is a
-    // BEFORE INSERT trigger, scoped to this test's own cloned database
-    // (ManagementGroupStorePg's ephemeral clone), that raises only for
-    // agent_id='agent-B'.
-    {
-        PgConn conn{PQconnectdb(h.mg_bundle.dsn().c_str())};
-        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
-        const std::string fn_sql =
-            "CREATE OR REPLACE FUNCTION management_group_store.block_agent_b() "
-            "RETURNS trigger AS $$ BEGIN IF NEW.agent_id = 'agent-B' THEN "
-            "RAISE EXCEPTION 'test: forced add_member failure for agent-B'; "
-            "END IF; RETURN NEW; END; $$ LANGUAGE plpgsql;";
-        PgResult fn_res{PQexec(conn.get(), fn_sql.c_str())};
-        REQUIRE(fn_res.ok());
-        PgResult trig_res{PQexec(
-            conn.get(),
-            "CREATE TRIGGER block_agent_b BEFORE INSERT ON "
-            "management_group_store.management_group_members "
-            "FOR EACH ROW EXECUTE FUNCTION management_group_store.block_agent_b();")};
-        REQUIRE(trig_res.ok());
-    }
+    // A trigger in this test's own cloned database (see block_add_member_for).
+    block_add_member_for(h.mg_bundle, "agent-B");
 
     auto res = h.post(GroupFromResultsHarness::form_body("partial-group"));
     CHECK(res->status == 500);
@@ -1393,4 +1444,187 @@ TEST_CASE("group-from-results: a Search term needs the results table's Response:
         REQUIRE(group.has_value());
         CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
     }
+}
+
+// ── (#3619) Audit-failure posture: no audit row, no mutation (ADR-0033 §9) ──
+//
+// Group materialisation is a mutation. Its `attempted` row is written BEFORE `create_group`, and a
+// row the store does not persist refuses the request with nothing created. Every other row this
+// route writes (the scope-drop `response.read`/denied row, the partial-failure row, the success
+// row) proceeds and marks the response `Sec-Audit-Failed: true`, so the caller can tell an
+// audited answer from an unaudited one.
+
+namespace {
+/// Fails exactly the rows matching (action, result); every other row persists.
+std::function<bool(const AuditRow&)> fail_only(std::string action, std::string result) {
+    return [action = std::move(action), result = std::move(result)](const AuditRow& r) {
+        return !(r.action == action && r.result == result);
+    };
+}
+} // namespace
+
+TEST_CASE("group-from-results audit: the attempted row is stored BEFORE the group is created",
+          "[pg][server][dashboard][group_from_results][audit][3619]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    h.group_name_probe = "attempted-first";
+
+    auto res = h.post(GroupFromResultsHarness::form_body("attempted-first"));
+    CHECK(res->status == 200);
+    REQUIRE(h.audits_for("group.create_from_results", "attempted") == 1);
+    REQUIRE(h.group_existed_at_attempted.has_value());
+    CHECK_FALSE(*h.group_existed_at_attempted);
+    CHECK(h.audits_for("group.create_from_results", "success") == 1);
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+}
+
+TEST_CASE("group-from-results audit: an attempted row the store does not persist creates NO group",
+          "[pg][server][dashboard][group_from_results][audit][security][3619]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
+    h.audit_persists = fail_only("group.create_from_results", "attempted");
+
+    auto res = h.post(GroupFromResultsHarness::form_body("unaudited-group"));
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    // The form is hx-swap="none": the toast is the operator's only signal.
+    CHECK(contains(res->get_header_value("HX-Trigger"), "Nothing was created"));
+    CHECK_FALSE(h.mg.find_group_by_name("unaudited-group").has_value());
+    CHECK(h.audits_for("group.create_from_results", "success") == 0);
+    CHECK(h.audits_for("group.create_from_results", "failure") == 0);
+}
+
+TEST_CASE("group-from-results audit: a refused request writes no attempted row",
+          "[pg][server][dashboard][group_from_results][audit][3619]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+
+    // A duplicate name, a set that matches nothing, a missing name, and a cross-site POST.
+    REQUIRE(h.post(GroupFromResultsHarness::form_body("dup"))->status == 200);
+    const int attempted_after_first = h.audits_for("group.create_from_results", "attempted");
+    CHECK(h.post(GroupFromResultsHarness::form_body("dup"))->status == 400);
+    CHECK(h.post("group_name=empty&command_id=" + std::string(kCommandId) + "&plugin=" + kPlugin +
+                 "&f_category=no-such-category")
+              ->status == 422);
+    CHECK(h.post("group_name=&command_id=" + std::string(kCommandId))->status == 400);
+    CHECK(h.post(GroupFromResultsHarness::form_body("xsite"),
+                 {{"Host", kHost}, {"Origin", "https://evil.example"}})
+              ->status == 403);
+    CHECK(h.audits_for("group.create_from_results", "attempted") == attempted_after_first);
+}
+
+TEST_CASE("group-from-results audit: a scope-drop row that is not persisted is flagged on the "
+          "response, and the narrowed group is still created",
+          "[pg][server][dashboard][group_from_results][audit][3619]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
+    h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{"agent-A"};
+    };
+    h.audit_persists = fail_only("response.read", "denied");
+
+    auto res = h.post(GroupFromResultsHarness::form_body("narrowed"));
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    REQUIRE(h.audits_for("response.read", "denied") == 1);
+    auto group = h.mg.find_group_by_name("narrowed");
+    REQUIRE(group.has_value());
+    CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
+}
+
+TEST_CASE("group-from-results audit: a success row that is not persisted keeps the 200 and is "
+          "flagged on the response",
+          "[pg][server][dashboard][group_from_results][audit][3619]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    h.audit_persists = fail_only("group.create_from_results", "success");
+
+    auto res = h.post(GroupFromResultsHarness::form_body("success-unrecorded"));
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.mg.find_group_by_name("success-unrecorded").has_value());
+    // The attempted row stands, so the trail reads "started, outcome unknown", never nothing.
+    CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
+}
+
+TEST_CASE("group-from-results audit: a partial add_member failure whose failure row is not "
+          "persisted keeps the 500 and is flagged on the response",
+          "[pg][server][dashboard][group_from_results][audit][add_member][3619]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
+    block_add_member_for(h.mg_bundle, "agent-B");
+    h.audit_persists = fail_only("group.create_from_results", "failure");
+
+    auto res = h.post(GroupFromResultsHarness::form_body("partial-unrecorded"));
+    CHECK(res->status == 500);
+    CHECK(contains(res->body, "1 of 2"));
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
+    CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
+}
+
+TEST_CASE("group-from-results audit: a REAL audit-store failure on the scope-drop row and on a "
+          "partial add_member failure is counted by the store and flagged on the response",
+          "[pg][server][dashboard][group_from_results][audit][add_member][3619]") {
+    // Criterion 2 of #3619: the failure is forced in the audit STORE (a Postgres trigger rejects
+    // exactly the two rows), concurrent with a scope drop and a partial add_member failure, and
+    // the assertion is the store's emit-failure counter -- the value /metrics publishes as
+    // yuzu_server_audit_emit_failed_total, which the shipped YuzuAuditPersistFailures alert reads.
+    YUZU_REQUIRE_PG_DB_TPL(adb, group_audit_tpl);
+    PgPool apool{{.conninfo = adb.dsn(), .size = 2}};
+    AuditStore store{apool};
+    REQUIRE(store.is_open());
+    {
+        PgConn conn{PQconnectdb(adb.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult fn_res{PQexec(
+            conn.get(),
+            "CREATE OR REPLACE FUNCTION audit_store.reject_3619() RETURNS trigger AS $$ BEGIN "
+            "IF (NEW.action = 'response.read' AND NEW.result = 'denied') OR "
+            "(NEW.action = 'group.create_from_results' AND NEW.result = 'failure') THEN "
+            "RAISE EXCEPTION 'test: forced audit write failure'; END IF; RETURN NEW; END; $$ "
+            "LANGUAGE plpgsql;")};
+        REQUIRE(fn_res.ok());
+        PgResult trig_res{PQexec(conn.get(),
+                                 "CREATE TRIGGER reject_3619 BEFORE INSERT ON "
+                                 "audit_store.audit_events FOR EACH ROW EXECUTE FUNCTION "
+                                 "audit_store.reject_3619();")};
+        REQUIRE(trig_res.ok());
+    }
+
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B", "agent-C"});
+    h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{"agent-A", "agent-B"}; // agent-C is dropped by scope
+    };
+    block_add_member_for(h.mg_bundle, "agent-B"); // agent-B fails to land
+    h.real_audit = &store;
+
+    const auto before = store.emit_failed_count();
+    auto res = h.post(GroupFromResultsHarness::form_body("store-fault"));
+
+    CHECK(res->status == 500);
+    CHECK(contains(res->body, "1 of 2"));
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    // Exactly the two rejected rows: the scope-drop row and the partial-failure row.
+    CHECK(store.emit_failed_count() - before == 2);
+
+    // The attempted row DID persist (the trigger passes it), so the trail reads "started,
+    // outcome unknown" rather than nothing; the two rejected rows are absent.
+    AuditQuery attempted;
+    attempted.action = "group.create_from_results";
+    const auto rows = store.query(attempted);
+    REQUIRE(rows.has_value());
+    int n_attempted = 0, n_failure = 0;
+    for (const auto& r : *rows) {
+        n_attempted += r.result == "attempted";
+        n_failure += r.result == "failure";
+    }
+    CHECK(n_attempted == 1);
+    CHECK(n_failure == 0);
+    AuditQuery dropped;
+    dropped.action = "response.read";
+    const auto drop_rows = store.query(dropped);
+    REQUIRE(drop_rows.has_value());
+    CHECK(drop_rows->empty());
 }

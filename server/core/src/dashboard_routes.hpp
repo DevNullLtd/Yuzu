@@ -72,7 +72,11 @@ public:
         const httplib::Request&, httplib::Response&)>;
     using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                       const std::string&, const std::string&)>;
-    using AuditFn = std::function<void(const httplib::Request&, const std::string&,
+    /// Writes one audit row; returns the persist outcome (true == stored, or audit-off).
+    /// #3619: `bool`, never `void` -- a void sink cannot tell a stored row from a lost one.
+    /// Handlers never call it directly: every row goes through `audit_attempted` or
+    /// `audit_or_flag` (pinned by tests/test_dashboard_audit_checked_lexical.py).
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string&,
                                        const std::string&, const std::string&,
                                        const std::string&, const std::string&)>;
 
@@ -171,11 +175,13 @@ public:
         csrf_trusted_origins_ = std::move(origins);
     }
 
-    /// ADR-0033 section 9 ("no audit row, no mutation") for the expression-targeted Send
-    /// (`scope_expression` on POST /api/dashboard/execute): the SAME audit sink as `AuditFn`
-    /// but returning the persist outcome, so the route can write an `attempted` row BEFORE
-    /// dispatch and refuse (503) when it is not stored. Unset = the expression path fails
-    /// CLOSED (503), never "dispatch without evidence". Set before `register_routes`.
+    /// ADR-0033 section 9 ("no audit row, no mutation"): the SAME audit sink as `AuditFn`, used
+    /// only for the `attempted` row a mutation writes BEFORE it acts (`audit_attempted`): every
+    /// console send on POST /api/dashboard/execute, POST /api/dashboard/group-from-results, and
+    /// the Echo re-enable and purge fragments (#3619; the expression-targeted send was first).
+    /// A separate setter because its UNSET contract differs from `AuditFn`'s: unset here means
+    /// those mutations fail CLOSED (503), never "act without evidence", whereas an empty
+    /// `AuditFn` is an audit-off deployment. Set before `register_routes`.
     using PersistAuditFn = std::function<bool(const httplib::Request&, const std::string&,
                                               const std::string&, const std::string&,
                                               const std::string&, const std::string&)>;
@@ -309,6 +315,28 @@ private:
     /// confined caller is admitted; their set is still cut to their visible scope by
     /// `keep_visible`. Filters-only requests do not call it (their path is unchanged).
     bool admit_search_read(const httplib::Request& req, httplib::Response& res) const;
+
+    /// #3619 / ADR-0033 section 9, "no audit row, no mutation": writes the `attempted` row
+    /// through `persist_audit_fn_` BEFORE a mutation (a console send, a group materialisation,
+    /// an Echo re-enable or purge). Call it after every refusal, so a rejected request burns no
+    /// row. When the row is not stored -- the store refused it, the sink threw, or the sink is
+    /// unwired (fail CLOSED) -- answers 503 with `Sec-Audit-Failed: true`, @p refusal_html as
+    /// the body and, when @p toast is non-null, an HX-Trigger toast (for hx-swap="none" forms,
+    /// which never show a body), and returns false: the caller returns without mutating.
+    [[nodiscard]] bool audit_attempted(const httplib::Request& req, httplib::Response& res,
+                                       const std::string& action, const std::string& target_type,
+                                       const std::string& target_id, const std::string& detail_text,
+                                       const std::string& refusal_html,
+                                       const char* toast = nullptr) const;
+
+    /// #3619: every other row (outcome, refusal, scope narrowing, read-class send). Writes it
+    /// through `audit_fn_` and, when it is not stored, marks the response
+    /// `Sec-Audit-Failed: true`. Never changes the status or body: the request's own answer
+    /// stands (set-and-proceed, the dashboard HTML posture in rest_audit.hpp).
+    void audit_or_flag(const httplib::Request& req, httplib::Response& res,
+                       const std::string& action, const std::string& result,
+                       const std::string& target_type, const std::string& target_id,
+                       const std::string& detail_text) const;
 
     std::vector<std::string> csrf_trusted_origins_;
     PersistAuditFn persist_audit_fn_;
