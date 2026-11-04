@@ -927,7 +927,8 @@ for a row not yet derived. The source decides it: `installed_apps.list_inventory
 `pkg_inventory.store_packages` → `store`; `windows_optional_features.list` →
 `optional_feature`; `msi_packages.list_inventory` → `msi`; `runtimes.python` → `runtime`;
 `middleware.ibm_mq` → `middleware`. A row with an empty source (a pre-tail agent) falls back by
-ecosystem: `msi`, `optional_feature`, `python` → `runtime`, `ibm_mq` → `middleware`, `snap` and
+ecosystem: `msi` → `msi`, `optional_feature` → `optional_feature`, `python` → `runtime`,
+`ibm_mq` → `middleware`, `snap` and
 `flatpak` → `store`, `brew`, `rpm`, `deb`, `apk`, `pacman` → `package_manager`, `windows`, `macos`,
 `macos_pkgutil` → `installer`, anything else `''`. `component` and `driver` are reserved for the
 component and drivers facets; no source maps to them yet. The table has a compile-time
