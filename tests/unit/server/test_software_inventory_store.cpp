@@ -1808,6 +1808,65 @@ TEST_CASE("delete_agent removes both the child rows and the parent state row",
     CHECK(other->empty());
 }
 
+namespace {
+// Holds the per-agent ingest advisory lock on its own pooled connection until destroyed (an
+// in-flight ingest on another replica).
+struct HeldIngestLock {
+    PgPool::Lease lease;
+    HeldIngestLock(PgPool& pool, const std::string& agent) : lease(pool.acquire()) {
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(
+                    lease.get(),
+                    "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || "
+                    "$1, 0))",
+                    std::vector<std::string>{agent})
+                    .status() == PGRES_TUPLES_OK);
+    }
+    void release() {
+        if (!std::exchange(held_, false))
+            return;
+        pg::exec_params(lease.get(), "ROLLBACK", std::vector<std::string>{});
+    }
+    ~HeldIngestLock() { release(); }
+
+private:
+    bool held_{true};
+};
+} // namespace
+
+TEST_CASE("delete_agent waits on the per-agent ingest lock, gives up inside its bound, and erases "
+          "once the lock is free",
+          "[pg][software_inventory]") {
+    // Without the lock, delete_agent would commit straight past an in-flight ingest and the
+    // ingest's rows would resurrect the device afterwards (a ghost). Held lock => the delete
+    // cannot commit and nothing is erased; released => it erases.
+    SWINV_SHARED(store, pool);
+
+    const std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", "2026-01-01"},
+                                             {"Firefox", "120", "Mozilla", ""}};
+    REQUIRE(store.apply_installed_software("agent-lock",
+                                           SoftwareInventoryStore::canonical_hash(rows), rows,
+                                           1000) == InventoryIngestOutcome::kStored);
+
+    HeldIngestLock held(pool, "agent-lock");
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_FALSE(store.delete_agent("agent-lock")); // lock_timeout, not an unbounded wait
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(9));
+    {
+        auto during = store.get_agent_software("agent-lock");
+        REQUIRE(during.has_value());
+        CHECK(during->size() == 2); // the failed delete rolled back: rows intact
+    }
+
+    held.release();
+    CHECK(store.delete_agent("agent-lock"));
+    auto after = store.get_agent_software("agent-lock");
+    REQUIRE(after.has_value());
+    CHECK(after->empty());
+}
+
 TEST_CASE("SoftwareInventoryStore catalogue + version aggregates", "[pg][software_inventory]") {
     // Gov F1: the /inventory dashboard's fleet aggregates (software_catalog /
     // software_versions) had no store-level coverage — the GROUP BY SQL, the

@@ -2536,8 +2536,23 @@ bool SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
     const std::string id{agent_id};
     // All three deletes in one transaction so an agent removal can't leave a parent
     // inventory_state row without its child rows (installed_software, software_facet_state), or
-    // vice versa (Gate 2 INFO).
+    // vice versa (Gate 2 INFO). They run under the SAME per-agent advisory lock both ingest paths
+    // take, so an in-flight ingest either commits first (and is erased here) or runs after the
+    // erase and re-creates its rows from its own report -- never a ghost device left behind by
+    // an ingest that straddled the delete. The wait is bounded (an operator action, but never an
+    // unbounded one): a report holding the lock past the bound fails this call and the
+    // decommission is simply re-issued.
     const bool committed = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult lt = pg::exec_params(c, "SET LOCAL lock_timeout = '5s'",
+                                          std::vector<std::string>{});
+        if (lt.status() != PGRES_COMMAND_OK)
+            return false;
+        pg::PgResult lk = pg::exec_params(
+            c,
+            "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || $1, 0))",
+            std::vector<std::string>{id});
+        if (lk.status() != PGRES_TUPLES_OK)
+            return false;
         pg::PgResult d1 = pg::exec_params(
             c, "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
             std::vector<std::string>{id});
