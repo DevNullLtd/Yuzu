@@ -1028,6 +1028,18 @@ test must reproduce the section hash, the report hash and the hash membership ru
 byte for byte, including that a facet whose status moves from `full` to a status-only status
 (for example `disabled`) leaves the report hash while its rows are kept.
 
+Three further facts belong to the agent change that sends v3. (1) The shipped
+`SyncScheduler::apply_ack` (`agents/core/src/sync_scheduler.cpp`) matches `need_full` by the
+exact source name, so the per-section token `installed_software:<facet>` reads as a clean sync:
+the scheduler must treat any `installed_software:*` token as a nack of the source, or a
+refused or delta section is never resent. (2) The server must be upgraded before that agent:
+an agent that sends v3 to a server without it is parsed as v2 and loops on a full resend on
+every cycle. (3) `ConstrainedPolicy::drop_source` (the 2026-10-29 Update) removes the source's
+rows on a constrained read under v2, because the full replace omits them; under v3 the same
+read is a status-only section and the rows are kept, so the writer must send `full` (honest
+empty) to retire a facet's rows and not a status. The first v3 report of a device also deletes
+all its v2 rows first, so it should carry `full` for every facet it holds.
+
 **Not in this change.** Delta apply and the `-` deletions; storage of component rows; the agent
 writer; any read surface returning the new columns (the existing reads select the old columns
 only; `find_by_purl` is a store method with no caller).

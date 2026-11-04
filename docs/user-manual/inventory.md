@@ -347,7 +347,33 @@ the agent side arrives in a later release. Operators can see the outcome of each
 `need_full`, `delta_unsupported`, `rejected` or `error`, and `facet` is the collector source
 (`unknown` for a name the server does not recognise). The existing
 `yuzu_inventory_ingest_total` keeps one outcome per report; a v3 report with any section asked for
-again counts as `need_full`.
+again counts as `need_full`. A blob the server cannot split into sections at all (see below) counts
+as `dropped` there, and a call whose transaction failed counts as `error` for every section of the
+call that was not refused (a refused section stays `rejected`).
+
+**Upgrade order, and what the shipped agent does with a per-section request.** Upgrade the server
+before any agent. The agent in this release does not understand the per-section request: it
+looks for its own source name in the acknowledgement's `need_full` list, and
+`installed_software:<source>` is not that name, so a per-section request reads to it as a clean
+sync until the agent release that sends v3 reads the new form. Nothing is lost today, because
+no shipped agent sends v3. One behaviour also changes with the format: when a collector that
+withholds its rows on a constrained read (the `drop_source` policy, for example
+`middleware.ibm_mq`) cannot answer, a v2 report replaces the device's rows without that
+source's, while a v3 report records a status-only section and keeps the previous rows.
+
+**When a section is refused.** `yuzu_inventory_section_ingest_total{outcome="rejected"}` counts a
+section that broke the blob v3 grammar, and the warn-level server log line "v3 section(s) ...
+refused" names the agent and the reason. The reason is one of `unknown_facet`, `duplicate_facet`,
+`unknown_status`, `rows_in_status_only`, `delete_in_full`, `wrong_record_for_facet`,
+`source_mismatch`, `unknown_record`, `bad_record`, `bad_row_hash`, `bad_version_source`, `row_cap`,
+`nul_byte` or `unterminated`. The agent resends the same bytes, so a refusal never clears on its
+own, and the refused facet keeps its previous rows and section hash (its rows go stale; nothing is
+deleted) until the agent is fixed. `facet="unknown"` on the counter means the server does not
+recognise the name: that is almost always an agent newer than the server, so upgrade the server
+first rather than fixing the agent. A blob that cannot be attributed to sections at all (a record
+before any section, a header with no section, an unusable section header, more than 32 sections,
+or over 3 MiB) is counted `dropped`, logged as "unusable v3 ... blob", and asked for again by the
+whole source name.
 
 ## How the sync behaves (and why it's quiet on the network)
 
@@ -1157,15 +1183,17 @@ Shipped alert rules live in the `yuzu-inventory` group of
 `docs/prometheus/yuzu-alerts.yml`: `YuzuInventorySustainedIngestErrors` (a non-zero
 `error` rate held for 15m), `YuzuInventoryHighNeedFullRatio` (>20% of ingests are
 `need_full` for 15m — hash-skip is not taking, so agents keep re-sending full
-payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob dropped + nacked),
+payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob, or a v3 blob that cannot be split into
+sections, dropped + nacked),
 `YuzuInventoryReportRejected` (a whole report rejected at the source-map cap),
 `YuzuInventoryGenericBlobRejectedDepth` (a generic source blob rejected for
 nesting past `kMcpMaxJsonDepth`, json-dump-depth-guard fix),
 `YuzuInventoryReadDegraded` (a read returned a degrade, by reason),
 `YuzuInventoryIngestSlow` (full-payload and sectioned (`phase=~"full|v3"`) ingests
 holding a connection >10s — a leading pool-saturation indicator),
-`YuzuInventorySectionIngestRefused` (warning: a v3 section was refused, `outcome="rejected"`;
-the refusal is a grammar failure that never self-heals, so fix the agent),
+`YuzuInventorySectionIngestRefused` (warning: a v3 section was refused, `outcome="rejected"`,
+at least once in the last day, so a single refusal is enough; the refusal is a grammar failure
+that never self-heals, so fix the agent),
 `YuzuInventorySectionDeltaUnsupported` (info, held 1h: a v3 delta was answered with a request
 for a full section because this server cannot apply deltas yet; expected, no action), and
 `YuzuInventoryStaleCountUnavailable` (the freshness gauge may be frozen).
