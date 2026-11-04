@@ -264,13 +264,15 @@ struct GroupFromResultsHarness {
     /// per request; `fleet_read_calls` proves whether the gate ran at all.
     bool fleet_read_admit{true};
     int fleet_read_calls{0};
+    std::string fleet_read_securable;
+    std::string fleet_read_operation;
 
     /// The flat ManagementGroup:Write admission (`perm_fn`). Admits by default; read live per
     /// call so a case can revoke it while the attempted row is written (#3619 review).
+    /// `perm_asked` records each call as "<securable>:<operation>".
     bool perm_allow{true};
     int perm_calls{0};
-    std::string fleet_read_securable;
-    std::string fleet_read_operation;
+    std::vector<std::string> perm_asked;
 
     /// @param degrade_response_store true → wire a ResponseStore pointed at
     ///        an unreachable pool (never open), so the 503-before-scope-logic
@@ -337,9 +339,10 @@ struct GroupFromResultsHarness {
         };
         // Read live per call, so a case can revoke ManagementGroup:Write mid-request (#3619).
         // A denial answers 403 itself, as the production gate does.
-        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
-                              const std::string&) -> bool {
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
+                              const std::string& type, const std::string& op) -> bool {
             ++perm_calls;
+            perm_asked.push_back(type + ":" + op);
             if (perm_allow)
                 return true;
             res.status = 403;
@@ -1909,6 +1912,7 @@ TEST_CASE("group-from-results audit (UP-5): ManagementGroup:Write revoked while 
     CHECK(res->status == 403);
     CHECK_FALSE(h.mg.find_group_by_name("perm-revoked").has_value());
     CHECK(h.perm_calls == 2); // admission, then the recheck after the attempted row
+    CHECK(h.perm_asked == std::vector<std::string>{"ManagementGroup:Write", "ManagementGroup:Write"});
     CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
     REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
     CHECK(h.audit_detail("group.create_from_results", "failure") == "permission_revoked");

@@ -1148,14 +1148,18 @@ TEST_CASE("fragment purge/reenable audit (#3619 UP-5): the route permission revo
             auto res = h.post(path, "device_id=dev-A&source=process");
             CHECK(res->status == 403);
             CHECK(h.calls.empty());
-            CHECK(h.perms.size() == 2); // admission, then the recheck after the attempted row
+            // Admission, then the recheck after the attempted row -- of the ROUTE's own
+            // permission (Gate 3 QE-1: purge must not recheck the weaker Execution:Execute).
+            REQUIRE(h.perms.size() == 2);
+            const bool purge = act == "echo.source.purge";
+            CHECK(h.perms[1].securable_type == (purge ? "Infrastructure" : "Execution"));
+            CHECK(h.perms[1].op == (purge ? "Delete" : "Execute"));
             CHECK(h.audits_for(action, "attempted") == 1);
             REQUIRE(h.audits_for(action, "failure") == 1);
             CHECK(h.audit_detail(action, "failure") == "permission_revoked source=process");
             CHECK(h.audits_for(action, "success") == 0);
-            const std::string metric = act == "echo.source.purge"
-                                           ? "yuzu_echo_source_purge_total"
-                                           : "yuzu_echo_source_reenable_total";
+            const std::string metric =
+                purge ? "yuzu_echo_source_purge_total" : "yuzu_echo_source_reenable_total";
             CHECK(h.metric(metric, "denied") == 1.0);
         }
     }
@@ -1166,6 +1170,7 @@ TEST_CASE("dashboard execute audit (#3619 UP-5): Execution:Execute revoked while
           "[pg][server][dashboard][execute][audit][security][3619]") {
     FragmentHarness h;
     h.resolve_to = {"os_info", "version"};
+    h.dispatch_sent = 0; // a regression reaches dispatch, never the result-render path
     h.audit_persists = [&h](const AuditRow& r) {
         if (r.action == "command.dispatch" && r.result == "attempted")
             h.perm_allow = false; // revoked mid-write
@@ -1174,6 +1179,11 @@ TEST_CASE("dashboard execute audit (#3619 UP-5): Execution:Execute revoked while
     auto res = h.post("/api/dashboard/execute", "instruction=run&scope=dev-B");
     CHECK(res->status == 403);
     CHECK(h.calls.empty());
+    // The last gate call is the recheck after the attempted row, of the route's own permission
+    // (the route makes other gate calls before the row, so the count is not pinned here).
+    REQUIRE(h.perms.size() >= 2);
+    CHECK(h.perms.back().securable_type == "Execution");
+    CHECK(h.perms.back().op == "Execute");
     CHECK(h.audits_for("command.dispatch", "attempted") == 1);
     REQUIRE(h.audits_for("command.dispatch", "failure") == 1);
     CHECK(h.audit_detail("command.dispatch", "failure") == "reason=permission_revoked");

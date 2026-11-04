@@ -15,6 +15,8 @@ This gate pins the two properties that make that structural rather than per-site
      shared `detail::try_persist_audit` kernel (rest_audit.hpp) as an ARGUMENT.
 
 A string-presence check, not a parser: it cannot prove a helper is called on the right path.
+It also does not see a call through `(*this).`, a parenthesised name, `.operator()` or
+`std::invoke`; those are pinned as known misses in the self-checks below.
 The behaviour is bound by the Catch2 cases tagged [3619]; this gate stops a new bare call from
 reappearing silently. It runs a few in-memory self-checks first, so a detector that stopped
 matching fails loudly instead of passing everything.
@@ -88,6 +90,13 @@ def self_check() -> list[str]:
         "    this->persist_audit_fn_(req, a, r, t, i, d);\n": 1,
         "    (void)this -> audit_fn_ (req, a, r, t, i, d);\n": 1,
         "    detail::try_persist_audit(this->audit_fn_, req, a, r, t, i, d);\n": 0,
+        # KNOWN MISSES, pinned so nobody reads this gate as complete (Gate 2 sec-3): a call
+        # through `(*this).`, a parenthesised name, `.operator()` or `std::invoke` is not seen.
+        # None exists today; the [3619] Catch2 cases are the behavioural guard.
+        "    (*this).audit_fn_(req, a, r, t, i, d);\n": 0,
+        "    (audit_fn_)(req, a, r, t, i, d);\n": 0,
+        "    audit_fn_.operator()(req, a, r, t, i, d);\n": 0,
+        "    std::invoke(audit_fn_, req, a, r, t, i, d);\n": 0,
     }
     for src, want in cases.items():
         got = len(bare_calls(src))
