@@ -251,7 +251,7 @@ public:
     /// `get_hardware_ci` (mcp_tools_hardware.cpp) calls this same closure through
     /// `mcp::ToolDeps`, so the REST and MCP records cannot diverge.
     /// `with_sections` asks for the v2 per-section statuses and rows (read in the SAME snapshot
-    /// as the record, one extra read per call): ONLY the REST record route and the MCP tool pass
+    /// as the record: no extra lease, one more set of statements in the same single-lease transaction): ONLY the REST record route and the MCP tool pass
     /// `true`. The dashboard fragment (including the 1-2 s sync-now poll) and the actions lens
     /// pass `false` and get `ci_sections` empty ("not read"), so they never pay for rows they do
     /// not render.

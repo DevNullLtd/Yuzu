@@ -449,6 +449,26 @@ TEST_CASE("REST hardware: the 200/202 bodies are typed in the OpenAPI spec and m
                                               kind_desc[after] == '_')));
     }
     CHECK(kind_desc.find("must ignore kinds it does not know") != std::string::npos);
+    // The other direction: every kind the description lists is registered (a kind removed from
+    // the registry, or a typo, cannot linger in the documentation).
+    {
+        const std::string kmark = "Registered kinds today: ";
+        const auto kat = kind_desc.find(kmark);
+        REQUIRE(kat != std::string::npos);
+        std::string list = kind_desc.substr(kat + kmark.size());
+        list.resize(list.find('.')); // the kind list carries no '.', the next sentence starts at one
+        std::set<std::string> listed;
+        std::string_view rest = list;
+        while (!rest.empty()) {
+            const auto comma = rest.find(", ");
+            listed.emplace(rest.substr(0, comma));
+            if (comma == std::string_view::npos)
+                break;
+            rest.remove_prefix(comma + 2);
+        }
+        std::set<std::string> registered(kinds.begin(), kinds.end());
+        CHECK(listed == registered);
+    }
     // The rows description lists, per list kind, its exact column list in a parseable form -
     // `Columns: <kind>: <col>, <col>; <kind>: ...` - and the parse equals the registry in BOTH
     // directions: the same kinds and the same columns in the same order. A column added to,
@@ -480,7 +500,8 @@ TEST_CASE("REST hardware: the 200/202 bodies are typed in the OpenAPI spec and m
                     break;
                 list.remove_prefix(comma + 2);
             }
-            CHECK(documented.emplace(kind, std::move(cols)).second); // each kind once
+            const bool first_clause_for_kind = documented.emplace(kind, std::move(cols)).second;
+            CHECK(first_clause_for_kind); // each kind once
             if (semi == std::string_view::npos)
                 break;
             rest.remove_prefix(semi + 1);

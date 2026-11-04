@@ -833,7 +833,10 @@ nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*n
             {"machine_id_hash", ci_json_ph(ci.machine_id_hash)},
             {"machine_id_algorithm", ci_json_ph(ci.machine_id_algorithm)},
             {"machine_id_source", ci_json_ph(ci.machine_id_source)},
-            // null = the sections read failed (sections_state "degraded"); [] = nothing stored.
+            // [] = nothing stored (or not read). A failed sections read never reaches this
+            // serializer: both surfaces answer their retryable error first
+            // (`hardware_ci_sections_unreadable`), so ci.sections null is not emitted by REST or
+            // MCP today; the null arm only keeps the serializer total.
             {"sections", detail.ci_sections ? ci_sections_json(ci, *detail.ci_sections) : nlohmann::json(nullptr)},
         };
         out["ci_state"] = "found";

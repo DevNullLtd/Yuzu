@@ -1498,6 +1498,8 @@ TEST_CASE("get_device_ci_with_sections: a failed section statement keeps the rec
         REQUIRE(got.has_value());
         CHECK(got->sections_failed);
         REQUIRE(got->record.has_value());
+        check_scalars_equal(*got->record, a);
+        CHECK(got->record->sections.empty());
     }
     SECTION("a failed record SELECT is a degrade, not a record") {
         exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci RENAME COLUMN model TO model_x");
@@ -1528,34 +1530,76 @@ TEST_CASE("get_device_ci_with_sections: a concurrent replace never pairs one gen
     std::atomic<int> torn{0};
     std::atomic<int> reads{0};
     std::atomic<int> failures{0};
-    std::thread writer([&] {
+    std::atomic<int> puts{0};
+    std::atomic<bool> saw_a{false};
+    std::atomic<bool> saw_b{false};
+    // No Catch macro runs off the main thread: the writer only records into atomics, and an
+    // exception out of put() is counted as a failure rather than reaching std::terminate.
+    // The guard stops the writer BEFORE joining, so a REQUIRE/CHECK throw on the main thread
+    // between the start and the explicit join cannot leave a joinable thread (std::terminate)
+    // or a writer that never stops.
+    std::thread writer;
+    struct StopAndJoin {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~StopAndJoin() {
+            stop.store(true);
+            if (t.joinable())
+                t.join();
+        }
+    } guard{stop, writer};
+    writer = std::thread([&] {
         bool flip = true;
         while (!stop.load()) {
-            if (put(flip ? b : a) != InventoryIngestOutcome::kStored)
+            try {
+                if (put(flip ? b : a) == InventoryIngestOutcome::kStored)
+                    puts.fetch_add(1);
+                else
+                    failures.fetch_add(1);
+            } catch (...) {
                 failures.fetch_add(1);
+            }
             flip = !flip;
         }
     });
-    for (int i = 0; i < 400; ++i) {
+    // Read at least kMinReads times; keep going (up to kMaxReads) until both generations have
+    // been observed, so "the writer never ran" cannot pass vacuously.
+    constexpr int kMinReads = 400;
+    constexpr int kMaxReads = 20000;
+    for (int i = 0; i < kMaxReads; ++i) {
+        if (i >= kMinReads && saw_a.load() && saw_b.load())
+            break;
         auto got = store.get_device_ci_with_sections("agent-race");
         if (!got || !got->record || got->sections_failed) {
             failures.fetch_add(1);
             continue;
         }
         reads.fetch_add(1);
-        // Scalars carry the generation in the model; every section reason carries it too.
+        // Scalars carry the generation in the model; every section reason and every row cell
+        // carries it too (cells look like "<g>-<kind>-r0-<col>").
         const char gen = got->record->model.back(); // "model-A" / "model-B"
-        for (const auto& sec : got->record->sections)
+        (gen == 'A' ? saw_a : saw_b).store(true);
+        const std::string gen_str(1, gen);
+        for (const auto& sec : got->record->sections) {
             if (sec.reason.find(std::string("reason-") + gen + "-") != 0)
                 torn.fetch_add(1);
+            for (const auto& row : sec.rows)
+                if (row.empty() || row[0].find(gen_str + "-") != 0)
+                    torn.fetch_add(1);
+        }
         if (got->record->sections.size() != a.sections.size())
             torn.fetch_add(1);
     }
     stop.store(true);
     writer.join();
     CHECK(failures.load() == 0);
-    CHECK(reads.load() == 400);
+    CHECK(reads.load() >= kMinReads);
     CHECK(torn.load() == 0);
+    // The race actually ran: the writer replaced the record many times, and the readers saw
+    // both generations. A generous floor, not a timing bound.
+    CHECK(puts.load() >= 10);
+    CHECK(saw_a.load());
+    CHECK(saw_b.load());
 }
 
 TEST_CASE("v2 full replace swaps the whole child set; v1 <-> v2 transitions", "[pg][device_ci][v2]") {

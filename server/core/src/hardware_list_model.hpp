@@ -201,7 +201,11 @@ struct HardwareCiDetail {
     /// only the REST record route and the MCP tool do) - never "the device has none". An ERROR
     /// means the sections read itself failed: both the REST route (503) and the MCP tool (a
     /// retryable error) answer it via `hardware_ci_sections_unreadable` and withhold the record,
-    /// never an empty list. Default-constructed = empty.
+    /// never an empty list. Default-constructed = empty = NOT READ: `hardware_ci_json` renders an
+    /// empty `ci_sections` as `sections_state` "absent", which is a CLAIM that the sections were
+    /// read and none were stored. A caller that did not read the sections (`with_sections` false,
+    /// as the dashboard fragment does) must NOT feed this detail to `hardware_ci_json` for a
+    /// record-serving surface (REST record route, MCP get_hardware_ci).
     std::expected<std::vector<DeviceCiSection>, CiReadError> ci_sections{};
     std::optional<std::vector<SoftwareEntry>> software; // nullopt = store degraded/unwired
     bool software_truncated{false};                     // capped at kHwSoftwareCap
@@ -301,6 +305,9 @@ enum class HardwareCiRead {
 /// Inside `ci`, `sections` is an array in registry order of `{kind, status, reason, source,
 /// complete, rows}`; `complete` is true only for status `ok`, and a section whose status is
 /// anything but `ok`/`constrained` carries its reason and NO rows.
+/// A default (empty) `ci_sections` means NOT READ and renders as `sections_state` "absent":
+/// callers that did not read the sections (`with_sections` false) must NOT feed their detail
+/// here for a record-serving surface (see `HardwareCiDetail::ci_sections`).
 [[nodiscard]] nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t now_secs);
 
 } // namespace yuzu::server
