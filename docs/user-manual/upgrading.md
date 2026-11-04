@@ -355,7 +355,7 @@ The ticket for `execute_instruction_definition`, `create_result_set_from_instruc
 
 **Who is affected.** Automation that runs workflows with a `supervised`-tier MCP token. Sessions and API tokens without an MCP tier are unaffected, and the `operator` and `readonly` tiers were already refused by the tier check.
 
-**What to do.** No MCP tool for workflow execution exists yet, so a `supervised` token has no ticket path to run a workflow until the `execute_workflow` tool ships (#2146). Until then run the workflow from a session or an API token without an MCP tier, or run its steps one at a time through `execute_instruction`, which is approval-gated per step. Do not remove the tier from a token that does other work only to run workflows: the tier constrains every other operation that token performs.
+**What to do.** Run the workflow through the MCP tool `execute_workflow`, which takes an approval ticket (`-32006` with an `approval_id`, approval, recall), or from a session or an API token without an MCP tier, or run its steps one at a time through `execute_instruction`, which is approval-gated per step. Do not remove the tier from a token that does other work only to run workflows: the tier constrains every other operation that token performs.
 
 **Rollback.** Rolling back restores the old behaviour: a `supervised` token again runs a workflow without a ticket. No data changes in either direction.
 
