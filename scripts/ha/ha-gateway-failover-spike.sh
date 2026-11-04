@@ -70,8 +70,11 @@ load_state() {
     # The REST port is published on a random host port that changes when the server
     # container is recreated or restarted, so never trust the stored value.
     local p; p="$(docker compose -p "$SPIKE_PROJECT" --env-file "$STATE/env" -f "$COMPOSE_FILE" port server 8443 2>/dev/null | sed 's/.*://')"
-    [ -n "$p" ] && SPIKE_SERVER_URL="https://127.0.0.1:$p"
+    # An empty lookup means the server is not published right now. Never fall back to the stored port: another
+    # local listener may hold it, and the admin login would be sent there. An empty URL makes curl fail.
+    if [ -n "$p" ]; then SPIKE_SERVER_URL="https://127.0.0.1:$p"; else SPIKE_SERVER_URL=""; fi
 }
+need_rest() { [ -n "${SPIKE_SERVER_URL:-}" ] || die "the server's REST port is not published right now (is the rig up?); refusing to send a login anywhere"; }
 compose() { docker compose -p "$SPIKE_PROJECT" --env-file "$STATE/env" -f "$COMPOSE_FILE" "$@"; }
 cname()   { printf '%s-%s-1' "$SPIKE_PROJECT" "$1"; }
 setenv()  { # setenv KEY VALUE : upsert into the state env file (atomic; any failure aborts, nothing is truncated)
@@ -179,6 +182,7 @@ EOF
         wait_for "$n /readyz" 90 gw_http "$n" http://127.0.0.1:8081/readyz
     done
     # login + one multi-use enrolment token (never committed; lives in $STATE only)
+    need_rest
     curl -ksf -c "$STATE/cookies" "$SPIKE_SERVER_URL/login" -d "username=admin&password=$SPIKE_ADMIN_PASS" -o /dev/null || die "admin login failed"
     local html tok
     html="$(curl -ksf -b "$STATE/cookies" -X POST "$SPIKE_SERVER_URL/api/settings/enrollment-tokens" \
@@ -280,6 +284,7 @@ agent_map() {
 
 dispatch_probe() { # dispatch_probe RUN LABEL AGENT_ID : one os_info command to one agent
     local run="$1" label="$2" aid="$3" body cmd status n
+    need_rest
     body="$(curl -ks -m 15 -w '\n%{http_code}' -b "$STATE/cookies" -H "Origin: $SPIKE_SERVER_URL" \
         -X POST -H 'Content-Type: application/json' \
         -d "{\"plugin\":\"os_info\",\"action\":\"os_name\",\"agent_ids\":[\"$aid\"]}" "$SPIKE_SERVER_URL/api/command")"
@@ -339,6 +344,7 @@ cmd_mgmt() {
     compose up -d --force-recreate server >/dev/null 2>&1 || { setenv SPIKE_MGMT_ADDR "$old"; die "server recreate failed (state restored)"; }
     load_state   # the REST port is published on a fresh random host port after a recreate
     wait_for "server REST" 120 curl -ksf "$SPIKE_SERVER_URL/login"
+    need_rest
     curl -ksf -c "$STATE/cookies" "$SPIKE_SERVER_URL/login" -d "username=admin&password=$SPIKE_ADMIN_PASS" -o /dev/null || die "re-login failed"
     sleep 15; ok "management address now $a"
 }

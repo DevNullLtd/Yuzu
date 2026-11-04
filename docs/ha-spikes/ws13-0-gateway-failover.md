@@ -124,6 +124,15 @@ clustered gateways, a real server and Postgres, and 20 / 100 / 300 agents.
   The CSVs are the only retained record, so the numbers are not independently reproducible from this
   repository; the rig is, which reproduces the measurements, not the figures. Archiving the subset needed to
   recompute the CSVs is left to the maintainers.
+- **This rig and this record are not a deployment pattern.** The rig relaxes what a deployment must not:
+  fixed addresses on one bridge network; throwaway credentials that appear in this host's process list and
+  `docker inspect` while it runs; one gateway certificate and key shared by three nodes (the reference rig's
+  layout); an agent-to-gateway edge with one-way TLS, where the gateway does not verify agent client
+  certificates; a `mode tcp` VIP without PROXY protocol, so the gateways see the proxy as every agent's
+  address; a REST login over `curl -k` to the rig's own CA; no monitoring, persistence or hardening; and a
+  management plane open on the bridge and protected only by the unchanged reference peer authorization. Do
+  not copy its configuration, or a figure from this record, into a deployment or a runbook. Deployment
+  guidance stays in `docs/user-manual/gateway.md` and, when it exists, the 13.4 rollout runbook.
 - **Docker is not a real network.** A kill produced a gateway-side FIN/RST within tens of milliseconds
   (the Peer FIN/RST column). Real node loss can be silent; that is what F2p covers.
 - **DNS here is a static zone served by CoreDNS on the same host.** Resolver behaviour (TTL, caching,
@@ -196,9 +205,11 @@ siblings in failover time (that address affects dispatch, not agents).
 | F3x-dns-194637 | F3x | DNS | 100 | 43 | 0 | none to +400s | never | 43 / 43, 62-91 | 0 / 43 | - / - |
 <!-- END GENERATED: faults-f3-f2p -->
 
-In `results.csv` the `victim_readyz_non200_s` column is blank for the six 100-agent F2p runs because their
-gateway sample series ends at +149 s, before the breaker opened (the `breaker_open_s` column, from the
-gateway log, shows 156-162 s in all seven F2p runs); blank there means "not sampled long enough", not "never".
+In `results.csv` the `victim_readyz_non200_s` column is blank for every run in which `/readyz` never went
+non-200 within the sampled window, so a blank is only as strong as the `readyz_sampled_to_s` column beside it
+(the series ends at +149 or +150 s for the six 100-agent F2p runs, before the breaker opened, and at +399 or
++400 s for the F3/F3x runs). The `breaker_open_s` column, from the gateway log, shows 156-162 s in all seven
+F2p runs: for those six, blank means "not sampled long enough", not "never".
 For F3/F3x "Moved" is 0 by construction (the agents never left). In the F2p rows the victim's circuit
 breaker opened at 156-162 s in every run; the 100-agent runs' windows (150 s) ended before `/readyz`
 followed, and the one run whose window outlasted it (300 agents, 200 s) shows `/readyz` at 157 s. In the F3
@@ -275,7 +286,7 @@ could not resolve, so both of its probes failed); they were not used for any cla
    precondition is therefore confirmed for this rig. Its consequence is not: on this single-replica server
    dispatch kept working, routes became non-routable at about 60-90 s, and every agent was routable again
    2-6 s after the path returned (300 agents), but the harmful case, route-directory dispatch on two or more
-   replicas, could not be tested here. But this fleet had
+   replicas, could not be tested here. The fleet also had
    inventory, DEX and Spark collection disabled and no churn, so almost nothing but heartbeats crossed the
    link; the reading of the code is that Register, inventory and stream-status calls feed the breaker and
    heartbeat flushes do not. That matches the full-partition runs: when the node was cut off completely the
@@ -328,7 +339,7 @@ could not resolve, so both of its probes failed); they were not used for any cla
 |---|---|---|
 | H1 | Clean kill: agents re-attach to survivors, TLS passes | Observed (about 9-10 s DNS) |
 | H2 | Silent partition: detection bounded by keepalive; a VIP with a health check is faster | Observed for a full partition (about 47 s DNS, about 24-27 s VIP); the green-health-check case is a lower bound (over 118 s) |
-| H3 | Node up, server path dropped: agents stay; routes expire; self-heals | Observed (single replica, 6 runs) |
+| H3 | Node up, server path dropped: agents stay; routes expire; routable again after the path returns | Observed (single replica, 6 runs; the return was timed in 2 of them, 300 agents, and seen by hand in a third) |
 | H3b | `/readyz` stays 200, a VIP will not eject the node | Observed in this rig for the dropped-upstream fault with a quiet fleet; in the full partitions the breaker did open (+156-162 s); **not established for a production fleet** |
 | H4 | Reconnect of a third of the fleet with 13.1 jitter does not overload Register | Recovery times observed up to 114 agents at once; capacity was **not** tested (finding 9) |
 | H5 | A restored node stays empty | Seen informally in early runs; no retained artefact; unverified here |
