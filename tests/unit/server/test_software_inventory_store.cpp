@@ -5490,6 +5490,24 @@ TEST_CASE("ingest_inventory_report v3: a section holding a NUL byte is refused, 
     CHECK(names_of(pool, "agent-nul", kV3Apps) == std::vector<std::string>{"Alpha"});
 }
 
+TEST_CASE("ingest_inventory_report v3: a blob cut off inside its last record refuses that section",
+          "[pg][software_inventory][seam][v3]") {
+    SWINV_SHARED(store, pool);
+    yuzu::MetricsRegistry metrics;
+    std::string blob = w_hdr() + w_sec(kV3Pkgs, "full") + w_plus("libfoo", kV3Pkgs) +
+                       w_sec(kV3Apps, "full") + w_plus("Alpha", kV3Apps) + w_plus("Beta", kV3Apps);
+    blob.pop_back(); // the last record loses its terminator
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = "claimed-and-ignored";
+    (*rep.mutable_plugin_data())["installed_software"] = blob;
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-cut", rep, ack, &metrics);
+    CHECK(std::set<std::string>(ack.need_full().begin(), ack.need_full().end()) ==
+          std::set<std::string>{"installed_software:installed_apps.list_inventory"});
+    CHECK(names_of(pool, "agent-cut", kV3Apps).empty()); // "Alpha" was whole, but not applied alone
+    CHECK(names_of(pool, "agent-cut", kV3Pkgs) == std::vector<std::string>{"libfoo"});
+}
+
 TEST_CASE("ingest_inventory_report v3: a clean report is stored, then hash-only claims match",
           "[pg][software_inventory][seam][v3]") {
     SWINV_SHARED(store, pool);

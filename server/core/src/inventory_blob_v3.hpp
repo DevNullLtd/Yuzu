@@ -22,10 +22,12 @@
 ///    is full | delta | constrained | timeout | oversize | not_collected | disabled; only full
 ///    and delta sections carry records.
 ///
-/// One framing rule every record obeys: it holds no NUL byte. NUL is valid UTF-8, so the field
-/// scrub keeps it, but the text bound to Postgres cannot carry one, so a NUL would be hashed and
-/// then stored without it (two rows reading the same with different keys). The section is
-/// refused instead; the agent writer must never emit NUL.
+/// Two framing rules every record obeys. (1) A record is 0x1E-terminated, the last one too: an
+/// unterminated final record is a truncated blob, so it refuses the section it sits in (or the
+/// whole blob when it is a section header or precedes every section). (2) A record holds no NUL
+/// byte: NUL is valid UTF-8, so the field scrub keeps it, but the text bound to Postgres cannot
+/// carry one, so a NUL would be hashed and then stored without it (two rows reading the same
+/// with different keys). The section is refused instead; the agent writer must never emit NUL.
 ///
 /// Containment: a grammar violation INSIDE a section refuses that section only (the other
 /// sections of the call still apply and the refused facet is nacked). A defect that cannot be
@@ -129,6 +131,7 @@ enum class V3Refusal {
     kBadVersionSource, ///< a comp record with a version_source outside the closed set
     kRowCap,           ///< kV3MaxRows / kV3MaxDeletions / kV3MaxComponents exceeded
     kNulByte,          ///< a record holding a NUL byte (it could not be stored as it was hashed)
+    kUnterminated,     ///< the last record of the blob lacks its 0x1E terminator (truncated)
 };
 
 [[nodiscard]] constexpr std::string_view v3_refusal_name(V3Refusal r) noexcept {
@@ -161,6 +164,8 @@ enum class V3Refusal {
         return "row_cap";
     case V3Refusal::kNulByte:
         return "nul_byte";
+    case V3Refusal::kUnterminated:
+        return "unterminated";
     }
     return "none";
 }
@@ -329,7 +334,8 @@ parse_v3_blob(std::string_view blob) {
     std::size_t pos = kV3Header.size();
     while (pos < blob.size()) {
         std::size_t rec_end = blob.find('\x1e', pos);
-        if (rec_end == std::string_view::npos)
+        const bool terminated = rec_end != std::string_view::npos;
+        if (!terminated)
             rec_end = blob.size();
         const std::string_view rec = blob.substr(pos, rec_end - pos);
         pos = rec_end + 1;
@@ -350,6 +356,17 @@ parse_v3_blob(std::string_view blob) {
             p = f_end + 1;
         }
 
+        // An unterminated final record is a truncated blob. A truncated section header cannot
+        // be attributed to a facet; a truncated row belongs to the section it sits in.
+        if (!terminated) {
+            if (f[0] == "S")
+                return std::unexpected(K::kBadSectionHeader);
+            if (rep.sections.empty())
+                return std::unexpected(K::kRecordBeforeSection);
+            if (rep.sections.back().refusal == V3Refusal::kNone)
+                v3_detail::refuse(rep.sections.back(), V3Refusal::kUnterminated);
+            continue;
+        }
         const bool has_nul = rec.find('\0') != std::string_view::npos;
 
         if (f[0] == "S") {

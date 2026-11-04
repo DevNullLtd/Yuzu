@@ -469,13 +469,10 @@ TEST_CASE("v3 drops a 17th token and a nameless row", "[server][inventory_blob_v
     CHECK(s2.sections[0].refusal == V3Refusal::kSourceMismatch);
 }
 
-TEST_CASE("v3 empty records are skipped and a trailing record needs no terminator",
-          "[server][inventory_blob_v3]") {
+TEST_CASE("v3 empty records are skipped", "[server][inventory_blob_v3]") {
     std::string blob = header() + sec(kApps, "full");
     blob += kRs; // an empty record
-    std::string last = plus("A", kApps);
-    last.pop_back(); // unterminated final record
-    const V3Report r = parse_ok(blob + last);
+    const V3Report r = parse_ok(blob + plus("A", kApps));
     REQUIRE(r.sections.size() == 1);
     CHECK(r.sections[0].rows.size() == 1);
 }
@@ -493,6 +490,46 @@ TEST_CASE("v3 NUL: the refused section is cleared and later sections still apply
     CHECK(v3_refusal_name(V3Refusal::kNulByte) == "nul_byte");
     CHECK(r.sections[1].refusal == V3Refusal::kNone);
     REQUIRE(r.sections[1].rows.size() == 1);
+}
+
+TEST_CASE("v3 an unterminated final record is refused, never applied",
+          "[server][inventory_blob_v3]") {
+    const auto unterminated = [](std::string record) {
+        record.pop_back();
+        return record;
+    };
+    SECTION("a truncated row refuses its own section; earlier sections are untouched") {
+        const V3Report r =
+            parse_ok(header() + sec("pkg_inventory.packages", "full") +
+                     plus("Good", "pkg_inventory.packages") + sec(kApps, "full") + plus("A", kApps) +
+                     unterminated(plus("B", kApps)));
+        REQUIRE(r.sections.size() == 2);
+        CHECK(r.sections[0].refusal == V3Refusal::kNone);
+        REQUIRE(r.sections[0].rows.size() == 1);
+        CHECK(r.sections[1].refusal == V3Refusal::kUnterminated);
+        CHECK(r.sections[1].rows.empty()); // the complete row A is not applied alone
+        CHECK(v3_refusal_name(V3Refusal::kUnterminated) == "unterminated");
+    }
+    SECTION("the first refusal of a section is kept") {
+        const V3Report r = parse_ok(header() + sec(kApps, "full") + plus("A", "other.source") +
+                                    unterminated(plus("B", kApps)));
+        REQUIRE(r.sections.size() == 1);
+        CHECK(r.sections[0].refusal == V3Refusal::kSourceMismatch);
+    }
+    SECTION("a truncated section header fails the whole blob") {
+        auto r = parse_v3_blob(header() + sec(kApps, "full") + plus("A", kApps) +
+                               unterminated(sec("pkg_inventory.packages", "full")));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == V3ParseErrorKind::kBadSectionHeader);
+    }
+    SECTION("a truncated record before any section fails the whole blob") {
+        auto r = parse_v3_blob(header() + unterminated(plus("A", kApps)));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == V3ParseErrorKind::kRecordBeforeSection);
+    }
+    SECTION("a header alone is not a section") {
+        CHECK_FALSE(parse_v3_blob(header() + unterminated(sec(kApps, "full"))).has_value());
+    }
 }
 
 TEST_CASE("install_type_for: the source table is total over kSoftwareSources",
