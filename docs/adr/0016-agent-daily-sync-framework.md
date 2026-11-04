@@ -686,7 +686,8 @@ agent's next full report on the upgraded server.
 **Personal data.** `chassis_serial`, `board_serial` and the DIMM `serial` column join the
 serial/UUID/MAC behavioural-PII tier. The `volume` and `partition` mount-point column can name an
 account or a personal label as the OS reports it, so the agent redacts such entries before sending
-(2026-11-01 entry, "Mount points (personal data)"). As of the 2026-11-04 entry at the end of this file (H.7), the sections are served on REST and MCP behind the audited `inventory.device.ci` read.
+(2026-11-01 entry, "Mount points (personal data)"). As of the 2026-11-04 entry at the end of this
+file (H.7), the sections are served on REST and MCP behind the audited `inventory.device.ci` read.
 
 ### 2026-11-01 — `device_ci` blob v2 (agent writer)
 
