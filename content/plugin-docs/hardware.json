@@ -131,6 +131,32 @@
       }
     },
     {
+      "action": "drivers_inventory",
+      "definition_ids": [
+        "device.hardware.drivers_inventory"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "signed state is derived from the per-module taint flag E only; signer, INF, hardware id and date have no Linux source",
+          "mechanism": "/proc/modules + /sys/module/<m>/{version,taint} bounded no-follow reads",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "no public kext/dext enumeration API",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "WMI Win32_PnPSignedDriver (DeviceName, DriverVersion, DriverDate, DriverProviderName, DeviceClass, Signer, IsSigned, InfName, HardWareID), bounded",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
       "action": "machine_id",
       "definition_ids": [
         "device.hardware.machine_id"
@@ -315,10 +341,10 @@
   ],
   "caveats": [
     "**The eight read actions never set a typed result status.** Every such sample line reads `UNDECLARED / UNKNOWN /` regardless of whether the underlying probe succeeded, partially failed, or hit an unsupported leg (e.g. Linux `manufacturer`/`model`/`bios`/`system` all read `unknown` in the sample, and get the same `UNDECLARED` status as a clean Windows read). A consumer must inspect the row content (`unknown` fields, the `drivers` action's `__truncated__` marker), not the status, to tell success from degradation.",
-    "**Two legs are partial: `drivers` on macOS, `memory` on Linux and macOS.** `drivers` is not implemented on macOS. No public per-driver/kext enumeration API exists; the descriptor declares it `YUZU_SUPPORT_UNSUPPORTED` (`hardware_plugin.cpp:858`) and the macOS sample shows the house `unknown` row rather than a capture. `memory` is aggregate-only on Linux and macOS. Linux needs `dmidecode` (typically root) for per-DIMM detail and falls back to `/proc/meminfo`'s total when unavailable or unprivileged; the Linux sample (captured as root/euid 0 in a container) still shows the aggregate `total` row, meaning `dmidecode` itself found nothing usable in that environment even with root. macOS has no public per-DIMM API at all and always reports the aggregate.",
+    "**Two legs are partial: `drivers` on macOS, `memory` on Linux and macOS.** `drivers` is not implemented on macOS. No public per-driver/kext enumeration API exists; the descriptor declares it `YUZU_SUPPORT_UNSUPPORTED` (`hardware_plugin.cpp:858`) and the macOS sample shows the house `unknown` row rather than a capture. `memory` is aggregate-only on Linux and macOS. Linux needs `dmidecode` (typically root) for per-DIMM detail and falls back to `/proc/meminfo`'s total when unavailable or unprivileged; the Linux sample (captured as root/euid 0 in a container) still shows the aggregate `total` row, meaning `dmidecode` itself found nothing usable in that environment even with root. macOS has no public per-DIMM API at all and always reports the aggregate. Separately: On macOS there is no public source for `chassis`, `baseboard` or `machine_id` (the hardware UUID from `system` already identifies the machine), yet all four new actions are advertised `planned` on every OS. The per-OS leg PRs move such legs to a typed `unsupported` with a reason; until then a consumer must read `<os>:planned` as \"not read\", never as \"this host has no value\". The appended `cpu`/`dimm` columns are likewise always `-`: `socket_designation`, `stepping`, `manufacturer`, `part_number` and `serial` ride on every `cpu`/`dimm` row so downstream schemas are final, but no leg fills them yet.",
     "**A connected-but-empty WMI query now emits an explicit `unknown` row instead of silently emitting nothing** — a deliberate divergence from the plugin's pre-#3404 behavior, made so a consumer can distinguish \"the probe ran and found nothing\" from an unrelated dispatch failure (`hardware_plugin.cpp:190-205`). Do not revert this to match the old silent-gap behavior.",
     "**Windows `disks.interface` reports the WMI-layer bus (`SCSI`), not the physical bus** — both drives in the Windows sample are NVMe/SATA but report `SCSI`, because `Win32_DiskDrive.InterfaceType` reports the storage stack layer WMI actually asks, not the physical connector. `disk_actions.smart` decodes the true bus (`nvme`/`sata`/`usb`) via a lower-level IOCTL and is the more accurate source when that distinction matters.",
-    "**Some planned actions can never have a source.** On macOS there is no public source for `chassis`, `baseboard` or `machine_id` (the hardware UUID from `system` already identifies the machine), yet all four new actions are advertised `planned` on every OS. The per-OS leg PRs move such legs to a typed `unsupported` with a reason; until then a consumer must read `<os>:planned` as \"not read\", never as \"this host has no value\". The appended `cpu`/`dimm` columns are likewise always `-`: `socket_designation`, `stepping`, `manufacturer`, `part_number` and `serial` ride on every `cpu`/`dimm` row so downstream schemas are final, but no leg fills them yet."
+    "**`drivers_inventory` on Linux derives its signed state from one flag, and only toward \"unsigned\".** `/sys/module/<module>/taint` holds the module's taint letters; `E` (an unsigned module was loaded) maps to `unsigned`. A module without `E` reads `-`, never `signed`: the kernel may not enforce signatures at all, so the absence of the flag proves nothing. Signer, INF name, hardware id and date have no Linux source and are always `-`; provider and class are the fixed literals `kernel` and `module`, as in `drivers`. A built-in module has no `version` file and reads `-`. A module unloaded between the `/proc/modules` read and its `/sys/module` read also reads `-` (a normal race, not recorded as a failure); a refused or failed `/sys` read is recorded as a status token. Windows: Hitting the cap sets `windows:drivers_inventory:row_cap` and a `constrained` status (the rows read are still emitted). Many `Win32_PnPSignedDriver` rows carry only a hardware id (a device with no driver bound, for example `ACP HDA Node` on the capture host): every other field of those rows is `-`. `DriverDate` is accepted only as a CIM datetime or an ISO date; the locale-formatted text a PowerShell session prints (`21/06/2006 01:00:00`) cannot be read unambiguously and gives `-`. The row escaper folds a backslash to `/`, so a hardware id is written `ACPI/VEN_PNP&DEV_0C0C`. The Windows leg is verified here only by reading and by the pure header's tests; the WMI call itself runs on a Windows host."
   ],
   "definitions": [
     {
@@ -416,6 +442,24 @@
         "ttlSeconds": 86400
       },
       "id": "device.hardware.drivers",
+      "platforms": [
+        "windows",
+        "linux"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Lists installed drivers in a stable order (sorted by name, INF, hardware id, version; exact duplicates removed) with version, date, provider, device class, signer, signed state, INF name and hardware id. Always leads with one status row: supported when the read was complete, constrained with reason tokens when it was cut short (a row cap of 4096, a refused or failed read), unsupported on macOS. A value that could not be read is \"-\", never a guess. Windows reads Win32_PnPSignedDriver (bounded WMI, 4096 rows); a device with no driver bound shows only its hardware id. Linux reads /proc/modules plus /sys/module/<module>/version and taint with bounded no-follow reads: the signed state is \"unsigned\" only when the module's taint flags contain E, and \"-\" otherwise (no flag proves a module signed); signer, INF, hardware id and date have no Linux source. Not supported on macOS (no public kext/dext enumeration API). The existing \"drivers\" instruction is unchanged. This is an on-demand question; it is not part of the daily sync.",
+      "display_name": "Driver Inventory (Signed State)",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {},
+      "id": "device.hardware.drivers_inventory",
       "platforms": [
         "windows",
         "linux"
@@ -566,14 +610,14 @@
     }
   ],
   "description": "Reports hardware inventory: manufacturer, model, BIOS, CPU, memory, disks, drivers, chassis, baseboard, swap, machine id",
-  "how_it_works": "Twelve independent actions, dispatched by action name (`hardware_plugin.cpp:963`). `manufacturer`/`model`/`processors`/`system` are single native calls per OS (WMI, `sysctlbyname`/IOKit, or a `/sys`/`/proc` file read) with no subprocess. `bios` and `disks` need data no native API on macOS exposes, so those two legs shell out through the agent's bounded subprocess runner (`run_bounded_subprocess`, fixed deadline, no shell) to `system_profiler` and parse its output with a pure header-only parser (`hardware_macos_bios.hpp`, `hardware_disks_macos.hpp`). `memory` tries `dmidecode` on Linux (also via the bounded runner) and falls back to `/proc/meminfo`'s aggregate total when `dmidecode` is missing or fails. `drivers` enumerates `Win32_PnPSignedDriver` on Windows or reads `/proc/modules` on Linux; it is not implemented on macOS (no public per-driver/kext enumeration API). The four newest actions (`chassis`, `baseboard`, `swap`, `machine_id`) read nothing yet: each answers with exactly one `status|<action>|unsupported|<os>:planned` row from the shared planned-leg reporter (`agents/shared/planned_leg.hpp`, called from the dispatch in `hardware_plugin.cpp`), until the per-OS leg PRs land the real reads.\n\nEvery action that can find nothing still emits one row carrying the literal `unknown` in place of an unread value (`hardware_plugin.cpp:243`, `:257`, `:342-344` and equivalents) — never a silent zero-row output — so a consumer can tell \"the probe ran and found nothing\" from \"this action produced no output for an unrelated reason.\" This plugin is deliberately not a live-monitoring feed: every action is a point-in-time read with no polling, no event stream, and (except `drivers`, whose WMI query can take several seconds) no expectation of taking more than a few milliseconds.",
+  "how_it_works": "Thirteen independent actions, dispatched by action name (`hardware_plugin.cpp` `execute()`). `manufacturer`/`model`/`processors`/`system` are single native calls per OS (WMI, `sysctlbyname`/IOKit, or a `/sys`/`/proc` file read) with no subprocess. `bios` and `disks` need data no native API on macOS exposes, so those two legs shell out through the agent's bounded subprocess runner (`run_bounded_subprocess`, fixed deadline, no shell) to `system_profiler` and parse its output with a pure header-only parser (`hardware_macos_bios.hpp`, `hardware_disks_macos.hpp`). `memory` tries `dmidecode` on Linux (also via the bounded runner) and falls back to `/proc/meminfo`'s aggregate total when `dmidecode` is missing or fails. `drivers` enumerates `Win32_PnPSignedDriver` on Windows or reads `/proc/modules` on Linux; it is not implemented on macOS (no public per-driver/kext enumeration API). `drivers_inventory` is its stable-ordered, bounded sibling (the `drivers` action and its rows are unchanged): it adds signer, signed state, INF name and hardware id, sorts every row by (name, INF, hardware id, version), removes exact duplicates, and always leads with one `status|drivers_inventory|<supported|constrained|unsupported>|<tokens or ->` row followed by `driver_inv|<name>|<version>|<date>|<provider>|<class>|<signer>|<signed>|<inf>|<hwid>` rows, `-` standing in for any value that is absent. Windows runs one bounded WMI query on `Win32_PnPSignedDriver` (nine properties, `WHERE DeviceName IS NOT NULL`, a 4096-row cap rather than the 512-row cap the other actions use). Linux reads `/proc/modules` (bounded to 1 MiB, module names validated to `[A-Za-z0-9_-]{1,64}`) and, under one opened `/sys/module` directory descriptor, `<module>/version` and `<module>/taint` with 256-byte no-follow reads; no subprocess runs and no `.ko` file is opened. Ordering, de-duplication, escaping and the status row are one pure header (`hardware_drivers_inventory.hpp`) shared by both legs. The four newest actions (`chassis`, `baseboard`, `swap`, `machine_id`) read nothing yet: each answers with exactly one `status|<action>|unsupported|<os>:planned` row from the shared planned-leg reporter (`agents/shared/planned_leg.hpp`, called from the dispatch in `hardware_plugin.cpp`), until the per-OS leg PRs land the real reads.\n\nEvery action that can find nothing still emits one row carrying the literal `unknown` in place of an unread value (`hardware_plugin.cpp:243`, `:257`, `:342-344` and equivalents) — never a silent zero-row output — so a consumer can tell \"the probe ran and found nothing\" from \"this action produced no output for an unrelated reason.\" This plugin is deliberately not a live-monitoring feed: every action is a point-in-time read with no polling, no event stream, and (except `drivers` and `drivers_inventory`, whose WMI query can take several seconds) no expectation of taking more than a few milliseconds.",
   "inputs": [],
   "kind": {
     "collector": true,
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "c78d09361368",
+  "leg_hash": "93cbaf4434ef",
   "manifest_version": 1,
   "name": "hardware",
   "outputs": [
@@ -887,6 +931,124 @@
         }
       ],
       "definition_id": "device.hardware.drivers"
+    },
+    {
+      "columns": [
+        {
+          "description": "Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), driver_inv (one per driver).",
+          "example": "driver_inv",
+          "name": "row_kind",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "string",
+          "values": [
+            "status",
+            "driver_inv"
+          ]
+        },
+        {
+          "description": "Driver or module name: the Windows DeviceName, or the Linux kernel module name. Status rows: the action name.",
+          "example": "AMD Audio CoProcessor",
+          "name": "name",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Driver version (Windows DriverVersion; Linux /sys/module/<m>/version), or \"-\" when the host reports none. Status rows: the level (supported, constrained or unsupported).",
+          "example": "6.0.0.109",
+          "name": "version",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Driver date as YYYY-MM-DD (Windows only), or \"-\" when empty or in a form that cannot be read unambiguously. Status rows: the reason tokens, comma-separated, or \"-\" when there are none.",
+          "example": "2025-03-26",
+          "name": "date",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Driver publisher (Windows DriverProviderName; the fixed literal \"kernel\" on Linux), or \"-\" when empty.",
+          "example": "AMD",
+          "name": "provider",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows DeviceClass (e.g. SYSTEM, NET, MEDIA); the fixed literal \"module\" on Linux; \"-\" when empty.",
+          "example": "SYSTEM",
+          "name": "device_class",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows signer of the driver package (Signer), or \"-\" when empty. No Linux source.",
+          "example": "Microsoft Windows Hardware Compatibility Publisher",
+          "name": "signer",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Signature state. Windows: IsSigned True/False. Linux: \"unsigned\" only when the module taint flags contain E; \"-\" otherwise, since no flag proves a module signed. Values: signed, unsigned, or \"-\" when unknown.",
+          "example": "signed",
+          "name": "signed",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "string",
+          "values": [
+            "signed",
+            "unsigned",
+            "-"
+          ]
+        },
+        {
+          "description": "Windows INF name (InfName, e.g. oem18.inf), or \"-\" when empty. No Linux source.",
+          "example": "oem18.inf",
+          "name": "inf",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows hardware id (HardWareID); a backslash is written as \"/\" by the row escaper. \"-\" when empty. No Linux source.",
+          "example": "PCI/VEN_1022&DEV_15E2&SUBSYS_15E21022&REV_63",
+          "name": "hwid",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.hardware.drivers_inventory"
     },
     {
       "columns": [
@@ -1278,7 +1440,26 @@
     }
   ],
   "readme": "agents/plugins/hardware/README.md",
-  "result_status": [],
+  "result_status": [
+    {
+      "completeness": "`OK` / `FULL`",
+      "provenance": "the read completed",
+      "status": "`supported`",
+      "when": "`-`"
+    },
+    {
+      "completeness": "`CONSTRAINED` / `PARTIAL`",
+      "provenance": "the read was cut short or partly refused; the rows that were read are still emitted",
+      "status": "`constrained`",
+      "when": "`linux:drivers_inventory:row_cap`, `windows:drivers_inventory:row_cap` (4096 rows reached), `linux:drivers_inventory:permission_denied` (EACCES/EPERM on `/proc/modules` or a `/sys/module` file), `linux:drivers_inventory:read_failed` (any other failed read, including a symlinked attribute), `linux:drivers_inventory:invalid_module_name` (a module name outside the kernel alphabet was skipped), `linux:drivers_inventory:proc_modules_oversized`, `windows:drivers_inventory:<wmi error token>` (the query failed; no rows)"
+    },
+    {
+      "completeness": "`UNAVAILABLE` / `PARTIAL`",
+      "provenance": "macOS",
+      "status": "`unsupported`",
+      "when": "`macos:no_enumeration_api`"
+    }
+  ],
   "samples": {
     "linux": {
       "actions": [
@@ -1483,12 +1664,32 @@
             "status|machine_id|unsupported|linux:planned"
           ],
           "truncated": false
+        },
+        {
+          "action": "drivers_inventory",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 19,
+          "rows": [
+            "status|drivers_inventory|supported|-",
+            "driver_inv|autofs4|-|-|kernel|module|-|-|-|-",
+            "driver_inv|br_netfilter|-|-|kernel|module|-|-|-|-",
+            "driver_inv|bridge|2.3|-|kernel|module|-|-|-|-",
+            "driver_inv|ip_set|-|-|kernel|module|-|-|-|-"
+          ],
+          "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-10-27",
+        "date": "2026-11-04",
         "host_class": "vm",
-        "leg_hash": "c78d09361368",
+        "leg_hash": "93cbaf4434ef",
         "os": "linux",
         "os_version": "Ubuntu 26.04.1 LTS x86_64",
         "privilege": "euid 0"
@@ -1690,12 +1891,28 @@
             "status|machine_id|unsupported|macos:planned"
           ],
           "truncated": false
+        },
+        {
+          "action": "drivers_inventory",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "macos:no_enumeration_api",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|drivers_inventory|unsupported|macos:no_enumeration_api"
+          ],
+          "truncated": false
         }
       ],
       "stamp": {
         "date": "2026-10-27",
         "host_class": "bare-metal",
-        "leg_hash": "c78d09361368",
+        "leg_hash": "93cbaf4434ef",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -1822,6 +2039,26 @@
           "truncated": false
         },
         {
+          "action": "drivers_inventory",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 138,
+          "rows": [
+            "status|drivers_inventory|supported|-",
+            "driver_inv|ACP HDA Node|-|-|-|-|-|-|-|ACP/DEVTYPE_0001&DEVREV_0000&VEN_1022&DEV_15E2&SUBSYS_102215E2&REV_63",
+            "driver_inv|ACPI Power Button|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_PNP&DEV_0C0C",
+            "driver_inv|ACPI Processor Container Device|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_ACPI&DEV_0010",
+            "driver_inv|ACPI Thermal Zone|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/ThermalZone"
+          ],
+          "truncated": false
+        },
+        {
           "action": "system",
           "not_captured": null,
           "params": "",
@@ -1904,12 +2141,12 @@
         }
       ],
       "stamp": {
-        "date": "2026-10-27",
+        "date": "2026-11-04",
         "host_class": "bare-metal",
-        "leg_hash": "c78d09361368",
+        "leg_hash": "93cbaf4434ef",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
-        "privilege": "LocalSystem (elevated)"
+        "privilege": "interactive user (elevated; serial, system UUID, computer-device GUID and peripheral BLE addresses redacted)"
       }
     }
   },
@@ -1978,6 +2215,15 @@
       "securable": "Inventory"
     },
     {
+      "action": "drivers_inventory",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
       "action": "system",
       "dispatch_class": "ReadOnly",
       "execute_gate": "None",
@@ -2033,6 +2279,7 @@
     ],
     "plugin": [
       "agents/plugins/hardware/src/hardware_disks_macos.hpp",
+      "agents/plugins/hardware/src/hardware_drivers_inventory.hpp",
       "agents/plugins/hardware/src/hardware_estate_legs.hpp",
       "agents/plugins/hardware/src/hardware_linux_parsers.hpp",
       "agents/plugins/hardware/src/hardware_macos_bios.hpp",
@@ -2047,6 +2294,7 @@
       "tests/unit/server/test_hardware_ui.cpp",
       "tests/unit/test_hardware_device_identity_posix_actions.cpp",
       "tests/unit/test_hardware_disks_macos.cpp",
+      "tests/unit/test_hardware_drivers_inventory.cpp",
       "tests/unit/test_hardware_linux_parsers.cpp",
       "tests/unit/test_hardware_local_dispatcher.cpp",
       "tests/unit/test_hardware_macos_bios.cpp"
@@ -2054,9 +2302,9 @@
   },
   "version": "1.0.0",
   "where_the_data_goes": [
-    "**Instruction result, plus a daily-sync consumer for eleven of the twelve actions.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The `device_ci` daily-sync source (ADR-0016) additionally invokes `manufacturer`, `model`, `system`, `bios`, `processors`, `memory`, `disks`, `chassis`, `baseboard`, `machine_id` and `swap` in-process via `LocalDispatcher` and folds their output into its canonical CI record (`agents/core/src/sync_source_device_ci.hpp`), which the server reconstructs field-for-field (`server/core/src/device_ci_ingestion.cpp`). The four newest actions (`chassis`, `baseboard`, `swap`, `machine_id`) are optional sections of that record: each contributes its own status, the planned one included, and a failure in one never stops the report. Only `drivers` is not part of the record. `content/definitions/hardware.yaml:517-518` documents this for the `system` action specifically.",
+    "**Instruction result, plus a daily-sync consumer for eleven of the thirteen actions.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The `device_ci` daily-sync source (ADR-0016) additionally invokes `manufacturer`, `model`, `system`, `bios`, `processors`, `memory`, `disks`, `chassis`, `baseboard`, `machine_id` and `swap` in-process via `LocalDispatcher` and folds their output into its canonical CI record (`agents/core/src/sync_source_device_ci.hpp`), which the server reconstructs field-for-field (`server/core/src/device_ci_ingestion.cpp`). The four newest actions (`chassis`, `baseboard`, `swap`, `machine_id`) are optional sections of that record: each contributes its own status, the planned one included, and a failure in one never stops the report. `drivers` and `drivers_inventory` are not part of the record (`drivers_inventory` is an on-demand question with no gather block). `content/definitions/hardware.yaml:517-518` documents this for the `system` action specifically.",
     "**Not consumed by** Echo, DEX, or metrics. `manufacturer`/`model`/`bios`/`processors`/`memory`/`disks` gather on a 3600s TTL; `drivers` and `system` on an 86400s TTL (`content/definitions/hardware.yaml`); nothing polls continuously.",
-    "**Sensitivity.** `system` rows carry the hardware serial number and SMBIOS/firmware UUID — direct, stable device identifiers; `manufacturer`/`model`/`bios`/`disks` name the specific hardware but not a person; `drivers` rows name installed driver software (`name`/`provider`) — a software inventory by another route. No row carries a username or account name.",
+    "**Sensitivity.** `system` rows carry the hardware serial number and SMBIOS/firmware UUID — direct, stable device identifiers; `manufacturer`/`model`/`bios`/`disks` name the specific hardware but not a person; `drivers` and `drivers_inventory` rows name installed driver software (`name`/`provider`, plus `signer`, INF name and hardware id on `drivers_inventory`) — a software inventory by another route. No row carries a username or account name.",
     "**Siblings:** `device_identity` (domain/OU join state, same Wave 3 native-acquisition migration), `disk_actions` (SMART health and volume-to-drive mapping — `hardware.disks` reports the drive inventory, `disk_actions` reports its health and logical mounts).",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.hardware.system\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
   ]

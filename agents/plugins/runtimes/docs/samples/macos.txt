@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-04 · euid 501 · leg-hash 95588fa519d1
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-04 · euid 501 · leg-hash 3cef2d295916
 == action=dotnet
 status|dotnet|supported|-
 [result_status] OK / FULL / 

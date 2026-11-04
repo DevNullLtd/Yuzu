@@ -83,16 +83,13 @@ A home with no `release` file is only reported when a java binary proves it is a
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `dotnet` | 🟡 planned · rung 1 · NDP release-key table + dotnet InstalledVersions + Program Files walk | 🟡 planned · rung 1 · /usr/local/share/dotnet/shared walk | ✅ supported · rung 1 · /usr/share/dotnet, /usr/lib/dotnet, /usr/lib64/dotnet shared/<framework>/<version> and sdk/<version> directory walk; network mounts skipped via /proc/self/mountinfo |
-| `jvm` | 🟡 planned · rung 1 · JavaSoft keys + Program Files\\Java walk | 🟡 planned · rung 1 · /Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict + Contents/Home/release | ✅ supported · rung 1 · <home>/release file reads under /usr/lib/jvm, /opt/java, /usr/lib64/jvm, /var/opt/java (bin/java probe when a home has no release); network mounts skipped via /proc/self/mountinfo |
+| `dotnet` | ✅ supported · rung 1 · HKLM\\SOFTWARE\\dotnet\\Setup\\InstalledVersions\\<arch>\\{sharedfx,sdk} values + NDP v4 Full Release key table and v3.5 Version, both registry views; no filesystem walk | ✅ supported · rung 1 · /usr/local/share/dotnet (and x64/) shared/<framework>/<version> and sdk/<version> directory walk; network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · /usr/share/dotnet, /usr/lib/dotnet, /usr/lib64/dotnet shared/<framework>/<version> and sdk/<version> directory walk; network mounts skipped via /proc/self/mountinfo |
+| `jvm` | ✅ supported · rung 1 · HKLM JavaSoft, Eclipse Adoptium, Microsoft JDK and Azul Zulu keys (both views) + one <home>\\release read; no Program Files walk | ✅ supported · rung 1 · /Library/Java/JavaVirtualMachines/*/Contents/Home/release read (Contents/Info.plist JavaVM dict fallback); network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · <home>/release file reads under /usr/lib/jvm, /opt/java, /usr/lib64/jvm, /var/opt/java (bin/java probe when a home has no release); network mounts skipped via /proc/self/mountinfo |
 | `python` | ✅ supported · rung 1 · HKLM\\SOFTWARE\\Python\\PythonCore\\<tag> Version/SysVersion/InstallPath in both registry views (PEP 514); per-user hives never read | ✅ supported · rung 1 · single-level listing of /Library/Frameworks/Python.framework/Versions; version from each version's Resources/Info.plist; network mounts skipped via getmntinfo_r_np | 🟡 constrained · rung 1 · single-level listing of /usr/bin and /usr/local/bin for python3.<minor> regular files; version is major.minor from the name (patch level not read); network mounts skipped via /proc/self/mountinfo |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`dotnet` / Windows** — planned; the action answers a single unsupported status row on this OS
-- **`dotnet` / macOS** — planned; the action answers a single unsupported status row on this OS
-- **`jvm` / Windows** — planned; the action answers a single unsupported status row on this OS
-- **`jvm` / macOS** — planned; the action answers a single unsupported status row on this OS
+- **`jvm` / macOS** — fixture-verified only: no JDK is installed on the macOS development host, so this leg rests on trees built from the documented bundle layout
 - **`python` / Linux** — patch level unavailable without running the interpreter
 <!-- END GENERATED -->
 
@@ -123,21 +120,21 @@ Every row is pipe-delimited. The first row is always `status|<action>|<level>|<r
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `row_kind` | string | `status` `dotnet` | Linux | `dotnet` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), dotnet (one per runtime found). |
-| `flavour` | string | `core` `sdk` `unmodelled` | Linux | `core` | Runtime kind. Values: core (a Microsoft.NETCore.App, Microsoft.AspNetCore.App or Microsoft.WindowsDesktop.App shared framework), sdk (an SDK install), unmodelled (any other shared-framework name — reported, never dropped). The three core frameworks all read core at the same version; the install path tells them apart. Status rows: the action name. |
-| `version` | string | - | Linux | `8.0.31` | Version taken from the install directory name (e.g. 8.0.31, or a preview build such as 9.0.100-preview.1.24101.2). Status rows: the level (supported, constrained or unsupported). |
-| `install_path` | string | - | Linux | `/usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.31` | Absolute path of the framework or SDK version directory the version was read from. Status rows: the comma-joined failure tokens, or -. |
-| `vendor` | string | - | Linux | `-` | Always "-" for dotnet: the install tree carries no vendor field. |
+| `row_kind` | string | `status` `dotnet` | Windows, macOS, Linux | `dotnet` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), dotnet (one per runtime found). |
+| `flavour` | string | `core` `runtime` `sdk` `netfx` `unmodelled` | Windows, macOS, Linux | `core` | Runtime kind. Values: core (Linux and macOS: a Microsoft.NETCore.App, Microsoft.AspNetCore.App or Microsoft.WindowsDesktop.App shared framework), runtime (Windows: a shared framework from the registry), sdk (an SDK install), netfx (Windows: .NET Framework), unmodelled (any other shared-framework name — reported, never dropped). On Linux and macOS the three core frameworks all read core at the same version; the install path tells them apart. Status rows: the action name. |
+| `version` | string | - | Windows, macOS, Linux | `8.0.31` | Version taken from the install directory name on Linux and macOS, or the registry value name on Windows (e.g. 8.0.31, or a preview build such as 9.0.100-preview.1.24101.2). Status rows: the level (supported, constrained or unsupported). |
+| `install_path` | string | - | Windows, macOS, Linux | `/usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.31` | Absolute path of the framework or SDK version directory the version was read from. Status rows: the comma-joined failure tokens, or -. |
+| `vendor` | string | - | Windows, macOS, Linux | `-` | "-" on Linux and on the native macOS root: the install tree carries no vendor field. Windows rows and the macOS x64 (Rosetta) sub-root rows read "Microsoft". |
 
 **`crossplatform.runtimes.jvm` — `row_kind|flavour|version|install_path|vendor`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `row_kind` | string | `status` `jvm` | Linux | `jvm` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), jvm (one per runtime found). |
-| `flavour` | string | `jdk` `jre` `unmodelled` | Linux | `jdk` | Image kind from the IMAGE_TYPE key of the release file. Values: jdk, jre, unmodelled (the file does not say — Debian and SUSE OpenJDK release files have no IMAGE_TYPE, and a release-less home has no file at all; never guessed from the path). Status rows: the action name. |
-| `version` | string | - | Linux | `17.0.20` | JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION. A release file with neither key yields no row and a release_unparsable constraint; a home with a java binary but no release file yields - and a release_missing constraint. Status rows: the level (supported, constrained or unsupported). |
-| `install_path` | string | - | Linux | `/opt/java/openjdk` | Absolute path of the JVM home directory. Status rows: the comma-joined failure tokens, or -. |
-| `vendor` | string | - | Linux | `Eclipse Adoptium` | IMPLEMENTOR from the release file (e.g. Eclipse Adoptium, Debian), self-reported by the build and not verified, or "-" when the key is absent (or the home has no release file). |
+| `row_kind` | string | `status` `jvm` | Windows, macOS, Linux | `jvm` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), jvm (one per runtime found). |
+| `flavour` | string | `jdk` `jre` `unmodelled` | Windows, macOS, Linux | `jdk` | Image kind from the IMAGE_TYPE key of the release file. Values: jdk, jre, unmodelled (the file does not say — Debian and SUSE OpenJDK release files have no IMAGE_TYPE, and a release-less home has no file at all; never guessed from the path). Status rows: the action name. |
+| `version` | string | - | Windows, macOS, Linux | `17.0.20` | JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION. A release file with neither key yields no row and a release_unparsable constraint; on Linux a home with a java binary but no release file yields - and a release_missing constraint; on Windows such a home keeps its row, with the version key of the registry registration as the version, and no constraint; on macOS the Info.plist JavaVM dictionary of the bundle supplies the version. Status rows: the level (supported, constrained or unsupported). |
+| `install_path` | string | - | Windows, macOS, Linux | `/opt/java/openjdk` | Absolute path of the JVM home directory. Status rows: the comma-joined failure tokens, or -. |
+| `vendor` | string | - | Windows, macOS, Linux | `Eclipse Adoptium` | IMPLEMENTOR from the release file (e.g. Eclipse Adoptium, Debian), self-reported by the build and not verified, or "-" when the key is absent (or the home has no release file). |
 
 **`crossplatform.runtimes.python` — `row_kind|flavour|version|install_path|vendor`**
 
@@ -170,16 +167,24 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-28 · interactive user (elevated) · leg-hash 10a510136fd8
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-04 · interactive user (elevated) · leg-hash 3cef2d295916
 
 ```
 == action=dotnet
-status|dotnet|unsupported|windows:planned
-[result_status] UNAVAILABLE / PARTIAL / windows:planned
+status|dotnet|supported|-
+dotnet|netfx|4.8.1|C:/Windows/Microsoft.NET/Framework/v4.0.30319/|Microsoft
+dotnet|netfx|4.8.1|C:/Windows/Microsoft.NET/Framework64/v4.0.30319/|Microsoft
+dotnet|runtime|8.0.33|C:/Program Files (x86)/dotnet/|Microsoft
+dotnet|runtime|8.0.33|C:/Program Files/dotnet/|Microsoft
+dotnet|runtime|9.0.22|C:/Program Files (x86)/dotnet/|Microsoft
+dotnet|runtime|9.0.22|C:/Program Files/dotnet/|Microsoft
+[result_status] OK / FULL
 
 == action=jvm
-status|jvm|unsupported|windows:planned
-[result_status] UNAVAILABLE / PARTIAL / windows:planned
+status|jvm|supported|-
+jvm|jdk|21.0.13|C:/Program Files/Temurin/|Eclipse Adoptium
+jvm|unmodelled|21.0.12.1|C:/Program Files/Microsoft/jdk-21.0.12.101-hotspot/|Microsoft
+[result_status] OK / FULL
 
 == action=python
 status|python|supported|-
@@ -187,23 +192,23 @@ python|cpython|3.14.6|C:/Python314/|PythonCore
 [result_status] OK / FULL
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-28 · euid 501 · leg-hash 10a510136fd8
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-04 · euid 501 · leg-hash 3cef2d295916
 
 ```
 == action=dotnet
-status|dotnet|unsupported|macos:planned
-[result_status] UNAVAILABLE / PARTIAL / macos:planned
+status|dotnet|supported|-
+[result_status] OK / FULL
 
 == action=jvm
-status|jvm|unsupported|macos:planned
-[result_status] UNAVAILABLE / PARTIAL / macos:planned
+status|jvm|supported|-
+[result_status] OK / FULL
 
 == action=python
 status|python|supported|-
 [result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-28 · euid 1000 · leg-hash 10a510136fd8
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-28 · euid 1000 · leg-hash 3cef2d295916
 
 ```
 == action=dotnet
@@ -226,9 +231,8 @@ python|unmodelled|3.14|/usr/bin/python3.14|-
 1. **Parts of the macOS and Windows `dotnet` and `jvm` legs are verified against fixtures, not real installs.** No JDK is installed on the development Mac (installing one needs administrator rights), so the macOS `jvm` leg and its capability-matrix status rest on fixture trees built from the documented bundle layout, and the macOS `dotnet` leg is likewise tree-based. On the Windows capture host the .NET Framework mapping is Microsoft's documented release table, no SDK was installed (the `sdk` flavour is untested against a real host), and the Temurin `release` file was not read, so its vendor was not observed. Homebrew's dotnet and JDKs (under `/opt/homebrew`) are not machine-scope roots and are not walked.
 2. **Runtimes reachable only through an alias entry are not listed.** A framework, version or JVM home entry that is itself a symlink (Debian `default-java`, Fedora `java`) is skipped silently because its real directory is a sibling entry. A Linux `python3.<minor>` symlink is skipped too: an alternatives link leaves its real file listed as a sibling entry, while a link into another prefix is not followed, so that interpreter is not listed. A runtime reachable only through such a link is missed, while a symlink at a candidate root that is not a same-action alias is a `symlink_refused` constraint, not a skip.
 3. **Only standard locations are walked.** `dotnet` reads `/usr/share/dotnet`, `/usr/lib/dotnet` and `/usr/lib64/dotnet`; `jvm` reads `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm` and `/var/opt/java` (Linux), `/Library/Java/JavaVirtualMachines` (macOS) and the registered homes (Windows); `JAVA_HOME` and `PATH` are never consulted. A runtime installed elsewhere (an Oracle RPM under `/usr/java`, a version manager in a home directory, a custom prefix) is not found by design, since the plugin does not search user profiles, so `supported` with zero rows means none found at these roots. `python` reads `/usr/bin`, `/usr/local/bin` and `/var/usrlocal/bin` (Linux; the last is tried on every host but exists only where `/usr/local` is a symlink to `../var/usrlocal`, as on rpm-ostree hosts such as Fedora CoreOS and RHEL Edge, and is absent elsewhere), `/Library/Frameworks/Python.framework/Versions` (macOS) and `HKLM\SOFTWARE\Python\PythonCore` (Windows); Homebrew, pyenv, conda, virtual environments, Xcode's `Python3.framework` and the Microsoft Store and per-user Windows installs are not walked, and other PEP 514 publishers (for example Anaconda) are not listed. A Homebrew interpreter is the `brew` ecosystem's row, and a distro or Windows Uninstall entry is the other ecosystem's row, so the same interpreter can appear in more than one source.
-4. **Version data can be missing or partial, and is never guessed.** On Windows a home whose registry tag is the only version evidence reports that tag (for example `21.0.13.9`, the installer's four-part form), and the vendor of such a home is empty. Some OpenJDK 8 packages ship no `release` file: Ubuntu 22.04 `openjdk-8-jre-headless`, Rocky 9 `java-1.8.0-openjdk-headless` and Alpine 3.20 `openjdk8-jre-base` were measured to ship none. Such a home is reported with version `-`, flavour `unmodelled` and `release_missing`, so the host reads `constrained` while it is installed; the `install_path` names the major, and reading the real version would need the package manager or `java -version`, which this plugin never uses. Linux `python` reports major.minor only: the row version is taken from the file name (`python3.11` reads `3.11`), and the patch level is not stored in any file the plugin can read without starting the interpreter, so it is not guessed. The Linux descriptor leg is declared `constrained` for this reason; the status row stays `supported` because the limit is known and constant, not a failed read. A symlinked `python3.X` entry (some distributions alias a minor to another) is skipped, as `python3` itself is: only regular files count. A missing or unreadable `python` version file never raises a constraint: on macOS a version directory whose `Info.plist` is absent, binary, oversized or unreadable still produces a row, with the directory's `x.y` as the version and vendor `-`, and on Windows a tag with no `Version` or `SysVersion` value reports the tag's `major.minor`; only a failure to open or list a root (or a cap) makes the result `constrained`.
+4. **Version data can be missing or partial, and is never guessed.** On Windows a home whose registry tag is the only version evidence reports that tag (for example `21.0.13.9`, the installer's four-part form), and the vendor of such a home is empty. Some OpenJDK 8 packages ship no `release` file: Ubuntu 22.04 `openjdk-8-jre-headless`, Rocky 9 `java-1.8.0-openjdk-headless` and Alpine 3.20 `openjdk8-jre-base` were measured to ship none. Such a home is reported with version `-`, flavour `unmodelled` and `release_missing`, so the host reads `constrained` while it is installed; the `install_path` names the major, and reading the real version would need the package manager or `java -version`, which this plugin never uses. Linux `python` reports major.minor only: the row version is taken from the file name (`python3.11` reads `3.11`), and the patch level is not stored in any file the plugin can read without starting the interpreter, so it is not guessed. The Linux descriptor leg is declared `constrained` for this reason; the status row stays `supported` because the limit is known and constant, not a failed read. A symlinked `python3.X` entry (some distributions alias a minor to another) is skipped, as `python3` itself is: only regular files count. A missing or unreadable `python` version file never raises a constraint: on macOS a version directory whose `Info.plist` is absent, binary, oversized or unreadable still produces a row, with the directory's `x.y` as the version and vendor `-`, and on Windows a tag with no `Version` or `SysVersion` value reports the tag's `major.minor`; only a failure to open or list a root (or a cap) makes the result `constrained`. A `jvm` `release` file that parses but has no version key differs by OS: on Windows the home keeps its row with the registry tag (or no token) and no constraint; on macOS and Linux there is no row and the action records `release_unparsable`.
 5. **Network mounts are skipped from a dispatch-start snapshot.** A root on, under or containing a mount of a listed network type (`nfs`, `cifs`, `smb3`, `9p`, `virtiofs`, `autofs`, network `fuse.*` and others in `yuzu::shared::is_network_fstype`) is never opened, so a healthy network-mounted JDK is skipped too, and a host whose `/` is a network or virtiofs mount skips every root. The guard cannot see a mount that appears after the snapshot, a stacked filesystem such as an overlay over a dead network mount, an unlisted network type or a hang on a local block device; each can pin one of the agent's shared command workers until the kernel returns, and an unreadable mount table (`mountinfo_unreadable`) leaves the walk guarded only by the mounts read (#4875). On macOS the snapshot is `getmntinfo_r_np(MNT_NOWAIT)` (the kernel's cache, unprivileged) and a mount the system creates under `/System/Volumes/Data` is also matched by its logical spelling without that prefix; the residuals above apply there too, with one difference: a failed snapshot leaves the macOS walks (`python`, `dotnet` and `jvm`) with no guard at all (it records `macos:runtimes:mountinfo_unreadable` and the status is `constrained`). On Windows the `jvm` `release` read is made only on a fixed local drive (`GetDriveTypeW` must answer `DRIVE_FIXED`): a home on a remote, removable, optical, RAM or unknown-type drive is never opened and is kept as a row with `windows:runtimes:jvm:release_unreadable` (a registry home value that is empty, mistyped or oversized records `windows:runtimes:jvm:home_unusable` instead), so a JDK on a removable or network drive reads as unreadable, not absent. Each ancestor directory of the `release` path below the drive root must not be a reparse point either (otherwise the home reads as unreadable), but that is a best-effort check (`GetFileAttributesW` per ancestor, then a separate `CreateFileW`): a check-then-open race by a local writer of a user-writable ancestor, for example flipping a directory to a junction to a UNC path, is a disclosed residual, and the leaf open, `CreateFileW`, and `ReadFile` have no deadline: a dead FIXED volume (iSCSI, USB, VHD) can block the calling sync thread until the kernel returns, the same residual as the other Windows readers.
-6. **A `jvm` `release` file that parses but has no version key differs by OS.** On Windows the home keeps its row with the registry tag (or no token) and no constraint; on macOS and Linux there is no row and the action records `release_unparsable`.
 
 ## Source and tests
 
@@ -236,7 +240,7 @@ python|unmodelled|3.14|/usr/bin/python3.14|-
 - Plugin: `agents/plugins/runtimes/src/runtimes_legs.hpp` · `agents/plugins/runtimes/src/runtimes_linux.cpp` · `agents/plugins/runtimes/src/runtimes_linux_parsers.hpp` · `agents/plugins/runtimes/src/runtimes_macos.cpp` · `agents/plugins/runtimes/src/runtimes_macos_parsers.hpp` · `agents/plugins/runtimes/src/runtimes_parsers.hpp` · `agents/plugins/runtimes/src/runtimes_plugin.cpp` · `agents/plugins/runtimes/src/runtimes_python_parsers.hpp` · `agents/plugins/runtimes/src/runtimes_win.cpp` · `agents/plugins/runtimes/src/runtimes_win_parsers.hpp`
 - Definitions: `content/definitions/runtimes.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp`
-- Tests: `tests/test_runtimes_definition.py` · `tests/unit/test_runtimes_linux_parsers.cpp` · `tests/unit/test_runtimes_local_dispatcher.cpp` · `tests/unit/test_runtimes_parsers.cpp` · `tests/unit/test_runtimes_python_parsers.cpp` · `tests/unit/test_runtimes_win_walk.cpp`
+- Tests: `tests/test_runtimes_definition.py` · `tests/unit/test_runtimes_linux_parsers.cpp` · `tests/unit/test_runtimes_local_dispatcher.cpp` · `tests/unit/test_runtimes_macos_dotnet_jvm.cpp` · `tests/unit/test_runtimes_parsers.cpp` · `tests/unit/test_runtimes_python_parsers.cpp` · `tests/unit/test_runtimes_win_walk.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-28-runtimes-python.added.md`
+- Changelog: `changelog.d/2026-10-28-runtimes-python.added.md` · `changelog.d/2026-11-04-runtimes-dotnet-jvm-drivers-inventory.added.md`
 <!-- END GENERATED -->

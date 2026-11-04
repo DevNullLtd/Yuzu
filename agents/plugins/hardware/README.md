@@ -7,7 +7,7 @@
 | **Version** | 1.0.0 |
 | **Kind** | Collector · read-only · gathered (device.hardware.manufacturer, device.hardware.model, device.hardware.bios, device.hardware.processors, device.hardware.memory, device.hardware.disks, device.hardware.drivers, device.hardware.system) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `baseboard` (definition `device.hardware.baseboard`) · `bios` (definition `device.hardware.bios`) · `chassis` (definition `device.hardware.chassis`) · `disks` (definition `device.hardware.disks`) · `drivers` (definition `device.hardware.drivers`) · `machine_id` (definition `device.hardware.machine_id`) · `manufacturer` (definition `device.hardware.manufacturer`) · `memory` (definition `device.hardware.memory`) · `model` (definition `device.hardware.model`) · `processors` (definition `device.hardware.processors`) · `swap` (definition `device.hardware.swap`) · `system` (definition `device.hardware.system`) |
+| **Actions** | `baseboard` (definition `device.hardware.baseboard`) · `bios` (definition `device.hardware.bios`) · `chassis` (definition `device.hardware.chassis`) · `disks` (definition `device.hardware.disks`) · `drivers` (definition `device.hardware.drivers`) · `drivers_inventory` (definition `device.hardware.drivers_inventory`) · `machine_id` (definition `device.hardware.machine_id`) · `manufacturer` (definition `device.hardware.manufacturer`) · `memory` (definition `device.hardware.memory`) · `model` (definition `device.hardware.model`) · `processors` (definition `device.hardware.processors`) · `swap` (definition `device.hardware.swap`) · `system` (definition `device.hardware.system`) |
 | **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
@@ -38,6 +38,7 @@ flowchart LR
 | `chassis` | 🟡 planned · rung 1 · GetSystemFirmwareTable('RSMB') SMBIOS type 3 via the shared SMBIOS walker | 🟡 planned · rung 1 · no public source on Apple hardware; a later change declares it unsupported | 🟡 planned · rung 1 · /sys/class/dmi/id/chassis_{type,serial,asset_tag} + SMBIOS type 3 |
 | `disks` | ✅ supported · rung 1 · WMI Win32_DiskDrive | ✅ supported · rung 2 · run_bounded_subprocess(system_profiler SPStorageDataType SPNVMeDataType SPSerialATADataType -json) + native parser (hardware_disks_macos.hpp) | ✅ supported · rung 1 · /sys/block/*/{size,device/model} native walk |
 | `drivers` | ✅ supported · rung 1 · WMI Win32_PnPSignedDriver | ⛔ unsupported | ✅ supported · rung 1 · /proc/modules |
+| `drivers_inventory` | ✅ supported · rung 1 · WMI Win32_PnPSignedDriver (DeviceName, DriverVersion, DriverDate, DriverProviderName, DeviceClass, Signer, IsSigned, InfName, HardWareID), bounded | ⛔ unsupported | ✅ supported · rung 1 · /proc/modules + /sys/module/<m>/{version,taint} bounded no-follow reads |
 | `machine_id` | 🟡 planned · rung 1 · keyed hash of the registry MachineGuid | 🟡 planned · rung 1 · no public source beyond the hardware UUID `system` already reports; a later change declares it unsupported | 🟡 planned · rung 1 · keyed hash of /etc/machine-id |
 | `manufacturer` | ✅ supported · rung 1 · WMI Win32_ComputerSystem.Manufacturer | ✅ supported · rung 1 · sysctlbyname(hw.manufacturer) | ✅ supported · rung 1 · /sys/class/dmi/id/sys_vendor |
 | `memory` | ✅ supported · rung 1 · WMI Win32_PhysicalMemory | 🟡 constrained · rung 1 · sysctlbyname(hw.memsize) | 🟡 constrained · rung 2 · run_bounded_subprocess(dmidecode -t memory) |
@@ -54,6 +55,8 @@ flowchart LR
 - **`chassis` / Windows** — not read yet: one unsupported status row, windows:planned
 - **`chassis` / macOS** — not read yet: one unsupported status row, macos:planned
 - **`chassis` / Linux** — not read yet: one unsupported status row, linux:planned
+- **`drivers_inventory` / macOS** — no public kext/dext enumeration API
+- **`drivers_inventory` / Linux** — signed state is derived from the per-module taint flag E only; signer, INF, hardware id and date have no Linux source
 - **`machine_id` / Windows** — not read yet: one unsupported status row, windows:planned
 - **`machine_id` / macOS** — not read yet: one unsupported status row, macos:planned
 - **`machine_id` / Linux** — not read yet: one unsupported status row, linux:planned
@@ -137,6 +140,21 @@ Pipe-delimited rows, one per record via `write_output()`. Scalar actions (`manuf
 | `date` | string | - | Windows | `2026-04-14` | Driver release date as YYYY-MM-DD, parsed from the WMI CIM datetime (Windows only; empty if malformed or on Linux). Values: YYYY-MM-DD format, or empty. |
 | `provider` | string | - | Windows, Linux | `Realtek Semiconductor Corp.` | Driver publisher (Windows DriverProviderName; the fixed literal "kernel" on Linux). Values: free text, or the literal "kernel". |
 | `device_class` | string | - | Windows, Linux | `MEDIA` | Windows DeviceClass (e.g. NET, SYSTEM, MEDIA); the fixed literal "module" on Linux. Values: free text WMI device class, or the literal "module". |
+
+**`device.hardware.drivers_inventory` — `row_kind|name|version|date|provider|device_class|signer|signed|inf|hwid`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `status` `driver_inv` | Windows, Linux | `driver_inv` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), driver_inv (one per driver). |
+| `name` | string | - | Windows, Linux | `AMD Audio CoProcessor` | Driver or module name: the Windows DeviceName, or the Linux kernel module name. Status rows: the action name. |
+| `version` | string | - | Windows, Linux | `6.0.0.109` | Driver version (Windows DriverVersion; Linux /sys/module/<m>/version), or "-" when the host reports none. Status rows: the level (supported, constrained or unsupported). |
+| `date` | string | - | Windows | `2025-03-26` | Driver date as YYYY-MM-DD (Windows only), or "-" when empty or in a form that cannot be read unambiguously. Status rows: the reason tokens, comma-separated, or "-" when there are none. |
+| `provider` | string | - | Windows, Linux | `AMD` | Driver publisher (Windows DriverProviderName; the fixed literal "kernel" on Linux), or "-" when empty. |
+| `device_class` | string | - | Windows, Linux | `SYSTEM` | Windows DeviceClass (e.g. SYSTEM, NET, MEDIA); the fixed literal "module" on Linux; "-" when empty. |
+| `signer` | string | - | Windows | `Microsoft Windows Hardware Compatibility Publisher` | Windows signer of the driver package (Signer), or "-" when empty. No Linux source. |
+| `signed` | string | `signed` `unsigned` `-` | Windows, Linux | `signed` | Signature state. Windows: IsSigned True/False. Linux: "unsigned" only when the module taint flags contain E; "-" otherwise, since no flag proves a module signed. Values: signed, unsigned, or "-" when unknown. |
+| `inf` | string | - | Windows | `oem18.inf` | Windows INF name (InfName, e.g. oem18.inf), or "-" when empty. No Linux source. |
+| `hwid` | string | - | Windows | `PCI/VEN_1022&DEV_15E2&SUBSYS_15E21022&REV_63` | Windows hardware id (HardWareID); a backslash is written as "/" by the row escaper. "-" when empty. No Linux source. |
 
 **`device.hardware.machine_id` — `row_kind|hash_hex|algorithm|source`**
 
@@ -224,7 +242,7 @@ The provenance of a constrained result is the same token list. Every other actio
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-27 · LocalSystem (elevated) · leg-hash c78d09361368
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-04 · interactive user (elevated; serial, system UUID, computer-device GUID and peripheral BLE addresses redacted) · leg-hash 93cbaf4434ef
 
 ```
 == action=manufacturer
@@ -269,6 +287,22 @@ driver|11|Hyper-V Virtual Switch Extension Adapter|10.0.26100.1|2006-06-21|Micro
 … 12 of 178 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
+== action=drivers_inventory
+status|drivers_inventory|supported|-
+driver_inv|ACP HDA Node|-|-|-|-|-|-|-|ACP/DEVTYPE_0001&DEVREV_0000&VEN_1022&DEV_15E2&SUBSYS_102215E2&REV_63
+driver_inv|ACPI Power Button|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_PNP&DEV_0C0C
+driver_inv|ACPI Processor Container Device|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/VEN_ACPI&DEV_0010
+driver_inv|ACPI Thermal Zone|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM|Microsoft Windows|signed|machine.inf|ACPI/ThermalZone
+driver_inv|ACPI x64-based PC|10.0.26100.1|2006-06-21|Microsoft|COMPUTER|Microsoft Windows|signed|hal.inf|acpiapic
+driver_inv|AMD Audio CoProcessor|6.0.0.109|2025-03-26|AMD|SYSTEM|Microsoft Windows Hardware Compatibility Publisher|signed|oem18.inf|PCI/VEN_1022&DEV_15E2&SUBSYS_15E21022&REV_63
+driver_inv|AMD Controller Emulation|24.20.0.10|2024-03-21|AMD|SYSTEM|Microsoft Windows Hardware Compatibility Publisher|signed|oem5.inf|ROOT/AMDXE
+driver_inv|AMD Crash Defender|25.10.0.1|2025-01-27|Advanced Micro Devices, Inc.|SYSTEM|Microsoft Windows Hardware Compatibility Publisher|signed|oem7.inf|ROOT/AMDLOG
+driver_inv|AMD GPIO Controller|2.2.0.130|2022-09-15|Advanced Micro Devices, Inc|SYSTEM|Microsoft Windows Hardware Compatibility Publisher|signed|oem0.inf|ACPI/VEN_AMDI&DEV_0030
+driver_inv|AMD High Definition Audio Device|10.0.1.40|2025-03-17|Advanced Micro Devices|MEDIA|Microsoft Windows Hardware Compatibility Publisher|signed|oem13.inf|HDAUDIO/FUNC_01&VEN_1002&DEV_AA01&SUBSYS_00AA0100&REV_1008
+driver_inv|AMD Micro PEP Device|1.0.42.0|2023-02-10|Advanced Micro Devices, Inc.|SYSTEM|Microsoft Windows Hardware Compatibility Publisher|signed|oem2.inf|ACPI/VEN_AMDI&DEV_0009
+… 12 of 138 rows shown
+[result_status] OK / FULL
+
 == action=system
 serial|1234567890
 system_uuid|00000000-0000-0000-0000-000000000002
@@ -291,7 +325,7 @@ status|machine_id|unsupported|windows:planned
 [result_status] UNAVAILABLE / UNKNOWN / windows:planned
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-27 · euid 501 · leg-hash c78d09361368
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-27 · euid 501 · leg-hash 93cbaf4434ef
 
 ```
 == action=manufacturer
@@ -344,9 +378,13 @@ status|swap|unsupported|macos:planned
 == action=machine_id
 status|machine_id|unsupported|macos:planned
 [result_status] UNAVAILABLE / UNKNOWN / macos:planned
+
+== action=drivers_inventory
+status|drivers_inventory|unsupported|macos:no_enumeration_api
+[result_status] UNAVAILABLE / PARTIAL / macos:no_enumeration_api
 ```
 
-**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-27 · euid 0 · leg-hash c78d09361368
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-04 · euid 0 · leg-hash 93cbaf4434ef
 
 ```
 == action=manufacturer
@@ -414,6 +452,22 @@ status|swap|unsupported|linux:planned
 == action=machine_id
 status|machine_id|unsupported|linux:planned
 [result_status] UNAVAILABLE / UNKNOWN / linux:planned
+
+== action=drivers_inventory
+status|drivers_inventory|supported|-
+driver_inv|autofs4|-|-|kernel|module|-|-|-|-
+driver_inv|br_netfilter|-|-|kernel|module|-|-|-|-
+driver_inv|bridge|2.3|-|kernel|module|-|-|-|-
+driver_inv|ip_set|-|-|kernel|module|-|-|-|-
+driver_inv|ip_tables|-|-|kernel|module|-|-|-|-
+driver_inv|llc|-|-|kernel|module|-|-|-|-
+driver_inv|nf_conntrack_netlink|-|-|kernel|module|-|-|-|-
+driver_inv|nft_compat|-|-|kernel|module|-|-|-|-
+driver_inv|sch_fq_codel|-|-|kernel|module|-|-|-|-
+driver_inv|stp|-|-|kernel|module|-|-|-|-
+driver_inv|tun|-|-|kernel|module|-|-|-|-
+… 12 of 19 rows shown
+[result_status] OK / FULL
 ```
 <!-- END GENERATED -->
 
@@ -428,9 +482,9 @@ status|machine_id|unsupported|linux:planned
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/hardware/src/hardware_disks_macos.hpp` · `agents/plugins/hardware/src/hardware_estate_legs.hpp` · `agents/plugins/hardware/src/hardware_linux_parsers.hpp` · `agents/plugins/hardware/src/hardware_macos_bios.hpp` · `agents/plugins/hardware/src/hardware_plugin.cpp`
+- Plugin: `agents/plugins/hardware/src/hardware_disks_macos.hpp` · `agents/plugins/hardware/src/hardware_drivers_inventory.hpp` · `agents/plugins/hardware/src/hardware_estate_legs.hpp` · `agents/plugins/hardware/src/hardware_linux_parsers.hpp` · `agents/plugins/hardware/src/hardware_macos_bios.hpp` · `agents/plugins/hardware/src/hardware_plugin.cpp`
 - Definitions: `content/definitions/hardware.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
-- Tests: `tests/test_hardware_definition.py` · `tests/unit/server/test_hardware_list_model.cpp` · `tests/unit/server/test_hardware_routes.cpp` · `tests/unit/server/test_hardware_sync_routes.cpp` · `tests/unit/server/test_hardware_ui.cpp` · `tests/unit/test_hardware_device_identity_posix_actions.cpp` · `tests/unit/test_hardware_disks_macos.cpp` · `tests/unit/test_hardware_linux_parsers.cpp` · `tests/unit/test_hardware_local_dispatcher.cpp` · `tests/unit/test_hardware_macos_bios.cpp`
+- Tests: `tests/test_hardware_definition.py` · `tests/unit/server/test_hardware_list_model.cpp` · `tests/unit/server/test_hardware_routes.cpp` · `tests/unit/server/test_hardware_sync_routes.cpp` · `tests/unit/server/test_hardware_ui.cpp` · `tests/unit/test_hardware_device_identity_posix_actions.cpp` · `tests/unit/test_hardware_disks_macos.cpp` · `tests/unit/test_hardware_drivers_inventory.cpp` · `tests/unit/test_hardware_linux_parsers.cpp` · `tests/unit/test_hardware_local_dispatcher.cpp` · `tests/unit/test_hardware_macos_bios.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->
