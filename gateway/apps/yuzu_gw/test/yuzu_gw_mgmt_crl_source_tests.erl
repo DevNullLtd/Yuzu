@@ -429,10 +429,27 @@ https_test_() ->
                   ?assertEqual({error, fetch_tls}, Get(Wrong, undefined, 3000))
               after Stop() end
           end},
-         {"a host name the certificate does not carry is fetch_tls",
+         {"a certificate that does not carry the host name is fetch_tls",
           fun() ->
-              {Port, Stop} = Serve(respond(200, Body, [])),
-              try ?assertEqual({error, fetch_tls}, Get(Url("127.0.0.2", Port), undefined, 3000))
+              %% A leaf the same CA issued whose names carry neither localhost nor 127.0.0.1. The
+              %% fetch goes to 127.0.0.1, which every OS serves: an earlier form of this case
+              %% dialled 127.0.0.2, which macOS does not configure on lo0, so the connect hung
+              %% and the fetch came back fetch_timeout there (#7060).
+              NoKey = filename:join(Dir, "nosan.key"),
+              NoCsr = filename:join(Dir, "nosan.csr"),
+              NoPem = filename:join(Dir, "nosan.pem"),
+              NoExt = filename:join(Dir, "nosan.ext"),
+              ok = file:write_file(NoExt, <<"subjectAltName=DNS:other.example\n"
+                                            "extendedKeyUsage=serverAuth\n"
+                                            "basicConstraints=CA:FALSE\n">>),
+              _ = os:cmd("openssl ecparam -name prime256v1 -genkey -noout -out '" ++ NoKey ++ "' 2>&1"),
+              _ = os:cmd("openssl req -new -key '" ++ NoKey ++ "' -subj /CN=nosan -out '" ++ NoCsr ++ "' 2>&1"),
+              _ = os:cmd("openssl x509 -req -in '" ++ NoCsr ++ "' -CA '" ++ Ca ++ "' -CAkey '"
+                         ++ filename:join(Dir, "ca.key") ++ "' -CAcreateserial -days 1 -sha256 -extfile '"
+                         ++ NoExt ++ "' -out '" ++ NoPem ++ "' 2>&1"),
+              ?assert(filelib:is_regular(NoPem)),
+              {Port, Stop} = start_server(NoPem, NoKey, respond(200, Body, [])),
+              try ?assertEqual({error, fetch_tls}, Get(Url("127.0.0.1", Port), undefined, 3000))
               after Stop() end
           end},
          {"a body past the bound is aborted mid-stream as too_large",
