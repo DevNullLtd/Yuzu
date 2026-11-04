@@ -3596,9 +3596,10 @@ test('instructions runner hardening',
 )
 
 # scripts/test/ensure-puppeteer.sh and ensure-gcovr.sh, the /test Phase 0b installers, run against
-# stub node/npm/python3/uname executables in a temp HOME (never the real HOME or repo tree): every
-# ready / NOT READY branch, the hash-verified pip install, and the refuse-to-delete guard. Bash only
-# (skips on Windows), so the Linux-only docs suite.
+# stub node/npm/npx/python3 executables in a temp HOME (never the real HOME or repo tree): every
+# ready / NOT READY branch, the hash-verified pip install, the interrupted-install repairs and the
+# refuse-to-delete guards. Bash only; the gcovr cases skip off Linux (the script is Linux-only) and
+# the whole file skips on Windows. Suite docs, which CI runs on the Linux leg and /test runs natively.
 test('ensure install helpers',
   _python3_test,
   args: [files('test_ensure_install_helpers.py')],

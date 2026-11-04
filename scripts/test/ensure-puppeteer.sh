@@ -16,9 +16,10 @@
 #      (a missing shared library on a minimal Linux image is the usual cause) would otherwise
 #      surface as a confusing failure deep inside the crawl.
 #
-# What it changes: tests/puppeteer/node_modules, the puppeteer browser cache (~/.cache/puppeteer)
-# and npm's own cache (~/.npm). It reads no credentials and prints none of its own; the output of
-# npm and the browser installer is passed through as they print it.
+# What it changes: tests/puppeteer/node_modules, the puppeteer browser cache (PUPPETEER_CACHE_DIR,
+# default ~/.cache/puppeteer), npm's own cache (~/.npm) and one lock file,
+# ${XDG_CACHE_HOME:-~/.cache}/yuzu-ensure-puppeteer.lock. It reads no credentials and prints none of
+# its own; the output of npm and the browser installer is passed through as they print it.
 #
 # INTEGRITY: `npm ci` installs exactly the committed package-lock.json (every entry carries a
 # sha512), with lifecycle scripts disabled (--ignore-scripts) and the browser download deferred to
@@ -27,15 +28,21 @@
 # are not hash-verified -- an accepted residual for a developer test tool.
 #
 # RECOVERY: an interrupted Chrome download or extract leaves a partial archive and a build directory
-# with no usable binary; puppeteer then fails the same way on every run. This script deletes that one
-# build directory (and the stale *.zip beside it) ONCE and reinstalls, but only when the browser
-# lives in puppeteer's own cache (a directory named `chrome`), and never when PUPPETEER_EXECUTABLE_PATH
-# names a binary the caller supplied. A browser that fails to start because of a missing shared
-# library is NOT reinstalled (a download cannot fix it); the missing libraries are listed instead.
+# with no usable binary; puppeteer then fails the same way on every run. This script removes that one
+# build directory (and the stale *chrome*.zip archives beside it) ONCE and reinstalls. It does so only
+# when (a) the browser lives inside puppeteer's own cache directory, at <cache>/chrome/<build>/..., so
+# a path set by a config file or a lookalike directory is never touched, (b) the caller did not supply
+# PUPPETEER_EXECUTABLE_PATH, and (c) for a browser that is present but will not start, the binary
+# itself is demonstrably broken (it cannot even print --version). A browser that runs but fails to
+# start headless for another reason (an unwritable TMPDIR, memory limits) is left in place, and one
+# that is missing shared libraries is not reinstalled either (a download cannot fix it); the missing
+# libraries are listed instead.
 #
-# Every network step has a timeout (when `timeout` exists) and the install section takes an exclusive
-# lock (when `flock` exists), so a stalled connection ends and two worktrees cannot race on the shared
-# ~/.cache/puppeteer.
+# Every network step has a timeout (when `timeout` or `gtimeout` exists; override with
+# YUZU_ENSURE_NPM_TIMEOUT / _BROWSER_TIMEOUT / _LAUNCH_TIMEOUT, seconds) and the whole run holds an
+# exclusive lock (when `flock` exists; YUZU_ENSURE_LOCK_TIMEOUT bounds the wait), so a stalled
+# connection ends and two worktrees cannot race on the shared browser cache. The lock descriptor is
+# closed for every child process, so a leaked child cannot keep it.
 #
 # Exit 0 = ready. Exit 1 = not ready; the last line printed says what to do.
 set -euo pipefail
@@ -44,22 +51,30 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PP="$ROOT/tests/puppeteer"
 NODE_MIN_MAJOR=22
 NODE_MIN_MINOR=12
-NPM_CI_TIMEOUT=600
-BROWSER_TIMEOUT=900
-LAUNCH_TIMEOUT=60
+NPM_CI_TIMEOUT="${YUZU_ENSURE_NPM_TIMEOUT:-600}"
+BROWSER_TIMEOUT="${YUZU_ENSURE_BROWSER_TIMEOUT:-900}"
+LAUNCH_TIMEOUT="${YUZU_ENSURE_LAUNCH_TIMEOUT:-60}"
+LOCK_TIMEOUT="${YUZU_ENSURE_LOCK_TIMEOUT:-2400}"
 
 say()  { printf 'ensure-puppeteer: %s\n' "$*"; }
 die()  { printf 'ensure-puppeteer: NOT READY: %s\n' "$*" >&2; exit 1; }
 
 [[ -n "${HOME:-}" ]] || die "HOME is not set"
 
-# tmo SECONDS CMD...: run CMD under `timeout` when it exists (macOS has none by default).
+# tmo SECONDS CMD...: run CMD under a timeout when one exists (macOS has `gtimeout` only with
+# coreutils installed), with the lock descriptor (9) closed for the child.
 tmo() {
-    local secs="$1"; shift
+    local secs="$1" t=""
+    shift
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$secs" "$@" || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: $1 $2"; return $rc; }
+        t=timeout
+    elif command -v gtimeout >/dev/null 2>&1; then
+        t=gtimeout
+    fi
+    if [[ -n "$t" ]]; then
+        "$t" -k 10 "$secs" "$@" 9>&- || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}"; return $rc; }
     else
-        "$@"
+        "$@" 9>&-
     fi
 }
 
@@ -78,12 +93,17 @@ say "node ${node_ver}"
 
 [[ -f "$PP/package-lock.json" ]] || die "$PP/package-lock.json is missing; this checkout is incomplete"
 
-# One install at a time per user: the browser cache is shared by every worktree.
+# One install at a time per user: the browser cache is shared by every worktree. The lock file is
+# opened for APPEND (never truncated) and only in a directory you own and not through a symlink,
+# so a planted link cannot be used to clobber another file.
 if command -v flock >/dev/null 2>&1; then
     LOCKFILE="${XDG_CACHE_HOME:-$HOME/.cache}/yuzu-ensure-puppeteer.lock"
-    mkdir -p "$(dirname "$LOCKFILE")" || die "cannot create $(dirname "$LOCKFILE")"
-    exec 9>"$LOCKFILE" || die "cannot open $LOCKFILE"
-    flock -w "$BROWSER_TIMEOUT" 9 || die "timed out waiting for another ensure-puppeteer run (lock: $LOCKFILE)"
+    lockdir="$(dirname "$LOCKFILE")"
+    mkdir -p "$lockdir" || die "cannot create $lockdir"
+    [[ -O "$lockdir" ]] || die "$lockdir is not owned by you; refusing to put a lock file there"
+    [[ ! -L "$LOCKFILE" ]] || die "$LOCKFILE is a symlink; refusing to use it as a lock file"
+    exec 9>>"$LOCKFILE" || die "cannot open $LOCKFILE"
+    flock -w "$LOCK_TIMEOUT" 9 || die "timed out waiting for another ensure-puppeteer run (lock: $LOCKFILE)"
 fi
 
 # --- 2. dependencies ----------------------------------------------------------------------
@@ -114,7 +134,7 @@ exe_path() {
     ( cd "$PP" && node --input-type=module -e "
         import puppeteer from 'puppeteer';
         console.log(await puppeteer.executablePath());
-    " )
+    " ) 9>&-
 }
 browser_present() {
     local exe
@@ -124,23 +144,30 @@ browser_present() {
 install_browser() {
     ( cd "$PP" && tmo "$BROWSER_TIMEOUT" npx --no-install puppeteer browsers install chrome )
 }
-# Delete the ONE build directory that holds a partial or corrupt browser, plus the stale archives
-# beside it. Refuses (returns 1) unless the browser is inside a puppeteer cache `chrome` directory
-# and the caller did not supply their own binary.
+# Remove the partial or corrupt browser install and its stale archives. Refuses (returns 1) unless
+# the browser path is <puppeteer cache>/chrome/<build>/... inside the cache directory this script
+# knows about, and the caller did not supply their own binary. The build directory is the first path
+# component under <cache>/chrome/ -- the same on Linux (chrome-linux64/chrome) and macOS (an .app
+# bundle several levels deep).
 heal_browser() {
     [[ -z "${PUPPETEER_EXECUTABLE_PATH:-}" ]] || return 1
-    local exe dir parent
+    local exe cache base rel first build
     exe="$(exe_path)" || return 1
-    [[ -n "$exe" ]] || return 1
-    dir="$(dirname "$(dirname "$exe")")"
-    parent="$(dirname "$dir")"
-    [[ "$(basename "$parent")" == "chrome" && "$dir" != "$parent" ]] || return 1
-    say "removing the partial browser install at $dir"
-    rm -rf "$dir" || return 1
-    rm -f "$parent"/*.zip 2>/dev/null || true
+    cache="${PUPPETEER_CACHE_DIR:-$HOME/.cache/puppeteer}"
+    base="${cache%/}/chrome/"
+    [[ "$exe" == "$base"* ]] || return 1
+    rel="${exe#"$base"}"
+    first="${rel%%/*}"
+    [[ -n "$first" && "$first" != "." && "$first" != ".." ]] || return 1
+    build="$base$first"
+    if [[ -d "$build" && ! -L "$build" ]]; then
+        say "removing the partial browser install at $build"
+        rm -rf "$build" || return 1
+    fi
+    rm -f "$base"*chrome*.zip 2>/dev/null || true
 }
 
-RECOVERY="to reset the browser cache run: cd tests/puppeteer && npx puppeteer browsers clear (then re-run); or set PUPPETEER_EXECUTABLE_PATH to an existing Chrome for Testing binary"
+RECOVERY="to reset the browser cache run: cd tests/puppeteer && npx puppeteer browsers clear (this removes ALL cached browsers, shared by every project; then re-run); or set PUPPETEER_EXECUTABLE_PATH to an existing Chrome for Testing binary"
 
 # If node cannot even load puppeteer, say that now: treating it as "browser absent" would download
 # a browser and then fail with a message that points at the wrong thing.
@@ -173,6 +200,12 @@ launch_check() {
         console.log('launched ' + v);
     " ) 2>&1
 }
+# True when the binary itself runs. A truncated or half-extracted browser cannot even print its
+# version; an intact one can, whatever else stopped it launching.
+browser_runs() {
+    [[ -n "$1" && -x "$1" ]] && tmo 20 "$1" --version >/dev/null 2>&1
+}
+last_line() { printf '%s' "${1##*$'\n'}"; }
 
 if ! launch_out="$(launch_check)"; then
     exe="$(exe_path || true)"
@@ -180,15 +213,19 @@ if ! launch_out="$(launch_check)"; then
     if [[ -n "$exe" ]] && command -v ldd >/dev/null 2>&1; then
         missing="$(ldd "$exe" 2>/dev/null | grep 'not found' | sed 's/^[[:space:]]*//' | tr '\n' ';' || true)"
     fi
+    printf '%s\n' "$launch_out" >&2
     if [[ -n "$missing" ]]; then
-        die "the browser will not start: shared libraries are missing (${missing}) - install them (Debian/Ubuntu: apt install the matching packages); a reinstall will not help"
+        die "the browser will not start: shared libraries are missing (${missing}) - install the packages that provide them (Debian/Ubuntu: apt-file search <library> names the package); a reinstall will not help"
+    fi
+    if browser_runs "$exe"; then
+        die "the browser runs (it prints its version) but will not start headless, so it was NOT reinstalled; the output above says why - often an unwritable TMPDIR, a memory limit or a sandbox restriction. Last line: $(last_line "$launch_out")"
     fi
     if heal_browser; then
-        say "the browser is present but will not start; reinstalling it once"
+        say "the browser binary is broken; reinstalling it once"
         install_browser || die "browser reinstall failed (${RECOVERY})"
-        launch_out="$(launch_check)" || die "the browser still will not start headless after a reinstall (${RECOVERY}); see the output above: ${launch_out##*$'\n'}"
+        launch_out="$(launch_check)" || { printf '%s\n' "$launch_out" >&2; die "the browser still will not start headless after a reinstall (${RECOVERY}). Last line: $(last_line "$launch_out")"; }
     else
-        die "the browser will not start headless and is not in puppeteer's cache, so it was left alone (${RECOVERY}): ${launch_out##*$'\n'}"
+        die "the browser is broken but is not inside puppeteer's own cache directory (or PUPPETEER_EXECUTABLE_PATH is set), so it was left alone (${RECOVERY}). Last line: $(last_line "$launch_out")"
     fi
 fi
 printf '%s\n' "$launch_out"

@@ -106,6 +106,17 @@ Every test target carries a `suite:` label (`agent`, `echo`, `server`, `proto`, 
 meson test -C build-linux --suite <server|agent|echo> --print-errorlogs   # omit --suite for everything
 ```
 
+### The `/test` pre-push gate and its tooling
+
+`/test` (default and `--full`) installs two things the C++ build does not need, in its Phase 0b
+(`.claude/skills/test/SKILL.md`): the headless browser for the dashboard gates (`scripts/test/ensure-puppeteer.sh`)
+and `gcovr` for the coverage gate (`scripts/test/ensure-gcovr.sh`, Linux). They need **Node 22.12 or newer**,
+**python3 3.10 or newer with `venv`/`ensurepip`** (on Debian/Ubuntu `apt install python3-venv`) and `~/.local/bin`
+on `PATH`, plus network access to registry.npmjs.org, pypi.org and Google's Chrome for Testing CDN, and about
+0.5 GB of disk on the first run. A box that cannot satisfy them still runs `/test`: a missing gcovr only
+turns the coverage gate into a WARN (default mode), and `PUPPETEER_EXECUTABLE_PATH` skips the browser download.
+Details, recovery and the integrity posture: `tests/puppeteer/README.md` and `docs/ci-architecture.md`.
+
 Tests require `-Dbuild_tests=true`. vcpkg installs Catch2 (the default-on `tests` feature, see "Dependency features") only on `x64 | arm64`; the ARM64 cross-compile CI job intentionally skips tests.
 
 ### Direct binary invocation

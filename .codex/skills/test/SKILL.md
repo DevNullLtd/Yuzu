@@ -75,9 +75,9 @@ Wall-clock order is fixed:
 4. Phase 3 OTA: full mode only; may record SKIP if still stubbed.
 5. Phase 7a perf: full mode only, before UAT stack; measure-and-report only.
 6. Phase 4 fresh stack: `bash scripts/start-UAT.sh`; skipped in quick mode.
-7. Phase 5 gates: unit, EUnit, Dialyzer, CT, integration/e2e/synthetic UAT/puppeteer/instructions as applicable. Security E2E runs after the parallel fan-out, alone (its rate-limit probe empties the shared login bucket). Puppeteer and Browser smoke record FAIL (never SKIP) when `tests/puppeteer/node_modules/puppeteer` is absent; in default and full modes `scripts/test/ensure-puppeteer.sh` and `scripts/test/ensure-gcovr.sh` install what they need first (Phase 0b in the Claude runner).
+7. Phase 5 gates: unit, EUnit, Dialyzer, CT, integration/e2e/synthetic UAT/puppeteer/instructions as applicable. Security E2E runs after the parallel fan-out, alone (its rate-limit probe empties the shared login bucket). Puppeteer and Browser smoke record FAIL (never SKIP) when `tests/puppeteer/node_modules/puppeteer` is absent (step 1b installs it first).
 8. Phase 6 sanitizers: full mode only, dispatched runner.
-9. Phase 7b coverage: full mode only, enforces `tests/coverage-baseline.json`.
+9. Phase 7b coverage: `--full` enforces `tests/coverage-baseline.json`; default mode runs it report-only. Before measuring, `scripts/test/ensure-gcovr.sh` is re-run, and if the pinned gcovr is not usable the gate is not run and a WARN Coverage row is recorded.
 10. Phase 8 teardown and summary.
 
 Phases 0, 0b and 1 are mandatory-blocking. Other phases should normally continue so the operator gets one prioritized report.

@@ -192,9 +192,10 @@ older `Puppeteer` gate is warn-only). `/test` Phase 0b runs `scripts/test/ensure
 which installs the Node dependencies and Chrome for Testing when absent and proves the browser
 launches headless; if it cannot, the run aborts before the build. A missing
 `tests/puppeteer/node_modules/puppeteer` at Phase 5 records FAIL, never SKIP.
-`/test` Phase 0b also runs `scripts/test/ensure-gcovr.sh` (Linux only), which installs the `gcovr`
-version pinned in `requirements-ci.in` from the hash-pinned `requirements-ci.txt` into a private
-virtualenv, so the local coverage gate measures with CI's tool and records a number instead of WARN.
+`/test` Phase 0b also runs `scripts/test/ensure-gcovr.sh` (Linux only). A gcovr you already have at the
+version pinned in `requirements-ci.in` that can produce the gate's reports is used as it is; otherwise it
+installs that version from the hash-pinned `requirements-ci.txt` (the file CI uses) into a private
+virtualenv. If neither works, default mode records WARN and Phase 7b measures nothing; `--full` stops.
 Shared browser mechanics are in `tests/puppeteer/lib/harness.mjs`;
 `tests/puppeteer/README.md` covers running it by hand.
 

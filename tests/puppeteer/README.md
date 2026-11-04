@@ -17,9 +17,31 @@ bash scripts/test/ensure-puppeteer.sh
 `node_modules` and the browser are not committed. `/test` runs this script itself (Phase 0b, default
 and `--full` modes) and aborts the run if it cannot finish, so the gates never skip for a missing
 install. It is idempotent: on a ready machine it only verifies, including that Chrome launches
-headless. By hand it is the same as `(cd tests/puppeteer && npm ci)` plus
-`npx puppeteer browsers install chrome`. If no Chrome for Testing build exists for your platform (Linux arm64 is the usual case) or the box has no route to the download, point
-`PUPPETEER_EXECUTABLE_PATH` at a Chrome for Testing binary.
+headless. By hand it is `PUPPETEER_SKIP_DOWNLOAD=1 npm ci --ignore-scripts` in `tests/puppeteer` plus
+`npx puppeteer browsers install chrome`; the script adds timeouts, a lock and the repairs below.
+
+Needs: Node 22.12 or newer, and network access to registry.npmjs.org and Google's Chrome for Testing
+CDN (about 400 MB per browser build, in `~/.cache/puppeteer`, shared by every worktree; old builds are
+not pruned). The Chrome archive is not hash-verified (no checksum is published). Standard proxy and CA
+variables (`HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, `npm_config_registry`) reach npm and the downloader.
+
+If no Chrome for Testing build exists for your platform (for example Linux arm64) or the box has no
+route to the download, point `PUPPETEER_EXECUTABLE_PATH` at an existing Chrome for Testing binary. That
+variable only skips the browser download: `npm ci` still runs unless `node_modules` is already present.
+
+### Recovery
+
+An interrupted install repairs itself on the next run: a partial Chrome download or a truncated binary
+inside puppeteer's own cache is removed and fetched again once. If it still fails:
+
+- `cd tests/puppeteer && npx puppeteer browsers clear` removes ALL cached browsers (shared by every
+  project that uses puppeteer), then re-run the script.
+- `rm -rf tests/puppeteer/node_modules` and re-run, if node cannot load puppeteer.
+- A browser that prints its version but will not start headless is not reinstalled: look at the output
+  above the error (an unwritable `TMPDIR`, a memory limit or a sandbox restriction is the usual cause);
+  on Linux missing shared libraries are listed by name.
+- Timeouts can be raised with `YUZU_ENSURE_NPM_TIMEOUT`, `YUZU_ENSURE_BROWSER_TIMEOUT` and
+  `YUZU_ENSURE_LAUNCH_TIMEOUT` (seconds).
 
 ## Run
 

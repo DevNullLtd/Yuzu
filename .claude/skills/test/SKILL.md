@@ -81,15 +81,15 @@ Phase 8 — Teardown + Summary    (cleans Phase 2 compose projects + scratch dir
                                  purpose — do NOT call start-UAT.sh stop)
 ```
 
-**Wall-clock order: 0, 1, 2, 3, 7a-perf, 4, 5, 6, 7b-coverage, 8.** Perf is intentionally pulled forward of Phase 4 because it has no functional dependency on the UAT stack (every upstream RPC is meck'd inside the suite, gateway components run in-process) but its measurements are extremely sensitive to CPU/scheduler contention. Running perf on a quiet box — after Phase 1 binaries exist but before Phase 2's docker compose, Phase 4's native server+gateway+agent, and Phase 5's parallel fan-out — gives the most-isolated environment available in the pipeline. DB phase numbers stay stable (`phase=7` for both perf and coverage) so the report table groups them together at the end; the wall-clock split is purely an isolation guarantee.
+**Wall-clock order: 0, 0b, 1, 2, 3, 7a-perf, 4, 5, 6, 7b-coverage, 8.** Perf is intentionally pulled forward of Phase 4 because it has no functional dependency on the UAT stack (every upstream RPC is meck'd inside the suite, gateway components run in-process) but its measurements are extremely sensitive to CPU/scheduler contention. Running perf on a quiet box — after Phase 1 binaries exist but before Phase 2's docker compose, Phase 4's native server+gateway+agent, and Phase 5's parallel fan-out — gives the most-isolated environment available in the pipeline. DB phase numbers stay stable (`phase=7` for both perf and coverage) so the report table groups them together at the end; the wall-clock split is purely an isolation guarantee.
 
 **Phase 8 leaves the UAT alive.** `scripts/test/teardown.sh` only stops Docker compose projects matching `yuzu-test-${RUN_ID}-*` (Phase 2 fixtures); it does not touch the native processes started by `start-UAT.sh`. This is deliberate: a successful `/test --full` run leaves a working UAT at the tested HEAD so humans can sanity-check it before cutting `/release`. Do **not** add `bash scripts/start-UAT.sh stop` to your orchestration — if the operator wants the stack down they can run it themselves.
 
-Phases 0, 0b and 1 are the blocking phases — a failed preflight, a failed tooling install or a HEAD that doesn't compile stops the run, because nothing after them can be trusted. Every other phase runs to completion regardless of upstream failures so the operator gets a prioritized fix list in one pass.
+Phases 0, 0b and 1 are the blocking phases — a failed preflight, a failed Puppeteer install (or, in `--full`, a failed gcovr install) or a HEAD that doesn't compile stops the run, because nothing after them can be trusted. Every other phase runs to completion regardless of upstream failures so the operator gets a prioritized fix list in one pass.
 
 **Every phase emits structured timing data into the test-runs DB.** Top-level gate timings land in `test_gates.duration_seconds`; sub-step timings (upgrade phases, OTA flow steps, individual command round-trips) land in `test_timings`. This is how trend analysis catches "Phase 2 upgrade got 3× slower since last week" without grepping log files.
 
-> **PR2 status.** Phases 0, 1, 2, 4, 5, 6, 7, 8 are wired. Phase 3 (cross-platform OTA self-exec) is still stubbed pending PR3; its gate rows record as `SKIP` with a "planned for PR3" note. Phase 6 (sanitizers) dispatches `.github/workflows/sanitizer-tests.yml` onto the `yuzu-wsl2-linux` self-hosted runner; if the runner is offline the gate records WARN and the rest of the run continues. Phase 7 coverage runs locally against `tests/coverage-baseline.json` (real captured numbers; the original PR2 `__seed: true` permissive baseline is gone). Phase 7 perf is **measure-and-report** as of 2026-05-03: the gate records `perf_*` metrics into the test-runs DB but no longer reads a baseline file or fails on regressions — see Phase 7a below and `docs/perf-baseline-calibration-2026-05-03.md`.
+> **PR2 status.** Phases 0, 0b, 1, 2, 4, 5, 6, 7, 8 are wired. Phase 3 (cross-platform OTA self-exec) is still stubbed pending PR3; its gate rows record as `SKIP` with a "planned for PR3" note. Phase 6 (sanitizers) dispatches `.github/workflows/sanitizer-tests.yml` onto the `yuzu-wsl2-linux` self-hosted runner; if the runner is offline the gate records WARN and the rest of the run continues. Phase 7 coverage runs locally against `tests/coverage-baseline.json` (real captured numbers; the original PR2 `__seed: true` permissive baseline is gone). Phase 7 perf is **measure-and-report** as of 2026-05-03: the gate records `perf_*` metrics into the test-runs DB but no longer reads a baseline file or fails on regressions — see Phase 7a below and `docs/perf-baseline-calibration-2026-05-03.md`.
 
 ## Step 0 — Initialise run state
 
@@ -155,20 +155,28 @@ that are not committed. `/test` installs them rather than skipping the gates: a 
 want of a one-line install silently stops protecting the dashboard. The script is idempotent (a
 ready box only verifies), and it proves the browser LAUNCHES headless, not merely that a file exists.
 
-The coverage gate (Phase 7b, report-only in default mode) needs `gcovr`. `ensure-gcovr.sh` installs it
-the way CI does: `pip install --require-hashes` from `requirements-ci.txt` into a private virtualenv
-(`~/.local/share/yuzu/gcovr-venv`), so gcovr and every dependency are hash-verified, and links the one
-`gcovr` into `~/.local/bin`. (`pip3 install --user` fails on a distro Python that is externally managed,
-and a bare `pipx install gcovr==X` would leave the dependencies unpinned.) It passes when the `gcovr`
-your `PATH` resolves to (the lookup `coverage-gate.sh` itself does) reports the version `requirements-ci.in`
-pins; a gcovr you already have at that version is used as it is, and only a missing or different one is
-installed. It needs python3 3.10+ with `ensurepip` to install, and `~/.local/bin` on `PATH`: on a fresh
-account the directory may not exist at login, so the first run can install the tool and still report it
-is not on `PATH` until you re-login or add it. It does nothing off Linux, where the coverage gate does
-not measure.
+The coverage gate (Phase 7b, report-only in default mode) needs `gcovr`. `ensure-gcovr.sh` installs what
+it installs with the hash-pinned file CI uses: `pip install --require-hashes` from `requirements-ci.txt`
+into a private virtualenv (`~/.local/share/yuzu/gcovr-venv`; CI installs with `--user`), so gcovr and every
+dependency are hash-verified, and links the one `gcovr` into `~/.local/bin`. (`pip3 install --user` fails on
+a distro Python that is externally managed, and a bare `pipx install gcovr==X` would leave the dependencies
+unpinned.) It passes when the `gcovr` your `PATH` resolves to (the lookup `coverage-gate.sh` itself does)
+reports the version `requirements-ci.in` pins and can produce the reports the gate asks for: a gcovr you
+already have at that version is used as it is (its integrity is then yours, not verified here), and only a
+missing, different or non-working one is replaced. It needs python3 3.10+ with `ensurepip` to install, and
+`~/.local/bin` on `PATH` (`export PATH="$HOME/.local/bin:$PATH"`): on a fresh account the directory may not
+exist at login, so the first run can install the tool and still report it is not on `PATH` until you
+re-login or add it. It does nothing off Linux, where the coverage gate does not measure.
 
-First run side effects: a Chrome for Testing download into `~/.cache/puppeteer` (a few hundred MB), npm's
-cache in `~/.npm`, and the gcovr virtualenv under `~/.local/share/yuzu/`. Later runs only verify.
+The Chrome for Testing archive is fetched over TLS from Google's CDN and is NOT hash-verified (no checksum is
+published); `npm ci` is lockfile-integrity-checked with lifecycle scripts disabled.
+
+First run side effects: a Chrome for Testing download into `~/.cache/puppeteer` (about 400 MB per build, shared
+by every worktree; old builds are not pruned), npm's cache in `~/.npm`, and the gcovr virtualenv (about 60 MB)
+under `~/.local/share/yuzu/`. Later runs only verify. Network steps run under timeouts (npm 600 s, browser
+900 s, launch 60 s, pip 600 s; `YUZU_ENSURE_NPM_TIMEOUT`, `_BROWSER_TIMEOUT`, `_LAUNCH_TIMEOUT`,
+`_PIP_TIMEOUT` and `_LOCK_TIMEOUT` override), so a stalled link can add up to roughly an hour on a first run
+before the run gives up. An interrupted install repairs itself on the next run.
 
 ```bash
 if [[ "$MODE" == "default" || "$MODE" == "full" ]]; then
@@ -178,7 +186,7 @@ if [[ "$MODE" == "default" || "$MODE" == "full" ]]; then
     bash scripts/test/test-db-write.sh gate \
         --run-id "$RUN_ID" --phase 0 --gate "Puppeteer install" \
         --status "$PPTR_STATUS" --duration $(( $(date +%s) - PPTR_START )) \
-        --log "ensure-puppeteer.log"
+        --log "ensure-puppeteer.log" --notes "$(tail -n 1 "$LOG_DIR/ensure-puppeteer.log")"
     if [[ "$PPTR_STATUS" == "FAIL" ]]; then
         cat "$LOG_DIR/ensure-puppeteer.log"
         bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED
@@ -186,8 +194,8 @@ if [[ "$MODE" == "default" || "$MODE" == "full" ]]; then
     fi
 
     # gcovr only matters to the coverage gate (Phase 7b), which measures on Linux alone. (`uname`, not
-    # host_os: the runbook blocks may run in separate shells, and nothing here may depend on a function.)
-    GCOVR_UNAVAILABLE=""
+    # the host_os function, so this block depends on nothing defined elsewhere.)
+    rm -f "$LOG_DIR/gcovr-unavailable"
     if [[ "$(uname -s)" != "Linux" ]]; then
         bash scripts/test/test-db-write.sh gate \
             --run-id "$RUN_ID" --phase 0 --gate "gcovr install" \
@@ -207,16 +215,18 @@ if [[ "$MODE" == "default" || "$MODE" == "full" ]]; then
         bash scripts/test/test-db-write.sh gate \
             --run-id "$RUN_ID" --phase 0 --gate "gcovr install" \
             --status "$GCOVR_RECORD" --duration $(( $(date +%s) - GCOVR_START )) \
-            --log "ensure-gcovr.log"
+            --log "ensure-gcovr.log" --notes "$(tail -n 1 "$LOG_DIR/ensure-gcovr.log")"
         if [[ "$GCOVR_STATUS" == "FAIL" ]]; then
             cat "$LOG_DIR/ensure-gcovr.log"
             if [[ "$MODE" == "full" ]]; then
                 bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED
                 exit 1
             fi
-            # Remember it for Phase 7b: with no usable pinned gcovr the coverage gate must not run at
-            # all, or it would measure with whatever other gcovr is on PATH and record that as a figure.
-            GCOVR_UNAVAILABLE=1
+            # Remember it for Phase 7b IN A FILE under the run's log directory (the one thing the runbook
+            # already carries between blocks): with no usable pinned gcovr the coverage gate must not
+            # run at all, or it would measure with whatever other gcovr is on PATH and record that as
+            # a figure.
+            : > "$LOG_DIR/gcovr-unavailable"
             echo "gcovr unavailable: Phase 7b will not measure coverage (default mode is report-only)"
         fi
     fi
@@ -350,8 +360,8 @@ if [[ "$PHASE1_FAILS" -gt 0 ]]; then
 fi
 ```
 
-Phases 0, 0b and 1 are the blocking phases. If preflight, the tooling install
-or the HEAD build fails, nothing else can run.
+Phases 0, 0b and 1 are the blocking phases. If preflight, the Puppeteer install (or, in `--full`,
+the gcovr install) or the HEAD build fails, nothing else can run.
 
 ## Phase 2 — Upgrade Test (the user's headline priority)
 
@@ -750,22 +760,32 @@ The gate script:
 Coverage runs locally on the operator's dev box, at the end of the pipeline (after Phase 5 gates and Phase 6 sanitizer dispatch). It uses `${BUILDDIR}-coverage/` (separate from the main `${BUILDDIR}/` to keep ccache hit rates intact). Coverage is contention-tolerant — it's measuring code-execution coverage, not throughput, so the live UAT stack from Phase 4 doesn't affect the numbers. The earlier perf step (Phase 7a) already ran on a quiet box.
 
 ```bash
-if [[ "$MODE" == "full" ]]; then
+# Is the pinned gcovr still usable NOW? Phase 0b checked it, but the venv is shared by every worktree
+# and another one may have rebuilt it since, and a failure recorded in Phase 0b must hold. Re-running
+# the installer is a no-op when all is well. If gcovr is not usable the gate is not run at all, so a
+# different gcovr on PATH can never produce a figure that gets compared with the baseline.
+gcovr_usable() {
+    [[ "$(uname -s)" != "Linux" ]] && return 0      # coverage-gate.sh refuses off Linux on its own
+    [[ ! -e "$LOG_DIR/gcovr-unavailable" ]] \
+        && bash scripts/test/ensure-gcovr.sh > "$LOG_DIR/ensure-gcovr-7b.log" 2>&1
+}
+if ! gcovr_usable; then
+    bash scripts/test/test-db-write.sh gate \
+        --run-id "$RUN_ID" --phase 7 --gate "Coverage" \
+        --status WARN --duration 0 \
+        --notes "not measured: the pinned gcovr is not usable (see the gcovr install row and the ensure-gcovr logs in the run's log directory)"
+    if [[ "$MODE" == "default" ]]; then
+        bash scripts/test/test-db-write.sh gate \
+            --run-id "$RUN_ID" --phase 7 --gate "Perf" \
+            --status SKIP --duration 0 --notes "perf measurement runs in --full only"
+    fi
+elif [[ "$MODE" == "full" ]]; then
     bash scripts/test/coverage-gate.sh --run-id "$RUN_ID"
 elif [[ "$MODE" == "default" ]]; then
     # Default mode: coverage in report-only (metric recorded, no enforce);
     # perf skipped (default-mode budget is too tight for the ~3-5 min
     # CT suite plus registry churn).
-    if [[ -n "${GCOVR_UNAVAILABLE:-}" ]]; then
-        # Phase 0b could not provide the pinned gcovr. Measuring with some other gcovr on PATH would
-        # record a number that is not comparable to the baseline, so record WARN and measure nothing.
-        bash scripts/test/test-db-write.sh gate \
-            --run-id "$RUN_ID" --phase 7 --gate "Coverage" \
-            --status WARN --duration 0 \
-            --notes "not measured: Phase 0b could not provide the pinned gcovr (see the gcovr install row)"
-    else
-        bash scripts/test/coverage-gate.sh --run-id "$RUN_ID" --report-only || true
-    fi
+    bash scripts/test/coverage-gate.sh --run-id "$RUN_ID" --report-only || true
     bash scripts/test/test-db-write.sh gate \
         --run-id "$RUN_ID" --phase 7 --gate "Perf" \
         --status SKIP --duration 0 --notes "perf measurement runs in --full only"

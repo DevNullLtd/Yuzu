@@ -125,7 +125,7 @@ product artifact):
 | Directory | What it is | Exercised by |
 |---|---|---|
 | `site/` | Astro docs site (GitHub Pages) | `docs-site.yml` build job on every PR touching it |
-| `tests/puppeteer/` | Puppeteer UAT harness | manual / UAT runs only — **no CI coverage** |
+| `tests/puppeteer/` | Puppeteer UAT harness | manual / UAT runs and the local `/test` pre-push gate (Phases 0b and 5) — **no CI coverage** |
 | `deploy/docker/cedar-vale/app/` | Cedar & Vale demo deck server (Express + pg; built only by the viz-UAT rig) | local `docker-compose.viz-uat.yml` builds |
 
 Each directory commits a `package-lock.json` and is listed in the
