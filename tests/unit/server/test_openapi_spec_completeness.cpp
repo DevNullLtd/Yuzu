@@ -2336,18 +2336,116 @@ TEST_CASE("openapi documents: the response status set of the hand-checked operat
         // size_exceeded); 500 (open or write failed); 503 (store null or unavailable,
         // advance_offset error).
         {"/uploads/{upload_id}/chunk", "put", {"200", "400", "401", "409", "410", "413", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Get("/api/v1/plugin-config"): 200; 400 (list_config
+        // InvalidInput for a plugin filter that is not a valid identifier); 403 (list_read_fn
+        // admitted a management-group-confined grant, refused by design, so it is declared); 503
+        // (list_read_fn unwired or degraded, store not open, Unavailable). A 401 from the gate is
+        // left undeclared.
+        {"/plugin-config", "get", {"200", "400", "403", "503"}},
+        // plugin_config_routes.cpp, sink.Get(.../([^/]+)/kill-switch): 200; 400 (get_kill_switch
+        // InvalidInput, and a present-but-empty os); 503 (store not open, Unavailable). A missing
+        // row reads as enabled=true, so there is no 404. 401 and 403 (perm_fn) are left
+        // undeclared.
+        {"/plugin-config/{plugin}/kill-switch", "get", {"200", "400", "503"}},
+        // plugin_config_routes.cpp, sink.Put(.../([^/]+)/kill-switch): 200; 400 (JSON body,
+        // enabled, reason, scope and actor grammar); 413 (parse_json_object_body over
+        // kMaxBodyBytes); 500 (set_kill_switch WriteFailed); 503 (store not open, Unavailable,
+        // attempt audit unavailable). 401 and 403 are left undeclared.
+        {"/plugin-config/{plugin}/kill-switch", "put", {"200", "400", "413", "500", "503"}},
+        // file_retrieval_routes.cpp register_status(): 200 (open or terminal session); 400 (TLS
+        // gate); 401 (session_unknown); 410 (expired); 503 (store null or unavailable). A
+        // terminal session answers 200, so there is no 409.
+        {"/uploads/{upload_id}", "get", {"200", "400", "401", "410", "503"}},
+        // file_retrieval_routes.cpp register_cancel(): 204; 400 (TLS gate); 401; 409
+        // (session_terminal, including a lost cancel race); 410 (expired); 503 (store null or
+        // unavailable, cancel_session error).
+        {"/uploads/{upload_id}", "delete", {"204", "400", "401", "409", "410", "503"}},
+        // file_retrieval_routes.cpp register_commit(): 200; 400 (TLS gate, sha256 missing); 401;
+        // 409 (session_terminal); 410 (expired); 422 (hash_mismatch); 500 (blob cannot be read
+        // back to verify); 503 (store null or unavailable, cancel_session or commit_session
+        // error).
+        {"/uploads/{upload_id}/commit", "post", {"200", "400", "401", "409", "410", "422", "500", "503"}},
     };
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
         const json spec = json::parse(document_text(with_guides));
         for (const auto& row : rows) {
             INFO(row.method << " " << row.path);
-            REQUIRE(spec["paths"].contains(row.path));
-            REQUIRE(spec["paths"][row.path].contains(row.method));
+            // CHECK, not REQUIRE: a missing route must report itself and let the remaining rows
+            // and the second document form still run.
+            const bool has_path = spec["paths"].contains(row.path);
+            CHECK(has_path);
+            if (!has_path)
+                continue;
+            const bool has_method = spec["paths"].at(row.path).contains(row.method);
+            CHECK(has_method);
+            if (!has_method)
+                continue;
             std::set<std::string> declared;
-            for (const auto& [code, response] : spec["paths"][row.path][row.method]["responses"].items())
+            for (const auto& [code, response] :
+                 spec["paths"].at(row.path).at(row.method).at("responses").items())
                 declared.insert(code);
             CHECK(declared == row.statuses);
+        }
+    }
+}
+
+TEST_CASE("openapi documents: the plugin-config success responses reference the {data, meta} "
+          "envelope schemas the handlers return",
+          "[openapi][structure][responses]") {
+    // plugin_config_routes.cpp answers GET/PUT of a value as {data: <entry>, meta}, the secret
+    // PUT as {data: <metadata>, meta}, and both DELETEs as {deleted: true, meta} (no data
+    // wrapper). Each row names the operation, the schema its 200 must reference, and that
+    // schema's required members.
+    struct Row {
+        const char* path;
+        const char* method;
+        const char* schema;
+        std::set<std::string> required;
+    };
+    const std::vector<Row> rows = {
+        {"/plugin-config/{plugin}/{key}", "get", "PluginConfigEntryResponse", {"data", "meta"}},
+        {"/plugin-config/{plugin}/{key}", "put", "PluginConfigEntryResponse", {"data", "meta"}},
+        {"/plugin-config/{plugin}/{key}/secret", "put", "PluginConfigSecretMetaResponse",
+         {"data", "meta"}},
+        {"/plugin-config/{plugin}/{key}", "delete", "PluginConfigDeleteResponse",
+         {"deleted", "meta"}},
+        {"/plugin-config/{plugin}/{key}/secret", "delete", "PluginConfigDeleteResponse",
+         {"deleted", "meta"}},
+    };
+    const auto keys_of = [](const json& obj) {
+        std::set<std::string> out;
+        for (auto it = obj.begin(); it != obj.end(); ++it)
+            out.insert(it.key());
+        return out;
+    };
+    const auto set_of = [](const json& arr) {
+        std::set<std::string> out;
+        for (const auto& k : arr)
+            out.insert(k.get<std::string>());
+        return out;
+    };
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        for (const auto& row : rows) {
+            INFO(row.method << " " << row.path);
+            const bool has_op = spec["paths"].contains(row.path) &&
+                                spec["paths"].at(row.path).contains(row.method);
+            CHECK(has_op);
+            if (!has_op)
+                continue;
+            const json& ok = spec["paths"].at(row.path).at(row.method).at("responses").at("200");
+            const std::string ref =
+                ok.at("content").at("application/json").at("schema").value("$ref", "");
+            CHECK(ref == std::string("#/components/schemas/") + row.schema);
+            const json& schemas = spec.at("components").at("schemas");
+            const bool has_schema = schemas.contains(row.schema);
+            CHECK(has_schema);
+            if (!has_schema)
+                continue;
+            CHECK(set_of(schemas.at(row.schema).at("required")) == row.required);
+            CHECK(keys_of(schemas.at(row.schema).at("properties")) == row.required);
         }
     }
 }
