@@ -1218,8 +1218,7 @@ sync, defeating the hash-skip protocol.
   `machine_id` section means the reported machine ID was not a hash and was discarded.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
   device serial and system UUID. Agents keep working unchanged; upgrade the server
-  before the agents. Served by `GET /api/v1/hardware/{id}` and MCP `get_hardware_ci` (not yet
-  rendered in the dashboard Hardware pages).
+  before the agents.
 - **What the agent sends.** An agent that carries this change always sends the versioned
   record; there is no flag to fall back to the earlier format, and `--inventory-disable`
   still stops the collection. Each section reports one of four levels:
