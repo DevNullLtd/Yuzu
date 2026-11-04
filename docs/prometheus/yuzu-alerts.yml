@@ -5206,8 +5206,9 @@ groups:
         # Blob v3 (ADR-0016 Update 2026-11-04): a section the server refuses is nacked
         # per section (`installed_software:<facet>`), and the other sections of the call
         # still apply. outcome=rejected is a GRAMMAR refusal: the agent resends the same
-        # bytes and never self-heals, so it is its own alert rather than a rise in
-        # YuzuInventoryHighNeedFullRatio. outcome=delta_unsupported is NOT here: it is the
+        # bytes and never self-heals, so it is its own alert; a refused section also counts
+        # toward YuzuInventoryHighNeedFullRatio (it is answered need_full), but that ratio
+        # alone cannot say that the cause is a grammar break. outcome=delta_unsupported is NOT here: it is the
         # expected placeholder until the delta apply is built, so it has its own
         # non-paging rule (YuzuInventorySectionDeltaUnsupported) below.
         # increase over a day with NO hold (the YuzuCertInventoryReportsRejected shape): one
@@ -5226,9 +5227,12 @@ groups:
             grammar (an unknown status, rows in a status-only section, a record whose
             source is not the facet, a record holding a NUL byte or missing its
             terminator, a cap) - it NEVER self-heals, the agent resends the same bytes
-            and the server keeps the facet's previously held rows and section hash, so
-            fix the agent (grep the warn-level "v3 section(s) ... refused" server log
-            line for the agent_id and the refusal reason).
+            and the server keeps the facet's previously held rows and section hash (on a
+            device's first v3 report its v2 rows are already replaced, so there are none
+            to keep), so fix the agent (grep the warn-level "v3 section(s) ... refused"
+            server log line for the agent_id and the refusal reason). facet="unknown"
+            is the exception: the server does not know the facet name, so upgrade the
+            server first.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventorySectionDeltaUnsupported
         # The expected honest placeholder until the delta apply is built (the agent falls

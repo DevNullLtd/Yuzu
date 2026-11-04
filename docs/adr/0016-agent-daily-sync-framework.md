@@ -485,7 +485,7 @@ Mechanics:
   classification: `install_location` is
   operator-tier — an ordinary stored Response (90-day default retention, no
   per-subject erasure, not covered by `--inventory-disable`), never in this
-  blob — and can name an account's home directory
+  v2 blob — and can name an account's home directory
   (`/Users/<account>/...`, `C:/Users/<name>/...`). §8's finding — that the
   sync neither crawls a logged-in user's hive nor `~/Applications` — is about
   the sync and the Windows `HKCU` path specifically; it does not extend to
@@ -1001,7 +1001,8 @@ constraints (`install_type` in the vocabulary above or `''`, `install_scope` in 
 above and the partial btree `installed_software_purl_idx` on `(purl) WHERE purl <> ''`; and the new `software_facet_state (agent_id, facet, status, token, section_hash, enabled,
 last_confirmed_at, duration_ms, bytes_read, updated_at)` table, primary key `(agent_id, facet)`.
 The index builds are not online: they hold `ACCESS EXCLUSIVE` for their duration, under the same
-hard-cutover posture the ladder records for v7. In a fresh deployment the table is empty, so the
+fresh-database hard-cutover ruling of 2026-10-24 (not v7's basis; see the ladder and the playbook's
+recorded-exception register). In a fresh deployment the table is empty, so the
 build returns at once; the ladder row keeps the measured build time over a populated table as a
 hazard note only.
 

@@ -370,7 +370,8 @@ refused" names the agent and the reason. The reason is one of `unknown_facet`, `
 `source_mismatch`, `unknown_record`, `bad_record`, `bad_row_hash`, `bad_version_source`, `row_cap`,
 `nul_byte` or `unterminated`. The agent resends the same bytes, so a refusal never clears on its
 own, and the refused facet keeps its previous rows and section hash (its rows go stale; nothing is
-deleted) until the agent is fixed. `facet="unknown"` on the counter means the server does not
+deleted) until the agent is fixed. The one exception is a device's first v3 report: its v2 rows were
+already replaced, so a facet refused then has no rows to keep. `facet="unknown"` on the counter means the server does not
 recognise the name: that is almost always an agent newer than the server, so upgrade the server
 first rather than fixing the agent. A blob that cannot be attributed to sections at all (a record
 before any section, a header with no section, an unusable section header, more than 32 sections,
@@ -1195,7 +1196,7 @@ nesting past `kMcpMaxJsonDepth`, json-dump-depth-guard fix),
 holding a connection >10s — a leading pool-saturation indicator),
 `YuzuInventorySectionIngestRefused` (warning: a v3 section was refused, `outcome="rejected"`,
 at least once in the last day, so a single refusal is enough; the refusal is a grammar failure
-that never self-heals, so fix the agent),
+that never self-heals, so fix the agent, except `facet="unknown"`, where the server is older than the agent: upgrade the server),
 `YuzuInventorySectionDeltaUnsupported` (info, held 1h: a v3 delta was answered with a request
 for a full section because this server cannot apply deltas yet; expected, no action), and
 `YuzuInventoryStaleCountUnavailable` (the freshness gauge may be frozen).
