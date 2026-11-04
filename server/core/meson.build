@@ -1019,6 +1019,7 @@ yuzu_server_routes_lib = static_library(
     'src/device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
     'src/device_ui.cpp',
     'src/inventory_routes.cpp',
+    'src/software_curation_routes.cpp',
     'src/inventory_ui.cpp',
     'src/device_containment_routes.cpp',
     'src/device_estate_routes.cpp',
