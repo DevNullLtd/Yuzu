@@ -742,8 +742,8 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
     const auto size_before = plugin_status_value(d, desc, "db_size_bytes");
     REQUIRE(size_before.has_value());
     CHECK(std::stoll(*size_before) > kMinBudget - 16 * kMiB);
-    CHECK(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total") ==
-          std::optional<std::string>{"0"});
+    CHECK(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total").value_or("<absent>") ==
+          "0");
     CHECK(plugin_status_value(d, desc, "db_auto_vacuum") == std::optional<std::string>{"none"});
     // The overage is measured when asked, not cached from a pass: this database is over its
     // budget before any pass has ever run (a gauge that starts at 0 would hide it).
@@ -756,8 +756,8 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
     const YuzuParam pause_service[] = {{"service_enabled", "false"}};
     REQUIRE(d.run(desc, "configure", pause_service).rc == 0);
     REQUIRE(d.run(desc, "rollup").rc == 0);
-    CHECK(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total") ==
-          std::optional<std::string>{"0"});
+    CHECK(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total").value_or("<absent>") ==
+          "0");
     const auto over_paused = plugin_status_value(d, desc, "budget_over_bytes");
     REQUIRE(over_paused.has_value());
     CHECK(std::stoll(*over_paused) > 0);
@@ -793,8 +793,8 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
     CHECK(guard_value("retention_guard_failed|__clock_state__|") == clock_failures_before + 1);
     CHECK(guard_value("retention_guard_failures_total|") == failures_before + 1);
     CHECK(guard_value("retention_guard_declines_total|") == declines_before);
-    CHECK(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total") ==
-          std::optional<std::string>{"0"});
+    CHECK(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total").value_or("<absent>") ==
+          "0");
     {
         const auto kept = raw_sql(db_path, "SELECT count(*) FROM service_hourly_r");
         REQUIRE(kept.size() == 1);
@@ -814,8 +814,8 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
 
     // Eviction ran on the public path and took the hourly rows (enforce_budget in do_rollup); the
     // retired raw-row counter stays at its stored value.
-    CHECK(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total") ==
-          std::optional<std::string>{"34"});
+    CHECK(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total").value_or("<absent>") ==
+          "34");
     CHECK(plugin_status_value(d, desc, "budget_evicted_raw_rows_total") ==
           std::optional<std::string>{"0"});
     // Only the 47 h row is left: the 48 h floor holds.
