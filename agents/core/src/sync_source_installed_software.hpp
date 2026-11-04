@@ -161,14 +161,16 @@ YUZU_EXPORT AdaptedRows parse_runtimes_python_output(const std::string& out, Con
 /// {kind=app, ecosystem=dotnet, publisher=Microsoft}; name by flavour: `runtime` or `core` ->
 /// `.NET Runtime`, `sdk` -> `.NET SDK`, `netfx` -> `.NET Framework`, anything else -> `.NET`.
 /// `-` version -> empty; flavour, path and the row's vendor are dropped. The collector's table row
-/// uses ConstrainedPolicy::drop_source: a `constrained` answer withholds these rows
-/// (Status::withheld) and the cycle continues; `unsupported` is skipped.
+/// uses ConstrainedPolicy::keep_rows_if_present_seen: a `constrained` answer that carried at
+/// least one dotnet row keeps its rows (status ok, reason = the tokens); one with no row fails
+/// the cycle (stored rows are untouched, never deleted); `unsupported` is skipped.
 YUZU_EXPORT AdaptedRows parse_runtimes_dotnet_output(const std::string& out, ConstrainedPolicy policy);
 
 /// Adapt `runtimes` `jvm` output (same five-token shape, row tag `jvm`). Each row becomes
 /// {kind=app, ecosystem=jvm}; name by flavour: `jdk` -> `Java JDK`, `jre` -> `Java JRE`, anything
 /// else -> `Java`; publisher = the row's vendor (the build's self-reported IMPLEMENTOR; `-` ->
-/// empty); `-` version -> empty; flavour and path dropped. Same drop_source policy as dotnet.
+/// empty); `-` version -> empty; flavour and path dropped. Same keep_rows_if_present_seen policy
+/// as dotnet.
 YUZU_EXPORT AdaptedRows parse_runtimes_jvm_output(const std::string& out, ConstrainedPolicy policy);
 
 /// Adapt `windows_optional_features` `list` output (`feature|<name>|<state>|<0/1>`):

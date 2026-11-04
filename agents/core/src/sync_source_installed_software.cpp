@@ -327,15 +327,21 @@ const InventoryAction kInventoryActions[] = {
          return parse_middleware_output(o, "ibm_mq", pol);
      },
      .constrained = ConstrainedPolicy::drop_source},
-    // Same host-fact constraint as python: a constrained answer withholds just that source's rows.
+    // A constrained answer is per-home or per-root (one JDK on a removable drive, one NFS root, one
+    // oversized release file) and still carries a row for every install it found, so the rows are
+    // KEPT when at least one was seen; a constrained answer with ZERO rows skips the cycle (stored
+    // rows untouched) rather than deleting them. The typed answer is CONSTRAINED + PARTIAL, hence
+    // accept_partial, as for managers.
     {.plugin = "runtimes",
      .action = "dotnet",
      .adapt = parse_runtimes_dotnet_output,
-     .constrained = ConstrainedPolicy::drop_source},
+     .accept_partial = true,
+     .constrained = ConstrainedPolicy::keep_rows_if_present_seen},
     {.plugin = "runtimes",
      .action = "jvm",
      .adapt = parse_runtimes_jvm_output,
-     .constrained = ConstrainedPolicy::drop_source},
+     .accept_partial = true,
+     .constrained = ConstrainedPolicy::keep_rows_if_present_seen},
 };
 
 } // namespace

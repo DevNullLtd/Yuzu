@@ -31,7 +31,10 @@ cadences.
   skips that day's report and keeps the last good state — nothing is deleted. A
   `constrained` `managers` answer that still names at least one present manager
   is accepted: the constraint concerns manager facts the presence row never
-  carried. A `constrained` `runtimes` (`python`, `dotnet`, `jvm`) or `middleware` `ibm_mq` answer is the other
+  carried. A `constrained` `runtimes` `dotnet` or `jvm` answer that still lists at least one install is
+  accepted the same way: the constraint names a home or root that could not be fully read, and every
+  install found keeps its row; one that lists none skips the day's report and keeps the last good
+  state. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
   exception: it withholds only that source's rows and the cycle continues, so the
   stored rows of that source are removed until a later read succeeds (see
   Troubleshooting). A skipped cycle
@@ -187,7 +190,8 @@ cadences.
   registered in the 32-bit view) and the .NET Framework release key (no directory is read); Linux and macOS list the `shared/<framework>/<version>` and `sdk/<version>` directory names
   under the standard machine roots (`/usr/share/dotnet`, `/usr/lib/dotnet`, `/usr/lib64/dotnet`; macOS
   `/usr/local/share/dotnet`). Homebrew, `dotnet-install` and per-user installs are not walked.
-  A constrained read withholds only the `dotnet` rows, as for Python.
+  A constrained read keeps the rows it found (see the managers rule above); if it found none, the day's
+  report is skipped and the stored `dotnet` rows stay.
 
   **Java runtimes** are collected through `runtimes` `jvm` (all three OSes; `source`
   `runtimes.jvm`) as one `app` row per JVM home, `ecosystem` `jvm`, `name` `Java JDK`, `Java JRE`
@@ -198,7 +202,8 @@ cadences.
   JavaSoft, Eclipse Adoptium and Azul Zulu registry keys and then each home's `release` file; Linux
   walks `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm` and `/var/opt/java`; macOS walks
   `/Library/Java/JavaVirtualMachines`. Version managers and Homebrew JDKs are not walked. A
-  constrained read withholds only the `jvm` rows. The macOS Java leg is verified against fixture
+  constrained read keeps the rows it found; if it found none, the day's report is skipped and the
+  stored `jvm` rows stay. The macOS Java leg is verified against fixture
   trees built from the documented bundle layout, not a real JDK install.
 
   **IBM MQ** is collected through the `middleware` plugin's `ibm_mq` action (Linux; `source`
@@ -914,16 +919,17 @@ mount table could not be read), `macos:runtimes:permission_denied`,
 `windows:runtimes:python_reg:row_cap` (a walk cap was hit). Fix the named cause; the next
 daily sync restores the rows.
 
-**A device's .NET or Java rows vanished, but the rest of its software is still reported; its
-log shows `sync: runtimes.dotnet constrained (<tokens>) — rows withheld this cycle` (or
-`runtimes.jvm`).** The same withhold as the Python case above, for the `dotnet` or `jvm` source
-alone: the stored rows of that source are removed until a read succeeds again. The tokens name the
-cause, for example `windows:runtimes:dotnet_reg:access_denied`,
+**A device's .NET or Java software has stopped updating; its log shows
+`sync: runtimes.dotnet failed: <tokens> — skipping this cycle` (or `runtimes.jvm`).** The
+`dotnet` or `jvm` read was constrained and found no install at all, so the agent skipped the day's
+report rather than send an empty list; the stored rows are kept and nothing is deleted. A
+constrained read that still found an install is not an error: its rows are sent, and the log shows
+`sync: runtimes.jvm constrained (<tokens>) — rows kept`. The tokens name the cause, for example `windows:runtimes:dotnet_reg:access_denied`,
 `windows:runtimes:jvm_reg:access_denied`, `windows:runtimes:jvm:release_unreadable`,
 `linux:runtimes:release_missing` or `macos:runtimes:release_unparsable`, and any `row_cap`; the
 `runtimes` README lists them all. On Linux and macOS a Java home with no `release` file keeps the source constrained
 for as long as it is installed; on Windows such a home keeps its row with no version and the source
-stays supported. Fix the named cause; the next daily sync restores the rows.
+stays supported. Fix the named cause; the next daily sync resumes.
 
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`
