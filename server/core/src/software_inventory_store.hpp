@@ -31,7 +31,7 @@
 ///     result. Staleness is acceptable (return the last projection); failure-as-empty
 ///     is not.
 
-#include "inventory_blob_v3.hpp"       // V3Report (pure blob-v3 grammar types)
+#include "inventory_blob_v3.hpp"        // V3Report (pure blob-v3 grammar types)
 #include "inventory_ingest_outcome.hpp" // InventoryIngestOutcome
 #include "software_inventory_types.hpp"
 
@@ -327,7 +327,7 @@ enum class V3SectionOutcome {
     kStored,           ///< full section: the facet's rows were replaced
     kStatusOnly,       ///< status-only section: facet state recorded, rows untouched
     kNeedFull,         ///< not applied (delta on a base we do not hold, or a facet we cannot store)
-    kDeltaUnsupported, ///< a delta whose base matches: delta apply is not built, a full is asked for
+    kDeltaUnsupported, ///< a delta whose base matches: no delta apply yet, a full is asked for
     kRejected,         ///< the section broke the grammar and was refused
     kError,            ///< the transaction failed; nothing of this call was applied
 };

@@ -839,7 +839,14 @@ tail: unlike the v2 hash, `package_id` and `source` are always written), `0x1F`-
 `0x1E`-terminated. The sort walks the stored fields in wire order: `name`, `version`,
 `publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`,
 `signature_status`, `distro_id`, `distro_version`, `install_location`, `package_id`, `source`,
-byte-wise. An honest-empty `full` section hashes the empty string.
+byte-wise. An honest-empty `full` section hashes the empty string. The hash is over the
+**stored form** of each row: the field step above (scrub to UTF-8, then clamp) has already run,
+and the rows are sorted and de-duplicated, so an agent that mirrors it hashes the scrubbed and
+clamped fields, never the raw bytes it collected. The pinned vectors are the test cases
+`canonical_section_hash is order and duplicate independent, 16 slots always, pinned` and
+`v3_report_hash sorts by facet in byte order, carries the v3: prefix, pinned` in
+`tests/unit/server/test_software_inventory_store.cpp`; a writer is correct when it reproduces
+them.
 
 **Report hash.** The value stored in `inventory_state.content_hash` for a v3 agent, and the value
 a v3 agent claims in a hash-only report, is `v3:` followed by the SHA-256 hex of
@@ -872,6 +879,16 @@ advisory lock as the v2 replace):
 - *`component_inventory`.* Grammar-validated; its facet state is recorded with an empty section
   hash (this store holds no component rows), so it never enters the report hash; a section that
   carries records is nacked, a status-only one is a complete report.
+- *Refused sections.* A refused section is skipped before any write, so its previously held
+  rows, facet state and section hash stay as they were, and the report hash still includes that
+  held section hash. A facet the agent refuses permanently therefore keeps its old rows and is
+  nacked `need_full` on every cycle until the agent is fixed (`YuzuInventorySectionIngestRefused`
+  alerts on it); this is by design, not a stuck state to repair on the server.
+- *Report state.* `inventory_state` (the report hash and `last_seen`) is written only by a call
+  that wrote at least one section's state: a `full`, a status-only or a `component_inventory`
+  section. A call made up only of `delta` and refused sections is a nack, not a received report:
+  it leaves the hash and `last_seen` alone, and the full section the agent sends on the resend
+  is what advances them.
 - *Failure.* A SQL failure rolls the whole call back and every section in it that was not
   refused is answered `error` and nacked. A v2 full report additionally deletes the agent's
   `software_facet_state` rows, and `delete_agent` deletes them too.
@@ -939,10 +956,20 @@ decision is reversible and is revisited when a measurement exists.
 **Observability.** Each section bumps `yuzu_inventory_section_ingest_total{facet,outcome}`
 (`outcome`: `stored`, `status_only`, `need_full`, `delta_unsupported`, `rejected`, `error`; `facet`
 is a collector source, `component_inventory`, or `unknown`, never the agent's raw string). The
-apply is timed under `yuzu_inventory_ingest_duration_seconds{phase="v3"}`, and the source-level
+apply is timed under `yuzu_inventory_ingest_duration_seconds{source="installed_software",phase="v3"}`,
+and the source-level
 `yuzu_inventory_ingest_total` outcome is `stored`, `need_full`, `error` or `dropped`. The
 agent-reported per-section duration and bytes live in the facet state row, not in Prometheus
 labels.
+
+**Hand-off to the delta apply and the agent writer.** Two facts the next changes must carry.
+`instance_key` hashes the row's whole 16-slot record, so adding a slot to that record re-keys
+every stored row once; the weekly full floor bounds how long old and new keys coexist. Until the
+delta apply and the component store exist, every `delta` section and every `component_inventory`
+section that carries records is answered `need_full`; the agent writer's golden-vector parity
+test must reproduce the section hash, the report hash and the hash membership rule above
+byte for byte, including that a facet whose status moves from `full` to a status-only status
+(for example `disabled`) leaves the report hash while its rows are kept.
 
 **Not in this change.** Delta apply and the `-` deletions; storage of component rows; the agent
 writer; any read surface returning the new columns (the existing reads select the old columns

@@ -5142,7 +5142,10 @@ groups:
             Postgres outage (self-heals via the next sync + weekly full-floor); if
             uncorrelated it is likely one or more devices whose payload the store
             keeps rejecting — grep the warn-level SoftwareInventoryStore logs for
-            the agent_id.
+            the agent_id. A blob-v3 call applies all of its sections in ONE
+            transaction, so a single row Postgres refuses (for example an embedded
+            NUL) answers error for every section of that call, on every resend, until
+            the agent is fixed; the warn line to grep for names "v3 ingest ... failed".
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryHighNeedFullRatio
         expr: |
@@ -5162,7 +5165,41 @@ groups:
             one-time need_full by design, phase-spread across the daily sync window,
             self-healing; check release notes for a recent contract change before
             treating this as an incident. A sustained ratio with no such change
-            suggests hash drift or agents stuck in a resend cycle.
+            suggests hash drift or agents stuck in a resend cycle. Blob-v3 agents
+            add one more source of need_full until the server can apply deltas and
+            store component rows: every delta section and every component_inventory
+            section that carries records is answered need_full, so a fleet of v3
+            agents reporting deltas raises this ratio without any hash drift.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventorySectionIngestRefused
+        # Blob v3 (ADR-0016 Update 2026-11-04): a section the server refuses is nacked
+        # per section (`installed_software:<facet>`), and the other sections of the call
+        # still apply. outcome=rejected is a GRAMMAR refusal: the agent resends the same
+        # bytes and never self-heals, so it is its own alert rather than a rise in
+        # YuzuInventoryHighNeedFullRatio. outcome=delta_unsupported is the expected
+        # honest placeholder until the delta apply is built (the agent falls back to a
+        # full section), kept here so the rate is visible and this rule is the reminder
+        # to retire the case when the delta apply lands.
+        expr: |
+          sum by (facet) (rate(yuzu_inventory_section_ingest_total{outcome=~"rejected|delta_unsupported"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software v3 sections being refused or not applied"
+          description: >-
+            yuzu_inventory_section_ingest_total{outcome="rejected"} or
+            {outcome="delta_unsupported"} has been non-zero for 15m for the facet
+            label. rejected = the section broke the blob v3 grammar (an unknown
+            status, rows in a status-only section, a record whose source is not the
+            facet, a cap) - it NEVER self-heals, the agent resends the same bytes and
+            the server keeps the facet's previously held rows and section hash, so fix
+            the agent (grep the warn-level "v3 section(s) ... refused" server log
+            line for the agent_id and the refusal reason). delta_unsupported = a
+            delta section whose base matched; the server cannot apply deltas yet,
+            answers need_full, and the agent falls back to a full section - expected
+            while v3 agents ship ahead of the delta apply, a runbook item only if it
+            persists once the delta apply has shipped.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryDroppedBlobs
         # outcome=dropped = a blob over the 3 MiB cap was rejected + nacked. UNLIKE
@@ -5728,10 +5765,12 @@ groups:
         # into le=15/20/30/45/60 rather than collapsing into +Inf — the
         # +Inf-minus-le=10 complement below is an honest count of full ingests over
         # 10s, and histogram_quantile over the tail now yields a real p99. Fires
-        # ahead of YuzuInventoryReadDegraded (sre).
+        # ahead of YuzuInventoryReadDegraded (sre). phase=v3 (a blob-v3 call: up to 32
+        # sections in one transaction on one connection) is the heaviest hold and is
+        # matched with phase=full, or it would be invisible to this rule.
         expr: |
-          sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase="full",le="+Inf"}[10m]))
-          - sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase="full",le="10"}[10m]))
+          sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase=~"full|v3",le="+Inf"}[10m]))
+          - sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase=~"full|v3",le="10"}[10m]))
           > 0.1
         for: 10m
         labels:
@@ -5739,9 +5778,11 @@ groups:
         annotations:
           summary: "Installed-software full-payload ingests exceeding 10s"
           description: >-
-            More than ~6/min full-payload inventory ingests are holding a Postgres
-            connection >10s — a leading indicator of pool saturation under a
-            need_full herd, ahead of read-path degradation. Correlate with
+            More than ~6/min full-payload inventory ingests (phase full, or v3 - a
+            blob-v3 call applies every section in one transaction on one connection,
+            the heaviest hold) are holding a Postgres connection >10s — a leading
+            indicator of pool saturation under a need_full herd, ahead of read-path
+            degradation. Correlate with
             yuzu_pg_pool_waiters and yuzu_pg_acquire_wait_seconds.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       # Recording rule (#1686): now that yuzu_inventory_ingest_duration_seconds

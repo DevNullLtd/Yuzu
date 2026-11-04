@@ -16,7 +16,7 @@
 ///       +    | name | version | publisher | install_date | kind | ecosystem | epoch | release |
 ///              arch | signature_status | distro_id | distro_version | install_location |
 ///              <slot 14, reserved, always empty> | package_id | source      an install row
-///       -    | row_hash                                                      a deletion by row hash
+///       -    | row_hash                                                      a row-hash deletion
 ///       comp | kind | name | version | version_source | path | size | mtime | anchor_app
 ///  - `facet` is a `software_catalog::kSoftwareSources` value or `component_inventory`; `status`
 ///    is full | delta | constrained | timeout | oversize | not_collected | disabled; only full
@@ -93,9 +93,9 @@ enum class V3Status {
 }
 
 [[nodiscard]] constexpr std::optional<V3Status> v3_status_parse(std::string_view s) noexcept {
-    for (const auto st : {V3Status::kFull, V3Status::kDelta, V3Status::kConstrained,
-                          V3Status::kTimeout, V3Status::kOversize, V3Status::kNotCollected,
-                          V3Status::kDisabled}) {
+    for (const auto st :
+         {V3Status::kFull, V3Status::kDelta, V3Status::kConstrained, V3Status::kTimeout,
+          V3Status::kOversize, V3Status::kNotCollected, V3Status::kDisabled}) {
         if (v3_status_name(st) == s)
             return st;
     }
@@ -114,15 +114,15 @@ enum class V3Refusal {
     kUnknownFacet,
     kDuplicateFacet,
     kUnknownStatus,
-    kRowsInStatusOnly,   ///< a +, - or comp record in a status-only section
-    kDeleteInFull,       ///< a - record in a full section
+    kRowsInStatusOnly,    ///< a +, - or comp record in a status-only section
+    kDeleteInFull,        ///< a - record in a full section
     kWrongRecordForFacet, ///< + in component_inventory, or comp in any other facet
-    kSourceMismatch,     ///< a + row whose source is not the section's facet
+    kSourceMismatch,      ///< a + row whose source is not the section's facet
     kUnknownRecord,
-    kBadRecord,          ///< a record missing a required field
-    kBadRowHash,         ///< a - record that is not 64 lowercase hex
-    kBadVersionSource,   ///< a comp record with a version_source outside the closed set
-    kRowCap,             ///< kV3MaxRows / kV3MaxDeletions / kV3MaxComponents exceeded
+    kBadRecord,        ///< a record missing a required field
+    kBadRowHash,       ///< a - record that is not 64 lowercase hex
+    kBadVersionSource, ///< a comp record with a version_source outside the closed set
+    kRowCap,           ///< kV3MaxRows / kV3MaxDeletions / kV3MaxComponents exceeded
 };
 
 [[nodiscard]] constexpr std::string_view v3_refusal_name(V3Refusal r) noexcept {
@@ -189,10 +189,10 @@ struct V3Section {
     std::string token; ///< agent-reported reason token for a non-full status
     std::int64_t duration_ms{0};
     std::int64_t bytes_read{0};
-    std::vector<SoftwareEntry> rows;         ///< `+` records, v2-field-parity scrubbed/clamped
-    std::vector<std::string> deletions;      ///< `-` row hashes
-    std::vector<V3Component> components;     ///< `comp` records
-    V3Refusal refusal{V3Refusal::kNone};     ///< set => every other member is cleared
+    std::vector<SoftwareEntry> rows;     ///< `+` records, v2-field-parity scrubbed/clamped
+    std::vector<std::string> deletions;  ///< `-` row hashes
+    std::vector<V3Component> components; ///< `comp` records
+    V3Refusal refusal{V3Refusal::kNone}; ///< set => every other member is cleared
 };
 
 struct V3Report {

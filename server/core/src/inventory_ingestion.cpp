@@ -149,10 +149,25 @@ const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& age
         ack.add_need_full(kSourceInstalledSoftware);
         return "dropped";
     }
-    for (const auto& sec : parsed->sections) {
-        if (sec.refusal != V3Refusal::kNone)
-            spdlog::warn("inventory: v3 section '{}' from agent={} refused ({}), nacking it",
-                         sec.facet, agent_id, v3_refusal_name(sec.refusal));
+    // ONE line per report, not per section (a hostile agent can refuse every one of its
+    // <= kMaxSections sections on every resend). The facet is logged from the closed set, never
+    // the agent's raw string.
+    {
+        std::size_t refused = 0;
+        std::string detail;
+        for (const auto& sec : parsed->sections) {
+            if (sec.refusal == V3Refusal::kNone)
+                continue;
+            ++refused;
+            if (!detail.empty())
+                detail += ", ";
+            detail += is_known_v3_facet(sec.facet) ? sec.facet : std::string("unknown");
+            detail += ':';
+            detail += v3_refusal_name(sec.refusal);
+        }
+        if (refused > 0)
+            spdlog::warn("inventory: {} v3 section(s) from agent={} refused ({}), nacking them",
+                         refused, agent_id, detail);
     }
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -163,9 +178,10 @@ const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& age
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         // A creating site for yuzu_inventory_ingest_duration_seconds: pass seconds_buckets_60s()
         // (see the v2 site below for why every site must).
-        metrics->histogram("yuzu_inventory_ingest_duration_seconds",
-                           {{"source", kSourceInstalledSoftware}, {"phase", "v3"}},
-                           yuzu::Histogram::seconds_buckets_60s())
+        metrics
+            ->histogram("yuzu_inventory_ingest_duration_seconds",
+                        {{"source", kSourceInstalledSoftware}, {"phase", "v3"}},
+                        yuzu::Histogram::seconds_buckets_60s())
             .observe(secs);
     }
 

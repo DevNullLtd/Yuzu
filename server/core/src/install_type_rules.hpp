@@ -58,8 +58,8 @@ inline constexpr std::array<InstallTypeRow, 8> kInstallTypeBySource{{
 }};
 
 /// Fallback for a row whose source is empty (a pre-tail agent) or not in the table.
-[[nodiscard]] constexpr std::string_view install_type_for_ecosystem(
-    std::string_view ecosystem) noexcept {
+[[nodiscard]] constexpr std::string_view
+install_type_for_ecosystem(std::string_view ecosystem) noexcept {
     if (ecosystem == "msi")
         return "msi";
     if (ecosystem == "optional_feature")
@@ -116,8 +116,9 @@ namespace install_type_detail {
 
 } // namespace install_type_detail
 
-static_assert(install_type_detail::table_total_and_well_formed(),
-              "kInstallTypeBySource must have exactly one row per software_catalog::kSoftwareSources "
-              "value, each naming a kInstallTypes type; add the row for a new collector source here");
+static_assert(
+    install_type_detail::table_total_and_well_formed(),
+    "kInstallTypeBySource must have exactly one row per software_catalog::kSoftwareSources "
+    "value, each naming a kInstallTypes type; add the row for a new collector source here");
 
 } // namespace yuzu::server

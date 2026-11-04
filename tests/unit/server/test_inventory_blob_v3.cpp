@@ -36,7 +36,9 @@ std::string rec(std::initializer_list<std::string_view> fields) {
     return out + kRs;
 }
 
-std::string header() { return std::string(kV3Header); }
+std::string header() {
+    return std::string(kV3Header);
+}
 
 // `S` record. duration/bytes are strings so a test can feed junk.
 std::string sec(std::string_view facet, std::string_view status, std::string_view base = "",
@@ -46,10 +48,11 @@ std::string sec(std::string_view facet, std::string_view status, std::string_vie
 }
 
 // `+` record with the 16 row slots (slot 14 is the reserved uninstall_string).
-std::string plus(std::string_view name, std::string_view source, std::string_view install_location = "",
-                 std::string_view slot14 = "", std::string_view version = "1.0") {
-    return rec({"+", name, version, "Pub", "2026-01-01", "app", "windows", "", "", "x64", "", "", "",
-                install_location, slot14, "pkg-id", source});
+std::string plus(std::string_view name, std::string_view source,
+                 std::string_view install_location = "", std::string_view slot14 = "",
+                 std::string_view version = "1.0") {
+    return rec({"+", name, version, "Pub", "2026-01-01", "app", "windows", "", "", "x64", "", "",
+                "", install_location, slot14, "pkg-id", source});
 }
 
 constexpr std::string_view kApps = "installed_apps.list_inventory";
@@ -77,7 +80,7 @@ TEST_CASE("v3 header detection: only the exact header bytes make a blob v3",
     // A v2 blob whose first product is literally named "v3" is still v2.
     CHECK_FALSE(is_v3_blob(std::string("v3") + kFs + "1.0" + kFs + "Pub" + kFs + "2026" + kRs));
     CHECK_FALSE(is_v3_blob(std::string("v3") + kRs));
-    CHECK_FALSE(is_v3_blob(std::string(1, kFs) + "v3"));  // header without its terminator
+    CHECK_FALSE(is_v3_blob(std::string(1, kFs) + "v3"));        // header without its terminator
     CHECK_FALSE(is_v3_blob(std::string(1, kFs) + "v30" + kRs)); // a different version token
     CHECK_FALSE(is_v3_blob(""));
     // A non-v3 blob is refused by the parser, not misread.
@@ -155,13 +158,13 @@ TEST_CASE("v3 parses every record kind", "[server][inventory_blob_v3]") {
 
 TEST_CASE("v3 status vocabulary round-trips and only full/delta carry rows",
           "[server][inventory_blob_v3]") {
-    for (const auto name : {"full", "delta", "constrained", "timeout", "oversize", "not_collected",
-                            "disabled"}) {
+    for (const auto name :
+         {"full", "delta", "constrained", "timeout", "oversize", "not_collected", "disabled"}) {
         const auto st = v3_status_parse(name);
         REQUIRE(st.has_value());
         CHECK(v3_status_name(*st) == name);
-        CHECK(v3_status_carries_rows(*st) == (std::string_view(name) == "full" ||
-                                              std::string_view(name) == "delta"));
+        CHECK(v3_status_carries_rows(*st) ==
+              (std::string_view(name) == "full" || std::string_view(name) == "delta"));
     }
     CHECK_FALSE(v3_status_parse("").has_value());
     CHECK_FALSE(v3_status_parse("FULL").has_value());
@@ -176,22 +179,23 @@ TEST_CASE("v3 grammar refusals isolate to the section", "[server][inventory_blob
     };
     const std::string h(64, 'f');
     const std::vector<Case> cases = {
-        {"rows in a status-only section",
-         sec(kApps, "constrained") + plus("A", kApps), V3Refusal::kRowsInStatusOnly},
-        {"a deletion in a status-only section",
-         sec(kApps, "timeout") + rec({"-", h}), V3Refusal::kRowsInStatusOnly},
-        {"a - record in a full section", sec(kApps, "full") + rec({"-", h}), V3Refusal::kDeleteInFull},
-        {"source differs from the facet",
-         sec(kApps, "full") + plus("A", "pkg_inventory.packages"), V3Refusal::kSourceMismatch},
+        {"rows in a status-only section", sec(kApps, "constrained") + plus("A", kApps),
+         V3Refusal::kRowsInStatusOnly},
+        {"a deletion in a status-only section", sec(kApps, "timeout") + rec({"-", h}),
+         V3Refusal::kRowsInStatusOnly},
+        {"a - record in a full section", sec(kApps, "full") + rec({"-", h}),
+         V3Refusal::kDeleteInFull},
+        {"source differs from the facet", sec(kApps, "full") + plus("A", "pkg_inventory.packages"),
+         V3Refusal::kSourceMismatch},
         {"empty source", sec(kApps, "full") + plus("A", ""), V3Refusal::kSourceMismatch},
         {"unknown status", sec(kApps, "partial") + plus("A", kApps), V3Refusal::kUnknownStatus},
         {"empty status", sec(kApps, "") + plus("A", kApps), V3Refusal::kUnknownStatus},
         {"unknown facet", sec("made_up.source", "full"), V3Refusal::kUnknownFacet},
         {"unknown record kind", sec(kApps, "full") + rec({"?", "x"}), V3Refusal::kUnknownRecord},
-        {"a malformed row hash",
-         sec(kApps, "delta", "b") + rec({"-", "not-a-hash"}), V3Refusal::kBadRowHash},
-        {"an uppercase row hash",
-         sec(kApps, "delta", "b") + rec({"-", std::string(64, 'F')}), V3Refusal::kBadRowHash},
+        {"a malformed row hash", sec(kApps, "delta", "b") + rec({"-", "not-a-hash"}),
+         V3Refusal::kBadRowHash},
+        {"an uppercase row hash", sec(kApps, "delta", "b") + rec({"-", std::string(64, 'F')}),
+         V3Refusal::kBadRowHash},
         {"a + record in component_inventory",
          sec(kComponentInventoryFacet, "full") + plus("A", kComponentInventoryFacet),
          V3Refusal::kWrongRecordForFacet},
@@ -211,8 +215,8 @@ TEST_CASE("v3 grammar refusals isolate to the section", "[server][inventory_blob
     };
     for (const auto& c : cases) {
         CAPTURE(c.name);
-        const std::string clean = sec("pkg_inventory.packages", "full") +
-                                  plus("Good", "pkg_inventory.packages");
+        const std::string clean =
+            sec("pkg_inventory.packages", "full") + plus("Good", "pkg_inventory.packages");
         const V3Report r = parse_ok(header() + c.body + clean);
         // The clean section after the bad one always survives.
         const auto* good = find(r, "pkg_inventory.packages");
@@ -235,8 +239,21 @@ TEST_CASE("v3 grammar refusals isolate to the section", "[server][inventory_blob
     }
 }
 
-TEST_CASE("v3 refusal stops at the section boundary: later records of a refused section are skipped",
+TEST_CASE("v3 duplicate facet: the first occurrence applies, only the later one is refused",
           "[server][inventory_blob_v3]") {
+    const V3Report r = parse_ok(header() + sec(kApps, "full") + plus("First", kApps) +
+                                sec(kApps, "full") + plus("Second", kApps));
+    REQUIRE(r.sections.size() == 2);
+    CHECK(r.sections[0].refusal == V3Refusal::kNone);
+    REQUIRE(r.sections[0].rows.size() == 1);
+    CHECK(r.sections[0].rows[0].name == "First");
+    CHECK(r.sections[1].refusal == V3Refusal::kDuplicateFacet);
+    CHECK(r.sections[1].rows.empty());
+}
+
+TEST_CASE(
+    "v3 refusal stops at the section boundary: later records of a refused section are skipped",
+    "[server][inventory_blob_v3]") {
     // The first bad record refuses the section; the rows after it must not resurrect it.
     const V3Report r = parse_ok(header() + sec(kApps, "full") + plus("A", kApps) +
                                 plus("Bad", "pkg_inventory.packages") + plus("C", kApps));
@@ -298,8 +315,8 @@ TEST_CASE("v3 caps: sections, rows and blob bytes", "[server][inventory_blob_v3]
             CHECK(r.sections[0].rows.size() == kV3MaxRows);
         }
         {
-            const V3Report r = parse_ok(header() + sec(kApps, "full") + rows +
-                                        plus("one-too-many", kApps) + tail);
+            const V3Report r =
+                parse_ok(header() + sec(kApps, "full") + rows + plus("one-too-many", kApps) + tail);
             REQUIRE(r.sections.size() == 2);
             CHECK(r.sections[0].refusal == V3Refusal::kRowCap);
             CHECK(r.sections[0].rows.empty());
@@ -312,9 +329,9 @@ TEST_CASE("v3 caps: sections, rows and blob bytes", "[server][inventory_blob_v3]
         std::string a;
         for (std::size_t i = 0; i < kV3MaxRows; ++i)
             a += plus("n" + std::to_string(i), kApps);
-        const V3Report r = parse_ok(header() + sec(kApps, "full") + a +
-                                    sec("pkg_inventory.packages", "full") +
-                                    plus("Late", "pkg_inventory.packages"));
+        const V3Report r =
+            parse_ok(header() + sec(kApps, "full") + a + sec("pkg_inventory.packages", "full") +
+                     plus("Late", "pkg_inventory.packages"));
         REQUIRE(r.sections.size() == 2);
         CHECK(r.sections[0].refusal == V3Refusal::kNone);
         CHECK(r.sections[1].refusal == V3Refusal::kRowCap);
@@ -329,7 +346,8 @@ TEST_CASE("v3 caps: sections, rows and blob bytes", "[server][inventory_blob_v3]
     }
 }
 
-TEST_CASE("v3 field scrub and clamp match the v2 parser's contract", "[server][inventory_blob_v3]") {
+TEST_CASE("v3 field scrub and clamp match the v2 parser's contract",
+          "[server][inventory_blob_v3]") {
     // Same vector as the agent/v2 drift guards (test_inventory_sync.cpp kScrubVectorRaw/Expected,
     // test_software_inventory_store.cpp): invalid UTF-8 becomes U+FFFD byte for byte.
     const std::string raw = std::string("X") + "\xc0\x80" + "\xed\xa0\x80" + "\xf4\x90\x80\x80" +
@@ -362,13 +380,59 @@ TEST_CASE("v3 field scrub and clamp match the v2 parser's contract", "[server][i
 
 TEST_CASE("v3 numeric diagnostics read as zero when they are not plain digits",
           "[server][inventory_blob_v3]") {
-    for (const char* junk : {"", "-5", "+5", "1.5", "12x", "abc", " 7", "99999999999999999999"}) {
-        CAPTURE(junk);
-        const V3Report r = parse_ok(header() + sec(kApps, "constrained", "", "", junk, junk));
+    // std::string, not const char*: a char pointer cannot carry an embedded NUL, and a NUL is the
+    // one byte the digit loop and from_chars could both stop at.
+    const std::vector<std::string> junk = {
+        "",
+        "-5",
+        "+5",
+        "1.5",
+        "12x",
+        "abc",
+        " 7",
+        "99999999999999999999",
+        std::string("12\0"
+                    "3",
+                    4),        // a NUL between digits
+        std::string("\0", 1),  // a lone NUL
+        std::string("5\0", 2), // a trailing NUL
+        std::string("\0"
+                    "5",
+                    2), // a leading NUL
+    };
+    for (const std::string& j : junk) {
+        CAPTURE(j.size(), j);
+        const V3Report r = parse_ok(header() + sec(kApps, "constrained", "", "", j, j));
         CHECK(r.sections[0].duration_ms == 0);
         CHECK(r.sections[0].bytes_read == 0);
         CHECK(r.sections[0].refusal == V3Refusal::kNone);
     }
+}
+
+TEST_CASE("v3 embedded NUL: a facet name fails the blob, a + field passes the scrub unchanged",
+          "[server][inventory_blob_v3]") {
+    // A NUL inside a facet is outside the facet charset, so it is an unattributable defect (the
+    // whole blob is refused) before the known-facet check could name it: it never reaches a
+    // need_full string or a metric label.
+    const std::string nul_mid = std::string("installed_apps") + '\0' + ".list_inventory";
+    for (const std::string& bad : {nul_mid, std::string(1, '\0')}) {
+        CAPTURE(bad.size());
+        auto r = parse_v3_blob(header() + sec(bad, "full"));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == V3ParseErrorKind::kBadSectionHeader);
+    }
+    // A NUL inside a `+` field is a valid byte for the scrub step (it is valid UTF-8), exactly as
+    // for the v2 field step the two must stay identical to. The parser keeps it; the store's
+    // handling of such a row is a separate, deferred decision (a lockstep agent + server change),
+    // so this pins the CURRENT parity rather than endorsing the byte.
+    const std::string with_nul("A\0"
+                               "B",
+                               3);
+    const V3Report r = parse_ok(header() + sec(kApps, "full") + plus(with_nul, kApps));
+    REQUIRE(r.sections[0].rows.size() == 1);
+    CHECK(r.sections[0].refusal == V3Refusal::kNone);
+    CHECK(r.sections[0].rows[0].name == with_nul);
+    CHECK(r.sections[0].rows[0].name.size() == 3);
 }
 
 TEST_CASE("v3 drops a 17th token and a nameless row", "[server][inventory_blob_v3]") {
@@ -429,14 +493,13 @@ TEST_CASE("install_type_for: an empty or unknown source falls back by ecosystem"
         const char* ecosystem;
         const char* expect;
     };
-    for (const auto& r : {Row{"msi", "msi"}, Row{"optional_feature", "optional_feature"},
-                          Row{"python", "runtime"}, Row{"ibm_mq", "middleware"},
-                          Row{"snap", "store"}, Row{"flatpak", "store"},
-                          Row{"brew", "package_manager"}, Row{"rpm", "package_manager"},
-                          Row{"deb", "package_manager"}, Row{"apk", "package_manager"},
-                          Row{"pacman", "package_manager"}, Row{"windows", "installer"},
-                          Row{"macos", "installer"}, Row{"macos_pkgutil", "installer"},
-                          Row{"", ""}, Row{"made_up", ""}}) {
+    for (const auto& r :
+         {Row{"msi", "msi"}, Row{"optional_feature", "optional_feature"}, Row{"python", "runtime"},
+          Row{"ibm_mq", "middleware"}, Row{"snap", "store"}, Row{"flatpak", "store"},
+          Row{"brew", "package_manager"}, Row{"rpm", "package_manager"},
+          Row{"deb", "package_manager"}, Row{"apk", "package_manager"},
+          Row{"pacman", "package_manager"}, Row{"windows", "installer"}, Row{"macos", "installer"},
+          Row{"macos_pkgutil", "installer"}, Row{"", ""}, Row{"made_up", ""}}) {
         CAPTURE(r.ecosystem);
         CHECK(install_type_for("", r.ecosystem) == r.expect);
         CHECK(install_type_for("some.future_source", r.ecosystem) == r.expect);

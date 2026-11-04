@@ -34,6 +34,18 @@ namespace {
 constexpr const char* kStoreName = "software_inventory_store";
 constexpr const char* kSourceInstalledSoftware = "installed_software";
 
+// The per-agent advisory lock every writer of one agent's rows takes (the v2 replace, the v3
+// apply and delete_agent): one statement, one site to read. $1 = agent_id.
+// CROSS-STORE NAMESPACE (do not remove the prefix): advisory-lock keys are ONE cluster-wide
+// 64-bit space. A bare hashtextextended(agent_id, 0) is the same key as the fixed-string locks
+// other jobs take (a valid agent id `software_normalization` IS the normalisation job's key), so
+// a stream of full reports from such an agent could make that job's try-lock lose every tick.
+// Every sibling store prefixes its key the same way (`vuln_finding_store:`, `device_ci:`,
+// `app_usage:`, ...). The literal is cross-checked by the test's own copy
+// (test_software_inventory_store.cpp, HeldIngestLock): keep the bytes identical.
+constexpr const char* kAgentLockSql =
+    "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || $1, 0))";
+
 // Bounded acquires (ADR-0012 lease discipline). Ingest runs on the gRPC thread
 // (direct ReportInventory / gateway ProxyInventory) so it must give up fast on a
 // saturated pool — best-effort, the agent retries next cycle + weekly floor.
@@ -366,11 +378,13 @@ const std::vector<pg::PgMigration>& migrations() {
          "ADD COLUMN IF NOT EXISTS install_location TEXT NOT NULL DEFAULT '', "
          "ADD COLUMN IF NOT EXISTS identity_key     TEXT NOT NULL DEFAULT '', "
          "ADD COLUMN IF NOT EXISTS instance_key     TEXT NOT NULL DEFAULT '';"
-         "ALTER TABLE installed_software DROP CONSTRAINT IF EXISTS installed_software_install_type_chk;"
+         "ALTER TABLE installed_software DROP CONSTRAINT IF EXISTS "
+         "installed_software_install_type_chk;"
          "ALTER TABLE installed_software ADD CONSTRAINT installed_software_install_type_chk "
          "CHECK (install_type IN ('', 'msi', 'installer', 'store', 'package_manager', "
          "'optional_feature', 'runtime', 'middleware', 'component', 'driver')) NOT VALID;"
-         "ALTER TABLE installed_software DROP CONSTRAINT IF EXISTS installed_software_install_scope_chk;"
+         "ALTER TABLE installed_software DROP CONSTRAINT IF EXISTS "
+         "installed_software_install_scope_chk;"
          "ALTER TABLE installed_software ADD CONSTRAINT installed_software_install_scope_chk "
          "CHECK (install_scope IN ('machine', 'user')) NOT VALID;"
          "CREATE UNIQUE INDEX IF NOT EXISTS installed_software_instance_idx "
@@ -978,16 +992,8 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         // taxonomy is sre's gate, out of scope for this round). The wait is
         // transaction-scoped + bounded by the pool's statement_timeout; a distinct
         // "contended" outcome label is the right pool-hygiene follow-up.
-        // CROSS-STORE NAMESPACE (do not remove the prefix): advisory-lock keys are ONE
-        // cluster-wide 64-bit space. A bare hashtextextended(agent_id, 0) is the same key as
-        // the fixed-string locks other jobs take (a valid agent id `software_normalization`
-        // IS the normalisation job's key), so a stream of full reports from such an agent
-        // could make that job's try-lock lose every tick. Every sibling store prefixes its
-        // key the same way (`vuln_finding_store:`, `device_ci:`, `app_usage:`, ...).
-        pg::PgResult lk = pg::exec_params(
-            c,
-            "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || $1, 0))",
-            std::vector<std::string>{agent_id_s});
+        // The key namespace is explained at kAgentLockSql.
+        pg::PgResult lk = pg::exec_params(c, kAgentLockSql, std::vector<std::string>{agent_id_s});
         if (lk.status() != PGRES_TUPLES_OK)
             return false;
         pg::PgResult del = pg::exec_params(
@@ -1042,8 +1048,8 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
     struct Prepared {
         std::vector<SoftwareEntry> rows; // normalised, keys derived (full sections)
         std::string section_hash;
-        bool write{false};     // this section writes facet state (and maybe rows)
-        bool is_delta{false};  // a non-component delta: answered need-full, needs the base compare
+        bool write{false};    // this section writes facet state (and maybe rows)
+        bool is_delta{false}; // a non-component delta: answered need-full, needs the base compare
     };
     std::vector<Prepared> prep(n);
     bool any_write = false;
@@ -1094,24 +1100,21 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                          agent_id, PQerrorMessage(c));
             return false;
         };
-        // The SAME per-agent advisory lock as the v2 replace (key namespace and rationale at
-        // that site): a v2 full and a v3 call for one agent serialise.
-        pg::PgResult lk = pg::exec_params(
-            c,
-            "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || $1, 0))",
-            std::vector<std::string>{agent_id_s});
+        // The SAME per-agent advisory lock as the v2 replace (kAgentLockSql; blocking rationale
+        // at the v2 site): a v2 full and a v3 call for one agent serialise.
+        pg::PgResult lk = pg::exec_params(c, kAgentLockSql, std::vector<std::string>{agent_id_s});
         if (lk.status() != PGRES_TUPLES_OK)
             return fail("lock");
 
-        pg::PgResult st = pg::exec_params(
-            c,
-            "SELECT content_hash FROM software_inventory_store.inventory_state "
-            "WHERE agent_id = $1 AND source = $2",
-            std::vector<std::string>{agent_id_s, kSourceInstalledSoftware});
+        pg::PgResult st =
+            pg::exec_params(c,
+                            "SELECT content_hash FROM software_inventory_store.inventory_state "
+                            "WHERE agent_id = $1 AND source = $2",
+                            std::vector<std::string>{agent_id_s, kSourceInstalledSoftware});
         if (st.status() != PGRES_TUPLES_OK)
             return fail("state read");
-        const bool was_v3 =
-            PQntuples(st.get()) > 0 && std::string_view(PQgetvalue(st.get(), 0, 0)).starts_with("v3:");
+        const bool was_v3 = PQntuples(st.get()) > 0 &&
+                            std::string_view(PQgetvalue(st.get(), 0, 0)).starts_with("v3:");
 
         // A delta is judged against the section hash the server holds. Both answers ask for a
         // full section (delta apply is not built); the outcome records which one it was.
@@ -1144,15 +1147,16 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
             // stale held facet would otherwise stay in the report hash for ever.
             if (!was_v3) {
                 pg::PgResult del = pg::exec_params(
-                    c, "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
+                    c,
+                    "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
                     std::vector<std::string>{agent_id_s});
                 if (del.status() != PGRES_COMMAND_OK)
                     return fail("transition delete");
-                pg::PgResult stale = pg::exec_params(
-                    c,
-                    "DELETE FROM software_inventory_store.software_facet_state "
-                    "WHERE agent_id = $1",
-                    std::vector<std::string>{agent_id_s});
+                pg::PgResult stale =
+                    pg::exec_params(c,
+                                    "DELETE FROM software_inventory_store.software_facet_state "
+                                    "WHERE agent_id = $1",
+                                    std::vector<std::string>{agent_id_s});
                 if (stale.status() != PGRES_COMMAND_OK)
                     return fail("transition facet delete");
             }
@@ -1165,11 +1169,11 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                 const std::string bytes = std::to_string(sec.bytes_read);
                 const std::string status{v3_status_name(sec.status)};
                 if (sec.status == V3Status::kFull && sec.facet != kComponentInventoryFacet) {
-                    pg::PgResult del = pg::exec_params(
-                        c,
-                        "DELETE FROM software_inventory_store.installed_software "
-                        "WHERE agent_id = $1 AND source = $2",
-                        std::vector<std::string>{agent_id_s, sec.facet});
+                    pg::PgResult del =
+                        pg::exec_params(c,
+                                        "DELETE FROM software_inventory_store.installed_software "
+                                        "WHERE agent_id = $1 AND source = $2",
+                                        std::vector<std::string>{agent_id_s, sec.facet});
                     if (del.status() != PGRES_COMMAND_OK)
                         return fail("section delete");
                     if (!prep[i].rows.empty() && !insert_entries(c, agent_id_s, prep[i].rows))
@@ -1207,7 +1211,8 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                         " enabled = EXCLUDED.enabled, duration_ms = EXCLUDED.duration_ms, "
                         " bytes_read = EXCLUDED.bytes_read, updated_at = EXCLUDED.updated_at",
                         std::vector<std::string>{agent_id_s, sec.facet, status, sec.token,
-                                                 sec.status == V3Status::kDisabled ? "false" : "true",
+                                                 sec.status == V3Status::kDisabled ? "false"
+                                                                                   : "true",
                                                  dur, bytes, ts_s});
                     if (up.status() != PGRES_COMMAND_OK)
                         return fail("facet upsert");
@@ -1241,8 +1246,7 @@ SoftwareInventoryStore::apply_installed_software_v3(std::string_view agent_id, V
                 "ON CONFLICT (agent_id, source) DO UPDATE SET "
                 "  content_hash = EXCLUDED.content_hash, last_seen = EXCLUDED.last_seen "
                 "RETURNING agent_id",
-                std::vector<std::string>{agent_id_s, kSourceInstalledSoftware, report_hash,
-                                         ts_s});
+                std::vector<std::string>{agent_id_s, kSourceInstalledSoftware, report_hash, ts_s});
             if (par.status() != PGRES_TUPLES_OK)
                 return fail("state upsert");
         }
@@ -2543,14 +2547,11 @@ bool SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
     // unbounded one): a report holding the lock past the bound fails this call and the
     // decommission is simply re-issued.
     const bool committed = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
-        pg::PgResult lt = pg::exec_params(c, "SET LOCAL lock_timeout = '5s'",
-                                          std::vector<std::string>{});
+        pg::PgResult lt =
+            pg::exec_params(c, "SET LOCAL lock_timeout = '5s'", std::vector<std::string>{});
         if (lt.status() != PGRES_COMMAND_OK)
             return false;
-        pg::PgResult lk = pg::exec_params(
-            c,
-            "SELECT pg_advisory_xact_lock(hashtextextended('software_inventory_store:' || $1, 0))",
-            std::vector<std::string>{id});
+        pg::PgResult lk = pg::exec_params(c, kAgentLockSql, std::vector<std::string>{id});
         if (lk.status() != PGRES_TUPLES_OK)
             return false;
         pg::PgResult d1 = pg::exec_params(

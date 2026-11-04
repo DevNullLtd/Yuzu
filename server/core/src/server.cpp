@@ -2056,11 +2056,18 @@ public:
                           "a report skipped because another report for the same agent held its "
                           "lock, certificate_inventory only - not a failure)",
                           "counter");
+        metrics_.describe("yuzu_inventory_section_ingest_total",
+                          "Blob-v3 installed-software section outcomes by facet and outcome "
+                          "(facet = a collector source, component_inventory, or unknown; "
+                          "outcome = stored/status_only/need_full/delta_unsupported/rejected/"
+                          "error; moves only once a v3 agent reports)",
+                          "counter");
         cert_ingest_metric::register_metrics(metrics_); // slice-2 PR 2a-2a
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
                           "Time to apply one inventory source's report - the pooled-connection + "
                           "transaction hold time per ingest, by source and phase "
-                          "(full = full-payload replace; hash_only = hash-skip compare)",
+                          "(full = full-payload replace; hash_only = hash-skip compare; "
+                          "v3 = sectioned apply)",
                           "histogram");
         // RbacStore observability (ADR-0041). Described + zero-seeded up front so
         // the HELP/TYPE lines and closed dims exist on an idle server — critical
