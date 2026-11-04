@@ -17,8 +17,8 @@ cadences.
   `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
   `store_packages` (Linux snaps and flatpaks), and
   `windows_optional_features` `list` and `msi_packages` `list_inventory`
-  (Windows machine-context MSI products), `runtimes` `python` (installed
-  Python interpreters), and `middleware` `ibm_mq` (IBM MQ
+  (Windows machine-context MSI products), `runtimes` `python`, `dotnet` and `jvm` (installed
+  Python, .NET and Java runtimes), and `middleware` `ibm_mq` (IBM MQ
   installations; Linux). An action whose plugin is not loaded, or
   that answers "unsupported on this OS", is skipped. A plugin that is not
   loaded is logged at warn (the rows its action produced are removed on the next
@@ -31,7 +31,7 @@ cadences.
   skips that day's report and keeps the last good state — nothing is deleted. A
   `constrained` `managers` answer that still names at least one present manager
   is accepted: the constraint concerns manager facts the presence row never
-  carried. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
+  carried. A `constrained` `runtimes` (`python`, `dotnet`, `jvm`) or `middleware` `ibm_mq` answer is the other
   exception: it withholds only that source's rows and the cycle continues, so the
   stored rows of that source are removed until a later read succeeds (see
   Troubleshooting). A skipped cycle
@@ -48,7 +48,7 @@ cadences.
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `pkg_inventory.store_packages`,
   `windows_optional_features.list`, `msi_packages.list_inventory`,
-  `runtimes.python`, `middleware.ibm_mq`); `package_id`
+  `runtimes.python`, `runtimes.dotnet`, `runtimes.jvm`, `middleware.ibm_mq`); `package_id`
   is empty for these producers except `msi_packages.list_inventory`, where it is
   the MSI product code. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
@@ -87,19 +87,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ | .NET | Java |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` | `app` | `app` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` | `dotnet` | `jvm` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) | ✓ (`.NET Runtime`, `.NET SDK`, `.NET Framework`) | ✓ (`Java JDK`, `Java JRE`) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ | ✓ (empty if the install records none) | ✓ (empty if the build has no `release` file) |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) | `Microsoft` | ✓ (the build's self-reported `IMPLEMENTOR`; empty if absent) |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -178,6 +178,29 @@ cadences.
   software rows, so the stored `python` rows are removed until a read succeeds again
   (see Troubleshooting). A missing or unreadable version file never does this, the
   row reports the version it could determine.
+
+  **.NET runtimes** are collected through `runtimes` `dotnet` (all three OSes; `source`
+  `runtimes.dotnet`) as one `app` row per installed runtime, SDK or Framework version, `ecosystem`
+  `dotnet`, `publisher` `Microsoft`, `version` the install's version, and `name` `.NET Runtime`,
+  `.NET SDK` or `.NET Framework` (any other shared framework reads `.NET`). No process is started.
+  Windows reads the .NET installer registry keys in both registry views (the shared frameworks are
+  registered in the 32-bit view) and the .NET Framework release key, and cross-checks the install
+  directory; Linux and macOS list the `shared/<framework>/<version>` and `sdk/<version>` directory names
+  under the standard machine roots (`/usr/share/dotnet`, `/usr/lib/dotnet`, `/usr/lib64/dotnet`; macOS
+  `/usr/local/share/dotnet`). Homebrew, `dotnet-install` and per-user installs are not walked.
+  A constrained read withholds only the `dotnet` rows, as for Python.
+
+  **Java runtimes** are collected through `runtimes` `jvm` (all three OSes; `source`
+  `runtimes.jvm`) as one `app` row per JVM home, `ecosystem` `jvm`, `name` `Java JDK`, `Java JRE`
+  or `Java` (when the build does not say), `version` from the home's `release` file (empty when the
+  home has none) and `publisher` the file's `IMPLEMENTOR`. The publisher is self-reported by the
+  build and is never inferred from the registry key that registered it: a non-Oracle JDK also writes
+  the Oracle JavaSoft key. No process is started and `JAVA_HOME` is not consulted. Windows reads the
+  JavaSoft, Eclipse Adoptium and Azul Zulu registry keys and then each home's `release` file; Linux
+  walks `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm` and `/var/opt/java`; macOS walks
+  `/Library/Java/JavaVirtualMachines`. Version managers and Homebrew JDKs are not walked. A
+  constrained read withholds only the `jvm` rows. The macOS Java leg is verified against fixture
+  trees built from the documented bundle layout, not a real JDK install.
 
   **IBM MQ** is collected through the `middleware` plugin's `ibm_mq` action (Linux; `source`
   `middleware.ibm_mq`) with `kind` `app`, `ecosystem` `ibm_mq`, `name` `IBM MQ` and `publisher`
@@ -891,6 +914,16 @@ mount table could not be read), `macos:runtimes:permission_denied`,
 `windows:runtimes:python_reg:access_denied` and any `<os>:runtimes:row_cap` or
 `windows:runtimes:python_reg:row_cap` (a walk cap was hit). Fix the named cause; the next
 daily sync restores the rows.
+
+**A device's .NET or Java rows vanished, but the rest of its software is still reported; its
+log shows `sync: runtimes.dotnet constrained (<tokens>) — rows withheld this cycle` (or
+`runtimes.jvm`).** The same withhold as the Python case above, for the `dotnet` or `jvm` source
+alone: the stored rows of that source are removed until a read succeeds again. The tokens name the
+cause, for example `windows:runtimes:dotnet_reg:access_denied`,
+`windows:runtimes:jvm_reg:access_denied`, `windows:runtimes:jvm:release_unreadable`,
+`linux:runtimes:release_missing` or `macos:runtimes:release_unparsable`, and any `row_cap`; the
+`runtimes` README lists them all. A Java home with no `release` file keeps the source constrained
+for as long as it is installed. Fix the named cause; the next daily sync restores the rows.
 
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`

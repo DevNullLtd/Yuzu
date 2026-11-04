@@ -327,6 +327,15 @@ const InventoryAction kInventoryActions[] = {
          return parse_middleware_output(o, "ibm_mq", pol);
      },
      .constrained = ConstrainedPolicy::drop_source},
+    // Same host-fact constraint as python: a constrained answer withholds just that source's rows.
+    {.plugin = "runtimes",
+     .action = "dotnet",
+     .adapt = parse_runtimes_dotnet_output,
+     .constrained = ConstrainedPolicy::drop_source},
+    {.plugin = "runtimes",
+     .action = "jvm",
+     .adapt = parse_runtimes_jvm_output,
+     .constrained = ConstrainedPolicy::drop_source},
 };
 
 } // namespace
@@ -514,6 +523,58 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
         e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
         e.kind = "app";
         e.ecosystem = "python";
+        entries.push_back(std::move(e));
+        return true;
+    }, policy, /*escaped=*/true);
+}
+
+AdaptedRows parse_runtimes_dotnet_output(const std::string& out, ConstrainedPolicy policy) {
+    // dotnet|<flavour>|<version or ->|<install_path or ->|<vendor or -> (runtimes plugin: runtime
+    // /sdk/netfx on Windows, core/sdk/unmodelled on Linux and macOS). Same shape and escape-aware
+    // split as the python adapter; the vendor column is dropped, the publisher is always Microsoft.
+    return adapt_pkg_inventory(out, "dotnet",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
+        if (tok[0] != "dotnet" || tok.size() != 5)
+            return false;
+        SwEntry e;
+        if (tok[1] == "runtime" || tok[1] == "core")
+            e.name = ".NET Runtime";
+        else if (tok[1] == "sdk")
+            e.name = ".NET SDK";
+        else if (tok[1] == "netfx")
+            e.name = ".NET Framework";
+        else
+            e.name = ".NET";
+        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
+        e.publisher = "Microsoft";
+        e.kind = "app";
+        e.ecosystem = "dotnet";
+        entries.push_back(std::move(e));
+        return true;
+    }, policy, /*escaped=*/true);
+}
+
+AdaptedRows parse_runtimes_jvm_output(const std::string& out, ConstrainedPolicy policy) {
+    // jvm|<flavour>|<version or ->|<install_path or ->|<vendor or ->. The vendor is the release
+    // file's IMPLEMENTOR, free text the producer escapes, so the split is escape-aware; the vendor
+    // is clamped and stored as the publisher.
+    return adapt_pkg_inventory(out, "jvm",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
+        if (tok[0] != "jvm" || tok.size() != 5)
+            return false;
+        SwEntry e;
+        if (tok[1] == "jdk")
+            e.name = "Java JDK";
+        else if (tok[1] == "jre")
+            e.name = "Java JRE";
+        else
+            e.name = "Java";
+        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
+        e.publisher = tok[4] == "-" ? std::string{} : clamp_field(tok[4], kMaxFieldLen);
+        e.kind = "app";
+        e.ecosystem = "jvm";
         entries.push_back(std::move(e));
         return true;
     }, policy, /*escaped=*/true);

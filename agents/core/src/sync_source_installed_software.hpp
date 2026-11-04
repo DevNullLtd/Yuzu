@@ -41,7 +41,7 @@ struct SwEntry {
     std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
     std::string kind;      // "package" | "app" | "pkg" | "feat"
-    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi|python|ibm_mq
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|snap|flatpak|optional_feature|msi|python|ibm_mq|dotnet|jvm
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
@@ -155,6 +155,21 @@ YUZU_EXPORT AdaptedRows parse_msi_packages_list_inventory_output(const std::stri
 /// collector's table row uses ConstrainedPolicy::drop_source: a `constrained` answer withholds
 /// these rows (Status::withheld) and the cycle continues; `unsupported` is skipped.
 YUZU_EXPORT AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPolicy policy);
+
+/// Adapt `runtimes` `dotnet` output (`status|dotnet|<level>|...` plus five-token
+/// `dotnet|<flavour>|<version or ->|<install_path or ->|<vendor or ->`). Each row becomes
+/// {kind=app, ecosystem=dotnet, publisher=Microsoft}; name by flavour: `runtime` or `core` ->
+/// `.NET Runtime`, `sdk` -> `.NET SDK`, `netfx` -> `.NET Framework`, anything else -> `.NET`.
+/// `-` version -> empty; flavour, path and the row's vendor are dropped. The collector's table row
+/// uses ConstrainedPolicy::drop_source: a `constrained` answer withholds these rows
+/// (Status::withheld) and the cycle continues; `unsupported` is skipped.
+YUZU_EXPORT AdaptedRows parse_runtimes_dotnet_output(const std::string& out, ConstrainedPolicy policy);
+
+/// Adapt `runtimes` `jvm` output (same five-token shape, row tag `jvm`). Each row becomes
+/// {kind=app, ecosystem=jvm}; name by flavour: `jdk` -> `Java JDK`, `jre` -> `Java JRE`, anything
+/// else -> `Java`; publisher = the row's vendor (the build's self-reported IMPLEMENTOR; `-` ->
+/// empty); `-` version -> empty; flavour and path dropped. Same drop_source policy as dotnet.
+YUZU_EXPORT AdaptedRows parse_runtimes_jvm_output(const std::string& out, ConstrainedPolicy policy);
 
 /// Adapt `windows_optional_features` `list` output (`feature|<name>|<state>|<0/1>`):
 /// EVERY feature becomes {kind=feat, ecosystem=optional_feature} with the DISM
