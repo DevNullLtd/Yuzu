@@ -486,7 +486,12 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
   and `justification` is at most 4096 bytes; a grant keeps at most 100 decisions (the 100th is
   final: the 101st is refused with `400`, nothing written, and the grant can be reviewed again
   only in a new campaign, which freezes a fresh population) and a history read returns at most the latest 100 entries
-  of a grant. A success answers `{recorded, decision_seq, previous_decision}`.
+  of a grant. Every entry except the latest also returns at most the first 512 characters of its
+  justification (cut in SQL, counted in characters), flagged by `justification_truncated`: the
+  per-grant limit alone does not bound a campaign with many grants (100 x 4 KiB x grants, about
+  430 MB per copy at 1000 grants, held in several copies by the REST, MCP and page paths). The full
+  text of a superseded entry stays in the database and is not returned; an assessor exports it with
+  a database read of `access_review_attestation_history`. A success answers `{recorded, decision_seq, previous_decision}`.
 - Audit shape: `target_id` is the campaign id alone and the grant is in `detail`, for every
   outcome that reaches the gate or the store (the refusal of an engine session and the
   unsupported-media-type refusal carry an empty `target_id`). Audit rows written before this
@@ -542,7 +547,8 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
 5. The decision is committed before its audit row is written, and a failed audit write never undoes
    it. After a dropped connection the outcome of an attestation can be unknown: read the campaign
    and compare `decision_seq` before retrying; a retry appends an identical decision until the
-   grant reaches its limit of 100 decisions, after which the request is refused.
+   grant reaches its limit of 100 decisions, after which the request is refused. A
+   superseded entry is returned truncated, so match an earlier entry on the first 512 characters.
 6. Under a continuous stream of attestations a `close` can wait up to the pool's lock timeout and
    answer `503`; retry it.
 

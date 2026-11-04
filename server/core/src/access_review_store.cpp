@@ -280,13 +280,24 @@ AttestationHistoryRow read_history(PGresult* res, int i) {
     h.previous_decision = PQgetvalue(res, i, col++);
     h.reviewer = PQgetvalue(res, i, col++);
     h.justification = PQgetvalue(res, i, col++);
+    h.justification_truncated = std::string_view(PQgetvalue(res, i, col++)) == "t";
     h.decided_at_ms = to_i64(PQgetvalue(res, i, col++));
     return h;
 }
 
+// The grant's latest entry (h.seq = the state row's decision_seq, $3 below is the preview length)
+// keeps its whole justification; every other entry is cut to its first $3 CHARACTERS by the
+// database (`left` counts characters, so a multibyte sequence is never split), and the flag says
+// whether anything was cut. Done in SQL so the discarded text is never read into this process.
+// `a` is the state row (LEFT JOINed: a history row whose state row is missing still reaches the
+// merge below, which reports it, and is treated as superseded here).
 constexpr const char* kHistoryCols =
-    "campaign_id, principal_type, principal_id, role_name, seq, decision, previous_decision, "
-    "reviewer, justification, decided_at_ms";
+    "h.campaign_id, h.principal_type, h.principal_id, h.role_name, h.seq, h.decision, "
+    "h.previous_decision, h.reviewer, "
+    "CASE WHEN h.seq = a.decision_seq THEN h.justification "
+    "     ELSE left(h.justification, $3::integer) END, "
+    "(h.seq IS DISTINCT FROM a.decision_seq AND length(h.justification) > $3::integer), "
+    "h.decided_at_ms";
 
 } // namespace
 
@@ -597,22 +608,23 @@ AccessReviewStore::get_campaign(const std::string& campaign_id, bool include_his
             // the state row's decision_seq minus the cap), so a grant carrying more rows than the
             // write cap allows (written by other means) cannot make this read unbounded.
             // decision_seq stays the total count, so truncation reads as decision_seq > entries.
-            // COALESCE keeps a history row whose state row is missing, so the merge below still
-            // reports that corruption instead of the row silently vanishing.
+            // The LEFT JOIN + COALESCE keep a history row whose state row is missing, so the
+            // merge below still reports that corruption instead of the row silently vanishing.
+            // A second bound, in kHistoryCols: every entry but the latest returns a justification
+            // preview, so entries x grants cannot multiply the 4 KiB stored text.
             std::string hsql =
                 std::string("SELECT ") + kHistoryCols +
                 " FROM access_review_store.access_review_attestation_history h "
-                "WHERE campaign_id=$1 "
-                "  AND seq > COALESCE((SELECT a.decision_seq "
-                "                      FROM access_review_store.access_review_attestation a "
-                "                      WHERE a.campaign_id = h.campaign_id "
-                "                        AND a.principal_type = h.principal_type "
-                "                        AND a.principal_id = h.principal_id "
-                "                        AND a.role_name = h.role_name), 0) - $2::integer "
-                "ORDER BY principal_type, principal_id, role_name, seq";
+                "LEFT JOIN access_review_store.access_review_attestation a "
+                "  ON a.campaign_id = h.campaign_id AND a.principal_type = h.principal_type "
+                " AND a.principal_id = h.principal_id AND a.role_name = h.role_name "
+                "WHERE h.campaign_id=$1 "
+                "  AND h.seq > COALESCE(a.decision_seq, 0) - $2::integer "
+                "ORDER BY h.principal_type, h.principal_id, h.role_name, h.seq";
             pg::PgResult hres = pg::exec_params(
                 conn, hsql.c_str(),
-                std::vector<std::string>{campaign_id, std::to_string(kMaxDecisionsPerGrant)});
+                std::vector<std::string>{campaign_id, std::to_string(kMaxDecisionsPerGrant),
+                                         std::to_string(kHistoryJustificationPreviewChars)});
             if (hres.status() != PGRES_TUPLES_OK) {
                 error_msg = std::string("get_campaign history read failed: ") +
                             PQerrorMessage(conn);

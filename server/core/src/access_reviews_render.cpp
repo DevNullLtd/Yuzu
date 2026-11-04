@@ -111,9 +111,12 @@ std::string side_card(const CampaignView& v, const CampaignDerived& d, bool can_
 
 // A history entry that repeats its predecessor (same decision, reviewer and justification, and it
 // replaced a decision equal to its own) is a re-recorded decision, which is what a retry after an
-// unacknowledged commit appends. It is not a change of mind, so it is labelled apart.
+// unacknowledged commit appends. It is not a change of mind, so it is labelled apart. A superseded
+// entry's justification may be a prefix of the stored text, so when either side was cut the texts
+// cannot be shown equal: such a pair is never a re-record and reads as a superseding decision.
 bool is_rerecord(const AttestationHistoryRow& prev, const AttestationHistoryRow& cur) {
-    return cur.decision == prev.decision && cur.reviewer == prev.reviewer &&
+    return !prev.justification_truncated && !cur.justification_truncated &&
+           cur.decision == prev.decision && cur.reviewer == prev.reviewer &&
            cur.justification == prev.justification && cur.previous_decision == cur.decision;
 }
 
@@ -129,6 +132,8 @@ std::string history_entry(const AccessReviewAttestationRow& a, std::size_t i) {
                       esc(e.reviewer) + " " + when(e.decided_at_ms);
     if (!e.justification.empty())
         out += ": " + esc(e.justification);
+    if (e.justification_truncated)
+        out += " (truncated)";
     if (i > 0)
         out += is_rerecord(a.history[i - 1], e)
                    ? std::string(" (re-recorded)")

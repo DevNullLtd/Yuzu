@@ -173,7 +173,12 @@ grant keeps at most 100 decisions; the 100th is final and no further decision is
 grant in that campaign. The history and the audit rows identify who wrote the entries, and the
 remedy is to close the campaign and open a new one, which freezes a fresh population. A blind retry
 of an unacknowledged attempt appends an identical decision until that limit, after which the request
-is refused. **The history table is
+is refused. **Superseded justifications are shown truncated:** a history read returns, for every entry
+except a grant's latest, at most the first 512 characters of its justification, flagged by
+`justification_truncated`, so a campaign with many grants cannot make one response grow without bound
+(100 entries per grant alone would not bound it). The full text stays in the database; an assessor who
+needs it exports it with a database read of `access_review_attestation_history`, not through the API.
+**The history table is
 append-only against the application path and ordinary SQL, not against the application's database
 credential** (it owns the schema and could disable the guard, forge a matching row or truncate), a
 role granted TRUNCATE, or a database administrator; the independent evidence is the audit store

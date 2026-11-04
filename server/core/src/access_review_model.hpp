@@ -228,7 +228,9 @@ static_assert(kPrincipalIdMaxLen == 1024 && kRoleNameMaxLen == 1024,
 /// `kDecisionCapMessage`, nothing written) and `get_campaign(id, true)` returns at most this many
 /// history entries per grant (the latest), so one grant cannot make a read or a response grow
 /// without bound. `decision_seq` stays the total count: a consumer detects a truncated history as
-/// `decision_seq > history.size()`. Same type as `decision_seq`.
+/// `decision_seq > history.size()`. Same type as `decision_seq`. The count alone does not bound a
+/// campaign with many grants: superseded entries also return a justification preview only
+/// (`kHistoryJustificationPreviewChars`, access_review_store.hpp).
 inline constexpr std::int32_t kMaxDecisionsPerGrant = 100;
 
 /// The refusal text REST (400) and MCP (invalid-params) return for a decision past the cap, so the

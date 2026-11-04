@@ -531,6 +531,56 @@ TEST_CASE("reviews render: an identical consecutive decision is re-recorded, not
     CHECK_THAT(other, !ContainsSubstring("re-recorded"));
 }
 
+TEST_CASE("reviews render: only a truncated history entry carries the (truncated) marker, escaped",
+          "[access-reviews][render][4752]") {
+    auto a = twice_decided();
+    // Entry 1 is a superseded entry whose stored text was cut; entry 2 (the latest) is whole.
+    a.history[0].justification = "<b>start of a long note";
+    a.history[0].justification_truncated = true;
+    const auto out = campaign_html(view(camp("c1", "T"), {a}), true);
+    CHECK_THAT(out, ContainsSubstring("&lt;b&gt;start of a long note (truncated)"));
+    CHECK_THAT(out, !ContainsSubstring("<b>start"));
+    // Exactly one marker: the entry that was not cut (and the current row) show none.
+    std::size_t markers = 0;
+    for (std::size_t at = out.find("(truncated)"); at != std::string::npos;
+         at = out.find("(truncated)", at + 1))
+        ++markers;
+    CHECK(markers == 1);
+
+    // No entry cut: no marker anywhere.
+    CHECK_THAT(campaign_html(view(camp("c1", "T"), {twice_decided()}), true),
+               !ContainsSubstring("(truncated)"));
+}
+
+TEST_CASE("reviews render: a cut entry is never a re-record of its successor, only whole texts are "
+          "compared",
+          "[access-reviews][render][4752]") {
+    const std::string prefix(512, 'p');
+    const auto repeat = [&](bool prev_cut, bool cur_cut) {
+        auto a = att("user", "bob", "Operator", "attested", "carol", prefix);
+        a.decision_seq = 2;
+        a.history = {hist(1, "attested", "pending", "carol", prefix),
+                     hist(2, "attested", "attested", "carol", prefix)};
+        a.history[0].justification_truncated = prev_cut;
+        a.history[1].justification_truncated = cur_cut;
+        return campaign_html(view(camp("c1", "T"), {a}), true);
+    };
+    // Neither side cut and the texts equal: a re-record (the pre-existing behaviour).
+    const auto whole = repeat(false, false);
+    CHECK_THAT(whole, ContainsSubstring("re-recorded 1 time<"));
+    CHECK_THAT(whole, ContainsSubstring("(re-recorded)"));
+    // A cut text is a prefix, so equal text proves nothing: the pair reads as a superseding
+    // decision whichever side was cut, and when both were.
+    for (const auto [prev_cut, cur_cut] : {std::pair{true, false}, std::pair{false, true},
+                                           std::pair{true, true}}) {
+        INFO("prev_cut=" << prev_cut << " cur_cut=" << cur_cut);
+        const auto out = repeat(prev_cut, cur_cut);
+        CHECK_THAT(out, ContainsSubstring("superseded 1 earlier decision<"));
+        CHECK_THAT(out, ContainsSubstring("(supersedes #1)"));
+        CHECK_THAT(out, !ContainsSubstring("re-recorded"));
+    }
+}
+
 TEST_CASE("reviews render: a decision backfilled from before the history reads not recorded, never "
           "pending",
           "[access-reviews][render][4752]") {

@@ -2505,6 +2505,8 @@ TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the app
     const auto gdesc = (*get)["description"].get<std::string>();
     CHECK(gdesc.find("decision_seq") != std::string::npos);
     CHECK(gdesc.find("history") != std::string::npos);
+    CHECK(gdesc.find("justification_truncated") != std::string::npos);
+    CHECK(gdesc.find("at most its first 512 characters") != std::string::npos);
 
     const auto& items = (*get)["outputSchema"]["properties"]["attestations"]["items"];
     REQUIRE(items.is_object());
@@ -2512,8 +2514,12 @@ TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the app
     const auto& hist = items["properties"]["history"];
     CHECK(hist["type"] == "array");
     for (const char* k : {"seq", "decision", "previous_decision", "reviewer", "justification",
-                          "decided_at_ms"})
+                          "justification_truncated", "decided_at_ms"}) {
         CHECK(hist["items"]["properties"].contains(k));
+        const auto& hreq = hist["items"]["required"];
+        CHECK(std::find(hreq.begin(), hreq.end(), k) != hreq.end());
+    }
+    CHECK(hist["items"]["properties"]["justification_truncated"]["type"] == "boolean");
     CHECK(hist["items"]["properties"]["seq"]["type"] == "integer");
     CHECK(hist["items"]["properties"]["previous_decision"]["enum"] ==
           nlohmann::json::array({"", "pending", "attested", "flagged_revoke"}));

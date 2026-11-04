@@ -3875,7 +3875,14 @@ written. The 100th decision is final: the grant takes no further decision in tha
 the audit rows identify who wrote the entries, and the remedy is to close the campaign and open a new one (a
 new campaign freezes a fresh population). A history read returns at most the latest
 100 entries of a grant; `decision_seq` stays the total, so `decision_seq` greater than the number of entries
-means earlier ones are not shown. A successful attest answers `{recorded, decision_seq, previous_decision}`.
+means earlier ones are not shown. The entry count alone does not bound the response of a campaign with many
+grants (100 entries of 4096 bytes each, per grant), so every entry except the grant's latest also returns at
+most its first 512 characters of justification, cut in SQL (`left()` counts characters, so a multibyte
+sequence is never split) and flagged by `justification_truncated`; the latest entry is whole and equals the
+state row. The full text of a superseded entry stays in the database and is not returned, so an export of it
+is a database read of `access_review_attestation_history`. A grant adds at most 100 entries of 512 characters
+plus one whole entry to a response. The Access page marks a cut entry "(truncated)" and never labels a pair
+in which either entry was cut as a re-recording, because a cut text cannot be shown equal to the next one. A successful attest answers `{recorded, decision_seq, previous_decision}`.
 
 **Lost COMMIT.** One history event is one committed decision transaction. When the connection drops after
 COMMIT was sent, the server cannot tell whether the decision was recorded and answers a write failure (503 on
@@ -3886,7 +3893,7 @@ may have been recorded). The first attempt writes a
 `result=failure` audit row whose fixed text says the decision store is unavailable or the decision may not have
 been committed (`kStoreFailureMessage`), so an auditor sees a failure row next to a committed decision. To tell
 whether a decision landed, read the campaign, compare `decision_seq` with the value you last saw and match your
-entry on reviewer, justification and `decided_at_ms`. A store failure that is not the caller's is answered with
+entry on reviewer, justification (an earlier entry shows at most its first 512 characters) and `decided_at_ms`. A store failure that is not the caller's is answered with
 that fixed message and `retry_after_ms` 5000 (`503` on REST, an internal error on MCP), never database text,
 which goes to the server log. There is no idempotency key yet.
 

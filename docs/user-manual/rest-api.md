@@ -4343,9 +4343,19 @@ pending. Each entry has `seq` (1 for the first decision on the grant; order is b
 `seq`, never by time), `decision`, `previous_decision` (the decision it replaced:
 `pending` for the first one; an empty string means *not recorded*, for a decision
 that predates the history table, and never means pending), `reviewer`,
-`justification` and `decided_at_ms` (the wall clock of the server replica that
-recorded it). The grant's own `decision`, `reviewer`, `justification` and
-`decided_at_ms` are the latest entry. The response grows with every recorded
+`justification`, `justification_truncated` and `decided_at_ms` (the wall clock of
+the server replica that recorded it). The grant's own `decision`, `reviewer`,
+`justification` and `decided_at_ms` are the latest entry. Only the latest entry
+carries its whole `justification`. Every earlier entry carries at most the first
+512 characters of the text it was recorded with (counted in characters, so a
+multibyte character is never split), and `justification_truncated` is `true`
+exactly when text was cut (always `false` for the latest entry and for a short
+one). The full text of an earlier entry stays in the database and is not
+returned by this call, which keeps the response bounded for a campaign with many
+grants: at most 100 entries per grant, and at most 512 characters of
+justification on all but the latest. To match your own earlier entry after a lost
+answer (see `POST .../attestations` below), compare its `justification` with the
+first 512 characters of what you sent. The response grows with every recorded
 decision, up to 100 per grant: `history[]` lists at most the latest 100 entries of
 a grant, and `decision_seq` stays the total, so `decision_seq` greater than the
 number of entries means earlier ones are not shown (the write cap keeps a grant at
@@ -4360,7 +4370,11 @@ reads "re-recorded" when every later entry repeats the one before it exactly (th
 same decision, reviewer and justification), which is what a retry after an
 unacknowledged commit produces (see `POST .../attestations` below), and
 "superseded <n> earlier decisions" otherwise. An entry's own line says whether it
-is a re-recording or supersedes the one before.
+is a re-recording or supersedes the one before. An entry whose justification was
+cut shows the shortened text followed by "(truncated)". A pair in which either
+entry was cut is never labelled a re-recording, because a cut text cannot be
+shown to equal the next one; it reads as superseding even when the full texts
+were identical.
 
 `400`: the campaign id is malformed (see the rule above). `403` without
 `AccessReview:Read` (or an engine-classed caller). `404` — no campaign with
@@ -4483,7 +4497,8 @@ transaction commits. If the connection drops after the commit was sent, the serv
 cannot tell whether it was recorded and answers a write failure (`503`). Before
 retrying, `GET /api/v1/access-reviews/{id}`, compare `decision_seq` with the value
 you last saw and look for your own entry (match `reviewer`, `justification` and
-`decided_at_ms`). A blind retry after an unacknowledged commit appends an identical
+`decided_at_ms`; once a later decision exists, an earlier entry's `justification`
+is at most its first 512 characters). A blind retry after an unacknowledged commit appends an identical
 decision at the next `seq`; it is kept and visible, never an error, until the
 grant reaches its limit of 100 decisions, after which the request is refused (read
 the campaign first if your earlier attempt may have been recorded). The first

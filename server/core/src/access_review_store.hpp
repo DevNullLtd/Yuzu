@@ -107,6 +107,13 @@ namespace yuzu::server {
 /// `bad_request:` so no stored decision row is unbounded.
 inline constexpr std::size_t kMaxJustificationBytes = 4096;
 
+/// Most characters (not bytes) of a SUPERSEDED history entry's justification that
+/// `get_campaign(id, true)` returns; the grant's latest entry is always returned in full. The
+/// full text stays in the database. Together with `kMaxDecisionsPerGrant` this bounds what one
+/// grant adds to a response, so a campaign with many grants cannot make it grow by
+/// 4 KiB x 100 x grants.
+inline constexpr std::int32_t kHistoryJustificationPreviewChars = 512;
+
 /// One grant to freeze into a campaign at `open_campaign` time — the shape
 /// `access_review_model::AccessReviewRow` is expanded into (one `GrantRef`
 /// per (principal, role) pair, not per principal — a principal holding N
@@ -151,7 +158,11 @@ struct AttestationHistoryRow {
     std::string previous_decision; ///< "pending" | "attested" | "flagged_revoke"; "" for a row
                                    ///< backfilled by schema v3 (not recorded, NOT pending)
     std::string reviewer;
+    /// The grant's latest entry in full; a superseded entry carries at most its first
+    /// `kHistoryJustificationPreviewChars` characters (the full text stays in the database).
     std::string justification;
+    /// True only for a superseded entry whose stored text was longer than the preview.
+    bool justification_truncated{false};
     std::int64_t decided_at_ms{0}; ///< the recording replica's wall clock
 };
 
@@ -268,8 +279,12 @@ public:
     /// the same REPEATABLE READ snapshot, capped at the latest
     /// `kMaxDecisionsPerGrant` entries per grant (a backstop: the write cap keeps
     /// a grant at or under it, so `decision_seq > history.size()` means rows were
-    /// added by other means); it defaults to false so a caller that
-    /// shows only the latest decision stays one cheap read.
+    /// added by other means). Every entry except the grant's latest (`seq == decision_seq`)
+    /// carries at most its first `kHistoryJustificationPreviewChars` characters of justification,
+    /// cut in SQL on a character boundary, with `justification_truncated` set when the stored
+    /// text was longer; the latest entry is whole. The two bounds together cap what one grant
+    /// adds to a response; a superseded entry's full text is in the database only. It
+    /// defaults to false so a caller that shows only the latest decision stays one cheap read.
     /// `unexpected("bad_request: ...")`
     /// when `campaign_id` fails `valid_campaign_id` (empty included), checked
     /// before the pool is touched. `unexpected("not_found: ...")`

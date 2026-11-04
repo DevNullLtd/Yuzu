@@ -3101,9 +3101,19 @@ TEST_CASE("decision history: REST, MCP and the Access page agree, and the OpenAP
     seed_user_grant(h, "alice");
     const auto cid = h.open_campaign_rest("history reads");
 
+    // The first decision carries a justification longer than the preview, so once it is
+    // superseded every read surface returns it cut and flagged (the #4752 read ceiling).
+    const std::string long_note(600, 'x');
     h.session_user = "carol";
-    REQUIRE(h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator", "attested"))->status ==
-            200);
+    REQUIRE(h.sink
+                .Post(attest_url(cid),
+                      nlohmann::json{{"principal_type", "user"},
+                                     {"principal_id", "bob"},
+                                     {"role_name", "Operator"},
+                                     {"decision", "attested"},
+                                     {"justification", long_note}}
+                          .dump())
+                ->status == 200);
     h.session_user = "dave";
     REQUIRE(h.sink
                 .Post(attest_url(cid),
@@ -3143,6 +3153,11 @@ TEST_CASE("decision history: REST, MCP and the Access page agree, and the OpenAP
     CHECK(bob["history"][1]["reviewer"] == "dave");
     CHECK(bob["history"][1]["justification"] == "left <the> team");
     CHECK(bob["history"][1]["decided_at_ms"].get<std::int64_t>() > 0);
+    // The superseded entry is cut to the preview and flagged; the latest entry is whole.
+    CHECK(bob["history"][0]["justification"] == std::string(512, 'x'));
+    CHECK(bob["history"][0]["justification_truncated"] == true);
+    CHECK(bob["history"][1]["justification_truncated"] == false);
+    CHECK(bob["justification"] == "left <the> team");
 
     // A grant nobody has decided: seq 0 and an empty array, never absent.
     const auto alice = find_att(rest_atts, "alice");
@@ -3160,6 +3175,7 @@ TEST_CASE("decision history: REST, MCP and the Access page agree, and the OpenAP
     const auto mcp_atts = mcp_body["result"]["structuredContent"]["attestations"];
     CHECK(mcp_atts.dump() == rest_atts.dump());
     CHECK(find_att(mcp_atts, "bob")["history"].size() == 2);
+    CHECK(find_att(mcp_atts, "bob")["history"][0]["justification_truncated"] == true);
 
     // OpenAPI names exactly the keys the route emits, on both the row and the history entry.
     const auto spec = nlohmann::json::parse(yuzu::server::openapi_spec_json());
@@ -3212,6 +3228,58 @@ TEST_CASE("decision history: REST, MCP and the Access page agree, and the OpenAP
     // The justification carries markup; it reaches the page escaped only.
     CHECK(frag->body.find("left &lt;the&gt; team") != std::string::npos);
     CHECK(frag->body.find("left <the> team") == std::string::npos);
+    // The cut entry shows the preview and the marker; the whole one shows none.
+    CHECK(frag->body.find(std::string(512, 'x') + " (truncated)") != std::string::npos);
+    CHECK(frag->body.find(std::string(513, 'x')) == std::string::npos);
+    std::size_t markers = 0;
+    for (auto at = frag->body.find("(truncated)"); at != std::string::npos;
+         at = frag->body.find("(truncated)", at + 1))
+        ++markers;
+    CHECK(markers == 1);
+}
+
+// The ceiling in numbers: a grant at the 100-decision limit with a 4096-character justification on
+// every decision serialises to one whole latest entry plus 99 previews, not 100 x 4 KiB. The bound
+// is derived from the constants; kEntryOverheadBytes covers the fixed keys, the seq, the decision
+// words, a short reviewer name and the timestamp of one entry (about 200 bytes measured).
+TEST_CASE("decision history: a grant at the decision limit serialises under the derived ceiling",
+          "[pg][access_review][rest][access-reviews][4752]") {
+    constexpr std::size_t kEntryOverheadBytes = 320;
+    constexpr std::size_t kBound =
+        static_cast<std::size_t>(yuzu::server::kMaxDecisionsPerGrant) *
+            (static_cast<std::size_t>(yuzu::server::kHistoryJustificationPreviewChars) +
+             kEntryOverheadBytes) +
+        yuzu::server::kMaxJustificationBytes;
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    const auto cid = h.open_campaign_rest("read ceiling");
+    for (std::int32_t i = 1; i <= yuzu::server::kMaxDecisionsPerGrant; ++i) {
+        REQUIRE(h.access_review_store
+                    ->record_attestation(cid, "user", "bob", "Operator",
+                                         i % 2 ? "attested" : "flagged_revoke", "carol",
+                                         std::string(yuzu::server::kMaxJustificationBytes, 'j'))
+                    .has_value());
+    }
+    auto rest = h.sink.Get("/api/v1/access-reviews/" + cid);
+    REQUIRE(rest);
+    REQUIRE(rest->status == 200);
+    const auto atts = nlohmann::json::parse(rest->body)["data"]["attestations"];
+    REQUIRE(atts.size() == 1);
+    const auto& history = atts[0]["history"];
+    REQUIRE(history.size() == 100);
+    for (std::size_t i = 0; i < 99; ++i) {
+        CHECK(history[i]["justification"].get<std::string>().size() == 512);
+        CHECK(history[i]["justification_truncated"] == true);
+    }
+    CHECK(history[99]["justification"].get<std::string>().size() == 4096);
+    CHECK(history[99]["justification_truncated"] == false);
+    const auto bytes = history.dump().size();
+    INFO("serialised history bytes: " << bytes << " bound: " << kBound);
+    CHECK(bytes < kBound);
+    // Not vacuous: the stored text alone is 100 x 4096 bytes, well over the bound.
+    CHECK(static_cast<std::size_t>(yuzu::server::kMaxDecisionsPerGrant) *
+              yuzu::server::kMaxJustificationBytes >
+          kBound);
 }
 
 // ── Per-grant decision cap and the success body (#4752) ────────────────────

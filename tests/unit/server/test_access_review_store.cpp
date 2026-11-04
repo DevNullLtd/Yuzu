@@ -1512,6 +1512,133 @@ std::string grant_lock_sql(const std::string& cid) {
 
 } // namespace
 
+// #4752 read ceiling: the per-grant limit of 100 decisions does not bound a campaign with many
+// grants, so a superseded entry returns a justification preview and only the latest is whole.
+TEST_CASE("get_campaign history: a superseded justification is cut to 512 characters and flagged, "
+          "the latest entry and short entries are whole",
+          "[access_review][store][pg][4752]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(yuzu::server::kHistoryJustificationPreviewChars == 512);
+    auto open_res = store.open_campaign("Read ceiling", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    // 1: 4096 chars (cut); 2: short (whole); 3: exactly 512 (whole, the boundary); 4: 513 (cut by
+    // one); 5: 4096 chars and the latest (whole).
+    const std::vector<std::string> texts = {std::string(4096, 'a'), "short", std::string(512, 'e'),
+                                            std::string(513, 'f'), std::string(4096, 'g')};
+    for (const auto& t : texts)
+        REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", t)
+                    .has_value());
+
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    const auto* row = find_row(*view, "user", "alice", "Admin");
+    REQUIRE(row != nullptr);
+    REQUIRE(row->decision_seq == 5);
+    REQUIRE(row->history.size() == 5);
+    CHECK(row->history[0].justification == std::string(512, 'a'));
+    CHECK(row->history[0].justification_truncated);
+    CHECK(row->history[1].justification == "short");
+    CHECK_FALSE(row->history[1].justification_truncated);
+    CHECK(row->history[2].justification == std::string(512, 'e'));
+    CHECK_FALSE(row->history[2].justification_truncated);
+    CHECK(row->history[3].justification == std::string(512, 'f'));
+    CHECK(row->history[3].justification_truncated);
+    // The latest entry is whole and equals the state row's justification.
+    CHECK(row->history[4].justification == std::string(4096, 'g'));
+    CHECK_FALSE(row->history[4].justification_truncated);
+    CHECK(row->justification == std::string(4096, 'g'));
+
+    // The database keeps every full text: the cut is the read's, not the write's.
+    {
+        PgConn c{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        const std::string sql =
+            "SELECT length(justification) FROM "
+            "access_review_store.access_review_attestation_history WHERE campaign_id='" +
+            cid + "' AND principal_id='alice' ORDER BY seq";
+        PgResult r{PQexec(c.get(), sql.c_str())};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(r.get()) == 5);
+        CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "4096");
+        CHECK(std::string(PQgetvalue(r.get(), 3, 0)) == "513");
+    }
+
+    // A grant decided once has only its latest entry: never cut, never flagged.
+    REQUIRE(store.record_attestation(cid, "group", "eng", "Reader", "attested", "carol",
+                                     std::string(4096, 'z'))
+                .has_value());
+    auto again = store.get_campaign(cid, true);
+    REQUIRE(again.has_value());
+    const auto* once = find_row(*again, "group", "eng", "Reader");
+    REQUIRE(once != nullptr);
+    REQUIRE(once->history.size() == 1);
+    CHECK(once->history[0].justification == std::string(4096, 'z'));
+    CHECK_FALSE(once->history[0].justification_truncated);
+}
+
+TEST_CASE("get_campaign history: the cut counts characters, so a multibyte justification is never "
+          "split mid-sequence",
+          "[access_review][store][pg][4752]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign("Multibyte cut", "admin", three_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    const auto repeat = [](const std::string& unit, std::size_t n) {
+        std::string s;
+        for (std::size_t i = 0; i < n; ++i)
+            s += unit;
+        return s;
+    };
+    // 600 two-byte and 600 three-byte characters (1200 and 1800 bytes, under the 4096 byte cap).
+    const std::string two = repeat("\xC3\xA9", 600);       // U+00E9
+    const std::string three = repeat("\xE2\x82\xAC", 600); // U+20AC
+    const std::string last = repeat("\xC3\xA9", 600);
+    for (const auto& t : {two, three, last})
+        REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", t)
+                    .has_value());
+
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    const auto* row = find_row(*view, "user", "alice", "Admin");
+    REQUIRE(row != nullptr);
+    REQUIRE(row->history.size() == 3);
+    CHECK(row->history[0].justification == repeat("\xC3\xA9", 512));
+    CHECK(row->history[0].justification.size() == 1024);
+    CHECK(row->history[0].justification_truncated);
+    CHECK(row->history[1].justification == repeat("\xE2\x82\xAC", 512));
+    CHECK(row->history[1].justification.size() == 1536);
+    CHECK(row->history[1].justification_truncated);
+    // The latest entry is whole, 600 characters.
+    CHECK(row->history[2].justification == last);
+    CHECK_FALSE(row->history[2].justification_truncated);
+
+    // Valid UTF-8 on every cut entry: each lead byte is followed by its continuation bytes.
+    for (std::size_t k = 0; k < 2; ++k) {
+        const auto& s = row->history[k].justification;
+        std::size_t chars = 0;
+        for (std::size_t i = 0; i < s.size();) {
+            const auto b = static_cast<unsigned char>(s[i]);
+            const std::size_t len = b < 0x80 ? 1 : (b >> 5) == 0x6 ? 2 : (b >> 4) == 0xE ? 3 : 0;
+            REQUIRE(len != 0);
+            REQUIRE(i + len <= s.size());
+            for (std::size_t j = 1; j < len; ++j)
+                REQUIRE((static_cast<unsigned char>(s[i + j]) & 0xC0) == 0x80);
+            i += len;
+            ++chars;
+        }
+        CHECK(chars == 512);
+    }
+}
+
 TEST_CASE("two attests of one grant serialise on the row lock and chain to seq 2",
           "[access_review][store][pg][concurrency]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
