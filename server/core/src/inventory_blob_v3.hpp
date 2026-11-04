@@ -25,7 +25,8 @@
 /// Containment: a grammar violation INSIDE a section refuses that section only (the other
 /// sections of the call still apply and the refused facet is nacked). A defect that cannot be
 /// attributed to a facet (header, an unreadable section header, a record before any section,
-/// more than kV3MaxSections sections, an oversized blob) fails the whole blob.
+/// a header with no section at all, more than kV3MaxSections sections, an oversized blob) fails
+/// the whole blob.
 /// Every field is UTF-8-scrubbed and codepoint-clamped exactly like the v2 parser (scrub first,
 /// then clamp), so the server-recomputed hashes match the agent's.
 
@@ -451,6 +452,9 @@ parse_v3_blob(std::string_view blob) {
             v3_detail::refuse(sec, V3Refusal::kUnknownRecord);
         }
     }
+    // A header with no section names nothing: fail closed like any other unattributable blob.
+    if (rep.sections.empty())
+        return std::unexpected(K::kBadSectionHeader);
     return rep;
 }
 

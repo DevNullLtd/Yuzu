@@ -84,8 +84,10 @@ TEST_CASE("v3 header detection: only the exact header bytes make a blob v3",
     auto r = parse_v3_blob(std::string("v3") + kFs + "1.0" + kRs);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error() == V3ParseErrorKind::kNotV3);
-    // The header alone is a valid, empty report.
-    CHECK(parse_ok(header()).sections.empty());
+    // The header alone names no section: refused, so no caller can mistake it for a stored report.
+    auto none = parse_v3_blob(header());
+    REQUIRE_FALSE(none.has_value());
+    CHECK(none.error() == V3ParseErrorKind::kBadSectionHeader);
 }
 
 TEST_CASE("v3 parses every record kind", "[server][inventory_blob_v3]") {

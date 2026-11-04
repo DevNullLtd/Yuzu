@@ -4841,6 +4841,22 @@ TEST_CASE("v3: the first v3 call deletes every row the v2 path left, and only th
                                            v2rows, 0) == InventoryIngestOutcome::kStored);
     res = store.apply_installed_software_v3("agent-tr", v3_report({v3_full(kV3Apps, {})}));
     CHECK(row_count(pool, "agent-by") == "3");
+
+    // A first contact that is STATUS-ONLY is the transition too: no v2 row survives it, the
+    // facet state records the status, and the report hash carries no section.
+    REQUIRE(store.apply_installed_software("agent-st", SoftwareInventoryStore::canonical_hash(v2rows),
+                                           v2rows, 0) == InventoryIngestOutcome::kStored);
+    REQUIRE(row_count(pool, "agent-st") == "3");
+    res = store.apply_installed_software_v3(
+        "agent-st", v3_report({v3_status(kV3Apps, V3Status::kConstrained, "windows:apps:tok")}));
+    REQUIRE(res.size() == 1);
+    CHECK(res[0].outcome == V3SectionOutcome::kStatusOnly);
+    CHECK(row_count(pool, "agent-st") == "0");
+    CHECK(sql_rows(pool,
+                   "SELECT status FROM software_inventory_store.software_facet_state "
+                   "WHERE agent_id = 'agent-st' AND facet = $1",
+                   {kV3Apps})[0][0] == "constrained");
+    CHECK(stored_hash(pool, "agent-st") == SoftwareInventoryStore::v3_report_hash({}));
 }
 
 TEST_CASE("v3: a status-only section records the status and leaves rows and confirmation alone",
@@ -5220,7 +5236,8 @@ TEST_CASE("ingest_inventory_report v3: a blob that cannot be attributed to secti
                                            v2rows, 0) == InventoryIngestOutcome::kStored);
 
     for (const std::string& blob :
-         {w_hdr() + w_plus("Orphan", kV3Apps),      // a record before any section
+         {w_hdr(),                                  // a header naming no section at all
+          w_hdr() + w_plus("Orphan", kV3Apps),      // a record before any section
           w_hdr() + w_rec({"S", "", "full"}),        // a section header with no facet
           w_hdr() + std::string(4u * 1024 * 1024, 'x')}) { // over the 3 MiB cap
         agentpb::InventoryReport rep;
@@ -5233,7 +5250,7 @@ TEST_CASE("ingest_inventory_report v3: a blob that cannot be attributed to secti
     }
     CHECK(metrics.counter("yuzu_inventory_ingest_total",
                           {{"source", "installed_software"}, {"outcome", "dropped"}})
-              .value() == 3.0);
+              .value() == 4.0);
     CHECK(names_of(pool, "agent-bad", "") == std::vector<std::string>{"Chrome"});
     CHECK(stored_hash(pool, "agent-bad") == SoftwareInventoryStore::canonical_hash(v2rows));
 }

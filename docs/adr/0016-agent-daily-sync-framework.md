@@ -825,8 +825,8 @@ than the facet; `+` in `component_inventory` or `comp` anywhere else; an unknown
 record kind; a malformed row hash; an unknown `version_source`; a repeated facet; a row over the
 per-call cap. The rest of a refused section is skipped to the next `S`, and the other sections
 still apply. A defect that cannot be attributed to a facet fails the whole blob (a record before
-any section, an `S` record whose facet is empty or outside the charset, more than 32 sections,
-over 3 MiB): the ingest seam answers the whole-source `installed_software` nack and counts
+any section, a header with no section after it, an `S` record whose facet is empty or outside
+the charset, more than 32 sections, over 3 MiB): the ingest seam answers the whole-source `installed_software` nack and counts
 `dropped`, like an over-cap v2 blob.
 
 **Nack form.** `InventoryAck.need_full` is a `repeated string`, so the per-section nack is
