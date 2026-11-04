@@ -10013,8 +10013,9 @@ ADR-1005 exception). The `content_dist` plugin's `upload_file` action is the ref
 - **Credentials.** Both headers are `<id>.<secret>`. An unknown id and a wrong secret get the same
   `401` (`grant_unknown` / `session_unknown`). For the four `{upload_id}` routes, the id in
   `X-Yuzu-Upload-Session` must equal the `{upload_id}` path segment, or the request also gets `401 session_unknown`.
-- **Expiry.** A session expires when its grant expires. The first request after `expires_at` (status,
-  chunk, commit or cancel) discards the partial file and returns `410 expired`.
+- **Expiry.** A session expires when its grant expires. A request after `expires_at` (status, chunk,
+  commit or cancel) returns `410 expired`. The request that wins the expiry transition also discards
+  the partial file, if it can be removed.
 - **Body cap.** Every `/api/v1/uploads` route is capped at 8 MiB before authentication and must send a
   measurable body (a `Content-Length`, no chunked transfer encoding). See [Pre-Auth Request Body Caps](#pre-auth-request-body-caps).
 - **Store unavailable:** `503`.
@@ -10045,8 +10046,8 @@ Returns the session's status, for example so an agent can resume. Send `X-Yuzu-U
 `open`, `committed` or `cancelled`; a committed or cancelled session still answers `200` with its
 final state. An expired session never answers `200`: it gets `410 expired`. Neither `upload_id` nor the declared size is returned.
 
-**Errors:** `401 session_unknown`; `410 expired`. When this request is the first one after expiry, it
-also discards the partial file.
+**Errors:** `401 session_unknown`; `410 expired`. When this request wins the expiry transition, it
+also discards the partial file, if it can be removed.
 
 #### `PUT /api/v1/uploads/{upload_id}/chunk`
 

@@ -2421,11 +2421,11 @@ TEST_CASE("openapi documents: the plugin-config success responses reference the 
           "[openapi][structure][responses]") {
     // plugin_config_routes.cpp answers GET/PUT of a value as {data: <entry>, meta}, the secret
     // PUT as {data: <metadata>, meta}, GET/PUT of a kill switch as {data: <switch>, meta}, and
-    // both DELETEs as {deleted: true, meta} (no data wrapper). Each row names the operation, the schema its 200 must reference, and that
-    // schema's required members. The schema's property keys must equal its required members
-    // exactly, on purpose: a new optional top-level member is an envelope change a client should
-    // be told about, so it has to update this table. The 200 description must also state the
-    // envelope, because a generated client reads that text.
+    // both DELETEs as {deleted: true, meta} (no data wrapper). Each row names the operation, the
+    // schema its 200 must reference, and that schema's required members. The schema's property
+    // keys must equal its required members exactly, on purpose: a new optional top-level member is
+    // an envelope change a client should be told about, so it has to update this table. The 200
+    // description must also state the envelope, because a generated client reads that text.
     struct Row {
         const char* path;
         const char* method;
