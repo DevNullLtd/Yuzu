@@ -6,7 +6,6 @@
 #include "list_keyset.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, a4_denial, ensure_correlation_id
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit, try_persist_audit
-#include "software_catalog_rules.hpp"
 #include "software_normalization_pack.hpp"
 
 #include <nlohmann/json.hpp>
@@ -64,11 +63,10 @@ std::optional<Triple> decode_key(std::string_view key) {
 }
 
 std::optional<std::string> encode_cursor(const CurationCursor& c) {
-    const auto k = encode_key({c.raw_name, c.raw_publisher, c.ecosystem});
-    if (!k)
+    if (has_sep(c.raw_name) || has_sep(c.raw_publisher) || has_sep(c.ecosystem))
         return std::nullopt;
-    return keyset::b64url_encode(std::to_string(c.device_count) + kSep +
-                                 *keyset::b64url_decode(*k));
+    return keyset::b64url_encode(std::to_string(c.device_count) + kSep + c.raw_name + kSep +
+                                 c.raw_publisher + kSep + c.ecosystem);
 }
 
 std::optional<CurationCursor> decode_cursor(std::string_view token) {
@@ -104,20 +102,6 @@ std::string ok_body(nlohmann::json data) {
     return dump_safe({{"data", std::move(data)}, {"meta", {{"api_version", "v1"}}}});
 }
 
-bool known_ecosystem(std::string_view e) {
-    namespace sc = software_catalog;
-    return std::any_of(sc::kEcosystemFamilies.begin(), sc::kEcosystemFamilies.end(),
-                       [&](const sc::EcosystemFamily& f) { return f.ecosystem == e; });
-}
-
-bool valid_cpe_product(std::string_view s) {
-    return s != "-" && s != "." &&
-           std::all_of(s.begin(), s.end(), [](char c) {
-               return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' ||
-                      c == '-' || c == '+';
-           });
-}
-
 void fail(httplib::Response& res, int status, std::string_view message,
           detail::A4ErrorOpts opts = {}) {
     res.status = status;
@@ -147,10 +131,7 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return std::nullopt;
         if (!session->token_scope_service.empty()) {
             // No `.permission`: no grant would admit a service-scoped token here.
-            res.status = 403;
-            res.set_content(detail::a4_error(res, "service-scoped tokens may not use the "
-                                                  "software curation queue"),
-                            "application/json");
+            fail(res, 403, "service-scoped tokens may not use the software curation queue");
             return std::nullopt;
         }
         if (!deps.perm_fn(req, res, "Inventory", operation))
@@ -320,7 +301,7 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             deny_400(req, res, kVerb, "unknown category");
             return;
         }
-        if (!valid_cpe_product(cpe)) {
+        if (!valid_cpe_product(cpe) || reserved_cpe_product(cpe)) {
             deny_400(req, res, kVerb, "cpe_product has an invalid character or is a reserved value");
             return;
         }
@@ -333,8 +314,7 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          "ecosystem=" + eco + " alias=" + keys->alias_key +
                              " publisher=" + keys->alias_publisher))
             return;
-        const auto pid = deps.registry->curate_alias(eco, raw_name, raw_pub, vendor, product,
-                                                     edition, category, cpe);
+        const auto pid = deps.registry->curate_alias(eco, *keys, category, cpe);
         if (!pid) {
             spdlog::warn("SoftwareCurationRoutes: curate_alias failed: {}", pid.error());
             unavailable(res, "curation write failed");
@@ -388,11 +368,9 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         const auto ct = req.get_header_value("Content-Type");
         if (!ct.starts_with("text/csv") && !ct.starts_with("text/plain")) {
-            res.status = 415;
             (void)detail::try_persist_audit(deps.audit_fn, req, kVerb, "denied", "Inventory", "",
                                             "unsupported content type");
-            res.set_content(detail::a4_error(res, "Content-Type must be text/csv or text/plain"),
-                            "application/json");
+            fail(res, 415, "Content-Type must be text/csv or text/plain");
             return;
         }
         // The parser is the trust boundary: its caps (bytes, rows, fields, NUL) apply here.

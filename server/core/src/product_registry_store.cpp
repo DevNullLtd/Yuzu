@@ -254,6 +254,57 @@ bool mark_dimension_stale(PGconn* c, const char* where, const std::vector<std::s
     return pg::exec_params(c, sql.c_str(), params).status() == PGRES_COMMAND_OK;
 }
 
+/// The per-row product + alias upserts of a pack, shared by `load_pack_if_empty` (boot seed) and
+/// `replace_pack` (runtime replace) so the two cannot drift. Returns the failed step's name
+/// (the connection still carries its error text), or nullopt on success.
+// ponytail: per-row statements inside the caller's one txn; kMaxPackRows bounds it at 5000.
+// Switch to unnest() arrays past ~500 rows / if replace latency matters.
+std::optional<std::string_view> upsert_pack_rows(PGconn* c, const ParsedPack& pack,
+                                                 const std::string& now) {
+    std::unordered_map<std::string, std::string> product_ids; // norm_key -> id
+    for (const auto& r : pack.rows) {
+        auto pit = product_ids.find(r.norm_key);
+        if (pit == product_ids.end()) {
+            pg::PgResult pr = pg::exec_params(
+                c,
+                "INSERT INTO product_registry_store.products "
+                "(norm_key, vendor, title, edition, platform, created_at, updated_at, "
+                " purl_type, cpe_product, origin, category) "
+                "VALUES ($1, $2, $3, $4, '', $5::bigint, $5::bigint, $6, $7, 'pack', $8) "
+                "ON CONFLICT (norm_key) DO UPDATE SET "
+                "  category = EXCLUDED.category, "
+                "  purl_type = CASE WHEN products.purl_type = '' THEN EXCLUDED.purl_type "
+                "                   ELSE products.purl_type END, "
+                "  cpe_product = CASE WHEN products.cpe_product = '' THEN EXCLUDED.cpe_product "
+                "                     ELSE products.cpe_product END, "
+                "  origin = CASE WHEN products.origin = 'curated' THEN 'curated' "
+                "                ELSE 'pack' END, "
+                "  updated_at = EXCLUDED.updated_at "
+                "RETURNING product_id",
+                std::vector<std::string>{r.norm_key, r.vendor, r.title, r.edition, now,
+                                         std::string{purl_type_for(r.ecosystem)}, r.cpe_product,
+                                         r.category});
+            if (pr.status() != PGRES_TUPLES_OK || PQntuples(pr.get()) != 1)
+                return "pack product upsert";
+            pit = product_ids.emplace(r.norm_key, PQgetvalue(pr.get(), 0, 0)).first;
+        }
+        pg::PgResult al = pg::exec_params(
+            c,
+            "INSERT INTO product_registry_store.product_aliases "
+            "(source, raw_name, raw_publisher, product_id, method, confidence, "
+            " first_matched_at, last_seen_at, status, pack_version) "
+            "VALUES ($1, $2, $3, $4::bigint, 'pack', 1.0, $5::bigint, $5::bigint, 'active', $6) "
+            "ON CONFLICT (source, raw_name, raw_publisher) DO UPDATE SET "
+            "  product_id = EXCLUDED.product_id, pack_version = EXCLUDED.pack_version, "
+            "  status = 'active', last_seen_at = EXCLUDED.last_seen_at",
+            std::vector<std::string>{"pack:" + r.ecosystem, r.raw_name, r.raw_publisher, pit->second,
+                                     now, pack.pack_version});
+        if (al.status() != PGRES_COMMAND_OK)
+            return "pack alias upsert";
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 ProductRegistryStore::ProductRegistryStore(pg::PgPool& pool) : pool_(pool) {
@@ -735,49 +786,8 @@ ProductRegistryStore::load_pack_if_empty(const ParsedPack& pack, std::string_vie
         if (ins.status() != PGRES_COMMAND_OK)
             return fail("pack insert", c);
 
-        // ponytail: per-row statements inside the one txn; a pack is a few hundred rows.
-        // Switch to unnest() arrays past ~500 rows.
-        std::unordered_map<std::string, std::string> product_ids; // norm_key -> id
-        for (const auto& r : pack.rows) {
-            auto pit = product_ids.find(r.norm_key);
-            if (pit == product_ids.end()) {
-                pg::PgResult pr = pg::exec_params(
-                    c,
-                    "INSERT INTO product_registry_store.products "
-                    "(norm_key, vendor, title, edition, platform, created_at, updated_at, "
-                    " purl_type, cpe_product, origin, category) "
-                    "VALUES ($1, $2, $3, $4, '', $5::bigint, $5::bigint, $6, $7, 'pack', $8) "
-                    "ON CONFLICT (norm_key) DO UPDATE SET "
-                    "  category = EXCLUDED.category, "
-                    "  purl_type = CASE WHEN products.purl_type = '' THEN EXCLUDED.purl_type "
-                    "                   ELSE products.purl_type END, "
-                    "  cpe_product = CASE WHEN products.cpe_product = '' THEN EXCLUDED.cpe_product "
-                    "                     ELSE products.cpe_product END, "
-                    "  origin = CASE WHEN products.origin = 'curated' THEN 'curated' "
-                    "                ELSE 'pack' END, "
-                    "  updated_at = EXCLUDED.updated_at "
-                    "RETURNING product_id",
-                    std::vector<std::string>{r.norm_key, r.vendor, r.title, r.edition, now,
-                                             std::string{purl_type_for(r.ecosystem)}, r.cpe_product,
-                                             r.category});
-                if (pr.status() != PGRES_TUPLES_OK || PQntuples(pr.get()) != 1)
-                    return fail("pack product upsert", c);
-                pit = product_ids.emplace(r.norm_key, PQgetvalue(pr.get(), 0, 0)).first;
-            }
-            pg::PgResult al = pg::exec_params(
-                c,
-                "INSERT INTO product_registry_store.product_aliases "
-                "(source, raw_name, raw_publisher, product_id, method, confidence, "
-                " first_matched_at, last_seen_at, status, pack_version) "
-                "VALUES ($1, $2, $3, $4::bigint, 'pack', 1.0, $5::bigint, $5::bigint, 'active', $6) "
-                "ON CONFLICT (source, raw_name, raw_publisher) DO UPDATE SET "
-                "  product_id = EXCLUDED.product_id, pack_version = EXCLUDED.pack_version, "
-                "  status = 'active', last_seen_at = EXCLUDED.last_seen_at",
-                std::vector<std::string>{"pack:" + r.ecosystem, r.raw_name, r.raw_publisher,
-                                         pit->second, now, pack.pack_version});
-            if (al.status() != PGRES_COMMAND_OK)
-                return fail("pack alias upsert", c);
-        }
+        if (const auto step = upsert_pack_rows(c, pack, now))
+            return fail(*step, c);
         outcome = PackLoadOutcome::loaded;
         return true;
     });
@@ -907,15 +917,10 @@ ProductRegistryStore::reject_curation(std::string_view raw_name, std::string_vie
 }
 
 std::expected<std::int64_t, std::string>
-ProductRegistryStore::curate_alias(std::string_view ecosystem, std::string_view raw_name,
-                                   std::string_view raw_publisher, std::string_view vendor,
-                                   std::string_view product, std::string_view edition,
+ProductRegistryStore::curate_alias(std::string_view ecosystem, const CuratedAliasKeys& keys,
                                    std::string_view category, std::string_view cpe_product) {
     if (!open_)
         return std::unexpected("product registry store is not open");
-    auto keys = derive_curated_alias(ecosystem, raw_name, raw_publisher, vendor, product, edition);
-    if (!keys)
-        return std::unexpected(keys.error());
     std::int64_t product_id = 0;
     std::string error;
     bool ok = false;
@@ -944,7 +949,7 @@ ProductRegistryStore::curate_alias(std::string_view ecosystem, std::string_view 
                 "                   ELSE products.purl_type END, "
                 "  updated_at = EXCLUDED.updated_at "
                 "RETURNING product_id",
-                std::vector<std::string>{keys->norm_key, keys->vendor, keys->title, keys->edition,
+                std::vector<std::string>{keys.norm_key, keys.vendor, keys.title, keys.edition,
                                          now, std::string{purl_type_for(ecosystem)},
                                          std::string{cpe_product}, std::string{category}});
             if (pr.status() != PGRES_TUPLES_OK || PQntuples(pr.get()) != 1)
@@ -960,7 +965,7 @@ ProductRegistryStore::curate_alias(std::string_view ecosystem, std::string_view 
                 "ON CONFLICT (source, raw_name, raw_publisher) DO UPDATE SET "
                 "  product_id = EXCLUDED.product_id, method = 'curated', confidence = 1.0, "
                 "  status = 'active', last_seen_at = EXCLUDED.last_seen_at",
-                std::vector<std::string>{keys->source, keys->alias_key, keys->alias_publisher,
+                std::vector<std::string>{keys.source, keys.alias_key, keys.alias_publisher,
                                          std::to_string(product_id), now});
             if (al.status() != PGRES_COMMAND_OK)
                 return fail("curated alias upsert");
@@ -1032,51 +1037,8 @@ ProductRegistryStore::replace_pack(const ParsedPack& pack, std::string_view load
             if (ret.status() != PGRES_COMMAND_OK)
                 return fail("pack alias retire");
 
-            // ponytail: per-row statements inside the one txn (as load_pack_if_empty); kMaxPackRows
-            // bounds it at 5000. Switch to unnest() arrays if replace latency matters.
-            std::unordered_map<std::string, std::string> product_ids; // norm_key -> id
-            for (const auto& r : pack.rows) {
-                auto pit = product_ids.find(r.norm_key);
-                if (pit == product_ids.end()) {
-                    pg::PgResult pr = pg::exec_params(
-                        c,
-                        "INSERT INTO product_registry_store.products "
-                        "(norm_key, vendor, title, edition, platform, created_at, updated_at, "
-                        " purl_type, cpe_product, origin, category) "
-                        "VALUES ($1, $2, $3, $4, '', $5::bigint, $5::bigint, $6, $7, 'pack', $8) "
-                        "ON CONFLICT (norm_key) DO UPDATE SET "
-                        "  category = EXCLUDED.category, "
-                        "  purl_type = CASE WHEN products.purl_type = '' THEN EXCLUDED.purl_type "
-                        "                   ELSE products.purl_type END, "
-                        "  cpe_product = CASE WHEN products.cpe_product = '' "
-                        "                     THEN EXCLUDED.cpe_product "
-                        "                     ELSE products.cpe_product END, "
-                        "  origin = CASE WHEN products.origin = 'curated' THEN 'curated' "
-                        "                ELSE 'pack' END, "
-                        "  updated_at = EXCLUDED.updated_at "
-                        "RETURNING product_id",
-                        std::vector<std::string>{r.norm_key, r.vendor, r.title, r.edition, now,
-                                                 std::string{purl_type_for(r.ecosystem)},
-                                                 r.cpe_product, r.category});
-                    if (pr.status() != PGRES_TUPLES_OK || PQntuples(pr.get()) != 1)
-                        return fail("pack product upsert");
-                    pit = product_ids.emplace(r.norm_key, PQgetvalue(pr.get(), 0, 0)).first;
-                }
-                pg::PgResult al = pg::exec_params(
-                    c,
-                    "INSERT INTO product_registry_store.product_aliases "
-                    "(source, raw_name, raw_publisher, product_id, method, confidence, "
-                    " first_matched_at, last_seen_at, status, pack_version) "
-                    "VALUES ($1, $2, $3, $4::bigint, 'pack', 1.0, $5::bigint, $5::bigint, "
-                    "        'active', $6) "
-                    "ON CONFLICT (source, raw_name, raw_publisher) DO UPDATE SET "
-                    "  product_id = EXCLUDED.product_id, pack_version = EXCLUDED.pack_version, "
-                    "  status = 'active', last_seen_at = EXCLUDED.last_seen_at",
-                    std::vector<std::string>{"pack:" + r.ecosystem, r.raw_name, r.raw_publisher,
-                                             pit->second, now, pack.pack_version});
-                if (al.status() != PGRES_COMMAND_OK)
-                    return fail("pack alias upsert");
-            }
+            if (const auto step = upsert_pack_rows(c, pack, now))
+                return fail(*step);
             // The alias keys a title resolved through are not reproducible in SQL: stale them all.
             if (!mark_dimension_stale(c, "TRUE", std::vector<std::string>{}))
                 return fail("dimension invalidation");

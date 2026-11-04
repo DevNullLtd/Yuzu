@@ -736,8 +736,11 @@ TEST_CASE("curate_alias writes a curated product and edition-bearing alias and s
                         "raw_publisher, ecosystem, norm_status, pack_version, first_seen_at, "
                         "updated_at) VALUES ('q', '', 'windows', 'unnormalized', '2026.11.1', 1, 1)");
 
-    auto pid = store.curate_alias("windows", "SQL Server 2019 Standard", "Microsoft Corporation",
-                                  "Microsoft", "SQL Server", "", "database", "sql_server");
+    const auto alias = yuzu::server::derive_curated_alias("windows", "SQL Server 2019 Standard",
+                                                          "Microsoft Corporation", "Microsoft",
+                                                          "SQL Server", "");
+    REQUIRE(alias.has_value());
+    auto pid = store.curate_alias("windows", *alias, "database", "sql_server");
     REQUIRE(pid.has_value());
     CHECK(*pid > 0);
 
@@ -748,10 +751,6 @@ TEST_CASE("curate_alias writes a curated product and edition-bearing alias and s
     CHECK((*prod)->category == "database");
     CHECK((*prod)->cpe_product == "sql_server");
 
-    const auto alias = yuzu::server::derive_curated_alias("windows", "SQL Server 2019 Standard",
-                                                          "Microsoft Corporation", "Microsoft",
-                                                          "SQL Server", "");
-    REQUIRE(alias.has_value());
     CHECK(alias->source == "curated:windows");
     CHECK(alias->alias_key.ends_with(" standard")); // the edition is in the key, no wildcard
     auto resolved =
@@ -765,16 +764,12 @@ TEST_CASE("curate_alias writes a curated product and edition-bearing alias and s
     CHECK(curation_scalar(pool, "SELECT pack_version FROM "
                                 "product_registry_store.title_dimension") == "");
 
-    // Re-curating converges on the same product; a bad edition is refused before any write.
-    auto again = store.curate_alias("windows", "SQL Server 2019 Standard", "Microsoft Corporation",
-                                    "Microsoft", "SQL Server", "", "database", "");
+    // Re-curating converges on the same product and keeps its cpe_product.
+    auto again = store.curate_alias("windows", *alias, "database", "");
     REQUIRE(again.has_value());
     CHECK(*again == *pid);
     CHECK(curation_scalar(pool, "SELECT cpe_product FROM product_registry_store.products "
                                 "WHERE product_id = " + std::to_string(*pid)) == "sql_server");
-    CHECK_FALSE(store.curate_alias("windows", "SQL Server Standard", "", "Microsoft", "SQL Server",
-                                   "enterprise", "database", "")
-                    .has_value());
 }
 
 TEST_CASE("replace_pack refuses the same version, retires dropped pack aliases and stales the "

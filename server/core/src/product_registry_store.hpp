@@ -330,15 +330,15 @@ public:
                     std::string_view ecosystem);
 
     /// Curate one title: mint (or refresh) the canonical product and bind the `curated:<ecosystem>`
-    /// alias to it. ONE transaction behind the blocking normalisation lock (the dimension
-    /// invalidation contract), marking every title-dimension row stale (`pack_version = ''`) in
-    /// that same transaction. The alias key is `alias_key(normalize_title(raw_name))` - it carries
-    /// the edition, no wildcard - and the publisher key is `normalize_vendor(raw_publisher)`.
-    /// Returns the product id; `unexpected(reason)` on any failure (nothing written).
+    /// alias to it. `keys` is the caller's `derive_curated_alias` result (the alias key carries the
+    /// edition, no wildcard; the publisher key is the normalised publisher); `ecosystem` is the
+    /// one `keys` was derived for (it selects the purl type). ONE transaction behind the blocking
+    /// normalisation lock (the dimension invalidation contract), marking every title-dimension
+    /// row stale (`pack_version = ''`) in that same transaction. Returns the product id;
+    /// `unexpected(reason)` on any failure (nothing written).
     [[nodiscard]] std::expected<std::int64_t, std::string>
-    curate_alias(std::string_view ecosystem, std::string_view raw_name,
-                 std::string_view raw_publisher, std::string_view vendor, std::string_view product,
-                 std::string_view edition, std::string_view category, std::string_view cpe_product);
+    curate_alias(std::string_view ecosystem, const CuratedAliasKeys& keys,
+                 std::string_view category, std::string_view cpe_product);
 
     /// Replace the stored alias pack with `pack` (the runtime counterpart of `load_pack_if_empty`).
     /// One transaction behind the pack lock AND the blocking normalisation lock: the singleton

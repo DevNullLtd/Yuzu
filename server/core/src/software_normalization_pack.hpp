@@ -33,7 +33,9 @@
 ///     `pack_version` (see product_registry_store.hpp).
 
 #include "product_normalize.hpp"
+#include "software_catalog_rules.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <expected>
@@ -85,6 +87,29 @@ struct ParsedPack {
 /// (`sql server standard`). Idempotent under `normalize_title`.
 [[nodiscard]] inline std::string alias_key(const NormalizedTitle& nt) {
     return nt.edition.empty() ? nt.title : nt.title + ' ' + nt.edition;
+}
+
+/// Field predicates shared by the pack parser and the REST curation route, so the two
+/// trust-boundary checks cannot drift. The parser reports each failure with its own error string.
+
+/// Characters a `cpe_product` token may hold (empty is allowed: "no CPE product").
+[[nodiscard]] inline bool valid_cpe_product(std::string_view s) {
+    return std::all_of(s.begin(), s.end(), [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' ||
+               c == '-' || c == '+';
+    });
+}
+
+/// "-" and "." are CPE logical values (not applicable / any), never a product token.
+[[nodiscard]] inline bool reserved_cpe_product(std::string_view s) {
+    return s == "-" || s == ".";
+}
+
+/// A known ecosystem, or empty (the pack's wildcard; a caller that requires one checks it itself).
+[[nodiscard]] inline bool known_ecosystem(std::string_view e) {
+    namespace sc = software_catalog;
+    return e.empty() || std::any_of(sc::kEcosystemFamilies.begin(), sc::kEcosystemFamilies.end(),
+                                    [&](const sc::EcosystemFamily& f) { return f.ecosystem == e; });
 }
 
 /// Parse and validate a pack. The error string names the first defect (with its
