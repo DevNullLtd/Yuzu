@@ -621,7 +621,7 @@ public:
             // file, its owner and the remedy; a corrupt-and-unmovable db) reaches the log.
             spdlog::error("ECHO: failed to open db: {}", result.error());
             if (yuzu::echo::is_free_space_refusal(result.error())) {
-                // The v10 roll-up migration needs twice the file's size free and the volume has
+                // The v10 roll-up migration needs twice the file's size (plus its log) free and the volume has
                 // less. Nothing was changed. The plugin LOADS, offline, so `echo.status` can say why
                 // (`storage_state|offline|free_space`); no trigger is registered and nothing
                 // collects until the agent restarts with the space freed.

@@ -53,7 +53,7 @@ format_storage_offline_lines(bool query_engine_available) {
 }
 
 /// The prefix of EchoDatabase::open's refusal when the v10 roll-up migration finds less than twice
-/// the database file free on its volume (echo_db_v10_migration.cpp). The plugin tells that refusal
+/// the database file (plus its write-ahead log) free on its volume (echo_db_v10_migration.cpp). The plugin tells that refusal
 /// from every other open failure by this text.
 inline constexpr std::string_view kFreeSpaceRefusalPrefix = "not enough free disk space to migrate";
 

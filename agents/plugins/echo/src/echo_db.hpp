@@ -527,7 +527,7 @@ struct StateWrite {
 /// member defaults to the production behaviour; production never sets one.
 struct OpenSeams {
     /// Free bytes on the volume holding the database, or nullopt when unknown. Consulted twice by
-    /// the v10 migration: before it starts (refuse below 2 x the file size) and again before its
+    /// the v10 migration: before it starts (refuse below 2 x the file size plus its write-ahead log) and again before its
     /// one VACUUM. Empty = std::filesystem::space().available.
     std::function<std::optional<std::uintmax_t>(const std::filesystem::path&)> free_bytes;
     /// Called inside the v10 transaction right after the retired tables are dropped; an error it
@@ -547,7 +547,7 @@ public:
      * (#559, refused rather than trusted), a schema transaction wedged, or -- on Windows only --
      * a planted echo.db (refused) or a planted -wal, -shm or -journal that could not be replaced
      * (foreign owner or extra hard link), or -- for a database that still holds the retired raw
-     * tables -- a volume with less than twice the file's size free, or a v10 migration that
+     * tables -- a volume with less than twice the file's size (plus its log) free, or a v10 migration that
      * rolled back (the retired tables are then intact and the next open retries). The plugin ABI
      * carries only an error CODE, so the caller must log this text.
      *

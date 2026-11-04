@@ -1343,7 +1343,7 @@ TEST_CASE("v10 migration: lagged process rows below the roll-up mark still reach
           "[echo][v10][migration][usage]") {
     Seeded seeded;
     // The old roll-up summarised these rows into the tiers (the mark is the next hour), but the
-    // usage fold never read them (cursor at 0). The tier fold skips them, so the usage-only pass
+    // usage fold never read them (cursor at 0). The tier fold skips them, so the usage walk
     // is the only thing that credits them, and the tiers must not be fed twice.
     seed(seeded, [&](sqlite3* db) {
         insert_raw(db, "process", {I(kH0 + 10), I(1), T("started"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
@@ -1410,7 +1410,7 @@ TEST_CASE("v10 migration: rows below the roll-up mark are not fed to a usage sou
     CHECK(db.get_config("usage_active_generation", "absent") == "0"); // nothing stamped
 }
 
-TEST_CASE("v10 migration: the below-mark usage pass starts past the usage cursor",
+TEST_CASE("v10 migration: the usage walk starts past the usage cursor",
           "[echo][v10][migration][usage]") {
     Seeded seeded;
     // Row 1 (the start) is below the mark and already read by the usage fold: it is the open run

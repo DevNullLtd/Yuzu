@@ -37,7 +37,7 @@
  *        also fed to the usage fold in this transaction when usage is enabled and Active (the
  *        fold's own predicate, whether or not the process source is enabled), so a lagging
  *        usage fold loses nothing it would have credited (one id-ordered walk over every row past
- *        the cursor, whatever its ts, since the tiers already hold the rows below the mark); a usage source that is
+ *        the cursor, whatever its ts, so a run that straddles the mark pairs start first); a usage source that is
  *        disabled or awaiting its baseline would not have credited them either, and gets nothing;
  *     5. drop the 16 raw tables and every `_legacy` table, create the `$X_Live` shim views (empty,
  *        with the old columns), delete the rollup marks and the usage cursor from echo_config, and
@@ -561,7 +561,7 @@ RegistryEvent decode_registry(const RawRow& r) {
 struct Report {
     int64_t legacy_tier_rows{0};
     int64_t raw_rows{0};
-    int64_t below_mark{0}; // raw rows older than the old roll-up mark (or floor): not folded, counted
+    int64_t below_mark{0}; // raw rows older than the old roll-up mark (or floor): not folded into the tiers, counted
     int64_t rejected{0};
     int64_t ring_keys{0};
     int64_t untrusted_marks{0};   // marks ahead of the clock, replaced by the converted tier's edge
@@ -1361,7 +1361,7 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
     const StorageBytes end = db.storage_bytes();
     spdlog::info("EchoDatabase: migrated to schema version 10 (roll-up tiers) in {} s: {} old summary "
                  "rows converted, {} raw rows folded, {} raw rows older than the old roll-up mark (or "
-                 "the converted tier's edge that replaced an untrusted one) were not folded (under a "
+                 "the converted tier's edge that replaced an untrusted one) were not folded into the tiers (under a "
                  "sane mark the old roll-up had summarised them, except rows written by a "
                  "process-event backfill or skipped by the clock-gap clamp, and the two cannot be told "
                  "apart; under a replaced floor they are the rows the converted tier's edge does not "
