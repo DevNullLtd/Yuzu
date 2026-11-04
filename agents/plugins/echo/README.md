@@ -40,7 +40,7 @@ as rows of the old shape. The retired raw names (`$Process_Live`
 and the other fifteen `<source>_live`) stay answerable as empty views with their old columns, so a
 stored query returns no rows instead of an error. A database written by an earlier build is migrated
 once, in a single transaction, on the first open (schema v10; see "Upgrading an existing
-database"): the volume must hold twice the database file free, or the open is refused with the
+database"): the volume must hold twice the database file plus its write-ahead log free, or the open is refused with the
 retired tables intact and Echo stays offline (`status` reports `storage_state|offline|free_space`)
 until space is freed and the agent restarts. `sql` refuses common table expressions (`WITH`; a query that starts with `WITH` gets
 `only SELECT queries are allowed`), `NATURAL` / `USING` joins (write joins with `ON`) and

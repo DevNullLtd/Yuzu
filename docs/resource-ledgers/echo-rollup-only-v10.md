@@ -31,7 +31,7 @@ releases exactly the resource listed.
 - **Write lock:** held for the whole transaction (tens of seconds on a 250 MiB file). No collector
   writes meanwhile; the open has not returned, so none is running yet. The query connection does not
   exist yet, so no reader pins the WAL.
-- **Disk:** the pre-check refuses a volume with less than twice the file free (the open fails with
+- **Disk:** the pre-check refuses a volume with less than twice the file plus its write-ahead log free (the open fails with
   `kFreeSpaceRefusalPrefix`, nothing changed). The transaction's WAL is not bounded by the file's size
   (325.7 MB on a 241.8 MB file, 1.35 times, one measurement); the check covers that case (WAL plus
   the new file about 404 MB, under the 483 MB demanded) and no general bound is proven. The WAL is
@@ -71,7 +71,7 @@ releases exactly the resource listed.
   would not have credited them and gets nothing (the rows are counted, not fed). An Active
   lifecycle with no cursor refuses the migration; the rows past the cursor, the stored counter
   and the rows folded are in the log line (a row past the cursor but below the roll-up floor is
-  not read, and is in the "older than the mark" count).
+  not folded into the tiers and is in the "older than the mark" count, but a second usage-only pass still feeds it to usage).
 - **After COMMIT:** the connection must be in autocommit (`sqlite3_get_autocommit`); a wedged one is
   returned as an error and `open()` closes it, never publishes it.
 

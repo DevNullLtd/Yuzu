@@ -36,8 +36,9 @@
  *        process rows past `usage_hwm_id` (the usage fold's own cursor, deleted in step 5) are
  *        also fed to the usage fold in this transaction when usage is enabled and Active (the
  *        fold's own predicate, whether or not the process source is enabled), so a lagging
- *        usage fold loses nothing it would have credited; a usage source that is disabled or
- *        awaiting its baseline would not have credited them either, and gets nothing;
+ *        usage fold loses nothing it would have credited (the rows below the mark reach usage
+ *        only, through a second pass: the tiers already hold them); a usage source that is
+ *        disabled or awaiting its baseline would not have credited them either, and gets nothing;
  *     5. drop the 16 raw tables and every `_legacy` table, create the `$X_Live` shim views (empty,
  *        with the old columns), delete the rollup marks and the usage cursor from echo_config, and
  *        stamp schema_version 10.
@@ -50,7 +51,7 @@
  * pass retries daily.
  *
  * BOUNDS. Before it starts the migration refuses a volume with less than twice the database file
- * free (so Echo stays offline until the space is freed and the agent restarts, rather than risking
+ * plus its write-ahead log already on disk free (so Echo stays offline until the space is freed and the agent restarts, rather than risking
  * the host's disk). The transaction's WAL (the converted summary bytes plus the zeroed raw pages)
  * is NOT bounded by the file's size: it measured 1.35 times the file. The twice-the-file check
  * covers the measured case (WAL 325.7 MB plus the new file about 79 MB is about 404 MB, under the
@@ -566,7 +567,7 @@ struct Report {
     int64_t ring_keys{0};
     int64_t untrusted_marks{0};   // marks ahead of the clock, replaced by the converted tier's edge
     int64_t usage_lag_rows{0};    // raw process rows past usage_hwm_id (the stored lag)
-    int64_t usage_lag_folded{0};  // of those, the ones at or above the floor and fed (usage Active)
+    int64_t usage_lag_folded{0};  // of those, the ones fed to usage (usage Active), above or below the floor
     int64_t usage_lag_events{0};  // the counter the old fold kept, read before it is deleted
 };
 

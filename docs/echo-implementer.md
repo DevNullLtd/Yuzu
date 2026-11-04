@@ -273,8 +273,8 @@ error), so the version never skips past a step that did not finish. A database w
 retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10` does, in ONE
 `BEGIN IMMEDIATE` transaction:
 
-1. Pre-check: the volume holds twice the file plus its write-ahead log free, else the open fails with a message that begins
-   with `kFreeSpaceRefusalPrefix`; the plugin then loads offline (`storage_state|offline|free_space`,
+1. Pre-check: the volume holds twice the file plus its write-ahead log free, else the open fails
+   with a message that begins with `kFreeSpaceRefusalPrefix`; the plugin then loads offline (`storage_state|offline|free_space`,
    no trigger registered) instead of failing to load. A free-space figure that cannot be read is a refusal too (the 2x check is mandatory, never skipped) and is logged; a database with nothing to migrate needs no room.
 2. Rename each old summary tier to `<name>_legacy`, install the roll-up schema, then convert every
    legacy row into the interned table (an average becomes `avg * samples`, a sum column is rebuilt
@@ -320,8 +320,8 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    (the stored `usage_lag_events`, normally 0) are fed to `usage_fold_in` in this same transaction,
    so a lagging usage fold loses nothing it would have credited when the cursor is deleted; the
    log line carries the rows past the cursor, the stored counter and how many of them were folded
-   (a row past the cursor but below the roll-up floor is not read and is in the "older than the
-   mark" figure). They are fed only when the usage fold would have credited them, through the
+   (a row past the cursor but below the roll-up floor is not folded into the tiers, and is in the
+   "older than the mark" figure, but a second usage-only pass still feeds it to usage). They are fed only when the usage fold would have credited them, through the
    fold's own predicate (`usage_active_in`): usage enabled and the lifecycle Active, with the
    active generation parsed as `usage_lifecycle_state` parses it (an empty or malformed
    `usage_active_generation` is 0 and reads Active against an absent or 0 `usage_generation`,
