@@ -242,6 +242,27 @@ TEST_CASE("macos dotnet: a too-small row budget yields row_cap (SYNTHETIC)",
     CHECK(acc.reason() == "macos:runtimes:row_cap");
 }
 
+TEST_CASE("macos dotnet: the entries-visited budget bounds the walk and reports row_cap (SYNTHETIC)",
+          "[runtimes][dotnet][macos][cap]") {
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_macdn_entries_"};
+    const fs::path root = dir.path / "root";
+    for (const char* v : {"8.0.1", "8.0.2", "8.0.3"})
+        fs::create_directories(root / kDotnet / "shared/Microsoft.NETCore.App" / v);
+    {
+        rt::lnx::WalkConfig cfg; // default budget: the whole tree, no token
+        Acc acc;
+        CHECK(mac::dotnet_rows_at(root, acc, cfg).size() == 3);
+        CHECK_FALSE(acc.any_failure());
+    }
+    {
+        rt::lnx::WalkConfig cfg;
+        cfg.limits.entries_visited = 1;
+        Acc acc;
+        CHECK(mac::dotnet_rows_at(root, acc, cfg).size() < 3);
+        CHECK(acc.reason() == "macos:runtimes:row_cap");
+    }
+}
+
 // == jvm =========================================================================================
 
 TEST_CASE("macos jvm: a bundle with release takes version, flavour and vendor from release "

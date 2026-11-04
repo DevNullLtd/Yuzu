@@ -19,6 +19,7 @@
 
 #include "hardware_drivers_inventory.hpp"
 #include "local_dispatcher.hpp"
+#include "test_helpers.hpp" // yuzu::test::TempDir
 
 #include <algorithm>
 #include <cstdint>
@@ -348,17 +349,9 @@ TEST_CASE("drivers_inventory linux: denied and failed attribute reads are record
 #if !defined(_WIN32)
 namespace {
 struct TempTree {
-    fs::path root;
-    TempTree() {
-        root = fs::temp_directory_path() /
-               ("yuzu_test_drvinv_" + std::to_string(::getpid()) + "_" +
-                std::to_string(reinterpret_cast<std::uintptr_t>(this)));
-        fs::create_directories(root);
-    }
-    ~TempTree() {
-        std::error_code ec;
-        fs::remove_all(root, ec);
-    }
+    yuzu::test::TempDir dir{"yuzu_test_drvinv_"};
+    fs::path root{dir.path};
+    TempTree() { fs::create_directories(root); }
     void write(const fs::path& rel, const std::string& body) const {
         fs::create_directories((root / rel).parent_path());
         std::ofstream(root / rel, std::ios::binary) << body;
@@ -411,6 +404,27 @@ TEST_CASE("drivers_inventory read_linux: bounded no-follow reads over a real tre
     CHECK(c.constrained);
     CHECK(c.tokens.find("linux:drivers_inventory:read_failed") != std::string::npos);
     CHECK(c.tokens.find("linux:drivers_inventory:invalid_module_name") != std::string::npos);
+}
+
+TEST_CASE("drivers_inventory read_linux: a sysfs attribute over the field cap is refused, at the cap is read",
+          "[hardware][drivers_inventory][linux]") {
+    TempTree t;
+    t.write("proc_modules", "exact 1 0 - Live 0x0\nover 1 0 - Live 0x0\n");
+    t.write("sys/exact/version", std::string(di::kSysfsFieldCap, '1'));
+    t.write("sys/over/version", std::string(di::kSysfsFieldCap + 1, '2'));
+    ConstraintAccumulator acc;
+    const auto rows =
+        di::read_linux((t.root / "proc_modules").string(), (t.root / "sys").string(), acc);
+    REQUIRE(rows.size() == 2);
+    const auto version_of = [&](std::string_view name) {
+        for (const auto& r : rows)
+            if (r.name == name)
+                return r.version;
+        return std::string{"<missing>"};
+    };
+    CHECK(version_of("exact").size() == di::kSysfsFieldCap);
+    CHECK(version_of("over").empty());
+    CHECK(acc.reason() == "linux:drivers_inventory:read_failed");
 }
 
 TEST_CASE("drivers_inventory read_linux: an unreadable /proc/modules or /sys/module is constrained",
