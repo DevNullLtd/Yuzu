@@ -44,14 +44,14 @@ The skill runs on both **Linux** (CI, WSL2) and **macOS** (operator dev box). Th
 
 **Security E2E prerequisite:** curl >= 7.68 (>= 7.84 for the Retry-After check; an older curl skips that one assertion, below 7.68 the gate fails with an explicit message).
 
-**macOS prerequisites:** GNU bash 5+ (`brew install bash` — stock /bin/bash 3.2 doesn't support `mapfile`/`declare -A`), kerl-installed Erlang, vcpkg with `VCPKG_ROOT` set, OrbStack or Docker Desktop installed (and launched once so its CLI symlinks populate `~/.orbstack/bin`).
+**macOS prerequisites:** GNU bash 5+ (`brew install bash` — stock /bin/bash 3.2 doesn't support `mapfile`/`declare -A`), kerl-installed Erlang, vcpkg with `VCPKG_ROOT` set, OrbStack or Docker Desktop installed (and launched once so its CLI symlinks populate `~/.orbstack/bin`), and Node 22.12+ (Phase 0b installs the puppeteer dependencies and Chrome itself; the gcovr install is Linux-only, so macOS needs no pipx).
 
 **What skips on macOS without a running Docker daemon:**
 - Phase 1 docker-image-build → SKIP (operator can build locally only what they need)
 - Phase 2 upgrade-test → SKIP via `test-upgrade-stack.sh`'s `docker_available` early-out, gate row records SKIP with operator-readable note
 - Phase 6 sanitizers → still dispatches to the `yuzu-bigtam-linux` self-hosted pool, unaffected by local Docker availability
 
-Everything else (Phase 0 preflight, Phase 1 C++ + Erlang build, Phase 4 native stack, Phase 5 unit/EUnit/dialyzer/CT/integration/e2e/synthetic-UAT/puppeteer/browser-smoke, Phase 7a perf, Phase 8 teardown) runs natively on macOS. Phase 7b coverage is Linux-only: on macOS the gate refuses with a WARN row (#6187).
+Everything else (Phase 0 preflight, Phase 0b tooling, Phase 1 C++ + Erlang build, Phase 4 native stack, Phase 5 unit/EUnit/dialyzer/CT/integration/e2e/synthetic-UAT/puppeteer/browser-smoke, Phase 7a perf, Phase 8 teardown) runs natively on macOS. Phase 7b coverage is Linux-only: on macOS the gate refuses with a WARN row (#6187).
 
 ## Workflow summary
 
@@ -85,7 +85,7 @@ Phase 8 — Teardown + Summary    (cleans Phase 2 compose projects + scratch dir
 
 **Phase 8 leaves the UAT alive.** `scripts/test/teardown.sh` only stops Docker compose projects matching `yuzu-test-${RUN_ID}-*` (Phase 2 fixtures); it does not touch the native processes started by `start-UAT.sh`. This is deliberate: a successful `/test --full` run leaves a working UAT at the tested HEAD so humans can sanity-check it before cutting `/release`. Do **not** add `bash scripts/start-UAT.sh stop` to your orchestration — if the operator wants the stack down they can run it themselves.
 
-Phase 1 is the only mandatory-blocking phase — if HEAD doesn't compile, nothing else can run. Every other phase runs to completion regardless of upstream failures so the operator gets a prioritized fix list in one pass.
+Phases 0, 0b and 1 are the blocking phases — a failed preflight, a failed tooling install or a HEAD that doesn't compile stops the run, because nothing after them can be trusted. Every other phase runs to completion regardless of upstream failures so the operator gets a prioritized fix list in one pass.
 
 **Every phase emits structured timing data into the test-runs DB.** Top-level gate timings land in `test_gates.duration_seconds`; sub-step timings (upgrade phases, OTA flow steps, individual command round-trips) land in `test_timings`. This is how trend analysis catches "Phase 2 upgrade got 3× slower since last week" without grepping log files.
 
@@ -148,19 +148,26 @@ bash scripts/test/test-db-write.sh gate \
 [[ "$PRE_STATUS" == "FAIL" ]] && { bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED; exit 1; }
 ```
 
-### Phase 0b — Test tooling (default and `--full`; skipped in `--quick`, which has no live stack)
+### Phase 0b — Test tooling (default and `--full` only; `--quick` has no live stack and the `--instructions*` modes need neither a browser nor coverage)
 
 The two headless-browser gates in Phase 5 need Node dependencies and a Chrome for Testing binary
 that are not committed. `/test` installs them rather than skipping the gates: a gate that skips for
 want of a one-line install silently stops protecting the dashboard. The script is idempotent (a
 ready box only verifies), and it proves the browser LAUNCHES headless, not merely that a file exists.
 
-The coverage gate (Phase 7b, report-only in default mode) needs `gcovr`. `ensure-gcovr.sh` installs the
-version CI pins (`requirements-ci.in`) with `pipx`, because `pip3 install --user` fails on a distro
-Python that is externally managed. It does nothing off Linux, where the coverage gate does not measure.
+The coverage gate (Phase 7b, report-only in default mode) needs `gcovr`. `ensure-gcovr.sh` installs it
+the way CI does: `pip install --require-hashes` from `requirements-ci.txt` into a private virtualenv
+(`~/.local/share/yuzu/gcovr-venv`), so gcovr and every dependency are hash-verified, and links the one
+`gcovr` into `~/.local/bin`. (`pip3 install --user` fails on a distro Python that is externally managed,
+and a bare `pipx install gcovr==X` would leave the dependencies unpinned.) It passes only when the
+`gcovr` your `PATH` resolves to is that one, the lookup `coverage-gate.sh` itself does. It does nothing
+off Linux, where the coverage gate does not measure.
+
+First run side effects: a Chrome for Testing download into `~/.cache/puppeteer` (a few hundred MB), npm's
+cache in `~/.npm`, and the gcovr virtualenv under `~/.local/share/yuzu/`. Later runs only verify.
 
 ```bash
-if [[ "$MODE" != "quick" ]]; then
+if [[ "$MODE" == "default" || "$MODE" == "full" ]]; then
     PPTR_START=$(date +%s)
     bash scripts/test/ensure-puppeteer.sh > "$LOG_DIR/ensure-puppeteer.log" 2>&1 \
         && PPTR_STATUS=PASS || PPTR_STATUS=FAIL
@@ -315,8 +322,8 @@ if [[ "$PHASE1_FAILS" -gt 0 ]]; then
 fi
 ```
 
-Phase 1 is the only mandatory-blocking phase. If HEAD doesn't compile,
-nothing else can run.
+Phases 0, 0b and 1 are the blocking phases. If preflight, the tooling install
+or the HEAD build fails, nothing else can run.
 
 ## Phase 2 — Upgrade Test (the user's headline priority)
 
@@ -849,7 +856,7 @@ The skill is designed so a single gate failure does NOT short-circuit the run. G
 | Mode | Phases | Wall clock | Use case |
 |---|---|---|---|
 | `--quick` | 0, 1 (no images), 5-subset, 8 | 8-15 min | "About to commit, want a fast sanity check" |
-| default | 0, 1, 2, 4, 5, 8 | 25-45 min | "About to push to dev" |
+| default | 0, 0b, 1, 2, 4, 5, 8 | 25-45 min | "About to push to dev" |
 | `--full` | 0-8 (PR2/PR3 features lit) | 60-120 min | "About to tag a release" |
 | `--instructions` | 0, 4, 5-instructions, 8 | 8-20 min | "Content YAML changed / dispatch path edited" |
 | `--instructions-quarantine` | 0, 4, ceremony | 30-40s | "Quarantine plugin / firewall behaviour edited" |

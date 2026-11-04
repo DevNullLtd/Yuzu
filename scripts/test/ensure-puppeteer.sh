@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ensure-puppeteer.sh -- make tests/puppeteer runnable, installing what is missing.
 #
-# Called by /test Phase 0 (default and --full modes) so the two headless-browser gates
+# Called by /test Phase 0b (default and --full modes) so the two headless-browser gates
 # ("Puppeteer", "Browser smoke") always have something to run. Before this existed a missing
 # `npm ci` recorded SKIP, and a gate that skips for want of a one-line install is a gate that
 # silently stops protecting the dashboard. Idempotent: a second run on a ready box only
@@ -16,8 +16,17 @@
 #      (a missing shared library on a minimal Linux image is the usual cause) would otherwise
 #      surface as a confusing failure deep inside the crawl.
 #
-# Exit 0 = ready. Exit 1 = not ready; the last line printed says what to do. Never prints
-# credentials; makes no change outside tests/puppeteer/node_modules and the puppeteer cache.
+# What it changes: tests/puppeteer/node_modules, the puppeteer browser cache (~/.cache/puppeteer)
+# and npm's own cache (~/.npm). It reads no credentials and prints none of its own; the output of
+# npm and the browser installer is passed through as they print it.
+#
+# INTEGRITY: `npm ci` installs exactly the committed package-lock.json (every entry carries a
+# sha512), with lifecycle scripts disabled (--ignore-scripts) and the browser download deferred to
+# step 3. The Chrome for Testing archive itself is fetched over TLS from Google's CDN at the build
+# puppeteer pins; neither Google nor @puppeteer/browsers publishes a checksum for it, so its bytes
+# are not hash-verified -- an accepted residual for a developer test tool.
+#
+# Exit 0 = ready. Exit 1 = not ready; the last line printed says what to do.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -56,7 +65,7 @@ if (( stale )); then
     say "installing dependencies (npm ci) in tests/puppeteer"
     # Defer the browser download to step 3 so a failure there names itself. A caller who set
     # PUPPETEER_EXECUTABLE_PATH wants no download at all, which this also satisfies.
-    ( cd "$PP" && PUPPETEER_SKIP_DOWNLOAD=1 npm ci --no-audit --no-fund ) \
+    ( cd "$PP" && PUPPETEER_SKIP_DOWNLOAD=1 npm ci --ignore-scripts --no-audit --no-fund ) \
         || die "npm ci failed in tests/puppeteer; check network access to the npm registry"
 else
     say "dependencies already match package-lock.json"
@@ -94,7 +103,7 @@ if ! ( cd "$PP" && node --input-type=module -e "
         await b.close();
         console.log('launched ' + v);
     " ) 2>&1; then
-    die "the browser is installed but will not start headless; on a minimal Linux image a shared library is usually missing (run: ldd \"\$(cd tests/puppeteer && node --input-type=module -e \"import p from 'puppeteer'; console.log(await p.executablePath())\")\" | grep 'not found')"
+    die "the browser is installed but will not start headless; on a minimal Linux image a shared library is usually missing (find the browser with: cd tests/puppeteer && npx puppeteer browsers list, then run ldd on it and look for 'not found')"
 fi
 
 say "ready"
