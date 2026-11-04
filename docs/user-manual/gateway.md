@@ -439,7 +439,7 @@ from those two settings, not an observed figure. Plan for these requirements:
   containment). Use addresses that stay the same (a virtual IP or fixed node addresses) for
   gateway-fronted fleets; if the addresses behind the name change, a quarantined agent
   cannot reach any node and cannot be released remotely.
-- **Management address.** The server reaches a gateway cluster's management plane (`:50063`) through one address, `--gateway-command-addr`. With several gateway nodes and that address naming one node, killing that node left the whole fleet undispatchable in two HA WS-13 spike runs although every agent had re-attached (a control run is still owed, #7051; what to configure instead is tracked in #7062). Until then, plan for an address that survives the loss of a node, such as a virtual IP or a name that reaches every node, and check the certificate pin or identity the gateway's management listener requires for whatever address you choose; this is reasoned from the code and was not tried in the spike.
+- **Management address.** The server reaches a gateway cluster's management plane (`:50063`) through one address, `--gateway-command-addr`. With several gateway nodes and that address naming one node, killing that node left the whole fleet undispatchable in two HA WS-13 spike runs although every agent had re-attached (a control run is still owed, #7051; what to configure instead is tracked in #7062). Until then, use the shape the spike exercised: one address in front of all the gateway nodes that passes TCP through without terminating TLS and is reachable only from the server hosts. Every node's management certificate must carry that name, because the server checks it against the address it dials, and every node must admit the server (the same management peer settings on each). The nodes must be clustered. Spike finding 10: some commands to re-attached agents were accepted and never delivered behind that address. A multi-address DNS name was not tried, and the server's management channel sets no keepalive.
 - **A node that is up but has lost its server.** Failover does not cover this case. From
   the sources, the gateway acknowledges proxied heartbeats from its own node-local state
   whatever the state of its upstream (an unknown session gets `NOT_FOUND`), and the agent
@@ -452,8 +452,12 @@ from those two settings, not an observed figure. Plan for these requirements:
   the code, not yet measured: `yuzu_gw_upstream_rpc_errors_total{rpc_name="batch_heartbeat"}` rising (about once
   a second if the server refuses connections, about once every 6 s if the path silently drops them) and the
   gateway log line `BatchHeartbeat failed`; the same counter rises when the server itself is down, so
-  compare gateways. The agent log will not show it. The action reasoned from the code is to stop the
-  gateway node so that its agents re-register through the surviving nodes; this was not tried in the spike. Whether a quarantine or
+  compare gateways. The agent log will not show it. First restore the node's path to the server: in the spike
+  agents were routable again 2 to 6 s after the path returned. If that cannot be done soon and other gateway nodes can take
+  its agents, stopping the node so they re-register through the survivors is the action reasoned from the code; it was not
+  tried for this fault. Do it only if the counter rises on that node alone (a rise on every gateway means the server is the
+  problem), keep the node stopped, and confirm its agents are routable through a survivor. It disconnects every agent on
+  the node (agents older than 0.15.0 may wedge), and on a one-gateway deployment it takes the whole fleet offline. Whether a quarantine or
   other protective action issued in this state reaches the endpoint, and the consequence for dispatch on
   two server replicas, have not been measured.
 - **Agents older than 0.15.0** may wedge in their reconnect path and need a restart (see
