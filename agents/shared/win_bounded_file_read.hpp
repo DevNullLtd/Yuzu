@@ -7,7 +7,9 @@
 //     (attributes carry FILE_ATTRIBUTE_REPARSE_POINT), never followed; parent
 //     directories are trusted (the callers read machine-wide, admin-writable
 //     trees such as C:\ProgramData);
-//   - a directory is refused;
+//   - a directory is refused as `error` (the leaf is opened with FILE_FLAG_BACKUP_SEMANTICS:
+//     without it CreateFileW answers ERROR_ACCESS_DENIED for a directory, which would be
+//     misreported as `denied`, an ACL refusal, when it is a wrong-kind path);
 //   - at most min(`cap`, kMaxBoundedReadBytes) bytes are returned, by ONE ReadFile.
 //     A larger file is read up to that limit and flagged `truncated` (the callers
 //     parse a header-sized prefix), so the read is bounded in memory and in time
@@ -58,7 +60,9 @@ struct BoundedRead {
     const HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                  OPEN_EXISTING,
-                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT |
+                                     FILE_FLAG_BACKUP_SEMANTICS,
+                                 nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         const DWORD err = GetLastError();
         if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)

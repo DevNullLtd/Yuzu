@@ -220,11 +220,19 @@ TEST_CASE("pkg_inventory plugin: status row first, then only well-formed rows of
                 REQUIRE(f.size() >= 2);
                 if (std::string_view{action} == "packages") {
                     REQUIRE(f.size() == 5);
+#if defined(_WIN32)
+                    CHECK(f[1] == "chocolatey"); // Windows packages = Chocolatey; Homebrew is macOS
+#else
                     CHECK(f[1] == "homebrew");
+#endif
                 } else {
                     CHECK(std::string_view{action} == "store_packages");
                     REQUIRE(f.size() == 9);
+#if defined(_WIN32)
+                    CHECK(f[1] == "appx"); // Windows store_packages = the Appx roster
+#else
                     CHECK((f[1] == "snap" || f[1] == "flatpak"));
+#endif
                 }
             } else {
                 FAIL("unexpected row kind after the status row: " << f[0]);
