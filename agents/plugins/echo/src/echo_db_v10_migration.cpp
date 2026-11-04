@@ -1274,21 +1274,24 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
         if (!before.ok)
             return std::unexpected("the database size could not be read");
         const auto free_now = free_bytes_of(seams, path);
+        // Twice the file, plus the write-ahead log already on disk: the migration's own writes
+        // land in the log before the checkpoint, and the log's current size is known up front.
+        const auto need = 2 * before.file_bytes() + before.wal_bytes;
         // An unreadable volume is a refusal too: the 2x check is mandatory, never skipped.
         if (!free_now) {
             return std::unexpected(
                 std::string{kFreeSpaceRefusalPrefix} +
                 std::format(" the Echo database to its roll-up tables: the free space on the volume "
                             "could not be read and {} bytes are needed (twice the {}-byte database "
-                            "file)",
-                            2 * before.file_bytes(), before.file_bytes()));
+                            "file plus its {}-byte log)",
+                            need, before.file_bytes(), before.wal_bytes));
         }
-        if (*free_now < 2 * static_cast<std::uintmax_t>(before.file_bytes())) {
+        if (*free_now < static_cast<std::uintmax_t>(need)) {
             return std::unexpected(
                 std::string{kFreeSpaceRefusalPrefix} +
                 std::format(" the Echo database to its roll-up tables: {} bytes are free and {} are "
-                            "needed (twice the {}-byte database file)",
-                            *free_now, 2 * before.file_bytes(), before.file_bytes()));
+                            "needed (twice the {}-byte database file plus its {}-byte log)",
+                            *free_now, need, before.file_bytes(), before.wal_bytes));
         }
     }
 

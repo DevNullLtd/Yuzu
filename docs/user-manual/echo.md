@@ -97,7 +97,7 @@ Use the `configure` action to adjust Echo behavior.
 
 | Setting | Valid range | Default | Description |
 |---------|-----------|---------|-------------|
-| `retention_days` | 1-365 | 7 | Days to keep events before automatic purge |
+| `retention_days` | 1-365 | 7 | Days to keep events before automatic purge. One store is bounded by count, not age: each cursor source (registry, removable devices, mapped drives and the other sources that read a log) keeps its newest 4096 record keys in a replay ring so a re-read does not record the same event twice. A key carries the same text the tiers carry (a registry key path and value name, a device or image path, a hashed mapped-drive identity), so on a quiet source those keys outlive the tiers; `echo.purge_source` on the paused source erases them. |
 | `db_budget_bytes` | whole bytes, 33554432 (32 MiB) or more | 262144000 (250 MiB) | Cap on what `echo.db` holds (used pages plus the write-ahead log). When the database is over it, the maintenance pass removes the oldest hourly rows older than 48 hours (5 days for `procperf`) (see [The database byte budget](#the-database-byte-budget)). Lowering `db_budget_bytes` deletes history on the next maintenance pass (within 15 minutes) and cannot be undone. A value below the minimum or that is not a whole number is refused with an `error\|` line and nothing changes. |
 | `fast_interval` | 10-3600 | 60 | Seconds between process/network collections |
 | `slow_interval` | 30-7200 | 300 | Seconds between service/user collections |

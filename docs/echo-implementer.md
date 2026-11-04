@@ -273,7 +273,7 @@ error), so the version never skips past a step that did not finish. A database w
 retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10` does, in ONE
 `BEGIN IMMEDIATE` transaction:
 
-1. Pre-check: the volume holds twice the file free, else the open fails with a message that begins
+1. Pre-check: the volume holds twice the file plus its write-ahead log free, else the open fails with a message that begins
    with `kFreeSpaceRefusalPrefix`; the plugin then loads offline (`storage_state|offline|free_space`,
    no trigger registered) instead of failing to load. A free-space figure that cannot be read is a refusal too (the 2x check is mandatory, never skipped) and is logged; a database with nothing to migrate needs no room.
 2. Rename each old summary tier to `<name>_legacy`, install the roll-up schema, then convert every
