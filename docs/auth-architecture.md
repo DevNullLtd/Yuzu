@@ -3953,7 +3953,7 @@ adds at most 99 entries of 64 characters plus one whole entry to a response, and
 in the grant's own `justification`, which is the state-row copy, and once as the latest `history` entry). The
 response therefore grows linearly with the number of frozen grants: the per-grant ceiling is a bound on one grant, not
 on the response, because there is no cap on the factor. There is no per-campaign budget and the number of frozen grants
-is not capped (a recorded residual; its acceptance is a separate decision that is not yet recorded).
+is not capped (a recorded residual, accepted by the project owner on 2026-11-04 at the measured figures).
 
 *Measured response sizes.* On 2026-11-04, on Linux (glibc), with a FRESH server process for each case (baseline
 server peak RSS about 104 to 105 MB), one `GET /api/v1/access-reviews/{id}` against a campaign of 1000 frozen grants with 100

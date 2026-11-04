@@ -495,7 +495,7 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
   410 MB of text per copy at 1000 grants, held in several copies by the REST, MCP and page paths). With the
   preview the response grows linearly with the number of frozen grants (the per-grant ceiling bounds one grant, not the
   response, because there is no cap on the factor); there is no per-campaign budget and the frozen grant count is not
-  capped (a recorded residual; its acceptance is a separate decision that is not yet recorded).
+  capped (a recorded residual, accepted by the project owner on 2026-11-04 at the measured figures).
 
   Measured 2026-11-04 on Linux (glibc), with a FRESH server process per case (baseline server peak RSS about 104 to 105 MB),
   one `GET /api/v1/access-reviews/{id}` on a campaign of 1000 frozen grants with 100 decisions each (built by
@@ -591,7 +591,7 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
 7. **Recorded residual and options under consideration (memory use of the history read).** The project owner
    ruled on 2026-11-04 to cut the preview of a superseded entry to 64 characters as the immediate response to the
    measured memory use of the history read (about 2.4 GB for the worst measured case with the former 512-character
-   preview). The remaining exposure is a recorded residual: there is no per-campaign budget, no cap on the number of
+   preview). The project owner also accepted the remaining exposure on 2026-11-04 at the measured figures. It is a recorded residual: there is no per-campaign budget, no cap on the number of
    frozen grants, no concurrency limit on the route and no shipped memory limit, so the response and its memory still
    grow linearly with the number of frozen grants and with the number of requests in flight (the scaled break-even is
    in `docs/auth-architecture.md`, "The decision history", and is not measured). The structural options under
