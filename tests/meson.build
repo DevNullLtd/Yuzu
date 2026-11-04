@@ -1415,7 +1415,7 @@ echo_test_exe = executable(
 # The sizing cases fold 20,000 distinct keys per source, so they run as their own test() with a
 # longer timeout; the main run excludes them (the same filter-split shape as the server shards below).
 # The schema-v10 migration cases ([v10]: a seeded v9 database folded over all 17 sources, chunked
-# folds, rollbacks) are about a third of the suite's run time on their own, which pushed the main
+# folds, rollbacks) are about a quarter of the suite's run time on their own, which pushed the main
 # run past its 90 s limit on the Windows debug runner (about 55 s before them), so they are a
 # third test() too. Together the three filters cover every case exactly once.
 test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]~[v10]', '--durations=yes'], suite: 'echo', timeout: 90)
