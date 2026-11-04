@@ -94,6 +94,11 @@ clustered gateways, a real server and Postgres, and 20 / 100 / 300 agents.
   by 0.6 s and 0.9 s (column `t0_shift_ms`). Runs without such evidence are **not** corrected and may be
   optimistic by up to about a second; the route and `/readyz` samples carry the same skew, and the sampler
   achieved about 0.77 Hz, not 1 Hz. The final script reads the clock from the shell's own built-in.
+- **Commit messages on this branch overstate in places** (the first commit's headline result before the
+  round-1 corrections; "tables are generated" while the management-address and HAProxy columns are
+  operator-supplied; "reads the HAProxy variant from run metadata" for runs that recorded none). The commits
+  were not rewritten because the governance ledger cites them by hash; this record is the statement of
+  what was measured.
 - **Percentiles** are the sorted value at index `round(p/100 x (n-1))` over the victim's agents, using
   Python's round-half-to-even, so for an even count the "median" is the upper or lower middle value
   depending on n. They are not interpolated.
@@ -176,21 +181,24 @@ siblings in failover time (that address affects dispatch, not agents).
 <!-- BEGIN GENERATED: faults-f3-f2p -->
 | Run | Fault | Addressing | Agents | On victim | Moved | Victim /readyz non-200 | Breaker opened (s) | Non-routable (k / N, when s) | Tombstoned (k / N, when s) | Undo: ready / all routable (s) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| F2p-dns-220945 | F2p | DNS | 100 | 35 | 35 | never | 162 | - | - | 5 / 5 |
+| F2p-dns-220945 | F2p | DNS | 100 | 35 | 35 | none to +149s | 162 | - | - | 5 / 5 |
 | F2p-vip-001328 | F2p | VIP | 300 | 100 | 100 | 157 | 157 | - | - | 30 / 30 |
-| F2p-vip-214249 | F2p | VIP | 100 | 34 | 34 | never | 156 | - | - | - / - |
-| F2p-vip-215144 | F2p | VIP | 100 | 34 | 34 | never | 158 | - | - | - / - |
-| F2p-vip-220044 | F2p | VIP | 100 | 34 | 34 | never | 162 | - | - | 6 / 6 |
-| F2p-vip-224347 | F2p | VIP | 100 | 34 | 34 | never | 161 | - | - | 23 / 23 |
-| F2p-vip-225245 | F2p | VIP | 100 | 34 | 34 | never | 159 | - | - | 21 / 22 |
-| F3-dns-013638 | F3 | DNS | 300 | 111 | 0 | never | never | 111 / 111, 60-89 | 0 / 111 | 1 / 2 |
-| F3-dns-174502 | F3 | DNS | 20 | 18 | 0 | never | n/a | 18 / 18, 68-80 | 18 / 18, 275 | - / - |
-| F3-dns-193321 | F3 | DNS | 100 | 35 | 0 | never | never | 35 / 35, 61-90 | 35 / 35, 381 | - / - |
-| F3-vip-020123 | F3 | VIP | 300 | 100 | 0 | never | never | 100 / 100, 60-89 | 12 / 100, 244 | 1 / 6 |
-| F3-vip-210017 | F3 | VIP | 100 | 34 | 0 | never | never | 34 / 34, 60-91 | 32 / 34, 269 | - / - |
-| F3x-dns-194637 | F3x | DNS | 100 | 43 | 0 | never | never | 43 / 43, 62-91 | 0 / 43 | - / - |
+| F2p-vip-214249 | F2p | VIP | 100 | 34 | 34 | none to +150s | 156 | - | - | - / - |
+| F2p-vip-215144 | F2p | VIP | 100 | 34 | 34 | none to +150s | 158 | - | - | - / - |
+| F2p-vip-220044 | F2p | VIP | 100 | 34 | 34 | none to +149s | 162 | - | - | 6 / 6 |
+| F2p-vip-224347 | F2p | VIP | 100 | 34 | 34 | none to +150s | 161 | - | - | 23 / 23 |
+| F2p-vip-225245 | F2p | VIP | 100 | 34 | 34 | none to +150s | 159 | - | - | 21 / 22 |
+| F3-dns-013638 | F3 | DNS | 300 | 111 | 0 | none to +399s | never | 111 / 111, 60-89 | 0 / 111 | 1 / 2 |
+| F3-dns-174502 | F3 | DNS | 20 | 18 | 0 | none to +400s | n/a | 18 / 18, 68-80 | 18 / 18, 275 | - / - |
+| F3-dns-193321 | F3 | DNS | 100 | 35 | 0 | none to +400s | never | 35 / 35, 61-90 | 35 / 35, 381 | - / - |
+| F3-vip-020123 | F3 | VIP | 300 | 100 | 0 | none to +399s | never | 100 / 100, 60-89 | 12 / 100, 244 | 1 / 6 |
+| F3-vip-210017 | F3 | VIP | 100 | 34 | 0 | none to +399s | never | 34 / 34, 60-91 | 32 / 34, 269 | - / - |
+| F3x-dns-194637 | F3x | DNS | 100 | 43 | 0 | none to +400s | never | 43 / 43, 62-91 | 0 / 43 | - / - |
 <!-- END GENERATED: faults-f3-f2p -->
 
+In `results.csv` the `victim_readyz_non200_s` column is blank for the six 100-agent F2p runs because their
+gateway sample series ends at +149 s, before the breaker opened (the `breaker_open_s` column, from the
+gateway log, shows 156-162 s in all seven F2p runs); blank there means "not sampled long enough", not "never".
 For F3/F3x "Moved" is 0 by construction (the agents never left). In the F2p rows the victim's circuit
 breaker opened at 156-162 s in every run; the 100-agent runs' windows (150 s) ended before `/readyz`
 followed, and the one run whose window outlasted it (300 agents, 200 s) shows `/readyz` at 157 s. In the F3
@@ -263,9 +271,11 @@ could not resolve, so both of its probes failed); they were not used for any cla
    the VIP case exceeds it, and why was not investigated.
 4. **A gateway that is up but cut off from the server was invisible to `/readyz` in a quiet fleet, and
    what it means for a production fleet is not measured.** In six F3/F3x runs the victim's `/readyz` never
-   changed and its breaker never opened in 400 s; no agent moved. The effect on the server side was mild
-   and self-healing: dispatch kept working (single replica), routes became non-routable at about 60-90 s,
-   and every agent was routable again 2-6 s after the path returned (300 agents). But this fleet had
+   changed and its breaker never opened in 400 s; no agent moved. The ADR's "known gap, unconfirmed"
+   precondition is therefore confirmed for this rig. Its consequence is not: on this single-replica server
+   dispatch kept working, routes became non-routable at about 60-90 s, and every agent was routable again
+   2-6 s after the path returned (300 agents), but the harmful case, route-directory dispatch on two or more
+   replicas, could not be tested here. But this fleet had
    inventory, DEX and Spark collection disabled and no churn, so almost nothing but heartbeats crossed the
    link; the reading of the code is that Register, inventory and stream-status calls feed the breaker and
    heartbeat flushes do not. That matches the full-partition runs: when the node was cut off completely the
@@ -358,9 +368,10 @@ could not resolve, so both of its probes failed); they were not used for any cla
 
 - **13.2 (agent endpoint list):** nothing here shows it is needed for the VIP and multi-A shapes tested.
   Whether a deployment with a static node list and no DNS needs it was not tested.
-- **13.6 (gateway closes agent streams after a long upstream outage):** the failure it addresses was
-  invisible to `/readyz` and self-healing in this single-replica, quiet-fleet rig, and became visible
-  after about 160 s only when the node was fully cut off. How much it matters depends on the multi-replica
+- **13.6 (gateway closes agent streams after a long upstream outage):** the precondition it addresses
+  (a node with live agents and a dead upstream path) is confirmed and was invisible to `/readyz` in this
+  single-replica, quiet-fleet rig; the harm it would prevent was not testable here, and the breaker opened,
+  after about 160 s, only when the node was fully cut off. How much it matters depends on the multi-replica
   case and on whether production traffic feeds the breaker (follow-up 2).
 - **#6920 (what belongs in the gate):** finding 5 (management-plane addressing) is a failover property
   that no agent-side slice covers. It is a candidate gate item in its own right.
@@ -397,14 +408,16 @@ could not resolve, so both of its probes failed); they were not used for any cla
   one run, and the 100-agent runs' 150 s windows ended before the fall). The `/readyz` flip in the same run
   was at +157 s, which is a different quantity. The shipped `YuzuGatewayConnectionDrops` alert needs that
   gauge to fall below 70 % of its value five minutes earlier for two minutes, and needs a positive connection
-  rate in the last five minutes. By derivation, not measurement: the victim takes no new connection after the
-  fault, so unless agents had connected to it in the preceding five minutes the rate term is zero and the
-  alert cannot fire; if it can, the earliest is about +300 s. `YuzuGatewayUpstreamCircuitOpened` (a breaker
-  that opened and has not closed, held three minutes) would fire at about +340 s, since the breaker opened at
-  +157 s. Two qualifiers: this
-  harness read the gauge over the node's loopback, whereas a networked Prometheus would see the node
-  unreachable in a full partition, which `YuzuGatewayDown` covers; and in the agent-port-only shape (the one
-  with the lost commands, finding 10) only the drop alert could act. The alert rule itself was not exercised.
+  rate in the last five minutes. By derivation, not measurement, the rate term is necessary but not
+  sufficient: by +300 s the five-minute window holds no pre-fault connection, and the victim takes none after
+  the fault, so the alert needs an agent to have connected to the victim after the fault, and cannot
+  otherwise fire; if it can, the earliest is about +300 s. `YuzuGatewayUpstreamCircuitOpened` (a breaker that
+  opened and has not closed, held three minutes) would fire at about +340 s, since the breaker opened at
+  +157 s. Qualifiers: this harness read the gauge over the node's loopback, whereas a networked Prometheus
+  would see the node unreachable in a full partition, which `YuzuGatewayDown` covers; in the agent-port-only
+  shape (the one with the lost commands, finding 10) only the drop alert could act; and the server-side fleet
+  alerts (`YuzuAgentFleetDrop`, `YuzuAgentDisconnected`) exist and were not evaluated. None of the alert
+  rules was exercised.
 
 None of these pages was edited by this slice.
 

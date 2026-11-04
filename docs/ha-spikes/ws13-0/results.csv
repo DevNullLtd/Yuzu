@@ -1,46 +1,46 @@
-run,scenario,mode,mgmt,haproxy,agents,on_victim_before,reregistered_n,load1_at_fault,t0_shift_ms,lost_p50_s,lost_max_s,rereg_p50_s,rereg_p99_s,rereg_max_s,register_peak_per_s,first_peer_fin_rst_ms,victim_readyz_non200_s,breaker_open_s,nonroutable_n,nonroutable_first_s,nonroutable_last_s,tombstoned_n,tombstoned_first_s,tombstoned_last_s,probes,victim_readyz_200_s_after_undo,all_routable_s_after_undo,invalid,note
-run-F1-dns-005812,F1,dns,single node,,300,107,107,0.92,,7.4,10.1,9.4,13.1,13.2,28,95,0,,1,9,9,1,9,9,UUU,,,,H7: management address on gateway-1 only; gateway-1 killed
-run-F1-dns-011727,F1,dns,single node,,300,108,108,1.44,,8.0,10.0,9.7,13.1,13.2,28,44,0,,1,10,10,1,10,10,TTU,,,,H7: management address on gateway-1 only; gateway-1 killed
-run-F1-dns-173401,F1,dns,VIP,,20,9,9,0.46,,6.1,7.3,8.2,10.3,10.3,,,0,n/a,0,,,0,,,SY,,,,no packet capture (capture container name clash)
-run-F1-dns-173707,F1,dns,VIP,,20,13,13,0.71,,6.1,9.7,8.8,12.7,12.7,,41,0,n/a,0,,,0,,,TY,,,,
-run-F1-dns-183422,F1,dns,VIP,,100,34,34,52.54,,8.0,9.9,9.9,13.2,13.2,8,63,1,,0,,,0,,,SY,,,,host load 52 at fault (harness settle burst)
-run-F1-dns-184233,F1,dns,VIP,,100,37,37,1.33,,6.9,9.9,9.4,12.9,12.9,8,41,1,,0,,,0,,,SY,,,,
-run-F1-dns-185051,F1,dns,VIP,,100,38,38,1.14,,7.7,10.0,9.9,12.8,12.8,10,43,0,,0,,,0,,,SY,,,,
-run-F1-dns-212006,F1,dns,single node,,100,33,33,0.59,,7.4,9.7,9.0,12.6,12.6,10,61,1,,0,,,0,,,H401H401H401,,,,H7 config (management address on gateway-1 only); dispatch probes VOID (HTTP 401: stale login after the server recreate); failover timings valid
-run-F1-dns-231546,F1,dns,VIP,,300,110,110,0.85,,7.8,9.9,9.9,13.0,13.1,25,45,0,,0,,,0,,,SYY,,,,
-run-F1-dns-233447,F1,dns,VIP,,300,114,114,0.62,,7.2,10.0,9.6,12.7,12.9,23,47,0,,0,,,0,,,SYY,,,,
-run-F1-vip-003436,F1,vip,VIP,redispatch,300,100,100,1.26,,8.0,9.9,14.0,15.9,16.2,27,42,0,,0,,,0,,,SYY,,,,
-run-F1-vip-200701,F1,vip,VIP,default,100,34,34,0.96,,7.9,9.9,18.4,24.4,24.4,9,42,1,,0,,,0,,,SY,,,,
-run-F1-vip-201537,F1,vip,VIP,default,100,34,34,1.15,909,7.9,9.8,21.1,26.1,26.1,7,40,2,,0,,,0,,,SY,,,,
-run-F1-vip-202418,F1,vip,VIP,default,100,34,34,0.81,,7.8,9.9,18.6,24.6,24.6,10,72,0,,0,,,0,,,SY,,,,
-run-F1-vip-221906,F1,vip,VIP,redispatch,100,34,34,1.19,,7.0,9.9,13.1,16.3,16.3,9,68,0,,0,,,0,,,SY,,,,
-run-F1-vip-222734,F1,vip,VIP,redispatch,100,34,34,1.22,595,6.9,9.7,12.8,15.7,15.7,8,40,0,,1,13,13,1,13,13,SY,,,,
-run-F1-vip-223600,F1,vip,VIP,redispatch,100,34,34,0.68,,7.1,9.9,13.4,16.0,16.0,8,39,0,,0,,,0,,,SY,,,,
-run-F1-vip-235437,F1,vip,VIP,default,300,100,100,1.22,,7.9,10.0,18.6,24.6,24.6,22,43,0,,0,,,0,,,SYY,,,,
-run-F1g-dns-192444,F1g,dns,VIP,,100,44,44,2.30,,7.9,10.0,10.8,16.0,16.0,15,9275,1,,44,1,1,44,1,1,Y,,,,
-run-F2-dns-174030,F2,dns,VIP,,20,11,11,1.01,,39.0,49.5,41.5,50.5,50.5,,,,n/a,0,,,0,,,TYY,,,,
-run-F2-dns-185902,F2,dns,VIP,,100,39,39,0.89,,43.9,58.8,46.2,61.1,61.1,4,,,,0,,,0,,,TYY,,,,
-run-F2-dns-190724,F2,dns,VIP,,100,35,35,0.67,,45.1,58.9,47.1,61.9,61.9,3,,,,0,,,0,,,TYT,,,,
-run-F2-dns-191603,F2,dns,VIP,,100,44,44,1.20,,47.5,59.7,50.1,62.7,62.7,4,,,,0,,,0,,,TYY,,,,
-run-F2-dns-212901,F2,dns,single node,,100,34,34,1.33,,48.2,60.1,50.7,63.3,63.3,3,,,,0,,,0,,,TYT,,,,H7 config (management address on gateway-1 only); F2 = agent port only; login restored by hand mid-run so the probes are valid
-run-F2-vip-203241,F2,vip,VIP,default,100,34,24,2.68,,114.8,129.7,118.8,132.7,132.7,2,,,,34,62,91,0,,,TYTY,,,,F2 = agent port blackholed only (VIP health check stayed green); RIGHT-CENSORED: not all victim agents re-registered by the end of the window
-run-F2-vip-204246,F2,vip,VIP,default,100,34,24,11.20,,115.6,129.8,117.6,135.8,135.8,2,137812,,,34,63,91,0,,,TYTT,,,,F2 = agent port blackholed only (VIP health check stayed green); RIGHT-CENSORED; host load 11 at fault
-run-F2-vip-205134,F2,vip,VIP,default,100,34,24,0.99,,116.5,129.1,121.9,131.2,131.2,2,147455,,,34,62,89,0,,,TYTY,,,,F2 = agent port blackholed only (VIP health check stayed green); RIGHT-CENSORED
-run-F2p-dns-220945,F2p,dns,VIP,,100,35,35,1.23,,44.7,59.7,47.5,61.7,61.7,3,,,162,0,,,0,,,TYY,5,5,,
-run-F2p-vip-001328,F2p,vip,VIP,default,300,100,100,7.74,,22.9,25.5,24.5,28.5,28.5,24,15708,157,157,0,,,0,,,TYY,30,30,,
-run-F2p-vip-214249,F2p,vip,VIP,default,100,34,34,0.96,,23.7,25.5,25.7,28.3,28.3,8,15511,,156,0,,,0,,,TYY,,,,
-run-F2p-vip-215144,F2p,vip,VIP,default,100,34,34,1.24,,22.6,25.0,24.2,28.0,28.0,8,15441,,158,0,,,0,,,TYY,,,,
-run-F2p-vip-220044,F2p,vip,VIP,default,100,34,34,4.77,,25.6,27.7,27.4,30.4,30.4,11,17717,,162,1,26,26,1,26,26,TYY,6,6,,
-run-F2p-vip-224347,F2p,vip,VIP,redispatch,100,34,34,0.19,,22.8,25.6,24.5,28.4,28.4,8,15702,,161,0,,,0,,,TYY,23,23,,
-run-F2p-vip-225245,F2p,vip,VIP,redispatch,100,34,34,0.75,,23.2,26.1,26.0,29.1,29.1,8,16300,,159,0,,,0,,,TYY,21,22,,
-run-F3-dns-013638,F3,dns,VIP,,300,111,0,1.17,,,,,,,0,,,,111,60,89,0,,,YYYYYY,1,2,,
-run-F3-dns-174502,F3,dns,VIP,,20,18,0,0.68,,,,,,,,,,n/a,18,68,80,18,275,275,YYYYY,,,,
-run-F3-dns-193321,F3,dns,VIP,,100,35,0,0.46,,,,,,,0,,,,35,61,90,35,381,381,YYYYYY,,,,
-run-F3-vip-020123,F3,vip,VIP,default,300,100,0,1.67,,,,,,,0,,,,100,60,89,12,244,244,YYYYYY,1,6,,
-run-F3-vip-210017,F3,vip,VIP,default,100,34,0,0.41,,,,,,,0,,,,34,60,91,32,269,269,YYYYYY,,,,
-run-F3x-dns-194637,F3x,dns,VIP,,100,43,0,0.61,,,,,,,0,,,,43,62,91,0,,,YYYYYY,,,,
-run-NOFAULT-dns-172531,NOFAULT,dns,VIP,,20,9,0,0.64,,,,,,,,,46,n/a,0,,,0,,,??,,,,early harness: readyz parsing glitch (the readyz column is not meaningful) and the old dispatch format
-run-NOFAULT-dns-172816,NOFAULT,dns,VIP,,20,9,0,0.59,,,,,,,,,,n/a,0,,,0,,,UU,,,,early harness: the server could not resolve the management name (rig defect since fixed) so both probes failed
-run-NOFAULT-dns-173302,NOFAULT,dns,VIP,,20,9,0,0.38,,,,,,,,,,n/a,0,,,0,,,YY,,,,
-run-NOFAULT-dns-182641,NOFAULT,dns,VIP,,100,37,0,19.22,,,,,,,0,,,,0,,,0,,,YY,,,,
-run-NOFAULT-vip-195954,NOFAULT,vip,VIP,default,100,34,0,0.55,,,,,,,0,,,,0,,,0,,,YY,,,,
+run,scenario,mode,mgmt,haproxy,agents,on_victim_before,reregistered_n,load1_at_fault,t0_shift_ms,lost_p50_s,lost_max_s,rereg_p50_s,rereg_p99_s,rereg_max_s,register_peak_per_s,first_peer_fin_rst_ms,victim_readyz_non200_s,readyz_sampled_to_s,breaker_open_s,nonroutable_n,nonroutable_first_s,nonroutable_last_s,tombstoned_n,tombstoned_first_s,tombstoned_last_s,probes,victim_readyz_200_s_after_undo,all_routable_s_after_undo,invalid,note
+run-F1-dns-005812,F1,dns,single node,,300,107,107,0.92,,7.4,10.1,9.4,13.1,13.2,28,95,0,150,,1,9,9,1,9,9,UUU,,,,H7: management address on gateway-1 only; gateway-1 killed
+run-F1-dns-011727,F1,dns,single node,,300,108,108,1.44,,8.0,10.0,9.7,13.1,13.2,28,44,0,150,,1,10,10,1,10,10,TTU,,,,H7: management address on gateway-1 only; gateway-1 killed
+run-F1-dns-173401,F1,dns,VIP,,20,9,9,0.46,,6.1,7.3,8.2,10.3,10.3,,,0,121,n/a,0,,,0,,,SY,,,,no packet capture (capture container name clash)
+run-F1-dns-173707,F1,dns,VIP,,20,13,13,0.71,,6.1,9.7,8.8,12.7,12.7,,41,0,120,n/a,0,,,0,,,TY,,,,
+run-F1-dns-183422,F1,dns,VIP,,100,34,34,52.54,,8.0,9.9,9.9,13.2,13.2,8,63,1,120,,0,,,0,,,SY,,,,host load 52 at fault (harness settle burst)
+run-F1-dns-184233,F1,dns,VIP,,100,37,37,1.33,,6.9,9.9,9.4,12.9,12.9,8,41,1,119,,0,,,0,,,SY,,,,
+run-F1-dns-185051,F1,dns,VIP,,100,38,38,1.14,,7.7,10.0,9.9,12.8,12.8,10,43,0,120,,0,,,0,,,SY,,,,
+run-F1-dns-212006,F1,dns,single node,,100,33,33,0.59,,7.4,9.7,9.0,12.6,12.6,10,61,1,150,,0,,,0,,,H401H401H401,,,,H7 config (management address on gateway-1 only); dispatch probes VOID (HTTP 401: stale login after the server recreate); failover timings valid
+run-F1-dns-231546,F1,dns,VIP,,300,110,110,0.85,,7.8,9.9,9.9,13.0,13.1,25,45,0,150,,0,,,0,,,SYY,,,,
+run-F1-dns-233447,F1,dns,VIP,,300,114,114,0.62,,7.2,10.0,9.6,12.7,12.9,23,47,0,150,,0,,,0,,,SYY,,,,
+run-F1-vip-003436,F1,vip,VIP,redispatch,300,100,100,1.26,,8.0,9.9,14.0,15.9,16.2,27,42,0,150,,0,,,0,,,SYY,,,,
+run-F1-vip-200701,F1,vip,VIP,default,100,34,34,0.96,,7.9,9.9,18.4,24.4,24.4,9,42,1,119,,0,,,0,,,SY,,,,
+run-F1-vip-201537,F1,vip,VIP,default,100,34,34,1.15,909,7.9,9.8,21.1,26.1,26.1,7,40,2,121,,0,,,0,,,SY,,,,
+run-F1-vip-202418,F1,vip,VIP,default,100,34,34,0.81,,7.8,9.9,18.6,24.6,24.6,10,72,0,119,,0,,,0,,,SY,,,,
+run-F1-vip-221906,F1,vip,VIP,redispatch,100,34,34,1.19,,7.0,9.9,13.1,16.3,16.3,9,68,0,119,,0,,,0,,,SY,,,,
+run-F1-vip-222734,F1,vip,VIP,redispatch,100,34,34,1.22,595,6.9,9.7,12.8,15.7,15.7,8,40,0,121,,1,13,13,1,13,13,SY,,,,
+run-F1-vip-223600,F1,vip,VIP,redispatch,100,34,34,0.68,,7.1,9.9,13.4,16.0,16.0,8,39,0,120,,0,,,0,,,SY,,,,
+run-F1-vip-235437,F1,vip,VIP,default,300,100,100,1.22,,7.9,10.0,18.6,24.6,24.6,22,43,0,149,,0,,,0,,,SYY,,,,
+run-F1g-dns-192444,F1g,dns,VIP,,100,44,44,2.30,,7.9,10.0,10.8,16.0,16.0,15,9275,1,119,,44,1,1,44,1,1,Y,,,,
+run-F2-dns-174030,F2,dns,VIP,,20,11,11,1.01,,39.0,49.5,41.5,50.5,50.5,,,,199,n/a,0,,,0,,,TYY,,,,
+run-F2-dns-185902,F2,dns,VIP,,100,39,39,0.89,,43.9,58.8,46.2,61.1,61.1,4,,,150,,0,,,0,,,TYY,,,,
+run-F2-dns-190724,F2,dns,VIP,,100,35,35,0.67,,45.1,58.9,47.1,61.9,61.9,3,,,149,,0,,,0,,,TYT,,,,
+run-F2-dns-191603,F2,dns,VIP,,100,44,44,1.20,,47.5,59.7,50.1,62.7,62.7,4,,,149,,0,,,0,,,TYY,,,,
+run-F2-dns-212901,F2,dns,single node,,100,34,34,1.33,,48.2,60.1,50.7,63.3,63.3,3,,,150,,0,,,0,,,TYT,,,,H7 config (management address on gateway-1 only); F2 = agent port only; login restored by hand mid-run so the probes are valid
+run-F2-vip-203241,F2,vip,VIP,default,100,34,24,2.68,,114.8,129.7,118.8,132.7,132.7,2,,,149,,34,62,91,0,,,TYTY,,,,F2 = agent port blackholed only (VIP health check stayed green); RIGHT-CENSORED: not all victim agents re-registered by the end of the window
+run-F2-vip-204246,F2,vip,VIP,default,100,34,24,11.20,,115.6,129.8,117.6,135.8,135.8,2,137812,,149,,34,63,91,0,,,TYTT,,,,F2 = agent port blackholed only (VIP health check stayed green); RIGHT-CENSORED; host load 11 at fault
+run-F2-vip-205134,F2,vip,VIP,default,100,34,24,0.99,,116.5,129.1,121.9,131.2,131.2,2,147455,,150,,34,62,89,0,,,TYTY,,,,F2 = agent port blackholed only (VIP health check stayed green); RIGHT-CENSORED
+run-F2p-dns-220945,F2p,dns,VIP,,100,35,35,1.23,,44.7,59.7,47.5,61.7,61.7,3,,,149,162,0,,,0,,,TYY,5,5,,
+run-F2p-vip-001328,F2p,vip,VIP,default,300,100,100,7.74,,22.9,25.5,24.5,28.5,28.5,24,15708,157,199,157,0,,,0,,,TYY,30,30,,
+run-F2p-vip-214249,F2p,vip,VIP,default,100,34,34,0.96,,23.7,25.5,25.7,28.3,28.3,8,15511,,150,156,0,,,0,,,TYY,,,,
+run-F2p-vip-215144,F2p,vip,VIP,default,100,34,34,1.24,,22.6,25.0,24.2,28.0,28.0,8,15441,,150,158,0,,,0,,,TYY,,,,
+run-F2p-vip-220044,F2p,vip,VIP,default,100,34,34,4.77,,25.6,27.7,27.4,30.4,30.4,11,17717,,149,162,1,26,26,1,26,26,TYY,6,6,,
+run-F2p-vip-224347,F2p,vip,VIP,redispatch,100,34,34,0.19,,22.8,25.6,24.5,28.4,28.4,8,15702,,150,161,0,,,0,,,TYY,23,23,,
+run-F2p-vip-225245,F2p,vip,VIP,redispatch,100,34,34,0.75,,23.2,26.1,26.0,29.1,29.1,8,16300,,150,159,0,,,0,,,TYY,21,22,,
+run-F3-dns-013638,F3,dns,VIP,,300,111,0,1.17,,,,,,,0,,,399,,111,60,89,0,,,YYYYYY,1,2,,
+run-F3-dns-174502,F3,dns,VIP,,20,18,0,0.68,,,,,,,,,,400,n/a,18,68,80,18,275,275,YYYYY,,,,
+run-F3-dns-193321,F3,dns,VIP,,100,35,0,0.46,,,,,,,0,,,400,,35,61,90,35,381,381,YYYYYY,,,,
+run-F3-vip-020123,F3,vip,VIP,default,300,100,0,1.67,,,,,,,0,,,399,,100,60,89,12,244,244,YYYYYY,1,6,,
+run-F3-vip-210017,F3,vip,VIP,default,100,34,0,0.41,,,,,,,0,,,399,,34,60,91,32,269,269,YYYYYY,,,,
+run-F3x-dns-194637,F3x,dns,VIP,,100,43,0,0.61,,,,,,,0,,,400,,43,62,91,0,,,YYYYYY,,,,
+run-NOFAULT-dns-172531,NOFAULT,dns,VIP,,20,9,0,0.64,,,,,,,,,46,89,n/a,0,,,0,,,??,,,,early harness: readyz parsing glitch (the readyz column is not meaningful) and the old dispatch format
+run-NOFAULT-dns-172816,NOFAULT,dns,VIP,,20,9,0,0.59,,,,,,,,,,44,n/a,0,,,0,,,UU,,,,early harness: the server could not resolve the management name (rig defect since fixed) so both probes failed
+run-NOFAULT-dns-173302,NOFAULT,dns,VIP,,20,9,0,0.38,,,,,,,,,,29,n/a,0,,,0,,,YY,,,,
+run-NOFAULT-dns-182641,NOFAULT,dns,VIP,,100,37,0,19.22,,,,,,,0,,,59,,0,,,0,,,YY,,,,
+run-NOFAULT-vip-195954,NOFAULT,vip,VIP,default,100,34,0,0.55,,,,,,,0,,,59,,0,,,0,,,YY,,,,

@@ -372,7 +372,7 @@ redisp = set(x for x in redisp.split(",") if x)
 notes = dict(x.split("=", 1) for x in notes.split(",") if "=" in x)
 cols = ["run", "scenario", "mode", "mgmt", "haproxy", "agents", "on_victim_before", "reregistered_n", "load1_at_fault",
         "t0_shift_ms", "lost_p50_s", "lost_max_s", "rereg_p50_s", "rereg_p99_s", "rereg_max_s", "register_peak_per_s",
-        "first_peer_fin_rst_ms", "victim_readyz_non200_s", "breaker_open_s",
+        "first_peer_fin_rst_ms", "victim_readyz_non200_s", "readyz_sampled_to_s", "breaker_open_s",
         "nonroutable_n", "nonroutable_first_s", "nonroutable_last_s", "tombstoned_n", "tombstoned_first_s", "tombstoned_last_s",
         "probes", "victim_readyz_200_s_after_undo", "all_routable_s_after_undo", "invalid", "note"]
 def sec(ms): return "" if ms is None else f"{ms/1000:.1f}"
@@ -437,6 +437,7 @@ for f in sorted(glob.glob(state + "/run-*/summary.json")):
     flip = ""
     for i in range(len(gw) - 1):
         if gw[i][0] >= t0c and gw[i][1] != "200" and gw[i + 1][1] != "200": flip = f"{(gw[i][0] - t0c) / 1000:.0f}"; break
+    sampled_to = f"{(gw[-1][0] - t0c) / 1000:.0f}" if gw else ""
     brk = ""
     gl = f"{rd}/gwlog-{vcont}.txt"
     if not os.path.exists(gl): brk = "n/a"   # no gateway log was kept for this run: "never opened" cannot be claimed
@@ -468,7 +469,7 @@ for f in sorted(glob.glob(state + "/run-*/summary.json")):
         "lost_p50_s": sec(adj(a.get("p50"))), "lost_max_s": sec(adj(a.get("max"))),
         "rereg_p50_s": sec(adj(b.get("p50"))), "rereg_p99_s": sec(adj(b.get("p99"))), "rereg_max_s": sec(adj(b.get("max"))),
         "register_peak_per_s": d.get("register_peak_per_s", ""),
-        "first_peer_fin_rst_ms": f"{min(first_fin):.0f}" if first_fin else "", "victim_readyz_non200_s": flip, "breaker_open_s": brk,
+        "first_peer_fin_rst_ms": f"{min(first_fin):.0f}" if first_fin else "", "victim_readyz_non200_s": flip, "readyz_sampled_to_s": sampled_to, "breaker_open_s": brk,
         "nonroutable_n": len(nr), "nonroutable_first_s": f"{min(nr):.0f}" if nr else "", "nonroutable_last_s": f"{max(nr):.0f}" if nr else "",
         "tombstoned_n": len(tb), "tombstoned_first_s": f"{min(tb):.0f}" if tb else "", "tombstoned_last_s": f"{max(tb):.0f}" if tb else "",
         "probes": "".join(pcl), "victim_readyz_200_s_after_undo": rec.get("victim_readyz_200_s", ""), "all_routable_s_after_undo": rec.get("all_routable_s", ""),
@@ -523,7 +524,8 @@ for r in rows:
     tbw = "%s / %s, %s" % (r["tombstoned_n"], r["on_victim_before"], span(r["tombstoned_first_s"], r["tombstoned_last_s"])) if int(r["tombstoned_n"]) else "0 / %s" % r["on_victim_before"]
     t2.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
         r["run"][4:], r["scenario"], "DNS" if r["mode"] == "dns" else "VIP", r["agents"], r["on_victim_before"],
-        r["reregistered_n"] if r["scenario"] in ("F2", "F2p") else "0", r["victim_readyz_non200_s"] or "never", r["breaker_open_s"] or "never",
+        r["reregistered_n"] if r["scenario"] in ("F2", "F2p") else "0",
+        r["victim_readyz_non200_s"] or ("none to +%ss" % r["readyz_sampled_to_s"]), r["breaker_open_s"] or "never",
         nrw if r["scenario"] in ("F3", "F3x") else "-", tbw if r["scenario"] in ("F3", "F3x") else "-",
         (r["victim_readyz_200_s_after_undo"] or "-") + " / " + (r["all_routable_s_after_undo"] or "-")))
 pc = collections.OrderedDict()
