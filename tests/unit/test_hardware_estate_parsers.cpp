@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace est = yuzu::hardware::estate;
@@ -516,5 +517,10 @@ TEST_CASE("estate: guarded_rc contains anything an action throws and returns 1",
     CHECK(est::guarded_rc("t", []() -> int { throw std::runtime_error("boom"); }) == 1);
     CHECK(est::guarded_rc("t", []() -> int { throw std::bad_alloc(); }) == 1);
     CHECK(est::guarded_rc("t", []() -> int { throw 42; }) == 1); // non-standard exception type
-    static_assert(noexcept(est::guarded_rc("t", [] { return 0; })), "guarded_rc must be noexcept");
+    // Pin guarded_rc's own exception specification. The arguments are named objects so the operand
+    // is only the call: a string literal would add the string_view(const char*) conversion, which
+    // libc++ does not mark noexcept, and that made this assertion fail on Apple Clang.
+    const std::string_view action_name{"t"};
+    auto ok_fn = [] { return 0; };
+    static_assert(noexcept(est::guarded_rc(action_name, ok_fn)), "guarded_rc must be noexcept");
 }
