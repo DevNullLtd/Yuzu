@@ -282,7 +282,7 @@ inline constexpr std::array<UnitOsRow, 244> kUnitOs{{
     {"peripherals", "thunderbolt", kWin | kLin | kMac},
     {"pkg_inventory", "managers", kWin | kLin | kMac},
     {"pkg_inventory", "packages", kWin | kMac},
-    // store_packages: the Windows leg is `planned` (applicable); macOS is `unsupported`.
+    // store_packages: macOS is `unsupported` (installed_apps owns it).
     {"pkg_inventory", "store_packages", kWin | kLin},
     {"platform_security", "secure_boot", kWin | kLin},
     {"platform_security", "code_integrity", kWin | kLin | kMac},

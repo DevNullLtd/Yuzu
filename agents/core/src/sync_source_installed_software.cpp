@@ -385,6 +385,8 @@ std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
 AdaptedRows parse_pkg_inventory_packages_output(const std::string& out, ConstrainedPolicy policy) {
     // package|homebrew|<id>|<version>|<formula|cask>
     // package|chocolatey|<id>|<version or ->|pkg
+    // A row whose id carries an escaped `\|` splits wider than five tokens, fails the width
+    // check below and is dropped (a gap, never a shifted row); this adapter does not unescape.
     return adapt_pkg_inventory(out, kActionPackages,
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
@@ -419,7 +421,11 @@ AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out,
     // package|<snap|flatpak|appx>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<state>
     // Appx: <id> is the PackageFullName (Name_Version_Arch_ResourceId_PublisherId); the entry's
     // name is the Name part, its version and arch come from tok[3] / tok[6] (`-` = unknown),
-    // there is no release, and a `deprovisioned` row is seen but not mapped.
+    // there is no release, and a `deprovisioned` row is seen but not mapped. A degraded appx
+    // row whose registry key carries a '|' (an escaped `\|` on the wire; a parseable
+    // PackageFullName never does) splits to ten tokens, fails the `!= 9` check below and is
+    // dropped: a gap, never a shifted row. The split is not escape-aware because this adapter
+    // is shared with snap/flatpak and never unescapes (it would store `Weird\|Key` as a name).
     // ACTIVE rows only: an inactive or unknown revision is on disk but is not
     // installed software. A degraded active row (version `-`, kind `unknown`) is
     // still collected (honest-empty version), never a reason to skip the cycle.

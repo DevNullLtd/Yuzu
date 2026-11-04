@@ -344,6 +344,7 @@ struct FileRead {
 //       subkey names of AppxAllUserStore\<store_key>
 //   ValueRead read_reg_string(std::string_view store_key, std::string_view subkey,
 //                             std::string_view value) const;
+//       a REG_SZ value only (REG_EXPAND_SZ reads as `error`: no environment expansion is done)
 //   NameList list_dir(std::string_view path, std::size_t cap) const;
 //       the REAL (non-reparse) sub-DIRECTORY names of `path`, single level
 //   FileRead read_file(std::string_view path, std::size_t cap) const;
@@ -593,8 +594,7 @@ public:
             return out;
         }
         constexpr DWORD kMaxValueBytes = 64 * 1024;
-        if ((type != REG_SZ && type != REG_EXPAND_SZ) || size < sizeof(wchar_t) ||
-            size > kMaxValueBytes) {
+        if (type != REG_SZ || size < sizeof(wchar_t) || size > kMaxValueBytes) {
             out.status = OpStatus::error;
             return out;
         }
