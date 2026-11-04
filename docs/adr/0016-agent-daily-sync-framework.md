@@ -607,8 +607,9 @@ and the agent. A second `static_assert` keeps every row budget between the short
 and the clamp-bound row, and at or above the measured width recorded beside it (`row_floor`), so
 a budget cannot be cut below a width actually observed to dodge the 80% line.
 
-The `partition` and `topology` budgets are assumed widths: no captures exist yet, so they are
-re-measured when the storage legs land (`swap` has no capture either, its legs being planned, and
+The `partition` and `topology` budgets are assumed widths: no Linux or macOS captures exist yet
+(a Windows `partition` capture does: 76 to 85 wire bytes against the 95 floor, 2026-11-04), so they
+are re-measured when the storage legs land (`swap` has no capture either, its legs being planned, and
 its floor is its shortest possible row). `topology`'s cap is 96, not the 192 starting target,
 because 192 x 144 B would put the registry-derived total past the 80% line.
 
@@ -755,9 +756,10 @@ calls on handles opened without a deadline (`disk_actions_win.cpp`, "BOUNDING").
 on the thread the agent joins on reconnect and on shutdown, so one wedged drive would leave the
 endpoint unable to reconnect or to stop cleanly. Until those calls have a bound, the Windows writer
 does not run the action: the `volume` section is `unavailable` with `agent:windows_volumes_unbounded`
-and carries no rows. The operator-triggered `volumes` action is unchanged, and the Windows
-`partitions` and `topology` legs are status-only (`windows:planned`), so no other section is
-affected. The Windows volume rows return when the platform gap named in `disk_actions_win.cpp` (plugin OS
+and carries no rows. The operator-triggered `volumes` action is unchanged. The Windows
+`partitions` leg reads `Win32_DiskPartition` and `Win32_LogicalDiskToPartition`, and cross-checks the
+drive letters against `Win32_LogicalDisk`, through the bounded WMI helper (`agents/shared/wmi_bounded.hpp`, per-call deadlines), so it runs on the sync thread; only
+Windows `topology` is status-only (`windows:planned`). No other section is affected. The Windows volume rows return when the platform gap named in `disk_actions_win.cpp` (plugin OS
 calls have no deadline, #3925) is closed. The reason is expected on every Windows host and needs no
 operator action; the operator-triggered `volumes` action still works there.
 

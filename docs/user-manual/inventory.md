@@ -1298,6 +1298,9 @@ sync, defeating the hash-skip protocol.
   chassis (type, serial, asset tag), baseboard (vendor, product, serial) and a hashed
   machine-id, each with its source, plus typed per-device rows for CPUs, DIMMs, disks,
   swap, volumes, partitions and storage topology, each section with its own status.
+  Partitions are read on Windows only so far (Linux and macOS report `<os>:planned`, meaning
+  not read; storage topology is planned everywhere), and the stored sections are not yet
+  shown in the Hardware pages or API.
   `blob_version` says which format an agent last sent. A device whose agent is still on
   the original format has **no** section rows stored — read that as "not stored", not
   "the device has none". A section reported `constrained` with reason `server_cap:<n>`
