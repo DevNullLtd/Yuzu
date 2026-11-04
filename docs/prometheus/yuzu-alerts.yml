@@ -2932,7 +2932,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "POST /api/command's audit sink or a post-dispatch helper is throwing, not degrading cleanly"
+          summary: "A dispatch surface's audit sink, post-dispatch helper or dispatch call itself threw, not degrading cleanly"
           description: >-
             yuzu_server_dispatch_fanout_throw_total is non-zero on
             {{ $labels.route }} (phase={{ $labels.phase }}).
@@ -2946,12 +2946,41 @@ groups:
             specific post-dispatch helper in command_routes.cpp's guarded()
             wrapper that threw instead — e.g. phase=forward_gateway_pending
             means the gateway-forward step itself threw, not the audit sink;
-            check the named helper, not AuditStore, for that case. Either way
-            a well-behaved sink/helper should report failure via its own
-            return value, not an exception; a non-zero rate here points at a
-            bug in that specific sink/helper (e.g. an allocation failure
-            surfacing as bad_alloc, or a logic error) rather than at ordinary
-            store degradation. BE PRECISE ABOUT for: 2m (governance round 1, SRE-2):
+            check the named helper, not AuditStore, for that case. phase=dispatch
+            counts the dispatch call ITSELF throwing, on route=command_v1
+            (POST /api/v1/commands), route=instruction_execute
+            (POST /api/v1/instructions/{id}/execute) and route=mcp
+            (execute_instruction_definition). The execution row was left running,
+            NOT cancelled, because some agents may already hold the command.
+            Runbook for phase=dispatch: find the dispatch_exception failure audit
+            row (it names the execution_id and, when known, agents_sent, a lower
+            bound) and the server log line naming the exception; check that
+            execution's per-agent results (the error body carries it as
+            error.execution_id, error.data.execution_id on MCP). Four cases for
+            the row: (1) agents_sent is above 0 and its targeted count was stored,
+            so the answers of those agents complete it; (2) agents_sent is above 0
+            but the targeted count could NOT be stored
+            (yuzu_exec_tracker_bookkeeping_failed_total{op="set_agents_targeted"}),
+            and an agent HAS answered: the row stays running and will not close by
+            itself (the stuck sweep never closes a row an agent has answered), so
+            close it with cancel_execution (POST /api/v1/executions/{id}/cancel);
+            (3) no send was accepted, or none is known, and no agent has answered:
+            the row closes by itself, or close it with cancel_execution; (4)
+            agents_sent is above 0, its targeted count was NOT stored, and no agent
+            has answered YET: the stuck sweep can mark that row cancelled after
+            about 30 minutes although agents may still be running the command (a
+            swept row means no agent answered, not that none received it), so
+            check the devices before trusting a cancelled status. In every case
+            do NOT blindly re-run the command, because an agent may already be
+            running it. For the audit-sink and post-dispatch-helper phases
+            (success, denial, a named helper) a well-behaved sink/helper should
+            report failure via its own return value, not an exception, so a
+            non-zero rate there points at a bug in that specific sink/helper
+            (e.g. an allocation failure surfacing as bad_alloc, or a logic error)
+            rather than at ordinary store degradation; for phase=dispatch the
+            exception came from the dispatch call itself, so look at the
+            exception the server log names (a bad_alloc, a store or send-path
+            fault), not at a sink. BE PRECISE ABOUT for: 2m (governance round 1, SRE-2):
             it delays the page by two minutes, it does NOT require a
             sustained episode. increase()[15m] stays true for ~15 minutes
             after a single increment, so one throw still pages, two minutes
@@ -4463,8 +4492,11 @@ groups:
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
             behavioural routes. The audit-first admin writes (webhooks, offload targets,
-            directory sync, group mappings, MCP settings) 503 the same way. Upload-grant revoke
-            refuses on both REST (503) and MCP (retryable -32603), so a leaked grant stays
+            directory sync, group mappings, MCP settings) 503 the same way, and so do four
+            dashboard mutations (#3619): every console send (POST /api/dashboard/execute),
+            group-from-results, and the Echo retention-paused re-enable and purge, which send,
+            create or purge nothing while their "attempted" row cannot be stored. Upload-grant
+            revoke refuses on both REST (503) and MCP (retryable -32603), so a leaked grant stays
             redeemable until the outage ends or its TTL expires, whichever is first (#6169).
             Approval approve and reject (approval.approve, approval.reject) 503 with
             Sec-Audit-Failed when the "attempted" row fails; then the decision is not applied
@@ -5142,7 +5174,11 @@ groups:
             Postgres outage (self-heals via the next sync + weekly full-floor); if
             uncorrelated it is likely one or more devices whose payload the store
             keeps rejecting — grep the warn-level SoftwareInventoryStore logs for
-            the agent_id.
+            the agent_id. A blob-v3 call applies all of its sections in ONE
+            transaction, so any one failing statement (a statement timeout or a lost
+            connection under load, for example) answers error for every section of that
+            call that was not refused and rolls the whole call back; the next sync resends it. The warn line
+            to grep for names "v3 ingest ... failed".
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryHighNeedFullRatio
         expr: |
@@ -5162,11 +5198,69 @@ groups:
             one-time need_full by design, phase-spread across the daily sync window,
             self-healing; check release notes for a recent contract change before
             treating this as an incident. A sustained ratio with no such change
-            suggests hash drift or agents stuck in a resend cycle.
+            suggests hash drift or agents stuck in a resend cycle. Blob-v3 agents
+            add one more source of need_full until the server can apply deltas and
+            store component rows: every delta section and every full or delta
+            component_inventory section (even one with no records) is answered
+            need_full, so a fleet of v3 agents reporting deltas or the component
+            facet raises this ratio without any hash drift.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventorySectionIngestRefused
+        # Blob v3 (ADR-0016 Update 2026-11-04): a section the server refuses is nacked
+        # per section (`installed_software:<facet>`), and the other sections of the call
+        # still apply. outcome=rejected is a GRAMMAR refusal: the agent resends the same
+        # bytes and never self-heals, so it is its own alert; a refused section also counts
+        # toward YuzuInventoryHighNeedFullRatio (it is answered need_full), but that ratio
+        # alone cannot say that the cause is a grammar break. outcome=delta_unsupported is NOT here: it is the
+        # expected placeholder until the delta apply is built, so it has its own
+        # non-paging rule (YuzuInventorySectionDeltaUnsupported) below.
+        # increase over a day with NO hold (the YuzuCertInventoryReportsRejected shape): one
+        # refused section per sync cycle is enough, and a rate()-with-for would never fire for a
+        # low-cadence refusal. The series are pre-seeded at 0 (seed_section_ingest_series), so the
+        # first refusal is a real increase.
+        expr: |
+          sum by (facet) (increase(yuzu_inventory_section_ingest_total{outcome="rejected"}[1d])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software v3 sections being refused"
+          description: >-
+            yuzu_inventory_section_ingest_total{outcome="rejected"} increased in the
+            last day for the facet label. rejected = the section broke the blob v3
+            grammar (an unknown status, rows in a status-only section, a record whose
+            source is not the facet, a record holding a NUL byte or missing its
+            terminator, a cap) - it NEVER self-heals, the agent resends the same bytes
+            and the server keeps the facet's previously held rows and section hash (on a
+            device's first v3 call that applies a section its v2 rows are already replaced,
+            so there are none to keep), so fix the agent (grep the warn-level "v3 section(s) ... refused"
+            server log line for the agent_id and the refusal reason). facet="unknown"
+            is the exception: the server does not know the facet name, which is a
+            version-skew incident to fix by reprovisioning matching builds.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventorySectionDeltaUnsupported
+        # The expected honest placeholder until the delta apply is built (the agent falls
+        # back to a full section, nothing is lost). Info severity, so it never pages: it keeps
+        # the rate visible and is the reminder to retire this rule when the delta apply lands.
+        expr: |
+          sum by (facet) (rate(yuzu_inventory_section_ingest_total{outcome="delta_unsupported"}[15m])) > 0
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "Installed-software v3 deltas answered with a full-section request"
+          description: >-
+            yuzu_inventory_section_ingest_total{outcome="delta_unsupported"} has been
+            non-zero for 1h for the facet label. A delta section whose base matched was
+            answered need_full because this server cannot apply deltas yet; the agent
+            falls back to a full section. Expected while v3 agents ship ahead of the delta
+            apply, so no action is needed; it is a runbook item only if it persists once
+            the delta apply has shipped.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryDroppedBlobs
-        # outcome=dropped = a blob over the 3 MiB cap was rejected + nacked. UNLIKE
-        # outcome=error this NEVER self-heals: the agent resends the same over-cap
+        # outcome=dropped = a blob over the 3 MiB cap, or a blob-v3 blob that cannot be
+        # attributed to sections (a record before any section, no section after the header,
+        # an unusable S record, over 32 sections), was rejected + nacked. UNLIKE
+        # outcome=error this NEVER self-heals: the agent resends the same
         # payload and backs off forever (the agent's own cap should prevent reaching
         # here, so a non-zero rate signals agent/server cap drift after a version
         # skew, or a non-conforming agent). Deliberately a SEPARATE alert — folding
@@ -5181,14 +5275,15 @@ groups:
           summary: "Installed-software ingest dropping over-cap blobs"
           description: >-
             yuzu_inventory_ingest_total{outcome="dropped"} is non-zero: one or more
-            agents are sending an installed-software blob over the 3 MiB cap (the label
-            source says which; source="certificate_inventory" also counts an unknown
+            agents are sending an installed-software blob over the 3 MiB cap, or a blob-v3
+            blob the server cannot split into sections (the warn-level "unusable v3 ...
+            blob" line names the reason) (the label source says which; source="certificate_inventory" also counts an unknown
             major version or an unparseable header, which are NOT resent - see
             YuzuCertInventoryReportsRejected for those), which
             is dropped + nacked and will NOT self-heal (the agent resends the same
             payload). Likely an agent/server cap-constant drift after a version skew,
             or a non-conforming agent — check the agent version and the warn-level
-            "oversized ... blob" server logs for the agent_id.
+            "oversized ... blob" or "unusable v3 ... blob" server logs for the agent_id.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryReportRejected
         # outcome=rejected = a whole report carrying too many sources (content_hashes /
@@ -5728,10 +5823,12 @@ groups:
         # into le=15/20/30/45/60 rather than collapsing into +Inf — the
         # +Inf-minus-le=10 complement below is an honest count of full ingests over
         # 10s, and histogram_quantile over the tail now yields a real p99. Fires
-        # ahead of YuzuInventoryReadDegraded (sre).
+        # ahead of YuzuInventoryReadDegraded (sre). phase=v3 (a blob-v3 call: up to 32
+        # sections in one transaction on one connection) is the heaviest hold and is
+        # matched with phase=full, or it would be invisible to this rule.
         expr: |
-          sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase="full",le="+Inf"}[10m]))
-          - sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase="full",le="10"}[10m]))
+          sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase=~"full|v3",le="+Inf"}[10m]))
+          - sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase=~"full|v3",le="10"}[10m]))
           > 0.1
         for: 10m
         labels:
@@ -5739,9 +5836,11 @@ groups:
         annotations:
           summary: "Installed-software full-payload ingests exceeding 10s"
           description: >-
-            More than ~6/min full-payload inventory ingests are holding a Postgres
-            connection >10s — a leading indicator of pool saturation under a
-            need_full herd, ahead of read-path degradation. Correlate with
+            More than ~6/min full-payload inventory ingests (phase full, or v3 - a
+            blob-v3 call applies every section in one transaction on one connection,
+            the heaviest hold) are holding a Postgres connection >10s — a leading
+            indicator of pool saturation under a need_full herd, ahead of read-path
+            degradation. Correlate with
             yuzu_pg_pool_waiters and yuzu_pg_acquire_wait_seconds.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       # Recording rule (#1686): now that yuzu_inventory_ingest_duration_seconds
