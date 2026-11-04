@@ -5161,9 +5161,9 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
     //  - ordering during an allowance (at most N overtakes per H per lane);
     //  - the server's census ordering, #5690: if the older send is still waiting on
     //    stream_write_mu_ when the hold releases, the released entry can reach the wire first.
-    //    The server orders by the event's stamp (millisecond on the legacy path, nanosecond on this one), then by arrival, and flags a
-    //    pair whose arrival order disagrees with its stamp order (`order_uncertain`); it no
-    //    longer keeps the overtaking verdict silently;
+    //    The server orders by the event's stamp (millisecond on the legacy path, nanosecond on this
+    //    one), then by arrival, and flags a pair whose arrival order disagrees with its stamp order
+    //    (`order_uncertain`); it no longer keeps the overtaking verdict silently;
     //  - enqueued_ns is system_clock (stamped at the enqueue sites, wall = system_clock::now();
     //    replayed lifecycle entries keep the original persisted ns):
     //    a backward wall-clock step between an older compliant and a newer errored makes the

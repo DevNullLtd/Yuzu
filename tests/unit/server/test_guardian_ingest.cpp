@@ -750,7 +750,10 @@ TEST_CASE("guardian ingest: an event with an empty rule_id is refused and not st
     CHECK(store.event_count() == 0);
     CHECK(store.events_written_total() == 0);
     CHECK(cap.text().find("empty rule_id") != std::string::npos);
-    CHECK(metrics.counter(yuzu::server::detail::kGuardianEventsRejectedMetric, {{"reason", "empty_rule_id"}}).value() == 1);
+    CHECK(metrics
+              .counter(yuzu::server::detail::kGuardianEventsRejectedMetric,
+                       {{"reason", "empty_rule_id"}})
+              .value() == 1);
 
     // A well-formed rule id still goes in, so the refusal is the empty id, not the path.
     ingest_guardian_response(store, "agent-A", make_rule_event("evt-ok", "rule-1"), nullptr,
@@ -771,7 +774,8 @@ TEST_CASE("guardian ingest: the agent stamp and the receipt reach the stored ord
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
         const std::string sql =
             "SELECT proj_key || '|' || proj_key_capped FROM guaranteed_state_store."
-            "guaranteed_state_events WHERE event_id = '" + event_id + "'";
+            "guaranteed_state_events WHERE event_id = '" +
+            event_id + "'";
         pg::PgResult r{PQexec(conn.get(), sql.c_str())};
         REQUIRE(r.ok());
         return PQntuples(r.get()) == 1 ? std::string(PQgetvalue(r.get(), 0, 0)) : std::string{};

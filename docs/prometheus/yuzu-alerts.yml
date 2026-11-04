@@ -4202,7 +4202,8 @@ groups:
             device compliance score as authoritative while this fires (#4855).
             source="guardian_census" means the census pending-evidence count
             read (#5690) failed, which only freezes the
-            yuzu_server_guardian_census_pending_events gauge at its last value.
+            yuzu_server_guardian_census_pending_events gauge at its last value (or
+            leaves it absent before the first successful read).
             source="guardian_rules" means an AUTHORITATIVE rule/status read
             (get_rule/list_rules/agent_rule_statuses/rule_names/
             errored_rule_count) is degrading: the read itself returns a typed

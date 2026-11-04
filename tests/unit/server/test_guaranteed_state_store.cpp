@@ -3465,8 +3465,9 @@ TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state 
           "[pg][guaranteed_state_store][census]") {
     // guard.errored is the #2818 spark subscription-death detach lifecycle event. It
     // must set the per-(agent, rule) census state to "errored" exactly as
-    // guard.unhealthy does. The census is ordered by the (key, ingest_seq) tuple, with the agent stamp as the key (equal
-    // timestamps overwrite), so D4 characterises that existing tie behaviour.
+    // guard.unhealthy does. The census is ordered by the (key, ingest_seq) tuple, with the agent
+    // stamp as the key (equal timestamps overwrite), so D4 characterises that existing tie
+    // behaviour.
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store{pool, /*retention_days=*/30};
@@ -3505,7 +3506,8 @@ TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state 
         REQUIRE(store.insert_event(ev("d3b", "r1", "a1", "guard.errored", "2026-06-04T10:01:00Z")));
         CHECK(census()[{"a1", "r1"}] == "compliant");
     }
-    SECTION("D4: equal timestamps, distinct event ids: the later arrival wins (and the pair is flagged, #5690)") {
+    SECTION("D4: equal timestamps, distinct event ids: the later arrival wins (and the pair is "
+            "flagged, #5690)") {
         REQUIRE(store.insert_event(ev("d4a", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
         REQUIRE(store.insert_event(ev("d4b", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
         CHECK(census()[{"a1", "r1"}] == "errored");
@@ -3515,9 +3517,10 @@ TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state 
         CHECK(census()[{"a1", "r2"}] == "compliant");
     }
     SECTION("D5: an exact redelivery of the errored event never reaches the census write") {
-        // Equal timestamps (compliant arrives after errored, so it wins the same-key tie by arrival, and the pair is flagged, #5690): had the
-        // redelivery reached the upsert, the tie would flip the row to errored, so the final
-        // census assertion can observe a reached census write.
+        // Equal timestamps (compliant arrives after errored, so it wins the same-key tie by
+        // arrival, and the pair is flagged, #5690): had the redelivery reached the upsert, the tie
+        // would flip the row to errored, so the final census assertion can observe a reached census
+        // write.
         const auto errored = ev("d5x", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z");
         CHECK(store.insert_event_classified(errored).outcome == EventInsertOutcome::Inserted);
         REQUIRE(store.insert_event(ev("d5y", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));

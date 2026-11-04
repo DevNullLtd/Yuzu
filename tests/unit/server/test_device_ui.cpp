@@ -302,8 +302,9 @@ TEST_CASE("device live disk: usage-bar tones, low-free floor, clamp, unmeasured,
     }
 }
 
-TEST_CASE("device Guardian lens: the tile is never 'good' over an uncertain or pending guard (#5690)",
-          "[device][ui][ordering]") {
+TEST_CASE(
+    "device Guardian lens: the tile is never 'good' over an uncertain or pending guard (#5690)",
+    "[device][ui][ordering]") {
     DeviceGuardRow clean{"Defender RTP", "compliant", "2026-06-16T10:00:00Z"};
     DeviceGuardRow unc{"BitLocker", "compliant", "2026-06-16T10:00:00Z"};
     unc.order_uncertain = true;
@@ -319,7 +320,8 @@ TEST_CASE("device Guardian lens: the tile is never 'good' over an uncertain or p
         CHECK(bad.find("class=\"n warn\"") != std::string::npos);
         CHECK(bad.find("1 with uncertain ordering or an unreflected verdict") != std::string::npos);
         CHECK(bad.find("&middot; ordering uncertain") != std::string::npos); // the row marker
-        CHECK(bad.find("See the Guaranteed State guide, section 'When a verdict is flagged or does not move'.") != std::string::npos); // the row marker points at the runbook
+        CHECK(bad.find("See the Guaranteed State guide, section 'When a verdict is flagged or does "
+                       "not move'.") != std::string::npos); // the row marker points at the runbook
     }
     CHECK(good.find("ordering uncertain") == std::string::npos);
 }

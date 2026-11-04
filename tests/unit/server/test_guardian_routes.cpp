@@ -2439,7 +2439,18 @@ TEST_CASE("every compliance figure shows an uncertain pair beside it (#5690)",
     h.seed_status("a2", "lin-1", "svc1", "drift.detected", "2026-09-01T09:00:00Z");
     h.seed_status("b1", "lin-2", "svc1", "guard.compliant", "2026-09-01T10:00:00Z");
     const std::string phrase = "1 pair with uncertain ordering or an unreflected verdict";
-    const std::string pointer = "See the Guaranteed State guide, section 'When a verdict is flagged or does not move'.";
+    const std::string pointer =
+        "See the Guaranteed State guide, section 'When a verdict is flagged or does not move'.";
+
+    // The pointer sits inside the note that starts at `note_start`, before that note's closing div.
+    auto note_ends_with_pointer = [&](const std::string& body, const std::string& note_start) {
+        const auto start = body.find(note_start);
+        if (start == std::string::npos)
+            return false;
+        const auto close = body.find("</div>", start);
+        const auto at = body.find(pointer, start);
+        return close != std::string::npos && at != std::string::npos && at < close;
+    };
 
     auto count_of = [&](const std::string& body) {
         std::size_t count = 0;
@@ -2474,6 +2485,7 @@ TEST_CASE("every compliance figure shows an uncertain pair beside it (#5690)",
              pos = res->body.find(pointer, pos + 1))
             ++pointers;
         CHECK(pointers == 2);
+        CHECK(note_ends_with_pointer(res->body, phrase + ": each device is counted"));
     }
     SECTION("the baseline page: a note under the hero and a count on the guard row") {
         auto res = h.sink.Get("/fragments/guardian/baseline/bl1/page");
@@ -2481,5 +2493,6 @@ TEST_CASE("every compliance figure shows an uncertain pair beside it (#5690)",
         CHECK(res->body.find(phrase + ": the figures above") != std::string::npos);
         CHECK(res->body.find("1 uncertain") != std::string::npos);
         CHECK(res->body.find(pointer) != std::string::npos);
+        CHECK(note_ends_with_pointer(res->body, phrase + ": the figures above"));
     }
 }

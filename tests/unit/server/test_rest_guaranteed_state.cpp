@@ -6066,10 +6066,12 @@ TEST_CASE("REST guaranteed-state: order_uncertain and projection_pending on the 
         REQUIRE(r.ok());
     }
     h.seed_status("a1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
-    h.seed_status("a2", "WS-1", "r1", "drift.detected", "2026-06-20T10:00:00Z"); // older key, later arrival
+    h.seed_status("a2", "WS-1", "r1", "drift.detected",
+                  "2026-06-20T10:00:00Z"); // older key, later arrival
     h.seed_status("b1", "WS-1", "r2", "guard.compliant", "2026-06-20T10:01:00Z");
     h.seed_status("b2", "WS-2", "r2", "guard.compliant", "2026-06-20T10:01:00Z");
-    h.seed_status("b3", "WS-2", "r2", "drift.detected", "2026-06-20T10:02:00Z"); // projection fails: pending
+    h.seed_status("b3", "WS-2", "r2", "drift.detected",
+                  "2026-06-20T10:02:00Z"); // projection fails: pending
     h.seed_status("c1", "WS-1", "r3", "guard.compliant", "2026-06-20T10:01:00Z");
 
     const auto get = [&](const std::string& path, bool with_headers) {
@@ -6103,14 +6105,19 @@ TEST_CASE("REST guaranteed-state: order_uncertain and projection_pending on the 
     // The notes say what uncertain_rules counts (reverting the wording must turn this red).
     CHECK(fleet["data"]["note"].get<std::string>().find("uncertain_rules counts live rules") !=
           std::string::npos);
-    CHECK(get("/api/v1/guaranteed-state/status/WS-1", false)["data"]["note"]
-              .get<std::string>()
-              .find("uncertain_rules counts this device's rules") != std::string::npos);
-    CHECK(get("/api/v1/guaranteed-state/status/WS-1", false)["data"]["uncertain_rules"].get<int>() == 1);
-    CHECK(get("/api/v1/guaranteed-state/status/WS-2", false)["data"]["uncertain_rules"].get<int>() == 1);
+    CHECK(
+        get("/api/v1/guaranteed-state/status/WS-1", false)["data"]["note"].get<std::string>().find(
+            "uncertain_rules counts this device's rules") != std::string::npos);
+    CHECK(
+        get("/api/v1/guaranteed-state/status/WS-1", false)["data"]["uncertain_rules"].get<int>() ==
+        1);
+    CHECK(
+        get("/api/v1/guaranteed-state/status/WS-2", false)["data"]["uncertain_rules"].get<int>() ==
+        1);
 
-    CHECK(get("/api/v1/guaranteed-state/agents/WS-2/rules", false)["data"]["guards"][0]
-              ["projection_pending"].get<bool>());
+    CHECK(get("/api/v1/guaranteed-state/agents/WS-2/rules",
+              false)["data"]["guards"][0]["projection_pending"]
+              .get<bool>());
     int uncertain_guards = 0;
     for (const auto& g : get("/api/v1/guaranteed-state/agents/WS-1/rules", false)["data"]["guards"])
         if (g["order_uncertain"].get<bool>())

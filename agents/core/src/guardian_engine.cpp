@@ -3106,15 +3106,15 @@ void GuardianEngine::emit_guard_event(
     // its remediation within one second such a pair. Both sources are FLOORED to milliseconds so a
     // gap-repair stamp (`timestamp_override`) and a live event are on one scale, and so the
     // conversion goes from a finer unit to a coarser one and cannot overflow.
-    const std::int64_t stamp_ms =
-        timestamp_override.has_value()
-            ? std::chrono::duration_cast<std::chrono::milliseconds>(
-                  timestamp_override->time_since_epoch())
-                  .count()
-            : static_cast<std::int64_t>(now_ms);
+    const std::int64_t stamp_ms = timestamp_override.has_value()
+                                      ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            timestamp_override->time_since_epoch())
+                                            .count()
+                                      : static_cast<std::int64_t>(now_ms);
     std::int64_t stamp_secs = stamp_ms / 1000;
     std::int64_t stamp_sub_ms = stamp_ms % 1000;
-    if (stamp_sub_ms < 0) { // C++ division truncates toward zero; correct to a floor so nanos is in [0, 1e9)
+    if (stamp_sub_ms <
+        0) { // C++ division truncates toward zero; correct to a floor so nanos is in [0, 1e9)
         stamp_sub_ms += 1000;
         --stamp_secs;
     }

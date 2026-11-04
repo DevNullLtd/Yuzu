@@ -29,9 +29,9 @@
  * event is delivered in admission order or counted as lost; two events for the
  * SAME rule_id never collapse into one slot (drift.detected, drift.remediated,
  * remediation.failed, guard.compliant, guard.unhealthy are all distinct census
- * signals - the server orders events with an identical stamp by ARRIVAL order (and flags the pair), so reordering
- * is a correctness bug, not just a cardinality change). Bounded by BOTH
- * `max_events` and `max_bytes` (Event::ByteSizeLong(), computed once at offer()).
+ * signals - the server orders events with an identical stamp by ARRIVAL order (and flags the pair),
+ * so reordering is a correctness bug, not just a cardinality change). Bounded by BOTH `max_events`
+ * and `max_bytes` (Event::ByteSizeLong(), computed once at offer()).
  *
  * LOSS ACCOUNTING AND THE STICKY INTEGRITY GAP. Every event this executor admitted
  * or was offered but the server will not receive is a *loss* except the two

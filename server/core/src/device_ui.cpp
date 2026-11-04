@@ -1040,7 +1040,8 @@ std::string render_device_guardian_lens(const std::string& agent_id,
     for (const auto& g : guards)
         h += "<tr><td class=\"name\">" + esc(g.name) + "</td><td>" + guard_state_badge(g.state) +
              (g.order_uncertain || g.projection_pending
-                  ? " <span class=\"gp-mute\" title=\"The ordering of this verdict cannot be proven, "
+                  ? " <span class=\"gp-mute\" title=\"The ordering of this verdict cannot be "
+                    "proven, "
                     "or a retained event is not yet reflected. " +
                         std::string(kUncertainRunbookPointer) +
                         "\">&middot; ordering uncertain</span>"

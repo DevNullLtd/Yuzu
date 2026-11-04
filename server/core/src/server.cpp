@@ -4028,19 +4028,20 @@ public:
                           "model row is lost. >0 means /dex is under-counting - investigate "
                           "(commonly a stale-schema dev DB; see docs/user-manual/dex.md).",
                           "counter");
-        metrics_.describe("yuzu_server_guardian_census_proj_failures_total",
-                          "Compliance-census (guardian_agent_rule_status) writes that failed "
-                          "for a reason other than the rule not existing. The failure does not "
-                          "discard the source event: it stays stored with pending census "
-                          "evidence (except for source batch), and the pair keeps its previous state "
-                          "until a redelivery of that event repairs it or a later event for the pair arrives. A "
-                          "repair that fails is counted here again. >0 means the census may be "
-                          "stale; the server log line 'census upsert failed' names the agent "
-                          "and rule. A write refused because the rule is not defined on this "
-                          "server (the census foreign key, SQLSTATE 23503) is a normal "
-                          "outcome and is not counted; a failure to retire the evidence of "
-                          "such an event is an ingest error.",
-                          "counter");
+        metrics_.describe(
+            "yuzu_server_guardian_census_proj_failures_total",
+            "Compliance-census (guardian_agent_rule_status) writes that failed "
+            "for a reason other than the rule not existing. The failure does not "
+            "discard the source event: it stays stored with pending census "
+            "evidence (except for source batch), and the pair keeps its previous state "
+            "until a redelivery of that event repairs it or a later event for the pair arrives. A "
+            "repair that fails is counted here again. >0 means the census may be "
+            "stale; the server log line 'census upsert failed' names the agent "
+            "and rule. A write refused because the rule is not defined on this "
+            "server (the census foreign key, SQLSTATE 23503) is a normal "
+            "outcome and is not counted; a failure to retire the evidence of "
+            "such an event is an ingest error.",
+            "counter");
         metrics_.describe("yuzu_server_guardian_census_projection_total",
                           "Compliance-census projections by source (first_delivery, repair, "
                           "batch) and outcome (applied, refused_flagged, refused_noop, "
