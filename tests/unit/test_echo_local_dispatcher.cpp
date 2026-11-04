@@ -982,8 +982,13 @@ TEST_CASE("echo plugin: status counts each source's finest tier and query and ex
         // A source with nothing folded reports 0 / 0, and the plain baseline table has its own key.
         CHECK(plugin_status_value(d, desc, "config|tcp_rows") == std::optional<std::string>{"0"});
         CHECK(plugin_status_value(d, desc, "config|tcp_oldest_ts") == std::optional<std::string>{"0"});
-        CHECK(plugin_status_value(d, desc, "config|netqual_boot_rows") ==
-              std::optional<std::string>{"0"});
+        // The per-boot netqual baseline lives in a plain table: the key is always reported, but
+        // whether the collector has already written a row is up to the OS (Windows may have), so
+        // only its presence and form are pinned.
+        const auto boot_rows = plugin_status_value(d, desc, "config|netqual_boot_rows");
+        REQUIRE(boot_rows.has_value());
+        CHECK(!boot_rows->empty());
+        CHECK(boot_rows->find_first_not_of("0123456789") == std::string::npos);
     }
 
     SECTION("query: one line per hour bucket, shaped like the old event rows") {
