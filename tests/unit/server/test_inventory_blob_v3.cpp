@@ -365,6 +365,10 @@ TEST_CASE("v3 caps: sections, rows and blob bytes", "[server][inventory_blob_v3]
         REQUIRE(r.sections.size() == 2);
         CHECK(r.sections[0].refusal == V3Refusal::kUnknownRecord);
         CHECK(r.sections[0].rows.empty());
+        // The storage is released, not just emptied.
+        CHECK(r.sections[0].rows.capacity() == 0);
+        CHECK(r.sections[0].deletions.capacity() == 0);
+        CHECK(r.sections[0].components.capacity() == 0);
         CHECK(r.sections[1].refusal == V3Refusal::kNone);
         CHECK(r.sections[1].rows.size() == 1);
     }

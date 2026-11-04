@@ -309,9 +309,11 @@ namespace v3_detail {
 
 inline void refuse(V3Section& sec, V3Refusal why) {
     sec.refusal = why;
-    sec.rows.clear();
-    sec.deletions.clear();
-    sec.components.clear();
+    // Swap, not clear(): release the capacity too, so a refused section's buffers do not
+    // outlive the refusal (the call-wide counters were already given back by refuse_sec).
+    decltype(sec.rows)().swap(sec.rows);
+    decltype(sec.deletions)().swap(sec.deletions);
+    decltype(sec.components)().swap(sec.components);
 }
 
 } // namespace v3_detail
