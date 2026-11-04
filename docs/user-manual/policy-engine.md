@@ -151,6 +151,59 @@ Policies can be scoped to specific management groups. When a policy is bound
 to a group, only agents that are members of that group (or its descendant
 groups) are subject to the policy's compliance checks.
 
+`managementGroups` takes management group **ids** (the 12-character id the
+server assigns, e.g. `abc123def456`), not display names: a name matches no
+group, so the policy would target nothing. An entry that cannot be a group id
+(it holds a space or other punctuation outside letters, digits and `_ . : * -`)
+is refused with `400` (#2123; malformed lists are covered below). A non-empty `managementGroups` list replaces the
+policy's `scope` for targeting.
+
+### YAML line endings, comments and lists
+
+Policy and fragment YAML is read by the server's own line scanner (#2123):
+
+- **Line endings:** LF, CRLF (Windows) and a lone CR are all line breaks, so a
+  file authored on Windows reads exactly like its LF copy.
+- **Comments and blank lines** may appear anywhere inside a block, at any
+  indent; they never end the block.
+- **Inline lists** (`tags: [prod, pci]`) must open and close on the **same
+  line**. For several lines use a block list of `- item` lines.
+- **Block lists:** keep every `- item` line at the same indent. A `- item` line
+  out of line with the others, or an item continued on the next line, makes
+  the list unreadable as written, and the policy is refused with `400` rather
+  than stored with a different scope. The same applies when a list is followed
+  directly by another list's next item: end the list with another key first.
+  A line missing its `- `,
+  an empty-string item (`- ""`), and a `- item` line indented to
+  `selector:`'s own column, are refused the same way.
+- A single value where a list is expected (`tags: prod`,
+  `managementGroups: abc123def456`) is refused: write `tags: [prod]` or a
+  `- prod` line. `tags: null` (or `~`) on its own means no tags; followed by
+  `- item` lines, as with a value or an inline list followed by them, it is
+  refused.
+- A key is read only as the **first word on its line**: `scope:` inside a
+  one-line value (`description: "see scope: x"`) or a comment is not the
+  policy's scope. A line inside a multi-line `description: |` block can
+  still be read as a key (see below).
+- **Not yet refused** (tracked on #2123), so avoid them: a list line indented
+  at or shallower than `scope:` itself, a `- item` written after another key
+  (such as `platform:` under `selector:`, or any key after
+  `managementGroups:`), tab characters in indentation, a `scope:` or
+  `managementGroups:` line inside a multi-line `description: |` block, a
+  null list item (a bare `- `, `tags: [,]`, or the empty entry in `[a,,b]`),
+  a quoted key (`"tags":`) or a space before the colon (`tags :`), neither
+  of which is read as the key, a block-scalar value (`platform: >`), a
+  duplicate key (the server reads the first, a YAML parser the last), a
+  flow-mapped selector (`selector: {tags: [prod]}`), and a compact
+  `triggers:` list. Each can still drop or replace an entry without an
+  error, leaving the policy targeting a broader, narrower or different
+  device set than its YAML says. A lone CR is also a line break to the
+  server, but terminals and diffs render it as nothing, so a key after one
+  is read without showing on its own line. Keep a list's `- item` lines
+  together, directly under their key, write keys unquoted with the colon
+  straight after the name, each key once, in block style, indent with spaces
+  only, and keep those key names out of multi-line descriptions.
+
 ### Example Policy YAML
 
 ```yaml
@@ -166,7 +219,8 @@ spec:
     - type: interval
       interval_seconds: 300
   managementGroups:
-    - eu-production-servers
+    # the eu-production-servers group's id (ids, not names)
+    - 3f9c2a7b1e04
   inputs:
     severity_threshold: "high"
 ```
@@ -567,7 +621,7 @@ spec:
     - type: <interval|file_change|service_status|event_log|registry|startup>
       interval_seconds: <seconds>
   managementGroups:
-    - <group-name-or-id>
+    - <group-id>
   inputs:
     <key>: <value>
 ```
