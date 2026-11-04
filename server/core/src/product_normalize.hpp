@@ -63,13 +63,20 @@ struct NormalizedTitle {
 /// Total over arbitrary bytes; never throws.
 NormalizedTitle normalize_title(std::string_view raw);
 
+/// The origin-label prefix the agent writes into `publisher` when a source declares no vendor
+/// (`via:<ecosystem>`, ADR-0016 update 2026-11-04). It names where a row came from, never who
+/// made it. MUST equal the agent's kOriginLabelPrefix (sync_source_installed_software.cpp).
+inline constexpr std::string_view kOriginLabelPrefix = "via:";
+
 /// Normalise a raw vendor/publisher name deterministically: ASCII lowercase,
 /// commas/semicolons trimmed from token edges, legal-suffix tokens stripped
 /// (inc, inc., incorporated, corp, corp., corporation, ltd, ltd., llc, gmbh,
 /// s.a., co., company, technologies, software, systems, foundation),
 /// whitespace collapsed, then a tiny built-in alias table (Microsoft, Adobe,
 /// Oracle, JetBrains, VMware forms) maps well-known variants onto one
-/// canonical vendor. Total over arbitrary bytes; never throws.
+/// canonical vendor. A RAW value starting with kOriginLabelPrefix (case-sensitive, exact: the
+/// agent emits it lowercase, so a Windows Publisher of "VIA:..." is a vendor) is an origin label,
+/// not a vendor, and normalises to "". Total over arbitrary bytes; never throws.
 std::string normalize_vendor(std::string_view raw);
 
 /// Deterministic canonical product key — the `products.norm_key` UNIQUE

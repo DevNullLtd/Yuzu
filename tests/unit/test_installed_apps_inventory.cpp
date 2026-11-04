@@ -229,7 +229,7 @@ TEST_CASE("parse_rpm_inv_line maps (none) and pins signature values (matches PR 
           "[installed_apps][inventory]") {
     SECTION("fully populated, payload+header both signed") {
         const auto r = parse_rpm_inv_line(
-            "bash\t0\t5.2.21\t3.fc40\tx86_64\tFedora Project\tMon 01 Jan 2026\tsigpgpblob\trsahdrblob");
+            "bash\t0\t5.2.21\t3.fc40\tx86_64\tFedora Project\tMon 01 Jan 2026\tsigpgpblob\trsahdrblob\tFedora Project");
         REQUIRE(r.has_value());
         CHECK(r->name == "bash");
         CHECK(r->epoch == "0");
@@ -244,40 +244,61 @@ TEST_CASE("parse_rpm_inv_line maps (none) and pins signature values (matches PR 
     }
     SECTION("header-signed only (SIGPGP (none)) still reads signed -- the modern RHEL/Fedora case") {
         const auto r = parse_rpm_inv_line(
-            "openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\t(none)\trsahdrblob");
+            "openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\t(none)\trsahdrblob\tFedora Project");
         REQUIRE(r.has_value());
         CHECK(r->signature_status == "signed");
     }
     SECTION("payload-signed only (RSAHEADER (none)) still reads signed") {
         const auto r =
-            parse_rpm_inv_line("openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\tsigpgpblob\t(none)");
+            parse_rpm_inv_line("openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\tsigpgpblob\t(none)\tFedora Project");
         REQUIRE(r.has_value());
         CHECK(r->signature_status == "signed");
     }
     SECTION("both tags absent reads unsigned") {
         const auto r =
-            parse_rpm_inv_line("openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\t(none)\t(none)");
+            parse_rpm_inv_line("openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\t(none)\t(none)\tFedora Project");
         REQUIRE(r.has_value());
         CHECK(r->signature_status == "unsigned");
     }
     SECTION("old-rpm literal %{...} echo on both tags reads unsigned, never a false positive") {
         const auto r = parse_rpm_inv_line(
-            "openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\t%{SIGPGP}\t%{RSAHEADER}");
+            "openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\t%{SIGPGP}\t%{RSAHEADER}\tFedora Project");
         REQUIRE(r.has_value());
         CHECK(r->signature_status == "unsigned");
     }
     SECTION("(none) epoch/arch/packager map to honest-empty") {
         const auto r = parse_rpm_inv_line(
-            "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\t(none)\tTue 02 Jan 2026\t(none)\t(none)");
+            "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\t(none)\tTue 02 Jan 2026\t(none)\t(none)\t(none)");
         REQUIRE(r.has_value());
         CHECK(r->epoch.empty());
         CHECK(r->arch.empty());
         CHECK(r->publisher.empty());
         CHECK(r->signature_status == "unsigned");
     }
+    SECTION("publisher is the declared VENDOR; PACKAGER (a person) only when VENDOR is unset") {
+        // Shape of a Rocky Linux 9 row (rpm 4.16): PACKAGER is the build system's address, VENDOR the org.
+        const auto rocky = parse_rpm_inv_line(
+            "libgcc\t(none)\t11.4.1\t2.1.el9\taarch64\tRocky Linux Build System (Peridot) "
+            "<releng@rockylinux.org>\tSun Nov 19 22:25:36 2023\t(none)\t89024a04\t"
+            "Rocky Enterprise Software Foundation");
+        REQUIRE(rocky.has_value());
+        CHECK(rocky->publisher == "Rocky Enterprise Software Foundation");
+        // VENDOR (none), PACKAGER set: the fallback keeps the packager rather than going empty.
+        const auto fallback = parse_rpm_inv_line(
+            "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\tFedora (43) Signing\td\t(none)\t(none)\t(none)");
+        REQUIRE(fallback.has_value());
+        CHECK(fallback->publisher == "Fedora (43) Signing");
+        // both unset: empty, the agent core labels it via:rpm
+        const auto none = parse_rpm_inv_line("p\t0\t1\t1\tnoarch\t(none)\td\t(none)\t(none)\t(none)");
+        REQUIRE(none.has_value());
+        CHECK(none->publisher.empty());
+    }
     SECTION("wrong token count is dropped") {
         CHECK_FALSE(parse_rpm_inv_line("bash\t0\t5.2.21").has_value());
         CHECK_FALSE(parse_rpm_inv_line("p\t0\t1\t1\tnoarch\tX\td\tonly-eight-tokens").has_value());
+        // the nine-token row of an agent that predates the VENDOR column is a different shape: dropped
+        CHECK_FALSE(parse_rpm_inv_line("p\t0\t1\t1\tnoarch\tX\td\t(none)\t(none)").has_value());
+        CHECK_FALSE(parse_rpm_inv_line("p\t0\t1\t1\tnoarch\tX\td\t(none)\t(none)\tV\textra").has_value());
     }
 }
 

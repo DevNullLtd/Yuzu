@@ -96,10 +96,25 @@ cadences.
   | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — |
   | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — |
   | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — | ✓ (`IBM`) |
+  | `publisher` | VENDOR, else PACKAGER, else `via:rpm` | Maintainer, else `via:deb` | `via:apk` | `via:pacman` | Publisher, else `via:windows` | signing leaf CN, else `via:macos` | `via:macos_pkgutil` | `via:brew` | `via:brew` | `Microsoft` | `via:snap` | `via:flatpak` | `Publisher`, else `via:msi` | the interpreter's vendor, else `via:python` | `IBM` |
   | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — |
   | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — |
   | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — |
+
+  **`publisher` is never empty.** It is the vendor the source itself declares; when a
+  source declares none, it is the label `via:<ecosystem>` (`via:brew`, `via:snap`,
+  `via:deb` and so on), which names where the row came from, not who made the software.
+  A label is a fixed, lower-case, exact `via:` prefix: Homebrew, Snap and Flatpak are read
+  without starting a process, so they carry no vendor and always read `via:brew`,
+  `via:snap` and `via:flatpak`; `pacman` and `apk` have no vendor field in their package
+  list; a macOS installer receipt id is an identifier, not a vendor. The catalogue treats a
+  label as no vendor: it does not count towards the publisher total, never wins as a
+  title's representative publisher over a declared one, and does not take part in title
+  matching (a title from `via:snap` matches the same title with no publisher). The
+  `publisher` filter and search still match the literal text, so searching `via:` lists
+  every labelled row. The rpm vendor is read from the package's `VENDOR` tag; the
+  `PACKAGER` tag, which is usually a person or a build-system address, is kept only when a
+  package has no vendor.
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -108,8 +123,8 @@ cadences.
   packages (they are installed). Machine-scope Homebrew
   is collected through `pkg_inventory` with `ecosystem` `brew`: each formula is
   `kind` `pkg`, each cask `kind` `app` (`source` `pkg_inventory.packages`), plus
-  one `kind` `app` row named `homebrew` with `source` `pkg_inventory.managers`
-  that records Homebrew itself is present — one row however many prefixes
+  one `kind` `app` row named `homebrew` (`publisher` `Homebrew`) with `source`
+  `pkg_inventory.managers` that records Homebrew itself is present — one row however many prefixes
   exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). Per-user
   Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew is
   mapped from `managers` today: the Linux manager rows (dpkg, apt, rpm, dnf,
@@ -135,7 +150,7 @@ cadences.
   not. For these rows `version` carries the DISM feature state verbatim
   (`enabled`, `disabled`, `pending_enable`, `pending_disable`, `superseded`,
   `partially_installed`, `unknown`) because a feature has no version of its own;
-  `publisher` is empty. A host with a disabled feature therefore still lists
+  `publisher` is the constant `Microsoft` (DISM features are Windows components). A host with a disabled feature therefore still lists
   it, so the `/software` catalogue count (grouped by name) counts a host with a
   DISABLED feature as having it — read `version` to tell them apart.
 
@@ -159,7 +174,8 @@ cadences.
 
   **Python interpreters** are collected through `runtimes` `python` (all three OSes;
   `source` `runtimes.python`) as one `app` row per interpreter, `name` `Python`,
-  `ecosystem` `python`, `version` the interpreter version; publisher and the other
+  `ecosystem` `python`, `version` the interpreter version, `publisher` the vendor the
+  interpreter's install metadata declares (`via:python` when it declares none); the other
   package fields are empty. No process is started: each OS answers from install
   metadata. Windows reads the PEP 514 `HKLM\SOFTWARE\Python\PythonCore` keys in both
   registry views (python.org installs; per-user installs and other PEP 514

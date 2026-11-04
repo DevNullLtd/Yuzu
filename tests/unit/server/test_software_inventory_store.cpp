@@ -2194,6 +2194,30 @@ TEST_CASE("refresh_catalog_rollup rebuilds title_triples with exact distinct tri
     CHECK(count_rows(pool, "title_triples") == 3);
 }
 
+TEST_CASE("catalogue rollup: origin labels are not publishers and never beat a declared vendor",
+          "[pg][software_inventory][vendor]") {
+    SWINV_SHARED(store, pool);
+    // wget: one device with a declared vendor, one with only a label (the label sorts AFTER an
+    // upper-case vendor, so a plain max(publisher) would pick it). curl: label only.
+    put(store, "v1", Rows{ent("wget", "1.24", "GNU Project", "pkg", "deb", kSrcApps)});
+    put(store, "v2", Rows{ent("wget", "1.24", "via:brew", "pkg", "brew", kSrcPkg),
+                          ent("curl", "8.0", "via:brew", "pkg", "brew", kSrcPkg)});
+    REQUIRE(store.refresh_catalog_rollup());
+
+    // total_publishers counts declared vendors only.
+    const auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->total_publishers == 1);
+
+    const auto cat = store.software_catalog({});
+    REQUIRE(cat.has_value());
+    std::map<std::string, std::string> pub;
+    for (const auto& r : *cat)
+        pub[r.name] = r.publisher;
+    CHECK(pub["wget"] == "GNU Project"); // the declared vendor wins
+    CHECK(pub["curl"] == "via:brew");    // no vendor anywhere: the label is shown
+}
+
 TEST_CASE("refresh_catalog_rollup leaves an over-wide triple out of title_triples and still succeeds",
           "[pg][software_inventory]") {
     SWINV_SHARED(store, pool);
@@ -4578,6 +4602,32 @@ TEST_CASE("canonical_section_hash is order and duplicate independent, 16 slots a
     SoftwareEntry derived = a;
     SoftwareInventoryStore::derive_install_keys(derived);
     CHECK(SoftwareInventoryStore::canonical_section_hash({derived}) == base);
+}
+
+TEST_CASE("canonical_section_hash pins a row whose publisher is an origin label (via:brew)",
+          "[software_inventory][v3][hash][vendor]") {
+    // The agent writes `via:<ecosystem>` into slot 3 when a source declares no vendor; the server
+    // hashes it like any other publisher (no special case on the hash path). Recipe:
+    //   printf 'wget\0371.24\037via:brew\037\037pkg\037brew\037\037\037\037\037\037\037\037\037\037pkg_inventory.packages\036' | shasum -a 256
+    SoftwareEntry e;
+    e.name = "wget";
+    e.version = "1.24";
+    e.publisher = "via:brew";
+    e.kind = "pkg";
+    e.ecosystem = "brew";
+    e.source = kV3Pkgs;
+    CHECK(SoftwareInventoryStore::canonical_section_hash({e}) ==
+          "906ce129e4448180dcee1d554df55367a898b40e73551cf9dbfaa73d26d0c69f");
+    // ...and the label is in the hash: the same row with the slot empty hashes differently.
+    SoftwareEntry bare = e;
+    bare.publisher.clear();
+    CHECK(SoftwareInventoryStore::canonical_section_hash({bare}) !=
+          SoftwareInventoryStore::canonical_section_hash({e}));
+    // The identity key ignores the label: a labelled row keys like a vendorless one.
+    SoftwareEntry labelled = e;
+    SoftwareInventoryStore::derive_install_keys(labelled);
+    SoftwareInventoryStore::derive_install_keys(bare);
+    CHECK(labelled.identity_key == bare.identity_key);
 }
 
 TEST_CASE("v3_report_hash sorts by facet in byte order, carries the v3: prefix, pinned",

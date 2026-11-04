@@ -461,11 +461,12 @@ InvCollection get_inventory_linux() {
         // unsigned is computed in C++ by parse_rpm_inv_line/rpm_sig_present —
         // matches vuln_scan's vuln_identity.hpp (PR #1804) exactly, so the two
         // collectors agree on this field for the same rpm. Never a live
-        // `rpm -K` verification. PACKAGER per the v2 spec (`list` keeps VENDOR
-        // for its stable operator contract).
+        // `rpm -K` verification. The publisher is the declared VENDOR, falling
+        // back to PACKAGER (a person, kept only when VENDOR is unset); both ride in
+        // the row, `list` is untouched.
         collect({path, "-qa", "--queryformat",
                 "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{PACKAGER}\t"
-                "%{INSTALLTIME:date}\t%{SIGPGP}\t%{RSAHEADER}\n"},
+                "%{INSTALLTIME:date}\t%{SIGPGP}\t%{RSAHEADER}\t%{VENDOR}\n"},
                 inv::parse_rpm_inv_line);
     } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/pacman", "/bin/pacman", "/usr/local/bin/pacman"});
               !path.empty()) {

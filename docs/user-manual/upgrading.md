@@ -2,6 +2,14 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: installed-software `publisher` is never empty (`via:` origin labels)
+
+- **What changed:** every installed-software row an upgraded agent sends carries a `publisher`. It is the vendor the source declares (rpm `VENDOR`, falling back to `PACKAGER`; deb `Maintainer`; Windows `Publisher`; the macOS signing certificate; `Microsoft` for Windows optional features; `Homebrew` for the Homebrew presence row; the vendor column of a Python interpreter; `IBM` for IBM MQ) or, when the source declares none, the origin label `via:<ecosystem>` (`via:brew`, `via:snap`, `via:flatpak`, `via:pacman`, `via:apk`, `via:macos_pkgutil` and so on). Before this change those rows sent an empty publisher.
+- **One full resend per device:** the publisher is part of the inventory hash, so the first report after the agent upgrade differs from the hash the server stored and each device sends its complete inventory once (the weekly floor is the backstop for a device that misses it). Expect one burst of full reports as a fleet upgrades; steady-state traffic is unchanged afterwards.
+- **What the server does with a label:** it treats a `via:` publisher as no vendor. The catalogue's publisher total excludes labels, a title's representative publisher prefers a declared vendor, and title matching ignores the label. The match is exact and case-sensitive on the lower-case prefix the agent writes, so a real publisher that happens to start with `VIA:` is still a vendor.
+- **Title dimension:** the software title dimension and curation queue are keyed on the raw (name, publisher, ecosystem) triple, so each formerly vendorless title is recorded once more under its `via:` label. The earlier empty-publisher rows are left in place; they are inert (nothing selects a triple that no longer appears in the inventory) and are bounded by one row per formerly vendorless title per ecosystem. A reaper for them is deferred.
+- **Scripts that read `publisher`:** a script that tested for an empty publisher to mean "unknown vendor" must also treat a value starting with `via:` as unknown.
+
 ## Behaviour change: installed-software schema v10 (the server accepts the sectioned report)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a database forward.

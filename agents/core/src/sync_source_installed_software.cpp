@@ -22,6 +22,9 @@ namespace {
 // Must match the server seam's caps (inventory_ingestion.cpp) so the server's
 // parse does not truncate/drop differently from what this source hashed.
 constexpr std::size_t kMaxEntries = 20000;
+// Origin-label prefix of a publisher the source does not declare (`via:<ecosystem>`). MUST equal
+// the server's kOriginLabelPrefix (product_normalize.hpp), which treats it as "no vendor".
+constexpr std::string_view kOriginLabelPrefix = "via:";
 constexpr std::size_t kMaxFieldLen = 1024;
 // Total canonical-blob ceiling — MUST equal the server seam's kMaxBlobBytes
 // (inventory_ingestion.cpp); the two are comment-coordinated. Deliberately set
@@ -139,6 +142,18 @@ std::vector<std::string_view> split_tokens(std::string_view line, std::size_t ma
         fp = bar + 1;
     }
     return tok;
+}
+
+// Undo yuzu::util::safe_output_field's pipe escape (`\|` -> `|`) on a free-text token.
+std::string unescape_pipes(std::string_view t) {
+    std::string out;
+    out.reserve(t.size());
+    for (std::size_t i = 0; i < t.size(); ++i) {
+        if (t[i] == '\\' && i + 1 < t.size() && t[i + 1] == '|')
+            continue; // drop the escape, keep the pipe
+        out += t[i];
+    }
+    return out;
 }
 
 AdaptedRows failed(std::string reason) {
@@ -458,6 +473,7 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out, Constrai
         SwEntry e;
         e.name = std::string(m->manager);
         e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
+        e.publisher = "Homebrew"; // constant vendor of the presence row (middleware precedent)
         e.kind = "app";
         e.ecosystem = std::string(m->ecosystem);
         entries.push_back(std::move(e));
@@ -498,12 +514,13 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
     // runtimes_python_parsers.hpp). The status row is the shared inventory grammar. Every row
     // becomes one {name Python, kind app, ecosystem python} entry whose version is the row's
     // (`-` = unknown -> empty; on Linux it is major.minor, the patch level is not available there).
-    // The flavour, path and vendor have no installed_software slot and are dropped. A constrained
+    // The vendor rides in `publisher` (`-` = unknown); the flavour and path have no
+    // installed_software slot and are dropped. A constrained
     // status withholds these rows only: see the table row's ConstrainedPolicy::drop_source.
     // The producer escapes a literal pipe in the free-text fields (runtimes_parsers.hpp
     // field_or_dash -> safe_output_field gives `\|`), so the split is escape-aware: width stays
-    // strict (five logical fields) and only the version, which is dotted digits by construction
-    // on every leg, is stored, so no unescape is needed.
+    // strict (five logical fields); the version is dotted digits by construction on every leg, and
+    // the vendor is unescaped (`\|` -> `|`) before it is stored.
     return adapt_pkg_inventory(out, "python",
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
@@ -512,6 +529,10 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
         SwEntry e;
         e.name = "Python";
         e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
+        // The vendor column is free text (the producer escapes a literal pipe as `\|`), so it
+        // is unescaped here; `-` = unknown, left empty for the collector's via:python label.
+        if (tok[4] != "-")
+            e.publisher = clamp_field(unescape_pipes(tok[4]), kMaxFieldLen);
         e.kind = "app";
         e.ecosystem = "python";
         entries.push_back(std::move(e));
@@ -577,6 +598,7 @@ AdaptedRows parse_windows_optional_features_output(const std::string& out) {
         if (e.name.empty())
             return true;
         e.version = clamp_field(tok[2], kMaxFieldLen);
+        e.publisher = "Microsoft"; // DISM features are Windows components: constant vendor
         e.kind = "feat";
         e.ecosystem = "optional_feature";
         res.entries.push_back(std::move(e));
@@ -594,6 +616,11 @@ std::vector<std::pair<std::string_view, std::string_view>> installed_software_ac
     for (const auto& row : kInventoryActions)
         out.emplace_back(row.plugin, row.action);
     return out;
+}
+
+void vendor_or_origin(SwEntry& e) {
+    if (e.publisher.empty())
+        e.publisher = std::string(kOriginLabelPrefix) + e.ecosystem;
 }
 
 std::string installed_software_canonical_blob(std::vector<SwEntry> entries) {
@@ -730,6 +757,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
                              row.plugin, row.action, rows.reason);
             for (auto& e : rows.entries) {
                 e.source = source;
+                vendor_or_origin(e);
                 all.push_back(std::move(e));
             }
         }

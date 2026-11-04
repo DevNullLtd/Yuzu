@@ -1826,7 +1826,7 @@ TEST_CASE("windows_optional_features adapter: real capture keeps every feature w
     for (const auto& e : r.entries) {
         CHECK(e.kind == "feat");
         CHECK(e.ecosystem == "optional_feature");
-        CHECK(e.publisher.empty());
+        CHECK(e.publisher == "Microsoft"); // constant vendor: DISM features are Windows components
         state[e.name] = e.version;
         enabled += e.version == "enabled";
         disabled += e.version == "disabled";
@@ -2787,7 +2787,7 @@ TEST_CASE("characterisation: managers", "[sync][characterisation][adapter]") {
     Grammar g{"managers",
               bind_managers,
               "manager|homebrew|present|-|/opt/homebrew|-|-",
-              entry_of("homebrew", "", "", "app", "brew"),
+              entry_of("homebrew", "", "Homebrew", "app", "brew"),
               "manager|snap|present|2.60|/|-|-",
               "manager|homebrew|present|-|/opt/homebrew|-",
               true};
@@ -2799,11 +2799,11 @@ TEST_CASE("characterisation: managers", "[sync][characterisation][adapter]") {
     const std::string sup = st("managers", "supported", "-");
     const std::string hb = "manager|homebrew|present|4.1|/opt/homebrew|-|-";
     SECTION("presence row fields") {
-        CHECK(run({sup, hb}) == res("ok", "", {entry_of("homebrew", "4.1", "", "app", "brew")}));
+        CHECK(run({sup, hb}) == res("ok", "", {entry_of("homebrew", "4.1", "Homebrew", "app", "brew")}));
         CHECK(run({sup, hb, "manager|homebrew|present|-|/usr/local|-|-"}) ==
               res("ok", "",
-                  {entry_of("homebrew", "4.1", "", "app", "brew"),
-                   entry_of("homebrew", "", "", "app", "brew")}));
+                  {entry_of("homebrew", "4.1", "Homebrew", "app", "brew"),
+                   entry_of("homebrew", "", "Homebrew", "app", "brew")}));
     }
     SECTION("a present non-homebrew manager is seen and dropped") {
         for (const char* m :
@@ -2815,7 +2815,7 @@ TEST_CASE("characterisation: managers", "[sync][characterisation][adapter]") {
         }
         // a dropped manager next to a mapped one: only the mapped one is an entry
         CHECK(run({st("managers", "constrained", "tok"), "manager|snap|present|1|/|-|-", hb}) ==
-              res("ok", "tok", {entry_of("homebrew", "4.1", "", "app", "brew")}));
+              res("ok", "tok", {entry_of("homebrew", "4.1", "Homebrew", "app", "brew")}));
     }
     SECTION("an unavailable manager is neither seen nor mapped") {
         const std::string un =
@@ -2833,7 +2833,7 @@ TEST_CASE("characterisation: managers", "[sync][characterisation][adapter]") {
     }
     SECTION("supported keeps no reason, whatever field 4 holds") {
         CHECK(run({st("managers", "supported", "tok|more"), hb}) ==
-              res("ok", "", {entry_of("homebrew", "4.1", "", "app", "brew")}));
+              res("ok", "", {entry_of("homebrew", "4.1", "Homebrew", "app", "brew")}));
     }
     SECTION("unknown level fails even with a present row") {
         CHECK(run({st("managers", "bogus", "tok"), hb}) == res("failed", "bad status"));
@@ -2878,13 +2878,20 @@ TEST_CASE("characterisation: msi list_inventory",
 // Collector level: the whole blob, pinned. The blob is hashed byte-identically on agent and
 // server (ADR-0016), so any movement here is a one-sided change. Re-measure ONLY on a sample
 // recapture, the same rule as the record counts above.
+//
+// Revision boundary (SAM-41, vendor on every row): every digest below moved once, when each row
+// gained a non-empty publisher (a declared vendor, else `via:<ecosystem>`). Every v2 device's
+// stored hash therefore differs after the agent upgrade and the device sends one full inventory
+// (the weekly floor is the backstop); the SwEntry fixture cross-pins (kCrossPinHash and the
+// extended / tail-order / mixed-blob pins) did NOT move, because the fallback is applied in the
+// collector, not in installed_software_canonical_blob.
 TEST_CASE("characterisation: collector blob digests are byte-pinned",
           "[sync][characterisation][collector]") {
-    constexpr const char* kMac = "db0a9878010b71264fced3df9cb00e4703093e50cb59314d171a3227b929f2bf";
+    constexpr const char* kMac = "64e09c0cdc2fb0011487b2d423db2301c3488c59068cbb16c2ab63bb153da631";
     constexpr const char* kWindows =
-        "fe9619361232be03c99ea7e0dc4059c988344734d91d18cb24dc30ec0b1e61e5";
+        "d9d4a2681b82bd7513fb57068d327be30db77a09677da1e11aa8daeaf2776ee5";
     constexpr const char* kLinuxManagers =
-        "522b8d64c16e2f503bdff8f68d2ba21989e534234da2c7174b7f11b38b955561";
+        "fe4b1ba29b6c0e31d42ed519ece8ac674818a6b1ab423acf6f4854735f667d17";
     const auto digest = [](const char* what) {
         const auto got = collect_with(all_plugins());
         INFO(what);
@@ -3007,7 +3014,7 @@ TEST_CASE("manager-ecosystem table: each row maps through its own action only",
               res("ok", "", {entry_of("wget", "1.24", "", "pkg", "brew")}));
         CHECK(show(bind_managers(nl({st("managers", "supported", "-"),
                                      "manager|homebrew|present|4.1|/opt/homebrew|-|-"}))) ==
-              res("ok", "", {entry_of("homebrew", "4.1", "", "app", "brew")}));
+              res("ok", "", {entry_of("homebrew", "4.1", "Homebrew", "app", "brew")}));
     }
     SECTION("snap -> snap and flatpak -> flatpak, through store_packages") {
         CHECK(show(bind_store(nl({st("store_packages", "supported", "-"),
@@ -3130,7 +3137,8 @@ TEST_CASE("runtimes python adapter: real-capture rows map to Python / app / pyth
     using Status = AdaptedRows::Status;
     // Rows as the plugin emits them over the committed captures: the debian:bookworm listing
     // (major.minor only on Linux), the python.org 3.13.1 framework plist (macOS) and a Windows
-    // PythonCore tag (flavour/path/vendor are dropped: no installed_software slot).
+    // PythonCore tag (flavour/path are dropped: no installed_software slot; the vendor column
+    // is the publisher, and `-` stays empty for the collector's via:python label).
     const auto r = parse_runtimes_python_output(
         nl({"status|python|supported|-",
             "python|unmodelled|3.11|/usr/bin/python3.11|-",
@@ -3140,12 +3148,13 @@ TEST_CASE("runtimes python adapter: real-capture rows map to Python / app / pyth
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 3);
     const char* versions[] = {"3.11", "3.13.1", "3.14.6"};
+    const char* publishers[] = {"", "org.python.python", "PythonCore"};
     for (std::size_t i = 0; i < 3; ++i) {
         CHECK(r.entries[i].name == "Python");
         CHECK(r.entries[i].version == versions[i]);
         CHECK(r.entries[i].kind == "app");
         CHECK(r.entries[i].ecosystem == "python");
-        CHECK(r.entries[i].publisher.empty());
+        CHECK(r.entries[i].publisher == publishers[i]);
     }
 }
 
@@ -3166,6 +3175,7 @@ TEST_CASE("runtimes python adapter: rows built by the producer round-trip throug
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].version == "3.13.1");
         CHECK(r.entries[0].ecosystem == "python");
+        CHECK(r.entries[0].publisher == "org.python|custom"); // the escape is undone
     }
     SECTION("more escaped pipes than the split width still read as five logical fields") {
         rec.vendor = "a|b|c|d|e|f|g|h|i|j|k|l";
@@ -3174,6 +3184,7 @@ TEST_CASE("runtimes python adapter: rows built by the producer round-trip throug
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].version == "3.13.1");
+        CHECK(r.entries[0].publisher == "a|b|c|d|e|f|g|h|i|j|k|l");
     }
 }
 
@@ -3188,6 +3199,7 @@ TEST_CASE("runtimes python adapter: `-` version is empty; malformed rows are dro
     REQUIRE(r.entries.size() == 1);
     CHECK(r.entries[0].version.empty());
     CHECK(r.entries[0].ecosystem == "python");
+    CHECK(r.entries[0].publisher.empty()); // vendor `-` = unknown: the collector labels it
 }
 
 TEST_CASE("runtimes python adapter: status grammar decides the answer", "[sync][parse][adapter][runtimes]") {
@@ -3605,5 +3617,94 @@ TEST_CASE("collector: one drop_source source withheld does not touch the other",
         REQUIRE(got.has_value());
         CHECK(count_source(got->first, "runtimes.python") == 1);
         CHECK(count_source(got->first, "middleware.ibm_mq") == 0);
+    }
+}
+
+// --- SAM-41: a non-empty publisher on every row of every source ---
+
+TEST_CASE("vendor_or_origin: a declared vendor stays, an empty one becomes via:<ecosystem>",
+          "[sync][vendor]") {
+    SwEntry declared;
+    declared.publisher = "Acme";
+    declared.ecosystem = "brew";
+    vendor_or_origin(declared);
+    CHECK(declared.publisher == "Acme");
+
+    for (const char* eco : {"deb", "pacman", "apk", "rpm", "windows", "macos", "macos_pkgutil",
+                            "brew", "snap", "flatpak", "optional_feature", "msi", "python"}) {
+        INFO(eco);
+        SwEntry e;
+        e.ecosystem = eco;
+        vendor_or_origin(e);
+        CHECK(e.publisher == std::string("via:") + eco);
+    }
+
+    // The fallback lives in the collector, not in the blob builder: a fixture entry with an empty
+    // publisher still hashes with an empty slot 3, which is what keeps the cross-pins above fixed.
+    SwEntry bare;
+    bare.name = "n";
+    bare.ecosystem = "brew";
+    const auto blob = installed_software_canonical_blob({bare});
+    CHECK(fields_of(records_of(blob)[0])[2].empty());
+}
+
+namespace {
+// Every record of a collector run must carry a publisher; returns the distinct publishers per
+// source so a case can pin the derivation of the sources it cares about.
+std::map<std::string, std::set<std::string>> publishers_by_source(const std::string& blob) {
+    std::map<std::string, std::set<std::string>> out;
+    for (const auto& rec : records_of(blob)) {
+        const auto f = fields_of(rec);
+        REQUIRE(f.size() == 16);
+        INFO("source=" << f[15] << " name=" << f[0]);
+        CHECK_FALSE(f[2].empty());
+        out[f[15]].insert(f[2]);
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE("collector: every source's real-capture rows carry a publisher or a via: label",
+          "[sync][vendor][collector]") {
+    SECTION("Mac-shaped run") {
+        fake_mac();
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        const auto by = publishers_by_source(got->first);
+        CHECK(by.at("pkg_inventory.managers") == std::set<std::string>{"Homebrew"});
+        CHECK(by.at("pkg_inventory.packages") == std::set<std::string>{"via:brew"});
+        for (const auto& rec : records_of(got->first)) {
+            const auto f = fields_of(rec);
+            if (f[5] == "macos_pkgutil")
+                CHECK(f[2] == "via:macos_pkgutil"); // a reverse-domain id is not a vendor
+        }
+    }
+    SECTION("Windows-shaped run") {
+        fake_windows();
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        const auto by = publishers_by_source(got->first);
+        CHECK(by.at("windows_optional_features.list") == std::set<std::string>{"Microsoft"});
+        CHECK(by.count("msi_packages.list_inventory") == 1);
+    }
+    SECTION("Linux-shaped run: deb, store packages, python and ibm_mq") {
+        fake_mac();
+        g_fake[0].out["list_inventory"] =
+            capture_section("installed_apps", "linux.txt", "list_inventory");
+        g_fake[1].out["store_packages"] =
+            nl({supported_status("store_packages"), snap_store_row("btop", "1.4.7", "app", "1073"),
+                flatpak_store_row("org.gnome.Calculator", "app", kCalcCommit)});
+        g_fake[4].out["python"] = nl({supported_status("python"),
+                                      "python|cpython|3.14.6|C:/Python314/|PythonCore",
+                                      "python|unmodelled|3.11|/usr/bin/python3.11|-"});
+        g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
+        const auto got = collect_with(with_middleware());
+        REQUIRE(got.has_value());
+        const auto by = publishers_by_source(got->first);
+        CHECK(by.at("pkg_inventory.store_packages") ==
+              std::set<std::string>{"via:snap", "via:flatpak"});
+        CHECK(by.at("runtimes.python") == std::set<std::string>{"PythonCore", "via:python"});
+        CHECK(by.at("middleware.ibm_mq") == std::set<std::string>{"IBM"});
+        CHECK(by.count("installed_apps.list_inventory") == 1);
     }
 }

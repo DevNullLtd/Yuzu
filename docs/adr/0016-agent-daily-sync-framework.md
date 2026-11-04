@@ -1023,3 +1023,62 @@ byte for byte, including that a facet whose status moves from `full` to a status
 **Not in this change.** Delta apply and the `-` deletions; storage of component rows; the agent
 writer; any read surface returning the new columns (the existing reads select the old columns
 only; `find_by_purl` is a store method with no caller).
+
+### 2026-11-04 — `installed_software`: a publisher on every row, and the `via:` origin label
+
+Every row of every `installed_software` source now carries a non-empty `publisher` before any
+agent sends the v3 sectioned report, so the hash an agent has already agreed with the server
+(slot 3 of the row, hashed on both the v2 and the v3 path) is settled once. There is no new wire
+slot and no parser refusal: the server already parses and hashes slot 3 on both paths, so the
+change is a value rule on the agent, one recognition rule in the server normaliser, and golden
+vectors on both sides.
+
+**The value rule.** A row's publisher is the vendor its source declares; when the source
+declares none it is the origin label `via:<ecosystem>`, where the ecosystem is the row's own
+`ecosystem` value. The fallback is applied in exactly one place, the collector loop in
+`make_installed_software_source` (`vendor_or_origin`, after each adapter has run and the row's
+`source` is stamped), not inside `installed_software_canonical_blob`. The blob builder therefore
+still hashes a fixture entry with an empty publisher as an empty slot, and the fixture
+cross-pins (`kCrossPinHash` and the extended, tail-order and mixed-blob pins) did not move.
+
+| Source (`source`) | Publisher | Fallback |
+|---|---|---|
+| `installed_apps.list_inventory`, rpm | package `VENDOR` tag, else `PACKAGER` (a person or a build-system address; kept only when no vendor is set) | `via:rpm` |
+| same, deb | `Maintainer` | `via:deb` |
+| same, pacman, apk | none: `pacman -Q` and `apk info -v` list no vendor and a second subprocess per package is not worth it | `via:pacman`, `via:apk` |
+| same, Windows | the Uninstall key's `Publisher` | `via:windows` |
+| same, macOS apps | the signing certificate's leaf common name | `via:macos` |
+| same, macOS installer receipts | none: a reverse-domain id is an identifier, not a vendor, and no heuristic turns one into the other | `via:macos_pkgutil` |
+| `pkg_inventory.packages` (Homebrew), `pkg_inventory.store_packages` (snap, flatpak) | none: `pkg_inventory` starts no process by design | `via:brew`, `via:snap`, `via:flatpak` |
+| `pkg_inventory.managers` (Homebrew presence row) | the constant `Homebrew` | n/a |
+| `windows_optional_features.list` | the constant `Microsoft` (DISM features are Windows components; the middleware table's `IBM` is the precedent) | n/a |
+| `msi_packages.list_inventory` | the product's `Publisher` | `via:msi` |
+| `runtimes.python` | the row's vendor column (it was previously dropped), unescaped | `via:python` when the column is `-` |
+| `middleware.ibm_mq` | `IBM`, from the product table (unchanged) | n/a |
+
+The rpm `list_inventory` query format gains a tenth column, `%{VENDOR}`, at the end; the pinned
+argv literal in `docs/agent-spawn-sink-manifest.md` is updated to match, and `parse_rpm_inv_line`
+now requires ten tokens. The `list` action keeps its own columns.
+
+**The server rule.** `normalize_vendor` returns the empty vendor when the RAW value starts with
+`kOriginLabelPrefix` (`via:`), as its first statement, before lower-casing or tokenising. The test
+is case-sensitive and exact: the agent writes the prefix in lower case, so a Windows publisher of
+`VIA:Acme` is a vendor and normalises as one, and a vendor that merely contains `via:` is not a
+label. A labelled title therefore keys like a vendorless one (`norm_key` is unchanged for it).
+The catalogue treats a label as no vendor in two more places: `total_publishers` excludes
+`publisher LIKE 'via:%'`, and the representative publisher of a title (the rollup statement and
+the single-device catalogue read) prefers a non-label value and falls back to the plain maximum
+only when every row of the group is labelled.
+
+**Disposition of `title_dimension` and `curation_queue`.** Both are keyed on the raw
+`(raw_name, raw_publisher, ecosystem)` triple. Every formerly vendorless title is therefore
+re-keyed once under its `via:` label as devices upgrade, and the old empty-publisher rows stay in
+place. They are inert: the candidate query selects only triples present in `title_triples`, which
+is rebuilt from the live inventory, so a triple no device reports any more is never read. The
+residue is bounded at one row per formerly vendorless title per ecosystem. A stale-triple reaper
+is deferred.
+
+**Cost and hash movement.** Every v2 device's stored `installed_software` hash changes on the
+agent upgrade (every row gained a publisher), so each device sends one full inventory once; the
+weekly floor is the backstop for a device that misses it. The agent's collector characterisation
+digests over the real capture samples moved once and are re-pinned with that comment.

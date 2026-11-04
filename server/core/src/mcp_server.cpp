@@ -917,8 +917,10 @@ static const ToolDef kTools[] = {
     {"query_installed_software",
      "Query the typed installed-software inventory collected by the agent daily-sync framework "
      "(ADR-0016) — machine-wide installed packages per device, fleet-wide. Each row carries name, "
-     "version (upstream, release stripped), publisher (rpm PACKAGER / deb Maintainer / Windows "
-     "Publisher), install_date, kind (package|app|pkg|feat), "
+     "version (upstream, release stripped), publisher (the declared vendor: rpm VENDOR else PACKAGER, "
+     "deb Maintainer, Windows Publisher, macOS signer; or, when the source declares none, the "
+     "origin label via:<ecosystem> such as via:brew, which names where the row came from, not a "
+     "vendor), install_date, kind (package|app|pkg|feat), "
      "ecosystem (@@ECOSYSTEM_LIST@@), "
      "epoch, release, arch, signature_status (rpm only, from stored header tags), "
      "distro_id and distro_version (/etc/os-release, rpm/deb/apk/pacman rows); fields an ecosystem does not "

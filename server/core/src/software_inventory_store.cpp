@@ -708,6 +708,16 @@ std::string distinct_list(std::string_view col) {
            " <> ''), '')";
 }
 
+// The representative publisher of a group: a declared vendor over an origin label
+// (`via:<ecosystem>`, product_normalize.hpp kOriginLabelPrefix), falling back to the plain max
+// (a label, or '') when no row of the group has a vendor. Plain max() would pick `via:` over
+// any capitalised vendor, since lowercase sorts after uppercase.
+std::string representative_publisher(std::string_view col) {
+    const std::string c(col);
+    return "coalesce(nullif(max(CASE WHEN " + c + " NOT LIKE 'via:%' THEN " + c +
+           " END), ''), max(" + c + "))";
+}
+
 // The search term the reads bind: invalid UTF-8 AND embedded NUL are scrubbed to U+FFFD BEFORE
 // the clamp (U+FFFD is 3 bytes, so the clamp must come after), then the LIKE metacharacters are
 // escaped. PG TEXT cannot hold a NUL and libpq's text-format bind truncates at the first one, so
@@ -2070,8 +2080,9 @@ SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
         sql += " ORDER BY (-device_count), name LIMIT " + bind(std::to_string(limit)) + "::bigint";
     } else {
         const std::string eco_list = distinct_list("i.ecosystem");
-        sql = "SELECT i.name, max(i.publisher), 1::bigint, count(DISTINCT i.version), " + eco_list +
-              ", " + distinct_list("i.kind") +
+        sql = "SELECT i.name, " + representative_publisher("i.publisher") +
+              ", 1::bigint, count(DISTINCT i.version), " + eco_list + ", " +
+              distinct_list("i.kind") +
               ", coalesce((SELECT c.newest_version FROM software_inventory_store.catalog_rollup c "
               "WHERE c.name = i.name AND c.grain = " +
               std::to_string(sc::kGrainTitle) +
@@ -2431,7 +2442,7 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
         // GROUPING(kind, ecosystem, source); every number is an exact distinct count within
         // its own grouping set — nothing is summed across grains. The comma-joined lists
         // are the distinct non-empty dimension values of THAT set's rows (the q predicate and
-        // the "spans" display read them). max(publisher) picks a representative publisher.
+        // the "spans" display read them). representative_publisher() prefers a declared vendor.
         if (!cmd("DELETE FROM software_inventory_store.catalog_rollup"))
             return false;
         if (!cmd("INSERT INTO software_inventory_store.catalog_rollup (name, grain, kind, "
@@ -2442,7 +2453,8 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
                  "g.sources, coalesce(nt.newest_version, '') "
                  "FROM (SELECT name, GROUPING(kind, ecosystem, source)::smallint AS grain, "
                  "coalesce(kind, '') AS kind, coalesce(ecosystem, '') AS ecosystem, "
-                 "coalesce(source, '') AS source, max(publisher) AS publisher, "
+                 "coalesce(source, '') AS source, " + representative_publisher("publisher") +
+                 " AS publisher, "
                  "count(DISTINCT agent_id) AS device_count, "
                  "count(DISTINCT version) AS version_count, "
                  "count(DISTINCT agent_id) FILTER (WHERE signature_status = 'unsigned') "
@@ -2489,15 +2501,16 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
             std::vector<std::string>{});
         if (rpm.status() != PGRES_TUPLES_OK || PQntuples(rpm.get()) != 1)
             return failed("KPI rpm totals", rpm);
-        // (c) distinct non-empty publishers, from the source table (GROUP BY subselect: a hash
-        // aggregate, about 16x faster than count(DISTINCT) at 1.8M rows).
+        // (c) distinct non-empty DECLARED publishers (origin labels `via:<ecosystem>` name a
+        // source, not a vendor, so they are excluded), from the source table (GROUP BY
+        // subselect: a hash aggregate, about 16x faster than count(DISTINCT) at 1.8M rows).
         if (abort_requested())
             return false;
         pg::PgResult pubs = pg::exec_params(
             c,
             "SELECT count(*) FROM (SELECT publisher FROM "
             "software_inventory_store.installed_software WHERE publisher <> '' "
-            "GROUP BY publisher) p",
+            "AND publisher NOT LIKE 'via:%' GROUP BY publisher) p",
             std::vector<std::string>{});
         if (pubs.status() != PGRES_TUPLES_OK || PQntuples(pubs.get()) != 1)
             return failed("KPI publisher count", pubs);
