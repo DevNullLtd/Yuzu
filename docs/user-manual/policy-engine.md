@@ -188,12 +188,14 @@ Policy and fragment YAML is read by the server's own line scanner (#2123):
 - **Not yet refused** (tracked on #2123), so avoid them: a list line indented
   at or shallower than `scope:` itself, a `- item` written after another key
   (such as `platform:` under `selector:`, or any key after
-  `managementGroups:`), tab characters in indentation, and a `scope:` or
-  `managementGroups:` line inside a multi-line `description: |` block. Each
-  can still drop or replace an entry without an error, leaving the policy
-  targeting more devices than its YAML says. Keep a list's `- item` lines
-  together, directly under their key, indent with spaces only, and keep those
-  key names out of multi-line descriptions.
+  `managementGroups:`), tab characters in indentation, a `scope:` or
+  `managementGroups:` line inside a multi-line `description: |` block, and a
+  null list item (a bare `- `, `tags: [,]`, or the empty entry in `[a,,b]`).
+  Each can still drop or replace an entry without an error, leaving the
+  policy targeting a broader, narrower or different device set than its YAML
+  says. Keep a list's `- item` lines together, directly under their key,
+  indent with spaces only, and keep those key names out of multi-line
+  descriptions.
 
 ### Example Policy YAML
 

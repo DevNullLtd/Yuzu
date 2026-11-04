@@ -215,8 +215,11 @@ std::vector<std::string> scan_block_list(const std::string& yaml, const KeyLine&
             push_raw(result, cur, text, /*dash=*/true);
             continue;
         }
-        // A bare `- ` is a YAML null, not an item; a quoted `- ""` is an empty
-        // string and is kept so the caller refuses it (governance Gate 8 N3).
+        // A bare `- ` is an item whose value is null. It is still DROPPED here,
+        // so it is not refused and an all-null `tags:` list reads as no tags
+        // (pre-existing, not yet refused; tracked on #2123, ledger
+        // G8R5-NULL-ITEM). A quoted `- ""` is an empty string and is kept so
+        // the caller refuses it (governance Gate 8 N3).
         const bool present = !item.empty();
         strip_quotes(item);
         cur = kNpos;
@@ -307,8 +310,10 @@ std::vector<std::string> extract_yaml_list(const std::string& yaml, const std::s
                 comma = inner.size();
             auto item = inner.substr(start, comma - start);
             trim(item);
-            // A quoted empty string (`""`) is kept so the caller refuses it; only a
-            // missing entry between commas is skipped (governance Gate 8 N3).
+            // A quoted empty string (`""`) is kept so the caller refuses it
+            // (governance Gate 8 N3). A missing entry between commas (`[,]`,
+            // `[a,,b]`) is still DROPPED, not refused (pre-existing, not yet
+            // refused; tracked on #2123, ledger G8R5-NULL-ITEM).
             const bool present = !item.empty();
             strip_quotes(item);
             if (present)
