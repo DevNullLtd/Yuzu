@@ -73,7 +73,8 @@ inline bool is_lane1(std::string_view eco) {
 }
 
 /// Lane 3 — OS-native software (GUI apps, non-distro package managers incl. Snap
-/// and Flatpak, Windows optional features, machine-context MSI products, IBM MQ installations, .NET and Java runtimes) that v1 identifies but does NOT
+/// and Flatpak, Windows optional features, machine-context MSI products, IBM MQ
+/// installations, .NET and Java runtimes) that v1 identifies but does NOT
 /// assess: `kind` app/feat OR an OS-native ecosystem. `pkg` is routed by its
 /// ecosystem, not as a kind-level trigger. See ADR-0023 §2 (update 2026-10-04).
 inline bool is_os_native(const SoftwareEntry& e) {
