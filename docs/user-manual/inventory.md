@@ -1215,7 +1215,12 @@ sync, defeating the hash-skip protocol.
   the original format has **no** section rows stored — read that as "not stored", not
   "the device has none". A section reported `constrained` with reason `server_cap:<n>`
   means the server kept only the first `n` rows; `server:machine_id_shape` on the
-  `machine_id` section means the reported machine ID was not a hash and was discarded.
+  `machine_id` section means the reported machine ID was not a hash and was discarded;
+  `server:row_count_mismatch` means the rows stored for the section no longer match the count
+  recorded when the device last synced in full (rows were lost outside the product, for example
+  a partial database restore), so the section is served `constrained` and incomplete with the
+  rows that remain, and the next daily full sync repairs it. A section stored before this check
+  existed has no recorded count and is not checked until that device's next full sync.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
   device serial and system UUID. Agents keep working unchanged; upgrade the server
   before the agents.
