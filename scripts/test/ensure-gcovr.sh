@@ -132,7 +132,7 @@ empty_dir() { [[ -d "$1" && -z "$(ls -A "$1" 2>/dev/null)" ]]; }
 # Leftovers of an interrupted rebuild (the moved-aside copy): ours by name, and removed only if they
 # are recognisably a venv of ours.
 for old in "$VENV".old.*; do
-    if [[ -d "$old" ]] && owned "$old"; then rm -rf "$old"; fi
+    if [[ -d "$old" ]] && { owned "$old" || empty_dir "$old"; }; then rm -rf "$old"; fi
 done
 
 if [[ -e "$VENV" ]]; then
@@ -155,7 +155,7 @@ tmo "$PIP_TIMEOUT" "$VENV/bin/pip" install --quiet --disable-pip-version-check -
 # The stamp is written only after pip succeeded, so a half-built venv never reads as fresh.
 printf '%s\n' "$req_sha" > "$STAMP" || die "cannot write $STAMP"
 for old in "$VENV".old.*; do
-    if [[ -d "$old" ]] && owned "$old"; then rm -rf "$old"; fi
+    if [[ -d "$old" ]] && { owned "$old" || empty_dir "$old"; }; then rm -rf "$old"; fi
 done
 ln -sfn "$VENV/bin/gcovr" "$LINK" || die "cannot link $LINK"
 

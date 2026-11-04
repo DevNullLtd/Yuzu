@@ -142,7 +142,11 @@ heal_browser() {
 
 RECOVERY="to reset the browser cache run: cd tests/puppeteer && npx puppeteer browsers clear (then re-run); or set PUPPETEER_EXECUTABLE_PATH to an existing Chrome for Testing binary"
 
-if browser_present; then
+# If node cannot even load puppeteer, say that now: treating it as "browser absent" would download
+# a browser and then fail with a message that points at the wrong thing.
+exe_now="$(exe_path)" \
+    || die "node could not load puppeteer (its error is above); remove tests/puppeteer/node_modules and re-run"
+if [[ -n "$exe_now" && -e "$exe_now" ]]; then
     say "browser already present"
 else
     if [[ -n "${PUPPETEER_EXECUTABLE_PATH:-}" ]]; then

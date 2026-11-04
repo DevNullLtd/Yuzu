@@ -285,10 +285,13 @@ class EnsurePuppeteer(SandboxCase):
         self.expect(self.run_script(), 0, "ready")
         self.assertEqual(self.npx_calls(), [self.INSTALL])
 
-    def test_node_errors_while_locating_the_browser_are_not_swallowed(self):
+    def test_node_that_cannot_load_puppeteer_says_so_and_does_not_download(self):
+        # A broken import must not read as "browser absent": no pointless download, and node's own
+        # error stays visible.
         r = self.run_script(STUB_EXEPATH_ERR="1")
-        self.expect(r, 1, "not where puppeteer looks")
+        self.expect(r, 1, "node could not load puppeteer")
         self.assertIn("Cannot find package 'puppeteer'", r.stderr)
+        self.assertEqual(self.npx_calls(), [])
 
     def test_install_that_reports_success_without_a_binary_is_not_ready(self):
         self.exe.unlink()
@@ -497,10 +500,8 @@ class EnsureGcovr(SandboxCase):
                 self.expect(self.run_script(YUZU_GCOVR_VENV=str(venv)), 0, "ready")
                 self.assertEqual(len(self.pip_calls()), 1)
                 self.assertEqual((venv / ".requirements-ci.sha256").read_text().strip(), self.sb.req_sha())
-                # An empty $VENV is moved aside too, and an empty directory is not "recognisably ours", so
-                # the script leaves that (empty) husk behind; nothing but an empty husk may remain.
-                for old in self.old_dirs(venv):
-                    self.assertEqual(list((venv.parent / old).iterdir()), [], old)
+                # A replaced $VENV is moved aside and removed; nothing (not even an empty husk) may remain.
+                self.assertEqual(self.old_dirs(venv), [])
 
     def test_only_recognisable_old_venv_leftovers_are_removed(self):
         mine = self.sb.venv.parent / (self.sb.venv.name + ".old.123")
