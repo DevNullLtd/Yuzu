@@ -18,10 +18,13 @@
 # Dashboard: http://localhost:8080
 # Grafana:   http://localhost:3000 (admin / $YUZU_GRAFANA_ADMIN_PASSWORD)
 #
-# Required before any `docker compose` command, `down` included (#4817):
+# Required before any `docker compose` command that reads this file, `down`
+# included (#4817):
 #   export YUZU_GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"
-# (or put it in deploy/docker/.env). Grafana applies it only when it first
-# creates its database: on an existing grafana-data volume, change it with
+# (or put it in deploy/docker/.env; keep the same value across shells). For
+# `down`, `ps` and `logs` any non-empty value works. Grafana applies it only when
+# it first creates its database: an existing grafana-data volume keeps its old
+# password (admin/admin if it predates #4817); change it with
 #   docker compose exec grafana grafana cli admin reset-admin-password '<new>'
 # Prometheus: http://localhost:9090
 

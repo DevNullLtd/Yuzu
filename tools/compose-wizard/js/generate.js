@@ -71,14 +71,22 @@ async function generate() {
 
   // #4817: Grafana's built-in default is admin/admin and the wizard used to
   // default the field to it. Require a value, and refuse the well-known one.
+  // Read raw, not via val(): val() trims, which would silently change a padded
+  // password instead of refusing it.
+  const grafanaPass = document.getElementById('grafana-pass').value;
   if (chk('include-grafana')) {
-    const gp = val('grafana-pass');
+    const gp = grafanaPass;
     if (!gp || gp.toLowerCase() === 'admin') {
       alert('Grafana: set an admin password on the Monitoring step (use 🎲 Generate). It must not be empty or "admin" — anyone who can reach port ' + (num('grafana-port') || 3000) + ' would get full Grafana admin.');
       return;
     }
-    if (/[\x00-\x1f]/.test(gp)) {
-      alert('Grafana: the admin password must not contain control characters or line breaks (it is written to .env as one line).');
+    // The value is written unquoted to .env, where Compose expands `$`, drops
+    // everything after ` #`, strips surrounding whitespace and treats a leading
+    // quote as quoting: the password Grafana got would silently differ from
+    // the one typed (#4817 review). Printable ASCII without space, `$` or
+    // quotes round-trips through Compose's .env parser unchanged.
+    if (/[^\x21-\x7e]|[$'"]/.test(gp)) {
+      alert('Grafana: the admin password may use only printable ASCII letters, digits and symbols, without spaces, $, \' or " (it is written unquoted to .env, where Compose would change those). Use 🎲 Generate for a safe value.');
       return;
     }
   }
@@ -139,7 +147,7 @@ async function generate() {
     promPort: num('prom-port'),
     grafana: chk('include-grafana'),
     grafanaPort: num('grafana-port'),
-    grafanaPass: val('grafana-pass'),
+    grafanaPass: grafanaPass,
     gateway: chk('include-gateway'),
     gwAgentPort: num('gw-agent-port'),
     gwHealthPort: num('gw-health-port'),

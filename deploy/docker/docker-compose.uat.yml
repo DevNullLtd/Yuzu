@@ -9,11 +9,16 @@
 #   docker compose -f docker-compose.uat.yml down -v
 #
 # Or let scripts/win-start-UAT.sh manage this automatically: it generates the
-# Grafana admin password, keeps it in .uat/grafana-admin-password (0600) and
-# prints it. UAT ONLY - Grafana and ClickHouse are published on every interface.
+# Grafana admin password, keeps it in .uat/grafana-admin-password (0600 where
+# the filesystem honours it) and prints it. UAT ONLY - Grafana and ClickHouse
+# are published on every interface.
 #
 # Run by hand, every `docker compose` command (`down` included) needs (#4817):
 #   export YUZU_GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+# Keep the same value across shells (or use a .env); for `down`, `ps` and `logs`
+# any non-empty value works. An existing grafana-uat-data volume keeps its old
+# password (admin/admin if it predates #4817) until `down -v` or
+#   docker compose exec grafana grafana cli admin reset-admin-password '<new>'
 
 services:
   prometheus:

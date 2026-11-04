@@ -351,7 +351,7 @@
               <input type="text" id="grafana-pass" value="" placeholder="set a strong value">
               <button type="button" onclick="genSecret('grafana-pass')" class="btn small">🎲 Generate</button>
             </div>
-            <small>Required. Written only to <code>.env</code>; the compose file refuses to start without it. Grafana applies it only when it first creates its database (#4817).</small>
+            <small>Required. Printable ASCII without spaces, <code>$</code> or quotes (it is written unquoted to <code>.env</code>, the only place it is stored; the compose file refuses to start without it). Grafana applies it only when it first creates its database (#4817).</small>
           </div>
         </fieldset>
 

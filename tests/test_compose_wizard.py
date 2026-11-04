@@ -432,6 +432,60 @@ class ComposeWizardGrafanaPassword(unittest.TestCase):
                 self.assertEqual(len(out["alerts"]), 1, out["alerts"])
                 self.assertIn("Grafana", out["alerts"][0])
 
+    # #4817 review: the value is written unquoted to .env. Compose expands `$`, drops
+    # everything after ` #`, strips surrounding whitespace and treats a leading
+    # quote as quoting, so these would silently become a different password.
+    DOTENV_HOSTILE = ["pa$$word", "a$b", "${X}", "abc #def", "a b", " lead", "trail ",
+                      "a\tb", "a\nb", "a\rb", "a\x00b", "'abc'", '"abc"', "ab'c", 'ab"c',
+                      "caf\u00e9-password"]
+    DOTENV_SAFE = ["0f1e2d3c4b5a6978", "abc#def", "#abc", "a\\b", "a;b", "a=b", "a!b",
+                   "{x}", "%x%", "~x", "`x`", "a&b|c<d>e", "Pass-Word_1.2+3@4:5,6/7?8*9"]
+
+    def test_generate_refuses_dotenv_hostile_values(self):
+        for value in self.DOTENV_HOSTILE:
+            with self.subTest(value=value):
+                out = self._generate(**{"grafana-pass": value})
+                self.assertEqual(out["compose"], "", f"generate() emitted a compose for {value!r}")
+                self.assertEqual(len(out["alerts"]), 1, out["alerts"])
+                self.assertIn("Grafana", out["alerts"][0])
+
+    def test_generate_accepts_dotenv_safe_values(self):
+        for value in self.DOTENV_SAFE:
+            with self.subTest(value=value):
+                out = self._generate(**{"grafana-pass": value})
+                self.assertEqual(out["alerts"], [])
+                self.assertIn(f"YUZU_GRAFANA_ADMIN_PASSWORD={value}\n", out["env"] + "\n")
+
+    def test_accepted_values_round_trip_through_compose(self):
+        has_compose = shutil.which("docker") is not None and subprocess.run(
+            ["docker", "compose", "version"], capture_output=True, timeout=60).returncode == 0
+        if not has_compose:
+            if os.environ.get("YUZU_REQUIRE_DOCKER") == "1":
+                self.fail("YUZU_REQUIRE_DOCKER=1 but `docker compose` is not available")
+            self.skipTest("docker compose is not available")
+        # Oracle: Compose's own .env parser (no daemon needed) must give Grafana
+        # exactly the password the wizard accepted.
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_wizard_env_") as d:
+            compose = Path(d) / "c.yml"
+            compose.write_text("services:\n  g:\n    image: busybox\n    environment:\n"
+                               "      - P=${YUZU_GRAFANA_ADMIN_PASSWORD:?x}\n")
+            for value in self.DOTENV_SAFE:
+                with self.subTest(value=value):
+                    out = self._generate(**{"grafana-pass": value})
+                    line = next(l for l in out["env"].splitlines()
+                                if l.startswith("YUZU_GRAFANA_ADMIN_PASSWORD="))
+                    env_file = Path(d) / ".env"
+                    env_file.write_text(line + "\n")
+                    env = {k: v for k, v in os.environ.items()
+                           if k != "YUZU_GRAFANA_ADMIN_PASSWORD"}
+                    proc = subprocess.run(
+                        ["docker", "compose", "--env-file", str(env_file), "-f", str(compose),
+                         "config", "--format", "json"],
+                        capture_output=True, text=True, env=env, timeout=60)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    got = json.loads(proc.stdout)["services"]["g"]["environment"]["P"]
+                    self.assertEqual(got, value)
+
     def test_generate_accepts_a_strong_value(self):
         out = self._generate(**{"grafana-pass": GRAFANA_PASS})
         self.assertEqual(out["alerts"], [])

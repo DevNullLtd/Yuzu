@@ -6,9 +6,19 @@
 ##   docker compose -f docker-compose.uat.yml up -d
 ##   docker compose -f docker-compose.uat.yml logs -f
 ##   docker compose -f docker-compose.uat.yml down -v
-##   (every command, `down` included, needs both variables set - #4817)
+##   (every command, `down` included, needs both variables set - #4817; keep
+##   the same values across shells, e.g. in a .env next to this file; for
+##   `down`, `ps` and `logs` any non-empty values work)
 ##
-## Dashboard:   http://localhost:8080  (admin / adminpassword1)
+## UAT ONLY - every published port (server, gateway, Prometheus, Grafana,
+## ClickHouse) is on every interface.
+##
+## An existing grafana-data volume keeps its old Grafana password (admin/admin
+## if it predates #4817) until `down -v` or
+##   docker compose -f docker-compose.uat.yml exec grafana \
+##     grafana cli admin reset-admin-password '<new>'
+##
+## Dashboard:   http://localhost:8092  (admin / adminpassword1)
 ## Grafana:     http://localhost:3000  (admin / $YUZU_GRAFANA_ADMIN_PASSWORD)
 ## Prometheus:  http://localhost:9090
 ## ClickHouse:  http://localhost:8123  (default / yuzu)

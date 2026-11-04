@@ -233,7 +233,8 @@ jobs:
       - name: Compose Wizard certs volume (#5420)
         run: |
           node --version
-          YUZU_REQUIRE_NODE=1 python3 tests/test_compose_wizard.py
+          docker compose version
+          YUZU_REQUIRE_NODE=1 YUZU_REQUIRE_DOCKER=1 python3 tests/test_compose_wizard.py
 
       # The /swagger page's renderer runs under node against a fake DOM. The meson entry
       # skips without node, so run it here on the hosted image and fail rather than skip
@@ -255,6 +256,14 @@ jobs:
       # escaping) and mutation-tests itself. Stdlib only.
       - name: Agent installer trust-anchor ACL lint
         run: python3 tests/test_agent_installer_acl_lint.py
+
+      # Grafana default credentials (#4817): every tracked compose that runs
+      # Grafana requires YUZU_GRAFANA_ADMIN_PASSWORD, and the UAT launchers pass
+      # it without exporting it. The meson entry runs only on the self-hosted
+      # Linux docs leg; run it here too so a compose-only PR always checks it.
+      # Stdlib + bash.
+      - name: Grafana default credentials lint
+        run: python3 -I tests/test_compose_default_credentials.py
 
       # Gateway scrape (#5695): every shipped Prometheus config, and every
       # compose stack that runs a Prometheus next to a gateway, scrapes the
