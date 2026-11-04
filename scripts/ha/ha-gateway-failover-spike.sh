@@ -53,7 +53,10 @@ ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
 note() { printf '      %s\n' "$*"; }
 fail() { printf '\033[1;31mFAIL\033[0m %s\n' "$*"; FAILS=$((FAILS + 1)); }
 die()  { printf '\033[1;31mdie\033[0m %s\n' "$*" >&2; exit 2; }
-ms()   { date +%s%3N; }
+# Milliseconds since the epoch from bash's own clock. NOT `date +%s%3N`: on a host whose `date` is
+# uutils coreutils 0.10 about one call in ten returned a stamp up to ~0.9 s AHEAD of real time (143 of
+# 1500 calls measured), which made fault timestamps late and every derived duration short.
+ms()   { local t=${EPOCHREALTIME/./}; echo $(( t / 1000 )); }
 
 # ---- state / compose plumbing ------------------------------------------------
 STATE=""
@@ -69,9 +72,11 @@ load_state() {
 }
 compose() { docker compose -p "$SPIKE_PROJECT" --env-file "$STATE/env" -f "$COMPOSE_FILE" "$@"; }
 cname()   { printf '%s-%s-1' "$SPIKE_PROJECT" "$1"; }
-setenv()  { # setenv KEY VALUE : upsert into the state env file
-    grep -v "^$1=" "$STATE/env" > "$STATE/env.tmp" 2>/dev/null || true
-    printf '%s=%s\n' "$1" "$2" >> "$STATE/env.tmp"; mv "$STATE/env.tmp" "$STATE/env"; chmod 600 "$STATE/env"
+setenv()  { # setenv KEY VALUE : upsert into the state env file (atomic; fails loudly, never truncates)
+    local tmp="$STATE/env.tmp.$$"
+    { grep -v "^$1=" "$STATE/env" || [ $? -eq 1 ]; printf '%s=%s\n' "$1" "$2"; } > "$tmp" 2>/dev/null \
+        && [ -s "$tmp" ] && grep -q "^$1=" "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$STATE/env" \
+        || { rm -f "$tmp"; die "cannot update $STATE/env ($1) - the state file was left unchanged"; }
 }
 psql_q() { # psql_q SQL : tuples-only, comma separated
     docker exec -e PGPASSWORD="$YUZU_DB_PASSWORD" "$(cname postgres)" \
@@ -81,7 +86,7 @@ gw_http() { # gw_http NODE URL : body on stdout, empty on failure
     docker exec "$(cname "$1")" wget -qO- -T 2 "$2" 2>/dev/null
 }
 netfault() { # netfault CONTAINER 'shell command'
-    docker run --rm --net "container:$1" --cap-add NET_ADMIN "$NETFAULT_IMAGE" -c "$2"
+    docker run --rm --net "container:$1" --cap-add NET_ADMIN "$NETFAULT_IMAGE" -ec "$2"
 }
 wait_for() { # wait_for DESC TIMEOUT cmd... : echoes elapsed seconds
     local desc="$1" t="$2"; shift 2; local s; s=$(date +%s)
@@ -215,12 +220,20 @@ cmd_restore() {
     ok "faults undone"; cmd_status
 }
 
-cmd_down() { load_state; compose down -v --remove-orphans; rm -f "$STATE_ROOT/current"; ok "rig removed (state kept in $STATE)"; }
+cmd_down() {
+    load_state
+    if compose down -v --remove-orphans; then
+        rm -f "$STATE_ROOT/current"; ok "rig removed (state kept in $STATE)"
+    else
+        fail "compose down failed: the rig may still be running (state kept, 'current' link kept)"
+    fi
+}
 
 # ---- sampling ----------------------------------------------------------------
 sampler_start() { # writes routes.csv (state), gw.csv (per node) at 1 Hz
     local run="$1"
-    ( while :; do
+    ( exec 9>&-   # never hold the command lock: an orphaned sampler must not block the next command
+      while :; do
         t=$(ms)
         psql_q "SELECT $t, agent_id, coalesce(gateway_node,''), connection_epoch, coalesce(session_id,''), coalesce((lease_until > now())::int,0) FROM gateway_route_store.agent_routes ORDER BY agent_id" >> "$run/routes.csv"
         for n in gateway-1 gateway-2 gateway-3; do
@@ -231,7 +244,10 @@ sampler_start() { # writes routes.csv (state), gw.csv (per node) at 1 Hz
         sleep 1
     done ) & echo $! > "$run/sampler.pid"
 }
-sampler_stop() { [ -f "$1/sampler.pid" ] && kill "$(cat "$1/sampler.pid")" 2>/dev/null; wait 2>/dev/null; }
+sampler_stop() { # idempotent: the pid file is removed once the sampler has been signalled
+    [ -f "$1/sampler.pid" ] || return 0
+    kill "$(cat "$1/sampler.pid")" 2>/dev/null; rm -f "$1/sampler.pid"; wait 2>/dev/null; return 0
+}
 
 # agent_map RUN : container -> agent_id, session (from agent logs + routes), one line each
 agent_map() {
@@ -257,9 +273,10 @@ dispatch_probe() { # dispatch_probe RUN LABEL AGENT_ID : one os_info command to 
 import json, sys
 try: r = json.load(sys.stdin).get("responses", [])
 except Exception: r = []
-ok = [x for x in r if not x.get("error_detail") and x.get("output")]
+ok = [x for x in r if x.get("status") == 0 and not x.get("error_detail") and x.get("output")]
 bad = [x.get("error_detail", "")[:40] for x in r if x.get("error_detail")]
-print("delivered=%d error=%s" % (len(ok), bad[0] if bad else "none"))')"
+st = ",".join(str(x.get("status")) for x in r) or "none"
+print("delivered=%d status=%s error=%s" % (len(ok), st, bad[0] if bad else "none"))')"
     echo "$(ms),$label,$aid,http=$status,cmd=${cmd:-none},$n" >> "$run/dispatch.csv"
 }
 
@@ -317,88 +334,183 @@ cmd_haproxy() {
     sleep 15; ok "haproxy config now $c"
 }
 
-# export OUTDIR [redispatch-run,...] [run=note,...] : summarised results (one CSV row per run) for
-# the committed record. Everything is RECOMPUTED from the raw run data (routes.csv, gw.csv, the
-# agent logs, the packet captures), not copied from the per-run summary, so a fix to a derivation
-# applies to runs taken before the fix. Raw logs and secrets are NOT exported.
+# export OUTDIR [redispatch-run,...] [run=note,...] [RECORD.md] : summarised results for the committed
+# record. Everything is RECOMPUTED from the raw run data (routes.csv, gw.csv, the agent and gateway logs,
+# the packet captures), not copied from the per-run summary, so a fix to a derivation applies to runs
+# taken before the fix. Writes OUTDIR/results.csv (one row per run) and OUTDIR/probes.csv (one row per
+# dispatch probe), and, if RECORD.md is given, replaces the text between its
+# "<!-- BEGIN GENERATED: name -->" / "<!-- END GENERATED: name -->" markers with the generated tables, so
+# no figure in those tables is typed by hand. Raw logs and secrets are NOT exported.
 cmd_export() {
     load_state
     local out="${1:?export OUTDIR}"; mkdir -p "$out"
-    python3 -I - "$STATE" "$out" "${2:-}" "${3:-}" <<'PY'
-import csv, glob, json, os, re, sys
-state, out, redisp, notes = sys.argv[1:5]
+    python3 -I - "$STATE" "$out" "${2:-}" "${3:-}" "${4:-}" <<'PY'
+import csv, glob, os, re, sys, collections
+from datetime import datetime
+state, out, redisp, notes, record = sys.argv[1:6]
 redisp = set(x for x in redisp.split(",") if x)
 notes = dict(x.split("=", 1) for x in notes.split(",") if "=" in x)
-cols = ["run", "scenario", "mode", "haproxy", "agents", "on_victim_before", "reregistered_n", "load1_at_fault",
-        "lost_p50_s", "lost_max_s", "rereg_p50_s", "rereg_p99_s", "rereg_max_s", "register_peak_per_s",
-        "busy_in_agent_logs", "first_peer_fin_rst_ms", "victim_readyz_non200_s",
+cols = ["run", "scenario", "mode", "mgmt", "haproxy", "agents", "on_victim_before", "reregistered_n", "load1_at_fault",
+        "t0_shift_ms", "lost_p50_s", "lost_max_s", "rereg_p50_s", "rereg_p99_s", "rereg_max_s", "register_peak_per_s",
+        "first_peer_fin_rst_ms", "victim_readyz_non200_s", "breaker_open_s",
         "nonroutable_n", "nonroutable_first_s", "nonroutable_last_s", "tombstoned_n", "tombstoned_first_s", "tombstoned_last_s",
-        "dispatch", "victim_readyz_200_s_after_undo", "all_routable_s_after_undo", "invalid", "note"]
-def pct(xs, p):
-    xs = sorted(xs); return xs[min(len(xs) - 1, int(round(p / 100 * (len(xs) - 1))))] if xs else None
+        "probes", "victim_readyz_200_s_after_undo", "all_routable_s_after_undo", "invalid", "note"]
 def sec(ms): return "" if ms is None else f"{ms/1000:.1f}"
-def classify(line):
-    # Y delivered | U gateway_unavailable | T accepted, no result inside the wait | H<code> HTTP error | E other error | ? old format
+def iso_ms(s):  # gateway log timestamp -> epoch ms
+    return datetime.fromisoformat(s.replace(",", ".")).timestamp() * 1000
+def pclass(line, logs):
+    # Y delivered | S server-synthesised failure scored as delivered by an older harness (command id in no agent log)
+    # U gateway unavailable | T accepted, no result inside the wait | H<code> HTTP error | E other | ? old format
     if "delivered=" not in line: return "?"
     m = re.search(r"http=(\d+)", line)
     if m and m.group(1) != "200": return "H" + m.group(1)
-    if "delivered=1" in line: return "Y"
+    if "delivered=1" in line:
+        if "status=" in line: return "Y"
+        c = re.search(r"cmd=([^,\s]+)", line)
+        return "Y" if (not logs or (c and c.group(1) in logs)) else "S"
     if "gateway_unavailable" in line: return "U"
     if "error=none" in line: return "T"
     return "E"
-rows = []
+rows, probes = [], []
 for f in sorted(glob.glob(state + "/run-*/summary.json")):
+    import json
     d = json.load(open(f)); rd = os.path.dirname(f); run = os.path.basename(rd)
     m = re.match(r"run-(\w+)-(dns|vip)-", run); sc, mode = m.group(1), m.group(2)
     meta = d.get("meta", ""); t0 = int(open(rd + "/fault_ms").read())
     vic = re.search(r"victim=(yuzu_gw@[0-9.]+)", meta); vic = vic.group(1) if vic else ""
     vcont = re.search(r"container=(gateway-\d)", meta); vcont = vcont.group(1) if vcont else ""
     load = re.search(r"load=([0-9.]+)", meta)
-    # route state around the fault
+    hp = re.search(r"haproxy=(\S+)", meta); mg = re.search(r"mgmt=(\S+)", meta)
+    haproxy = ""
+    if mode == "vip":
+        haproxy = ("redispatch" if "redispatch" in hp.group(1) else "default") if hp else ("redispatch" if run in redisp else "default")
+    mgmt = ("single node" if "gateway-1:50063" in mg.group(1) else "VIP") if mg else ("single node" if notes.get(run, "").startswith("H7") or "management address on gateway-1" in notes.get(run, "") else "VIP")
     samples = {}
     for r in csv.reader(open(rd + "/routes.csv")):
         if len(r) >= 6: samples.setdefault(r[1], []).append((int(r[0]), r[2], int(r[5])))
     on_vic = [a for a, seq in samples.items() if [n for t, n, l in seq if t < t0][-1:] == [vic]]
-    def first_after(a, pred):
-        for t, n, l in samples[a]:
-            if t >= t0 and pred(n, l): return (t - t0) / 1000
-    nr = [x for x in (first_after(a, lambda n, l: l == 0) for a in on_vic) if x is not None]
-    tb = [x for x in (first_after(a, lambda n, l: n == "") for a in on_vic) if x is not None]
-    # victim /readyz: first moment TWO consecutive samples are not 200 (one failed exec is not a flip)
-    gw = sorted((int(r[0]), r[2]) for r in csv.reader(open(rd + "/gw.csv")) if len(r) == 4 and r[1] == vcont)
-    flip = ""
-    for i in range(len(gw) - 1):
-        if gw[i][0] >= t0 and gw[i][1] != "200" and gw[i + 1][1] != "200": flip = f"{(gw[i][0] - t0) / 1000:.0f}"; break
-    # packets: only those whose SOURCE is the gateway side (the agent's own FIN after it gives up is not a signal)
-    ip = vic.split("@")[-1]; first = []
+    # ---- packets: only those whose SOURCE is the gateway side count (an agent's own FIN is not a signal)
+    ip = vic.split("@")[-1]; peer_abs = []
     for cf in glob.glob(rd + "/spike-cap-*.fin_rst.txt"):
         for l in open(cf, errors="replace"):
             mm = re.match(r"(\d+\.\d+)\s+.*?\bIP ([0-9.]+)\.\d+ > .*Flags \[([^\]]*)\]", l)
-            if mm and mm.group(2) in (ip, "10.77.12.20") and re.search(r"[FR]", mm.group(3)) and float(mm.group(1)) * 1000 >= t0:
-                first.append(float(mm.group(1)) * 1000 - t0)
-    busy = sum(open(x, errors="replace").read().lower().count("gateway is busy") for x in glob.glob(rd + "/agentlog-*.txt"))
+            if mm and mm.group(2) in (ip, "10.77.12.20") and re.search(r"[FR]", mm.group(3)): peer_abs.append(float(mm.group(1)) * 1000)
+    # ---- fault timestamp: the older harness stamped it with a `date` that ran up to ~0.9 s ahead of real time in
+    # ~10% of calls. A peer reset BEFORE the stamped fault is proof of that; then the fault is placed 41 ms (the
+    # median reset delay) before the first reset and every duration measured from the stamp is lengthened to match.
+    shift = 0
+    if sc in ("F1", "F1g") and peer_abs:
+        first_abs = min(peer_abs)
+        if first_abs < t0 and t0 - first_abs < 1500: shift = int(t0 - (first_abs - 41))
+    t0c = t0 - shift
+    first_fin = [x - t0c for x in peer_abs if x >= t0c]
+    # ---- routes, readyz, breaker
+    def first_after(a, pred):
+        for t, n, l in samples[a]:
+            if t >= t0c and pred(n, l): return (t - t0c) / 1000
+    nr = [x for x in (first_after(a, lambda n, l: l == 0) for a in on_vic) if x is not None]
+    tb = [x for x in (first_after(a, lambda n, l: n == "") for a in on_vic) if x is not None]
+    gw = sorted((int(r[0]), r[2]) for r in csv.reader(open(rd + "/gw.csv")) if len(r) == 4 and r[1] == vcont)
+    flip = ""
+    for i in range(len(gw) - 1):
+        if gw[i][0] >= t0c and gw[i][1] != "200" and gw[i + 1][1] != "200": flip = f"{(gw[i][0] - t0c) / 1000:.0f}"; break
+    brk = ""
+    gl = f"{rd}/gwlog-{vcont}.txt"
+    if os.path.exists(gl):
+        for l in open(gl, errors="replace"):
+            if "Circuit breaker: OPEN" in l:
+                mt = re.match(r"(\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d\.\d+[+-]\d\d:\d\d)", l)
+                if mt: brk = f"{(iso_ms(mt.group(1)) - t0c) / 1000:.0f}"; break
+    logs = "".join(open(x, errors="replace").read() for x in glob.glob(rd + "/agentlog-*.txt"))
+    pcl = []
+    if os.path.exists(rd + "/dispatch.csv"):
+        for l in open(rd + "/dispatch.csv"):
+            parts = l.strip().split(",")
+            if len(parts) < 4: continue
+            cl = pclass(l, logs); pcl.append(cl)
+            lab = parts[1]; aid = parts[2]
+            tgt = "on the victim" if "victim" in lab else ("other node, had been on the victim" if aid in on_vic else "unaffected node")
+            probes.append({"run": run, "scenario": sc, "mode": mode, "mgmt": mgmt, "when": lab.split(" ")[0], "target": tgt, "class": cl})
     rec = {}
     if os.path.exists(rd + "/recovery.txt"):
         rec = dict(kv.split("=", 1) for kv in open(rd + "/recovery.txt").read().split() if "=" in kv)
-    regd = d["reregistered_ms_after_fault"]
+    a = d["lost_connection_ms_after_fault"]; b = d["reregistered_ms_after_fault"]
+    def adj(v): return None if v is None else v + shift
     rows.append({
-        "run": run, "scenario": sc, "mode": mode,
-        "haproxy": ("redispatch" if run in redisp else "default") if mode == "vip" else "",
-        "agents": d["agents"], "on_victim_before": len(on_vic), "reregistered_n": regd["n"],
-        "load1_at_fault": load.group(1) if load else "",
-        "lost_p50_s": sec(d["lost_connection_ms_after_fault"].get("p50")), "lost_max_s": sec(d["lost_connection_ms_after_fault"].get("max")),
-        "rereg_p50_s": sec(regd.get("p50")), "rereg_p99_s": sec(regd.get("p99")), "rereg_max_s": sec(regd.get("max")),
-        "register_peak_per_s": d.get("register_peak_per_s", ""), "busy_in_agent_logs": busy,
-        "first_peer_fin_rst_ms": f"{min(first):.0f}" if first else "", "victim_readyz_non200_s": flip,
+        "run": run, "scenario": sc, "mode": mode, "mgmt": mgmt, "haproxy": haproxy,
+        "agents": d["agents"], "on_victim_before": len(on_vic), "reregistered_n": b["n"], "load1_at_fault": load.group(1) if load else "",
+        "t0_shift_ms": shift or "",
+        "lost_p50_s": sec(adj(a.get("p50"))), "lost_max_s": sec(adj(a.get("max"))),
+        "rereg_p50_s": sec(adj(b.get("p50"))), "rereg_p99_s": sec(adj(b.get("p99"))), "rereg_max_s": sec(adj(b.get("max"))),
+        "register_peak_per_s": d.get("register_peak_per_s", ""),
+        "first_peer_fin_rst_ms": f"{min(first_fin):.0f}" if first_fin else "", "victim_readyz_non200_s": flip, "breaker_open_s": brk,
         "nonroutable_n": len(nr), "nonroutable_first_s": f"{min(nr):.0f}" if nr else "", "nonroutable_last_s": f"{max(nr):.0f}" if nr else "",
         "tombstoned_n": len(tb), "tombstoned_first_s": f"{min(tb):.0f}" if tb else "", "tombstoned_last_s": f"{max(tb):.0f}" if tb else "",
-        "dispatch": "".join(classify(x) for x in d.get("dispatch", [])),
-        "victim_readyz_200_s_after_undo": rec.get("victim_readyz_200_s", ""), "all_routable_s_after_undo": rec.get("all_routable_s", ""),
+        "probes": "".join(pcl), "victim_readyz_200_s_after_undo": rec.get("victim_readyz_200_s", ""), "all_routable_s_after_undo": rec.get("all_routable_s", ""),
         "invalid": "yes" if os.path.exists(rd + "/INVALID") else "", "note": notes.get(run, ""),
     })
 with open(os.path.join(out, "results.csv"), "w", newline="") as fh:
     w = csv.DictWriter(fh, fieldnames=cols, lineterminator="\n"); w.writeheader(); w.writerows(rows)
-print(f"{len(rows)} runs -> {out}/results.csv")
+with open(os.path.join(out, "probes.csv"), "w", newline="") as fh:
+    w = csv.DictWriter(fh, fieldnames=["run", "scenario", "mode", "mgmt", "when", "target", "class"], lineterminator="\n"); w.writeheader(); w.writerows(probes)
+print(f"{len(rows)} runs, {len(probes)} probes -> {out}")
+
+# ------------------------------------------------------------------ generated tables
+def rng(xs, fmt="{:.1f}"):
+    xs = [float(x) for x in xs if x not in ("", None)]
+    if not xs: return "-"
+    lo, hi = min(xs), max(xs); return fmt.format(lo) if lo == hi else fmt.format(lo) + "-" + fmt.format(hi)
+NAME = {"F1": "F1 kill", "F1g": "F1g graceful stop", "F2": "F2 agent port only", "F2p": "F2p full partition"}
+g = collections.OrderedDict()
+for r in rows:
+    if r["scenario"] not in NAME or r["invalid"]: continue
+    g.setdefault((r["scenario"], r["mode"], r["haproxy"], r["mgmt"], r["agents"]), []).append(r)
+order = {"F1": 0, "F1g": 1, "F2p": 2, "F2": 3}
+t1 = ["| Fault | Addressing | Mgmt addr | Agents | Runs | On victim | Re-registered | Noticed p50 (s) | Re-registered p50 (s) | p99 (s) | Worst (s) | Peak regs/s | Peer FIN/RST (ms) |",
+      "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+for k, v in sorted(g.items(), key=lambda kv: (order[kv[0][0]], kv[0][1], kv[0][4] if False else int(kv[0][4]), kv[0][3], kv[0][2])):
+    sc, mode, hp, mg, ag = k
+    allr = all(int(x["reregistered_n"]) == int(x["on_victim_before"]) for x in v)
+    rer = "all" if allr else "**" + " / ".join(sorted({f"{x['reregistered_n']} of {x['on_victim_before']}" for x in v})) + "**"
+    addr = "DNS" if mode == "dns" else "VIP" + (", redispatch" if hp == "redispatch" else ", default")
+    fault = NAME[sc] + (" (VIP health check stays green)" if sc == "F2" and mode == "vip" else "")
+    t1.append("| %s | %s | %s | %s | %d | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+        fault, addr, "single node" if mg == "single node" else "VIP", ag, len(v),
+        rng([x["on_victim_before"] for x in v], "{:.0f}"), rer, rng([x["lost_p50_s"] for x in v]), rng([x["rereg_p50_s"] for x in v]),
+        rng([x["rereg_p99_s"] for x in v]), rng([x["rereg_max_s"] for x in v]), rng([x["register_peak_per_s"] for x in v], "{:.0f}"),
+        rng([x["first_peer_fin_rst_ms"] for x in v], "{:.0f}")))
+t2 = ["| Run | Fault | Addressing | Agents | On victim | Moved | Victim /readyz non-200 | Breaker opened (s) | Non-routable (k / N, when s) | Tombstoned (k / N, when s) | Undo: ready / all routable (s) |",
+      "|---|---|---|---|---|---|---|---|---|---|---|"]
+for r in rows:
+    if r["scenario"] not in ("F3", "F3x", "F2p", "F2") or r["invalid"]: continue
+    if r["scenario"] in ("F2", "F2p") and not r["breaker_open_s"] and r["scenario"] == "F2" : continue
+    def span(a, b): return a if a == b else a + "-" + b
+    nrw = "%s / %s, %s" % (r["nonroutable_n"], r["on_victim_before"], span(r["nonroutable_first_s"], r["nonroutable_last_s"])) if int(r["nonroutable_n"]) else "0 / %s" % r["on_victim_before"]
+    tbw = "%s / %s, %s" % (r["tombstoned_n"], r["on_victim_before"], span(r["tombstoned_first_s"], r["tombstoned_last_s"])) if int(r["tombstoned_n"]) else "0 / %s" % r["on_victim_before"]
+    t2.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+        r["run"][4:], r["scenario"], "DNS" if r["mode"] == "dns" else "VIP", r["agents"], r["on_victim_before"],
+        r["reregistered_n"] if r["scenario"] in ("F2", "F2p") else "0", r["victim_readyz_non200_s"] or "never", r["breaker_open_s"] or "never",
+        nrw if r["scenario"] in ("F3", "F3x") else "-", tbw if r["scenario"] in ("F3", "F3x") else "-",
+        (r["victim_readyz_200_s_after_undo"] or "-") + " / " + (r["all_routable_s_after_undo"] or "-")))
+pc = collections.OrderedDict()
+for q in probes:
+    if q["scenario"] == "NOFAULT" or "dispatch probes VOID" in notes.get(q["run"], ""): continue
+    pc.setdefault((q["scenario"], q["mgmt"], q["target"]), collections.Counter())[q["class"]] += 1
+t3 = ["| Fault | Mgmt addr | Probe target | Probes | Delivered (Y) | Server-synthesised failure scored as delivered by the old harness (S) | Gateway unavailable (U) | Accepted, no result (T) | Other |",
+      "|---|---|---|---|---|---|---|---|---|"]
+for (sc, mg, tg), c in sorted(pc.items(), key=lambda kv: (order.get(kv[0][0], 9) if kv[0][0] in order else 5, kv[0][0], kv[0][1], kv[0][2])):
+    n = sum(c.values()); oth = n - sum(c[k] for k in "YSUT")
+    t3.append("| %s | %s | %s | %d | %d | %d | %d | %d | %d |" % (sc, mg, tg, n, c["Y"], c["S"], c["U"], c["T"], oth))
+tables = {"failover": "\n".join(t1), "faults-f3-f2p": "\n".join(t2), "probes": "\n".join(t3)}
+for name, txt in tables.items(): open(os.path.join(out, f"table-{name}.md"), "w").write(txt + "\n")
+if record:
+    doc = open(record).read()
+    for name, txt in tables.items():
+        pat = re.compile(r"(<!-- BEGIN GENERATED: %s -->\n)(.*?)(<!-- END GENERATED: %s -->)" % (re.escape(name), re.escape(name)), re.S)
+        if not pat.search(doc): print(f"WARNING: markers for '{name}' not found in {record}"); continue
+        doc = pat.sub(lambda m: m.group(1) + txt + "\n" + m.group(3), doc)
+    open(record, "w").write(doc)
+    print("tables spliced into", record)
 PY
 }
 
@@ -424,7 +536,7 @@ PY
 # scenario_cleanup : on any exit (including `die` and Ctrl-C) stop this run's sampler and remove its
 # capture containers. It deliberately does NOT undo an injected fault: the next `settle`/`restore`
 # flushes the rules, and silently healing the node would hide that a run was cut short.
-RUN_ACTIVE=""
+RUN_ACTIVE=""; STOP_PID=""
 scenario_cleanup() {
     [ -n "$RUN_ACTIVE" ] && sampler_stop "$RUN_ACTIVE" 2>/dev/null
     local c; for c in $(docker ps -aq -f "name=spike-cap-$$" 2>/dev/null); do docker rm -f "$c" >/dev/null 2>&1; done
@@ -442,9 +554,11 @@ cmd_scenario() {
     case "$mode" in dns) addr="gw-dns.ha.test:50051";; vip) addr="gw-vip.ha.test:50051";; *) die "bad mode";; esac
     if [ "$SPIKE_SERVER_ADDR" != "$addr" ]; then
         say "switching agents to $addr (recreate)"
+        local old_addr="$SPIKE_SERVER_ADDR"
         setenv SPIKE_SERVER_ADDR "$addr"; load_state
         local n; n="$(compose ps -q agent | wc -l)"
-        compose up -d --scale agent="$n" --force-recreate agent >/dev/null 2>&1 || die "agent recreate failed"
+        compose up -d --scale agent="$n" --force-recreate agent >/dev/null 2>&1 \
+            || { setenv SPIKE_SERVER_ADDR "$old_addr"; die "agent recreate failed (addressing mode restored to $old_addr)"; }
         local s; s=$(date +%s)
         until [ "$(connected_count)" = "$n" ]; do
             [ $(( $(date +%s) - s )) -ge 300 ] && { fail "only $(connected_count)/$n agents re-registered after 300s"; break; }
@@ -497,7 +611,7 @@ cmd_scenario() {
     case "$id" in
         NOFAULT) note "no fault injected";;
         F1)  docker kill "$(cname $vc)" >/dev/null || frc=$?;;
-        F1g) docker stop -t 40 "$(cname $vc)" >/dev/null &;;
+        F1g) docker stop -t 40 "$(cname $vc)" >/dev/null & STOP_PID=$!;;
         F2)  netfault "$(cname $vc)" 'iptables -I INPUT -p tcp --dport 50051 -j DROP; iptables -I OUTPUT -p tcp --sport 50051 -j DROP' || frc=$?;;
         F2p) netfault "$(cname $vc)" 'iptables -I INPUT -j DROP; iptables -I OUTPUT -j DROP; iptables -I INPUT -i lo -j ACCEPT; iptables -I OUTPUT -o lo -j ACCEPT' || frc=$?;;
         F3)  netfault "$(cname $vc)" 'iptables -I OUTPUT -p tcp -d 10.77.12.4 --dport 50055 -j DROP' || frc=$?;;
@@ -525,6 +639,7 @@ cmd_scenario() {
     done
     local now_rel=$(( ($(ms) - t0) / 1000 )); [ "$now_rel" -lt "$window" ] && sleep $(( window - now_rel ))
 
+    if [ -n "${STOP_PID:-}" ]; then wait "$STOP_PID" || { fail "docker stop failed (exit $?): this run is INVALID"; echo "docker stop failed" > "$run/INVALID"; }; STOP_PID=""; fi
     sampler_stop "$run"
     note "per node after: $(node_counts | tr '\n' ' ')"
     for c in "${caps[@]}"; do
