@@ -14,6 +14,7 @@
 #include "device_ci_ingestion.hpp"
 #include "device_ci_kinds.hpp"
 #include "device_inventory_store.hpp"
+#include "hardware_list_model.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "sha256_hex.hpp"
@@ -30,6 +31,7 @@
 #include <cstdlib>
 #include <functional>
 #include <iterator>
+#include <map>
 #include <latch>
 #include <optional>
 #include <stdexcept>
@@ -1987,4 +1989,191 @@ TEST_CASE("mixed version: an old 22-field blob and a v2 blob for different agent
     auto new_secs = store.get_device_ci_sections("agent-new");
     REQUIRE(new_secs.has_value());
     CHECK(new_secs->size() == 10);
+}
+
+// ── The persisted per-section row count (migration v3, up-2) ───────────────────────────────────
+
+namespace {
+
+// kind -> the persisted row_count as text ("NULL" for SQL NULL), straight from the table.
+std::map<std::string, std::string> persisted_row_counts(PgPool& pool, const std::string& agent) {
+    std::map<std::string, std::string> out;
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(), "SELECT kind, row_count FROM device_inventory_store.device_ci_section WHERE agent_id = $1",
+        std::vector<std::string>{agent});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        out[PQgetvalue(res.get(), i, 0)] = PQgetisnull(res.get(), i, 1) ? "NULL" : PQgetvalue(res.get(), i, 1);
+    return out;
+}
+
+// The section the wire serves for one device and kind, read through the real store snapshot and
+// the real mapping (the path GET /api/v1/hardware/{id} and MCP get_hardware_ci take).
+nlohmann::json served_section(DeviceInventoryStore& store, const std::string& agent, const std::string& kind) {
+    auto got = store.get_device_ci_with_sections(agent);
+    REQUIRE(got.has_value());
+    REQUIRE_FALSE(got->sections_failed);
+    yuzu::server::HardwareCiDetail d;
+    yuzu::server::apply_ci_with_sections_read(d, std::move(*got));
+    const auto j = yuzu::server::hardware_ci_json(d, 0);
+    for (const auto& sec : j["ci"]["sections"])
+        if (sec["kind"] == kind)
+            return sec;
+    return nlohmann::json();
+}
+
+DeviceCiRecord blob_with_rows(int cpu_rows, int dimm_rows) {
+    std::vector<std::vector<std::string>> recs = {
+        {"status", "chassis", "ok", ""}, {"status", "cpu", "ok", ""}, {"status", "dimm", "ok", ""},
+        {"status", "swap", "ok", ""}};
+    for (int i = 0; i < cpu_rows; ++i)
+        recs.push_back({"cpu", std::to_string(i), "M", "1", "1", "1", "s", "1"});
+    for (int i = 0; i < dimm_rows; ++i)
+        recs.push_back({"dimm", "DIMM" + std::to_string(i), "8192", "DDR4", "3200", "Samsung", "M471", "-"});
+    return parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+}
+
+InventoryIngestOutcome put_record(DeviceInventoryStore& store, const std::string& agent, const DeviceCiRecord& r) {
+    return store.apply_device_ci(agent, DeviceInventoryStore::canonical_hash(r), std::optional<DeviceCiRecord>{r},
+                                 1);
+}
+
+} // namespace
+
+// Kills (by mutation: disable the read-side check) the up-2 defect - a child table emptied out of
+// band served as a complete section.
+TEST_CASE("v2 ingest persists the stored row count and an out-of-band child delete is served constrained",
+          "[pg][device_ci][v2][row_count]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // 40 cpu rows against a cap of 32: the count is what was STORED (32), not what was sent.
+    REQUIRE(put_record(store, "agent-rc", blob_with_rows(40, 2)) == InventoryIngestOutcome::kStored);
+    const auto counts = persisted_row_counts(pool, "agent-rc");
+    CHECK(counts.at("cpu") == "32");
+    CHECK(counts.at("dimm") == "2");
+    CHECK(counts.at("swap") == "0");       // table-backed, nothing sent: a verified empty
+    CHECK(counts.at("chassis") == "NULL"); // status-only: not verifiable
+
+    SECTION("an intact device serves exactly as before") {
+        const auto dimm = served_section(store, "agent-rc", "dimm");
+        CHECK(dimm["status"] == "ok");
+        CHECK(dimm["complete"] == true);
+        CHECK(dimm["reason"].is_null());
+        CHECK(dimm["rows"].size() == 2);
+        const auto cpu = served_section(store, "agent-rc", "cpu");
+        CHECK(cpu["status"] == "constrained");
+        CHECK(cpu["reason"] == "server_cap:32");
+        CHECK(cpu["rows"].size() == 32);
+        CHECK(served_section(store, "agent-rc", "swap")["complete"] == true);
+        CHECK(served_section(store, "agent-rc", "chassis")["complete"] == true);
+    }
+    SECTION("deleting the dimm rows out of band is served as constrained and incomplete") {
+        exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-rc'");
+        const auto dimm = served_section(store, "agent-rc", "dimm");
+        CHECK(dimm["status"] == "constrained");
+        CHECK(dimm["complete"] == false);
+        CHECK(dimm["reason"] == "server:row_count_mismatch");
+        CHECK(dimm["rows"].empty());
+        // The sibling sections are untouched by the loss.
+        const auto cpu = served_section(store, "agent-rc", "cpu");
+        CHECK(cpu["reason"] == "server_cap:32");
+        CHECK(cpu["rows"].size() == 32);
+        CHECK(served_section(store, "agent-rc", "swap")["complete"] == true);
+        // The raw store read still carries the stored status + count for the mapping to decide on.
+        auto secs = store.get_device_ci_sections("agent-rc");
+        REQUIRE(secs.has_value());
+        const auto* raw = find_section(*secs, "dimm");
+        REQUIRE(raw != nullptr);
+        CHECK(raw->row_count == std::optional<int>(2));
+        CHECK(raw->rows.empty());
+    }
+    SECTION("a PARTIAL loss (one of two dimm rows) is caught too, and the surviving row is served") {
+        exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm "
+                        "WHERE agent_id = 'agent-rc' AND ord = 1");
+        const auto dimm = served_section(store, "agent-rc", "dimm");
+        CHECK(dimm["status"] == "constrained");
+        CHECK(dimm["complete"] == false);
+        CHECK(dimm["reason"] == "server:row_count_mismatch");
+        CHECK(dimm["rows"].size() == 1);
+    }
+    SECTION("a capped section that also loses rows keeps server_cap and gains the mismatch token") {
+        exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_cpu "
+                        "WHERE agent_id = 'agent-rc' AND ord >= 10");
+        const auto cpu = served_section(store, "agent-rc", "cpu");
+        CHECK(cpu["status"] == "constrained");
+        CHECK(cpu["reason"] == "server_cap:32;server:row_count_mismatch");
+        CHECK(cpu["rows"].size() == 10);
+    }
+}
+
+TEST_CASE("a full replace rewrites the persisted row count (never stale)", "[pg][device_ci][v2][row_count]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(put_record(store, "agent-rp", blob_with_rows(3, 2)) == InventoryIngestOutcome::kStored);
+    auto c1 = persisted_row_counts(pool, "agent-rp");
+    CHECK(c1.at("cpu") == "3");
+    CHECK(c1.at("dimm") == "2");
+
+    REQUIRE(put_record(store, "agent-rp", blob_with_rows(1, 0)) == InventoryIngestOutcome::kStored);
+    auto c2 = persisted_row_counts(pool, "agent-rp");
+    CHECK(c2.at("cpu") == "1");
+    CHECK(c2.at("dimm") == "0"); // the section is still reported, now with no rows
+    CHECK(served_section(store, "agent-rp", "cpu")["complete"] == true);
+    CHECK(served_section(store, "agent-rp", "dimm")["complete"] == true);
+
+    REQUIRE(put_record(store, "agent-rp", blob_with_rows(5, 1)) == InventoryIngestOutcome::kStored);
+    auto c3 = persisted_row_counts(pool, "agent-rp");
+    CHECK(c3.at("cpu") == "5");
+    CHECK(c3.at("dimm") == "1");
+    CHECK(served_section(store, "agent-rp", "cpu")["rows"].size() == 5);
+}
+
+TEST_CASE("a v2 database upgrades to v3 in place: existing sections have no count and read as before",
+          "[pg][device_ci][migration][v3][row_count]") {
+    // A private database: a v3 store seeds a v2-shaped device, the test rolls the schema back to v2
+    // (drops the additive column and rewinds schema_meta), and a new store runs migration 3.
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        REQUIRE(put_record(seed, "agent-up", blob_with_rows(2, 2)) == InventoryIngestOutcome::kStored);
+    }
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci_section DROP COLUMN row_count");
+    exec_stmt(pool, "UPDATE public.schema_meta SET version = 2 WHERE store = 'device_inventory_store'");
+
+    DeviceInventoryStore store{pool}; // runs migration 3
+    REQUIRE(store.is_open());
+
+    // Every pre-v3 section row has no count.
+    for (const auto& [kind, n] : persisted_row_counts(pool, "agent-up")) {
+        INFO(kind);
+        CHECK(n == "NULL");
+    }
+    // Reads exactly as before - no mismatch is ever raised for an unverifiable section, even one
+    // that lost its rows.
+    exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-up'");
+    const auto dimm = served_section(store, "agent-up", "dimm");
+    CHECK(dimm["status"] == "ok");
+    CHECK(dimm["complete"] == true);
+    CHECK(dimm["reason"].is_null());
+    CHECK(served_section(store, "agent-up", "cpu")["rows"].size() == 2);
+
+    // The next full replace (the daily sync) arms the check for that device.
+    REQUIRE(put_record(store, "agent-up", blob_with_rows(2, 2)) == InventoryIngestOutcome::kStored);
+    CHECK(persisted_row_counts(pool, "agent-up").at("dimm") == "2");
+    CHECK(served_section(store, "agent-up", "dimm")["complete"] == true);
+    exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-up'");
+    CHECK(served_section(store, "agent-up", "dimm")["reason"] == "server:row_count_mismatch");
 }

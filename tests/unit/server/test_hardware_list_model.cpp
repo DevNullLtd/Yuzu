@@ -1360,3 +1360,116 @@ TEST_CASE("apply_ci_with_sections_read: a failed sections read keeps the error a
     CHECK(d.ci_sections.error() == CiReadError::kDegraded);
     CHECK(hardware_ci_sections_unreadable(d));
 }
+
+// ── The persisted row-count check (up-2): a section whose child rows were lost out of band ────
+
+namespace {
+
+DeviceCiSection counted_section(std::string kind, std::string level, std::string reason, std::optional<int> count,
+                                std::size_t rows) {
+    std::vector<std::vector<std::string>> r;
+    for (std::size_t i = 0; i < rows; ++i)
+        r.push_back({std::to_string(i), "M", "4", "8", "2800", "S", "1"});
+    auto s = make_section(std::move(kind), std::move(level), std::move(reason), std::move(r));
+    s.row_count = count;
+    return s;
+}
+
+} // namespace
+
+// Kills: verifying a section with no persisted count (the pre-v3 upgrade path must read as before).
+TEST_CASE("verify_section_row_count: a NULL count leaves the section exactly as stored",
+          "[hardware][model][sections][row_count]") {
+    for (const char* level : {"ok", "constrained", "unavailable", "permission_denied", "novel", ""}) {
+        INFO(level);
+        const auto v = verify_section_row_count(counted_section("cpu", level, "r", std::nullopt, 0));
+        CHECK(v.level == level);
+        CHECK(v.reason == "r");
+    }
+}
+
+TEST_CASE("verify_section_row_count: an equal count leaves the section exactly as stored",
+          "[hardware][model][sections][row_count]") {
+    auto v = verify_section_row_count(counted_section("cpu", "ok", "", 3, 3));
+    CHECK(v.level == "ok");
+    CHECK(v.reason.empty());
+    v = verify_section_row_count(counted_section("cpu", "ok", "", 0, 0)); // a verified-empty section
+    CHECK(v.level == "ok");
+    v = verify_section_row_count(counted_section("cpu", "constrained", "server_cap:32", 32, 32));
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server_cap:32");
+}
+
+// Kills: serving a section whose rows were deleted as complete (the up-2 defect).
+TEST_CASE("verify_section_row_count: fewer rows than stored downgrades ok to constrained",
+          "[hardware][model][sections][row_count]") {
+    const auto v = verify_section_row_count(counted_section("cpu", "ok", "", 3, 0));
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server:row_count_mismatch");
+    // An ok section that already carried a reason keeps it, with the token appended.
+    const auto w = verify_section_row_count(counted_section("cpu", "ok", "agent:note", 3, 1));
+    CHECK(w.level == "constrained");
+    CHECK(w.reason == "agent:note;server:row_count_mismatch");
+}
+
+TEST_CASE("verify_section_row_count: more rows than stored is the same downgrade",
+          "[hardware][model][sections][row_count]") {
+    const auto v = verify_section_row_count(counted_section("cpu", "ok", "", 1, 2));
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server:row_count_mismatch");
+}
+
+TEST_CASE("verify_section_row_count: an already constrained section keeps its reason and gains the token once",
+          "[hardware][model][sections][row_count]") {
+    const auto v = verify_section_row_count(counted_section("cpu", "constrained", "server_cap:32", 32, 10));
+    CHECK(v.level == "constrained");
+    CHECK(v.reason == "server_cap:32;server:row_count_mismatch");
+    // Idempotent: a reason that already names the mismatch is not extended.
+    const auto again = verify_section_row_count(
+        counted_section("cpu", "constrained", "server:row_count_mismatch", 3, 1));
+    CHECK(again.reason == "server:row_count_mismatch");
+    // A constrained section with no reason takes just the token.
+    CHECK(verify_section_row_count(counted_section("cpu", "constrained", "", 3, 1)).reason ==
+          "server:row_count_mismatch");
+}
+
+// Kills: upgrading or reasoning over a level that has no rows by contract.
+TEST_CASE("verify_section_row_count: unavailable, permission_denied, unknown and blank levels are never touched",
+          "[hardware][model][sections][row_count]") {
+    for (const char* level : {"unavailable", "permission_denied", "novel", ""}) {
+        INFO(level);
+        const auto v = verify_section_row_count(counted_section("cpu", level, "why", 5, 0));
+        CHECK(v.level == level);
+        CHECK(v.reason == "why");
+    }
+}
+
+// Kills: a mismatch that reaches the model but not the wire, or one that drops the rows that were read.
+TEST_CASE("hardware_ci_json: a row-count mismatch is served constrained and incomplete with its rows",
+          "[hardware][model][json][sections][row_count]") {
+    auto d = v2_detail({counted_section("cpu", "ok", "", 3, 1), counted_section("dimm", "ok", "", 2, 0),
+                        counted_section("disk", "ok", "", std::nullopt, 0)});
+    const auto j = hardware_ci_json(d, 0);
+    const auto& cpu = section_of(j, "cpu");
+    CHECK(cpu["status"] == "constrained");
+    CHECK(cpu["complete"] == false);
+    CHECK(cpu["reason"] == "server:row_count_mismatch");
+    CHECK(cpu["rows"].size() == 1); // the rows that WERE read are still served
+    const auto& dimm = section_of(j, "dimm");
+    CHECK(dimm["status"] == "constrained");
+    CHECK(dimm["complete"] == false);
+    CHECK(dimm["rows"].empty());
+    // No persisted count: exactly as before.
+    const auto& disk = section_of(j, "disk");
+    CHECK(disk["status"] == "ok");
+    CHECK(disk["complete"] == true);
+    CHECK(disk["reason"].is_null());
+}
+
+TEST_CASE("hardware_ci_json: a status-only section never takes the row-count check",
+          "[hardware][model][json][sections][row_count]") {
+    auto d = v2_detail({counted_section("chassis", "ok", "", 4, 0)});
+    const auto j = hardware_ci_json(d, 0);
+    CHECK(section_of(j, "chassis")["status"] == "ok");
+    CHECK(section_of(j, "chassis")["complete"] == true);
+}

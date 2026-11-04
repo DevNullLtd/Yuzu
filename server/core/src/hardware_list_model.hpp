@@ -217,6 +217,32 @@ struct HardwareCiDetail {
     std::optional<std::int64_t> software_last_seen;
 };
 
+/// The reason token a section carries when its stored child rows disagree with the row count
+/// persisted beside its status row (`device_ci_section.row_count`, migration v3).
+inline constexpr std::string_view kSectionRowCountMismatchReason = "server:row_count_mismatch";
+
+/// The level and reason a section is SERVED with, after reconciling its status row with the
+/// number of child rows actually read (up-2: a child table emptied out of band, e.g. a partial
+/// single-table restore or a manual DELETE, must never read as a complete section).
+///
+/// The one decision, pure (no store, no PG). Rules:
+///  - `row_count == nullopt` (a status-only kind, or a row written before migration v3): the
+///    section is served exactly as stored - never verified, never downgraded.
+///  - `rows.size() == *row_count`: exactly as stored.
+///  - otherwise (fewer rows, or - impossible by construction, still handled - more) the section
+///    is DOWNGRADED, never upgraded: `ok` -> `constrained`, and `server:row_count_mismatch` is
+///    appended to the reason (`;`-joined, the same convention as `server_cap:<n>`). An already
+///    `constrained` section keeps its level and its existing reason tokens (the agent's or
+///    `server_cap:<n>`); the mismatch token is appended after them so the loss is not hidden.
+///    The rows that WERE read are still served (a constrained section serves its rows).
+///  - `unavailable`, `permission_denied`, an unknown level and a blank level are never touched:
+///    by contract they serve no rows, so there is nothing to reconcile.
+struct SectionVerdict {
+    std::string level;
+    std::string reason;
+};
+[[nodiscard]] SectionVerdict verify_section_row_count(const DeviceCiSection& section);
+
 inline constexpr std::size_t kHwSoftwareCap = 2000;
 
 /// Sync-on-demand (`__sync__.now`) shipped in the 0.13.1 dev line; a release

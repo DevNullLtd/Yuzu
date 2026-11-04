@@ -23,6 +23,12 @@ struct DeviceCiSection {
     std::string level;  ///< agent-reported level, or "constrained" after a server cap
     std::string reason; ///< agent-reported reason; ";server_cap:<n>" appended on truncation
     std::vector<std::vector<std::string>> rows;
+    /// READ SIDE ONLY (never set by the parser; the writer derives it from the rows it actually
+    /// inserts): the child-row count persisted with the section's status row, so an out-of-band
+    /// loss of child rows is detectable. nullopt = a status-only kind, or a row written before
+    /// migration v3 - not verifiable, and read exactly as before. See `verify_section_row_count`
+    /// (hardware_list_model.hpp) for the one decision that consumes it.
+    std::optional<int> row_count;
 };
 
 /// One device-CI record — the typed projection of the `device_ci` canonical wire

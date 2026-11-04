@@ -221,7 +221,7 @@ std::vector<std::string_view> ci_columns(const DeviceCiSectionDef& def) {
 }
 
 /// `ci.sections`: one entry per section the device reported, in registry order. `complete` is true
-/// only for level `ok`. Rows are served only for `ok` and `constrained` (a constrained section is
+/// only for level `ok` after the row-count check (`verify_section_row_count`). Rows are served only for `ok` and `constrained` (a constrained section is
 /// a bounded or partial projection, so its `complete:false` is the whole point); every other level
 /// - `unavailable`, `permission_denied`, or a level this server does not know - renders its reason
 /// and no rows, even if rows were somehow stored.
@@ -240,6 +240,11 @@ nlohmann::json ci_sections_json(const DeviceCiRecord& ci,
             source = ci_json_ph(ci.board_source);
         else if (std::string_view(def.section) == "machine_id")
             source = ci_json_ph(ci.machine_id_source);
+        // The served level/reason: the stored status reconciled with the rows actually read.
+        // A downgrade only ever moves ok -> constrained, so the row-serving test below is
+        // unchanged by it.
+        const SectionVerdict verdict = def.table != nullptr ? verify_section_row_count(*it)
+                                                            : SectionVerdict{it->level, it->reason};
         nlohmann::json rows = nlohmann::json::array();
         if (def.table != nullptr && (it->level == "ok" || it->level == "constrained")) {
             const auto cols = ci_columns(def);
@@ -251,10 +256,10 @@ nlohmann::json ci_sections_json(const DeviceCiRecord& ci,
             }
         }
         out.push_back({{"kind", def.section},
-                       {"status", it->level.empty() ? nlohmann::json(nullptr) : nlohmann::json(it->level)},
-                       {"reason", ci_json_ph(it->reason)},
+                       {"status", verdict.level.empty() ? nlohmann::json(nullptr) : nlohmann::json(verdict.level)},
+                       {"reason", ci_json_ph(verdict.reason)},
                        {"source", std::move(source)},
-                       {"complete", it->level == "ok"},
+                       {"complete", verdict.level == "ok"},
                        {"rows", std::move(rows)}});
     }
     return out;
@@ -954,6 +959,23 @@ void apply_ci_with_sections_read(HardwareCiDetail& detail,
         detail.ci_sections = std::move((*detail.ci)->sections);
         (*detail.ci)->sections.clear(); // moved-from: the sections live in `ci_sections` alone
     }
+}
+
+SectionVerdict verify_section_row_count(const DeviceCiSection& section) {
+    SectionVerdict v{section.level, section.reason};
+    if (!section.row_count.has_value())
+        return v; // not verifiable: served exactly as stored
+    if (section.level != "ok" && section.level != "constrained")
+        return v; // no rows by contract: nothing to reconcile
+    if (static_cast<long long>(section.rows.size()) == static_cast<long long>(*section.row_count))
+        return v;
+    v.level = "constrained"; // ok -> constrained; constrained stays
+    if (v.reason.find(kSectionRowCountMismatchReason) == std::string::npos) {
+        if (!v.reason.empty())
+            v.reason += ';';
+        v.reason += kSectionRowCountMismatchReason;
+    }
+    return v;
 }
 
 } // namespace yuzu::server
