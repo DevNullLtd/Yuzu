@@ -16,9 +16,10 @@
  *   partition|<disk>|<partition>|<size_bytes>|<type>|<mount_points>|<detail>
  *   topology|<kind>|<name>|<uuid>|<members>|<detail>
  *
- * `partitions` and `topology` are PLANNED on every OS: until their leg PRs land they answer
- * one `status|<action>|unsupported|<os>:planned` row (agents/shared/planned_leg.hpp). The
- * leg PR that fills one adds its row formatter; the columns are declared in
+ * `partitions` is read on Windows (disk_actions_partitions.hpp builds its rows); on Linux and
+ * macOS, and `topology` everywhere, are PLANNED: until their leg PRs land they answer one
+ * `status|<action>|unsupported|<os>:planned` row (agents/shared/planned_leg.hpp). The leg PR
+ * that fills one adds its row formatter; the columns are declared in
  * content/definitions/disk_actions.yaml.
  *
  * `health`, `bus` and `media` are FIXED vocabularies emitted verbatim (they are

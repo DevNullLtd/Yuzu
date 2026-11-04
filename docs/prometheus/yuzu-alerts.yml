@@ -4643,8 +4643,11 @@ groups:
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
             behavioural routes. The audit-first admin writes (webhooks, offload targets,
-            directory sync, group mappings, MCP settings) 503 the same way. Upload-grant revoke
-            refuses on both REST (503) and MCP (retryable -32603), so a leaked grant stays
+            directory sync, group mappings, MCP settings) 503 the same way, and so do four
+            dashboard mutations (#3619): every console send (POST /api/dashboard/execute),
+            group-from-results, and the Echo retention-paused re-enable and purge, which send,
+            create or purge nothing while their "attempted" row cannot be stored. Upload-grant
+            revoke refuses on both REST (503) and MCP (retryable -32603), so a leaked grant stays
             redeemable until the outage ends or its TTL expires, whichever is first (#6169).
             Approval approve and reject (approval.approve, approval.reject) 503 with
             Sec-Audit-Failed when the "attempted" row fails; then the decision is not applied
