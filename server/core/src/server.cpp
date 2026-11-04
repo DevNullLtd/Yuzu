@@ -235,6 +235,7 @@
 #include "device_containment_routes.hpp"
 #include "device_estate_routes.hpp"
 #include "hardware_routes.hpp"
+#include "software_curation_routes.hpp"
 #include "home_routes.hpp" // Dashboard summary fragment (readout, attention, estate) over injected seams
 #include "home_ui.hpp"     // sign_in_location: where a signed-out page request goes
 #include "home_panels_routes.hpp" // HM-2: Dashboard policies + events fragments
@@ -20070,6 +20071,20 @@ private:
                              .forensics_visibility_fn = forensics_visibility_fn,
                              .forensics_plugins = forensics_plugins(),
                          });
+
+        // Software normalisation curation REST (queue, curated aliases, pack replace). The
+        // routes borrow product_registry_store_ and are served only until web_server_->stop(),
+        // which precedes the store reset in stop(); the class holds no state of its own.
+        {
+            HttplibRouteSink curation_sink{*web_server_};
+            SoftwareCurationRoutes{}.register_routes(
+                curation_sink, SoftwareCurationRoutes::Deps{
+                                   .auth_fn = auth_fn,
+                                   .perm_fn = perm_fn,
+                                   .audit_fn = audit_fn,
+                                   .registry = product_registry_store_.get(),
+                               });
+        }
 
         // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs
         // attention, estate state). Every figure arrives through a closure over an

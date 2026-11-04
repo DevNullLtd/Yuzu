@@ -1879,6 +1879,7 @@ if build_server
       'unit/server/test_rest_software_packages.cpp',
       'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_software_catalogue.cpp',   # GET /api/v1/inventory/software/catalogue[/versions]
+      'unit/server/test_rest_software_curation.cpp',    # software normalisation curation REST routes
       'unit/server/test_rest_dex_app_perf_devices.cpp',   # version-row "which devices" drill: GET /api/v1/dex/perf/app/devices
       'unit/server/test_rest_devices.cpp',   # #4033 (#2146 Batch A): GET /api/v1/devices[/{id}] + agent-count-preview
       'unit/server/test_group_agent_count_preview.cpp',   # #4033: pure shared create-group-preview model
