@@ -34,11 +34,13 @@
  * a row (version = the registry's version tag, flavour `unmodelled`) and records
  * `windows:runtimes:jvm:release_unreadable`; a home with no `release` file at all is the same row
  * without a token. The release file is opened as itself (FILE_FLAG_OPEN_REPARSE_POINT) and a
- * reparse point is refused: a link is never followed, and each ancestor directory of the
- * file below the drive root is checked not to be a reparse point first (refused as unreadable). A
+ * reparse point is refused, and each ancestor directory of the file below the drive root is
+ * checked not to be a reparse point first (refused as unreadable) -- a BEST-EFFORT check
+ * (GetFileAttributesW per ancestor, then a separate CreateFileW): a check-then-open race by a
+ * local writer of a user-writable ancestor is a disclosed residual. A
  * JVM key whose home value is present but empty, mistyped or oversized records
  * `windows:runtimes:jvm:home_unusable` (an absent value stays silent). The read has no deadline,
- * a disclosed residual on a dead FIXED volume.
+ * a disclosed residual on a dead FIXED volume, beside the ancestor-check race above.
  *
  * BOUNDED. One kMaxEntriesVisited counter per walk across both views (every enumerated name and
  * value counts, an over-long one too) and ONE RowByteBudget of kMaxEntriesVisited rows and
@@ -314,9 +316,10 @@ struct RealRegOps {
         *data = yuzu::win::reg_sz_to_utf8(buf.c_str(), got);
         return ERROR_SUCCESS;
     }
-    /// One bounded read of a local-drive file, opened as itself and never followed through a link
-    /// (the leaf by FILE_FLAG_OPEN_REPARSE_POINT, every ancestor below the drive root by an attribute
-    /// check). It has no deadline: CreateFileW / ReadFile on a dead FIXED volume (iSCSI, USB, VHD)
+    /// One bounded read of a local-drive file, opened as itself (the leaf by
+    /// FILE_FLAG_OPEN_REPARSE_POINT; every ancestor below the drive root by a BEST-EFFORT attribute
+    /// check, then a separate CreateFileW: a check-then-open race by a local writer of a
+    /// user-writable ancestor is a disclosed residual). It has no deadline: CreateFileW / ReadFile on a dead FIXED volume (iSCSI, USB, VHD)
     /// can block the sync thread, a disclosed residual shared with the other Windows readers.
     /// engaged-and-empty: the file does not exist. nullopt: it exists (or may) but is not read -- not
     /// a plain `X:\...` path, not on a fixed local drive (remote, removable, optical, RAM or

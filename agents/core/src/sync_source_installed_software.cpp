@@ -164,7 +164,7 @@ AdaptedRows failed(std::string reason) {
 // What a `constrained` level does is the action's `policy` (the table's
 // `constrained` column). ConstrainedPolicy::fail: the action fails the cycle
 // (packages: a constrained listing is an incomplete package list). When
-// keep_rows_if_present_seen (managers) the constraint names facts the presence
+// keep_rows_if_present_seen (managers, dotnet, jvm) the constraint names facts the presence
 // row does not carry, so the adapted rows are kept (status ok, reason = the status
 // token) -- but ONLY if at least one PRESENT data row of the action's kind was
 // seen, mapped or not (`on_row` returns true for it): constrained with zero such
@@ -792,8 +792,8 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
                 return skip(source + ":partial");
             }
             if (!rows.reason.empty())
-                spdlog::info("sync: {}.{} constrained ({}) — rows kept: the constraint names facts "
-                             "this row does not carry",
+                spdlog::info("sync: {}.{} constrained ({}) — rows kept: anything the read "
+                             "could not see is absent from this cycle's report",
                              row.plugin, row.action, rows.reason);
             for (auto& e : rows.entries) {
                 e.source = source;

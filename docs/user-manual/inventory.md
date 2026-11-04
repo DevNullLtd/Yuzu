@@ -32,9 +32,10 @@ cadences.
   `constrained` `managers` answer that still names at least one present manager
   is accepted: the constraint concerns manager facts the presence row never
   carried. A `constrained` `runtimes` `dotnet` or `jvm` answer that still lists at least one install is
-  accepted the same way: the constraint names a home or root that could not be fully read, and every
-  install found keeps its row; one that lists none skips the day's report and keeps the last good
-  state. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
+  accepted the same way: the constraint names a home or root that could not be fully read, the installs
+  found keep their rows and any install the read could not see is deleted server-side with no marker;
+  one that lists none skips the device's whole installed-software report for the day (retried daily
+  on backoff) and keeps the last good state. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
   exception: it withholds only that source's rows and the cycle continues, so the
   stored rows of that source are removed until a later read succeeds (see
   Troubleshooting). A skipped cycle
@@ -208,8 +209,9 @@ cadences.
   and a home on a removable, optical, remote or otherwise non-fixed drive keeps its row but its
   `release` file is not read (`windows:runtimes:jvm:release_unreadable`); `supported` with no rows
   means none was found at the standard roots, not that none is installed. A
-  constrained read keeps the rows it found; if it found none, the day's report is skipped and the
-  stored `jvm` rows stay. The macOS Java leg is verified against fixture
+  constrained read keeps the rows it found (installs it could not read are deleted server-side with no
+  marker); if it found none, the device's whole installed-software report is skipped for the day and
+  the stored `jvm` rows stay. The macOS Java leg is verified against fixture
   trees built from the documented bundle layout, not a real JDK install.
 
   **IBM MQ** is collected through the `middleware` plugin's `ibm_mq` action (Linux; `source`
@@ -925,13 +927,14 @@ mount table could not be read), `macos:runtimes:permission_denied`,
 `windows:runtimes:python_reg:row_cap` (a walk cap was hit). Fix the named cause; the next
 daily sync restores the rows.
 
-**A device's .NET or Java software has stopped updating; its log shows
+**A device's whole installed-software report has frozen; its log shows
 `sync: runtimes.dotnet failed: <tokens> — skipping this cycle` (or `runtimes.jvm`).** The
-`dotnet` or `jvm` read was constrained and found no install at all, so the agent skipped the day's
-report rather than send an empty list; the stored rows are kept and nothing is deleted. A
+`dotnet` or `jvm` read was constrained and found no install at all, so the agent skipped the
+device's whole installed-software report rather than send an empty list, and retries daily on
+backoff while the answer stays constrained; the stored rows are kept and nothing is deleted. A
 constrained read that still found an install is not an error: its rows are sent, and the log shows
 `sync: runtimes.jvm constrained (<tokens>) — rows kept`. The tokens name the cause, for example `windows:runtimes:dotnet_reg:access_denied`,
-`windows:runtimes:jvm_reg:access_denied`, `windows:runtimes:jvm:release_unreadable`,
+`windows:runtimes:jvm_reg:access_denied`, `windows:runtimes:jvm:release_unreadable`, `windows:runtimes:jvm:home_unusable`,
 `linux:runtimes:release_missing` or `macos:runtimes:release_unparsable`, and any `row_cap`; the
 `runtimes` README lists them all. On Linux a Java home with a java binary but no `release` file keeps the source constrained
 for as long as it is installed; on macOS the bundle's `Info.plist` supplies the version; on Windows

@@ -62,7 +62,7 @@ using SyncPluginMap = std::map<std::string, const YuzuPluginDescriptor*, std::le
 /// collector's action table; the status row itself is parsed by
 /// agents/shared/inventory_status_row.hpp). The collector's cycle is all-or-nothing, so a source
 /// that cannot answer skips the report -- except `drop_source`, which exists for the middleware
-/// rows only.
+/// and python rows only.
 enum class ConstrainedPolicy {
     /// The action fails the cycle: a partial roster would delete stored rows.
     fail,
@@ -74,7 +74,7 @@ enum class ConstrainedPolicy {
     // replace: DELETE agent rows + INSERT), so rows withheld this cycle are
     // REMOVED from the stored inventory until the source recovers: a constrained cycle shows as
     // the source's rows missing plus its warn line, never as stale rows. For the middleware rows
-    // only: their steady-state constraint is a permission fact, and failing the whole cycle would
+    // and python rows only: their steady-state constraint is a permission fact, and failing the whole cycle would
     // freeze every other source for ever.
     drop_source,
 };

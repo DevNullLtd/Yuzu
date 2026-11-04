@@ -17,7 +17,7 @@
 ##            (jvm); /Library/Frameworks/Python.framework/Versions/<x.y>/Resources/Info.plist
 ##            (python). Network mounts are skipped (getmntinfo_r_np).
 ##   Windows: HKLM\SOFTWARE\dotnet\Setup\InstalledVersions and the NDP release keys (dotnet);
-##            HKLM JavaSoft, Eclipse Adoptium and Azul Zulu keys plus one <home>\release read
+##            HKLM JavaSoft, Eclipse Adoptium, Microsoft and Azul Zulu keys plus one <home>\release read
 ##            (jvm); HKLM\SOFTWARE\Python\PythonCore (python). All in both registry views,
 ##            PEP 514 for python; per-user hives are never read.
 ##
