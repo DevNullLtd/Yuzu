@@ -2439,6 +2439,7 @@ TEST_CASE("every compliance figure shows an uncertain pair beside it (#5690)",
     h.seed_status("a2", "lin-1", "svc1", "drift.detected", "2026-09-01T09:00:00Z");
     h.seed_status("b1", "lin-2", "svc1", "guard.compliant", "2026-09-01T10:00:00Z");
     const std::string phrase = "1 pair with uncertain ordering or an unreflected verdict";
+    const std::string pointer = "See the Guaranteed State guide, section 'When a verdict is flagged or does not move'.";
 
     auto count_of = [&](const std::string& body) {
         std::size_t count = 0;
@@ -2467,11 +2468,18 @@ TEST_CASE("every compliance figure shows an uncertain pair beside it (#5690)",
         REQUIRE(res != nullptr);
         CHECK(res->body.find(phrase + ": each device is counted") != std::string::npos);
         CHECK(res->body.find("&middot; ordering uncertain") != std::string::npos);
+        // The note and the row marker both point at the runbook section.
+        std::size_t pointers = 0;
+        for (std::size_t pos = res->body.find(pointer); pos != std::string::npos;
+             pos = res->body.find(pointer, pos + 1))
+            ++pointers;
+        CHECK(pointers == 2);
     }
     SECTION("the baseline page: a note under the hero and a count on the guard row") {
         auto res = h.sink.Get("/fragments/guardian/baseline/bl1/page");
         REQUIRE(res != nullptr);
         CHECK(res->body.find(phrase + ": the figures above") != std::string::npos);
         CHECK(res->body.find("1 uncertain") != std::string::npos);
+        CHECK(res->body.find(pointer) != std::string::npos);
     }
 }

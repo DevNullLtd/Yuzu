@@ -263,6 +263,17 @@ public:
         census_lock_barrier_ = std::move(fn);
     }
 
+    /// Test seam for the pre-commit health check: `fn` runs with the transaction's `PGconn*` (as
+    /// `void*`, this header does not include libpq) immediately before each of the three
+    /// `txn_healthy` checks (the repair of a redelivered pending event, a single-event insert, a
+    /// batch insert), so a test can put the transaction into the aborted state and prove the commit
+    /// is refused instead of reporting success for a transaction that stored nothing. Production
+    /// leaves it empty (a no-op). Set it before the store is used concurrently and clear it with an
+    /// empty function.
+    void set_pre_commit_hook_for_test(std::function<void(void*)> fn) {
+        pre_commit_hook_ = std::move(fn);
+    }
+
     // Rule CRUD. Mutating methods return `std::expected<void, std::string>`
     // (fail-hard — ADR-0038 posture). Duplicate-UNIQUE collisions (name or
     // rule_id) are reported as an error prefixed with `kConflictPrefix` so
@@ -564,6 +575,7 @@ private:
     std::atomic<uint64_t> events_redelivered_{0};  // event_id conflict, MATCHING payload
     std::atomic<uint64_t> events_ingest_errors_{0}; // operational ingest fault
     std::function<void()> census_lock_barrier_;     // test seam, empty in production
+    std::function<void(void*)> pre_commit_hook_;    // test seam, empty in production
 
     // Compute ttl_expires_at = now + retention_days*86400 in epoch seconds;
     // retention_days <= 0 means "never expire" (returns 0, the sentinel the

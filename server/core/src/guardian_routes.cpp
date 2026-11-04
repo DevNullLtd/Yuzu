@@ -246,6 +246,10 @@ rollup_by_rule(const std::vector<yuzu::server::GuardianAgentRuleStatus>& rows,
 }
 
 // Wording shared by every surface that shows the uncertain count beside a compliance figure.
+// Where an operator reads what to do about a flagged pair (docs/user-manual/guaranteed-state.md).
+constexpr const char* kUncertainRunbookPointer =
+    "See the Guaranteed State guide, section 'When a verdict is flagged or does not move'.";
+
 std::string uncertain_phrase(int64_t n) {
     return std::to_string(n) + (n == 1 ? " pair" : " pairs") +
            " with uncertain ordering or an unreflected verdict";
@@ -2158,7 +2162,7 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
         if (total.uncertain > 0)
             h += "<div class=\"gp-note\">" + uncertain_phrase(total.uncertain) +
                  ": the figures above count each pair at the verdict the census holds, "
-                 "which may not be the latest.</div>";
+                 "which may not be the latest. " + std::string(kUncertainRunbookPointer) + "</div>";
     }
 
     // Stat tiles (mode-aware: remediation tiles only when an Enforce member exists).
@@ -2541,7 +2545,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
         if (d_uncertain > 0)
             h += "<div class=\"gp-note\">" + uncertain_phrase(d_uncertain) +
                  ": each device is counted at the verdict the census holds, "
-                 "which may not be the latest.</div>";
+                 "which may not be the latest. " + std::string(kUncertainRunbookPointer) + "</div>";
     }
     {
         auto tile = [](const std::string& n, const char* tone, const std::string& l, const std::string& sx) {
@@ -2597,7 +2601,8 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
                    : "<span class=\"" + std::string(cls) + "\">&#9679; " + html_escape(d.state) + "</span>" +
                          (d.uncertain ? " <span class=\"gp-drift\" title=\"The ordering of this device's "
                                         "verdict cannot be proven, or a retained event is not yet "
-                                        "reflected\">&middot; ordering uncertain</span>"
+                                        "reflected. " + std::string(kUncertainRunbookPointer) +
+                                        "\">&middot; ordering uncertain</span>"
                                       : std::string{});
             // not-impl rows carry the platform display name in `updated`, not a timestamp.
             const std::string as_of =

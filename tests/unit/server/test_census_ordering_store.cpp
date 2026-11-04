@@ -674,6 +674,69 @@ TEST_CASE("census ordering: a failed projection leaves pending evidence and a re
     CHECK(census(db.dsn(), "a", "r1").starts_with("errored|"));
 }
 
+TEST_CASE("census ordering: a transaction aborted before commit is refused and stores nothing",
+          "[pg][guaranteed_state_store][db][census][ordering][k]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    const std::string events = std::string("SELECT count(*) FROM ") + kSchema +
+                               ".guaranteed_state_events";
+    // Aborts the open transaction right before the health check, as a failed DEX savepoint
+    // release would; without the check COMMIT of an aborted transaction reports success.
+    const auto abort_txn = [](void* conn) {
+        PQclear(PQexec(static_cast<PGconn*>(conn), "SELECT 1/0"));
+    };
+
+    SECTION("a plain census-bearing event") {
+        store.set_pre_commit_hook_for_test(abort_txn);
+        const auto r = store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase));
+        CHECK(r.outcome == EventInsertOutcome::Error);
+        CHECK(r.error.find("transaction aborted before commit") != std::string::npos);
+        store.set_pre_commit_hook_for_test(nullptr);
+        CHECK(query_scalar(db.dsn(), events) == "0");
+        CHECK(census(db.dsn(), "a", "r1").empty());
+    }
+    SECTION("a reserved-rule observation, which carries no census meaning") {
+        store.set_pre_commit_hook_for_test(abort_txn);
+        auto obs = ev("__observation__-1-0", "__observation__", "a", "process.crashed", kBase);
+        obs.guard_category = "";
+        const auto r = store.insert_event_classified(obs);
+        CHECK(r.outcome == EventInsertOutcome::Error);
+        CHECK(r.error.find("transaction aborted before commit") != std::string::npos);
+        store.set_pre_commit_hook_for_test(nullptr);
+        CHECK(query_scalar(db.dsn(), events) == "0");
+    }
+    SECTION("the repair of a redelivered pending event") {
+        install_census_fail(db.dsn(), "NEW.state = 'drifted'");
+        const auto e1 = ev("e1", "r1", "a", kDrifted, kBase + 100);
+        REQUIRE(store.insert_event_classified(e1).outcome == EventInsertOutcome::Inserted);
+        REQUIRE(pending_count(db.dsn()) == "1");
+        remove_census_fail(db.dsn());
+
+        store.set_pre_commit_hook_for_test(abort_txn);
+        const auto r = store.insert_event_classified(e1);
+        CHECK(r.outcome == EventInsertOutcome::Error);
+        CHECK(r.error.find("transaction aborted before the repair commit") != std::string::npos);
+        store.set_pre_commit_hook_for_test(nullptr);
+        CHECK(pending_count(db.dsn()) == "1"); // nothing was retired by the refused repair
+        CHECK(census(db.dsn(), "a", "r1").empty());
+
+        // A later redelivery with a healthy transaction still repairs it.
+        CHECK(store.insert_event_classified(e1).outcome == EventInsertOutcome::Redelivered);
+        CHECK(pending_count(db.dsn()) == "0");
+    }
+    SECTION("a batch") {
+        store.set_pre_commit_hook_for_test(abort_txn);
+        const auto n = store.insert_events({ev("b1", "r1", "a", kDrifted, kBase),
+                                            ev("b2", "r1", "a", kCompliant, kBase + 1)});
+        CHECK_FALSE(n.has_value());
+        store.set_pre_commit_hook_for_test(nullptr);
+        CHECK(query_scalar(db.dsn(), events) == "0");
+    }
+}
+
 TEST_CASE("census ordering: two failed projections then a repair keep the disagreement",
           "[pg][guaranteed_state_store][db][census][ordering][k]") {
     // Astra SQL pass Q2: H (key 120, seq lower) and L (key 110, seq higher) both fail and stay

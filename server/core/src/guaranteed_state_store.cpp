@@ -1824,6 +1824,7 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
                         return op_error(std::string("census savepoint failed: ") +
                                             PQerrorMessage(conn),
                                         kReasonQueryError);
+                    if (pre_commit_hook_) pre_commit_hook_(conn);
                     if (!txn_healthy(conn))
                         return op_error("transaction aborted before the repair commit",
                                         kReasonQueryError);
@@ -1894,6 +1895,7 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
     // Checked for EVERY event, not only census-bearing ones: the DEX savepoint block above discards
     // the results of its own SAVEPOINT / ROLLBACK TO / RELEASE, and COMMIT of an aborted
     // transaction reports success to libpq while storing nothing.
+    if (pre_commit_hook_) pre_commit_hook_(conn);
     if (!txn_healthy(conn))
         return op_error("transaction aborted before commit", kReasonQueryError);
 
@@ -2029,6 +2031,7 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
     // After the whole loop, not after each projection: the DEX savepoint block inside it ignores
     // the results of its own ROLLBACK TO / RELEASE, so only a check right before COMMIT can see an
     // aborted transaction that COMMIT would otherwise report as success.
+    if (pre_commit_hook_) pre_commit_hook_(conn);
     if (!txn_healthy(conn))
         return std::unexpected("transaction aborted before commit");
     if (!txn.commit())
