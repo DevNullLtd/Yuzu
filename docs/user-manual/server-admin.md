@@ -4925,7 +4925,7 @@ sudo bash install-server-postgres.sh --dsn 'postgresql://yuzu:...@db.example.com
 sudo bash install-server-postgres.sh
 ```
 
-The helper is **non-fatal when no local cluster is found** (prints install hints and exits 0) — this posture flips to a hard failure when the server starts requiring the DSN. The app role's credential is freshly random and never shared with the `postgres` superuser. Per-store schemas are *not* created by the helper; the server's migration runner owns those at startup (ADR-0008).
+The helper is **non-fatal when no local cluster is found** (prints install hints and exits 0) — this posture flips to a hard failure when the server starts requiring the DSN. The app role's credential is freshly random and never shared with the `postgres` superuser. Per-store schemas are *not* created by the helper; the server's migration runner owns those at startup (ADR-0008). The database should be UTF8-encoded (the shipped `yuzu-postgres` image's default; the helper sets no encoding of its own, so a native cluster follows its `initdb` locale): the access-review history read cuts a superseded justification by characters, which assumes UTF8, and on a database with a single-byte encoding a cut can fall inside a multibyte sequence.
 
 ### Backing up PostgreSQL state
 

@@ -2497,6 +2497,7 @@ TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the app
                                "retry_after_ms can mean the decision was recorded anyway",
                                "before retrying, call get_access_review, compare decision_seq",
                                "match reviewer, justification and decided_at_ms",
+                               "an earlier entry shows at most its first 512 characters",
                                "a blind retry appends another identical decision"})
         CHECK(rdesc.find(needle) != std::string::npos);
     for (const char* stale : {"UPSERT", "OVERWRITES", "not retained"})

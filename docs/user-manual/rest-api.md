@@ -4337,9 +4337,9 @@ gate, so a caller without the permission still gets the `403`.
 ```
 
 `decision_seq` is the number of decisions recorded for the grant: `0` exactly
-while it is `pending`, then `1`, `2` and so on. `history[]` lists every decision
-for the grant in `seq` order, oldest first, and is empty while the grant is
-pending. Each entry has `seq` (1 for the first decision on the grant; order is by
+while it is `pending`, then `1`, `2` and so on. `history[]` lists the grant's
+decisions in `seq` order, oldest first (at most the latest 100), and is empty
+while the grant is pending. Each entry has `seq` (1 for the first decision on the grant; order is by
 `seq`, never by time), `decision`, `previous_decision` (the decision it replaced:
 `pending` for the first one; an empty string means *not recorded*, for a decision
 that predates the history table, and never means pending), `reviewer`,
@@ -4359,7 +4359,9 @@ first 512 characters of what you sent. The response grows with every recorded
 decision, up to 100 per grant: `history[]` lists at most the latest 100 entries of
 a grant, and `decision_seq` stays the total, so `decision_seq` greater than the
 number of entries means earlier ones are not shown (the write cap keeps a grant at
-or under 100, so this appears only if rows were added or removed by other means).
+or under 100 for rows written through the application path, so this appears only if
+rows were added or removed by other means, such as owner-level SQL with the guard
+triggers disabled, which is outside the guarantee).
 The Settings campaign fragment shows the latest decision only and has
 no marker for earlier ones; that difference is intended. The Access page shows the
 latest decision with a marker and the earlier ones behind a disclosure; when the
@@ -4434,7 +4436,10 @@ decision. `400`, one cause each:
 - `principal_type`, `principal_id` or `role_name` is longer than 1024 bytes or contains a NUL byte. The
   message is `principal_type, principal_id and role_name must be 1-1024 bytes without NUL`. It is decided
   before any lookup, so it holds for all three principal types, and it writes no audit row (the schema
-  `maxLength` values are discovery metadata; the handler enforces the limit).
+  `maxLength` values are discovery metadata; the handler enforces the limit). The limit bounds the
+  audit rows and no known creation path produces a longer id, but a frozen grant whose `principal_id` or
+  `role_name` exceeds 1024 bytes cannot be attested: it stays `pending` and is reported as an incomplete
+  review when the campaign closes.
 - `justification` is longer than 4096 bytes or contains a NUL byte. The store checks this after the
   separation-of-duties gate and writes a `failure` audit row.
 - The grant already holds the maximum of 100 recorded decisions. The message is
@@ -4477,7 +4482,9 @@ refresh it. For identity-provider-governed groups the group rule is therefore no
 a current-membership check; review those groups at the identity provider when the
 campaign closes. For an engine or group grant the history entry does not record the
 ownership or membership basis; the `sod=pass` audit row is the evidence of
-independence (see `docs/auth-architecture.md` "Periodic access reviews").
+independence (see `docs/auth-architecture.md` "Periodic access reviews"). Treat
+independence as unevidenced if that row was not persisted (`Sec-Audit-Failed: true`
+on the response).
 
 **Every decision is kept.** A second decision for the same `(campaign_id,
 principal_type, principal_id, role_name)` does not replace the first: it is
@@ -4490,7 +4497,8 @@ final, and no further decision is accepted on that grant in that campaign. The
 history and the audit rows identify who wrote the entries. To review the grant
 again, close the campaign and open a new one, which freezes a fresh population. `record_attestation`'s MCP `destructiveHint` stays
 `true` because the current decision is replaced with no route back to pending; the
-earlier one is retained in the history.
+earlier one is kept in the history (a read returns the latest 100 entries per grant,
+an earlier justification cut to its first 512 characters).
 
 **If the answer is lost, read before retrying.** A decision is recorded when its
 transaction commits. If the connection drops after the commit was sent, the server
@@ -4499,7 +4507,7 @@ retrying, `GET /api/v1/access-reviews/{id}`, compare `decision_seq` with the val
 you last saw and look for your own entry (match `reviewer`, `justification` and
 `decided_at_ms`; once a later decision exists, an earlier entry's `justification`
 is at most its first 512 characters). A blind retry after an unacknowledged commit appends an identical
-decision at the next `seq`; it is kept and visible, never an error, until the
+decision at the next `seq`; it is kept and visible, not an error, until the
 grant reaches its limit of 100 decisions, after which the request is refused (read
 the campaign first if your earlier attempt may have been recorded). The first
 attempt writes a `failure` audit row, so an auditor sees a failure row next to a

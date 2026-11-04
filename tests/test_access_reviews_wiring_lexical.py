@@ -23,8 +23,9 @@ It also pins two properties of the attestation write path that no route test can
      is either one of the three machine-checkable prefixes the two classifiers key on, or a string
      recorded here as a genuine fault (503 / internal-error). A new unprefixed client-validation
      string would otherwise be answered as a retryable store failure. A message built in a variable
-     (the decision-cap refusal) is outside this check; the classifier test covers it. The REST and MCP classifiers must both delegate to the one shared
-     `classify_store_error` (a local copy is how they drift apart).
+     (the decision-cap refusal) is outside this check; the classifier test covers it. The REST and
+     MCP classifiers must both delegate to the one shared `classify_store_error` (a local copy is
+     how they drift apart).
 
 Same method as test_access_audit_wiring_lexical.py (comments stripped, whitespace collapsed,
 in-memory mutations prove each pattern is live). Lexical only.

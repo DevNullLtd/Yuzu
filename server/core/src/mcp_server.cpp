@@ -3440,9 +3440,10 @@ static const ToolDef kTools[] = {
      "again for the same (campaign_id, principal_type, principal_id, role_name) makes the new "
      "decision the CURRENT one and it can never return the grant to pending, so "
      "destructiveHint:true; the earlier decision is NOT lost, every decision is kept in the "
-     "grant's history (get_access_review returns it, with a decision_seq). The reviewer must "
-     "differ from the subject of the grant: a user grant naming the caller, an engine "
-     "principal the caller owns, or a group the caller belongs to is refused with a "
+     "grant's history (get_access_review returns the latest 100 entries per grant, with an "
+     "earlier justification cut to its first 512 characters, and a decision_seq). The "
+     "reviewer must differ from the subject of the grant: a user grant naming the caller, an "
+     "engine principal the caller owns, or a group the caller belongs to is refused with a "
      "permission-denied result, 'the reviewer must differ from the subject of this grant; ask "
      "another reviewer to record this decision', and records nothing. principal_id and "
      "role_name are at most 1024 bytes each and justification at most 4096 bytes. Each grant "
@@ -3455,7 +3456,8 @@ static const ToolDef kTools[] = {
      "An internal error that carries retry_after_ms can mean the decision was recorded anyway "
      "(a lost commit acknowledgement): before retrying, call get_access_review, compare "
      "decision_seq with the value you last saw and look for your own entry (match reviewer, "
-     "justification and decided_at_ms), because a blind retry appends another identical "
+     "justification and decided_at_ms; an earlier entry shows at most its first 512 "
+     "characters), because a blind retry appends another identical "
      "decision, which is kept and visible, not an error, until the grant reaches its limit of "
      "100 decisions, after which the request is refused. Mirrors POST "
      "/api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested or "
@@ -3473,15 +3475,16 @@ static const ToolDef kTools[] = {
     {"get_access_review",
      "Full evidentiary state of one review campaign: metadata plus every frozen "
      "attestation row (pending/attested/flagged_revoke) plus pending_count. Each attestation "
-     "carries its current decision, a decision_seq (0 while pending) and history, every "
-     "decision recorded for that grant oldest first as {seq, decision, previous_decision, "
-     "reviewer, justification, justification_truncated, decided_at_ms}; previous_decision "
-     "\"\" means not recorded (the decision predates the history), never pending. The "
-     "response grows with every re-recorded decision, up to 100 decisions per grant; a "
-     "history lists at most the latest 100, so decision_seq greater than the number of history "
-     "entries means earlier ones are not shown. Only the latest history entry carries its "
-     "whole justification; an earlier entry carries at most its first 512 characters, with "
-     "justification_truncated true when text was cut (the full text stays in the database). "
+     "carries its current decision, a decision_seq (0 while pending) and history, the latest "
+     "decisions recorded for that grant (at most 100) oldest first as {seq, decision, "
+     "previous_decision, reviewer, justification, justification_truncated, decided_at_ms}; "
+     "previous_decision \"\" means not recorded (the decision predates the history), never "
+     "pending. The response grows with every re-recorded decision, up to 100 decisions per "
+     "grant; a history lists at most the latest 100, so decision_seq greater than the number "
+     "of history entries means earlier ones are not shown. Only the latest history entry "
+     "carries its whole justification; an earlier entry carries at most its first 512 "
+     "characters, with justification_truncated true when text was cut (the full text stays "
+     "in the database). "
      "campaign.rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state frozen "
      "AT OPEN (empty string for a campaign opened before this field existed). Mirrors GET "
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
@@ -5532,8 +5535,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
      {ToolEffect::Destructive, true, "Raise Guardian policy generation"}},
     {"open_access_review", {ToolEffect::Additive, false, "Open access review campaign"}},
     // record_attestation: the current decision is replaced and a grant can never return to
-    // pending → Destructive. The earlier decision is retained in the grant's history, so this
-    // is not a loss of evidence; the hint stays true because the current state is replaced.
+    // pending → Destructive. The earlier decision is kept in the grant's history (the read
+    // returns the latest 100 per grant, earlier justifications cut), so this is not a loss of
+    // evidence; the hint stays true because the current state is replaced.
     {"record_attestation", {ToolEffect::Destructive, false, "Record access review attestation"}},
     // close_access_review: one-way open→closed lifecycle (no reopen path) → Destructive.
     {"close_access_review", {ToolEffect::Destructive, false, "Close access review campaign"}},
@@ -28559,7 +28563,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // Same read as GET /api/v1/access-reviews/{id}: every decision, not only the latest.
+                // Same read as GET /api/v1/access-reviews/{id}: the grant's history.
                 auto view_res = access_review_store->get_campaign(campaign_id, /*include_history=*/true);
                 if (!view_res) {
                     mcp_audit("failure", view_res.error());

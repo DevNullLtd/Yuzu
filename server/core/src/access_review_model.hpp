@@ -202,13 +202,16 @@ inline constexpr std::string_view kCampaignIdInvalidMessage =
     "campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -";
 
 /// Longest `principal_type` / `principal_id` and `role_name` an attestation names, in bytes. The
-/// cap bounds what a caller can make an audit row (and a log line) carry before any existence proof,
-/// and must still admit every grant the stores can freeze: an OIDC principal is
+/// cap bounds what a caller can make an audit row (and a log line) carry before any existence
+/// proof, and must still admit every grant the stores can freeze: an OIDC principal is
 /// `oidc:<iss>#<sub>` with `iss` and `sub` each capped at 255 bytes by `oidc_provider.cpp` (about
 /// 516 bytes), a SAML principal caps each component the same way, and an IdP group is stored as
 /// `<source>:<external_id>` with an external id up to 512 bytes (`kMaxExternalIdLength` in
 /// `rbac_store.cpp`). `RbacStore::create_role` and the engine principal id carry no length cap of
 /// their own, so 1024 is a bound on what is attestable, not a proven upper bound of every store.
+/// No known creation path produces a longer id. A frozen grant whose `principal_id` or `role_name`
+/// is longer cannot be attested (400); it stays pending and is reported as an incomplete review
+/// when the campaign closes.
 /// A row carries at most three such fields (`audit_token` neutralises bytes but does not shorten
 /// them), so an audit row stays under about 3.3 KiB.
 inline constexpr std::size_t kPrincipalIdMaxLen = 1024;
@@ -227,7 +230,9 @@ static_assert(kPrincipalIdMaxLen == 1024 && kRoleNameMaxLen == 1024,
 /// Most decisions one grant keeps. `record_attestation` refuses the next one (`bad_request:` +
 /// `kDecisionCapMessage`, nothing written) and `get_campaign(id, true)` returns at most this many
 /// history entries per grant (the latest), so one grant cannot make a read or a response grow
-/// without bound. `decision_seq` stays the total count: a consumer detects a truncated history as
+/// without bound (for rows written through the application path; rows added by other means, such
+/// as owner-level SQL with the guard triggers disabled, are outside that guarantee).
+/// `decision_seq` stays the total count: a consumer detects a truncated history as
 /// `decision_seq > history.size()`. Same type as `decision_seq`. The count alone does not bound a
 /// campaign with many grants: superseded entries also return a justification preview only
 /// (`kHistoryJustificationPreviewChars`, access_review_store.hpp).

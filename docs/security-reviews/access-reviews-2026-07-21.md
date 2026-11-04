@@ -485,11 +485,19 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
 - Input bounds: `principal_type`, `principal_id` and `role_name` are 1 to 1024 bytes without NUL
   and `justification` is at most 4096 bytes; a grant keeps at most 100 decisions (the 100th is
   final: the 101st is refused with `400`, nothing written, and the grant can be reviewed again
-  only in a new campaign, which freezes a fresh population) and a history read returns at most the latest 100 entries
-  of a grant. Every entry except the latest also returns at most the first 512 characters of its
+  only in a new campaign, which freezes a fresh population; the history and audit rows identify who
+  wrote the entries) and a history read returns at most the latest 100 entries
+  of a grant (for rows written through the application path; rows added by other means, such as
+  owner-level SQL with the guard triggers disabled, are outside that guarantee). Every entry except the latest also returns at most the first 512 characters of its
   justification (cut in SQL, counted in characters), flagged by `justification_truncated`: the
-  per-grant limit alone does not bound a campaign with many grants (100 x 4 KiB x grants, about
-  430 MB per copy at 1000 grants, held in several copies by the REST, MCP and page paths). The full
+  per-grant limit alone does not bound a campaign with many grants (100 x 4096 bytes x grants, about
+  410 MB per copy at 1000 grants, held in several copies by the REST, MCP and page paths). With the
+  preview the response is bounded by the per-grant ceiling x the number of frozen grants; there is
+  no per-campaign budget (an accepted limit). At 1000 grants, each grant at its 100-decision
+  limit, one copy is at most about 87 MB with ASCII text, about 241 MB with 4-byte characters and
+  about 364 MB when every character is a control character that JSON escapes to six bytes, plus
+  about 50 MB when the reviewer ids are about 520 bytes long (the figures use the test's estimate
+  of 320 bytes of fixed fields per entry). The full
   text of a superseded entry stays in the database and is not returned; an assessor exports it with
   a database read of `access_review_attestation_history`. A success answers `{recorded, decision_seq, previous_decision}`.
 - Audit shape: `target_id` is the campaign id alone and the grant is in `detail`, for every
@@ -534,8 +542,10 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
    path. It is a database-administrator procedure that must cover the state row's latest reviewer
    and justification, the history rows, the subject id (part of a primary key and of a restricted
    foreign key, so redacting key columns is not feasible without rewriting keys and the frozen
-   snapshot), the campaign's `created_by` and `closed_by`, and the audit rows (kept for the audit
-   retention period); "re-verify" means checking that the guard triggers are enabled again and
+   snapshot), the frozen `grant_snapshot` of each grant (it holds `display_name` and
+   `owner_or_email`, an email address for a user; the state row's guard trigger pins it as
+   immutable, so redacting it needs that trigger disabled too), the campaign's `title` (free
+   text), `created_by` and `closed_by`, and the audit rows (kept for the audit retention period); "re-verify" means checking that the guard triggers are enabled again and
    that the consistency trigger holds. The procedure has not been exercised.
 3. A person with two identities (a local account and an SSO identity) counts as two reviewers (the
    accepted exception in `docs/enterprise-readiness-soc2-first-customer.md`).
@@ -548,7 +558,8 @@ them, and a later decision on the same grant overwrote the earlier one. Now:
    it. After a dropped connection the outcome of an attestation can be unknown: read the campaign
    and compare `decision_seq` before retrying; a retry appends an identical decision until the
    grant reaches its limit of 100 decisions, after which the request is refused. A
-   superseded entry is returned truncated, so match an earlier entry on the first 512 characters.
+   superseded entry is returned truncated (and an earlier history entry shows at most its first 512
+   characters), so match an earlier entry on those.
 6. Under a continuous stream of attestations a `close` can wait up to the pool's lock timeout and
    answer `503`; retry it.
 

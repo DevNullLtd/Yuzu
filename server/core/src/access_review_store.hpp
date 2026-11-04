@@ -79,7 +79,9 @@
 /// decision was recorded (`PgPool`'s lost-COMMIT ambiguity) and is answered
 /// with a write failure. GET the campaign and compare `decision_seq` before
 /// retrying: a retry after an unacknowledged commit appends an identical
-/// decision at seq+1, which is kept and visible, never an error.
+/// decision at seq+1, which is kept and visible (an earlier entry shows at most
+/// its first 512 characters, so match on the rest), not an error, until the
+/// grant's 100th decision.
 ///
 /// Close starvation: a queued `close_campaign` does not block a NEW
 /// attestation's `FOR SHARE` on the campaign row, so under a continuous
@@ -185,7 +187,8 @@ struct AccessReviewAttestationRow {
     std::string grant_snapshot;   ///< verbatim from the freezing `GrantRef`
     /// Decisions recorded for this grant; 0 exactly while `decision == "pending"`.
     std::int32_t decision_seq{0};
-    /// Every decision for this grant in `seq` order. Filled only by
+    /// The latest (at most `kMaxDecisionsPerGrant`) decisions for this grant in `seq` order, every
+    /// entry but the latest with its justification cut to a preview. Filled only by
     /// `get_campaign(id, include_history=true)`; empty otherwise (not a claim that none exist).
     std::vector<AttestationHistoryRow> history;
 };
@@ -275,11 +278,13 @@ public:
 
     /// Full evidentiary state for one campaign: metadata + every frozen
     /// attestation row + `pending_count`. With `include_history` each row also
-    /// carries its `history` (every recorded decision in `seq` order), read in
+    /// carries its `history` (the recorded decisions in `seq` order), read in
     /// the same REPEATABLE READ snapshot, capped at the latest
     /// `kMaxDecisionsPerGrant` entries per grant (a backstop: the write cap keeps
     /// a grant at or under it, so `decision_seq > history.size()` means rows were
-    /// added by other means). Every entry except the grant's latest (`seq == decision_seq`)
+    /// added by other means). The cap holds for rows written through the application path;
+    /// rows added by other means (owner-level SQL with the guard triggers disabled, which can
+    /// forge a state row) are outside the guarantee. Every entry except the grant's latest (`seq == decision_seq`)
     /// carries at most its first `kHistoryJustificationPreviewChars` characters of justification,
     /// cut in SQL on a character boundary, with `justification_truncated` set when the stored
     /// text was longer; the latest entry is whole. The two bounds together cap what one grant

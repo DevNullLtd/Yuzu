@@ -3757,8 +3757,10 @@ topology floor" above); `AccessReview:Attest` is admin-only through the legacy r
    redaction has no application path: it is a database-administrator procedure that must cover the state row's
    latest reviewer and justification, the history rows, the subject id (part of a primary key and of a
    restricted foreign key, so redacting key columns is not feasible without rewriting keys and the frozen
-   snapshot), the campaign's `created_by` and `closed_by`, and the audit rows (kept for the audit retention
-   period); "re-verify" means checking that the guard triggers are enabled again and that the consistency
+   snapshot), the frozen `grant_snapshot` of each grant (it holds `display_name` and `owner_or_email`, an
+   email address for a user; the state row's guard trigger pins it as immutable, so redacting it needs that
+   trigger disabled too), the campaign's `title` (free text), `created_by` and `closed_by`, and the audit rows
+   (kept for the audit retention period); "re-verify" means checking that the guard triggers are enabled again and that the consistency
    trigger holds. The procedure has not been exercised (SOC 2 data-inventory row in
    `docs/enterprise-readiness-soc2-first-customer.md`).
 5. **The reviewer must differ from the subject of the grant (#4752).** The rules, the window and the residuals
@@ -3875,19 +3877,32 @@ written. The 100th decision is final: the grant takes no further decision in tha
 the audit rows identify who wrote the entries, and the remedy is to close the campaign and open a new one (a
 new campaign freezes a fresh population). A history read returns at most the latest
 100 entries of a grant; `decision_seq` stays the total, so `decision_seq` greater than the number of entries
-means earlier ones are not shown. The entry count alone does not bound the response of a campaign with many
+means earlier ones are not shown. That bound holds for rows written through the application path; rows added by
+other means (owner-level SQL with the guard triggers disabled, for example a forged pending state row with more than
+100 history rows) are outside the guarantee and are returned as they stand. The entry count alone does not bound the response of a campaign with many
 grants (100 entries of 4096 bytes each, per grant), so every entry except the grant's latest also returns at
 most its first 512 characters of justification, cut in SQL (`left()` counts characters, so a multibyte
 sequence is never split) and flagged by `justification_truncated`; the latest entry is whole and equals the
 state row. The full text of a superseded entry stays in the database and is not returned, so an export of it
-is a database read of `access_review_attestation_history`. A grant adds at most 100 entries of 512 characters
-plus one whole entry to a response. The Access page marks a cut entry "(truncated)" and never labels a pair
+is a database read of `access_review_attestation_history`. A grant adds at most 99 entries of 512 characters
+plus one whole entry to a response, so a response is bounded by the per-grant ceiling times the number of frozen
+grants; there is no per-campaign budget (an accepted limit). At 1000 grants at the limit one copy is at
+most about 87 MB with ASCII text, about 241 MB with 4-byte characters and about 364 MB when every character is
+a control character that JSON escapes to six bytes, plus about 50 MB when reviewer ids are about 520 bytes (an
+estimate of 320 bytes of fixed fields per entry; REST, MCP and the page each hold a copy). The Access page marks a cut entry "(truncated)" and never labels a pair
 in which either entry was cut as a re-recording, because a cut text cannot be shown equal to the next one. A successful attest answers `{recorded, decision_seq, previous_decision}`.
+
+**Database encoding.** The truncation counts characters and assumes a UTF8-encoded database (the shipped image's
+default); on a database with a single-byte encoding a cut can fall inside a multibyte sequence.
+
+**Frozen grants whose ids exceed 1024 bytes.** No known creation path produces an id longer than the limit, but a
+frozen grant whose `principal_id` or `role_name` exceeds 1024 bytes cannot be attested (`400`); it stays pending
+and is reported as an incomplete review when the campaign closes.
 
 **Lost COMMIT.** One history event is one committed decision transaction. When the connection drops after
 COMMIT was sent, the server cannot tell whether the decision was recorded and answers a write failure (503 on
 REST). Before retrying, GET the campaign and compare `decision_seq`. A retry after an unacknowledged commit
-appends an identical decision at seq+1; it is kept and visible, never an error, until the grant reaches its
+appends an identical decision at seq+1; it is kept and visible, not an error, until the grant reaches its
 limit of 100 decisions, after which the request is refused (read the campaign first if your earlier attempt
 may have been recorded). The first attempt writes a
 `result=failure` audit row whose fixed text says the decision store is unavailable or the decision may not have

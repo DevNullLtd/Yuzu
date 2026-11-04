@@ -3190,6 +3190,40 @@ TEST_CASE("decision history: REST, MCP and the Access page agree, and the OpenAP
           keys_of(bob["history"][0]));
     CHECK(att_schema["properties"]["history"]["items"]["$ref"] ==
           "#/components/schemas/AccessReviewAttestationHistoryEntry");
+    // The OpenAPI prose states the preview length from the constant, so a change to one that
+    // leaves the other behind fails.
+    const std::string preview_chars =
+        std::to_string(yuzu::server::kHistoryJustificationPreviewChars);
+    const std::string first_n = "first " + preview_chars + " characters";
+    CHECK(spec["paths"]["/access-reviews/{id}"]["get"]["description"].get<std::string>().find(
+              first_n) != std::string::npos);
+    CHECK(spec["paths"]["/access-reviews/{id}/attestations"]["post"]["description"]
+              .get<std::string>()
+              .find(first_n) != std::string::npos);
+    CHECK(hist_schema["properties"]["justification"]["description"].get<std::string>().find(
+              "at most its first " + preview_chars + " characters") != std::string::npos);
+
+    // The MCP output schema names exactly the keys the tool emits for a history entry too (an
+    // extra emitted key must fail here, not only a missing one).
+    {
+        nlohmann::json list = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/list"}};
+        auto tools = h.mcp_call(list.dump());
+        REQUIRE(tools);
+        bool schema_found = false;
+        for (const auto& t : nlohmann::json::parse(tools->body)["result"]["tools"]) {
+            if (t["name"] != "get_access_review")
+                continue;
+            schema_found = true;
+            const auto& mcp_hist =
+                t["outputSchema"]["properties"]["attestations"]["items"]["properties"]["history"]
+                 ["items"];
+            CHECK(property_names(mcp_hist) == keys_of(find_att(mcp_atts, "bob")["history"][0]));
+            CHECK(std::set<std::string>(mcp_hist["required"].begin(),
+                                        mcp_hist["required"].end()) ==
+                  keys_of(find_att(mcp_atts, "bob")["history"][0]));
+        }
+        CHECK(schema_found);
+    }
 
     // The Access page: the real fragment route over the real store, history opted in.
     yuzu::server::test::TestRouteSink page;
@@ -3241,7 +3275,8 @@ TEST_CASE("decision history: REST, MCP and the Access page agree, and the OpenAP
 // The ceiling in numbers: a grant at the 100-decision limit with a 4096-character justification on
 // every decision serialises to one whole latest entry plus 99 previews, not 100 x 4 KiB. The bound
 // is derived from the constants; kEntryOverheadBytes covers the fixed keys, the seq, the decision
-// words, a short reviewer name and the timestamp of one entry (about 200 bytes measured).
+// words, a short reviewer name and the timestamp of one entry (320 is an ASCII estimate with
+// headroom, not a measurement).
 TEST_CASE("decision history: a grant at the decision limit serialises under the derived ceiling",
           "[pg][access_review][rest][access-reviews][4752]") {
     constexpr std::size_t kEntryOverheadBytes = 320;
@@ -3383,6 +3418,46 @@ TEST_CASE("attestation cap: the decision after the 100th is 400 on REST and inva
         CHECK(sc["decision_seq"] == 1);
         CHECK(sc["previous_decision"] == "pending");
     }
+}
+
+// Negative control for the wire-prefix strip: only the cap refusal loses its `bad_request: `
+// classification prefix. Another store refusal of the caller's (a justification over its bound,
+// decided in the store after the gate) keeps the text it has always had, on both transports.
+TEST_CASE("attestation wire text: only the cap refusal loses the bad_request prefix, another store "
+          "refusal keeps it on REST and MCP",
+          "[pg][access_review][rest][mcp][4752]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    const auto cid = h.open_campaign_rest("wire prefix");
+    h.session_user = "carol";
+    const std::string too_long(yuzu::server::kMaxJustificationBytes + 1, 'j');
+    const std::string expected = "bad_request: justification exceeds " +
+                                 std::to_string(yuzu::server::kMaxJustificationBytes) + " bytes";
+
+    SECTION("REST") {
+        auto req = nlohmann::json::parse(sod_body("user", "bob", "Operator"));
+        req["justification"] = too_long;
+        auto res = h.sink.Post(attest_url(cid), req.dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["message"].get<std::string>().starts_with("bad_request: "));
+        CHECK(body["error"]["message"] == expected);
+    }
+
+    SECTION("MCP") {
+        auto args = sod_args(cid, "user", "bob", "Operator");
+        args["justification"] = too_long;
+        auto res = h.mcp_call_tool("record_attestation", args);
+        const auto err = mcp_error_of(res);
+        CHECK(err["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(err["message"].get<std::string>().starts_with("bad_request: "));
+        CHECK(err["message"] == expected);
+    }
+    // Nothing was recorded.
+    CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 0);
 }
 
 TEST_CASE("attestation success body: OpenAPI and the MCP output schema name exactly the fields the "

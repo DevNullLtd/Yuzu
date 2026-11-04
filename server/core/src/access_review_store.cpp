@@ -606,7 +606,10 @@ AccessReviewStore::get_campaign(const std::string& campaign_id, bool include_his
             // 4-tuple, so a history row's grant is found by a forward merge, not a search.
             // Each grant returns only its latest kMaxDecisionsPerGrant entries (`seq` greater than
             // the state row's decision_seq minus the cap), so a grant carrying more rows than the
-            // write cap allows (written by other means) cannot make this read unbounded.
+            // write cap allows cannot make this read unbounded. That holds for rows written
+            // through the application path; rows added by other means (owner-level SQL with the
+            // guard triggers disabled, e.g. a forged pending state row with more history rows
+            // above its decision_seq) are outside the guarantee.
             // decision_seq stays the total count, so truncation reads as decision_seq > entries.
             // The LEFT JOIN + COALESCE keep a history row whose state row is missing, so the
             // merge below still reports that corruption instead of the row silently vanishing.
