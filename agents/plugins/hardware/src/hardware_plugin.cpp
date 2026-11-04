@@ -8,6 +8,8 @@
  *   "processors"   — Lists installed CPUs with model, cores, threads, clock.
  *   "memory"       — Lists installed memory modules.
  *   "disks"        — Lists physical disk drives.
+ *   "drivers_inventory" — Stable-ordered driver rows with signer/signed/INF/hardware id
+ *                    (Windows + Linux; one unsupported status row on macOS).
  *   "system"       — Serial number + system UUID (CMDB correlation key).
  *   "chassis", "baseboard", "swap", "machine_id" — PLANNED on every OS: each answers one
  *                    `status|<action>|unsupported|<os>:planned` row until its leg lands
@@ -21,6 +23,7 @@
 #include <yuzu/plugin.hpp>
 
 #include "hardware_estate_legs.hpp" // chassis/baseboard/swap/machine_id Kind
+#include "hardware_drivers_inventory.hpp" // drivers_inventory: pure compose + Linux read shell
 
 #include <planned_leg.hpp> // shared planned-leg reporter (agents/shared)
 
@@ -775,6 +778,59 @@ int do_drivers(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ── drivers_inventory action ──────────────────────────────────────────────
+// The stable-ordered, bounded sibling of `drivers` (which stays idx-ordered and unchanged): adds
+// signer / signed state / INF / hardware id, sorts and de-duplicates every row, and leads with a
+// typed status row. The row grammar, ordering and every parser live in
+// hardware_drivers_inventory.hpp so the unit suite runs them on any host; this function is only
+// the OS read plus the output.
+//   Windows: Win32_PnPSignedDriver straight through run_bounded_wmi_query with a 4096-row cap (not
+//            the 512-row wmi_query wrapper, which truncates real hosts).
+//   Linux:   /proc/modules plus /sys/module/<m>/{version,taint} (hardware_drivers_inventory.hpp
+//            read_linux, no-follow bounded reads, no subprocess, no .ko parsing).
+//   macOS:   no public kext/dext enumeration API: one unsupported status row.
+
+int do_drivers_inventory(yuzu::CommandContext& ctx) {
+    namespace di = yuzu::hardware::drivers_inventory;
+#if defined(_WIN32) || defined(__linux__)
+    yuzu::shared::ConstraintAccumulator acc;
+    std::vector<di::Row> rows;
+#ifdef _WIN32
+    auto result = wmi::run_bounded_wmi_query(
+        L"ROOT\\CIMV2",
+        L"SELECT DeviceName, DriverVersion, DriverDate, DriverProviderName, DeviceClass, Signer, "
+        L"IsSigned, InfName, HardWareID FROM Win32_PnPSignedDriver WHERE DeviceName IS NOT NULL",
+        wmi::BoundedQueryOptions{.row_cap = di::kRowCap});
+    if (result.error) {
+        // A failed query is never an empty supported answer: it is a constrained, row-less one.
+        spdlog::warn("hardware: drivers_inventory WMI query failed: {}", *result.error);
+        acc.add_failure(std::string{di::kWindowsPrefix} + *result.error);
+    } else {
+        rows.reserve(result.rows.size());
+        for (const auto& r : result.rows)
+            rows.push_back(di::row_from_wmi(r));
+        if (result.truncated)
+            acc.add_failure(di::kWindowsRowCap);
+    }
+#else
+    rows = di::read_linux("/proc/modules", "/sys/module", acc);
+#endif
+    const auto composed = di::compose(std::move(rows), acc);
+    for (const auto& line : composed.lines)
+        ctx.write_output(line);
+    if (composed.constrained)
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              composed.tokens);
+    else
+        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL);
+#else
+    const std::string_view token = di::kMacosUnsupported;
+    ctx.write_output(di::unsupported_line(token));
+    ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL, token);
+#endif
+    return 0;
+}
+
 // ABI4 capability declarations (#2204). Windows reads WMI throughout — the
 // ADR-3002 context section names this plugin's WMI usage as an existing
 // rung-1 example ("Windows plugins live here (hardware/bitlocker/
@@ -857,6 +913,19 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/modules", nullptr},
         /* .macos_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_PnPSignedDriver", nullptr},
+    },
+    {
+        /* .action      = */ "drivers_inventory",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "/proc/modules + /sys/module/<m>/{version,taint} bounded no-follow reads",
+         "signed state is derived from the per-module taint flag E only; signer, INF, hardware id "
+         "and date have no Linux source"},
+        /* .macos_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "no public kext/dext enumeration API"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "WMI Win32_PnPSignedDriver (DeviceName, DriverVersion, DriverDate, DriverProviderName, "
+         "DeviceClass, Signer, IsSigned, InfName, HardWareID), bounded",
+         nullptr},
     },
     {
         /* .action      = */ "system",
@@ -943,8 +1012,8 @@ public:
 
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"manufacturer", "model",   "bios",   "processors", "memory",
-                                     "disks",        "drivers", "system", "chassis",
-                                     "baseboard",    "swap",    "machine_id", nullptr};
+                                     "disks",        "drivers", "drivers_inventory", "system",
+                                     "chassis",      "baseboard", "swap", "machine_id", nullptr};
         return acts;
     }
 
@@ -976,6 +1045,8 @@ public:
             return do_disks(ctx);
         if (action == "drivers")
             return do_drivers(ctx);
+        if (action == "drivers_inventory")
+            return do_drivers_inventory(ctx);
         if (action == "system")
             return do_system(ctx);
         if (auto k = yuzu::hardware::estate::parse_kind(action))
