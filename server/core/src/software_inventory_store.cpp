@@ -349,21 +349,20 @@ const std::vector<pg::PgMigration>& migrations() {
         {10,
          // SAM-13: blob contract v3 (ADR-0016 Update 2026-11-04). Six server-derived/stored
          // columns on installed_software and a per-(agent, facet) state table.
-         // COLUMNS: constant defaults are metadata-only (the v5 precedent), no rewrite. A row
-         // that predates v10 reads install_type '' ("not derived"), install_scope 'machine' (the
-         // only scope ever collected) and '' keys until its agent's next full replace, bounded by
-         // the weekly floor (kFullFloor, sync_scheduler.hpp).
+         // COLUMNS: constant defaults are metadata-only (the v5 precedent), no rewrite.
+         // install_type '' means "not derived" and install_scope defaults to 'machine' (the only
+         // scope ever collected); '' keys and '' install_location/purl are the v2 path's values.
          // CHECKs are NOT VALID: new and updated rows are checked, existing rows are not scanned.
-         // '' is admitted for exactly the not-yet-derived rows above, so a later VALIDATE can
-         // never fail. DROP IF EXISTS + ADD keeps a white-box schema_meta rewind idempotent.
+         // '' is admitted for exactly the not-derived value above, so a later VALIDATE can never
+         // fail. DROP IF EXISTS + ADD keeps a white-box schema_meta rewind idempotent.
          // The install_type list is FROZEN here: a new type needs its own migration (the
          // kInstallTypes test pins this list against the vocabulary).
          // UNIQUENESS is (agent_id, instance_key), NOT the spec row's identity-keyed UNIQUE: an
          // MSI product is listed by BOTH msi_packages and installed_apps and the two are not
          // de-duplicated (ADR-0016 Update 2026-10-17), so an identity key would reject a Windows
          // host's first v10 ingest. instance_key (SHA-256 of the whole canonical row) is unique
-         // after normalize() by construction. Partial: pre-v10 rows (instance_key '') are
-         // excluded, so there is no backfill and no rewrite.
+         // after normalize() by construction. Partial: a row without a key (instance_key '') is
+         // outside it, so the build needs no backfill and no rewrite.
          // PURL: the Package URL composed server-side for a v3 row (purl_compose.hpp), '' for a
          // v2-reported row and for an ecosystem with no registered purl type. Indexed by a
          // partial btree WHERE purl <> '' (the same partial shape as the instance index), so a

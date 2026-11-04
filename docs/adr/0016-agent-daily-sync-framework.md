@@ -987,12 +987,13 @@ deletion-tracking change and is not added here.
 columns on `installed_software` (`install_type`, `install_scope` default `machine`,
 `install_location`, `identity_key`, `instance_key`, `purl`; constant defaults, no rewrite); two CHECK
 constraints (`install_type` in the vocabulary above or `''`, `install_scope` in `machine`,
-`user`) added `NOT VALID`, so existing rows are not scanned and `''` is admitted for the rows
-that predate v10 until their agent's next full report (at most a week); the partial unique index
+`user`) added `NOT VALID` (`''` is the "not derived" value of `install_type`); the partial unique index
 above and the partial btree `installed_software_purl_idx` on `(purl) WHERE purl <> ''`; and the new `software_facet_state (agent_id, facet, status, token, section_hash, enabled,
 last_confirmed_at, duration_ms, bytes_read, updated_at)` table, primary key `(agent_id, facet)`.
 The index builds are not online: they hold `ACCESS EXCLUSIVE` for their duration, under the same
-hard-cutover posture the ladder records for v7. The ladder row carries the measured build time.
+hard-cutover posture the ladder records for v7. In a fresh deployment the table is empty, so the
+build returns at once; the ladder row keeps the measured build time over a populated table as a
+hazard note only.
 
 **Partitioning decision: `installed_software` stays a plain table.** No measurement exists (the
 partitioning spike was skipped). Hash-partitioning by `agent_id` needs the non-transactional

@@ -310,9 +310,8 @@ database.
   `package_manager` (`pkg_inventory.packages` and `pkg_inventory.managers`, which is the
   Homebrew presence row), `store` (`pkg_inventory.store_packages`), `optional_feature`
   (`windows_optional_features.list`), `runtime` (`runtimes.python`) and `middleware`
-  (`middleware.ibm_mq`). `component` and `driver` are reserved. A row stored before the
-  upgrade reads an empty `install_type` until its device's next full report, at most a week
-  later.
+  (`middleware.ibm_mq`). `component` and `driver` are reserved. A row whose source and ecosystem are both
+  unrecognised reads an empty `install_type`.
 - **`install_scope`** is `machine` or `user`. The sync collects machine scope only, so every row
   reads `machine`.
 - **`install_location`** is the folder the software was installed into, when the collector reports
