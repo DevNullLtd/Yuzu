@@ -1,6 +1,5 @@
 | Run | Fault | Addressing | Agents | On victim | Moved | Victim /readyz non-200 | Breaker opened (s) | Non-routable (k / N, when s) | Tombstoned (k / N, when s) | Undo: ready / all routable (s) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| F2-dns-174030 | F2 | DNS | 20 | 11 | 11 | never | n/a | - | - | - / - |
 | F2p-dns-220945 | F2p | DNS | 100 | 35 | 35 | never | 162 | - | - | 5 / 5 |
 | F2p-vip-001328 | F2p | VIP | 300 | 100 | 100 | 157 | 157 | - | - | 30 / 30 |
 | F2p-vip-214249 | F2p | VIP | 100 | 34 | 34 | never | 156 | - | - | - / - |

@@ -68,7 +68,8 @@ clustered gateways, a real server and Postgres, and 20 / 100 / 300 agents.
   victim and one on another node at +10 s, +120 s and +300 s (where the window allows). A probe is
   classed Y (a response with status SUCCESS and output), U (the server reported "gateway unavailable"),
   F (an answer with status FAILURE, TIMEOUT or REJECTED), T (accepted by the server, no result within 6 s),
-  or H4xx (HTTP error). **S** marks a probe an earlier
+  or H4xx (HTTP error). F can only occur in runs taken with the final harness, which records the response
+  status; none of the 45 committed runs has it, so the F column of the Probes table is zero by construction. **S** marks a probe an earlier
   version of the harness scored as delivered although the server had synthesised a failure
   (`status=2`): the command id appears in no agent log of that run.
 - **Between runs** every fleet was restarted and given time to settle so each run starts from the same
@@ -169,7 +170,6 @@ siblings in failover time (that address affects dispatch, not agents).
 <!-- BEGIN GENERATED: faults-f3-f2p -->
 | Run | Fault | Addressing | Agents | On victim | Moved | Victim /readyz non-200 | Breaker opened (s) | Non-routable (k / N, when s) | Tombstoned (k / N, when s) | Undo: ready / all routable (s) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| F2-dns-174030 | F2 | DNS | 20 | 11 | 11 | never | n/a | - | - | - / - |
 | F2p-dns-220945 | F2p | DNS | 100 | 35 | 35 | never | 162 | - | - | 5 / 5 |
 | F2p-vip-001328 | F2p | VIP | 300 | 100 | 100 | 157 | 157 | - | - | 30 / 30 |
 | F2p-vip-214249 | F2p | VIP | 100 | 34 | 34 | never | 156 | - | - | - / - |
@@ -289,20 +289,22 @@ could not resolve, so both of its probes failed); they were not used for any cla
    because the next settle restarted the fleet.
 9. **A DNS-addressed kill of up to 114 agents re-registered within about 13 s, and that is all this shows.**
    With a VIP the same kill took up to about 26 s (about 16 s with redispatch), a full partition about 28-30 s
-   and a graceful stop about 16 s (the Failover table).
+   and a graceful stop of a DNS-addressed gateway about 16 s (the Failover table; no graceful stop was run behind a VIP).
    No agent log in any of the 45 runs contains the gateway's "the gateway is busy" refusal. But the gateway
    returns that only when its register wait queue is full (10,000 entries by default), which a fleet of 300
    agents cannot fill, so its absence says nothing about capacity. What the data show is the time to recover,
    with registration peaks up to 28 per second at 300 agents.
 
 10. **After the agent-port-only fault, commands to agents that had re-attached elsewhere were sometimes lost
-    (observed, unexplained).** In 3 runs, 2 of 4 such probes (and the one such probe in the single-node
-    management run) were accepted by the server, appeared in no agent log and drew no gateway completion
-    line. One candidate explanation, not verified: the victim node keeps a local session for the agent for
-    about 150 s (its `yuzu_gw_agents_current` gauge stayed at its pre-fault value through a partition) and the
-    gateway looks at its local table before the cluster, so a command routed through the victim goes nowhere.
-    If that is right it is a product defect, not a rig artefact. A confirming experiment would point the
-    management address at a node other than the victim and expect every probe to be delivered.
+    (observed, unexplained).** Across the agent-port-only runs, 5 probes went to agents that had already
+    re-attached to another node (4 with the management plane behind the VIP, 1 with it on a single node). 3 of
+    the 5 were accepted by the server and are in no agent, gateway or server log. One candidate explanation,
+    not verified: the victim node keeps a local session for the agent while it is partitioned (its
+    `yuzu_gw_agents_current` gauge stayed at its pre-fault value for the first 155 s of a full partition and
+    only then fell) and the gateway looks at its local table before the cluster, so a command routed through
+    the victim goes nowhere. If that is right it is a product defect, not a rig artefact. A confirming
+    experiment would point the management address at a node other than the victim and expect every probe to be
+    delivered; because loss is intermittent it needs several repetitions.
 
 ## Hypothesis scorecard
 
@@ -379,9 +381,12 @@ could not resolve, so both of its probes failed); they were not used for any cla
   The DNS measurements sit inside that; the VIP "health check stays green" case did not (finding 3).
 - `docs/user-manual/server-admin.md` documents `--gateway-command-addr` as one address without warning that
   killing that node loses command dispatch to the whole fleet (finding 5).
-- **Alerting:** the victim gateway's `yuzu_gw_agents_current` did not fall during a partition (35 throughout
-  one 100-agent full-partition run), so the shipped alert on a more than 30 % drop in that gauge would not
-  have fired for these faults. The alert rule itself was not exercised.
+- **Alerting:** during a full partition the victim gateway's `yuzu_gw_agents_current` stayed at its
+  pre-fault value for about 155 s and then fell (in the 300-agent, 200 s run: 100, then 96 at +160 s, 71 at
+  +170 s, 13 at +190 s; the 100-agent runs' 150 s windows ended before the fall). The shipped
+  `YuzuGatewayConnectionDrops` alert needs that gauge to fall below 70 % of its value five minutes earlier
+  for two minutes, and needs a positive connection rate in the last five minutes, so for these faults it would
+  fire late if at all; a killed node is covered by a different alert. The alert rule itself was not exercised.
 
 None of these pages was edited by this slice.
 

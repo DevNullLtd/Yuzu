@@ -452,7 +452,8 @@ for f in sorted(glob.glob(state + "/run-*/summary.json")):
             cl = pclass(l, logs); pcl.append(cl)
             lab = parts[1]; aid = parts[2]
             tgt = "on the victim" if "victim" in lab else ("other node, had been on the victim" if aid in on_vic else "unaffected node")
-            probes.append({"run": run, "scenario": sc, "mode": mode, "mgmt": mgmt, "when": lab.split(" ")[0], "target": tgt, "class": cl})
+            probes.append({"run": run, "scenario": sc, "mode": mode, "mgmt": mgmt, "when": lab.split(" ")[0], "target": tgt, "class": cl,
+                           "invalid": "yes" if os.path.exists(rd + "/INVALID") else ""})
     rec = {}
     if os.path.exists(rd + "/recovery.txt"):
         rec = dict(kv.split("=", 1) for kv in open(rd + "/recovery.txt").read().split() if "=" in kv)
@@ -476,7 +477,7 @@ def atomic_write(path, writer):
     with open(tmp, "w", newline="") as fh: writer(fh)
     os.replace(tmp, path)
 atomic_write(os.path.join(out, "results.csv"), lambda fh: (lambda w: (w.writeheader(), w.writerows(rows)))(csv.DictWriter(fh, fieldnames=cols, lineterminator="\n")))
-atomic_write(os.path.join(out, "probes.csv"), lambda fh: (lambda w: (w.writeheader(), w.writerows(probes)))(csv.DictWriter(fh, fieldnames=["run", "scenario", "mode", "mgmt", "when", "target", "class"], lineterminator="\n")))
+atomic_write(os.path.join(out, "probes.csv"), lambda fh: (lambda w: (w.writeheader(), w.writerows(probes)))(csv.DictWriter(fh, fieldnames=["run", "scenario", "mode", "mgmt", "when", "target", "class", "invalid"], lineterminator="\n")))
 print(f"{len(rows)} runs, {len(probes)} probes -> {out}")
 
 # ------------------------------------------------------------------ generated tables
@@ -506,8 +507,7 @@ for k, v in sorted(g.items(), key=lambda kv: (order[kv[0][0]], kv[0][1], kv[0][4
 t2 = ["| Run | Fault | Addressing | Agents | On victim | Moved | Victim /readyz non-200 | Breaker opened (s) | Non-routable (k / N, when s) | Tombstoned (k / N, when s) | Undo: ready / all routable (s) |",
       "|---|---|---|---|---|---|---|---|---|---|---|"]
 for r in rows:
-    if r["scenario"] not in ("F3", "F3x", "F2p", "F2") or r["invalid"]: continue
-    if r["scenario"] in ("F2", "F2p") and not r["breaker_open_s"] and r["scenario"] == "F2" : continue
+    if r["scenario"] not in ("F3", "F3x", "F2p") or r["invalid"]: continue
     def span(a, b): return a if a == b else a + "-" + b
     nrw = "%s / %s, %s" % (r["nonroutable_n"], r["on_victim_before"], span(r["nonroutable_first_s"], r["nonroutable_last_s"])) if int(r["nonroutable_n"]) else "0 / %s" % r["on_victim_before"]
     tbw = "%s / %s, %s" % (r["tombstoned_n"], r["on_victim_before"], span(r["tombstoned_first_s"], r["tombstoned_last_s"])) if int(r["tombstoned_n"]) else "0 / %s" % r["on_victim_before"]
@@ -518,7 +518,7 @@ for r in rows:
         (r["victim_readyz_200_s_after_undo"] or "-") + " / " + (r["all_routable_s_after_undo"] or "-")))
 pc = collections.OrderedDict()
 for q in probes:
-    if q["scenario"] == "NOFAULT" or "dispatch probes VOID" in notes.get(q["run"], ""): continue
+    if q["scenario"] == "NOFAULT" or q["invalid"] or "dispatch probes VOID" in notes.get(q["run"], ""): continue
     pc.setdefault((q["scenario"], q["mgmt"], q["target"]), collections.Counter())[q["class"]] += 1
 t3 = ["| Fault | Mgmt addr | Probe target | Probes | Delivered (Y) | Server-synthesised failure scored as delivered by the old harness (S) | Gateway unavailable (U) | Failure status (F) | Accepted, no result (T) | Other |",
       "|---|---|---|---|---|---|---|---|---|---|"]
@@ -531,7 +531,10 @@ if record:
     doc = open(record).read()
     for name, txt in tables.items():
         pat = re.compile(r"^(<!-- BEGIN GENERATED: %s -->\n)(.*?)^(<!-- END GENERATED: %s -->)$" % (re.escape(name), re.escape(name)), re.S | re.M)
-        if not pat.search(doc): print(f"WARNING: markers for '{name}' not found in {record}"); continue
+        nb = len(re.findall(r"^<!-- BEGIN GENERATED: %s -->$" % re.escape(name), doc, re.M))
+        ne = len(re.findall(r"^<!-- END GENERATED: %s -->$" % re.escape(name), doc, re.M))
+        if nb != 1 or ne != 1 or not pat.search(doc):
+            sys.exit(f"ERROR: the record must hold exactly one whole-line BEGIN and one END marker for '{name}' (found {nb} and {ne}); nothing was written")
         doc = pat.sub(lambda m: m.group(1) + txt + "\n" + m.group(3), doc)
     atomic_write(record, lambda fh: fh.write(doc))
     print("tables spliced into", record)
@@ -579,23 +582,28 @@ cmd_scenario() {
     trap 'scenario_cleanup' EXIT
     trap 'scenario_cleanup; exit 130' INT TERM
     load_state
-    [ ! -e "$STATE/DIRTY" ] || die "the rig is in an unknown state after a failed addressing-mode switch ($STATE/DIRTY); run 'ramp <N>' or 'down' first"
     case "$mode" in dns) addr="gw-dns.ha.test:50051";; vip) addr="gw-vip.ha.test:50051";; *) die "bad mode";; esac
-    if [ "$SPIKE_SERVER_ADDR" != "$addr" ]; then
+    # A leftover DIRTY marker means an earlier addressing-mode switch did not finish (a failed or
+    # interrupted recreate): the fleet may be mixed. Re-create it, even if the variable already
+    # names the requested address; the marker is cleared only once the recreate and the registration
+    # wait have succeeded.
+    if [ "$SPIKE_SERVER_ADDR" != "$addr" ] || [ -e "$STATE/DIRTY" ]; then
         say "switching agents to $addr (recreate)"
         local old_addr="$SPIKE_SERVER_ADDR"
+        : > "$STATE/DIRTY" || die "cannot write $STATE/DIRTY"   # FIRST: any interruption from here on leaves the rig flagged
         setenv SPIKE_SERVER_ADDR "$addr"; load_state
         local n; n="$(compose ps -q agent | wc -l)"
         if ! compose up -d --scale agent="$n" --force-recreate agent >/dev/null 2>&1; then
             # The containers may be half-recreated: restoring the variable does not restore them.
-            setenv SPIKE_SERVER_ADDR "$old_addr"; : > "$STATE/DIRTY"
-            die "agent recreate failed: the fleet is in an unknown state (marked $STATE/DIRTY); re-create the agents or 'down' the rig before measuring"
+            setenv SPIKE_SERVER_ADDR "$old_addr"
+            die "agent recreate failed: the fleet is in an unknown state ($STATE/DIRTY stays); re-run this scenario to retry the recreate, or 'down' the rig"
         fi
         local s; s=$(date +%s)
         until [ "$(connected_count)" = "$n" ]; do
             [ $(( $(date +%s) - s )) -ge 300 ] && { fail "only $(connected_count)/$n agents re-registered after 300s"; break; }
             sleep 2
         done
+        rm -f "$STATE/DIRTY"
     fi
     [ -n "$window" ] || case "$id" in F3|F3x) window=400;; *) window=150;; esac
     [ "$settle" = 1 ] && settle_fleet
@@ -622,8 +630,9 @@ cmd_scenario() {
     # Everything that defines how this run was configured, so a result can be traced to it.
     echo "victim=$victim container=$vc total=$total mode=$mode window=$window settled=$settle corefile=$SPIKE_COREFILE mgmt=$SPIKE_MGMT_ADDR haproxy=${SPIKE_HAPROXY_CFG:-haproxy.cfg} tag=$SPIKE_TAG script_sha=$(git -C "$REPO_ROOT" hash-object "${BASH_SOURCE[0]}" 2>/dev/null | cut -c1-12) load=$(cut -d' ' -f1-3 /proc/loadavg)" > "$run/meta.txt"
     RUN_ACTIVE="$run"
-    # The addressing mode the fleet ACTUALLY runs (from a container's command line), not the one requested.
-    local observed; observed="$(docker inspect -f '{{range .Config.Cmd}}{{println .}}{{end}}' "$(compose ps -q agent | head -1)" 2>/dev/null | sed -n 's/^--server=//p')"
+    # The addressing mode the fleet ACTUALLY runs, read from EVERY agent container's command line
+    # (a half-recreated fleet is mixed, so looking at one container is not enough).
+    local observed; observed="$(docker inspect -f '{{range .Config.Cmd}}{{println .}}{{end}}' $(compose ps -q agent) 2>/dev/null | sed -n 's/^--server=//p' | sort -u | paste -sd, -)"
     echo "agents_server=${observed:-unknown}" >> "$run/meta.txt"
     if [ "$observed" != "$addr" ]; then
         fail "agents run with --server=${observed:-unknown}, not the requested $addr: this run is INVALID"
