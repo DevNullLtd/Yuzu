@@ -187,7 +187,8 @@ cadences.
   `dotnet`, `publisher` `Microsoft`, `version` the install's version, and `name` `.NET Runtime`,
   `.NET SDK` or `.NET Framework` (any other shared framework reads `.NET`). No process is started.
   Windows reads the .NET installer registry keys in both registry views (the shared frameworks are
-  registered in the 32-bit view) and the .NET Framework release key (no directory is read); Linux and macOS list the `shared/<framework>/<version>` and `sdk/<version>` directory names
+  registered in the 32-bit view) and the .NET Framework release key (no directory is read, so only a registered install is found; a
+  zip or `dotnet-install` copy is not); Linux and macOS list the `shared/<framework>/<version>` and `sdk/<version>` directory names
   under the standard machine roots (`/usr/share/dotnet`, `/usr/lib/dotnet`, `/usr/lib64/dotnet`; macOS
   `/usr/local/share/dotnet`). Homebrew, `dotnet-install` and per-user installs are not walked.
   A constrained read keeps the rows it found (see the managers rule above); if it found none, the day's
@@ -195,13 +196,18 @@ cadences.
 
   **Java runtimes** are collected through `runtimes` `jvm` (all three OSes; `source`
   `runtimes.jvm`) as one `app` row per JVM home, `ecosystem` `jvm`, `name` `Java JDK`, `Java JRE`
-  or `Java` (when the build does not say), `version` from the home's `release` file (empty when the
-  home has none) and `publisher` the file's `IMPLEMENTOR`. The publisher is self-reported by the
+  or `Java` (when the build does not say), `version` from the home's `release` file (when the home has
+  none: empty on Linux, the bundle's `Info.plist` version on macOS, the registry's version key on
+  Windows) and `publisher` the file's `IMPLEMENTOR`. The publisher is self-reported by the
   build and is never inferred from the registry key that registered it: a non-Oracle JDK also writes
   the Oracle JavaSoft key. No process is started and `JAVA_HOME` is not consulted. Windows reads the
-  JavaSoft, Eclipse Adoptium and Azul Zulu registry keys and then each home's `release` file; Linux
+  JavaSoft, Eclipse Adoptium, Microsoft and Azul Zulu registry keys and then each home's `release` file; Linux
   walks `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm` and `/var/opt/java`; macOS walks
-  `/Library/Java/JavaVirtualMachines`. Version managers and Homebrew JDKs are not walked. A
+  `/Library/Java/JavaVirtualMachines`. Version managers and Homebrew JDKs are not walked. On Windows
+  only a JDK that registered itself under one of those keys is found (a zip or tarball install is not),
+  and a home on a removable, optical, remote or otherwise non-fixed drive keeps its row but its
+  `release` file is not read (`windows:runtimes:jvm:release_unreadable`); `supported` with no rows
+  means none was found at the standard roots, not that none is installed. A
   constrained read keeps the rows it found; if it found none, the day's report is skipped and the
   stored `jvm` rows stay. The macOS Java leg is verified against fixture
   trees built from the documented bundle layout, not a real JDK install.
@@ -927,9 +933,10 @@ constrained read that still found an install is not an error: its rows are sent,
 `sync: runtimes.jvm constrained (<tokens>) — rows kept`. The tokens name the cause, for example `windows:runtimes:dotnet_reg:access_denied`,
 `windows:runtimes:jvm_reg:access_denied`, `windows:runtimes:jvm:release_unreadable`,
 `linux:runtimes:release_missing` or `macos:runtimes:release_unparsable`, and any `row_cap`; the
-`runtimes` README lists them all. On Linux and macOS a Java home with no `release` file keeps the source constrained
-for as long as it is installed; on Windows such a home keeps its row with no version and the source
-stays supported. Fix the named cause; the next daily sync resumes.
+`runtimes` README lists them all. On Linux a Java home with a java binary but no `release` file keeps the source constrained
+for as long as it is installed; on macOS the bundle's `Info.plist` supplies the version; on Windows
+such a home keeps its row with the registry's version key as its version and the source stays
+supported. Fix the named cause; the next daily sync resumes.
 
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`
