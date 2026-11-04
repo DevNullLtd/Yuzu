@@ -65,16 +65,19 @@ fi
 
 [[ -n "${HOME:-}" ]] || die "HOME is not set"
 VENV="${YUZU_GCOVR_VENV:-${HOME%/}/.local/share/yuzu/gcovr-venv}"
-VENV="${VENV%/}"
-[[ -n "$VENV" ]] || die "YUZU_GCOVR_VENV must not be empty or /"
+while [[ "$VENV" == */ && "$VENV" != "/" ]]; do VENV="${VENV%/}"; done
+[[ -n "$VENV" && "$VENV" != "/" ]] || die "YUZU_GCOVR_VENV must not be empty or /"
+[[ ! -L "$VENV" ]] || die "YUZU_GCOVR_VENV ($VENV) is a symlink; point it at the real directory"
 LINK="${HOME%/}/.local/bin/gcovr"
 
 # _timed KEEP_LOCK SECONDS CMD...: run CMD under a timeout when one exists (macOS has `gtimeout` only
-# with coreutils installed). With a terminal on stdin, --foreground keeps Ctrl-C working. KEEP_LOCK=1
-# lets the child inherit the lock descriptor (an orphaned INSTALL then keeps other runs waiting for
-# it, which is right); 0 closes it (probes must never hold the lock).
+# with coreutils installed). The timeout kills the whole process group, so no orphan outlives it; the
+# price is that a Ctrl-C typed in a terminal waits for the current step to finish or time out (use
+# `kill -TERM -<pgid>` to stop sooner). KEEP_LOCK=1 lets the child inherit the lock descriptor (an
+# orphaned INSTALL then keeps other runs waiting for it, which is right); 0 closes it (probes must
+# never hold the lock).
 _timed() {
-    local keep="$1" secs="$2" t="" fg=""
+    local keep="$1" secs="$2" t=""
     shift 2
     if command -v timeout >/dev/null 2>&1; then
         t=timeout
@@ -82,11 +85,10 @@ _timed() {
         t=gtimeout
     fi
     if [[ -n "$t" ]]; then
-        [[ -t 0 ]] && fg="--foreground"
         if [[ "$keep" == 1 ]]; then
-            $t $fg -k 10 "$secs" "$@" || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}"; return $rc; }
+            $t -k 10 "$secs" "$@" || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}" >&2; return $rc; }
         else
-            $t $fg -k 10 "$secs" "$@" 9>&- || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}"; return $rc; }
+            $t -k 10 "$secs" "$@" 9>&- || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}" >&2; return $rc; }
         fi
     elif [[ "$keep" == 1 ]]; then
         "$@"

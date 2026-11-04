@@ -34,11 +34,12 @@
 # a path set by a config file or a lookalike directory is never touched, (b) the caller did not supply
 # PUPPETEER_EXECUTABLE_PATH, and (c) for a browser that is present but will not start, the file is
 # demonstrably INCOMPLETE (shorter than an ELF header, or its section-header table runs past the end
-# of the file) or is not a recognisable binary at all. A browser that cannot print its version but is
+# of the file) or is garbage that cannot run. A browser that cannot print its version but is
 # structurally complete, one that runs but fails to start headless for another reason (an unwritable
-# TMPDIR, memory limits), and one that is missing shared libraries are all LEFT IN PLACE: a download
-# cannot fix them, and a healthy shared build must never be deleted on weak evidence. Missing
-# libraries are listed by name.
+# TMPDIR, memory limits, a missing sibling file), one that is missing shared libraries, and any
+# Mach-O or PE binary (macOS, Windows: there is no completeness check for them) are all LEFT IN PLACE
+# with the recovery command: a download cannot fix them, and a healthy shared build must never be
+# deleted on weak evidence. Missing libraries are listed by name.
 #
 # Every network step has a timeout (when `timeout` or `gtimeout` exists; override with
 # YUZU_ENSURE_NPM_TIMEOUT / _BROWSER_TIMEOUT / _LAUNCH_TIMEOUT, seconds) and the whole run holds an
@@ -66,11 +67,13 @@ die()  { printf 'ensure-puppeteer: NOT READY: %s\n' "$*" >&2; exit 1; }
 [[ -n "${HOME:-}" ]] || die "HOME is not set"
 
 # _timed KEEP_LOCK SECONDS CMD...: run CMD under a timeout when one exists (macOS has `gtimeout` only
-# with coreutils installed). With a terminal on stdin, --foreground keeps Ctrl-C working. KEEP_LOCK=1
-# lets the child inherit the lock descriptor (an orphaned INSTALL then keeps other runs waiting for
-# it, which is right); 0 closes it (probes must never hold the lock).
+# with coreutils installed). The timeout kills the whole process group, so no orphan outlives it; the
+# price is that a Ctrl-C typed in a terminal waits for the current step to finish or time out (use
+# `kill -TERM -<pgid>` to stop sooner). KEEP_LOCK=1 lets the child inherit the lock descriptor (an
+# orphaned INSTALL then keeps other runs waiting for it, which is right); 0 closes it (probes must
+# never hold the lock).
 _timed() {
-    local keep="$1" secs="$2" t="" fg=""
+    local keep="$1" secs="$2" t=""
     shift 2
     if command -v timeout >/dev/null 2>&1; then
         t=timeout
@@ -78,11 +81,10 @@ _timed() {
         t=gtimeout
     fi
     if [[ -n "$t" ]]; then
-        [[ -t 0 ]] && fg="--foreground"
         if [[ "$keep" == 1 ]]; then
-            $t $fg -k 10 "$secs" "$@" || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}"; return $rc; }
+            $t -k 10 "$secs" "$@" || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}" >&2; return $rc; }
         else
-            $t $fg -k 10 "$secs" "$@" 9>&- || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}"; return $rc; }
+            $t -k 10 "$secs" "$@" 9>&- || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}" >&2; return $rc; }
         fi
     elif [[ "$keep" == 1 ]]; then
         "$@"
@@ -224,13 +226,19 @@ browser_runs() {
 }
 # Positive evidence that an ELF binary is INCOMPLETE (an interrupted extract). 0 = certainly incomplete
 # (shorter than an ELF header, or its section-header table runs past the end of the file); 1 = the
-# file is structurally complete; 2 = not an ELF64 little-endian file, so no conclusion (macOS, garbage).
+# file is structurally complete; 2 = unrecognised content (garbage, a script) with no conclusion;
+# 3 = a recognised executable format that is not ELF64-LE (Mach-O, PE) for which there is no
+# completeness check here, so it is never treated as incomplete.
 binary_incomplete() {
     local f="$1" size hex shoff=0 i b shentsize shnum
     size="$(wc -c < "$f" 2>/dev/null | tr -d ' ')" || return 2
     [[ -n "$size" ]] || return 2
     (( size >= 64 )) || return 0
     hex="$(od -An -v -tx1 -N64 "$f" 2>/dev/null | tr -d ' \n')" || return 2
+    case "${hex:0:8}" in
+        feedface|feedfacf|cefaedfe|cffaedfe|cafebabe|bebafeca) return 3 ;;   # Mach-O (thin and universal)
+    esac
+    [[ "${hex:0:4}" == "4d5a" ]] && return 3                                  # PE ("MZ")
     [[ "${hex:0:8}" == "7f454c46" && "${hex:8:2}" == "02" && "${hex:10:2}" == "01" ]] || return 2
     for ((i = 7; i >= 0; i--)); do b="${hex:$((80 + i * 2)):2}"; shoff=$(( (shoff << 8) | 0x$b )); done
     shentsize=$(( 0x${hex:118:2}${hex:116:2} ))   # e_shentsize: 2 bytes at ELF offset 0x3a
@@ -250,16 +258,20 @@ if ! launch_out="$(launch_check)"; then
     if [[ -n "$missing" ]]; then
         die "the browser will not start: shared libraries are missing (${missing}) - install the packages that provide them (Debian/Ubuntu: apt-file search <library> names the package); a reinstall will not help"
     fi
-    if browser_runs "$exe"; then
-        die "the browser runs (it prints its version) but will not start headless, so it was NOT reinstalled; the output above says why - often an unwritable TMPDIR, a memory limit or a sandbox restriction. Last line: $(last_line "$launch_out")"
-    fi
-    # `--version` failing is weak evidence on its own (an address-space limit, a cold disk, a seccomp
-    # profile all do it to a healthy browser). Reinstall only when the file is demonstrably incomplete
-    # or is not a recognisable binary; a structurally complete one is left for the operator.
+    # Decide from the FILE, not from `--version` alone (an address-space limit, a cold disk or a seccomp
+    # profile make a healthy browser fail it; an EMPTY executable "runs" as an empty shell script).
+    #   0 certainly incomplete (an interrupted extract)            -> reinstall once
+    #   2 unrecognised content (garbage, a script) that cannot run -> reinstall once
+    #   1 complete ELF, 3 a recognised non-ELF executable          -> never deleted; say what to do
     inc=0
     binary_incomplete "$exe" || inc=$?
-    if [[ "$inc" -eq 1 ]]; then
-        die "the browser binary is complete but cannot run (it fails even to print its version) and was NOT reinstalled; the output above says why. Last line: $(last_line "$launch_out")"
+    runs=0
+    browser_runs "$exe" && runs=1
+    if [[ "$inc" -eq 1 || "$inc" -eq 3 || ( "$inc" -eq 2 && "$runs" -eq 1 ) ]]; then
+        if [[ "$runs" -eq 1 ]]; then
+            die "the browser runs (it prints its version) but will not start headless, so it was NOT reinstalled; the output above says why - often an unwritable TMPDIR, a memory limit, a sandbox restriction, or a missing sibling file such as icudtl.dat after an interrupted extract (${RECOVERY}). Last line: $(last_line "$launch_out")"
+        fi
+        die "the browser file cannot run and was NOT reinstalled automatically (it is $([[ "$inc" -eq 3 ]] && echo 'a Mach-O or PE binary, which this script cannot check for completeness' || echo 'a complete ELF binary, so a download would not help')); the output above says why (${RECOVERY}). Last line: $(last_line "$launch_out")"
     fi
     if heal_browser; then
         say "the browser binary is incomplete or corrupt; reinstalling it once"
