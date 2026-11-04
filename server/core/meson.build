@@ -562,6 +562,21 @@ cpe_map_embed = custom_target(
   ],
 )
 
+# SAM.4 provisional software-title alias pack (content/software-normalization/aliases.csv)
+# embedded as kSoftwareNormalizationSeed; the runtime parser is the authoritative floor.
+software_normalization_seed_embed = custom_target(
+  'software_normalization_seed',
+  input: files('../../content/software-normalization/aliases.csv'),
+  output: 'software_normalization_seed.cpp',
+  command: [
+    embed_python,
+    files('scripts/embed_binary.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'SoftwareNormalizationSeed',
+  ],
+)
+
 # Vendored Nayuki QR-Code-generator (MIT, pinned v1.8.0; see
 # server/core/vendor/qrcodegen/qrcodegen-NOTICE.txt). Built as its own
 # static lib with warnings off so third-party source does not trip our
@@ -615,6 +630,7 @@ yuzu_server_core_lib = static_library(
    yuzu_echo_timeline_js_embed,
    echo_retention_tiers_tsv_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
+   software_normalization_seed_embed,
   files(
     'src/config_secret_keys.cpp',
     'src/runtime_config_store.cpp',
@@ -701,6 +717,7 @@ yuzu_server_core_lib = static_library(
     'src/instruction_routes.cpp',
     'src/execution_tracker.cpp',
     'src/execution_model.cpp',
+    'src/execution_mutation.cpp', # cancel/rerun REST v1 + MCP twins: one admit-audit-effect sequence
     'src/execution_routes.cpp',
     'src/health_routes.cpp',
     'src/healthcheck_probe.cpp', # #5906: yuzu-server --healthcheck transport
@@ -792,6 +809,7 @@ yuzu_server_core_lib = static_library(
     'src/mcp_server.cpp',
     'src/mcp_input_schema.cpp',
     'src/instruction_param_schema.cpp',
+    'src/mcp_instruction_execute.cpp', # MCP twin of POST /api/instructions/{id}/execute: bounds + JSON-RPC rendering over instruction_execute
     'src/mcp_orientation.cpp',
     'src/mcp_session.cpp',
     'src/mcp_stream.cpp',
@@ -845,6 +863,8 @@ yuzu_server_core_lib = static_library(
     'src/hardware_actions_ui.cpp',
     'src/sle_routes.cpp',
     'src/software_catalog_rollup.cpp',
+    'src/software_normalization_job.cpp',
+    'src/software_title_dimension.cpp',
     'src/software_catalogue_model.cpp',
     'src/crypto_cbom.cpp',    # /crypto CBOM export: pure CycloneDX 1.7 shaper
     'src/crypto_library_model.cpp', # /crypto slice 1: pure curated table + shared REST/MCP model
@@ -875,10 +895,14 @@ yuzu_server_core_lib = static_library(
     'src/workflow_routes.cpp',
     'src/notification_routes.cpp',
     'src/command_routes.cpp',
+    'src/command_v1_routes.cpp', # POST /api/v1/commands: the REST v1 twin of /api/command + MCP execute_instruction (#2146)
     'src/page_routes.cpp',
     'src/dashboard_api_routes.cpp',
     'src/nvd_routes.cpp',
     'src/approval_routes.cpp',
+    'src/instruction_execute.cpp', # the transport-free core shared by the v1 REST and MCP instruction-definition execute twins (#2146)
+    'src/instruction_execute_ports.cpp', # production store bindings for the shared core
+    'src/instruction_execute_routes.cpp', # POST /api/v1/instructions/{id}/execute
     'src/config_write.cpp', # the transport-free core shared by the config routes (legacy + v1) and the MCP get/set_runtime_config tools
     'src/config_routes.cpp', # #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
     'src/diagnostics_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API, extracted onto the HttpRouteSink seam
@@ -929,6 +953,7 @@ yuzu_server_core_lib = static_library(
     'src/vuln_finding_store.cpp',
     'src/product_normalize.cpp',
     'src/product_registry_store.cpp',
+    'src/software_normalization_pack.cpp',
     'src/software_licensing_store.cpp',
     'src/software_licensing_ingestion.cpp',
     'src/app_usage_store.cpp',           # Wave 7b PR7b.2

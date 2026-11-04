@@ -266,7 +266,9 @@ bool VulnFindingStore::reconcile_agent(const AgentReconcile& r) {
         // CROSS-STORE NAMESPACE (do not remove the prefix): pg_advisory_xact_lock
         // keys are a SINGLE cluster-wide 64-bit space, NOT scoped per schema. The
         // sibling SoftwareInventoryStore full-replace path locks
-        // hashtextextended(agent_id, 0) (software_inventory_store.cpp:~467). A bare
+        // hashtextextended('software_inventory_store:' || agent_id, 0), the same per-store prefix
+        // this store uses (it was the bare agent id until a valid agent id collided with a
+        // fixed-string job key, #6965). A bare
         // hashtextextended(agent_id, 0) here would collide with it on the same
         // agent_id, so a slow inventory ingest for agent X would needlessly block a
         // vuln reconcile for X (and vice versa) past this txn's timeout even though
