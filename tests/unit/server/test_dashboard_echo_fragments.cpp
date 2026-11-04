@@ -1028,11 +1028,15 @@ TEST_CASE("fragment purge/reenable audit: a refusal is visible and counted, and 
             CHECK(res->body == std::string("<span class=\"echo-row-error\" "
                                            "data-reason=\"audit_unavailable\">") +
                                    kEchoAuditRefusalText + "</span>");
+            // Guarded parse: a regression that drops `showToast` fails a CHECK, never aborts.
             const auto trigger = nlohmann::json::parse(res->get_header_value("HX-Trigger"),
                                                        nullptr, /*allow_exceptions=*/false);
             REQUIRE_FALSE(trigger.is_discarded());
-            CHECK(trigger["showToast"]["message"] == kEchoAuditRefusalText);
-            CHECK(trigger["showToast"]["level"] == "error");
+            REQUIRE(trigger.is_object());
+            REQUIRE(trigger.contains("showToast"));
+            REQUIRE(trigger["showToast"].is_object());
+            CHECK(trigger["showToast"].value("message", std::string{}) == kEchoAuditRefusalText);
+            CHECK(trigger["showToast"].value("level", std::string{}) == "error");
             const std::string metric = std::string(action) == "echo.source.purge"
                                            ? "yuzu_echo_source_purge_total"
                                            : "yuzu_echo_source_reenable_total";
@@ -1046,8 +1050,9 @@ TEST_CASE("fragment purge audit: a flapping audit store dispatches exactly once 
           "attempted row",
           "[pg][server][echo][purge][fragment][audit][security][3619]") {
     // CH-3: four clicks against a store that refuses every other attempted row.
-    FragmentHarness h;
+    // Declared before the harness so it outlives the predicate that captures it.
     int attempted_calls = 0;
+    FragmentHarness h;
     h.audit_persists = [&attempted_calls](const AuditRow& r) {
         if (r.action == "echo.source.purge" && r.result == "attempted")
             return (++attempted_calls % 2) == 0; // fail, ok, fail, ok

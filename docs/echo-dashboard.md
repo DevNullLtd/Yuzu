@@ -461,7 +461,7 @@ Per `docs/observability-conventions.md`:
 > per-device scope denial, missing wiring, and audit failure all into `denied` and
 > otherwise only ever writes `requested`. The fragment counts an audit-store refusal
 > (the `attempted` row could not be stored, `503`, #3619) as `audit_unavailable`, a
-> value REST never writes (REST folds it into `denied`); `yuzu_echo_source_reenable_total`
+> value REST never writes; `yuzu_echo_source_reenable_total`
 > uses the same value. `success` and `agent_not_connected` are comparable; nothing else
 > is, and there is no `surface` label to split them.
 

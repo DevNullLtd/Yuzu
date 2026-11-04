@@ -17,6 +17,7 @@
   outcomes) and the Echo SQL and status-scan sends keep the request's own answer but now mark the
   response `Sec-Audit-Failed: true` when the row does not persist, instead of answering exactly as
   if it had been recorded. Expect one extra audit row per console send, group creation, Echo
-  re-enable and Echo purge. Not covered: `POST /api/command`, MCP `execute_instruction`,
-  management-group creation through REST, MCP and Settings, and the Echo **Capture sources** push
-  still audit after acting (tracked separately). Upgrade note: [`upgrading.md`](docs/user-manual/upgrading.md).
+  re-enable and Echo purge. Not covered, among others: `POST /api/command`, MCP
+  `execute_instruction`, the legacy command forwarder, management-group creation through REST, MCP
+  and Settings, and the Echo **Capture sources** push still audit after acting; follow-up issues
+  for them have not been filed yet. See [Upgrading](docs/user-manual/upgrading.md).

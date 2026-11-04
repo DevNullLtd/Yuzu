@@ -143,6 +143,11 @@ static constexpr const char* kEchoAuditRefusal =
     "The audit record could not be stored, so nothing was sent. Retry once the audit store "
     "recovers.";
 
+/// The toast when create_group itself fails (a store error, or a same-name group created
+/// concurrently after the duplicate check). Constant text: no store or caller data.
+static constexpr const char* kGroupCreateFailed =
+    "The group could not be created. Nothing was created. Retry shortly.";
+
 /// The refusal sentence for a group set cut by the read cap (toast and body say the same thing).
 static constexpr const char* kGroupPartialRefusal =
     "The result set was cut by the read cap, so the agent list is partial. "
@@ -974,10 +979,15 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  mg.created_by = session->username;
                  auto group_result = mgmt_group_store_->create_group(mg);
                  if (!group_result) {
-                     // The attempted row above is stored, so it gets an outcome (#3619).
+                     // The attempted row above is stored, so it gets an outcome (#3619). It
+                     // names the group: there is no group id to pair it by (Gate 8 UP-13).
                      audit_or_flag(req, res, "group.create_from_results", "failure",
-                                   "ManagementGroup", "", "create_failed");
+                                   "ManagementGroup", "", "create_failed name=" + group_name);
                      res.status = 500;
+                     // The form is hx-swap="none": without the toast the operator sees nothing
+                     // (a same-name race lost to a concurrent create lands here).
+                     res.set_header("HX-Retarget", "#group-form-slot");
+                     res.set_header("HX-Trigger", refusal_toast_header(kGroupCreateFailed));
                      res.set_content(
                          "<span class=\"feedback-error\">"
                          "Failed to create group: " +

@@ -1678,7 +1678,11 @@ TEST_CASE("group-from-results audit: a create_group failure records a failure ou
     CHECK_FALSE(h.mg.find_group_by_name("create-fails").has_value());
     REQUIRE(h.audits_for("group.create_from_results", "attempted") == 1);
     REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
-    CHECK(contains(h.audit_detail("group.create_from_results", "failure"), "create_failed"));
+    CHECK(h.audit_detail("group.create_from_results", "failure") ==
+          "create_failed name=create-fails");
+    // The form is hx-swap="none": the toast is the only thing the operator sees (Gate 8 UP-1).
+    CHECK(toast_message(*res) ==
+          "The group could not be created. Nothing was created. Retry shortly.");
     CHECK(h.audits_for("group.create_from_results", "success") == 0);
 }
 
