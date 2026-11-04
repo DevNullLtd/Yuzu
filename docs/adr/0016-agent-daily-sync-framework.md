@@ -1052,10 +1052,9 @@ only; `find_by_purl` is a store method with no caller).
 
 ### 2026-11-04 — `installed_software`: a publisher on every row, and the `via:` origin label
 
-Every row of every `installed_software` source now carries a non-empty `publisher` before any
-agent sends the v3 sectioned report, so the hash an agent has already agreed with the server
-(slot 3 of the row, hashed on both the v2 and the v3 path) is settled once. There is no new wire
-slot and no parser refusal: the server already parses and hashes slot 3 on both paths, so the
+Every row of every `installed_software` source carries a non-empty `publisher`, so slot 3 of the
+row (hashed on both the v2 and the v3 path) is always populated. There is no new wire
+slot and no parser refusal: the server parses and hashes slot 3 on both paths, so the
 change is a value rule on the agent, one recognition rule in the server normaliser, and golden
 vectors on both sides.
 
@@ -1079,7 +1078,7 @@ cross-pins (`kCrossPinHash` and the extended, tail-order and mixed-blob pins) di
 | `pkg_inventory.managers` (Homebrew presence row) | the constant `Homebrew` | n/a |
 | `windows_optional_features.list` | the constant `Microsoft` (DISM features are Windows components; the middleware table's `IBM` is the precedent) | n/a |
 | `msi_packages.list_inventory` | the product's `Publisher` | `via:msi` |
-| `runtimes.python`, Windows and Linux | the row's vendor column (it was previously dropped), unescaped | `via:python` when the column is `-` |
+| `runtimes.python`, Windows and Linux | the row's vendor column, unescaped | `via:python` when the column is `-` |
 | `runtimes.python`, macOS | none: the column is a `CFBundleIdentifier` reverse-domain id (`org.python.python`), an identifier and not a vendor, and no heuristic turns one into the other; the adapter ignores the column on macOS | `via:python` |
 | `middleware.ibm_mq` | `IBM`, from the product table (unchanged) | n/a |
 
@@ -1098,14 +1097,10 @@ the single-device catalogue read) prefers a non-label value and falls back to th
 only when every row of the group is labelled.
 
 **Disposition of `title_dimension` and `curation_queue`.** Both are keyed on the raw
-`(raw_name, raw_publisher, ecosystem)` triple. Every formerly vendorless title is therefore
-re-keyed once under its `via:` label as devices upgrade, and the old empty-publisher rows stay in
-place. They are inert: the candidate query selects only triples present in `title_triples`, which
-is rebuilt from the live inventory, so a triple no device reports any more is never read. The
-residue is bounded at one row per formerly vendorless title per ecosystem. A stale-triple reaper
-is deferred.
+`(raw_name, raw_publisher, ecosystem)` triple, so a title with no declared vendor is keyed under
+its `via:` label, not under an empty publisher. The candidate query selects only triples present
+in `title_triples`, which is rebuilt from the live inventory.
 
-**Cost and hash movement.** Every v2 device's stored `installed_software` hash changes on the
-agent upgrade (every row gained a publisher), so each device sends one full inventory once; the
-weekly floor is the backstop for a device that misses it. The agent's collector characterisation
-digests over the real capture samples moved once and are re-pinned with that comment.
+**Hash.** The publisher is part of each row's hash. The agent's collector characterisation
+digests over the real capture samples include it. The fixture cross-pins are independent of the
+fallback, which is applied in the collector, not in the blob builder.

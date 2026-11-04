@@ -296,7 +296,7 @@ TEST_CASE("parse_rpm_inv_line maps (none) and pins signature values (matches PR 
     SECTION("wrong token count is dropped") {
         CHECK_FALSE(parse_rpm_inv_line("bash\t0\t5.2.21").has_value());
         CHECK_FALSE(parse_rpm_inv_line("p\t0\t1\t1\tnoarch\tX\td\tonly-eight-tokens").has_value());
-        // the nine-token row of an agent that predates the VENDOR column is a different shape: dropped
+        // a nine-token row (no VENDOR column) is the wrong shape: dropped
         CHECK_FALSE(parse_rpm_inv_line("p\t0\t1\t1\tnoarch\tX\td\t(none)\t(none)").has_value());
         CHECK_FALSE(parse_rpm_inv_line("p\t0\t1\t1\tnoarch\tX\td\t(none)\t(none)\tV\textra").has_value());
     }

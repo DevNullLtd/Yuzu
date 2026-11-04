@@ -2879,11 +2879,9 @@ TEST_CASE("characterisation: msi list_inventory",
 // server (ADR-0016), so any movement here is a one-sided change. Re-measure ONLY on a sample
 // recapture, the same rule as the record counts above.
 //
-// Revision boundary (SAM-41, vendor on every row): every digest below moved once, when each row
-// gained a non-empty publisher (a declared vendor, else `via:<ecosystem>`). Every v2 device's
-// stored hash therefore differs after the agent upgrade and the device sends one full inventory
-// (the weekly floor is the backstop); the SwEntry fixture cross-pins (kCrossPinHash and the
-// extended / tail-order / mixed-blob pins) did NOT move, because the fallback is applied in the
+// Every row carries a non-empty publisher (a declared vendor, else `via:<ecosystem>`), so the
+// digests below include it. The SwEntry fixture cross-pins (kCrossPinHash and the extended /
+// tail-order / mixed-blob pins) are independent of the fallback, which is applied in the
 // collector, not in installed_software_canonical_blob.
 TEST_CASE("characterisation: collector blob digests are byte-pinned",
           "[sync][characterisation][collector]") {
