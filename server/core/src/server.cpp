@@ -111,6 +111,7 @@
 #include "step_up_gate.hpp" // MFA step-up chokepoint (policy table: step_up_policy.hpp)
 #include "same_site_write_gate.hpp" // cookie-session writes require a same-site Origin or Referer
 #include "rest_a4_envelope_http.hpp"
+#include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
 #include "app_perf_fleet_store.hpp"
@@ -2117,12 +2118,8 @@ public:
                           "a report skipped because another report for the same agent held its "
                           "lock, certificate_inventory only - not a failure)",
                           "counter");
-        metrics_.describe("yuzu_inventory_section_ingest_total",
-                          "Blob-v3 installed-software section outcomes by facet and outcome "
-                          "(facet = a collector source, component_inventory, or unknown; "
-                          "outcome = stored/status_only/need_full/delta_unsupported/rejected/"
-                          "error; moves only once a v3 agent reports)",
-                          "counter");
+        // Closed facet x outcome label set, pre-seeded so the first refused section counts.
+        seed_section_ingest_series(metrics_);
         cert_ingest_metric::register_metrics(metrics_); // slice-2 PR 2a-2a
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
                           "Time to apply one inventory source's report - the pooled-connection + "

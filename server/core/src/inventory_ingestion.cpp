@@ -25,6 +25,13 @@ namespace pb = ::yuzu::agent::v1;
 
 constexpr const char* kSourceInstalledSoftware = "installed_software";
 
+// The `facet` label of yuzu_inventory_section_ingest_total (and the facet named in the refusal
+// log line): a collector source or component_inventory, else "unknown" - never the agent's raw
+// string.
+std::string facet_label(std::string_view facet) {
+    return is_known_v3_facet(facet) ? std::string(facet) : std::string("unknown");
+}
+
 // Input caps — the report is untrusted (security-guardian). A blob over the cap
 // is rejected (dropped + nacked); entries/fields beyond the cap are
 // dropped/truncated.
@@ -161,7 +168,7 @@ const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& age
             ++refused;
             if (!detail.empty())
                 detail += ", ";
-            detail += is_known_v3_facet(sec.facet) ? sec.facet : std::string("unknown");
+            detail += facet_label(sec.facet);
             detail += ':';
             detail += v3_refusal_name(sec.refusal);
         }
@@ -189,11 +196,9 @@ const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& age
     bool any_error = false;
     for (const auto& r : results) {
         if (metrics) {
-            // `facet` is a closed label set: a collector source, component_inventory, or
-            // "unknown" for a name the server does not know (never the agent's raw string).
             metrics
                 ->counter("yuzu_inventory_section_ingest_total",
-                          {{"facet", is_known_v3_facet(r.facet) ? r.facet : std::string("unknown")},
+                          {{"facet", facet_label(r.facet)},
                            {"outcome", std::string(v3_section_outcome_name(r.outcome))}})
                 .increment();
         }
@@ -212,6 +217,24 @@ const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& age
 }
 
 } // namespace
+
+void seed_section_ingest_series(::yuzu::MetricsRegistry& metrics) {
+    metrics.describe("yuzu_inventory_section_ingest_total",
+                     "Blob-v3 installed-software section outcomes by facet and outcome "
+                     "(facet = a collector source, component_inventory, or unknown; "
+                     "outcome = stored/status_only/need_full/delta_unsupported/rejected/"
+                     "error; moves only once a v3 agent reports)",
+                     "counter");
+    const auto seed = [&](const std::string& facet) {
+        for (const auto outcome : kV3SectionOutcomes)
+            metrics.counter("yuzu_inventory_section_ingest_total",
+                            {{"facet", facet}, {"outcome", std::string(v3_section_outcome_name(outcome))}});
+    };
+    for (const auto& src : software_catalog::kSoftwareSources)
+        seed(std::string(src.value));
+    seed(std::string(kComponentInventoryFacet));
+    seed("unknown");
+}
 
 bool validate_inventory_report_source_count(const std::string& agent_id,
                                             const pb::InventoryReport& report,

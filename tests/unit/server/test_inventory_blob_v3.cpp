@@ -1,14 +1,18 @@
 /**
  * test_inventory_blob_v3.cpp — pure coverage for inventory_blob_v3.hpp (the blob-v3 grammar)
- * and install_type_rules.hpp (the install-type table). No store, no libpq, no clock, no
- * protobuf: every case feeds literal wire bytes to the parser.
+ * and install_type_rules.hpp (the install-type table), plus the section counter's boot
+ * pre-seed. No store, no libpq, no clock: every parser case feeds literal wire bytes.
  */
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "install_type_rules.hpp"
 #include "inventory_blob_v3.hpp"
+#include "inventory_ingestion.hpp"
 #include "software_catalog_rules.hpp"
+#include "software_inventory_store.hpp"
+
+#include <yuzu/metrics.hpp>
 
 #include <cstddef>
 #include <initializer_list>
@@ -569,4 +573,38 @@ TEST_CASE("install_type_for: an empty or unknown source falls back by ecosystem"
         CHECK(install_type_for("", r.ecosystem) == r.expect);
         CHECK(install_type_for("some.future_source", r.ecosystem) == r.expect);
     }
+}
+
+TEST_CASE("seed_section_ingest_series creates every closed facet x outcome series at 0",
+          "[server][inventory_v3][metrics]") {
+    yuzu::MetricsRegistry m;
+    seed_section_ingest_series(m);
+    const auto text = m.serialize();
+    CHECK(text.find("# HELP yuzu_inventory_section_ingest_total ") != std::string::npos);
+    CHECK(text.find("# TYPE yuzu_inventory_section_ingest_total counter") != std::string::npos);
+
+    std::vector<std::string> facets{std::string(kComponentInventoryFacet), "unknown"};
+    for (const auto& src : software_catalog::kSoftwareSources)
+        facets.emplace_back(src.value);
+    std::size_t series = 0;
+    for (const auto& facet : facets) {
+        for (const auto outcome : kV3SectionOutcomes) {
+            CAPTURE(facet, v3_section_outcome_name(outcome));
+            CHECK(text.find("yuzu_inventory_section_ingest_total{facet=\"" + facet +
+                            "\",outcome=\"" + std::string(v3_section_outcome_name(outcome)) +
+                            "\"} 0") != std::string::npos);
+            ++series;
+        }
+    }
+    // No series beyond the closed set: every sample line of the family is one counted above.
+    std::size_t lines = 0;
+    for (std::size_t at = text.find("\nyuzu_inventory_section_ingest_total{");
+         at != std::string::npos;
+         at = text.find("\nyuzu_inventory_section_ingest_total{", at + 1))
+        ++lines;
+    CHECK(lines == series);
+
+    // Idempotent.
+    seed_section_ingest_series(m);
+    CHECK(m.serialize() == text);
 }

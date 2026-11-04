@@ -35,6 +35,7 @@
 #include "inventory_ingest_outcome.hpp" // InventoryIngestOutcome
 #include "software_inventory_types.hpp"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -331,6 +332,13 @@ enum class V3SectionOutcome {
     kRejected,         ///< the section broke the grammar and was refused
     kError,            ///< the transaction failed; nothing of this call was applied
 };
+
+/// Every outcome, in the enum's order: the closed `outcome` label set the section counter is
+/// pre-seeded from.
+inline constexpr std::array<V3SectionOutcome, 6> kV3SectionOutcomes = {
+    V3SectionOutcome::kStored,   V3SectionOutcome::kStatusOnly,
+    V3SectionOutcome::kNeedFull, V3SectionOutcome::kDeltaUnsupported,
+    V3SectionOutcome::kRejected, V3SectionOutcome::kError};
 
 [[nodiscard]] constexpr std::string_view v3_section_outcome_name(V3SectionOutcome o) noexcept {
     switch (o) {

@@ -28,6 +28,13 @@ namespace yuzu::server {
 
 class SoftwareInventoryStore;
 
+/// Describe `yuzu_inventory_section_ingest_total{facet,outcome}` and create every closed-set
+/// series at 0 (facets: each collector source, `component_inventory`, `unknown`; outcomes: the six
+/// `V3SectionOutcome` names), per docs/observability-conventions.md: a series that first appears
+/// already at 1 contributes no increase, so the first refused section would never alert.
+/// ServerImpl calls this once at construction; the unit test calls the same function.
+void seed_section_ingest_series(::yuzu::MetricsRegistry& metrics);
+
 /// Validate the untrusted report's map cardinality before any generic or
 /// typed store write. Returns false after logging/counting a whole-report
 /// rejection; callers acknowledge without requesting a resend.
