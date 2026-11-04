@@ -163,7 +163,7 @@ spec:
         platforms: [windows, darwin, linux]
       - name: version
         type: string
-        description: 'JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION. A release file with neither key yields no row and a release_unparsable constraint; on Linux a home with a java binary but no release file yields - and a release_missing constraint; on Windows such a home keeps its row, with the registry's version key as the version, and no constraint; on macOS the bundle's Info.plist JavaVM dictionary supplies the version. Status rows: the level (supported, constrained or unsupported).'
+        description: 'JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION. A release file with neither key yields no row and a release_unparsable constraint; on Linux a home with a java binary but no release file yields - and a release_missing constraint; on Windows such a home keeps its row, with the version key of the registry registration as the version, and no constraint; on macOS the Info.plist JavaVM dictionary of the bundle supplies the version. Status rows: the level (supported, constrained or unsupported).'
         example: 17.0.20
         platforms: [windows, darwin, linux]
       - name: install_path
