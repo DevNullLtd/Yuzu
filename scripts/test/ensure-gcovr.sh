@@ -53,7 +53,13 @@ resolved_version() { gcovr --version 2>/dev/null | sed -n 's/^gcovr \([0-9][0-9.
 
 ours() { [[ "$(resolved_real || true)" == "$(readlink -f "$VENV/bin/gcovr" 2>/dev/null || true)" ]]; }
 
-if ours && [[ "$(resolved_version)" == "$pin" ]]; then
+# The venv records the hash of the requirements-ci.txt it was built from, so a change to any
+# transitive pin (not only gcovr's own version) rebuilds it instead of leaving a stale tree.
+req_sha="$(sha256sum "$ROOT/requirements-ci.txt" | cut -d' ' -f1)"
+STAMP="$VENV/.requirements-ci.sha256"
+venv_fresh() { [[ "$(cat "$STAMP" 2>/dev/null || true)" == "$req_sha" ]]; }
+
+if ours && [[ "$(resolved_version)" == "$pin" ]] && venv_fresh; then
     say "gcovr ${pin} already installed (${VENV})"
     exit 0
 fi
@@ -62,20 +68,33 @@ if [[ -e "$LINK" && ! -L "$LINK" ]]; then
     die "$LINK exists and is not a symlink; move it aside so the pinned gcovr can be linked there"
 fi
 
-python3 -m venv --help >/dev/null 2>&1 \
-    || die "python3 cannot create virtualenvs; install the venv module (apt install python3-venv)"
+# requirements-ci.txt pins gcovr 8.7, meson 1.12 and jsonschema 4.26, which all need Python 3.10+.
+# Say so up front: otherwise an older interpreter (RHEL9's 3.9, Ubuntu 20.04's 3.8) reaches pip, which
+# reports "no matching distribution", and the cause reads like a network problem.
+command -v python3 >/dev/null 2>&1 || die "python3 is not on PATH"
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
+    || die "python3 $(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])') is older than 3.10, which the pinned gcovr and meson require; install a newer python3 (docs/rhel9-build-setup.md covers RHEL9)"
+# `python3 -m venv --help` succeeds on Debian/Ubuntu even without python3-venv; ensurepip is what is missing.
+python3 -c 'import ensurepip' >/dev/null 2>&1 \
+    || die "python3 cannot create virtualenvs (the ensurepip module is missing); install it (Debian/Ubuntu: apt install python3-venv)"
 
 mkdir -p "$(dirname "$VENV")" "$(dirname "$LINK")"
 venv_version="$("$VENV/bin/gcovr" --version 2>/dev/null | sed -n 's/^gcovr \([0-9][0-9.]*\).*/\1/p' | head -n1 || true)"
-if [[ "$venv_version" == "$pin" ]]; then
+if [[ "$venv_version" == "$pin" ]] && venv_fresh; then
     say "the venv at ${VENV} already has gcovr ${pin}; linking it"
 else
+    # $VENV is rebuilt from scratch, so refuse to delete anything that is not already a virtualenv of
+    # ours (or empty): YUZU_GCOVR_VENV pointed at a populated directory must never be wiped.
+    if [[ -e "$VENV" && ! -f "$VENV/pyvenv.cfg" && -n "$(ls -A "$VENV" 2>/dev/null)" ]]; then
+        die "refusing to delete $VENV: it is not a virtualenv (no pyvenv.cfg); point YUZU_GCOVR_VENV at an unused path"
+    fi
     say "installing gcovr==${pin} with hashes from requirements-ci.txt into ${VENV}"
     rm -rf "$VENV"
     python3 -m venv "$VENV" || die "could not create the virtualenv at $VENV"
     "$VENV/bin/pip" install --quiet --disable-pip-version-check --require-hashes \
         -r "$ROOT/requirements-ci.txt" \
-        || die "pip could not install requirements-ci.txt with hashes; check network access to PyPI"
+        || die "pip could not install requirements-ci.txt with hashes (see the pip error above); the usual causes are no network access to PyPI or a python3 older than the pinned packages support"
+    printf '%s\n' "$req_sha" > "$STAMP"
 fi
 ln -sfn "$VENV/bin/gcovr" "$LINK"
 

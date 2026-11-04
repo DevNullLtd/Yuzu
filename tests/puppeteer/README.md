@@ -18,7 +18,7 @@ bash scripts/test/ensure-puppeteer.sh
 and `--full` modes) and aborts the run if it cannot finish, so the gates never skip for a missing
 install. It is idempotent: on a ready machine it only verifies, including that Chrome launches
 headless. By hand it is the same as `(cd tests/puppeteer && npm ci)` plus
-`npx puppeteer browsers install chrome`. On a box with no route to the download, point
+`npx puppeteer browsers install chrome`. If no Chrome for Testing build exists for your platform (Linux arm64 is the usual case) or the box has no route to the download, point
 `PUPPETEER_EXECUTABLE_PATH` at a Chrome for Testing binary.
 
 ## Run

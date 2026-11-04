@@ -181,23 +181,42 @@ if [[ "$MODE" == "default" || "$MODE" == "full" ]]; then
         exit 1
     fi
 
-    GCOVR_START=$(date +%s)
-    bash scripts/test/ensure-gcovr.sh > "$LOG_DIR/ensure-gcovr.log" 2>&1 \
-        && GCOVR_STATUS=PASS || GCOVR_STATUS=FAIL
-    bash scripts/test/test-db-write.sh gate \
-        --run-id "$RUN_ID" --phase 0 --gate "gcovr install" \
-        --status "$GCOVR_STATUS" --duration $(( $(date +%s) - GCOVR_START )) \
-        --log "ensure-gcovr.log"
-    if [[ "$GCOVR_STATUS" == "FAIL" ]]; then
-        cat "$LOG_DIR/ensure-gcovr.log"
-        bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED
-        exit 1
+    # gcovr only matters to the coverage gate (Phase 7b), which measures on Linux alone.
+    if [[ "$(host_os)" != "linux" ]]; then
+        bash scripts/test/test-db-write.sh gate \
+            --run-id "$RUN_ID" --phase 0 --gate "gcovr install" \
+            --status SKIP --duration 0 --notes "the coverage gate measures on Linux only"
+    else
+        GCOVR_START=$(date +%s)
+        bash scripts/test/ensure-gcovr.sh > "$LOG_DIR/ensure-gcovr.log" 2>&1 \
+            && GCOVR_STATUS=PASS || GCOVR_STATUS=FAIL
+        # Default mode runs coverage report-only, so a host that cannot install gcovr (a python3
+        # older than 3.10, no route to PyPI) keeps the old behaviour: WARN and carry on. --full
+        # ENFORCES the coverage baseline, so there a missing gcovr stops the run.
+        if [[ "$GCOVR_STATUS" == "FAIL" && "$MODE" != "full" ]]; then
+            GCOVR_RECORD=WARN
+        else
+            GCOVR_RECORD=$GCOVR_STATUS
+        fi
+        bash scripts/test/test-db-write.sh gate \
+            --run-id "$RUN_ID" --phase 0 --gate "gcovr install" \
+            --status "$GCOVR_RECORD" --duration $(( $(date +%s) - GCOVR_START )) \
+            --log "ensure-gcovr.log"
+        if [[ "$GCOVR_STATUS" == "FAIL" ]]; then
+            cat "$LOG_DIR/ensure-gcovr.log"
+            if [[ "$MODE" == "full" ]]; then
+                bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED
+                exit 1
+            fi
+            echo "gcovr unavailable: the coverage gate will record WARN (default mode is report-only)"
+        fi
     fi
 fi
 ```
 
-**On failure**: stop, like preflight. The log's last line says what to do (no Node, no network to the
-npm registry, a missing shared library for Chrome). An offline box can point
+**On failure**: stop, like preflight, for the Puppeteer step (and for the gcovr step in `--full`; in default
+mode a gcovr failure is a WARN, because coverage is report-only there). The log's last line says what to do
+(no Node, no network to the npm registry, a missing shared library for Chrome, a python3 older than 3.10). An offline box can point
 `PUPPETEER_EXECUTABLE_PATH` at an existing Chrome for Testing binary.
 
 ## Phase 1 — Build HEAD
