@@ -25,6 +25,13 @@ namespace pb = ::yuzu::agent::v1;
 
 constexpr const char* kSourceInstalledSoftware = "installed_software";
 
+// The `facet` label of yuzu_inventory_section_ingest_total (and the facet named in the refusal
+// log line): a collector source or component_inventory, else "unknown" - never the agent's raw
+// string.
+std::string facet_label(std::string_view facet) {
+    return is_known_v3_facet(facet) ? std::string(facet) : std::string("unknown");
+}
+
 // Input caps — the report is untrusted (security-guardian). A blob over the cap
 // is rejected (dropped + nacked); entries/fields beyond the cap are
 // dropped/truncated.
@@ -56,9 +63,10 @@ static_assert(kMaxBlobBytes == kV3MaxBlobBytes && kMaxEntries == kV3MaxRows &&
 // source) — the same byte form the agent hashes (ADR-0016 §4), so the server
 // re-hash matches. Slots 13-14 (install_location, uninstall_string) are RESERVED on THIS
 // (v2) path: they are consumed to keep the positions but never stored or hashed, because
-// ADR-0016 §8 has not been re-opened for them (#5186). An agent that hashes real values there
-// gets need_full until the server accepts them. The blob-v3 `+` record (inventory_blob_v3.hpp)
-// is the path that stores slot 13; slot 14 stays reserved there too. A shorter record (v1
+// the v2 grammar was never re-classified for them (#5186). An agent that hashes real values
+// there gets need_full until the server accepts them. The blob-v3 `+` record
+// (inventory_blob_v3.hpp) is the path that stores slot 13, after ADR-0016 §8 was re-opened for
+// it in the v10 Update; slot 14 stays reserved there too. A shorter record (v1
 // 4-field, v2 12-field) parses fine: the token walk stops at the record's end, leaving the
 // remaining fields default-empty
 // (the documented mixed-version behaviour — an old agent's rows store with empty
@@ -152,7 +160,7 @@ const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& age
         return "dropped";
     }
     // ONE line per report, not per section (a hostile agent can refuse every one of its
-    // <= kMaxSections sections on every resend). The facet is logged from the closed set, never
+    // <= kV3MaxSections sections on every resend). The facet is logged from the closed set, never
     // the agent's raw string.
     {
         std::size_t refused = 0;
@@ -163,7 +171,7 @@ const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& age
             ++refused;
             if (!detail.empty())
                 detail += ", ";
-            detail += is_known_v3_facet(sec.facet) ? sec.facet : std::string("unknown");
+            detail += facet_label(sec.facet);
             detail += ':';
             detail += v3_refusal_name(sec.refusal);
         }
@@ -191,11 +199,9 @@ const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& age
     bool any_error = false;
     for (const auto& r : results) {
         if (metrics) {
-            // `facet` is a closed label set: a collector source, component_inventory, or
-            // "unknown" for a name the server does not know (never the agent's raw string).
             metrics
                 ->counter("yuzu_inventory_section_ingest_total",
-                          {{"facet", is_known_v3_facet(r.facet) ? r.facet : std::string("unknown")},
+                          {{"facet", facet_label(r.facet)},
                            {"outcome", std::string(v3_section_outcome_name(r.outcome))}})
                 .increment();
         }
@@ -214,6 +220,33 @@ const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& age
 }
 
 } // namespace
+
+void seed_section_ingest_series(::yuzu::MetricsRegistry& metrics) {
+    metrics.describe("yuzu_inventory_section_ingest_total",
+                     "Blob-v3 installed-software section outcomes by facet and outcome "
+                     "(facet = a collector source, component_inventory, or unknown; "
+                     "outcome = stored/status_only/need_full/mismatch/rejected/"
+                     "error; moves only once a v3 agent reports)",
+                     "counter");
+    const auto seed = [&](const std::string& facet) {
+        for (const auto outcome : kV3SectionOutcomes)
+            metrics.counter("yuzu_inventory_section_ingest_total",
+                            {{"facet", facet}, {"outcome", std::string(v3_section_outcome_name(outcome))}});
+    };
+    for (const auto& src : software_catalog::kSoftwareSources)
+        seed(std::string(src.value));
+    seed(std::string(kComponentInventoryFacet));
+    seed("unknown");
+
+    metrics.describe("yuzu_software_changes_total",
+                     "Install-history ledger rows written by applied installed-software "
+                     "sections, by kind (install/remove/upgrade); a baseline section writes "
+                     "none",
+                     "counter");
+    for (const auto kind : kSoftwareChangeKinds)
+        metrics.counter("yuzu_software_changes_total",
+                        {{"kind", std::string(software_change_kind_name(kind))}});
+}
 
 bool validate_inventory_report_source_count(const std::string& agent_id,
                                             const pb::InventoryReport& report,

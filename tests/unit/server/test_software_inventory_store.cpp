@@ -4327,7 +4327,7 @@ TEST_CASE("name-pattern reads: a deny-all scope is an empty value with no SQL; a
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Blob v3 + migration v10 (SAM-13, ADR-0016 Update 2026-11-04)
+// Blob v3 + migration v10 (ADR-0016 Update 2026-11-04)
 // ═════════════════════════════════════════════════════════════════════════════
 
 namespace {
@@ -4518,7 +4518,9 @@ TEST_CASE("derive_install_keys: type, scope, identity key and instance key",
     CHECK(a2.instance_key == a.instance_key);
     SoftwareEntry ext = full_extended_entry();
     SoftwareInventoryStore::derive_install_keys(ext);
-    CHECK(ext.install_type == "installer");
+    // An rpm row stamped installed_apps.list_inventory is package_manager, like the same row
+    // from a pre-tail agent (empty source).
+    CHECK(ext.install_type == "package_manager");
     CHECK(SoftwareInventoryStore::canonical_hash({ext}) == kCrossPinHashExtended);
 
     // A pre-tail (v2, empty source) row falls back by ecosystem; an unknown one is not derived.
@@ -5780,6 +5782,42 @@ TEST_CASE("run_retention_prune_changes: 400-day window under the clock guard, ca
     CHECK(remaining() == 2);
 }
 
+TEST_CASE("v3: a delta that would leave a facet over the per-call record cap is a mismatch",
+          "[pg][software_inventory][v3]") {
+    SWINV_SHARED(store, pool);
+    std::vector<SoftwareEntry> rows;
+    rows.reserve(yuzu::server::kV3MaxRows);
+    for (std::size_t i = 0; i < yuzu::server::kV3MaxRows; ++i)
+        rows.push_back(v3_entry("n" + std::to_string(i), kV3Apps));
+    std::vector<V3Component> comps;
+    comps.reserve(yuzu::server::kV3MaxComponents);
+    for (std::size_t i = 0; i < yuzu::server::kV3MaxComponents; ++i)
+        comps.push_back(comp("c" + std::to_string(i), "/p/" + std::to_string(i)));
+    auto res = store.apply_installed_software_v3(
+        "agent-cap", v3_report({v3_full(kV3Apps, rows), comp_full(comps)}));
+    REQUIRE(res.size() == 2);
+    REQUIRE(res[0].outcome == V3SectionOutcome::kStored);
+    REQUIRE(res[1].outcome == V3SectionOutcome::kStored);
+
+    // Both deltas carry the hash the agent would hold, so only the cap refuses them.
+    const auto extra = v3_entry("one-too-many", kV3Apps);
+    auto after_rows = rows;
+    after_rows.push_back(extra);
+    const auto extra_c = comp("one-too-many", "/p/extra");
+    auto after_comps = comps;
+    after_comps.push_back(extra_c);
+    res = store.apply_installed_software_v3(
+        "agent-cap", v3_report({v3_delta(kV3Apps, section_hash_of(rows), after_rows, {}, {extra}),
+                               comp_delta(comp_hash_of(comps), after_comps, {}, {extra_c})}));
+    REQUIRE(res.size() == 2);
+    CHECK(res[0].outcome == V3SectionOutcome::kMismatch);
+    CHECK(res[1].outcome == V3SectionOutcome::kMismatch);
+    CHECK(row_count(pool, "agent-cap") == std::to_string(yuzu::server::kV3MaxRows));
+    CHECK(facet_status(pool, "agent-cap", kV3Apps) == "full/" + section_hash_of(rows));
+    CHECK(facet_status(pool, "agent-cap", kV3Comp) == "full/" + comp_hash_of(comps));
+    CHECK(ledger_count(pool, "agent-cap") == "0");
+}
+
 TEST_CASE("v3: a delta-only or all-refused call neither wipes v2 rows nor flips the state",
           "[pg][software_inventory][v3]") {
     SWINV_SHARED(store, pool);
@@ -6016,6 +6054,32 @@ TEST_CASE("ingest_inventory_report v3: a refused section nacks only its facet; t
                          {{"source", "installed_software"}, {"phase", "v3"}})
               .snapshot()
               .count == 1);
+}
+
+TEST_CASE("ingest_inventory_report v3: a full component_inventory section with no records is "
+          "nacked",
+          "[pg][software_inventory][seam][v3]") {
+    SWINV_SHARED(store, pool);
+    yuzu::MetricsRegistry metrics;
+
+    // A syntactically complete, honest-empty component section: header line only, no records.
+    const std::string blob = w_hdr() + w_sec(kV3Comp, "full");
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = "claimed-and-ignored";
+    (*rep.mutable_plugin_data())["installed_software"] = blob;
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-seam-cz", rep, ack, &metrics);
+
+    CHECK(std::vector<std::string>(ack.need_full().begin(), ack.need_full().end()) ==
+          std::vector<std::string>{"installed_software:component_inventory"});
+    CHECK(metrics
+              .counter("yuzu_inventory_section_ingest_total",
+                       {{"facet", kV3Comp}, {"outcome", "need_full"}})
+              .value() == 1.0);
+    CHECK(metrics
+              .counter("yuzu_inventory_ingest_total",
+                       {{"source", "installed_software"}, {"outcome", "need_full"}})
+              .value() == 1.0);
 }
 
 TEST_CASE("ingest_inventory_report v3: a section holding a NUL byte is refused, nothing of it is "

@@ -3214,6 +3214,22 @@ tests:
           - labels: 'ALERTS{alertname="YuzuInventoryIngestSlow", alertstate="firing", severity="warning"}'
             value: 1
 
+  # CASE - the same shape on phase="full" still fires: widening the selector to include v3 must
+  # not drop the original phase.
+  - interval: 1m
+    name: inventory ingest slow - phase full over 10s still fires
+    input_series:
+      - series: 'yuzu_inventory_ingest_duration_seconds_bucket{job="yuzu",instance="s1",source="installed_software",phase="full",le="+Inf"}'
+        values: "0+12x40"
+      - series: 'yuzu_inventory_ingest_duration_seconds_bucket{job="yuzu",instance="s1",source="installed_software",phase="full",le="10"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryIngestSlow", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryIngestSlow", alertstate="firing", severity="warning"}'
+            value: 1
+
   # CASE - the same slow shape on a phase the rule does not cover (hash_only, a compare with no
   # write) does not fire: the selector widened to the two full-apply phases, not to every phase.
   - interval: 1m
@@ -3230,8 +3246,8 @@ tests:
 
   # ── YuzuInventorySectionIngestRefused ────────────────────────────────────
   #
-  # A refused (grammar) section is counted per facet; the rule fires after a 15m hold and carries
-  # the facet label (sum by (facet)). mismatch has its own rule further down.
+  # A refused (grammar) section is counted per facet; the rule is an increase over a day with no
+  # hold and carries the facet label (sum by (facet)). mismatch has its own rule further down.
   # CASE - a facet whose sections keep being refused fires, naming the facet.
   - interval: 1m
     name: inventory section ingest refused - a rejected facet fires with its facet label
@@ -3240,12 +3256,24 @@ tests:
         values: "0+1x50"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing"}'
-        eval_time: 10m
-        exp_samples: []
-      - expr: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing"}'
         eval_time: 25m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing", facet="installed_apps.list_inventory", severity="warning"}'
+            value: 1
+
+  # CASE - ONE refused section fires (a pre-seeded 0, then a single increment). RED against the
+  # former `rate(...[15m]) > 0` with `for: 15m`: one increment keeps the rate non-zero for under
+  # 15m, so the hold was never met and a low-cadence refusal never alerted.
+  - interval: 1m
+    name: inventory section ingest refused - a single refusal fires
+    input_series:
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="pkg_inventory.packages",outcome="rejected"}'
+        values: "0x10 1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventorySectionIngestRefused", alertstate="firing", facet="pkg_inventory.packages", severity="warning"}'
             value: 1
 
   # CASE - mismatch (a delta or component section that did not verify and was rolled back) does
@@ -3261,22 +3289,54 @@ tests:
         exp_samples: []
 
   # ── YuzuInventorySectionDeltaMismatch ────────────────────────────────────
-  # CASE - a facet whose deltas keep failing verification fires as a warning after a 1h hold,
-  # naming the facet.
-  - interval: 1m
-    name: inventory section delta mismatch - fires as a warning with its facet label after 1h
+  # The rule reads a day of increases, so it can fire at the real report cadence (a device
+  # reports about once a day; a short rate() window never holds for the 1h `for:`).
+  # CASE - a facet whose deltas keep failing verification (1 mismatch per 10m against 5 stored:
+  # 144 a day, 17% of the facet's sections) fires as a warning after the 1h hold, naming the facet.
+  - interval: 10m
+    name: inventory section delta mismatch - a sustained share fires as a warning with its facet label
     input_series:
       - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="pkg_inventory.packages",outcome="mismatch"}'
-        values: "0+1x100"
+        values: "0+1x300"
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="pkg_inventory.packages",outcome="stored"}'
+        values: "0+5x300"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuInventorySectionDeltaMismatch", alertstate="firing"}'
-        eval_time: 45m
+        eval_time: 30m
         exp_samples: []
       - expr: 'ALERTS{alertname="YuzuInventorySectionDeltaMismatch", alertstate="firing"}'
-        eval_time: 80m
+        eval_time: 6h
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuInventorySectionDeltaMismatch", alertstate="firing", facet="pkg_inventory.packages", severity="warning"}'
             value: 1
+
+  # CASE - a handful of mismatches in a day (an agent restored from a snapshot, a report racing a
+  # decommission) is expected and never fires, even when it is a large share of a tiny facet.
+  - interval: 10m
+    name: inventory section delta mismatch - an isolated few do not fire
+    input_series:
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="pkg_inventory.packages",outcome="mismatch"}'
+        values: "0x20 1x20 2x20 3x20 4x200"
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="pkg_inventory.packages",outcome="stored"}'
+        values: "0+1x280"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventorySectionDeltaMismatch"}'
+        eval_time: 12h
+        exp_samples: []
+
+  # CASE - a steady trickle that is a small share of a busy facet (1 per 10m against 50 stored,
+  # 2%) never fires.
+  - interval: 10m
+    name: inventory section delta mismatch - a small share of a busy facet does not fire
+    input_series:
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="pkg_inventory.packages",outcome="mismatch"}'
+        values: "0+1x300"
+      - series: 'yuzu_inventory_section_ingest_total{job="yuzu",instance="s1",facet="pkg_inventory.packages",outcome="stored"}'
+        values: "0+50x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventorySectionDeltaMismatch"}'
+        eval_time: 12h
+        exp_samples: []
 
   # CASE - a rejected section never fires the mismatch rule (it has the warning above).
   - interval: 1m

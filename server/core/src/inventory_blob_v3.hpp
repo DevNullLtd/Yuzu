@@ -189,7 +189,7 @@ inline constexpr std::array<std::string_view, 9> kV3VersionSources{{
     "unreadable",
 }};
 
-/// One `comp` record: parsed and validated here, stored by a later change.
+/// One `comp` record: parsed and validated here, stored in `software_components`.
 struct V3Component {
     std::string kind;
     std::string name;
@@ -212,7 +212,7 @@ struct V3Section {
     std::vector<SoftwareEntry> rows;     ///< `+` records, v2-field-parity scrubbed/clamped
     std::vector<std::string> deletions;  ///< `-` row hashes
     std::vector<V3Component> components; ///< `comp` records
-    V3Refusal refusal{V3Refusal::kNone}; ///< set => every other member is cleared
+    V3Refusal refusal{V3Refusal::kNone}; ///< set => rows, deletions and components are cleared
 };
 
 struct V3Report {
@@ -316,9 +316,11 @@ namespace v3_detail {
 
 inline void refuse(V3Section& sec, V3Refusal why) {
     sec.refusal = why;
-    sec.rows.clear();
-    sec.deletions.clear();
-    sec.components.clear();
+    // Swap, not clear(): release the capacity too, so a refused section's buffers do not
+    // outlive the refusal (the call-wide counters were already given back by refuse_sec).
+    decltype(sec.rows)().swap(sec.rows);
+    decltype(sec.deletions)().swap(sec.deletions);
+    decltype(sec.components)().swap(sec.components);
 }
 
 } // namespace v3_detail
@@ -337,6 +339,14 @@ parse_v3_blob(std::string_view blob) {
     std::size_t total_rows = 0;
     std::size_t total_deletions = 0;
     std::size_t total_components = 0;
+    // A refused section's records are discarded, so its share of the call-wide caps is given
+    // back: a refused section must not shrink the budget of the sections that follow it.
+    const auto refuse_sec = [&](V3Section& s, V3Refusal why) {
+        total_rows -= s.rows.size();
+        total_deletions -= s.deletions.size();
+        total_components -= s.components.size();
+        v3_detail::refuse(s, why);
+    };
 
     std::size_t pos = kV3Header.size();
     while (pos < blob.size()) {
@@ -371,7 +381,7 @@ parse_v3_blob(std::string_view blob) {
             if (rep.sections.empty())
                 return std::unexpected(K::kRecordBeforeSection);
             if (rep.sections.back().refusal == V3Refusal::kNone)
-                v3_detail::refuse(rep.sections.back(), V3Refusal::kUnterminated);
+                refuse_sec(rep.sections.back(), V3Refusal::kUnterminated);
             continue;
         }
         const bool has_nul = rec.find('\0') != std::string_view::npos;
@@ -392,17 +402,17 @@ parse_v3_blob(std::string_view blob) {
             sec.bytes_read = v3_detail::parse_nonneg(f[6]);
             sec.expect = std::move(f[7]);
             if (!is_known_v3_facet(sec.facet)) {
-                v3_detail::refuse(sec, V3Refusal::kUnknownFacet);
+                refuse_sec(sec, V3Refusal::kUnknownFacet);
             } else if (has_nul) {
-                v3_detail::refuse(sec, V3Refusal::kNulByte);
+                refuse_sec(sec, V3Refusal::kNulByte);
             } else if (!st) {
-                v3_detail::refuse(sec, V3Refusal::kUnknownStatus);
+                refuse_sec(sec, V3Refusal::kUnknownStatus);
             } else if (*st == V3Status::kDelta && !v3_detail::is_hex64_lower(sec.expect)) {
-                v3_detail::refuse(sec, V3Refusal::kBadRecord);
+                refuse_sec(sec, V3Refusal::kBadRecord);
             } else {
                 for (const auto& prev : rep.sections) {
                     if (prev.facet == sec.facet) {
-                        v3_detail::refuse(sec, V3Refusal::kDuplicateFacet);
+                        refuse_sec(sec, V3Refusal::kDuplicateFacet);
                         break;
                     }
                 }
@@ -418,19 +428,19 @@ parse_v3_blob(std::string_view blob) {
             continue; // the rest of a refused section is skipped to the next S
 
         if (has_nul) {
-            v3_detail::refuse(sec, V3Refusal::kNulByte);
+            refuse_sec(sec, V3Refusal::kNulByte);
             continue;
         }
         const bool is_component_facet = sec.facet == kComponentInventoryFacet;
         if (f[0] == "+") {
             if (!v3_status_carries_rows(sec.status)) {
-                v3_detail::refuse(sec, V3Refusal::kRowsInStatusOnly);
+                refuse_sec(sec, V3Refusal::kRowsInStatusOnly);
             } else if (is_component_facet) {
-                v3_detail::refuse(sec, V3Refusal::kWrongRecordForFacet);
+                refuse_sec(sec, V3Refusal::kWrongRecordForFacet);
             } else if (total_rows >= kV3MaxRows) {
-                v3_detail::refuse(sec, V3Refusal::kRowCap);
+                refuse_sec(sec, V3Refusal::kRowCap);
             } else if (f[16] != sec.facet) {
-                v3_detail::refuse(sec, V3Refusal::kSourceMismatch);
+                refuse_sec(sec, V3Refusal::kSourceMismatch);
             } else {
                 SoftwareEntry e;
                 e.name = std::move(f[1]);
@@ -456,28 +466,28 @@ parse_v3_blob(std::string_view blob) {
             }
         } else if (f[0] == "-") {
             if (!v3_status_carries_rows(sec.status))
-                v3_detail::refuse(sec, V3Refusal::kRowsInStatusOnly);
+                refuse_sec(sec, V3Refusal::kRowsInStatusOnly);
             else if (sec.status == V3Status::kFull)
-                v3_detail::refuse(sec, V3Refusal::kDeleteInFull);
+                refuse_sec(sec, V3Refusal::kDeleteInFull);
             else if (!v3_detail::is_hex64_lower(f[1]))
-                v3_detail::refuse(sec, V3Refusal::kBadRowHash);
+                refuse_sec(sec, V3Refusal::kBadRowHash);
             else if (total_deletions >= kV3MaxDeletions)
-                v3_detail::refuse(sec, V3Refusal::kRowCap);
+                refuse_sec(sec, V3Refusal::kRowCap);
             else {
                 ++total_deletions;
                 sec.deletions.push_back(std::move(f[1]));
             }
         } else if (f[0] == "comp") {
             if (!v3_status_carries_rows(sec.status))
-                v3_detail::refuse(sec, V3Refusal::kRowsInStatusOnly);
+                refuse_sec(sec, V3Refusal::kRowsInStatusOnly);
             else if (!is_component_facet)
-                v3_detail::refuse(sec, V3Refusal::kWrongRecordForFacet);
+                refuse_sec(sec, V3Refusal::kWrongRecordForFacet);
             else if (f[1].empty() || f[2].empty())
-                v3_detail::refuse(sec, V3Refusal::kBadRecord);
+                refuse_sec(sec, V3Refusal::kBadRecord);
             else if (!v3_detail::version_source_known(f[4]))
-                v3_detail::refuse(sec, V3Refusal::kBadVersionSource);
+                refuse_sec(sec, V3Refusal::kBadVersionSource);
             else if (total_components >= kV3MaxComponents)
-                v3_detail::refuse(sec, V3Refusal::kRowCap);
+                refuse_sec(sec, V3Refusal::kRowCap);
             else {
                 ++total_components;
                 V3Component c;
@@ -492,7 +502,7 @@ parse_v3_blob(std::string_view blob) {
                 sec.components.push_back(std::move(c));
             }
         } else {
-            v3_detail::refuse(sec, V3Refusal::kUnknownRecord);
+            refuse_sec(sec, V3Refusal::kUnknownRecord);
         }
     }
     // A header with no section names nothing: fail closed like any other unattributable blob.

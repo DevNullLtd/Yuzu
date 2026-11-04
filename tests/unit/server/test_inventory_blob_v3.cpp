@@ -1,14 +1,18 @@
 /**
  * test_inventory_blob_v3.cpp — pure coverage for inventory_blob_v3.hpp (the blob-v3 grammar)
- * and install_type_rules.hpp (the install-type table). No store, no libpq, no clock, no
- * protobuf: every case feeds literal wire bytes to the parser.
+ * and install_type_rules.hpp (the install-type table), plus the section counter's boot
+ * pre-seed. No store, no libpq, no clock: every parser case feeds literal wire bytes.
  */
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "install_type_rules.hpp"
 #include "inventory_blob_v3.hpp"
+#include "inventory_ingestion.hpp"
 #include "software_catalog_rules.hpp"
+#include "software_inventory_store.hpp"
+
+#include <yuzu/metrics.hpp>
 
 #include <cstddef>
 #include <initializer_list>
@@ -253,6 +257,11 @@ TEST_CASE("v3 grammar refusals isolate to the section", "[server][inventory_blob
          sec(kApps, "full") + plus("A", kApps, std::string("C:\\x\0y", 6)), V3Refusal::kNulByte},
         {"a NUL in the section header token", sec(kApps, "full", "", std::string("t\0k", 3)),
          V3Refusal::kNulByte},
+        {"a NUL in a delta section's expect field",
+         sec(kApps, "delta", "b", "", "0", "0", std::string(32, 'e') + std::string("\0", 1) +
+                                                    std::string(31, 'e')) +
+             rec({"-", h}),
+         V3Refusal::kNulByte},
         {"a NUL in a comp record",
          sec(kComponentInventoryFacet, "full") +
              rec({"comp", "jar", "x", "1", "pom", std::string("/p\0q", 4), "1", "1", ""}),
@@ -385,6 +394,53 @@ TEST_CASE("v3 caps: sections, rows and blob bytes", "[server][inventory_blob_v3]
         REQUIRE(r.sections.size() == 2);
         CHECK(r.sections[0].refusal == V3Refusal::kNone);
         CHECK(r.sections[1].refusal == V3Refusal::kRowCap);
+    }
+    SECTION("a refused section gives its share of the call-wide row budget back") {
+        std::string a;
+        for (std::size_t i = 0; i < kV3MaxRows; ++i)
+            a += plus("n" + std::to_string(i), kApps);
+        // The first section fills the whole budget, then breaks the grammar (an unknown record
+        // kind), so it is refused and its rows are discarded. The next section must still get
+        // the full budget, not a spurious row_cap.
+        const V3Report r =
+            parse_ok(header() + sec(kApps, "full") + a + rec({"zzz", "x"}) +
+                     sec("pkg_inventory.packages", "full") + plus("Late", "pkg_inventory.packages"));
+        REQUIRE(r.sections.size() == 2);
+        CHECK(r.sections[0].refusal == V3Refusal::kUnknownRecord);
+        CHECK(r.sections[0].rows.empty());
+        // The storage is released, not just emptied.
+        CHECK(r.sections[0].rows.capacity() == 0);
+        CHECK(r.sections[0].deletions.capacity() == 0);
+        CHECK(r.sections[0].components.capacity() == 0);
+        CHECK(r.sections[1].refusal == V3Refusal::kNone);
+        CHECK(r.sections[1].rows.size() == 1);
+    }
+    SECTION("a refused delta section gives its `-` budget and storage back") {
+        std::string d;
+        for (std::size_t i = 0; i < kV3MaxDeletions; ++i) {
+            std::string h = std::to_string(i);
+            h.insert(0, 64 - h.size(), 'a');
+            d += rec({"-", h});
+        }
+        const V3Report r =
+            parse_ok(header() + sec(kApps, "delta", "b") + d + rec({"zzz", "x"}) +
+                     sec("pkg_inventory.packages", "delta", "b") + rec({"-", std::string(64, 'b')}));
+        REQUIRE(r.sections.size() == 2);
+        CHECK(r.sections[0].refusal == V3Refusal::kUnknownRecord);
+        CHECK(r.sections[0].deletions.capacity() == 0);
+        CHECK(r.sections[1].refusal == V3Refusal::kNone);
+        CHECK(r.sections[1].deletions.size() == 1);
+    }
+    SECTION("a refused component section gives its `comp` budget and storage back") {
+        std::string c;
+        for (std::size_t i = 0; i < kV3MaxComponents; ++i)
+            c += rec({"comp", "jar", "n" + std::to_string(i), "1", "pom", "/p", "1", "1", ""});
+        const V3Report r =
+            parse_ok(header() + sec(kComponentInventoryFacet, "full") + c + rec({"zzz", "x"}));
+        REQUIRE(r.sections.size() == 1);
+        CHECK(r.sections[0].refusal == V3Refusal::kUnknownRecord);
+        CHECK(r.sections[0].components.empty());
+        CHECK(r.sections[0].components.capacity() == 0);
     }
     SECTION("a blob over kV3MaxBlobBytes is oversize") {
         std::string blob = header() + sec(kApps, "full");
@@ -565,6 +621,12 @@ TEST_CASE("v3 an unterminated final record is refused, never applied",
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == V3ParseErrorKind::kRecordBeforeSection);
     }
+    SECTION("a delta header cut off inside its expect field fails the whole blob") {
+        auto r = parse_v3_blob(header() + sec(kApps, "full") + plus("A", kApps) +
+                               unterminated(sec("pkg_inventory.packages", "delta", "b")));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == V3ParseErrorKind::kBadSectionHeader);
+    }
     SECTION("a header alone is not a section") {
         CHECK_FALSE(parse_v3_blob(header() + unterminated(sec(kApps, "full"))).has_value());
     }
@@ -577,8 +639,10 @@ TEST_CASE("install_type_for: the source table is total over kSoftwareSources",
         const auto t = install_type_for(src.value, "");
         CHECK_FALSE(t.empty());
         CHECK(is_install_type(t));
-        // The source wins over a contradicting ecosystem.
-        CHECK(install_type_for(src.value, "rpm") == t);
+        // The source wins over a contradicting ecosystem, except the one ecosystem-refined
+        // source (next test case).
+        if (src.value != kEcosystemRefinedSource)
+            CHECK(install_type_for(src.value, "rpm") == t);
     }
     CHECK(install_type_for("installed_apps.list_inventory", "") == "installer");
     CHECK(install_type_for("pkg_inventory.managers", "") == "package_manager");
@@ -588,6 +652,25 @@ TEST_CASE("install_type_for: the source table is total over kSoftwareSources",
     CHECK(install_type_for("msi_packages.list_inventory", "") == "msi");
     CHECK(install_type_for("runtimes.python", "") == "runtime");
     CHECK(install_type_for("middleware.ibm_mq", "") == "middleware");
+}
+
+TEST_CASE("install_type_for: installed_apps rows read their Linux package ecosystem",
+          "[server][install_type]") {
+    // The same package is package_manager whether the agent stamped a source or not.
+    for (const char* eco : {"deb", "rpm", "apk", "pacman"}) {
+        CAPTURE(eco);
+        CHECK(install_type_for("installed_apps.list_inventory", eco) == "package_manager");
+        CHECK(install_type_for("installed_apps.list_inventory", eco) ==
+              install_type_for("", eco));
+    }
+    for (const char* eco : {"windows", "macos", "macos_pkgutil", "", "made_up"}) {
+        CAPTURE(eco);
+        CHECK(install_type_for("installed_apps.list_inventory", eco) == "installer");
+    }
+    // Source-first for every other source: a contradicting ecosystem changes nothing.
+    CHECK(install_type_for("pkg_inventory.store_packages", "rpm") == "store");
+    CHECK(install_type_for("msi_packages.list_inventory", "deb") == "msi");
+    CHECK(install_type_for("runtimes.python", "rpm") == "runtime");
 }
 
 TEST_CASE("install_type_for: an empty or unknown source falls back by ecosystem",
@@ -607,4 +690,60 @@ TEST_CASE("install_type_for: an empty or unknown source falls back by ecosystem"
         CHECK(install_type_for("", r.ecosystem) == r.expect);
         CHECK(install_type_for("some.future_source", r.ecosystem) == r.expect);
     }
+}
+
+TEST_CASE("the section outcome labels are the literals the alerts and the manual name",
+          "[server][inventory_v3][metrics]") {
+    // YuzuInventorySectionIngestRefused reads "rejected", YuzuInventorySectionDeltaMismatch
+    // reads "mismatch", and metrics.md lists all six: a rename must be deliberate.
+    CHECK(v3_section_outcome_name(V3SectionOutcome::kStored) == "stored");
+    CHECK(v3_section_outcome_name(V3SectionOutcome::kStatusOnly) == "status_only");
+    CHECK(v3_section_outcome_name(V3SectionOutcome::kNeedFull) == "need_full");
+    CHECK(v3_section_outcome_name(V3SectionOutcome::kMismatch) == "mismatch");
+    CHECK(v3_section_outcome_name(V3SectionOutcome::kRejected) == "rejected");
+    CHECK(v3_section_outcome_name(V3SectionOutcome::kError) == "error");
+    CHECK(kV3SectionOutcomes.size() == 6);
+}
+
+TEST_CASE("seed_section_ingest_series creates every closed facet x outcome series at 0",
+          "[server][inventory_v3][metrics]") {
+    yuzu::MetricsRegistry m;
+    seed_section_ingest_series(m);
+    const auto text = m.serialize();
+    CHECK(text.find("# HELP yuzu_inventory_section_ingest_total ") != std::string::npos);
+    CHECK(text.find("# TYPE yuzu_inventory_section_ingest_total counter") != std::string::npos);
+
+    std::vector<std::string> facets{std::string(kComponentInventoryFacet), "unknown"};
+    for (const auto& src : software_catalog::kSoftwareSources)
+        facets.emplace_back(src.value);
+    std::size_t series = 0;
+    for (const auto& facet : facets) {
+        for (const auto outcome : kV3SectionOutcomes) {
+            CAPTURE(facet, v3_section_outcome_name(outcome));
+            CHECK(text.find("yuzu_inventory_section_ingest_total{facet=\"" + facet +
+                            "\",outcome=\"" + std::string(v3_section_outcome_name(outcome)) +
+                            "\"} 0") != std::string::npos);
+            ++series;
+        }
+    }
+    // No series beyond the closed set: every sample line of the family is one counted above.
+    std::size_t lines = 0;
+    for (std::size_t at = text.find("\nyuzu_inventory_section_ingest_total{");
+         at != std::string::npos;
+         at = text.find("\nyuzu_inventory_section_ingest_total{", at + 1))
+        ++lines;
+    CHECK(lines == series);
+
+    // The ledger counter's closed `kind` set is seeded too, so its first increment is a rate.
+    CHECK(kSoftwareChangeKinds.size() == 3);
+    for (const auto kind : kSoftwareChangeKinds) {
+        CAPTURE(software_change_kind_name(kind));
+        CHECK(text.find("yuzu_software_changes_total{kind=\"" +
+                        std::string(software_change_kind_name(kind)) + "\"} 0") !=
+              std::string::npos);
+    }
+
+    // Idempotent.
+    seed_section_ingest_series(m);
+    CHECK(m.serialize() == text);
 }
