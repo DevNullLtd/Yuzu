@@ -352,6 +352,22 @@ TEST_CASE("v3 caps: sections, rows and blob bytes", "[server][inventory_blob_v3]
         CHECK(r.sections[0].refusal == V3Refusal::kNone);
         CHECK(r.sections[1].refusal == V3Refusal::kRowCap);
     }
+    SECTION("a refused section gives its share of the call-wide row budget back") {
+        std::string a;
+        for (std::size_t i = 0; i < kV3MaxRows; ++i)
+            a += plus("n" + std::to_string(i), kApps);
+        // The first section fills the whole budget, then breaks the grammar (an unknown record
+        // kind), so it is refused and its rows are discarded. The next section must still get
+        // the full budget, not a spurious row_cap.
+        const V3Report r =
+            parse_ok(header() + sec(kApps, "full") + a + rec({"zzz", "x"}) +
+                     sec("pkg_inventory.packages", "full") + plus("Late", "pkg_inventory.packages"));
+        REQUIRE(r.sections.size() == 2);
+        CHECK(r.sections[0].refusal == V3Refusal::kUnknownRecord);
+        CHECK(r.sections[0].rows.empty());
+        CHECK(r.sections[1].refusal == V3Refusal::kNone);
+        CHECK(r.sections[1].rows.size() == 1);
+    }
     SECTION("a blob over kV3MaxBlobBytes is oversize") {
         std::string blob = header() + sec(kApps, "full");
         blob.append(kV3MaxBlobBytes - blob.size() + 1, 'x');
@@ -594,6 +610,19 @@ TEST_CASE("install_type_for: an empty or unknown source falls back by ecosystem"
         CHECK(install_type_for("", r.ecosystem) == r.expect);
         CHECK(install_type_for("some.future_source", r.ecosystem) == r.expect);
     }
+}
+
+TEST_CASE("the section outcome labels are the literals the alerts and the manual name",
+          "[server][inventory_v3][metrics]") {
+    // YuzuInventorySectionIngestRefused reads "rejected", YuzuInventorySectionDeltaUnsupported
+    // reads "delta_unsupported", and metrics.md lists all six: a rename must be deliberate.
+    CHECK(v3_section_outcome_name(V3SectionOutcome::kStored) == "stored");
+    CHECK(v3_section_outcome_name(V3SectionOutcome::kStatusOnly) == "status_only");
+    CHECK(v3_section_outcome_name(V3SectionOutcome::kNeedFull) == "need_full");
+    CHECK(v3_section_outcome_name(V3SectionOutcome::kDeltaUnsupported) == "delta_unsupported");
+    CHECK(v3_section_outcome_name(V3SectionOutcome::kRejected) == "rejected");
+    CHECK(v3_section_outcome_name(V3SectionOutcome::kError) == "error");
+    CHECK(kV3SectionOutcomes.size() == 6);
 }
 
 TEST_CASE("seed_section_ingest_series creates every closed facet x outcome series at 0",
