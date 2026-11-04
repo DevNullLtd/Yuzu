@@ -96,6 +96,8 @@ inline constexpr std::string_view kMcpTransport =
     "MCP transport endpoint: tool calls are governed by the MCP tier and approval ladder";
 inline constexpr std::string_view kContentAuthoring =
     "content authoring: running the content is gated separately";
+inline constexpr std::string_view kReferenceDataReplace =
+    "fleet-wide reference data replace: not credentials, identity or authority; audited before the write";
 inline constexpr std::string_view kPolicyLifecycle =
     "policy lifecycle: governed by the Policy securable and approval";
 inline constexpr std::string_view kEvidenceCapture = "evidence capture under its own securable";
@@ -248,7 +250,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     // software_curation_routes.cpp
     step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/aliases)",                        step_up_detail::kOperationalData),
     step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/queue/([A-Za-z0-9_-]+)/reject)",  step_up_detail::kOperationalData),
-    step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/pack)",                           step_up_detail::kContentAuthoring),
+    step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/pack)",                           step_up_detail::kReferenceDataReplace),
     // instruction_fragment_routes.cpp
     step_up_detail::exempt("POST",  R"(/fragments/instructions/yaml-preview)",                                    step_up_detail::kReadShaped),
     // instruction_routes.cpp

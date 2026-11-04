@@ -12,6 +12,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <limits>
 #include <vector>
@@ -93,6 +94,14 @@ namespace {
 
 constexpr int kDefaultQueueLimit = 100;
 
+// Audit verbs. The two read verbs appear only as a `denied` row (a service-scoped token's
+// refusal); an admitted read is never audited.
+constexpr const char* kVerbStatus = "inventory.software.curation.status";
+constexpr const char* kVerbQueue = "inventory.software.curation.queue";
+constexpr const char* kVerbAlias = "inventory.software.curation.alias";
+constexpr const char* kVerbReject = "inventory.software.curation.reject";
+constexpr const char* kVerbPack = "inventory.software.curation.pack";
+
 std::string dump_safe(const nlohmann::json& j) {
     // Raw titles come from agents and may not be valid UTF-8: replace, never throw.
     return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
@@ -119,7 +128,7 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // operator surfaces; a service token has no Inventory grant to admit it), the GLOBAL
     // permission, then a wired store. false == the response is already written.
     auto admit = [deps](const httplib::Request& req, httplib::Response& res,
-                        const char* operation) -> std::optional<auth::Session> {
+                        const char* operation, const char* verb) -> std::optional<auth::Session> {
         detail::ensure_correlation_id(res);
         if (!deps.auth_fn || !deps.perm_fn) {
             spdlog::error("SoftwareCurationRoutes: auth/permission gate unwired; failing closed");
@@ -130,8 +139,18 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!session)
             return std::nullopt;
         if (!session->token_scope_service.empty()) {
-            // No `.permission`: no grant would admit a service-scoped token here.
-            fail(res, 403, "service-scoped tokens may not use the software curation queue");
+            // No `.permission`: no grant would admit a service-scoped token here. Audited
+            // `denied`, as the sibling software routes do (inventory_routes.cpp
+            // deny_service_scoped). A permission refusal is audited by perm_fn itself.
+            res.status = 403;
+            res.set_content(detail::a4_denial(res, 403,
+                                              "service-scoped tokens may not use the software "
+                                              "curation queue"),
+                            "application/json");
+            (void)detail::try_persist_audit(deps.audit_fn, req, verb, "denied", "Inventory",
+                                            "fleet",
+                                            "service-scoped token denied on the software curation "
+                                            "queue");
             return std::nullopt;
         }
         if (!deps.perm_fn(req, res, "Inventory", operation))
@@ -163,7 +182,7 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // -- GET status -----------------------------------------------------------------------
     sink.Get("/api/v1/inventory/software/normalization/status",
              [deps, admit](const httplib::Request& req, httplib::Response& res) {
-                 if (!admit(req, res, "Read"))
+                 if (!admit(req, res, "Read", kVerbStatus))
                      return;
                  const auto st = deps.registry->normalization_status();
                  if (!st) {
@@ -184,7 +203,7 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // -- GET queue ------------------------------------------------------------------------
     sink.Get("/api/v1/inventory/software/normalization/queue", [deps, admit](const httplib::Request& req,
                                                           httplib::Response& res) {
-        if (!admit(req, res, "Read"))
+        if (!admit(req, res, "Read", kVerbQueue))
             return;
         for (const char* name : {"status", "limit", "cursor"}) {
             if (req.get_param_value_count(name) > 1) {
@@ -252,8 +271,8 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     sink.Post("/api/v1/inventory/software/normalization/aliases", [deps, admit, audit_first, deny_400](
                                                    const httplib::Request& req,
                                                    httplib::Response& res) {
-        static constexpr const char* kVerb = "inventory.software.curation.alias";
-        if (!admit(req, res, "Write"))
+        static constexpr const char* kVerb = kVerbAlias;
+        if (!admit(req, res, "Write", kVerb))
             return;
         const auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.is_object()) {
@@ -333,8 +352,8 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     sink.Post(R"(/api/v1/inventory/software/normalization/queue/([A-Za-z0-9_-]+)/reject)",
               [deps, admit, audit_first, deny_400](const httplib::Request& req,
                                                    httplib::Response& res) {
-                  static constexpr const char* kVerb = "inventory.software.curation.reject";
-                  if (!admit(req, res, "Write"))
+                  static constexpr const char* kVerb = kVerbReject;
+                  if (!admit(req, res, "Write", kVerb))
                       return;
                   const auto t = curation_keys::decode_key(req.matches[1].str());
                   if (!t) {
@@ -362,12 +381,20 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     sink.Post("/api/v1/inventory/software/normalization/pack", [deps, admit, audit_first, deny_400](
                                                 const httplib::Request& req,
                                                 httplib::Response& res) {
-        static constexpr const char* kVerb = "inventory.software.curation.pack";
-        const auto session = admit(req, res, "Write");
+        static constexpr const char* kVerb = kVerbPack;
+        const auto session = admit(req, res, "Write", kVerb);
         if (!session)
             return;
-        const auto ct = req.get_header_value("Content-Type");
-        if (!ct.starts_with("text/csv") && !ct.starts_with("text/plain")) {
+        // The media type alone (RFC 9110 8.3.1): drop parameters, trim, compare
+        // case-insensitively. `text/csvx` is not `text/csv`.
+        auto ct = req.get_header_value("Content-Type");
+        ct.resize(std::min(ct.find(';'), ct.size()));
+        const auto first = ct.find_first_not_of(" \t");
+        const auto last = ct.find_last_not_of(" \t");
+        ct = first == std::string::npos ? std::string{} : ct.substr(first, last - first + 1);
+        std::transform(ct.begin(), ct.end(), ct.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ct != "text/csv" && ct != "text/plain") {
             (void)detail::try_persist_audit(deps.audit_fn, req, kVerb, "denied", "Inventory", "",
                                             "unsupported content type");
             fail(res, 415, "Content-Type must be text/csv or text/plain");

@@ -935,6 +935,10 @@ ProductRegistryStore::curate_alias(std::string_view ecosystem, const CuratedAlia
             if (!take_normalization_lock(c))
                 return fail("normalisation lock");
             const std::string now = std::to_string(now_secs());
+            // Same INSERT as upsert_pack_rows' product upsert, but the ON CONFLICT differs on
+            // purpose: a curated write marks the product origin = 'curated' and a given
+            // cpe_product wins; the pack loader's rule keeps an existing cpe_product and an
+            // existing 'curated' origin.
             pg::PgResult pr = pg::exec_params(
                 c,
                 "INSERT INTO product_registry_store.products "

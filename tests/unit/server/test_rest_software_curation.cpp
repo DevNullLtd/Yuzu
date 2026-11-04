@@ -185,8 +185,9 @@ TEST_CASE("every curation route refuses an unauthenticated caller, a service-sco
             INFO(r.second);
             REQUIRE(call(r)->status == 401);
         }
+        CHECK(h.audits.empty());
     }
-    SECTION("service-scoped token: 403 before the permission is even asked") {
+    SECTION("service-scoped token: 403 before the permission is even asked, audited denied") {
         h.service_scoped = true;
         for (const auto& r : routes) {
             INFO(r.second);
@@ -195,6 +196,19 @@ TEST_CASE("every curation route refuses an unauthenticated caller, a service-sco
             CHECK(json::parse(res->body)["error"]["permission"].is_null());
         }
         CHECK(h.perms.empty());
+        // One `denied` row per refusal, under the route's own verb (the reads' verbs appear
+        // only here), on the fleet target, and never a `requested` row.
+        const std::vector<std::string> verbs = {
+            "inventory.software.curation.status", "inventory.software.curation.queue",
+            "inventory.software.curation.alias", "inventory.software.curation.reject",
+            "inventory.software.curation.pack"};
+        REQUIRE(h.audits.size() == verbs.size());
+        for (std::size_t i = 0; i < verbs.size(); ++i) {
+            INFO(verbs[i]);
+            CHECK(h.audits[i].action == verbs[i]);
+            CHECK(h.audits[i].result == "denied");
+            CHECK(h.audits[i].target_id == "fleet");
+        }
     }
     SECTION("permission denied (a confined caller fails the global gate)") {
         h.perm_ok = false;
@@ -202,8 +216,10 @@ TEST_CASE("every curation route refuses an unauthenticated caller, a service-sco
             INFO(r.second);
             REQUIRE(call(r)->status == 403);
         }
+        // The permission gate audits its own refusals (auth.permission_required); this
+        // handler does not double-write.
+        CHECK(h.audits.empty());
     }
-    CHECK(h.audits.empty());
 }
 
 TEST_CASE("reads ask Inventory:Read and writes ask Inventory:Write, globally",
@@ -239,6 +255,7 @@ TEST_CASE("a store that cannot answer is a 503 with retry_after_ms, never an emp
         REQUIRE(res->status == 503);
         CHECK(json::parse(res->body)["error"]["retry_after_ms"] == 5000);
     }
+    CHECK(h.audits.empty()); // an admitted read is never audited
 }
 
 TEST_CASE("queue query parameters: bad status, limit, cursor and repeats are 400",
@@ -351,6 +368,13 @@ TEST_CASE("POST pack: content type, parser refusal reason, and fail-closed audit
     ClosedStore cs;
     Harness h{&cs.store};
     CHECK(h.sink.Post(kBase + "/pack", "x", "application/json")->status == 415);
+    // The media type is matched whole, case-insensitively, parameters ignored.
+    CHECK(h.sink.Post(kBase + "/pack", "x", "text/csvx")->status == 415);
+    CHECK(h.sink.Post(kBase + "/pack", "x", "text/csv-evil; charset=utf-8")->status == 415);
+    CHECK(h.sink.Post(kBase + "/pack", "x", "xtext/plain")->status == 415);
+    // Past the type gate, the parser refuses the body.
+    CHECK(h.sink.Post(kBase + "/pack", "x", "Text/CSV")->status == 400);
+    CHECK(h.sink.Post(kBase + "/pack", "x", "TEXT/PLAIN ; charset=utf-8")->status == 400);
 
     const auto refused = h.sink.Post(kBase + "/pack", "#pack_version: 2026.11.1\n", "text/csv");
     REQUIRE(refused->status == 400);
@@ -433,9 +457,18 @@ TEST_CASE("curation routes end to end over a live store", "[pg][software_curatio
     REQUIRE(store.is_open());
     Harness h{&store};
 
-    // Empty queue / status.
+    // Empty queue / status: all seven keys, with their JSON types.
     auto st = json::parse(h.sink.Get(kBase + "/status")->body)["data"];
+    CHECK(st.size() == 7);
+    CHECK(st.at("pack_version").is_string());
+    CHECK(st.at("loaded_at").is_number_integer());
+    CHECK(st.at("loaded_by").is_string());
+    for (const char* k :
+         {"titles_normalized", "titles_unnormalized", "queue_open", "queue_rejected"})
+        CHECK(st.at(k).is_number_integer());
     CHECK(st["queue_open"] == 0);
+    CHECK(json::parse(h.sink.Get(kBase + "/queue")->body)["data"]["count"] == 0);
+    CHECK(h.audits.empty()); // admitted reads are never audited
 
     // Curate -> 201, the alias resolves.
     const auto cur = h.sink.Post(kBase + "/aliases", alias_body());
