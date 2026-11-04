@@ -788,3 +788,5 @@ absorb any realistic overflow first, so `swap` is a defensive tail.
 the same build enroll, and every replica is on that build. The deployment contract (a fresh
 database, every writer on this build; `docs/user-manual/upgrading.md`, "Deployment contract (hard
 cutover)") excludes an earlier server, so this entry states no behaviour of an agent against one.
+
+> **Update (2026-11-03):** `runtimes.dotnet` and `runtimes.jvm` are collected as ecosystems `dotnet` and `jvm` (kind `app`; name `.NET Runtime`/`.NET SDK`/`.NET Framework` or `Java JDK`/`Java JRE`; version from the plugin row; publisher Microsoft or the JVM vendor), on Windows, macOS and Linux, under the same `drop_source` constrained policy as `runtimes.python`. `hardware.drivers_inventory` is an on-demand action and is not a daily-sync source.
