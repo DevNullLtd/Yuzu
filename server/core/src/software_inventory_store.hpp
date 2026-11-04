@@ -78,7 +78,10 @@ struct SoftwareCursor {
 /// global-gated. Callers caveat the counts, exactly like the `query_software` route.
 struct SoftwareCatalogRow {
     std::string name;
-    std::string publisher; ///< representative publisher (max over the group); may vary
+    /// Representative publisher of the group: the greatest non-empty publisher that is not a
+    /// `via:` label (a declared vendor), else the greatest publisher overall (a `via:<ecosystem>` label, or '' when every
+    /// row has none). A label never wins over a vendor. May vary across the group's rows.
+    std::string publisher;
     /// EXACT count of distinct devices carrying the title under the active
     /// kind/ecosystem/source filters (a device carrying it through two sources counts
     /// ONCE). One precomputed row per (title, filter grain, distinct dimension
