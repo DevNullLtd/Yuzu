@@ -2509,7 +2509,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 `days`, `week`, `bucket`). The cursor carries the position of the last certificate served and
 the walk's `as_of`, so every page is measured against the same time and starts strictly after
 that certificate: a certificate revoked between pages never makes the walk skip another (an
-offset would). `next_cursor` is `null` on the last page, and also `null` when more rows follow but the last row on the page has a `null` `key` (its 0x1F byte cannot be encoded into a cursor, so that continuation is lost: narrow the query with `status` or reject entries and list again). Order: expiring soonest first, expired and revoked most recent first, the
+offset would). `next_cursor` is `null` on the last page. Order: expiring soonest first, expired and revoked most recent first, the
 rest newest-issued first. Every filtered call is audited `crypto.ca.certificates.view`, as
 is every unfiltered call (set-and-proceed: `audit_persisted: false` in the body and `Sec-Audit-Failed: true` when the row
 is lost; a confined refusal is a `denied` row, and an unavailable access check a `failure` row).
@@ -7935,7 +7935,7 @@ The curation queue, most-installed first (`device_count` descending, then `raw_n
 | `limit` | integer | 1-500, default 100 |
 | `cursor` | string | The `next_cursor` of the previous page |
 
-A repeated parameter, an unknown `status`, a `limit` outside 1-500 or a malformed `cursor` is a `400`. Each row carries `key` (the opaque value the reject route takes; `null` for a title whose fields hold the 0x1F control byte, which cannot be rejected through this API), `raw_name`, `raw_publisher`, `ecosystem`, `device_count`, `status`, `first_queued_at` and `last_seen_at`; `next_cursor` is `null` on the last page. A degraded read is a `503` with `retry_after_ms`, never an empty page.
+A repeated parameter, an unknown `status`, a `limit` outside 1-500 or a malformed `cursor` is a `400`. Each row carries `key` (the opaque value the reject route takes; `null` for a title whose fields hold the 0x1F control byte, which cannot be rejected through this API), `raw_name`, `raw_publisher`, `ecosystem`, `device_count`, `status`, `first_queued_at` and `last_seen_at`; `next_cursor` is `null` on the last page, and also `null` when more rows follow but the last row on the page has a `null` `key` (its 0x1F byte cannot be encoded into a cursor, so that continuation is lost: narrow the query with `status` or reject entries and list again). A degraded read is a `503` with `retry_after_ms`, never an empty page.
 
 #### `POST /api/v1/inventory/software/normalization/aliases`
 
@@ -7949,7 +7949,7 @@ Marks one open queue entry `rejected` (`200 {"data": {"rejected": true}}`). `key
 
 #### `POST /api/v1/inventory/software/normalization/pack`
 
-Replaces the stored alias pack. The body is the alias-pack CSV (`Content-Type: text/csv` or `text/plain`, else `415`); the format and the 1 MiB, 5,000-row (and at least 50-row) and 256-byte-field limits are those of the seed pack parser, whose refusal reason is returned in the `400` (a NUL byte or invalid UTF-8 included). A body over 1 MiB never reaches the parser: the pre-auth body cap answers `413`. A replace keeps products a curator owns (`origin` curated) at their category and `cpe_product`, and leaves curated aliases active. The pack aliases the new pack no longer carries stop resolving, the ones it carries stay, and every title is marked for re-resolution. A pack whose `pack_version` equals the stored one is a `409`. `200` returns `{pack_version, sha256, rows}`.
+Replaces the stored alias pack. The body is the alias-pack CSV (`Content-Type: text/csv` or `text/plain`, else `415`); the format and the 1 MiB, 5,000-row (and at least 50-row) and 256-byte-field limits are those of the seed pack parser, whose refusal reason is returned in the `400` (a NUL byte or invalid UTF-8 included). A body over 1 MiB never reaches the parser: the pre-auth body cap answers `413`. A replace keeps products a curator owns (`origin` curated) at their category, and at their `cpe_product` once it is non-empty. A replace also leaves curated aliases active. An alias curated with the category omitted still marks its product curated, which freezes that product's category against later packs. The pack aliases the new pack no longer carries stop resolving, the ones it carries stay, and every title is marked for re-resolution. A pack whose `pack_version` equals the stored one is a `409`. `200` returns `{pack_version, sha256, rows}`.
 
 ---
 

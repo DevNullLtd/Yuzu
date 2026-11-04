@@ -1174,7 +1174,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        curation); **revisit by 2026-12-31**. The twin takes the same store methods
        and the same field validators (`valid_cpe_product`, `known_ecosystem`,
        `derive_curated_alias`), so there is no second validator. This entry
-       retires when the twin merges. No ledger row is added: the parity ledger
+       retires when the twin merges. No issue exists for that follow-up yet
+       (update this line when it is filed). No ledger row is added: the parity ledger
        admits an `exception:` row for a `/api/v1` route but does not require one.
      - **What an MCP-only caller can and cannot reach today.** The status, queue
        and curated aliases are not reachable over MCP; the OpenAPI document is
