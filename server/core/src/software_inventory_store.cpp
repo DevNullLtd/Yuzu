@@ -4,6 +4,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
+#include "ascii_fold.hpp"
 #include "install_type_rules.hpp"
 #include "purl_compose.hpp"
 #include "pg/pg_raii.hpp"
@@ -821,11 +822,7 @@ void SoftwareInventoryStore::derive_install_keys(SoftwareEntry& e) {
     e.install_scope = "machine"; // the collection is machine-scope only (ADR-0016 §8)
 
     // location_norm: ASCII-lower-cased, trailing path separators stripped ('' stays '').
-    std::string loc = e.install_location;
-    for (char& ch : loc) {
-        if (ch >= 'A' && ch <= 'Z')
-            ch = static_cast<char>(ch - 'A' + 'a');
-    }
+    std::string loc = ascii_lower(e.install_location);
     while (!loc.empty() && (loc.back() == '/' || loc.back() == '\\'))
         loc.pop_back();
 

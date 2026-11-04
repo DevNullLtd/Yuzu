@@ -19,7 +19,7 @@
 ///   - namespace, name, version, qualifier values: UTF-8 bytes percent-encoded (uppercase hex)
 ///     except `A-Z a-z 0-9 . - _ ~` and ':' (spec 5.2 / 5.4: ':' is never encoded; '+' '@' '/'
 ///     ' ' '?' '#' are). Namespace segments are encoded one by one; a distro id is ONE segment.
-///   - qualifiers: lowercase keys, empty values dropped, sorted by key (so `arch` before
+///   - qualifiers: lowercase keys, sorted by key (so `arch` before
 ///     `distro` before `epoch`), joined with '&'.
 ///
 /// Per ecosystem (the table in ADR-0016 Update 2026-11-04 repeats it):
@@ -48,9 +48,11 @@
 /// kMaxPurlBytes. The cap sits below the btree tuple limit of the column's index; the composer
 /// NEVER truncates, because a cut purl names a different package.
 
+#include "ascii_fold.hpp"
 #include "software_inventory_types.hpp"
 #include "software_normalization_pack.hpp" // purl_type_for
 
+#include <algorithm>
 #include <cstddef>
 #include <string>
 #include <string_view>
@@ -84,15 +86,6 @@ namespace purl_detail {
             out.push_back(kHex[c >> 4]);
             out.push_back(kHex[c & 0x0f]);
         }
-    }
-    return out;
-}
-
-[[nodiscard]] inline std::string ascii_lower(std::string_view in) {
-    std::string out(in);
-    for (char& ch : out) {
-        if (ch >= 'A' && ch <= 'Z')
-            ch = static_cast<char>(ch - 'A' + 'a');
     }
     return out;
 }
@@ -155,15 +148,10 @@ namespace purl_detail {
     out += name;
     out += '@';
     out += version;
-    // Qualifier keys are fixed lowercase literals; sort by key, then drop empty values.
-    for (std::size_t i = 1; i < quals.size(); ++i) {
-        for (std::size_t j = i; j > 0 && quals[j].first < quals[j - 1].first; --j)
-            std::swap(quals[j], quals[j - 1]);
-    }
+    // Qualifier keys are fixed lowercase literals (unique); every value is pushed non-empty.
+    std::ranges::sort(quals, {}, &decltype(quals)::value_type::first);
     char sep = '?';
     for (const auto& [key, value] : quals) {
-        if (value.empty())
-            continue;
         out += sep;
         out += key;
         out += '=';
