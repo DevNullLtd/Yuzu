@@ -551,8 +551,10 @@ struct OldValue {
 
 /// Neutralises untrusted text for an `audit|k=v|...` line: invalid UTF-8 -> '?', control bytes, DEL, space, '=' and
 /// ',' (yuzu::log_token) -> '_', and '|' -> '_' (log_token does not map the field separator).
-/// The C1 controls U+0080-U+009F (NEL U+0085 among them), U+2028 and U+2029 -> '_' too (fold_line_breaks; log_token
-/// passes every byte >= 0x80). A trailing backslash becomes '_'. Over `cap` bytes it is cut on a character boundary
+/// log_token already folds the C1 controls U+0080-U+009F (NEL U+0085 among them), U+2028 and U+2029 to '_'; the
+/// fold_line_breaks call below is a now-redundant belt-and-braces fold. fold_line_breaks already folded the whole
+/// C1 range before log_token did, so the emitted bytes are unchanged by log_token folding them too; the call stays
+/// as belt and braces. A trailing backslash becomes '_'. Over `cap` bytes it is cut on a character boundary
 /// and gets `~<total length>`; the cap and `~<total>` are measured after folding.
 [[nodiscard]] inline std::string audit_token(std::string_view s, std::size_t cap = kAuditTokenCap) {
     std::string t;
@@ -564,7 +566,7 @@ struct OldValue {
         t = yuzu::log_token(scrubbed);
     }
     std::replace(t.begin(), t.end(), '|', '_');
-    yuzu::profiles::fold_line_breaks(t); // log_token folds C0 and DEL but passes C1, U+2028 and U+2029
+    yuzu::profiles::fold_line_breaks(t); // redundant after log_token (which folds C1, U+2028, U+2029); kept belt-and-braces
     // A field that ends in a backslash would make the following separator read as an escaped `|` to the server's
     // splitter (result_parsing.hpp find_unescaped_pipe) and merge two cells.
     if (!t.empty() && t.back() == '\\') t.back() = '_';

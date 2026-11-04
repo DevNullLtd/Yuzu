@@ -153,6 +153,20 @@ TEST_CASE("is_store_unavailable classifies StoreBusy as unavailable (#2396)",
     CHECK(is_store_unavailable(AuthDBError::QueryFailed));
     CHECK(is_store_unavailable(AuthDBError::WriteFailed));
     CHECK(is_store_unavailable(AuthDBError::SecretUnavailable));
+    // #6995: a CSPRNG fault keeps its fail-closed 503 mapping. Dropping it from the
+    // helper would turn an MFA enrolment/regeneration entropy fault into a 500 or a
+    // "code rejected" response.
+    CHECK(is_store_unavailable(AuthDBError::EntropyUnavailable));
+    // #6995: the two named predicates split that set. Entropy is the one value that is
+    // fail-closed (is_store_unavailable) but NOT a store fault, so a site that counts store
+    // outages cannot misattribute it.
+    CHECK(yuzu::server::is_entropy_failure(AuthDBError::EntropyUnavailable));
+    CHECK_FALSE(yuzu::server::is_store_fault(AuthDBError::EntropyUnavailable));
+    for (const auto e : {AuthDBError::StoreBusy, AuthDBError::QueryFailed, AuthDBError::WriteFailed,
+                         AuthDBError::SecretUnavailable}) {
+        CHECK(yuzu::server::is_store_fault(e));
+        CHECK_FALSE(yuzu::server::is_entropy_failure(e));
+    }
     // ...and that genuine business outcomes stay OUT of it (never a 503).
     CHECK_FALSE(is_store_unavailable(AuthDBError::UserNotFound));
     CHECK_FALSE(is_store_unavailable(AuthDBError::InvalidCredentials));

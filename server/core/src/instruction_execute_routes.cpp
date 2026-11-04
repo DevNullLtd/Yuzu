@@ -1,0 +1,268 @@
+#include "instruction_execute_routes.hpp"
+
+#include "dispatch_denial_text.hpp"
+#include "http_route_sink.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth (#2437-class guard)
+#include "rest_a4_envelope.hpp"
+#include "rest_a4_envelope_http.hpp"
+
+#include <yuzu/log_token.hpp>
+
+#include <spdlog/spdlog.h>
+
+#include <nlohmann/json.hpp>
+
+#include <mutex>
+#include <utility>
+
+namespace yuzu::server::instruction_execute {
+
+namespace {
+
+constexpr std::string_view kAuditAction = "instruction.execute";
+
+/// Hand-built A4 error body: `A4ErrorOpts` has no `reason`, and the reason token is what lets
+/// an agentic caller branch without parsing prose. `correlation_id` and the always-present
+/// nullable `retry_after_ms` keep it A4-complete.
+std::string error_body(httplib::Response& res, int code, const std::string& message,
+                       const std::string& reason, std::optional<int> retry_after_ms,
+                       const std::string& remediation = {},
+                       const nlohmann::json& extra = nlohmann::json::object()) {
+    nlohmann::json err{{"code", code},
+                       {"message", message},
+                       {"retry_after_ms", retry_after_ms ? nlohmann::json(*retry_after_ms)
+                                                         : nlohmann::json(nullptr)},
+                       {"correlation_id", detail::ensure_correlation_id(res)}};
+    if (!reason.empty())
+        err["reason"] = reason;
+    if (!remediation.empty())
+        err["remediation"] = remediation;
+    for (const auto& [k, v] : extra.items())
+        err[k] = v;
+    return nlohmann::json{{"error", std::move(err)}, {"meta", {{"api_version", "v1"}}}}.dump();
+}
+
+void send_refusal(httplib::Response& res, const Refusal& r) {
+    int status = 500;
+    std::string message = r.message;
+    std::string remediation = r.remediation;
+    switch (r.kind) {
+    case RefusalKind::kStoreUnavailable:
+    case RefusalKind::kApprovalUnavailable:
+    case RefusalKind::kApprovalQueueFull:
+    case RefusalKind::kClassifierUnavailable:
+        status = 503;
+        break;
+    case RefusalKind::kAuditUnavailable:
+        status = 503;
+        res.set_header("Sec-Audit-Failed", "true");
+        break;
+    case RefusalKind::kNotFound:
+    case RefusalKind::kNoVisibleTarget:
+        status = 404;
+        break;
+    case RefusalKind::kBadRequest:
+        status = 400;
+        break;
+    case RefusalKind::kApprovalCapReached:
+        status = 429;
+        break;
+    case RefusalKind::kDispatchDenied: {
+        const auto& d = *r.denial;
+        const auto text = describe_dispatch_denial(d.reason, r.plugin, r.action, d, DenialSurface::kRest);
+        message = text.message;
+        remediation = text.remediation;
+        switch (text.cls) {
+        case DispatchDenialClass::kInvalidParams:
+            status = 400;
+            break;
+        case DispatchDenialClass::kPermissionDenied:
+            status = 403;
+            break;
+        case DispatchDenialClass::kInternal:
+            status = 500;
+            break;
+        }
+        break;
+    }
+    case RefusalKind::kSchemaInvalid:
+    case RefusalKind::kApprovalSubmitFailed:
+    case RefusalKind::kMisconfigured:
+    case RefusalKind::kDispatchFailed:
+        status = 500;
+        break;
+    }
+    res.status = status;
+    // A dispatch that threw names the row it left running as a TYPED field (command_v1 does the
+    // same), and `agents_sent` when the send path accepted a send: nothing to parse out of prose.
+    nlohmann::json extra = nlohmann::json::object();
+    if (r.kind == RefusalKind::kDispatchFailed) {
+        extra["execution_id"] = r.execution_id;
+        if (r.agents_sent > 0)
+            extra["agents_sent"] = r.agents_sent;
+    }
+    res.set_content(
+        error_body(res, status, message, r.reason, r.retry_after_ms, remediation, extra),
+        "application/json");
+}
+
+void send_zero_reach(httplib::Response& res, const ZeroReach& z) {
+    const bool retry = zero_reach_retryable(z.cause);
+    const int status = z.cause == ZeroReachCause::InvalidScope ? 400 : 503;
+    res.status = status;
+    nlohmann::json err{{"code", status},
+                       {"message", z.message},
+                       {"reason", std::string(zero_reach_token(z.cause))},
+                       {"retry_after_ms", retry ? nlohmann::json(5000) : nlohmann::json(nullptr)},
+                       {"correlation_id", detail::ensure_correlation_id(res)},
+                       {"command_id", z.command_id},
+                       {"execution_id", z.execution_id},
+                       {"agents_quarantined", z.agents_quarantined},
+                       {"agents_unknown_plugin", z.agents_unknown_plugin},
+                       {"agents_kill_switched_os", z.agents_kill_switched_os}};
+    res.set_content(
+        nlohmann::json{{"error", std::move(err)}, {"meta", {{"api_version", "v1"}}}}.dump(),
+        "application/json");
+}
+
+} // namespace
+
+void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
+    sink.Post(R"(/api/v1/instructions/([^/]+)/execute)", [deps = std::move(deps)](
+                                                              const httplib::Request& req,
+                                                              httplib::Response& res) {
+        // Gate first, the legacy route's own pair. Plain and global by design: see the header.
+        if (!deps.perm_fn || !deps.perm_fn(req, res, "Execution", "Execute")) {
+            if (!deps.perm_fn) { // unwired is misconfiguration, never "no gate"
+                static std::once_flag logged; // once per process, not per request
+                std::call_once(logged, [] {
+                    spdlog::error("POST /api/v1/instructions/{{id}}/execute: perm_fn is not wired; "
+                                  "refusing every request with 500 (server configuration defect)");
+                });
+                res.status = 500;
+                res.set_content(error_body(res, 500, "authorization not configured",
+                                           "misconfigured", std::nullopt,
+                                           "this is a server configuration defect and retrying "
+                                           "will not help; report it to the server operator"),
+                                "application/json");
+            }
+            return;
+        }
+
+        // An unwired audit sink fails CLOSED: this route is audit-first (the `requested` row is
+        // written before any effect), so a deployment with no sink cannot be treated as "audit
+        // off". Behind the gate (an unauthorised caller learns nothing about the configuration)
+        // and before any body work, store read or dispatch. No retry hint: an unwired sink is a
+        // server defect, not a transient fault.
+        if (!deps.audit_fn) {
+            static std::once_flag logged; // once per process, not per request
+            std::call_once(logged, [] {
+                spdlog::error("POST /api/v1/instructions/{{id}}/execute: audit_fn is not wired; "
+                              "refusing every request with 503 (server configuration defect)");
+            });
+            res.status = 503;
+            res.set_header("Sec-Audit-Failed", "true");
+            res.set_content(error_body(res, 503, "audit subsystem not configured; nothing was sent",
+                                       "audit_unavailable", std::nullopt,
+                                       "the server has no audit sink wired; this is a server "
+                                       "configuration defect and retrying will not help"),
+                            "application/json");
+            return;
+        }
+
+        // The call's ONE correlation id: the response header, the error body, and the
+        // `correlation_id=` token of every `instruction.execute` row this call writes.
+        const std::string cid = detail::ensure_correlation_id(res);
+        const std::string definition_id = req.matches[1].str();
+        const AuditHook audit = [&](std::string_view result, const std::string& detail_text) {
+            if (!deps.audit_fn)
+                return false; // unreachable past the guard above; never "audit off"
+            // `target_id` keeps the id as-is (bounded) so a normal id is byte-identical to the
+            // row's subject, but a hostile id (CR/LF/ESC/DEL...) must not reach the column raw:
+            // sanitize_pg_text only repairs invalid UTF-8 and NUL, so every OTHER control byte
+            // would be stored verbatim. Cleaned only when the id is malformed (a control byte or
+            // invalid UTF-8, the step-0 refusal's own predicate) or holds a code point log_token
+            // folds that step 0 lets through (C1 controls, U+2028, U+2029): those ids stay valid
+            // and reach the lookup, but their audit subject is folded like the detail token.
+            std::string target = bounded_definition_id(definition_id);
+            if (definition_id_needs_audit_fold(definition_id))
+                target = ::yuzu::log_token(target);
+            return deps.audit_fn(req, std::string(kAuditAction), std::string(result),
+                                 "instruction", target, detail_text);
+        };
+        // A refusal before the core runs still leaves a `denied` row (command_v1 does the same
+        // for its body-depth and JSON-parse refusals); a lost row sets Sec-Audit-Failed, and the
+        // 400 itself stands.
+        const auto refuse_body = [&](const char* message, const char* reason) {
+            if (!audit_pre_core_denial(audit, cid, reason, definition_id))
+                res.set_header("Sec-Audit-Failed", "true");
+            res.status = 400;
+            res.set_content(error_body(res, 400, message, reason, std::nullopt),
+                            "application/json");
+        };
+
+        // #2437-class guard: raw-text depth check BEFORE parse, so a pathologically nested
+        // `params` cannot crash the dump below.
+        if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+            refuse_body("request body nests too deeply", "body_depth");
+            return;
+        }
+        auto body = nlohmann::json::parse(req.body, nullptr, /*allow_exceptions=*/false);
+        if (body.is_discarded()) {
+            refuse_body("invalid request body", "invalid_json");
+            return;
+        }
+
+        Request rq;
+        rq.surface = Surface::kRest;
+        rq.definition_id = definition_id;
+        rq.body = std::move(body);
+        rq.correlation_id = cid;
+        // Unwired caller derivation fails CLOSED on visibility: a present-EMPTY set, never the
+        // default VisibleSet (nullopt = unfiltered).
+        rq.caller = deps.caller_fn ? deps.caller_fn(req)
+                                   : DispatchCaller{.exec_visible = authz::deny_all()};
+
+        // The same per-principal share of the pending-approval queue MCP has: a script looping on
+        // an approval-gated definition must not fill the cap every other principal shares.
+        rq.submitter_pending_cap = kSubmitterPendingCap;
+
+        const Outcome out =
+            run(rq, deps.ports, audit, bind_event_emit(deps.emit_event_fn, req, deps.ports.metrics));
+        if (out.audit_dropped)
+            res.set_header("Sec-Audit-Failed", "true");
+
+        if (const auto* r = std::get_if<Refusal>(&out.result)) {
+            send_refusal(res, *r);
+            return;
+        }
+        if (const auto* p = std::get_if<PendingApproval>(&out.result)) {
+            res.status = 202;
+            res.set_content(nlohmann::json{{"data",
+                                            {{"status", "pending_approval"},
+                                             {"approval_id", p->approval_id},
+                                             {"approval_mode", p->approval_mode},
+                                             {"definition_id", p->definition_id}}},
+                                           {"meta", {{"api_version", "v1"}}}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
+        if (const auto* z = std::get_if<ZeroReach>(&out.result)) {
+            send_zero_reach(res, *z);
+            return;
+        }
+        const auto& d = std::get<Dispatched>(out.result);
+        res.status = 200;
+        res.set_content(nlohmann::json{{"data",
+                                        {{"command_id", d.command_id},
+                                         {"execution_id", d.execution_id},
+                                         {"agents_reached", d.agents_reached},
+                                         {"definition_id", d.definition_id}}},
+                                       {"meta", {{"api_version", "v1"}}}}
+                            .dump(),
+                        "application/json");
+    });
+}
+
+} // namespace yuzu::server::instruction_execute

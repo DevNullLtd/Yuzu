@@ -30,6 +30,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -108,7 +109,8 @@ void swinv_reset() {
         lease.get(),
         "TRUNCATE software_inventory_store.installed_software, "
         "software_inventory_store.inventory_state, software_inventory_store.catalog_rollup, "
-        "software_inventory_store.version_rollup, software_inventory_store.catalog_rollup_meta "
+        "software_inventory_store.version_rollup, software_inventory_store.catalog_rollup_meta, "
+        "software_inventory_store.title_triples "
         "RESTART IDENTITY CASCADE",
         std::vector<std::string>{});
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
@@ -1149,7 +1151,7 @@ TEST_CASE("SoftwareInventoryStore reports !is_open when any column its queries u
     }
     // A catalog read that returned only part of the schema would pass vacuously; name the tables.
     for (const char* table : {"installed_software", "inventory_state", "catalog_rollup",
-                              "version_rollup", "catalog_rollup_meta"}) {
+                              "version_rollup", "title_triples", "catalog_rollup_meta"}) {
         CAPTURE(table);
         REQUIRE(std::any_of(columns.begin(), columns.end(),
                             [&](const auto& c) { return c.first == table; }));
@@ -2086,6 +2088,68 @@ std::int64_t count_rows(PgPool& pool, const char* table) {
     return std::stoll(PQgetvalue(r.get(), 0, 0));
 }
 } // namespace
+
+TEST_CASE("refresh_catalog_rollup rebuilds title_triples with exact distinct triples and device counts",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    // git/Git SCM/brew on d1+d2 (d1 twice via two versions), git/Git SCM/rpm on d3, and the
+    // same name with a different publisher on d3: three distinct triples.
+    put(store, "d1",
+        Rows{ent("git", "2.40", "Git SCM", "package", "brew", kSrcPkg),
+             ent("git", "2.41", "Git SCM", "package", "brew", kSrcPkg)});
+    put(store, "d2", Rows{ent("git", "2.39", "Git SCM", "package", "brew", kSrcPkg)});
+    put(store, "d3",
+        Rows{ent("git", "2.41", "Git SCM", "package", "rpm", kSrcPkg),
+             ent("git", "1.0", "Other", "package", "rpm", kSrcPkg)});
+    REQUIRE(store.refresh_catalog_rollup());
+
+    auto r = run_sql(pool, "SELECT name, publisher, ecosystem, device_count "
+                           "FROM software_inventory_store.title_triples "
+                           "ORDER BY publisher, ecosystem");
+    REQUIRE(PQntuples(r.get()) == 3);
+    CHECK(std::string(PQgetvalue(r.get(), 0, 1)) == "Git SCM");
+    CHECK(std::string(PQgetvalue(r.get(), 0, 2)) == "brew");
+    CHECK(std::string(PQgetvalue(r.get(), 0, 3)) == "2"); // d1 once + d2, not three rows
+    CHECK(std::string(PQgetvalue(r.get(), 1, 2)) == "rpm");
+    CHECK(std::string(PQgetvalue(r.get(), 1, 3)) == "1");
+    CHECK(std::string(PQgetvalue(r.get(), 2, 1)) == "Other");
+
+    // A second refresh replaces the table rather than appending.
+    REQUIRE(store.refresh_catalog_rollup());
+    CHECK(count_rows(pool, "title_triples") == 3);
+}
+
+TEST_CASE("refresh_catalog_rollup leaves an over-wide triple out of title_triples and still succeeds",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    // Ingest clamps each field to 1024 bytes but not their sum. Three incompressible 1024-byte
+    // fields exceed the btree entry limit (~2704 bytes) of title_triples' primary key: without
+    // the size cap in the rollup INSERT the whole refresh would fail ("index row size ...
+    // exceeds btree version 4 maximum") and freeze the catalogue. Deterministic noise, because a
+    // repeated character would compress below the limit and not reproduce the failure.
+    const auto noise = [](std::uint32_t seed) {
+        std::mt19937 gen{seed};
+        std::string out;
+        for (int i = 0; i < 1024; ++i)
+            out += static_cast<char>(33 + gen() % 94);
+        return out;
+    };
+    put(store, "d1",
+        Rows{ent(noise(1), "1.0", noise(2), "package", noise(3), kSrcPkg),
+             ent("small-title", "1.0", "Pub", "package", "rpm", kSrcPkg)});
+    REQUIRE(store.refresh_catalog_rollup());
+
+    // Control: the wide row was ingested, so only the cap kept it out of title_triples.
+    CHECK(count_rows(pool, "installed_software") == 2);
+    CHECK(count_rows(pool, "title_triples") == 1);
+    auto r = run_sql(pool, "SELECT name FROM software_inventory_store.title_triples");
+    REQUIRE(PQntuples(r.get()) == 1);
+    CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "small-title");
+    // The catalogue itself refreshed (it does not depend on the cap).
+    auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->refreshed_at > 0);
+}
 
 TEST_CASE("catalogue Installs are exact distinct devices under every filter grain",
           "[pg][software_inventory]") {

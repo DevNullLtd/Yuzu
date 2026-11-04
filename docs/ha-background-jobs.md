@@ -42,12 +42,14 @@ one unit of work — with the caveat that the many trivially-identical read-only
 passes on `health_recompute_thread_` are folded into a single
 `health_store.recompute_metrics` entry (they are all ReplicaSafe; the CRL publish,
 which is NOT, is enumerated separately). Passes on their own dedicated component
-threads (cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
-projector, the two store-worker delivery pools, and — since HA WS-8 — the Postgres
-reachability probe) each get their own entry too — the 2026-09-07 sweep
+threads (cert reloader, catalogue rollup, software-title normalisation, provisional-MFA
+cleanup, OTA watchdog, MCP projector, the two store-worker delivery pools, and — since HA
+WS-8 — the Postgres reachability probe) each get their own entry too — the 2026-09-07 sweep
 (methodology recorded in the `kBackgroundJobs` header) brought the table to 40 after
-an earlier revision missed eight of these; later additions (48 passes now, including the one-shot
-`inventory_store.purge_typed_sources` on `typed_purge_thread_`) are recorded in that header.
+an earlier revision missed eight of these; later additions (49 passes now, including the one-shot
+`inventory_store.purge_typed_sources` on `typed_purge_thread_` and the hourly
+`software_normalization_job.run_tick` on `SoftwareNormalizationJob::thread_`) are recorded in
+that header.
 
 ## How classification is enforced — and its honest limit
 
@@ -61,7 +63,7 @@ an earlier revision missed eight of these; later additions (48 passes now, inclu
   ReplicaSafe ones (the event-outbox poll, the one-shot typed-source purge
   `inventory_store.purge_typed_sources` (2a-1b), the four retention prunes (incl.
   `offline_endpoint_store.run_retention_prune`, #5678), the app_perf rollup upsert,
-  and the must-run-per-replica / shared-PG-writing passes the sweep added: cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
+  and the must-run-per-replica / shared-PG-writing passes the sweep added: cert reloader, catalogue rollup, software-title normalisation (`software_normalization_job.run_tick`), provisional-MFA cleanup, OTA watchdog, MCP
   projector, MCP bridge sweep + session gc, the Guardian reconcile claim sweep
   `guardian_reconcile_gate.sweep` (#5513), store-worker delivery pools, the HA WS-8
   Postgres reachability probe).

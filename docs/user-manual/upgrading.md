@@ -39,6 +39,18 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 - **Fixing a policy deletes its compliance history.** There is no in-place policy update: a corrected policy is a delete and a create, and the delete cascades away the policy's compliance status, dispatch state and remediation history. Export what you need as evidence (`GET /api/v1/policies/{id}` and its compliance status) and record the old and new `scope_expression` in your change ticket before you recreate it.
 - **Audit:** a `policy.create` audit row now records the stored targeting (`scope=… groups=…`), so what a policy targets can be read back from the audit log.
 
+## ⚠️ Breaking: `echo.sql` refuses `WITH`, `NATURAL`, `USING` and bound-parameter markers
+
+**What changed.** The Echo agent plugin's `echo.sql` action refuses a query before it is prepared when it uses a common table expression, a `NATURAL` or `USING` join, or a parameter marker (`?`, `$x`, `:x`, `@x`, `#x`). A query that starts with `WITH` is answered `only SELECT queries are allowed`; `WITH` elsewhere, `NATURAL` and `USING` are answered `query contains forbidden keyword: <word>`; a marker is answered `query contains a bound-parameter marker`. Write a join with `ON` and a CTE as a subquery; `$`-prefixed table names such as `$Process_Hourly` still work.
+
+**Who is affected.** Anything that stores or replays an `echo.sql` query text: stored schedules, pinned or re-evaluated result sets, workflow steps, and REST and MCP callers.
+
+**Before you upgrade.** Search those stores for `WITH`, `NATURAL`, `USING`, a `$` that is not a `$Table_Name` placeholder, or any of `? : @ #`, outside string literals, and rewrite the queries.
+
+**Mixed fleet.** An agent that is not yet upgraded still answers these queries, so one stored query answers differently per agent version. Compare a result set's `device_count` with the source execution's `agents_failure` to see whether agents refused it.
+
+**Rolling back.** Clean: nothing is stored differently, and an older agent accepts the queries again.
+
 ## ⚠️ Breaking: stored response rows are capped per command and device (256 by default) (#561)
 
 - **What changed:** the response store keeps at most 256 rows for one command on one device (`--response-max-rows-per-agent`, env `YUZU_RESPONSE_MAX_ROWS_PER_AGENT`, range 1-65536). Rows past the cap are dropped, newest first, and the row just before the dropped frames ends with a `...[rows past per-agent cap dropped]` marker. One terminal-status row is still recorded past the cap when none exists, so the command's outcome shows.
@@ -140,6 +152,28 @@ With the capability removed, serial and UUID read `unknown` again and the two pl
 **Existing capability drop-ins.** The unit's capability bounding set is now exactly one capability, so a drop-in of yours that adds a capability (for example `AmbientCapabilities=CAP_NET_BIND_SERVICE`) no longer gets it. On systemd 259 the agent still starts and the added capability is silently dropped (observed on a Linux host; other systemd versions are untested). Add the same capability to `CapabilityBoundingSet=` in that drop-in too (both settings add to the unit's values), restart the agent, and check `CapBnd` with the verify command.
 
 **Tested and untested.** A check of the live unit's capability sets and the copy behaviour is part of CI on a self-hosted Linux runner. It has been run on a Linux host under systemd 259 as root. Real firmware tables are untested. The CI check runs a test copy of the unit (it replaces `ExecStart` and the paths), so it does not prove the packaged unit starts. systemd 239 (RHEL 8) is designed for but untested: on RHEL 8, verify with the command above after the upgrade. Whether SELinux or AppArmor confines `CAP_DAC_READ_SEARCH` is also untested.
+
+## ⚠️ Breaking: an MFA enrolment or recovery-code refusal caused by the host's random-number generator is now audited as `csprng_unavailable` and counted in `yuzu_secure_random_failure_total`, not as a store outage (#6995)
+
+**What changed.** When the host's random-number generator fails while the server is drawing an MFA TOTP secret, a recovery code or a recovery code's salt, the request was already refused fail-closed (#4763): nothing is issued, and an enrolment confirmed at that moment is rolled back. The status code, `Retry-After` header and operator message are **unchanged**. What changes is how the refusal is recorded and counted, because it used to be indistinguishable from a database outage:
+
+| Where you see it | Before | After |
+|---|---|---|
+| Metric at sign-in enrolment (`POST /login`) | `yuzu_auth_secret_unavailable_total{route="login"}` and `yuzu_auth_read_degrade_total{route="login",reason="query_error"}` | `yuzu_secure_random_failure_total{reason="prng_failure",site="mfa_enroll"}` only |
+| Metric at the Settings TOTP-secret step (`POST /api/settings/mfa/init`) | `yuzu_auth_secret_unavailable_total{route="mfa_enroll"}` | `yuzu_secure_random_failure_total{reason="prng_failure",site="mfa_enroll"}` |
+| Metric at enrolment confirm (sign-in `POST /login/mfa/enroll` and Settings `POST /api/settings/mfa/verify`, which mint the recovery codes) | `yuzu_auth_secret_unavailable_total{route="mfa_enroll"}` | `yuzu_secure_random_failure_total{reason="prng_failure",site="mfa_recovery"}` |
+| Metric at Settings **Regenerate recovery codes** | none (audit row only) | `yuzu_secure_random_failure_total{site="mfa_recovery"}`; a refusal caused by a database fault is now `yuzu_auth_secret_unavailable_total{route="mfa_recovery"}` |
+| Audit `detail` of `mfa.enroll.required`, `mfa.enroll.failed`, `mfa.enroll.initiated`, `mfa.recovery_codes.generated` | `mfa_init_enrollment: secret/store unavailable (fail-closed)`, `mfa_verify_enrollment: secret/store unavailable (fail-closed, no session minted)` (sign-in confirm), `secret/store unavailable (fail-closed)` (Settings), the store-unavailable message, `regeneration failed` | starts `csprng_unavailable: ` followed by `mfa_enroll` or `mfa_recovery` |
+| `mfa.enroll.failed` event `reason` (sign-in enrolment) | `store_unavailable` | `csprng_unavailable` |
+
+The new MFA rows keep their existing `result=error` (the token-issuance rows that already use the marker write `result=failure`), so match on the `detail` prefix `csprng_unavailable: ` and not on `result`.
+
+All six `site` series of `yuzu_secure_random_failure_total` (the four token sites and the two MFA sites) are now created at 0 when the server starts, so a first scrape shows them and a lone first fault produces a rate.
+
+**Who is affected.** Anyone with a SIEM or webhook rule keyed on `mfa.enroll.failed` with `reason=store_unavailable` or on the old audit detail text, and anyone with a Prometheus rule on `yuzu_auth_secret_unavailable_total{route="mfa_enroll"|"login"}` or `yuzu_auth_read_degrade_total` who relied on it to see a random-number failure. Those rules stop matching this condition without an error. An operator who already pages on `rate(yuzu_secure_random_failure_total[5m]) > 0` now also gets paged for MFA faults.
+
+**What to do.** Re-key SIEM filters to `csprng_unavailable`, and add your own Prometheus rule if you do not have one (none ships): `sum by (site) (rate(yuzu_secure_random_failure_total[5m])) > 0`. **During a rolling upgrade** counters and audit text are per replica, so an un-upgraded replica still reports this fault the old way. Alert on both until every replica runs the same build. Response steps are in the [auth-store recovery runbook](../ops-runbooks/auth-db-recovery.md#mfa-enrolment-refused-random-number-failure-503); see also [Secret-minting failure metric](metrics.md#secret-minting-csprng-failure-metric).
+
 ## ⚠️ Breaking: a user-store outage on Settings user create / role change and on SCIM `active:false` is now a retryable 503 with its own audit reason (#4068)
 
 **What changed.** When the user store cannot answer, `POST /api/settings/users/{username}/role` used to answer `404` and record `user.role_change` / `denied` / `user_not_found`. It now answers `503` (`Retry-After: 2`) and records `user.role_change` / `failure` / `store_unavailable`. `POST /api/settings/users` no longer proceeds on an unanswered duplicate-name check: it answers `503` and records `user.create` / `failure` / `store_unavailable`. A SCIM `PUT`/`PATCH` with `active:false` on a resource whose mirror already reads inactive used to answer `200` (reporting the deprovision complete) when the user store could not confirm the account state; it now answers `503` with `Retry-After: 2` and records `scim.user.deactivated` / `failure` / `store_unavailable: verifying account state`. A genuinely missing user is still `404` / `user_not_found`.
@@ -199,6 +233,132 @@ The `GET` deny runs after the kill switches, the `Origin` check, the protocol-ve
 
 **Rolling upgrade.** The class binding and the `GET` deny are enforced per replica. A replica that has not been upgraded yet still has the old behaviour, so finish the roll promptly.
 
+## New: v1 REST and MCP twins for command dispatch, execution cancel and rerun, and stored-definition execute (#2146)
+
+Additive, apart from one change to existing behaviour (the MCP approval-ticket mint's pending-approval cap, below); no
+action is needed to keep a deployment working. The new surfaces are `POST /api/v1/commands` (the REST v1 twin of `POST /api/command` and
+the MCP `execute_instruction`; it creates an execution row and returns `execution_id`),
+`POST /api/v1/executions/{id}/cancel` and `.../rerun` with the MCP tools `cancel_execution` and
+`record_execution_rerun`, and `POST /api/v1/instructions/{id}/execute` with the MCP tool
+`execute_instruction_definition` (reference: `rest-api.md`, `mcp.md`). Cancel only marks the tracker record
+cancelled and rerun only creates a `pending` record: neither sends anything to a device.
+
+What an operator should know:
+
+- **Audit first, fail closed.** `POST /api/v1/commands`, the instruction execute twins and the cancel and rerun
+  twins write their audit row before the effect, and refuse (`503` with `Sec-Audit-Failed: true` on the dispatch
+  routes; nothing sent or changed) when it cannot be stored. The REST cancel, rerun and instruction-execute routes
+  also answer `503` with `Sec-Audit-Failed: true` (`audit_unavailable`, no retry hint; nothing changed or sent)
+  rather than run without a durable audit sink if the sink is not wired, which a correctly started server never
+  is. The MCP twins rely on the production wiring instead: the server builds its audit callback unconditionally
+  and refuses to boot when the audit store cannot be opened. Two result values are newly written by these verbs
+  (other verbs already write them, for example `inventory.sync.request`): `requested` (the row written before a
+  dispatch) and `pending` (an instruction execute held for approval). A SIEM rule that treats
+  `result != "success"` as a failure now also matches them on these verbs; key on the outcome row, as for
+  `attempted` (`audit-log.md`, "Result vocabulary"). Every row the new execute routes write
+  (`POST /api/v1/instructions/{id}/execute`, and the shared pipeline behind the MCP twin) ends with a
+  `correlation_id=` that pairs a `requested` row with its outcome row and with the response the caller saw; the
+  legacy `POST /api/instructions/{id}/execute` rows are unchanged and carry none.
+- **A dispatch that throws part-way.** On `POST /api/v1/commands` and the instruction execute twins the execution
+  row is left `running`, never cancelled, because some agents may already hold the command; no retry is
+  advertised. The error names the row and the accepted-send count as typed fields: `error.execution_id` (an empty string
+  when no row exists) and `error.agents_sent` (only when it is at least 1); on MCP they are `error.data.execution_id`
+  and `error.data.agents_sent`. When the send path had accepted a send to at least one agent it stores that number as the
+  row's targeted count, so those agents' results complete the row. The `failure` audit row carries `agents_sent=<n>`
+  (before `correlation_id=`) whenever a send was accepted by the send path, even if the count could not be stored; if it could not,
+  the remediation says the server closes the record by itself ONLY if no agent ever responds, that a record an agent
+  has answered will NOT close by itself, and that `cancel_execution` closes it.
+  `agents_sent` is a LOWER BOUND: a send that was in flight when the dispatch threw is not counted, and a count
+  that is too low lets the row close as soon as that many agents have answered, before an uncounted agent has.
+  A send counts once the send path accepts it; for a gateway-routed agent that means queued for forwarding, which can still fail, so `agents_sent` bounds the sends, not the deliveries.
+  With no accepted send the row stays `running` with a targeted count of 0 until the stuck-execution sweep
+  (about every 15 minutes) cancels it. The sweep closes ONLY a row that is still `running`, has a targeted count
+  of 0, has no per-agent response at all and no pending command-outbox delivery, and was dispatched more than
+  about 30 minutes ago; it declines a pass in which a majority of the running executions (at 20 or more) look
+  stuck. So a swept row means "no agent answered", not "no agent received the command": an agent that was sent the
+  command but was not counted (or has not answered yet) may still run it. `cancel_execution` closes a row at once.
+- **Changed: a definition id with a control character or invalid UTF-8 is refused.** `POST /api/v1/instructions/{id}/execute` answers
+  `400` and the MCP tool `execute_instruction_definition` answers `-32602`, both with `reason`
+  `invalid_definition_id`, when the id holds any byte below `0x20` or equal to `0x7F` (NUL included) or is not valid UTF-8 (on REST, for example an overlong `%C0%80` or a lone `%FF`; the MCP JSON transport already rejects ill-formed UTF-8). The check runs
+  before the definition lookup, writes a `denied` audit row (`reason=invalid_definition_id definition=<cleaned id>`),
+  has `retry_after_ms` null, and mints no ticket. The store binds the id as a C string, so `foo\0xyz` would
+  otherwise have resolved the definition `foo` while the audit row recorded another string, and an invalid UTF-8 id would otherwise have reached Postgres and read as a retryable `503`. The legacy
+  `POST /api/instructions/{id}/execute` is unchanged. On REST the audit row's `target_id` and `definition=` carry the
+  same folded string for such an id (each unsafe byte becomes `_`, as does space, `=` and `,`) and for one holding a C1
+  control, U+2028 or U+2029 code point (still valid and looked up as usual); the fold is lossy: only a malformed id's
+  row says so (`reason=invalid_definition_id`), while a valid id of the second kind has the same `target_id`,
+  `definition=` and `reason` as the legitimate folded name. A client that sends ids exactly as `GET /api/v1/definitions`
+  lists them is unaffected.
+- **Supervised MCP tokens.** `cancel_execution` is exempt from the supervised-tier approval ticket (it only
+  updates the tracker record), the one tool on a closed exempt list; the REST route still refuses a
+  supervised-tier token. `record_execution_rerun` and `execute_instruction_definition` need a ticket as any
+  other `Execution:Execute` write does. A definition whose own `approval_mode` is not `auto` still cannot be
+  run through the execute routes or tools: its approval can be recorded but nothing redeems it (#6064).
+- **Pending-approval cap.** `POST /api/v1/instructions/{id}/execute` refuses a principal that already holds about
+  25 pending approvals with `429` (`approval_cap_reached`), the soft bound the MCP tools already applied (the count
+  is read and then the approval submitted, so concurrent requests from one principal can briefly exceed it). A
+  looping script or agentic worker that used the legacy route without a cap will meet it on the v1 route. The
+  legacy `POST /api/instructions/{id}/execute` does not apply it.
+- **Changed: the MCP approval-ticket mint's cap now fails closed.** The supervised-tier ticket mint of every
+  approval-gated tool read the principal's pending count with a call that returned `0` when the approval store
+  could not be read, so a struggling store admitted every principal; the mint now refuses with `-32603`
+  `approval_unavailable` (`retry_after_ms` 5000) and creates no ticket. A full shared queue (1000 pending) is now
+  `-32603` `approval_queue_full` with `retry_after_ms: null`, where it used to read as a retryable store failure
+  (`approval_submit_failed`, `retry_after_ms` 5000), so a client that retried it on a timer will stop. The count
+  no longer includes pending rows older than the 7-day approval window, and the mint's refusals now carry
+  `error.data.reason` and an audit detail of `reason=<token> correlation_id=<id>` (a full queue is a `denied`
+  row). What to do: for `approval_queue_full` a reviewer must decide pending approvals (or they expire after 7
+  days); for `approval_unavailable` check the health of the approval store
+  (`yuzu_server_approval_submit_refused_total{reason="approval_unavailable"}`).
+- **Body cap on `POST /api/v1/commands`.** The route has its own `commands` body-cap class (4 MiB, and the body
+  must be measurable in advance): a request with a chunked `Transfer-Encoding` body or no `Content-Length` is
+  refused with `411`. The legacy `POST /api/command` falls under the default 4 MiB class, which does not
+  require a measurable body, so a client that streams chunked bodies to the legacy route needs to send a
+  `Content-Length` to use the v1 route.
+- **Metrics.** Two new counters, `yuzu_server_approval_submit_refused_total{reason}` and
+  `yuzu_server_event_emit_failed_total{event_type}`, are pre-seeded to `0`. `yuzu_server_dispatch_target_rejected_total`
+  gains `route="command_v1"`, `yuzu_server_instruction_param_rejected_total` gains `route="mcp"`, and
+  `yuzu_server_dispatch_fanout_throw_total` gains `phase="dispatch"` for the routes `command_v1`,
+  `instruction_execute` and `mcp` (`metrics.md`). The platform events `command.dispatched`, `execution.created`, `execution.completed`,
+  `approval.created` and `instruction.executed` are also published by the new twins (`analytics-events.md`).
+
+**Rolling upgrade.** Every check here is per replica. A replica that has not been upgraded does not serve the new
+REST routes (`404`) or the new MCP tools, so a client or load balancer can meet either behaviour during the roll:
+adopt the new routes only once every replica is upgraded. The mint-cap change above, and the new `requested` and
+`pending` audit results, likewise appear only from upgraded replicas, so a mixed-version roll writes the old mint
+rows and the new ones side by side.
+
+**Rollback.** Rolling back to the previous build removes the new routes and tools (clients get `404`, or the tool
+is unavailable) and restores the old fail-open mint cap and its old refusal wording. This change adds no database
+migration or schema change in either direction; execution rows, approvals and audit rows already written stay in
+place.
+
+## Behaviour change: result-set producers refuse a gated definition action for a non-administrator (#2146)
+
+**What changed.** `create_result_set_from_instruction_result` and `reevaluate_result_set` (MCP) no longer stamp ticket provenance on the dispatch, so a consumed supervised-tier approval ticket is no longer approval for the `plugin.action` of the stored definition they run. If that action is gated (admin or approval), a non-administrator caller is refused with `-32003` and `error.data.reason = approval_required` (permanent, `retry_after_ms` null), and no execution record is created. `create_result_set_from_echo_query` and `execute_bundle` are unchanged.
+
+**Who is affected.** Supervised-tier (ticket-then-recall) tokens that ran a gated action through these two tools: the ticket is still minted and approved, but the recall now refuses, and the ticket is spent. Operator-tier tokens whose owner is not an administrator were already refused by the dispatch gate and now receive the explicit reason instead of a generic "no agents reached" error.
+
+**What to do.** Run the call with an administrator token, or ask an administrator to change the definition to a non-gated action.
+
+**Rolling upgrade.** The check is enforced per replica. A replica that has not been upgraded still honours a consumed supervised-tier ticket on these two tools, so the fix holds across the cluster only once every replica is upgraded; until then the same recall can run on one replica and be refused (`-32003`, `approval_required`) on another.
+
+**Rollback.** Rolling back restores the old behaviour: a ticket again lifts the gate of a stored definition's action, including one repointed after the ticket was approved. No data changes in either direction.
+
+## Behaviour change: supervised-tier approval tickets bind the resolved definition effect (#2146)
+
+The ticket for `execute_instruction_definition`, `create_result_set_from_instruction_result` and `reevaluate_result_set` now binds the `plugin.action` the stored definition resolves to, not only the call's arguments, so a definition repointed between approval and re-call is refused (`-32003` "the definition changed since this approval was requested", ticket unspent) instead of running the new action under the old approval. Approval tickets for these tools that are pending, or approved but not yet redeemed, when you upgrade must be re-requested (a ticket minted before the binding is an ordinary mismatch). An unreadable definition store while a ticket is requested or redeemed for the two result-set tools is now a `-32603` (retryable when the store cannot answer) that mints and spends nothing, and a supervised token without `Execution:Execute` is refused before the ticket for them rather than after it is approved. Rolling back to an older build drops the protection: that build does not bind the effect, so a ticket again covers only the call's arguments, and a ticket minted by the new build is refused by the older one.
+
+## ⚠️ Breaking: a supervised-tier MCP token needs an approval ticket for Workflow:Execute (#2146)
+
+**What changed.** `Workflow:Execute` joined the operations a `supervised`-tier MCP token can only perform through an approval ticket. `POST /api/workflows/{id}/execute` now refuses such a token with `403` (audit action `auth.approval_required`, "approval required on this transport"). Before this change the token ran the workflow with no ticket and no human in the loop.
+
+**Who is affected.** Automation that runs workflows with a `supervised`-tier MCP token. Sessions and API tokens without an MCP tier are unaffected, and the `operator` and `readonly` tiers were already refused by the tier check.
+
+**What to do.** No MCP tool for workflow execution exists yet, so a `supervised` token has no ticket path to run a workflow until the `execute_workflow` tool ships (#2146). Until then run the workflow from a session or an API token without an MCP tier, or run its steps one at a time through `execute_instruction`, which is approval-gated per step. Do not remove the tier from a token that does other work only to run workflows: the tier constrains every other operation that token performs.
+
+**Rollback.** Rolling back restores the old behaviour: a `supervised` token again runs a workflow without a ticket. No data changes in either direction.
+
 ## ⚠️ Breaking: /mcp/v1/ refuses callers whose credential carries no MCP tier (#4309)
 
 **What changed.** `GET`, `POST` and `DELETE` on `/mcp/v1/` now refuse every authenticated credential whose MCP tier is empty, for every principal, with HTTP `403` and JSON-RPC `-32003`. The message is `/mcp/v1/ requires an MCP-tier bearer token`; the body has a `null` id, a `correlation_id`, `retry_after_ms: null` and a `remediation`, and no `permission` field. Two credential kinds carry no tier: a browser session cookie (local, OIDC or SAML sign-in) and an API token minted without `mcp_tier` (this includes a service-scoped token, one minted with `scope_service`, that has no tier). There is no engine special case: an engine token is always minted with tier `readonly`, so it is admitted, and a tierless engine row would be refused. There is no flag and no kill switch for this check, by design: a default-open flag would keep the gap open, and the remedy is one REST call.
@@ -209,7 +369,7 @@ The `GET` deny runs after the kill switches, the `Origin` check, the protocol-ve
 
 **What to do.** For each affected client, in this order:
 
-1. A human operator mints a tiered token with `readonly`, `operator` or `supervised` (the lowest tier that covers the tools the client needs). `readonly` allows reads only. `operator` allows reads, tag writes and deletes (a tag delete goes through approval), executions (auto-approved for most pairs) and token rotation. Anything else that writes or deletes needs `supervised`, where executions, deletes, device quarantine and the policy, security, user-management, management-group and API-token-create writes go through approval. The server-administration securables (TLS, plugin signing, server and analytics configuration, enrollment, OIDC configuration) are refused at every tier, `supervised` included; the Authorization Tiers table in the MCP chapter lists the exact matrix. Over REST this is `POST /api/v1/tokens` with `"mcp_tier"` and an `expires_at` (unix epoch seconds in the future, at most 90 days out). On the Settings > API Tokens page choose a tier and a TTL in hours of at most 2160; a token created with the none choice carries no MCP tier and is refused on `/mcp/v1/`, so choose a tier only if the token is for MCP.
+1. A human operator mints a tiered token with `readonly`, `operator` or `supervised` (the lowest tier that covers the tools the client needs). `readonly` allows reads only. `operator` allows reads, tag writes and deletes (a tag delete goes through approval), executions (auto-approved for most pairs) and token rotation. Anything else that writes or deletes needs `supervised`, where executions, workflow executions, deletes, device quarantine and the policy, security, user-management, management-group and API-token-create writes go through approval. The server-administration securables (TLS, plugin signing, server and analytics configuration, enrollment, OIDC configuration) are refused at every tier, `supervised` included; the Authorization Tiers table in the MCP chapter lists the exact matrix. Over REST this is `POST /api/v1/tokens` with `"mcp_tier"` and an `expires_at` (unix epoch seconds in the future, at most 90 days out). On the Settings > API Tokens page choose a tier and a TTL in hours of at most 2160; a token created with the none choice carries no MCP tier and is refused on `/mcp/v1/`, so choose a tier only if the token is for MCP.
 2. Switch the client to send **only** `Authorization: Bearer <token>`. Remove cookie jars and any cookie setting from the client.
 3. Revoke the old token, if there is one (a tierless token cannot be fixed in place: rotation keeps the tier, so the successor of a tierless token is tierless too).
 
@@ -597,6 +757,14 @@ human roles first and follow the prerequisites in [Role-Based Access Control](rb
 
 **What to expect.** New collection begins without operator action, on each OS where the source has a collector (OS compatibility matrix in `docs/user-manual/echo.md`), for `procperf` (and the daily per-application performance sync it feeds), `netqual`, `module` (Windows ETW), `software`, `arp`, `dns`, `netconn` and `mapdrive` (`netconn` and `mapdrive` also run history backfills; `netconn_lookback_seconds` bounds the first). A source whose `<source>_enabled` row cannot be read is treated as disabled for that tick and its stored rows are kept.
 
+## Behaviour change: the Echo registry source reads logged-off users' hives (Windows)
+
+**What changed.** The Echo `registry` source used to baseline only the hives that were loaded. It now also reads the `Run`, `RunOnce`, `Policies` and `Winlogon` roots of each logged-off profile whose path the profile-list walk can resolve (at most 512 entries are walked; a virtual service or system account, a `<sid>.bak` leftover and a profile first found with no readable path are not read), on the hourly tick (every 12 `slow_interval`s: hourly at the default 300 s), by mounting the profile's `NTUSER.DAT` through the guarded offline-hive mount the other per-user plugins use. It is on by default, there is no offline-only switch (`registry_enabled=false` stops the whole registry source), and it needs no setting.
+
+**What to expect on the first start after the upgrade.** The agent mounts each logged-off profile's hive in scope once and baselines it silently (no gap row, except that an agent without the backup and restore privileges writes one `gap:unreadable` row for each of up to five roots of each such hive on first sight); a host with many logged-off profiles spreads that over a few ticks (`registry_offline_roots_deferred` counts the ones waiting). The upgrade date is the start of offline coverage: changes made to a logged-off hive before it are not reported. After that, each logged-off profile is mounted once per hourly tick (and also on first sight of a newly found profile, on a re-enable, and on every tick while a hive is capped or its mount is owed a retry) with the backup and restore privileges enabled for the span of the mount, holding that profile's `NTUSER.DAT` exclusively for it. The values under those roots belong to other users: the new value of each added or changed one is stored unmasked in `$Registry_Live`, like those of loaded hives, with the old value's type and size and never the old value, and a row's `ts` is the key's last-write time when the read saw a plausible one (`docs/user-manual/echo.md`, *Logged-off users*).
+
+**Rolling back.** A build without offline hives ignores the cursor's `offline` list and drops those roots' baselines without a row, so a change made to a logged-off hive while the older build runs is never reported, and a later re-upgrade re-baselines those roots silently (the `gap:restart` row's "found by the baseline diff" does not hold for them). Loaded roots are unaffected. Before the rollback, if the stored baselines and values must not stay on disk, set `registry_enabled` to `false`, then run `echo.purge_source` with `source` set to `registry` (the agent refuses to purge an enabled source).
+
 ## ⚠️ Breaking: MFA step-up is checked once, before the route's own checks, and two more routes need a fresh proof
 
 A fresh MFA proof is required on 37 named high-risk routes (the list is in
@@ -788,7 +956,7 @@ window is 0 or less. This release has no supported return to v0.14.1 (see "Deplo
 
 ## ⚠️ Breaking: the OpenAPI document is larger and typed, every operation has an `operationId`, and there is a `/swagger` page
 
-**What changed.** `GET /api/v1/openapi.json` now gives 262 of its 264 operations a success response with a content block (the previous release's document listed 241 operations and did so for 14), and every operation carries an `operationId` (the earlier document had none). The document also lists 23 operations that the previous release's document did not, among them `GET /config`, `PUT /config/{key}` and `GET`, `PUT` and `DELETE /dex/score-policy`; all 23 are typed. The default form of the document, which is also what the MCP resource `yuzu://openapi` serves, grew from about 314 KB (the previous release, v0.14.1) to about 670 KB as served. A second form, `GET /api/v1/openapi.json?guides=true` (the value must be exactly `true` or `1`), adds a prose guide to each of the 47 tag groups. The MCP resource and the discover tools never serve the guide form, short of a build defect. A new dashboard page, `/swagger`, renders the guide form in the browser. Both the route and the page need `Infrastructure:Read`, and the page has no navigation entry. The default form is re-serialised by the server, so its key order and whitespace differ from the guide form. This changes the description of the API, not the API: no route, request or response changed, so the version rule in `docs/api-versioning-policy.md`, which governs routes and fields, does not call for a new version. It is marked Breaking because a generated client, a byte-for-byte pin of the document or a size-limited context stops working as before.
+**What changed.** `GET /api/v1/openapi.json` now gives 266 of its 268 operations a success response with a content block (the previous release's document listed 241 operations and did so for 14), and every operation carries an `operationId` (the earlier document had none; the stored-definition execute route is `postInstructionsByIdExecute`). The document also lists 27 operations that the previous release's document did not, among them `GET /config`, `PUT /config/{key}` and `GET`, `PUT` and `DELETE /dex/score-policy`; all 27 are typed. The default form of the document, which is also what the MCP resource `yuzu://openapi` serves, grew from about 314 KB (the previous release, v0.14.1) to about 670 KB as served. A second form, `GET /api/v1/openapi.json?guides=true` (the value must be exactly `true` or `1`), adds a prose guide to each of the 48 tag groups. The MCP resource and the discover tools never serve the guide form, short of a build defect. A new dashboard page, `/swagger`, renders the guide form in the browser. Both the route and the page need `Infrastructure:Read`, and the page has no navigation entry. The default form is re-serialised by the server, so its key order and whitespace differ from the guide form. This changes the description of the API, not the API: no route, request or response changed, so the version rule in `docs/api-versioning-policy.md`, which governs routes and fields, does not call for a new version. It is marked Breaking because a generated client, a byte-for-byte pin of the document or a size-limited context stops working as before.
 
 **Who is affected.** Anyone who generates a client from the document (typed return types, renamed methods and a changed security-scheme model can break generated code), anyone who compares or hash-pins the document byte for byte, and any agentic worker that reads `yuzu://openapi` into its context.
 
@@ -797,8 +965,8 @@ window is 0 or less. This release has no supported return to v0.14.1 (see "Deplo
 - A client generator that derived method names from the path and verb now uses the `operationId` values, so generated method names change. Regenerate the client and review the diff.
 - **The Echo operations were renamed.** The activity-record routes were renamed from TAR to Echo (`/api/v1/echo/...`), so their `operationId` values changed with them: `getTarCaptureSources`, `getTarProcessTree`, `getTarRetentionPaused`, `postTarRetentionPausedPurge` and `postResultSetsFromTarQuery` are now `getEchoCaptureSources`, `getEchoProcessTree`, `getEchoRetentionPaused`, `postEchoRetentionPausedPurge` and `postResultSetsFromEchoQuery`, and the `Dashboard TAR` tag is `Dashboard Echo`. A generated client needs regenerating.
 - **Byte-for-byte comparisons and hash pins.** The default document is now re-serialised by the server, compact and with its keys in alphabetical order, so it differs from the previous release's bytes almost throughout, not only from the guide form. A snapshot or hash taken from the earlier release must be re-baselined. The response also carries an `ETag` now, which the earlier release did not send.
-- An integration that reads `yuzu://openapi` or `GET /api/v1/openapi.json` into a size-limited context needs about twice the room: the default form grew from about 314 KB to about 670 KB as served before compression, and `?guides=true` is about 980 KB. An agentic worker that wants the routes and not the whole document should call `discover_routes` (or `GET /api/v1/discover/routes`), which returns a projection of the same source (about 192 KB, against about 670 KB for the document): method, path, summary, tags, description and, for an unserved operation, an `unavailable` note.
-- **Response types.** 229 operations had no success schema (they described the body in prose, and two of them, `GET /ca/root` and `GET /ca/crl`, had a content block with no schema); 227 of them now declare one, and all 23 operations added since are typed. So a generated client returns model types where it used to return an untyped object. 262 of the 264 operations are typed; the two `DELETE` operations that answer `204` (`DELETE /upload-grants/{grant_id}` and `DELETE /uploads/{upload_id}`) have no body and stay untyped. The models are derived from the handlers, but a client that deserialises strictly will now fail on any place where the document and a handler disagree, which an untyped client never noticed. Report such a mismatch as a defect in the document.
+- An integration that reads `yuzu://openapi` or `GET /api/v1/openapi.json` into a size-limited context needs about twice the room: the default form grew from about 314 KB to about 670 KB as served before compression, and `?guides=true` is about 980 KB. An agentic worker that wants the routes and not the whole document should call `discover_routes` (or `GET /api/v1/discover/routes`), which returns a projection of the same source (about 192 KB, against about 670 KB for the document): method, path, summary, tags, description and, for an unserved operation, an `unavailable` note. These sizes were measured before the four #2146 twin operations were added; the document is slightly larger with them (an estimate from the added source text is about 3 percent; it was not measured against the served bytes).
+- **Response types.** 229 operations had no success schema (they described the body in prose, and two of them, `GET /ca/root` and `GET /ca/crl`, had a content block with no schema); 227 of them now declare one, and all 27 operations added since are typed. So a generated client returns model types where it used to return an untyped object. 266 of the 268 operations are typed; the two `DELETE` operations that answer `204` (`DELETE /upload-grants/{grant_id}` and `DELETE /uploads/{upload_id}`) have no body and stay untyped. The models are derived from the handlers, but a client that deserialises strictly will now fail on any place where the document and a handler disagree, which an untyped client never noticed. Report such a mismatch as a defect in the document.
 - **Security schemes.** The top-level `security` was one requirement that asked for the bearer token, the `X-Yuzu-Token` header and the session cookie together. It is now three alternatives, any one of which authenticates. The `cookieAuth` scheme names the real cookie, `yuzu_session` (it said `session`). `GET /ca/root` and `GET /ca/crl` carry `security: []` because they are public. In builds after 0.15.0 the document marks `POST /elevate`, `POST /elevate/revoke`, `POST /users/me/password` and `POST /users/{username}/password` as accepting the session cookie only (`security: [{cookieAuth}]`), and the five `/uploads` routes name the grant or session header they authenticate with (the new `uploadGrantAuth` and `uploadSessionAuth` schemes), so a generated client no longer sends a bearer token those routes do not accept. An integration that holds only an API token, an MCP token or an engine credential cannot call the four cookie-only routes at all; that was already true, and the document says so from those builds on. A generator or gateway that enforced the old combined requirement, or that copied the cookie name, needs the current document imported again; a gateway that enforced the old top-level requirement would have demanded an operator credential on the agent-authenticated `/uploads` routes.
 - **Operations the server does not serve.** 14 operations in three groups (License Management, Device Tokens and Software Deployment) are in the document but are not registered by the server today, so each carries an `x-yuzu-unavailable` note. A client generated from the document has a method for each of them, and calling one fails because the route does not exist. Skip them, or filter on the marker before generating.
 - **Revalidate instead of refetching.** Send the `ETag` of the last response back in `If-None-Match` and an unchanged document answers `304` with no body. Without it, every request is built and compressed again: on a 32-core host a request that accepts brotli took about 1.4 seconds for the default form and about 2.0 seconds for `?guides=true`, and 24 such requests in parallel did not make `/health` miss a response (it answered in 1.4 to 5.5 ms). The compressed bytes are not cached, so the cost is CPU per uncached request. Hosts with 2 to 4 cores were not measured and will saturate sooner, so a script that polls the document, or a monitor that fetches `/swagger`'s data on a timer, should send `If-None-Match`. A browser loading `/swagger` revalidates by itself. In 0.15.0 the comparison is exact, so a proxy that rewrites the `ETag` to a weak one defeats it. In builds after 0.15.0 a weak validator (`W/"..."`), a list of validators and `*` on its own match too, so a proxy that weakens or merges validators does not defeat it; a header that is not a valid `If-None-Match` is answered with the full document.

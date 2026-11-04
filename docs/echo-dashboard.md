@@ -182,7 +182,7 @@ No changes to the `echo.sql` agent action; the change is purely server-side scop
   same dispatch-and-poll seam the device-page "Get live info" uses (untracked
   dispatch, `execution_id=""`, so it never enters the executions drawer). The agent
   runs them on its read-only authorizer connection (#760/#631).
-- The agent forbids recursive CTEs, so the tree is reconstructed **server-side in
+- The agent refuses common table expressions (`WITH`) before the query is prepared, so the tree is reconstructed **server-side in
   C++** from the flat event rows: per-pid alive-intervals are built from the
   `started`/`stopped` stream, incarnations whose lifetime overlaps the chosen window
   `[from, to]` are kept (PID-reuse-safe — each lifetime is its own node), and each is
