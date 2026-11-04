@@ -40,6 +40,8 @@
 # single-host numbers and are labelled so in the summaries.
 
 set -uo pipefail
+export LC_ALL=C   # a comma-radix locale would change EPOCHREALTIME's format
+[ "${BASH_VERSINFO[0]}" -ge 5 ] || { echo "needs bash 5 or newer (EPOCHREALTIME)" >&2; exit 2; }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
@@ -56,7 +58,7 @@ die()  { printf '\033[1;31mdie\033[0m %s\n' "$*" >&2; exit 2; }
 # Milliseconds since the epoch from bash's own clock. NOT `date +%s%3N`: on a host whose `date` is
 # uutils coreutils 0.10 about one call in ten returned a stamp up to ~0.9 s AHEAD of real time (143 of
 # 1500 calls measured), which made fault timestamps late and every derived duration short.
-ms()   { local t=${EPOCHREALTIME/./}; echo $(( t / 1000 )); }
+ms()   { local t=${EPOCHREALTIME/[.,]/}; echo $(( t / 1000 )); }
 
 # ---- state / compose plumbing ------------------------------------------------
 STATE=""
@@ -72,11 +74,16 @@ load_state() {
 }
 compose() { docker compose -p "$SPIKE_PROJECT" --env-file "$STATE/env" -f "$COMPOSE_FILE" "$@"; }
 cname()   { printf '%s-%s-1' "$SPIKE_PROJECT" "$1"; }
-setenv()  { # setenv KEY VALUE : upsert into the state env file (atomic; fails loudly, never truncates)
-    local tmp="$STATE/env.tmp.$$"
-    { grep -v "^$1=" "$STATE/env" || [ $? -eq 1 ]; printf '%s=%s\n' "$1" "$2"; } > "$tmp" 2>/dev/null \
-        && [ -s "$tmp" ] && grep -q "^$1=" "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$STATE/env" \
-        || { rm -f "$tmp"; die "cannot update $STATE/env ($1) - the state file was left unchanged"; }
+setenv()  { # setenv KEY VALUE : upsert into the state env file (atomic; any failure aborts, nothing is truncated)
+    local tmp="$STATE/env.tmp.$$" rc=0
+    if [ -f "$STATE/env" ]; then
+        grep -v "^$1=" "$STATE/env" > "$tmp"; rc=$?   # 0 = kept some lines, 1 = kept none, >=2 = an error
+        [ "$rc" -le 1 ] || { rm -f "$tmp"; die "cannot read $STATE/env while updating $1 (grep exit $rc); the file was left unchanged"; }
+    else
+        : > "$tmp" || die "cannot create $tmp"
+    fi
+    printf '%s=%s\n' "$1" "$2" >> "$tmp" && chmod 600 "$tmp" && grep -q "^$1=" "$tmp" && mv "$tmp" "$STATE/env" \
+        || { rm -f "$tmp"; die "cannot update $STATE/env ($1); the file was left unchanged"; }
 }
 psql_q() { # psql_q SQL : tuples-only, comma separated
     docker exec -e PGPASSWORD="$YUZU_DB_PASSWORD" "$(cname postgres)" \
@@ -84,6 +91,14 @@ psql_q() { # psql_q SQL : tuples-only, comma separated
 }
 gw_http() { # gw_http NODE URL : body on stdout, empty on failure
     docker exec "$(cname "$1")" wget -qO- -T 2 "$2" 2>/dev/null
+}
+# flush_faults : remove every injected iptables rule on all three gateways; non-zero if any node could not be flushed
+flush_faults() {
+    local g rc=0
+    for g in gateway-1 gateway-2 gateway-3; do
+        netfault "$(cname $g)" 'iptables -F INPUT; iptables -F OUTPUT' >/dev/null 2>&1 || { fail "could not flush the fault rules on $g"; rc=1; }
+    done
+    return $rc
 }
 netfault() { # netfault CONTAINER 'shell command'
     docker run --rm --net "container:$1" --cap-add NET_ADMIN "$NETFAULT_IMAGE" -ec "$2"
@@ -214,9 +229,10 @@ cmd_restore() {
     load_state
     for n in gateway-1 gateway-2 gateway-3; do
         docker start "$(cname $n)" >/dev/null 2>&1
-        netfault "$(cname $n)" 'iptables -F INPUT; iptables -F OUTPUT' 2>/dev/null
-        wait_for "$n /readyz" 90 gw_http "$n" http://127.0.0.1:8081/readyz
+        wait_for "$n up" 60 docker exec "$(cname $n)" true
     done
+    flush_faults || return 1
+    for n in gateway-1 gateway-2 gateway-3; do wait_for "$n /readyz" 90 gw_http "$n" http://127.0.0.1:8081/readyz; done
     ok "faults undone"; cmd_status
 }
 
@@ -273,7 +289,8 @@ dispatch_probe() { # dispatch_probe RUN LABEL AGENT_ID : one os_info command to 
 import json, sys
 try: r = json.load(sys.stdin).get("responses", [])
 except Exception: r = []
-ok = [x for x in r if x.get("status") == 0 and not x.get("error_detail") and x.get("output")]
+# agent.proto CommandResponse.Status: RUNNING=0 SUCCESS=1 FAILURE=2 TIMEOUT=3 REJECTED=4
+ok = [x for x in r if x.get("status") == 1 and not x.get("error_detail") and x.get("output")]
 bad = [x.get("error_detail", "")[:40] for x in r if x.get("error_detail")]
 st = ",".join(str(x.get("status")) for x in r) or "none"
 print("delivered=%d status=%s error=%s" % (len(ok), st, bad[0] if bad else "none"))')"
@@ -287,8 +304,9 @@ settle_fleet() {
     say "settling: undo faults, restart $n agents"
     for g in gateway-1 gateway-2 gateway-3; do
         docker start "$(cname $g)" >/dev/null 2>&1
-        netfault "$(cname $g)" 'iptables -F INPUT; iptables -F OUTPUT' 2>/dev/null
+        wait_for "$g up" 60 docker exec "$(cname $g)" true
     done
+    flush_faults || die "settle: could not remove the injected faults; refusing to measure on a faulted rig"
     for g in gateway-1 gateway-2 gateway-3; do wait_for "$g /readyz" 90 gw_http "$g" http://127.0.0.1:8081/readyz; done
     sleep 12   # let HAProxy see the returned node healthy (rise 2 x 3 s)
     # restart in batches of 50; each agent keeps its tmpfs identity across a restart
@@ -360,7 +378,8 @@ def iso_ms(s):  # gateway log timestamp -> epoch ms
     return datetime.fromisoformat(s.replace(",", ".")).timestamp() * 1000
 def pclass(line, logs):
     # Y delivered | S server-synthesised failure scored as delivered by an older harness (command id in no agent log)
-    # U gateway unavailable | T accepted, no result inside the wait | H<code> HTTP error | E other | ? old format
+    # U gateway unavailable | F a failure/timeout/rejected answer | T accepted, no result inside the wait
+    # H<code> HTTP error | E other | ? old format
     if "delivered=" not in line: return "?"
     m = re.search(r"http=(\d+)", line)
     if m and m.group(1) != "200": return "H" + m.group(1)
@@ -369,6 +388,8 @@ def pclass(line, logs):
         c = re.search(r"cmd=([^,\s]+)", line)
         return "Y" if (not logs or (c and c.group(1) in logs)) else "S"
     if "gateway_unavailable" in line: return "U"
+    st = re.search(r"status=([0-9,]+)", line)
+    if st and re.search(r"[234]", st.group(1)): return "F"   # FAILURE / TIMEOUT / REJECTED answer
     if "error=none" in line: return "T"
     return "E"
 rows, probes = [], []
@@ -416,6 +437,7 @@ for f in sorted(glob.glob(state + "/run-*/summary.json")):
         if gw[i][0] >= t0c and gw[i][1] != "200" and gw[i + 1][1] != "200": flip = f"{(gw[i][0] - t0c) / 1000:.0f}"; break
     brk = ""
     gl = f"{rd}/gwlog-{vcont}.txt"
+    if not os.path.exists(gl): brk = "n/a"   # no gateway log was kept for this run: "never opened" cannot be claimed
     if os.path.exists(gl):
         for l in open(gl, errors="replace"):
             if "Circuit breaker: OPEN" in l:
@@ -449,10 +471,12 @@ for f in sorted(glob.glob(state + "/run-*/summary.json")):
         "probes": "".join(pcl), "victim_readyz_200_s_after_undo": rec.get("victim_readyz_200_s", ""), "all_routable_s_after_undo": rec.get("all_routable_s", ""),
         "invalid": "yes" if os.path.exists(rd + "/INVALID") else "", "note": notes.get(run, ""),
     })
-with open(os.path.join(out, "results.csv"), "w", newline="") as fh:
-    w = csv.DictWriter(fh, fieldnames=cols, lineterminator="\n"); w.writeheader(); w.writerows(rows)
-with open(os.path.join(out, "probes.csv"), "w", newline="") as fh:
-    w = csv.DictWriter(fh, fieldnames=["run", "scenario", "mode", "mgmt", "when", "target", "class"], lineterminator="\n"); w.writeheader(); w.writerows(probes)
+def atomic_write(path, writer):
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="") as fh: writer(fh)
+    os.replace(tmp, path)
+atomic_write(os.path.join(out, "results.csv"), lambda fh: (lambda w: (w.writeheader(), w.writerows(rows)))(csv.DictWriter(fh, fieldnames=cols, lineterminator="\n")))
+atomic_write(os.path.join(out, "probes.csv"), lambda fh: (lambda w: (w.writeheader(), w.writerows(probes)))(csv.DictWriter(fh, fieldnames=["run", "scenario", "mode", "mgmt", "when", "target", "class"], lineterminator="\n")))
 print(f"{len(rows)} runs, {len(probes)} probes -> {out}")
 
 # ------------------------------------------------------------------ generated tables
@@ -496,22 +520,24 @@ pc = collections.OrderedDict()
 for q in probes:
     if q["scenario"] == "NOFAULT" or "dispatch probes VOID" in notes.get(q["run"], ""): continue
     pc.setdefault((q["scenario"], q["mgmt"], q["target"]), collections.Counter())[q["class"]] += 1
-t3 = ["| Fault | Mgmt addr | Probe target | Probes | Delivered (Y) | Server-synthesised failure scored as delivered by the old harness (S) | Gateway unavailable (U) | Accepted, no result (T) | Other |",
-      "|---|---|---|---|---|---|---|---|---|"]
+t3 = ["| Fault | Mgmt addr | Probe target | Probes | Delivered (Y) | Server-synthesised failure scored as delivered by the old harness (S) | Gateway unavailable (U) | Failure status (F) | Accepted, no result (T) | Other |",
+      "|---|---|---|---|---|---|---|---|---|---|"]
 for (sc, mg, tg), c in sorted(pc.items(), key=lambda kv: (order.get(kv[0][0], 9) if kv[0][0] in order else 5, kv[0][0], kv[0][1], kv[0][2])):
-    n = sum(c.values()); oth = n - sum(c[k] for k in "YSUT")
-    t3.append("| %s | %s | %s | %d | %d | %d | %d | %d | %d |" % (sc, mg, tg, n, c["Y"], c["S"], c["U"], c["T"], oth))
+    n = sum(c.values()); oth = n - sum(c[k] for k in "YSUFT")
+    t3.append("| %s | %s | %s | %d | %d | %d | %d | %d | %d | %d |" % (sc, mg, tg, n, c["Y"], c["S"], c["U"], c["F"], c["T"], oth))
 tables = {"failover": "\n".join(t1), "faults-f3-f2p": "\n".join(t2), "probes": "\n".join(t3)}
 for name, txt in tables.items(): open(os.path.join(out, f"table-{name}.md"), "w").write(txt + "\n")
 if record:
     doc = open(record).read()
     for name, txt in tables.items():
-        pat = re.compile(r"(<!-- BEGIN GENERATED: %s -->\n)(.*?)(<!-- END GENERATED: %s -->)" % (re.escape(name), re.escape(name)), re.S)
+        pat = re.compile(r"^(<!-- BEGIN GENERATED: %s -->\n)(.*?)^(<!-- END GENERATED: %s -->)$" % (re.escape(name), re.escape(name)), re.S | re.M)
         if not pat.search(doc): print(f"WARNING: markers for '{name}' not found in {record}"); continue
         doc = pat.sub(lambda m: m.group(1) + txt + "\n" + m.group(3), doc)
-    open(record, "w").write(doc)
+    atomic_write(record, lambda fh: fh.write(doc))
     print("tables spliced into", record)
 PY
+    local rc=$?
+    [ "$rc" -eq 0 ] || { fail "export failed (python exit $rc); the outputs were not updated"; return 1; }
 }
 
 # report : one markdown table over every summary.json under the state dir
@@ -550,15 +576,21 @@ cmd_scenario() {
         --victim) force_victim="$2"; shift 2;; --no-settle) settle=0; shift;;
         *) die "scenario: unknown arg $1";; esac; done
     [ -n "$id" ] && [ -n "$mode" ] || die "usage: scenario <ID> --mode dns|vip [--window SECS]"
+    trap 'scenario_cleanup' EXIT
+    trap 'scenario_cleanup; exit 130' INT TERM
     load_state
+    [ ! -e "$STATE/DIRTY" ] || die "the rig is in an unknown state after a failed addressing-mode switch ($STATE/DIRTY); run 'ramp <N>' or 'down' first"
     case "$mode" in dns) addr="gw-dns.ha.test:50051";; vip) addr="gw-vip.ha.test:50051";; *) die "bad mode";; esac
     if [ "$SPIKE_SERVER_ADDR" != "$addr" ]; then
         say "switching agents to $addr (recreate)"
         local old_addr="$SPIKE_SERVER_ADDR"
         setenv SPIKE_SERVER_ADDR "$addr"; load_state
         local n; n="$(compose ps -q agent | wc -l)"
-        compose up -d --scale agent="$n" --force-recreate agent >/dev/null 2>&1 \
-            || { setenv SPIKE_SERVER_ADDR "$old_addr"; die "agent recreate failed (addressing mode restored to $old_addr)"; }
+        if ! compose up -d --scale agent="$n" --force-recreate agent >/dev/null 2>&1; then
+            # The containers may be half-recreated: restoring the variable does not restore them.
+            setenv SPIKE_SERVER_ADDR "$old_addr"; : > "$STATE/DIRTY"
+            die "agent recreate failed: the fleet is in an unknown state (marked $STATE/DIRTY); re-create the agents or 'down' the rig before measuring"
+        fi
         local s; s=$(date +%s)
         until [ "$(connected_count)" = "$n" ]; do
             [ $(( $(date +%s) - s )) -ge 300 ] && { fail "only $(connected_count)/$n agents re-registered after 300s"; break; }
@@ -590,8 +622,13 @@ cmd_scenario() {
     # Everything that defines how this run was configured, so a result can be traced to it.
     echo "victim=$victim container=$vc total=$total mode=$mode window=$window settled=$settle corefile=$SPIKE_COREFILE mgmt=$SPIKE_MGMT_ADDR haproxy=${SPIKE_HAPROXY_CFG:-haproxy.cfg} tag=$SPIKE_TAG script_sha=$(git -C "$REPO_ROOT" hash-object "${BASH_SOURCE[0]}" 2>/dev/null | cut -c1-12) load=$(cut -d' ' -f1-3 /proc/loadavg)" > "$run/meta.txt"
     RUN_ACTIVE="$run"
-    trap 'scenario_cleanup' EXIT
-    trap 'scenario_cleanup; exit 130' INT TERM
+    # The addressing mode the fleet ACTUALLY runs (from a container's command line), not the one requested.
+    local observed; observed="$(docker inspect -f '{{range .Config.Cmd}}{{println .}}{{end}}' "$(compose ps -q agent | head -1)" 2>/dev/null | sed -n 's/^--server=//p')"
+    echo "agents_server=${observed:-unknown}" >> "$run/meta.txt"
+    if [ "$observed" != "$addr" ]; then
+        fail "agents run with --server=${observed:-unknown}, not the requested $addr: this run is INVALID"
+        echo "addressing mode mismatch (observed ${observed:-unknown}, requested $addr)" > "$run/INVALID"
+    fi
 
     sampler_start "$run"
     # packet capture on up to three agents attached to the victim (FIN/RST vs silence)
@@ -663,18 +700,26 @@ cmd_scenario() {
         # routable again. (Under F3/F3x the agents never moved, so the second is the gateway
         # re-adopting them, not a reconnect.)
         local r0 t_ready t_all; r0=$(date +%s)
-        for g in gateway-1 gateway-2 gateway-3; do netfault "$(cname $g)" 'iptables -F INPUT; iptables -F OUTPUT' 2>/dev/null; done
-        until [ "$(docker exec "$(cname $vc)" wget -qO- -T 2 -S http://127.0.0.1:8081/readyz 2>&1 | grep -oE 'HTTP/[0-9.]+ [0-9]{3}' | head -1 | cut -d' ' -f2)" = 200 ]; do
-            [ $(( $(date +%s) - r0 )) -ge 900 ] && break; sleep 1
-        done
-        t_ready=$(( $(date +%s) - r0 ))
-        until [ "$(connected_count)" = "$total" ]; do
-            [ $(( $(date +%s) - r0 )) -ge 900 ] && { fail "recovery: only $(connected_count)/$total routable after 900s"; break; }
-            sleep 1
-        done
-        t_all=$(( $(date +%s) - r0 ))
-        echo "victim_readyz_200_s=$t_ready all_routable_s=$t_all routable=$(connected_count)/$total" > "$run/recovery.txt"
-        note "RECOVERY after undoing $id: victim /readyz 200 after ${t_ready}s, $(connected_count)/$total routable after ${t_all}s"
+        if ! flush_faults; then
+            echo "undo failed: fault rules could not be removed" > "$run/recovery.txt"
+        else
+            local tmo=""
+            until [ "$(docker exec "$(cname $vc)" wget -qO- -T 2 -S http://127.0.0.1:8081/readyz 2>&1 | grep -oE 'HTTP/[0-9.]+ [0-9]{3}' | head -1 | cut -d' ' -f2)" = 200 ]; do
+                [ $(( $(date +%s) - r0 )) -ge 900 ] && { tmo=" (victim /readyz did not return within 900 s)"; break; }; sleep 1
+            done
+            t_ready=$(( $(date +%s) - r0 ))
+            until [ "$(connected_count)" = "$total" ]; do
+                [ $(( $(date +%s) - r0 )) -ge 900 ] && { tmo="$tmo (only $(connected_count)/$total routable within 900 s)"; break; }
+                sleep 1
+            done
+            t_all=$(( $(date +%s) - r0 ))
+            if [ -n "$tmo" ]; then
+                fail "recovery timed out:$tmo"; echo "undo timed out:$tmo" > "$run/recovery.txt"
+            else
+                echo "victim_readyz_200_s=$t_ready all_routable_s=$t_all routable=$(connected_count)/$total" > "$run/recovery.txt"
+                note "RECOVERY after undoing $id: victim /readyz 200 after ${t_ready}s, $(connected_count)/$total routable after ${t_all}s"
+            fi
+        fi
         ;;
     esac
 }

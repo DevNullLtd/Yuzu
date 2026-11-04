@@ -66,8 +66,9 @@ clustered gateways, a real server and Postgres, and 20 / 100 / 300 agents.
   `/readyz` and `yuzu_gw_agents_current` per gateway about once a second; the circuit-breaker state from
   the victim gateway's log. After each fault, one `os_info.os_name` command is sent to one agent on the
   victim and one on another node at +10 s, +120 s and +300 s (where the window allows). A probe is
-  classed Y (a response with status 0 and output), U (the server reported "gateway unavailable"), T
-  (accepted by the server, no result within 6 s), or H4xx (HTTP error). **S** marks a probe an earlier
+  classed Y (a response with status SUCCESS and output), U (the server reported "gateway unavailable"),
+  F (an answer with status FAILURE, TIMEOUT or REJECTED), T (accepted by the server, no result within 6 s),
+  or H4xx (HTTP error). **S** marks a probe an earlier
   version of the harness scored as delivered although the server had synthesised a failure
   (`status=2`): the command id appears in no agent log of that run.
 - **Between runs** every fleet was restarted and given time to settle so each run starts from the same
@@ -88,20 +89,24 @@ clustered gateways, a real server and Postgres, and 20 / 100 / 300 agents.
   `date +%s%3N` on a host whose `date` is uutils coreutils 0.10, and about one call in ten (143 of 1500
   tested) returned a stamp up to 0.9 s ahead of real time. A fault stamped late makes every duration measured
   from it too short. Where a gateway-originated reset was captured before the stamped fault, the fault was
-  re-placed from the capture (41 ms before the first reset, the median observed delay): 2 runs, shifted
+  re-placed from the capture (41 ms before the first reset; the median delay in the runs with no stamp problem is about 44 ms): 2 runs, shifted
   by 0.6 s and 0.9 s (column `t0_shift_ms`). Runs without such evidence are **not** corrected and may be
   optimistic by up to about a second; the route and `/readyz` samples carry the same skew, and the sampler
   achieved about 0.77 Hz, not 1 Hz. The final script reads the clock from the shell's own built-in.
-- **Percentiles** are nearest-rank values over the victim's agents (for an even count, the lower middle
-  value), not interpolated medians.
+- **Percentiles** are the sorted value at index `round(p/100 x (n-1))` over the victim's agents, using
+  Python's round-half-to-even, so for an even count the "median" is the upper or lower middle value
+  depending on n. They are not interpolated.
 - **The harness changed during the campaign.** The settle step gained a wait for load to fall after the
   first 100-agent runs; the full-partition scenario (F2p) and the HAProxy redispatch variant were added
   after the first VIP runs; recovery timing was added after the first two F2p runs; and several rig
   defects were fixed along the way (file permissions on the server config, a name the server could not
-  resolve, a REST port that changes on a server restart, a stale login). Each run's `meta.txt` records the
-  script's hash from the later runs onward; the earlier runs do not. Derived columns in the CSV (peer
-  FIN/RST timing, route and `/readyz` timelines, breaker timing, probe classes) were recomputed from the raw
-  run data with the final code, so they are consistent across the early and late runs.
+  resolve, a REST port that changes on a server restart, a stale login). **None of the 45 committed runs has
+  its configuration in its `meta.txt`** (the DNS order, the management address, the HAProxy variant and the
+  script hash were added to the metadata afterwards). The "Mgmt addr" and HAProxy columns, and which runs are
+  the H7 and redispatch runs, therefore come from the operator's own notes, listed under "Run configurations"
+  below. Derived columns in the CSV (peer FIN/RST timing, route and `/readyz` timelines, breaker timing,
+  probe classes) were recomputed from the raw run data with the final code, so they are consistent across
+  the early and late runs.
 - **Raw data is not committed, and no copy exists outside the measuring host.** The per-run logs, route
   samples and packet captures (about 1.1 GB, almost all of it the route samples) are on that host only.
   The CSVs are the only retained record, so the numbers are not independently reproducible from this
@@ -153,16 +158,18 @@ agents that were on the victim re-registered by the end of the window. The table
 <!-- END GENERATED: failover -->
 
 The **bold** "24 of 34" row is **right-censored**: in each of those three runs 10 of the 34 victims had not
-re-registered when the window ended, 150 s after the fault. The median and worst values are over the 24 that
-had; the true median and worst case are higher than shown and were not measured. The two "single node" rows
-were taken with the management address on one gateway and do not differ from their VIP-managed siblings in
-failover time (that address affects dispatch, not agents).
+re-registered when the window ended, 150 s after the fault. The **re-registered** median and worst values
+are over the 24 that had, so they are lower bounds; the true values are higher and were not measured. The
+"noticed" median is over all 34 victims, every one of which had noticed the loss by 130 s. The "single node"
+rows were taken with the management address on one gateway and do not differ from their VIP-managed
+siblings in failover time (that address affects dispatch, not agents).
 
 ### Full partitions and a gateway cut off from the server
 
 <!-- BEGIN GENERATED: faults-f3-f2p -->
 | Run | Fault | Addressing | Agents | On victim | Moved | Victim /readyz non-200 | Breaker opened (s) | Non-routable (k / N, when s) | Tombstoned (k / N, when s) | Undo: ready / all routable (s) |
 |---|---|---|---|---|---|---|---|---|---|---|
+| F2-dns-174030 | F2 | DNS | 20 | 11 | 11 | never | n/a | - | - | - / - |
 | F2p-dns-220945 | F2p | DNS | 100 | 35 | 35 | never | 162 | - | - | 5 / 5 |
 | F2p-vip-001328 | F2p | VIP | 300 | 100 | 100 | 157 | 157 | - | - | 30 / 30 |
 | F2p-vip-214249 | F2p | VIP | 100 | 34 | 34 | never | 156 | - | - | - / - |
@@ -171,7 +178,7 @@ failover time (that address affects dispatch, not agents).
 | F2p-vip-224347 | F2p | VIP | 100 | 34 | 34 | never | 161 | - | - | 23 / 23 |
 | F2p-vip-225245 | F2p | VIP | 100 | 34 | 34 | never | 159 | - | - | 21 / 22 |
 | F3-dns-013638 | F3 | DNS | 300 | 111 | 0 | never | never | 111 / 111, 60-89 | 0 / 111 | 1 / 2 |
-| F3-dns-174502 | F3 | DNS | 20 | 18 | 0 | never | never | 18 / 18, 68-80 | 18 / 18, 275 | - / - |
+| F3-dns-174502 | F3 | DNS | 20 | 18 | 0 | never | n/a | 18 / 18, 68-80 | 18 / 18, 275 | - / - |
 | F3-dns-193321 | F3 | DNS | 100 | 35 | 0 | never | never | 35 / 35, 61-90 | 35 / 35, 381 | - / - |
 | F3-vip-020123 | F3 | VIP | 300 | 100 | 0 | never | never | 100 / 100, 60-89 | 12 / 100, 244 | 1 / 6 |
 | F3-vip-210017 | F3 | VIP | 100 | 34 | 0 | never | never | 34 / 34, 60-91 | 32 / 34, 269 | - / - |
@@ -181,35 +188,36 @@ failover time (that address affects dispatch, not agents).
 For F3/F3x "Moved" is 0 by construction (the agents never left). In the F2p rows the victim's circuit
 breaker opened at 156-162 s in every run; the 100-agent runs' windows (150 s) ended before `/readyz`
 followed, and the one run whose window outlasted it (300 agents, 200 s) shows `/readyz` at 157 s. In the F3
-and F3x runs the breaker never opened in 400 s. Routes are tombstoned by the server's periodic reap sweep, so
+and F3x runs for which a gateway log was kept the breaker never opened in 400 s ("n/a" marks a run with no
+gateway log: the 20-agent F3 run; for it only `/readyz`, which includes the breaker, stayed 200). Routes are tombstoned by the server's periodic reap sweep, so
 the tombstone times (244-381 s, and none within 400 s in two runs) reflect the sweep's phase rather than
 anything about the fault.
 
 ### Dispatch probes
 
 <!-- BEGIN GENERATED: probes -->
-| Fault | Mgmt addr | Probe target | Probes | Delivered (Y) | Server-synthesised failure scored as delivered by the old harness (S) | Gateway unavailable (U) | Accepted, no result (T) | Other |
-|---|---|---|---|---|---|---|---|---|
-| F1 | VIP | on the victim | 15 | 0 | 14 | 0 | 1 | 0 |
-| F1 | VIP | other node, had been on the victim | 5 | 5 | 0 | 0 | 0 | 0 |
-| F1 | VIP | unaffected node | 14 | 14 | 0 | 0 | 0 | 0 |
-| F1 | single node | on the victim | 2 | 0 | 0 | 1 | 1 | 0 |
-| F1 | single node | other node, had been on the victim | 1 | 0 | 0 | 0 | 1 | 0 |
-| F1 | single node | unaffected node | 3 | 0 | 0 | 3 | 0 | 0 |
-| F1g | VIP | unaffected node | 1 | 1 | 0 | 0 | 0 | 0 |
-| F2p | VIP | on the victim | 7 | 0 | 0 | 0 | 7 | 0 |
-| F2p | VIP | other node, had been on the victim | 5 | 5 | 0 | 0 | 0 | 0 |
-| F2p | VIP | unaffected node | 9 | 9 | 0 | 0 | 0 | 0 |
-| F2 | VIP | on the victim | 10 | 0 | 0 | 0 | 10 | 0 |
-| F2 | VIP | other node, had been on the victim | 4 | 2 | 0 | 0 | 2 | 0 |
-| F2 | VIP | unaffected node | 10 | 10 | 0 | 0 | 0 | 0 |
-| F2 | single node | on the victim | 1 | 0 | 0 | 0 | 1 | 0 |
-| F2 | single node | other node, had been on the victim | 1 | 0 | 0 | 0 | 1 | 0 |
-| F2 | single node | unaffected node | 1 | 1 | 0 | 0 | 0 | 0 |
-| F3 | VIP | on the victim | 14 | 14 | 0 | 0 | 0 | 0 |
-| F3 | VIP | unaffected node | 15 | 15 | 0 | 0 | 0 | 0 |
-| F3x | VIP | on the victim | 3 | 3 | 0 | 0 | 0 | 0 |
-| F3x | VIP | unaffected node | 3 | 3 | 0 | 0 | 0 | 0 |
+| Fault | Mgmt addr | Probe target | Probes | Delivered (Y) | Server-synthesised failure scored as delivered by the old harness (S) | Gateway unavailable (U) | Failure status (F) | Accepted, no result (T) | Other |
+|---|---|---|---|---|---|---|---|---|---|
+| F1 | VIP | on the victim | 15 | 0 | 14 | 0 | 0 | 1 | 0 |
+| F1 | VIP | other node, had been on the victim | 5 | 5 | 0 | 0 | 0 | 0 | 0 |
+| F1 | VIP | unaffected node | 14 | 14 | 0 | 0 | 0 | 0 | 0 |
+| F1 | single node | on the victim | 2 | 0 | 0 | 1 | 0 | 1 | 0 |
+| F1 | single node | other node, had been on the victim | 1 | 0 | 0 | 0 | 0 | 1 | 0 |
+| F1 | single node | unaffected node | 3 | 0 | 0 | 3 | 0 | 0 | 0 |
+| F1g | VIP | unaffected node | 1 | 1 | 0 | 0 | 0 | 0 | 0 |
+| F2p | VIP | on the victim | 7 | 0 | 0 | 0 | 0 | 7 | 0 |
+| F2p | VIP | other node, had been on the victim | 5 | 5 | 0 | 0 | 0 | 0 | 0 |
+| F2p | VIP | unaffected node | 9 | 9 | 0 | 0 | 0 | 0 | 0 |
+| F2 | VIP | on the victim | 10 | 0 | 0 | 0 | 0 | 10 | 0 |
+| F2 | VIP | other node, had been on the victim | 4 | 2 | 0 | 0 | 0 | 2 | 0 |
+| F2 | VIP | unaffected node | 10 | 10 | 0 | 0 | 0 | 0 | 0 |
+| F2 | single node | on the victim | 1 | 0 | 0 | 0 | 0 | 1 | 0 |
+| F2 | single node | other node, had been on the victim | 1 | 0 | 0 | 0 | 0 | 1 | 0 |
+| F2 | single node | unaffected node | 1 | 1 | 0 | 0 | 0 | 0 | 0 |
+| F3 | VIP | on the victim | 14 | 14 | 0 | 0 | 0 | 0 | 0 |
+| F3 | VIP | unaffected node | 15 | 15 | 0 | 0 | 0 | 0 | 0 |
+| F3x | VIP | on the victim | 3 | 3 | 0 | 0 | 0 | 0 | 0 |
+| F3x | VIP | unaffected node | 3 | 3 | 0 | 0 | 0 | 0 | 0 |
 <!-- END GENERATED: probes -->
 
 "Other node, had been on the victim" are agents that had already re-attached elsewhere when probed;
@@ -262,11 +270,15 @@ could not resolve, so both of its probes failed); they were not used for any cla
 5. **Agent failover and command dispatch are separate things.** With the server's management address on
    one gateway, killing that gateway left every probe undelivered (0 of 4 to agents on surviving nodes and 0 of 2 to agents on the dead
    node, in the table) although every agent on the dead node had re-attached (H7). In the runs with the management
-   plane behind a VIP, probes to agents on surviving nodes were all delivered (the Probes table). This is not
-   something the agent-side design of 13.2 can address.
+   plane behind a VIP, every probe to an agent that had never moved was delivered, and so was every probe to
+   an agent that had re-attached after a kill or a full partition (the Probes table). **Not so after the
+   agent-port-only fault:** 2 of 4 probes to agents that had re-attached elsewhere were accepted by the server
+   and never reached an agent (finding 10). This is not something the agent-side design of 13.2 can address.
 6. **A restored gateway came back empty.** In the minutes after a node returned it held no agents; agents
-   do not rebalance (observed directly at 20 agents; every later settle restarted the fleet, so longer-term
-   behaviour was not observed). This is evidence for the failback work (WS-15, #5759).
+   do not rebalance. This was seen by eye during the early 20-agent runs and no run artefact retains it
+   (every later run began with a settle step that restarted the fleet), so it is **unverified here**; it is
+   consistent with the design (nothing in the agent or the gateway moves a connected agent) and is the
+   question the failback work (WS-15, #5759) exists for.
 7. **About 7 s of the agents' recovery after a clean FIN/RST is agent-side teardown, before the reconnect
    starts.** The reset is seen within tens of milliseconds, but "Subscribe stream ended" is logged about
    6-8 s later (heartbeat thread stop, then the concurrency-claim keepalive thread stop), followed by the
@@ -275,11 +287,22 @@ could not resolve, so both of its probes failed); they were not used for any cla
 8. **No flap-back was observed** (no agent returned to its first node during any run's window, 45 runs,
    sampled about once a second). The period after a partition heals was not observed for stale sessions,
    because the next settle restarted the fleet.
-9. **The reconnect of up to 114 agents at once re-registered within about 13 s (16 s for a graceful stop), and that is all this shows.**
+9. **A DNS-addressed kill of up to 114 agents re-registered within about 13 s, and that is all this shows.**
+   With a VIP the same kill took up to about 26 s (about 16 s with redispatch), a full partition about 28-30 s
+   and a graceful stop about 16 s (the Failover table).
    No agent log in any of the 45 runs contains the gateway's "the gateway is busy" refusal. But the gateway
    returns that only when its register wait queue is full (10,000 entries by default), which a fleet of 300
    agents cannot fill, so its absence says nothing about capacity. What the data show is the time to recover,
-   with registration peaks up to 28 per second.
+   with registration peaks up to 28 per second at 300 agents.
+
+10. **After the agent-port-only fault, commands to agents that had re-attached elsewhere were sometimes lost
+    (observed, unexplained).** In 3 runs, 2 of 4 such probes (and the one such probe in the single-node
+    management run) were accepted by the server, appeared in no agent log and drew no gateway completion
+    line. One candidate explanation, not verified: the victim node keeps a local session for the agent for
+    about 150 s (its `yuzu_gw_agents_current` gauge stayed at its pre-fault value through a partition) and the
+    gateway looks at its local table before the cluster, so a command routed through the victim goes nowhere.
+    If that is right it is a product defect, not a rig artefact. A confirming experiment would point the
+    management address at a node other than the victim and expect every probe to be delivered.
 
 ## Hypothesis scorecard
 
@@ -290,7 +313,7 @@ could not resolve, so both of its probes failed); they were not used for any cla
 | H3 | Node up, server path dropped: agents stay; routes expire; self-heals | Observed (single replica, 6 runs) |
 | H3b | `/readyz` stays 200, a VIP will not eject the node | Observed in this rig for the dropped-upstream fault with a quiet fleet; in the full partitions the breaker did open (+156-162 s); **not established for a production fleet** |
 | H4 | Reconnect of a third of the fleet with 13.1 jitter does not overload Register | Recovery times observed up to 114 agents at once; capacity was **not** tested (finding 9) |
-| H5 | A restored node stays empty | Observed, short horizon |
+| H5 | A restored node stays empty | Seen informally in early runs; no retained artefact; unverified here |
 | H6 | DNS: a replaced node on a new IP is found only after the resolver cooldown | **Not run** |
 | H7 | Single management address: killing that node breaks dispatch fleet-wide | Observed (2 runs) |
 | H8 | Stale session re-announce after a partition heals | No reversion seen during the windows; post-heal period not observed |
@@ -300,10 +323,11 @@ could not resolve, so both of its probes failed); they were not used for any cla
 
 - **Follow-up measurements needed before any figure here is quoted in a #6920 decision:**
   1. the port-only VIP fault (finding 3) with a window long enough that every victim has re-registered;
-  2. an F3 run with inventory, DEX and Spark enabled and some registration churn, to see whether the
-     breaker opens and a VIP ejects the node (finding 4);
+  2. an F3 run with inventory, DEX and Spark enabled and some registration churn, recording the gateway's
+     `yuzu_gw_upstream_circuit_transitions_total` and the victim's `/readyz` once a second, to see whether
+     the breaker opens and a VIP ejects the node (finding 4);
   3. a positive control for refusals: lower the gateway's register queue limit (`upstream_register_queue_max`)
-     until "the gateway is busy" is produced, then repeat a kill (finding 9);
+     until "the gateway is busy" is produced and appears in an agent log, then repeat a kill (finding 9);
   4. an H7 control that proves the management address was the only difference;
   5. a re-run of the early-harness runs on the corrected clock, to replace the corrections described above.
 - **Not run:** H6, H9, fixed-order DNS, a static endpoint list with no DNS (13.2's case), a real
@@ -315,8 +339,8 @@ could not resolve, so both of its probes failed); they were not used for any cla
   are valid; the partition's probes are valid because the login was restored by hand mid-run. The early VIP
   F2 runs are labelled "agent port only", not a full partition, and as right-censored.
 - **Packet capture** was missing for the first 20-agent kill (a container name clash, fixed).
-- The HAProxy variant is read from each run's metadata where it was recorded; for the earlier runs it was
-  taken from the operator's list typed when the CSV was exported.
+- The HAProxy variant, the management address and the DNS order are operator-supplied for every run (see
+  "Run configurations"); the run metadata did not record them.
 - Raw logs and secrets are not committed. The summary CSVs are the artefact.
 
 ## What this means for the open decisions (inputs, not decisions)
@@ -334,6 +358,32 @@ could not resolve, so both of its probes failed); they were not used for any cla
   `mode tcp` every agent's peer address is the proxy.
 - **WS-15:** finding 6.
 - **A new candidate issue:** finding 7 (agent teardown latency after a clean reset).
+
+## Run configurations (operator-supplied)
+
+- **HAProxy `option redispatch` variant:** `run-F1-vip-221906`, `run-F1-vip-222734`, `run-F1-vip-223600`,
+  `run-F1-vip-003436`, `run-F2p-vip-224347`, `run-F2p-vip-225245`. Every other VIP run used the default
+  configuration.
+- **Management address on `gateway-1` only (the H7 runs):** `run-F1-dns-005812`, `run-F1-dns-011727`,
+  `run-F1-dns-212006`, `run-F2-dns-212901`. Every other run had the management plane behind the VIP.
+- **DNS zone order:** shuffled in every DNS run (the fixed-order zone was built but not used for any run in
+  this record).
+
+## Operator documentation this record contradicts or extends
+
+- `docs/user-manual/gateway.md` (the section on a node that is up but has lost its server) says the agent
+  "stops being dispatchable" after the route lease expires and that the case "has not been observed end to
+  end". In this rig dispatch to such an agent kept working on the single-replica server; the multi-replica
+  case, where the route directory is used, was not tested.
+- The same page quotes a worst case of about 80 s to detect a lost node (60 s keepalive plus 20 s timeout).
+  The DNS measurements sit inside that; the VIP "health check stays green" case did not (finding 3).
+- `docs/user-manual/server-admin.md` documents `--gateway-command-addr` as one address without warning that
+  killing that node loses command dispatch to the whole fleet (finding 5).
+- **Alerting:** the victim gateway's `yuzu_gw_agents_current` did not fall during a partition (35 throughout
+  one 100-agent full-partition run), so the shipped alert on a more than 30 % drop in that gauge would not
+  have fired for these faults. The alert rule itself was not exercised.
+
+None of these pages was edited by this slice.
 
 ## Reproduce
 
