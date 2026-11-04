@@ -11,6 +11,8 @@ echo_sources = files(
   'src/echo_db.cpp',
   'src/echo_diff.cpp',
   'src/echo_schema_registry.cpp',
+  'src/echo_fold_schema.cpp',
+  'src/echo_fold.cpp',
   'src/echo_aggregator.cpp',
   'src/echo_usage.cpp',
   'src/echo_sql_executor.cpp',

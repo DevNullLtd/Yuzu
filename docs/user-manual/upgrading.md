@@ -2,6 +2,17 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: `echo.sql` refuses `WITH`, `NATURAL`, `USING` and bound-parameter markers
+
+**What changed.** The Echo agent plugin's `echo.sql` action refuses a query before it is prepared when it uses a common table expression, a `NATURAL` or `USING` join, or a parameter marker (`?`, `$x`, `:x`, `@x`, `#x`). A query that starts with `WITH` is answered `only SELECT queries are allowed`; `WITH` elsewhere, `NATURAL` and `USING` are answered `query contains forbidden keyword: <word>`; a marker is answered `query contains a bound-parameter marker`. Write a join with `ON` and a CTE as a subquery; `$`-prefixed table names such as `$Process_Hourly` still work.
+
+**Who is affected.** Anything that stores or replays an `echo.sql` query text: stored schedules, pinned or re-evaluated result sets, workflow steps, and REST and MCP callers.
+
+**Before you upgrade.** Search those stores for `WITH`, `NATURAL`, `USING`, a `$` that is not a `$Table_Name` placeholder, or any of `? : @ #`, outside string literals, and rewrite the queries.
+
+**Mixed fleet.** An agent that is not yet upgraded still answers these queries, so one stored query answers differently per agent version. Compare a result set's `device_count` with the source execution's `agents_failure` to see whether agents refused it.
+
+**Rolling back.** Clean: nothing is stored differently, and an older agent accepts the queries again.
 ## ⚠️ Breaking: stored response rows are capped per command and device (256 by default) (#561)
 
 - **What changed:** the response store keeps at most 256 rows for one command on one device (`--response-max-rows-per-agent`, env `YUZU_RESPONSE_MAX_ROWS_PER_AGENT`, range 1-65536). Rows past the cap are dropped, newest first, and the row just before the dropped frames ends with a `...[rows past per-agent cap dropped]` marker. One terminal-status row is still recorded past the cap when none exists, so the command's outcome shows.
@@ -707,6 +718,14 @@ human roles first and follow the prerequisites in [Role-Based Access Control](rb
 **Opt-outs after the upgrade stick.** The reset runs once. A `<source>_enabled=false` written through `echo.configure` after the migration has succeeded (look for the success line) is kept across restarts and further upgrades.
 
 **What to expect.** New collection begins without operator action, on each OS where the source has a collector (OS compatibility matrix in `docs/user-manual/echo.md`), for `procperf` (and the daily per-application performance sync it feeds), `netqual`, `module` (Windows ETW), `software`, `arp`, `dns`, `netconn` and `mapdrive` (`netconn` and `mapdrive` also run history backfills; `netconn_lookback_seconds` bounds the first). A source whose `<source>_enabled` row cannot be read is treated as disabled for that tick and its stored rows are kept.
+
+## Behaviour change: the Echo registry source reads logged-off users' hives (Windows)
+
+**What changed.** The Echo `registry` source used to baseline only the hives that were loaded. It now also reads the `Run`, `RunOnce`, `Policies` and `Winlogon` roots of each logged-off profile whose path the profile-list walk can resolve (at most 512 entries are walked; a virtual service or system account, a `<sid>.bak` leftover and a profile first found with no readable path are not read), on the hourly tick (every 12 `slow_interval`s: hourly at the default 300 s), by mounting the profile's `NTUSER.DAT` through the guarded offline-hive mount the other per-user plugins use. It is on by default, there is no offline-only switch (`registry_enabled=false` stops the whole registry source), and it needs no setting.
+
+**What to expect on the first start after the upgrade.** The agent mounts each logged-off profile's hive in scope once and baselines it silently (no gap row, except that an agent without the backup and restore privileges writes one `gap:unreadable` row for each of up to five roots of each such hive on first sight); a host with many logged-off profiles spreads that over a few ticks (`registry_offline_roots_deferred` counts the ones waiting). The upgrade date is the start of offline coverage: changes made to a logged-off hive before it are not reported. After that, each logged-off profile is mounted once per hourly tick (and also on first sight of a newly found profile, on a re-enable, and on every tick while a hive is capped or its mount is owed a retry) with the backup and restore privileges enabled for the span of the mount, holding that profile's `NTUSER.DAT` exclusively for it. The values under those roots belong to other users: the new value of each added or changed one is stored unmasked in `$Registry_Live`, like those of loaded hives, with the old value's type and size and never the old value, and a row's `ts` is the key's last-write time when the read saw a plausible one (`docs/user-manual/echo.md`, *Logged-off users*).
+
+**Rolling back.** A build without offline hives ignores the cursor's `offline` list and drops those roots' baselines without a row, so a change made to a logged-off hive while the older build runs is never reported, and a later re-upgrade re-baselines those roots silently (the `gap:restart` row's "found by the baseline diff" does not hold for them). Loaded roots are unaffected. Before the rollback, if the stored baselines and values must not stay on disk, set `registry_enabled` to `false`, then run `echo.purge_source` with `source` set to `registry` (the agent refuses to purge an enabled source).
 
 ## ⚠️ Breaking: MFA step-up is checked once, before the route's own checks, and two more routes need a fresh proof
 
