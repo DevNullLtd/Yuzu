@@ -40,11 +40,16 @@ std::string header() {
     return std::string(kV3Header);
 }
 
-// `S` record. duration/bytes are strings so a test can feed junk.
+// `S` record. duration/bytes are strings so a test can feed junk. `expect` defaults to a valid
+// 64-hex value for a delta section (the field a delta must carry) and to empty otherwise; pass
+// any literal to override.
 std::string sec(std::string_view facet, std::string_view status, std::string_view base = "",
                 std::string_view token = "", std::string_view dur = "0",
-                std::string_view bytes = "0") {
-    return rec({"S", facet, status, base, token, dur, bytes});
+                std::string_view bytes = "0", std::string_view expect = "auto") {
+    const std::string valid(64, 'e');
+    if (expect == "auto")
+        expect = status == "delta" ? std::string_view(valid) : std::string_view{};
+    return rec({"S", facet, status, base, token, dur, bytes, expect});
 }
 
 // `+` record with the 16 row slots (slot 14 is the reserved uninstall_string).
@@ -154,6 +159,39 @@ TEST_CASE("v3 parses every record kind", "[server][inventory_blob_v3]") {
     REQUIRE(mq != nullptr);
     CHECK(mq->status == V3Status::kDisabled);
     CHECK(mq->refusal == V3Refusal::kNone);
+}
+
+TEST_CASE("v3 S record field 7 is the expect hash: parsed, mandatory on delta, ignored on full",
+          "[server][inventory_blob_v3]") {
+    const std::string want(64, 'c');
+    SECTION("a delta section parses expect as field 7") {
+        const V3Report r = parse_ok(header() + sec(kApps, "delta", "b", "", "0", "0", want));
+        REQUIRE(r.sections.size() == 1);
+        CHECK(r.sections[0].refusal == V3Refusal::kNone);
+        CHECK(r.sections[0].expect == want);
+    }
+    SECTION("a delta section without a 64-hex expect is refused bad_record") {
+        for (const std::string& bad :
+             {std::string{}, std::string(63, 'c'), std::string(65, 'c'), std::string(64, 'C'),
+              std::string(64, 'g')}) {
+            const V3Report r = parse_ok(header() + sec(kApps, "delta", "b", "", "0", "0", bad) +
+                                        rec({"-", std::string(64, 'a')}));
+            REQUIRE(r.sections.size() == 1);
+            CHECK(r.sections[0].refusal == V3Refusal::kBadRecord);
+        }
+        // The field absent altogether (a six-field header) is the same refusal.
+        const V3Report none =
+            parse_ok(header() + rec({"S", kApps, "delta", "b", "", "0", "0"}));
+        CHECK(none.sections[0].refusal == V3Refusal::kBadRecord);
+    }
+    SECTION("a full section accepts any expect value and keeps it") {
+        const V3Report r = parse_ok(header() + sec(kApps, "full", "", "", "0", "0", "whatever") +
+                                    plus("A", kApps));
+        REQUIRE(r.sections.size() == 1);
+        CHECK(r.sections[0].refusal == V3Refusal::kNone);
+        CHECK(r.sections[0].expect == "whatever");
+        CHECK(r.sections[0].rows.size() == 1);
+    }
 }
 
 TEST_CASE("v3 status vocabulary round-trips and only full/delta carry rows",

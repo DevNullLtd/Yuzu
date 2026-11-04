@@ -2120,8 +2120,13 @@ public:
         metrics_.describe("yuzu_inventory_section_ingest_total",
                           "Blob-v3 installed-software section outcomes by facet and outcome "
                           "(facet = a collector source, component_inventory, or unknown; "
-                          "outcome = stored/status_only/need_full/delta_unsupported/rejected/"
+                          "outcome = stored/status_only/need_full/mismatch/rejected/"
                           "error; moves only once a v3 agent reports)",
+                          "counter");
+        metrics_.describe("yuzu_software_changes_total",
+                          "Install-history ledger rows written by applied installed-software "
+                          "sections, by kind (install/remove/upgrade); a baseline section writes "
+                          "none",
                           "counter");
         cert_ingest_metric::register_metrics(metrics_); // slice-2 PR 2a-2a
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
@@ -18031,6 +18036,39 @@ private:
                         spdlog::error("deployment prune threw ({}) — thread continuing", e.what());
                     } catch (...) {
                         spdlog::error("deployment prune threw unknown exception — continuing");
+                    }
+                }
+                // SAM-14: clock-guarded, single-writer prune of the installed-software change
+                // ledger (400 days), beside the deployment prune above. Hourly, like the
+                // offline_endpoint prune below (its own constant, so that prune's lexical gate keeps
+                // seeing exactly one use of its tick condition): a pass that hit the cap re-arms immediately (bounded to 12
+                // passes), any other result stops the drain until the next hour. ReplicaSafe, no
+                // leader_gate call: the guard's advisory lock lets one replica win a tick.
+                constexpr int kSoftwareLedgerPruneEveryNTicks = 60; // ~1h at 60s/tick
+                if (software_inventory_store_ && software_inventory_store_->is_open() &&
+                    !stop_requested_.load(std::memory_order_acquire) &&
+                    tick % kSoftwareLedgerPruneEveryNTicks == 1) {
+                    try {
+                        YUZU_ASSERT_BACKGROUND_JOB(
+                            "software_inventory_store.run_retention_prune_changes");
+                        for (int drain = 0;
+                             drain < 12 && !stop_requested_.load(std::memory_order_acquire);
+                             ++drain) {
+                            const int pruned =
+                                software_inventory_store_->run_retention_prune_changes();
+                            if (pruned < 0)
+                                spdlog::warn("software change ledger prune did not run (store not "
+                                             "open or no connection/transaction); retrying next "
+                                             "hour");
+                            if (pruned != SoftwareInventoryStore::kChangesPruneCapPerPass)
+                                break;
+                        }
+                    } catch (const std::exception& e) {
+                        spdlog::error("software change ledger prune threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        spdlog::error("software change ledger prune threw unknown exception — "
+                                      "continuing");
                     }
                 }
                 // #5678 / #1545 UP-4: hourly clock-guarded prune of endpoint_state rows

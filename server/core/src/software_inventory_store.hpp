@@ -324,12 +324,13 @@ struct NamePatternDevicesPage {
 /// What one blob-v3 section became (`apply_installed_software_v3`). The ingest seam maps it to
 /// the `yuzu_inventory_section_ingest_total{facet,outcome}` label and to the per-section nack.
 enum class V3SectionOutcome {
-    kStored,           ///< full section: the facet's rows were replaced
-    kStatusOnly,       ///< status-only section: facet state recorded, rows untouched
-    kNeedFull,         ///< not applied (delta on a base we do not hold, or a facet we cannot store)
-    kDeltaUnsupported, ///< a delta whose base matches: no delta apply yet, a full is asked for
-    kRejected,         ///< the section broke the grammar and was refused
-    kError,            ///< the transaction failed; nothing of this call was applied
+    kStored,     ///< full section replaced the facet's rows, or a delta section was applied
+    kStatusOnly, ///< status-only section: facet state recorded, rows untouched
+    kNeedFull,   ///< not applied: a delta on a base the server does not hold
+    kMismatch,   ///< a delta/component section that did not verify (stale `-`, key collision or
+                 ///< a post-apply hash != the agent's `expect`): rolled back, the facet is nacked
+    kRejected,   ///< the section broke the grammar and was refused
+    kError,      ///< the transaction failed; nothing of this call was applied
 };
 
 [[nodiscard]] constexpr std::string_view v3_section_outcome_name(V3SectionOutcome o) noexcept {
@@ -340,8 +341,8 @@ enum class V3SectionOutcome {
         return "status_only";
     case V3SectionOutcome::kNeedFull:
         return "need_full";
-    case V3SectionOutcome::kDeltaUnsupported:
-        return "delta_unsupported";
+    case V3SectionOutcome::kMismatch:
+        return "mismatch";
     case V3SectionOutcome::kRejected:
         return "rejected";
     case V3SectionOutcome::kError:
@@ -354,6 +355,33 @@ enum class V3SectionOutcome {
 [[nodiscard]] constexpr bool v3_section_needs_full(V3SectionOutcome o) noexcept {
     return o != V3SectionOutcome::kStored && o != V3SectionOutcome::kStatusOnly;
 }
+
+/// What one applied section did to the device's install history (`software_changes`).
+enum class SoftwareChangeKind { kInstall, kRemove, kUpgrade };
+
+[[nodiscard]] constexpr std::string_view software_change_kind_name(SoftwareChangeKind k) noexcept {
+    switch (k) {
+    case SoftwareChangeKind::kInstall:
+        return "install";
+    case SoftwareChangeKind::kRemove:
+        return "remove";
+    case SoftwareChangeKind::kUpgrade:
+        return "upgrade";
+    }
+    return "install";
+}
+
+/// One ledger row (see `SoftwareInventoryStore::diff_changes`). `instance_key` is the NEW row's
+/// for install/upgrade and the removed row's for remove.
+struct SoftwareChange {
+    SoftwareChangeKind kind{SoftwareChangeKind::kInstall};
+    std::string name;
+    std::string publisher;
+    std::string identity_key;
+    std::string instance_key;
+    std::string from_version; ///< remove/upgrade
+    std::string to_version;   ///< install/upgrade
+};
 
 struct V3SectionResult {
     std::string facet;
@@ -435,18 +463,59 @@ public:
     ///    {status, token, recomputed section_hash, last_confirmed_at, duration, bytes}.
     ///  - status-only (constrained|timeout|oversize|not_collected|disabled): record the status
     ///    only; rows, section_hash and last_confirmed_at are left alone.
-    ///  - `delta`: NOT applied here (delta apply and `-` deletions belong to the next change).
-    ///    Always answered need-full: kNeedFull when its base is not the stored section hash,
-    ///    kDeltaUnsupported when it is (a WARN names the gap). Nothing is lost: the agent falls
-    ///    back to a full section.
-    ///  - `component_inventory`: grammar-validated, its facet state recorded with an EMPTY
-    ///    section_hash (this store holds no component rows), and answered kNeedFull.
+    ///  - `delta`: applied as row-hash `-` / `+` changes against the rows the server already holds,
+    ///    inside a SAVEPOINT per section. The facet must be held with status full|delta and a
+    ///    section hash equal to the delta's `base`, else kNeedFull (nothing written). The `-` set
+    ///    is ONE DELETE ... instance_key = ANY(...) RETURNING; the rows it returns must equal the
+    ///    unique `-` count. The facet's rows are then re-read and their section hash must equal the
+    ///    agent's `expect`. A stale `-`, an instance_key collision on a `+`, or a hash that
+    ///    differs rolls that section back to its savepoint and answers kMismatch (the other
+    ///    sections of the call still apply and the facet is nacked); on success the facet state
+    ///    carries status 'delta' and `expect` as its section hash.
+    ///  - LEDGER: every applied section writes `software_changes` rows (install | remove |
+    ///    upgrade) in the same transaction, from `diff_changes` over the rows that went out and
+    ///    came in. A full section is a BASELINE (no ledger rows) when its facet is not held at all
+    ///    (first contact, or the v2-to-v3 transition) or was last 'disabled'; otherwise it is
+    ///    diffed against the held rows, so a status-only section followed by a full one, or an
+    ///    honest-empty full followed by a populated one, still yields the right rows. There are
+    ///    NO tombstones on `installed_software`: a removal is a hard delete plus a `remove` row.
+    ///  - `component_inventory`: full replaces the agent's `software_components` rows, delta
+    ///    applies `-` row_hash / `comp` changes (same verification), in THIS store's schema and
+    ///    transaction so the section hash joins the report hash atomically. An honest-empty full
+    ///    deletes the rows. A primary-key collision inside one section is a producer defect: kMismatch.
     ///  - a refused section (V3Section::refusal) is kRejected; the others still apply.
     /// A SQL failure rolls the whole call back and answers kError for EVERY section in it.
     /// Returns one result per `report.sections` entry, in order. The stored section hash is
     /// always recomputed from the applied rows, never taken from the wire.
     [[nodiscard]] std::vector<V3SectionResult>
     apply_installed_software_v3(std::string_view agent_id, V3Report report);
+
+    /// Ledger rows for a set of rows that left (`old_rows`) and a set that arrived (`new_rows`),
+    /// both with derived keys. removed = old-not-new, added = new-not-old, keyed by instance_key.
+    /// One removed row is paired with one added row of the same identity stem (identity_key with
+    /// its version segment blanked), in sorted instance_key order: differing versions -> one
+    /// `upgrade(from, to)`; EQUAL versions (install_date, signature, publisher spelling or
+    /// location churn) -> NO row. Leftovers are `remove` / `install`. Pure.
+    [[nodiscard]] static std::vector<SoftwareChange>
+    diff_changes(const std::vector<SoftwareEntry>& old_rows,
+                 const std::vector<SoftwareEntry>& new_rows);
+
+    /// Canonical form of one component (`kind US name US version US version_source US path US size
+    /// US mtime US anchor_app RS`), its row hash (SHA-256 hex; the value a delta `-` names) and the
+    /// hash of a whole component section (records sorted by those fields, size and mtime
+    /// numerically, de-duplicated by whole record, SHA-256 hex over the concatenated records).
+    /// Pure; the agent writer mirrors it byte for byte.
+    [[nodiscard]] static std::string component_row_hash(const V3Component& c);
+    [[nodiscard]] static std::string canonical_component_section_hash(std::vector<V3Component> rows);
+
+    /// Clock-guarded, capped prune of `software_changes` older than kChangesRetentionSeconds
+    /// (docs/clock-guarded-retention.md, all seven parts through `pg::run_clock_guarded_prune`).
+    /// Returns rows deleted, 0 on a decline or a lost lock race, -1 when the store is not open
+    /// or the pass failed. A pass that hit the cap may have more: the caller re-arms.
+    int run_retention_prune_changes();
+
+    static constexpr std::int64_t kChangesRetentionSeconds = 400LL * 24 * 60 * 60;
+    static constexpr int kChangesPruneCapPerPass = 50'000;
 
     /// Hash of one section's rows: SHA-256 hex over the sorted, de-duplicated rows, each written
     /// as ALL 16 wire slots (slot 14 empty; no conditional tail), 0x1F-joined and

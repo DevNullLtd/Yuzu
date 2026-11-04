@@ -12,6 +12,17 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 - **Backups:** `software_facet_state` is an ordinary table, so a `pg_dump` backup of the database covers it.
 - **Metric:** `yuzu_inventory_section_ingest_total{facet,outcome}` counts the outcome of each section of a v3 report; see "Install type, scope and location, and the sectioned report" in the installed-software inventory manual.
 
+## Behaviour change: installed-software schema v11 (delta sections are applied, the change ledger and the component store)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a database forward.
+
+- **What the schema adds:** three new empty tables, `software_changes` (the install, removal and upgrade history), `software_components` (the components found on each device) and `retention_meta`, plus one sequence. Nothing existing is altered, so the migration takes no lock on `installed_software` and returns at once.
+- **What the server now does:** a `delta` section of the sectioned report is applied to the device's stored software and checked against the hash the device holds afterwards; a section that does not check out is undone on its own and asked for again in full. The `component_inventory` section is stored per device. Every stored section writes its install, removal and upgrade entries to the change history in the same transaction. A device's first report (and the first after a collector was switched off and on) sets the starting point and writes none. Removed software is deleted from the device's list, with its history entry as the record. No shipped agent sends the sectioned report yet, so none of this moves until agents that do are deployed.
+- **Contract change for agent writers:** the `S` section record has a seventh field, `expect`, the section hash after the agent applies the section. A `delta` section without a valid `expect` is refused. Deploy the server before any agent that sends delta sections.
+- **Retention:** change-history entries older than 400 days are deleted, at most 50,000 rows per hourly pass, under the clock guard (see `docs/clock-guarded-retention.md`). A server whose clock has jumped declines the first pass and logs why instead of deleting. Components are not pruned: they are the current list and are removed with the device.
+- **Metric and alert:** `yuzu_software_changes_total{kind}` counts history entries. The section outcome `delta_unsupported` is replaced by `mismatch`, and the info alert `YuzuInventorySectionDeltaUnsupported` by the warning alert `YuzuInventorySectionDeltaMismatch`, which fires when deltas keep failing verification for an hour.
+- **Backups:** the new tables are ordinary tables, so a `pg_dump` backup of the database covers them.
+
 ## ⚠️ Breaking: policy YAML is read as written whatever its line endings; lists it cannot read are refused (#2123)
 
 - **What changed:** the server's policy and instruction-definition YAML scanner treats LF, CRLF and a lone CR as line breaks, and a blank or `#` comment line no longer ends a block. Before, a Windows-authored (CRLF) file with a blank line inside `spec.scope.selector`, or any file with a comment line indented less than the block, lost the predicates after it: a policy written for Windows devices tagged `prod` was stored as `ostype == "windows"` and evaluated against every Windows device.

@@ -339,13 +339,28 @@ dashboard or the API shows that record yet.
 A section the server cannot accept is asked for again by name (`installed_software:<source>` in
 the acknowledgement's `need_full`), while the other sections of the same report are stored. The
 first v3 report from a device removes the rows its earlier v2 reports left, so a device never
-shows the same software from two report formats. A `delta` section, and the
-`component_inventory` section, are checked but not applied by this server version: each is
-answered with a request for a full section, so nothing is lost. No shipped agent sends v3 yet;
-the agent side arrives in a later release. Operators can see the outcome of each section in
+shows the same software from two report formats.
+
+A `delta` section lists only what changed (rows removed by hash, rows added) and carries the hash
+the device holds after applying it. The server applies it to the rows it already holds and checks
+its own result against that hash. If the device's starting point is not the one the server holds,
+or a removal names a row the server does not have, or the result does not match, the section is
+undone on its own (the other sections of the report still apply) and asked for again in full, so
+nothing is lost. The `component_inventory` section is stored the same way, per device, as the
+current list of components found (`full` replaces the list, `delta` changes it, an empty `full`
+clears it).
+
+The server also keeps a change history for installed software: one entry for every install,
+removal or upgrade a stored section produced, with the version before and after. A device's first
+report, and the first report after a collector was switched off and on again, set the starting
+point and produce no history. Removed software is simply deleted from the device's list; the
+history entry is the record that it was there. History older than 400 days is pruned. Nothing in
+the dashboard or the API shows the change history or the components yet. No shipped agent sends v3
+yet; the agent side arrives in a later release. Operators can see the outcome of each section in
 `yuzu_inventory_section_ingest_total{facet,outcome}`, where `outcome` is `stored`, `status_only`,
-`need_full`, `delta_unsupported`, `rejected` or `error`, and `facet` is the collector source
-(`unknown` for a name the server does not recognise). The existing
+`need_full`, `mismatch`, `rejected` or `error`, and `facet` is the collector source
+(`unknown` for a name the server does not recognise), and the number of history entries in
+`yuzu_software_changes_total{kind}`. The existing
 `yuzu_inventory_ingest_total` keeps one outcome per report; a v3 report with any section asked for
 again counts as `need_full`.
 

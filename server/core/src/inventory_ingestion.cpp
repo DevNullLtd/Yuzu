@@ -136,7 +136,9 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
 // section's outcome into the per-section nack (`installed_software:<facet>`; the whole-source
 // `installed_software` nack is kept for a blob that cannot be attributed to sections at all)
 // and the section counter. Returns the source-level `yuzu_inventory_ingest_total` outcome.
-// A refused section never stops the others: the store applies every section that parsed.
+// A refused section never stops the others: the store applies every section that parsed, and a
+// delta or component section that does not verify is rolled back alone (`mismatch`) and nacked
+// like a refused one, so the agent resends that facet in full.
 const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& agent_id,
                            const std::string& blob, pb::InventoryAck& ack,
                            ::yuzu::MetricsRegistry* metrics) {

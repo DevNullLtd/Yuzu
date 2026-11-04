@@ -5196,20 +5196,20 @@ groups:
             self-healing; check release notes for a recent contract change before
             treating this as an incident. A sustained ratio with no such change
             suggests hash drift or agents stuck in a resend cycle. Blob-v3 agents
-            add one more source of need_full until the server can apply deltas and
-            store component rows: every delta section and every full or delta
-            component_inventory section (even one with no records) is answered
-            need_full, so a fleet of v3 agents reporting deltas or the component
-            facet raises this ratio without any hash drift.
+            add one more source of need_full: a delta section whose base the server
+            does not hold (for example after a restore from backup, or after the
+            facet was last reported as a status-only section) is answered need_full
+            and the agent resends that facet in full. A delta that did not verify is
+            counted separately (outcome=mismatch, YuzuInventorySectionDeltaMismatch).
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventorySectionIngestRefused
         # Blob v3 (ADR-0016 Update 2026-11-04): a section the server refuses is nacked
         # per section (`installed_software:<facet>`), and the other sections of the call
         # still apply. outcome=rejected is a GRAMMAR refusal: the agent resends the same
         # bytes and never self-heals, so it is its own alert rather than a rise in
-        # YuzuInventoryHighNeedFullRatio. outcome=delta_unsupported is NOT here: it is the
-        # expected placeholder until the delta apply is built, so it has its own
-        # non-paging rule (YuzuInventorySectionDeltaUnsupported) below.
+        # YuzuInventoryHighNeedFullRatio. outcome=mismatch is NOT here: a delta or component
+        # section that did not verify is rolled back and the agent resends in full, so it
+        # self-heals and has its own rule (YuzuInventorySectionDeltaMismatch) below.
         expr: |
           sum by (facet) (rate(yuzu_inventory_section_ingest_total{outcome="rejected"}[15m])) > 0
         for: 15m
@@ -5227,24 +5227,30 @@ groups:
             fix the agent (grep the warn-level "v3 section(s) ... refused" server log
             line for the agent_id and the refusal reason).
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
-      - alert: YuzuInventorySectionDeltaUnsupported
-        # The expected honest placeholder until the delta apply is built (the agent falls
-        # back to a full section, nothing is lost). Info severity, so it never pages: it keeps
-        # the rate visible and is the reminder to retire this rule when the delta apply lands.
+      - alert: YuzuInventorySectionDeltaMismatch
+        # A delta or component_inventory section that did not verify is rolled back alone
+        # (the facet keeps its previously held rows and hash) and nacked, so the agent
+        # resends that facet in full and the fleet self-heals. An occasional mismatch is
+        # normal (an agent restored from a snapshot, a report racing a decommission); a
+        # SUSTAINED one means the agent's delta writer and the server disagree about the
+        # row set (a contract defect) and the fleet is quietly paying for full resends.
         expr: |
-          sum by (facet) (rate(yuzu_inventory_section_ingest_total{outcome="delta_unsupported"}[15m])) > 0
+          sum by (facet) (rate(yuzu_inventory_section_ingest_total{outcome="mismatch"}[15m])) > 0
         for: 1h
         labels:
-          severity: info
+          severity: warning
         annotations:
-          summary: "Installed-software v3 deltas answered with a full-section request"
+          summary: "Installed-software v3 deltas failing verification"
           description: >-
-            yuzu_inventory_section_ingest_total{outcome="delta_unsupported"} has been
-            non-zero for 1h for the facet label. A delta section whose base matched was
-            answered need_full because this server cannot apply deltas yet; the agent
-            falls back to a full section. Expected while v3 agents ship ahead of the delta
-            apply, so no action is needed; it is a runbook item only if it persists once
-            the delta apply has shipped.
+            yuzu_inventory_section_ingest_total{outcome="mismatch"} has been non-zero
+            for 1h for the facet label. A delta section named a row the server does not
+            hold, added a row whose key collides with a held one, or left the facet with
+            a section hash other than the agent's own post-apply hash, so the server
+            rolled that section back and asked for a full one. The agent self-heals by
+            resending the facet in full, so nothing is lost, but a persistent rate means
+            the agent and server disagree about the row set: grep the warn-level
+            "did not verify" server line for the agent_id and compare the agent's
+            writer against the server's canonical section hash.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryDroppedBlobs
         # outcome=dropped = a blob over the 3 MiB cap was rejected + nacked. UNLIKE
