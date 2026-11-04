@@ -3428,7 +3428,7 @@ static const ToolDef kTools[] = {
      R"j("title":{"type":"string","minLength":1,"description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
      R"j(},"required":["title"]})j",
      R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"},)j"
-     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the decision or change was committed but its audit row failed to persist"}},"required":["campaign_id","grant_count"]})j"},
+     R"j("audit_persisted":{"type":"boolean","description":"Present, and false, only when the operation succeeded but its audit row was not saved"}},"required":["campaign_id","grant_count"]})j"},
 
     // campaign_id on the three id tools below carries maxLength/pattern as DISCOVERY METADATA
     // only: the schema validator runs just for approval-gated calls, so each handler's own
@@ -3471,11 +3471,11 @@ static const ToolDef kTools[] = {
      R"j("principal_type":{"type":"string","enum":["user","group","engine"],"description":"Type of the principal that holds the grant"},)j"
      R"j("principal_id":{"type":"string","minLength":1,"maxLength":1024,"description":"Id of the principal that holds the grant, as listed in get_access_review (at most 1024 bytes)"},)j"
      R"j("role_name":{"type":"string","minLength":1,"maxLength":1024,"description":"Role of the grant being decided (at most 1024 bytes)"},)j"
-     R"j("decision":{"type":"string","enum":["attested","flagged_revoke"],"description":"attested keeps the grant; flagged_revoke records evidence that it should be revoked and revokes nothing"},)j"
+     R"j("decision":{"type":"string","enum":["attested","flagged_revoke"],"description":"attested records that the grant is still appropriate; flagged_revoke records evidence that it should be revoked. Neither changes any grant"},)j"
      R"j("justification":{"type":"string","maxLength":4096,"description":"Reviewer's reason (at most 4096 bytes). Only the latest entry of a grant's history is returned whole"})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
      R"j({"type":"object","properties":{"recorded":{"type":"boolean"},"decision_seq":{"type":"integer"},"previous_decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},)j"
-     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the decision or change was committed but its audit row failed to persist"}},"required":["recorded","decision_seq","previous_decision"]})j"},
+     R"j("audit_persisted":{"type":"boolean","description":"Present, and false, only when the operation succeeded but its audit row was not saved"}},"required":["recorded","decision_seq","previous_decision"]})j"},
 
     {"get_access_review",
      "Full evidentiary state of one review campaign: metadata plus every frozen "
@@ -3524,7 +3524,7 @@ static const ToolDef kTools[] = {
      R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"})j"
      R"j(},"required":["campaign_id"]})j",
      R"j({"type":"object","properties":{"closed":{"type":"boolean"},)j"
-     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the decision or change was committed but its audit row failed to persist"}},"required":["closed"]})j"},
+     R"j("audit_persisted":{"type":"boolean","description":"Present, and false, only when the operation succeeded but its audit row was not saved"}},"required":["closed"]})j"},
 
     // ── KEK (key-encryption-key) rotation tools (#2395 track C) — MCP twins
     // of POST/GET /api/v1/secrets/kek/* (kek_routes.hpp/.cpp), sharing the

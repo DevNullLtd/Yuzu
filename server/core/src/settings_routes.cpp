@@ -1503,7 +1503,7 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     if (!view_res.has_value()) {
         // The store's machine-checkable "not_found: " prefix separates an unknown campaign id
         // (it answered) from a genuine read failure. Neither shows the store's own text, which
-        // carries its classification prefix; the failure is logged instead.
+        // carries its classification prefix. A genuine read failure is logged.
         if (view_res.error().starts_with("not_found:")) {
             html += "<div class=\"feedback-error\">No campaign with that id.</div></div>";
             return html;

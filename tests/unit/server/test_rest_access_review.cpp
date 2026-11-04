@@ -2702,6 +2702,34 @@ TEST_CASE("attestation SoD: a refusal stands and a recorded decision stands when
         CHECK(body["result"]["structuredContent"]["audit_persisted"] == false);
         CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 1);
     }
+
+    SECTION("open_access_review success, audit row returns false") {
+        h.mcp_audit_mode = AccessReviewHarness::McpAuditMode::fail;
+        h.mcp_audit_mode_action = "access_review.campaign_opened";
+        auto res = h.mcp_call_tool("open_access_review", {{"title", "audit-degraded open"}});
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK_FALSE(sc["campaign_id"].get<std::string>().empty());
+        CHECK(sc["audit_persisted"] == false);
+    }
+
+    SECTION("close_access_review success, audit row returns false") {
+        h.mcp_audit_mode = AccessReviewHarness::McpAuditMode::fail;
+        h.mcp_audit_mode_action = "access_review.closed";
+        auto res = h.mcp_call_tool("close_access_review", {{"campaign_id", cid}});
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        CHECK(body["result"]["structuredContent"]["closed"] == true);
+        CHECK(body["result"]["structuredContent"]["audit_persisted"] == false);
+        // The campaign is closed whether or not its audit row was saved: a second close finds it
+        // so.
+        auto again = h.mcp_call_tool("close_access_review", {{"campaign_id", cid}});
+        REQUIRE(again);
+        CHECK(nlohmann::json::parse(again->body).contains("error"));
+    }
 }
 
 // ── Byte-exact subject comparison, input bounds, store-failure answers (#4752 round 7) ─────────
@@ -3503,7 +3531,7 @@ TEST_CASE("attestation success body: OpenAPI and the MCP output schema name exac
         const auto& out = t["outputSchema"];
         CHECK(out["properties"]["decision_seq"]["type"] == "integer");
         CHECK(out["properties"]["previous_decision"]["type"] == "string");
-        // The three success fields plus the optional degraded-audit signal, which is never required.
+        // The three success fields plus the optional degraded-audit signal (never required).
         CHECK(out["properties"].size() == 4);
         CHECK(out["properties"]["audit_persisted"]["type"] == "boolean");
         CHECK(out["required"].size() == 3);
@@ -3535,9 +3563,9 @@ TEST_CASE("access-review writes: both machine contracts declare the degraded-aud
                 return prm;
         return nlohmann::json{};
     };
-    for (const auto& op : {paths["/access-reviews/{id}"]["get"],
-                           paths["/access-reviews/{id}/attestations"]["post"],
-                           paths["/access-reviews/{id}/close"]["post"]}) {
+    for (const auto& op :
+         {paths["/access-reviews/{id}"]["get"], paths["/access-reviews/{id}/attestations"]["post"],
+          paths["/access-reviews/{id}/close"]["post"]}) {
         const auto prm = id_param(op);
         REQUIRE_FALSE(prm.is_null());
         CHECK(prm["schema"]["pattern"] == pattern);

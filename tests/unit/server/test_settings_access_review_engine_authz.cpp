@@ -390,8 +390,8 @@ TEST_CASE("access-review fragments: a human holding the same custom role is stil
     CHECK(r.fragment_audits.empty()); // the belt writes only on a refusal
 }
 
-TEST_CASE("access-review campaign fragment: a malformed or unknown id shows a plain notice, never the "
-          "store's classification prefix",
+TEST_CASE("access-review campaign fragment: a malformed or unknown id shows a plain notice, never "
+          "the store's classification prefix",
           "[pg][settings][access_review][4752]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, ar_engine_tpl);
     Rig r{db_.dsn()};
