@@ -2,6 +2,43 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: policy YAML is read as written whatever its line endings; lists it cannot read are refused (#2123)
+
+- **What changed:** the server's policy and instruction-definition YAML scanner treats LF, CRLF and a lone CR as line breaks, and a blank or `#` comment line no longer ends a block. Before, a Windows-authored (CRLF) file with a blank line inside `spec.scope.selector`, or any file with a comment line indented less than the block, lost the predicates after it: a policy written for Windows devices tagged `prod` was stored as `ostype == "windows"` and evaluated against every Windows device.
+- **Now refused with `400` (was accepted):**
+  - a `tags` or `managementGroups` inline `[ ]` list that does not close on its own line (an unclosed `tags: [prod` used to be stored with the tag missing; a multi-line `managementGroups: [g1,` list used to target `g1` plus junk);
+  - a block list whose `- item` lines are not at one indent, or whose item continues on the next line;
+  - a list followed directly by another list's next item (end the list with another key first);
+  - a list line missing its `- `, or a `- item` line indented to `selector:`'s own column;
+  - a single value where a list is expected (`tags: prod` or `managementGroups: abc123def456`; write `tags: [prod]`), and list lines written after a value on the key line (`tags: null` or `tags: [a]` followed by `- prod`). `tags: null` and `managementGroups: null` on their own still mean none;
+  - a `managementGroups` entry outside letters, digits and `_ . : * -`. Group ids are server-assigned, so no working reference is affected. A display name inside that charset (e.g. `web-servers`) is still accepted and, as before, matches no group (tracked in #3182).
+- **Not yet refused** (tracked on #2123): a list line indented at or shallower than `scope:` itself, a `- item` written after another key (such as `platform:` under `selector:`, or any key after `managementGroups:`), tab characters in indentation, a `scope:` or `managementGroups:` line inside a multi-line `description: |` block, a null list item (a bare `- `, `tags: [,]`, or the empty entry in `[a,,b]`), a quoted key (`"tags":`) or a space before the colon (`tags :`), neither of which is read as the key, a block-scalar value (`platform: >`), a duplicate key (the server reads the first, a YAML parser the last), a flow-mapped selector (`selector: {tags: [prod]}`), and a compact `triggers:` list can still drop or replace an entry without an error, leaving the policy targeting a broader, narrower or different device set than its YAML says. A lone CR is also a line break to the server, but terminals and diffs render it as nothing, so a key after one is read without showing on its own line. For example, this keeps only `tag:a`:
+
+  ```yaml
+  scope:
+    selector:
+      tags:
+        - a
+  - b          # at scope:'s column: not read
+  ```
+
+  Keep a list's `- item` lines together directly under their key, write keys unquoted with the colon straight after the name, each key once, in block style, indent with spaces only, and keep those key names out of multi-line descriptions.
+- **Existing policies are not re-read.** A policy's scope, management groups and triggers are derived once, when it is created. A policy created before this release from CRLF YAML, from YAML with a comment line inside a block, or with a single-value `tags: prod`, may still be evaluating against a **broader** device set than its YAML says (`tags: prod` was stored with no tag filter at all). Re-deriving and flagging these automatically is tracked in #7004.
+- **To find candidates without changing anything:** list each policy's stored targeting next to its source and compare them by eye:
+
+  ```sql
+  SELECT p.id, p.name, p.scope_expression,
+         (SELECT string_agg(g.group_id, ',') FROM policy_store.policy_groups g WHERE g.policy_id = p.id) AS groups,
+         (SELECT count(*) FROM policy_store.policy_triggers t WHERE t.policy_id = p.id) AS triggers,
+         p.yaml_source LIKE E'%\r%' AS has_cr
+  FROM policy_store.policies p
+  ORDER BY has_cr DESC, p.name;
+  ```
+
+  Compare `scope_expression` with `spec.scope.selector` (every `tags` entry must appear as `EXISTS tag:<name>`), `groups` with `managementGroups`, and `triggers` with the YAML's `triggers` count. `has_cr` marks the likeliest cases, but an LF file with a comment line inside a block can be affected too.
+- **Fixing a policy deletes its compliance history.** There is no in-place policy update: a corrected policy is a delete and a create, and the delete cascades away the policy's compliance status, dispatch state and remediation history. Export what you need as evidence (`GET /api/v1/policies/{id}` and its compliance status) and record the old and new `scope_expression` in your change ticket before you recreate it.
+- **Audit:** a `policy.create` audit row now records the stored targeting (`scope=… groups=…`), so what a policy targets can be read back from the audit log.
+
 ## ⚠️ Breaking: `echo.sql` refuses `WITH`, `NATURAL`, `USING` and bound-parameter markers
 
 **What changed.** The Echo agent plugin's `echo.sql` action refuses a query before it is prepared when it uses a common table expression, a `NATURAL` or `USING` join, or a parameter marker (`?`, `$x`, `:x`, `@x`, `#x`). A query that starts with `WITH` is answered `only SELECT queries are allowed`; `WITH` elsewhere, `NATURAL` and `USING` are answered `query contains forbidden keyword: <word>`; a marker is answered `query contains a bound-parameter marker`. Write a join with `ON` and a CTE as a subquery; `$`-prefixed table names such as `$Process_Hourly` still work.
@@ -13,6 +50,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 **Mixed fleet.** An agent that is not yet upgraded still answers these queries, so one stored query answers differently per agent version. Compare a result set's `device_count` with the source execution's `agents_failure` to see whether agents refused it.
 
 **Rolling back.** Clean: nothing is stored differently, and an older agent accepts the queries again.
+
 ## ⚠️ Breaking: stored response rows are capped per command and device (256 by default) (#561)
 
 - **What changed:** the response store keeps at most 256 rows for one command on one device (`--response-max-rows-per-agent`, env `YUZU_RESPONSE_MAX_ROWS_PER_AGENT`, range 1-65536). Rows past the cap are dropped, newest first, and the row just before the dropped frames ends with a `...[rows past per-agent cap dropped]` marker. One terminal-status row is still recorded past the cap when none exists, so the command's outcome shows.
@@ -61,9 +99,9 @@ Lowering `db_budget_bytes` later deletes history the same way, within 15 minutes
 
 ## Behaviour change: agents send the versioned device-identity record
 
-**What changed.** The agent's daily device-identity report (`device_ci`) is now the versioned record: chassis, baseboard and a hashed machine id, plus typed rows for CPUs, DIMMs, disks, swap, volumes, partitions and storage topology, each section with its own status. It is sent by every agent of this build; there is no flag to fall back to the earlier format, and `--inventory-disable` still stops the collection. A section the host cannot produce is reported as unavailable instead of stopping the report.
+**What changed.** The agent's daily device-identity report (`device_ci`) is now the versioned record: chassis, baseboard and a hashed machine id, plus typed rows for CPUs, DIMMs, disks, swap, volumes, partitions and storage topology, each section with its own status. It is sent by every agent of this build; there is no flag to fall back to the earlier format, and `--inventory-disable` still stops the collection. A section the host cannot produce is reported as unavailable instead of stopping the report. On Windows agents the chassis, baseboard, swap and machine-id sections now carry data instead of `windows:planned`, and the CPU and DIMM rows fill their socket, stepping and DIMM identity columns, so each Windows device sends one changed daily report after its agent is upgraded; the Linux and macOS sections are unchanged.
 
-**What the record leaves out.** On Windows the volume section is reported `unavailable` (`agent:windows_volumes_unbounded`), meaning not collected rather than "the device has none", with no rows, because the Windows volume probe has no deadline and must not run on the thread the agent joins on reconnect and on shutdown. A mount point under a user profile or under `/Volumes` is replaced with `[redacted]` and its section is reported `constrained` (`agent:mount_points_redacted`).
+**What the record leaves out.** Partition coverage is per OS: Windows reads the partition table (the Win32_DiskPartition view; it does not list the Microsoft Reserved partition or folder mount points), while on Linux and macOS the `partition` section carries a single `<os>:planned` status and no rows, meaning not read, not "no partitions". On Windows the volume section is reported `unavailable` (`agent:windows_volumes_unbounded`), meaning not collected rather than "the device has none", with no rows, because the Windows volume probe has no deadline and must not run on the thread the agent joins on reconnect and on shutdown. A mount point under a user profile or under `/Volumes` is replaced with `[redacted]` and its section is reported `constrained` (`agent:mount_points_redacted`).
 
 **Order in a fresh deployment.** Bring the server up (every replica) before the agents of the same build enroll. An earlier server is outside the deployment contract (a fresh database, every writer on this build; see "Deployment contract (hard cutover)" in the Forensics section of this page), so this page describes no behaviour of the record against one.
 
