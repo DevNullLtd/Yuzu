@@ -73,7 +73,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_SUPPORTED, 1,
          "/Library/Java/JavaVirtualMachines/*/Contents/Home/release read (Contents/Info.plist "
          "JavaVM dict fallback); network mounts skipped via getmntinfo_r_np",
-         nullptr},
+         "fixture-verified only: no JDK is installed on the macOS development host, so this leg "
+         "rests on trees built from the documented bundle layout"},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "HKLM JavaSoft, Eclipse Adoptium and Azul Zulu keys (both views) + one <home>\\release "
