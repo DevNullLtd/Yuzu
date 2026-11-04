@@ -30,6 +30,9 @@
 # victim (FIN/RST seen, or silence), because `docker kill` is not guaranteed to
 # produce the same wire behaviour as a real node loss.
 #
+# This is a local measurement rig, NOT a deployment pattern: see "This rig and this record are not a
+# deployment pattern" in docs/ha-spikes/ws13-0-gateway-failover.md before copying anything from it.
+#
 # Platform: Linux with Docker only (GNU date, /proc/loadavg, flock, network namespaces, cgroup cpusets).
 # Credentials are per-rig, random and throwaway; they appear in this host's process list (docker exec
 # -e PGPASSWORD, the agents' --enrollment-token argument) while the rig runs, which is acceptable for a

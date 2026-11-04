@@ -127,12 +127,16 @@ clustered gateways, a real server and Postgres, and 20 / 100 / 300 agents.
 - **This rig and this record are not a deployment pattern.** The rig relaxes what a deployment must not:
   fixed addresses on one bridge network; throwaway credentials that appear in this host's process list and
   `docker inspect` while it runs; one gateway certificate and key shared by three nodes (the reference rig's
-  layout); an agent-to-gateway edge with one-way TLS, where the gateway does not verify agent client
-  certificates; a `mode tcp` VIP without PROXY protocol, so the gateways see the proxy as every agent's
-  address; a REST login over `curl -k` to the rig's own CA; no monitoring, persistence or hardening; and a
-  management plane open on the bridge and protected only by the unchanged reference peer authorization. Do
-  not copy its configuration, or a figure from this record, into a deployment or a runbook. Deployment
-  guidance stays in `docs/user-manual/gateway.md` and, when it exists, the 13.4 rollout runbook.
+  layout); a `mode tcp` VIP without PROXY protocol, so the gateways see the proxy as every agent's address;
+  a REST login over `curl -k` to the rig's own CA; an enrolment token good for 100,000 uses over 72 hours;
+  agent data directories on tmpfs with mode 0777; HAProxy's statistics port (8404) open on the bridge
+  without authentication; no backup, retention, monitoring or hardening; a management plane open on the bridge
+  and protected only by the unchanged reference peer authorization; and a harness that needs access to the
+  Docker daemon, which is root-equivalent on the host. The one-way TLS at the agent-to-gateway edge (the
+  gateway does not verify agent client certificates) is the shipped reference shape, not a relaxation made
+  here; it is recorded under the 13.4 input below. Do not copy this rig's configuration, or a figure from
+  this record, into a deployment or a runbook. Deployment guidance stays in `docs/user-manual/gateway.md` and,
+  when it exists, the 13.4 rollout runbook.
 - **Docker is not a real network.** A kill produced a gateway-side FIN/RST within tens of milliseconds
   (the Peer FIN/RST column). Real node loss can be silent; that is what F2p covers.
 - **DNS here is a static zone served by CoreDNS on the same host.** Resolver behaviour (TTL, caching,
@@ -339,7 +343,7 @@ could not resolve, so both of its probes failed); they were not used for any cla
 |---|---|---|
 | H1 | Clean kill: agents re-attach to survivors, TLS passes | Observed (about 9-10 s DNS) |
 | H2 | Silent partition: detection bounded by keepalive; a VIP with a health check is faster | Observed for a full partition (about 47 s DNS, about 24-27 s VIP); the green-health-check case is a lower bound (over 118 s) |
-| H3 | Node up, server path dropped: agents stay; routes expire; routable again after the path returns | Observed (single replica, 6 runs; the return was timed in 2 of them, 300 agents, and seen by hand in a third) |
+| H3 | Node up, server path dropped: agents stay; routes expire; routable again after the path returns | Observed (single replica, 6 runs; the return was timed in 2 of them, both 300 agents) |
 | H3b | `/readyz` stays 200, a VIP will not eject the node | Observed in this rig for the dropped-upstream fault with a quiet fleet; in the full partitions the breaker did open (+156-162 s); **not established for a production fleet** |
 | H4 | Reconnect of a third of the fleet with 13.1 jitter does not overload Register | Recovery times observed up to 114 agents at once; capacity was **not** tested (finding 9) |
 | H5 | A restored node stays empty | Seen informally in early runs; no retained artefact; unverified here |
