@@ -274,10 +274,14 @@ cadences.
   `C:/Users/<name>/...` on Windows) and is stored as an ordinary Response (90-day
   default retention, no per-subject erasure), outside this sync and outside
   `--inventory-disable`. The sync blob also has `install_location` and
-  `uninstall_string` slots, but they are reserved: the server ignores them and
-  stores neither, until ADR-0016 §8 is re-classified for them with the
-  agent-side change, #5186. No shipped agent fills them; a build that does gets a
-  full-resend request every cycle until the server accepts them. (The only `HKCU`
+  `uninstall_string` slots. In the v2 blob they are reserved: the server ignores
+  them and stores neither, and an agent that fills them gets a full-resend request
+  every cycle. The sectioned v3 blob stores `install_location` and keeps
+  `uninstall_string` reserved (see "Install type, scope and location, and the
+  sectioned report" below). No shipped agent sends either slot, and the agent-side
+  change that starts sending `install_location` decides what a machine-scope
+  collector may put in it, since a path under a user's profile names an account
+  (ADR-0016 §8, #5186). (The only `HKCU`
   read is the agent's own service-account hive, which is benign: the agent runs outside any
   interactive login session, so `HKCU` is that service account's profile. Note
   the account is **LocalSystem** today, not the intended `NT SERVICE\YuzuAgent`
@@ -293,6 +297,86 @@ cadences.
   `YUZU_AGENT_INVENTORY_DISABLE`) on the agent to collect and push **no**
   installed-software inventory. Deploy-time opt-out; not a server-side runtime
   toggle. It does not gate the operator `list`/`query`/`list_per_user` actions.
+
+### Install type, scope and location, and the sectioned report
+
+Each stored software row carries four more attributes. They are read-side facts today: the
+fleet query, catalogue and device pages do not return them yet, so they are visible only in the
+database.
+
+- **`install_type`** says how the software got onto the machine. The server derives it from the
+  producing collector (the row's `source`), and from the ecosystem when a row has no source:
+  `installer` (`installed_apps.list_inventory`, except that its Linux packages, whose ecosystem is
+  `deb`, `rpm`, `apk` or `pacman`, read `package_manager`, as they do from an agent that sends no
+  source), `msi` (`msi_packages.list_inventory`),
+  `package_manager` (`pkg_inventory.packages` and `pkg_inventory.managers`, which is the
+  Homebrew presence row), `store` (`pkg_inventory.store_packages`), `optional_feature`
+  (`windows_optional_features.list`), `runtime` (`runtimes.python`) and `middleware`
+  (`middleware.ibm_mq`). `component` and `driver` are reserved. A row whose source and ecosystem are both
+  unrecognised reads an empty `install_type`.
+- **`install_scope`** is `machine` or `user`. The sync collects machine scope only, so every row
+  reads `machine`.
+- **`install_location`** is the folder the software was installed into, when the collector reports
+  one. It is stored only from the v3 blob; the v2 blob's slot is ignored, so it is empty for every
+  device until an agent that sends v3 is deployed.
+- **`purl`** is the row's Package URL (for example
+  `pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12`), composed by the server from the
+  row's name, version, release, epoch, architecture and distribution. Linux package rows
+  (`deb`, `rpm`, `apk`, `pacman`, which the Package-URL specification calls `alpm`) and Homebrew
+  formulae and casks carry one; the other ecosystems have no registered Package-URL type, so
+  their `purl` is empty, and so is the Homebrew presence row. The server stores it only from the
+  v3 blob: a row from a v2 report has an empty `purl` until its device's first v3 report. The
+  value is indexed, and the store can look up the devices carrying exactly one `purl`; the
+  dashboard and the API do not return it yet.
+
+**The per-source report (blob v3).** A v3 report is a list of sections, one per collector source,
+each with a status (`full`, `delta`, `constrained`, `timeout`, `oversize`, `not_collected` or
+`disabled`). The server applies each section on its own: a `full` section replaces only that
+collector's rows, so one collector's failure no longer holds back the rest of the report, and a
+status-only section records why a collector did not report and keeps its previous rows. The
+latest status of each collector, with the section's content hash, when it last reported in full,
+how long the collector took and how many bytes it read, is kept per device. Nothing in the
+dashboard or the API shows that record yet.
+
+A section the server cannot accept is asked for again by name (`installed_software:<source>` in
+the acknowledgement's `need_full`), while the other sections of the same report are stored. The
+first v3 call from a device that applies a section removes the rows its earlier v2 reports left, so a device never
+shows the same software from two report formats. A `delta` section, and the
+`component_inventory` section, are checked but not applied by this server version: each is
+answered with a request for a full section, so nothing is lost. No shipped agent sends v3 yet;
+the agent side arrives in a later release. Operators can see the outcome of each section in
+`yuzu_inventory_section_ingest_total{facet,outcome}`, where `outcome` is `stored`, `status_only`,
+`need_full`, `delta_unsupported`, `rejected` or `error`, and `facet` is the collector source
+(`unknown` for a name the server does not recognise). The existing
+`yuzu_inventory_ingest_total` keeps one outcome per report; a v3 report with any section asked for
+again counts as `need_full`. A blob the server cannot split into sections at all (see below) counts
+as `dropped` there, and a call whose transaction failed counts as `error` for every section of the
+call that was not refused (a refused section stays `rejected`).
+
+**Sequencing, and what the shipped agent does with a per-section request.** Bring up every server
+replica before the agents of the same build enroll. The agent in this release does not understand the per-section request: it
+looks for its own source name in the acknowledgement's `need_full` list, and
+`installed_software:<source>` is not that name, so a per-section request reads to it as a clean
+sync until the agent release that sends v3 reads the new form. Nothing is lost today, because
+no shipped agent sends v3. One behaviour also changes with the format: when a collector that
+withholds its rows on a constrained read (the `drop_source` policy, for example
+`middleware.ibm_mq`) cannot answer, a v2 report replaces the device's rows without that
+source's, while a v3 report records a status-only section and keeps the previous rows.
+
+**When a section is refused.** `yuzu_inventory_section_ingest_total{outcome="rejected"}` counts a
+section that broke the blob v3 grammar, and the warn-level server log line "v3 section(s) ...
+refused" names the agent and the reason. The reason is one of `unknown_facet`, `duplicate_facet`,
+`unknown_status`, `rows_in_status_only`, `delete_in_full`, `wrong_record_for_facet`,
+`source_mismatch`, `unknown_record`, `bad_record`, `bad_row_hash`, `bad_version_source`, `row_cap`,
+`nul_byte` or `unterminated`. The agent resends the same bytes, so a refusal never clears on its
+own, and the refused facet keeps its previous rows and section hash (its rows go stale; nothing is
+deleted) until the agent is fixed. The one exception is a device's first v3 call that applies a section: its v2 rows were
+already replaced, so a facet refused then has no rows to keep. `facet="unknown"` on the counter means the server does not
+recognise the name: that is a version-skew incident (an agent and a server of different builds),
+fixed by reprovisioning matching builds rather than by fixing the agent. A blob that cannot be attributed to sections at all (a record
+before any section, a header with no section, an unusable section header, more than 32 sections,
+or over 3 MiB) is counted `dropped`, logged as "unusable v3 ... blob", and asked for again by the
+whole source name.
 
 ## How the sync behaves (and why it's quiet on the network)
 
@@ -964,9 +1048,10 @@ ingest is failing. Four further series sharpen the picture:
   applying one source's report holds a pooled Postgres connection (advisory lock +
   the atomic replace, whose inserts are now batched into a single `unnest()`
   statement). `phase=full` is the full-payload replace; `phase=hash_only` is the
-  cheap hash-skip compare + `last_seen` bump — split so the steady-state
-  hash_only majority doesn't bury the `full` tail, the pool-pressure signal under
-  a cold-cache `need_full` herd.
+  cheap hash-skip compare + `last_seen` bump; `phase=v3` is a sectioned report's
+  apply (up to 32 sections in one transaction) — split so the steady-state
+  hash_only majority doesn't bury the `full` and `v3` tail, the pool-pressure
+  signal under a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
   `pool_acquire_timeout` / `query_error`, plus `admission_full` for `source="installed_software"` and `source="ca_issued"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
   `software_licensing` / `product_registry` / `app_usage` / `generic`, and the `/crypto` sources `ca_issued` (Yuzu-issued certificate reads) and `crypto_layout` (dashboard layouts), see [metrics.md](metrics.md#crypto-dashboard-metrics)) — an
@@ -1101,14 +1186,20 @@ Shipped alert rules live in the `yuzu-inventory` group of
 `docs/prometheus/yuzu-alerts.yml`: `YuzuInventorySustainedIngestErrors` (a non-zero
 `error` rate held for 15m), `YuzuInventoryHighNeedFullRatio` (>20% of ingests are
 `need_full` for 15m — hash-skip is not taking, so agents keep re-sending full
-payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob dropped + nacked),
+payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob, or a v3 blob that cannot be split into
+sections, dropped + nacked),
 `YuzuInventoryReportRejected` (a whole report rejected at the source-map cap),
 `YuzuInventoryGenericBlobRejectedDepth` (a generic source blob rejected for
 nesting past `kMcpMaxJsonDepth`, json-dump-depth-guard fix),
 `YuzuInventoryReadDegraded` (a read returned a degrade, by reason),
-`YuzuInventoryIngestSlow` (full-payload ingests holding a connection >10s — a
-leading pool-saturation indicator), and `YuzuInventoryStaleCountUnavailable` (the
-freshness gauge may be frozen).
+`YuzuInventoryIngestSlow` (full-payload and sectioned (`phase=~"full|v3"`) ingests
+holding a connection >10s — a leading pool-saturation indicator),
+`YuzuInventorySectionIngestRefused` (warning: a v3 section was refused, `outcome="rejected"`,
+at least once in the last day, so a single refusal is enough; the refusal is a grammar failure
+that never self-heals, so fix the agent, except `facet="unknown"`, a version-skew incident fixed by reprovisioning matching builds),
+`YuzuInventorySectionDeltaUnsupported` (info, held 1h: a v3 delta was answered with a request
+for a full section because this server cannot apply deltas yet; expected, no action), and
+`YuzuInventoryStaleCountUnavailable` (the freshness gauge may be frozen).
 
 A **recording rule**, `yuzu:inventory_ingest_duration_seconds:p99{source,phase}`,
 ships in the same group: it precomputes the 99th-percentile ingest duration per
@@ -1207,6 +1298,9 @@ sync, defeating the hash-skip protocol.
   chassis (type, serial, asset tag), baseboard (vendor, product, serial) and a hashed
   machine-id, each with its source, plus typed per-device rows for CPUs, DIMMs, disks,
   swap, volumes, partitions and storage topology, each section with its own status.
+  Partitions are read on Windows only so far (Linux and macOS report `<os>:planned`, meaning
+  not read; storage topology is planned everywhere), and the stored sections are not yet
+  shown in the Hardware pages or API.
   `blob_version` says which format an agent last sent. A device whose agent is still on
   the original format has **no** section rows stored — read that as "not stored", not
   "the device has none". A section reported `constrained` with reason `server_cap:<n>`
