@@ -18,22 +18,14 @@ struct SyncWindow {
     int end_min{0};
 };
 
-/// A broken-down local civil time. `month` is 1-12.
-struct LocalTm {
-    int year{1970};
-    int month{1};
-    int day{1};
-    int hour{0};
-    int minute{0};
-    int second{0};
-};
-
-/// Injected local-time conversions. from_local MUST normalise out-of-range fields
-/// (day = 32 is the first of the next month, as mktime does) and resolve a
-/// non-existent local time (a spring-forward gap) forward.
+/// Injected local-time conversions over the C library's broken-down time (`std::tm`).
+/// from_local MUST normalise out-of-range fields (tm_mday = 32 is the first of the next
+/// month, as mktime does), decide DST itself (the argument's tm_isdst belongs to the
+/// instant to_local was given, not to the requested time) and resolve a non-existent
+/// local time (a spring-forward gap) forward.
 struct LocalClock {
-    std::function<LocalTm(std::int64_t)> to_local;
-    std::function<std::int64_t(const LocalTm&)> from_local;
+    std::function<std::tm(std::int64_t)> to_local;
+    std::function<std::int64_t(const std::tm&)> from_local;
 };
 
 /// The machine's local zone through the C library; DST is the library's.
@@ -47,17 +39,10 @@ inline LocalClock system_local_clock() {
 #else
         localtime_r(&tt, &tmv);
 #endif
-        return LocalTm{tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-                       tmv.tm_hour,        tmv.tm_min,     tmv.tm_sec};
+        return tmv;
     };
-    c.from_local = [](const LocalTm& l) {
-        std::tm tmv{};
-        tmv.tm_year = l.year - 1900;
-        tmv.tm_mon = l.month - 1;
-        tmv.tm_mday = l.day;
-        tmv.tm_hour = l.hour;
-        tmv.tm_min = l.minute;
-        tmv.tm_sec = l.second;
+    c.from_local = [](const std::tm& l) {
+        std::tm tmv = l; // mktime normalises in place
         tmv.tm_isdst = -1; // let the library decide
         return static_cast<std::int64_t>(std::mktime(&tmv));
     };
@@ -76,13 +61,13 @@ inline std::int64_t next_window_fire(std::int64_t now, SyncWindow w, std::uint64
         return now + kDay;
     const std::int64_t off = static_cast<std::int64_t>(w.start_min) * 60 +
                              static_cast<std::int64_t>(phase_hash % static_cast<std::uint64_t>(span));
-    LocalTm l = clock.to_local(now);
-    l.hour = static_cast<int>(off / 3600);
-    l.minute = static_cast<int>(off % 3600 / 60);
-    l.second = static_cast<int>(off % 60);
+    std::tm l = clock.to_local(now);
+    l.tm_hour = static_cast<int>(off / 3600);
+    l.tm_min = static_cast<int>(off % 3600 / 60);
+    l.tm_sec = static_cast<int>(off % 60);
     std::int64_t cand = clock.from_local(l);
     if (cand <= now) {
-        ++l.day;
+        ++l.tm_mday;
         cand = clock.from_local(l);
     }
     return cand > now ? cand : now + kDay;

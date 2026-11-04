@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -3655,20 +3656,22 @@ yuzu::agent::LocalClock utc_clock() {
         const c::sys_days d = c::floor<c::days>(tp);
         const c::year_month_day ymd{d};
         const c::hh_mm_ss<c::seconds> hms{tp - d};
-        return yuzu::agent::LocalTm{static_cast<int>(ymd.year()),
-                                    static_cast<int>(static_cast<unsigned>(ymd.month())),
-                                    static_cast<int>(static_cast<unsigned>(ymd.day())),
-                                    static_cast<int>(hms.hours().count()),
-                                    static_cast<int>(hms.minutes().count()),
-                                    static_cast<int>(hms.seconds().count())};
+        std::tm l{};
+        l.tm_year = static_cast<int>(ymd.year()) - 1900;
+        l.tm_mon = static_cast<int>(static_cast<unsigned>(ymd.month())) - 1;
+        l.tm_mday = static_cast<int>(static_cast<unsigned>(ymd.day()));
+        l.tm_hour = static_cast<int>(hms.hours().count());
+        l.tm_min = static_cast<int>(hms.minutes().count());
+        l.tm_sec = static_cast<int>(hms.seconds().count());
+        return l;
     };
-    clock.from_local = [](const yuzu::agent::LocalTm& l) {
-        const c::sys_days d =
-            c::sys_days{c::year{l.year} / c::month{static_cast<unsigned>(l.month)} / 1} +
-            c::days{l.day - 1};
+    clock.from_local = [](const std::tm& l) {
+        const c::sys_days d = c::sys_days{c::year{l.tm_year + 1900} /
+                                          c::month{static_cast<unsigned>(l.tm_mon + 1)} / 1} +
+                              c::days{l.tm_mday - 1};
         return static_cast<std::int64_t>(
-            c::duration_cast<c::seconds>(d.time_since_epoch() + c::hours{l.hour} +
-                                         c::minutes{l.minute} + c::seconds{l.second})
+            c::duration_cast<c::seconds>(d.time_since_epoch() + c::hours{l.tm_hour} +
+                                         c::minutes{l.tm_min} + c::seconds{l.tm_sec})
                 .count());
     };
     return clock;
@@ -3725,7 +3728,7 @@ struct Sam19Rig {
 constexpr std::int64_t kNoon = 1'781'092'800; // 2026-06-10 12:00:00Z
 int utc_minutes(std::int64_t t) {
     const auto l = utc_clock().to_local(t);
-    return l.hour * 60 + l.minute;
+    return l.tm_hour * 60 + l.tm_min;
 }
 
 } // namespace

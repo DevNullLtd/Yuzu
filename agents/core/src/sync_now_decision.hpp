@@ -34,11 +34,11 @@
 
 #include "sync_scheduler.hpp"
 
-#include <cerrno>
+#include <charconv>
 #include <chrono>
-#include <cstdlib>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace yuzu::agent {
 
@@ -96,15 +96,14 @@ struct SyncNowDecision {
     }
     long delay = 0;
     if (!delay_max_s.empty()) {
-        const std::string d(delay_max_s);
-        char* end = nullptr;
-        errno = 0;
-        delay = std::strtol(d.c_str(), &end, 10);
-        const bool digits_only = d.find_first_not_of("0123456789") == std::string::npos;
-        if (!digits_only || errno != 0 || delay < 0 || delay > kSyncNowMaxDelaySeconds) {
+        // from_chars rejects garbage, a leading space or '+', and overflow; ptr != end
+        // rejects trailing characters ("12s", "1.5").
+        const char* const end = delay_max_s.data() + delay_max_s.size();
+        const auto [ptr, ec] = std::from_chars(delay_max_s.data(), end, delay);
+        if (ec != std::errc{} || ptr != end || delay < 0 || delay > kSyncNowMaxDelaySeconds) {
             return {SyncNowDecision::Status::Failure, 2,
-                    "invalid delay_max_s '" + d + "' — expected an integer 0.." +
-                        std::to_string(kSyncNowMaxDelaySeconds)};
+                    "invalid delay_max_s '" + std::string(delay_max_s) +
+                        "' — expected an integer 0.." + std::to_string(kSyncNowMaxDelaySeconds)};
         }
     }
     auto armed = sched->request_now(source_param, std::chrono::seconds{delay});

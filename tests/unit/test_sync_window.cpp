@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <map>
 #include <optional>
 #include <string>
@@ -24,27 +25,40 @@ namespace {
 constexpr std::int64_t kHour = 3600;
 constexpr std::int64_t kDay = 24 * kHour;
 
-// Days since 1970-01-01 for a proleptic Gregorian civil date; linear in `d`, so an
+namespace chr = std::chrono;
+
+// Broken-down time <-> seconds-since-epoch read as if UTC. Linear in tm_mday, so an
 // out-of-range day normalises the way mktime does (day 32 of a 31-day month = the 1st).
-std::int64_t days_from_civil(std::int64_t y, std::int64_t m, std::int64_t d) {
-    y -= m <= 2;
-    const std::int64_t era = (y >= 0 ? y : y - 399) / 400;
-    const std::int64_t yoe = y - era * 400;
-    const std::int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-    const std::int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + doe - 719468;
+std::int64_t civil_seconds(const std::tm& l) {
+    const chr::year_month_day first{chr::year{l.tm_year + 1900},
+                                    chr::month{static_cast<unsigned>(l.tm_mon + 1)}, chr::day{1}};
+    const chr::sys_days d = chr::sys_days{first} + chr::days{l.tm_mday - 1};
+    return d.time_since_epoch().count() * kDay + l.tm_hour * kHour + l.tm_min * 60 + l.tm_sec;
 }
 
-void civil_from_days(std::int64_t z, int& y, int& m, int& d) {
-    z += 719468;
-    const std::int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-    const std::int64_t doe = z - era * 146097;
-    const std::int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    const std::int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    const std::int64_t mp = (5 * doy + 2) / 153;
-    d = static_cast<int>(doy - (153 * mp + 2) / 5 + 1);
-    m = static_cast<int>(mp < 10 ? mp + 3 : mp - 9);
-    y = static_cast<int>(yoe + era * 400 + (m <= 2));
+std::tm civil_tm(std::int64_t secs) {
+    const chr::sys_seconds tp{chr::seconds{secs}};
+    const chr::sys_days d = chr::floor<chr::days>(tp);
+    const chr::year_month_day ymd{d};
+    const chr::hh_mm_ss<chr::seconds> hms{tp - d};
+    std::tm l{};
+    l.tm_year = static_cast<int>(ymd.year()) - 1900;
+    l.tm_mon = static_cast<int>(static_cast<unsigned>(ymd.month())) - 1;
+    l.tm_mday = static_cast<int>(static_cast<unsigned>(ymd.day()));
+    l.tm_hour = static_cast<int>(hms.hours().count());
+    l.tm_min = static_cast<int>(hms.minutes().count());
+    l.tm_sec = static_cast<int>(hms.seconds().count());
+    return l;
+}
+
+std::int64_t utc(int y, int m, int d, int hh, int mm) {
+    std::tm l{};
+    l.tm_year = y - 1900;
+    l.tm_mon = m - 1;
+    l.tm_mday = d;
+    l.tm_hour = hh;
+    l.tm_min = mm;
+    return civil_seconds(l);
 }
 
 struct FakeZone {
@@ -59,25 +73,10 @@ struct FakeZone {
 
     LocalClock clock() const {
         const FakeZone z = *this;
-        LocalClock c;
-        c.to_local = [z](std::int64_t t) {
-            const std::int64_t local = t + z.offset_at(t);
-            std::int64_t days = local / kDay;
-            std::int64_t rem = local % kDay;
-            if (rem < 0) {
-                rem += kDay;
-                --days;
-            }
-            LocalTm l;
-            civil_from_days(days, l.year, l.month, l.day);
-            l.hour = static_cast<int>(rem / kHour);
-            l.minute = static_cast<int>(rem % kHour / 60);
-            l.second = static_cast<int>(rem % 60);
-            return l;
-        };
-        c.from_local = [z](const LocalTm& l) {
-            const std::int64_t local = days_from_civil(l.year, l.month, l.day) * kDay +
-                                       l.hour * kHour + l.minute * 60 + l.second;
+        LocalClock lc;
+        lc.to_local = [z](std::int64_t t) { return civil_tm(t + z.offset_at(t)); };
+        lc.from_local = [z](const std::tm& l) {
+            const std::int64_t local = civil_seconds(l);
             const std::int64_t as_dst = local - z.dst_off;
             const std::int64_t as_std = local - z.std_off;
             const bool dst_ok = z.offset_at(as_dst) == z.dst_off;
@@ -90,13 +89,9 @@ struct FakeZone {
                 return as_std;
             return as_std; // spring-forward gap: resolves forward, as mktime does
         };
-        return c;
+        return lc;
     }
 };
-
-std::int64_t utc(int y, int m, int d, int hh, int mm) {
-    return days_from_civil(y, m, d) * kDay + hh * kHour + mm * 60;
-}
 
 const FakeZone kUtc{0, 0, 0, 0};
 const FakeZone kPacificFixed{-8 * kHour, -8 * kHour, 0, 0};
@@ -107,8 +102,8 @@ constexpr std::int64_t kSpan = (300 - 60) * 60;
 
 // Minutes after local midnight of `t` in `clock`'s zone.
 int local_minutes(const LocalClock& clock, std::int64_t t) {
-    const LocalTm l = clock.to_local(t);
-    return l.hour * 60 + l.minute;
+    const std::tm l = clock.to_local(t);
+    return l.tm_hour * 60 + l.tm_min;
 }
 
 bool in_window(const LocalClock& clock, std::int64_t t, SyncWindow w = kNight) {
@@ -170,10 +165,10 @@ TEST_CASE("next_window_fire: spring-forward gap resolves forward and stays in th
     SECTION("a slot inside the gap lands at 03:30 local, not before the gap") {
         const std::uint64_t h = 5400; // 01:00 + 1.5 h = 02:30 local (nonexistent)
         const std::int64_t fire = next_window_fire(now, kNight, h, clock);
-        const LocalTm l = clock.to_local(fire);
-        CHECK(l.day == 8);
-        CHECK(l.hour == 3);
-        CHECK(l.minute == 30);
+        const std::tm l = clock.to_local(fire);
+        CHECK(l.tm_mday == 8);
+        CHECK(l.tm_hour == 3);
+        CHECK(l.tm_min == 30);
     }
     SECTION("every slot of the window lands inside it on the gap day") {
         for (std::uint64_t h = 0; h < static_cast<std::uint64_t>(kSpan); h += 97) {
@@ -204,7 +199,7 @@ TEST_CASE("next_window_fire: fall-back overlap picks one deterministic instant",
 TEST_CASE("next_window_fire: an unconvertible local time falls back to a day later, never the past",
           "[sync][window]") {
     LocalClock broken = kUtc.clock();
-    broken.from_local = [](const LocalTm&) -> std::int64_t { return -1; };
+    broken.from_local = [](const std::tm&) -> std::int64_t { return -1; };
     const std::int64_t now = utc(2026, 6, 10, 12, 0);
     CHECK(next_window_fire(now, kNight, 7, broken) == now + kDay);
     CHECK(next_window_fire(now, SyncWindow{300, 60}, 7, kUtc.clock()) == now + kDay); // empty span

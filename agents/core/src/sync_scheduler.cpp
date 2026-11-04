@@ -127,8 +127,6 @@ SyncScheduler::State& SyncScheduler::load_state(std::size_t idx, std::int64_t no
         st.skip_streak =
             static_cast<int>(std::clamp<long long>(ss, 0, std::numeric_limits<int>::max()));
         st.last_skip = kv_get_(kv_key(src.name, "last_skip"));
-        // Restart after being off: spread the catch-up rather than fire at once.
-        catch_up_if_overdue(idx, now_secs);
     }
     st.loaded = true;
     return st;
@@ -156,7 +154,7 @@ void SyncScheduler::note_skip(std::size_t idx, std::int64_t now_secs) {
         ++st.skip_streak;
     const std::int64_t interval = src.interval.count();
     if (!src.skip_backoff) {
-        st.next_fire = src.window ? next_due(idx, now_secs) : now_secs + interval;
+        st.next_fire = now_secs + interval;
     } else {
         const std::int64_t slot = next_due(idx, now_secs);
         if (st.skip_streak <= kSkipRetryBudget)
@@ -369,7 +367,7 @@ std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
             continue;
         const SyncSource& src = sources_[i];
         State& st = load_state(i, now_secs);
-        // Resume from sleep with the state already loaded: spread, don't stampede.
+        // Restart after being off, or resume from sleep: spread the catch-up, don't stampede.
         catch_up_if_overdue(i, now_secs);
         if (now_secs < st.next_fire)
             continue;
