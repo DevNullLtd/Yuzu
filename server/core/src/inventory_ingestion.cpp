@@ -157,7 +157,7 @@ const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& age
         return "dropped";
     }
     // ONE line per report, not per section (a hostile agent can refuse every one of its
-    // <= kMaxSections sections on every resend). The facet is logged from the closed set, never
+    // <= kV3MaxSections sections on every resend). The facet is logged from the closed set, never
     // the agent's raw string.
     {
         std::size_t refused = 0;

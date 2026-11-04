@@ -526,7 +526,8 @@ void append_section_record(std::string& out, const SoftwareEntry& e) {
 
 // Postgres bind form of an entry set: one text[] per inserted column, in the order of the
 // INSERT below. The column list, the SELECT list, the unnest() alias list and this array order
-// are one contract; kInsertColumnCount is checked against it.
+// are one contract; kInsertColumnCount sizes the array and must equal the column count (nothing
+// checks it against the SQL, so change them together).
 constexpr std::size_t kInsertColumnCount = 20;
 
 // Batched insert (#1664): one statement carrying the per-row columns as parallel text[]

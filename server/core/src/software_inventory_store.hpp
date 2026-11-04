@@ -448,9 +448,11 @@ public:
     ///    kDeltaUnsupported when it is (a WARN names the gap). Nothing is lost: the agent falls
     ///    back to a full section.
     ///  - `component_inventory`: grammar-validated, its facet state recorded with an EMPTY
-    ///    section_hash (this store holds no component rows), and answered kNeedFull.
+    ///    section_hash (this store holds no component rows). A `full` or `delta` one is answered
+    ///    kNeedFull; a status-only one is a complete report (kStatusOnly).
     ///  - a refused section (V3Section::refusal) is kRejected; the others still apply.
-    /// A SQL failure rolls the whole call back and answers kError for EVERY section in it.
+    /// A SQL failure rolls the whole call back and answers kError for every section in it that
+    /// was not refused (a refused section stays kRejected).
     /// Returns one result per `report.sections` entry, in order. The stored section hash is
     /// always recomputed from the applied rows, never taken from the wire.
     [[nodiscard]] std::vector<V3SectionResult>
@@ -494,8 +496,11 @@ public:
     /// qualifiers sorted); only blob-v3 rows carry a purl. Rows are ordered (agent_id,
     /// install_id); `limit` defaults to 100 when <= 0 and is clamped to kFleetQueryRowCap, so a
     /// short page is not proof of exhaustion. Returns agent_id, name, version, ecosystem, purl
-    /// and install_id per row. FLEET-WIDE and unscoped like `software_catalog`: a caller that
-    /// exposes it MUST gate it (global `Inventory:Read`, ADR-0017). AUTHORITATIVE read:
+    /// and install_id per row. FLEET-WIDE and unscoped like `software_catalog`, and it returns
+    /// `agent_id` per row, so a caller that exposes it must NOT rest on a bare global
+    /// `Inventory:Read`: it must admit then filter the rows to the agents the caller may read
+    /// (`authorize_list_read` / `require_fleet_read`, ADR-0017), as `query_software` does with
+    /// its `agent_ids` push-down (this method has none yet). AUTHORITATIVE read:
     /// `std::nullopt` on a store/pool/query degrade; an empty `purl` is a precondition miss ->
     /// empty value. No route, tool or page calls this yet.
     [[nodiscard]] std::optional<std::vector<SoftwareFleetRow>> find_by_purl(std::string_view purl,
