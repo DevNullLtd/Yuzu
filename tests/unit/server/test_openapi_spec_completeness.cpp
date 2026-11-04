@@ -2393,17 +2393,20 @@ TEST_CASE("openapi documents: the response status set of the hand-checked operat
             INFO(row.method << " " << row.path);
             // CHECK, not REQUIRE: a missing route must report itself and let the remaining rows
             // and the second document form still run.
-            const bool has_path = spec["paths"].contains(row.path);
+            const bool has_path = spec.at("paths").contains(row.path);
             CHECK(has_path);
             if (!has_path)
                 continue;
-            const bool has_method = spec["paths"].at(row.path).contains(row.method);
+            const bool has_method = spec.at("paths").at(row.path).contains(row.method);
             CHECK(has_method);
             if (!has_method)
                 continue;
             const json* responses = find_at(spec, {"paths", row.path, row.method, "responses"});
             CHECK(responses != nullptr);
-            if (responses == nullptr || !responses->is_object())
+            if (responses == nullptr)
+                continue;
+            CHECK(responses->is_object());
+            if (!responses->is_object())
                 continue;
             std::set<std::string> declared;
             for (const auto& [code, response] : responses->items())
@@ -2417,8 +2420,8 @@ TEST_CASE("openapi documents: the plugin-config success responses reference the 
           "envelope schemas the handlers return",
           "[openapi][structure][responses]") {
     // plugin_config_routes.cpp answers GET/PUT of a value as {data: <entry>, meta}, the secret
-    // PUT as {data: <metadata>, meta}, and both DELETEs as {deleted: true, meta} (no data
-    // wrapper). Each row names the operation, the schema its 200 must reference, and that
+    // PUT as {data: <metadata>, meta}, GET/PUT of a kill switch as {data: <switch>, meta}, and
+    // both DELETEs as {deleted: true, meta} (no data wrapper). Each row names the operation, the schema its 200 must reference, and that
     // schema's required members. The schema's property keys must equal its required members
     // exactly, on purpose: a new optional top-level member is an envelope change a client should
     // be told about, so it has to update this table. The 200 description must also state the
@@ -2438,33 +2441,35 @@ TEST_CASE("openapi documents: the plugin-config success responses reference the 
          {"deleted", "meta"}},
         {"/plugin-config/{plugin}/{key}/secret", "delete", "PluginConfigDeleteResponse",
          {"deleted", "meta"}},
+        {"/plugin-config/{plugin}/kill-switch", "get", "PluginConfigKillSwitchResponse",
+         {"data", "meta"}},
+        {"/plugin-config/{plugin}/kill-switch", "put", "PluginConfigKillSwitchResponse",
+         {"data", "meta"}},
     };
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
         const json spec = json::parse(document_text(with_guides));
         for (const auto& row : rows) {
             INFO(row.method << " " << row.path);
-            const json* ok =
-                find_at(spec, {"paths", row.path, row.method, "responses", "200"});
+            const json* ok = find_at(spec, {"paths", row.path, row.method, "responses", "200"});
             CHECK(ok != nullptr);
             if (ok == nullptr)
                 continue;
-            const json* ref_node =
-                find_at(*ok, {"content", "application/json", "schema", "$ref"});
-            CHECK(ref_node != nullptr);
+            const json* ref_node = find_at(*ok, {"content", "application/json", "schema", "$ref"});
+            CHECK((ref_node != nullptr && ref_node->is_string()));
             if (ref_node != nullptr && ref_node->is_string())
                 CHECK(ref_node->get<std::string>() ==
                       std::string("#/components/schemas/") + row.schema);
             const json* description = find_at(*ok, {"description"});
-            CHECK(description != nullptr);
+            CHECK((description != nullptr && description->is_string()));
             if (description != nullptr && description->is_string())
                 CHECK(description->get<std::string>().find("meta: {api_version}") !=
                       std::string::npos);
             const json* required = find_at(spec, {"components", "schemas", row.schema, "required"});
             const json* properties =
                 find_at(spec, {"components", "schemas", row.schema, "properties"});
-            CHECK(required != nullptr);
-            CHECK(properties != nullptr);
+            CHECK((required != nullptr && required->is_array()));
+            CHECK((properties != nullptr && properties->is_object()));
             if (required != nullptr && required->is_array())
                 CHECK(set_of(*required) == row.required);
             if (properties != nullptr && properties->is_object())

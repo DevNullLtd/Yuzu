@@ -10065,7 +10065,8 @@ not be opened or written).
 **`size_exceeded` ends the session:** the server attempts to cancel it and, when that cancel succeeds, discards the partial file. The request answers `413` either way.
 
 **Audit:** chunks are not audited one by one. Only `upload_grant.chunk` `failure` rows for `expired`
-and `size_exceeded` are written.
+and `size_exceeded` are written, and on a best-effort basis: a row that cannot be persisted sets
+`Sec-Audit-Failed` on the response and the request still completes.
 
 #### `POST /api/v1/uploads/{upload_id}/commit`
 
