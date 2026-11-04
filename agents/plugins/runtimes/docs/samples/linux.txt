@@ -1,4 +1,4 @@
-captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-28 · euid 1000 · leg-hash 10a510136fd8
+captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-28 · euid 1000 · leg-hash 95588fa519d1
 == action=dotnet
 status|dotnet|supported|-
 [result_status] OK / FULL / 

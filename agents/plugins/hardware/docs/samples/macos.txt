@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-27 · euid 501 · leg-hash c78d09361368
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-27 · euid 501 · leg-hash 93cbaf4434ef
 == action=manufacturer
 manufacturer|Apple Inc.
 [result_status] UNDECLARED / UNKNOWN / 
@@ -49,4 +49,8 @@ status|swap|unsupported|macos:planned
 == action=machine_id
 status|machine_id|unsupported|macos:planned
 [result_status] UNAVAILABLE / UNKNOWN / macos:planned
+
+== action=drivers_inventory
+status|drivers_inventory|unsupported|macos:no_enumeration_api
+[result_status] UNAVAILABLE / PARTIAL / macos:no_enumeration_api
 

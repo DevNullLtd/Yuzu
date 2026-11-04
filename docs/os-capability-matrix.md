@@ -491,6 +491,9 @@ implementation is.
 | hardware | drivers | linux | supported | 1 | /proc/modules | - |
 | hardware | drivers | macos | unsupported | - | - | - |
 | hardware | drivers | windows | supported | 1 | WMI Win32_PnPSignedDriver | - |
+| hardware | drivers_inventory | linux | supported | 1 | /proc/modules + /sys/module/<m>/{version,taint} bounded no-follow reads | signed state is derived from the per-module taint flag E only; signer, INF, hardware id and date have no Linux source |
+| hardware | drivers_inventory | macos | unsupported | - | - | no public kext/dext enumeration API |
+| hardware | drivers_inventory | windows | supported | 1 | WMI Win32_PnPSignedDriver (DeviceName, DriverVersion, DriverDate, DriverProviderName, DeviceClass, Signer, IsSigned, InfName, HardWareID), bounded | - |
 | hardware | system | linux | supported | 1 | /sys/class/dmi/id/product_serial + product_uuid | - |
 | hardware | system | macos | supported | 1 | IOServiceGetMatchingService(IOPlatformExpertDevice) + IORegistryEntryCreateCFProperty(kIOPlatformSerialNumberKey/kIOPlatformUUIDKey) | - |
 | hardware | system | windows | supported | 1 | WMI Win32_BIOS.SerialNumber + Win32_ComputerSystemProduct.UUID | - |
@@ -762,11 +765,11 @@ implementation is.
 | remote_access_audit | list | macos | supported | 2 | bounded reads of /etc/ssh/sshd_config (Include followed, config symlinks followed as sshd does) and each account's authorized_keys (no-follow; pure parsers, SHA-256 fingerprints); one bounded launchctl print-disabled system argv | configured access as written, not sshd's effective policy; the launchd override is not 'running'; CA trust, key and principals commands, a principals file, hostbased auth and AuthenticationMethods are not read; the Remote Login access list (pam_sacl) is not read; key comments, option values and key-file paths are never emitted; only homes under /Users owned by uid 500 or above, and /var/root, are walked; a symlinked key file or .ssh is refused; network mounts are skipped |
 | remote_access_audit | list | windows | planned | 1 | per-profile .ssh\\authorized_keys, %ProgramData%\\ssh\\administrators_authorized_keys and sshd_config via win_profiles | not read yet: one unsupported status row, windows:planned |
 | runtimes | dotnet | linux | supported | 1 | /usr/share/dotnet, /usr/lib/dotnet, /usr/lib64/dotnet shared/<framework>/<version> and sdk/<version> directory walk; network mounts skipped via /proc/self/mountinfo | - |
-| runtimes | dotnet | macos | planned | 1 | /usr/local/share/dotnet/shared walk | planned; the action answers a single unsupported status row on this OS |
-| runtimes | dotnet | windows | planned | 1 | NDP release-key table + dotnet InstalledVersions + Program Files walk | planned; the action answers a single unsupported status row on this OS |
+| runtimes | dotnet | macos | supported | 1 | /usr/local/share/dotnet (and x64/) shared/<framework>/<version> and sdk/<version> directory walk; network mounts skipped via getmntinfo_r_np | - |
+| runtimes | dotnet | windows | supported | 1 | HKLM\\SOFTWARE\\dotnet\\Setup\\InstalledVersions\\<arch>\\{sharedfx,sdk} values + NDP v4 Full Release key table and v3.5 Version, both registry views; no filesystem walk | - |
 | runtimes | jvm | linux | supported | 1 | <home>/release file reads under /usr/lib/jvm, /opt/java, /usr/lib64/jvm, /var/opt/java (bin/java probe when a home has no release); network mounts skipped via /proc/self/mountinfo | - |
-| runtimes | jvm | macos | planned | 1 | /Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict + Contents/Home/release | planned; the action answers a single unsupported status row on this OS |
-| runtimes | jvm | windows | planned | 1 | JavaSoft keys + Program Files\\Java walk | planned; the action answers a single unsupported status row on this OS |
+| runtimes | jvm | macos | supported | 1 | /Library/Java/JavaVirtualMachines/*/Contents/Home/release read (Contents/Info.plist JavaVM dict fallback); network mounts skipped via getmntinfo_r_np | - |
+| runtimes | jvm | windows | supported | 1 | HKLM JavaSoft, Eclipse Adoptium and Azul Zulu keys (both views) + one <home>\\release read; no Program Files walk | - |
 | runtimes | python | linux | constrained | 1 | single-level listing of /usr/bin and /usr/local/bin for python3.<minor> regular files; version is major.minor from the name (patch level not read); network mounts skipped via /proc/self/mountinfo | patch level unavailable without running the interpreter |
 | runtimes | python | macos | supported | 1 | single-level listing of /Library/Frameworks/Python.framework/Versions; version from each version's Resources/Info.plist; network mounts skipped via getmntinfo_r_np | - |
 | runtimes | python | windows | supported | 1 | HKLM\\SOFTWARE\\Python\\PythonCore\\<tag> Version/SysVersion/InstallPath in both registry views (PEP 514); per-user hives never read | - |
