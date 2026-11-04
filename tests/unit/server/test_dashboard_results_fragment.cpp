@@ -116,7 +116,9 @@ struct FragmentResultsHarness {
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                           const std::string&) -> bool { return true; };
         auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                           const std::string&, const std::string&, const std::string&) {};
+                           const std::string&, const std::string&, const std::string&) {
+            return true;
+        };
 
         // fleet_read_fn_ is deliberately left UNWIRED here -- `routes` reads
         // it live per-request (the handler captures `this`, not a snapshot
@@ -248,6 +250,7 @@ TEST_CASE("GET /api/v1/echo/retention-paused: service-scoped token denial is aud
                               const std::string& result, const std::string& target_type,
                               const std::string& target_id, const std::string& detail) {
         audits.push_back({action, result, target_type, target_id, detail});
+        return true;
     };
 
     routes.register_routes(
