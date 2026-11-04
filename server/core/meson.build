@@ -562,6 +562,21 @@ cpe_map_embed = custom_target(
   ],
 )
 
+# SAM.4 provisional software-title alias pack (content/software-normalization/aliases.csv)
+# embedded as kSoftwareNormalizationSeed; the runtime parser is the authoritative floor.
+software_normalization_seed_embed = custom_target(
+  'software_normalization_seed',
+  input: files('../../content/software-normalization/aliases.csv'),
+  output: 'software_normalization_seed.cpp',
+  command: [
+    embed_python,
+    files('scripts/embed_binary.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'SoftwareNormalizationSeed',
+  ],
+)
+
 # Vendored Nayuki QR-Code-generator (MIT, pinned v1.8.0; see
 # server/core/vendor/qrcodegen/qrcodegen-NOTICE.txt). Built as its own
 # static lib with warnings off so third-party source does not trip our
@@ -600,6 +615,52 @@ yuzu_key_provider_dep = declare_dependency(
   dependencies: [openssl_dep],
 )
 
+# yuzu_server_core is built as TWO static libraries because a single MSVC
+# /GL (LTO) archive of every server TU passed the 4 GiB COFF archive limit:
+# the Windows release job failed with "LNK1248: image size (1000F160B) exceeds
+# maximum allowable size (FFFFFFFF)". This is a lib.exe size cut, NOT the
+# ADR-0031 presentation/core boundary. LTO is unchanged: /LTCG runs at the
+# final exe/test link over the IR of both archives.
+#
+# yuzu_server_routes_lib holds server.cpp, rest_api_v1.cpp, mcp_server.cpp,
+# mcp_tools_discovery.cpp and the *_routes / *_ui handlers EXCEPT auth_routes,
+# home_ui and login_ui, which core-lib files call. yuzu_server_core_lib holds
+# everything else.
+#
+# Which lib does a new TU belong in? Handlers and page renderers (*_routes,
+# *_ui) go in routes, unless a core-lib TU calls them: auth_routes, home_ui and
+# login_ui are the three that stayed in core for that reason. Everything else
+# (models, stores, API seams, mcp_* helpers) defaults to core; it goes in routes
+# only if it includes or calls something defined in server.cpp, rest_api_v1.cpp,
+# mcp_server.cpp or a *_routes / *_ui TU (mcp_tools_discovery.cpp is the one such
+# case). Keep the edge ONE-WAY: nothing in yuzu_server_core_lib may reference a
+# symbol defined in yuzu_server_routes_lib, so the cut stays movable. Nothing
+# enforces that at link time (both libs are always linked together, and the MSVC
+# linker, GNU ld under start-group and ld64 do not reject a cycle). On
+# Linux/macOS, `nm` over the two libs' .a.p object dirs shows a violation (an
+# undefined symbol in a core object that only a routes object defines); on a
+# -Db_lto build use gcc-nm or `nm --plugin`, because plain nm reads LTO objects
+# as empty and the check would pass vacuously. check_core_presentation_link.py
+# covers only the enrolled families, not this.
+# Routes-lib static initialisers (shell::bake in the *_ui TUs) call into core,
+# so keep core free of order-sensitive namespace-scope dynamic initialisation.
+#
+# Re-split trigger: split again along the REST/MCP handler layer (rest_api_v1,
+# mcp_*) when either archive passes about 3.2 GiB (80% of the 4 GiB cap) in the
+# Windows release+LTO job.
+#
+# Both targets MUST use the SAME cpp_args and dependencies: CPPHTTPLIB_*
+# defines change httplib class layout, and a mismatch is an ODR violation the
+# linker folds silently (see yuzu_server_core_dep below).
+yuzu_server_core_cpp_args = https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []) + switch_werror_args
+yuzu_server_core_incs = include_directories('include', '../../common/include')
+yuzu_server_core_deps = [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
+                         sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
+                         libpq_dep, yuzu_key_provider_dep]
+yuzu_server_core_deps += auth_crypto_deps
+yuzu_server_core_deps += https_deps
+yuzu_server_core_deps += saml_deps
+
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
@@ -615,11 +676,11 @@ yuzu_server_core_lib = static_library(
    yuzu_echo_timeline_js_embed,
    echo_retention_tiers_tsv_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
+   software_normalization_seed_embed,
   files(
     'src/config_secret_keys.cpp',
     'src/runtime_config_store.cpp',
     'src/runtime_config_view.cpp',
-    'src/server.cpp',
     'src/agent_registry.cpp',
     'src/agent_service_impl.cpp',
     'src/gateway_service_impl.cpp',
@@ -631,6 +692,7 @@ yuzu_server_core_lib = static_library(
     'src/auth_db.cpp',
     'src/enrollment_cfg_import.cpp', # WS-6 6.2: one-time legacy enrollment .cfg -> Postgres import
     'src/auth_routes.cpp',
+    'src/rest_a4_envelope.cpp', # A4 error envelope + correlation id (moved out of rest_api_v1.cpp: lib-split back edge)
     'src/authz_gates.cpp',
     'src/mfa_step_up.cpp',
     'src/route_inventory.cpp', # process-wide record of HttplibRouteSink registrations (boot-time step-up sweep)
@@ -639,34 +701,17 @@ yuzu_server_core_lib = static_library(
     'src/totp.cpp',
     'src/auto_approve.cpp',
     'src/cidr_match.cpp',
-    'src/dashboard_ui.cpp',
     'src/app_shell.cpp',
     'src/enrolment_render.cpp', # Groups and enrolment page: pure enrolment fragment renderers
     'src/groups_render.cpp', # Groups and enrolment page: pure group tree / detail / members renderers
-    'src/groups_ui.cpp', # Groups and enrolment page: the page template
-    'src/groups_routes.cpp', # Groups and enrolment page: /groups + static glue
     'src/integrations_render.cpp', # System Integrations: pure MCP/Gateway panels + MCP form parser
-    'src/integrations_routes.cpp',
-    'src/integrations_ui.cpp',
     'src/access_render.cpp', # Access pages (Phase 2): pure HTML renderers for /access/users
-    'src/access_ui.cpp', # Access pages: the Users page template
-    'src/access_routes.cpp', # Access pages: /access/users + its two fragments + static glue
     'src/access_tokens_render.cpp', # Tokens and principals page: pure renderers
-    'src/access_tokens_ui.cpp', # Tokens and principals page: template
-    'src/access_tokens_routes.cpp', # Tokens and principals page: /access/tokens + fragments + glue
     'src/access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
-    'src/access_audit_ui.cpp', # Audit and reviews page: template
-    'src/access_audit_routes.cpp', # Audit and reviews page: /access/audit + fragments + glue
     'src/access_reviews_render.cpp', # Audit and reviews page: Access reviews renderers
-    'src/access_reviews_routes.cpp', # Audit and reviews page: Access reviews fragments
     'src/login_ui.cpp',
-    'src/settings_ui.cpp',
-    'src/settings_security_ui.cpp',  # Security and sign-in page (System group)
     'src/settings_security_render.cpp', # pure SSO / 2FA / HTTPS / mTLS panel renderers
-    'src/settings_routes.cpp',
     'src/settings_model.cpp', # #4028 — shared REST/fragment Settings read-twin builders
-    'src/settings_general_routes.cpp', # System "General and appearance": page + 2 UI fragments
-    'src/settings_general_ui.cpp',
     'src/plugin_signing_helpers.cpp',
     'src/nvd_db.cpp',
     'src/nvd_version.cpp',
@@ -677,7 +722,6 @@ yuzu_server_core_lib = static_library(
     'src/update_registry.cpp',
     'src/response_store.cpp',
     'src/forensics_visibility.cpp', # #4990: ForensicsVisibilityFn + the production resolver
-    'src/response_routes.cpp',
     'src/response_query_model.cpp', # #2146 A2-R2: shared REST v1 + MCP builder for the
                                      # instruction/command-ID-keyed response query/aggregate/export surface
     'src/bundle_service.cpp',
@@ -686,7 +730,6 @@ yuzu_server_core_lib = static_library(
     'src/credential_change_owner.cpp', # #5342: ADR-0012 §3 query owner — one-transaction
                                        # local credential change (auth + session_store + audit_store)
     'src/tag_store.cpp',
-    'src/tag_routes.cpp',
     'src/scope_engine.cpp',
     'src/scope_preview.cpp', # #2146 Batch B2: shared REST v1 + MCP scope-preview builder
     'src/yaml_scan.cpp',
@@ -697,14 +740,10 @@ yuzu_server_core_lib = static_library(
     'src/instruction_store.cpp',
     'src/instruction_yaml.cpp',
     'src/instruction_definition_model.cpp', # #4029: shared REST v1 + MCP builder
-    'src/instruction_routes.cpp',
     'src/execution_tracker.cpp',
     'src/execution_model.cpp',
-    'src/execution_routes.cpp',
-    'src/health_routes.cpp',
     'src/healthcheck_probe.cpp', # #5906: yuzu-server --healthcheck transport
     'src/home_panels_render.cpp',
-    'src/home_panels_routes.cpp',
     'src/leader_elector.cpp',
     'src/pg_reachability_probe.cpp', # HA WS-8: runtime Postgres-reachability signal for /readyz
     'src/command_outbox_store.cpp',
@@ -717,25 +756,14 @@ yuzu_server_core_lib = static_library(
     'src/approval_manager.cpp',
     'src/approval_model.cpp',
     'src/schedule_engine.cpp',
-    'src/schedule_routes.cpp',
     'src/schedule_runner.cpp',
     'src/schedule_model.cpp', # ADR-0031 WS-A4: seventh per-family seam, pure JSON row builder
     'src/schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam
-    'src/help_ui.cpp',
-    'src/swagger_page_ui.cpp',
     'src/home_ui.cpp',     # Home (/home): the sign-in landing page, rendered per request
     'src/home_render.cpp', # Dashboard panels: pure value structs + renderers
-    'src/home_routes.cpp', # Dashboard: GET /fragments/dashboard/summary over injected seams
-    'src/instruction_ui.cpp',
-    'src/echo_page_ui.cpp',
-    'src/echo_timeline_page_ui.cpp', # hidden Echo timeline page shell (flag-gated route)
-    'src/result_sets_ui.cpp',
     'src/result_set_extras_render.cpp',
     'src/approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
-    'src/approvals_ui.cpp',
     'src/executions_page_render.cpp', # Operate O1: the Executions page's pure list and panel renderers
-    'src/executions_ui.cpp',
-    'src/workflows_ui.cpp',
     'src/workflows_page_render.cpp', # Operate WF-A: the Workflows page's pure definitions and schedules renderers
     'src/rbac_store.cpp',
     'src/rbac_admin_authority_owner.cpp',
@@ -754,20 +782,16 @@ yuzu_server_core_lib = static_library(
     'src/session_store.cpp',
     'src/plugin_config_store.cpp',
     'src/enablement_store.cpp', # ADR-3006: durable enablement store + continuity anchor
-    'src/plugin_config_routes.cpp',
     'src/upload_grant_store.cpp',
-    'src/file_retrieval_routes.cpp',
     'src/secure_random.cpp',
     'src/scim_store.cpp',
     'src/scim_json.cpp',
-    'src/scim_routes.cpp',
     'src/sso_boot_guard.cpp',
     'src/deprovision_revoke.cpp',
     'src/quarantine_store.cpp',
     'src/quarantine_reapply.cpp',
     'src/quarantine_containment_reconciler.cpp',
     'src/result_set_store.cpp',
-    'src/result_set_routes.cpp',
     'src/result_set_matcher.cpp',
     'src/result_set_model.cpp', # #2146 Batch B2: shared REST v1 + MCP builder
     'src/policy_store.cpp',
@@ -785,28 +809,19 @@ yuzu_server_core_lib = static_library(
     'src/dex_alert_router.cpp',
     'src/dex_blast_radius.cpp',
     'src/custom_properties_store.cpp',
-    'src/custom_properties_routes.cpp',
     'src/device_data_render.cpp',
-    'src/device_data_routes.cpp',
-    'src/mcp_server.cpp',
     'src/mcp_input_schema.cpp',
     'src/instruction_param_schema.cpp',
     'src/mcp_orientation.cpp',
     'src/mcp_session.cpp',
     'src/mcp_stream.cpp',
     'src/mcp_stream_bridge.cpp',
-    'src/mcp_tools_discovery.cpp',
     'src/mcp_tools_hardware.cpp',
     'src/mcp_tools_containment.cpp',
     'src/mcp_tools_crypto.cpp',
     'src/mcp_transport.cpp',
-    'src/rest_api_v1.cpp',
     'src/compliance_model.cpp',
     'src/compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam
-    'src/compliance_routes.cpp',
-    'src/policy_admin_routes.cpp', # ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin — outside the seam)
-    'src/guardian_routes.cpp',
-    'src/dex_routes.cpp',
     'src/dex_read_model.cpp',
     'src/dex_types.cpp', # ADR-0031 WS-A4 PR-1 F1 fix: pure catalogue/health computation, relocated out of dex_routes.cpp
     'src/dex_window.cpp', # ADR-0031 WS-A4 PR-1 F1 fix: pure window/OS-filter resolvers, relocated out of dex_routes.cpp
@@ -818,92 +833,43 @@ yuzu_server_core_lib = static_library(
     'src/software_deployment_model.cpp', # #2146 Batch B5 -- shared REST+MCP builder (Rule 1)
     'src/dex_perf_model.cpp',
     'src/dex_app_perf_model.cpp',
-    'src/dex_app_perf_ui.cpp',
-    'src/dex_perf_ui.cpp',
     'src/network_perf_model.cpp',
     'src/network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
-    'src/network_routes.cpp',
-    'src/network_ui.cpp',
     'src/discovered_devices_model.cpp',
     'src/discovered_devices_reader.cpp',
     'src/device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
-    'src/device_routes.cpp',
-    'src/device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
-    'src/device_ui.cpp',
     'src/group_agent_count_preview.cpp',
-    'src/inventory_routes.cpp',
-    'src/inventory_ui.cpp',
     'src/inventory_ci_join.cpp',
     'src/hardware_list_model.cpp',
     'src/device_containment_render.cpp',
-    'src/device_containment_routes.cpp',
     'src/device_estate_render.cpp',
-    'src/device_estate_routes.cpp',
-    'src/hardware_routes.cpp',
-    'src/hardware_ui.cpp',
-    'src/hardware_actions_ui.cpp',
-    'src/sle_routes.cpp',
     'src/software_catalog_rollup.cpp',
+    'src/software_normalization_job.cpp',
+    'src/software_title_dimension.cpp',
     'src/software_catalogue_model.cpp',
     'src/crypto_cbom.cpp',    # /crypto CBOM export: pure CycloneDX 1.7 shaper
     'src/crypto_library_model.cpp', # /crypto slice 1: pure curated table + shared REST/MCP model
     'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
-    'src/crypto_routes.cpp',  # /crypto slice 1: page + fragments + REST v1 route owner
-    'src/crypto_ui.cpp',      # /crypto slice 1: pure HTML renderers
     'src/crypto_widget_catalogue.cpp', # /crypto widgets: pure catalogue + D13 windows + JSON shapers
     'src/crypto_dashboard_layout_store.cpp', # /crypto widgets: per-operator layout (born-on-PG)
-    'src/preflight_routes.cpp',
-    'src/preflight_ui.cpp',
     'src/preflight_eval.cpp',
     'src/preflight_run_store.cpp',
     'src/preflight_runner.cpp',
-    'src/verify_routes.cpp',
-    'src/verify_ui.cpp',
     'src/verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
     'src/dex_api.cpp', # ADR-0031 WS-A4: the fifth per-family in-process API seam (DEX signals)
     'src/dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
-    'src/deployment_routes.cpp',
-    'src/deployment_ui.cpp',
     'src/deployments_render.cpp',
     'src/deployment_run_store.cpp',
     'src/deployment_engine.cpp',
     'src/echo_process_tree.cpp',
     'src/echo_timeline_render.cpp',
-    'src/echo_tree_routes.cpp',
-    'src/dashboard_routes.cpp',
-    'src/workflow_routes.cpp',
-    'src/notification_routes.cpp',
-    'src/command_routes.cpp',
-    'src/page_routes.cpp',
-    'src/dashboard_api_routes.cpp',
-    'src/nvd_routes.cpp',
-    'src/approval_routes.cpp',
+    'src/instruction_execute.cpp', # the transport-free core shared by the v1 REST and MCP instruction-definition execute twins (#2146)
+    'src/instruction_execute_ports.cpp', # production store bindings for the shared core
     'src/config_write.cpp', # the transport-free core shared by the config routes (legacy + v1) and the MCP get/set_runtime_config tools
-    'src/config_routes.cpp', # #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
-    'src/diagnostics_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API, extracted onto the HttpRouteSink seam
-    'src/legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
-    'src/instruction_fragment_routes.cpp', # #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
     'src/instruction_extras_render.cpp', # Instructions extras: YAML-save merge + library fragment helpers
-    'src/approvals_fragment_routes.cpp', # #2542 PR-12: the Approvals HTMX fragment, extracted onto the HttpRouteSink seam
-    'src/mcp_disabled_routes.cpp', # #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
-    'src/webhook_routes.cpp',
-    'src/offload_routes.cpp',
     'src/integrations_sync_render.cpp', # SYS-5: pure webhook / offload / directory-sync panel renderers
-    'src/integrations_sync_routes.cpp', # SYS-5: the six Integrations read fragments + controller JS route
-    'src/discovery_routes.cpp',
-    'src/discover_routes.cpp', # A2 discovery surface: /api/v1/discover/* (Issue 17.1)
-    'src/settings_data_ui.cpp', # System > Data and retention page template (SYS-4)
     'src/developer_render.cpp', # System > Developer and API: pure renderers (SYS-4)
-    'src/developer_routes.cpp', # System > Developer and API: page + fragments (SYS-4)
-    'src/developer_ui.cpp', # System > Developer and API page template (SYS-4)
     'src/enrollment_directory_model.cpp', # #4031: shared row builders — directory/enrollment/OIDC-config read twins
-    'src/enrollment_directory_routes.cpp', # #4031: REST v1 read twins — /api/v1/{directory,enrollment,settings/oidc}
-    'src/viz_routes.cpp',
-    'src/viz_page_ui.cpp',
-    'src/viz_host_page_ui.cpp',
-    'src/compliance_ui.cpp',
-    'src/guardian_ui.cpp',
-    'src/guardian_page_ui.cpp',
     'src/cel_eval.cpp',
     'src/compliance_eval.cpp',
     'src/list_keyset.cpp', # pure keyset cursor/int primitives (workflow-execution list)
@@ -923,18 +889,17 @@ yuzu_server_core_lib = static_library(
     'src/dex_app_version_failures_owner.cpp',
     'src/inventory_ingestion.cpp',
     'src/inventory_store.cpp',
-    'src/data_inventory_routes.cpp',
     'src/software_inventory_store.cpp',
     'src/vuln_finding_store.cpp',
     'src/product_normalize.cpp',
     'src/product_registry_store.cpp',
+    'src/software_normalization_pack.cpp',
     'src/software_licensing_store.cpp',
     'src/software_licensing_ingestion.cpp',
     'src/app_usage_store.cpp',           # Wave 7b PR7b.2
     'src/certificate_inventory_store.cpp',      # slice-2 PR 2a-2a
     'src/certificate_inventory_ingestion.cpp',  # slice-2 PR 2a-2a
     'src/app_usage_ingestion.cpp',       # Wave 7b PR7b.2
-    'src/app_usage_routes.cpp',          # Wave 7b PR7b.2
     'src/app_usage_read_model.cpp',      # Wave 7b PR7b.2 (Rule 1 shared builder)
     'src/device_ci_ingestion.cpp',
     'src/device_inventory_store.cpp',
@@ -982,43 +947,156 @@ yuzu_server_core_lib = static_library(
     'src/ca_store.cpp',
     'src/crl_publisher.cpp',
     'src/default_certs.cpp',
-    'src/ca_routes.cpp',
     'src/ca_panel_render.cpp',
+    'src/plugin_page_model.cpp',
+    'src/kek_panel_render.cpp',
+    'src/security_headers.cpp',
+  )],
+  include_directories: yuzu_server_core_incs,
+  cpp_args: yuzu_server_core_cpp_args,
+  dependencies: yuzu_server_core_deps,
+)
+
+# Upper half of the server core (see the split comment above). Depends on
+# yuzu_server_core_lib; the reverse is forbidden.
+yuzu_server_routes_lib = static_library(
+  'yuzu_server_routes',
+  files(
+    'src/server.cpp',
+    'src/dashboard_ui.cpp',
+    'src/groups_ui.cpp', # Groups and enrolment page: the page template
+    'src/groups_routes.cpp', # Groups and enrolment page: /groups + static glue
+    'src/integrations_routes.cpp',
+    'src/integrations_ui.cpp',
+    'src/access_ui.cpp', # Access pages: the Users page template
+    'src/access_routes.cpp', # Access pages: /access/users + its two fragments + static glue
+    'src/access_tokens_ui.cpp', # Tokens and principals page: template
+    'src/access_tokens_routes.cpp', # Tokens and principals page: /access/tokens + fragments + glue
+    'src/access_audit_ui.cpp', # Audit and reviews page: template
+    'src/access_audit_routes.cpp', # Audit and reviews page: /access/audit + fragments + glue
+    'src/access_reviews_routes.cpp', # Audit and reviews page: Access reviews fragments
+    'src/settings_ui.cpp',
+    'src/settings_security_ui.cpp',  # Security and sign-in page (System group)
+    'src/settings_routes.cpp',
+    'src/settings_general_routes.cpp', # System "General and appearance": page + 2 UI fragments
+    'src/settings_general_ui.cpp',
+    'src/response_routes.cpp',
+    'src/tag_routes.cpp',
+    'src/instruction_routes.cpp',
+    'src/execution_routes.cpp',
+    'src/health_routes.cpp',
+    'src/home_panels_routes.cpp',
+    'src/schedule_routes.cpp',
+    'src/help_ui.cpp',
+    'src/swagger_page_ui.cpp',
+    'src/home_routes.cpp', # Dashboard: GET /fragments/dashboard/summary over injected seams
+    'src/instruction_ui.cpp',
+    'src/echo_page_ui.cpp',
+    'src/echo_timeline_page_ui.cpp', # hidden Echo timeline page shell (flag-gated route)
+    'src/result_sets_ui.cpp',
+    'src/approvals_ui.cpp',
+    'src/executions_ui.cpp',
+    'src/workflows_ui.cpp',
+    'src/plugin_config_routes.cpp',
+    'src/file_retrieval_routes.cpp',
+    'src/scim_routes.cpp',
+    'src/result_set_routes.cpp',
+    'src/custom_properties_routes.cpp',
+    'src/device_data_routes.cpp',
+    'src/mcp_server.cpp',
+    'src/mcp_tools_discovery.cpp',
+    'src/rest_api_v1.cpp',
+    'src/compliance_routes.cpp',
+    'src/policy_admin_routes.cpp', # ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin — outside the seam)
+    'src/guardian_routes.cpp',
+    'src/dex_routes.cpp',
+    'src/dex_app_perf_ui.cpp',
+    'src/dex_perf_ui.cpp',
+    'src/network_routes.cpp',
+    'src/network_ui.cpp',
+    'src/device_routes.cpp',
+    'src/device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
+    'src/device_ui.cpp',
+    'src/inventory_routes.cpp',
+    'src/inventory_ui.cpp',
+    'src/device_containment_routes.cpp',
+    'src/device_estate_routes.cpp',
+    'src/hardware_routes.cpp',
+    'src/hardware_ui.cpp',
+    'src/hardware_actions_ui.cpp',
+    'src/sle_routes.cpp',
+    'src/crypto_routes.cpp',  # /crypto slice 1: page + fragments + REST v1 route owner
+    'src/crypto_ui.cpp',      # /crypto slice 1: pure HTML renderers
+    'src/preflight_routes.cpp',
+    'src/preflight_ui.cpp',
+    'src/verify_routes.cpp',
+    'src/verify_ui.cpp',
+    'src/deployment_routes.cpp',
+    'src/deployment_ui.cpp',
+    'src/echo_tree_routes.cpp',
+    'src/dashboard_routes.cpp',
+    'src/workflow_routes.cpp',
+    'src/notification_routes.cpp',
+    'src/command_routes.cpp',
+    'src/page_routes.cpp',
+    'src/dashboard_api_routes.cpp',
+    'src/nvd_routes.cpp',
+    'src/approval_routes.cpp',
+    'src/config_routes.cpp', # #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
+    'src/diagnostics_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API, extracted onto the HttpRouteSink seam
+    'src/legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
+    'src/instruction_fragment_routes.cpp', # #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
+    'src/approvals_fragment_routes.cpp', # #2542 PR-12: the Approvals HTMX fragment, extracted onto the HttpRouteSink seam
+    'src/mcp_disabled_routes.cpp', # #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
+    'src/webhook_routes.cpp',
+    'src/offload_routes.cpp',
+    'src/integrations_sync_routes.cpp', # SYS-5: the six Integrations read fragments + controller JS route
+    'src/discovery_routes.cpp',
+    'src/discover_routes.cpp', # A2 discovery surface: /api/v1/discover/* (Issue 17.1)
+    'src/settings_data_ui.cpp', # System > Data and retention page template (SYS-4)
+    'src/developer_routes.cpp', # System > Developer and API: page + fragments (SYS-4)
+    'src/developer_ui.cpp', # System > Developer and API page template (SYS-4)
+    'src/enrollment_directory_routes.cpp', # #4031: REST v1 read twins — /api/v1/{directory,enrollment,settings/oidc}
+    'src/viz_routes.cpp',
+    'src/viz_page_ui.cpp',
+    'src/viz_host_page_ui.cpp',
+    'src/compliance_ui.cpp',
+    'src/guardian_ui.cpp',
+    'src/guardian_page_ui.cpp',
+    'src/data_inventory_routes.cpp',
+    'src/app_usage_routes.cpp',          # Wave 7b PR7b.2
+    'src/ca_routes.cpp',
     'src/kek_routes.cpp',
     'src/settings_plugins_routes.cpp',
     'src/settings_plugins_ui.cpp',
-    'src/plugin_page_model.cpp',
-    'src/kek_panel_render.cpp',
     'src/pki_routes.cpp',
     'src/settings_pki_ui.cpp',
-    'src/security_headers.cpp',
-  )],
-  include_directories: ['include', '../../common/include'],
-  cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []) + switch_werror_args,
-  dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
-                 sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
-                 libpq_dep, yuzu_key_provider_dep] + auth_crypto_deps + https_deps
-               + saml_deps,
+    'src/execution_mutation.cpp', # cancel/rerun REST v1 + MCP twins: one admit-audit-effect sequence
+    'src/mcp_instruction_execute.cpp', # MCP twin of POST /api/instructions/{id}/execute: bounds + JSON-RPC rendering over instruction_execute
+    'src/command_v1_routes.cpp', # POST /api/v1/commands: the REST v1 twin of /api/command + MCP execute_instruction (#2146)
+    'src/instruction_execute_routes.cpp', # POST /api/v1/instructions/{id}/execute
+  ),
+  include_directories: yuzu_server_core_incs,
+  cpp_args: yuzu_server_core_cpp_args,
+  dependencies: yuzu_server_core_deps,
 )
 
 yuzu_server_core_dep = declare_dependency(
-  link_with: yuzu_server_core_lib,
+  link_with: [yuzu_server_routes_lib, yuzu_server_core_lib],
   include_directories: [include_directories('include'), include_directories('../../common/include')],
   # CPPHTTPLIB_OPENSSL_SUPPORT gates real data members on httplib::ClientImpl/
   # SSLClient (header-only, inline definitions) — every consumer TU must define
-  # it identically to yuzu_server_core_lib's own cpp_args, or the linker folds
-  # mismatched-layout definitions of the same class into one symbol (ODR
-  # violation). main.cpp transitively includes <httplib.h> via scim_routes.hpp
-  # without this propagated, which corrupted httplib::Client objects on first
-  # use (SIGSEGV in NvdClient::fetch_paginated's first request).
+  # it identically to yuzu_server_core_cpp_args (shared by both server-core
+  # libs), or the linker folds mismatched-layout definitions of the same class
+  # into one symbol (ODR violation). main.cpp transitively includes
+  # <httplib.h> via scim_routes.hpp without this propagated, which corrupted
+  # httplib::Client objects on first use (SIGSEGV in
+  # NvdClient::fetch_paginated's first request).
   # CPPHTTPLIB_LISTEN_BACKLOG doesn't affect class layout (no ODR hazard), but
   # is propagated for the same reason: without it, a consumer TU falls back to
   # httplib's default listen() backlog of 5 instead of the intended 128.
   compile_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'],
-  dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
-                 sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
-                 libpq_dep, yuzu_key_provider_dep] + auth_crypto_deps + https_deps
-               + saml_deps,
+  dependencies: yuzu_server_core_deps,
 )
 
 yuzu_server_exe = executable(

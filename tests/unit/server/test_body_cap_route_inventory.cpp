@@ -339,6 +339,7 @@ constexpr DefaultAllow kDefaultIsCorrectFor[] = {
     // own workflow_yaml/product_pack_yaml kBodyCapTable entries.
     {"POST", R"body_cap_path(/api/scope/estimate)body_cap_path", "Trigger body: small JSON (scope estimate params) -- not a YAML-authoring route."},
     {"POST", R"body_cap_path(/api/instructions/([^/]+)/execute)body_cap_path", "Trigger body: small JSON (instruction execution args) -- not a YAML-authoring route."},
+    {"POST", R"body_cap_path(/api/v1/instructions/([^/]+)/execute)body_cap_path", "v1 twin of the route above (instruction_execute_routes.cpp): small JSON (targeting + params); the MCP twin bounds params at 32 keys x 64 KiB and agent_ids at 10000, so the 4 MiB default is already above every honest body."},
 
     // ── Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up,
     // 2026-08-07): 68 routes went from invisible to this scan to resolving
@@ -396,6 +397,8 @@ constexpr DefaultAllow kDefaultIsCorrectFor[] = {
     {"POST", R"body_cap_path(/api/command)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: generic command dispatch -- plugin/action identifiers (128-byte bound, validated) plus an agent_ids array; bounded well under 4 MiB even for a full-fleet target list, and fan-out is confined separately via dispatch_confined_arms."},
     {"POST", R"body_cap_path(/api/executions/([^/]+)/cancel)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: execution id from the URL only -- no meaningful body."},
     {"POST", R"body_cap_path(/api/executions/([^/]+)/rerun)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: a single 'scope' string field ('failed_only' or empty)."},
+    {"POST", R"body_cap_path(/api/v1/executions/([A-Za-z0-9_-]{1,128})/cancel)body_cap_path", "REST v1 twin of the legacy cancel: execution id from the URL only; the handler reads no body."},
+    {"POST", R"body_cap_path(/api/v1/executions/([A-Za-z0-9_-]{1,128})/rerun)body_cap_path", "REST v1 twin of the legacy rerun: the handler parses only a single boolean failed_only field and rejects any other key; the 4 MiB catch-all bounds the parse."},
     {"POST", R"body_cap_path(/api/instruction-sets)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: InstructionSet JSON body -- name + description only."},
     {"POST", R"body_cap_path(/api/instructions)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: single InstructionDefinition JSON body (id/name/version/type/plugin/action/description + a handful of flags) -- not the bulk-import route (see the report accompanying this change for /api/instructions/import, which is NOT in this allowlist)."},
     {"POST", R"body_cap_path(/api/inventory/query)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: small JSON filter body (agent_id/plugin/since/until/limit) -- same shape as the already-recorded /api/v1/inventory/query entry above."},

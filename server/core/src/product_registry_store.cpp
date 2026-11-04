@@ -1,9 +1,11 @@
 #include "product_registry_store.hpp"
 
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "software_normalization_pack.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -15,8 +17,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -40,7 +44,8 @@ const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for
     // the migration transaction, so these tables land in
     // `product_registry_store`. Runtime statements below schema-qualify
-    // explicitly. Migration v2 (product_tags) is PR4 — do NOT add it here.
+    // explicitly. v2 is the SAM.4 normalisation layer; the product_tags
+    // migration (PR4) is the next version, not part of v2.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          // Canonical product identities (roadmap §7.1). norm_key is the
@@ -75,6 +80,65 @@ const std::vector<pg::PgMigration>& migrations() {
          // The reverse lookup ("which raw names map onto this product") — the
          // posture rollup's install_count join walks aliases by product_id.
          "CREATE INDEX product_aliases_product_idx ON product_aliases (product_id);"},
+        {2,
+         // SAM.4 software-title normalisation layer. ONLINE: every ALTER adds a
+         // constant-default column (metadata-only, no table rewrite, the same
+         // precedent as software_inventory_store's additive columns) and every
+         // CREATE TABLE is a new empty table, so nothing here needs a rewrite or
+         // CREATE INDEX CONCURRENTLY.
+         "ALTER TABLE products "
+         "  ADD COLUMN IF NOT EXISTS purl_type   TEXT NOT NULL DEFAULT '',"
+         "  ADD COLUMN IF NOT EXISTS cpe_product TEXT NOT NULL DEFAULT '',"
+         "  ADD COLUMN IF NOT EXISTS origin      TEXT NOT NULL DEFAULT 'matcher',"
+         "  ADD COLUMN IF NOT EXISTS category    TEXT NOT NULL DEFAULT 'other';"
+         "ALTER TABLE product_aliases "
+         "  ADD COLUMN IF NOT EXISTS status       TEXT NOT NULL DEFAULT 'active',"
+         "  ADD COLUMN IF NOT EXISTS pack_version TEXT NOT NULL DEFAULT '';"
+         // The one loaded alias pack (id pinned to 1: a singleton).
+         "CREATE TABLE normalization_pack ("
+         "  id           INT PRIMARY KEY CHECK (id = 1),"
+         "  pack_version TEXT NOT NULL,"
+         "  sha256       TEXT NOT NULL,"
+         "  body         TEXT NOT NULL,"
+         "  loaded_by    TEXT NOT NULL,"
+         "  loaded_at    BIGINT NOT NULL);"
+         // The permanent title dimension: one row per distinct installed-software
+         // (raw_name, raw_publisher, ecosystem) triple. product_id is nullable
+         // with ON DELETE SET NULL (curating a product away must not leave a
+         // dangling identity); a 'normalized' row with a NULL product is re-queued.
+         // pack_version = '' is the stale sentinel (see the header).
+         "CREATE TABLE title_dimension ("
+         "  raw_name       TEXT NOT NULL,"
+         "  raw_publisher  TEXT NOT NULL,"
+         "  ecosystem      TEXT NOT NULL,"
+         "  norm_status    TEXT NOT NULL CHECK (norm_status IN ('normalized', 'unnormalized')),"
+         "  method         TEXT NOT NULL DEFAULT '' "
+         "                 CHECK (method IN ('', 'curated', 'pack', 'exact_norm', 'birth')),"
+         "  product_id     BIGINT REFERENCES products (product_id) ON DELETE SET NULL,"
+         "  vendor         TEXT NOT NULL DEFAULT '',"
+         "  product        TEXT NOT NULL DEFAULT '',"
+         "  edition        TEXT NOT NULL DEFAULT '',"
+         "  title_version  TEXT NOT NULL DEFAULT '',"
+         "  category       TEXT NOT NULL DEFAULT 'other' CHECK (category IN "
+         "                 ('web_server', 'database', 'message_broker', 'runtime', 'other')),"
+         "  purl_type      TEXT NOT NULL DEFAULT '',"
+         "  cpe_product    TEXT NOT NULL DEFAULT '',"
+         "  pack_version   TEXT NOT NULL,"
+         "  first_seen_at  BIGINT NOT NULL,"
+         "  updated_at     BIGINT NOT NULL,"
+         "  PRIMARY KEY (raw_name, raw_publisher, ecosystem));"
+         "CREATE INDEX title_dimension_product_idx ON title_dimension (product_id);"
+         // Titles the pack could not resolve, weighted by device count. 'rejected'
+         // is a curator decision that outlives the title's absence.
+         "CREATE TABLE curation_queue ("
+         "  raw_name        TEXT NOT NULL,"
+         "  raw_publisher   TEXT NOT NULL,"
+         "  ecosystem       TEXT NOT NULL,"
+         "  device_count    BIGINT NOT NULL DEFAULT 0,"
+         "  status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'rejected')),"
+         "  first_queued_at BIGINT NOT NULL,"
+         "  last_seen_at    BIGINT NOT NULL,"
+         "  PRIMARY KEY (raw_name, raw_publisher, ecosystem));"},
     };
     return kMigrations;
 }
@@ -139,17 +203,55 @@ double result_f64(const pg::PgResult& res, int row, int col) {
 
 // Shared SELECT column list for product reads, order matched by fill_product.
 constexpr const char* kProductCols =
-    "product_id, norm_key, vendor, title, edition, platform, created_at, updated_at";
+    "product_id, norm_key, vendor, title, edition, platform, created_at, updated_at, "
+    "purl_type, cpe_product, origin, category";
 
-void fill_product(const pg::PgResult& res, int row, ProductRow& out) {
-    out.product_id = result_i64(res, row, 0);
-    out.norm_key = PQgetvalue(res.get(), row, 1);
-    out.vendor = PQgetvalue(res.get(), row, 2);
-    out.title = PQgetvalue(res.get(), row, 3);
-    out.edition = PQgetvalue(res.get(), row, 4);
-    out.platform = PQgetvalue(res.get(), row, 5);
-    out.created_at = result_i64(res, row, 6);
-    out.updated_at = result_i64(res, row, 7);
+// `c0` is the column offset of the product block (0 for a plain products read).
+void fill_product(const pg::PgResult& res, int row, ProductRow& out, int c0 = 0) {
+    out.product_id = result_i64(res, row, c0 + 0);
+    out.norm_key = PQgetvalue(res.get(), row, c0 + 1);
+    out.vendor = PQgetvalue(res.get(), row, c0 + 2);
+    out.title = PQgetvalue(res.get(), row, c0 + 3);
+    out.edition = PQgetvalue(res.get(), row, c0 + 4);
+    out.platform = PQgetvalue(res.get(), row, c0 + 5);
+    out.created_at = result_i64(res, row, c0 + 6);
+    out.updated_at = result_i64(res, row, c0 + 7);
+    out.purl_type = PQgetvalue(res.get(), row, c0 + 8);
+    out.cpe_product = PQgetvalue(res.get(), row, c0 + 9);
+    out.origin = PQgetvalue(res.get(), row, c0 + 10);
+    out.category = PQgetvalue(res.get(), row, c0 + 11);
+}
+
+/// The dimension invalidation lock (see the header's "Dimension invalidation contract"): the
+/// BLOCKING twin of the try-lock every `SoftwareTitleDimension` pass takes, on the same key.
+/// A pass holds it for its whole transaction (each statement is bounded by the 60 s statement
+/// timeout and the pass by its 60 s budget), so the wait is bounded by a transaction-local
+/// statement timeout above that (`kNormalizationLockWait`); a timeout fails the write
+/// (fail-soft, like every write here) and the caller retries.
+bool take_normalization_lock(PGconn* c) {
+    // Both timeouts: Postgres applies `lock_timeout` to an advisory-lock wait, and the pool
+    // sets a 10 s one on every connection, so without the second SET LOCAL the writer would
+    // give up after 10 s whatever its statement_timeout says.
+    for (const char* setting : {"statement_timeout", "lock_timeout"}) {
+        const std::string sql = std::string("SET LOCAL ") + setting + " = '" +
+                                std::to_string(kNormalizationLockWait.count()) + "s'";
+        if (pg::exec_params(c, sql.c_str(), std::vector<std::string>{}).status() !=
+            PGRES_COMMAND_OK)
+            return false;
+    }
+    static const std::string lock_sql = "SELECT pg_advisory_xact_lock(hashtextextended('" +
+                                        std::string(kNormalizationLockKey) + "', 0))";
+    return pg::exec_params(c, lock_sql.c_str(), std::vector<std::string>{}).status() ==
+           PGRES_TUPLES_OK;
+}
+
+/// The stale sentinel (`pack_version = ''`): the next normalisation pass re-selects the row.
+/// `where` is a trusted literal predicate over `title_dimension`, never caller text.
+bool mark_dimension_stale(PGconn* c, const char* where, const std::vector<std::string>& params) {
+    const std::string sql = std::string("UPDATE product_registry_store.title_dimension "
+                                        "SET pack_version = '' WHERE pack_version <> '' AND (") +
+                            where + ")";
+    return pg::exec_params(c, sql.c_str(), params).status() == PGRES_COMMAND_OK;
 }
 
 } // namespace
@@ -167,6 +269,40 @@ ProductRegistryStore::ProductRegistryStore(pg::PgPool& pool) : pool_(pool) {
                       "persistence disabled");
         return;
     }
+
+    // Post-migration projection check (postgres-store-playbook "Runner guards"): run() skips
+    // any migration at or below the stored high-water mark, so a schema_meta stamped by a
+    // different binary can leave a v2 column missing while run() still reports success. One
+    // LIMIT 0 SELECT per table over every column the runtime uses touches no rows and fails
+    // the store closed here, not as `undefined column` on the first pass or pack load.
+    struct Projection {
+        const char* table;
+        const char* columns;
+    };
+    static constexpr Projection kProjections[] = {
+        {"products", kProductCols},
+        {"product_aliases", "source, raw_name, raw_publisher, product_id, method, confidence, "
+                            "first_matched_at, last_seen_at, status, pack_version"},
+        {"normalization_pack", "id, pack_version, sha256, body, loaded_by, loaded_at"},
+        {"title_dimension", "raw_name, raw_publisher, ecosystem, norm_status, method, product_id, "
+                            "vendor, product, edition, title_version, category, purl_type, "
+                            "cpe_product, pack_version, first_seen_at, updated_at"},
+        {"curation_queue", "raw_name, raw_publisher, ecosystem, device_count, status, "
+                           "first_queued_at, last_seen_at"},
+    };
+    for (const auto& p : kProjections) {
+        const std::string sql = std::string("SELECT ") + p.columns +
+                                " FROM product_registry_store." + p.table + " LIMIT 0";
+        pg::PgResult probe = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+        if (probe.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ProductRegistryStore: post-migration schema projection check failed on "
+                          "{} - an expected column is missing (hypothesis: a skipped or partial "
+                          "migration; could also be a dropped connection or other transient "
+                          "failure) - product registry persistence disabled: {}",
+                          p.table, PQresultErrorMessage(probe.get()));
+            return;
+        }
+    }
     open_ = true;
 }
 
@@ -174,38 +310,87 @@ std::optional<std::int64_t>
 ProductRegistryStore::upsert_product(std::string_view norm_key, std::string_view vendor,
                                      std::string_view title, std::string_view edition,
                                      std::string_view platform) {
-    // Fail-soft write (evaluator matcher pass): any failure returns nullopt —
-    // the next cycle re-derives the same deterministic result (roadmap R7).
+    // Fail-soft write: any failure returns nullopt - the next cycle re-derives the same
+    // deterministic result (roadmap R7). It is also a registry mutation that can change how a
+    // title resolves, so it follows the dimension invalidation contract: the blocking
+    // normalisation lock, the upsert and the stale sentinel in ONE transaction.
     if (!open_ || norm_key.empty())
         return std::nullopt;
-    auto lease = pool_.try_acquire_for(kAcquireTimeout);
-    if (!lease) {
-        spdlog::warn("ProductRegistryStore: upsert_product skipped for norm_key={}, no "
-                     "connection ({})",
+    std::optional<std::int64_t> id;
+    bool ok = false;
+    try {
+        ok = pool_.with_txn_for(kAcquireTimeout, [&](PGconn* c) -> bool {
+            if (!take_normalization_lock(c)) {
+                spdlog::warn("ProductRegistryStore: upsert_product could not take the "
+                             "normalisation lock for norm_key={}: {}",
+                             norm_key, PQerrorMessage(c));
+                return false;
+            }
+            // The row as it is now, read under the lock (every resolution-changing writer holds
+            // it): a write that changes nothing leaves every resolution as it was, so it marks
+            // nothing - a caller that refreshes each cycle must not re-queue the dimension.
+            pg::PgResult before = pg::exec_params(
+                c,
+                "SELECT vendor, title, edition, platform FROM product_registry_store.products "
+                "WHERE norm_key = $1",
+                std::vector<std::string>{std::string(norm_key)});
+            if (before.status() != PGRES_TUPLES_OK) {
+                spdlog::warn("ProductRegistryStore: upsert_product could not read the current "
+                             "row for norm_key={}: {}",
+                             norm_key, PQerrorMessage(c));
+                return false;
+            }
+            const bool existed = PQntuples(before.get()) == 1;
+            const bool unchanged = existed && vendor == PQgetvalue(before.get(), 0, 0) &&
+                                   title == PQgetvalue(before.get(), 0, 1) &&
+                                   edition == PQgetvalue(before.get(), 0, 2) &&
+                                   platform == PQgetvalue(before.get(), 0, 3);
+            // Single-statement upsert keyed on the UNIQUE norm_key. created_at is preserved on
+            // conflict; the RETURNING carries the id for both the insert and the update arm
+            // (#1033 idiom).
+            pg::PgResult res = pg::exec_params(
+                c,
+                "INSERT INTO product_registry_store.products "
+                "(norm_key, vendor, title, edition, platform, created_at, updated_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6::bigint, $6::bigint) "
+                "ON CONFLICT (norm_key) DO UPDATE SET "
+                "  vendor = EXCLUDED.vendor, title = EXCLUDED.title, edition = EXCLUDED.edition, "
+                "  platform = EXCLUDED.platform, updated_at = EXCLUDED.updated_at "
+                "RETURNING product_id",
+                std::vector<std::string>{std::string(norm_key), std::string(vendor),
+                                         std::string(title), std::string(edition),
+                                         std::string(platform), std::to_string(now_secs())});
+            if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+                spdlog::warn("ProductRegistryStore: upsert_product failed for norm_key={}: {}",
+                             norm_key, PQerrorMessage(c));
+                return false;
+            }
+            const std::int64_t pid = result_i64(res, 0, 0);
+            // A NEW product can resolve an unnormalized title (the exact-key tier); a CHANGED
+            // one changes the vendor/title/edition every row resolved to it copied.
+            if (!unchanged &&
+                !mark_dimension_stale(
+                    c, existed ? "product_id = $1::bigint" : "norm_status = 'unnormalized'",
+                    existed ? std::vector<std::string>{std::to_string(pid)}
+                            : std::vector<std::string>{})) {
+                spdlog::warn("ProductRegistryStore: upsert_product could not mark the title "
+                             "dimension stale for norm_key={}: {}",
+                             norm_key, PQerrorMessage(c));
+                return false;
+            }
+            id = pid;
+            return true;
+        });
+    } catch (const std::exception& e) {
+        spdlog::warn("ProductRegistryStore: upsert_product threw for norm_key={}: {}", norm_key,
+                     e.what());
+        return std::nullopt;
+    }
+    if (!ok)
+        spdlog::warn("ProductRegistryStore: upsert_product did not complete for norm_key={} (no "
+                     "connection, or a statement failed - see above): {}",
                      norm_key, pool_.last_error());
-        return std::nullopt;
-    }
-    // Single-statement upsert keyed on the UNIQUE norm_key: atomic, no txn or
-    // advisory lock needed. created_at is preserved on conflict; the RETURNING
-    // carries the id for both the insert and the update arm (#1033 idiom).
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "INSERT INTO product_registry_store.products "
-        "(norm_key, vendor, title, edition, platform, created_at, updated_at) "
-        "VALUES ($1, $2, $3, $4, $5, $6::bigint, $6::bigint) "
-        "ON CONFLICT (norm_key) DO UPDATE SET "
-        "  vendor = EXCLUDED.vendor, title = EXCLUDED.title, edition = EXCLUDED.edition, "
-        "  platform = EXCLUDED.platform, updated_at = EXCLUDED.updated_at "
-        "RETURNING product_id",
-        std::vector<std::string>{std::string(norm_key), std::string(vendor), std::string(title),
-                                 std::string(edition), std::string(platform),
-                                 std::to_string(now_secs())});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
-        spdlog::warn("ProductRegistryStore: upsert_product failed for norm_key={}: {}", norm_key,
-                     PQerrorMessage(lease.get()));
-        return std::nullopt;
-    }
-    return result_i64(res, 0, 0);
+    return ok ? id : std::nullopt;
 }
 
 bool ProductRegistryStore::upsert_alias(std::string_view source, std::string_view raw_name,
@@ -213,36 +398,78 @@ bool ProductRegistryStore::upsert_alias(std::string_view source, std::string_vie
                                         std::string_view method, double confidence) {
     if (!open_ || source.empty() || raw_name.empty() || product_id <= 0)
         return false;
-    auto lease = pool_.try_acquire_for(kAcquireTimeout);
-    if (!lease) {
-        spdlog::warn("ProductRegistryStore: upsert_alias skipped for ({}, {}), no connection ({})",
+    // A registry mutation that can change how a title resolves: the dimension invalidation
+    // contract applies (blocking normalisation lock, the upsert and the stale sentinel in ONE
+    // transaction). The alias key is a C++ derivation of the raw title that SQL cannot
+    // reproduce, so when the link is new or re-pointed the affected rows cannot be named and
+    // every row is marked stale; the next passes re-resolve the dimension (idempotent). A
+    // refresh that changes neither the product nor the method marks nothing.
+    bool ok = false;
+    try {
+        ok = pool_.with_txn_for(kAcquireTimeout, [&](PGconn* c) -> bool {
+            if (!take_normalization_lock(c)) {
+                spdlog::warn("ProductRegistryStore: upsert_alias could not take the "
+                             "normalisation lock for ({}, {}): {}",
+                             source, raw_name, PQerrorMessage(c));
+                return false;
+            }
+            pg::PgResult before = pg::exec_params(
+                c,
+                "SELECT product_id, method FROM product_registry_store.product_aliases "
+                "WHERE source = $1 AND raw_name = $2 AND raw_publisher = $3",
+                std::vector<std::string>{std::string(source), std::string(raw_name),
+                                         std::string(raw_publisher)});
+            if (before.status() != PGRES_TUPLES_OK) {
+                spdlog::warn("ProductRegistryStore: upsert_alias could not read the current "
+                             "link for ({}, {}): {}",
+                             source, raw_name, PQerrorMessage(c));
+                return false;
+            }
+            const bool unchanged = PQntuples(before.get()) == 1 &&
+                                   std::to_string(product_id) == PQgetvalue(before.get(), 0, 0) &&
+                                   method == PQgetvalue(before.get(), 0, 1);
+            // first_matched_at is preserved on conflict; the link's target/method/confidence +
+            // last_seen_at refresh each evaluator cycle (soft keys are re-derived, never frozen
+            // - roadmap R7). A dangling product_id fails the FK and lands in the error branch
+            // below (fail-soft, no throw).
+            pg::PgResult res = pg::exec_params(
+                c,
+                "INSERT INTO product_registry_store.product_aliases "
+                "(source, raw_name, raw_publisher, product_id, method, confidence, "
+                "first_matched_at, last_seen_at) "
+                "VALUES ($1, $2, $3, $4::bigint, $5, $6::double precision, $7::bigint, "
+                "$7::bigint) "
+                "ON CONFLICT (source, raw_name, raw_publisher) DO UPDATE SET "
+                "  product_id = EXCLUDED.product_id, method = EXCLUDED.method, "
+                "  confidence = EXCLUDED.confidence, last_seen_at = EXCLUDED.last_seen_at "
+                "RETURNING product_id",
+                std::vector<std::string>{std::string(source), std::string(raw_name),
+                                         std::string(raw_publisher), std::to_string(product_id),
+                                         std::string(method), std::to_string(confidence),
+                                         std::to_string(now_secs())});
+            if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+                spdlog::warn("ProductRegistryStore: upsert_alias failed for ({}, {}): {}", source,
+                             raw_name, PQerrorMessage(c));
+                return false;
+            }
+            if (!unchanged && !mark_dimension_stale(c, "TRUE", std::vector<std::string>{})) {
+                spdlog::warn("ProductRegistryStore: upsert_alias could not mark the title "
+                             "dimension stale for ({}, {}): {}",
+                             source, raw_name, PQerrorMessage(c));
+                return false;
+            }
+            return true;
+        });
+    } catch (const std::exception& e) {
+        spdlog::warn("ProductRegistryStore: upsert_alias threw for ({}, {}): {}", source, raw_name,
+                     e.what());
+        return false;
+    }
+    if (!ok)
+        spdlog::warn("ProductRegistryStore: upsert_alias did not complete for ({}, {}) (no "
+                     "connection, or a statement failed - see above): {}",
                      source, raw_name, pool_.last_error());
-        return false;
-    }
-    // first_matched_at is preserved on conflict; the link's target/method/
-    // confidence + last_seen_at refresh each evaluator cycle (soft keys are
-    // re-derived, never frozen — roadmap R7). A dangling product_id fails the
-    // FK and lands in the error branch below (fail-soft, no throw).
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "INSERT INTO product_registry_store.product_aliases "
-        "(source, raw_name, raw_publisher, product_id, method, confidence, "
-        "first_matched_at, last_seen_at) "
-        "VALUES ($1, $2, $3, $4::bigint, $5, $6::double precision, $7::bigint, $7::bigint) "
-        "ON CONFLICT (source, raw_name, raw_publisher) DO UPDATE SET "
-        "  product_id = EXCLUDED.product_id, method = EXCLUDED.method, "
-        "  confidence = EXCLUDED.confidence, last_seen_at = EXCLUDED.last_seen_at "
-        "RETURNING product_id",
-        std::vector<std::string>{std::string(source), std::string(raw_name),
-                                 std::string(raw_publisher), std::to_string(product_id),
-                                 std::string(method), std::to_string(confidence),
-                                 std::to_string(now_secs())});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
-        spdlog::warn("ProductRegistryStore: upsert_alias failed for ({}, {}): {}", source, raw_name,
-                     PQerrorMessage(lease.get()));
-        return false;
-    }
-    return true;
+    return ok;
 }
 
 std::expected<std::optional<std::int64_t>, RegistryReadError>
@@ -397,7 +624,7 @@ ProductRegistryStore::list_aliases(std::int64_t product_id) {
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT source, raw_name, raw_publisher, product_id, method, confidence, "
-        "first_matched_at, last_seen_at "
+        "first_matched_at, last_seen_at, status, pack_version "
         "FROM product_registry_store.product_aliases "
         "WHERE product_id = $1::bigint ORDER BY source, raw_name, raw_publisher "
         "LIMIT $2::bigint",
@@ -422,6 +649,8 @@ ProductRegistryStore::list_aliases(std::int64_t product_id) {
         r.confidence = result_f64(res, i, 5);
         r.first_matched_at = result_i64(res, i, 6);
         r.last_seen_at = result_i64(res, i, 7);
+        r.status = PQgetvalue(res.get(), i, 8);
+        r.pack_version = PQgetvalue(res.get(), i, 9);
         out.push_back(std::move(r));
     }
     return out;
@@ -464,6 +693,157 @@ std::optional<std::int64_t> ProductRegistryStore::count_aliases() {
         return std::nullopt;
     }
     return result_i64(res, 0, 0);
+}
+
+std::expected<PackLoadOutcome, std::string>
+ProductRegistryStore::load_pack_if_empty(const ParsedPack& pack, std::string_view loaded_by) {
+    if (!open_)
+        return std::unexpected("product registry store is not open");
+    PackLoadOutcome outcome = PackLoadOutcome::already_present;
+    std::string error;
+    const auto fail = [&](std::string_view what, PGconn* c) {
+        error = std::string{what} + ": " + PQerrorMessage(c);
+        return false;
+    };
+    const bool ok = pool_.with_txn_for(kAcquireTimeout, [&](PGconn* c) -> bool {
+        // Blocking xact lock: two replicas booting together serialise here, and the
+        // loser then sees the winner's pack row and returns already_present.
+        pg::PgResult lk = pg::exec_params(
+            c, "SELECT pg_advisory_xact_lock(hashtextextended('product_registry_pack', 0))",
+            std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK)
+            return fail("pack advisory lock", c);
+        pg::PgResult cur = pg::exec_params(
+            c, "SELECT pack_version FROM product_registry_store.normalization_pack WHERE id = 1",
+            std::vector<std::string>{});
+        if (cur.status() != PGRES_TUPLES_OK)
+            return fail("pack read", c);
+        if (PQntuples(cur.get()) == 1) {
+            spdlog::info("ProductRegistryStore: alias pack {} already loaded; embedded pack {} "
+                         "not applied",
+                         PQgetvalue(cur.get(), 0, 0), pack.pack_version);
+            return true;
+        }
+        const std::string now = std::to_string(now_secs());
+        pg::PgResult ins = pg::exec_params(
+            c,
+            "INSERT INTO product_registry_store.normalization_pack "
+            "(id, pack_version, sha256, body, loaded_by, loaded_at) "
+            "VALUES (1, $1, $2, $3, $4, $5::bigint)",
+            std::vector<std::string>{pack.pack_version, pack.sha256, pack.body, std::string{loaded_by},
+                                     now});
+        if (ins.status() != PGRES_COMMAND_OK)
+            return fail("pack insert", c);
+
+        // ponytail: per-row statements inside the one txn; a pack is a few hundred rows.
+        // Switch to unnest() arrays past ~500 rows.
+        std::unordered_map<std::string, std::string> product_ids; // norm_key -> id
+        for (const auto& r : pack.rows) {
+            auto pit = product_ids.find(r.norm_key);
+            if (pit == product_ids.end()) {
+                pg::PgResult pr = pg::exec_params(
+                    c,
+                    "INSERT INTO product_registry_store.products "
+                    "(norm_key, vendor, title, edition, platform, created_at, updated_at, "
+                    " purl_type, cpe_product, origin, category) "
+                    "VALUES ($1, $2, $3, $4, '', $5::bigint, $5::bigint, $6, $7, 'pack', $8) "
+                    "ON CONFLICT (norm_key) DO UPDATE SET "
+                    "  category = EXCLUDED.category, "
+                    "  purl_type = CASE WHEN products.purl_type = '' THEN EXCLUDED.purl_type "
+                    "                   ELSE products.purl_type END, "
+                    "  cpe_product = CASE WHEN products.cpe_product = '' THEN EXCLUDED.cpe_product "
+                    "                     ELSE products.cpe_product END, "
+                    "  origin = CASE WHEN products.origin = 'curated' THEN 'curated' "
+                    "                ELSE 'pack' END, "
+                    "  updated_at = EXCLUDED.updated_at "
+                    "RETURNING product_id",
+                    std::vector<std::string>{r.norm_key, r.vendor, r.title, r.edition, now,
+                                             std::string{purl_type_for(r.ecosystem)}, r.cpe_product,
+                                             r.category});
+                if (pr.status() != PGRES_TUPLES_OK || PQntuples(pr.get()) != 1)
+                    return fail("pack product upsert", c);
+                pit = product_ids.emplace(r.norm_key, PQgetvalue(pr.get(), 0, 0)).first;
+            }
+            pg::PgResult al = pg::exec_params(
+                c,
+                "INSERT INTO product_registry_store.product_aliases "
+                "(source, raw_name, raw_publisher, product_id, method, confidence, "
+                " first_matched_at, last_seen_at, status, pack_version) "
+                "VALUES ($1, $2, $3, $4::bigint, 'pack', 1.0, $5::bigint, $5::bigint, 'active', $6) "
+                "ON CONFLICT (source, raw_name, raw_publisher) DO UPDATE SET "
+                "  product_id = EXCLUDED.product_id, pack_version = EXCLUDED.pack_version, "
+                "  status = 'active', last_seen_at = EXCLUDED.last_seen_at",
+                std::vector<std::string>{"pack:" + r.ecosystem, r.raw_name, r.raw_publisher,
+                                         pit->second, now, pack.pack_version});
+            if (al.status() != PGRES_COMMAND_OK)
+                return fail("pack alias upsert", c);
+        }
+        outcome = PackLoadOutcome::loaded;
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(error.empty() ? "pack load transaction failed (no connection or "
+                                               "commit failure): " + pool_.last_error()
+                                             : error);
+    return outcome;
+}
+
+std::optional<std::vector<NormalizationAliasRow>>
+ProductRegistryStore::read_normalization_aliases(PGconn* conn,
+                                                 const std::vector<std::string_view>& alias_keys,
+                                                 const std::vector<std::string_view>& sources) {
+    std::vector<NormalizationAliasRow> out;
+    if (alias_keys.empty() || sources.empty())
+        return out;
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "SELECT a.source, a.raw_name, a.raw_publisher, "
+        "  p.product_id, p.norm_key, p.vendor, p.title, p.edition, p.platform, p.created_at, "
+        "  p.updated_at, p.purl_type, p.cpe_product, p.origin, p.category "
+        "FROM product_registry_store.product_aliases a "
+        "JOIN product_registry_store.products p ON p.product_id = a.product_id "
+        "WHERE a.status = 'active' AND a.source = ANY($2::text[]) "
+        "  AND a.raw_name = ANY($1::text[])",
+        std::vector<std::string>{pg::to_text_array(alias_keys), pg::to_text_array(sources)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ProductRegistryStore: alias read failed: {}", PQerrorMessage(conn));
+        return std::nullopt;
+    }
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        NormalizationAliasRow r;
+        r.source = PQgetvalue(res.get(), i, 0);
+        r.raw_name = PQgetvalue(res.get(), i, 1);
+        r.raw_publisher = PQgetvalue(res.get(), i, 2);
+        fill_product(res, i, r.product, 3);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::optional<std::vector<ProductRow>>
+ProductRegistryStore::read_products_by_norm_key(PGconn* conn,
+                                                const std::vector<std::string_view>& norm_keys) {
+    std::vector<ProductRow> out;
+    if (norm_keys.empty())
+        return out;
+    const std::string sql = std::string("SELECT ") + kProductCols +
+                            " FROM product_registry_store.products WHERE norm_key = ANY($1::text[])";
+    pg::PgResult res =
+        pg::exec_params(conn, sql.c_str(), std::vector<std::string>{pg::to_text_array(norm_keys)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ProductRegistryStore: product read failed: {}", PQerrorMessage(conn));
+        return std::nullopt;
+    }
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        ProductRow r;
+        fill_product(res, i, r);
+        out.push_back(std::move(r));
+    }
+    return out;
 }
 
 } // namespace yuzu::server
