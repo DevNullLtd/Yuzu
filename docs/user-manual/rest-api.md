@@ -2509,7 +2509,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 `days`, `week`, `bucket`). The cursor carries the position of the last certificate served and
 the walk's `as_of`, so every page is measured against the same time and starts strictly after
 that certificate: a certificate revoked between pages never makes the walk skip another (an
-offset would). `next_cursor` is `null` on the last page. Order: expiring soonest first, expired and revoked most recent first, the
+offset would). `next_cursor` is `null` on the last page, and also `null` when more rows follow but the last row on the page has a `null` `key` (its 0x1F byte cannot be encoded into a cursor, so that continuation is lost: narrow the query with `status` or reject entries and list again). Order: expiring soonest first, expired and revoked most recent first, the
 rest newest-issued first. Every filtered call is audited `crypto.ca.certificates.view`, as
 is every unfiltered call (set-and-proceed: `audit_persisted: false` in the body and `Sec-Audit-Failed: true` when the row
 is lost; a confined refusal is a `denied` row, and an unavailable access check a `failure` row).
@@ -7909,7 +7909,7 @@ Installs per version for one title: distinct devices per version, most-installed
 
 #### Software normalisation curation
 
-The queue of installed-software titles the server could not resolve to a product, and the writes that settle them (see [Software title normalisation](inventory.md#software-title-normalisation-server-job)). REST only: there is no MCP tool or page for these yet. All five routes need a **global** grant: `Inventory:Read` for the two reads, `Inventory:Write` for the three writes. A management-group-confined caller gets `403` (the queue and the pack are fleet-wide and cannot be scoped), and a service-scoped API token is refused with `403` and no `permission` field. Every error is the standard envelope.
+The queue of installed-software titles the server could not resolve to a product, and the writes that settle them (see [Software title normalisation](inventory.md#software-title-normalisation-server-job)). REST only: there is no MCP tool or page for these yet (a recorded ADR-1005 exception, roadmap row 4.3-mcp, revisit by 2026-12-31). All five routes need a **global** grant: `Inventory:Read` for the two reads, `Inventory:Write` for the three writes. A management-group-confined caller gets `403` (the queue and the pack are fleet-wide and cannot be scoped), and a service-scoped API token is refused with `403` and no `permission` field. Every error is the standard envelope.
 
 The three writes are audited BEFORE the store is touched, as `inventory.software.curation.alias`, `inventory.software.curation.reject` and `inventory.software.curation.pack` (result `requested`; a request refused for its content writes `denied`, and so does a service-scoped token's `403` on any of the five routes). The `requested` row records the request, not its outcome: the HTTP status is the outcome, and a `404`, `409` or `503` after the row means nothing changed. An audit row that cannot be stored fails the request with `503` and `Sec-Audit-Failed: true`, and nothing is written. An admitted read is not audited; a caller refused by the permission gate is audited by the gate itself. None of the routes dispatches work to a device, and all are exempt from MFA step-up.
 
@@ -7939,17 +7939,17 @@ A repeated parameter, an unknown `status`, a `limit` outside 1-500 or a malforme
 
 #### `POST /api/v1/inventory/software/normalization/aliases`
 
-Curates a title onto a canonical product. The body is a JSON object of strings, each at most 256 bytes with no NUL: `ecosystem` (one of the published ecosystems), `raw_name`, `vendor` and `product` (required), and optional `raw_publisher` (empty binds any publisher), `edition` (an edition token such as `standard`; empty takes the edition found in `raw_name`), `category` (`web_server`, `database`, `message_broker`, `runtime` or `other`, default `other`) and `cpe_product` (lowercase letters, digits and `_ . - +`).
+Curates a title onto a canonical product. The body is a JSON object of strings, each at most 256 bytes with no NUL: `ecosystem` (one of the published ecosystems: `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python` and `ibm_mq`), `raw_name`, `vendor` and `product` (required), and optional `raw_publisher` (empty binds any publisher), `edition` (an edition token such as `standard`; empty takes the edition found in `raw_name`), `category` (`web_server`, `database`, `message_broker`, `runtime` or `other`; when omitted, an existing product keeps its category and a new product gets `other`) and `cpe_product` (lowercase letters, digits and `_ . - +`; the CPE logical values `-` and `.` are reserved and refused).
 
 The stored alias key carries the edition, so a curated alias binds exactly one edition and there is no edition wildcard. The product and the `curated:<ecosystem>` alias are written in one transaction taken after the normalisation lock, and every title is marked for re-resolution in that same transaction. `201` returns `{product_id, norm_key, alias_source, alias_key, alias_publisher}`. An invalid field, an unknown ecosystem or category, or an edition that is not an edition token or contradicts `raw_name` is a `400`.
 
 #### `POST /api/v1/inventory/software/normalization/queue/{key}/reject`
 
-Marks one open queue entry `rejected` (`200 {"data": {"rejected": true}}`). `key` is the value on a queue row. A rejected entry stays in the queue, is kept by later reconciles and does not trigger re-resolution. A malformed key is a `400`; an entry that is absent or already rejected is a `404`.
+Marks one open queue entry `rejected` (`200 {"data": {"rejected": true}}`). `key` is the value on a queue row. A rejected entry stays in the queue, is kept by later reconciles and does not trigger re-resolution. A malformed key (including one with a NUL byte or invalid UTF-8) is a `400`; an entry that is absent or already rejected is a `404`.
 
 #### `POST /api/v1/inventory/software/normalization/pack`
 
-Replaces the stored alias pack. The body is the alias-pack CSV (`Content-Type: text/csv` or `text/plain`, else `415`); the format and the 1 MiB, 5,000-row and 256-byte-field limits are those of the seed pack parser, whose refusal reason is returned in the `400`. The pack aliases the new pack no longer carries stop resolving, the ones it carries stay, and every title is marked for re-resolution. A pack whose `pack_version` equals the stored one is a `409`. `200` returns `{pack_version, sha256, rows}`.
+Replaces the stored alias pack. The body is the alias-pack CSV (`Content-Type: text/csv` or `text/plain`, else `415`); the format and the 1 MiB, 5,000-row (and at least 50-row) and 256-byte-field limits are those of the seed pack parser, whose refusal reason is returned in the `400` (a NUL byte or invalid UTF-8 included). A body over 1 MiB never reaches the parser: the pre-auth body cap answers `413`. A replace keeps products a curator owns (`origin` curated) at their category and `cpe_product`, and leaves curated aliases active. The pack aliases the new pack no longer carries stop resolving, the ones it carries stay, and every title is marked for re-resolution. A pack whose `pack_version` equals the stored one is a `409`. `200` returns `{pack_version, sha256, rows}`.
 
 ---
 
