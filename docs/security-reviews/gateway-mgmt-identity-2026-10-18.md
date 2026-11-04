@@ -28,6 +28,9 @@ are not read as oversights and the mechanisms rejected here are not re-added by 
   minted, with the install CA's key, a leaf over a **new key**, a **same-key re-issue**, and leaves
   naming **another install** and an **agent URI**, and observed them admitted, admitted, refused and
   refused; and promtool behaviour cases for the new alert reasons.
+  Those real-stack checks pre-date PR 4b: the CRL check (`mgmt_crl_source`) was **not** run on the real
+  stack, because `scripts/integration-test.sh` sets no source and no Common Test case covers it; PR 4b's
+  evidence is the unit, watcher and configuration tests and promtool.
 - **Governance (this run) found, and this record reflects:** the default-mode trap (an unset mode with
   no pins used to select the identity), the implicit activation of the identity under a bring-your-own
   CA, and the unbound bundle case were each found by reviewers independently before merge. They are
@@ -41,8 +44,9 @@ are not read as oversights and the mechanisms rejected here are not re-added by 
   record are recorded in that ledger; they are models, not human reviewers.
 - **Risk acceptance.** This record marks three consequences as accepted: (1) a CA-key-only holder can
   command the fleet under the shipped `identity` default; (2) withdrawal is a serial in
-  `mgmt_peer_denied` plus a gateway restart, with no CRL path until the CRL-fed follow-up lands, and
-  revoking the certificate in the CA inventory alone does nothing; (3) an own-certificate install
+  `mgmt_peer_denied` plus a gateway restart, and revoking the certificate in the CA inventory alone
+  does nothing, **until a gateway sets `mgmt_crl_source` (PR 4b, ADR-2004 amendment): the CRL then
+  withdraws it, and this acceptance stays open only for a gateway that does not set it**; (3) an own-certificate install
   that takes the new shipped config loses its command plane (`no_uri_san`) until it sets `pin`. The author does not approve their own risk acceptance. The acceptance is recorded
   by the approving reviewer on the pull request, with a review-by date to be set there. This record
   carries neither a name nor a date for it.
@@ -127,9 +131,15 @@ not be enabled there. A pin is immune to both.
 2. **Interim loss of automatic withdrawal.** A `cert_file` pin withdrew a key within one refresh
    interval. An identity-mode server certificate is withdrawn by a serial in `mgmt_peer_denied`,
    which is read at boot and takes effect when the gateway next restarts (the restart disconnects the
-   agents on that node; see the gateway manual for the conditions). CRL-fed withdrawal is the
-   follow-up. Until then, an operator who needs fast withdrawal should keep a pin in `identity` mode
-   and replace the pinned file, which withdraws the key within one interval exactly as before.
+   agents on that node; see the gateway manual for the conditions). CRL-fed withdrawal is PR 4b: a
+   gateway that sets `mgmt_crl_source` refuses a withdrawn certificate on the streams it admits after
+   its next fetch (within one refresh interval of the server publishing), with no restart, even on a
+   connection the server already holds open; a stream already running is not cut. After a CA re-root, the source must serve the
+   new CA's CRL, or unset it: a CRL signed by the old CA no longer verifies against the new
+   `cacertfile`, so the gateway refuses every stream as `revocation_unknown` until it does. A
+   gateway with no source still needs the pinned file replaced (within one interval) or the
+   deny-list edited (at a gateway restart); an operator who needs fast withdrawal without a CRL
+   source can keep a pin in `identity` mode and replace the pinned file.
 3. **The deny-list names serials, not keys.** A compromised server **key** is withdrawn by denying
    every serial issued over it (the server's `superseded` re-issue means there may be two), or by
    re-keying the set. The server refuses to re-certify a key it has seen revoked for any other reason
@@ -247,7 +257,7 @@ append a `governance.d` row).
 ## Follow-up work
 
 - Identity in the shipped configs; pins optional-only (release N+1): done, see the amendment above. Making the identity the default for an UNSET key is not done; a later release may, after the unset-mode WARN has shipped.
-- CRL-fed automatic withdrawal with `revocation_stale` / `revocation_unknown` refusals.
+- ~~CRL-fed automatic withdrawal with `revocation_stale` / `revocation_unknown` refusals.~~ Delivered in PR 4b (ADR 2004, Amendment A1 to A8).
 - The reverse hop (gateway to server) is unchanged; a symmetric identity there is a separate decision.
 - #5988 (the server does not retry `UNAUTHENTICATED`) remains and is no longer on the renewal path.
 

@@ -229,8 +229,8 @@ groups:
 
       # #1422 mgmt-plane peer authorization, every rejection reason EXCEPT
       # pin_mismatch (that one has its own rule below, because a routine
-      # server-leaf rotation in pin mode produces a few of it). None of these
-      # reasons is produced by a rotation: missing_server_auth_eku, bad_peer_cert
+      # server-leaf rotation in pin mode produces a few of it). Rotation produces
+      # none of these except the CRL reasons described below: missing_server_auth_eku, bad_peer_cert
       # = a CA-cert holder that is not the server reached the command plane (or
       # the server presents a leaf without the serverAuth EKU); no_pins_resolved,
       # no_pins_configured, bad_pin_config = the gateway's pin configuration
@@ -248,7 +248,13 @@ groups:
       # reach this rule only when no pin is configured or the mode is identity
       # (identity mode reports the identity's reason); identity_unresolved (a
       # gateway configuration defect) and revoked are reported as themselves in
-      # every mode. internal_error = a defect. Each one needs a
+      # every mode. The CRL (#6016 PR 4b) adds crl_revoked (the CA's CRL lists the
+      # peer's serial), revocation_unknown (a CRL source is set and no usable CRL is
+      # held) and revocation_stale (the held CRL is past nextUpdate plus grace);
+      # crl_revoked CAN follow a server re-issue: the re-issue revokes the old serial
+      # as superseded, so a replica still presenting it is refused until it restarts
+      # (in identity mode it is refused no_uri_san first, if its old certificate had
+      # no identity). internal_error = a defect. Each one needs a
       # person, so no `for:`. The name is the pre-split rule's, so existing
       # silences and routes keep applying to the non-rotation reasons.
       - alert: YuzuGatewayMgmtAuthRejected
@@ -306,14 +312,30 @@ groups:
             revoked means the peer presented a certificate whose serial is in
             mgmt_peer_denied: the server is still using a withdrawn
             certificate, re-key it, or a holder of that certificate is
-            connecting. mgmt_peer_auth_mode, mgmt_peer_identity and
-            mgmt_peer_denied are read at boot: a change to them applies only
+            connecting; crl_revoked means the peer presented a certificate
+            whose serial is on the CA's CRL: the server is still using a
+            certificate the CA withdrew (a re-issue supersedes the old serial,
+            so first check that every server replica has reloaded the new
+            certificate), or a holder of that certificate is connecting;
+            revocation_unknown means this gateway has a mgmt_crl_source but no
+            usable CRL for the peer's issuer (see YuzuGatewayMgmtCrlNotLoaded,
+            and the gateway log's mgmt_crl_source: line for the fetch or verification
+            cause; a server whose 8443 certificate is not issued by the
+            install CA needs the {url, Url, #{cacertfile => Path}} form of
+            mgmt_crl_source or a {file, Path} source); revocation_stale means
+            the loaded CRL is past its nextUpdate plus mgmt_crl_grace_s (see
+            YuzuGatewayMgmtCrlStale: restore the CRL fetch, or check that the
+            server is publishing a CRL at all). mgmt_peer_auth_mode, mgmt_peer_identity,
+            mgmt_peer_denied and mgmt_crl_source are read at boot: a change to them applies only
             if the gateway is restarted, which disconnects every agent on the
             node, and agents without the #5183 fix stay wedged after it;
             internal_error is a gateway defect (collect the gateway log and
-            report it). no_uri_san and identity_mismatch with no admission at all
+            report it). no_uri_san, identity_mismatch, revocation_unknown,
+            revocation_stale and crl_revoked with no admission at all
             in the same five minutes also raise YuzuGatewayMgmtIdentityOutage
-            (critical). Rotation never produces these reasons, except identity_unresolved in
+            (critical). Rotation does not produce these reasons, except crl_revoked from a
+            server replica still presenting a superseded certificate that a configured pin
+            admits (in identity mode with no pin it is refused no_uri_san first), and identity_unresolved in
             identity_or_pin with an unresolved identity. With pins
             configured in identity_or_pin, no_uri_san and identity_mismatch
             are reported as pin_mismatch instead and raise
@@ -322,7 +344,7 @@ groups:
 
       # The identity outage (#6016, release N+1). YuzuGatewayMgmtAuthRejected
       # above is warning-grade because most of its reasons are a person's
-      # to-do. Two of them are a total command outage under the shipped
+      # to-do. Some of them are a total command outage under the shipped
       # identity configs: no_uri_san (the server presents a certificate with
       # no identity: its own --cert/--key or a bring-your-own certificate on
       # the pin-less shipped config, or a built-in certificate that has not
@@ -351,7 +373,7 @@ groups:
       - alert: YuzuGatewayMgmtIdentityOutage
         expr: |
           sum by (job, instance, reason) (
-            increase(yuzu_gw_mgmt_auth_rejected_total{reason=~"no_uri_san|identity_mismatch"}[5m])
+            increase(yuzu_gw_mgmt_auth_rejected_total{reason=~"no_uri_san|identity_mismatch|revocation_unknown|revocation_stale|crl_revoked"}[5m])
           ) > 0
           unless on (job, instance)
           sum by (job, instance) (increase(yuzu_gw_mgmt_auth_admitted_total[5m])) > 0
@@ -391,8 +413,137 @@ groups:
             yuzu_server_identity_uri_present reads 1, the certificate the
             server presents is not default-server.pem: it has its own
             --cert/--key, so set mgmt_peer_auth_mode to pin.
+            crl_revoked means the CA's CRL lists the certificate the server
+            presents: the server must be given a current certificate (a
+            re-issue supersedes the old serial; check every server replica
+            has reloaded it) before this gateway will admit it. If the
+            certificate was revoked BY HAND (any reason but the automatic
+            superseded), the server will not re-certify that key: re-key the
+            default certificate set by renaming default-marker.json aside
+            (every default leaf gets a new key, so update any gateway
+            mgmt_peer_pins at the same time), then restart every server
+            replica (docs/user-manual/upgrading.md, "already revoked").
+            revocation_unknown or revocation_stale means the gateway cannot
+            vouch for the CRL (none loaded, or past nextUpdate plus
+            mgmt_crl_grace_s): see YuzuGatewayMgmtCrlNotLoaded and
+            YuzuGatewayMgmtCrlStale, and restore the CRL fetch from the
+            server's 8443 (or the {file, Path} source). A CRL source change
+            is read at boot, which disconnects the node's agents, and agents
+            without the #5183 fix stay wedged after it.
             YuzuGatewayMgmtAuthRejected fires for the same cause (warning) and
             lists every other reason.
+
+      # The CRL (#6016 PR 4b). The gateway reads the CA's CRL (mgmt_crl_source)
+      # and refuses a listed server certificate (crl_revoked), and refuses
+      # every peer when it cannot vouch for the CRL. Two gauges drive two
+      # alerts. CrlNotLoaded is the total outage: a source is configured and no
+      # CRL has verified, so every stream is refused as revocation_unknown (the
+      # gateway fails closed; it does not admit while it cannot check). It is
+      # critical because the identity outage rule above only pages when a
+      # rejection is counted, and a gateway nothing is connecting to is silent.
+      # CrlStale is the early warning: the loaded CRL is past its nextUpdate,
+      # but the gateway keeps admitting until nextUpdate plus mgmt_crl_grace_s
+      # (default 24 h), so a person has that long to restore the fetch before
+      # revocation_stale refuses everything. Both are per gateway and have no
+      # `unless` on admission: they describe the gateway's own CRL state, not
+      # traffic. Neither is part of any readiness probe: a gateway that cannot
+      # reach the server's CRL URL must not be taken out of rotation by it.
+      # NotLoaded waits ten minutes: a server that needs a few minutes to come up
+      # (Postgres first) refuses the gateway's first fetches for that long, and
+      # that is a cold start, not an outage; a real outage is also visible sooner
+      # through YuzuGatewayMgmtIdentityOutage once traffic exists. RefreshStalled
+      # covers what neither can see: a CRL that is still valid but is no longer
+      # being refreshed (a wedged watcher, or a fetch that keeps failing), which
+      # would otherwise be silent until CrlStale at nextUpdate, up to 48 hours.
+      # It reads the gauge the watcher advances only on a successful read.
+      - alert: YuzuGatewayMgmtCrlNotLoaded
+        expr: |
+          yuzu_gw_mgmt_crl_enforced == 1
+          and on (job, instance)
+          yuzu_gw_mgmt_crl_loaded == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway has a CRL source but no usable CRL ({{ $labels.instance }})"
+          description: >-
+            This gateway has a mgmt_crl_source configured and has not loaded a
+            CRL that verifies against its management listener's CA, so it
+            refuses every management stream as revocation_unknown and the
+            server's commands to this gateway's agents fail. Read the
+            gateway log's mgmt_crl_source: lines for the cause and
+            yuzu_gw_mgmt_crl_rejected_total{reason} for its class: fetch_tls
+            means the TLS to the server's 8443 failed: its certificate is not
+            issued by the CA the gateway verifies it with (a bring-your-own
+            dashboard certificate needs the {url, Url, #{cacertfile => Path}}
+            form of mgmt_crl_source, or a {file, Path} source) OR the host in
+            the URL is not one of that certificate's names (--cert-san);
+            fetch_connect means the server is unreachable; fetch_timeout means
+            it did not answer in time; fetch_status means it answered with a
+            status other than 200 (503 is "CRL not yet published": the server
+            is still starting or its CA is unavailable); malformed or
+            too_large means the bytes are not a usable CRL; unverified or
+            issuer_mismatch means the CRL was not signed by the CA the
+            management listener trusts; future_dated means the CRL is dated
+            more than an hour ahead of THIS gateway's clock (check the clock
+            here and on the server); file_unreadable means a {file, Path}
+            source or a cacertfile cannot be read. A change to
+            mgmt_crl_source is read at boot, which disconnects the node's
+            agents, and agents without the #5183 fix stay wedged after it;
+            do it only if they can take the disconnect.
+
+      - alert: YuzuGatewayMgmtCrlStale
+        expr: |
+          time() > yuzu_gw_mgmt_crl_next_update_timestamp_seconds
+          and on (job, instance)
+          yuzu_gw_mgmt_crl_loaded == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway's loaded CRL is past its nextUpdate ({{ $labels.instance }})"
+          description: >-
+            The CRL this gateway holds is past its nextUpdate. The gateway
+            still admits the server until nextUpdate plus mgmt_crl_grace_s
+            (default 24 hours), then refuses every stream as
+            revocation_stale. The CRL is not being refreshed: the server
+            stopped publishing, or this gateway cannot fetch it. Check
+            yuzu_gw_mgmt_crl_rejected_total{reason} for the failing class and
+            the server's own CRL publication (the elected server leader
+            republishes when under 24 hours remain, so a period with no
+            leader stops it, and so does a server that cannot reach the CA
+            key; restarting a server replica republishes at startup); restore
+            the fetch before the grace ends.
+
+      - alert: YuzuGatewayMgmtCrlRefreshStalled
+        expr: |
+          (time() - yuzu_gw_mgmt_crl_last_success_timestamp_seconds > 1800)
+          and on (job, instance)
+          yuzu_gw_mgmt_crl_loaded == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway has not read its CRL source for over 30 minutes ({{ $labels.instance }})"
+          description: >-
+            This gateway holds a CRL but has not read its source successfully
+            for more than 30 minutes (default refresh: 5 seconds), so a
+            revocation the CA publishes now will not reach it, and nothing
+            else alerts until the held CRL passes its nextUpdate (up to 48
+            hours). Either the watcher cannot read its source or every fetch
+            is failing: read yuzu_gw_mgmt_crl_rejected_total{reason} and the
+            gateway log's mgmt_crl_source: lines. fetch_tls, fetch_connect,
+            fetch_timeout and fetch_status point at the server's 8443;
+            file_unreadable means a {file, Path}
+            source or a cacertfile on a dead mount that has stopped
+            answering; malformed and too_large mean the bytes are not a
+            usable CRL; unverified, issuer_mismatch, replay and future_dated
+            mean the server is serving a CRL this gateway will not take. A
+            watcher process that is itself wedged shows no new rejections and
+            no new log lines. The rule compares the Prometheus clock with the
+            gateway's clock, so keep both on NTP. If you raised
+            mgmt_crl_refresh_ms above 15 minutes, raise the 1800 in this rule
+            with it.
 
       # pin_mismatch: the peer's key is not the pinned key. A routine rotation
       # produces a few: the server presents its new leaf up to one
