@@ -579,7 +579,7 @@ TEST_CASE("render_filter_bar route: dispatched through TestRouteSink, the "
           const std::string&) { return true; };
     DashboardRoutes::AuditFn audit_fn =
         [](const httplib::Request&, const std::string&, const std::string&,
-          const std::string&, const std::string&, const std::string&) {};
+          const std::string&, const std::string&, const std::string&) { return true; };
 
     // MEMBER ORDER IS LOAD-BEARING (mirrors FragmentHarness,
     // test_dashboard_echo_fragments.cpp:106-180): `sink` declared LAST so it
@@ -665,7 +665,7 @@ TEST_CASE("create-group-form route: dispatched through TestRouteSink, the "
           const std::string&) { return true; };
     DashboardRoutes::AuditFn audit_fn =
         [](const httplib::Request&, const std::string&, const std::string&,
-          const std::string&, const std::string&, const std::string&) {};
+          const std::string&, const std::string&, const std::string&) { return true; };
 
     struct SinkHarness {
         DashboardRoutes routes;
@@ -724,7 +724,7 @@ TEST_CASE("create-group-form route: an Unknown Forensics decision shows the coun
                                          const std::string&, const std::string&) { return true; };
     DashboardRoutes::AuditFn audit_fn = [](const httplib::Request&, const std::string&,
                                            const std::string&, const std::string&,
-                                           const std::string&, const std::string&) {};
+                                           const std::string&, const std::string&) { return true; };
     struct SinkHarness {
         yuzu::server::test::ForensicsCaller forensics;
         DashboardRoutes routes;
@@ -785,7 +785,7 @@ TEST_CASE("create-group-form route: a filter value over kMaxFacetValueBytes repl
                                          const std::string&, const std::string&) { return true; };
     DashboardRoutes::AuditFn audit_fn = [](const httplib::Request&, const std::string&,
                                            const std::string&, const std::string&,
-                                           const std::string&, const std::string&) {};
+                                           const std::string&, const std::string&) { return true; };
     struct SinkHarness {
         DashboardRoutes routes;
         yuzu::server::test::TestRouteSink sink;
@@ -870,7 +870,7 @@ TEST_CASE("create-group-form route: an over-bound filter on a degraded store sho
                                          const std::string&, const std::string&) { return true; };
     DashboardRoutes::AuditFn audit_fn = [](const httplib::Request&, const std::string&,
                                            const std::string&, const std::string&,
-                                           const std::string&, const std::string&) {};
+                                           const std::string&, const std::string&) { return true; };
     struct SinkHarness {
         DashboardRoutes routes;
         yuzu::server::test::TestRouteSink sink;
@@ -957,7 +957,7 @@ TEST_CASE("create-group-form route: a JIT-elevated session sees the "
           const std::string&) { return true; };
     DashboardRoutes::AuditFn audit_fn =
         [](const httplib::Request&, const std::string&, const std::string&,
-          const std::string&, const std::string&, const std::string&) {};
+          const std::string&, const std::string&, const std::string&) { return true; };
 
     struct SinkHarness {
         DashboardRoutes routes;
@@ -1029,7 +1029,7 @@ TEST_CASE("render_filter_bar route: a JIT-elevated session sees every agent's "
           const std::string&) { return true; };
     DashboardRoutes::AuditFn audit_fn =
         [](const httplib::Request&, const std::string&, const std::string&,
-          const std::string&, const std::string&, const std::string&) {};
+          const std::string&, const std::string&, const std::string&) { return true; };
 
     struct SinkHarness {
         DashboardRoutes routes;
