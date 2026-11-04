@@ -24,7 +24,7 @@
 #
 # Where it writes (the only changes this script makes):
 #   $YUZU_GCOVR_VENV   default ~/.local/share/yuzu/gcovr-venv   the virtualenv, plus beside it
-#                      <venv>.lock and, transiently, <venv>.old.<pid>; ~/.local/share/yuzu is created
+#                      <venv>.lock and, transiently, <venv>.yuzu-gcovr-old.<pid>; ~/.local/share/yuzu is created
 #   ~/.local/bin/gcovr a symlink to the venv's gcovr (replaces an existing symlink there, e.g. a
 #                      pipx shim; refuses to replace a regular file)
 # pip may also write its own cache under ~/.cache/pip.
@@ -32,15 +32,17 @@
 # RECOVERY / SAFETY: a rebuild MOVES the old venv aside (one atomic rename) before building, then
 # removes the moved copy, so an interrupt can never leave a half-deleted directory at $VENV; a
 # half-BUILT venv carries a marker written before venv creation, so the next run recognises and
-# replaces it, and a leftover <venv>.old.<pid> is removed by name. The delete guard refuses to touch a
+# replaces it, and a leftover <venv>.yuzu-gcovr-old.<pid> is removed by name. The delete guard refuses to touch a
 # $VENV that is not this script's own (it must carry the marker file or the requirements stamp this
 # script writes) unless it is empty: a plain Python venv of yours, such as a project .venv, is never
 # taken for ours. A managed venv that is fresh and healthy is not rebuilt just because something else
 # shadows it on PATH. The install holds an exclusive lock (when `flock` exists; the lock file is opened
 # for append, never through a symlink, and only in a directory you own) so two worktrees cannot
 # rebuild the same venv under each other; pip runs under a timeout (when `timeout` or `gtimeout`
-# exists; YUZU_ENSURE_PIP_TIMEOUT / YUZU_ENSURE_LOCK_TIMEOUT override, in seconds), and the lock
-# descriptor is closed for every child process.
+# exists; YUZU_ENSURE_PIP_TIMEOUT / YUZU_ENSURE_LOCK_TIMEOUT override, in seconds). The lock descriptor
+# is closed for every PROBE child (version checks, the capability probe), so a leaked probe cannot keep
+# it; the install steps (python3 -m venv, pip) keep it on purpose, so an orphaned install makes the next
+# run wait for it instead of racing it.
 #
 # Linux only: coverage-gate.sh refuses to measure anywhere else (the baseline is Linux/gcc data,
 # #6187), so on another OS this exits 0 with a note rather than installing something unused.
@@ -62,25 +64,38 @@ if [[ "$(uname -s)" != "Linux" ]]; then
 fi
 
 [[ -n "${HOME:-}" ]] || die "HOME is not set"
-VENV="${YUZU_GCOVR_VENV:-$HOME/.local/share/yuzu/gcovr-venv}"
-LINK="$HOME/.local/bin/gcovr"
+VENV="${YUZU_GCOVR_VENV:-${HOME%/}/.local/share/yuzu/gcovr-venv}"
+VENV="${VENV%/}"
+[[ -n "$VENV" ]] || die "YUZU_GCOVR_VENV must not be empty or /"
+LINK="${HOME%/}/.local/bin/gcovr"
 
-# tmo SECONDS CMD...: run CMD under a timeout when one exists, with the lock descriptor (9) closed
-# for the child.
-tmo() {
-    local secs="$1" t=""
-    shift
+# _timed KEEP_LOCK SECONDS CMD...: run CMD under a timeout when one exists (macOS has `gtimeout` only
+# with coreutils installed). With a terminal on stdin, --foreground keeps Ctrl-C working. KEEP_LOCK=1
+# lets the child inherit the lock descriptor (an orphaned INSTALL then keeps other runs waiting for
+# it, which is right); 0 closes it (probes must never hold the lock).
+_timed() {
+    local keep="$1" secs="$2" t="" fg=""
+    shift 2
     if command -v timeout >/dev/null 2>&1; then
         t=timeout
     elif command -v gtimeout >/dev/null 2>&1; then
         t=gtimeout
     fi
     if [[ -n "$t" ]]; then
-        "$t" -k 10 "$secs" "$@" 9>&- || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}"; return $rc; }
+        [[ -t 0 ]] && fg="--foreground"
+        if [[ "$keep" == 1 ]]; then
+            $t $fg -k 10 "$secs" "$@" || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}"; return $rc; }
+        else
+            $t $fg -k 10 "$secs" "$@" 9>&- || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}"; return $rc; }
+        fi
+    elif [[ "$keep" == 1 ]]; then
+        "$@"
     else
         "$@" 9>&-
     fi
 }
+tmo()       { _timed 1 "$@"; }   # install steps
+tmo_probe() { _timed 0 "$@"; }   # probes
 
 pin="$(sed -n 's/^gcovr==\([0-9][0-9.]*\).*/\1/p' "$ROOT/requirements-ci.in" | head -n1)"
 [[ -n "$pin" ]] || die "no gcovr== pin found in requirements-ci.in"
@@ -92,15 +107,15 @@ req_sha="$(sha256sum "$ROOT/requirements-ci.txt" | cut -d' ' -f1)" || die "canno
 
 # What the caller's PATH resolves gcovr to, and its version. Both empty when it is not found.
 resolved_real() { local p; p="$(command -v gcovr 2>/dev/null)" || return 1; readlink -f "$p"; }
-resolved_version() { gcovr --version 2>/dev/null | sed -n 's/^gcovr \([0-9][0-9.]*\).*/\1/p' | head -n1 || true; }
+resolved_version() { tmo_probe 20 gcovr --version 2>/dev/null | sed -n 's/^gcovr \([0-9][0-9.]*\).*/\1/p' | head -n1 || true; }
 ours() { [[ "$(resolved_real || true)" == "$(readlink -f "$VENV/bin/gcovr" 2>/dev/null || true)" ]]; }
 
 STAMP="$VENV/.requirements-ci.sha256"
 venv_fresh() { [[ "$(cat "$STAMP" 2>/dev/null || true)" == "$req_sha" ]]; }
 # gcovr's own import can succeed with a dependency missing; --html (which the coverage gate uses)
 # then fails late. Import what the gate needs.
-venv_healthy() { "$VENV/bin/python" -c 'import gcovr, jinja2, lxml, pygments, yaml' >/dev/null 2>&1; }
-venv_version() { "$VENV/bin/gcovr" --version 2>/dev/null | sed -n 's/^gcovr \([0-9][0-9.]*\).*/\1/p' | head -n1 || true; }
+venv_healthy() { tmo_probe 30 "$VENV/bin/python" -c 'import gcovr, jinja2, lxml, pygments, yaml' >/dev/null 2>&1; }
+venv_version() { tmo_probe 20 "$VENV/bin/gcovr" --version 2>/dev/null | sed -n 's/^gcovr \([0-9][0-9.]*\).*/\1/p' | head -n1 || true; }
 # The managed venv is complete: right version, built from the current requirements, imports work.
 managed_ok() { [[ "$(venv_version)" == "$pin" ]] && venv_fresh && venv_healthy; }
 
@@ -109,7 +124,7 @@ managed_ok() { [[ "$(venv_version)" == "$pin" ]] && venv_fresh && venv_healthy; 
 gcovr_works() {
     local d rc=0
     d="$(mktemp -d "${TMPDIR:-/tmp}/yuzu_test_gcovr_probe.XXXXXX")" || return 1
-    ( cd "$d" && tmo 60 gcovr --root . --json-summary j.json --xml x.xml --html --html-details -o i.html . ) >/dev/null 2>&1 || rc=$?
+    ( cd "$d" && tmo_probe 60 gcovr --root . --json-summary j.json --xml x.xml --html --html-details -o i.html . ) >/dev/null 2>&1 || rc=$?
     rm -rf "$d"
     return $rc
 }
@@ -155,6 +170,7 @@ mkdir -p "$(dirname "$VENV")" "$(dirname "$LINK")" || die "cannot create $(dirna
 if command -v flock >/dev/null 2>&1; then
     [[ -O "$(dirname "$VENV")" ]] || die "$(dirname "$VENV") is not owned by you; refusing to put a lock file there"
     [[ ! -L "$VENV.lock" ]] || die "$VENV.lock is a symlink; refusing to use it as a lock file"
+    [[ ! -e "$VENV.lock" || -f "$VENV.lock" ]] || die "$VENV.lock is not a regular file; refusing to use it as a lock file"
     exec 9>>"$VENV.lock" || die "cannot open $VENV.lock"
     flock -w "$LOCK_TIMEOUT" 9 || die "timed out waiting for another ensure-gcovr run (lock: $VENV.lock)"
     if already_ready; then
@@ -167,11 +183,13 @@ fi
 # enough -- any Python virtualenv, including a project's own .venv, has one.
 owned() { [[ -f "$1/$MARKER" || -f "$1/.requirements-ci.sha256" ]]; }
 empty_dir() { [[ -d "$1" && -z "$(ls -A "$1" 2>/dev/null)" ]]; }
-# Moved-aside leftovers are ours by NAME: <venv>.old.<digits>, never a symlink.
+# Moved-aside leftovers live in a name only this script uses, <venv>.yuzu-gcovr-old.<pid>, so they are
+# ours by NAME even when half-deleted (a generic suffix like .old.N could be somebody's own directory).
+# Never a symlink.
 remove_leftovers() {
     local old
-    for old in "$VENV".old.*; do
-        [[ -d "$old" && ! -L "$old" && "$old" =~ \.old\.[0-9]+$ ]] || continue
+    for old in "$VENV".yuzu-gcovr-old.*; do
+        [[ -d "$old" && ! -L "$old" ]] || continue
         rm -rf "$old"
     done
 }
@@ -183,18 +201,18 @@ if managed_ok; then
 else
     if [[ -e "$VENV" ]]; then
         if ! owned "$VENV" && ! empty_dir "$VENV"; then
-            die "refusing to replace $VENV: it is not a virtualenv of this script (no ${MARKER} or requirements stamp); point YUZU_GCOVR_VENV at an unused path"
+            die "refusing to replace $VENV: it is not a virtualenv of this script (no ${MARKER} or requirements stamp); point YUZU_GCOVR_VENV at an unused path, or if it is the leftover of an interrupted run of this script, remove it by hand (rm -rf) and re-run"
         fi
         # Atomic: after this rename $VENV does not exist, and the old tree is deleted afterwards. A kill
-        # during the delete leaves only a <venv>.old.<pid> directory, never a half-deleted $VENV.
-        mv "$VENV" "$VENV.old.$$" || die "cannot move $VENV aside"
+        # during the delete leaves only a <venv>.yuzu-gcovr-old.<pid> directory, never a half-deleted $VENV.
+        mv "$VENV" "$VENV.yuzu-gcovr-old.$$" || die "cannot move $VENV aside"
     fi
 
     say "installing gcovr==${pin} with hashes from requirements-ci.txt into ${VENV}"
     mkdir -p "$VENV" || die "cannot create $VENV"
     # The marker goes in BEFORE venv creation, so a build killed at any later point is recognisably ours.
     : > "$VENV/$MARKER" || die "cannot write to $VENV"
-    python3 -m venv "$VENV" || die "could not create the virtualenv at $VENV"
+    tmo 300 python3 -m venv "$VENV" || die "could not create the virtualenv at $VENV"
     tmo "$PIP_TIMEOUT" "$VENV/bin/pip" install --quiet --disable-pip-version-check --require-hashes \
         -r "$ROOT/requirements-ci.txt" \
         || die "pip could not install requirements-ci.txt with hashes (see the pip error above); the usual causes are no network access to PyPI, or a hash-pinned wheel that is not available for this platform"

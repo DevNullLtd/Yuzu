@@ -32,17 +32,21 @@
 # build directory (and the stale *chrome*.zip archives beside it) ONCE and reinstalls. It does so only
 # when (a) the browser lives inside puppeteer's own cache directory, at <cache>/chrome/<build>/..., so
 # a path set by a config file or a lookalike directory is never touched, (b) the caller did not supply
-# PUPPETEER_EXECUTABLE_PATH, and (c) for a browser that is present but will not start, the binary
-# itself is demonstrably broken (it cannot even print --version). A browser that runs but fails to
-# start headless for another reason (an unwritable TMPDIR, memory limits) is left in place, and one
-# that is missing shared libraries is not reinstalled either (a download cannot fix it); the missing
-# libraries are listed instead.
+# PUPPETEER_EXECUTABLE_PATH, and (c) for a browser that is present but will not start, the file is
+# demonstrably INCOMPLETE (shorter than an ELF header, or its section-header table runs past the end
+# of the file) or is not a recognisable binary at all. A browser that cannot print its version but is
+# structurally complete, one that runs but fails to start headless for another reason (an unwritable
+# TMPDIR, memory limits), and one that is missing shared libraries are all LEFT IN PLACE: a download
+# cannot fix them, and a healthy shared build must never be deleted on weak evidence. Missing
+# libraries are listed by name.
 #
 # Every network step has a timeout (when `timeout` or `gtimeout` exists; override with
 # YUZU_ENSURE_NPM_TIMEOUT / _BROWSER_TIMEOUT / _LAUNCH_TIMEOUT, seconds) and the whole run holds an
 # exclusive lock (when `flock` exists; YUZU_ENSURE_LOCK_TIMEOUT bounds the wait), so a stalled
 # connection ends and two worktrees cannot race on the shared browser cache. The lock descriptor is
-# closed for every child process, so a leaked child cannot keep it.
+# closed for every PROBE child (version checks, ldd, the launch check), so a leaked probe cannot keep
+# it; the install steps (npm, npx) keep it on purpose, so an orphaned download makes the next run wait
+# for it instead of racing it.
 #
 # Exit 0 = ready. Exit 1 = not ready; the last line printed says what to do.
 set -euo pipefail
@@ -61,22 +65,33 @@ die()  { printf 'ensure-puppeteer: NOT READY: %s\n' "$*" >&2; exit 1; }
 
 [[ -n "${HOME:-}" ]] || die "HOME is not set"
 
-# tmo SECONDS CMD...: run CMD under a timeout when one exists (macOS has `gtimeout` only with
-# coreutils installed), with the lock descriptor (9) closed for the child.
-tmo() {
-    local secs="$1" t=""
-    shift
+# _timed KEEP_LOCK SECONDS CMD...: run CMD under a timeout when one exists (macOS has `gtimeout` only
+# with coreutils installed). With a terminal on stdin, --foreground keeps Ctrl-C working. KEEP_LOCK=1
+# lets the child inherit the lock descriptor (an orphaned INSTALL then keeps other runs waiting for
+# it, which is right); 0 closes it (probes must never hold the lock).
+_timed() {
+    local keep="$1" secs="$2" t="" fg=""
+    shift 2
     if command -v timeout >/dev/null 2>&1; then
         t=timeout
     elif command -v gtimeout >/dev/null 2>&1; then
         t=gtimeout
     fi
     if [[ -n "$t" ]]; then
-        "$t" -k 10 "$secs" "$@" 9>&- || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}"; return $rc; }
+        [[ -t 0 ]] && fg="--foreground"
+        if [[ "$keep" == 1 ]]; then
+            $t $fg -k 10 "$secs" "$@" || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}"; return $rc; }
+        else
+            $t $fg -k 10 "$secs" "$@" 9>&- || { local rc=$?; [[ $rc -eq 124 ]] && say "timed out after ${secs}s: ${1:-} ${2:-}"; return $rc; }
+        fi
+    elif [[ "$keep" == 1 ]]; then
+        "$@"
     else
         "$@" 9>&-
     fi
 }
+tmo()       { _timed 1 "$@"; }   # install steps
+tmo_probe() { _timed 0 "$@"; }   # probes
 
 command -v node >/dev/null 2>&1 || die "node is not on PATH; install Node ${NODE_MIN_MAJOR}.${NODE_MIN_MINOR} or newer"
 command -v npm  >/dev/null 2>&1 || die "npm is not on PATH; it ships with Node"
@@ -97,11 +112,12 @@ say "node ${node_ver}"
 # opened for APPEND (never truncated) and only in a directory you own and not through a symlink,
 # so a planted link cannot be used to clobber another file.
 if command -v flock >/dev/null 2>&1; then
-    LOCKFILE="${XDG_CACHE_HOME:-$HOME/.cache}/yuzu-ensure-puppeteer.lock"
+    LOCKFILE="${XDG_CACHE_HOME:-${HOME%/}/.cache}/yuzu-ensure-puppeteer.lock"
     lockdir="$(dirname "$LOCKFILE")"
     mkdir -p "$lockdir" || die "cannot create $lockdir"
     [[ -O "$lockdir" ]] || die "$lockdir is not owned by you; refusing to put a lock file there"
     [[ ! -L "$LOCKFILE" ]] || die "$LOCKFILE is a symlink; refusing to use it as a lock file"
+    [[ ! -e "$LOCKFILE" || -f "$LOCKFILE" ]] || die "$LOCKFILE is not a regular file; refusing to use it as a lock file"
     exec 9>>"$LOCKFILE" || die "cannot open $LOCKFILE"
     flock -w "$LOCK_TIMEOUT" 9 || die "timed out waiting for another ensure-puppeteer run (lock: $LOCKFILE)"
 fi
@@ -131,10 +147,10 @@ fi
 # than guessing where Chrome for Testing lives on this OS. Node's own errors are NOT swallowed: a
 # broken import must read as a broken import, not as "browser absent".
 exe_path() {
-    ( cd "$PP" && node --input-type=module -e "
+    ( cd "$PP" && tmo_probe 60 node --input-type=module -e "
         import puppeteer from 'puppeteer';
         console.log(await puppeteer.executablePath());
-    " ) 9>&-
+    " )
 }
 browser_present() {
     local exe
@@ -153,7 +169,8 @@ heal_browser() {
     [[ -z "${PUPPETEER_EXECUTABLE_PATH:-}" ]] || return 1
     local exe cache base rel first build
     exe="$(exe_path)" || return 1
-    cache="${PUPPETEER_CACHE_DIR:-$HOME/.cache/puppeteer}"
+    cache="${PUPPETEER_CACHE_DIR:-${HOME%/}/.cache/puppeteer}"
+    [[ "$cache" == /* ]] || return 1       # puppeteer resolves a relative cache against its own cwd, not ours
     base="${cache%/}/chrome/"
     [[ "$exe" == "$base"* ]] || return 1
     rel="${exe#"$base"}"
@@ -192,7 +209,7 @@ fi
 # Same flags as tests/puppeteer/lib/harness.mjs launch(), so this proves what the gates need. A
 # present-but-truncated binary passes the existence check above and fails here.
 launch_check() {
-    ( cd "$PP" && tmo "$LAUNCH_TIMEOUT" node --input-type=module -e "
+    ( cd "$PP" && tmo_probe "$LAUNCH_TIMEOUT" node --input-type=module -e "
         import puppeteer from 'puppeteer';
         const b = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
         const v = await b.version();
@@ -203,15 +220,31 @@ launch_check() {
 # True when the binary itself runs. A truncated or half-extracted browser cannot even print its
 # version; an intact one can, whatever else stopped it launching.
 browser_runs() {
-    [[ -n "$1" && -x "$1" ]] && tmo 20 "$1" --version >/dev/null 2>&1
+    [[ -n "$1" && -x "$1" ]] && tmo_probe 20 "$1" --version >/dev/null 2>&1
 }
-last_line() { printf '%s' "${1##*$'\n'}"; }
+# Positive evidence that an ELF binary is INCOMPLETE (an interrupted extract). 0 = certainly incomplete
+# (shorter than an ELF header, or its section-header table runs past the end of the file); 1 = the
+# file is structurally complete; 2 = not an ELF64 little-endian file, so no conclusion (macOS, garbage).
+binary_incomplete() {
+    local f="$1" size hex shoff=0 i b shentsize shnum
+    size="$(wc -c < "$f" 2>/dev/null | tr -d ' ')" || return 2
+    [[ -n "$size" ]] || return 2
+    (( size >= 64 )) || return 0
+    hex="$(od -An -v -tx1 -N64 "$f" 2>/dev/null | tr -d ' \n')" || return 2
+    [[ "${hex:0:8}" == "7f454c46" && "${hex:8:2}" == "02" && "${hex:10:2}" == "01" ]] || return 2
+    for ((i = 7; i >= 0; i--)); do b="${hex:$((80 + i * 2)):2}"; shoff=$(( (shoff << 8) | 0x$b )); done
+    shentsize=$(( 0x${hex:118:2}${hex:116:2} ))   # e_shentsize: 2 bytes at ELF offset 0x3a
+    shnum=$(( 0x${hex:122:2}${hex:120:2} ))       # e_shnum: 2 bytes at ELF offset 0x3c
+    (( shoff >= 0 && size >= shoff + shnum * shentsize )) && return 1
+    return 0
+}
+last_line() { printf '%s\n' "$1" | tail -n 1; }
 
 if ! launch_out="$(launch_check)"; then
     exe="$(exe_path || true)"
     missing=""
     if [[ -n "$exe" ]] && command -v ldd >/dev/null 2>&1; then
-        missing="$(ldd "$exe" 2>/dev/null | grep 'not found' | sed 's/^[[:space:]]*//' | tr '\n' ';' || true)"
+        missing="$(tmo_probe 20 ldd "$exe" 2>/dev/null | grep 'not found' | sed 's/^[[:space:]]*//' | tr '\n' ';' || true)"
     fi
     printf '%s\n' "$launch_out" >&2
     if [[ -n "$missing" ]]; then
@@ -220,8 +253,16 @@ if ! launch_out="$(launch_check)"; then
     if browser_runs "$exe"; then
         die "the browser runs (it prints its version) but will not start headless, so it was NOT reinstalled; the output above says why - often an unwritable TMPDIR, a memory limit or a sandbox restriction. Last line: $(last_line "$launch_out")"
     fi
+    # `--version` failing is weak evidence on its own (an address-space limit, a cold disk, a seccomp
+    # profile all do it to a healthy browser). Reinstall only when the file is demonstrably incomplete
+    # or is not a recognisable binary; a structurally complete one is left for the operator.
+    inc=0
+    binary_incomplete "$exe" || inc=$?
+    if [[ "$inc" -eq 1 ]]; then
+        die "the browser binary is complete but cannot run (it fails even to print its version) and was NOT reinstalled; the output above says why. Last line: $(last_line "$launch_out")"
+    fi
     if heal_browser; then
-        say "the browser binary is broken; reinstalling it once"
+        say "the browser binary is incomplete or corrupt; reinstalling it once"
         install_browser || die "browser reinstall failed (${RECOVERY})"
         launch_out="$(launch_check)" || { printf '%s\n' "$launch_out" >&2; die "the browser still will not start headless after a reinstall (${RECOVERY}). Last line: $(last_line "$launch_out")"; }
     else

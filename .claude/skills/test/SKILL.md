@@ -173,10 +173,12 @@ published); `npm ci` is lockfile-integrity-checked with lifecycle scripts disabl
 
 First run side effects: a Chrome for Testing download into `~/.cache/puppeteer` (about 400 MB per build, shared
 by every worktree; old builds are not pruned), npm's cache in `~/.npm`, and the gcovr virtualenv (about 60 MB)
-under `~/.local/share/yuzu/`. Later runs only verify. Network steps run under timeouts (npm 600 s, browser
-900 s, launch 60 s, pip 600 s; `YUZU_ENSURE_NPM_TIMEOUT`, `_BROWSER_TIMEOUT`, `_LAUNCH_TIMEOUT`,
-`_PIP_TIMEOUT` and `_LOCK_TIMEOUT` override), so a stalled link can add up to roughly an hour on a first run
-before the run gives up. An interrupted install repairs itself on the next run.
+under `~/.local/share/yuzu/`. Later runs only verify. A first run takes minutes on a normal link. Network
+steps run under timeouts (npm 600 s, browser 900 s, launch 60 s, pip 600 s; `YUZU_ENSURE_NPM_TIMEOUT`,
+`_BROWSER_TIMEOUT`, `_LAUNCH_TIMEOUT`, `YUZU_ENSURE_PIP_TIMEOUT` and `_LOCK_TIMEOUT` override), and a stalled
+connection that burns every timeout, with the retries, can hold Phase 0b for well over an hour (about 70
+minutes for the Puppeteer step alone; up to about two hours if another run holds the lock). An interrupted
+install repairs itself on the next run.
 
 ```bash
 if [[ "$MODE" == "default" || "$MODE" == "full" ]]; then
@@ -186,7 +188,7 @@ if [[ "$MODE" == "default" || "$MODE" == "full" ]]; then
     bash scripts/test/test-db-write.sh gate \
         --run-id "$RUN_ID" --phase 0 --gate "Puppeteer install" \
         --status "$PPTR_STATUS" --duration $(( $(date +%s) - PPTR_START )) \
-        --log "ensure-puppeteer.log" --notes "$(tail -n 1 "$LOG_DIR/ensure-puppeteer.log")"
+        --log "ensure-puppeteer.log" --notes "$(tail -n 1 "$LOG_DIR/ensure-puppeteer.log" | LC_ALL=C tr -cd '[:print:]')"
     if [[ "$PPTR_STATUS" == "FAIL" ]]; then
         cat "$LOG_DIR/ensure-puppeteer.log"
         bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED
@@ -215,7 +217,7 @@ if [[ "$MODE" == "default" || "$MODE" == "full" ]]; then
         bash scripts/test/test-db-write.sh gate \
             --run-id "$RUN_ID" --phase 0 --gate "gcovr install" \
             --status "$GCOVR_RECORD" --duration $(( $(date +%s) - GCOVR_START )) \
-            --log "ensure-gcovr.log" --notes "$(tail -n 1 "$LOG_DIR/ensure-gcovr.log")"
+            --log "ensure-gcovr.log" --notes "$(tail -n 1 "$LOG_DIR/ensure-gcovr.log" | LC_ALL=C tr -cd '[:print:]')"
         if [[ "$GCOVR_STATUS" == "FAIL" ]]; then
             cat "$LOG_DIR/ensure-gcovr.log"
             if [[ "$MODE" == "full" ]]; then
