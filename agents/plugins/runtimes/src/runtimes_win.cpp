@@ -1,12 +1,13 @@
 /**
  * runtimes_win.cpp -- Windows leg entry point.
  *
- * `python` is read from the PEP 514 registry keys (runtimes_win_parsers.hpp, `win::python_rows`,
- * templated on a registry-ops seam; production uses RealRegOps). The Windows .NET and JVM reads (the
- * HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP release-key table + dotnet InstalledVersions + a
- * Program Files walk; the JavaSoft registry keys + a Program Files\Java walk) are still planned:
- * those actions report `status|<action>|unsupported|windows:planned`, matching the PLANNED Windows
- * legs the descriptor table in runtimes_plugin.cpp declares.
+ * All three actions are registry reads (runtimes_win_parsers.hpp, templated on a registry-ops seam;
+ * production uses RealRegOps), both registry views, no subprocess and no directory walk:
+ *   python  HKLM\SOFTWARE\Python\PythonCore (PEP 514), `win::python_rows`.
+ *   dotnet  HKLM\SOFTWARE\dotnet\Setup\InstalledVersions (shared frameworks and SDKs) plus the
+ *           .NET Framework NDP\v4\Full release table and NDP\v3.5, `win::dotnet_rows`.
+ *   jvm     the JavaSoft, Eclipse Adoptium and Azul Zulu home registrations, then one bounded read of
+ *           each home's `release` file (never through a reparse point), `win::jvm_rows`.
  */
 #include "runtimes_legs.hpp"
 #include "runtimes_win_parsers.hpp"
