@@ -152,6 +152,7 @@ const char* const kWingetPath =
 struct FakeOps {
     std::map<std::string, pw::NameList> reg_lists;                        // store key -> list
     std::map<std::string, std::string> reg_values;                        // "key|subkey|value"
+    std::map<std::string, pw::OpStatus> reg_value_status;                 // same key: a non-ok read
     std::map<std::string, pw::NameList> dir_lists;                        // path -> list
     std::map<std::string, pw::FileRead> files;                            // lower-cased path
     mutable std::vector<std::string> file_reads;                          // paths asked for
@@ -170,8 +171,10 @@ struct FakeOps {
     }
     [[nodiscard]] pw::ValueRead read_reg_string(std::string_view key, std::string_view sub,
                                                 std::string_view value) const {
-        const auto it = reg_values.find(std::string{key} + "|" + std::string{sub} + "|" +
-                                        std::string{value});
+        const auto id = std::string{key} + "|" + std::string{sub} + "|" + std::string{value};
+        if (const auto st = reg_value_status.find(id); st != reg_value_status.end())
+            return {st->second, {}};
+        const auto it = reg_values.find(id);
         if (it == reg_values.end()) return {pw::OpStatus::absent, {}};
         return {pw::OpStatus::ok, it->second};
     }
@@ -620,6 +623,42 @@ TEST_CASE("win managers: the highest registered App Installer version wins; a mi
     const auto rows = pw::manager_rows(ops, acc);
     REQUIRE(rows.size() == 1);
     CHECK(rows[0] == "manager|winget|present|1.29.379.0|-|-|-");
+}
+
+TEST_CASE("win managers: an unreadable App Installer Path leaves the root `-` and raises no token",
+          "[pkg_inventory][windows][managers]") {
+    for (const auto st : {pw::OpStatus::denied, pw::OpStatus::error}) {
+        FakeOps ops; // SYNTHETIC
+        ops.set_apps("Applications", {kWingetKey});
+        ops.reg_value_status[std::string{"Applications|"} + kWingetKey + "|Path"] = st;
+        ConstraintAccumulator acc;
+        const auto rows = pw::manager_rows(ops, acc);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == "manager|winget|present|1.29.379.0|-|-|-");
+        CHECK_FALSE(acc.any_failure());
+    }
+}
+
+TEST_CASE("win managers: an incomplete Appx roster listing still reports winget and raises its token",
+          "[pkg_inventory][windows][managers]") {
+    {
+        FakeOps ops; // SYNTHETIC: more roster keys existed than the cap
+        ops.reg_lists["Applications"] = {pw::OpStatus::ok, {kApplications[0], kWingetKey}, true, false};
+        ConstraintAccumulator acc;
+        const auto rows = pw::manager_rows(ops, acc);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == "manager|winget|present|1.29.379.0|-|-|-");
+        CHECK(acc.reason() == "windows:pkg_inventory:appx_applications:entry_cap");
+    }
+    {
+        FakeOps ops; // SYNTHETIC: the enumeration stopped on an error mid-way
+        ops.reg_lists["Applications"] = {pw::OpStatus::ok, {kApplications[0], kWingetKey}, false, true};
+        ConstraintAccumulator acc;
+        const auto rows = pw::manager_rows(ops, acc);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == "manager|winget|present|1.29.379.0|-|-|-");
+        CHECK(acc.reason() == "windows:pkg_inventory:appx_applications:enum_failed");
+    }
 }
 
 TEST_CASE("win managers: a present-but-unreadable manager is an unavailable row plus a token",
