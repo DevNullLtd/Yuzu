@@ -63,15 +63,15 @@ constexpr const char* kReasonConcurrencyBudget = "concurrency_budget";
 // JC-8 (coordinator review): label parity with InventoryStore's
 // yuzu_inventory_read_degrade_total{reason, source} family — a constant
 // "source" so a future second Guardian-adjacent read-degrade emitter stays
-// distinguishable on the same dashboards without a metric rename. Two
-// sources exist today (#4856, plus "guardian_census" below): "guardian_state" for the DEX/observation
+// distinguishable on the same dashboards without a metric rename. Three
+// sources exist today: "guardian_state" for the DEX/observation
 // family (dex_read<>/dex_observation, fail-soft — an empty/degraded result
-// is returned to the caller) and "guardian_rules" for the AUTHORITATIVE
+// is returned to the caller), "guardian_rules" for the AUTHORITATIVE
 // rule/status reads (get_rule/list_rules/agent_rule_statuses*/rule_names*/
 // errored_rule_count, fail-hard — a std::expected error is returned and the
-// caller decides how to fail). Both bump the SAME counter,
-// yuzu_server_guardian_read_degrade_total{reason,source}, so an alert can
-// aggregate `by (reason, source)` without missing either family.
+// caller decides how to fail) (#4856), and "guardian_census" (below). All
+// bump the SAME counter, yuzu_server_guardian_read_degrade_total{reason,source},
+// so an alert can aggregate `by (reason, source)` without missing any family.
 constexpr const char* kDegradeSource = "guardian_state";
 constexpr const char* kDegradeSourceRules = "guardian_rules";
 // The census pending-evidence count read (pending_projection_count_checked,

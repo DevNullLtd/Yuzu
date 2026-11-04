@@ -3235,9 +3235,10 @@ tests:
   # ── YuzuGuardianReadDegraded (#4856) ─────────────────────────────────────
   #
   # `sum(rate(yuzu_server_guardian_read_degrade_total[5m])) by (reason,
-  # source) > 0`, for: 5m, warning. Two sources share the counter:
-  # "guardian_state" (DEX/observation reads, fail-soft) and "guardian_rules"
-  # (authoritative rule/status reads, fail-hard) - both must page on a
+  # source) > 0`, for: 5m, warning. Three sources share the counter:
+  # "guardian_state" (DEX/observation reads, fail-soft), "guardian_rules"
+  # (authoritative rule/status reads, fail-hard) and "guardian_census" (the
+  # census pending-evidence count read, #5690) - each must page on a
   # sustained non-zero rate, keyed by both labels.
 
   # CASE — a sustained degrade on the DEX/observation family (guardian_state)

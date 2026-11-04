@@ -892,8 +892,8 @@ TEST_CASE("census ordering: the pending gauge counts stored evidence and reports
     CHECK(store.pending_projection_count_checked().value() == 1);
 
     PgPool dead{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
-    GuaranteedStateStore closed(dead);
     yuzu::MetricsRegistry metrics;
+    GuaranteedStateStore closed(dead);
     closed.set_metrics(&metrics);
     CHECK_FALSE(closed.pending_projection_count_checked().has_value());
     // A failed read is counted as a read degrade; only the reason depends on how the pool fails.
@@ -1226,7 +1226,7 @@ TEST_CASE("census ordering: every projection outcome is counted by source",
     CHECK(count("repair", "applied") == 1);
 }
 
-TEST_CASE("census ordering: a repair projects from the stored inputs and keeps a lower-key pending row pending",
+TEST_CASE("census ordering: a repair projects from the stored inputs and keeps a higher-key pending row pending",
           "[pg][guaranteed_state_store][db][census][ordering][k]") {
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
