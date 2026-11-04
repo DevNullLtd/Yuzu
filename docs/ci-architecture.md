@@ -1943,7 +1943,8 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
   invocation and Ok 8 for the second.
 - Timeouts are not in the log: read `timeout:` in `tests/meson.build`. The ones
   that matter: agent shards 240 s, `blocked log sink SIGTERM harness` 300 s, echo
-  90 s, `gateway eunit` and `gateway ct` 600 s.
+  90 s (`echo unit tests`; `echo fold sizing` and `echo v10 migration` are 300 s),
+  `gateway eunit` and `gateway ct` 600 s.
 - Not usable: the step summaries are not exposed by the jobs API, the meson-logs
   artifact uploads only on failure, and the runner telemetry database does not
   carry these entries (the junit import runs once at job end and reads the last
