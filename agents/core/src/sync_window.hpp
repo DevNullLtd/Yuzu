@@ -35,12 +35,13 @@ inline LocalClock system_local_clock() {
         const std::time_t tt = static_cast<std::time_t>(t);
         std::tm tmv{};
         // The conversion's return value is deliberately unchecked: on failure tmv stays
-        // zeroed (year 1900), so next_window_fire's mktime yields -1, both candidates fail
-        // `cand <= now`, and it returns its now + 24 h fallback.
+        // zeroed (year 1900), so mktime yields a pre-epoch value or -1 (libc-dependent),
+        // both candidates fail `cand <= now`, and next_window_fire returns its now + 24 h
+        // fallback.
 #ifdef _WIN32
-        localtime_s(&tmv, &tt);
+        (void)localtime_s(&tmv, &tt);
 #else
-        localtime_r(&tt, &tmv);
+        (void)localtime_r(&tt, &tmv);
 #endif
         return tmv;
     };

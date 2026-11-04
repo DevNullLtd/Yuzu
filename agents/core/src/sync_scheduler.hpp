@@ -106,9 +106,10 @@ public:
     /// tick(). With `delay_max` zero: next_fire = now, force_full = true,
     /// needfull_streak = 0, persisted, and that same tick fires them. With
     /// `delay_max` > 0 the same state is armed but next_fire = now + a stable
-    /// per-(agent,source) offset in [0, delay_max), and the batch pass fires the
-    /// source once that is due, so a fleet-wide click does not stampede the server.
-    /// A source requested twice keeps the smaller delay. `add_source` must not be
+    /// per-(agent,source) offset in [0, delay_max), or the fire already armed sooner,
+    /// whichever is earlier, and the batch pass fires the source once that is due, so a
+    /// fleet-wide click does not stampede the server. A source requested twice keeps
+    /// the smaller delay. `add_source` must not be
     /// called after the ticking thread starts (sources_ is read here without the
     /// mutex — append-only before publication, as agent.cpp does).
     [[nodiscard]] std::vector<std::string>
@@ -124,16 +125,19 @@ public:
     static constexpr std::string_view kAllSources{"all"};
 
     /// Hard floor: even with hash-skip, send a full payload at least this often
-    /// (defense-in-depth against server cold-cache / agent hash bugs — ADR-0016 §4).
+    /// (defense-in-depth against server cold-cache / agent hash bugs — ADR-0016 §4). A
+    /// windowed source fires at a local-time moment, so across a spring-forward the 7th
+    /// day's fire is an hour short of this floor and the full send lands on the 8th.
     static constexpr std::chrono::seconds kFullFloor{7 * 24 * 60 * 60};
     /// First-run catch-up is delayed by a stable per-(agent,source) offset in
     /// [0, this) so a mass-enroll / site power-on does not herd.
     static constexpr std::chrono::seconds kStartupJitterWindow{10 * 60};
-    /// Overdue catch-up (a persisted next_fire more than kMaxTickSeconds in the past:
-    /// the agent was off, the machine slept, or the server was unreachable for longer
-    /// than that and the failed send left the state unadvanced) is spread over
-    /// [0, this) from now by a stable per-(agent,source) offset, so a Monday-morning
-    /// power-on, or the server coming back after an outage, is gentle.
+    /// Catch-up (a persisted next_fire more than kMaxTickSeconds in the past: the agent
+    /// was off, the machine slept, or the server was unreachable for longer than that and
+    /// the failed send left the state unadvanced; or more than two days in the future: a
+    /// clock stepped back, or a corrupt value) is re-armed over [0, this) from now by a
+    /// stable per-(agent,source) offset, so a Monday-morning power-on, or the server
+    /// coming back after an outage, is gentle.
     static constexpr std::chrono::seconds kCatchUpWindow{30 * 60};
     /// A server `need_full` resend is delayed by `kMinTickSeconds` + a stable
     /// per-(agent,source) offset in [0, this), so a mass cold-cache event (e.g. a
@@ -195,8 +199,10 @@ private:
     /// has one, else the next phase-aligned slot of its interval.
     std::int64_t next_due(std::size_t idx, std::int64_t now_secs) const;
     /// Re-arm a LOADED source whose next_fire is more than kMaxTickSeconds in the
-    /// past (a live agent never is: it wakes at least every clamped sleep) to
-    /// now + a stable offset in [0, kCatchUpWindow), and persist it.
+    /// past (a live agent never is: it wakes at least every clamped sleep) OR more than
+    /// two days in the future (no interval plus window reaches that) to now + a stable
+    /// offset in [0, kCatchUpWindow), and persist it. last_hash and force_full are
+    /// left untouched.
     void catch_up_if_overdue(std::size_t idx, std::int64_t now_secs);
     /// Hash-skip decision for one source at `now_secs`, given its freshly
     /// collected `hash` — factored out of tick() so the forced-source (pass 1)

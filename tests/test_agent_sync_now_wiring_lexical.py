@@ -19,6 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 AGENT_CPP = ROOT / "agents" / "core" / "src" / "agent.cpp"
 TAG = "test_agent_sync_now_wiring_lexical"
+HEAD = 'if (cmd.plugin() == "__sync__") {'
 HINT = (
     " (this gate pins the __sync__.now parameter wiring; if agent.cpp was legitimately restructured"
     " or renamed, update the patterns AND the MUTATIONS patterns in"
@@ -34,6 +35,12 @@ def normalise(src):
 def problems(src):
     """One message per violated invariant, in invariant order; [] when clean."""
     t = normalise(src)
+    # Only the text from the __sync__ branch head on is searched, so a same-shaped read
+    # elsewhere in agent.cpp cannot satisfy a pattern; a missing head is itself a problem.
+    head = t.find(HEAD)
+    if head < 0:
+        return [f"agent.cpp no longer has the `{HEAD}` branch"]
+    t = t[head:]
     out = []
     if not re.search(r'auto it = cmd\.parameters\( ?\)\.find\( ?"source" ?\); ?[^;]*\) ?source = it->second;', t):
         out.append('the __sync__ branch no longer reads `cmd.parameters().find("source")` into `source`')
@@ -61,6 +68,9 @@ MUTATIONS = [
     (_FROM_HEAD + r'decide_sync_now\(cmd\.action\(\), source, delay_max_s,',
      r'\g<1>decide_sync_now(cmd.action(), source, std::string{},', re.S, 1,
      "decide_sync_now(cmd.action(), source, delay_max_s"),
+    # 4. the branch head renamed: nothing after it can be trusted to be the __sync__ block
+    (r'if \(cmd\.plugin\(\) == "__sync__"\) \{', 'if (cmd.plugin() == "__synced__") {', 0, 1,
+     "no longer has the"),
 ]
 
 

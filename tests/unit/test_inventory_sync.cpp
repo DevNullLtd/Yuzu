@@ -3943,3 +3943,104 @@ TEST_CASE("SAM-19: a delayed request_now still pending at a restart is re-armed 
     CHECK(r.calls == 2);
     CHECK(r.last_had_blob); // force_full survived the restart and the re-arm
 }
+
+TEST_CASE("SAM-19: a persisted next_fire the agent could not have written is re-armed, not trusted",
+          "[sync][scheduler][sam19]") {
+    // A clock stepped back, a VM restore, or a corrupt KV value: the schedule is far in the
+    // future (or saturated by strtoll) and, left alone, would stall the source until the wall
+    // clock caught up.
+    auto persist = [](Sam19Rig& r, const std::string& next_fire) {
+        r.kv["sync.a.next_fire"] = next_fire;
+        r.kv["sync.a.last_hash"] = "hash";
+        r.kv["sync.a.last_full"] = std::to_string(kNoon);
+        r.kv["sync.a.force_full"] = "0";
+    };
+
+    SECTION("a far-future next_fire is re-armed inside the catch-up window") {
+        for (const std::string& far : {std::to_string(kNoon + 10 * 86400),
+                                       std::to_string(kNoon + 2 * 86400 + 1)}) {
+            Sam19Rig r;
+            persist(r, far);
+            r.add("a");
+            r.sched->tick(kNoon);
+            INFO("persisted next_fire=" << far);
+            CHECK(r.calls == 0); // not at once
+            CHECK(r.next_fire("a") >= kNoon);
+            CHECK(r.next_fire("a") < kNoon + SyncScheduler::kCatchUpWindow.count());
+            CHECK(r.kv.at("sync.a.last_hash") == "hash"); // only the schedule was corrected
+            CHECK(r.kv.at("sync.a.force_full") == "0");
+
+            r.sched->tick(r.next_fire("a")); // and it syncs once the spread offset passes
+            CHECK(r.calls == 1);
+            CHECK_FALSE(r.last_had_blob); // hash-only: unchanged, inside the weekly floor
+        }
+    }
+    SECTION("a saturated value (strtoll clamps to LLONG_MIN / LLONG_MAX) does not overflow") {
+        for (const char* saturated : {"-9223372036854775808", "9223372036854775807",
+                                      "99999999999999999999", "-99999999999999999999"}) {
+            Sam19Rig r;
+            persist(r, saturated);
+            r.add("a");
+            r.sched->tick(kNoon);
+            INFO("persisted next_fire=" << saturated);
+            CHECK(r.calls == 0);
+            CHECK(r.next_fire("a") >= kNoon);
+            CHECK(r.next_fire("a") < kNoon + SyncScheduler::kCatchUpWindow.count());
+        }
+    }
+    SECTION("a normally armed next_fire a day ahead is left alone") {
+        Sam19Rig r;
+        const std::int64_t tomorrow = kNoon + 86400;
+        persist(r, std::to_string(tomorrow));
+        r.add("a");
+        r.sched->tick(kNoon);
+        CHECK(r.calls == 0);
+        CHECK(r.next_fire("a") == tomorrow); // not rewritten
+    }
+}
+
+TEST_CASE("SAM-19: a repeated delayed request never pushes an earlier armed fire later",
+          "[sync][scheduler][sam19]") {
+    const std::int64_t t0 = kNoon + 5000;
+    constexpr std::chrono::seconds kDelay{86400};
+
+    // Persist `persisted_next_fire`, request a kDelay-delayed sync of "a" and run one tick at t0.
+    auto request_at = [&](Sam19Rig& r, std::int64_t persisted_next_fire) {
+        r.kv["sync.a.next_fire"] = std::to_string(persisted_next_fire);
+        r.add("a");
+        REQUIRE(r.sched->request_now("a", kDelay) == std::vector<std::string>{"a"});
+        r.sched->tick(t0);
+    };
+
+    // This agent's stable offset for a delay of kDelay: a past next_fire is replaced by it.
+    std::int64_t offset = 0;
+    {
+        Sam19Rig probe;
+        request_at(probe, t0 - 100);
+        offset = probe.next_fire("a") - t0;
+    }
+    REQUIRE(offset > 2);
+    REQUIRE(offset < kDelay.count());
+
+    SECTION("a future fire already sooner than the offset is kept, and the sync is still forced full") {
+        Sam19Rig r;
+        const std::int64_t sooner = t0 + offset / 2; // e.g. a skip-ladder retry
+        request_at(r, sooner);
+        CHECK(r.next_fire("a") == sooner);
+        CHECK(r.kv.at("sync.a.force_full") == "1");
+        CHECK(r.calls == 0);
+    }
+    SECTION("a future fire later than the offset is pulled earlier to it") {
+        Sam19Rig r;
+        request_at(r, t0 + kDelay.count() + offset); // inside the two-day sanity bound
+        CHECK(r.next_fire("a") == t0 + offset);
+        CHECK(r.kv.at("sync.a.force_full") == "1");
+    }
+    SECTION("a past fire is replaced by the offset, not kept") {
+        Sam19Rig r;
+        request_at(r, t0 - 100); // due but not yet sent, within one clamped sleep
+        CHECK(r.next_fire("a") == t0 + offset);
+        CHECK(r.kv.at("sync.a.force_full") == "1");
+        CHECK(r.calls == 0);
+    }
+}

@@ -207,6 +207,10 @@ TEST_CASE("next_window_fire: an unconvertible local time falls back to a day lat
 
 TEST_CASE("next_window_fire: the real C-library clock lands inside the window",
           "[sync][window]") {
+    // Smoke test of the production conversions only: it asserts the result lies inside the
+    // window as the SAME clock reads it back, so it holds in whatever zone the host has
+    // (TZ unset, UTC, a DST zone) and pins nothing about which zone that is. The DST edges
+    // are pinned on the fake zone above.
     const LocalClock clock = system_local_clock();
     const std::int64_t now = 1'781'000'000; // a fixed instant, not the wall clock
     for (std::uint64_t h : {0ULL, 5400ULL, 14399ULL}) {

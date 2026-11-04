@@ -18,10 +18,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -67,9 +69,10 @@ std::unique_ptr<SyncScheduler> make_fake_scheduler() {
     return sched;
 }
 
-// Same as make_fake_scheduler but collect() counts calls, so a test can prove a
-// request armed nothing: a forced source would be collected in the very next tick.
-std::unique_ptr<SyncScheduler> make_counting_scheduler(int& collects) {
+// Same as make_fake_scheduler but collect() counts calls per source name, so a test can prove
+// a request armed nothing (a forced source would be collected in the very next tick) or when a
+// delayed one fires. `collects` only gains an entry once that source's collect() has run.
+std::unique_ptr<SyncScheduler> make_counting_scheduler(std::map<std::string, int>& collects) {
     auto kv = std::make_shared<std::map<std::string, std::string>>();
     auto kv_get = [kv](const std::string& k) {
         auto it = kv->find(k);
@@ -84,8 +87,9 @@ std::unique_ptr<SyncScheduler> make_counting_scheduler(int& collects) {
         SyncSource src;
         src.name = name;
         src.interval = std::chrono::seconds{86400};
-        src.collect = [&collects]() -> std::optional<std::pair<std::string, std::string>> {
-            ++collects;
+        src.collect = [&collects, name = std::string{name}]()
+            -> std::optional<std::pair<std::string, std::string>> {
+            ++collects[name];
             return std::nullopt;
         };
         sched->add_source(src);
@@ -158,21 +162,52 @@ TEST_CASE("decide_sync_now: delay_max_s accepts an integer in 0..86400", "[sync]
     }
 }
 
+TEST_CASE("decide_sync_now: delay_max_s reaches the scheduler: 0 collects in the same tick, "
+          "a positive value only once the stable offset has passed",
+          "[sync][agent_command]") {
+    constexpr std::int64_t kNow = 1000;
+    SECTION("absent and 0 are the immediate path") {
+        for (std::optional<std::string_view> immediate :
+             {std::optional<std::string_view>{}, std::optional<std::string_view>{"0"}}) {
+            std::map<std::string, int> collects;
+            auto sched = make_counting_scheduler(collects);
+            auto decision = decide_sync_now("now", "device_ci", immediate,
+                                            /*inventory_disable=*/false, sched.get());
+            REQUIRE(decision.status == SyncNowDecision::Status::Success);
+            sched->tick(kNow);
+            CHECK(collects["device_ci"] == 1);
+        }
+    }
+    SECTION("120 is deferred to a later tick") {
+        std::map<std::string, int> collects;
+        auto sched = make_counting_scheduler(collects);
+        auto decision = decide_sync_now("now", "device_ci", "120", /*inventory_disable=*/false,
+                                        sched.get());
+        REQUIRE(decision.status == SyncNowDecision::Status::Success);
+        sched->tick(kNow);
+        CHECK(collects["device_ci"] == 0); // would be 1 if the delay were dropped on the way in
+        sched->tick(kNow + 120); // the stable offset is inside [0, 120)
+        CHECK(collects["device_ci"] == 1);
+    }
+}
+
 TEST_CASE("decide_sync_now: malformed or out-of-range delay_max_s fails exit 2 and arms nothing",
           "[sync][agent_command]") {
     // "" is a present-but-empty value: malformed, not absent (absent is std::nullopt above).
+    // "+5" and "5 " are rejected by from_chars (no leading '+', no trailing characters).
     for (const char* bad :
-         {"", "abc", "-1", "90000", "1.5", "12s", " 5", "99999999999999999999"}) {
-        int collects = 0;
+         {"", "abc", "-1", "90000", "1.5", "12s", " 5", "+5", "5 ", "99999999999999999999"}) {
+        std::map<std::string, int> collects;
         auto sched = make_counting_scheduler(collects);
         auto decision =
             decide_sync_now("now", "device_ci", bad, /*inventory_disable=*/false, sched.get());
         INFO("delay_max_s=" << bad);
         CHECK(decision.status == SyncNowDecision::Status::Failure);
         CHECK(decision.exit_code == 2);
-        CHECK(decision.output.find("delay_max_s") != std::string::npos);
+        CHECK(decision.output ==
+              std::string("invalid delay_max_s '") + bad + "' — expected an integer 0..86400");
         sched->tick(1000); // a forced source would be collected at once
-        CHECK(collects == 0);
+        CHECK(collects.empty());
     }
 }
 
@@ -185,7 +220,7 @@ TEST_CASE("decide_sync_now: a source list is all-or-nothing", "[sync][agent_comm
         CHECK(decision.output == "requested|installed_software,device_ci");
     }
     SECTION("one unknown name: failure naming the valid set, nothing armed") {
-        int collects = 0;
+        std::map<std::string, int> collects;
         auto sched = make_counting_scheduler(collects);
         auto decision = decide_sync_now("now", "device_ci,bogus", std::nullopt,
                                         /*inventory_disable=*/false, sched.get());
@@ -194,7 +229,7 @@ TEST_CASE("decide_sync_now: a source list is all-or-nothing", "[sync][agent_comm
         CHECK(decision.output ==
               "unknown sync source 'device_ci,bogus' — expected one of installed_software,device_ci or all");
         sched->tick(1000);
-        CHECK(collects == 0);
+        CHECK(collects.empty());
     }
     SECTION("an empty list entry is unknown") {
         auto sched = make_fake_scheduler();

@@ -2,6 +2,13 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: installed software syncs in a nightly window, and an overdue sync is spread
+
+- **What changed:** the agent sends installed software once a day at a stable per-agent moment between 01:00 and 05:00 on the endpoint's own clock and time zone (it was a stable phase of the 24 hour cycle), and a sync more than 15 minutes overdue, or a send that keeps failing, is spread over the next 30 minutes instead of retried every 30 seconds throughout.
+- **Affected:** the server's `ReportInventory` load. A fleet in one time zone now reports within four hours (about six times the former per-second rate, roughly 70 calls a second per million agents), and after a mass reboot or an outage every overdue agent reports within 30 minutes (roughly 550 a second per million). An endpoint with no time zone configured uses UTC.
+- **Mixed fleet:** an agent that has not been upgraded keeps its old phase offset. It also ignores `delay_max_s` on `__sync__.now` and rejects a comma-separated source list, so anything that sends either must check the agent version first.
+- **Not configurable yet:** the window is built into the agent; there is no setting and no settings push for it.
+
 ## ⚠️ Breaking: stored response rows are capped per command and device (256 by default) (#561)
 
 - **What changed:** the response store keeps at most 256 rows for one command on one device (`--response-max-rows-per-agent`, env `YUZU_RESPONSE_MAX_ROWS_PER_AGENT`, range 1-65536). Rows past the cap are dropped, newest first, and the row just before the dropped frames ends with a `...[rows past per-agent cap dropped]` marker. One terminal-status row is still recorded past the cap when none exists, so the command's outcome shows.

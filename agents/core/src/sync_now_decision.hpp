@@ -36,6 +36,7 @@
 
 #include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -44,7 +45,7 @@
 namespace yuzu::agent {
 
 /// Upper bound of the `delay_max_s` command parameter (24 h).
-inline constexpr long kSyncNowMaxDelaySeconds = 86400;
+inline constexpr std::int64_t kSyncNowMaxDelaySeconds = 86400;
 
 /// Result of deciding a `__sync__.now` command — maps 1:1 onto the subset of
 /// CommandResponse fields the loop populates for this reserved command
@@ -77,11 +78,12 @@ struct SyncNowDecision {
 ///                        daily-sync framework isn't running (e.g.
 ///                        --inventory-disable, or not yet connected).
 ///
-/// Calls sched->request_now(source_param) exactly once when sched is
-/// non-null (matching the original inline `else if (auto armed = ...)`) —
-/// request_now() itself has a side effect, arming the scheduler's pending
-/// list for its next tick, so this is a "decision" only in the sense the
-/// original inline code was: the arm happens as part of computing the reply.
+/// Calls sched->request_now(source_param, std::chrono::seconds{delay}) exactly
+/// once when sched is non-null and delay_max_s is valid (matching the original
+/// inline `else if (auto armed = ...)`) — request_now() itself has a side effect,
+/// arming the scheduler's pending list for its next tick, so this is a "decision"
+/// only in the sense the original inline code was: the arm happens as part of
+/// computing the reply.
 [[nodiscard]] inline SyncNowDecision decide_sync_now(std::string_view action,
                                                       std::string_view source_param,
                                                       std::optional<std::string_view> delay_max_s,
@@ -96,7 +98,7 @@ struct SyncNowDecision {
                 inventory_disable ? "daily-sync disabled (--inventory-disable)"
                                    : "daily-sync not running (not connected)"};
     }
-    long delay = 0;
+    std::int64_t delay = 0;
     if (delay_max_s) {
         // from_chars rejects garbage, an empty range, a leading space or '+', and overflow;
         // ptr != end rejects trailing characters ("12s", "1.5").

@@ -36,6 +36,12 @@ std::int64_t next_slot(std::int64_t now, std::int64_t interval, std::int64_t off
     return base;
 }
 
+// A persisted next_fire further ahead than this is not a schedule this agent wrote: the
+// longest legitimate lead is a skip-ladder or window placement of 24 h plus a window, so
+// 2 days is a bound, not a tunable. A clock stepped back (NTP, a VM restore) or a corrupt
+// KV value would otherwise stall the source until the wall clock caught up.
+constexpr std::int64_t kFarFutureSlack = 2 * 24 * 60 * 60;
+
 } // namespace
 
 SyncScheduler::SyncScheduler(std::string agent_id, KvGetFn kv_get, KvSetFn kv_set, SenderFn sender,
@@ -82,14 +88,18 @@ std::int64_t SyncScheduler::next_due(std::size_t idx, std::int64_t now_secs) con
 
 void SyncScheduler::catch_up_if_overdue(std::size_t idx, std::int64_t now_secs) {
     State& st = states_[idx];
-    if (now_secs - st.next_fire <= kMaxTickSeconds.count())
+    // Two comparisons, no `now - next_fire`: next_fire comes from strtoll, which saturates a
+    // corrupt value to LLONG_MIN/LLONG_MAX, and that subtraction would overflow.
+    if (st.next_fire >= now_secs - kMaxTickSeconds.count() &&
+        st.next_fire <= now_secs + kFarFutureSlack)
         return;
     const SyncSource& src = sources_[idx];
+    const bool overdue = st.next_fire < now_secs;
     st.next_fire = now_secs + static_cast<std::int64_t>(
                                   fnv1a(agent_id_ + ":catchup:" + src.name) %
                                   static_cast<std::uint64_t>(kCatchUpWindow.count()));
-    spdlog::info("sync: source '{}' was overdue — catching up at +{}s", src.name,
-                 st.next_fire - now_secs);
+    spdlog::info("sync: source '{}' had {} next fire — catching up at +{}s", src.name,
+                 overdue ? "an overdue" : "an implausibly distant", st.next_fire - now_secs);
     save_state(src, st);
 }
 
@@ -242,9 +252,15 @@ std::vector<std::size_t> SyncScheduler::drain_pending(std::int64_t now_secs) {
         State& st = load_state(i, now_secs); // must run first so a never-loaded source is real
         // delay 0: fire in THIS tick's forced pass. delay > 0: a stable per-(agent,source)
         // offset in [0, delay) and NOT in the forced list — the batch pass fires it when due.
-        st.next_fire = delay > 0
-                           ? now_secs + phase_offset("now:" + sources_[i].name, delay)
-                           : now_secs;
+        // A request only ever pulls a fire earlier: a FUTURE next_fire already sooner than the
+        // offset (a skip-ladder retry, an earlier delayed click) is kept; a PAST one is replaced,
+        // or catch-up would re-spread it over 30 min instead of the requested window.
+        if (delay > 0) {
+            const std::int64_t fire_at = now_secs + phase_offset("now:" + sources_[i].name, delay);
+            st.next_fire = st.next_fire > now_secs ? std::min(st.next_fire, fire_at) : fire_at;
+        } else {
+            st.next_fire = now_secs;
+        }
         st.force_full = true;
         // An operator click deliberately beats the need_full backoff ladder (UP-5):
         // the ladder exists to stop a FLEET stampeding a cold server, not to
@@ -299,6 +315,9 @@ void SyncScheduler::apply_ack(std::size_t idx, const std::string& hash, bool sen
         if (sent_full)
             st.last_full = now_secs;
         st.next_fire = next_due(idx, now_secs);
+        // Once per successful sync per source (about daily): where the next one is placed.
+        spdlog::info("sync: source '{}' synced — next sync at epoch {} (in {}s)", src.name,
+                     st.next_fire, st.next_fire - now_secs);
     }
     save_state(src, st);
 }
