@@ -390,6 +390,27 @@ TEST_CASE("access-review fragments: a human holding the same custom role is stil
     CHECK(r.fragment_audits.empty()); // the belt writes only on a refusal
 }
 
+TEST_CASE("access-review campaign fragment: a malformed or unknown id shows a plain notice, never the "
+          "store's classification prefix",
+          "[pg][settings][access_review][4752]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, ar_engine_tpl);
+    Rig r{db_.dsn()};
+    const auto bob = r.cookie("bob", auth::Role::user);
+    const std::string base = std::string(kGetFragment) + "?id=";
+
+    // "has space" and "a%00b" fail the shared validator; "nosuchcampaign" passes it and is unknown.
+    for (const char* id : {"has%20space", "a%00b", "nosuchcampaign"}) {
+        INFO("id=" << id);
+        const auto res = r.cookie_get(base + id, bob);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_THAT(res->body, ContainsSubstring("No campaign with that id."));
+        CHECK_THAT(res->body, !ContainsSubstring("bad_request"));
+        CHECK_THAT(res->body, !ContainsSubstring("not_found"));
+        CHECK_THAT(res->body, !ContainsSubstring(kCampaignTitle));
+    }
+}
+
 TEST_CASE("access-review fragments: a caller without the grant and an unauthenticated caller are "
           "still refused at the gate, before the belt",
           "[pg][settings][engine_principal][access_review][authz][security]") {

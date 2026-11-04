@@ -277,7 +277,7 @@ decision_cap_wire_message(std::string_view store_error) noexcept {
 }
 
 /// The single shared campaign id validator: 1..kCampaignIdMaxLen bytes, each in `[A-Za-z0-9_-]`.
-/// REST, MCP and the Access page all call this (the Settings fragment does from its own change);
+/// REST, MCP, the Access page and the Settings campaign fragment all call this;
 /// never fork a second copy. It tests every byte of the view, so an embedded NUL is rejected:
 /// `pg/pg_exec.hpp` binds `c_str()`, so a NUL (httplib decodes `%00` in a route capture to a real
 /// one) would truncate the bound id and read or write a different row than the one named. The

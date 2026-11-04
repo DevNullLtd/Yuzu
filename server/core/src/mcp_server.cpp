@@ -3419,13 +3419,16 @@ static const ToolDef kTools[] = {
      "stays reviewable (frozen, not re-derived from live state). The fleet's current RBAC "
      "enforcement state (enabled|disabled|degraded) is stamped onto the campaign at this same "
      "moment — see get_access_review. Mirrors POST "
-     "/api/v1/access-reviews. Self-audited as access_review.campaign_opened. This records "
+     "/api/v1/access-reviews. Self-audited as access_review.campaign_opened. If the audit "
+     "row cannot be saved the campaign is still open and the result carries "
+     "audit_persisted:false. This records "
      "evidence and does not itself change any access grant — destructiveHint:false. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
      R"j("title":{"type":"string","minLength":1,"description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
      R"j(},"required":["title"]})j",
-     R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"}},"required":["campaign_id","grant_count"]})j"},
+     R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the decision or change was committed but its audit row failed to persist"}},"required":["campaign_id","grant_count"]})j"},
 
     // campaign_id on the three id tools below carries maxLength/pattern as DISCOVERY METADATA
     // only: the schema validator runs just for approval-gated calls, so each handler's own
@@ -3461,16 +3464,18 @@ static const ToolDef kTools[] = {
      "decision, which is kept and visible, not an error, until the grant reaches its limit of "
      "100 decisions, after which the request is refused. Mirrors POST "
      "/api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested or "
-     "access_review.flagged (by decision). Requires AccessReview:Attest.",
+     "access_review.flagged (by decision). If the audit row cannot be saved the decision "
+     "still stands and the result carries audit_persisted:false. Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$"},)j"
-     R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
-     R"j("principal_id":{"type":"string","minLength":1,"maxLength":1024},)j"
-     R"j("role_name":{"type":"string","minLength":1,"maxLength":1024},)j"
-     R"j("decision":{"type":"string","enum":["attested","flagged_revoke"]},)j"
-     R"j("justification":{"type":"string","maxLength":4096})j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"},)j"
+     R"j("principal_type":{"type":"string","enum":["user","group","engine"],"description":"Type of the principal that holds the grant"},)j"
+     R"j("principal_id":{"type":"string","minLength":1,"maxLength":1024,"description":"Id of the principal that holds the grant, as listed in get_access_review (at most 1024 bytes)"},)j"
+     R"j("role_name":{"type":"string","minLength":1,"maxLength":1024,"description":"Role of the grant being decided (at most 1024 bytes)"},)j"
+     R"j("decision":{"type":"string","enum":["attested","flagged_revoke"],"description":"attested keeps the grant; flagged_revoke records evidence that it should be revoked and revokes nothing"},)j"
+     R"j("justification":{"type":"string","maxLength":4096,"description":"Reviewer's reason (at most 4096 bytes). Only the latest entry of a grant's history is returned whole"})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
-     R"j({"type":"object","properties":{"recorded":{"type":"boolean"},"decision_seq":{"type":"integer"},"previous_decision":{"type":"string","enum":["pending","attested","flagged_revoke"]}},"required":["recorded","decision_seq","previous_decision"]})j"},
+     R"j({"type":"object","properties":{"recorded":{"type":"boolean"},"decision_seq":{"type":"integer"},"previous_decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the decision or change was committed but its audit row failed to persist"}},"required":["recorded","decision_seq","previous_decision"]})j"},
 
     {"get_access_review",
      "Full evidentiary state of one review campaign: metadata plus every frozen "
@@ -3490,7 +3495,7 @@ static const ToolDef kTools[] = {
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
      "AccessReview:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$"})j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"})j"
      R"j(},"required":["campaign_id"]})j",
      R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string","enum":["user","group","engine"]},"principal_id":{"type":"string"},"role_name":{"type":"string"},"decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"decided_at_ms":{"type":"integer"},"justification":{"type":"string"},"grant_snapshot":{"type":["object","null"]},"decision_seq":{"type":"integer"},"history":{"type":"array","items":{"type":"object","properties":{"seq":{"type":"integer"},"decision":{"type":"string","enum":["attested","flagged_revoke"]},"previous_decision":{"type":"string","enum":["","pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"justification":{"type":"string"},"justification_truncated":{"type":"boolean"},"decided_at_ms":{"type":"integer"}},"required":["seq","decision","previous_decision","reviewer","justification","justification_truncated","decided_at_ms"]}}},"required":["principal_type","principal_id","role_name","decision","reviewer","decided_at_ms","justification","grant_snapshot","decision_seq","history"]}},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
@@ -3508,15 +3513,18 @@ static const ToolDef kTools[] = {
      "Close an open review campaign. Does NOT require every attestation to be decided "
      "first — a campaign closed with pending rows still outstanding is itself evidence, "
      "not something this tool silently forces to completion. Mirrors POST "
-     "/api/v1/access-reviews/{id}/close. Self-audited as access_review.closed. Closing is a "
+     "/api/v1/access-reviews/{id}/close. Self-audited as access_review.closed. If the audit "
+     "row cannot be saved the campaign is still closed and the result carries "
+     "audit_persisted:false. Closing is a "
      "one-way lifecycle transition (no reopen path) that permanently freezes every still-pending "
      "attestation, so destructiveHint:true; it deletes no evidence (attestation rows are "
      "untouched), but the campaign's own open->closed state is irreversibly transitioned. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$"})j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"closed":{"type":"boolean"}},"required":["closed"]})j"},
+     R"j({"type":"object","properties":{"closed":{"type":"boolean"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the decision or change was committed but its audit row failed to persist"}},"required":["closed"]})j"},
 
     // ── KEK (key-encryption-key) rotation tools (#2395 track C) — MCP twins
     // of POST/GET /api/v1/secrets/kek/* (kek_routes.hpp/.cpp), sharing the

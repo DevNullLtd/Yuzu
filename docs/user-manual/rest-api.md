@@ -4578,7 +4578,12 @@ A refusal row is written before the `403`/`503` body. The recorded decision is
 committed first and its audit row follows: a failed audit write never undoes the
 decision and sets `Sec-Audit-Failed: true`, and a failed refusal row sets the same
 header while the refusal stands. The decision history, not the audit row, is the
-primary record of what was decided. Refusals are counted in
+primary record of what was decided. The same holds for opening and closing a
+campaign. Both machine contracts declare the signal: the OpenAPI responses of the
+three write routes document the `Sec-Audit-Failed` header, and the output schemas
+of the MCP tools `open_access_review`, `record_attestation` and `close_access_review`
+list `audit_persisted` as an optional boolean that is present, and false, only when
+the audit row was not saved. Refusals are counted in
 `yuzu_access_review_attestation_refused_total{surface,reason}`.
 
 #### `POST /api/v1/access-reviews/{id}/close`

@@ -3503,10 +3503,74 @@ TEST_CASE("attestation success body: OpenAPI and the MCP output schema name exac
         const auto& out = t["outputSchema"];
         CHECK(out["properties"]["decision_seq"]["type"] == "integer");
         CHECK(out["properties"]["previous_decision"]["type"] == "string");
-        CHECK(out["properties"].size() == 3);
+        // The three success fields plus the optional degraded-audit signal, which is never required.
+        CHECK(out["properties"].size() == 4);
+        CHECK(out["properties"]["audit_persisted"]["type"] == "boolean");
         CHECK(out["required"].size() == 3);
     }
     CHECK(found);
+}
+
+TEST_CASE("access-review writes: both machine contracts declare the degraded-audit signal and the "
+          "campaign id shape",
+          "[pg][access_review][rest][mcp][4752]") {
+    AccessReviewHarness h;
+    const auto spec = nlohmann::json::parse(yuzu::server::openapi_spec_json());
+    const auto& paths = spec["paths"];
+
+    // REST: the 201 (open) and the 200 (attest, close) document Sec-Audit-Failed.
+    const auto declares_header = [](const nlohmann::json& response) {
+        return response.contains("headers") && response["headers"].contains("Sec-Audit-Failed") &&
+               response["headers"]["Sec-Audit-Failed"]["schema"]["enum"][0] == "true";
+    };
+    CHECK(declares_header(paths["/access-reviews"]["post"]["responses"]["201"]));
+    CHECK(declares_header(paths["/access-reviews/{id}/attestations"]["post"]["responses"]["200"]));
+    CHECK(declares_header(paths["/access-reviews/{id}/close"]["post"]["responses"]["200"]));
+
+    // REST: the three {id} path parameters carry the shape the runtime enforces.
+    const std::string pattern = "^[A-Za-z0-9_-]{1,64}$";
+    const auto id_param = [](const nlohmann::json& op) {
+        for (const auto& prm : op["parameters"])
+            if (prm["name"] == "id")
+                return prm;
+        return nlohmann::json{};
+    };
+    for (const auto& op : {paths["/access-reviews/{id}"]["get"],
+                           paths["/access-reviews/{id}/attestations"]["post"],
+                           paths["/access-reviews/{id}/close"]["post"]}) {
+        const auto prm = id_param(op);
+        REQUIRE_FALSE(prm.is_null());
+        CHECK(prm["schema"]["pattern"] == pattern);
+        CHECK(prm["schema"]["minLength"] == 1);
+        CHECK(prm["schema"]["maxLength"] == yuzu::server::kCampaignIdMaxLen);
+        CHECK(prm.contains("description"));
+    }
+
+    // MCP: the optional signal is declared on all three write tools and is never required.
+    nlohmann::json list = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/list"}};
+    auto tools = h.mcp_call(list.dump());
+    REQUIRE(tools);
+    int seen = 0;
+    for (const auto& t : nlohmann::json::parse(tools->body)["result"]["tools"]) {
+        const std::string name = t["name"];
+        if (name != "open_access_review" && name != "record_attestation" &&
+            name != "close_access_review")
+            continue;
+        ++seen;
+        INFO("tool=" << name);
+        const auto& out = t["outputSchema"];
+        CHECK(out["properties"]["audit_persisted"]["type"] == "boolean");
+        for (const auto& req : out["required"])
+            CHECK(req != "audit_persisted");
+        CHECK(t["description"].get<std::string>().find("audit_persisted:false") !=
+              std::string::npos);
+        // Every input property of the write tools is described.
+        for (const auto& [key, prop] : t["inputSchema"]["properties"].items()) {
+            INFO("property=" << key);
+            CHECK(prop.contains("description"));
+        }
+    }
+    CHECK(seen == 3);
 }
 
 // The limits are spelled out in the MCP schema, the MCP description and the OpenAPI text. Each is
