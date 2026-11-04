@@ -20449,7 +20449,11 @@ void RestApiV1::register_routes(
                                         "group-scoped caller sees the count for their "
                                         "visible agents only, not the whole fleet; "
                                         "total_rules is the global rule-catalogue size "
-                                        "and is never confined")
+                                        "and is never confined; uncertain_rules counts live "
+                                        "rules with at least one reported pair that is "
+                                        "order-uncertain or has a pending event, within the "
+                                        "caller's scope, and 0 does not prove the census is "
+                                        "fresh or complete")
                             .str()),
                 "application/json");
         });
@@ -20572,7 +20576,9 @@ void RestApiV1::register_routes(
                                         "census-derived, #2298 item 6d) and both intersected "
                                         "against the live rule catalogue; "
                                         "compliant_rules/drifted_rules land with full status "
-                                        "ingest in a later rung")
+                                        "ingest in a later rung; uncertain_rules counts this "
+                                        "device's rules whose row is order-uncertain or "
+                                        "pending, and 0 does not prove freshness")
                             .str()),
                 "application/json");
         });

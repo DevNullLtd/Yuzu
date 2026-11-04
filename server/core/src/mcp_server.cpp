@@ -16784,7 +16784,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("note", "total_rules and errored_rules are both real (M1 "
                                 "census-derived, #2298 item 6d) and both intersected "
                                 "against the live rule catalogue; compliant_rules/"
-                                "drifted_rules land with full status ingest in a later rung");
+                                "drifted_rules land with full status ingest in a later rung; "
+                                "uncertain_rules counts this device's rules whose row is "
+                                "order-uncertain or pending, and 0 does not prove freshness");
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 res.set_content(
