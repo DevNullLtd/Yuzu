@@ -69,6 +69,20 @@ async function generate() {
     return;
   }
 
+  // #4817: Grafana's built-in default is admin/admin and the wizard used to
+  // default the field to it. Require a value, and refuse the well-known one.
+  if (chk('include-grafana')) {
+    const gp = val('grafana-pass');
+    if (!gp || gp.toLowerCase() === 'admin') {
+      alert('Grafana: set an admin password on the Monitoring step (use 🎲 Generate). It must not be empty or "admin" — anyone who can reach port ' + (num('grafana-port') || 3000) + ' would get full Grafana admin.');
+      return;
+    }
+    if (/[\x00-\x1f]/.test(gp)) {
+      alert('Grafana: the admin password must not contain control characters or line breaks (it is written to .env as one line).');
+      return;
+    }
+  }
+
   // N1: cert-san values are interpolated into the server command list; an unescaped
   // quote+newline payload could break out and inject standalone flags (e.g.
   // --no-tls → silent plaintext). Validate each token to DNS/IP shape before use.
@@ -320,7 +334,7 @@ ${c.tlsMode === 'default' ? `## ⚠️ REQUIRES SECURE-BY-DEFAULT IMAGES. This T
 ##   database and never replace it with your own or a read-only mount (#5420).
 ##
 ` : ``}## Dashboard:   ${webScheme}://localhost:${c.dashboardPort}  (${c.adminUser} / <your-password>)
-${c.grafana ? `## Grafana:     http://localhost:${c.grafanaPort}  (admin / ${c.grafanaPass})` : ''}
+${c.grafana ? `## Grafana:     http://localhost:${c.grafanaPort}  (admin / YUZU_GRAFANA_ADMIN_PASSWORD in .env)` : ''}
 ${c.prometheus ? `## Prometheus:  http://localhost:${c.promPort}` : ''}
 ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser} / ${c.chPass})` : ''}
 ##
@@ -844,7 +858,10 @@ ${c.tlsMode === 'plaintext'
     y += `    ports:\n`;
     y += `      - "${c.grafanaPort}:3000"\n`;
     y += `    environment:\n`;
-    y += `      - GF_SECURITY_ADMIN_PASSWORD=${c.grafanaPass}\n`;
+    y += `      # From .env, never baked into this file; required (#4817): Grafana's\n`;
+    y += `      # built-in default is admin/admin. Applied only when Grafana first\n`;
+    y += `      # creates its database.\n`;
+    y += `      - GF_SECURITY_ADMIN_PASSWORD=\${YUZU_GRAFANA_ADMIN_PASSWORD:?set YUZU_GRAFANA_ADMIN_PASSWORD in .env}\n`;
     y += `    configs:\n`;
     y += `      - source: grafana-datasource\n`;
     y += `        target: /etc/grafana/provisioning/datasources/prometheus.yml\n`;

@@ -43,6 +43,7 @@ import itertools
 import json
 import os
 import posixpath
+import re
 import shutil
 import subprocess
 import sys
@@ -111,11 +112,16 @@ vm.runInContext(fs.readFileSync(srcPath, 'utf8'), sandbox, { filename: srcPath }
     sandbox.__configs = input.configs;
     const out = vm.runInContext('__configs.map(c => generateCompose(c))', sandbox);
     process.stdout.write(JSON.stringify({ composes: out }));
+  } else if (mode === 'env') {
+    sandbox.__configs = input.configs;
+    const out = vm.runInContext('__configs.map(c => generateEnv(c))', sandbox);
+    process.stdout.write(JSON.stringify({ envs: out }));
   } else {
     await vm.runInContext('generate()', sandbox);
     process.stdout.write(JSON.stringify({
       alerts,
       compose: el('compose-output').textContent,
+      env: el('env-output').textContent,
     }));
   }
 })().catch(e => { console.error(e && e.stack || e); process.exit(2); });
@@ -365,6 +371,78 @@ class ComposeWizardCerts(unittest.TestCase):
                                  f"generate() emitted a compose for {field}={path}")
                 self.assertEqual(len(out["alerts"]), 1, out["alerts"])
                 self.assertIn(TLS_DIR, out["alerts"][0])
+
+
+# #4817: the wizard used to default the Grafana admin password to `admin` and
+# write whatever was chosen into the generated YAML as a literal. The compose
+# must instead require ${YUZU_GRAFANA_ADMIN_PASSWORD:?...} (the same rule as the
+# tracked composes, test_compose_default_credentials.py), the secret must live
+# only in .env, and generate() must refuse an empty value or `admin`.
+INDEX_HTML = ROOT / "tools" / "compose-wizard" / "index.html"
+GRAFANA_PASS = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
+
+@unittest.skipIf(NODE is None, "node is not installed")
+class ComposeWizardGrafanaPassword(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from test_compose_default_credentials import check as grafana_check
+        cls.grafana_check = staticmethod(grafana_check)
+        cls.config = dict(BASE_CONFIG, tlsMode="default", persistentVolumes=True,
+                          pgBundled=True, pgMode="bundled", grafanaPass=GRAFANA_PASS)
+        cls.compose = run_node("compose", {"configs": [cls.config]})["composes"][0]
+        cls.env = run_node("env", {"configs": [cls.config]})["envs"][0]
+
+    def test_compose_requires_the_variable(self):
+        self.assertIn("grafana:", self.compose)
+        self.assertEqual(self.grafana_check(self.compose), [])
+        self.assertIn("${YUZU_GRAFANA_ADMIN_PASSWORD:?", self.compose)
+
+    def test_secret_only_in_env(self):
+        self.assertNotIn(GRAFANA_PASS, self.compose,
+                         "the Grafana password is written into the compose YAML")
+        self.assertIn(f"YUZU_GRAFANA_ADMIN_PASSWORD={GRAFANA_PASS}\n", self.env + "\n")
+
+    def test_checker_rejects_the_pre_4817_compose(self):
+        broken = re.sub(r"GF_SECURITY_ADMIN_PASSWORD=.*",
+                        "GF_SECURITY_ADMIN_PASSWORD=admin", self.compose)
+        self.assertNotEqual(broken, self.compose)
+        self.assertTrue(self.grafana_check(broken))
+
+    def test_index_html_has_no_default_password(self):
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        m = re.search(r'<input[^>]*\bid="grafana-pass"[^>]*>', html)
+        self.assertIsNotNone(m, "no grafana-pass input in index.html")
+        value = re.search(r'\bvalue="([^"]*)"', m.group(0))
+        self.assertTrue(value is None or value.group(1) == "",
+                        f"grafana-pass has a default value: {m.group(0)}")
+        self.assertIn("genSecret('grafana-pass')", html)
+
+    def _generate(self, **overrides):
+        fields = dict(FORM_FIELDS, **{"tls-mode": "default", "include-grafana": True,
+                                      "grafana-port": "3000"})
+        fields.update(overrides)
+        return run_node("generate", {"fields": fields})
+
+    def test_generate_refuses_empty_or_admin(self):
+        for value in ("", "admin", "ADMIN", "  admin  "):
+            with self.subTest(value=value):
+                out = self._generate(**{"grafana-pass": value})
+                self.assertEqual(out["compose"], "", f"generate() emitted a compose for {value!r}")
+                self.assertEqual(len(out["alerts"]), 1, out["alerts"])
+                self.assertIn("Grafana", out["alerts"][0])
+
+    def test_generate_accepts_a_strong_value(self):
+        out = self._generate(**{"grafana-pass": GRAFANA_PASS})
+        self.assertEqual(out["alerts"], [])
+        self.assertEqual(self.grafana_check(out["compose"]), [])
+        self.assertNotIn(GRAFANA_PASS, out["compose"])
+        self.assertIn(f"YUZU_GRAFANA_ADMIN_PASSWORD={GRAFANA_PASS}", out["env"])
+
+    def test_generate_ignores_the_field_without_grafana(self):
+        out = self._generate(**{"include-grafana": False, "grafana-pass": ""})
+        self.assertEqual(out["alerts"], [])
+        self.assertNotIn("YUZU_GRAFANA_ADMIN_PASSWORD", out["compose"] + out["env"])
 
 
 # The gateway's sys.config is embedded in the generated compose, where nothing

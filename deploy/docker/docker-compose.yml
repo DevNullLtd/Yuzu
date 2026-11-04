@@ -16,7 +16,13 @@
 #   docker compose down           # stop all
 #
 # Dashboard: http://localhost:8080
-# Grafana:   http://localhost:3000 (admin/admin)
+# Grafana:   http://localhost:3000 (admin / $YUZU_GRAFANA_ADMIN_PASSWORD)
+#
+# Required before any `docker compose` command, `down` included (#4817):
+#   export YUZU_GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+# (or put it in deploy/docker/.env). Grafana applies it only when it first
+# creates its database: on an existing grafana-data volume, change it with
+#   docker compose exec grafana grafana cli admin reset-admin-password '<new>'
 # Prometheus: http://localhost:9090
 
 services:
@@ -122,7 +128,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      # Required, no default (#4817): Grafana's built-in default is admin/admin.
+      - GF_SECURITY_ADMIN_PASSWORD=${YUZU_GRAFANA_ADMIN_PASSWORD:?set YUZU_GRAFANA_ADMIN_PASSWORD to a strong random value, e.g. openssl rand -hex 16}
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/yuzu-dashboard.json
     volumes:
       - ../grafana/provisioning:/etc/grafana/provisioning:ro

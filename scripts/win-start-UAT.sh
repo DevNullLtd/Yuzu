@@ -27,6 +27,13 @@ BUILDDIR="$YUZU_ROOT/builddir"
 GATEWAY_DIR="$YUZU_ROOT/gateway"
 UAT_DIR="$YUZU_ROOT/.uat"
 
+# Grafana admin password (#4817). deploy/docker/docker-compose.uat.yml requires
+# YUZU_GRAFANA_ADMIN_PASSWORD for every command, `down` and `ps` included; it is
+# generated once, kept here (0600) and reused, and an exported
+# YUZU_GRAFANA_ADMIN_PASSWORD takes precedence.
+GRAFANA_PASSWORD_FILE="$UAT_DIR/grafana-admin-password"
+. "$YUZU_ROOT/scripts/lib/uat-grafana-password.sh"
+
 ADMIN_USER="admin"
 ADMIN_PASS='YuzuUatAdmin1!'
 
@@ -90,6 +97,7 @@ kill_native() {
 
 kill_docker() {
     echo "Stopping Docker containers..."
+    uat_grafana_password "$GRAFANA_PASSWORD_FILE"
     cd "$YUZU_ROOT/deploy/docker"
     docker compose -f docker-compose.uat.yml down -v 2>/dev/null && ok "Containers stopped" || ok "No containers running"
     cd "$YUZU_ROOT"
@@ -110,13 +118,14 @@ show_status() {
     done
     echo ""
     echo "Docker containers:"
+    uat_grafana_password "$GRAFANA_PASSWORD_FILE"
     cd "$YUZU_ROOT/deploy/docker"
     docker compose -f docker-compose.uat.yml ps 2>/dev/null || echo "  (compose not running)"
     cd "$YUZU_ROOT"
     echo ""
     echo "Endpoints:"
     echo "  Dashboard:   http://localhost:8080"
-    echo "  Grafana:     http://localhost:3000 (admin/admin)"
+    printf "  Grafana:     http://localhost:3000 (admin / %s)\n" "$YUZU_GRAFANA_ADMIN_PASSWORD"
     echo "  Prometheus:  http://localhost:9090"
     echo "  ClickHouse:  http://localhost:8123 (HTTP) / localhost:9000 (native)"
     echo "  GW Health:   http://localhost:8081/readyz"
@@ -273,6 +282,10 @@ start_all() {
     # ── Generate credentials ──────────────────────────────────────────────
     generate_config
     ok "Generated server config ($ADMIN_USER / $ADMIN_PASS)"
+    # The rm -rf above removed the state file; this saves the same password
+    # again (kill_docker exported it) or generates the first one.
+    uat_grafana_password "$GRAFANA_PASSWORD_FILE"
+    ok "Grafana admin password in $GRAFANA_PASSWORD_FILE"
 
     # ── Prepare dashboards for Grafana provisioning ───────────────────────
     prepare_dashboards
@@ -298,7 +311,7 @@ start_all() {
     if ! wait_for_http "http://localhost:3000/api/health" "Grafana" 45; then
         warn "Grafana may still be starting (installing ClickHouse plugin...)"
     else
-        ok "Grafana up at http://localhost:3000 (admin/admin)"
+        ok "Grafana up at http://localhost:3000 (admin / $YUZU_GRAFANA_ADMIN_PASSWORD)"
     fi
 
     # ── 2. Server ─────────────────────────────────────────────────────────
@@ -600,7 +613,7 @@ for r in d.get('responses',[]):
     echo ""
     echo "  Dashboard:   http://localhost:8080"
     printf "  Login:       %s / %s\n" "$ADMIN_USER" "$ADMIN_PASS"
-    echo "  Grafana:     http://localhost:3000 (admin/admin)"
+    printf "  Grafana:     http://localhost:3000 (admin / %s)\n" "$YUZU_GRAFANA_ADMIN_PASSWORD"
     echo "  Prometheus:  http://localhost:9090"
     echo "  ClickHouse:  http://localhost:8123"
     echo ""

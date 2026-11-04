@@ -1,12 +1,15 @@
 ## Yuzu UAT Stack — Self-contained, single-file deployment
 ##
 ## Usage:
+##   export YUZU_GW_COOKIE="$(openssl rand -hex 32)"
+##   export YUZU_GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"
 ##   docker compose -f docker-compose.uat.yml up -d
 ##   docker compose -f docker-compose.uat.yml logs -f
 ##   docker compose -f docker-compose.uat.yml down -v
+##   (every command, `down` included, needs both variables set - #4817)
 ##
 ## Dashboard:   http://localhost:8080  (admin / adminpassword1)
-## Grafana:     http://localhost:3000  (admin / admin)
+## Grafana:     http://localhost:3000  (admin / $YUZU_GRAFANA_ADMIN_PASSWORD)
 ## Prometheus:  http://localhost:9090
 ## ClickHouse:  http://localhost:8123  (default / yuzu)
 ##
@@ -384,7 +387,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      # Required, no default (#4817): Grafana's built-in default is admin/admin.
+      - GF_SECURITY_ADMIN_PASSWORD=${YUZU_GRAFANA_ADMIN_PASSWORD:?set YUZU_GRAFANA_ADMIN_PASSWORD to a strong random value, e.g. openssl rand -hex 16}
     configs:
       - source: grafana-datasource
         target: /etc/grafana/provisioning/datasources/prometheus.yml

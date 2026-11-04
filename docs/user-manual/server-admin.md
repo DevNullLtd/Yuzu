@@ -6153,10 +6153,19 @@ The default Docker deployment runs the server and agent standalone -- no gateway
 
 ```bash
 cd deploy/docker
+export YUZU_GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"   # required, see below
 docker compose up -d          # start all services
 docker compose logs -f        # follow logs
 docker compose down           # stop all services
 ```
+
+**Grafana admin password.** The composes that run Grafana (`deploy/docker/docker-compose.yml`, `deploy/docker/docker-compose.uat.yml`, `deploy/docker/docker-compose.full-uat.yml` and `docker-compose.uat.yml`) have no default Grafana password: they set `GF_SECURITY_ADMIN_PASSWORD=${YUZU_GRAFANA_ADMIN_PASSWORD:?...}`, so Compose refuses every command against them, `down` and `ps` included, until `YUZU_GRAFANA_ADMIN_PASSWORD` is set to a non-empty value (#4817). Set it in the shell as above, or as a line in a `.env` file next to the compose file. Grafana's own default when no password is configured is `admin`/`admin`, and Grafana is published on port 3000 on every interface, so anyone who could reach the host would otherwise have full Grafana admin, including adding data sources that make Grafana fetch arbitrary internal URLs. Keep the value out of git. Instead of a password in the environment, Grafana also accepts a file path in `GF_SECURITY_ADMIN_PASSWORD__FILE` (for example a Docker secret mounted at `/run/secrets/...`). Grafana reads the setting only when it first creates its database: on an existing `grafana-data` volume, a new value does nothing, and an install started from an earlier version of these files still accepts `admin`/`admin`. Change it in place with:
+
+```bash
+docker compose exec grafana grafana cli admin reset-admin-password '<new password>'
+```
+
+The UAT launchers set it for you: `scripts/docker-start-UAT.sh` (`docker-compose.full-uat.yml`) and `scripts/win-start-UAT.sh` (`deploy/docker/docker-compose.uat.yml`) use an exported `YUZU_GRAFANA_ADMIN_PASSWORD` if there is one, otherwise generate a random one the first time, keep it in `.uat/grafana-admin-password` (mode 0600), load it again for `stop` and `status`, and print it. They refuse the value `admin`. To change it, delete that file, or export a different value, before the next `start`. The two reference composes (`docker-compose.reference.yml`, `docker-compose.reference-gateway.yml`) run no Grafana. The Compose Wizard writes the password only to the `.env` it generates. `tests/test_compose_default_credentials.py` fails if a tracked compose runs Grafana without a required password.
 
 **What must persist.** Every shipped compose that keeps Postgres on a volume also keeps these two server directories on named volumes, and a compose you write needs the same two. (The sanitizer rig, `docker-compose.sanitizer-uat.yml`, keeps no state at all and is the one exception.)
 
@@ -6190,7 +6199,7 @@ A GitHub Actions check (`scripts/check-compose-versions.sh`) runs as the first s
 | 8081 | Gateway health/readiness | Gateway deployments only |
 | 9568 | Gateway Prometheus metrics | Gateway deployments only |
 | 9090 | Prometheus | Monitoring stack |
-| 3000 | Grafana (default login: admin/admin) | Monitoring stack |
+| 3000 | Grafana (user `admin`, password `YUZU_GRAFANA_ADMIN_PASSWORD`; no default, see "Grafana admin password" above) | Monitoring stack |
 
 **Volumes:** `server-data`, `server-certs` (`certs` in the reference composes), `postgres-data`, `agent-data`, `prometheus-data`, `grafana-data` are persisted across container restarts.
 

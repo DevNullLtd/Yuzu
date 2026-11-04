@@ -8,7 +8,12 @@
 #   docker compose -f docker-compose.uat.yml up -d
 #   docker compose -f docker-compose.uat.yml down -v
 #
-# Or let scripts/win-start-UAT.sh manage this automatically.
+# Or let scripts/win-start-UAT.sh manage this automatically: it generates the
+# Grafana admin password, keeps it in .uat/grafana-admin-password (0600) and
+# prints it. UAT ONLY - Grafana and ClickHouse are published on every interface.
+#
+# Run by hand, every `docker compose` command (`down` included) needs (#4817):
+#   export YUZU_GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"
 
 services:
   prometheus:
@@ -45,7 +50,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      # Required, no default (#4817): Grafana's built-in default is admin/admin.
+      - GF_SECURITY_ADMIN_PASSWORD=${YUZU_GRAFANA_ADMIN_PASSWORD:?set YUZU_GRAFANA_ADMIN_PASSWORD to a strong random value, e.g. openssl rand -hex 16}
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/yuzu-dashboard.json
       - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
     volumes:
