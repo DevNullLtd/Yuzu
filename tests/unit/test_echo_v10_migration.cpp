@@ -1338,6 +1338,30 @@ TEST_CASE("v10 migration: lagged process rows reach usage while the process sour
     CHECK(db.get_config("usage_feeder_enabled", "absent") == "false"); // the flag still says process is off
 }
 
+TEST_CASE("v10 migration: lagged process rows below the roll-up mark still reach usage, and only usage",
+          "[echo][v10][migration][usage]") {
+    Seeded seeded;
+    // The old roll-up summarised these rows into the tiers (the mark is the next hour), but the
+    // usage fold never read them (cursor at 0). The tier fold skips them, so the usage-only pass
+    // is the only thing that credits them, and the tiers must not be fed twice.
+    seed(seeded, [&](sqlite3* db) {
+        insert_raw(db, "process", {I(kH0 + 10), I(1), T("started"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+        insert_raw(db, "process", {I(kH0 + 70), I(1), T("stopped"), I(100), I(1), T("alpha.exe"), T(""), T("jsmith")});
+        exec(db, std::format("INSERT INTO echo_config VALUES ('usage_hwm_id', '0'), "
+                             "('usage_active_generation', '0'), ('rollup_process_hourly_at', '{}')",
+                             kH0 + 3600));
+    });
+    yuzu::test::LogCapture logs;
+    auto db = open_ok(seeded.tmp.path);
+    logs.stop();
+    INFO(logs.text());
+    CHECK(logs.text().find("usage lag: 2 raw process rows past usage_hwm_id (usage_lag_events was 0), 2 of "
+                           "them folded into usage") != std::string::npos);
+    CHECK(n(db, "SELECT run_count FROM usage_daily WHERE exe_key = 'alpha.exe'") == 1);
+    CHECK(n(db, "SELECT total_seconds FROM usage_daily WHERE exe_key = 'alpha.exe'") == 60);
+    CHECK(n(db, "SELECT COALESCE(SUM(start_count), 0) FROM process_hourly") == 0); // below the mark: not re-folded
+}
+
 TEST_CASE("v10 migration: a mark over a source with nothing to fold migrates whether or not it is trusted",
           "[echo][v10][migration][marks]") {
     Seeded seeded;

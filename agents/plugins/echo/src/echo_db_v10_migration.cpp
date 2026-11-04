@@ -253,26 +253,29 @@ std::optional<Columns> raw_columns(TransactionHandle& h, std::string_view source
 }
 
 // Streams `<source>_live` rows with ts >= min_ts in id order, kChunkRows at a time, to `on_chunk`.
+// `below_ts` flips that to ts < min_ts, and `after_id` starts the id walk past that id: together
+// they select the rows under the roll-up mark that are still past a cursor.
 // Id order, not (ts, id): every merge the fold applies (sum, max, min, last-by-guard with ties to
 // the later arrival) gives the same result for either order, and the id walk needs no sort.
 // Returns the number of rows read. The SELECT is finalised before this returns, so a later DROP
 // TABLE finds the table unlocked.
 std::optional<int64_t> for_each_chunk(
     TransactionHandle& h, std::string_view source, const Columns& c, int64_t min_ts,
-    const std::function<bool(const std::vector<RawRow>&)>& on_chunk) {
+    const std::function<bool(const std::vector<RawRow>&)>& on_chunk, bool below_ts = false,
+    int64_t after_id = std::numeric_limits<int64_t>::min()) {
     std::string select = "SELECT id";
     for (std::size_t i = 0; i < c.cols.size(); ++i)
         select += c.present[i] ? std::format(", {}", c.cols[i].name)
                                : std::format(", {} AS {}", c.cols[i].sql_type == "TEXT" ? "''" : "0",
                                              c.cols[i].name);
-    select += std::format(" FROM {}_live WHERE id > ?1 AND ts >= ?2 ORDER BY id LIMIT {}", source,
-                          kChunkRows);
+    select += std::format(" FROM {}_live WHERE id > ?1 AND ts {} ?2 ORDER BY id LIMIT {}", source,
+                          below_ts ? "<" : ">=", kChunkRows);
     auto st = prep(h, select);
     if (!st)
         return std::nullopt;
 
     int64_t total = 0;
-    int64_t last_id = std::numeric_limits<int64_t>::min();
+    int64_t last_id = after_id;
     for (;;) {
         sqlite3_reset(st.get());
         sqlite3_clear_bindings(st.get());
@@ -1065,6 +1068,36 @@ private:
         if (!read)
             return std::unexpected(h_.error());
         report_.raw_rows += *read;
+
+        // The chunk walk above reads only rows at or past the mark, so a process row past the
+        // usage cursor but below the mark (the old roll-up summarised it into the tiers, but the
+        // usage fold never read it) reached neither. Feed those to usage only, never to the tiers
+        // (the mark means the tiers already hold them), and count them with the other lagged rows.
+        if (def.name == "process" && usage_hwm != std::numeric_limits<int64_t>::max() &&
+            min_ts != std::numeric_limits<int64_t>::min()) {
+            const auto below = for_each_chunk(
+                h_, def.name, *cols, min_ts,
+                [&](const std::vector<RawRow>& rows) -> bool {
+                    std::vector<ProcessEvent> lagged;
+                    try {
+                        lagged = decode<ProcessEvent>(rows, decode_process);
+                    } catch (const std::exception& e) {
+                        failure = std::format("{}: {}", def.name, e.what());
+                        return false;
+                    }
+                    if (const auto u = usage::usage_fold_in(h_, now_, lagged); !u) {
+                        failure = "usage fold of the lagged process rows below the mark: " + u.error();
+                        return false;
+                    }
+                    report_.usage_lag_folded += static_cast<int64_t>(lagged.size());
+                    return true;
+                },
+                /*below_ts=*/true, /*after_id=*/usage_hwm);
+            if (failure)
+                return std::unexpected(*failure);
+            if (!below)
+                return std::unexpected(h_.error());
+        }
         return {};
     }
 
