@@ -13,8 +13,9 @@
  * What is pinned per host (host-independent shape first, then per-OS):
  *  - every action returns rc 0 and emits a `status|<action>|<level>|<tokens>`
  *    row FIRST (4 fields), then only rows of the action's own kinds;
- *  - manager rows have 7 fields; package rows have 5 (Homebrew) or 9 (snap and
- *    flatpak) fields (escape-aware split);
+ *  - manager rows have 7 fields; package rows have 5 (Homebrew; Windows
+ *    chocolatey) or 9 (snap and flatpak; Windows appx) fields (escape-aware
+ *    split);
  *  - Linux `packages`: exactly `status|packages|unsupported|linux:owned_by_installed_apps`,
  *    ZERO `package|` rows, UNAVAILABLE/PARTIAL typed status (Linux never
  *    enumerates a package; installed_apps owns the roster). MUTATION: if the
