@@ -481,8 +481,8 @@ cluster unit; intra-zone scale is more nodes.
 - **Known gap, unconfirmed.** A gateway node that is up but has lost its server still acknowledges proxied
   heartbeats from node-local state (`yuzu_gw_agent_service:heartbeat/2`; an unknown session gets `NOT_FOUND`),
   and the agent re-registers only on `NOT_FOUND` or `UNAUTHENTICATED`, so the agent sees success, gets no
-  trigger, its keepalives stay healthy, and the route lease (90 s) expires. The WS-13 spike measures it; if confirmed,
-  a WS-13 slice (the gateway ends agent streams after an outage longer than the lease) closes it.
+  trigger, its keepalives stay healthy, and the route lease (90 s) expires. The 13.0 spike confirmed the precondition on its rig (finding 4) and did not measure the consequence on two
+  replicas; if it proves harmful, a WS-13 slice (the gateway ends agent streams after an outage longer than the lease) closes it.
 - **Rollout.** Moving a direct-connect fleet behind a gateway silently stops its agents updating
   themselves while #5619 is open (the gateway implements neither `CheckForUpdate` nor `DownloadUpdate`),
   so the 13.4 rollout runbook must refuse unless the operator declares out-of-band package management
@@ -495,22 +495,13 @@ cluster unit; intra-zone scale is more nodes.
   replaced server no longer knows, on evidence since #5695: see Context and §7g); agent failover answers
   losing a gateway node. By deployment shape: a fleet that still connects directly is newly gated (the rollout
   item); a deployment with several gateway nodes keeps the failover items.
-- **Gate scope decided (2026-11-04, #6920, by the project lead).** The 13.0 spike record
-  (`docs/ha-spikes/ws13-0-gateway-failover.md`) was input; its figures are single-host and caveated, and five
-  follow-up measurements are #7051. (1) Slice 13.6 (a node that is up but has lost its server) stays **outside**
-  the gate: it leaves agents undispatchable rather than double-dispatching or mis-targeting, and the evidence is
-  thin (in six runs `/readyz` never changed, the breaker never opened in 400 s and no agent moved; dispatch kept
-  working on the single-replica server; route-directory dispatch on two replicas was not tested). It moves **into**
-  the gate if the #7051 loaded-fleet measurement, or the first two-replica run, shows agents staying undispatchable
-  while `/readyz` is green. (2) #5649 (reconcile convergence on two server replicas) and #5648 (a per-endpoint
-  circuit breaker) are **inside** the gate, whatever the gateway count: section 7c's convergence claim holds for
-  one replica only until #5649 is decided and run on two replicas (section 7g), and one dead server out of two can
-  open the gateway's only breaker. Neither is built. (3) A one-gateway deployment is deliberately not gated on the
-  failover items (there is no second node to fail over to; the gateway is then a single point of failure for its
-  fleet, which this gate, about running a second server replica, does not address); the rollout item and (2) still
-  gate it. (4) The management plane is a failover item in its own right and is **inside** the gate as slice 13.7
-  (#7062): the server's `--gateway-command-addr` names one node, and killing it left the fleet undispatchable
-  although every agent had re-attached (2 spike runs, no control run yet). The gate is **not lifted**.
+- **Decided 2026-11-04 (#6920, the project lead).** The 13.0 spike record (`docs/ha-spikes/ws13-0-gateway-failover.md`) was input. Its figures are single-host and caveated; the follow-up measurements are tracked in #7051.
+  (1) **Slice 13.6** (a gateway node that is up but has lost its server) stays OUTSIDE the gate, because its harm is untested. In the six F3/F3x spike runs `/readyz` never changed and no agent moved; in the five with a gateway log the breaker never opened in 400 s, on a quiet single-host fleet; and dispatch kept working on the single-replica server. What happens on two replicas, where the route directory is used, is not measured: by code reading, agents may be undispatchable there, protective actions included (whether a quarantine issued in that state reaches the endpoint is unmeasured), and spike finding 10 shows a command accepted and then lost after a port-only fault. It moves INTO the gate if a dispatch probe at +120 s and +300 s, in a two-replica WS-9 or lab run (never in production enablement), finds an agent still attached to such a node undispatchable, or if the #7051 loaded-fleet measurement shows the same.
+  (2) **#5649 and #5648 are INSIDE the gate**, whatever the gateway count. ADR-2002 section 7c's convergence claim holds for one replica only until #5649 is decided and run on two replicas (section 7g), and by code reading a hung or failing server out of two can feed the gateway's only circuit breaker (a cleanly dead one drops out of the channel's pick). Done means: for #5649, the decision is recorded and a WS-9 rig run on two replicas shows the reconcile converging; for #5648, a rig run with one hung (not killed) server out of two does not open the breaker for the other. #5648 is not built and #5649 is undecided, so this moves the gate further from lifted, not nearer.
+  (3) A **one-gateway** deployment is deliberately not gated on WS-13's failover items: there is no second node to fail over to. The gateway is then a single point of failure for its fleet. This gate applies only when enabling a second server replica and does not address that, and this is not a statement that one gateway is acceptable for HA. The rollout item and (2) still gate it. This keeps the 2026-11-02 relaxation of the original "for gateway-fronted fleets" clause.
+  (4) **Slice 13.7 (#7062)**, for a deployment with more than one gateway node, is INSIDE the gate: the server's `--gateway-command-addr` names one node, and killing it left the fleet undispatchable although every agent had re-attached. It is inside by this decision, not on measured evidence: the H7 spike runs were two kill runs with valid probes (0 of 6 delivered) and have no control run (#7051).
+  Risk acceptance: the gate is not lifted, and one server replica is the only supported shape (`docs/user-manual/server-admin.md`, Leader election). Owner: the project lead. Review when #7051 reports.
+  The gate is **not lifted**.
 
 **Status (WS-4): 4.1 done; 4.2a (writer-path hardening) done; 4.2b (Tasks A–D: store layer, per-site
 fail-closed posture + renew correlation, dispatch-wiring, `route_unreadable` consumer + alert rule) done;
@@ -1342,8 +1333,8 @@ correct action in both cases is today's behaviour (no replay).
   `register_agent` and wipes its placement until its own reannounce lands on it. A per-session replay
   guard planned for the gateway-side change bounds the replay RATE, not the NUMBER of rounds. Expected
   signature: `renew_leases`/`unknown_session` desync not decaying on some replica after both sides are
-  upgraded. The durable cross-replica session lookup (WS-5, `#4246` #3) is the real multi-replica fix;
-  until it lands the safe-to-scale gate still forbids a second replica.
+  upgraded. The durable cross-replica session lookup (WS-5, `#4246` #3) is the real multi-replica fix (it landed as §7f and is not sufficient on its own: see §7g item 3 and #5649);
+  the safe-to-scale gate still forbids a second replica.
 - **Lease window (observed on one local development rig with one agent, dev `3c8ac2c0c`; not
   reproducible from the repo; tracker #1197).** After a server-only restart a single-target command to
   an agent the new server does not know was still delivered while the lease and presence rows written
@@ -1569,8 +1560,8 @@ one core replica a server-only restart now recovers through the replay described
   some replica after both sides are upgraded, with
   `yuzu_gw_registration_replay_triggered_total{trigger="heartbeat"}` rising (it counts verdicts that queued
   at least one agent, so at most once per flush; INFERRED). The
-  durable cross-replica session lookup (WS-5, `#4246` #3) is the fix; until it lands the safe-to-scale
-  gate forbids a second replica.
+  durable cross-replica session lookup (WS-5, `#4246` #3) was the intended fix (it landed as §7f and is not sufficient on its own: see §7g item 3 and #5649); the safe-to-scale
+  gate still forbids a second replica.
 - **Observed on a local rig, not reproducible from the repository (one real agent, one core replica,
   debug builds).** After a server-only restart the replay came on the first agent heartbeat after the
   server was healthy again (17.5 s in the 10 s outage runs, with the same session id and no agent
@@ -2100,7 +2091,7 @@ every branch this PR's own scope covers, not that one.
 
 **Status: merged as PR #5694 (`eabc2b639`, 2026-10-12). THE SAFE-TO-SCALE GATE IS NOT
 LIFTED** — this closes one more `#4246` gap; it does not make a second replica safe (WS-6 6.1b/6.3, WS-13
-failover and rollout items per the gate as reworded 2026-11-02, WS-5's remaining slice-1 scope and the WS-9 scenarios are still open — see
+failover and rollout items, #5648 and #5649 per the gate as decided 2026-11-04 (#6920), WS-5's remaining slice-1 scope and the WS-9 scenarios are still open — see
 `docs/ha-delivery-matrix.md`). Run exactly ONE server replica (§7c).
 
 **Problem.** `GatewayUpstreamServiceImpl` resolved a gateway `session_id` to an `agent_id` only through
