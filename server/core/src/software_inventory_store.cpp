@@ -370,11 +370,12 @@ const std::vector<pg::PgMigration>& migrations() {
          // partial btree WHERE purl <> '' (the same partial shape as the instance index), so a
          // row without a purl costs no index entry and the lookup-by-exact-purl read is one seek.
          // Both indexes are built in this transaction, each by its own heap scan.
-         // The index build holds ACCESS EXCLUSIVE for its duration, like v7: accepted under the
-         // hard-cutover posture docs/postgres-migration-ladder.md records for v7 (a deviation
-         // from v7's "must be online" rule, with the build measured at 1.8M rows in the ladder
-         // row); statement_timeout is lifted for this txn as in v7, lock_timeout still bounds
-         // lock acquisition.
+         // The index builds hold ACCESS EXCLUSIVE for their duration: accepted under the
+         // 2026-10-24 fresh-database hard-cutover contract (docs/user-manual/upgrading.md
+         // "Deployment contract (hard cutover)"), as a recorded exception in
+         // docs/postgres-store-playbook.md to the rule that a build on a populated table must
+         // be online (the build is measured at 1.8M rows in the ladder row); statement_timeout is
+         // lifted for this txn as in v7, lock_timeout still bounds lock acquisition.
          // software_facet_state: one row per (agent, facet), the per-section status the v3 blob
          // reports plus the section hash the report hash is built from. A new empty table with a
          // plain primary key: online.
