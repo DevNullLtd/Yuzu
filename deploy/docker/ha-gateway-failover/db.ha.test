@@ -1,0 +1,12 @@
+$ORIGIN ha.test.
+$TTL 30
+@       IN SOA ns.ha.test. admin.ha.test. 1 3600 600 86400 30
+@       IN NS  ns.ha.test.
+ns      IN A   10.77.12.2
+; the three gateway nodes behind one name (multi-A DNS mode)
+gw-dns  IN A   10.77.12.11
+gw-dns  IN A   10.77.12.12
+gw-dns  IN A   10.77.12.13
+; the L4 VIP (HAProxy): agent edge and server->gateway management plane
+gw-vip  IN A   10.77.12.20
+gw-mgmt IN A   10.77.12.20

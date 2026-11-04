@@ -4,7 +4,6 @@
 #include "software_normalization_pack.hpp"
 
 #include "sha256_hex.hpp"
-#include "software_catalog_rules.hpp"
 
 #include <algorithm>
 #include <set>
@@ -40,24 +39,6 @@ bool valid_pack_version(std::string_view v) {
     return month >= 1 && month <= 12;
 }
 
-bool valid_cpe_product(std::string_view s) {
-    return std::all_of(s.begin(), s.end(), [](char c) {
-        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' ||
-               c == '-' || c == '+';
-    });
-}
-
-/// "-" and "." are CPE logical values (not applicable / any), never a product token.
-bool reserved_cpe_product(std::string_view s) {
-    return s == "-" || s == ".";
-}
-
-bool known_ecosystem(std::string_view e) {
-    namespace sc = software_catalog;
-    return e.empty() || std::any_of(sc::kEcosystemFamilies.begin(), sc::kEcosystemFamilies.end(),
-                                    [&](const sc::EcosystemFamily& f) { return f.ecosystem == e; });
-}
-
 std::string line_error(std::size_t line, std::string_view what) {
     return "line " + std::to_string(line) + ": " + std::string{what};
 }
@@ -71,6 +52,8 @@ std::expected<ParsedPack, std::string> parse_normalization_pack(std::string_view
         return std::unexpected("pack exceeds kMaxPackBytes (" + std::to_string(kMaxPackBytes) + ")");
     if (csv.find('\0') != std::string_view::npos)
         return std::unexpected("pack contains a NUL byte");
+    if (!valid_utf8(csv))
+        return std::unexpected("pack is not valid UTF-8");
 
     ParsedPack out;
     std::set<std::tuple<std::string, std::string, std::string>> seen;

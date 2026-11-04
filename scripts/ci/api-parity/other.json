@@ -148,9 +148,12 @@
     "method": "POST",
     "path": "/api/command",
     "capability_id": "post.api-command",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/commands"
+    },
+    "mcp_twin": "execute_instruction",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -211,9 +214,12 @@
     "method": "POST",
     "path": "/api/executions/{param}/cancel",
     "capability_id": "post.api-executions-param-cancel",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/executions/{param}/cancel"
+    },
+    "mcp_twin": "cancel_execution",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -230,9 +236,12 @@
     "method": "POST",
     "path": "/api/executions/{param}/rerun",
     "capability_id": "post.api-executions-param-rerun",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/executions/{param}/rerun"
+    },
+    "mcp_twin": "record_execution_rerun",
+    "status": "twinned"
   },
   {
     "method": "GET",

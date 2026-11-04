@@ -62,12 +62,14 @@
 /// cap. Chunked request bodies are legal HTTP, and this repo does not
 /// control every client that will ever talk to these routes, so the bit
 /// DEFAULTS OFF and is opted into per class, not per table. It is ON for
-/// four classes: `/mcp/` (that surface's own protocol/client contract already requires
+/// five classes: `/mcp/` (that surface's own protocol/client contract already requires
 /// `Content-Length` on every framed body - see `web_utils.hpp:577`'s
 /// `mcp_body_unmeasurable` rationale - so refusing an unmeasurable MCP body
 /// costs a conforming client nothing), `upload_session`, `hardware` (the
 /// Hardware CI routes carry only a tiny JSON body from the dashboard and API
-/// callers) and `dex_score_policy` (one JSON document, capped by its handler). Every other
+/// callers), `dex_score_policy` (one JSON document, capped by its handler) and `commands`
+/// (`POST /api/v1/commands`, a new route whose MCP twin `execute_instruction` already requires a
+/// measurable body, so a REST caller is held to the same contract). Every other
 /// class below — public REST (bundles), SCIM, certificate import (REST + dashboard), the
 /// plugin trust bundle, product-pack/workflow authoring, and the OTA upload — keeps it
 /// OFF and falls back to httplib's 100 MiB backstop for a body it cannot
@@ -572,6 +574,31 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // ANY method: the sibling GET is bodyless and shares the prefix (rule 4 in the routed-concern
     // row).
     {kBodyCapAnyMethod, "/api/v1/config", 16u * 1024, false, "config"},
+
+    // /api/v1/inventory/software/normalization/ — the software-title curation REST v1 routes
+    // (software_curation_routes.cpp). The body-bearing routes are POST .../aliases (one JSON
+    // object of at most eight strings, each capped at 256 bytes by the handler) and POST
+    // .../queue/{key}/reject (bodyless); the GETs (status, queue) are bodyless. 64 KiB is
+    // generous headroom over that shape while holding an unauthenticated flood 64x under the
+    // 4 MiB catch-all (the admission gate runs in the handler, after httplib buffers the body).
+    // ANY method: the GET siblings share the prefix (rule 4 in the routed-concern row).
+    {kBodyCapAnyMethod, "/api/v1/inventory/software/normalization/", 64u * 1024, false,
+     "software_curation"},
+    // POST /api/v1/inventory/software/normalization/pack — the alias-pack CSV upload. The raw
+    // body IS the CSV, which parse_normalization_pack refuses over kMaxPackBytes (1 MiB,
+    // software_normalization_pack.hpp), so the cap mirrors that bound exactly (the ca_revoke
+    // two-authority precedent). Longer literal prefix than the row above, so it wins there.
+    // ANY method; no sibling verb carries a body on this path.
+    {kBodyCapAnyMethod, "/api/v1/inventory/software/normalization/pack", 1u * 1024 * 1024,
+     false, "software_alias_pack"},
+    // /api/v1/commands -- POST: the REST v1 twin of MCP execute_instruction (command_v1_routes.cpp).
+    // The same 4 MiB as the `/mcp/` row because the same worst case rides it: a maximal request
+    // (10000 agent ids, 32 parameters of 64 KiB, an 8 KiB scope) is `kExecInstrWorstCaseBody`,
+    // about 3.3 MiB, which test_command_v1_routes.cpp pins against THIS entry. `requires_measurable`
+    // is true like the MCP row: an unmeasurable (chunked) body would otherwise bypass the pre-routing
+    // cap on this route while the twin refuses it. ANY method: the segment-boundary match keeps a
+    // future sibling under this prefix capped too (rule 4 in the routed-concern row).
+    {kBodyCapAnyMethod, "/api/v1/commands", 4u * 1024 * 1024, true, "commands"},
 
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.

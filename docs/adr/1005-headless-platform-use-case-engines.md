@@ -903,15 +903,18 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      test-existence tripwire (each registry tool's test file must name the tool
      and assert a schema and an audit row), and a Catch2 case checks that every
      registry tool is both a ledger `mcp_twin` and a `kExpectedTwins` row. Each
-     check carries a size-pinned, shrink-only allowlist seeded from the tree as
-     it stood. The gate-parity table (`GATE_PARITY_KNOWN_MISMATCHES`) holds
-     the six rows whose REST and MCP gates still differ, or whose agreement
+     check carries a size-pinned allowlist seeded from the tree as it stood. The
+     pin is an exact count that goes down when an entry is fixed; it goes up
+     only by a recorded owner ruling (see the 2026-10-31 gate-parity entry
+     below), so "shrink-only" describes the intended direction, not a
+     mechanical cap. The gate-parity table (`GATE_PARITY_KNOWN_MISMATCHES`) holds
+     the six rows (seven since the 2026-10-31 entry below) whose REST and MCP gates still differ, or whose agreement
      the check cannot prove, after it learned two shapes (a REST handler that
      refuses a service-scoped token before its gate, and an MCP handler whose
      own fleet read confines), with a
      one-line reason each in the script; a second table
      (`GATE_PARITY_NO_GATE_ALLOWED`) holds routes whose gate the script cannot
-     read. Both shrink only: a fix removes its entry and lowers the pin, and
+     read. Both are meant to shrink: a fix removes its entry and lowers the pin, and
      adding an entry or raising a pin is a reviewed deferral that needs a
      reason, a tracking issue and a ruling recorded in this ADR. These are
      tripwires, not proofs: the check compares gate labels, not effect (REST
@@ -1115,6 +1118,63 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      surface; the migration guide (`docs/user-manual/upgrading.md`) lists the
      old and new names. The ledger records the retirement because the policy
      requires it.
+   - **2026-10-31 - gate parity (check 6) pins one more known mismatch for
+     `POST /api/v1/commands` and `execute_instruction`.** Owner ruling: the
+     gate-parity table `GATE_PARITY_KNOWN_MISMATCHES` gains the entry
+     `("POST", "/api/v1/commands", "execute_instruction")` and its pin
+     `GATE_PARITY_KNOWN_MISMATCHES_MAX` is raised from 6 to 7 (the script pins the
+     count: the table size must equal it, so the pin is an exact value, not a
+     shrink-only cap; it goes down when an entry is fixed and up only by a ruling
+     like this one). The REST route is read
+     as `plain:Execution:Execute` and the tool's declared pair as
+     `confined:Execution:Execute`, so the lexical comparison cannot agree. Both
+     surfaces call the same `require_permission(Execution, Execute)`, whose
+     service-scoped branch answers 403 because `kServiceScopeGlobalSafe` is
+     empty, so a service-scoped caller is refused on both. The MCP `confined`
+     label is the C8 `ServiceScopeClass`, and is not a claim that the tool is
+     usable by a service-scoped caller. The entry is a deferral, not a proof of
+     agreement: the check compares labels and cannot see this. It is removed,
+     and the pin lowered, when the comparison can read the two gates as the same
+     kind. Tracking: programme #2146. This is the ruling the 2026-10-23 entry
+     above requires before a pin is raised. The ruling is recorded in the
+     governance ledger fragment
+     `governance.d/2146-batch-b-dispatch-core.DbkUcG.jsonl`, adjudicated by the
+     repository owner.
+   - **2026-10-31 - `cancel_execution` at the supervised MCP tier is exempt from
+     the approval ticket.** Owner ruling. Originally given 2026-10-30 as a
+     "risk-reducing STOP"; re-confirmed by the owner 2026-10-31 after that premise
+     was corrected: `cancel_execution` marks the tracker row cancelled and sends
+     nothing to any device (step-up class `kCancelsRecord`), so it does not stop
+     anything running on a device. The exemption is the closed list
+     `kApprovalExemptTools` in `server/core/src/mcp_policy.hpp`, read through
+     `requires_approval_for_tool()` by the generic C8 gate. Asymmetry: MCP is
+     looser than REST for this one tool. The REST mirror
+     (`POST /api/v1/executions/{id}/cancel`) is still gated, and gate-parity
+     check 6 compares labels and cannot see approval tiers, so it does not
+     flag it. Residual: a supervised credential holding no ticket can irreversibly
+     mark another record cancelled while that execution's devices may still be
+     running it; the `attempted` row written before the effect and the `success`
+     row after it are the mitigation. Adding a name to `kApprovalExemptTools` is
+     a security decision, recorded where the tool is classified, never a
+     convenience. The owner ruling is recorded in the governance ledger fragment
+     `governance.d/2146-batch-b-dispatch-core.DbkUcG.jsonl`, adjudicated by the
+     repository owner.
+   - **2026-10-30 - `Workflow:Execute` is approval-gated at the supervised MCP
+     tier.** Owner ruling 2026-10-30; the rule was cut out of this change with the
+     workflow twin on 2026-10-31, then ruled back into it on 2026-11-03 so the gap
+     closes without waiting for the twin. A workflow fans several steps out to the fleet in one
+     call with no per-step human look, so a supervised token needs an approval
+     ticket for it, like every other fleet execution at that tier. The rule is one
+     line in `requires_approval()` (`server/core/src/mcp_policy.hpp`), mirrored by
+     `AuthRoutes::require_permission` on every non-MCP transport, so
+     `POST /api/workflows/{id}/execute` refuses a supervised token with `403`.
+     Before it, a supervised token ran a workflow with no ticket. Residual: no MCP
+     tool maps to the pair yet (the `execute_workflow` tool is a separate change),
+     so until it ships a supervised token has no ticket path to run a workflow;
+     that availability loss is accepted in exchange for closing the gap. The owner
+     ruling is recorded in the governance ledger fragment
+     `governance.d/2146-batch-b-dispatch-core.DbkUcG.jsonl`, adjudicated by the
+     repository owner.
 
    - **2026-11-02 - the `list_agents` exception (#4041) is resolved for every
      caller except a service-scoped token.** The 2026-10-23 entry above recorded
@@ -1163,6 +1223,31 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      So this entry does not establish that MCP list reads are scoped as a class; the
      tools marked Confined in `docs/user-manual/mcp.md` are. Removing the pins drops
      the 2027-01-31 revisit date from the ledger, and that date now lives on #4041.
+
+   - **2026-11-04 - software normalisation curation (REST only; the MCP twin is
+     a recorded exception).** The five
+     `/api/v1/inventory/software/normalization/` routes (`GET status`, `GET queue`,
+     `POST aliases`, `POST queue/{key}/reject`, `POST pack`) have no MCP tool.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
+       as roadmap row **4.3-mcp** in the software estate roadmap (executed inside
+       delivery row SAM-29, the MCP twins of rule import, catalogue identity and
+       curation); **revisit by 2026-12-31**. The twin takes the same store methods
+       and the same field validators (`valid_cpe_product`, `known_ecosystem`,
+       `derive_curated_alias`), so there is no second validator. This entry
+       retires when the twin merges. No issue exists for that follow-up yet
+       (update this line when it is filed). No ledger row is added: the parity ledger
+       admits an `exception:` row for a `/api/v1` route but does not require one.
+     - **What an MCP-only caller can and cannot reach today.** The status, queue
+       and curated aliases are not reachable over MCP; the OpenAPI document is
+       readable as the `yuzu://openapi` resource.
+     - **The exception relaxes no control.** Every route needs a global
+       `Inventory:Read` (reads) or `Inventory:Write` (writes) grant, refuses a
+       service-scoped token, audits each write BEFORE the store is touched and
+       fails closed with `503` and `Sec-Audit-Failed`, and answers a degraded read
+       with `503`, never an empty `200`. The A4 envelope and the OpenAPI entries
+       hold for all five. Wire reference: `docs/user-manual/rest-api.md`,
+       "Software normalisation curation".
+     - Recorded by the change author; ADR-owner acceptance pending.
 
 ## Interim rules (until the named follow-ups ship)
 
