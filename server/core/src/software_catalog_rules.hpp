@@ -63,7 +63,7 @@ inline constexpr std::array<EcosystemFamily, 17> kEcosystemFamilies{{
     {"flatpak", "linux"},
     {"python", "other"},
     {"ibm_mq", "other"},  // middleware (SAM.2): no OS family -- the product runs on several
-    {"chocolatey", "windows"}, // pkg_inventory Windows legs (SAM-31)
+    {"chocolatey", "windows"}, // pkg_inventory Windows legs
     {"winget", "windows"},
     {"appx", "windows"},
 }};

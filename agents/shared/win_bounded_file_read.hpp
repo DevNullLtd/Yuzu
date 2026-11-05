@@ -7,8 +7,9 @@
 //     (attributes carry FILE_ATTRIBUTE_REPARSE_POINT), never followed;
 //   - the read also refuses (as `error`) a file with more than one hard link and a file whose
 //     resolved path (GetFinalPathNameByHandleW) is not the requested path, so a junction or
-//     symlink in ANY parent directory, swapped in after a listing, is not followed (a refusal
-//     only ever turns an answer into an `error`, never into data);
+//     symlink in ANY parent directory, swapped in after a listing, is opened by CreateFileW but
+//     never read or returned (a refusal only ever turns an answer into an `error`, never into
+//     data); the path must be a canonical absolute drive-letter path (see handle_path_is);
 //   - a directory is refused as `error` (the leaf is opened with FILE_FLAG_BACKUP_SEMANTICS:
 //     without it CreateFileW answers ERROR_ACCESS_DENIED for a directory, which would be
 //     misreported as `denied`, an ACL refusal, when it is a wrong-kind path);

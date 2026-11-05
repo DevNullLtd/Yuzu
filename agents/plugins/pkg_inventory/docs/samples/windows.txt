@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-05 · virtual service account (NT SERVICE\<name>, non-admin; NT SERVICE\YuzuAgent itself not used) · leg-hash 1b03567381e2
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-05 · NT SERVICE virtual service account (not an administrator; NT SERVICE\YuzuAgent itself not used) · leg-hash 1b03567381e2
 == action=managers
 status|managers|supported|-
 manager|chocolatey|present|-|C:/ProgramData/chocolatey|lib_dirs=19|-

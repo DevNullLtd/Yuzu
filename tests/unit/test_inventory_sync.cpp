@@ -3651,7 +3651,7 @@ TEST_CASE("collector: one drop_source source withheld does not touch the other",
 }
 
 // ============================================================================
-// pkg_inventory Windows legs (SAM-31): chocolatey / winget / appx adapter arms
+// pkg_inventory Windows legs: chocolatey / winget / appx adapter arms
 // ============================================================================
 
 namespace {
@@ -3808,7 +3808,7 @@ TEST_CASE("pkg_inventory adapters: the committed windows.txt sample round-trips 
     REQUIRE(m.entries.size() == 2);
     CHECK(m.entries[0].ecosystem == "chocolatey");
     CHECK(m.entries[1].ecosystem == "winget");
-    CHECK(m.entries[1].version == "1.29.379.0");
+    CHECK(m.entries[1].version == "2026.917.151.0");
 
     const auto p = parse_pkg_inventory_packages_output(
         capture_section("pkg_inventory", "windows.txt", "packages"), kFailPolicy);
@@ -3823,7 +3823,8 @@ TEST_CASE("pkg_inventory adapters: the committed windows.txt sample round-trips 
     const auto s = parse_pkg_inventory_store_packages_output(
         capture_section("pkg_inventory", "windows.txt", "store_packages"), kFailPolicy);
     REQUIRE(s.status == Status::ok);
-    CHECK(s.entries.size() == 13); // 7 Applications + 6 InboxApplications captured keys
+    // 119 captured Appx rows; the adapter keeps the 118 active ones and drops the 1 deprovisioned.
+    CHECK(s.entries.size() == 118);
     for (const auto& e : s.entries) {
         CHECK(e.ecosystem == "appx");
         CHECK(e.kind == "app");

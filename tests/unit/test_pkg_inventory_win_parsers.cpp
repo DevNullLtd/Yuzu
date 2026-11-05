@@ -585,6 +585,14 @@ TEST_CASE("win nuspec: a '>' inside a quoted attribute value does not end the st
           std::optional<std::string>{"1.2.3"});
     CHECK(pw::extract_xml_text("<version note='x>y'>4.5</version>", "version") ==
           std::optional<std::string>{"4.5"});
+    // the other quote character inside a quoted value does not close it
+    CHECK(pw::extract_xml_text("<version note=\"it's\">6.7</version>", "version") ==
+          std::optional<std::string>{"6.7"});
+    CHECK(pw::extract_xml_text("<version note='say \"hi\">x'>8.9</version>", "version") ==
+          std::optional<std::string>{"8.9"});
+    // a quoted '>' on an earlier element does not disturb the walk to the matching tag
+    CHECK(pw::extract_xml_text("<metadata x=\"a>b\"><version>1.0</version>", "version") ==
+          std::optional<std::string>{"1.0"});
     // an unterminated quote never closes the tag: unknown, not a leaked fragment
     CHECK_FALSE(pw::extract_xml_text("<version note=\"a>1.0</version>", "version").has_value());
 }
@@ -886,8 +894,8 @@ TEST_CASE("win sample: docs/samples/windows.txt is a captured run with well-form
           "[pkg_inventory][windows][sample]") {
     // The sample is a real plugin-capture of the three actions on a Windows host, so it cannot be
     // compared with fixture output; what stays checkable on every OS is its shape.
-    // The stamp and the three outcomes pin that this is a captured, fully answered run, and what
-    // account class it was taken as.
+    // The stamp and the three outcomes check the shape of a captured, fully answered run and
+    // the account class it claims; whether the file is authentic is the capture record's job.
     {
         std::ifstream in(std::filesystem::path(YUZU_PLUGIN_SRC_DIR) / "pkg_inventory" / "docs" /
                          "samples" / "windows.txt");
@@ -999,7 +1007,7 @@ TEST_CASE("win real ops: bounded file read and single-level directory listing on
     // the FakeOps cases reach: one small scratch tree (yuzu_test_ prefix: the Defender exclusion).
     yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_win_"};
     std::filesystem::create_directories(dir.path);
-    // The strict read compares the kernel's resolved path with the requested one, so the scratch
+    // The bounded read compares the kernel's resolved path with the requested one, so the scratch
     // root is spelled canonically (a runner's %TEMP% can carry an 8.3 short name).
     const auto root = std::filesystem::canonical(dir.path);
     std::filesystem::create_directories(root / "alpha");
@@ -1023,15 +1031,17 @@ TEST_CASE("win real ops: bounded file read and single-level directory listing on
     const auto cut = ops.read_file((root / "alpha" / "alpha.nuspec").string(), 10);
     REQUIRE(cut.status == pw::OpStatus::ok);
     CHECK(cut.bytes.size() == 10);
+    CHECK(cut.truncated);       // the real seam carries the bounded reader's flag through
+    CHECK_FALSE(f.truncated);
     CHECK(ops.read_file((root / "alpha" / "missing.nuspec").string(), 10).status ==
           pw::OpStatus::absent);
     CHECK(ops.read_file((root / "alpha").string(), 10).status == pw::OpStatus::error); // a directory
     CHECK(ops.read_file("", 10).status == pw::OpStatus::error);
 }
 
-TEST_CASE("win real ops: the nuspec read refuses a hard link and a redirected parent directory",
+TEST_CASE("win real ops: the nuspec read refuses a hard-linked file",
           "[pkg_inventory][windows][realops]") {
-    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_win_strict_"};
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_win_links_"};
     std::filesystem::create_directories(dir.path);
     const auto root = std::filesystem::canonical(dir.path);
     std::filesystem::create_directories(root / "real");
@@ -1041,28 +1051,41 @@ TEST_CASE("win real ops: the nuspec read refuses a hard link and a redirected pa
             << "<package><metadata><version>3.2.1</version></metadata></package>";
     }
     const pw::RealOps ops;
-    const auto plain = ops.read_file(nuspec.string(), 4096);
-    REQUIRE(plain.status == pw::OpStatus::ok); // the control: an ordinary file reads
+    REQUIRE(ops.read_file(nuspec.string(), 4096).status == pw::OpStatus::ok); // the control
 
-    // A second link to the same file: the read cannot tell whose content it is, so it refuses.
+    // A second link to the same file: the read cannot tell whose content it is, so it refuses
+    // both names.
     std::error_code ec;
     std::filesystem::create_hard_link(nuspec, root / "real" / "linked.nuspec", ec);
-    REQUIRE_FALSE(ec);
+    if (ec) SKIP("hard links unavailable on this volume (" << ec.message() << ")");
     CHECK(ops.read_file(nuspec.string(), 4096).status == pw::OpStatus::error);
     CHECK(ops.read_file((root / "real" / "linked.nuspec").string(), 4096).status ==
           pw::OpStatus::error);
     std::filesystem::remove(root / "real" / "linked.nuspec", ec);
-    REQUIRE(ops.read_file(nuspec.string(), 4096).status == pw::OpStatus::ok); // single link again
+    CHECK(ops.read_file(nuspec.string(), 4096).status == pw::OpStatus::ok); // single link again
+}
 
-    // A parent directory that is a symlink (a junction behaves the same): the leaf probe alone
-    // would follow it, the resolved-path check refuses it. Creating one needs a privilege the
-    // runner may not grant, in which case this half is skipped, loudly.
-    std::filesystem::create_directory_symlink(root / "real", root / "redirect", ec);
-    if (ec) {
-        SKIP("directory symlink not creatable here (" << ec.message() << "); redirect half skipped");
+TEST_CASE("win real ops: the nuspec read refuses a file reached through a symlinked parent",
+          "[pkg_inventory][windows][realops]") {
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_win_links_"};
+    std::filesystem::create_directories(dir.path);
+    const auto root = std::filesystem::canonical(dir.path);
+    std::filesystem::create_directories(root / "real");
+    const auto nuspec = root / "real" / "real.nuspec";
+    {
+        std::ofstream(nuspec, std::ios::binary)
+            << "<package><metadata><version>3.2.1</version></metadata></package>";
     }
-    CHECK(ops.read_file((root / "redirect" / "real.nuspec").string(), 4096).status ==
-          pw::OpStatus::error);
+    // A parent directory that is a symlink (a junction behaves the same): the open follows it, the
+    // resolved-path check refuses it. Creating one needs a privilege the runner may not grant.
+    std::error_code ec;
+    std::filesystem::create_directory_symlink(root / "real", root / "redirect", ec);
+    if (ec) SKIP("directory symlink not creatable here (" << ec.message() << ")");
+    const auto through = root / "redirect" / "real.nuspec";
+    REQUIRE(std::ifstream(through, std::ios::binary).good()); // the control: the link does resolve
+    const pw::RealOps ops;
+    CHECK(ops.read_file(through.string(), 4096).status == pw::OpStatus::error);
+    CHECK(ops.read_file(nuspec.string(), 4096).status == pw::OpStatus::ok); // the real path reads
 }
 
 #endif // _WIN32

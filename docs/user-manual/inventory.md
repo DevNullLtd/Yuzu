@@ -154,8 +154,9 @@ cadences.
   `WindowsApps` folder are not covered. These reads were measured as a non-admin
   virtual service account (the same account class as `NT SERVICE\YuzuAgent`);
   `NT SERVICE\YuzuAgent` itself was not used, so a hardened ACL on the roster keys
-  or the Chocolatey `lib` directory on a given host is not excluded. A Chocolatey
-  folder reached through a junction or symlink reads every package version as `-`. A roster key or `lib`
+  or the Chocolatey `lib` directory on a given host is not excluded. If
+  `C:\ProgramData\chocolatey` or its `lib` folder is a junction or symlink, every
+  Chocolatey package is listed with an empty version and the status stays supported. A roster key or `lib`
   directory that is denied (`constrained`, reason
   `windows:pkg_inventory:<source>:access_denied`), over the row or byte cap or
   cannot be listed makes that daily cycle skip for every source: the previously
