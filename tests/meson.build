@@ -4545,6 +4545,15 @@ test('forensics tier wiring lexical selftest',
   timeout: 30,
 )
 
+# #2146: the workflow-execute zero-reach status list lives in the header, the REST manual and the MCP
+# manual, and an absent command_id is never said to prove a step unsent. Self-checks in memory.
+test('workflow execute docs lexical',
+  _python3_test,
+  args: [files('test_workflow_execute_docs_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #3619: every audit row DashboardRoutes writes has its persist outcome checked (ADR-0033 §9).
 # Pins the bool AuditFn and the absence of direct sink calls; the script self-checks its detector.
 test('dashboard audit checked lexical',

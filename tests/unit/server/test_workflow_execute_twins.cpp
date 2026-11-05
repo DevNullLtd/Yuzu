@@ -28,6 +28,7 @@
 #include "dispatch_target_shape.hpp"
 #include "dispatch_zero_reach.hpp"
 #include "mcp_policy.hpp"
+#include "openapi_spec_access.hpp"
 #include "sha256_hex.hpp"
 #include "stream_budget.hpp"
 #include "test_route_sink.hpp"
@@ -1843,6 +1844,8 @@ struct Rest {
     std::string gate_type, gate_op;
     bool gate_admits{true};
     bool dispatch_throws{false};
+    /// When set, every step's send answers this (the zero-reach cases); otherwise it reaches one agent.
+    std::optional<ConfinedDispatchOutcome> dispatch_result;
     int gate_calls{0};
     int persist_calls{0};
     DispatchCaller caller{.principal = "alice",
@@ -1908,6 +1911,8 @@ struct Rest {
                     p->sent += 2; // accepted by the send path before the fan-out failed
                 throw std::runtime_error("registry exploded mid fan-out");
             }
+            if (dispatch_result)
+                return *dispatch_result;
             return ConfinedDispatchOutcome{.sent = 1, .command_id = "cmd-rest"};
         };
         d.caller_fn = [this](const httplib::Request&) { return caller; };
@@ -3536,6 +3541,140 @@ TEST_CASE("idempotency: a call that passed the pre-check and LOST the engine's c
     }
 }
 
+TEST_CASE("workflow execute: a KEYED zero-reach run is never retryable, whatever its cause, and says to "
+          "use a new key; an UNKEYED run keeps the advice of its cause",
+          "[workflow][twin][zeroreach][idempotency][retry]") {
+    struct Row {
+        const char* token;
+        bool unkeyed_retryable;
+        std::function<void(ConfinedDispatchOutcome&)> set;
+    };
+    const Row rows[] = {
+        {"containment_unreadable", true, [](auto& o) { o.containment_unreadable = true; }},
+        {"route_unreadable", true, [](auto& o) { o.route_unreadable = true; }},
+        {"os_gate_unreadable", true, [](auto& o) { o.os_gate_unreadable = true; }},
+        {"no_agents_reached", true, [](auto&) {}},
+        {"quarantined", false, [](auto& o) { o.denied_quarantined_count = 2; }},
+        {"plugin_not_found", false, [](auto& o) { o.unknown_plugin_count = 1; }},
+        {"kill_switched_os", false, [](auto& o) { o.kill_switched_os_count = 1; }},
+    };
+    for (const auto& r : rows) {
+        INFO(r.token);
+        for (const bool keyed_run : {false, true}) {
+            INFO(std::string(keyed_run ? "keyed" : "unkeyed"));
+            Fx f;
+            ConfinedDispatchOutcome out;
+            out.command_id = "cmd-zero";
+            r.set(out);
+            f.outcomes["i-ro"] = out;
+            const auto o = keyed_run ? f.run(keyed(f)) : f.run();
+            REQUIRE(o.status == WorkflowExecuteStatus::kNoAgentsReached);
+            CHECK(o.reason == r.token);
+            REQUIRE(o.steps.size() == 1);
+            if (keyed_run) {
+                CHECK_FALSE(o.retryable);
+                CHECK_FALSE(o.steps[0].retryable);
+                CHECK(o.remediation == kKeyedRetryRemediation);
+                CHECK(o.remediation.find("use a new idempotency key (MCP: a new approval)") !=
+                      std::string::npos);
+            } else {
+                CHECK(o.retryable == r.unkeyed_retryable);
+                CHECK(o.steps[0].retryable == r.unkeyed_retryable);
+                CHECK(o.remediation.empty());
+            }
+        }
+    }
+}
+
+TEST_CASE("workflow execute: a KEYED run that reached nobody because of the deadline or the engine "
+          "carries the new-key remediation too",
+          "[workflow][twin][zeroreach][idempotency][retry]") {
+    SECTION("deadline_exceeded") {
+        Fx f;
+        f.engine_status = "failed";
+        auto req = keyed(f);
+        req.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        const auto o = f.run(req);
+        REQUIRE(o.status == WorkflowExecuteStatus::kNoAgentsReached);
+        CHECK(o.reason == "deadline_exceeded");
+        CHECK_FALSE(o.retryable);
+        CHECK(o.remediation == kKeyedRetryRemediation);
+    }
+    SECTION("run_failed") {
+        Fx f;
+        f.engine_status = "failed";
+        auto a = f.api();
+        auto p = f.ports(a);
+        p.run = [&](const std::string&, const std::vector<std::string>&, StepDispatchFn,
+                    ConditionEvalFn, const WorkflowRunControl& control)
+            -> std::expected<std::string, std::string> {
+            if (control.on_admitted)
+                control.on_admitted("exec-1");
+            return std::string{"exec-1"};
+        };
+        const auto o = apply_workflow_execute(p, keyed(f));
+        REQUIRE(o.status == WorkflowExecuteStatus::kNoAgentsReached);
+        CHECK(o.reason == "run_failed");
+        CHECK_FALSE(o.retryable);
+        CHECK(o.remediation == kKeyedRetryRemediation);
+    }
+    SECTION("a step refused at send time (late_denied)") {
+        Fx f;
+        f.late_defs["i-ro"] = def("i-ro", "os_info", "os_version", "always");
+        const auto o = f.run(keyed(f));
+        REQUIRE(o.status == WorkflowExecuteStatus::kNoAgentsReached);
+        CHECK(o.reason == "late_denied");
+        CHECK_FALSE(o.retryable);
+        CHECK(o.remediation == kKeyedRetryRemediation);
+    }
+}
+
+TEST_CASE("workflow execute: the zero-reach status list is closed, matches what the code emits, and "
+          "the never-sent claim is gone from the remediations",
+          "[workflow][twin][zeroreach][docs]") {
+    // Every cause the shared classifier names is a member of the list, except the one a workflow
+    // cannot produce (it names its agents, so there is no scope to fail to parse).
+    for (const auto cause : {ZeroReachCause::ContainmentUnreadable, ZeroReachCause::RouteUnreadable,
+                             ZeroReachCause::OsGateUnreadable, ZeroReachCause::Quarantined,
+                             ZeroReachCause::PluginNotFound, ZeroReachCause::KillSwitchedOs,
+                             ZeroReachCause::Generic}) {
+        const auto token = zero_reach_token(cause);
+        INFO(token);
+        CHECK(std::find(kWorkflowZeroReachStatuses.begin(), kWorkflowZeroReachStatuses.end(),
+                        token) != kWorkflowZeroReachStatuses.end());
+    }
+    CHECK(std::find(kWorkflowZeroReachStatuses.begin(), kWorkflowZeroReachStatuses.end(),
+                    zero_reach_token(ZeroReachCause::InvalidScope)) ==
+          kWorkflowZeroReachStatuses.end());
+    // The four non-cause members are exactly the reasons the sequence assigns itself.
+    for (const char* own : {"late_denied", "definition_changed", "deadline_exceeded", "run_failed"})
+        CHECK(std::count(kWorkflowZeroReachStatuses.begin(), kWorkflowZeroReachStatuses.end(),
+                         std::string_view(own)) == 1);
+    CHECK(kWorkflowZeroReachStatuses.size() == 11);
+
+    // The three remediation texts that used to say a step with no command_id was never sent.
+    CHECK(std::string(kStepNotProvenUnsentText).find("may still have been sent") !=
+          std::string::npos);
+    Fx f;
+    f.bind("alice", kKey, "running", 900); // past the 180 s stale bound
+    const auto replay = f.run(keyed(f));
+    REQUIRE(replay.status == WorkflowExecuteStatus::kIdempotentReplay);
+    CHECK(replay.replay_status == "indeterminate");
+    CHECK(replay.remediation.find(std::string(kStepNotProvenUnsentText)) != std::string::npos);
+    CHECK(replay.remediation.find("never sent") == std::string::npos);
+
+    Fx t;
+    t.engine_throws_before_admit = false;
+    t.dispatch_override = [](const WorkflowStepInstruction&, const std::vector<std::string>&,
+                             const DispatchCaller&) -> ConfinedDispatchOutcome {
+        throw std::runtime_error("boom");
+    };
+    const auto threw = t.run();
+    REQUIRE(threw.status == WorkflowExecuteStatus::kRunFailed);
+    CHECK(threw.remediation.find(std::string(kStepNotProvenUnsentText)) != std::string::npos);
+    CHECK(threw.remediation.find("never sent") == std::string::npos);
+}
+
 TEST_CASE("idempotency: the idempotent counter's outcome set is closed", "[workflow][twin][idempotency]") {
     REQUIRE(kWorkflowRunIdempotentOutcomes.size() == 3);
     CHECK(kWorkflowRunIdempotentOutcomes[0] == "replayed");
@@ -3639,6 +3778,79 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: failed and 
     CHECK_FALSE(at_path(j, "/data").contains("retry_after_ms"));
     CHECK(stale->get_header_value("Retry-After").empty());
     CHECK(at_path(j, "/data/remediation").get<std::string>().find("new key") != std::string::npos);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a zero-reach 503 after the key is bound is not retryable "
+          "and says to use a new key; the same 503 without a key keeps its cause's retry hint",
+          "[workflow][twin][rest][zeroreach][idempotency][retry]") {
+    struct Row {
+        const char* token;
+        bool unkeyed_hint; // retry_after_ms 5000 on an unkeyed run
+        ConfinedDispatchOutcome out;
+    };
+    ConfinedDispatchOutcome generic;
+    generic.command_id = "cmd-zero";
+    ConfinedDispatchOutcome contained = generic;
+    contained.containment_unreadable = true;
+    ConfinedDispatchOutcome quarantined = generic;
+    quarantined.denied_quarantined_count = 3;
+    const Row rows[] = {{"no_agents_reached", true, generic},
+                        {"containment_unreadable", true, contained},
+                        {"quarantined", false, quarantined}};
+    for (const auto& row : rows) {
+        INFO(row.token);
+        {
+            Rest r; // UNKEYED
+            r.dispatch_result = row.out;
+            const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+            REQUIRE(res);
+            CHECK(res->status == 503);
+            const auto j = body_of(*res);
+            CHECK(at_path(j, "/error/reason") == row.token);
+            if (row.unkeyed_hint)
+                CHECK(at_path(j, "/error/retry_after_ms") == 5000);
+            else
+                CHECK(at_path(j, "/error/retry_after_ms").is_null());
+            CHECK((!at_path(j, "/error").contains("remediation") ||
+                   at_path(j, "/error/remediation").is_null()));
+        }
+        {
+            Rest r; // KEYED
+            r.dispatch_result = row.out;
+            const auto res = post_with_key(r, kKey);
+            REQUIRE(res);
+            CHECK(res->status == 503);
+            const auto j = body_of(*res);
+            CHECK(at_path(j, "/error/reason") == row.token);
+            CHECK(at_path(j, "/error/retry_after_ms").is_null());
+            CHECK(res->get_header_value("Retry-After").empty());
+            CHECK(at_path(j, "/error/remediation").get<std::string>().find(
+                      "use a new idempotency key (MCP: a new approval)") != std::string::npos);
+            CHECK(at_path(j, "/error/execution_id") == "exec-1");
+        }
+    }
+}
+
+TEST_CASE("openapi_spec_json(): the workflow execute operation lists every zero-reach reason, states "
+          "the keyed rule and no longer claims an absent command_id proves a step unsent",
+          "[workflow][twin][openapi][zeroreach][docs]") {
+    const json spec = json::parse(yuzu::server::openapi_spec_json());
+    const auto& op = spec.at("paths").at("/workflows/{id}/execute").at("post");
+    const auto desc = op.at("description").get<std::string>();
+    for (const auto token : kWorkflowZeroReachStatuses) {
+        if (token == "definition_changed")
+            continue; // MCP only: REST carries no ticket-bound effects to move off of
+        INFO(token);
+        CHECK(desc.find(std::string(token)) != std::string::npos);
+    }
+    CHECK(desc.find("WITH an Idempotency-Key the key is already bound") != std::string::npos);
+    CHECK(desc.find("retry_after_ms null, no Retry-After") != std::string::npos);
+    CHECK(desc.find("a step recorded pending or skipped may still have been sent") !=
+          std::string::npos);
+    CHECK(desc.find("was never sent") == std::string::npos);
+    const auto r503 = op.at("responses").at("503").at("description").get<std::string>();
+    CHECK(r503.find("run_failed and deadline_exceeded") != std::string::npos);
+    CHECK(r503.find("with an Idempotency-Key never retryable") != std::string::npos);
 }
 
 TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: the same key with a different "

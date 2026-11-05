@@ -1353,8 +1353,9 @@ static const ToolDef kTools[] = {
      "retryable) before anything is read or minted. A replay's status running (retry_after_ms 2000) means POLL get_workflow_execution, "
      "never re-send; past about 2 minutes treat a run that is still running as indeterminate "
      "(the server answers indeterminate, retryable false, once it has run for 180 seconds): "
-     "read get_workflow_execution, where a step with no command_id was never sent, and inspect "
-     "the step results before deciding on a new key. "
+     "read get_workflow_execution and inspect the step results before deciding on a new key: a "
+     "step recorded pending or skipped may still have been sent; check the audit and response "
+     "stores by plugin and time before re-running. "
      "SYNCHRONOUS DISPATCH, ASYNC DEVICE WORK: the call returns once every step's command has "
      "been SENT (it can take as long as the workflow's step retries and delays, but never longer "
      "than a 60 second run budget), not when devices "
@@ -1401,7 +1402,8 @@ static const ToolDef kTools[] = {
      "steps of retryCount x retryDelay) exceeds 60 seconds is refused -32602 reason "
      "workflow_exceeds_sync_budget before a ticket is minted. The run has 60 seconds from the call: "
      "no send starts after the deadline, the remaining steps are skipped and the run is closed "
-     "failed (status aborted, reason deadline_exceeded, not retryable). "
+     "failed: status aborted with reason deadline_exceeded if something had been sent, or, if no "
+     "step had reached an agent, status deadline_exceeded (not retryable either way). "
      "CREDENTIAL CHECK: before each step's first send, and after waking from each retry delay, the "
      "run re-validates the credential this call was made with. A revoked or expired credential "
      "(or an engine principal that is no longer active) stops the run with status aborted, reason "
@@ -1412,14 +1414,17 @@ static const ToolDef kTools[] = {
      "administrator elevation that expires, or a device-group narrowing, during the run is only "
      "bounded by the 60 second deadline. "
      "AUDIT: a 'requested' audit row (workflow.execute) is written BEFORE anything is sent; if "
-     "it cannot be saved the call fails with a retryable error and nothing was sent. A step "
+     "it cannot be saved the call fails with an internal error (-32603, retry_after_ms 5000) and "
+     "nothing was sent, but the approval ticket is already spent: a retry needs a NEW approval, "
+     "and a store fault after the ticket was consumed is the same. A step "
      "refused at send time because its definition changed is audited at that moment and is not "
      "retried. A closing row records the outcome (audit_persisted:false if that one was lost). "
      "A run that THROWS after that row is answered -32603 with error.data.reason "
      "dispatch_exception, error.data.execution_id and error.data.agents_sent (a lower bound, "
      "present when known) and retry_after_ms null: steps may already have been sent, so do NOT "
-     "re-send; read get_workflow_execution. A throw before that row is retryable "
-     "(retry_after_ms 5000) because nothing was sent. "
+     "re-send; read get_workflow_execution. A throw before that row is -32603 with "
+     "retry_after_ms 5000 because nothing was sent, but a ticket already consumed stays spent "
+     "and the retry needs a new approval. "
      "RESULT: a success envelope with execution_id, workflow_id, status and steps (one entry per "
      "send attempt: instruction_id, attempt (1-based; a retry has the next number and a new step "
      "starts at 1), command_id, agents_reached; when 0, a reason). status is "
@@ -1438,11 +1443,16 @@ static const ToolDef kTools[] = {
      "only draining lets a run finish its steps (it gives up retries it had not made). The closing "
      "audit row is result failure with run_outcome=failed|partial|interrupted|aborted. If "
      "NO step reached any agent the envelope instead carries status set to the cause with "
-     "agents_reached 0 on every step: \"quarantined\", "
-     "\"plugin_not_found\", \"kill_switched_os\", \"late_denied\" and \"definition_changed\" are PERMANENT "
-     "(retry_after_ms null); \"containment_unreadable\", \"route_unreadable\", "
-     "\"os_gate_unreadable\" and \"no_agents_reached\" (offline devices, or a concurrency "
-     "claim) are retryable (retry_after_ms 5000). The execution still exists and is readable. "
+     "agents_reached 0 on every step, one of: \"containment_unreadable\", \"route_unreadable\", "
+     "\"os_gate_unreadable\", \"no_agents_reached\" (offline devices, or a concurrency claim), "
+     "\"quarantined\", \"plugin_not_found\", \"kill_switched_os\", \"late_denied\", "
+     "\"definition_changed\", \"deadline_exceeded\" (the 60 second budget ended the run before "
+     "any step reached an agent) or \"run_failed\" (the engine closed the run without a single "
+     "dispatch attempt). This call always carries an idempotency_key and the key is bound to the "
+     "run, so EVERY one of them has retryable false, retry_after_ms null and remediation \"use a "
+     "new idempotency key (MCP: a new approval)\": repeating the call replays this failed run and "
+     "never runs again, so read the run first and decide on a new key and a new approval. The "
+     "execution still exists and is readable. "
      "Mirrors REST POST /api/v1/workflows/{id}/execute. Requires Workflow:Execute; a "
      "service-scoped token is denied.",
      R"j({"type":"object","properties":{)j"
@@ -1456,13 +1466,14 @@ static const ToolDef kTools[] = {
      R"j("idempotent_replay":{"type":"boolean","description":"Present (true) only when the idempotency_key was already bound to a run and this call sent nothing: the other fields then describe that run, thinly (status, started_at, message), and steps and late_denied are absent"},)j"
      R"j("started_at":{"type":"integer","description":"Present only on an idempotent replay: when the run started, epoch seconds"},)j"
      R"j("workflow_id":{"type":"string"},)j"
-     R"j("status":{"type":"string","description":"The engine's recorded status (completed, failed, ...), partial, aborted or interrupted for a run that sent something and did not succeed, or the zero-reach cause token when no step reached any agent. On an idempotent replay: the first answer's class judged from the stored steps, never from the engine's status alone: completed (only for a run that succeeded), partial, failed, aborted or interrupted (each retryable false), running (retry_after_ms 2000: poll, never re-send) or indeterminate (a run still running long after it started, or a completed run whose stored steps cannot prove its outcome; retryable false)"},)j"
+     R"j("status":{"type":"string","description":"The engine's recorded status (completed, failed, ...), partial, aborted or interrupted for a run that sent something and did not succeed, or the zero-reach cause token when no step reached any agent (one of containment_unreadable, route_unreadable, os_gate_unreadable, no_agents_reached, quarantined, plugin_not_found, kill_switched_os, late_denied, definition_changed, deadline_exceeded, run_failed). On an idempotent replay: the first answer's class judged from the stored steps, never from the engine's status alone: completed (only for a run that succeeded), partial, failed, aborted or interrupted (each retryable false), running (retry_after_ms 2000: poll, never re-send) or indeterminate (a run still running long after it started, or a completed run whose stored steps cannot prove its outcome; retryable false)"},)j"
      R"j("late_denied":{"type":"boolean","description":"True when a step was refused at send time because its definition changed after the precheck"},)j"
      R"j("steps":{"type":"array","items":{"type":"object","properties":{"instruction_id":{"type":"string"},"attempt":{"type":"integer","minimum":1,"description":"The 1-based send attempt of this step this entry records: a retry has the next number and the next step starts again at 1. A step is judged by its last attempt"},"command_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":0},"reason":{"type":"string","description":"Present when agents_reached is 0"},"retryable":{"type":"boolean"},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["instruction_id","command_id","agents_reached"]}},)j"
-     R"j("remediation":{"type":"string","description":"Present only on an indeterminate idempotent replay"},)j"
+     R"j("remediation":{"type":"string","description":"Present on an indeterminate idempotent replay and when no step reached any agent (use a new idempotency key (MCP: a new approval) for another run)"},)j"
      R"j("message":{"type":"string","description":"Present when no step reached any agent, and on an idempotent replay"},)j"
      R"j("reason":{"type":"string","enum":["deadline_exceeded","server_shutdown","credential_revoked","credential_indeterminate"],"description":"Present only when the run was stopped: the 60 second run budget (deadline_exceeded), the server stopping (server_shutdown, status interrupted), or the caller's credential check before a step (credential_revoked, or credential_indeterminate when it could not be confirmed after one retry; status aborted)"},)j"
-     R"j("retry_after_ms":{"type":["integer","null"],"description":"Present only when no step reached any agent: 5000 for a retryable cause, null for a permanent one"},)j"
+     R"j("retryable":{"type":"boolean","description":"Present when no step reached any agent and for partial, aborted and interrupted: always false here, because the idempotency_key is bound to the run and a repeat of the call replays it"},)j"
+     R"j("retry_after_ms":{"type":["integer","null"],"description":"Present only when no step reached any agent, and null on every such answer from this tool (the key is bound to the run: a retry replays it)"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the closing audit row failed to persist after the run had started"})j"
      R"j(},"required":["execution_id","workflow_id","status"]})j"},
 
@@ -8643,9 +8654,15 @@ McpServer::HandlerFn McpServer::build_handler(
             const auto respond_workflow_threw = [&](const char* what) {
                 spdlog::error("MCP execute_workflow: threw: {}", what);
                 mcp_audit("failure", "exception");
-                res.set_content(a4_error(kInternalError, "workflow execution failed", {},
-                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                "application/json");
+                res.set_content(
+                    a4_error(kInternalError, "workflow execution failed",
+                             approval_ticket_just_consumed
+                                 ? "nothing was sent, but the approval ticket is spent; request a "
+                                   "new approval for the same call and re-call with the same "
+                                   "idempotency_key"
+                                 : std::string{},
+                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                    "application/json");
             };
             // An execute_workflow run refused at ADMISSION (cap or draining): the same HTTP 429 /
             // 503 + Retry-After and honest retry_after_ms the streamed-POST cap answers, with the
@@ -8708,9 +8725,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 case WES::kStoreFailed:
                 case WES::kAuditFailed:
-                    res.set_content(a4_error(kInternalError, out.message, {},
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
+                    // Nothing was sent. Once the ticket was consumed (every call that reaches the
+                    // handler at the supervised tier) it is spent, so the retry the hint offers
+                    // needs a NEW approval; a refusal from the probe, before any mint or consume,
+                    // spent nothing.
+                    res.set_content(
+                        a4_error(kInternalError, out.message,
+                                 approval_ticket_just_consumed
+                                     ? "nothing was sent, but the approval ticket is spent; "
+                                       "request a new approval for the same call and re-call "
+                                       "with the same idempotency_key"
+                                     : std::string{},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
                     return;
                 case WES::kUnavailable:
                 case WES::kNoPrincipal:
@@ -22554,9 +22581,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         // success result carrying the cause, never a bare "reached 0".
                         payload["status"] = out.reason;
                         payload["message"] = out.message;
+                        payload["retryable"] = out.retryable;
                         payload["retry_after_ms"] =
                             out.retryable ? nlohmann::json(mcp::kMcpStoreFaultRetryMs)
                                           : nlohmann::json(nullptr);
+                        if (!out.remediation.empty())
+                            payload["remediation"] = out.remediation;
                     }
                     mcp_audit(out.status == WES::kOk ? "success" : "failure",
                               "execution_id=" + audit_caller_id(out.execution_id) +

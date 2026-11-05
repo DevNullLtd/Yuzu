@@ -6724,7 +6724,7 @@ nothing is sent.
 | `422` | `idempotency_key_conflict` | The `Idempotency-Key` is already bound to a DIFFERENT request (another workflow, or another set of agent ids). Terminal: nothing was sent, `error.execution_id` names the run the key is bound to. Use a new key for a different request. |
 | `429` | `per_principal_stream_cap`, `global_stream_cap` | Admission: the caller already has 2 workflow runs in progress, or the server's shared held-open budget (`--max-sse-streams`) is full. `Retry-After: 5` and `retry_after_ms: 5000`. Nothing was read, sent or audited. Retrying is safe. |
 | `500` | `no_principal` | The session has no principal. |
-| `500` | `dispatch_exception` | The run THREW after its `requested` row, so steps may already have been sent. `error.execution_id` names the run (empty when the engine had not admitted it) and `error.agents_sent` the lower-bound count of agents the send path had accepted a send to (present only when at least one). **No retry hint, on purpose: do not re-send.** Read the run with `GET /api/v1/workflow-executions/{id}` (a step with no `command_id` was never sent) and start another run only on that evidence. The engine closes the execution `failed` and marks its remaining steps `skipped`. A closing `failure` audit row names both handles; if that row is lost the answer carries `Sec-Audit-Failed: true`. |
+| `500` | `dispatch_exception` | The run THREW after its `requested` row, so steps may already have been sent. `error.execution_id` names the run (empty when the engine had not admitted it) and `error.agents_sent` the lower-bound count of agents the send path had accepted a send to (present only when at least one). **No retry hint, on purpose: do not re-send.** Read the run with `GET /api/v1/workflow-executions/{id}` (a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running) and start another run only on that evidence. The engine closes the execution `failed` and marks its remaining steps `skipped`. A closing `failure` audit row names both handles; if that row is lost the answer carries `Sec-Audit-Failed: true`. |
 | `503` | `draining` | Admission: the server is shutting down and starts no new run. `Retry-After: 5` and `retry_after_ms: 5000`; nothing was read, sent or audited. Retry against another replica or after the restart. |
 | `503` | `workflow_engine_unavailable`, `instruction_store_unavailable`, `approval_gate_unavailable`, `dispatch_unavailable` | A dependency is not wired or open; nothing was sent. |
 | `503` | `store_unavailable` | A store read failed (`retry_after_ms: 5000`). Also the answer to an unexpected fault BEFORE the `requested` row (the preflight half): nothing was sent, so retrying is safe. A failed idempotency lookup is this too: it is never treated as "no run is bound to the key", so nothing is written and nothing is sent. |
@@ -6772,7 +6772,7 @@ two outcomes cannot disagree: the same rule classifies both.
 | `aborted` | A step was refused at send time (its definition changed after approval or the preflight), or the run was stopped by its 60 second deadline or by the credential check. The replay does not say which of the stop causes (`data.reason` is absent). Final. | `retryable: false` |
 | `interrupted` | The stopping server ended the run. Final. | `retryable: false` |
 | `running` | The run is still in progress. **Poll `GET /api/v1/workflow-executions/{id}`; never re-send.** | `retry_after_ms: 2000`, `Retry-After: 2` |
-| `indeterminate` | The run has been `running` for over 180 seconds (the process died after the claim, or the final status write was dropped), OR the engine recorded it `completed` but its stored step rows cannot prove an outcome (a step still `pending` or `running`, a skip a completed run cannot hold, no rows, or rows that cannot be read back). Never `completed`. Not retryable. Read the run: a step with no `command_id` was never sent. Past about 2 minutes, treat a `running` answer the same way. | `retryable: false`, `remediation` |
+| `indeterminate` | The run has been `running` for over 180 seconds (the process died after the claim, or the final status write was dropped), OR the engine recorded it `completed` but its stored step rows cannot prove an outcome (a step still `pending` or `running`, a skip a completed run cannot hold, no rows, or rows that cannot be read back). Never `completed`. Not retryable. Read the run: a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running. Past about 2 minutes, treat a `running` answer the same way. | `retryable: false`, `remediation` |
 
 What the stored rows can and cannot say: a run the engine recorded `failed` or `cancelled` whose rows cannot be read back replays `failed`. A step-result write the engine dropped under a database brownout costs precision (a run may replay `partial` or `failed` where the first answer said `interrupted` or `aborted`), never correctness: the replay is never `completed` for a run it cannot prove succeeded. A `foreach` step is judged by its last attempt (every item of that attempt must have reached an agent); the engine sends one item today.
 
@@ -6818,7 +6818,7 @@ steps not yet started are `skipped` with reason `server_shutdown`, the execution
 "interrupted"`, `data.reason: "server_shutdown"` and `retryable: false`, even when nothing had been
 sent. Steps already sent are not recalled. The closing audit row is `failure` with
 `run_outcome=interrupted reason=server_shutdown`. Read the run with `GET
-/api/v1/workflow-executions/{id}`: a step with no `command_id` was never sent.
+/api/v1/workflow-executions/{id}`: a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running.
 
 **Credential check before every step.** A run asks, before each step's first send and again on
 waking from each retry delay (once per wake, not once per 250 ms wait slice), whether the credential
@@ -6878,13 +6878,24 @@ rule classifies a repeat of the key, so the replay says `completed` for a retrie
 `partial` for the continue case.
 
 **Nothing reached `503`:** if the run started but no step reached any agent, the answer is `503`
-with `error.reason` and `error.execution_id` (the run exists and is readable). `run_failed` (the
-engine ended the run without a single dispatch attempt, or its final state could not be read;
-`retry_after_ms: null`), `deadline_exceeded` (the 60 second run budget ended the run before any
-step reached an agent; `retry_after_ms: null`), `quarantined`,
-`plugin_not_found`, `kill_switched_os` and `late_denied` are permanent (`retry_after_ms: null`);
-`containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached` (offline
-devices, or a per-device concurrency claim) are retryable (`retry_after_ms: 5000`).
+with `error.reason` and `error.execution_id` (the run exists and is readable). The reasons are
+`containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached` (offline
+devices, or a per-device concurrency claim), `quarantined`, `plugin_not_found`, `kill_switched_os`,
+`late_denied`, `deadline_exceeded` (the 60 second run budget ended the run before any step reached
+an agent) and `run_failed` (the engine ended the run without a single dispatch attempt, or its final
+state could not be read).
+
+*With an `Idempotency-Key`* the key was bound to the run when it started, so a repeat of the call
+replays this `failed` run (`202`, `data.status: "failed"`) and never runs again: every one of these
+answers has `retry_after_ms: null`, no `Retry-After` header and `error.remediation` naming the way
+forward (use a new idempotency key). Read the run with `GET /api/v1/workflow-executions/{id}`, then
+start another under a new key.
+
+*Without a key* nothing was sent, so a retry is safe for the causes that carry `retry_after_ms: 5000`
+(`containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached`);
+`quarantined`, `plugin_not_found`, `kill_switched_os`, `late_denied`, `deadline_exceeded` and
+`run_failed` are permanent (`retry_after_ms: null`). Send a key anyway: it is what makes a lost
+answer safe to ask about.
 
 A missing `Workflow:Execute` permission is a `403` from the surface gate, before any of the above.
 

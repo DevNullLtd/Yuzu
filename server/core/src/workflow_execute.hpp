@@ -288,6 +288,34 @@ inline constexpr std::string_view kStepErrorDefinitionChanged = "definition_chan
 inline constexpr std::string_view kReasonCredentialRevoked = "credential_revoked";
 inline constexpr std::string_view kReasonCredentialIndeterminate = "credential_indeterminate";
 
+/// Every `error.reason` (REST 503) and every `status` (MCP success envelope) a run that started
+/// and reached no agent can carry, pinned against the MCP description, the output schema and the
+/// REST documents by test. The first four are the transient causes, the next three the permanent
+/// ones of `dispatch_zero_reach.hpp` (`invalid_scope` is not here: a workflow names its agents,
+/// so the dispatch never parses a scope); `late_denied` and `definition_changed` are a step
+/// refused at send time; `deadline_exceeded` is the run budget ending the run first; `run_failed`
+/// is the engine closing the run without a single dispatch attempt.
+inline constexpr std::array<std::string_view, 11> kWorkflowZeroReachStatuses{
+    "containment_unreadable", "route_unreadable", "os_gate_unreadable", "no_agents_reached",
+    "quarantined",            "plugin_not_found", "kill_switched_os",   "late_denied",
+    "definition_changed",     "deadline_exceeded", "run_failed"};
+
+/// What a step's absence of a `command_id` does NOT prove. The command id is stored only in the
+/// step result written after the dispatch returns, and that write can be dropped (a lease timeout,
+/// a statement failure, a crash between the send and the write), so a step recorded `pending` or
+/// `skipped` may still have been sent. Every remediation that tells a worker how to decide whether
+/// to run again carries this, never "no command_id means never sent".
+inline constexpr std::string_view kStepNotProvenUnsentText =
+    "a step recorded pending or skipped may still have been sent; check the audit and response "
+    "stores by plugin and time before re-running";
+
+/// What a KEYED run's refusal says when it was answered after the idempotency key was bound to the
+/// run: the key now replays this failed run (or conflicts), so a retry of the same call can never
+/// run again. An unkeyed run keeps the advice of its cause.
+inline constexpr std::string_view kKeyedRetryRemediation =
+    "the idempotency key is bound to this run and a repeat of it replays this answer; use a new "
+    "idempotency key (MCP: a new approval) for another run, after reading the run";
+
 /// `Retry-After` / `retry_after_ms` of a run refused for capacity or for a draining server. A run
 /// holds its worker for up to `kWorkflowSyncBudget`, so a slot usually frees well inside a minute;
 /// 5 s is the platform's stream-cap retry floor (`kMcpStreamCapRetryAfterMs`, mcp_stream.hpp).

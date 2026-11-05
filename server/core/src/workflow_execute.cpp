@@ -339,8 +339,8 @@ WorkflowExecuteOutcome replay_outcome(const WorkflowExecutePorts& ports,
     } else {
         o.message = "this idempotency key is bound to a run whose outcome could not be confirmed; "
                     "nothing was sent for this call";
-        o.remediation = "read get_workflow_execution; a step with no command_id was never sent; a "
-                        "deliberate re-run needs a new key";
+        o.remediation = "read get_workflow_execution; " + std::string(kStepNotProvenUnsentText) +
+                        "; a deliberate re-run needs a new key";
     }
     return o;
 }
@@ -1368,6 +1368,17 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
             o.retryable = false;
             o.message = "the workflow started but did not complete and no step reached any agent";
         }
+        if (claim) {
+            // The key was bound to this run when the engine admitted it, so a repeat of the same
+            // call replays this failure and never runs again: a cause that would have been
+            // retryable unkeyed is not retryable here, and no step's own flag may say otherwise.
+            o.retryable = false;
+            o.remediation = std::string(kKeyedRetryRemediation);
+            for (auto& n : o.steps) {
+                if (n.agents_reached == 0)
+                    n.retryable = false;
+            }
+        }
     }
 
     const bool succeeded = o.status == WorkflowExecuteStatus::kOk;
@@ -1448,8 +1459,8 @@ WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
     threw.remediation =
         "the run failed part-way and some steps may already have been sent to agents, so it was "
         "not retried and must not be re-sent; read the run with get_workflow_execution "
-        "(GET /api/v1/workflow-executions/{id}), where a step with no command_id was never "
-        "sent, before starting another";
+        "(GET /api/v1/workflow-executions/{id}); " +
+        std::string(kStepNotProvenUnsentText);
     RunProgress progress;
     try {
         return drive_run(ports, req, claim, progress);

@@ -79,6 +79,7 @@
 #include "store_errors.hpp"               // kDbErrorPrefix (list_workflow_executions degrade test)
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
 #include "workflow_execute.hpp" // #2146: kWorkflowSyncBudget, the run budget the MCP cap case asserts
+#include "dispatch_zero_reach.hpp" // ZeroReachCause / zero_reach_token: the closed zero-reach list the execute_workflow schema must name
 #include "schedule_engine.hpp" // #2146 A2-R1: list_schedules definition_id/enabled_only filter tests
 #include "test_schedule_engine_pg_helper.hpp" // ScheduleEnginePg - #2146 A2-R1
 // M5 remediation (ADR-0031 operator-surface functional coverage): mcp_server.hpp
@@ -48142,6 +48143,8 @@ struct WfMcpFx {
     std::optional<int> throw_on_dispatch;
     // 1-based index of the dispatch that reaches nobody (sent 0); unset == every dispatch reaches one.
     std::optional<int> zero_on_dispatch;
+    // When set, EVERY dispatch reaches nobody, with the cause this shapes onto the outcome.
+    std::optional<std::function<void(yuzu::server::ConfinedDispatchOutcome&)>> zero_all_with;
     std::vector<yuzu::server::StepDispatchError> step_errors; // failed step callbacks, in order
     std::function<void(int)> on_authorize; // called with the 0-based authorizer call index
     std::function<void()> on_run;          // called inside the run port once the run is admitted
@@ -48327,6 +48330,12 @@ struct WfMcpFx {
             ++dispatches;
             if (throw_on_dispatch && dispatches == *throw_on_dispatch)
                 return yuzu::test::dispatch_throwing_on_nth_send({"x1", "x2", "x3"}, 3);
+            if (zero_all_with) {
+                yuzu::server::ConfinedDispatchOutcome o{.sent = 0,
+                                                        .command_id = "cmd-" + std::to_string(dispatches)};
+                (*zero_all_with)(o);
+                return o;
+            }
             if (zero_on_dispatch && dispatches == *zero_on_dispatch)
                 return {.sent = 0, .command_id = "cmd-" + std::to_string(dispatches)};
             return {.sent = 1, .command_id = "cmd-" + std::to_string(dispatches)};
@@ -49136,6 +49145,9 @@ TEST_CASE("MCP execute_workflow: a throw BEFORE the requested row keeps the retr
     REQUIRE(j.contains("error"));
     CHECK(j["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(j["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    // The throw came after the ticket was consumed, so the retry the hint offers needs a new one.
+    CHECK(j["error"]["data"]["remediation"].get<std::string>().find("approval ticket is spent") !=
+          std::string::npos);
     CHECK_FALSE(j["error"]["data"].contains("execution_id"));
     CHECK(fx.dispatches == 0);
     CHECK(fx.run_calls == 0);
@@ -49706,6 +49718,162 @@ TEST_CASE("MCP execute_workflow: a lookup that fails is a retryable -32603 with 
     CHECK(fx.run_calls == 0);
     CHECK(fx.dispatches == 0);
     CHECK(fx.authorize_calls == 0);
+}
+
+
+TEST_CASE("MCP execute_workflow: a zero-reach answer is never retryable, whatever its cause, because the "
+          "key is bound to the run: retryable false, retry_after_ms null, remediation says use a new key",
+          "[mcp][pg][workflow][twin][zeroreach][idempotency][retry]") {
+    struct Row {
+        const char* token;
+        std::function<void(yuzu::server::ConfinedDispatchOutcome&)> shape;
+    };
+    // The first four are the causes that carry a 5000 ms hint on an UNKEYED run.
+    const Row rows[] = {
+        {"containment_unreadable", [](auto& o) { o.containment_unreadable = true; }},
+        {"route_unreadable", [](auto& o) { o.route_unreadable = true; }},
+        {"os_gate_unreadable", [](auto& o) { o.os_gate_unreadable = true; }},
+        {"no_agents_reached", [](auto&) {}},
+        {"quarantined", [](auto& o) { o.denied_quarantined_count = 1; }},
+    };
+    for (const auto& row : rows) {
+        INFO(row.token);
+        YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+        pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+        yuzu::server::InstructionStore store(instr_pool);
+        REQUIRE(store.is_open());
+        yuzu::test::ApprovalManagerPg appr_bundle;
+        yuzu::server::ApprovalManager& appr = *appr_bundle;
+        WfMcpFx fx;
+        fx.seed(store);
+        fx.zero_all_with = row.shape;
+        McpTestServer ts;
+        fx.wire(ts, store, appr);
+        ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+        const std::string approval_id = wf_mint_and_approve(ts, appr);
+        auto recall = ts.call(wf_exec_call(wf_recall_args(approval_id), 2));
+        REQUIRE(recall);
+        INFO(recall->body);
+        const auto payload = wf_payload(*recall);
+        CHECK(payload["status"] == row.token);
+        CHECK(payload["retryable"] == false);
+        CHECK(payload["retry_after_ms"].is_null());
+        CHECK(payload["remediation"].get<std::string>().find(
+                  "use a new idempotency key (MCP: a new approval)") != std::string::npos);
+        CHECK(payload["execution_id"] == "exec-1");
+        REQUIRE(payload["steps"].size() == 2);
+        for (const auto& st : payload["steps"]) {
+            CHECK(st["agents_reached"] == 0);
+            CHECK(st["retryable"] == false); // no step may contradict the run's answer
+        }
+    }
+}
+
+TEST_CASE("MCP execute_workflow: a zero-reach status is always one of the closed list the description and "
+          "the output schema name, and both name all of it",
+          "[mcp][workflow][twin][zeroreach][schema]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    bool found = false;
+    for (const auto& tool : nlohmann::json::parse(res->body)["result"]["tools"]) {
+        if (tool["name"] != "execute_workflow")
+            continue;
+        found = true;
+        const auto desc = tool["description"].get<std::string>();
+        const auto status_desc =
+            tool["outputSchema"]["properties"]["status"]["description"].get<std::string>();
+        for (const auto token : yuzu::server::kWorkflowZeroReachStatuses) {
+            INFO(token);
+            CHECK(desc.find("\"" + std::string(token) + "\"") != std::string::npos);
+            CHECK(status_desc.find(std::string(token)) != std::string::npos);
+        }
+        // Every cause the shared classifier can name is in the list, except the one a workflow
+        // never produces (its agents are named, so there is no scope to fail to parse).
+        for (const auto cause : {yuzu::server::ZeroReachCause::ContainmentUnreadable,
+                                 yuzu::server::ZeroReachCause::RouteUnreadable,
+                                 yuzu::server::ZeroReachCause::OsGateUnreadable,
+                                 yuzu::server::ZeroReachCause::Quarantined,
+                                 yuzu::server::ZeroReachCause::PluginNotFound,
+                                 yuzu::server::ZeroReachCause::KillSwitchedOs,
+                                 yuzu::server::ZeroReachCause::Generic}) {
+            const auto token = yuzu::server::zero_reach_token(cause);
+            INFO(token);
+            CHECK(std::find(yuzu::server::kWorkflowZeroReachStatuses.begin(),
+                            yuzu::server::kWorkflowZeroReachStatuses.end(),
+                            token) != yuzu::server::kWorkflowZeroReachStatuses.end());
+        }
+        // The keyed rule is stated in the description, the schema and the retry fields.
+        CHECK(desc.find("use a new idempotency key (MCP: a new approval)") != std::string::npos);
+        CHECK(desc.find("a step recorded pending or skipped may still have been sent") !=
+              std::string::npos);
+        CHECK(desc.find("was never sent") == std::string::npos);
+        CHECK(tool["outputSchema"]["properties"].contains("retryable"));
+        CHECK(tool["outputSchema"]["properties"]["remediation"]["description"]
+                  .get<std::string>()
+                  .find("no step reached any agent") != std::string::npos);
+    }
+    CHECK(found);
+}
+
+TEST_CASE("MCP execute_workflow: a refusal after the ticket was consumed says the ticket is spent; one "
+          "before any mint or consume says nothing about a ticket",
+          "[mcp][pg][workflow][twin][idempotency][approval][retry]") {
+    SECTION("the requested row cannot be saved: retryable -32603, but a NEW approval is needed") {
+        YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+        pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+        yuzu::server::InstructionStore store(instr_pool);
+        REQUIRE(store.is_open());
+        yuzu::test::ApprovalManagerPg appr_bundle;
+        yuzu::server::ApprovalManager& appr = *appr_bundle;
+        WfMcpFx fx;
+        fx.seed(store);
+        McpTestServer ts;
+        fx.wire(ts, store, appr);
+        ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+        const std::string approval_id = wf_mint_and_approve(ts, appr);
+        ts.audit_fail_action_result_ = "workflow.execute|requested";
+        auto recall = ts.call(wf_exec_call(wf_recall_args(approval_id), 2));
+        REQUIRE(recall);
+        INFO(recall->body);
+        const auto j = nlohmann::json::parse(recall->body);
+        REQUIRE(j.contains("error"));
+        CHECK(j["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(j["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(j["error"]["data"]["remediation"].get<std::string>().find(
+                  "approval ticket is spent") != std::string::npos);
+        CHECK(j["error"]["data"]["remediation"].get<std::string>().find("new approval") !=
+              std::string::npos);
+        CHECK(fx.dispatches == 0);
+        // The ticket really is spent: the same approval_id is refused.
+        ts.audit_fail_action_result_.clear();
+        auto again = ts.call(wf_exec_call(wf_recall_args(approval_id), 3));
+        REQUIRE(again);
+        CHECK(nlohmann::json::parse(again->body).contains("error"));
+        CHECK(fx.dispatches == 0);
+    }
+    SECTION("a store fault in the probe, before any mint, spends nothing and says nothing of a ticket") {
+        YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+        pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+        yuzu::server::InstructionStore store(instr_pool);
+        REQUIRE(store.is_open());
+        yuzu::test::ApprovalManagerPg appr_bundle;
+        yuzu::server::ApprovalManager& appr = *appr_bundle;
+        WfMcpFx fx;
+        fx.seed(store);
+        fx.find_fault = true;
+        McpTestServer ts;
+        fx.wire(ts, store, appr);
+        ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+        auto res = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})", 1));
+        REQUIRE(res);
+        const auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("error"));
+        CHECK(j["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(j["error"]["data"]["remediation"].is_null());
+        CHECK(appr.pending_count() == 0);
+    }
 }
 
 TEST_CASE("MCP execute_workflow: a caller with no tier (the handler path) claims the key on the first "
