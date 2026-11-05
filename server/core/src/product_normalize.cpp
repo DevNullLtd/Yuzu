@@ -167,8 +167,8 @@ NormalizedTitle normalize_title(std::string_view raw) {
 }
 
 std::string normalize_vendor(std::string_view raw) {
-    // FIRST, on the raw bytes: after ascii_lower/tokenising a `via:` label could alias a real
-    // vendor.
+    // FIRST, on the raw bytes: once ascii_lower/tokenising has run, a `via:` label could alias
+    // a real vendor.
     if (raw.starts_with(kOriginLabelPrefix))
         return {};
     std::vector<std::string> tokens;
