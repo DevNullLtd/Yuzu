@@ -39,6 +39,7 @@ struct HttpShape {
     case S::kExecuteFailed:
         return {400, false};
     case S::kApprovalRequired:
+    case S::kDispatchDenied:
         return {403, false};
     case S::kAuditFailed:
         return {503, true};
@@ -130,6 +131,7 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
             ports.approval_gate_available = d.approval_gate_available && d.approval_gate_available();
             ports.lookup = d.lookup;
             ports.classify = d.classify;
+            ports.authorize = d.authorize;
             if (d.command_dispatch_fn || d.command_dispatch_fn_concurrency) {
                 ports.dispatch = [&d](const WorkflowStepInstruction& def,
                                       const std::vector<std::string>& ids,
@@ -160,6 +162,17 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
                     d.metrics
                         ->counter("yuzu_server_dispatch_target_rejected_total",
                                   {{"route", "workflow"}, {"reason", std::string(reason)}})
+                        .increment();
+                } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
+                }
+            };
+            ports.count_dispatch_denied = [&](std::string_view reason) {
+                if (!d.metrics)
+                    return;
+                try {
+                    d.metrics
+                        ->counter("yuzu_server_dispatch_denied_total",
+                                  {{"reason", std::string(reason)}})
                         .increment();
                 } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
                 }
@@ -202,7 +215,7 @@ void register_workflow_execute_v1_route(HttpRouteSink& sink, WorkflowExecuteRout
                 out.status == WorkflowExecuteStatus::kApprovalRequired
                     ? "run each instruction through its own approval; a workflow only runs steps "
                       "this caller may run without one"
-                    : std::string_view{};
+                    : std::string_view{out.remediation};
             res.set_content(error_body(res, out, shape.code, shape.retryable_hint, remediation),
                             "application/json");
         });

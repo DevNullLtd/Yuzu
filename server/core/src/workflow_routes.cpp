@@ -2877,6 +2877,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                           return capability_registry->classify(plugin, action);
                       }}
                     : WorkflowClassifyFn{},
+            .authorize = deps.authorize_dispatch,
             .command_dispatch_fn = cmd_dispatch,
             .command_dispatch_fn_concurrency = cmd_dispatch_concurrency,
             .caller_fn = caller_fn,

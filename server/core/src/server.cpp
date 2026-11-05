@@ -20785,6 +20785,72 @@ private:
             // for the same caller).
             &metrics_, instruction_store_.get(), response_visible_set_fn);
 
+        // #6065 PR-Q: the dispatch-chokepoint pre-check closure, defined ONCE and
+        // handed to REST (POST and DELETE /api/v1/quarantine, the trailing register_routes
+        // param), to MCP (set_authorize_dispatch_fn, wired further below) and to the workflow
+        // execute twins (`wf_deps.authorize_dispatch` here; MCP's copy is the same
+        // set_authorize_dispatch_fn), so the surfaces cannot observe a different admit decision
+        // for the same caller
+        // (never bind a route-local copy). Each consumer holds its own COPY of this
+        // one lambda; the copies cannot diverge because it captures only `this` and
+        // everything it reads is live -- a stateful capture added here would break
+        // that, and tests/test_tier_policy_wiring_lexical.py pins "one definition,
+        // two uses". Formerly an inline lambda at the MCP wiring site; its
+        // rationale follows.
+        // Composes the SAME two DECISIONS build_classified_command
+        // makes, in the SAME order, and NEITHER is a re-implemented slice:
+        // the classify+authorize half calls classify_and_authorize_dispatch
+        // via the SAME has_permission binder (dispatch_has_permission
+        // above); the kill-switch half calls the SAME kill_switch_denial
+        // (agent_registry.hpp) finalize_classified_command itself calls —
+        // Gate 6 governance fix: an earlier round of this PR re-expressed
+        // that boolean inline instead of sharing code with
+        // finalize_classified_command, reintroducing the exact
+        // "from-scratch copy drifts from what production enforces" shape
+        // that function's own M6/wave1 extraction closed once already;
+        // this wiring now shares the extracted function instead.
+        // `action_allowed`'s construction (nullptr-guarded
+        // plugin_config_store_ wrap) is the SAME literal composition
+        // build_classified_command uses ahead of its own
+        // finalize_classified_command call, above. `plugin_config_store_`
+        // is read live through `this` (not captured by value), so this
+        // wiring is safe regardless of construction order relative to
+        // that store; an unset store means legacy-open for the
+        // kill-switch gate ONLY, mirroring build_classified_command's own
+        // unwired contract. Per McpServer::AuthorizeDispatchFn's
+        // fail-closed contract (mcp_server.hpp), omitting this whole call
+        // refuses every execute_instruction call outright, not merely a
+        // degraded tool.
+        const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =
+            [this](const yuzu::server::DispatchCaller& caller, std::string_view plugin,
+                   std::string_view action)
+                -> std::expected<yuzu::server::CommandCapability,
+                                 yuzu::server::detail::DispatchDenial> {
+                auto decision = yuzu::server::detail::classify_and_authorize_dispatch(
+                    capability_registry_, caller, plugin, action,
+                    [this](std::string_view principal, std::string_view securable,
+                           yuzu::server::authz::Operation op) {
+                        return dispatch_has_permission(principal, securable, op);
+                    });
+                if (!decision)
+                    return decision;
+                const yuzu::server::detail::KillSwitchFn action_allowed =
+                    plugin_config_store_ != nullptr
+                        ? yuzu::server::detail::KillSwitchFn(
+                              [this](std::string_view p, std::string_view a) {
+                                  return plugin_config_store_->kill_switch_decision(p, a);
+                              })
+                        : yuzu::server::detail::KillSwitchFn{};
+                // The dry run has no target, so it cannot see the per-OS
+                // layer (only the all-OS denial); a per-OS withhold shows
+                // up at dispatch as kill_switched_os_count > 0.
+                if (auto os_set =
+                        yuzu::server::detail::kill_switch_denial(*decision, action_allowed);
+                    !os_set) {
+                    return std::unexpected(os_set.error());
+                }
+                return decision;
+            };
         // WorkflowRoutes — /fragments/executions, /fragments/schedules, /api/workflows/*,
         //                   /api/workflow-executions/*, /api/product-packs/*, /api/scope/estimate
         //
@@ -20843,6 +20909,7 @@ private:
         // constructed above (shared with mcp_server_->set_workflow_api below).
         wf_deps.workflow_api = workflow_api;
         wf_deps.workflow_run = workflow_run_fn; // same closure MCP execute_workflow gets
+        wf_deps.authorize_dispatch = authorize_dispatch; // the step-pair dry run (sec-4)
         wf_deps.product_pack_store = product_pack_store_.get();
         wf_deps.instruction_store = instruction_store_.get();
         wf_deps.policy_store = policy_store_.get();
@@ -21915,70 +21982,6 @@ private:
                  .provider = dex_score_policy_provider_,
                  .audit = {}});
         }
-        // #6065 PR-Q: the dispatch-chokepoint pre-check closure, defined ONCE and
-        // handed to BOTH REST (POST and DELETE /api/v1/quarantine, the trailing register_routes
-        // param) and MCP (set_authorize_dispatch_fn, wired further below), so the two
-        // surfaces cannot observe a different admit decision for the same caller
-        // (never bind a route-local copy). Each consumer holds its own COPY of this
-        // one lambda; the copies cannot diverge because it captures only `this` and
-        // everything it reads is live -- a stateful capture added here would break
-        // that, and tests/test_tier_policy_wiring_lexical.py pins "one definition,
-        // two uses". Formerly an inline lambda at the MCP wiring site; its
-        // rationale follows.
-        // Composes the SAME two DECISIONS build_classified_command
-        // makes, in the SAME order, and NEITHER is a re-implemented slice:
-        // the classify+authorize half calls classify_and_authorize_dispatch
-        // via the SAME has_permission binder (dispatch_has_permission
-        // above); the kill-switch half calls the SAME kill_switch_denial
-        // (agent_registry.hpp) finalize_classified_command itself calls —
-        // Gate 6 governance fix: an earlier round of this PR re-expressed
-        // that boolean inline instead of sharing code with
-        // finalize_classified_command, reintroducing the exact
-        // "from-scratch copy drifts from what production enforces" shape
-        // that function's own M6/wave1 extraction closed once already;
-        // this wiring now shares the extracted function instead.
-        // `action_allowed`'s construction (nullptr-guarded
-        // plugin_config_store_ wrap) is the SAME literal composition
-        // build_classified_command uses ahead of its own
-        // finalize_classified_command call, above. `plugin_config_store_`
-        // is read live through `this` (not captured by value), so this
-        // wiring is safe regardless of construction order relative to
-        // that store; an unset store means legacy-open for the
-        // kill-switch gate ONLY, mirroring build_classified_command's own
-        // unwired contract. Per McpServer::AuthorizeDispatchFn's
-        // fail-closed contract (mcp_server.hpp), omitting this whole call
-        // refuses every execute_instruction call outright, not merely a
-        // degraded tool.
-        const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =
-            [this](const yuzu::server::DispatchCaller& caller, std::string_view plugin,
-                   std::string_view action)
-                -> std::expected<yuzu::server::CommandCapability,
-                                 yuzu::server::detail::DispatchDenial> {
-                auto decision = yuzu::server::detail::classify_and_authorize_dispatch(
-                    capability_registry_, caller, plugin, action,
-                    [this](std::string_view principal, std::string_view securable,
-                           yuzu::server::authz::Operation op) {
-                        return dispatch_has_permission(principal, securable, op);
-                    });
-                if (!decision)
-                    return decision;
-                const yuzu::server::detail::KillSwitchFn action_allowed =
-                    plugin_config_store_ != nullptr
-                        ? yuzu::server::detail::KillSwitchFn(
-                              [this](std::string_view p, std::string_view a) {
-                                  return plugin_config_store_->kill_switch_decision(p, a);
-                              })
-                        : yuzu::server::detail::KillSwitchFn{};
-                // The dry run has no target, so it cannot see the per-OS
-                // layer (only the all-OS denial); a per-OS withhold shows
-                // up at dispatch as kill_switched_os_count > 0.
-                if (auto os_set =
-                        yuzu::server::detail::kill_switch_denial(*decision, action_allowed);
-                    !os_set) {
-                    return std::unexpected(os_set.error());
-                }
-                return decision;
-            };
         // REST and MCP name this type separately; they must stay the SAME type, or the
         // copies handed to each could silently drift behind a std::function conversion.
         static_assert(std::is_same_v<RestApiV1::AuthorizeDispatchFn,

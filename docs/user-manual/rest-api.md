@@ -6662,23 +6662,54 @@ must use `execute_workflow`'s ticket flow (`docs/user-manual/mcp.md`).
 of at most 128 bytes each. `scope` is not accepted (`400`, `reason: scope_unsupported`); there is no
 fleet-wide default. A body nested deeper than 32 levels is `400`.
 
-**Everything is checked before anything is sent.** For every step of the workflow: its instruction
-must exist (`400 unknown_instruction`) and its approval mode must admit the caller (`auto` always;
-`role-gated` only for an administrator, JIT elevation included; `always` or an unknown mode never,
-`403 approval_required` naming the step). A step whose `plugin.action` is not in the capability
-catalogue is refused (`400 step_unclassified`). A Destructive step needs `agent_ids` with at least
-one agent visible to the caller (`404 destructive_no_visible_target` otherwise); a Forensics step
-needs exactly one id (`400 forensic_untargeted`). One refused step refuses the whole run. Unlike the
-legacy route, if the instruction store or the approval gate is not available the answer is `503`
-(`reason: instruction_store_unavailable` / `approval_gate_unavailable`) and nothing is sent.
+**Authority is all-or-nothing; reach is per step.** Before anything is sent, every step of the
+workflow is checked against the CALLER, and one refused step refuses the whole run with nothing
+sent. For every step: its instruction must exist (`400 unknown_instruction`); the caller must be
+allowed to dispatch its `plugin.action` (RBAC on the action's securable, the action's
+admin-or-approval gate judged against the caller's real administrator status, and the action's kill
+switch), else `403 dispatch_denied` naming the step, which is permanent for that caller (`retry_after_ms:
+null`, retrying cannot help; the chokepoint's own reason is in the audit row and in
+`yuzu_server_dispatch_denied_total{reason}`); and its approval mode must admit the caller (`auto`
+always; `role-gated` only for an administrator, JIT elevation included; `always` or an unknown mode
+never, `403 approval_required` naming the step). A step whose `plugin.action` is not in the
+capability catalogue is refused (`400 step_unclassified`). A Destructive or Forensics step needs
+`agent_ids` with at least one agent visible to the caller (`404 destructive_no_visible_target`
+otherwise); a Forensics step needs exactly one id (`400 forensic_untargeted`), and the permission
+check comes first (`403` before `400`). This does NOT promise that every step will reach a device:
+which devices a step reaches (visibility, containment, plugin presence, the per-OS kill switch,
+concurrency claims) is decided per step at send time, so an earlier step may already have been sent
+when a later one reaches nobody (see the `503` below). Unlike the legacy route, if the instruction
+store, the approval gate, the dispatcher or the authorizer is not available the answer is `503` and
+nothing is sent.
+
+| Status | `error.reason` | Meaning |
+|---|---|---|
+| `400` | `body_type`, `agent_ids_required`, `agent_ids_empty`, `agent_ids_type`, `agent_id_type`, `agent_id_len`, `agent_ids_count`, `scope_unsupported` | The body failed the targeting shape check. |
+| `400` | `workflow_no_steps` | The workflow exists but has no steps. |
+| `400` | `unknown_instruction` | A step names an instruction that does not exist. |
+| `400` | `step_unclassified` | A step's `plugin.action` is not in the capability catalogue. |
+| `400` | `destructive_untargeted`, `forensic_untargeted` | A Destructive or Forensics step is not explicitly targeted. |
+| `400` | `rejected` | The engine refused the run after the preflight; `error.message` carries its reason, and a closing `failure` audit row is written. |
+| `403` | `approval_required` | A step's approval mode does not admit the caller. |
+| `403` | `dispatch_denied` | The caller may not dispatch a step's `plugin.action`. Not retryable. |
+| `404` | `workflow_not_found` | Unknown or soft-deleted workflow. |
+| `404` | `destructive_no_visible_target` | A Destructive or Forensics step whose named agents are all outside the caller's view. |
+| `500` | `no_principal` | The session has no principal. |
+| `503` | `workflow_engine_unavailable`, `instruction_store_unavailable`, `approval_gate_unavailable`, `dispatch_unavailable` | A dependency is not wired or open; nothing was sent. |
+| `503` | `store_unavailable` | A store read failed (`retry_after_ms: 5000`). |
+| `503` | `audit_unavailable` | The `requested` row could not be saved (`Sec-Audit-Failed: true`); nothing was sent. |
+| `503` | a zero-reach cause | The run started and no step reached any agent (below). |
 
 **Audit.** A `workflow.execute` row with `result=requested` is written before anything is sent; if
 it cannot be saved the answer is `503` with `Sec-Audit-Failed: true` and nothing was sent. A step
-refused at send time because its definition changed after the precheck is audited as `denied` at
+refused at send time because its definition changed after the preflight is audited as `denied` at
 that moment (detail ends `(late)`). A closing row (`success`, `failure` or `denied`) records the
 outcome; if that one is lost the `202` carries `data.audit_persisted: false` and
-`Sec-Audit-Failed: true`. An approval or targeting refusal (before the `requested` row) is audited as `denied` with the
-`reason`. Audit details are neutralised (CWE-117).
+`Sec-Audit-Failed: true`. A refusal by the per-step checks (`approval_required`, `dispatch_denied`,
+`step_unclassified`, the targeting refusals) is audited as `denied` with the `reason`, and writes no
+`requested` row. A wiring failure, an unknown or empty workflow, an unknown instruction and a store
+read failure write no `workflow.execute` row at all. Audit details are neutralised (CWE-117); the
+full row list is in [audit-log.md](audit-log.md).
 
 **Dispatch is synchronous, device work is not.** The call returns after every step's command has
 been sent, including step retries and delays, so it can be slow. Each step is sent only to the
@@ -6700,8 +6731,7 @@ with `error.reason` and `error.execution_id` (the run exists and is readable). `
 `containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached` (offline
 devices, or a per-device concurrency claim) are retryable (`retry_after_ms: 5000`).
 
-Other statuses: `404` unknown or deleted workflow; `403` missing permission; `500` a session with no
-principal; `503` with `retry_after_ms: 5000` for a store read failure.
+A missing `Workflow:Execute` permission is a `403` from the surface gate, before any of the above.
 
 #### `GET /api/v1/workflow-executions`
 

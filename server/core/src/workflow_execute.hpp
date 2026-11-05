@@ -23,29 +23,46 @@
 /// `make_instruction_lookup` is the one adapter from the real
 /// `InstructionStore`.
 ///
+/// TWO HALVES, as `instruction_execute::prepare`/`run`. `prepare_workflow_execute` is steps 1-4
+/// and has NO effect on the endpoints: it writes only denial rows, and MCP calls it alone as the
+/// pre-mint probe, so a call that is going to be refused mints no approval ticket and burns none.
+/// `run_workflow_execute` is steps 5-6. `apply_workflow_execute` is the two in a row.
+///
 /// ORDER (each step refuses before the next runs; nothing is dispatched until step 6):
 ///   1. wiring: engine/API, instruction store open, approval gate present, classifier,
-///      dispatcher, audit sink, a resolvable principal.            -> kUnavailable / kNoPrincipal
+///      authorizer, dispatcher, audit sink, a resolvable principal.  -> kUnavailable / kNoPrincipal
 ///   2. read the workflow; no steps is refused.                    -> kStoreFailed / kWorkflowNotFound
-///   3. per step: the instruction exists (unknown -> 400) and its approval mode admits THIS
-///      caller (`auto` always; `role-gated` only for `caller.principal_is_admin`, which already
-///      mirrors the JIT-elevation-aware `effective_role`; `always` and any unknown mode never).
-///      A consumed MCP approval ticket does NOT relax this check: the ticket binds the workflow
+///   3. per step: the instruction exists (unknown -> 400); the shared chokepoint's dry run for its
+///      (plugin, action) admits THIS caller, once per distinct pair (RBAC, the ExecuteGate against
+///      the caller's real `approval_provenance`, the all-OS kill switch) -> kDispatchDenied (403,
+///      not retryable); then its approval mode admits this caller (`auto` always; `role-gated` only
+///      for `caller.principal_is_admin`, which already mirrors the JIT-elevation-aware
+///      `effective_role`; `always` and any unknown mode never).
+///      A consumed MCP approval ticket does NOT relax either check: the ticket binds the workflow
 ///      id and agent list, not the step list, and the REST twin has no ticket to relax it with.
 ///   4. per step: the capability is classified, and a Destructive/Forensics pair is targeted
 ///      explicitly (`evaluate_destructive_targeting`); a Destructive pair whose named agents are
 ///      all outside the caller's visible set is refused as `destructive_no_visible_target`.
 ///   5. the `requested` audit row. A persist failure refuses the run (kAuditFailed).
-///   6. `WorkflowExecutePorts::run`, whose per-step dispatch callback re-runs steps 3 and 4
-///      against a FRESH read of the instruction (so a definition edited after the preflight is
-///      refused at dispatch, audited there) and then dispatches through the caller's own
-///      `DispatchCaller`, so the shared chokepoint confines each step to the caller.
+///   6. `WorkflowExecutePorts::run`, whose per-step dispatch callback re-runs the approval-mode and
+///      targeting checks of steps 3 and 4 against a FRESH read of the instruction (so a definition
+///      edited after the preflight is refused at dispatch, audited there) and then dispatches
+///      through the caller's own `DispatchCaller`, so the shared chokepoint confines each step to
+///      the caller.
+///
+/// AUTHORITY IS ALL-OR-NOTHING, REACH IS PER STEP. Steps 1-4 decide what the CALLER may run and
+/// refuse the whole call, sending nothing, when any step fails them. Which DEVICES a step reaches
+/// is decided later, per step, at the dispatch chokepoint (visibility, containment, plugin
+/// presence, the per-OS kill switch, concurrency claims): a step that then reaches nobody is
+/// reported in `steps` with its reason, and an earlier step has already been sent. The preflight
+/// does NOT promise that every step will reach a device, only that the caller is allowed to ask.
 ///
 /// The `DispatchCaller` is the CALLER's, derived once by the transport (`caller_fn`), with
 /// `approval_provenance` left as the transport set it: REST leaves it `None`, MCP stamps `Ticket`
 /// only after the C8 gate consumed a ticket (dispatch_caller.hpp, stamping site 2). It is passed
 /// through unchanged to every step; this file never rebuilds a caller from a principal string.
 
+#include "agent_registry.hpp" // detail::DispatchDenial (the authorize port's error type)
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 #include "dispatch_confined_arms.hpp"
@@ -88,6 +105,14 @@ using WorkflowClassifyFn =
     std::function<std::expected<CommandCapability, ClassificationError>(std::string_view plugin,
                                                                        std::string_view action)>;
 
+/// The shared chokepoint's dry run (`classify_and_authorize_dispatch` plus the all-OS kill
+/// switch), the same closure `execute_instruction_definition` and the quarantine routes take
+/// (server.cpp's `authorize_dispatch`). It is given the CALLER's own `DispatchCaller`, so RBAC and
+/// the ExecuteGate are judged against the real `principal_is_admin` and `approval_provenance`. It
+/// cannot see a per-OS withhold (no target), which stays a per-step reach outcome.
+using WorkflowAuthorizeFn = std::function<std::expected<CommandCapability, detail::DispatchDenial>(
+    const DispatchCaller& caller, std::string_view plugin, std::string_view action)>;
+
 /// Send one step. The transport wraps its confined dispatcher (and, on REST, the ADR-1007
 /// per-device concurrency variant when wired). `agent_ids` is the request's own list.
 using WorkflowStepDispatchFn = std::function<ConfinedDispatchOutcome(
@@ -113,10 +138,16 @@ struct WorkflowExecutePorts {
     bool approval_gate_available{false};
     WorkflowInstructionLookupFn lookup;
     WorkflowClassifyFn classify;
+    /// Required (unset == dispatch not available, fail closed): called once per distinct step
+    /// pair in `prepare_workflow_execute`.
+    WorkflowAuthorizeFn authorize;
     WorkflowStepDispatchFn dispatch;
     WorkflowAuditFn audit;
     /// Optional: bumps `yuzu_server_dispatch_target_rejected_total{route="workflow",reason}`.
     std::function<void(std::string_view reason)> count_target_rejected;
+    /// Optional: bumps `yuzu_server_dispatch_denied_total{reason}` with the chokepoint's own
+    /// denial token (`forbidden`, `approval_required`, `kill_switched`, ...).
+    std::function<void(std::string_view reason)> count_dispatch_denied;
 };
 
 struct WorkflowExecuteRequest {
@@ -152,6 +183,7 @@ enum class WorkflowExecuteStatus {
     kInvalidWorkflow,            ///< the workflow has no steps (400)
     kUnknownInstruction,         ///< a step names an instruction that does not exist (400)
     kApprovalRequired,           ///< a step's approval mode does not admit this caller (403)
+    kDispatchDenied,             ///< the chokepoint dry run refuses this caller a step's pair (403, not retryable)
     kUnclassifiedStep,           ///< a step's plugin.action is not in the capability catalogue (400)
     kDestructiveUntargeted,      ///< a Destructive/Forensics step is not explicitly targeted (400)
     kDestructiveNoVisibleTarget, ///< ... or every named agent is outside the caller's view (404)
@@ -180,9 +212,12 @@ struct WorkflowExecuteOutcome {
     WorkflowExecuteStatus status{WorkflowExecuteStatus::kUnavailable};
     /// Operator-facing text for every non-kOk status. Never raw store text.
     std::string message;
-    /// Machine token for a refusal (`destructive_untargeted`, `approval_required`, ...), and for
-    /// kNoAgentsReached the dominant zero-reach cause.
+    /// Machine token for a refusal (`destructive_untargeted`, `approval_required`,
+    /// `dispatch_denied`, ...), and for kNoAgentsReached the dominant zero-reach cause.
     std::string reason;
+    /// What the caller can do about a refusal; set for kDispatchDenied (the chokepoint's own
+    /// wording, the ExecuteGate case rewritten because no ticket lifts a workflow step's gate).
+    std::string remediation;
     bool retryable{false};
     /// Set for kOk and kNoAgentsReached (the run exists in both).
     std::string execution_id;
@@ -196,8 +231,29 @@ struct WorkflowExecuteOutcome {
     bool audit_persisted{true};
 };
 
-/// Run the sequence in the header banner. Never throws for an expected refusal; a thrown port
-/// is the caller's to catch (the transports wrap it, as they wrap every other handler body).
+/// What `prepare_workflow_execute` hands to `run_workflow_execute`: only what the second half
+/// needs. The workflow and its instructions are re-read by the run itself (per step, fresh), so
+/// nothing a stale snapshot could widen is carried across.
+struct WorkflowExecutePlan {
+    std::size_t step_count{0};
+};
+
+/// Steps 1-4 of the banner. No effect on any endpoint, no `requested` row. A refusal is returned
+/// as the outcome the transport renders; a refusal from the per-step checks also writes its
+/// `denied` audit row (and, for a dispatch denial, counts `count_dispatch_denied`), exactly as
+/// `instruction_execute::prepare` does for its authorize refusal. A store fault, an unwired port
+/// and an unknown workflow write NO row (nothing identified the call yet).
+[[nodiscard]] std::expected<WorkflowExecutePlan, WorkflowExecuteOutcome>
+prepare_workflow_execute(const WorkflowExecutePorts& ports, const WorkflowExecuteRequest& req);
+
+/// Steps 5-6. `plan` must come from `prepare_workflow_execute` on the same ports and request.
+[[nodiscard]] WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
+                                                          const WorkflowExecuteRequest& req,
+                                                          const WorkflowExecutePlan& plan);
+
+/// Run the sequence in the header banner: prepare, then run. Never throws for an expected
+/// refusal; a thrown port is the caller's to catch (the transports wrap it, as they wrap every
+/// other handler body).
 [[nodiscard]] WorkflowExecuteOutcome apply_workflow_execute(const WorkflowExecutePorts& ports,
                                                             const WorkflowExecuteRequest& req);
 

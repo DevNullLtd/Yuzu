@@ -1347,16 +1347,21 @@ static const ToolDef kTools[] = {
      "and no fleet-wide default. Each step is sent only to the agents you can see; ids outside "
      "your visibility are silently dropped, and a step that then reaches nobody is reported in "
      "steps with its reason. "
-     "ALL-OR-NOTHING PRECHECK, before anything is sent: every step's instruction must exist and "
-     "have approval_mode auto (a role-gated step runs only for an administrator; an always-"
-     "approval step, or an unknown mode, refuses the whole call with 403 and a message naming the "
-     "step - run that instruction through its own approval instead). An approval ticket for this "
-     "call does NOT lift a step's own approval mode. A Destructive-classified step needs the "
-     "explicit agent_ids (always true here) and at least one of them visible to you, else the "
-     "call is refused; a Forensics step needs exactly one agent id. A step whose plugin.action is "
-     "not in the capability catalogue refuses the call. If the instruction store or the approval "
-     "gate is not available the call is refused with a 503 and NOTHING is sent (it does not skip "
-     "the check). "
+     "AUTHORITY IS ALL-OR-NOTHING, REACH IS PER STEP. Before anything is sent every step is "
+     "checked against YOU: its instruction must exist and have approval_mode auto (a role-gated "
+     "step runs only for an administrator; an always-approval step, or an unknown mode, refuses "
+     "the whole call with 403 and a message naming the step - run that instruction through its "
+     "own approval instead), and you must be allowed to dispatch its plugin.action (RBAC, the "
+     "action's admin-or-approval gate, the action's kill switch): if not, the whole call is "
+     "refused with 403 reason dispatch_denied naming the step, permanently for you (retrying "
+     "will not help) and nothing is sent. An approval ticket for this call does NOT lift either "
+     "check. A Destructive-classified step needs the explicit agent_ids (always true here) and "
+     "at least one of them visible to you, else the call is refused; a Forensics step needs "
+     "exactly one agent id. A step whose plugin.action is not in the capability catalogue "
+     "refuses the call. If the instruction store, the approval gate or the dispatcher is not "
+     "available the call is refused with a 503 and NOTHING is sent. Which DEVICES a step reaches "
+     "is decided per step at send time and is NOT checked up front: an earlier step may already "
+     "have been sent when a later one reaches nobody. "
      "TIER AND TICKET: the operator tier is denied. At the supervised tier the first call returns "
      "kApprovalRequired with an approval_id; repeat the SAME arguments plus that approval_id "
      "after an administrator approves. The ticket binds workflow_id and agent_ids, not the "
@@ -8384,6 +8389,175 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── execute_workflow, the parts the C8 pre-mint probe and the handler share ──
+            // (#2146 batch B). One copy of argument parsing, port wiring and refusal rendering,
+            // so the probe a supervised caller hits BEFORE a ticket is minted refuses exactly as
+            // the handler would after one is consumed. All three are inert unless called.
+            struct WorkflowMcpCall {
+                std::string workflow_id;
+                WorkflowExecuteRequest wreq;
+            };
+            // Writes the refusal into `res` and returns nullopt.
+            const auto parse_workflow_call = [&]() -> std::optional<WorkflowMcpCall> {
+                // Strict arguments: the C8 schema check only runs for approval-gated callers.
+                for (auto it = args.begin(); it != args.end(); ++it) {
+                    if (it.key() != "workflow_id" && it.key() != "agent_ids" &&
+                        it.key() != "approval_id") {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "unknown argument '" + it.key().substr(0, 64) +
+                                               "'; execute_workflow takes workflow_id, agent_ids "
+                                               "and approval_id"),
+                            "application/json");
+                        return std::nullopt;
+                    }
+                }
+                const auto wf_id = param_string_strict(args, "workflow_id");
+                if (!wf_id || wf_id->empty() || wf_id->size() > mcp::kExecInstrIdentMaxLen) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "workflow_id must be a non-empty string of at "
+                                                   "most 128 characters"),
+                                    "application/json");
+                    return std::nullopt;
+                }
+                auto agent_ids = parse_workflow_execute_body(args);
+                if (!agent_ids) {
+                    if (metrics) {
+                        try {
+                            metrics
+                                ->counter("yuzu_server_dispatch_target_rejected_total",
+                                          {{"route", "workflow"},
+                                           {"reason", agent_ids.error().reason}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
+                        }
+                    }
+                    mcp_audit("denied", "reason=" + agent_ids.error().reason);
+                    res.set_content(error_response(id, kInvalidParams, agent_ids.error().message), // retry-hint-exempt: input-parse failure, not a store fault
+                                    "application/json");
+                    return std::nullopt;
+                }
+                WorkflowMcpCall call;
+                call.workflow_id = *wf_id;
+                call.wreq.workflow_id = *wf_id;
+                call.wreq.agent_ids = std::move(*agent_ids);
+                // The caller's REAL DispatchCaller; an unwired derivation fails CLOSED on
+                // visibility (present-EMPTY set, never nullopt - ADR-0033 section 1).
+                // approval_provenance stays None whether or not a ticket was consumed.
+                call.wreq.caller =
+                    caller_fn ? caller_fn(*session)
+                              : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+                call.wreq.audit_context = "surface=mcp";
+                return call;
+            };
+            const auto make_workflow_ports = [&]() {
+                WorkflowExecutePorts ports;
+                ports.api = workflow_api_.get();
+                ports.run = workflow_run_fn_;
+                ports.instruction_store_open = instruction_store && instruction_store->is_open();
+                ports.approval_gate_available = approval_manager != nullptr;
+                ports.lookup = make_instruction_lookup(instruction_store);
+                ports.classify = classify_fn_;
+                ports.authorize = authorize_dispatch_fn_;
+                if (dispatch_fn) {
+                    ports.dispatch = [&](const WorkflowStepInstruction& def,
+                                         const std::vector<std::string>& ids,
+                                         const std::unordered_map<std::string, std::string>& params,
+                                         const DispatchCaller& c) {
+                        return workflow_concurrency_dispatch_fn_
+                                   ? workflow_concurrency_dispatch_fn_(
+                                         def.plugin, def.action, ids, "", params,
+                                         /*execution_id=*/"", c, def.id, def.concurrency_mode)
+                                   : dispatch_fn(def.plugin, def.action, ids, "", params,
+                                                 /*execution_id=*/"", c);
+                    };
+                }
+                ports.audit = [&](const std::string& action, const std::string& result_status,
+                                  const std::string& target_id, const std::string& detail_text) {
+                    return yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, action, result_status, "workflow", target_id, detail_text);
+                };
+                ports.count_target_rejected = [&](std::string_view reason) {
+                    if (!metrics)
+                        return;
+                    try {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "workflow"}, {"reason", std::string(reason)}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
+                    }
+                };
+                ports.count_dispatch_denied = [&](std::string_view reason) {
+                    if (!metrics)
+                        return;
+                    try {
+                        metrics
+                            ->counter("yuzu_server_dispatch_denied_total",
+                                      {{"reason", std::string(reason)}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
+                    }
+                };
+                return ports;
+            };
+            const auto respond_workflow_threw = [&](const char* what) {
+                spdlog::error("MCP execute_workflow: threw: {}", what);
+                mcp_audit("failure", "exception");
+                res.set_content(a4_error(kInternalError, "workflow execution failed", {},
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                "application/json");
+            };
+            // Renders any status the sequence refuses with (everything but kOk/kNoAgentsReached).
+            const auto render_workflow_refusal = [&](const WorkflowExecuteOutcome& out) {
+                using WES = WorkflowExecuteStatus;
+                mcp_audit(out.status == WES::kStoreFailed || out.status == WES::kAuditFailed ||
+                                  out.status == WES::kUnavailable
+                              ? "error"
+                              : "denied",
+                          "reason=" + out.reason);
+                switch (out.status) {
+                case WES::kStoreFailed:
+                case WES::kAuditFailed:
+                    res.set_content(a4_error(kInternalError, out.message, {},
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                case WES::kUnavailable:
+                case WES::kNoPrincipal:
+                    res.set_content(error_response(id, kInternalError, out.message),
+                                    "application/json");
+                    return;
+                case WES::kApprovalRequired:
+                    res.set_content(
+                        a4_error(kPermissionDenied, out.message,
+                                 "run each instruction through its own approval; a workflow only "
+                                 "runs steps this caller may run without one. An approval ticket "
+                                 "for this call does not lift a step's own approval mode"),
+                        "application/json");
+                    return;
+                case WES::kDispatchDenied:
+                    // Permanent for this caller: retry_after_ms stays null, and `reason` is the
+                    // stable token a worker branches on.
+                    res.set_content(a4_error(kPermissionDenied, out.message, out.remediation, -1,
+                                             {}, true, out.reason),
+                                    "application/json");
+                    return;
+                case WES::kOk:
+                case WES::kNoAgentsReached:
+                case WES::kInvalidWorkflow:
+                case WES::kWorkflowNotFound:
+                case WES::kUnknownInstruction:
+                case WES::kUnclassifiedStep:
+                case WES::kDestructiveUntargeted:
+                case WES::kDestructiveNoVisibleTarget:
+                case WES::kExecuteFailed:
+                    break;
+                }
+                res.set_content(error_response(id, kInvalidParams, out.message),
+                                "application/json");
+            };
+
             // ── C8: Generic tier + approval checks via catalogue().security ──
             // Look up the tool's (securable_type, operation) pair and run
             // tier_allows() / requires_approval() generically.  This fires
@@ -8760,6 +8934,33 @@ McpServer::HandlerFn McpServer::build_handler(
                                     : std::string(yuzu::server::instruction_execute::
                                                       kUnresolvedEffect);
                         canon = *ticket_bound_effect + args_canon;
+                    }
+                    // #2146 execute_workflow: the caller-level half of the sequence (prepare:
+                    // wiring, the workflow and every step's instruction, the chokepoint dry run
+                    // per distinct step pair, approval mode, targeting) runs HERE, before a
+                    // ticket is minted or consumed, so a call that is going to be refused mints
+                    // no ticket and burns none. Order is tier -> RBAC -> probe -> mint (sg-b1,
+                    // as execute_instruction_definition above). The probe is ADVISORY: the
+                    // handler runs the whole sequence again after the ticket is consumed against
+                    // fresh reads, and that run is authoritative. It dispatches nothing and
+                    // writes no `requested` row.
+                    if (tool_name == "execute_workflow") {
+                        if (!perm_fn(req, res, "Workflow", "Execute"))
+                            return;
+                        const auto call = parse_workflow_call();
+                        if (!call)
+                            return;
+                        try {
+                            const auto plan =
+                                prepare_workflow_execute(make_workflow_ports(), call->wreq);
+                            if (!plan) {
+                                render_workflow_refusal(plan.error());
+                                return;
+                            }
+                        } catch (const std::exception& e) {
+                            respond_workflow_threw(e.what());
+                            return;
+                        }
                     }
                     if (tool_name == "execute_instruction") {
                         if (auto bv = check_exec_instruction_shape(args)) {
@@ -22033,107 +22234,23 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "execute_workflow") {
                 if (!perm_fn(req, res, "Workflow", "Execute"))
                     return;
-                // Strict arguments: the C8 schema check only runs for approval-gated callers.
-                for (auto it = args.begin(); it != args.end(); ++it) {
-                    if (it.key() != "workflow_id" && it.key() != "agent_ids" &&
-                        it.key() != "approval_id") {
-                        res.set_content(
-                            error_response(id, kInvalidParams,
-                                           "unknown argument '" + it.key().substr(0, 64) +
-                                               "'; execute_workflow takes workflow_id, agent_ids "
-                                               "and approval_id"),
-                            "application/json");
-                        return;
-                    }
-                }
-                const auto wf_id = param_string_strict(args, "workflow_id");
-                if (!wf_id || wf_id->empty() || wf_id->size() > mcp::kExecInstrIdentMaxLen) {
-                    res.set_content(error_response(id, kInvalidParams,
-                                                   "workflow_id must be a non-empty string of at "
-                                                   "most 128 characters"),
-                                    "application/json");
+                const auto call = parse_workflow_call();
+                if (!call)
                     return;
-                }
-                auto agent_ids = parse_workflow_execute_body(args);
-                if (!agent_ids) {
-                    if (metrics) {
-                        try {
-                            metrics
-                                ->counter("yuzu_server_dispatch_target_rejected_total",
-                                          {{"route", "workflow"},
-                                           {"reason", agent_ids.error().reason}})
-                                .increment();
-                        } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
-                        }
-                    }
-                    mcp_audit("denied", "reason=" + agent_ids.error().reason);
-                    res.set_content(error_response(id, kInvalidParams, agent_ids.error().message), // retry-hint-exempt: input-parse failure, not a store fault
-                                    "application/json");
-                    return;
-                }
-                // The caller's REAL DispatchCaller; an unwired derivation fails CLOSED on
-                // visibility (present-EMPTY set, never nullopt - ADR-0033 section 1).
-                const auto caller =
-                    caller_fn ? caller_fn(*session)
-                              : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
-
-                WorkflowExecutePorts ports;
-                ports.api = workflow_api_.get();
-                ports.run = workflow_run_fn_;
-                ports.instruction_store_open = instruction_store && instruction_store->is_open();
-                ports.approval_gate_available = approval_manager != nullptr;
-                ports.lookup = make_instruction_lookup(instruction_store);
-                ports.classify = classify_fn_;
-                if (dispatch_fn) {
-                    ports.dispatch = [&](const WorkflowStepInstruction& def,
-                                         const std::vector<std::string>& ids,
-                                         const std::unordered_map<std::string, std::string>& params,
-                                         const DispatchCaller& c) {
-                        return workflow_concurrency_dispatch_fn_
-                                   ? workflow_concurrency_dispatch_fn_(
-                                         def.plugin, def.action, ids, "", params,
-                                         /*execution_id=*/"", c, def.id, def.concurrency_mode)
-                                   : dispatch_fn(def.plugin, def.action, ids, "", params,
-                                                 /*execution_id=*/"", c);
-                    };
-                }
-                ports.audit = [&](const std::string& action, const std::string& result_status,
-                                  const std::string& target_id, const std::string& detail_text) {
-                    return yuzu::server::detail::try_persist_audit(
-                        audit_fn, req, action, result_status, "workflow", target_id, detail_text);
-                };
-                ports.count_target_rejected = [&](std::string_view reason) {
-                    if (!metrics)
-                        return;
-                    try {
-                        metrics
-                            ->counter("yuzu_server_dispatch_target_rejected_total",
-                                      {{"route", "workflow"}, {"reason", std::string(reason)}})
-                            .increment();
-                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a refusal
-                    }
-                };
-
-                WorkflowExecuteRequest wreq;
-                wreq.workflow_id = *wf_id;
-                wreq.agent_ids = std::move(*agent_ids);
-                wreq.caller = caller;
-                wreq.audit_context = "surface=mcp";
+                const auto ports = make_workflow_ports();
 
                 WorkflowExecuteOutcome out;
                 try {
-                    out = apply_workflow_execute(ports, wreq);
+                    // The real sequence, authoritative after any C8 probe: the whole of prepare
+                    // runs again here against fresh reads, then the run.
+                    out = apply_workflow_execute(ports, call->wreq);
                 } catch (const std::exception& e) {
-                    spdlog::error("MCP execute_workflow: threw: {}", e.what());
-                    mcp_audit("failure", "exception");
-                    res.set_content(a4_error(kInternalError, "workflow execution failed", {},
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
+                    respond_workflow_threw(e.what());
                     return;
                 }
                 using WES = WorkflowExecuteStatus;
                 if (out.status == WES::kOk || out.status == WES::kNoAgentsReached) {
-                    auto payload = workflow_execute_result_json(out, *wf_id);
+                    auto payload = workflow_execute_result_json(out, call->workflow_id);
                     if (out.status == WES::kNoAgentsReached) {
                         // Same envelope shape as execute_instruction's zero-agents branch: a
                         // success result carrying the cause, never a bare "reached 0".
@@ -22150,36 +22267,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                mcp_audit(out.status == WES::kStoreFailed || out.status == WES::kAuditFailed ||
-                                  out.status == WES::kUnavailable
-                              ? "error"
-                              : "denied",
-                          "reason=" + out.reason);
-                switch (out.status) {
-                case WES::kStoreFailed:
-                case WES::kAuditFailed:
-                    res.set_content(a4_error(kInternalError, out.message, {},
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                case WES::kUnavailable:
-                case WES::kNoPrincipal:
-                    res.set_content(error_response(id, kInternalError, out.message),
-                                    "application/json");
-                    return;
-                case WES::kApprovalRequired:
-                    res.set_content(
-                        a4_error(kPermissionDenied, out.message,
-                                 "run each instruction through its own approval; a workflow only "
-                                 "runs steps this caller may run without one. An approval ticket "
-                                 "for this call does not lift a step's own approval mode"),
-                        "application/json");
-                    return;
-                default:
-                    res.set_content(error_response(id, kInvalidParams, out.message),
-                                    "application/json");
-                    return;
-                }
+                render_workflow_refusal(out);
+                return;
             }
 
             if (tool_name == "execute_bundle") {

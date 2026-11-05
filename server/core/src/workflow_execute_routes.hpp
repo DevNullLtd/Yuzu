@@ -36,6 +36,9 @@ struct WorkflowExecuteRouteDeps {
     std::function<bool()> approval_gate_available; ///< unset == not available
     WorkflowInstructionLookupFn lookup;
     WorkflowClassifyFn classify;
+    /// The shared chokepoint dry run (server.cpp's `authorize_dispatch`); unset == dispatch not
+    /// available (503, nothing done).
+    WorkflowAuthorizeFn authorize;
     WorkflowRoutes::CommandDispatchFn command_dispatch_fn;
     WorkflowRoutes::ConcurrencyDispatchFn command_dispatch_fn_concurrency;
     WorkflowRoutes::CallerFn caller_fn;

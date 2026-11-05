@@ -23,6 +23,7 @@
 #include "tag_store.hpp"
 #include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): WorkflowApi — replaces a direct WorkflowEngine reach for the v1 workflow reads
 #include "workflow_engine.hpp"
+#include "workflow_execute.hpp"  // WorkflowAuthorizeFn (Deps::authorize_dispatch)
 #include "workflow_run_port.hpp" // WorkflowRunFn (Deps::workflow_run)
 
 #include <httplib.h>
@@ -224,6 +225,10 @@ public:
         /// gets. Unset ⇒ that route answers "workflow engine not available". The legacy
         /// `POST /api/workflows/{id}/execute` keeps its own `workflow_engine` call.
         WorkflowRunFn workflow_run;
+        /// The shared dispatch-chokepoint dry run (server.cpp's `authorize_dispatch`) that the v1
+        /// execute route asks per distinct step pair before anything is sent. Unset ⇒ that
+        /// route answers 503 "workflow dispatch not available" (fail closed, never "no gate").
+        WorkflowAuthorizeFn authorize_dispatch;
         /// ADR-0031 WS-A4 (seventh family): the schedule-read seam — replaces
         /// a direct `ScheduleEngine*` reach for `GET /fragments/schedules` /
         /// `GET /api/v1/schedules` (the seamed read triad; the unversioned

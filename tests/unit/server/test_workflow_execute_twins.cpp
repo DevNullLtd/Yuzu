@@ -83,6 +83,7 @@ struct Fx {
     bool approval_gate{true};
     bool wire_api{true};
     bool wire_run{true};
+    bool wire_authorize{true};
     bool audit_ok{true};
     std::optional<size_t> audit_fails_on_call; // 0-based index of the audit call that fails
 
@@ -90,6 +91,13 @@ struct Fx {
     std::vector<std::string> events;
     std::vector<std::string> audit_details;
     std::vector<std::string> counted_rejections;
+    std::vector<std::string> counted_denials;
+    // The chokepoint dry run is the REAL classify_and_authorize_dispatch + kill_switch_denial over
+    // the production catalogue; these two sets stand in for the RBAC store and the plugin-config
+    // store. `rbac_denied`: securables the caller holds no grant on. `killed`: "plugin.action".
+    std::set<std::string> rbac_denied;
+    std::set<std::string> killed;
+    std::vector<std::string> authorize_calls; // "plugin.action", in call order
     std::vector<DispatchCaller> dispatched_callers;
     std::vector<std::vector<std::string>> dispatched_ids;
 
@@ -185,6 +193,29 @@ struct Fx {
         p.classify = [this](std::string_view plugin, std::string_view action) {
             return caps.classify(plugin, action);
         };
+        if (wire_authorize)
+            p.authorize = [this](const DispatchCaller& c, std::string_view plugin,
+                                 std::string_view action)
+                -> std::expected<CommandCapability, detail::DispatchDenial> {
+                authorize_calls.push_back(std::string(plugin) + "." + std::string(action));
+                auto decision = detail::classify_and_authorize_dispatch(
+                    caps, c, plugin, action,
+                    [this](std::string_view, std::string_view securable, authz::Operation) {
+                        return !rbac_denied.contains(std::string(securable));
+                    });
+                if (!decision)
+                    return decision;
+                const detail::KillSwitchFn allowed =
+                    [this](std::string_view pl, std::string_view ac)
+                    -> std::optional<std::unordered_set<std::string>> {
+                    if (killed.contains(std::string(pl) + "." + std::string(ac)))
+                        return std::nullopt;
+                    return std::unordered_set<std::string>{};
+                };
+                if (auto os_set = detail::kill_switch_denial(*decision, allowed); !os_set)
+                    return std::unexpected(os_set.error());
+                return decision;
+            };
         p.dispatch = [this](const WorkflowStepInstruction& d, const std::vector<std::string>& ids,
                             const std::unordered_map<std::string, std::string>&,
                             const DispatchCaller& c) {
@@ -209,6 +240,7 @@ struct Fx {
         p.count_target_rejected = [this](std::string_view r) {
             counted_rejections.emplace_back(r);
         };
+        p.count_dispatch_denied = [this](std::string_view r) { counted_denials.emplace_back(r); };
         return p;
     }
 
@@ -248,6 +280,7 @@ TEST_CASE("workflow execute: an unwired or closed dependency refuses with 503 an
         {"instruction store not open", [](Fx& f) { f.store_open = false; }, "instruction_store_unavailable"},
         {"workflow API not wired", [](Fx& f) { f.wire_api = false; }, "workflow_engine_unavailable"},
         {"workflow run port not wired", [](Fx& f) { f.wire_run = false; }, "workflow_engine_unavailable"},
+        {"dispatch authorizer not wired", [](Fx& f) { f.wire_authorize = false; }, "dispatch_unavailable"},
     };
     for (const auto& r : rows) {
         INFO(r.what);
@@ -262,9 +295,10 @@ TEST_CASE("workflow execute: an unwired or closed dependency refuses with 503 an
     }
 }
 
-TEST_CASE("workflow execute: a missing classifier, dispatcher or audit sink also refuses before any effect",
+TEST_CASE("workflow execute: a missing classifier, authorizer, dispatcher or audit sink also refuses "
+          "before any effect",
           "[workflow][twin][security][failclosed]") {
-    for (int which = 0; which < 3; ++which) {
+    for (int which = 0; which < 4; ++which) {
         Fx f;
         auto a = f.api();
         auto p = f.ports(a);
@@ -274,6 +308,8 @@ TEST_CASE("workflow execute: a missing classifier, dispatcher or audit sink also
             p.dispatch = nullptr;
         if (which == 2)
             p.audit = nullptr;
+        if (which == 3)
+            p.authorize = nullptr; // unwired is "no dry run", never "no gate": fail closed
         const auto o = apply_workflow_execute(p, f.request());
         CHECK(o.status == WorkflowExecuteStatus::kUnavailable);
         CHECK_FALSE(f.engine_called);
@@ -403,7 +439,9 @@ TEST_CASE("workflow execute: a Forensics step needs exactly one agent id",
     {
         Fx f;
         f.defs["i-ro"] = def("i-ro", "execution_artifacts", "shimcache");
-        const auto o = f.run(f.request({"a1", "a2"}));
+        auto req = f.request({"a1", "a2"});
+        req.caller.principal_is_admin = true; // the ExecuteGate admits; targeting decides
+        const auto o = f.run(req);
         CHECK(o.status == WorkflowExecuteStatus::kDestructiveUntargeted);
         CHECK(o.reason == std::string(kReasonForensicUntargeted));
         CHECK(f.counted_rejections == std::vector<std::string>{std::string(kReasonForensicUntargeted)});
@@ -412,7 +450,9 @@ TEST_CASE("workflow execute: a Forensics step needs exactly one agent id",
     {
         Fx f;
         f.defs["i-ro"] = def("i-ro", "execution_artifacts", "shimcache");
-        CHECK(f.run(f.request({"a1"})).status == WorkflowExecuteStatus::kOk);
+        auto req = f.request({"a1"});
+        req.caller.principal_is_admin = true;
+        CHECK(f.run(req).status == WorkflowExecuteStatus::kOk);
     }
 }
 
@@ -423,6 +463,7 @@ TEST_CASE("workflow execute: a Destructive step whose named agents are ALL outsi
         Fx f;
         f.defs["i-ro"] = def("i-ro", "filesystem", "delete_lines");
         auto req = f.request({"a1", "a2"});
+        req.caller.principal_is_admin = true;
         req.caller.exec_visible = authz::VisibleSet{std::unordered_set<std::string>{"zzz"}};
         const auto o = f.run(req);
         CHECK(o.status == WorkflowExecuteStatus::kDestructiveNoVisibleTarget);
@@ -435,6 +476,7 @@ TEST_CASE("workflow execute: a Destructive step whose named agents are ALL outsi
         Fx f;
         f.defs["i-ro"] = def("i-ro", "filesystem", "delete_lines");
         auto req = f.request({"a1", "a2"});
+        req.caller.principal_is_admin = true;
         req.caller.exec_visible = authz::VisibleSet{std::unordered_set<std::string>{"a2"}};
         CHECK(f.run(req).status == WorkflowExecuteStatus::kOk);
     }
@@ -442,6 +484,7 @@ TEST_CASE("workflow execute: a Destructive step whose named agents are ALL outsi
         Fx f;
         f.defs["i-ro"] = def("i-ro", "filesystem", "delete_lines");
         auto req = f.request({"a1"});
+        req.caller.principal_is_admin = true;
         req.caller.exec_visible = authz::deny_all();
         CHECK(f.run(req).status == WorkflowExecuteStatus::kDestructiveNoVisibleTarget);
     }
@@ -687,6 +730,163 @@ TEST_CASE("workflow execute: each step reaches EXACTLY the named agents the call
     }
 }
 
+// ───────────────────────────── caller-level authority: all-or-nothing (sec-4 / UP-2) ─────────
+
+namespace {
+
+// A pair whose catalogue row carries ExecuteGate::AdminOrApproval (a non-admin with no approval
+// provenance is refused by the chokepoint), and a read-only pair with ExecuteGate::None.
+constexpr const char* kGatedPlugin = "filesystem";
+constexpr const char* kGatedAction = "create_temp";
+
+Fx two_step_with_later_gated_pair() {
+    Fx f;
+    f.step_ids = {"i-ro", "i-gated"};
+    f.defs["i-gated"] = def("i-gated", kGatedPlugin, kGatedAction);
+    return f;
+}
+
+} // namespace
+
+TEST_CASE("workflow execute: a caller-level denial of a LATER step's pair refuses the whole call and "
+          "NOTHING is sent",
+          "[workflow][twin][security][authorize]") {
+    Fx f = two_step_with_later_gated_pair();
+    const auto o = f.run(); // alice: not an administrator, no approval provenance
+    REQUIRE(o.status == WorkflowExecuteStatus::kDispatchDenied);
+    CHECK(o.reason == "dispatch_denied");
+    CHECK_FALSE(o.retryable); // the chokepoint would say the same on every retry
+    CHECK(o.message.find("step-i-gated") != std::string::npos);
+    CHECK(o.message.find("filesystem.create_temp") != std::string::npos);
+    CHECK_FALSE(o.remediation.empty());
+    // Step 1 was NOT sent (it used to be, and the run then reported a retryable
+    // "no_agents_reached" for step 2).
+    CHECK_FALSE(f.engine_called);
+    CHECK_FALSE(f.dispatched_anything());
+    CHECK(o.execution_id.empty());
+    // Exactly one `denied` row naming the step and the chokepoint's own token; no `requested`.
+    REQUIRE(f.audit_details.size() == 1);
+    CHECK(f.events.front() == "audit:denied");
+    CHECK(f.audit_details[0].find("reason=dispatch_denied") != std::string::npos);
+    CHECK(f.audit_details[0].find("denial=approval_required") != std::string::npos);
+    CHECK(f.audit_details[0].find("step=i-gated") != std::string::npos);
+    CHECK(f.audit_details[0].find("action=filesystem.create_temp") != std::string::npos);
+    CHECK(f.counted_denials == std::vector<std::string>{"approval_required"});
+}
+
+TEST_CASE("workflow execute: the chokepoint's own verdict is used, per cause (RBAC, ExecuteGate, kill switch)",
+          "[workflow][twin][security][authorize]") {
+    const auto ro = [](Fx& f) { return std::string(f.caps.classify("os_info", "os_version")->securable); };
+    struct Row {
+        const char* what;
+        std::function<void(Fx&)> setup;
+        const char* denial;
+    };
+    const Row rows[] = {
+        {"no RBAC grant", [&](Fx& f) { f.rbac_denied.insert(ro(f)); }, "forbidden"},
+        {"action kill switch", [](Fx& f) { f.killed.insert("os_info.os_version"); }, "kill_switched"},
+        {"admin-or-approval gate", [](Fx& f) { f.defs["i-ro"] = def("i-ro", kGatedPlugin, kGatedAction); },
+         "approval_required"},
+    };
+    for (const auto& r : rows) {
+        INFO(r.what);
+        Fx f;
+        r.setup(f);
+        const auto o = f.run();
+        REQUIRE(o.status == WorkflowExecuteStatus::kDispatchDenied);
+        CHECK(o.reason == "dispatch_denied");
+        CHECK_FALSE(o.retryable);
+        CHECK(f.counted_denials == std::vector<std::string>{r.denial});
+        CHECK_FALSE(f.engine_called);
+        CHECK_FALSE(f.dispatched_anything());
+        REQUIRE(f.audit_details.size() == 1);
+        CHECK(f.audit_details[0].find(std::string("denial=") + r.denial) != std::string::npos);
+    }
+}
+
+TEST_CASE("workflow execute: the chokepoint is asked once per DISTINCT step pair, with the caller's real "
+          "DispatchCaller",
+          "[workflow][twin][security][authorize]") {
+    Fx f;
+    f.step_ids = {"i-ro", "i-ro2", "i-ro3", "i-gated"};
+    f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+    f.defs["i-ro3"] = def("i-ro3", "os_info", "os_version");
+    f.defs["i-gated"] = def("i-gated", kGatedPlugin, kGatedAction);
+    auto req = f.request();
+    req.caller.principal_is_admin = true; // so the gated pair is admitted and every pair is asked
+    REQUIRE(f.run(req).status == WorkflowExecuteStatus::kOk);
+    CHECK(f.authorize_calls ==
+          std::vector<std::string>{"os_info.os_version", "filesystem.create_temp"});
+
+    // The caller passed in is the one judged: provenance and admin flag are not re-derived.
+    Fx g = two_step_with_later_gated_pair();
+    auto ticketed = g.request();
+    ticketed.caller.approval_provenance = ApprovalProvenance::Ticket; // what a transport MAY stamp
+    CHECK(g.run(ticketed).status == WorkflowExecuteStatus::kOk);
+}
+
+TEST_CASE("workflow execute: allowed pairs run exactly as before",
+          "[workflow][twin][security][authorize]") {
+    Fx f;
+    f.step_ids = {"i-ro", "i-ro2"};
+    f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
+    const auto o = f.run();
+    CHECK(o.status == WorkflowExecuteStatus::kOk);
+    CHECK(f.events.front() == "audit:requested");
+    CHECK(f.counted_denials.empty());
+}
+
+TEST_CASE("workflow execute: caller authority is judged before targeting (403 before 400), as on "
+          "POST /api/command",
+          "[workflow][twin][security][authorize][targeting]") {
+    Fx f;
+    f.defs["i-ro"] = def("i-ro", "execution_artifacts", "shimcache"); // Forensics, gated
+    const auto o = f.run(f.request({"a1", "a2"}));                  // untargeted AND not admin
+    CHECK(o.status == WorkflowExecuteStatus::kDispatchDenied);
+    CHECK(f.counted_rejections.empty()); // the targeting counter was never reached
+}
+
+TEST_CASE("workflow execute: the gated-pair denial never advises an approval ticket, because none can lift it",
+          "[workflow][twin][security][authorize]") {
+    Fx f = two_step_with_later_gated_pair();
+    const auto o = f.run();
+    REQUIRE(o.status == WorkflowExecuteStatus::kDispatchDenied);
+    CHECK(o.message.find("supervised") == std::string::npos);
+    CHECK(o.remediation.find("supervised") == std::string::npos);
+    CHECK(o.remediation.find("retrying will not help") != std::string::npos);
+}
+
+TEST_CASE("workflow execute: a throwing authorizer is the caller's to catch and sends nothing",
+          "[workflow][twin][security][authorize]") {
+    Fx f;
+    auto a = f.api();
+    auto p = f.ports(a);
+    p.authorize = [](const DispatchCaller&, std::string_view,
+                     std::string_view) -> std::expected<CommandCapability, detail::DispatchDenial> {
+        throw std::runtime_error("authorizer exploded");
+    };
+    CHECK_THROWS(apply_workflow_execute(p, f.request()));
+    CHECK_FALSE(f.engine_called);
+    CHECK_FALSE(f.dispatched_anything());
+    CHECK(f.audit_details.empty());
+}
+
+TEST_CASE("workflow execute: prepare alone has no effect and writes no `requested` row; run does",
+          "[workflow][twin][security][authorize]") {
+    Fx f;
+    auto a = f.api();
+    const auto p = f.ports(a);
+    const auto req = f.request();
+    const auto plan = prepare_workflow_execute(p, req);
+    REQUIRE(plan.has_value());
+    CHECK(plan->step_count == 1);
+    CHECK(f.events.empty()); // no audit row, no dispatch, no engine
+    CHECK_FALSE(f.engine_called);
+    const auto o = run_workflow_execute(p, req, *plan);
+    CHECK(o.status == WorkflowExecuteStatus::kOk);
+    CHECK(f.events.front() == "audit:requested");
+}
+
 TEST_CASE("workflow execute: the caller's REAL DispatchCaller reaches every step unchanged",
           "[workflow][twin][security][caller]") {
     Fx f;
@@ -802,6 +1002,7 @@ struct Rest {
         auto ports = fx.ports(api);
         d.lookup = ports.lookup;
         d.classify = ports.classify;
+        d.authorize = ports.authorize;
         d.command_dispatch_fn = [this](const std::string& plugin, const std::string& action,
                                        const std::vector<std::string>& ids, const std::string&,
                                        const std::unordered_map<std::string, std::string>&,
@@ -941,6 +1142,7 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: step refusals map to 403/400/404
     };
     for (const auto& row : rows) {
         Rest r;
+        r.caller.principal_is_admin = true; // the ExecuteGate admits; the step's own verdict decides
         row.setup(r.fx);
         // Two ids so the Forensics row is untargeted; harmless for the others.
         const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1","a2"]})");
@@ -952,6 +1154,37 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: step refusals map to 403/400/404
     }
     Rest missing;
     CHECK(missing.sink.Post("/api/v1/workflows/other/execute", R"({"agent_ids":["a1"]})")->status == 404);
+}
+
+TEST_CASE("POST /api/v1/workflows/{id}/execute: a caller-level denial of any step's pair is a "
+          "non-retryable 403 dispatch_denied and sends nothing",
+          "[workflow][twin][rest][security][authorize]") {
+    Rest r;
+    r.fx.step_ids = {"i-ro", "i-gated"};
+    r.fx.defs["i-gated"] = def("i-gated", kGatedPlugin, kGatedAction);
+    const auto res = r.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    INFO(res->body);
+    REQUIRE(res->status == 403); // a 202 here has no error object to inspect
+    const auto j = body_of(*res);
+    CHECK(j["error"]["reason"] == "dispatch_denied");
+    CHECK(j["error"]["retry_after_ms"].is_null());
+    CHECK_FALSE(j["error"]["remediation"].get<std::string>().empty());
+    CHECK_FALSE(j["error"].contains("execution_id"));
+    CHECK_FALSE(r.fx.dispatched_anything()); // step 1 was NOT sent
+    CHECK_FALSE(r.fx.engine_called);
+    REQUIRE(r.fx.audit_details.size() == 1);
+    CHECK(r.fx.events.front() == "audit:denied");
+    CHECK(r.metrics.counter("yuzu_server_dispatch_denied_total", {{"reason", "approval_required"}})
+              .value() == 1);
+
+    // The same call as an administrator is admitted.
+    Rest admin;
+    admin.caller.principal_is_admin = true;
+    admin.fx.step_ids = {"i-ro", "i-gated"};
+    admin.fx.defs["i-gated"] = def("i-gated", kGatedPlugin, kGatedAction);
+    CHECK(admin.sink.Post("/api/v1/workflows/wf-1/execute", R"({"agent_ids":["a1"]})")->status ==
+          202);
 }
 
 TEST_CASE("POST /api/v1/workflows/{id}/execute: no step reaching any agent is a 503 with the cause, the "
@@ -976,6 +1209,7 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: no step reaching any agent is a 
     auto ports = r.fx.ports(r.api);
     d.lookup = ports.lookup;
     d.classify = ports.classify;
+    d.authorize = ports.authorize;
     d.command_dispatch_fn = [](const std::string&, const std::string&,
                                const std::vector<std::string>&, const std::string&,
                                const std::unordered_map<std::string, std::string>&,
@@ -1018,6 +1252,7 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: an unwired caller derivation is 
     auto ports = r.fx.ports(r.api);
     d.lookup = ports.lookup;
     d.classify = ports.classify;
+    d.authorize = ports.authorize;
     d.command_dispatch_fn = [&](const std::string&, const std::string&,
                                 const std::vector<std::string>&, const std::string&,
                                 const std::unordered_map<std::string, std::string>&,

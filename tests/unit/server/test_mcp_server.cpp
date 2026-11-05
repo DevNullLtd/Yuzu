@@ -48084,37 +48084,278 @@ TEST_CASE("MCP execute_workflow: the served tool declares approval_id, is destru
     CHECK(std::find(gated.begin(), gated.end(), "execute_workflow") != gated.end());
 }
 
+namespace {
+
+// What the PG-backed execute_workflow cases share: a real InstructionStore holding the two step
+// instructions, a workflow double serving them as wf-1, a run port that drives the step callback
+// once per step as the engine does, and an authorizer that counts its calls and can be told to
+// refuse the gated pair from a given call index on.
+struct WfMcpFx {
+    std::string ro_id;    // os_info.os_version, approval_mode auto
+    std::string gated_id; // filesystem.create_temp (ExecuteGate::AdminOrApproval), approval_mode auto
+    std::vector<std::string> step_ids;
+    int run_calls{0};
+    int dispatches{0};
+    int authorize_calls{0};
+    std::optional<int> deny_gated_from; // 0-based authorizer call index; unset == admit everything
+    std::shared_ptr<yuzu::server::test::FnWorkflowApi> api;
+
+    void seed(yuzu::server::InstructionStore& store) {
+        const auto make = [&](const char* name, const char* plugin, const char* action) {
+            yuzu::server::InstructionDefinition d;
+            d.name = name;
+            d.version = "1.0";
+            d.plugin = plugin;
+            d.action = action;
+            d.type = "question";
+            d.description = "wf step";
+            d.enabled = true;
+            d.approval_mode = "auto";
+            d.concurrency_mode = "per-device";
+            auto id = store.create_definition(d);
+            REQUIRE(id.has_value());
+            return *id;
+        };
+        ro_id = make("wf-ro", "os_info", "os_version");
+        gated_id = make("wf-gated", "filesystem", "create_temp");
+        step_ids = {ro_id, gated_id};
+        api = std::make_shared<yuzu::server::test::FnWorkflowApi>(
+            yuzu::server::test::FnWorkflowApi::ListFn{},
+            [this](const std::string& id)
+                -> std::expected<std::optional<yuzu::server::Workflow>, std::string> {
+                if (id != "wf-1")
+                    return std::optional<yuzu::server::Workflow>{};
+                yuzu::server::Workflow w;
+                w.id = "wf-1";
+                w.name = "wf";
+                int i = 0;
+                for (const auto& sid : step_ids) {
+                    yuzu::server::WorkflowStep st;
+                    st.index = i++;
+                    st.instruction_id = sid;
+                    st.label = "step-" + std::to_string(i);
+                    w.steps.push_back(st);
+                }
+                return std::optional<yuzu::server::Workflow>{w};
+            },
+            [](const std::string& id)
+                -> std::expected<std::optional<yuzu::server::WorkflowExecution>, std::string> {
+                yuzu::server::WorkflowExecution e;
+                e.id = id;
+                e.workflow_id = "wf-1";
+                e.status = "completed";
+                return std::optional<yuzu::server::WorkflowExecution>{e};
+            });
+    }
+
+    void wire(McpTestServer& ts, yuzu::server::InstructionStore& store,
+              yuzu::server::ApprovalManager& appr) {
+        ts.instruction_store_for_test = &store;
+        ts.approval_manager_for_test = &appr;
+        ts.workflow_api_for_test = api;
+        ts.caller_fn_for_test = [](const auth::Session&) {
+            return yuzu::server::DispatchCaller{.principal = "alice",
+                                                .principal_role = "user",
+                                                .exec_visible = std::nullopt,
+                                                .principal_is_admin = false};
+        };
+        ts.workflow_run_for_test = [this](const std::string&, const std::vector<std::string>&,
+                                          yuzu::server::StepDispatchFn fn,
+                                          yuzu::server::ConditionEvalFn,
+                                          const yuzu::server::WorkflowRunControl&)
+            -> std::expected<std::string, std::string> {
+            ++run_calls;
+            for (const auto& sid : step_ids)
+                (void)fn(sid, "[]", "{}");
+            return std::string{"exec-1"};
+        };
+        ts.authorize_dispatch_fn_for_test =
+            [this](const yuzu::server::DispatchCaller&, std::string_view plugin,
+                   std::string_view) -> std::expected<yuzu::server::CommandCapability,
+                                                      yuzu::server::detail::DispatchDenial> {
+            const int n = authorize_calls++;
+            if (deny_gated_from && n >= *deny_gated_from && plugin == "filesystem")
+                return std::unexpected(yuzu::server::detail::DispatchDenial{
+                    yuzu::server::detail::DispatchDenialReason::ApprovalRequired, "FileRetrieval",
+                    yuzu::server::authz::Operation::Write});
+            static constexpr yuzu::server::CommandCapability kRow{
+                .plugin = "unused",
+                .action = "unused",
+                .dispatch_class = yuzu::server::DispatchClass::ReadOnly,
+                .mutability = yuzu::server::Mutability::None,
+                .securable = "Execution",
+                .operation = yuzu::server::authz::Operation::Read,
+                .risk_tier = yuzu::server::authz::RiskTier::Low,
+                .system_reserved = false,
+                .execute_gate = yuzu::server::ExecuteGate::None,
+            };
+            return kRow;
+        };
+    }
+
+    yuzu::server::mcp::McpServer::DispatchFn dispatch_fn() {
+        return [this](const std::string&, const std::string&, const std::vector<std::string>&,
+                      const std::string&, const std::unordered_map<std::string, std::string>&,
+                      const std::string&, const yuzu::server::DispatchCaller&)
+                   -> yuzu::server::ConfinedDispatchOutcome {
+            ++dispatches;
+            return {.sent = 1, .command_id = "cmd-" + std::to_string(dispatches)};
+        };
+    }
+};
+
+} // namespace
+
 TEST_CASE("MCP execute_workflow: at the supervised tier the first call mints a ticket and dispatches "
-          "nothing; the recall with the approved ticket passes the C8 gate",
+          "nothing; the recall with the approved ticket runs the workflow",
           "[mcp][pg][workflow][twin][security][tier][approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
     yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
     McpTestServer ts;
-    WfExecDispatchProbe probe;
-    ts.approval_manager_for_test = &appr;
-    ts.start_with_dispatch(probe.fn(), "supervised");
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
     auto mint = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})", 1));
     REQUIRE(mint);
     const auto mj = nlohmann::json::parse(mint->body);
     REQUIRE(mj.contains("error"));
     CHECK(mj["error"]["code"] == -32006); // kApprovalRequired
     const std::string approval_id = mj["error"]["data"]["approval_id"].get<std::string>();
-    CHECK_FALSE(probe.dispatched);
+    CHECK(fx.dispatches == 0);
+    CHECK(fx.run_calls == 0);
+    CHECK(appr.pending_count() == 1);
     REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
-    // Recall: the C8 gate consumes the ticket and the handler runs. With no instruction store
-    // wired it then refuses fail-closed (-32603): the ticket got the call PAST the tier gate and
-    // did not, by itself, cause anything to be sent.
-    auto recall = ts.call(wf_exec_call(
-        R"({"workflow_id":"wf-1","agent_ids":["a1"],"approval_id":")" + approval_id + R"("})", 1));
-    REQUIRE(recall);
-    const auto rj = nlohmann::json::parse(recall->body);
-    REQUIRE(rj.contains("error"));
-    CHECK(rj["error"]["code"] == -32603);
-    CHECK_FALSE(probe.dispatched);
-    // A ticket minted for different arguments does not redeem for these.
+    // A ticket minted for different arguments does not redeem for these (and is not burned).
     auto mismatch = ts.call(wf_exec_call(
         R"({"workflow_id":"wf-2","agent_ids":["a1"],"approval_id":")" + approval_id + R"("})", 2));
     REQUIRE(mismatch);
     CHECK(nlohmann::json::parse(mismatch->body).contains("error"));
-    CHECK_FALSE(probe.dispatched);
+    CHECK(fx.dispatches == 0);
+    // The recall consumes the ticket and the whole sequence runs.
+    auto recall = ts.call(wf_exec_call(
+        R"({"workflow_id":"wf-1","agent_ids":["a1"],"approval_id":")" + approval_id + R"("})", 1));
+    REQUIRE(recall);
+    INFO(recall->body);
+    const auto rj = nlohmann::json::parse(recall->body);
+    REQUIRE(rj.contains("result"));
+    CHECK(fx.run_calls == 1);
+    CHECK(fx.dispatches == 2);
+    const auto payload = nlohmann::json::parse(rj["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["execution_id"] == "exec-1");
+    CHECK(payload["steps"].size() == 2);
+}
+
+TEST_CASE("MCP execute_workflow: a caller-level denial of any step's pair is refused BEFORE a ticket is "
+          "minted: no ticket, nothing sent, a stable non-retryable 403 reason",
+          "[mcp][pg][workflow][twin][security][tier][approval][authorize]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    fx.deny_gated_from = 0; // the LATER step's pair is refused to this caller
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+
+    auto refused = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})", 1));
+    REQUIRE(refused);
+    INFO(refused->body);
+    const auto j = nlohmann::json::parse(refused->body);
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(j["error"]["data"].value("reason", "") == "dispatch_denied");
+    CHECK((j["error"]["data"].contains("retry_after_ms") &&
+           j["error"]["data"]["retry_after_ms"].is_null())); // permanent: never a hint
+    CHECK_FALSE(j["error"]["data"].contains("approval_id"));
+    CHECK(j["error"]["message"].get<std::string>().find("step-2") != std::string::npos);
+    CHECK(appr.pending_count() == 0); // no ticket was minted
+    CHECK(fx.dispatches == 0);        // step 1 was NOT sent
+    CHECK(fx.run_calls == 0);
+
+    // The same call once the caller may run the pair mints a ticket as usual.
+    fx.deny_gated_from.reset();
+    auto minted = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})", 2));
+    REQUIRE(minted);
+    CHECK(nlohmann::json::parse(minted->body)["error"]["code"] == -32006);
+    CHECK(appr.pending_count() == 1);
+}
+
+TEST_CASE("MCP execute_workflow: the C8 probe is advisory; the handler runs the whole sequence again "
+          "after the ticket is consumed and refuses if authority was lost in between",
+          "[mcp][pg][workflow][twin][security][tier][approval][authorize]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn(), "supervised");
+    auto mint = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})", 1));
+    REQUIRE(mint);
+    const std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+    // The mint probe made 2 authorizer calls (two distinct pairs) and the recall's probe makes 2
+    // more; deny from the 5th on, so the recall's probe PASSES, the ticket is consumed, and the
+    // handler's own prepare is the one that refuses.
+    REQUIRE(fx.authorize_calls == 2);
+    fx.deny_gated_from = 4;
+    auto recall = ts.call(wf_exec_call(
+        R"({"workflow_id":"wf-1","agent_ids":["a1"],"approval_id":")" + approval_id + R"("})", 1));
+    REQUIRE(recall);
+    INFO(recall->body);
+    const auto j = nlohmann::json::parse(recall->body);
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(j["error"]["data"].value("reason", "") == "dispatch_denied");
+    CHECK(fx.authorize_calls == 6);
+    const auto ticket = appr.get(approval_id);
+    REQUIRE(ticket.has_value());
+    CHECK(ticket->consumed_at != 0); // spent: the handler, not the probe, refused
+    CHECK(fx.dispatches == 0);
+    CHECK(fx.run_calls == 0);
+}
+
+TEST_CASE("MCP execute_workflow: an untiered session is refused by the handler's own prepare, "
+          "sending nothing, and an allowed call runs",
+          "[mcp][pg][workflow][twin][security][authorize]") {
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore store(instr_pool);
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    WfMcpFx fx;
+    fx.seed(store);
+    fx.deny_gated_from = 0;
+    McpTestServer ts;
+    fx.wire(ts, store, appr);
+    ts.start_with_dispatch(fx.dispatch_fn());
+    auto refused = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})", 1));
+    REQUIRE(refused);
+    const auto j = nlohmann::json::parse(refused->body);
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(j["error"]["data"].value("reason", "") == "dispatch_denied");
+    CHECK(fx.dispatches == 0);
+    CHECK(fx.run_calls == 0);
+
+    fx.deny_gated_from.reset();
+    auto ok = ts.call(wf_exec_call(R"({"workflow_id":"wf-1","agent_ids":["a1"]})", 2));
+    REQUIRE(ok);
+    CHECK(nlohmann::json::parse(ok->body).contains("result"));
+    CHECK(fx.dispatches == 2);
 }

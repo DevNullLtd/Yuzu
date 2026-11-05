@@ -1,6 +1,7 @@
 #include "workflow_execute.hpp"
 
 #include "compliance_eval.hpp"
+#include "dispatch_denial_text.hpp"
 #include "dispatch_destructive_gate.hpp"
 #include "dispatch_target_shape.hpp"
 #include "instruction_store.hpp"
@@ -8,12 +9,14 @@
 #include "store_errors.hpp"
 #include "web_utils.hpp" // audit_token (CWE-117)
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/protective_actions.hpp>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <set>
 #include <unordered_set>
 #include <utility>
 
@@ -212,25 +215,28 @@ WorkflowExecuteStatus status_for(StepAdmission v) {
 
 } // namespace
 
-WorkflowExecuteOutcome apply_workflow_execute(const WorkflowExecutePorts& ports,
-                                              const WorkflowExecuteRequest& req) {
+std::expected<WorkflowExecutePlan, WorkflowExecuteOutcome>
+prepare_workflow_execute(const WorkflowExecutePorts& ports, const WorkflowExecuteRequest& req) {
     // ── 1. wiring: fail CLOSED, before any read or effect ────────────────
     if (!ports.api || !ports.run)
-        return refuse(WorkflowExecuteStatus::kUnavailable, "workflow engine not available",
-                      "workflow_engine_unavailable");
+        return std::unexpected(refuse(WorkflowExecuteStatus::kUnavailable,
+                                      "workflow engine not available",
+                                      "workflow_engine_unavailable"));
     if (!ports.instruction_store_open || !ports.lookup)
-        return refuse(WorkflowExecuteStatus::kUnavailable, "instruction store not available",
-                      "instruction_store_unavailable");
+        return std::unexpected(refuse(WorkflowExecuteStatus::kUnavailable,
+                                      "instruction store not available",
+                                      "instruction_store_unavailable"));
     if (!ports.approval_gate_available)
-        return refuse(WorkflowExecuteStatus::kUnavailable,
-                      "approval gate not available; a workflow is not run without it",
-                      "approval_gate_unavailable");
-    if (!ports.classify || !ports.dispatch || !ports.audit)
-        return refuse(WorkflowExecuteStatus::kUnavailable, "workflow dispatch not available",
-                      "dispatch_unavailable");
+        return std::unexpected(
+            refuse(WorkflowExecuteStatus::kUnavailable,
+                   "approval gate not available; a workflow is not run without it",
+                   "approval_gate_unavailable"));
+    if (!ports.classify || !ports.authorize || !ports.dispatch || !ports.audit)
+        return std::unexpected(refuse(WorkflowExecuteStatus::kUnavailable,
+                                      "workflow dispatch not available", "dispatch_unavailable"));
     if (req.caller.principal.empty() && !req.caller.system)
-        return refuse(WorkflowExecuteStatus::kNoPrincipal,
-                      "authenticated session has no principal", "no_principal");
+        return std::unexpected(refuse(WorkflowExecuteStatus::kNoPrincipal,
+                                      "authenticated session has no principal", "no_principal"));
 
     const std::string target_id = clip_token(req.workflow_id);
     auto deny_audit = [&](std::string_view reason, const std::string& extra) {
@@ -249,48 +255,131 @@ WorkflowExecuteOutcome apply_workflow_execute(const WorkflowExecutePorts& ports,
     if (!wf) {
         spdlog::warn("workflow execute: get_workflow failed: {}",
                      genericize_db_error("get_workflow", wf.error()));
-        return refuse(WorkflowExecuteStatus::kStoreFailed, "workflow store unavailable",
-                      "store_unavailable", /*retryable=*/true);
+        return std::unexpected(refuse(WorkflowExecuteStatus::kStoreFailed,
+                                      "workflow store unavailable", "store_unavailable",
+                                      /*retryable=*/true));
     }
     if (!*wf)
-        return refuse(WorkflowExecuteStatus::kWorkflowNotFound, "workflow not found",
-                      "workflow_not_found");
+        return std::unexpected(refuse(WorkflowExecuteStatus::kWorkflowNotFound,
+                                      "workflow not found", "workflow_not_found"));
     const Workflow& workflow = **wf;
     if (workflow.steps.empty())
-        return refuse(WorkflowExecuteStatus::kInvalidWorkflow, "workflow has no steps",
-                      "workflow_no_steps");
+        return std::unexpected(refuse(WorkflowExecuteStatus::kInvalidWorkflow,
+                                      "workflow has no steps", "workflow_no_steps"));
 
     // ── 3 + 4. every step admitted, or the whole run is refused ──────────
+    // The chokepoint dry run is asked once per distinct (plugin, action): its answer depends on
+    // the caller and the pair only, never on the step or the targets.
+    std::set<std::pair<std::string, std::string>> authorized;
     for (const auto& step : workflow.steps) {
         const auto def_r = ports.lookup(step.instruction_id);
         if (!def_r) {
             spdlog::warn("workflow execute: instruction lookup failed: {}",
                          genericize_db_error("workflow execute instruction lookup", def_r.error()));
-            return refuse(WorkflowExecuteStatus::kStoreFailed, "instruction store unavailable",
-                          "store_unavailable", /*retryable=*/true);
+            return std::unexpected(refuse(WorkflowExecuteStatus::kStoreFailed,
+                                          "instruction store unavailable", "store_unavailable",
+                                          /*retryable=*/true));
         }
         if (!*def_r)
-            return refuse(WorkflowExecuteStatus::kUnknownInstruction,
-                          "workflow step '" + step.label + "' references unknown instruction: " +
-                              step.instruction_id,
-                          "unknown_instruction");
+            return std::unexpected(
+                refuse(WorkflowExecuteStatus::kUnknownInstruction,
+                       "workflow step '" + step.label +
+                           "' references unknown instruction: " + step.instruction_id,
+                       "unknown_instruction"));
         const WorkflowStepInstruction& def = **def_r;
+        const std::string step_detail = " step=" + clip_token(step.instruction_id) +
+                                        " action=" + clip_token(def.plugin) + "." +
+                                        clip_token(def.action);
+
+        // Caller-level authority for the step's own pair, BEFORE any body or targeting work: a
+        // caller who may not run this pair learns nothing about its targeting, and 403 precedes
+        // 400 as on POST /api/command. Without this a refusal the chokepoint would make for the
+        // caller on step N surfaced only AFTER steps 1..N-1 had been sent, as a retryable
+        // "no agents reached".
+        if (auto pair = std::make_pair(def.plugin, def.action); !authorized.contains(pair)) {
+            if (const auto decision = ports.authorize(req.caller, def.plugin, def.action);
+                !decision) {
+                const auto& denial = decision.error();
+                const std::string denial_token(detail::to_string(denial.reason));
+                spdlog::warn("workflow execute: dispatch denied: {}.{} reason={} securable={} "
+                             "caller={}",
+                             ::yuzu::log_token(def.plugin), ::yuzu::log_token(def.action),
+                             denial_token, denial.securable.empty() ? "(none)" : denial.securable,
+                             req.caller.principal.empty()
+                                 ? "(anonymous)"
+                                 : ::yuzu::log_token(req.caller.principal));
+                if (ports.count_dispatch_denied)
+                    ports.count_dispatch_denied(denial_token);
+                // An unclassifiable pair is refused as admit_step refuses it (400), not as a
+                // permission denial.
+                const bool unclassified =
+                    denial.reason == detail::DispatchDenialReason::Unclassified ||
+                    denial.reason == detail::DispatchDenialReason::Ambiguous;
+                deny_audit(unclassified ? "step_unclassified" : "dispatch_denied",
+                           (unclassified ? std::string{} : " denial=" + denial_token) +
+                               step_detail);
+                if (unclassified)
+                    return std::unexpected(
+                        refuse(WorkflowExecuteStatus::kUnclassifiedStep,
+                               refusal_message_for(StepAdmission::kUnclassified, step, def, {}),
+                               "step_unclassified"));
+                const auto text = describe_dispatch_denial(denial.reason, def.plugin, def.action,
+                                                           denial, DenialSurface::kRest);
+                WorkflowExecuteOutcome o =
+                    refuse(WorkflowExecuteStatus::kDispatchDenied,
+                           "workflow step '" + step.label + "' (" + def.plugin + "." + def.action +
+                               "): " + text.message,
+                           "dispatch_denied");
+                o.remediation = text.remediation;
+                if (denial.reason == detail::DispatchDenialReason::ApprovalRequired) {
+                    // The shared wording advises a supervised token's ticket flow, which is false
+                    // here: no workflow transport stamps `approval_provenance`, so no ticket can
+                    // lift the pair's gate.
+                    o.message = "workflow step '" + step.label + "' (" + def.plugin + "." +
+                                def.action +
+                                "): approval required: this action is gated (admin "
+                                "or approval) and a workflow run does not carry an approval for it";
+                    o.remediation =
+                        "this call cannot succeed for this caller and retrying will not help; run "
+                        "it as an administrator, or ask an administrator to run the workflow or to "
+                        "change the step to a non-gated action";
+                }
+                return std::unexpected(std::move(o));
+            }
+            authorized.insert(std::move(pair));
+        }
+
         const auto d = admit_step(def, ports.classify, req.agent_ids, req.caller);
         if (d.verdict == StepAdmission::kAdmitted)
             continue;
         if (d.verdict == StepAdmission::kDestructiveUntargeted ||
             d.verdict == StepAdmission::kDestructiveNoVisibleTarget)
             count_rejected(d.reason);
-        deny_audit(d.reason, " step=" + clip_token(step.instruction_id) + " action=" +
-                                 clip_token(def.plugin) + "." + clip_token(def.action));
-        return refuse(status_for(d.verdict), refusal_message_for(d.verdict, step, def, d),
-                      std::string(d.reason));
+        deny_audit(d.reason, step_detail);
+        return std::unexpected(refuse(status_for(d.verdict),
+                                      refusal_message_for(d.verdict, step, def, d),
+                                      std::string(d.reason)));
     }
+    return WorkflowExecutePlan{.step_count = workflow.steps.size()};
+}
+
+WorkflowExecuteOutcome run_workflow_execute(const WorkflowExecutePorts& ports,
+                                            const WorkflowExecuteRequest& req,
+                                            const WorkflowExecutePlan& plan) {
+    const std::string target_id = clip_token(req.workflow_id);
+    auto deny_audit = [&](std::string_view reason, const std::string& extra) {
+        (void)ports.audit(std::string(kActionExecute), "denied", target_id,
+                          req.audit_context + " reason=" + std::string(reason) + extra);
+    };
+    auto count_rejected = [&](std::string_view reason) {
+        if (ports.count_target_rejected)
+            ports.count_target_rejected(reason);
+    };
 
     // ── 5. the requested row, BEFORE anything is dispatched ──────────────
     if (!ports.audit(std::string(kActionExecute), "requested", target_id,
                      req.audit_context + " agents=" + std::to_string(req.agent_ids.size()) +
-                         " steps=" + std::to_string(workflow.steps.size())))
+                         " steps=" + std::to_string(plan.step_count)))
         return refuse(WorkflowExecuteStatus::kAuditFailed,
                       "audit subsystem unavailable; refusing to dispatch without durable evidence",
                       "audit_unavailable", /*retryable=*/true);
@@ -434,6 +523,14 @@ WorkflowExecuteOutcome apply_workflow_execute(const WorkflowExecutePorts& ports,
             (late_denied ? " late_denied=true" : "") +
             (o.status == WorkflowExecuteStatus::kNoAgentsReached ? " reason=" + o.reason : ""));
     return o;
+}
+
+WorkflowExecuteOutcome apply_workflow_execute(const WorkflowExecutePorts& ports,
+                                              const WorkflowExecuteRequest& req) {
+    auto plan = prepare_workflow_execute(ports, req);
+    if (!plan)
+        return std::move(plan.error());
+    return run_workflow_execute(ports, req, *plan);
 }
 
 } // namespace yuzu::server
