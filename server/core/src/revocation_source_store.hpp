@@ -147,9 +147,6 @@ struct NewRevocationSource {
         std::vector<std::string> confirmed_address_classes;
     };
     std::vector<Url> urls;
-    /// True when classification ran on a STALE discovered NAT64 prefix set (the RFC 7050 refresh
-    /// failed; everything learned earlier was applied). Not stored; recorded in the audit row.
-    bool classified_degraded{false};
     /// `replace` only: refuse (kVersionConflict) unless the stored config_version equals this.
     std::optional<std::int64_t> expected_config_version;
 };

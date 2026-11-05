@@ -34,7 +34,6 @@
 #include "revocation_source_store.hpp"
 
 #include "bounded_resolver.hpp"
-#include "nat64_discovery.hpp"
 #include "oidc_egress_policy.hpp"
 
 #include <nlohmann/json.hpp>
@@ -80,8 +79,6 @@ struct ServiceError {
     std::string message;
     std::string param; ///< kInvalidParams: the parameter the message is about
     std::int64_t existing_id{0};
-    /// kUnavailable only: the honest retry hint in ms; 0 = the transport's default (5000).
-    std::int64_t retry_after_ms{0};
 };
 
 /// The administrator decision both transports act on (see `revocation_source_admin_gate.hpp`,
@@ -124,22 +121,14 @@ struct EgressEnv {
         local_addresses;
     /// NAT64 prefixes (RFC 6052) the operator declared (`--oidc-nat64-prefix`): an IPv6 address
     /// inside one is classified, and compared with this server's own addresses, by the IPv4 address
-    /// embedded in it. The well-known 64:ff9b::/96 and 6to4 2002::/16 are always decoded.
+    /// embedded in it. The well-known 64:ff9b::/96 and 6to4 2002::/16 are always decoded. These
+    /// are the ONLY NAT64 prefixes registration knows: it does no RFC 7050 discovery (the 2b-1b
+    /// fetcher does, and re-classifies every address at fetch time).
     std::vector<::yuzu::server::oidc::egress::Nat64Prefix> nat64_prefixes;
-    /// RFC 7050 discovery of the network's NAT64 prefixes, through the process-wide never-shrink
-    /// cache shared with the OIDC client (nat64_discovery.hpp). Empty function = no discovery.
-    std::function<net::Nat64Discovery(std::chrono::milliseconds budget)> discover_nat64;
     /// Counted once per degrade, with a closed `reason` (own_addresses_unavailable, dns_unavailable, dns_timeout, dns_busy,
-    /// dns_budget_exhausted, validation_busy, nat64_discovery_unavailable, nat64_discovery_stale, nat64_discovery_overflow). Empty = not counted (tests).
+    /// dns_budget_exhausted, validation_busy). Empty = not counted (tests).
     std::function<void(std::string_view reason)> note_degrade;
 };
-
-/// RFC 7050 for the registration check: resolve `ipv4only.arpa` through the bounded resolver
-/// (`lookup` empty = system DNS) into the SHARED discovered-prefix cache `cache`.
-[[nodiscard]] net::Nat64Discovery
-discover_nat64(std::chrono::milliseconds budget, net::LookupFn lookup,
-               net::Nat64DiscoveryCache& cache = net::process_nat64_cache(),
-               std::shared_ptr<net::ResolverPool> pool = {});
 
 /// The production environment. `listen_specs` are the configured listener addresses
 /// ("host", "host:port" or "[v6]:port"; an empty spec is a disabled listener and is skipped);

@@ -2,12 +2,11 @@
 
 /// @file bounded_resolver.hpp
 /// A name lookup with a hard time bound whose state is OWNED BY THE LOOKUP, never by the caller's
-/// stack. Shared by the OIDC egress path today (and any later egress check), so they resolve the same way.
+/// stack. CRL source registration (ADR-0070 R1) is the first consumer; the OIDC egress path may
+/// adopt it in a later change, so that later egress checks resolve the same way.
 ///
-/// WHY NOT httplib's `getaddrinfo_with_timeout`: on glibc it hands a request that lives on the
-/// CALLER's stack to the async resolver, and on timeout it ignores `EAI_NOTCANCELED`, so the
-/// resolver's helper thread later writes into a dead frame (a use-after-free, plus a leak). This
-/// header never does that: the blocking lookup runs on a worker thread that owns a heap-allocated
+/// WHY NOT httplib's `getaddrinfo_with_timeout`: on Linux its wait is not bounded the way this
+/// header's is. Here the blocking lookup runs on a worker thread that owns a heap-allocated
 /// `State` through a `shared_ptr`; the caller waits on a condition variable with a timeout and, on
 /// timeout, simply stops waiting. The worker finishes whenever the resolver returns, converts and
 /// frees the `addrinfo` list itself, and releases the state. Nothing the worker touches belongs to
@@ -23,10 +22,8 @@
 /// The lookup function is injectable (`LookupFn`) so a test can block it behind a latch and prove
 /// the timeout, the cap and the not-found paths deterministically, with no DNS.
 ///
-/// POOLS IN USE: the OIDC host-name check has its own cap-8 pool (oidc_provider.cpp); NAT64
-/// discovery uses its OWN capacity-one pool (`nat64_probe_pool()` in nat64_probe.hpp) so a hung
-/// discovery lookup can never take a host-check slot. The default process-wide pool (cap 16) is for
-/// a consumer that passes none.
+/// POOLS IN USE: CRL source registration uses the default process-wide pool (cap 16), which is
+/// for any consumer that passes none.
 ///
 /// CONTRACT FOR CONSUMERS:
 ///  - POOL OWNERSHIP. Every consumer that passes no pool shares the process pool, so a stuck

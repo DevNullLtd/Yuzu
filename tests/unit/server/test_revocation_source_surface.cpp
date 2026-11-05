@@ -423,20 +423,26 @@ TEST_CASE("revocation source validation: URL syntax", "[revocation_source][pg]")
         CHECK(e.param == "crl_urls[1].url");
         CHECK_THAT(e.message, ContainsSubstring("duplicate url"));
     }
-    // The scheme's default port and a trailing root dot do not make a second URL.
+    // The scheme's default port does not make a second URL: refused as a DUPLICATE, not for
+    // some other reason that happens to name the same parameter.
     for (const auto& [first, second] :
          {std::pair{"https://crl.example.com/a", "https://crl.example.com:443/a"},
-          std::pair{"http://crl.example.com/a", "http://crl.example.com:80/a"},
-          std::pair{"https://crl.example.com/a", "https://crl.example.com./a"}}) {
+          std::pair{"http://crl.example.com/a", "http://crl.example.com:80/a"}}) {
+        INFO(second);
         auto b = rstest::valid_body();
         b["crl_urls"] = json::array({rstest::url_entry(first, {"public"}),
                                      rstest::url_entry(second, {"public"})});
         const auto v = fx.svc.validate_registration(b);
-        if (v.has_value()) {
-            FAIL_CHECK(std::string(second) + " was accepted as a second URL");
-            continue;
-        }
+        REQUIRE_FALSE(v.has_value());
         CHECK(v.error().param == "crl_urls[1].url");
+        CHECK_THAT(v.error().message, ContainsSubstring("duplicate url"));
+    }
+    // A trailing root dot is refused as an invalid host on its own (it never reaches the
+    // duplicate check), so `h.` cannot be registered beside `h` either.
+    {
+        const auto e = refused(fx, with_url("https://crl.example.com./a"));
+        CHECK(e.param == "crl_urls[0].url");
+        CHECK_THAT(e.message, ContainsSubstring("invalid host name"));
     }
     // A non-default port IS a different URL.
     {
@@ -1102,6 +1108,65 @@ TEST_CASE("revocation source MCP: the annotations are truthful and openWorld is 
                    ContainsSubstring("facts only; the only built-in checks are D13's named rules "
                                      "and windows, each shown with its criterion"));
         CHECK((*t).contains("outputSchema"));
+        // Every input property is described (A5), so a dropped description fails here.
+        for (const auto& [prop, schema] : (*t)["inputSchema"]["properties"].items()) {
+            INFO(prop);
+            CHECK(schema.contains("description"));
+        }
+        // The output schema is typed down to its required fields, not just present.
+        const auto& out = (*t)["outputSchema"];
+        CHECK(out["type"] == "object");
+        CHECK_FALSE(out["required"].empty());
+        for (const auto& r : out["required"])
+            CHECK(out["properties"].contains(r.get<std::string>()));
+    }
+    // The bounds and item types the A5 review fixed, asserted on the schema itself.
+    for (const char* name : {kRegister, kUpdate, kRemove, kReset}) {
+        INFO(name);
+        const auto& p = (*find_tool(tools, name))["inputSchema"]["properties"];
+        REQUIRE(p.contains("approval_id"));
+        CHECK(p["approval_id"]["type"] == "string");
+        CHECK(p["approval_id"]["minLength"] == 1);
+        CHECK(p["approval_id"]["maxLength"] == 64);
+    }
+    for (const char* name : {kRegister, kUpdate}) {
+        INFO(name);
+        const auto& sch = (*find_tool(tools, name))["inputSchema"];
+        CHECK(sch["additionalProperties"] == false);
+        const auto& ca = sch["properties"]["ca_certificates"];
+        CHECK(ca["type"] == "array");
+        CHECK(ca["minItems"] == 1);
+        CHECK(ca["maxItems"] == 8);
+        CHECK(ca["items"]["type"] == "string");
+        CHECK(ca["items"]["maxLength"] == 16384);
+        const auto& urls = sch["properties"]["crl_urls"];
+        CHECK(urls["type"] == "array");
+        CHECK(urls["minItems"] == 1);
+        CHECK(urls["maxItems"] == 8);
+        const auto& item = urls["items"];
+        CHECK(item["type"] == "object");
+        CHECK(item["required"] == json::array({"url"}));
+        CHECK(item["additionalProperties"] == false);
+        CHECK(item["properties"]["url"]["type"] == "string");
+        CHECK(item["properties"]["url"]["maxLength"] == 2048);
+        CHECK(item["properties"]["url"].contains("description"));
+        const auto& classes = item["properties"]["confirmed_address_classes"];
+        CHECK(classes["type"] == "array");
+        CHECK(classes["maxItems"] == 5);
+        CHECK(classes["items"]["enum"] == json::array({"public", "private", "carrier-grade-nat",
+                                                       "unique-local", "non-global"}));
+        CHECK(classes.contains("description"));
+    }
+    CHECK((*find_tool(tools, kRegister))["inputSchema"]["required"] ==
+          json::array({"name", "ca_certificates", "crl_urls"}));
+    CHECK((*find_tool(tools, kUpdate))["inputSchema"]["required"] ==
+          json::array({"id", "expected_config_version", "name", "ca_certificates", "crl_urls"}));
+    {
+        const auto& pin = (*find_tool(tools, kReset))["inputSchema"]["properties"]["pin_crl_sha256"];
+        CHECK(pin["type"] == "string");
+        CHECK(pin["minLength"] == 64);
+        CHECK(pin["maxLength"] == 64);
+        CHECK(pin["pattern"] == "^[0-9a-f]{64}$");
     }
     // No OTHER tool in the catalogue became open-world.
     for (const auto& t : tools) {
@@ -1718,116 +1783,6 @@ TEST_CASE("revocation source MCP: a DENY on the grant refuses register and updat
             CHECK(row.result != "attempted");
 }
 
-// ─── RFC 7050: the shared never-shrink cache, and the call-site rules ────────────────────────
-
-namespace {
-namespace net = yuzu::server::net;
-using yuzu::server::oidc::egress::Nat64Prefix;
-
-// 2001:db8:122:344::/96 and 3fff:0:0:1::/96 wrapped around 192.0.0.170 (what a DNS64 returns).
-const std::string kPref1 = "2001:db8:122:344::c000:aa";
-
-net::LookupFn answering(std::vector<std::string> addrs) {
-    return [addrs = std::move(addrs)](const std::string&) -> net::ResolveResult {
-        return {net::ResolveStatus::kOk, addrs};
-    };
-}
-net::LookupFn failing(net::ResolveStatus st = net::ResolveStatus::kTemporary) {
-    return [st](const std::string&) -> net::ResolveResult { return {st, {}}; };
-}
-
-// The environment's discovery bound to a PRIVATE cache and a swappable lookup, so each test owns
-// its cache and can expire it.
-struct DiscoveryRig {
-    net::Nat64DiscoveryCache cache;
-    net::LookupFn lookup;
-    void expire() {
-        std::lock_guard lk(cache.mu);
-        cache.expires = {};
-    }
-    std::function<net::Nat64Discovery(std::chrono::milliseconds)> fn() {
-        return [this](std::chrono::milliseconds b) {
-            return rs::discover_nat64(b, lookup, cache);
-        };
-    }
-};
-} // namespace
-
-TEST_CASE("revocation source: discovered prefixes end to end (shared cache, fail closed, stale audit)",
-          "[revocation_source][resolver][pg]") {
-    auto dns = rstest::default_dns();
-    dns["disc-meta.example.com"] = {"2001:db8:122:344::a9fe:a9fe"}; // Pref64 + 169.254.169.254
-    dns["disc-self.example.com"] = {"2001:db8:122:344::a09:909"};   // Pref64 + the server's IPv4
-    dns["disc-ula.example.com"] = {"fd00:1:2:3::a00:1"};            // a ULA host
-    const std::vector<std::string> all5 = {"public", "private", "carrier-grade-nat", "unique-local",
-                                           "non-global"};
-
-    SECTION("a discovered prefix classifies metadata and the server's own address") {
-        auto rig = std::make_shared<DiscoveryRig>();
-        rig->lookup = answering({kPref1});
-        auto env = rstest::fake_env(dns);
-        env.discover_nat64 = rig->fn();
-        Fx fx(std::move(env));
-        for (const char* h : {"disc-meta.example.com", "disc-self.example.com"}) {
-            INFO(h);
-            CHECK_THAT(refused(fx, with_url(std::string("http://") + h + "/a.crl", all5)).message,
-                       ContainsSubstring("always refused"));
-        }
-    }
-    SECTION("a refresh that fails still applies everything learned, and the audit row says so") {
-        auto rig = std::make_shared<DiscoveryRig>();
-        rig->lookup = answering({kPref1});
-        auto env = rstest::fake_env(dns);
-        env.discover_nat64 = rig->fn();
-        Fx fx(std::move(env));
-        REQUIRE(fx.svc.validate_registration(with_url("http://v6.example.com/a.crl")).has_value());
-        rig->expire();
-        rig->lookup = failing(); // the refresh now fails
-        CHECK_THAT(refused(fx, with_url("http://disc-meta.example.com/a.crl", all5)).message,
-                   ContainsSubstring("always refused")); // metadata behind the OLD prefix still refused
-        const auto ok = fx.svc.validate_registration(with_url("http://v6.example.com/a.crl"));
-        REQUIRE(ok.has_value());
-        CHECK(ok->classified_degraded);
-        CHECK_THAT(rs::audit_detail_config("c", *ok), ContainsSubstring("nat64=stale"));
-    }
-    SECTION("nothing was ever learned and discovery fails: an IPv6 address is a retryable 503") {
-        auto rig = std::make_shared<DiscoveryRig>();
-        rig->lookup = failing();
-        std::vector<std::string> degrades;
-        auto env = rstest::fake_env(dns, {.degrades = &degrades});
-        env.discover_nat64 = rig->fn();
-        Fx fx(std::move(env));
-        fx.admin(false);
-        auto b = rstest::valid_body();
-        b["crl_urls"] = json::array({rstest::url_entry("http://v6.example.com/a.crl", {"public"})});
-        auto r = fx.rest_post(b);
-        REQUIRE(r->status == 503);
-        CHECK(data_of(*r)["error"]["retry_after_ms"].get<std::int64_t>() >= 55000); // the negative cache
-        CHECK(std::ranges::count(degrades, "nat64_discovery_unavailable") == 1);
-        CHECK(fx.store.list()->empty());
-        // An IPv4 destination never needs discovery and still registers.
-        CHECK(fx.rest_post(fx.post_body())->status == 201);
-    }
-    SECTION("a discovered ULA /96 does not turn unique-local into public (no skipped confirmation)") {
-        auto rig = std::make_shared<DiscoveryRig>();
-        // The network advertises fd00:1:2:3::/96 as its NAT64 prefix.
-        rig->lookup = answering({"fd00:1:2:3::c000:aa"});
-        auto env = rstest::fake_env(dns);
-        env.discover_nat64 = rig->fn();
-        Fx fx(std::move(env));
-        // Confirming only `public` is NOT enough: the plain view says unique-local.
-        const auto e = refused(fx, with_url("http://disc-ula.example.com/a.crl", {"public"}));
-        CHECK(e.param == "crl_urls[0].confirmed_address_classes");
-        CHECK_THAT(e.message, ContainsSubstring("unique-local"));
-        // Both classes either view yields, confirmed: accepted and both stored.
-        const auto v = fx.svc.validate_registration(
-            with_url("http://disc-ula.example.com/a.crl", {"public", "private", "unique-local"}));
-        REQUIRE(v.has_value());
-        CHECK(std::ranges::find(v->urls[0].confirmed_address_classes, "unique-local") !=
-              v->urls[0].confirmed_address_classes.end());
-    }
-}
-
 TEST_CASE("revocation source: the service's error classifier maps every store error",
           "[revocation_source][pg]") {
     using K = rs::ServiceError::Kind;
@@ -1899,91 +1854,7 @@ TEST_CASE("RevocationSourceStore: the OpenAPI PUT documents the 409", "[revocati
     CHECK(put.contains("503"));
 }
 
-// ─── round 5: one three-state outcome for every consumer, no cache poisoning, honest retry ───
-
-TEST_CASE("NAT64 cache: NXDOMAIN from one consumer and an answer from another do not flip each other",
-          "[revocation_source][resolver][pg]") {
-    namespace net = yuzu::server::net;
-    DiscoveryRig rig;
-    // The OIDC-side consumer sees NXDOMAIN for ipv4only.arpa: an ANSWER (no DNS64), not a failure.
-    const auto oidc_like = [](std::vector<yuzu::server::oidc::egress::Ipv6>&) {
-        return net::Nat64LookupOutcome::kAnsweredNone;
-    };
-    const auto first = net::discover_nat64_prefixes_cached(oidc_like, rig.cache);
-    CHECK(first.ever_answered);
-    CHECK_FALSE(first.stale);
-    // The registration consumer, with the cache still fresh, sees an answered state (no 503)...
-    rig.lookup = failing(net::ResolveStatus::kNotFound);
-    auto dns = rstest::default_dns();
-    auto env = rstest::fake_env(dns);
-    env.discover_nat64 = rig.fn();
-    Fx fx(std::move(env));
-    auto ok = fx.svc.validate_registration(with_url("http://v6.example.com/a.crl"));
-    REQUIRE(ok.has_value());
-    CHECK_FALSE(ok->classified_degraded); // no false nat64=stale
-    // ...and after expiry, its own NXDOMAIN (kNotFound) is again an answer, not a failure.
-    rig.expire();
-    ok = fx.svc.validate_registration(with_url("http://v6.example.com/a.crl"));
-    REQUIRE(ok.has_value());
-    CHECK_FALSE(ok->classified_degraded);
-    // An interleaved real failure IS stale, and only then.
-    rig.expire();
-    rig.lookup = failing();
-    ok = fx.svc.validate_registration(with_url("http://v6.example.com/a.crl"));
-    REQUIRE(ok.has_value());
-    CHECK(ok->classified_degraded);
-}
-
-TEST_CASE("NAT64 discovery failure: the retry hint matches the negative cache, overflow is loud",
-          "[revocation_source][resolver][pg]") {
-    namespace net = yuzu::server::net;
-    DiscoveryRig rig;
-    rig.lookup = failing();
-    std::vector<std::string> degrades;
-    auto env = rstest::fake_env(rstest::default_dns(), {.degrades = &degrades});
-    env.discover_nat64 = rig.fn();
-    {
-        Fx fx(std::move(env));
-        fx.admin(false);
-        auto b = rstest::valid_body();
-        b["crl_urls"] = json::array({rstest::url_entry("http://v6.example.com/a.crl", {"public"})});
-        auto r = fx.rest_post(b);
-        REQUIRE(r->status == 503);
-        const auto ra = data_of(*r)["error"]["retry_after_ms"].get<std::int64_t>();
-        CHECK(ra >= 55000); // ~ the 60 s negative cache, not a blind 5 s
-        CHECK(ra <= 60000);
-        // MCP carries the same hint.
-        auto m = fx.h.mcp_call_tool_approved(kRegister, b);
-        CHECK(mcp_error_code(*m) == yuzu::server::mcp::kInternalError);
-        CHECK(json::parse(m->body)["error"]["data"]["retry_after_ms"].get<std::int64_t>() >= 55000);
-    }
-    // Overflow: a distinct reason, a 60 s hint, one log transition and a counter of refusals.
-    DiscoveryRig big;
-    std::vector<std::string> many;
-    for (int i = 0; i < 65; ++i) {
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "2001:db8:%x:1::c000:aa", i + 1);
-        many.emplace_back(buf);
-    }
-    big.lookup = answering(many);
-    std::vector<std::string> degrades2;
-    auto env2 = rstest::fake_env(rstest::default_dns(), {.degrades = &degrades2});
-    env2.discover_nat64 = big.fn();
-    Fx fx2(std::move(env2));
-    fx2.admin(false);
-    auto b = rstest::valid_body();
-    b["crl_urls"] = json::array({rstest::url_entry("http://v6.example.com/a.crl", {"public"})});
-    auto r = fx2.rest_post(b);
-    REQUIRE(r->status == 503);
-    CHECK(data_of(*r)["error"]["retry_after_ms"] == 60000);
-    CHECK(std::ranges::count(degrades2, "nat64_discovery_overflow") == 1);
-    (void)fx2.rest_post(b);
-    CHECK(big.cache.stats.overflow_refusals.load() >= 1);
-    // The transition is reported once: the flag stays set until an answer fits.
-    CHECK(big.cache.overflow_logged);
-}
-
-// ─── round 6: one resolver / one mapping, and the outcome-unknown arm ───────────────────────
+// ─── round 6: the outcome-unknown arm ──────────────────────────────────────────────────────
 
 TEST_CASE("RevocationSource: an unknown write outcome is a retryable 503 / -32603 asking for a re-read",
           "[revocation_source][mcp][pg]") {
@@ -2036,7 +1907,7 @@ TEST_CASE("RevocationSource: an unknown write outcome is a retryable 503 / -3260
     CHECK(fx.store.list()->size() == 1);
 }
 
-// ─── round 7: single-flight discovery, and the kind -> status table ─────────────────────────
+// ─── round 7: the kind -> status table ─────────────────────────────────────────────────────
 
 TEST_CASE("RevocationSource: the REST and MCP kind -> status table is locked",
           "[revocation_source][mcp][pg]") {

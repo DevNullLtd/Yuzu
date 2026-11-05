@@ -4522,12 +4522,11 @@ static const ToolDef kTools[] = {
      "registered host, the only outbound reach any tool has. The refusals are exact: the NAT64 "
      "forms (the well-known 64:ff9b::/96 and any prefix the operator declared with "
      "--oidc-nat64-prefix) and 6to4 and IPv4-mapped forms are judged by the IPv4 address they "
-     "embed, using the operator-declared prefixes AND those the network advertises for "
-     "ipv4only.arpa (RFC 7050, a never-shrinking cache shared with the OIDC client; a discovered "
-     "prefix can only tighten a verdict; a failed refresh keeps what was learned and marks the audit "
-     "row nat64=stale). If this server's own addresses cannot be determined, a name lookup times "
-     "out, or the NAT64 prefixes were never learned or overflowed for an IPv6 host, the call fails "
-     "closed with a retryable error (the retry_after_ms hint is the time until the next real lookup: up to 60000 for the NAT64 cases, 5000 when the lookup was inconclusive; an overflow needs a restart, not just a retry) and registers nothing. Audited as "
+     "embed. Declared prefixes only at registration: no RFC 7050 discovery is done, so an address "
+     "behind an undeclared prefix the network advertises is judged as plain IPv6 here and "
+     "re-judged when the source is fetched. If this server's own addresses cannot be determined "
+     "or a name lookup times out, the call fails closed with a retryable error (retry_after_ms "
+     "5000) and registers nothing. Audited as "
      "crypto.revocation_source.register: an attempted row is written first and if it cannot be "
      "stored nothing is changed. Scope: facts only; the only built-in checks are D13's named rules and "
      "windows, each shown with its criterion. Mirrors POST /api/v1/crypto/revocation-sources.",
@@ -11289,12 +11288,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 case RsKind::kUnavailable:
                     break;
                 }
-                // The service's own hint when it has one (a NAT64 discovery failure is cached for
-                // 60 s, an overflow lasts until restart); otherwise the store-fault default.
                 res.set_content(a4_error(kInternalError, e.message, "retry the request",
-                                         /*retry_after_ms=*/e.retry_after_ms > 0
-                                             ? static_cast<long>(e.retry_after_ms)
-                                             : mcp::kMcpStoreFaultRetryMs),
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                 "application/json");
             };
             // Gate: tier, wiring, the empty-tier refusal for a write (#4309 - such a caller has

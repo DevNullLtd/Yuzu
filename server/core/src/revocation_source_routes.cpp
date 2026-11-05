@@ -49,12 +49,11 @@ void set_private_no_store(httplib::Response& res) {
 }
 
 void rest_error(httplib::Response& res, int status, const std::string& message,
-                bool retryable = false, const std::string& remediation = {},
-                std::int64_t retry_after_ms = 0) {
+                bool retryable = false, const std::string& remediation = {}) {
     res.status = status;
     detail::A4ErrorOpts opts;
     if (retryable)
-        opts.retry_after_ms = retry_after_ms > 0 ? retry_after_ms : kRetryAfterMs;
+        opts.retry_after_ms = kRetryAfterMs;
     opts.remediation = remediation;
     res.set_content(detail::a4_error(res, message, opts), "application/json");
 }
@@ -84,7 +83,7 @@ void service_error(httplib::Response& res, const rs::ServiceError& e) {
                        : "remove a source first with DELETE /api/v1/crypto/revocation-sources/{id}");
         return;
     case K::kUnavailable:
-        rest_error(res, 503, e.message, true, {}, e.retry_after_ms);
+        rest_error(res, 503, e.message, true);
         return;
     case K::kOutcomeUnknown:
         rest_error(res, 503, e.message, true,

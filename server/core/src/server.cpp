@@ -218,8 +218,7 @@
 #include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
 #include "crypto_dashboard_layout_store.hpp" // /crypto widgets: per-operator layout (born-on-PG, ADR-0071)
 #include "crypto_layout_erasure.hpp" // ADR-0071: erase-failure reason set + mapping
-#include "nat64_discovery.hpp" // the shared never-shrink NAT64 cache, published from the health tick
-#include "nat64_probe.hpp"     // the cap-1 discovery resolver pool (its in-flight gauge)
+#include "bounded_resolver.hpp" // CRL source registration's resolver pool (its in-flight gauge)
 #include "revocation_source_admin_gate.hpp" // ADR-0070 R1: decide_admin + the service
 #include "revocation_source_routes.hpp"      // ADR-0070 R1: /api/v1/crypto/revocation-sources
 #include "revocation_source_store.hpp"       // ADR-0070 R1: registered CRL sources (born-on-PG)
@@ -670,61 +669,20 @@ public:
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
         metrics_.describe("yuzu_server_revocation_source_degrade_total",
-                          "CRL source registrations refused (or, for nat64_discovery_stale, classified on stale data) "
-                          "for a retryable reason, by reason "
+                          "CRL source registrations refused for a retryable reason, by reason "
                           "(own_addresses_unavailable/dns_unavailable/dns_timeout/dns_busy/"
-                          "dns_budget_exhausted/validation_busy/nat64_discovery_unavailable/"
-                          "nat64_discovery_stale/nat64_discovery_overflow)",
+                          "dns_budget_exhausted/validation_busy)",
                           "counter");
-        metrics_.describe("yuzu_server_nat64_discovery_lookups_total",
-                          "NAT64 prefix discovery (RFC 7050, ipv4only.arpa) lookups by outcome, from "
-                          "every consumer of the shared cache (OIDC egress and CRL source "
-                          "registration): answered/answered_none/failed/inconclusive",
-                          "counter");
-        for (const char* outcome : {"answered", "answered_none", "failed", "inconclusive"})
-            metrics_.counter("yuzu_server_nat64_discovery_lookups_total", {{"outcome", outcome}});
-        metrics_.describe("yuzu_server_nat64_discovery_overflow_refusals_total",
-                          "IPv6 destinations refused because the shared NAT64 prefix set is in "
-                          "overflow (see yuzu_server_nat64_discovery_overflowed)",
-                          "counter");
-        metrics_.counter("yuzu_server_nat64_discovery_overflow_refusals_total");
-        metrics_.describe("yuzu_server_nat64_discovery_overflowed",
-                          "1 while the shared NAT64 prefix set is in overflow (more than 64 "
-                          "prefixes advertised): IPv6 CRL registrations and OIDC IPv6 fetches are "
-                          "refused until restart or an answer that fits; else 0",
-                          "gauge");
-        metrics_.gauge("yuzu_server_nat64_discovery_overflowed").set(0.0);
-        metrics_.describe("yuzu_server_nat64_discovery_resolver_in_flight",
-                          "NAT64 discovery lookups outstanding in its own capacity-one resolver pool, "
-                          "published every 15 s; 1 for longer than a few seconds means a discovery "
-                          "lookup is stuck (a blocking resolver module): discovery is then "
-                          "inconclusive until the server is restarted",
-                          "gauge");
-        metrics_.gauge("yuzu_server_nat64_discovery_resolver_in_flight").set(0.0);
-        metrics_.describe("yuzu_server_nat64_discovery_prefixes",
-                          "NAT64 prefixes learned and held by the shared never-shrink cache",
-                          "gauge");
-        metrics_.gauge("yuzu_server_nat64_discovery_prefixes").set(0.0);
-        metrics_.describe("yuzu_server_oidc_resolver_in_flight",
-                          "Name lookups outstanding in the OIDC host vet's own 8-slot resolver pool "
-                          "(NAT64 discovery has its own: see "
-                          "yuzu_server_nat64_discovery_resolver_in_flight), published every 15 s; a "
-                          "value pinned at 8 means a stuck resolver is refusing every OIDC fetch to a "
-                          "named host (always 0 on Windows, which uses GetAddrInfoExW)",
-                          "gauge");
-        metrics_.gauge("yuzu_server_oidc_resolver_in_flight").set(0.0);
         metrics_.describe("yuzu_server_revocation_source_resolver_in_flight",
                           "Name lookups outstanding in the 16-slot resolver pool CRL source registration "
-                          "resolves hosts in (NAT64 discovery has its own pool: see "
-                          "yuzu_server_nat64_discovery_resolver_in_flight), published every 15 s; a "
-                          "value pinned at 16 means a stuck resolver is refusing every registration",
+                          "resolves hosts in, published every 15 s; a value pinned at 16 means a stuck "
+                          "resolver is refusing every registration",
                           "gauge");
         metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight").set(0.0);
         // Pre-seed every reason so absent() alerting and rate() read 0, not "no series".
         for (const char* reason :
              {"own_addresses_unavailable", "dns_unavailable", "dns_timeout", "dns_busy",
-              "dns_budget_exhausted", "validation_busy", "nat64_discovery_unavailable",
-              "nat64_discovery_stale", "nat64_discovery_overflow"})
+              "dns_budget_exhausted", "validation_busy"})
             metrics_.counter("yuzu_server_revocation_source_degrade_total", {{"reason", reason}});
         metrics_.describe("yuzu_nvd_total_cves", "Distinct CVEs in the local NVD catalog", "gauge");
         metrics_.describe("yuzu_nvd_backfill_complete",
@@ -9565,44 +9523,10 @@ public:
                     metrics_.gauge("yuzu_http_held_open_responses")
                         .set(static_cast<double>(stream_budget_->active()));
                 }
-                // NAT64 discovery cache state and the bounded resolver pools, published from this
-                // 15 s tick (never from a request path), so an in-flight gauge cannot sit stale
-                // after a lookup ends; the cache counters are monotonic deltas.
-                {
-                    namespace net = ::yuzu::server::net;
-                    auto& c = net::process_nat64_cache();
-                    const auto bump = [&](const char* outcome, std::atomic<std::uint64_t>& v,
-                                          std::uint64_t& last) {
-                        const auto now = v.load(std::memory_order_relaxed);
-                        if (now > last)
-                            metrics_.counter("yuzu_server_nat64_discovery_lookups_total",
-                                             {{"outcome", outcome}})
-                                .increment(static_cast<double>(now - last));
-                        last = now;
-                    };
-                    bump("answered", c.stats.answered, nat64_published_[0]);
-                    bump("answered_none", c.stats.answered_none, nat64_published_[1]);
-                    bump("failed", c.stats.failed, nat64_published_[2]);
-                    bump("inconclusive", c.stats.inconclusive, nat64_published_[3]);
-                    const auto ovf = c.stats.overflow_refusals.load(std::memory_order_relaxed);
-                    if (ovf > nat64_published_[4])
-                        metrics_.counter("yuzu_server_nat64_discovery_overflow_refusals_total")
-                            .increment(static_cast<double>(ovf - nat64_published_[4]));
-                    nat64_published_[4] = ovf;
-                    {
-                        std::lock_guard lk(c.mu);
-                        metrics_.gauge("yuzu_server_nat64_discovery_overflowed")
-                            .set(c.overflowed ? 1.0 : 0.0);
-                        metrics_.gauge("yuzu_server_nat64_discovery_prefixes")
-                            .set(static_cast<double>(c.prefixes.size()));
-                    }
-                    metrics_.gauge("yuzu_server_oidc_resolver_in_flight")
-                        .set(static_cast<double>(oidc::OidcProvider::resolver_in_flight()));
-                    metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight")
-                        .set(static_cast<double>(net::process_resolver_in_flight()));
-                    metrics_.gauge("yuzu_server_nat64_discovery_resolver_in_flight")
-                        .set(static_cast<double>(net::nat64_probe_pool()->in_flight.load()));
-                }
+                // The CRL source registration resolver pool, published from this 15 s tick (never
+                // from a request path), so the in-flight gauge cannot sit stale after a lookup ends.
+                metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight")
+                    .set(static_cast<double>(::yuzu::server::net::process_resolver_in_flight()));
                 if (pg_pool_) {
                     metrics_.gauge("yuzu_pg_pool_in_use")
                         .set(static_cast<double>(pg_pool_->in_use()));
@@ -24388,8 +24312,6 @@ private:
     // pg_pool_ so it destructs before the pool; crypto_api_ borrows it (same join-before-reset
     // contract as the stores above).
     std::unique_ptr<CryptoDashboardLayoutStore> crypto_dashboard_layout_store_;
-    // Last-published values of the shared NAT64 cache's monotonic counters (health tick only).
-    std::uint64_t nat64_published_[5]{};
     std::shared_ptr<CryptoApi> crypto_api_;
     std::unique_ptr<CryptoRoutes> crypto_routes_;
     // Registered CRL sources - born-on-Postgres (ADR-0070 R1). Declared after pg_pool_ so they

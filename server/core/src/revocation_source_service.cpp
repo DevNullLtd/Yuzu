@@ -18,8 +18,6 @@
 #include <openssl/x509v3.h>
 
 #include "bounded_resolver.hpp"
-#include "nat64_discovery.hpp"
-#include "nat64_probe.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -392,10 +390,10 @@ std::expected<UrlParts, std::string> parse_url_syntax(const std::string& url) {
 
 // The identity two registered URLs are compared by: the scheme and the authority lowercased (both
 // are case-insensitive, RFC 3986 section 6.2.2.1; userinfo is refused, so the authority is host and
-// port only), the scheme's default port dropped (`https://h:443/a` is `https://h/a`, section 6.2.3),
-// and a trailing root dot dropped from a name host (`h.` is `h`); the path and query are kept byte
-// for byte (they are case-sensitive). Only called on a URL parse_url_syntax accepted, so "://" is
-// present.
+// port only) and the scheme's default port dropped (`https://h:443/a` is `https://h/a`, section
+// 6.2.3); the path and query are kept byte for byte (they are case-sensitive). Only called on a URL
+// parse_url_syntax accepted, so "://" is present and a name host has no trailing root dot (an empty
+// last label fails host validation, so `h.` is refused before this runs).
 std::string url_identity_key(std::string_view url) {
     const auto sep = url.find("://");
     const auto auth_end = url.find_first_of("/?", sep + 3);
@@ -415,8 +413,6 @@ std::string url_identity_key(std::string_view url) {
     }
     if ((scheme == "https" && port == "443") || (scheme == "http" && port == "80"))
         port.clear();
-    if (!host.empty() && host.front() != '[' && host.back() == '.')
-        host.pop_back();
     std::string key = scheme + "://" + host;
     if (!port.empty())
         key += ":" + port;
@@ -487,16 +483,6 @@ struct Ctx {
     std::chrono::steady_clock::time_point deadline{std::chrono::steady_clock::now() + kRequestBudget};
     bool own_loaded{false};
     std::set<Addr> own{};
-    bool discovery_loaded{false};
-    std::vector<eg::Nat64Prefix> discovered{}; ///< RFC 7050, shared never-shrink cache; kept apart from the declared ones
-    bool classified_degraded{false};         ///< a stale (not fresh) discovery set was used: recorded in the audit row
-
-    /// Load the RFC 7050 prefixes (once per request). The cache NEVER shrinks, so a failed refresh
-    /// still yields everything ever learned. Refused (retryable 503) when the set overflowed its
-    /// bound or when no lookup has EVER answered: "unknown" must not read as "no translator", or a
-    /// metadata address behind an unlearned prefix would classify public.
-    std::expected<void, ServiceError> load_discovery();
-
     void degrade(std::string_view reason) const {
         if (env.note_degrade)
             env.note_degrade(reason);
@@ -505,44 +491,6 @@ struct Ctx {
 
 std::unexpected<ServiceError> unavailable(std::string message) {
     return std::unexpected(ServiceError{Kind::kUnavailable, std::move(message), "", 0});
-}
-
-std::expected<void, ServiceError> Ctx::load_discovery() {
-    if (discovery_loaded)
-        return {};
-    discovery_loaded = true;
-    if (!env.discover_nat64)
-        return {};
-    const auto now = std::chrono::steady_clock::now();
-    const auto remaining =
-        now >= deadline ? std::chrono::milliseconds{0}
-                        : std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-    // Clamped to the request's remaining budget, so validation stays inside the documented 15 s.
-    const auto d = env.discover_nat64(std::min<std::chrono::milliseconds>(kPerLookupBudget, remaining));
-    if (d.overflowed) {
-        degrade("nat64_discovery_overflow");
-        // The overflow lasts until the set is replaced by an answer that fits or the server is
-        // restarted: a long retry hint is the honest one.
-        auto e = unavailable("the network advertises more NAT64 prefixes than this server tracks; "
-                             "IPv6 destinations cannot be classified safely until it is restarted "
-                             "or the network stops advertising them");
-        e.error().retry_after_ms = 60000;
-        return e;
-    }
-    if (!d.ever_answered) {
-        degrade("nat64_discovery_unavailable");
-        auto e = unavailable("the network's NAT64 prefixes (RFC 7050) could not be discovered, so an "
-                             "IPv6 address cannot be classified safely; retry");
-        // Matches the negative cache: the next real lookup happens when it expires.
-        e.error().retry_after_ms = static_cast<std::int64_t>(d.retry_after.count());
-        return e;
-    }
-    if (d.stale) {
-        degrade("nat64_discovery_stale"); // refresh failed: classified with everything learned before
-        classified_degraded = true;
-    }
-    discovered = d.prefixes;
-    return {};
 }
 
 // IPv4 addresses an IPv6 address stands for: IPv4-mapped (::ffff:a.b.c.d), NAT64 (the well-known
@@ -642,36 +590,22 @@ host_classes(const UrlParts& parts, Ctx& ctx, const std::string& param) {
         const auto a = parse_addr(t);
         if (!a)
             return invalid(param, "the host resolved to an address that cannot be classified");
-        if (!a->v4)
-            if (auto d = ctx.load_discovery(); !d)
-                return std::unexpected(d.error());
+        // Declared prefixes only: registration does no RFC 7050 discovery, so an address behind a
+        // prefix the network advertises but the operator did not declare is classified as plain
+        // IPv6 here, and the 2b-1b fetcher re-classifies it against discovered prefixes.
         const auto& declared = ctx.env.nat64_prefixes;
-        // Declared and discovered prefixes are judged SEPARATELY, never merged into one list: a
-        // declared prefix is an operator assertion that may relax a class, but a prefix the
-        // NETWORK advertises must not (a discovered ULA /96 would otherwise turn unique-local
-        // into "public" and skip the confirmation). Embedded-IPv4 own-address checks use both.
-        std::vector<eg::Nat64Prefix> both = declared;
-        both.insert(both.end(), ctx.discovered.begin(), ctx.discovered.end());
         bool own = ctx.own.contains(*a);
-        for (const auto& e : embedded_v4(*a, both))
+        for (const auto& e : embedded_v4(*a, declared))
             own = own || ctx.own.contains(e);
         if (own)
             return invalid(param, "the host resolves to an address this server is bound to or "
                                   "listening on; that is always refused");
-        std::vector<eg::AddressClass> yielded;
-        if (a->v4) {
-            yielded.push_back(classify_addr(*a));
-        } else {
-            yielded.push_back(eg::classify_ipv6(a->b, std::span<const eg::Nat64Prefix>(declared)));
-            yielded.push_back(
-                eg::classify_ipv6(a->b, std::span<const eg::Nat64Prefix>(ctx.discovered)));
-        }
-        for (const auto c : yielded) {
-            if (c == eg::AddressClass::Loopback || eg::detail::never_allowed(c))
-                return invalid(param, std::string("the host resolves to a ") + eg::class_name(c) +
-                                          " address; that class is always refused");
-            classes.insert(eg::class_name(c)); // every class EITHER view yields must be confirmed
-        }
+        const auto c = a->v4 ? classify_addr(*a)
+                             : eg::classify_ipv6(a->b, std::span<const eg::Nat64Prefix>(declared));
+        if (c == eg::AddressClass::Loopback || eg::detail::never_allowed(c))
+            return invalid(param, std::string("the host resolves to a ") + eg::class_name(c) +
+                                      " address; that class is always refused");
+        classes.insert(eg::class_name(c));
     }
     return classes;
 }
@@ -840,26 +774,6 @@ bool is_wildcard(const std::string& host) { return host.empty() || host == "0.0.
 
 } // namespace
 
-net::Nat64Discovery discover_nat64(std::chrono::milliseconds budget, net::LookupFn lookup,
-                                   net::Nat64DiscoveryCache& cache,
-                                   std::shared_ptr<net::ResolverPool> pool) {
-    if (!pool)
-        pool = net::nat64_probe_pool(); // the cap-1 discovery pool, shared with the OIDC probe
-    // RFC 7050 through the ONE shared cache (nat64_discovery.hpp), which the OIDC client also
-    // fills and reads. This function only supplies the lookup (ipv4only.arpa through the bounded
-    // resolver) and maps its result to the shared four-state outcome. A resolver "not found" is an
-    // ANSWER (no DNS64 here, a normal network), exactly as the OIDC client now treats NXDOMAIN.
-    // A busy pool, or a timeout under a budget CLAMPED below a full lookup, is inconclusive: this
-    // call fails, but nothing is written to the cache another consumer reads.
-    const bool clamped = budget < kPerLookupBudget;
-    return net::discover_nat64_prefixes_cached(
-        [&](std::vector<eg::Ipv6>& out) {
-            const auto r = net::bounded_resolve(net::kNat64ProbeName, budget, lookup, pool);
-            return net::nat64_outcome_from_resolve(r, clamped, out); // the ONE mapping, shared with OIDC
-        },
-        cache, budget);
-}
-
 EgressEnv make_system_egress_env(std::vector<std::string> listen_specs,
                                  std::vector<eg::Nat64Prefix> nat64_prefixes) {
     EgressEnv env;
@@ -867,9 +781,6 @@ EgressEnv make_system_egress_env(std::vector<std::string> listen_specs,
         return system_resolve(host, budget);
     };
     env.nat64_prefixes = std::move(nat64_prefixes);
-    env.discover_nat64 = [](std::chrono::milliseconds budget) {
-        return discover_nat64(budget, {}, net::process_nat64_cache());
-    };
     env.local_addresses = [specs = std::move(listen_specs)](std::chrono::milliseconds budget)
         -> std::optional<std::vector<std::string>> {
         const auto until = std::chrono::steady_clock::now() + budget;
@@ -1048,7 +959,6 @@ RevocationSourceService::validate_registration(const nlohmann::json& body, BodyM
             return invalid("crl_urls[" + std::to_string(i) + "].url", "duplicate url");
         out.urls.push_back(std::move(*u));
     }
-    out.classified_degraded = ctx.classified_degraded;
     return out;
 }
 
@@ -1334,8 +1244,6 @@ std::string audit_detail_config(std::string_view cid, const NewRevocationSource&
             out += (c ? "+" : "") + ::yuzu::log_token(n.urls[i].confirmed_address_classes[c]);
         out += ']';
     }
-    if (n.classified_degraded)
-        out += " nat64=stale"; // classification used the last learned prefixes: the refresh failed
     if (n.expected_config_version)
         out += " expected_config_version=" + std::to_string(*n.expected_config_version);
     return out;
