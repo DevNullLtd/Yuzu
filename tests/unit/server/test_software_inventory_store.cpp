@@ -2218,6 +2218,45 @@ TEST_CASE("catalogue rollup: origin labels are not publishers and never beat a d
     CHECK(pub["curl"] == "via:brew");    // no vendor anywhere: the label is shown
 }
 
+TEST_CASE("catalogue search matches the displayed representative publisher on the host and fleet paths",
+          "[pg][software_inventory][vendor]") {
+    SWINV_SHARED(store, pool);
+    // One device carries wget through TWO rows: a declared vendor and an origin label. The label
+    // sorts after the capitalised vendor, so a plain max(publisher) would show (and search) the
+    // label; the displayed publisher is the vendor, and a search for the vendor must find it.
+    put(store, "h1",
+        Rows{ent("wget", "1.24", "GNU Project", "pkg", "deb", kSrcApps),
+             ent("wget", "1.24", "via:brew", "pkg", "brew", kSrcPkg)});
+    put(store, "h2", Rows{ent("curl", "8.0", "via:brew", "pkg", "brew", kSrcPkg)});
+    REQUIRE(store.refresh_catalog_rollup());
+
+    const auto names = [&](SoftwareCatalogQuery q) {
+        const auto rows = store.software_catalog(q);
+        REQUIRE(rows.has_value());
+        std::set<std::string> out;
+        for (const auto& r : *rows)
+            out.insert(r.name);
+        return out;
+    };
+    for (const std::string agent : {"h1", ""}) { // host path, then fleet path
+        INFO("agent_id=" << agent);
+        SoftwareCatalogQuery q;
+        q.agent_id = agent;
+        q.q = "GNU";
+        CHECK(names(q) == std::set<std::string>{"wget"}); // the declared vendor is searchable
+        q.q = "via:";
+        // the label is searchable only where it is what the title shows
+        CHECK(names(q) == (agent.empty() ? std::set<std::string>{"curl"} : std::set<std::string>{}));
+    }
+    // ...and the shown publisher is the vendor on the host path too.
+    SoftwareCatalogQuery hq;
+    hq.agent_id = "h1";
+    const auto host = store.software_catalog(hq);
+    REQUIRE(host.has_value());
+    REQUIRE(host->size() == 1);
+    CHECK((*host)[0].publisher == "GNU Project");
+}
+
 TEST_CASE("refresh_catalog_rollup leaves an over-wide triple out of title_triples and still succeeds",
           "[pg][software_inventory]") {
     SWINV_SHARED(store, pool);

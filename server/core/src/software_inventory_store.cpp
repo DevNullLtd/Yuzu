@@ -712,13 +712,21 @@ std::string distinct_list(std::string_view col) {
            " <> ''), '')";
 }
 
+// SQL predicate fragment: `col` is an origin label (`via:<ecosystem>`, kOriginLabelPrefix). The
+// prefix carries no LIKE metacharacter, so it needs no escape.
+std::string is_origin_label(std::string_view col) {
+    static_assert(kOriginLabelPrefix.find_first_of("%_\\") == std::string_view::npos);
+    return std::string(col) + " LIKE '" + std::string(kOriginLabelPrefix) + "%'";
+}
+
 // The representative publisher of a group: a declared vendor over an origin label
 // (`via:<ecosystem>`, product_normalize.hpp kOriginLabelPrefix), falling back to the plain max
 // (a label, or '') when no row of the group has a vendor. Plain max() would pick `via:` over
-// any capitalised vendor, since lowercase sorts after uppercase.
+// any capitalised vendor, since lowercase sorts after uppercase. The display column AND the
+// catalogue `q` publisher arm both use this expression, so a search finds what is shown.
 std::string representative_publisher(std::string_view col) {
     const std::string c(col);
-    return "coalesce(nullif(max(CASE WHEN " + c + " NOT LIKE 'via:%' THEN " + c +
+    return "coalesce(nullif(max(CASE WHEN NOT (" + is_origin_label(c) + ") THEN " + c +
            " END), ''), max(" + c + "))";
 }
 
@@ -2029,7 +2037,8 @@ std::string catalogue_predicate(const SoftwareCatalogQuery& q, bool host,
         sql += " AND count(DISTINCT i.version) >= " + bind(std::to_string(versions_min)) +
                "::bigint";
     if (!term.empty())
-        sql += q_arms(bind(std::string(term)), "i.name", "max(i.publisher)", eco_list, src_list);
+        sql += q_arms(bind(std::string(term)), "i.name", representative_publisher("i.publisher"),
+                      eco_list, src_list);
     return sql;
 }
 } // namespace
@@ -2510,12 +2519,11 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
         // subselect: a hash aggregate, about 16x faster than count(DISTINCT) at 1.8M rows).
         if (abort_requested())
             return false;
-        pg::PgResult pubs = pg::exec_params(
-            c,
+        const std::string pubs_sql =
             "SELECT count(*) FROM (SELECT publisher FROM "
             "software_inventory_store.installed_software WHERE publisher <> '' "
-            "AND publisher NOT LIKE 'via:%' GROUP BY publisher) p",
-            std::vector<std::string>{});
+            "AND NOT (" + is_origin_label("publisher") + ") GROUP BY publisher) p";
+        pg::PgResult pubs = pg::exec_params(c, pubs_sql.c_str(), std::vector<std::string>{});
         if (pubs.status() != PGRES_TUPLES_OK || PQntuples(pubs.get()) != 1)
             return failed("KPI publisher count", pubs);
 
