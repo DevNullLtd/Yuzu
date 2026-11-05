@@ -21,8 +21,9 @@
 # F3-2r = the spike's F3 on two replicas: in the victim gateway's network namespace DROP tcp traffic
 # to the upstream VIP (HAProxy, :50055) ONLY. The agent edge (:50051) and the management plane (:50063)
 # stay up, so a command can still reach the agent and its response can return on the same SendCommand
-# stream. Probes (os_info.os_name, read-only) go through BOTH replicas at -30 s (control) and +60,
-# +120, +300, +420 s, then every 10 s after the path returns. Faults are injected from a sidecar that
+# stream. Probes (os_info.os_name, read-only) go through BOTH replicas in a control round that immediately
+# precedes the fault, then at +60, +120, +300, +420 s, then every ~5 s after the path returns until every clean
+# agent is dispatchable through both replicas. Faults are injected from a sidecar that
 # joins the node's network namespace (no host root needed) and are classified by a packet capture
 # taken IN the victim gateway's namespace.
 #
@@ -240,6 +241,9 @@ cmd_restore() {
 
 cmd_down() {
     load_state
+    # `down -v` destroys the containers and their logs: keep them in the state dir first
+    mkdir -p "$STATE/down-logs"
+    for c in $(compose ps -a --format '{{.Name}}' 2>/dev/null | grep -v -- '-agent-'); do docker logs "$c" > "$STATE/down-logs/$c.log" 2>&1; done
     if compose down -v --remove-orphans; then
         rm -f "$STATE_ROOT/current"; ok "rig removed (state kept in $STATE)"
     else
@@ -320,13 +324,14 @@ settle_fleet() {
 
 RUN_ACTIVE=""
 RUN_FINISHED=0
+FAULT_INJECTED=0   # set only by the process that injected a fault; the EXIT trap never flushes a fault it did not inject
 scenario_cleanup() {
     [ -n "$RUN_ACTIVE" ] && sampler_stop "$RUN_ACTIVE"
     # an interrupted run is marked, so that no later export summarises it as if it had completed
     [ -n "$RUN_ACTIVE" ] && [ "$RUN_FINISHED" -ne 1 ] && [ ! -e "$RUN_ACTIVE/INVALID" ] && echo "interrupted before the run completed" > "$RUN_ACTIVE/INVALID"
     docker rm -f "spike-2r-cap-$$" >/dev/null 2>&1
-    # never leave a fault behind
-    [ -n "${STATE:-}" ] && flush_faults >/dev/null 2>&1
+    # never leave a fault THIS process injected behind (a process that never injected one touches nothing)
+    [ "$FAULT_INJECTED" -eq 1 ] && [ -n "${STATE:-}" ] && flush_faults >/dev/null 2>&1
     return 0
 }
 
@@ -345,7 +350,7 @@ cmd_scenario() {
         *) die "scenario: unknown arg $1";; esac; done
     case "$id" in NOFAULT|F3-2r) ;; *) die "usage: scenario NOFAULT|F3-2r [--victim gateway-N] [--sample K] [--window S] [--recovery S]";; esac
     for v in "$window" "$sample" "$recovery"; do
-        case "$v" in ''|*[!0-9]*) die "scenario: --window, --sample and --recovery must be non-negative integers (got '$v')";; esac
+        case "$v" in ''|*[!0-9]*|0[0-9]*) die "scenario: --window, --sample and --recovery must be plain non-negative integers without a leading zero (got '$v')";; esac
     done
     [ "$window" -ge 60 ] && [ "$sample" -ge 1 ] || die "scenario: --window must be at least 60 and --sample at least 1"
     if [ -n "$victim_c" ]; then
@@ -395,7 +400,7 @@ cmd_scenario() {
     local frc=0
     case "$id" in
         NOFAULT) note "no fault injected";;
-        F3-2r)   netfault "$(cname "$vc")" "iptables -I OUTPUT -p tcp -d $HAPROXY_IP --dport 50055 -j DROP" || frc=$?;;
+        F3-2r)   FAULT_INJECTED=1; netfault "$(cname "$vc")" "iptables -I OUTPUT -p tcp -d $HAPROXY_IP --dport 50055 -j DROP" || frc=$?;;
     esac
     if [ "$frc" -ne 0 ]; then
         fail "fault $id was NOT injected (exit $frc): this run is INVALID and must not be used"; echo "fault $id exited $frc" > "$run/INVALID"
@@ -410,7 +415,7 @@ cmd_scenario() {
     local rel=$(( ($(ms) - t0) / 1000 )); [ "$rel" -lt "$window" ] && sleep $(( window - rel ))
 
     if [ "$id" = F3-2r ] && [ "$recovery" -gt 0 ]; then
-        say "undoing the fault; recovery probes every 10 s for up to ${recovery}s"
+        say "undoing the fault; recovery probes about every 5 s for up to ${recovery}s"
         local u0; u0=$(ms); echo "$u0" > "$run/undo_ms"
         if ! flush_faults; then echo "undo failed" > "$run/INVALID"; fail "fault rules could not be removed"; else
             while [ $(( ($(ms) - u0) / 1000 )) -lt "$recovery" ]; do
@@ -431,17 +436,30 @@ cmd_scenario() {
     for n in "${GATEWAYS[@]}"; do docker logs --since "$since" "$(cname "$n")" > "$run/gwlog-$n.txt" 2>&1; done
     docker logs --since "$since" "$(cname server)"   > "$run/serverlog-1.txt" 2>&1
     docker logs --since "$since" "$(cname server-2)" > "$run/serverlog-2.txt" 2>&1
+    # the registration lines of every sampled agent on BOTH replicas, from the full container logs (these are
+    # destroyed by `down -v`, and the first-enrolment pair behind the stale cohort is in no windowed log)
+    while IFS=, read -r aid _; do
+        for r in server server-2; do
+            docker logs "$(cname "$r")" 2>&1 | grep -F "$aid" | sed "s/^/$r: /"
+        done
+    done < "$run/sample.txt" > "$run/registrations.txt"
     python3 -I "$CLIENT" analyse --run "$run"
-    RUN_FINISHED=1
+    if [ "$FAILS" -eq 0 ]; then
+        : > "$run/COMPLETE"; RUN_FINISHED=1
+    else
+        echo "the run finished with $FAILS failure(s); see the log" > "$run/INVALID"; RUN_FINISHED=1
+    fi
 }
 
 # One command at a time per rig: a second scenario, a `down` or a `scale` against a rig that is mid-run would
 # invalidate it without a trace. The lock is held on fd 9 for the life of the command; the sampler and the other
 # background children close it (`exec 9>&-`) so an orphan can never block the next command.
 take_lock() {
-    mkdir -p "$STATE_ROOT" && chmod 700 "$STATE_ROOT"
-    exec 9>"$STATE_ROOT/.rig.lock" || die "cannot open $STATE_ROOT/.rig.lock"
-    flock -n 9 || die "another command already holds the rig lock ($STATE_ROOT/.rig.lock)"
+    # keyed to the PROJECT, not to a state root: the project name, the subnet and the containers are global, so a
+    # second command with another $TWOREP_STATE_ROOT must be refused too (and never get to flush a live run's fault)
+    local lock="${TMPDIR:-/tmp}/yuzu-ws13-7082-$PROJECT.lock"
+    exec 9>"$lock" || die "cannot open $lock"
+    flock -n 9 || die "another command already holds the rig lock ($lock)"
 }
 
 main() {

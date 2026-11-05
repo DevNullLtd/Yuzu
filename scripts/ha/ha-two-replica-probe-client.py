@@ -106,6 +106,41 @@ def classify_cohorts(rows):
     return sorted(bad)
 
 
+def run_validity(rd, rows):
+    """Reasons a run may NOT enter the trigger tally. Validity needs POSITIVE evidence: every expected cell must
+    exist. A run with no control rows, a missing replica or round, an empty probes file, or any rig error is
+    never reported as valid just because nothing in it failed."""
+    why = []
+    if os.path.exists(os.path.join(rd, "INVALID")):
+        why.append("INVALID marker: " + open(os.path.join(rd, "INVALID")).read().strip())
+    if not rows:
+        return why + ["no probe rows"]
+    meta = open(os.path.join(rd, "meta.txt")).read() if os.path.exists(os.path.join(rd, "meta.txt")) else ""
+    m = dict(x.split("=", 1) for x in meta.split() if "=" in x)
+    try:
+        window = int(m.get("window", "0"))
+    except ValueError:
+        window = 0
+    sample = read_sample(rd, os.path.join(rd, "sample.txt"))
+    clean = [x[0] for x in sample if x[1] == "clean"]
+    if not clean:
+        return why + ["no clean-cohort agents in the sample"]
+    expected = ["control"] + ["+%ds" % t for t in (60, 120, 300, 420) if t < window]
+    have = {(r["label"], r["replica"], r["surface"], r["agent_id"]) for r in rows if r.get("arm") == "ids"}
+    missing = [(lab, rep, sf, a) for lab in expected for rep in (1, 2) for sf in ("v1", "legacy") for a in clean
+               if (lab, rep, sf, a) not in have]
+    if missing:
+        why.append("%d expected probe cells have no row (first: round %s, replica %d, surface %s)" % (
+            len(missing), missing[0][0], missing[0][1], missing[0][2]))
+    errs = sum(1 for r in rows if r.get("final_outcome", r.get("outcome")) == "rig_error")
+    if errs:
+        why.append("%d rig-error rows (not a dispatch result)" % errs)
+    bad = classify_cohorts([dict(r) for r in rows])
+    if bad and len(bad) == len(clean):
+        why.append("every clean agent's control failed")
+    return why
+
+
 def median(values):
     v = sorted(values)
     n = len(v)
@@ -503,9 +538,11 @@ def cmd_analyse(a):
         lines += ["**INVALID RUN: %s**" % open(inv).read().strip(), ""]
     # control validity per clean agent: delivered through BOTH replicas, id arm, before the fault
     lines += ["control (clean cohort, id arm, both replicas, both surfaces): %s" % (
-        "ALL DELIVERED" if not inconclusive else
+        ("NO CONTROL ROWS" if not any(r["label"] == "control" for r in rows) else "ALL DELIVERED") if not inconclusive else
         "FAILED for %d agent(s) (%s): they are INCONCLUSIVE for the whole run (own table below), never a pass and never a refusal" % (
             len(inconclusive), ", ".join(x[:8] for x in inconclusive))), ""]
+    reasons = run_validity(a.run, rows)
+    lines += ["run validity (positive evidence required): %s" % ("VALID" if not reasons else "**NOT VALID for the trigger tally: " + "; ".join(reasons) + "**"), ""]
     if any(r["cohort_eff"] == "unknown" for r in rows):
         lines += ["**%d probe rows carry no cohort tag (an early run): reported as cohort `unknown`, never as clean.**" % sum(
             1 for r in rows if r["cohort_eff"] == "unknown"), ""]
@@ -563,8 +600,8 @@ def cmd_export(a):
         if missing:
             sys.exit("export: no such run(s): %s" % ", ".join(sorted(missing)))
         runs = [x for x in runs if os.path.basename(os.path.dirname(x)) in want]
-    with open(os.path.join(a.out, "probe-summary.csv"), "w", newline="") as f, \
-            open(os.path.join(a.out, "run-timeline.csv"), "w", newline="") as g:
+    tmp_f, tmp_g = [os.path.join(a.out, n + ".tmp.%d" % os.getpid()) for n in ("probe-summary.csv", "run-timeline.csv")]
+    with open(tmp_f, "w", newline="") as f, open(tmp_g, "w", newline="") as g:
         w = csv.writer(f, lineterminator="\n")
         w.writerow(["run", "scenario", "victim", "holder_replica", "round", "cohort", "probed_replica", "role", "arm",
                     "delivered", "refused", "server_synthesised", "accepted_no_result", "timeout", "invalid", "rig_error",
@@ -574,7 +611,7 @@ def cmd_export(a):
                     "nonroutable_n", "nonroutable_min_s", "nonroutable_median_s", "nonroutable_max_s",
                     "unarmed_n", "unarmed_min_s", "unarmed_median_s", "unarmed_max_s",
                     "routable_after_undo_n", "routable_after_undo_min_s", "routable_after_undo_median_s",
-                    "routable_after_undo_max_s", "inconclusive_agents", "valid", "invalid_reason", "probes_sha256"])
+                    "routable_after_undo_max_s", "inconclusive_agents", "complete_marker", "valid", "invalid_reason", "probes_sha256"])
         for pj in runs:
             rd = os.path.dirname(pj)
             run = os.path.basename(rd)
@@ -587,6 +624,7 @@ def cmd_export(a):
                 print("skipping %s: probes carry no cohort tag" % run)
                 continue
             inconclusive = classify_cohorts(rows)
+            vreasons = run_validity(rd, rows)
             for r in rows:
                 r.setdefault("reason", "")
             holders = sorted({r.get("holder", "") for r in rows if r.get("holder")})
@@ -621,9 +659,11 @@ def cmd_export(a):
                         *st(tl.get("first_nonroutable_s")), *st(tl.get("first_unarmed_s")),
                         *st(tl.get("first_routable_after_undo_s")),
                         len(inconclusive),
-                        "no" if os.path.exists(os.path.join(rd, "INVALID")) else "yes",
-                        open(os.path.join(rd, "INVALID")).read().strip() if os.path.exists(os.path.join(rd, "INVALID")) else "",
+                        "yes" if os.path.exists(os.path.join(rd, "COMPLETE")) else "no (run predates the marker or did not finish)",
+                        "yes" if not vreasons else "no", "; ".join(vreasons),
                         hashlib.sha256(open(pj, "rb").read()).hexdigest()])
+    os.replace(tmp_f, os.path.join(a.out, "probe-summary.csv"))
+    os.replace(tmp_g, os.path.join(a.out, "run-timeline.csv"))
     print("exported %d runs to %s" % (len(runs), a.out))
 
 

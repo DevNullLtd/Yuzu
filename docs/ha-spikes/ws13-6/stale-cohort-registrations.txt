@@ -1,0 +1,84 @@
+# first-registration lines of the 8 stale-cohort agents, from the full container logs of both replicas (replica 1 = server, replica 2 = server-2), captured before the rig was removed
+## run-F3-2r-162443 agent 14e0c219-5eb4-4e27-9dcb-c83941099e3e
+server: [2026-11-05 16:24:19.157] [info] [6898] [gateway] Agent 14e0c219-5eb4-4e27-9dcb-c83941099e3e re-registering (already enrolled)
+server: [2026-11-05 16:24:19.158] [info] [6898] [gateway] ProxyRegister succeeded: agent=14e0c219-5eb4-4e27-9dcb-c83941099e3e, session=gw-session-068261c0677757c74a4be2de56295f96
+server: [2026-11-05 16:24:19.160] [info] [6898] [gateway] Agent 14e0c219-5eb4-4e27-9dcb-c83941099e3e stream CONNECTED at gateway node 'yuzu_gw@10.77.12.11' (1 wire capability)
+server: [2026-11-05 16:39:38.386] [info] [8272] [gateway] Agent 14e0c219-5eb4-4e27-9dcb-c83941099e3e re-registering (already enrolled)
+server: [2026-11-05 16:39:38.387] [info] [8272] [gateway] ProxyRegister succeeded: agent=14e0c219-5eb4-4e27-9dcb-c83941099e3e, session=gw-session-068261c0677757c74a4be2de56295f96
+server: [2026-11-05 16:39:38.389] [info] [8275] [gateway] Agent 14e0c219-5eb4-4e27-9dcb-c83941099e3e stream CONNECTED at gateway node 'yuzu_gw@10.77.12.11' (1 wire capability)
+server-2: [2026-11-05 16:24:19.143] [info] [6366] [gateway] Agent 14e0c219-5eb4-4e27-9dcb-c83941099e3e auto-enrolled via enrollment token id=b2da75e1 (219/100000)
+server-2: [2026-11-05 16:24:19.148] [info] [6366] [gateway] Issued per-agent client cert for 14e0c219-5eb4-4e27-9dcb-c83941099e3e
+server-2: [2026-11-05 16:24:19.148] [info] [6366] [gateway] ProxyRegister succeeded: agent=14e0c219-5eb4-4e27-9dcb-c83941099e3e, session=gw-session-ac7dd93033a1274e2cf9e2f6306a79c4
+## run-F3-2r-162443 agent 3faa0b9b-ffaf-4b1d-a5a8-c060564b1082
+server: [2026-11-05 16:23:23.357] [info] [6898] [gateway] Agent 3faa0b9b-ffaf-4b1d-a5a8-c060564b1082 re-registering (already enrolled)
+server: [2026-11-05 16:23:23.358] [info] [6898] [gateway] ProxyRegister succeeded: agent=3faa0b9b-ffaf-4b1d-a5a8-c060564b1082, session=gw-session-6e2ccece776a76e1f645da7404b0b521
+server: [2026-11-05 16:23:23.361] [info] [6898] [gateway] Agent 3faa0b9b-ffaf-4b1d-a5a8-c060564b1082 stream CONNECTED at gateway node 'yuzu_gw@10.77.12.11' (1 wire capability)
+server: [2026-11-05 16:39:38.385] [info] [8269] [gateway] Agent 3faa0b9b-ffaf-4b1d-a5a8-c060564b1082 re-registering (already enrolled)
+server: [2026-11-05 16:39:38.386] [info] [8269] [gateway] ProxyRegister succeeded: agent=3faa0b9b-ffaf-4b1d-a5a8-c060564b1082, session=gw-session-6e2ccece776a76e1f645da7404b0b521
+server: [2026-11-05 16:39:38.388] [info] [8274] [gateway] Agent 3faa0b9b-ffaf-4b1d-a5a8-c060564b1082 stream CONNECTED at gateway node 'yuzu_gw@10.77.12.11' (1 wire capability)
+server-2: [2026-11-05 16:23:23.344] [info] [6216] [gateway] Agent 3faa0b9b-ffaf-4b1d-a5a8-c060564b1082 auto-enrolled via enrollment token id=b2da75e1 (199/100000)
+server-2: [2026-11-05 16:23:23.348] [info] [6216] [gateway] Issued per-agent client cert for 3faa0b9b-ffaf-4b1d-a5a8-c060564b1082
+server-2: [2026-11-05 16:23:23.348] [info] [6216] [gateway] ProxyRegister succeeded: agent=3faa0b9b-ffaf-4b1d-a5a8-c060564b1082, session=gw-session-1032d67a6090e42bac7362b54bce1c32
+## run-F3-2r-164225 agent 38b08ca0-1f11-4700-95d8-ee3ffb43f1e5
+server: [2026-11-05 16:41:49.901] [info] [8391] [gateway] Agent 38b08ca0-1f11-4700-95d8-ee3ffb43f1e5 auto-enrolled via enrollment token id=b2da75e1 (275/100000)
+server: [2026-11-05 16:41:49.906] [info] [8391] [gateway] Issued per-agent client cert for 38b08ca0-1f11-4700-95d8-ee3ffb43f1e5
+server: [2026-11-05 16:41:49.906] [info] [8391] [gateway] ProxyRegister succeeded: agent=38b08ca0-1f11-4700-95d8-ee3ffb43f1e5, session=gw-session-a1caa2253ac019c2566c044707be584d
+server: [2026-11-05 16:50:50.832] [info] [9165] [gateway] Agent 38b08ca0-1f11-4700-95d8-ee3ffb43f1e5 re-registering (already enrolled)
+server: [2026-11-05 16:50:50.834] [info] [9165] [gateway] ProxyRegister succeeded: agent=38b08ca0-1f11-4700-95d8-ee3ffb43f1e5, session=gw-session-fa94cafea6daa61f668cb22192c94c68
+server: [2026-11-05 16:50:50.837] [info] [9172] [gateway] Agent 38b08ca0-1f11-4700-95d8-ee3ffb43f1e5 stream CONNECTED at gateway node 'yuzu_gw@10.77.12.12' (1 wire capability)
+server-2: [2026-11-05 16:41:49.915] [info] [7737] [gateway] Agent 38b08ca0-1f11-4700-95d8-ee3ffb43f1e5 re-registering (already enrolled)
+server-2: [2026-11-05 16:41:49.916] [info] [7737] [gateway] ProxyRegister succeeded: agent=38b08ca0-1f11-4700-95d8-ee3ffb43f1e5, session=gw-session-fa94cafea6daa61f668cb22192c94c68
+server-2: [2026-11-05 16:41:49.920] [info] [7737] [gateway] Agent 38b08ca0-1f11-4700-95d8-ee3ffb43f1e5 stream CONNECTED at gateway node 'yuzu_gw@10.77.12.12' (1 wire capability)
+## run-F3-2r-164225 agent 744bf928-a65e-489b-8e47-86769e1011e4
+server: [2026-11-05 16:39:51.452] [info] [8277] [gateway] Agent 744bf928-a65e-489b-8e47-86769e1011e4 auto-enrolled via enrollment token id=b2da75e1 (234/100000)
+server: [2026-11-05 16:39:51.458] [info] [8277] [gateway] Issued per-agent client cert for 744bf928-a65e-489b-8e47-86769e1011e4
+server: [2026-11-05 16:39:51.458] [info] [8277] [gateway] ProxyRegister succeeded: agent=744bf928-a65e-489b-8e47-86769e1011e4, session=gw-session-d28f8c5e7722cd358121294eefbf450d
+server: [2026-11-05 16:50:50.831] [info] [9159] [gateway] Agent 744bf928-a65e-489b-8e47-86769e1011e4 re-registering (already enrolled)
+server: [2026-11-05 16:50:50.834] [info] [9159] [gateway] ProxyRegister succeeded: agent=744bf928-a65e-489b-8e47-86769e1011e4, session=gw-session-dd50357af2c4178e371ac26f32efec5b
+server: [2026-11-05 16:50:50.837] [info] [9152] [gateway] Agent 744bf928-a65e-489b-8e47-86769e1011e4 stream CONNECTED at gateway node 'yuzu_gw@10.77.12.12' (1 wire capability)
+server-2: [2026-11-05 16:39:51.468] [info] [7549] [gateway] Agent 744bf928-a65e-489b-8e47-86769e1011e4 re-registering (already enrolled)
+server-2: [2026-11-05 16:39:51.469] [info] [7549] [gateway] ProxyRegister succeeded: agent=744bf928-a65e-489b-8e47-86769e1011e4, session=gw-session-dd50357af2c4178e371ac26f32efec5b
+server-2: [2026-11-05 16:39:51.472] [info] [7549] [gateway] Agent 744bf928-a65e-489b-8e47-86769e1011e4 stream CONNECTED at gateway node 'yuzu_gw@10.77.12.12' (1 wire capability)
+server-2: [2026-11-05 16:41:19.907] [info] [7720] [gateway] Agent 744bf928-a65e-489b-8e47-86769e1011e4 re-registering (already enrolled)
+server-2: [2026-11-05 16:41:19.909] [info] [7720] [gateway] ProxyRegister succeeded: agent=744bf928-a65e-489b-8e47-86769e1011e4, session=gw-session-dd50357af2c4178e371ac26f32efec5b
+server-2: [2026-11-05 16:41:19.912] [info] [7727] [gateway] Agent 744bf928-a65e-489b-8e47-86769e1011e4 stream CONNECTED at gateway node 'yuzu_gw@10.77.12.12' (1 wire capability)
+## run-F3-2r-170006 agent 4245f5fd-5fa3-40c4-9993-210ffc7b8abe
+server: [2026-11-05 16:58:55.110] [info] [9765] [gateway] Agent 4245f5fd-5fa3-40c4-9993-210ffc7b8abe auto-enrolled via enrollment token id=b2da75e1 (323/100000)
+server: [2026-11-05 16:58:55.114] [info] [9765] [gateway] Issued per-agent client cert for 4245f5fd-5fa3-40c4-9993-210ffc7b8abe
+server: [2026-11-05 16:58:55.114] [info] [9765] [gateway] ProxyRegister succeeded: agent=4245f5fd-5fa3-40c4-9993-210ffc7b8abe, session=gw-session-e0f0c2035c18e5724b63ff6850535c23
+server-2: [2026-11-05 16:58:55.124] [info] [9084] [gateway] Agent 4245f5fd-5fa3-40c4-9993-210ffc7b8abe re-registering (already enrolled)
+server-2: [2026-11-05 16:58:55.124] [info] [9084] [gateway] ProxyRegister succeeded: agent=4245f5fd-5fa3-40c4-9993-210ffc7b8abe, session=gw-session-5219f55c9c4cc96838ac477856f1c2b2
+server-2: [2026-11-05 16:58:55.128] [info] [9084] [gateway] Agent 4245f5fd-5fa3-40c4-9993-210ffc7b8abe stream CONNECTED at gateway node 'yuzu_gw@10.77.12.13' (1 wire capability)
+server-2: [2026-11-05 17:08:30.624] [info] [10052] [gateway] Agent 4245f5fd-5fa3-40c4-9993-210ffc7b8abe re-registering (already enrolled)
+server-2: [2026-11-05 17:08:30.625] [info] [10052] [gateway] ProxyRegister succeeded: agent=4245f5fd-5fa3-40c4-9993-210ffc7b8abe, session=gw-session-5219f55c9c4cc96838ac477856f1c2b2
+server-2: [2026-11-05 17:08:30.628] [info] [10065] [gateway] Agent 4245f5fd-5fa3-40c4-9993-210ffc7b8abe stream CONNECTED at gateway node 'yuzu_gw@10.77.12.13' (1 wire capability)
+## run-F3-2r-170006 agent 48efce9f-0422-48e3-97e5-75e6482f5a16
+server: [2026-11-05 16:58:07.217] [info] [9738] [gateway] Agent 48efce9f-0422-48e3-97e5-75e6482f5a16 auto-enrolled via enrollment token id=b2da75e1 (304/100000)
+server: [2026-11-05 16:58:07.221] [info] [9738] [gateway] Issued per-agent client cert for 48efce9f-0422-48e3-97e5-75e6482f5a16
+server: [2026-11-05 16:58:07.221] [info] [9738] [gateway] ProxyRegister succeeded: agent=48efce9f-0422-48e3-97e5-75e6482f5a16, session=gw-session-5c987644ebc142d0427dc14ecd52cf2a
+server-2: [2026-11-05 16:58:07.230] [info] [9059] [gateway] Agent 48efce9f-0422-48e3-97e5-75e6482f5a16 re-registering (already enrolled)
+server-2: [2026-11-05 16:58:07.230] [info] [9059] [gateway] ProxyRegister succeeded: agent=48efce9f-0422-48e3-97e5-75e6482f5a16, session=gw-session-e4387d7ce70cfd3f4d909763549d930a
+server-2: [2026-11-05 16:58:07.233] [info] [9059] [gateway] Agent 48efce9f-0422-48e3-97e5-75e6482f5a16 stream CONNECTED at gateway node 'yuzu_gw@10.77.12.13' (1 wire capability)
+server-2: [2026-11-05 17:08:30.625] [info] [10058] [gateway] Agent 48efce9f-0422-48e3-97e5-75e6482f5a16 re-registering (already enrolled)
+server-2: [2026-11-05 17:08:30.626] [info] [10058] [gateway] ProxyRegister succeeded: agent=48efce9f-0422-48e3-97e5-75e6482f5a16, session=gw-session-e4387d7ce70cfd3f4d909763549d930a
+server-2: [2026-11-05 17:08:30.628] [info] [10068] [gateway] Agent 48efce9f-0422-48e3-97e5-75e6482f5a16 stream CONNECTED at gateway node 'yuzu_gw@10.77.12.13' (1 wire capability)
+## run-NOFAULT-160202 agent 295682fd-a9c8-4776-af45-8d106321213b
+server: [2026-11-05 16:00:26.399] [info] [2129] [gateway] Agent 295682fd-a9c8-4776-af45-8d106321213b auto-enrolled via enrollment token id=b2da75e1 (133/100000)
+server: [2026-11-05 16:00:26.402] [info] [2129] [gateway] Issued per-agent client cert for 295682fd-a9c8-4776-af45-8d106321213b
+server: [2026-11-05 16:00:26.402] [info] [2129] [gateway] ProxyRegister succeeded: agent=295682fd-a9c8-4776-af45-8d106321213b, session=gw-session-bc067869a061a138422edc86499d5e7a
+server-2: [2026-11-05 16:00:26.412] [info] [485] [gateway] Agent 295682fd-a9c8-4776-af45-8d106321213b re-registering (already enrolled)
+server-2: [2026-11-05 16:00:26.412] [info] [485] [gateway] ProxyRegister succeeded: agent=295682fd-a9c8-4776-af45-8d106321213b, session=gw-session-db97d5d110dc460d58e7aeea0f4e2ad1
+server-2: [2026-11-05 16:00:26.415] [info] [485] [gateway] Agent 295682fd-a9c8-4776-af45-8d106321213b stream CONNECTED at gateway node 'yuzu_gw@10.77.12.13' (1 wire capability)
+server-2: [2026-11-05 16:21:43.197] [info] [6130] [gateway] Agent 295682fd-a9c8-4776-af45-8d106321213b re-registering (already enrolled)
+server-2: [2026-11-05 16:21:43.198] [info] [6130] [gateway] ProxyRegister succeeded: agent=295682fd-a9c8-4776-af45-8d106321213b, session=gw-session-db97d5d110dc460d58e7aeea0f4e2ad1
+server-2: [2026-11-05 16:21:43.200] [info] [6140] [gateway] Agent 295682fd-a9c8-4776-af45-8d106321213b stream CONNECTED at gateway node 'yuzu_gw@10.77.12.13' (1 wire capability)
+## run-NOFAULT-160202 agent 9fa9e30a-000e-4413-9efc-a98be042f013
+server: [2026-11-05 16:00:50.759] [info] [412] [gateway] Agent 9fa9e30a-000e-4413-9efc-a98be042f013 auto-enrolled via enrollment token id=b2da75e1 (143/100000)
+server: [2026-11-05 16:00:50.764] [info] [412] [gateway] Issued per-agent client cert for 9fa9e30a-000e-4413-9efc-a98be042f013
+server: [2026-11-05 16:00:50.764] [info] [412] [gateway] ProxyRegister succeeded: agent=9fa9e30a-000e-4413-9efc-a98be042f013, session=gw-session-4548d65344be17d5cd88cc5e224a0ce6
+server-2: [2026-11-05 16:00:50.774] [info] [484] [gateway] Agent 9fa9e30a-000e-4413-9efc-a98be042f013 re-registering (already enrolled)
+server-2: [2026-11-05 16:00:50.774] [info] [484] [gateway] ProxyRegister succeeded: agent=9fa9e30a-000e-4413-9efc-a98be042f013, session=gw-session-8d0ca6956ac01347acd570a31074338d
+server-2: [2026-11-05 16:00:50.777] [info] [484] [gateway] Agent 9fa9e30a-000e-4413-9efc-a98be042f013 stream CONNECTED at gateway node 'yuzu_gw@10.77.12.13' (1 wire capability)
+server-2: [2026-11-05 16:21:43.195] [info] [6103] [gateway] Agent 9fa9e30a-000e-4413-9efc-a98be042f013 re-registering (already enrolled)
+server-2: [2026-11-05 16:21:43.197] [info] [6103] [gateway] ProxyRegister succeeded: agent=9fa9e30a-000e-4413-9efc-a98be042f013, session=gw-session-8d0ca6956ac01347acd570a31074338d
+server-2: [2026-11-05 16:21:43.199] [info] [6103] [gateway] Agent 9fa9e30a-000e-4413-9efc-a98be042f013 stream CONNECTED at gateway node 'yuzu_gw@10.77.12.13' (1 wire capability)
