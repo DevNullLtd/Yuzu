@@ -481,7 +481,7 @@ TEST_CASE("WorkflowEngine: a PERMANENT step failure is not retried and not slept
     const std::string yaml = "kind: Workflow\nmetadata:\n  name: permanent-wf\nspec:\n  steps:\n"
                              "    - instruction: inst-1\n"
                              "      retryCount: 3\n"
-                             "      retryDelay: 2\n"
+                             "      retryDelay: 30\n"
                              "    - instruction: inst-2\n";
     auto wf_id = *engine.create_workflow(yaml);
 
@@ -501,8 +501,9 @@ TEST_CASE("WorkflowEngine: a PERMANENT step failure is not retried and not slept
     const auto elapsed = std::chrono::steady_clock::now() - t0;
     REQUIRE(exec_result.has_value());
     CHECK(attempts == 1); // 3 retries were configured; none ran
-    // retryDelay is 2 s: a retry sleep would have cost at least 2 s.
-    CHECK(elapsed < std::chrono::milliseconds(1500));
+    // retryDelay is 30 s: a retry sleep would have cost 30 s. The bound is a hang guard only; the
+    // assertion that pins the behaviour is the attempt count.
+    CHECK(elapsed < std::chrono::seconds(3));
 
     const auto exec = only_execution(engine, wf_id);
     CHECK(exec.status == "failed");
@@ -693,11 +694,11 @@ TEST_CASE("WorkflowEngine: a run past its deadline stops before the next attempt
           "failed, ignores on_failure, and never sleeps a retry delay past the deadline (#2146 D1)",
           "[workflow_engine][pg][execute][deadline]") {
     WORKFLOW_ENGINE(engine);
-    // Step 1 retries 3 times with a 1 s delay and `continue` on failure; step 2 is plain.
+    // Step 1 retries 3 times with a 30 s delay and `continue` on failure; step 2 is plain.
     const std::string yaml = "kind: Workflow\nmetadata:\n  name: deadline-wf\nspec:\n  steps:\n"
                              "    - instruction: inst-1\n"
                              "      retryCount: 3\n"
-                             "      retryDelay: 1\n"
+                             "      retryDelay: 30\n"
                              "      onFailure: continue\n"
                              "    - instruction: inst-2\n";
     auto wf_id = *engine.create_workflow(yaml);
@@ -711,16 +712,26 @@ TEST_CASE("WorkflowEngine: a run past its deadline stops before the next attempt
     };
 
     SECTION("the retry delay is cut to the time left, then the next attempt is not made") {
+        // The deadline is set from inside the first dispatch, so the time left is measured from
+        // the attempt itself and never from test setup. The engine reads `control.deadline` on
+        // the calling thread each time it needs it, so the callback may move it.
         WorkflowRunControl control;
-        control.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+        StepDispatchFn arm_then_fail = [&](const std::string& id, const std::string&,
+                                           const std::string&)
+            -> std::expected<std::string, StepDispatchError> {
+            dispatched.push_back(id);
+            control.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+            return std::unexpected(StepDispatchError{"agent unreachable", false});
+        };
         const auto t0 = std::chrono::steady_clock::now();
-        auto r = engine.execute(wf_id, {"agent-1"}, always_fail, nullptr, nullptr, control);
+        auto r = engine.execute(wf_id, {"agent-1"}, arm_then_fail, nullptr, nullptr, control);
         const auto elapsed = std::chrono::steady_clock::now() - t0;
         REQUIRE(r.has_value());
-        // One attempt, then the 1 s delay was cut to the ~300 ms left. Uncapped, the run would
-        // have slept the whole second and then made three more attempts.
+        // One attempt, then the 30 s delay was cut to the ~250 ms left. Uncapped, the run would
+        // have slept 30 s and then made three more attempts. The bound is a hang guard: the
+        // uncapped sleep is ten times it.
         CHECK(dispatched == std::vector<std::string>{"inst-1"});
-        CHECK(elapsed < std::chrono::milliseconds(900));
+        CHECK(elapsed < std::chrono::seconds(3));
         const auto exec = only_execution(engine, wf_id);
         CHECK(exec.status == "failed");
         REQUIRE(exec.step_results.size() == 2);
@@ -843,19 +854,29 @@ const std::string kSlowRetryYaml = "kind: Workflow\nmetadata:\n  name: slow-retr
                                    "      onFailure: continue\n"
                                    "    - instruction: inst-2\n";
 
-/// Flips a stop level from another thread after `after`, then joins in the destructor.
+/// Flips a stop level from another thread `after` the run's first dispatch, so the flip lands
+/// while the run is asleep in its retry delay (or just before it; the outcome is the same) and
+/// never depends on how long test setup took. The dispatch callback calls `on_dispatch()`; the
+/// jthread joins in the destructor on every path.
 struct LevelFlipper {
     std::atomic<int> level{0}; // WorkflowStopLevel as int
-    std::thread t;
-    LevelFlipper(std::chrono::milliseconds after, WorkflowStopLevel to) {
-        t = std::thread([this, after, to] {
+    std::chrono::milliseconds after{0};
+    WorkflowStopLevel to{WorkflowStopLevel::kNone};
+    bool armed{false};
+    std::jthread t;
+    LevelFlipper() = default;
+    void arm(std::chrono::milliseconds when, WorkflowStopLevel target) {
+        after = when;
+        to = target;
+        armed = true;
+    }
+    void on_dispatch() {
+        if (!armed || t.joinable())
+            return;
+        t = std::jthread([this] {
             std::this_thread::sleep_for(after);
             level.store(static_cast<int>(to), std::memory_order_release);
         });
-    }
-    ~LevelFlipper() {
-        if (t.joinable())
-            t.join();
     }
     [[nodiscard]] WorkflowStopLevel get() const {
         return static_cast<WorkflowStopLevel>(level.load(std::memory_order_acquire));
@@ -870,10 +891,12 @@ TEST_CASE("WorkflowEngine: a stop wakes a run asleep in a retry delay within one
     WORKFLOW_ENGINE(engine);
     auto wf_id = *engine.create_workflow(kSlowRetryYaml);
     std::vector<std::string> dispatched;
-    StepDispatchFn always_fail = [&dispatched](const std::string& id, const std::string&,
-                                               const std::string&)
+    LevelFlipper flip; // armed by the sections that need a stop from another thread
+    StepDispatchFn always_fail = [&dispatched, &flip](const std::string& id, const std::string&,
+                                                      const std::string&)
         -> std::expected<std::string, StepDispatchError> {
         dispatched.push_back(id);
+        flip.on_dispatch();
         return std::unexpected(StepDispatchError{"agent unreachable", false});
     };
     int interrupted_calls = 0;
@@ -893,7 +916,7 @@ TEST_CASE("WorkflowEngine: a stop wakes a run asleep in a retry delay within one
     };
 
     SECTION("the run's own should_stop") {
-        LevelFlipper flip(std::chrono::milliseconds(300), WorkflowStopLevel::kStop);
+        flip.arm(std::chrono::milliseconds(100), WorkflowStopLevel::kStop);
         WorkflowRunControl control;
         control.should_stop = [&flip] { return flip.get(); };
         control.on_interrupted = [&interrupted_calls] { ++interrupted_calls; };
@@ -904,7 +927,7 @@ TEST_CASE("WorkflowEngine: a stop wakes a run asleep in a retry delay within one
         check_stopped(elapsed);
     }
     SECTION("the engine-level default reaches a run that passed no control (the legacy route)") {
-        LevelFlipper flip(std::chrono::milliseconds(300), WorkflowStopLevel::kStop);
+        flip.arm(std::chrono::milliseconds(100), WorkflowStopLevel::kStop);
         engine.set_should_stop([&flip] { return flip.get(); });
         WorkflowRunControl control; // as the legacy route: none
         control.on_interrupted = [&interrupted_calls] { ++interrupted_calls; };
@@ -968,10 +991,12 @@ TEST_CASE("WorkflowEngine: a DRAINING server abandons a retry sleep but keeps di
     WORKFLOW_ENGINE(engine);
     auto wf_id = *engine.create_workflow(kSlowRetryYaml);
     std::vector<std::string> dispatched;
-    StepDispatchFn fail_first = [&dispatched](const std::string& id, const std::string&,
-                                              const std::string&)
+    LevelFlipper flip;
+    StepDispatchFn fail_first = [&dispatched, &flip](const std::string& id, const std::string&,
+                                                     const std::string&)
         -> std::expected<std::string, StepDispatchError> {
         dispatched.push_back(id);
+        flip.on_dispatch();
         if (id == "inst-1")
             return std::unexpected(StepDispatchError{"agent unreachable", false});
         return std::string(R"({"status":"ok"})");
@@ -994,7 +1019,7 @@ TEST_CASE("WorkflowEngine: a DRAINING server abandons a retry sleep but keeps di
     };
 
     SECTION("draining flips while the run sleeps") {
-        LevelFlipper flip(std::chrono::milliseconds(300), WorkflowStopLevel::kDraining);
+        flip.arm(std::chrono::milliseconds(100), WorkflowStopLevel::kDraining);
         engine.set_should_stop([&flip] { return flip.get(); });
         const auto t0 = std::chrono::steady_clock::now();
         auto r = engine.execute(wf_id, {"agent-1"}, fail_first, nullptr, nullptr, control);
@@ -1074,8 +1099,16 @@ TEST_CASE("WorkflowEngine: in_flight_runs counts a run from the top of execute()
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             return std::string(R"({"status":"ok"})");
         };
-        std::thread a([&] { (void)engine.execute(wf_id, {"agent-1"}, hold); });
-        std::thread b([&] { (void)engine.execute(wf_id, {"agent-2"}, hold); });
+        // Declared after `hold` (which the threads call) and before the guard: on any exit path
+        // the guard releases the held steps first, then the jthreads join.
+        std::jthread a;
+        std::jthread b;
+        struct ReleaseOnExit {
+            std::atomic<bool>& flag;
+            ~ReleaseOnExit() { flag.store(true); }
+        } release_on_exit{release};
+        a = std::jthread([&] { (void)engine.execute(wf_id, {"agent-1"}, hold); });
+        b = std::jthread([&] { (void)engine.execute(wf_id, {"agent-2"}, hold); });
         const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         while (inside.load() < 2 && std::chrono::steady_clock::now() < give_up)
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1101,21 +1134,22 @@ TEST_CASE("WorkflowEngine: a final status write that cannot get a lease is retri
 
     // The step callback takes the pool's only connection and hands it back from another thread
     // after `hold`, so every write that follows the step meets a saturated pool.
-    std::thread releaser;
+    std::jthread releaser; // a failed REQUIRE below unwinds through its join, never std::terminate
     const auto run_with_pool_held = [&](std::chrono::milliseconds hold) {
         auto held = std::make_shared<PgPool::Lease>();
         StepDispatchFn fn = [&](const std::string&, const std::string&, const std::string&)
             -> std::expected<std::string, StepDispatchError> {
             *held = pool.try_acquire_for(std::chrono::seconds(2));
-            releaser = std::thread([held, hold] {
+            releaser = std::jthread([held, hold] {
                 std::this_thread::sleep_for(hold);
                 held->reset();
             });
             return std::string(R"({"status":"ok"})");
         };
         auto r = engine.execute(wf_id, {"agent-1"}, fn);
+        if (releaser.joinable())
+            releaser.join(); // the pool is whole again before anything below reads it
         REQUIRE(r.has_value());
-        releaser.join();
     };
     const auto finalize_failed = [&] {
         return metrics.counter("yuzu_server_workflow_finalize_failed_total", {}).value();
@@ -2471,8 +2505,12 @@ TEST_CASE("WorkflowEngine idempotency: TWO concurrent calls with one key admit E
                 std::this_thread::yield();
             out = execute_keyed(engine, wf_id, claim_of("alice", key, "fp-race"));
         };
-        std::thread ta(worker, std::ref(a));
-        std::thread tb(worker, std::ref(b));
+        std::jthread ta(worker, std::ref(a));
+        std::jthread tb(worker, std::ref(b));
+        struct GoOnExit {
+            std::atomic<bool>& flag;
+            ~GoOnExit() { flag.store(true); }
+        } go_on_exit{go}; // the workers spin on `go`; release them before the jthreads join
         while (ready.load() < 2)
             std::this_thread::yield();
         go = true;
@@ -2546,7 +2584,18 @@ TEST_CASE("WorkflowEngine idempotency: when the admission INSERT returns ZERO ro
                     .ok());
 
         ClaimResult out;
-        std::thread t([&] { out = execute_keyed(engine, wf_id, claim_of("alice", key, "fp-z")); });
+        std::jthread t([&] { out = execute_keyed(engine, wf_id, claim_of("alice", key, "fp-z")); });
+        // The parked INSERT cannot finish while `locker` holds the table. On an early exit this
+        // guard (destroyed before `t`) rolls the locker back, so the join below does not wait on a
+        // lock nobody will release.
+        struct ReleaseLocker {
+            PgConn& conn;
+            bool open{true};
+            ~ReleaseLocker() {
+                if (open)
+                    PgResult{PQexec(conn.get(), "ROLLBACK")};
+            }
+        } release_locker{locker};
 
         // Wait (bounded) until the INSERT is parked on the lock.
         bool parked = false;
@@ -2568,6 +2617,7 @@ TEST_CASE("WorkflowEngine idempotency: when the admission INSERT returns ZERO ro
                                         .c_str())}
                          .ok());
         REQUIRE(PgResult{PQexec(locker.get(), "COMMIT")}.ok());
+        release_locker.open = false;
         t.join();
 
         REQUIRE_FALSE(out.result.has_value());

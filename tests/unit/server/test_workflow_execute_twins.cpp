@@ -1741,6 +1741,10 @@ struct Rest {
 
 json body_of(const httplib::Response& r) { return json::parse(r.body); }
 
+/// Checked read by JSON pointer: a missing key throws json::out_of_range, which Catch2 reports as
+/// a failed test case. `operator[]` on a const json aborts the whole binary instead.
+const json& at_path(const json& j, const char* pointer) { return j.at(json::json_pointer(pointer)); }
+
 } // namespace
 
 TEST_CASE("POST /api/v1/workflows/{id}/execute: Workflow:Execute is the first and only surface gate; "
@@ -1766,15 +1770,15 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: success is 202 with the run and 
     REQUIRE(res);
     CHECK(res->status == 202);
     const auto j = body_of(*res);
-    CHECK(j["meta"]["api_version"] == "v1");
-    CHECK(j["data"]["execution_id"] == "exec-1");
-    CHECK(j["data"]["workflow_id"] == "wf-1");
-    CHECK(j["data"]["status"] == "completed");
-    CHECK(j["data"]["late_denied"] == false);
-    REQUIRE(j["data"]["steps"].size() == 1);
-    CHECK(j["data"]["steps"][0]["agents_reached"] == 1);
-    CHECK(j["data"]["steps"][0]["command_id"] == "cmd-rest");
-    CHECK_FALSE(j["data"].contains("audit_persisted"));
+    CHECK(at_path(j, "/meta/api_version") == "v1");
+    CHECK(at_path(j, "/data/execution_id") == "exec-1");
+    CHECK(at_path(j, "/data/workflow_id") == "wf-1");
+    CHECK(at_path(j, "/data/status") == "completed");
+    CHECK(at_path(j, "/data/late_denied") == false);
+    REQUIRE(at_path(j, "/data/steps").size() == 1);
+    CHECK(at_path(j, "/data/steps/0/agents_reached") == 1);
+    CHECK(at_path(j, "/data/steps/0/command_id") == "cmd-rest");
+    CHECK_FALSE(at_path(j, "/data").contains("audit_persisted"));
     CHECK(res->get_header_value("Sec-Audit-Failed").empty());
     // requested first, closing row last.
     CHECK(r.fx.events.front() == "audit:requested");
@@ -1794,13 +1798,13 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a run the engine ended FAILED af
     REQUIRE(res);
     CHECK(res->status == 202);
     const auto j = body_of(*res);
-    CHECK(j["data"]["status"] == "partial");
-    CHECK(j["data"]["run_status"] == "failed");
-    CHECK(j["data"]["retryable"] == false);
-    CHECK_FALSE(j["data"]["message"].get<std::string>().empty());
-    CHECK(j["data"]["execution_id"] == "exec-1");
-    REQUIRE(j["data"]["steps"].size() == 1);
-    CHECK(j["data"]["steps"][0]["agents_reached"] == 1);
+    CHECK(at_path(j, "/data/status") == "partial");
+    CHECK(at_path(j, "/data/run_status") == "failed");
+    CHECK(at_path(j, "/data/retryable") == false);
+    CHECK_FALSE(at_path(j, "/data/message").get<std::string>().empty());
+    CHECK(at_path(j, "/data/execution_id") == "exec-1");
+    REQUIRE(at_path(j, "/data/steps").size() == 1);
+    CHECK(at_path(j, "/data/steps/0/agents_reached") == 1);
     CHECK(r.fx.events.back() == "audit:failure");
     CHECK(r.fx.audit_details.back().find("run_outcome=partial") != std::string::npos);
 }
@@ -1816,9 +1820,9 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a step refused at send time afte
     REQUIRE(res);
     CHECK(res->status == 202);
     const auto j = body_of(*res);
-    CHECK(j["data"]["status"] == "aborted");
-    CHECK(j["data"]["late_denied"] == true);
-    CHECK(j["data"]["retryable"] == false);
+    CHECK(at_path(j, "/data/status") == "aborted");
+    CHECK(at_path(j, "/data/late_denied") == true);
+    CHECK(at_path(j, "/data/retryable") == false);
     CHECK(r.fx.events.back() == "audit:failure");
     CHECK(r.fx.audit_details.back().find("run_outcome=aborted") != std::string::npos);
 }
@@ -1858,9 +1862,9 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: an unwired approval gate or clos
         REQUIRE(res);
         CHECK(res->status == 503);
         const auto j = body_of(*res);
-        CHECK(j["error"]["reason"] ==
+        CHECK(at_path(j, "/error/reason") ==
               (which == 0 ? "approval_gate_unavailable" : "instruction_store_unavailable"));
-        CHECK(j["error"]["retry_after_ms"].is_null()); // a missing dependency is not transient
+        CHECK(at_path(j, "/error/retry_after_ms").is_null()); // a missing dependency is not transient
         CHECK_FALSE(r.fx.engine_called);
         CHECK_FALSE(r.fx.dispatched_anything());
         CHECK(r.persist_calls == 0);
@@ -1890,11 +1894,11 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a run that throws after the requ
     REQUIRE(res);
     CHECK(res->status == 500);
     const auto j = body_of(*res);
-    CHECK(j["error"]["reason"] == "dispatch_exception");
-    CHECK(j["error"]["execution_id"] == "exec-1");
-    CHECK(j["error"]["agents_sent"] == 2);
-    CHECK(j["error"]["retry_after_ms"].is_null());
-    CHECK(j["error"]["remediation"].get<std::string>().find("get_workflow_execution") !=
+    CHECK(at_path(j, "/error/reason") == "dispatch_exception");
+    CHECK(at_path(j, "/error/execution_id") == "exec-1");
+    CHECK(at_path(j, "/error/agents_sent") == 2);
+    CHECK(at_path(j, "/error/retry_after_ms").is_null());
+    CHECK(at_path(j, "/error/remediation").get<std::string>().find("get_workflow_execution") !=
           std::string::npos);
     CHECK(res->get_header_value("Sec-Audit-Failed").empty());
     CHECK(r.fx.events.front() == "audit:requested");
@@ -2032,10 +2036,10 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a caller-level denial of any ste
     INFO(res->body);
     REQUIRE(res->status == 403); // a 202 here has no error object to inspect
     const auto j = body_of(*res);
-    CHECK(j["error"]["reason"] == "dispatch_denied");
-    CHECK(j["error"]["retry_after_ms"].is_null());
-    CHECK_FALSE(j["error"]["remediation"].get<std::string>().empty());
-    CHECK_FALSE(j["error"].contains("execution_id"));
+    CHECK(at_path(j, "/error/reason") == "dispatch_denied");
+    CHECK(at_path(j, "/error/retry_after_ms").is_null());
+    CHECK_FALSE(at_path(j, "/error/remediation").get<std::string>().empty());
+    CHECK_FALSE(at_path(j, "/error").contains("execution_id"));
     CHECK_FALSE(r.fx.dispatched_anything()); // step 1 was NOT sent
     CHECK_FALSE(r.fx.engine_called);
     REQUIRE(r.fx.audit_details.size() == 1);
@@ -2091,9 +2095,9 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: no step reaching any agent is a 
     REQUIRE(res);
     CHECK(res->status == 503);
     const auto j = body_of(*res);
-    CHECK(j["error"]["reason"] == "quarantined");
-    CHECK(j["error"]["retry_after_ms"].is_null()); // permanent: retrying will not help
-    CHECK(j["error"]["execution_id"] == "exec-1");
+    CHECK(at_path(j, "/error/reason") == "quarantined");
+    CHECK(at_path(j, "/error/retry_after_ms").is_null()); // permanent: retrying will not help
+    CHECK(at_path(j, "/error/execution_id") == "exec-1");
 }
 
 TEST_CASE("POST /api/v1/workflows/{id}/execute: an unwired caller derivation is refused, never run "
@@ -2277,9 +2281,9 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a principal at its run cap gets 
     CHECK(res->status == 429);
     CHECK(res->get_header_value("Retry-After") == "5");
     const auto j = body_of(*res);
-    CHECK(j["error"]["reason"] == "per_principal_stream_cap");
-    CHECK(j["error"]["retry_after_ms"] == 5000);
-    CHECK(j["error"]["remediation"].get<std::string>().find("nothing was sent") != std::string::npos);
+    CHECK(at_path(j, "/error/reason") == "per_principal_stream_cap");
+    CHECK(at_path(j, "/error/retry_after_ms") == 5000);
+    CHECK(at_path(j, "/error/remediation").get<std::string>().find("nothing was sent") != std::string::npos);
     CHECK_FALSE(r.fx.engine_called);
     CHECK_FALSE(r.fx.dispatched_anything());
     CHECK(r.fx.events.empty()); // no audit row of any kind
@@ -2325,8 +2329,8 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a draining server refuses a new 
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Retry-After") == "5");
     const auto j = body_of(*res);
-    CHECK(j["error"]["reason"] == "draining");
-    CHECK(j["error"]["retry_after_ms"] == 5000);
+    CHECK(at_path(j, "/error/reason") == "draining");
+    CHECK(at_path(j, "/error/retry_after_ms") == 5000);
     CHECK(r.budget.active() == 0);
     CHECK(r.refused("draining") == 1);
     CHECK_FALSE(r.fx.engine_called);
@@ -2374,14 +2378,18 @@ TEST_CASE("workflow run budget: a run stopped at its deadline skips the rest, re
         f.step_ids = {"i-ro", "i-ro2"};
         f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
         f.engine_status = "failed"; // what the engine records for a stopped run
-        // Step 1 is sent and takes longer than the whole budget.
-        f.dispatch_override = [&](const WorkflowStepInstruction& d, const std::vector<std::string>&,
-                                  const DispatchCaller&) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        auto req = f.request();
+        // Step 1 is sent and runs until the deadline has passed: the callback waits for the
+        // deadline itself, so "it passes between step 1 and step 2" holds however long setup or
+        // the dispatch took. The margin only has to cover the in-process gap before the first
+        // attempt; it is not a race against the callback's length.
+        req.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+        const auto deadline = *req.deadline;
+        f.dispatch_override = [deadline](const WorkflowStepInstruction& d,
+                                         const std::vector<std::string>&, const DispatchCaller&) {
+            std::this_thread::sleep_until(deadline + std::chrono::milliseconds(5));
             return ConfinedDispatchOutcome{.sent = 1, .command_id = "cmd-" + d.id};
         };
-        auto req = f.request();
-        req.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
         const auto o = f.run(req);
         CHECK(f.engine_stopped);
         CHECK(o.status == WorkflowExecuteStatus::kRunIncomplete);
@@ -2507,11 +2515,11 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a run interrupted by a server st
     REQUIRE(res);
     CHECK(res->status == 202);
     const auto j = body_of(*res);
-    CHECK(j["data"]["status"] == "interrupted");
-    CHECK(j["data"]["reason"] == "server_shutdown");
-    CHECK(j["data"]["retryable"] == false);
-    CHECK(j["data"]["run_status"] == "failed");
-    REQUIRE(j["data"]["steps"].size() == 1);
+    CHECK(at_path(j, "/data/status") == "interrupted");
+    CHECK(at_path(j, "/data/reason") == "server_shutdown");
+    CHECK(at_path(j, "/data/retryable") == false);
+    CHECK(at_path(j, "/data/run_status") == "failed");
+    REQUIRE(at_path(j, "/data/steps").size() == 1);
     CHECK(r.fx.audit_details.back().find("run_outcome=interrupted") != std::string::npos);
 }
 
@@ -2753,7 +2761,10 @@ TEST_CASE("workflow credential check: the retry wait never runs past the run's d
     two_steps_with_reauth(f, {CC::kIndeterminate, CC::kValid});
     auto req = f.request();
     req.reauthorize_retry_delay = std::chrono::seconds(30); // far past the deadline below
-    req.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(80);
+    // The first credential ask answers indeterminate and the hook then waits out min(30 s, time
+    // left), so the deadline is what ends the run; the margin only has to cover the in-process
+    // gap before that first ask.
+    req.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
     const auto t0 = std::chrono::steady_clock::now();
     const auto o = f.run(req);
     CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
@@ -2775,10 +2786,10 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: a credential revoked after step 
     REQUIRE(res);
     CHECK(res->status == 202);
     const auto j = body_of(*res);
-    CHECK(j["data"]["status"] == "aborted");
-    CHECK(j["data"]["reason"] == "credential_revoked");
-    CHECK(j["data"]["retryable"] == false);
-    CHECK(j["data"]["steps"].size() == 1);
+    CHECK(at_path(j, "/data/status") == "aborted");
+    CHECK(at_path(j, "/data/reason") == "credential_revoked");
+    CHECK(at_path(j, "/data/retryable") == false);
+    CHECK(at_path(j, "/data/steps").size() == 1);
     CHECK(r.fx.reauth_calls == 2);
     CHECK(r.reauth_principals == std::vector<std::string>{"alice", "alice"});
     CHECK(r.reauth_tokens == std::vector<std::string>{"tok-live", "tok-live"});
@@ -2797,10 +2808,10 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute: an indeterminate credential chec
         REQUIRE(res);
         CHECK(res->status == 202);
         const auto j = body_of(*res);
-        CHECK(j["data"]["status"] == "aborted");
-        CHECK(j["data"]["reason"] == "credential_indeterminate");
-        CHECK(j["data"]["retryable"] == false);
-        CHECK(j["data"]["steps"].size() == 0);
+        CHECK(at_path(j, "/data/status") == "aborted");
+        CHECK(at_path(j, "/data/reason") == "credential_indeterminate");
+        CHECK(at_path(j, "/data/retryable") == false);
+        CHECK(at_path(j, "/data/steps").size() == 0);
         CHECK_FALSE(r.fx.dispatched_anything());
     }
     SECTION("valid every time") {
@@ -2858,7 +2869,7 @@ TEST_CASE("idempotency key: 8 to 128 bytes of [A-Za-z0-9._:-], nothing else",
     CHECK_FALSE(check_workflow_idempotency_key(std::string(128, 'k')));
     CHECK_FALSE(check_workflow_idempotency_key("a.b_c:d-E9ZZ"));
     const std::string too_long(129, 'k');
-    for (const std::string bad :
+    for (const auto& bad :
          {std::string{}, std::string("1234567"), too_long, std::string("key with space"),
           std::string("key/slash/123"), std::string("key@host123"), std::string("key\nline123"),
           std::string("caf\xc3\xa9-key-123"), std::string("key\"quote123"), std::string("key;semi123")}) {
@@ -3204,12 +3215,12 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a repeat of
     CHECK(res->status == 202);
     CHECK(res->get_header_value("Retry-After").empty());
     const auto j = body_of(*res);
-    CHECK(j["meta"]["api_version"] == "v1");
-    CHECK(j["data"]["execution_id"] == "exec-bound");
-    CHECK(j["data"]["status"] == "completed");
-    CHECK(j["data"]["idempotent_replay"] == true);
-    CHECK(j["data"]["started_at"] == r.fx.fixed_now - 7);
-    CHECK_FALSE(j["data"].contains("steps"));
+    CHECK(at_path(j, "/meta/api_version") == "v1");
+    CHECK(at_path(j, "/data/execution_id") == "exec-bound");
+    CHECK(at_path(j, "/data/status") == "completed");
+    CHECK(at_path(j, "/data/idempotent_replay") == true);
+    CHECK(at_path(j, "/data/started_at") == r.fx.fixed_now - 7);
+    CHECK_FALSE(at_path(j, "/data").contains("steps"));
     CHECK_FALSE(r.fx.engine_called);
     CHECK_FALSE(r.fx.dispatched_anything());
     CHECK(r.fx.authorize_calls.empty());
@@ -3257,9 +3268,9 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a run still
     CHECK(res->status == 202);
     CHECK(res->get_header_value("Retry-After") == "2");
     const auto j = body_of(*res);
-    CHECK(j["data"]["status"] == "running");
-    CHECK(j["data"]["retry_after_ms"] == 2000);
-    CHECK(j["data"]["idempotent_replay"] == true);
+    CHECK(at_path(j, "/data/status") == "running");
+    CHECK(at_path(j, "/data/retry_after_ms") == 2000);
+    CHECK(at_path(j, "/data/idempotent_replay") == true);
     CHECK(r.persist_calls == 0);
     CHECK(r.metrics.counter(kWorkflowRunIdempotentMetric, {{"outcome", "in_progress"}}).value() == 1);
 }
@@ -3281,11 +3292,11 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: failed and 
     REQUIRE(stale);
     CHECK(stale->status == 202);
     const auto j = body_of(*stale);
-    CHECK(j["data"]["status"] == "indeterminate");
-    CHECK(j["data"]["retryable"] == false);
-    CHECK_FALSE(j["data"].contains("retry_after_ms"));
+    CHECK(at_path(j, "/data/status") == "indeterminate");
+    CHECK(at_path(j, "/data/retryable") == false);
+    CHECK_FALSE(at_path(j, "/data").contains("retry_after_ms"));
     CHECK(stale->get_header_value("Retry-After").empty());
-    CHECK(j["data"]["remediation"].get<std::string>().find("new key") != std::string::npos);
+    CHECK(at_path(j, "/data/remediation").get<std::string>().find("new key") != std::string::npos);
 }
 
 TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: the same key with a different "
@@ -3298,9 +3309,9 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: the same ke
     REQUIRE(res);
     CHECK(res->status == 422);
     const auto j = body_of(*res);
-    CHECK(j["error"]["reason"] == "idempotency_key_conflict");
-    CHECK(j["error"]["execution_id"] == "exec-bound");
-    CHECK((!j["error"].contains("retry_after_ms") || j["error"]["retry_after_ms"].is_null()));
+    CHECK(at_path(j, "/error/reason") == "idempotency_key_conflict");
+    CHECK(at_path(j, "/error/execution_id") == "exec-bound");
+    CHECK((!at_path(j, "/error").contains("retry_after_ms") || at_path(j, "/error/retry_after_ms").is_null()));
     CHECK_FALSE(r.fx.engine_called);
     CHECK(r.metrics.counter(kWorkflowRunIdempotentMetric, {{"outcome", "conflict"}}).value() == 1);
 }
@@ -3331,8 +3342,8 @@ TEST_CASE("POST /api/v1/workflows/{id}/execute with Idempotency-Key: a malformed
           "400 idempotency_key_invalid before anything is read or leased; no key is unchanged",
           "[workflow][twin][rest][idempotency]") {
     Rest r;
-    for (const std::string bad : {std::string("short"), std::string(129, 'k'), std::string("bad key 12345"),
-                                  std::string("key/with/slash"), std::string()}) {
+    for (const auto& bad : {std::string("short"), std::string(129, 'k'), std::string("bad key 12345"),
+                            std::string("key/with/slash"), std::string()}) {
         INFO(bad);
         const auto res = post_with_key(r, bad);
         REQUIRE(res);
