@@ -15618,9 +15618,10 @@ private:
             // set `Connection: close` on the response, and httplib honours that. By status:
             //
             //   * 400 and above: httplib stamps `Connection: close` itself.
-            //   * below 400 (the sign-in 302 below, any future 2xx/3xx): from httplib 0.59 a response that
-            //     leaves a declared request body unread must carry `Connection: close`
-            //     (httplib.h v0.59.0:14797-14806); the response therefore closes the connection.
+            //   * below 400 (the sign-in 302 below, any future 2xx/3xx): from httplib 0.59 a
+            //     response that leaves a declared request body unread must carry
+            //     `Connection: close` (httplib.h v0.59.0:14797-14806); the response therefore
+            //     closes the connection.
             //
             // So the rule is applied ONCE, for every response, in the POST-ROUTING handler
             // below (httplib runs it after it has chosen the Connection header and before the
@@ -16448,8 +16449,9 @@ private:
             // error pages).
             security_headers.apply(res);
             // A response written without reading the request's declared body must close the
-            // connection: from httplib 0.59 a response below 400 that leaves that body unread must
-            // carry `Connection: close` (the pre-routing answers above). See the helper.
+            // connection: from httplib 0.59 a response below 400 that leaves that body unread
+            // must carry `Connection: close` (the pre-routing answers above).
+            // See the helper.
             close_if_unread_framed_body(req, res);
 
             // CORS headers for all /api/ responses (H6)

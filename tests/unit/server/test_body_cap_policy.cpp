@@ -1404,12 +1404,13 @@ struct PreRoutingAnswerServer {
 TEST_CASE("Pre-routing answer: a response to a request with an unread framed body closes the "
           "connection",
           "[body_cap][pre_routing][bounds][integration]") {
-    // From httplib 0.59 a response below 400 that leaves a declared request body unread must carry
-    // `Connection: close`. The probe waits for EOF rather than reading the header alone: the header
-    // is what we set, EOF is what the SERVER did with it. The 302 and 200 rows pin the close rule;
-    // the 413 and 400 rows pin that a refusal is answered and closed too (httplib stamps close
-    // itself for a status >= 400). The third framing is an empty Transfer-Encoding line followed by
-    // `chunked`: `get_header_value` sees no Transfer-Encoding, httplib reads the body as chunked.
+    // From httplib 0.59 a response below 400 that leaves a declared request body unread must
+    // carry `Connection: close`. The probe waits for EOF rather than reading the header
+    // alone: the header is what we set, EOF is what the SERVER did with it. The 302 and 200 rows
+    // pin the close rule; the 413 and 400 rows pin that a refusal is answered and closed too
+    // (httplib stamps close itself for a status >= 400). The third framing is an empty
+    // Transfer-Encoding line followed by `chunked`: `get_header_value` sees no Transfer-Encoding,
+    // httplib reads the body as chunked.
     for (const int status : {302, 200, 413, 400}) {
         for (const auto& [name, request] :
              {std::pair<const char*, std::string>{"chunked", yuzu::test::kChunkedPostRequest},

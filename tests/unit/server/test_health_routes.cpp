@@ -2340,12 +2340,13 @@ TEST_CASE("health_routes: the production redirect pre-routing serves probes and 
 TEST_CASE("health_routes: the plaintext redirect closes the connection after a request that "
           "declares a body it never reads",
           "[server][routes][health_routes][plaintext][live][bounds]") {
-    // From httplib 0.59 a response below 400 that leaves a declared request body unread must carry
-    // `Connection: close`. The probe is a raw socket on purpose: httplib::Client sends `Connection:
-    // close` itself and the server echoes it, and it sends `Expect: 100-continue` instead of a
-    // declared body of 1024 bytes or more once the early 301 arrives, so a Client-based check
-    // passes with the server's own close removed. The raw probe sends no Connection header, asserts
-    // the 301 head carries `Connection: close`, and waits for EOF.
+    // From httplib 0.59 a response below 400 that leaves a declared request body unread must
+    // carry `Connection: close`. The probe is a raw socket on purpose:
+    // httplib::Client sends `Connection: close` itself and the server echoes it, and it sends
+    // `Expect: 100-continue` instead of a declared body of 1024 bytes or more once the early 301
+    // arrives, so a Client-based check passes with the server's own close removed. The raw probe
+    // sends no Connection header, asserts the 301 head carries `Connection: close`, and waits
+    // for EOF.
     httplib::Server srv;
     srv.set_read_timeout(30, 0);
     health::install_plaintext_redirect_pre_routing(srv, "127.0.0.1", 8443);
