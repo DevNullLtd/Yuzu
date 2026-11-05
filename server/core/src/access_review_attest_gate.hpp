@@ -162,17 +162,14 @@ inline constexpr std::string_view kStoreFailureRemediation =
 /// uses.
 inline constexpr std::int64_t kStoreFailureRetryMs = kSodUnavailableRetryMs;
 
-/// Longest slice of the raw store error handed to `log_key_token`, which itself shortens to its own
-/// cap (`kGuardianLogIdMaxBytes`, 256 bytes): the same number, so the line carries at most 256.
-inline constexpr std::size_t kStoreFailureLogMaxBytes = ::yuzu::kGuardianLogIdMaxBytes;
-
 /// Write the raw store error to the server log (bounded, control bytes neutralised so it cannot
-/// forge a log line). The campaign id is validated before the store is reached.
+/// forge a log line). The campaign id is validated before the store is reached. The error goes to
+/// `log_key_token` whole: it shortens to its own cap (`kGuardianLogIdMaxBytes`, 256 bytes) on a
+/// code point boundary, which a byte cut made here first could not (it left a lone lead byte).
 inline void log_store_failure(std::string_view campaign_id, std::string_view surface,
                               std::string_view err) {
-    const std::string_view head = err.substr(0, kStoreFailureLogMaxBytes);
     spdlog::warn("access review attestation store failure: surface={} campaign={} error='{}'",
-                 surface, campaign_id, ::yuzu::log_key_token(head));
+                 surface, campaign_id, ::yuzu::log_key_token(err));
 }
 
 /// The failure audit row's detail: the fixed message plus the grant tuple. Never the raw error.

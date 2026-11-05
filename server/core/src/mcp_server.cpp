@@ -3659,7 +3659,7 @@ static const ToolDef kTools[] = {
      "evidence and does not itself change any access grant — destructiveHint:false. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("title":{"type":"string","minLength":1,"description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
+     R"j("title":{"type":"string","minLength":1,"maxLength":256,"description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'. At most 256 bytes and no NUL (a longer one is refused with invalid-params)"})j"
      R"j(},"required":["title"]})j",
      R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present, and false, only when the operation succeeded but its audit row was not saved"}},"required":["campaign_id","grant_count"]})j"},
@@ -3683,7 +3683,8 @@ static const ToolDef kTools[] = {
      "engine principal the caller owns, or a group the caller belongs to is refused with a "
      "permission-denied result, 'the reviewer must differ from the subject of this grant; ask "
      "another reviewer to record this decision', and records nothing. principal_id and "
-     "role_name are at most 1024 bytes each and justification at most 4096 bytes. Each grant "
+     "role_name are at most 1024 bytes each and justification at most 4096 bytes (a "
+     "justification that is present and not a string is refused with invalid params). Each grant "
      "keeps at most 100 recorded decisions, the 100th is final: a further one is refused with "
      "invalid params and records nothing, and the way to review that grant again is to close "
      "the campaign and open a new one. A successful call returns decision_seq (this "
@@ -29314,6 +29315,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Enforced here, not by the input schema: its maxLength is discovery metadata only
+                // (the schema validator runs just for approval-gated tools).
+                if (title.size() > kCampaignTitleMaxLen) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignTitleTooLongMessage),
+                                    "application/json");
+                    return;
+                }
                 auto rows_res = build_access_review(auth_db, rbac_store, engine_principal_store_,
                                                     engine_credential_store_, directory_sync);
                 if (!rows_res) {
@@ -29430,6 +29438,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(
                         a4_error(kInvalidParams, "decision must be attested or flagged_revoke"),
                         "application/json");
+                    return;
+                }
+                // A present justification that is not a string is refused, not read as "" (the
+                // REST twin does the same): the entry is append-only. Absent and null both mean
+                // no justification.
+                if (args.is_object() && args.contains("justification") &&
+                    !args["justification"].is_null() && !args["justification"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, kJustificationTypeMessage),
+                                    "application/json");
                     return;
                 }
                 // Bound the grant tuple BEFORE the gate (the REST twin does the same): the gate's

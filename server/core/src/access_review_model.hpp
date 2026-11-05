@@ -295,4 +295,23 @@ decision_cap_wire_message(std::string_view store_error) noexcept {
     return true;
 }
 
+/// Longest campaign title any surface accepts, in bytes. A title is a short human label (the
+/// examples are "Q3 2026 Access Review"), and it is the one caller-supplied free-text field of
+/// `open_access_review` that is stored for good (campaigns are never pruned) and returned by every
+/// list read, so it is bounded like the other fields. A longer title is refused with 400 before
+/// anything is written; no audit row is written for it.
+inline constexpr std::size_t kCampaignTitleMaxLen = 256;
+
+/// The refusal text REST (400) and MCP (invalid-params) return for a title over the cap, and the
+/// store backstop's text (which prefixes `bad_request: `). It spells out 256, pinned below.
+inline constexpr std::string_view kCampaignTitleTooLongMessage = "title must be at most 256 bytes";
+static_assert(kCampaignTitleMaxLen == 256,
+              "kCampaignTitleTooLongMessage spells out 256: update the text with the constant");
+
+/// The refusal text REST (400) and MCP (invalid-params) return for a PRESENT `justification` that
+/// is not a JSON string. Absent and JSON null both mean "no justification"; any other type used to
+/// be read as the empty string, so the decision was recorded without the note the reviewer sent
+/// and the call answered 200. The entry is append-only, so the lost note could only be superseded.
+inline constexpr std::string_view kJustificationTypeMessage = "justification must be a string";
+
 } // namespace yuzu::server

@@ -239,5 +239,36 @@ class StoreErrorStrings(unittest.TestCase):
         self.assertEqual(len(store_error_problems('return std::unexpected("title is too long");')), 1)
 
 
+SETTINGS_CPP = SRC_DIR / "settings_routes.cpp"
+
+
+def settings_error_problems(src):
+    """The Settings panel's arPost must show the error MESSAGE: the A4 envelope is
+    {error: {message, ...}}, so reading `data.error` alone shows "[object Object]" for every refusal."""
+    t = normalise(src)
+    at = t.find("function arPost(")
+    if at < 0:
+        return ["settings_routes.cpp: the Settings access review script no longer defines arPost"]
+    body = t[at:t.find("function arLoadCampaign(", at)]
+    if "e.message" not in body or "data.error ||" in body:
+        return ["settings_routes.cpp: arPost does not read error.message (a refusal would show [object Object])"]
+    return []
+
+
+class SettingsErrorMessage(unittest.TestCase):
+    def test_arpost_reads_the_message(self):
+        p = settings_error_problems(SETTINGS_CPP.read_text(encoding="utf-8"))
+        for m in p:
+            print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
+        self.assertEqual(p, [])
+
+    def test_pattern_is_live(self):
+        text = SETTINGS_CPP.read_text(encoding="utf-8")
+        self.assertTrue(settings_error_problems(text.replace("e.message", "e.msg")))
+        self.assertTrue(settings_error_problems(text.replace("var e = data && data.error;",
+                                                             "var e = data.error || data.message;")
+                                                .replace("e.message", "x")))
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False).result.wasSuccessful() else 1)

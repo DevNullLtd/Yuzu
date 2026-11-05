@@ -1298,7 +1298,11 @@ function arPost(url, body, onSuccess) {
       var data = {};
       try { data = JSON.parse(t); } catch (e) {}
       if (!r.ok) {
-        var msg = (data && (data.error || data.message)) || ('Action failed (' + r.status + ')');
+        // The error envelope is {error: {message, ...}}: read the message, not the object (a
+        // plain string `error` and a top-level `message` stay accepted).
+        var e = data && data.error;
+        var msg = (e && (typeof e === 'string' ? e : e.message)) || (data && data.message) ||
+                  ('Action failed (' + r.status + ')');
         arFeedback(msg, true);
         return;
       }

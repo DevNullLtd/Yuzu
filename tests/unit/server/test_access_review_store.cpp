@@ -248,6 +248,29 @@ TEST_CASE("open_campaign rejects an rbac_enforcement value outside "
     }
 }
 
+TEST_CASE("open_campaign bounds the title: the cap is accepted, one byte over is a bad_request "
+          "and nothing is written",
+          "[access_review][store][pg][4752]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string at_cap(yuzu::server::kCampaignTitleMaxLen, 'a');
+    auto ok = store.open_campaign(at_cap, "admin", {}, "enabled");
+    REQUIRE(ok.has_value());
+
+    auto over = store.open_campaign(at_cap + "a", "admin", {}, "enabled");
+    REQUIRE_FALSE(over.has_value());
+    CHECK(over.error() ==
+          "bad_request: " + std::string(yuzu::server::kCampaignTitleTooLongMessage));
+
+    // Only the campaign at the cap exists.
+    auto list = store.list_campaigns();
+    REQUIRE(list.has_value());
+    CHECK(list->size() == 1);
+}
+
 // ── Freeze-at-open (R3) ──────────────────────────────────────────────────────
 
 TEST_CASE("open_campaign freezes the full population as pending rows (R3)",

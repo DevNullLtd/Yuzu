@@ -100,6 +100,10 @@ const std::vector<pg::PgMigration>& migrations() {
         //
         // ADD COLUMN and ADD CONSTRAINT take ACCESS EXCLUSIVE (CREATE TRIGGER takes SHARE ROW
         // EXCLUSIVE), so the pool's 10 s lock_timeout is raised to 30 s as in ca_store v3/v4.
+        // This covers the locks v3's own statements wait for. It does not cover the runner's
+        // per-store advisory lock, taken before this SQL runs and bounded by the pool's 10 s: a
+        // second replica starting at the same moment can fail that wait and refuse to start, so
+        // start one replica first (docs/user-manual/upgrading.md).
         // The backfill is expected to be empty under the deployment contract; the
         // statement_timeout bounds a carried-forward one.
         {3, "SET LOCAL lock_timeout = '30s'; "
@@ -332,6 +336,11 @@ AccessReviewStore::open_campaign(std::string title, std::string created_by,
     // touched.
     if (title.find('\0') != std::string::npos)
         return std::unexpected("bad_request: title contains a NUL byte");
+    // The handlers refuse an over-long title first; this is the backstop for a caller that skips
+    // them. The same text, so the transports and the store cannot drift.
+    if (title.size() > kCampaignTitleMaxLen)
+        return std::unexpected(std::string(kBadRequestPrefix) +
+                               std::string(kCampaignTitleTooLongMessage));
     if (created_by.find('\0') != std::string::npos)
         return std::unexpected("bad_request: created_by contains a NUL byte");
     if (rbac_enforcement != "enabled" && rbac_enforcement != "disabled" &&

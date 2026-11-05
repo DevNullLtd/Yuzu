@@ -2356,6 +2356,108 @@ TEST_CASE("attestation SoD: a different reviewer records, and every decision is 
     }
 }
 
+TEST_CASE("attestation: a present justification that is not a string is refused and records "
+          "nothing; null and absent are accepted as no justification",
+          "[pg][access_review][rest][mcp][badtype][4752]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    const auto cid = h.open_campaign_rest("justification type");
+    h.session_user = "carol";
+    h.audit_log.clear();
+    const std::string msg{yuzu::server::kJustificationTypeMessage};
+
+    const std::vector<nlohmann::json> wrong_types = {123, true, nlohmann::json::array({1}),
+                                                     nlohmann::json{{"a", 1}}};
+
+    SECTION("REST") {
+        for (const auto& wrong : wrong_types) {
+            INFO("justification=" << wrong.dump());
+            auto body = nlohmann::json::parse(sod_body("user", "bob", "Operator"));
+            body["justification"] = wrong;
+            auto res = h.sink.Post(attest_url(cid), body.dump());
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(res->body.find(msg) != std::string::npos);
+        }
+        // Nothing was recorded and no row was written for the malformed requests.
+        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        CHECK(row.decision == "pending");
+        CHECK(row.decision_seq == 0);
+        CHECK(row.history.empty());
+        CHECK(audit_rows(h, "access_review.attested").empty());
+
+        // null is the same as absent: the decision is recorded, as the first one.
+        auto with_null = nlohmann::json::parse(sod_body("user", "bob", "Operator"));
+        with_null["justification"] = nullptr;
+        auto ok = h.sink.Post(attest_url(cid), with_null.dump());
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        const auto recorded = nlohmann::json::parse(ok->body)["data"];
+        CHECK(recorded["decision_seq"] == 1);
+    }
+
+    SECTION("MCP") {
+        for (const auto& wrong : wrong_types) {
+            INFO("justification=" << wrong.dump());
+            auto args = sod_args(cid, "user", "bob", "Operator");
+            args["justification"] = wrong;
+            auto res = h.mcp_call_tool("record_attestation", args);
+            const auto err = mcp_error_of(res);
+            CHECK(err.value("code", 0) == yuzu::server::mcp::kInvalidParams);
+            CHECK(err.value("message", std::string{}) == msg);
+        }
+        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        CHECK(row.decision == "pending");
+        CHECK(row.decision_seq == 0);
+        CHECK(row.history.empty());
+        CHECK(audit_rows(h, "access_review.attested").empty());
+
+        auto with_null = sod_args(cid, "user", "bob", "Operator");
+        with_null["justification"] = nullptr;
+        auto ok = h.mcp_call_tool("record_attestation", with_null);
+        REQUIRE(ok);
+        const auto okbody = nlohmann::json::parse(ok->body, nullptr, false);
+        REQUIRE_FALSE(okbody.is_discarded());
+        CHECK_FALSE(okbody.contains("error"));
+        CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 1);
+    }
+}
+
+TEST_CASE("open campaign: a title over 256 bytes is refused with 400 / invalid params and "
+          "writes nothing; 256 bytes is accepted",
+          "[pg][access_review][rest][mcp][4752]") {
+    AccessReviewHarness h;
+    const std::string at_cap(yuzu::server::kCampaignTitleMaxLen, 'a');
+    const std::string over = at_cap + "a";
+    const std::string msg{yuzu::server::kCampaignTitleTooLongMessage};
+
+    SECTION("REST") {
+        auto bad = h.sink.Post("/api/v1/access-reviews", nlohmann::json{{"title", over}}.dump());
+        REQUIRE(bad);
+        CHECK(bad->status == 400);
+        CHECK(bad->body.find(msg) != std::string::npos);
+        CHECK(audit_rows(h, "access_review.campaign_opened").empty());
+
+        auto ok = h.sink.Post("/api/v1/access-reviews", nlohmann::json{{"title", at_cap}}.dump());
+        REQUIRE(ok);
+        CHECK(ok->status == 201);
+    }
+
+    SECTION("MCP") {
+        auto bad = h.mcp_call_tool("open_access_review", {{"title", over}});
+        const auto err = mcp_error_of(bad);
+        CHECK(err.value("code", 0) == yuzu::server::mcp::kInvalidParams);
+        CHECK(err.value("message", std::string{}) == msg);
+        CHECK(audit_rows(h, "access_review.campaign_opened").empty());
+
+        auto ok = h.mcp_call_tool("open_access_review", {{"title", at_cap}});
+        REQUIRE(ok);
+        const auto okbody = nlohmann::json::parse(ok->body, nullptr, false);
+        REQUIRE_FALSE(okbody.is_discarded());
+        CHECK_FALSE(okbody.contains("error"));
+    }
+}
+
 TEST_CASE("attestation SoD: a subject cannot un-flag a grant that a reviewer flagged",
           "[pg][access_review][rest][sod][4752]") {
     AccessReviewHarness h;
