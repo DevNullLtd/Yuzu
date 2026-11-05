@@ -467,7 +467,13 @@ jobs:
     # re-derive this number in that PR, don't inherit it (see the warning
     # next to `SCENARIO_ALERTS` in `blind_band_sweep.py`, and
     # run_promtool_tests.py's own pull_with_retry() comment).
-    timeout-minutes: 45
+    # 45 -> 55 for #7191: the two `promtool test rules` calls per gate went
+    # from 120s to 240s (one of four shards intermittently ran past 120s), so a
+    # gate is 120 + 240 + 240 + 120 = 720s and step 1 is now ~1665s worst case
+    # (225 + 720x2). Step 2 is unchanged at ~915s. Sum ~2580s (43 min); 55
+    # minutes (3300s) keeps the same ~1.28x margin the 45-minute value had over
+    # the earlier sum. Re-derive this number if a call limit changes again.
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
