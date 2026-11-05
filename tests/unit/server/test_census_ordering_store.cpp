@@ -810,7 +810,7 @@ TEST_CASE("census ordering: a rule that is gone rejects the census write and kee
     CHECK(store.census_proj_failures_total() == 0); // a rejection is not a fault
 }
 
-TEST_CASE("census ordering: the batch path orders by key and stores no pending evidence",
+TEST_CASE("census ordering: the batch path orders by key and rolls back on a failed projection",
           "[pg][guaranteed_state_store][db][census][ordering][k]") {
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -825,11 +825,18 @@ TEST_CASE("census ordering: the batch path orders by key and stores no pending e
     CHECK(census(db.dsn(), "a", "r1") ==
           "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|true");
 
-    // A batch projection failure leaves no durable repair evidence (documented limit).
+    // The batch path records no pending evidence, so a failed projection aborts the whole batch:
+    // neither event is stored and the census row is unchanged.
     install_census_fail(db.dsn(), "true");
-    const auto m = store.insert_events({ev("b3", "r1", "a", kErrored, kBase + 300)});
-    REQUIRE(m.has_value());
+    const auto events_before = store.event_count();
+    const auto m = store.insert_events(
+        {ev("b3", "r1", "a", kErrored, kBase + 300), ev("b4", "r1", "a", kDrifted, kBase + 400)});
+    REQUIRE_FALSE(m.has_value());
+    CHECK(m.error().find("batch rolled back") != std::string::npos);
+    CHECK(store.event_count() == events_before);
     CHECK(pending_count(db.dsn()) == "0");
+    CHECK(census(db.dsn(), "a", "r1") ==
+          "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|true");
 }
 
 TEST_CASE("census ordering: a sequence collision is an operational error and never a redelivery",

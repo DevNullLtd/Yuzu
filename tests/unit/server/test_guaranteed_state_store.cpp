@@ -3764,17 +3764,18 @@ TEST_CASE("GuaranteedStateStore: a failed census write keeps the event, is count
               "2026-04-19T12:10:00Z");
     }
 
-    SECTION("batch: rows before and after the failed one still land") {
+    SECTION("batch: a failed census write rolls the whole batch back") {
+        // The batch path records no pending evidence, so it never stores an event whose census
+        // write failed: the rows before and after the failed one are rolled back with it.
         auto n = store.insert_events({make_event("b1", "r1", "agent-B", "high", "2026-04-19T12:01:00Z"),
                                       make_drift("b2", "r1", "agent-A", "2026-04-19T12:06:00Z"),
                                       make_event("b3", "r1", "agent-C", "high", "2026-04-19T12:02:00Z")});
-        REQUIRE(n.has_value());
-        CHECK(*n == 3);
-        CHECK(store.event_count() == 4);
+        REQUIRE_FALSE(n.has_value());
+        CHECK(n.error().find("batch rolled back") != std::string::npos);
+        CHECK(store.event_count() == 1);
         CHECK(store.census_proj_failures_total() == 1);
         CHECK(census_state(db.dsn(), "agent-A", "r1") == "compliant");
-        CHECK(census_state(db.dsn(), "agent-B", "r1") == "compliant");
-        CHECK(census_state(db.dsn(), "agent-C", "r1") == "compliant");
+        CHECK(census_count(db.dsn()) == "1"); // agent-B and agent-C never reached the census
     }
 }
 

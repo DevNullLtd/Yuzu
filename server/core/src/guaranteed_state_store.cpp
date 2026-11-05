@@ -1329,7 +1329,7 @@ bool census_bearing(const GuaranteedStateEventRow& row) {
 enum class ProjectionSource {
     FirstDelivery, // the event was just inserted (not pending) in this transaction
     Repair,        // a redelivery of an event stored with pending evidence
-    Batch,         // `insert_events`: a failed projection leaves NO pending evidence (documented)
+    Batch,         // `insert_events`: a failed projection aborts and rolls back the whole batch
 };
 
 const char* projection_source_label(ProjectionSource s) {
@@ -1587,7 +1587,7 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
 //   Failed:    counted on `failures` and logged at error. A first delivery records the event's
 //              pending evidence now, in the outer transaction (it was stored not pending, so the
 //              happy path writes the event once); a repair's evidence is already recorded; a
-//              batch row keeps none (documented, no production caller).
+//              batch records none, so `insert_events` aborts and rolls back the whole batch.
 //   Rejected:  the census foreign key (and only that constraint) refused the write because the
 //              rule is gone: definitive, not counted. A repair retires the evidence it was
 //              repairing in the outer transaction; a first delivery has none.
@@ -1662,7 +1662,7 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
         failures.fetch_add(1, std::memory_order_relaxed);
         spdlog::error("GuaranteedStateStore: census upsert failed (status row not updated; a "
                       "first delivery or repair keeps the event with pending evidence, a batch "
-                      "row keeps none) event_id={} agent_id={} rule_id={}: {}",
+                      "is rolled back) event_id={} agent_id={} rule_id={}: {}",
                       log_id_token(row.event_id), log_id_token(row.agent_id),
                       log_id_token(row.rule_id), ::yuzu::log_key_token(err));
         return CensusOutcome::Failed;
@@ -2021,6 +2021,12 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
             if (projected == CensusOutcome::Abandoned)
                 return std::unexpected(std::string("census savepoint failed: ") +
                                        PQerrorMessage(conn));
+            // The batch path records no pending evidence, so an event whose census write failed
+            // would be stored with nothing to repair it. Abort and roll back the whole batch
+            // instead, as for any other statement failure in it.
+            if (projected == CensusOutcome::Failed)
+                return std::unexpected("census projection failed for event_id '" + row.event_id +
+                                       "'; batch rolled back");
         }
         // DEX projection — same degrade-don't-destroy contract as insert_event,
         // under its own SAVEPOINT (Postgres aborts on any failed statement).
