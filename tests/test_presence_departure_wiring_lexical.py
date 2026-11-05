@@ -20,7 +20,9 @@ Plus the endpoint_state retention prune's host (#5678): in server.cpp the one
 preflight_runner_thread_ lambda, after its `tick % kOfflineEndpointPruneEveryNTicks == 1`
 condition. No unit test drives that thread, so deleting the call, dropping the cadence gate, or
 moving it onto another thread (health_recompute_thread_ shares the revocation sweep's budget)
-would leave every other test green.
+would leave every other test green. The software change ledger prune (SAM-14) is pinned the same
+way: one `software_inventory_store_->run_retention_prune_changes()` call, inside that lambda,
+after its `tick % kSoftwareLedgerPruneEveryNTicks == 1` condition.
 
 `//` comments are stripped and whitespace runs collapsed before matching, so line wrapping and
 comment text cannot satisfy or break a check. The self-test applies in-memory mutations (dropped
@@ -67,38 +69,40 @@ def problems(name, gate, src):
     return out
 
 
-PRUNE_CALL = "offline_endpoint_store_->run_retention_prune(kHardwareRosterWindow)"
-PRUNE_COND = "tick % kOfflineEndpointPruneEveryNTicks == 1"
+# (call, tick condition, label): each prune hosted on the preflight runner thread.
+PRUNES = (
+    ("offline_endpoint_store_->run_retention_prune(kHardwareRosterWindow)",
+     "tick % kOfflineEndpointPruneEveryNTicks == 1", "endpoint prune (#5678)"),
+    ("software_inventory_store_->run_retention_prune_changes()",
+     "tick % kSoftwareLedgerPruneEveryNTicks == 1", "software change ledger prune (SAM-14)"),
+)
 PRUNE_START = "preflight_runner_thread_ = std::thread("
 PRUNE_END = '"Pre-flight runner thread stopped"'
 
 
 def prune_problems(src):
-    """The prune call appears once file-wide, inside the preflight thread lambda, after its tick gate."""
+    """Each prune call appears once file-wide, inside the preflight thread lambda, after its tick gate."""
     t = normalise(src)
-    call, cond = normalise(PRUNE_CALL), normalise(PRUNE_COND)
     out = []
-    if t.count(call) != 1:
-        out.append(f"server.cpp: expected exactly one `{call}` (found {t.count(call)}) (#5678)")
-        return out
     lo, hi = t.find(normalise(PRUNE_START)), t.find(PRUNE_END)
     if lo < 0 or hi < lo:
-        out.append("server.cpp: preflight_runner_thread_ lambda not found (#5678)")
-        return out
+        return ["server.cpp: preflight_runner_thread_ lambda not found (#5678)"]
     body = t[lo:hi]
-    if call not in body:
-        out.append("server.cpp: the endpoint prune is not inside the preflight_runner_thread_ lambda (#5678)")
-    elif cond not in body or body.index(cond) > body.index(call):
-        out.append(f"server.cpp: the endpoint prune is not gated by `{cond}` (#5678)")
+    for raw_call, raw_cond, label in PRUNES:
+        call, cond = normalise(raw_call), normalise(raw_cond)
+        if t.count(call) != 1:
+            out.append(f"server.cpp: expected exactly one `{call}` (found {t.count(call)}): {label}")
+        elif call not in body:
+            out.append(f"server.cpp: the {label} is not inside the preflight_runner_thread_ lambda")
+        elif cond not in body or body.index(cond) > body.index(call):
+            out.append(f"server.cpp: the {label} is not gated by `{cond}`")
     return out
 
 
 # (pattern, replacement) mutations of server.cpp; each must make prune_problems() non-empty.
-PRUNE_MUTATIONS = [
-    (re.escape(PRUNE_CALL), "(void)0"),
-    (re.escape(PRUNE_COND), "true"),
-    (re.escape(PRUNE_START), "health_recompute_thread_ = std::thread("),
-]
+PRUNE_MUTATIONS = [m for call, cond, _ in PRUNES
+                   for m in ((re.escape(call), "(void)0"), (re.escape(cond), "true"))]
+PRUNE_MUTATIONS.append((re.escape(PRUNE_START), "health_recompute_thread_ = std::thread("))
 
 # (file index into SITES, pattern, replacement, expected substring of the FIRST problem)
 MUTATIONS = [
