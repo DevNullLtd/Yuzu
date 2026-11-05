@@ -7,7 +7,8 @@ first on PATH, a coreutils-only symlink farm behind it (so a node/python3/gcovr 
 never leak in), a temp YUZU_GCOVR_VENV and TMPDIR, and a private copy of the script plus the few repo
 files it reads. The script runs with its working directory in a NEUTRAL empty temp dir (neither the
 repo nor the sandbox repo), so a missing `cd` shows up as a stub that ran in the wrong place. The real
-repo tree and the real $HOME are never touched; each case asserts the former.
+repo tree and the real $HOME are never touched; each case asserts both, over the paths the helpers can
+write (see guard_snapshot), not over the whole checkout.
 
 Stubs append their argv to one log (calls.log), so a case can say which tools ran and which did not.
 Side observations that are not "a tool ran" (what the filesystem looked like when a stub was called,
@@ -26,6 +27,7 @@ YUZU_ENSURE_SCRIPT_DIR points the harness at a directory holding variants of the
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -270,11 +272,85 @@ class Sandbox:
             raise AssertionError(f"{script} still running after {timeout}s (blocked?)") from e
 
 
-def _git_status():
-    if not shutil.which("git"):
+# What the "real tree and real HOME were not written" guard watches. It must name only what the
+# helpers can write: a whole-checkout `git status` also sees files other suites create next to this one
+# (gateway/**/*.coverdata with pid-dependent names, in a tracked directory so each is listed), which made
+# every test fail in the CI docs suite whether or not a helper wrote anything.
+#   - tests/puppeteer/node_modules (the directory, its top-level entries, npm's own .package-lock.json and
+#     this repo's stamp), tests/puppeteer/package.json and package-lock.json (content);
+#   - every file under scripts/test (content; __pycache__ excluded) and requirements-ci.in / .txt;
+#   - the real HOME's paths the helpers write: the gcovr venv and its lock, the ~/.local/bin/gcovr link,
+#     the puppeteer lock file and browser cache directory.
+GUARD_HOME_PATHS = (".local/share/yuzu/gcovr-venv", ".local/share/yuzu/gcovr-venv.lock", ".local/bin/gcovr",
+                    ".cache/yuzu-ensure-puppeteer.lock", ".cache/puppeteer")
+
+
+def _sig(path):
+    """A content-free signature of one path, never following a link; None when it does not exist."""
+    try:
+        st = os.lstat(path)
+    except OSError:
         return None
-    return subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain"],
-                          capture_output=True, text=True).stdout
+    if stat.S_ISLNK(st.st_mode):
+        return ("link", os.readlink(path))
+    if stat.S_ISDIR(st.st_mode):
+        return ("dir", st.st_mtime_ns)
+    return ("file", st.st_size, st.st_mtime_ns)
+
+
+def _sha(path):
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _names(path):
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        return None
+
+
+def _tree(path):
+    """{relative path: ("file", sha) | ("link", target) | ("dir",)} for everything below `path`
+    (__pycache__ directories excluded: Python writes them on import and they are not the helpers')."""
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for name in dirnames + filenames:
+            full = Path(dirpath) / name
+            rel = str(full.relative_to(path))
+            if full.is_symlink():
+                out[rel] = ("link", os.readlink(full))
+            elif full.is_dir():
+                out[rel] = ("dir",)
+            else:
+                out[rel] = ("file", _sha(full))
+    return out
+
+
+def guard_snapshot(root, home):
+    """What the helpers could have written under `root` (a checkout) and `home` (a HOME), as a dict that
+    compares equal before and after a case that wrote nothing there."""
+    root, home = Path(root), Path(home)
+    pp = root / "tests" / "puppeteer"
+    nm = pp / "node_modules"
+    snap = {
+        "node_modules": (_sig(nm), _names(nm)),
+        "node_modules/.package-lock.json": _sig(nm / ".package-lock.json"),
+        "node_modules/stamp": (_sig(nm / ".yuzu-package-lock.sha256"), _sha(nm / ".yuzu-package-lock.sha256")),
+        "tests/puppeteer/package.json": _sha(pp / "package.json"),
+        "tests/puppeteer/package-lock.json": _sha(pp / "package-lock.json"),
+        "scripts/test": _tree(root / "scripts" / "test"),
+        "requirements-ci.in": _sha(root / "requirements-ci.in"),
+        "requirements-ci.txt": _sha(root / "requirements-ci.txt"),
+    }
+    for rel in GUARD_HOME_PATHS:
+        path = home / rel
+        snap["home:" + rel] = (_sig(path), _names(path), _sha(path / ".yuzu-gcovr-venv"),
+                               _sha(path / ".requirements-ci.sha256"))
+    return snap
 
 
 @unittest.skipIf(sys.platform == "win32" or not shutil.which("bash"), "needs bash and POSIX stubs")
@@ -282,8 +358,10 @@ class SandboxCase(unittest.TestCase):
     pin_in = pin_txt = "8.7"
 
     def setUp(self):
-        before = _git_status()
-        self.addCleanup(lambda: self.assertEqual(_git_status(), before, "real repo tree was written"))
+        home = Path(os.path.expanduser("~"))
+        before = guard_snapshot(ROOT, home)
+        self.addCleanup(lambda: self.assertEqual(guard_snapshot(ROOT, home), before,
+                                                 "the real repo tree or the real HOME was written"))
         self.sb = Sandbox(self.pin_in, self.pin_txt)
         self.addCleanup(self.sb.cleanup)
 
@@ -323,6 +401,96 @@ class SandboxCase(unittest.TestCase):
             tag, _, state = line.rpartition(" ")
             seen.setdefault(tag, set()).add(state)
         self.assertEqual(seen, {**{t: {"open"} for t in install_tags}, **{t: {"closed"} for t in probe_tags}})
+
+
+class GuardSnapshotSelfTest(unittest.TestCase):
+    """The guard that SandboxCase uses must (a) notice a helper writing where the helpers write, and (b)
+    not notice what other suites write next to this one. Both halves are asserted on scratch checkouts
+    and HOMEs, never on the real ones."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="yuzu_test_guard_")
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name).resolve()
+        self.n = 0
+
+    def scratch(self):
+        """A fresh (root, home) pair shaped like a checkout and a HOME."""
+        self.n += 1
+        root, home = self.base / f"repo{self.n}", self.base / f"home{self.n}"
+        for d in (root / "scripts" / "test", root / "tests" / "puppeteer", root / "gateway",
+                  home / ".local" / "bin", home / ".cache"):
+            d.mkdir(parents=True)
+        (root / "scripts" / "test" / "ensure-gcovr.sh").write_text("#!/bin/bash\n")
+        (root / "tests" / "puppeteer" / "package.json").write_text("{}\n")
+        (root / "tests" / "puppeteer" / "package-lock.json").write_text("{}\n")
+        (root / "requirements-ci.in").write_text("gcovr==8.7\n")
+        (root / "requirements-ci.txt").write_text("gcovr==8.7\n")
+        return root, home
+
+    def test_a_write_where_the_helpers_write_changes_the_snapshot(self):
+        def nm(r, h):
+            (r / "tests" / "puppeteer" / "node_modules").mkdir()
+            return r / "tests" / "puppeteer" / "node_modules"
+
+        def share(h):
+            (h / ".local" / "share" / "yuzu").mkdir(parents=True)
+            return h / ".local" / "share" / "yuzu"
+
+        writes = {
+            "node_modules created": lambda r, h: nm(r, h),
+            "a module installed": lambda r, h: (nm(r, h) / "puppeteer").mkdir(),
+            "npm's lock file written": lambda r, h: (nm(r, h) / ".package-lock.json").write_text(""),
+            "the lock stamp written": lambda r, h: (nm(r, h) / ".yuzu-package-lock.sha256").write_text("x\n"),
+            "package-lock.json rewritten": lambda r, h: (r / "tests" / "puppeteer" / "package-lock.json").write_text('{"a": 1}\n'),
+            "package.json rewritten": lambda r, h: (r / "tests" / "puppeteer" / "package.json").write_text('{"a": 1}\n'),
+            "a script rewritten": lambda r, h: (r / "scripts" / "test" / "ensure-gcovr.sh").write_text("#!/bin/bash\n# x\n"),
+            "a file added to scripts/test": lambda r, h: (r / "scripts" / "test" / "new.sh").write_text(""),
+            "requirements-ci.txt rewritten": lambda r, h: (r / "requirements-ci.txt").write_text("gcovr==8.8\n"),
+            "requirements-ci.in rewritten": lambda r, h: (r / "requirements-ci.in").write_text("gcovr==8.8\n"),
+            "the gcovr link created": lambda r, h: (h / ".local" / "bin" / "gcovr").symlink_to("/nowhere"),
+            "the gcovr venv created": lambda r, h: (share(h) / "gcovr-venv").mkdir(),
+            "the venv lock created": lambda r, h: (share(h) / "gcovr-venv.lock").write_text(""),
+            "the puppeteer lock created": lambda r, h: (h / ".cache" / "yuzu-ensure-puppeteer.lock").write_text(""),
+            "the browser cache created": lambda r, h: (h / ".cache" / "puppeteer").mkdir(),
+        }
+        for name, write in writes.items():
+            with self.subTest(name):
+                root, home = self.scratch()
+                before = guard_snapshot(root, home)
+                write(root, home)
+                self.assertNotEqual(guard_snapshot(root, home), before, f"{name}: the guard did not notice")
+
+    def test_a_link_pointed_somewhere_else_is_noticed(self):
+        root, home = self.scratch()
+        link = home / ".local" / "bin" / "gcovr"
+        link.symlink_to("/one")
+        before = guard_snapshot(root, home)
+        link.unlink()
+        link.symlink_to("/two")
+        self.assertNotEqual(guard_snapshot(root, home), before)
+
+    def test_a_marker_or_stamp_rewritten_inside_the_venv_is_noticed(self):
+        root, home = self.scratch()
+        venv = home / ".local" / "share" / "yuzu" / "gcovr-venv"
+        venv.mkdir(parents=True)
+        (venv / ".requirements-ci.sha256").write_text("a\n")
+        before = guard_snapshot(root, home)
+        (venv / ".requirements-ci.sha256").write_text("b\n")
+        self.assertNotEqual(guard_snapshot(root, home), before)
+
+    def test_what_other_suites_write_next_to_this_one_does_not_change_the_snapshot(self):
+        root, home = self.scratch()
+        before = guard_snapshot(root, home)
+        (root / "gateway" / "zz-pid-4242.coverdata").write_text("x")     # the CI failure: files in a tracked dir
+        (root / "gateway" / "zz-pid-4243.coverdata").write_text("x")
+        (root / "build-linux").mkdir()
+        (root / "build-linux" / "meson-log.txt").write_text("x")
+        (root / "tests" / "puppeteer" / "shot.png").write_text("x")
+        (root / "scripts" / "test" / "__pycache__").mkdir()
+        (root / "scripts" / "test" / "__pycache__" / "x.pyc").write_text("x")
+        (home / ".cache" / "somebody-else").mkdir()
+        self.assertEqual(guard_snapshot(root, home), before)
 
 
 class EnsurePuppeteer(SandboxCase):
